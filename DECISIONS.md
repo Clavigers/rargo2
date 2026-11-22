@@ -129,3 +129,13 @@ how its open ends were closed.
   delete caches, so failures are always recomputed. Concurrent identical
   failing compiles are still collapsed by in-flight deduplication.
 - Test binary runs are cached only when they pass, for the same reason.
+
+## D9. Zed is dropped from the benchmark set
+
+- The user said mid-run to give up on Zed: it takes too long and pulls in
+  too many unrelated system dependencies (it needed a private `cmake` just to
+  get past one build script, and pins its own toolchain and some forty git
+  dependencies). Acceptance is measured on rust-analyzer, Ruff and Bevy.
+- What Zed did exercise before being dropped: the unsandboxed fetch step
+  (toolchain install, git dependencies with submodules, crate downloads) and
+  build-script failure reporting, both of which behaved.
