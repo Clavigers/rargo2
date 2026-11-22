@@ -66,6 +66,10 @@ pub enum Obs {
     Symlink(Vec<u8>),
     /// A file that was looked up but never opened.
     Meta { size: u64, exec: bool },
+    /// A file that was looked up but never opened, by an action known not
+    /// to act on file sizes (the planner): only its existence and
+    /// executable bit were observed.
+    IsFile { exec: bool },
     /// A file whose content was read.
     File { hash: Hash, exec: bool },
     /// Something that is neither file, directory nor symlink.
@@ -370,6 +374,7 @@ pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> 
         (Obs::Other, Looked::Other) => true,
         (Obs::Symlink(a), Looked::Symlink(b)) => *a == b,
         (Obs::Meta { size, exec }, Looked::File(f)) => f.size == *size && f.exec() == *exec,
+        (Obs::IsFile { exec }, Looked::File(f)) => f.exec() == *exec,
         (Obs::File { hash, exec }, Looked::File(f)) => {
             if f.exec() != *exec {
                 return false;

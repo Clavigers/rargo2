@@ -27,6 +27,12 @@ pub trait Observer: Send + Sync {
     /// The action was not in the cache; it is about to run (or to wait for
     /// an identical run already in flight).
     fn miss(&self) {}
+    /// Whether [`Observer::explain`] should be called on a miss.
+    fn wants_explanation(&self) -> bool {
+        false
+    }
+    /// Why the cache did not have the action.
+    fn explain(&self, _why: &str) {}
     fn stdout(&self, _data: &[u8]) {}
     /// One line of stderr without the newline. `live` is present while the
     /// action is actually running.
@@ -227,6 +233,39 @@ impl Engine {
         h.finish()
     }
 
+    /// A human-readable reason why no trace under `key` holds in `view`.
+    fn explain_miss(&self, key: &Hash, view: &dyn View, no_cache: bool) -> String {
+        if no_cache {
+            return "caching was turned off for it".into();
+        }
+        let traces = self.traces.traces(key);
+        let Some((_, newest)) = traces.first() else {
+            return "this command line and environment have not been run before".into();
+        };
+        match newest.first_mismatch(view, &self.content) {
+            Some((path, was)) => {
+                let now = match was {
+                    Obs::Listing(_) => match view.list(path) {
+                        Ok(l) => format!("{} entries", l.len()),
+                        Err(_) => "not a directory".into(),
+                    },
+                    _ => match view.stat(path) {
+                        Looked::Absent => "absent".into(),
+                        Looked::Dir(_) => "a directory".into(),
+                        Looked::Symlink(t) => format!("a symlink to {}", show(&t)),
+                        Looked::Other => "a special file".into(),
+                        Looked::File(f) => match self.content.known_hash(&f.src) {
+                            Some(h) => format!("a file of {} bytes ({h:?})", f.size),
+                            None => format!("a file of {} bytes", f.size),
+                        },
+                    },
+                };
+                format!("{} was {:?}, is now {now} ({} recorded run(s))", show(path), was, traces.len())
+            }
+            None => "its recorded outputs are no longer in the store".into(),
+        }
+    }
+
     fn replay(&self, result: &ActionResult, observer: &dyn Observer) {
         if let Ok(out) = self.store.read(&result.stdout) {
             if !out.is_empty() {
@@ -261,6 +300,9 @@ impl Engine {
             if !announced {
                 req.observer.miss();
                 announced = true;
+                if req.observer.wants_explanation() {
+                    req.observer.explain(&self.explain_miss(&key, &*req.view, req.no_cache));
+                }
             }
 
             // Someone else may already be computing exactly this.
@@ -370,6 +412,10 @@ impl Engine {
             gid: req.gid,
             scratch: scratch.clone(),
             mountpoints: vec![b"proc".to_vec(), b"dev".to_vec(), b"sys".to_vec(), b"tmp".to_vec()],
+            // cargo checks that target source files exist while planning but
+            // never acts on their size; recording sizes would re-plan after
+            // every edit to a `lib.rs`.
+            size_blind: spec.kind == ActionKind::Plan,
         });
         // From here on the action directory must be torn down on every path.
         let run = self.run_in(spec, req, &action).await;

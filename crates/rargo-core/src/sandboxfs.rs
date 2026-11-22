@@ -76,12 +76,15 @@ struct FileN {
     read_src: Option<FileSrc>,
     /// Userspace I/O handle for lower files when passthrough is unavailable.
     file: Option<Arc<File>>,
+    /// Size and executable bit of the view file this node started as. Kept
+    /// after a copy-up: it is what the action observed.
+    lower_meta: Option<(u64, bool)>,
 }
 
 enum Kind {
     Dir(Box<Dir>),
     File(Box<FileN>),
-    Symlink { target: Vec<u8>, upper: bool },
+    Symlink { target: Vec<u8> },
     /// A directory that exists only to be mounted over.
     Mount,
     /// Fifo or socket created by the action. Never an output.
@@ -112,6 +115,7 @@ pub struct ActionFs {
     uid: u32,
     gid: u32,
     scratch: PathBuf,
+    size_blind: bool,
     st: Mutex<State>,
 }
 
@@ -123,6 +127,9 @@ pub struct ActionFsConfig {
     pub scratch: PathBuf,
     /// Top-level names that are bare mountpoints (`proc`, `dev`, ...).
     pub mountpoints: Vec<Vec<u8>>,
+    /// Record files that were only looked up as "exists" rather than with
+    /// their size. Only sound for actions known not to act on sizes.
+    pub size_blind: bool,
 }
 
 /// One entry of an action's upper layer.
@@ -237,6 +244,7 @@ impl SandboxFs {
             uid: cfg.uid,
             gid: cfg.gid,
             scratch: cfg.scratch,
+            size_blind: cfg.size_blind,
             st: Mutex::new(State {
                 nodes,
                 obs: Vec::new(),
@@ -286,18 +294,16 @@ impl SandboxFs {
                 RawObs::Listing(h) => Obs::Listing(h),
                 RawObs::File(n) => {
                     let Kind::File(f) = &st.nodes[n as usize] else { continue };
-                    // The lower identity is what was observed, even if the
-                    // node was later copied up.
-                    let (size, exec) = match &f.src {
-                        Src::Lower(info) => (info.size, info.exec()),
-                        Src::Upper { .. } => (0, f.mode & 0o111 != 0),
-                    };
+                    // What was observed is the view file the node started
+                    // as, even if the action later replaced its content.
+                    let Some((size, exec)) = f.lower_meta else { continue };
                     match &f.read_src {
                         Some(src) => {
-                            to_hash.push((out.len(), src.clone(), exec_of_lower(f)));
-                            Obs::File { hash: crate::hash::Hash::ZERO, exec: exec_of_lower(f) }
+                            to_hash.push((out.len(), src.clone(), exec));
+                            Obs::File { hash: crate::hash::Hash::ZERO, exec }
                         }
-                        None => Obs::Meta { size: lower_size(f).unwrap_or(size), exec },
+                        None if a.size_blind => Obs::IsFile { exec },
+                        None => Obs::Meta { size, exec },
                     }
                 }
             };
@@ -396,20 +402,6 @@ impl SandboxFs {
         let local = (node & LOCAL_MASK) as u32;
         let a = self.actions.get(&seq).ok_or(Errno::ESTALE)?.clone();
         Ok((a, local))
-    }
-}
-
-fn exec_of_lower(f: &FileN) -> bool {
-    match &f.src {
-        Src::Lower(info) => info.exec(),
-        Src::Upper { .. } => f.mode & 0o111 != 0,
-    }
-}
-
-fn lower_size(f: &FileN) -> Option<u64> {
-    match &f.src {
-        Src::Lower(info) => Some(info.size),
-        _ => None,
     }
 }
 
@@ -676,11 +668,12 @@ impl ActionFs {
                 (Slot::Lower(n), RawObs::Dir)
             }
             Looked::Symlink(t) => {
-                let n = self.push(st, Kind::Symlink { target: t.clone(), upper: false })?;
+                let n = self.push(st, Kind::Symlink { target: t.clone() })?;
                 (Slot::Lower(n), RawObs::Symlink(t))
             }
             Looked::File(info) => {
                 let mode = info.owner.mode;
+                let lower_meta = Some((info.size, info.exec()));
                 let n = self.push(
                     st,
                     Kind::File(Box::new(FileN {
@@ -692,6 +685,7 @@ impl ActionFs {
                         lower_pt_opens: 0,
                         read_src: None,
                         file: None,
+                        lower_meta,
                     })),
                 )?;
                 (Slot::Lower(n), RawObs::File(n))
@@ -1052,7 +1046,7 @@ impl Filesystem for SandboxFs {
             return Err(Errno::EEXIST);
         }
         let covers = a.covers_lower(&st, p, name);
-        let n = a.push(&mut st, Kind::Symlink { target: target.to_vec(), upper: true })?;
+        let n = a.push(&mut st, Kind::Symlink { target: target.to_vec() })?;
         a.dir_mut(&mut st, p)?.entries.insert(name.into(), Slot::Upper(n, covers));
         a.mark_dirty(&mut st, p);
         Ok(a.entry(&st, n))
@@ -1079,6 +1073,7 @@ impl Filesystem for SandboxFs {
                         lower_pt_opens: 0,
                         read_src: None,
                         file: None,
+                        lower_meta: None,
                     })),
                 )?
             }
@@ -1315,6 +1310,7 @@ impl Filesystem for SandboxFs {
                 lower_pt_opens: 0,
                 read_src: None,
                 file: None,
+                lower_meta: None,
             })),
         )?;
         a.dir_mut(&mut st, p)?.entries.insert(name.into(), Slot::Upper(n, covers));

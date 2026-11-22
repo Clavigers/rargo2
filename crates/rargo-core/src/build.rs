@@ -182,6 +182,8 @@ struct Run {
     inconsistent: AtomicBool,
     base_env: BTreeMap<String, String>,
     no_cache_tests: bool,
+    /// The client asked to be told why things run (`RARGO_EXPLAIN`).
+    explain: bool,
     root_id: Hash,
 }
 
@@ -303,19 +305,20 @@ enum Finish {
     Retry,
 }
 
-/// Collects an action's stderr for relaying.
-#[derive(Default)]
-struct Collect {
-    missed: AtomicBool,
+/// Observer for the planning action.
+struct PlanObserver {
+    client: Arc<Client>,
 }
-impl Observer for Collect {
-    fn miss(&self) {
-        self.missed.store(true, Ordering::Relaxed);
+impl Observer for PlanObserver {
+    fn wants_explanation(&self) -> bool {
+        self.client.env.contains_key("RARGO_EXPLAIN")
+    }
+    fn explain(&self, why: &str) {
+        self.client.out.note(&format!("planning runs because {why}"));
     }
 }
 
 struct Prepared {
-    worktree: Arc<Worktree>,
     root: PathBuf,
     cargo_home: PathBuf,
     base: Arc<BaseView>,
@@ -354,7 +357,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
     ]);
     let cwd = c.cwd.canonicalize().unwrap_or_else(|_| c.cwd.clone());
     let sandbox_cwd = tr.to_canonical(&cwd.to_string_lossy());
-    Ok(Prepared { worktree, root, cargo_home, base: Arc::new(base), tr, sandbox_cwd, env: base_env(&c.env) })
+    Ok(Prepared { root, cargo_home, base: Arc::new(base), tr, sandbox_cwd, env: base_env(&c.env) })
 }
 
 struct Planned {
@@ -410,7 +413,7 @@ async fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -
             no_cache: false,
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
-            observer: Arc::new(Collect::default()),
+            observer: Arc::new(PlanObserver { client: c.clone() }),
         })
         .await?;
     let r = &outcome.result;
@@ -578,6 +581,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         inconsistent: AtomicBool::new(false),
         base_env: env,
         no_cache_tests,
+        explain: c.env.contains_key("RARGO_EXPLAIN"),
         root_id: Hash::ZERO,
     });
 
@@ -633,6 +637,14 @@ impl Observer for UnitObserver {
         }
     }
 
+    fn wants_explanation(&self) -> bool {
+        self.run.explain
+    }
+
+    fn explain(&self, why: &str) {
+        self.run.c.out.note(&format!("{} runs because {why}", self.run.pd.plan.units[self.i].desc));
+    }
+
     fn stdout(&self, data: &[u8]) {
         let u = &self.run.pd.plan.units[self.i];
         match u.kind {
@@ -666,9 +678,17 @@ impl Observer for UnitObserver {
 
 struct TestObserver {
     out: Arc<Client>,
+    explain: bool,
+    label: String,
 }
 
 impl Observer for TestObserver {
+    fn wants_explanation(&self) -> bool {
+        self.explain
+    }
+    fn explain(&self, why: &str) {
+        self.out.out.note(&format!("{} runs because {why}", self.label));
+    }
     fn stdout(&self, data: &[u8]) {
         self.out.out.raw_out(self.out.out.tr.text(&String::from_utf8_lossy(data)).as_bytes());
     }
@@ -913,6 +933,19 @@ impl Run {
                 r.outputs.entries.iter().cloned().partition(|(p, _)| meta.contains(p));
             self.layer.add(i as u32, LEVEL_META, &early);
             self.layer.add(i as u32, LEVEL_FULL, &late);
+        }
+        // cargo links some outputs to friendlier names (`target/debug/app`);
+        // later units and tests refer to those names (`CARGO_BIN_EXE_*`).
+        let mut uplifted: Vec<(Vec<u8>, MEntry)> = Vec::new();
+        for o in &u.outputs {
+            if let Some(e) = r.outputs.get(o.path.as_bytes()) {
+                for dest in o.hardlink.iter().chain(o.export_path.iter()) {
+                    uplifted.push((bytes(dest), e.clone()));
+                }
+            }
+        }
+        if !uplifted.is_empty() {
+            self.layer.add(i as u32, LEVEL_FULL, &uplifted);
         }
         self.apply_worktree_writes(&r.outputs).await?;
         self.finish_unit_messages(i, &r, outcome.cached);
@@ -1393,7 +1426,11 @@ impl Run {
                             // failing one may be a flake and is run again.
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
-                            observer: Arc::new(TestObserver { out: self.c.clone() }),
+                            observer: Arc::new(TestObserver {
+                                out: self.c.clone(),
+                                explain: self.explain,
+                                label: format!("test of {}", plan.units[*unit as usize].desc),
+                            }),
                         })
                         .await?;
                     let r = &outcome.result;

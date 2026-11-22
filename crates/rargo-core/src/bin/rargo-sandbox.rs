@@ -71,6 +71,7 @@ fn main() -> anyhow::Result<()> {
         gid: unsafe { libc::getgid() },
         scratch,
         mountpoints: vec![b"proc".to_vec(), b"dev".to_vec(), b"sys".to_vec(), b"tmp".to_vec()],
+        size_blind: false,
     });
     let env: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
         .map(|(k, v)| (k.into_encoded_bytes(), v.into_encoded_bytes()))
