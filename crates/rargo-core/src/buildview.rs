@@ -48,11 +48,26 @@ impl HostMemo {
     }
 }
 
+/// One entry of a synthetic directory.
+#[derive(Clone, Debug)]
+pub enum SynthEnt {
+    File { hash: crate::hash::Hash, size: u64 },
+    Symlink(Vec<u8>),
+}
+
 pub enum Region {
     Host(HostRegion),
     Snap(Arc<Snapshot>),
     /// An empty directory.
     Empty,
+    /// `/nix/store`, restricted to the store paths of one closure. Store
+    /// paths never change once they exist, so nothing below is traced; the
+    /// closure's identity is part of the action key instead.
+    NixStore { names: Arc<std::collections::HashSet<Vec<u8>>> },
+    /// A flat directory of fixed files and symlinks (a minimal `/etc`).
+    Synth(Arc<HashMap<Vec<u8>, SynthEnt>>),
+    /// The mount point itself is a symlink.
+    Link(Vec<u8>),
 }
 
 pub struct Mount {
@@ -145,7 +160,10 @@ impl BaseView {
         let path = vjoin(dir, name);
         if let Some(m) = self.mount_at(&path) {
             return match &m.region {
-                Region::Empty | Region::Snap(_) => Looked::Dir(DIR_OWNER),
+                Region::Link(target) => Looked::Symlink(target.clone()),
+                Region::Empty | Region::Snap(_) | Region::NixStore { .. } | Region::Synth(_) => {
+                    Looked::Dir(DIR_OWNER)
+                }
                 Region::Host(h) => {
                     // The mount root itself may be a file (a worktree's
                     // `.git`), so look at what is really there.
@@ -161,9 +179,26 @@ impl BaseView {
         }
         let (m, rel) = self.mount_of(dir);
         let looked = match &m.region {
-            Region::Empty => Looked::Absent,
+            Region::Empty | Region::Link(_) => Looked::Absent,
             Region::Snap(s) => s.lookup(rel, name),
             Region::Host(h) => self.host_lookup(h, rel, name),
+            Region::NixStore { names } => {
+                // Only the closure's own store paths exist at the top.
+                if rel == b"/" && !names.contains(name) {
+                    Looked::Absent
+                } else {
+                    self.host_lookup(&nix_store_region(), rel, name)
+                }
+            }
+            Region::Synth(entries) => match (rel, entries.get(name)) {
+                (b"/", Some(SynthEnt::File { hash, size })) => Looked::File(FileInfo {
+                    size: *size,
+                    owner: Owner { uid: 0, gid: 0, mode: 0o644 },
+                    src: FileSrc::Blob(*hash),
+                }),
+                (b"/", Some(SynthEnt::Symlink(t))) => Looked::Symlink(t.clone()),
+                _ => Looked::Absent,
+            },
         };
         // A directory that exists only because something is mounted below.
         if matches!(looked, Looked::Absent) && self.mounts.iter().any(|o| is_strictly_under(&o.at, &path)) {
@@ -171,6 +206,10 @@ impl BaseView {
         }
         looked
     }
+}
+
+fn nix_store_region() -> HostRegion {
+    HostRegion::new("/nix/store")
 }
 
 fn is_strictly_under(path: &[u8], dir: &[u8]) -> bool {
@@ -185,9 +224,19 @@ impl View for BaseView {
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
         let (m, rel) = self.mount_of(dir);
         let listed: io::Result<Listing> = match &m.region {
-            Region::Empty => Ok(Vec::new()),
+            Region::Empty | Region::Link(_) => Ok(Vec::new()),
             Region::Snap(s) => s.list(rel),
             Region::Host(h) => self.host_list(h, rel).map(|l| l.as_ref().clone()),
+            Region::NixStore { names } if rel == b"/" => {
+                Ok(names.iter().map(|n| (n.clone(), DType::Dir)).collect())
+            }
+            Region::NixStore { .. } => self.host_list(&nix_store_region(), rel).map(|l| l.as_ref().clone()),
+            Region::Synth(entries) => Ok(entries
+                .iter()
+                .map(|(n, e)| {
+                    (n.clone(), if matches!(e, SynthEnt::File { .. }) { DType::File } else { DType::Symlink })
+                })
+                .collect()),
         };
         let mut out = match listed {
             Ok(l) => l,
@@ -227,7 +276,7 @@ impl View for BaseView {
                 // Only host regions can have symlinked parents that the
                 // literal path hides; snapshots and masks resolve literally.
                 let (m, _) = self.mount_of(dir);
-                if matches!(m.region, Region::Host(_)) && !self.is_real_dir(dir) {
+                if matches!(m.region, Region::Host(_) | Region::NixStore { .. }) && !self.is_real_dir(dir) {
                     return Looked::Absent;
                 }
                 self.lookup_unchecked(dir, name)
@@ -458,6 +507,7 @@ impl BuildView {
 }
 
 /// Convenience for building the standard mount table.
+#[derive(Clone)]
 pub struct ViewParts {
     pub snapshot: Arc<Snapshot>,
     /// Real path of the worktree's `.git` (file or directory).
@@ -469,6 +519,17 @@ pub struct ViewParts {
     pub hidden: Vec<Vec<u8>>,
     /// The forked cargo, shown at [`PLANNER_AT`].
     pub planner: PathBuf,
+    /// Restrict the root to a Nix closure instead of showing the host.
+    pub restricted: Option<Restricted>,
+}
+
+/// What replaces the host root in a flake-restricted sandbox.
+#[derive(Clone)]
+pub struct Restricted {
+    pub store_names: Arc<std::collections::HashSet<Vec<u8>>>,
+    pub etc: Arc<HashMap<Vec<u8>, SynthEnt>>,
+    /// Absolute symlinks to provide (`/bin/sh`, `/usr/bin/env`).
+    pub links: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 pub const WORKTREE_AT: &[u8] = b"/w";
@@ -478,20 +539,44 @@ pub const CARGO_HOME_AT: &[u8] = b"/c";
 pub const PLANNER_AT: &[u8] = b"/rargo/cargo";
 
 impl ViewParts {
-    pub fn build(self, memo: Arc<HostMemo>, min_gen: u64) -> BaseView {
-        let mut mounts = vec![
-            Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
-            Mount { at: WORKTREE_AT.to_vec(), region: Region::Snap(self.snapshot), traced: true },
+    /// Builds the mount table. With `host_root`, the host is the root even
+    /// if a restricted root is configured (the planner needs host libraries).
+    pub fn build(&self, memo: Arc<HostMemo>, min_gen: u64, host_root: bool) -> BaseView {
+        let mut mounts = Vec::new();
+        match (&self.restricted, host_root) {
+            (Some(r), false) => {
+                mounts.push(Mount { at: b"/".to_vec(), region: Region::Empty, traced: true });
+                mounts.push(Mount {
+                    at: b"/nix/store".to_vec(),
+                    region: Region::NixStore { names: r.store_names.clone() },
+                    traced: false,
+                });
+                mounts.push(Mount { at: b"/etc".to_vec(), region: Region::Synth(r.etc.clone()), traced: true });
+                for (at, target) in &r.links {
+                    mounts.push(Mount { at: at.clone(), region: Region::Link(target.clone()), traced: true });
+                }
+            }
+            _ => mounts.push(Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true }),
+        }
+        let this = self.clone();
+        let this = &this;
+        mounts.extend([
+            Mount { at: WORKTREE_AT.to_vec(), region: Region::Snap(this.snapshot.clone()), traced: true },
             Mount {
                 at: vjoin(WORKTREE_AT, b".git"),
-                region: Region::Host(HostRegion::new(self.git_path)),
+                region: Region::Host(HostRegion::new(this.git_path.clone())),
                 traced: true,
             },
-            Mount { at: CARGO_HOME_AT.to_vec(), region: Region::Host(HostRegion::new(self.cargo_home)), traced: true },
-            Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(self.planner)), traced: true },
-        ];
-        for m in self.masks.into_iter().chain(self.hidden) {
-            mounts.push(Mount { at: m, region: Region::Empty, traced: true });
+            Mount {
+                at: CARGO_HOME_AT.to_vec(),
+                region: Region::Host(HostRegion::new(this.cargo_home.clone())),
+                traced: true,
+            },
+            Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(this.planner.clone())), traced: true },
+        ]);
+        for m in this.masks.iter().chain(this.hidden.iter()) {
+            // Hidden host paths only matter when the host is visible.
+            mounts.push(Mount { at: m.clone(), region: Region::Empty, traced: true });
         }
         BaseView::new(mounts, memo, min_gen)
     }

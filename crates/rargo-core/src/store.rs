@@ -458,6 +458,32 @@ impl Store {
         freed
     }
 
+    /// Removes every blob that `live` does not contain and that has not been
+    /// used for `min_age_secs`. Returns `(blobs, bytes)` removed.
+    pub fn sweep(
+        &self,
+        live: &std::collections::HashSet<Hash>,
+        min_age_secs: u64,
+        on_evict: &dyn Fn(&Hash),
+    ) -> (usize, u64) {
+        let cutoff = now_secs().saturating_sub(min_age_secs);
+        let dead: Vec<(Hash, u64)> = self
+            .meta
+            .iter()
+            .filter(|e| !live.contains(e.key()) && (min_age_secs == 0 || e.value().last_used <= cutoff))
+            .map(|e| (*e.key(), e.value().size))
+            .collect();
+        let mut bytes = 0;
+        for (h, size) in &dead {
+            on_evict(h);
+            self.forget(h);
+            let _ = fs::remove_file(self.path_of(h, false));
+            let _ = fs::remove_file(self.path_of(h, true));
+            bytes += size;
+        }
+        (dead.len(), bytes)
+    }
+
     /// Removes a blob outright (used when its content turns out to be bad).
     pub fn remove(&self, h: &Hash) {
         self.forget(h);

@@ -191,6 +191,26 @@ impl IncrStore {
         self.stats.discarded_after_crash.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Adds every blob referenced by a kept state to `live`.
+    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
+        let mut metas: Vec<StateMeta> = Vec::new();
+        self.db.for_each(Table::Incr, |_, v| {
+            if let Ok(m) = bincode::deserialize::<StateMeta>(v) {
+                metas.push(m);
+            }
+        });
+        for meta in metas {
+            live.insert(meta.manifest);
+            let Ok(raw) = self.store.read(&meta.manifest) else { continue };
+            let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
+            for (_, e) in &m.entries {
+                if let MEntry::File { hash, .. } = e {
+                    live.insert(*hash);
+                }
+            }
+        }
+    }
+
     pub fn state_count(&self, crate_key: &Hash) -> usize {
         self.list(crate_key).len()
     }

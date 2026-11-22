@@ -88,9 +88,13 @@ fn main() {
         env.retain(|(k, _)| k != "RUSTUP_TOOLCHAIN");
         env.push(("RUSTUP_TOOLCHAIN".into(), tc));
     }
-    let status = args.first().map(|s| s.as_str()) == Some("--rargo-status");
-    if status {
-        args = vec!["__status".into()];
+    let admin = match args.first().map(|s| s.as_str()) {
+        Some("--rargo-status") => Some("__status"),
+        Some("--rargo-gc") => Some("__gc"),
+        _ => None,
+    };
+    if let Some(cmd) = admin {
+        args = vec![cmd.into()];
     } else {
         match subcommand(&args) {
             Some(cmd) if ROUTED.contains(&cmd) => {}

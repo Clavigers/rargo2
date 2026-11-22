@@ -141,8 +141,11 @@ def main():
         ap_, re_ = du(os.path.join(wt, "target"))
         apparent += ap_; real += re_
     store = (0, 0)
+    store_after_gc = (0, 0)
     if a.mode == "rargo":
         store = du(os.path.join(os.path.dirname(env["RARGO_SOCKET"]), "store"))
+        subprocess.run([RARGO, "--rargo-gc"], env=env, capture_output=True)
+        store_after_gc = du(os.path.join(os.path.dirname(env["RARGO_SOCKET"]), "store"))
     per_step = {}
     for steps in results.values():
         for n, (name, rc, dt) in enumerate(steps):
@@ -152,6 +155,7 @@ def main():
         wall_s=round(wall, 1), cpu_s=round((cpu1 - cpu0) / 1e6, 1),
         worktree_target_bytes=real, worktree_target_apparent_bytes=apparent,
         store_bytes=store[1],
+        store_after_gc_bytes=store_after_gc[1],
         disk_total_bytes=(real if a.mode == "stock" else store[1]),
         failures=len(failures),
         step_mean_s=[round(sum(v) / len(v), 2) for _, v in sorted(per_step.items())],

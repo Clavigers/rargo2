@@ -888,6 +888,15 @@ impl Worktree {
         Ok(out)
     }
 
+    /// Adds the blobs of every captured file to `live`.
+    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
+        for c in self.st.lock().changes.values() {
+            if let Change::File { hash, .. } = c {
+                live.insert(*hash);
+            }
+        }
+    }
+
     /// Number of overlay entries (for status and tests).
     pub fn dirty_count(&self) -> usize {
         self.st.lock().changes.len()

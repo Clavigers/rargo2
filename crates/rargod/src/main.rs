@@ -130,9 +130,18 @@ fn main() -> Result<()> {
         let d = daemon.clone();
         let budget = opts.store_budget;
         std::thread::Builder::new().name("evict".into()).spawn(move || {
+            let mut tick = 0u64;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(20));
                 let store = &d.engine.store;
+                // Unreferenced blobs go first, on a slower beat.
+                if tick % 6 == 5 {
+                    let (n, bytes) = d.collect_garbage(600);
+                    if n > 0 {
+                        eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
+                    }
+                }
+                tick += 1;
                 if store.total_bytes() > budget {
                     let fs = d.engine.fs.clone();
                     let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
@@ -241,6 +250,28 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         return Ok(());
     }
     let env: HashMap<String, String> = req.env.iter().cloned().collect();
+    if req.args.first().map(|s| s.as_str()) == Some("__gc") {
+        // Explicit collection: everything unreferenced, regardless of age.
+        // Meant for when no build is running.
+        let d = daemon.clone();
+        // While anything is running or queued, recently used blobs may be
+        // outputs not yet recorded anywhere; keep the usual grace period.
+        let (running, waiting, _, _) = daemon.engine.sched.snapshot();
+        let age = if running + waiting == 0 { 0 } else { 600 };
+        let (n, bytes) = tokio::task::spawn_blocking(move || d.collect_garbage(age)).await.unwrap_or((0, 0));
+        daemon.engine.store.db().flush();
+        let _ = tx.send(ServerMsg::Stdout(
+            format!(
+                "collected {n} unreferenced blobs, {:.1} MiB; store is now {:.1} MiB\n",
+                bytes as f64 / (1 << 20) as f64,
+                daemon.engine.store.total_bytes() as f64 / (1 << 20) as f64
+            )
+            .into_bytes(),
+        ));
+        let _ = tx.send(ServerMsg::Exit(0));
+        let _ = writer.await;
+        return Ok(());
+    }
     if req.args.first().map(|s| s.as_str()) == Some("__status") {
         let _ = tx.send(ServerMsg::Stdout(status_text(&daemon).into_bytes()));
         let _ = tx.send(ServerMsg::Exit(0));

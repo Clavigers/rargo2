@@ -186,6 +186,9 @@ struct Run {
     /// The client asked to be told why things run (`RARGO_EXPLAIN`).
     explain: bool,
     root_id: Hash,
+    /// In a flake sandbox the forked cargo cannot run (its libraries are
+    /// the host's); processes that ask for `$CARGO` get the flake's cargo.
+    cargo_override: Option<String>,
     wt_root: PathBuf,
     head: Option<[u8; 20]>,
     policy: crate::policy::Policy,
@@ -277,6 +280,21 @@ impl Daemon {
     fn store(&self) -> &Arc<Store> {
         &self.engine.store
     }
+
+    /// Removes blobs nothing refers to any more: outputs of traces that
+    /// were displaced, superseded incremental states, captures of files
+    /// that have since changed. Blobs used within `min_age_secs` are left
+    /// alone so that running builds keep what they are using.
+    pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
+        let mut live = HashSet::new();
+        self.engine.traces.mark(&mut live);
+        self.incr.mark(&mut live);
+        for wt in self.worktrees.lock().values() {
+            wt.mark(&mut live);
+        }
+        let fs = self.engine.fs.clone();
+        self.store().sweep(&live, min_age_secs, &|h| fs.forget_backing(h))
+    }
 }
 
 /// Handles a request to completion. Returns the client's exit code, or the
@@ -330,6 +348,9 @@ struct Prepared {
     head: Option<[u8; 20]>,
     policy: crate::policy::Policy,
     cargo_home: PathBuf,
+    /// The view the planner runs against (always the host root).
+    plan_base: Arc<BaseView>,
+    flake: Option<Arc<crate::flake::FlakeEnv>>,
     base: Arc<BaseView>,
     tr: Translator,
     sandbox_cwd: String,
@@ -361,15 +382,40 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
             }
         }
     }
-    let base = ViewParts {
+    // A flake, when present and not switched off, defines the environment.
+    let flake = if root.join("flake.nix").is_file() && policy.flake.enabled != Some(false) {
+        let (store, r, uid, gid) = (d.store().clone(), root.clone(), c.uid, c.gid);
+        Some(
+            tokio::task::spawn_blocking(move || crate::flake::resolve(&store, &r, uid, gid))
+                .await?
+                .context("evaluating the repository's flake (set `flake.enabled = false` in .rargo.toml to build without it)")?,
+        )
+    } else {
+        None
+    };
+    let restricted = match &flake {
+        Some(f) => {
+            let mut links = Vec::new();
+            for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
+                if let Some(target) = f.which(tool).or_else(|| if tool == "sh" { f.which("bash") } else { None }) {
+                    links.push((bytes(at), bytes(&target)));
+                }
+            }
+            Some(Restricted { store_names: f.closure_set(), etc: f.etc(d.store(), c.uid, c.gid)?, links })
+        }
+        None => None,
+    };
+    let parts = ViewParts {
         snapshot,
         git_path: root.join(".git"),
         cargo_home: cargo_home.clone(),
         masks,
         hidden: vec![d.cfg.state_dir.as_os_str().as_encoded_bytes().to_vec()],
         planner: d.cfg.planner.clone(),
-    }
-    .build(d.memo.clone(), generation);
+        restricted,
+    };
+    let base = parts.build(d.memo.clone(), generation, false);
+    let plan_base = if flake.is_some() { Arc::new(parts.build(d.memo.clone(), generation, true)) } else { Arc::new(parts.build(d.memo.clone(), generation, false)) };
     let tr = Translator::new(vec![
         (String::from_utf8_lossy(WORKTREE_AT).into_owned(), root.to_string_lossy().into_owned()),
         (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), cargo_home.to_string_lossy().into_owned()),
@@ -381,10 +427,25 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
         .and_then(|r| r.head().ok().and_then(|h| h.target()))
         .and_then(|o| <[u8; 20]>::try_from(o.as_bytes()).ok());
     let mut env = base_env(&c.env);
+    if let Some(f) = &flake {
+        // The flake's variables replace the host's: PATH, compilers and
+        // their flags all come from the devShell. HOME is a scratch place.
+        for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+            env.remove(k);
+        }
+        env.retain(|k, _| !k.starts_with("NIX_"));
+        for (k, v) in &f.env {
+            env.insert(k.clone(), v.clone());
+        }
+        env.insert("HOME".into(), "/tmp".into());
+        env.insert("CARGO_HOME".into(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned());
+        env.insert("RUSTC_WRAPPER".into(), String::new());
+        env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
+    }
     for (k, v) in policy.passed_env(&c.env) {
         env.entry(k).or_insert(v);
     }
-    Ok(Prepared { root, head, policy, cargo_home, base: Arc::new(base), tr, sandbox_cwd, env })
+    Ok(Prepared { root, head, policy, cargo_home, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
 }
 
 struct Planned {
@@ -424,7 +485,7 @@ async fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -
         cwd: bytes(&p.sandbox_cwd),
         net: NetMode::Loopback,
         mkdirs: vec![],
-        root_id: Hash::ZERO,
+        root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
         discard: vec![],
         label: "cargo (planning)".into(),
     };
@@ -432,7 +493,7 @@ async fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -
         .engine
         .obtain(Request {
             spec,
-            view: p.base.clone(),
+            view: p.plan_base.clone(),
             client_env: c.env.clone(),
             uid: c.uid,
             gid: c.gid,
@@ -609,7 +670,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         base_env: env,
         no_cache_tests,
         explain: c.env.contains_key("RARGO_EXPLAIN"),
-        root_id: Hash::ZERO,
+        root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
+        cargo_override: p.flake.as_ref().and_then(|f| f.which("cargo")),
         wt_root: p.root.clone(),
         head: p.head,
         policy: p.policy.clone(),
@@ -802,6 +864,9 @@ impl Run {
                     env.remove(k.as_bytes());
                 }
             }
+        }
+        if let Some(cargo) = &self.cargo_override {
+            env.insert(bytes("CARGO"), bytes(cargo));
         }
         env
     }

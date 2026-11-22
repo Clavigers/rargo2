@@ -5,6 +5,7 @@ pub mod buildview;
 pub mod db;
 pub mod engine;
 pub mod expand;
+pub mod flake;
 pub mod hash;
 pub mod incr;
 pub mod parse;

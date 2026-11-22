@@ -307,10 +307,18 @@ impl TraceCache {
         added
     }
 
-    /// Calls `f` with every blob hash referenced by any cached trace of the
-    /// keys currently in memory (used to pin against eviction is not needed:
-    /// incomplete traces are dropped on lookup).
-    pub fn mem_keys(&self) -> usize {
-        self.mem.len()
+    /// Adds every blob referenced by any recorded trace to `live`.
+    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
+        self.db.for_each(Table::Traces, |_, v| {
+            let Ok(raw) = zstd::decode_all(v) else { return };
+            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { return };
+            live.insert(t.result.stdout);
+            live.insert(t.result.stderr);
+            for (_, e) in &t.result.outputs.entries {
+                if let MEntry::File { hash, .. } = e {
+                    live.insert(*hash);
+                }
+            }
+        });
     }
 }

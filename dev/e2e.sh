@@ -320,6 +320,19 @@ out=$(cargo build --offline 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "stock cargo builds into the same target/ that rargo linked into" || bad "stock cargo builds into the same target/" "$out"
 expect "and rargo still works afterwards" "$R" build
 
+echo "== garbage collection keeps everything still needed"
+cd "$A"
+out=$("$R" --rargo-gc 2>&1)
+has "$out" "collected" && ok "gc ran: $out" || bad "gc ran" "$out"
+before=$(runs); "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1; after=$(runs)
+[ "$before" = "$after" ] && ok "after gc, build and test are still fully cached" || bad "after gc, build and test are still fully cached" "delta=$((after - before))"
+cd "$B"
+before=$(runs); "$R" build >/dev/null 2>&1; after=$(runs)
+[ "$before" = "$after" ] && ok "after gc, the other worktree is still fully cached" || bad "after gc, the other worktree is still fully cached" "delta=$((after - before))"
+echo "// post-gc edit" >>crates/util/src/lib.rs
+out=$("$R" build 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "after gc, an incremental rebuild works" || bad "after gc, an incremental rebuild works" "$out"
+
 echo
 "$R" --rargo-status
 echo
