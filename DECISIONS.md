@@ -274,3 +274,33 @@ how its open ends were closed.
   with the toolchain's own cargo unsandboxed at low priority, builds it with
   rargo in verify mode, and reports if the two disagree on success or if any
   cached unit did not reproduce.
+
+## D21. Workers
+
+- Transport: our own reliable message layer over UDP (`net.rs`). Messages
+  are independent (no head-of-line blocking between a bulk transfer and a
+  file-system request), fragments are acknowledged individually, congestion
+  control is slow start plus additive increase with halving on timeout.
+  Reason: DESIGN asks for a stateful UDP session; "protocol conventions" are
+  on the do-not-care list.
+- The worker traces; the server predicts. With the request the server sends
+  the answers to every lookup in the action's previous trace, evaluated
+  against the current view, and pushes the content of every file that trace
+  read which the worker is not known to hold. For an action that has never
+  run it borrows the non-worktree, non-cargo-home part of the newest trace of
+  the same program (every rustc reads the same sysroot) and adds the outputs
+  of the action's dependencies. Anything not predicted is one request away.
+- Content moves as chunks: `ar` archives are cut at members, ELF files at
+  sections, the rest by a rolling hash (16/64/256 KiB). Blobs stay whole on
+  disk at both ends; an index maps chunk hashes to places inside blobs.
+  Whatever arrives is re-hashed as a whole before it is trusted.
+- Dispatch rule: only when no local core is free, a worker has one, and
+  (bytes the worker lacks / assumed bandwidth + round trips x measured RTT)
+  is less than (queue length / cores x average action time).
+- A worker failure is never the action's failure: the action is rerun
+  locally. Output may then be shown twice.
+- Remote compiles get no incremental seed and save no state. Planning,
+  host-network actions and flake-rooted actions always run on the server.
+- Test rig: server and workers in separate network namespaces joined by a
+  bridge inside the server's namespace, `tc netem` on both ends of every
+  link. Nothing is configured in the host's own namespace.
