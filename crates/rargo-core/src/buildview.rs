@@ -160,12 +160,21 @@ impl BaseView {
             };
         }
         let (m, rel) = self.mount_of(dir);
-        match &m.region {
+        let looked = match &m.region {
             Region::Empty => Looked::Absent,
             Region::Snap(s) => s.lookup(rel, name),
             Region::Host(h) => self.host_lookup(h, rel, name),
+        };
+        // A directory that exists only because something is mounted below.
+        if matches!(looked, Looked::Absent) && self.mounts.iter().any(|o| is_strictly_under(&o.at, &path)) {
+            return Looked::Dir(DIR_OWNER);
         }
+        looked
     }
+}
+
+fn is_strictly_under(path: &[u8], dir: &[u8]) -> bool {
+    path.len() > dir.len() && vpath_starts_with(path, dir)
 }
 
 impl View for BaseView {
@@ -175,23 +184,34 @@ impl View for BaseView {
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
         let (m, rel) = self.mount_of(dir);
-        let mut out: Listing = match &m.region {
-            Region::Empty => Vec::new(),
-            Region::Snap(s) => s.list(rel)?,
-            Region::Host(h) => self.host_list(h, rel)?.as_ref().clone(),
+        let listed: io::Result<Listing> = match &m.region {
+            Region::Empty => Ok(Vec::new()),
+            Region::Snap(s) => s.list(rel),
+            Region::Host(h) => self.host_list(h, rel).map(|l| l.as_ref().clone()),
         };
-        // Mount points directly below this directory exist too.
+        let mut out = match listed {
+            Ok(l) => l,
+            // A directory that exists only because of a mount below it.
+            Err(_) if self.mounts.iter().any(|o| is_strictly_under(&o.at, dir)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        // Mount points below this directory exist too, as do the
+        // directories leading to them.
         for other in &self.mounts {
-            if let Some((parent, name)) = vsplit(&other.at) {
-                if parent == dir && !out.iter().any(|(n, _)| n == name) {
-                    let t = match self.lookup_unchecked(parent, name) {
-                        Looked::File(_) => DType::File,
-                        Looked::Symlink(_) => DType::Symlink,
-                        _ => DType::Dir,
-                    };
-                    out.push((name.to_vec(), t));
-                }
+            if !is_strictly_under(&other.at, dir) {
+                continue;
             }
+            let rest = &other.at[if dir == b"/" { 1 } else { dir.len() + 1 }..];
+            let name = rest.split(|&c| c == b'/').next().unwrap_or(rest);
+            if name.is_empty() || out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let t = match self.lookup_unchecked(dir, name) {
+                Looked::File(_) => DType::File,
+                Looked::Symlink(_) => DType::Symlink,
+                _ => DType::Dir,
+            };
+            out.push((name.to_vec(), t));
         }
         Ok(out)
     }
@@ -447,10 +467,15 @@ pub struct ViewParts {
     pub masks: Vec<Vec<u8>>,
     /// Real host paths hidden from the sandbox.
     pub hidden: Vec<Vec<u8>>,
+    /// The forked cargo, shown at [`PLANNER_AT`].
+    pub planner: PathBuf,
 }
 
 pub const WORKTREE_AT: &[u8] = b"/w";
 pub const CARGO_HOME_AT: &[u8] = b"/c";
+/// Where the forked cargo appears. Cargo puts its own path into every
+/// process's `CARGO` variable, so it has to be the same everywhere.
+pub const PLANNER_AT: &[u8] = b"/rargo/cargo";
 
 impl ViewParts {
     pub fn build(self, memo: Arc<HostMemo>, min_gen: u64) -> BaseView {
@@ -463,6 +488,7 @@ impl ViewParts {
                 traced: true,
             },
             Mount { at: CARGO_HOME_AT.to_vec(), region: Region::Host(HostRegion::new(self.cargo_home)), traced: true },
+            Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(self.planner)), traced: true },
         ];
         for m in self.masks.into_iter().chain(self.hidden) {
             mounts.push(Mount { at: m, region: Region::Empty, traced: true });
@@ -607,5 +633,33 @@ mod host_listing_tests {
             assert_eq!(seen, real, "listing of {dir}");
             assert!(matches!(v.stat(dir.as_bytes()), Looked::Dir(_)));
         }
+    }
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::*;
+
+    #[test]
+    fn file_mounted_below_a_directory_that_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("root")).unwrap();
+        std::fs::write(tmp.path().join("tool"), "binary").unwrap();
+        let memo = Arc::new(HostMemo::default());
+        let v = BaseView::new(
+            vec![
+                Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(tmp.path().join("root"))), traced: true },
+                Mount { at: b"/opt/x/tool".to_vec(), region: Region::Host(HostRegion::new(tmp.path().join("tool"))), traced: true },
+            ],
+            memo,
+            0,
+        );
+        assert!(matches!(v.stat(b"/opt"), Looked::Dir(_)));
+        assert!(matches!(v.stat(b"/opt/x"), Looked::Dir(_)));
+        assert!(matches!(v.stat(b"/opt/x/tool"), Looked::File(f) if f.size == 6));
+        assert!(matches!(v.stat(b"/opt/y"), Looked::Absent));
+        assert_eq!(v.list(b"/").unwrap(), vec![(b"opt".to_vec(), DType::Dir)]);
+        assert_eq!(v.list(b"/opt").unwrap(), vec![(b"x".to_vec(), DType::Dir)]);
+        assert_eq!(v.list(b"/opt/x").unwrap(), vec![(b"tool".to_vec(), DType::File)]);
     }
 }

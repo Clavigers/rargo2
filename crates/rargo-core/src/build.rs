@@ -367,6 +367,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
         cargo_home: cargo_home.clone(),
         masks,
         hidden: vec![d.cfg.state_dir.as_os_str().as_encoded_bytes().to_vec()],
+        planner: d.cfg.planner.clone(),
     }
     .build(d.memo.clone(), generation);
     let tr = Translator::new(vec![
@@ -404,7 +405,7 @@ async fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -
     env.insert(bytes(rp::PLAN_ENV), bytes(PLAN_PATH));
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
     env.insert(bytes("CARGO_CACHE_RUSTC_INFO"), bytes("0"));
-    let mut argv = vec![d.cfg.planner.as_os_str().as_encoded_bytes().to_vec()];
+    let mut argv = vec![PLANNER_AT.to_vec()];
     for a in args {
         // Paths the user typed refer to the real worktree.
         let a = match a.split_once('=') {
