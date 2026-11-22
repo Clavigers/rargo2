@@ -416,10 +416,24 @@ impl Store {
     /// Evicts least-recently-used blobs until the store is under `budget`
     /// bytes. `pinned` blobs are never evicted. Returns bytes freed.
     pub fn evict_to(&self, budget: u64, pinned: &dyn Fn(&Hash) -> bool) -> u64 {
+        self.evict(budget, 0, pinned, &|_| {})
+    }
+
+    /// Like [`Store::evict_to`], but leaves alone anything used in the last
+    /// `min_age_secs` seconds (running builds touch what they use), and
+    /// calls `on_evict` before removing each blob.
+    pub fn evict(
+        &self,
+        budget: u64,
+        min_age_secs: u64,
+        pinned: &dyn Fn(&Hash) -> bool,
+        on_evict: &dyn Fn(&Hash),
+    ) -> u64 {
         let total = self.total_bytes();
         if total <= budget {
             return 0;
         }
+        let cutoff = now_secs().saturating_sub(min_age_secs);
         let mut all: Vec<(u64, Hash, u64)> =
             self.meta.iter().map(|e| (e.value().last_used, *e.key(), e.value().size)).collect();
         all.sort_unstable();
@@ -428,13 +442,14 @@ impl Store {
             if total - freed <= budget {
                 break;
             }
-            if pinned(&h) {
+            if pinned(&h) || (min_age_secs > 0 && seen_used > cutoff) {
                 continue;
             }
             // Skip anything touched since the scan.
             if self.meta.get(&h).map(|m| m.last_used != seen_used).unwrap_or(true) {
                 continue;
             }
+            on_evict(&h);
             self.forget(&h);
             let _ = fs::remove_file(self.path_of(&h, false));
             let _ = fs::remove_file(self.path_of(&h, true));

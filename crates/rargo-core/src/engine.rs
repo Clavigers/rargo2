@@ -81,6 +81,9 @@ pub struct Outcome {
     pub result: Arc<ActionResult>,
     /// The result was replayed from the cache.
     pub cached: bool,
+    /// What the action wrote under the spec's `discard` prefixes. Only
+    /// present when the action actually ran; never part of a trace.
+    pub side: Vec<(Vec<u8>, MEntry)>,
 }
 
 #[derive(Default)]
@@ -294,7 +297,7 @@ impl Engine {
                 let hit = self.traces.lookup(&key, &*view, &self.content);
                 if let Some(t) = hit {
                     self.replay(&t.result, &*req.observer);
-                    return Ok(Outcome { result: Arc::new(t.result.clone()), cached: true });
+                    return Ok(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() });
                 }
             }
             if !announced {
@@ -342,17 +345,17 @@ impl Engine {
             }
 
             let mut attempt = 0;
-            let (result, obs) = loop {
+            let (result, obs, side) = loop {
                 attempt += 1;
-                let (result, obs, tainted) = self.run(&spec, &req).await?;
+                let (result, obs, tainted, side) = self.run(&spec, &req).await?;
                 if !tainted {
-                    break (result, Some(obs));
+                    break (result, Some(obs), side);
                 }
                 self.stats.tainted.fetch_add(1, Ordering::Relaxed);
                 if attempt >= 3 {
                     // Inputs keep changing under the action; return what we
                     // have without recording it.
-                    break (result, None);
+                    break (result, None, side);
                 }
             };
             let result = Arc::new(result);
@@ -387,7 +390,7 @@ impl Engine {
                     continue;
                 }
             }
-            return Ok(Outcome { result, cached: false });
+            return Ok(Outcome { result, cached: false, side });
         }
     }
 
@@ -399,7 +402,11 @@ impl Engine {
     }
 
     /// Runs the action once in a sandbox.
-    async fn run(&self, spec: &ActionSpec, req: &Request) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool)> {
+    async fn run(
+        &self,
+        spec: &ActionSpec,
+        req: &Request,
+    ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         let key = spec.weak_key();
         let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind)).await;
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
@@ -436,22 +443,39 @@ impl Engine {
         // Turn the upper layer into a manifest, moving files into the store.
         let store = self.store.clone();
         let content = self.content.clone();
-        let discard = spec.discard.clone();
         let upper = fin.upper;
         let (entries, out_hash, err_hash) = tokio::task::spawn_blocking(move || -> Result<_> {
             use rayon::prelude::*;
+            // Several names may be hard links to one written file (rustc
+            // links its incremental `metadata.rmeta` to the output `.rmeta`):
+            // store each scratch file once.
+            let mut scratch: Vec<(PathBuf, bool)> = upper
+                .iter()
+                .filter_map(|u| match &u.kind {
+                    UpperKind::File { path, exec } => Some((path.clone(), *exec)),
+                    _ => None,
+                })
+                .collect();
+            scratch.sort();
+            scratch.dedup_by(|a, b| a.0 == b.0);
+            let stored: HashMap<PathBuf, (Hash, u64)> = scratch
+                .into_par_iter()
+                .map(|(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
+                    let r = store
+                        .put_file_move(&path, exec)
+                        .with_context(|| format!("storing output file {}", path.display()))?;
+                    Ok((path, r))
+                })
+                .collect::<Result<_>>()?;
             let entries: Vec<(Vec<u8>, MEntry)> = upper
                 .into_par_iter()
-                .filter(|u| !discard.iter().any(|d| vpath_starts_with(&u.path, d)))
                 .map(|u| -> Result<(Vec<u8>, MEntry)> {
                     let e = match u.kind {
                         UpperKind::Dir => MEntry::Dir,
                         UpperKind::Whiteout => MEntry::Whiteout,
                         UpperKind::Symlink(t) => MEntry::Symlink(t),
                         UpperKind::File { path, exec } => {
-                            let (hash, size) = store
-                                .put_file_move(&path, exec)
-                                .with_context(|| format!("storing output {}", show(&u.path)))?;
+                            let (hash, size) = stored[&path];
                             MEntry::File { hash, exec, size }
                         }
                         UpperKind::LowerFile { info } => {
@@ -475,6 +499,9 @@ impl Engine {
 
         let mut entries = entries;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // Paths under a discard prefix are not part of the result.
+        let (side, entries): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|(p, _)| spec.discard.iter().any(|d| vpath_starts_with(p, d)));
         let stats = Stats { wall_us: info.wall_us, cpu_us: info.user_us + info.sys_us, max_rss_kb: info.max_rss_kb };
         self.stats.run_cpu_us.fetch_add(stats.cpu_us, Ordering::Relaxed);
         self.stats.run_wall_us.fetch_add(stats.wall_us, Ordering::Relaxed);
@@ -485,7 +512,7 @@ impl Engine {
             outputs: Arc::new(Manifest { entries }),
             stats,
         };
-        Ok((result, fin.obs, fin.tainted))
+        Ok((result, fin.obs, fin.tainted, side))
     }
 
     async fn run_in(

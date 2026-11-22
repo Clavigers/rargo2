@@ -330,11 +330,26 @@ pub struct BuildView {
     pub levels: Arc<Vec<u8>>,
     /// Directories whose content is not traced (incremental state).
     pub untraced: Vec<Vec<u8>>,
+    /// A private extra layer for this one action (its incremental seed).
+    pub seed: Option<Arc<OutputsLayer>>,
+}
+
+const SEED_LEVELS: [u8; 1] = [LEVEL_FULL];
+
+impl BuildView {
+    fn layered(&self, dir: &[u8], name: &[u8]) -> Option<LayerEnt> {
+        if let Some(seed) = &self.seed {
+            if let Some(e) = seed.get(dir, name, &SEED_LEVELS) {
+                return Some(e);
+            }
+        }
+        self.layer.get(dir, name, &self.levels)
+    }
 }
 
 impl View for BuildView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        match self.layer.get(dir, name, &self.levels) {
+        match self.layered(dir, name) {
             Some(LayerEnt::Entry(MEntry::File { hash, exec, size })) => Looked::File(FileInfo {
                 size,
                 owner: if exec { OWN_EXEC } else { OWN_FILE },
@@ -355,7 +370,10 @@ impl View for BuildView {
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        let layered = self.layer.names(dir, &self.levels);
+        let mut layered = self.layer.names(dir, &self.levels);
+        if let Some(seed) = &self.seed {
+            layered.extend(seed.names(dir, &SEED_LEVELS));
+        }
         // The directory may exist only in the layer.
         let mut map: HashMap<Vec<u8>, DType> = match self.base_has_dir(dir) {
             true => self.base.list(dir)?.into_iter().collect(),
@@ -389,7 +407,7 @@ impl View for BuildView {
 
     fn stat(&self, path: &[u8]) -> Looked {
         let Some((dir, name)) = vsplit(path) else { return Looked::Dir(DIR_OWNER) };
-        match self.layer.get(dir, name, &self.levels) {
+        match self.layered(dir, name) {
             Some(_) => self.lookup(dir, name),
             None => {
                 // The base checks that host parents are real directories;
@@ -412,10 +430,9 @@ impl BuildView {
     fn layer_has_dir(&self, dir: &[u8]) -> bool {
         match vsplit(dir) {
             None => true,
-            Some((p, n)) => matches!(
-                self.layer.get(p, n, &self.levels),
-                Some(LayerEnt::Implied) | Some(LayerEnt::Entry(MEntry::Dir))
-            ),
+            Some((p, n)) => {
+                matches!(self.layered(p, n), Some(LayerEnt::Implied) | Some(LayerEnt::Entry(MEntry::Dir)))
+            }
         }
     }
 }
@@ -489,6 +506,7 @@ mod tests {
             layer: layer.clone(),
             levels: Arc::new(levels),
             untraced: vec![],
+            seed: None,
         };
         // Sees only unit 0's metadata.
         let v = view(vec![LEVEL_META, LEVEL_NONE]);
@@ -532,7 +550,7 @@ mod tests {
                 (b"/t/debug/a/out/liba.rlib".to_vec(), file(2)),
             ],
         );
-        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_META]), untraced: vec![] };
+        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_META]), untraced: vec![], seed: None };
         assert!(matches!(v.stat(b"/t/debug/a/out"), Looked::Dir(_)));
         assert!(matches!(v.stat(b"/t/debug/a/out/liba.rmeta"), Looked::File(_)));
         assert!(matches!(v.stat(b"/t/debug/a/out/liba.rlib"), Looked::Absent));
@@ -560,7 +578,7 @@ mod tests {
         std::fs::write(tmp.path().join("kept"), "x").unwrap();
         let layer = Arc::new(OutputsLayer::new());
         layer.add(0, LEVEL_FULL, &[(b"/gone".to_vec(), MEntry::Whiteout)]);
-        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![] };
+        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None };
         assert!(matches!(v.stat(b"/gone"), Looked::Absent));
         assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
         let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
@@ -582,7 +600,7 @@ mod host_listing_tests {
             memo,
             g,
         ));
-        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![] };
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None };
         for dir in ["/usr/lib", "/etc", "/"] {
             let real = std::fs::read_dir(dir).unwrap().count();
             let seen = v.list(dir.as_bytes()).unwrap().len();

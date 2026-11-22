@@ -30,6 +30,8 @@ struct Opts {
     jobs: usize,
     mem_kb: u64,
     passthrough: bool,
+    /// Size the content store is kept under.
+    store_budget: u64,
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -47,6 +49,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         jobs: cpus,
         mem_kb: total_kb / 10 * 7,
         passthrough: true,
+        store_budget: 100 << 30,
     };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -58,6 +61,8 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--jobs" => o.jobs = val()?.parse()?,
             "--mem-gb" => o.mem_kb = val()?.parse::<u64>()? << 20,
             "--no-passthrough" => o.passthrough = false,
+            "--store-budget-gb" => o.store_budget = val()?.parse::<u64>()? << 30,
+            "--store-budget-mb" => o.store_budget = val()?.parse::<u64>()? << 20,
             other => bail!("unknown option `{other}`"),
         }
     }
@@ -117,6 +122,27 @@ fn main() -> Result<()> {
         opts.mem_kb >> 20,
         socket.display()
     );
+
+    // Eviction replaces `cargo clean`: least recently used blobs go first,
+    // nothing used in the last ten minutes is touched, and a trace whose
+    // outputs are gone is simply a miss.
+    {
+        let d = daemon.clone();
+        let budget = opts.store_budget;
+        std::thread::Builder::new().name("evict".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                let store = &d.engine.store;
+                if store.total_bytes() > budget {
+                    let fs = d.engine.fs.clone();
+                    let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
+                    if freed > 0 {
+                        eprintln!("rargod: evicted {} MiB (store now {} MiB)", freed >> 20, store.total_bytes() >> 20);
+                    }
+                }
+            }
+        })?;
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     let result = rt.block_on(serve(daemon, &socket));
@@ -284,7 +310,8 @@ fn status_text(d: &Daemon) -> String {
          reruns              {} changed-input, {} environment\n\
          scheduler           {} running, {} waiting, peak {}, {} granted, {} tokens\n\
          fuse                {} lookups, {} opens, {} userspace reads, {} userspace writes\n\
-         plans decoded       {}\n",
+         plans decoded       {}\n\
+         incremental         {} states saved; seeds: {} same worktree, {} ancestor, {} other, {} none; {} dropped after a crash\n",
         d.stats.requests.load(Ordering::Relaxed),
         e.store.blob_count(),
         e.store.total_bytes() as f64 / (1 << 20) as f64,
@@ -308,5 +335,11 @@ fn status_text(d: &Daemon) -> String {
         f.reads.load(Ordering::Relaxed),
         f.writes.load(Ordering::Relaxed),
         d.stats.plans_decoded.load(Ordering::Relaxed),
+        d.incr.stats.saved.load(Ordering::Relaxed),
+        d.incr.stats.seeded_same_worktree.load(Ordering::Relaxed),
+        d.incr.stats.seeded_ancestor.load(Ordering::Relaxed),
+        d.incr.stats.seeded_other.load(Ordering::Relaxed),
+        d.incr.stats.unseeded.load(Ordering::Relaxed),
+        d.incr.stats.discarded_after_crash.load(Ordering::Relaxed),
     )
 }

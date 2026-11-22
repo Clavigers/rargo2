@@ -306,6 +306,7 @@ fn large_directories_list_completely_through_a_build_view() {
             layer: Arc::new(OutputsLayer::new()),
             levels: Arc::new(vec![]),
             untraced: vec![],
+            seed: None,
         });
         let o = fx.engine.obtain(r).await.unwrap();
         assert_eq!(fx.text(&o.result.stdout), "400\n400\n0\n");

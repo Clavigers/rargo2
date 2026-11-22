@@ -50,6 +50,7 @@ pub struct Daemon {
     pub repos: RepoCache,
     pub worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
     pub parser: Parser,
+    pub incr: crate::incr::IncrStore,
     plans: DashMap<Hash, Arc<PlanData>>,
     /// Target directories seen per worktree, masked in later views.
     masks: DashMap<PathBuf, Vec<Vec<u8>>>,
@@ -185,6 +186,9 @@ struct Run {
     /// The client asked to be told why things run (`RARGO_EXPLAIN`).
     explain: bool,
     root_id: Hash,
+    wt_root: PathBuf,
+    head: Option<[u8; 20]>,
+    policy: crate::policy::Policy,
 }
 
 fn bytes(s: &str) -> Vec<u8> {
@@ -245,7 +249,9 @@ fn real_cargo_home(env: &HashMap<String, String>) -> PathBuf {
 impl Daemon {
     pub fn new(cfg: Config, engine: Arc<Engine>, watcher: Arc<Watcher>) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
+        let incr = crate::incr::IncrStore::new(engine.store.clone());
         Daemon {
+            incr,
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),
@@ -320,6 +326,9 @@ impl Observer for PlanObserver {
 
 struct Prepared {
     root: PathBuf,
+    /// HEAD commit of the worktree, if it has one.
+    head: Option<[u8; 20]>,
+    policy: crate::policy::Policy,
     cargo_home: PathBuf,
     base: Arc<BaseView>,
     tr: Translator,
@@ -333,6 +342,15 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
     let root = worktree.root.clone();
     let wt = worktree.clone();
     let snapshot = tokio::task::spawn_blocking(move || wt.snapshot()).await??;
+    // The repository's policy file, as of this snapshot.
+    let policy = match snapshot.lookup(b"/", crate::policy::POLICY_FILE.as_bytes()) {
+        Looked::File(f) => {
+            let hash = d.engine.content.hash(&f.src)?;
+            let text = d.store().read(&hash)?;
+            crate::policy::Policy::parse(&String::from_utf8_lossy(&text)).map_err(|e| anyhow!(e))?
+        }
+        _ => Default::default(),
+    };
     let cargo_home = real_cargo_home(&c.env);
     let generation = d.memo.advance();
     let mut masks = vec![vjoin(WORKTREE_AT, b"target")];
@@ -357,7 +375,15 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
     ]);
     let cwd = c.cwd.canonicalize().unwrap_or_else(|_| c.cwd.clone());
     let sandbox_cwd = tr.to_canonical(&cwd.to_string_lossy());
-    Ok(Prepared { root, cargo_home, base: Arc::new(base), tr, sandbox_cwd, env: base_env(&c.env) })
+    let head = git2::Repository::open(&root)
+        .ok()
+        .and_then(|r| r.head().ok().and_then(|h| h.target()))
+        .and_then(|o| <[u8; 20]>::try_from(o.as_bytes()).ok());
+    let mut env = base_env(&c.env);
+    for (k, v) in policy.passed_env(&c.env) {
+        env.entry(k).or_insert(v);
+    }
+    Ok(Prepared { root, head, policy, cargo_home, base: Arc::new(base), tr, sandbox_cwd, env })
 }
 
 struct Planned {
@@ -583,6 +609,9 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         no_cache_tests,
         explain: c.env.contains_key("RARGO_EXPLAIN"),
         root_id: Hash::ZERO,
+        wt_root: p.root.clone(),
+        head: p.head,
+        policy: p.policy.clone(),
     });
 
     let mut tasks = Vec::with_capacity(n);
@@ -776,14 +805,33 @@ impl Run {
         env
     }
 
-    fn view_for(&self, i: usize, include_self: bool, untraced: Vec<Vec<u8>>) -> Arc<dyn View> {
+    fn view_for(
+        &self,
+        i: usize,
+        include_self: bool,
+        untraced: Vec<Vec<u8>>,
+        seed: Option<Arc<OutputsLayer>>,
+    ) -> Arc<dyn View> {
         let mut levels = self.pd.levels(i);
         if include_self {
             let mut lv = (*levels).clone();
             lv[i] = LEVEL_FULL;
             levels = Arc::new(lv);
         }
-        Arc::new(BuildView { base: self.base.clone(), layer: self.layer.clone(), levels, untraced })
+        Arc::new(BuildView { base: self.base.clone(), layer: self.layer.clone(), levels, untraced, seed })
+    }
+
+    /// Whether `commit` is HEAD of this worktree or one of its ancestors.
+    fn is_ancestor_of_head(&self, commit: &[u8; 20]) -> bool {
+        let Some(head) = self.head else { return false };
+        if head == *commit {
+            return true;
+        }
+        let Ok(repo) = git2::Repository::open(&self.wt_root) else { return false };
+        match (git2::Oid::from_bytes(&head), git2::Oid::from_bytes(commit)) {
+            (Ok(h), Ok(c)) => repo.graph_descendant_of(h, c).unwrap_or(false),
+            _ => false,
+        }
     }
 
     async fn exec_unit(self: &Arc<Self>, i: usize) -> Result<UState> {
@@ -836,15 +884,22 @@ impl Run {
                         mkdirs.push(bytes(dir));
                     }
                 }
-                // Incremental compilation state is handled separately from
-                // the build proper; without a seed it only costs time.
-                if let Some(pos) = args.iter().position(|a| a.starts_with("incremental=")) {
-                    if pos > 0 && args[pos - 1] == "-C" {
-                        args.drain(pos - 1..=pos);
-                    }
-                }
             }
         }
+        // The crate's incremental directory: not an input and not an
+        // output of the build proper, but kept and shared (see `incr`).
+        let incr_dir: Option<Vec<u8>> = match u.kind {
+            rp::UnitKind::Compile => args
+                .iter()
+                .enumerate()
+                .find(|(n, a)| a.starts_with("incremental=") && *n > 0 && args[*n - 1] == "-C")
+                .map(|(_, a)| bytes(&a["incremental=".len()..])),
+            _ => None,
+        };
+        if let Some(dir) = &incr_dir {
+            mkdirs.push(dir.clone());
+        }
+        let _ = &mut args;
         let mut argv = vec![bytes(&cmd.program)];
         argv.extend(args.iter().map(|a| bytes(a)));
         let spec = ActionSpec {
@@ -852,11 +907,21 @@ impl Run {
             argv,
             env: self.action_env(&cmd),
             cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
-            net: NetMode::Loopback,
+            net: if u.kind == rp::UnitKind::RunScript && self.policy.build_script_network(&u.pkg_name) {
+                NetMode::Host
+            } else {
+                NetMode::Loopback
+            },
             mkdirs,
             root_id: self.root_id,
-            discard: vec![],
+            discard: incr_dir.iter().cloned().collect(),
             label: u.desc.clone(),
+        };
+        let crate_key = spec.weak_key();
+        let wt = self.wt_root.to_string_lossy().into_owned();
+        let mut seed = match &incr_dir {
+            Some(_) => self.d.incr.pick(&crate_key, &wt, &|c| self.is_ancestor_of_head(c)),
+            None => None,
         };
 
         let script = u.script.clone();
@@ -880,26 +945,51 @@ impl Run {
         // answer that makes people delete caches. Concurrent identical
         // failures are still shared through in-flight deduplication.
         let cacheable: Arc<dyn Fn(&ActionResult) -> bool + Send + Sync> = Arc::new(|r| r.success());
-        let outcome = self
-            .d
-            .engine
-            .obtain(Request {
-                spec,
-                view: self.view_for(i, false, vec![]),
-                client_env: self.c.env.clone(),
-                uid: self.c.uid,
-                gid: self.c.gid,
-                prio: self.c.prio,
-                no_cache: false,
-                cacheable,
-                declared_env,
-                observer: Arc::new(UnitObserver {
-                    run: self.clone(),
-                    i,
-                    shown: display_cmd(&cmd.program, &args),
-                }),
-            })
-            .await?;
+        let outcome = loop {
+            let seed_layer = seed.as_ref().map(|(_, m, _)| {
+                let l = OutputsLayer::new();
+                l.add_manifest(0, LEVEL_FULL, m);
+                Arc::new(l)
+            });
+            let outcome = self
+                .d
+                .engine
+                .obtain(Request {
+                    spec: spec.clone(),
+                    view: self.view_for(i, false, incr_dir.iter().cloned().collect(), seed_layer),
+                    client_env: self.c.env.clone(),
+                    uid: self.c.uid,
+                    gid: self.c.gid,
+                    prio: self.c.prio,
+                    no_cache: false,
+                    cacheable: cacheable.clone(),
+                    declared_env: declared_env.clone(),
+                    observer: Arc::new(UnitObserver {
+                        run: self.clone(),
+                        i,
+                        shown: display_cmd(&cmd.program, &args),
+                    }),
+                })
+                .await?;
+            let r = &outcome.result;
+            // A compiler that crashed (signal, or the exit code of an
+            // internal error) while reading someone's incremental state may
+            // have crashed because of that state: drop it and compile clean.
+            let crashed = r.signal().is_some() || r.code() == Some(101);
+            if crashed && !outcome.cached {
+                if let Some((id, _, _)) = seed.take() {
+                    self.d.incr.discard(&crate_key, id);
+                    continue;
+                }
+            }
+            break outcome;
+        };
+        if let (Some(dir), true, false) = (&incr_dir, outcome.result.success(), outcome.cached) {
+            let state = crate::incr::apply_changes(dir, seed.as_ref().map(|(_, m, _)| &**m), &outcome.side);
+            if !state.entries.is_empty() {
+                self.d.incr.save(&crate_key, &wt, self.head, &state);
+            }
+        }
         let r = outcome.result.clone();
         let _ = self.results[i].set((r.clone(), outcome.cached));
 
@@ -1405,7 +1495,11 @@ impl Run {
                         argv,
                         env: self.action_env(&cmd),
                         cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
-                        net: NetMode::Loopback,
+                        net: if self.policy.test_network(&plan.units[*unit as usize].pkg_name) {
+                            NetMode::Host
+                        } else {
+                            NetMode::Loopback
+                        },
                         mkdirs: vec![],
                         root_id: self.root_id,
                         discard: vec![],
@@ -1416,7 +1510,7 @@ impl Run {
                         .engine
                         .obtain(Request {
                             spec,
-                            view: self.view_for(*unit as usize, true, vec![]),
+                            view: self.view_for(*unit as usize, true, vec![], None),
                             client_env: self.c.env.clone(),
                             uid: self.c.uid,
                             gid: self.c.gid,
