@@ -39,6 +39,8 @@ pub struct Config {
 pub struct DaemonStats {
     pub requests: AtomicU64,
     pub plans_decoded: AtomicU64,
+    pub verify_units: AtomicU64,
+    pub verify_mismatches: AtomicU64,
 }
 
 /// State shared by all requests.
@@ -51,6 +53,10 @@ pub struct Daemon {
     pub worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
     pub parser: Parser,
     pub incr: crate::incr::IncrStore,
+    /// The most recent drift report, for `--rargo-status`.
+    pub drift_report: Mutex<Option<String>>,
+    /// Who last built in each worktree, for the background drift check.
+    pub last_clients: Mutex<HashMap<PathBuf, crate::drift::LastClient>>,
     plans: DashMap<Hash, Arc<PlanData>>,
     /// Target directories seen per worktree, masked in later views.
     masks: DashMap<PathBuf, Vec<Vec<u8>>>,
@@ -192,6 +198,10 @@ struct Run {
     wt_root: PathBuf,
     head: Option<[u8; 20]>,
     policy: crate::policy::Policy,
+    /// Re-run every unit that came from the cache, cleanly, and compare.
+    verify: bool,
+    verified: AtomicU64,
+    verify_mismatches: Mutex<Vec<String>>,
 }
 
 fn bytes(s: &str) -> Vec<u8> {
@@ -255,6 +265,8 @@ impl Daemon {
         let incr = crate::incr::IncrStore::new(engine.store.clone());
         Daemon {
             incr,
+            drift_report: Mutex::new(None),
+            last_clients: Mutex::new(HashMap::new()),
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),
@@ -662,6 +674,12 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     }
 
     let mut p = prepare(d, c).await?;
+    if !c.env.contains_key("RARGO_DRIFT_CHECK") {
+        d.last_clients.lock().insert(
+            p.root.clone(),
+            crate::drift::LastClient { env: c.env.clone(), uid: c.uid, gid: c.gid, at: Instant::now(), checked_head: None },
+        );
+    }
     let mut fetched = false;
     let planned = loop {
         match plan(d, c, &p, &args).await? {
@@ -739,6 +757,9 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         wt_root: p.root.clone(),
         head: p.head,
         policy: p.policy.clone(),
+        verify: c.env.contains_key("RARGO_VERIFY"),
+        verified: AtomicU64::new(0),
+        verify_mismatches: Mutex::new(Vec::new()),
     });
 
     let mut tasks = Vec::with_capacity(n);
@@ -771,6 +792,19 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         return Ok(Finish::Code(101));
     }
 
+    if run.verify {
+        let bad = run.verify_mismatches.lock().clone();
+        for m in &bad {
+            c2.out.warn(&format!("verify: {m}"));
+        }
+        c2.out.note(&format!(
+            "verify: {} cached unit(s) re-run cleanly, {} differed",
+            run.verified.load(Ordering::Relaxed),
+            bad.len()
+        ));
+        d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
+        d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
+    }
     // Place what was asked for into the real target directory.
     run.materialize_roots(&p.root).await?;
     c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
@@ -1114,6 +1148,73 @@ impl Run {
             }
             break outcome;
         };
+        if self.verify && outcome.cached && outcome.result.success() {
+            // The cached result claims to be what this action produces from
+            // these inputs. Run it again from nothing (no cache, no
+            // incremental seed) and see.
+            let clean = self
+                .d
+                .engine
+                .obtain(Request {
+                    spec: spec.clone(),
+                    view: self.view_for(i, false, incr_dir.iter().cloned().collect(), None),
+                    client_env: self.c.env.clone(),
+                    uid: self.c.uid,
+                    gid: self.c.gid,
+                    prio: self.c.prio,
+                    no_cache: true,
+                    cacheable: Arc::new(|_| false),
+                    declared_env: Arc::new(|_, _| Vec::new()),
+                    observer: Arc::new(NullObserver),
+                })
+                .await?;
+            self.verified.fetch_add(1, Ordering::Relaxed);
+            let (a, b) = (&outcome.result.outputs.entries, &clean.result.outputs.entries);
+            if !clean.result.success() {
+                self.verify_mismatches
+                    .lock()
+                    .push(format!("{}: cached as a success, but a clean run fails ({})", u.desc, describe_status(clean.result.status)));
+            } else if a != b {
+                // rustc's incremental mode names the object files inside an
+                // rlib after the compilation session; two rlibs that differ
+                // only in those names are the same result.
+                let store = self.d.store().clone();
+                let same = |x: &MEntry, y: Option<&MEntry>, path: &[u8]| -> bool {
+                    if Some(x) == y {
+                        return true;
+                    }
+                    let (MEntry::File { hash: hx, .. }, Some(MEntry::File { hash: hy, .. })) = (x, y) else { return false };
+                    if incr_dir.is_none() || !path.ends_with(b".rlib") {
+                        return false;
+                    }
+                    match (store.read(hx), store.read(hy)) {
+                        (Ok(bx), Ok(by)) => {
+                            let (sx, sy) = (crate::ar::stable_rlib_hash(&bx), crate::ar::stable_rlib_hash(&by));
+                            sx.is_some() && sx == sy
+                        }
+                        _ => false,
+                    }
+                };
+                let differing: Vec<String> = a
+                    .iter()
+                    .filter(|(p, e)| !same(e, clean.result.outputs.get(p), p))
+                    .map(|(p, _)| self.c.out.tr.path(&String::from_utf8_lossy(p)))
+                    .chain(
+                        b.iter()
+                            .filter(|(p, _)| outcome.result.outputs.get(p).is_none())
+                            .map(|(p, _)| self.c.out.tr.path(&String::from_utf8_lossy(p))),
+                    )
+                    .take(3)
+                    .collect();
+                if !differing.is_empty() {
+                    self.verify_mismatches.lock().push(format!(
+                        "{}: a clean run produces different output than the cached one ({})",
+                        u.desc,
+                        differing.join(", ")
+                    ));
+                }
+            }
+        }
         if let (Some(dir), true, false) = (&incr_dir, outcome.result.success(), outcome.cached) {
             let state = crate::incr::apply_changes(dir, seed.as_ref().map(|(_, m, _)| &**m), &outcome.side);
             if !state.entries.is_empty() {

@@ -32,6 +32,8 @@ struct Opts {
     passthrough: bool,
     /// Size the content store is kept under.
     store_budget: u64,
+    /// Minutes between background drift checks; 0 turns them off.
+    drift_minutes: u64,
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -50,6 +52,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         mem_kb: total_kb / 10 * 7,
         passthrough: true,
         store_budget: 100 << 30,
+        drift_minutes: 360,
     };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -61,6 +64,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--jobs" => o.jobs = val()?.parse()?,
             "--mem-gb" => o.mem_kb = val()?.parse::<u64>()? << 20,
             "--no-passthrough" => o.passthrough = false,
+            "--drift-interval-min" => o.drift_minutes = val()?.parse()?,
             "--store-budget-gb" => o.store_budget = val()?.parse::<u64>()? << 30,
             "--store-budget-mb" => o.store_budget = val()?.parse::<u64>()? << 20,
             other => bail!("unknown option `{other}`"),
@@ -154,6 +158,11 @@ fn main() -> Result<()> {
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    if opts.drift_minutes > 0 {
+        let d = daemon.clone();
+        let every = std::time::Duration::from_secs(opts.drift_minutes * 60);
+        rt.spawn(rargo_core::drift::background(d, every));
+    }
     let result = rt.block_on(serve(daemon, &socket));
     session.unmount();
     let _ = std::fs::remove_file(&socket);
@@ -278,6 +287,34 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         let _ = writer.await;
         return Ok(());
     }
+    if req.args.first().map(|s| s.as_str()) == Some("__drift") {
+        // On-demand drift check of the worktree the client is in.
+        let who = rargo_core::drift::LastClient {
+            env: Arc::new(env.clone()),
+            uid: cred.uid(),
+            gid: cred.gid(),
+            at: std::time::Instant::now(),
+            checked_head: None,
+        };
+        let mut root = PathBuf::from(&req.cwd);
+        while !root.join(".git").exists() {
+            if !root.pop() {
+                break;
+            }
+        }
+        let (msg, code) = match rargo_core::drift::check(&daemon, &root, &who).await {
+            Ok(r) => {
+                let text = r.render();
+                *daemon.drift_report.lock() = Some(format!("{}: {text}", root.display()));
+                (text, if r.agrees() { 0 } else { 1 })
+            }
+            Err(e) => (format!("error: drift check could not run: {e:#}\n"), 101),
+        };
+        let _ = tx.send(ServerMsg::Stdout(msg.into_bytes()));
+        let _ = tx.send(ServerMsg::Exit(code));
+        let _ = writer.await;
+        return Ok(());
+    }
     if req.args.first().map(|s| s.as_str()) == Some("__gc") {
         // Explicit collection: everything unreferenced, regardless of age.
         // Meant for when no build is running.
@@ -370,7 +407,9 @@ fn status_text(d: &Daemon) -> String {
          scheduler           {} running, {} waiting, peak {}, {} granted, {} tokens\n\
          fuse                {} lookups, {} opens, {} userspace reads, {} userspace writes\n\
          plans decoded       {}\n\
-         incremental         {} states saved; seeds: {} same worktree, {} ancestor, {} other, {} none; {} dropped after a crash\n",
+         incremental         {} states saved; seeds: {} same worktree, {} ancestor, {} other, {} none; {} dropped after a crash\n\
+         verify              {} cached units re-run cleanly, {} differed\n\
+         drift               {}\n",
         d.stats.requests.load(Ordering::Relaxed),
         e.store.blob_count(),
         e.store.total_bytes() as f64 / (1 << 20) as f64,
@@ -400,5 +439,8 @@ fn status_text(d: &Daemon) -> String {
         d.incr.stats.seeded_other.load(Ordering::Relaxed),
         d.incr.stats.unseeded.load(Ordering::Relaxed),
         d.incr.stats.discarded_after_crash.load(Ordering::Relaxed),
+        d.stats.verify_units.load(Ordering::Relaxed),
+        d.stats.verify_mismatches.load(Ordering::Relaxed),
+        d.drift_report.lock().clone().unwrap_or_else(|| "not checked yet".into()).trim_end(),
     )
 }

@@ -1,8 +1,10 @@
 //! rargo daemon internals.
 
+pub mod ar;
 pub mod build;
 pub mod buildview;
 pub mod db;
+pub mod drift;
 pub mod engine;
 pub mod expand;
 pub mod flake;

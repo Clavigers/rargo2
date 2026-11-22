@@ -226,3 +226,51 @@ how its open ends were closed.
   of it. Blobs used in the last ten minutes are never removed, so a running
   build cannot lose an input. A trace whose outputs are gone is a miss and
   is dropped when next looked at.
+
+## D18. Flake environments
+
+- A repository with `flake.nix` (unless `.rargo.toml` says `flake.enabled =
+  false`) is built in its default devShell: `nix print-dev-env --json` gives
+  the variables, `nix-store -qR` over every store path they mention gives
+  the closure. The result is remembered under a hash of `flake.nix`,
+  `flake.lock` and the other `.nix` files at the top level and under `nix/`.
+- Unit actions and tests then run in a root that contains only: the
+  closure under `/nix/store`, `/w`, `/c`, a four-file `/etc`, and `/bin/sh`
+  and `/usr/bin/env` as symlinks into the closure. `HOME` is `/tmp`.
+- Store paths are not traced; the closure's identity is in every key.
+  Reason: a store path's content is fixed by its name, and tracing it would
+  put thousands of pointless observations into every trace.
+- Planning still runs against the host root, with the flake's environment.
+  Reason: the forked cargo is a host binary and needs the host's libraries.
+  Its trace is therefore machine-specific; the plan it produces is not.
+- Processes get the flake's `cargo` as `$CARGO` when there is one, because
+  the forked cargo cannot run inside the restricted root.
+
+## D19. Moving cache entries between machines
+
+- `rargo --rargo-export DIR` / `--rargo-import DIR` (root only) copy all
+  traces and the blobs they refer to. Imported blobs are re-hashed, so an
+  export cannot place wrong bytes under a hash; the traces themselves are
+  trusted, which is why import is restricted to root.
+- This is the transport used to demonstrate phase 3's criterion. The worker
+  protocol of phase 4 moves content by chunk and is the efficient path.
+
+## D20. Verify mode and the drift check
+
+- `RARGO_VERIFY=1` re-runs every unit that came from the cache from nothing
+  (no cache, no incremental seed) and compares outputs. Differences are
+  reported as warnings and counted in `--rargo-status`.
+- rustc's incremental mode names the object files inside an rlib after the
+  random compilation session, so two otherwise identical compilations give
+  different rlib bytes (measured: only the member names and the table that
+  lists them differ; object contents and `.rmeta` are identical). Verify
+  therefore compares rlibs of incrementally compiled units by member content
+  with the session component of the name removed. This also means a
+  recompiled-but-unchanged library still relinks its binaries; making the
+  names stable is a phase 5 item.
+- The drift check (`rargo --rargo-drift-check`, and every six hours in the
+  background for worktrees whose HEAD moved, when the machine is idle)
+  clones HEAD into a scratch directory with `git clone --shared`, builds it
+  with the toolchain's own cargo unsandboxed at low priority, builds it with
+  rargo in verify mode, and reports if the two disagree on success or if any
+  cached unit did not reproduce.

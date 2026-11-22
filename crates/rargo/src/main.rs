@@ -74,6 +74,11 @@ fn passthrough(args: &[OsString]) -> ! {
 
 fn main() {
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // The drift check runs stock cargo; if this shim is the `cargo` it
+    // finds, step aside.
+    if std::env::var_os("RARGO_BYPASS").is_some() {
+        passthrough(&raw);
+    }
     let mut args: Vec<String> = match raw.iter().map(|a| a.clone().into_string()).collect() {
         Ok(a) => a,
         // cargo itself rejects non-UTF-8 arguments for build commands.
@@ -91,6 +96,7 @@ fn main() {
     let admin = match args.first().map(|s| s.as_str()) {
         Some("--rargo-status") => Some("__status"),
         Some("--rargo-gc") => Some("__gc"),
+        Some("--rargo-drift-check") => Some("__drift"),
         _ => None,
     };
     let transfer = match args.first().map(|s| s.as_str()) {
