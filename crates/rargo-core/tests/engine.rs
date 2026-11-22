@@ -277,3 +277,37 @@ fn failures_are_not_cached_unless_allowed() {
         assert!(err.contains("could not start"), "{err}");
     });
 }
+
+#[test]
+fn large_directories_list_completely_through_a_build_view() {
+    let fx = fixture();
+    // Enough entries with long names to need several READDIR round trips.
+    let big = fx.work.join("big");
+    std::fs::create_dir_all(&big).unwrap();
+    for i in 0..400 {
+        std::fs::write(big.join(format!("libsomething-with-a-long-name-{i:04}-5cc9b44b3cc93987.rmeta")), "x").unwrap();
+    }
+    rt().block_on(async {
+        let mut r = fx.req("ls /w/big | wc -l; ls -la /w/big | grep -c rmeta; ls /w/big | sort | uniq -d | wc -l", &[], &[], &[]);
+        let base = {
+            let g = fx.memo.advance();
+            Arc::new(BaseView::new(
+                vec![
+                    Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
+                    Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(&fx.work)), traced: true },
+                    Mount { at: b"/root/rargo-work/test-tmp".to_vec(), region: Region::Empty, traced: true },
+                ],
+                fx.memo.clone(),
+                g,
+            ))
+        };
+        r.view = Arc::new(BuildView {
+            base,
+            layer: Arc::new(OutputsLayer::new()),
+            levels: Arc::new(vec![]),
+            untraced: vec![],
+        });
+        let o = fx.engine.obtain(r).await.unwrap();
+        assert_eq!(fx.text(&o.result.stdout), "400\n400\n0\n");
+    });
+}

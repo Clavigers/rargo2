@@ -27,6 +27,8 @@ const LOCAL_BITS: u32 = 24;
 const LOCAL_MASK: u64 = (1 << LOCAL_BITS) - 1;
 const ROOT_LOCAL: u32 = 1;
 const BACKING_CACHE_MAX: usize = 200_000;
+/// How long a backing id stays registered after it was last handed out.
+const RETIRE_GRACE: Duration = Duration::from_secs(60);
 
 fn nodeid(seq: u64, local: u32) -> u64 {
     (seq << LOCAL_BITS) | local as u64
@@ -156,6 +158,8 @@ pub struct SandboxFs {
     content: Arc<Content>,
     session: OnceLock<Arc<Session>>,
     backing: DashMap<BackingKey, (i32, AtomicU64)>,
+    /// Backing ids no longer in the map, waiting to be closed.
+    retired: Mutex<Vec<(std::time::Instant, i32)>>,
     tick: AtomicU64,
     stats: FsStats,
 }
@@ -176,6 +180,7 @@ impl SandboxFs {
             content,
             session: OnceLock::new(),
             backing: DashMap::new(),
+            retired: Mutex::new(Vec::new()),
             tick: AtomicU64::new(0),
             stats: FsStats::default(),
         }
@@ -254,11 +259,17 @@ impl SandboxFs {
         }
         let mut st = a.st.lock();
         st.finished = true;
+        // Upper files were only ever opened by this action's processes, all
+        // of which are gone, so no reply can still refer to these ids. They
+        // are closed right away: the kernel's reference keeps the scratch
+        // file open for writing, and an output must not stay "text file
+        // busy" after its action has finished.
         if let Some(s) = self.session.get() {
             for id in st.backing_ids.drain(..) {
                 let _ = s.backing_close(id);
             }
         }
+        self.reap_retired();
         let mut upper = Vec::new();
         walk_upper(&st, &*a.view, ROOT_LOCAL, b"/", false, &mut upper);
 
@@ -309,31 +320,65 @@ impl SandboxFs {
         Finished { obs: compact_obs(out), upper, tainted }
     }
 
+    /// The passthrough backing id for an immutable backing file, registering
+    /// it with the kernel on first use.
+    ///
+    /// Ids are small integers the kernel reuses as soon as they are closed,
+    /// and the kernel resolves the id in an open reply only after our write
+    /// of that reply has returned. An id must therefore never be closed
+    /// while a reply carrying it may still be in flight: registration
+    /// happens exactly once per key (under the map's entry lock), and ids
+    /// taken out of the map are closed only after a grace period.
     fn backing_id(&self, key: BackingKey, file: &File) -> Res<i32> {
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
-        if let Some(e) = self.backing.get(&key) {
-            e.1.store(tick, Ordering::Relaxed);
-            return Ok(e.0);
-        }
-        let sess = self.session.get().ok_or(Errno::EIO)?;
-        let id = sess.backing_open(file.as_raw_fd())?;
-        if let Some(old) = self.backing.insert(key, (id, AtomicU64::new(tick))) {
-            let _ = sess.backing_close(old.0);
-        }
+        let id = match self.backing.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(e) => {
+                e.get().1.store(tick, Ordering::Relaxed);
+                return Ok(e.get().0);
+            }
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let sess = self.session.get().ok_or(Errno::EIO)?;
+                let id = sess.backing_open(file.as_raw_fd())?;
+                v.insert((id, AtomicU64::new(tick)));
+                id
+            }
+        };
         if self.backing.len() > BACKING_CACHE_MAX {
             self.trim_backing();
         }
+        self.reap_retired();
         Ok(id)
     }
 
-    fn trim_backing(&self) {
+    fn retire(&self, id: i32) {
+        self.retired.lock().push((std::time::Instant::now(), id));
+    }
+
+    /// Closes retired ids whose grace period is over.
+    fn reap_retired(&self) {
         let Some(sess) = self.session.get() else { return };
+        let mut r = self.retired.lock();
+        if r.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        r.retain(|(t, id)| {
+            if now.duration_since(*t) > RETIRE_GRACE {
+                let _ = sess.backing_close(*id);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn trim_backing(&self) {
         let mut all: Vec<(u64, BackingKey)> =
             self.backing.iter().map(|e| (e.value().1.load(Ordering::Relaxed), *e.key())).collect();
         all.sort_unstable_by_key(|e| e.0);
         for (_, k) in all.into_iter().take(BACKING_CACHE_MAX / 4) {
             if let Some((_, (id, _))) = self.backing.remove(&k) {
-                let _ = sess.backing_close(id);
+                self.retire(id);
             }
         }
     }
@@ -342,9 +387,7 @@ impl SandboxFs {
     /// the kernel does not keep the unlinked file alive).
     pub fn forget_backing(&self, h: &crate::hash::Hash) {
         if let Some((_, (id, _))) = self.backing.remove(&BackingKey::Blob(*h)) {
-            if let Some(s) = self.session.get() {
-                let _ = s.backing_close(id);
-            }
+            self.retire(id);
         }
     }
 

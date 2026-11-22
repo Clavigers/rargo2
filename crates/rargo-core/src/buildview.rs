@@ -540,3 +540,27 @@ mod tests {
         assert!(!names.contains(&b"gone".to_vec()) && names.contains(&b"kept".to_vec()));
     }
 }
+
+#[cfg(test)]
+mod host_listing_tests {
+    use super::*;
+
+    /// A build view over the real root lists a real directory completely.
+    #[test]
+    fn build_view_lists_host_directories() {
+        let memo = Arc::new(HostMemo::default());
+        let g = memo.advance();
+        let base = Arc::new(BaseView::new(
+            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true }],
+            memo,
+            g,
+        ));
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![] };
+        for dir in ["/usr/lib", "/etc", "/"] {
+            let real = std::fs::read_dir(dir).unwrap().count();
+            let seen = v.list(dir.as_bytes()).unwrap().len();
+            assert_eq!(seen, real, "listing of {dir}");
+            assert!(matches!(v.stat(dir.as_bytes()), Looked::Dir(_)));
+        }
+    }
+}

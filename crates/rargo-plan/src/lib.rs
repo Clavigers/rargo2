@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the format or the fork's behaviour changes; part of the
 /// planner's cache key through the binary itself, checked on load.
-pub const PLAN_VERSION: u32 = 1;
+pub const PLAN_VERSION: u32 = 2;
 
 /// Environment variable naming the file the plan is written to. Its presence
 /// switches the fork into planning mode.
@@ -161,6 +161,9 @@ pub struct Unit {
     /// The unit announces its `.rmeta` before it finishes and dependents may
     /// start on it.
     pub rmeta_early: bool,
+    /// The unit needs the object code of everything it depends on (it is
+    /// linked: a binary, test, proc macro, dylib or build script).
+    pub needs_objects: bool,
 
     // Presentation.
     /// `foo v0.1.0 (/w/crates/foo)`, as cargo prints after `Compiling`.

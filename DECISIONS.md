@@ -119,8 +119,13 @@ how its open ends were closed.
 
 ## D8. What is cached
 
-- rustc failures with exit code 1 (ordinary diagnostics) are cached; signals
-  and ICEs are not. Test binary runs are cached only when they pass. Reason:
-  a diagnostic failure is a deterministic function of the inputs; a crash or
-  a failing test may not be, and replaying a stale failure would be the kind
-  of wrong answer that makes people distrust the cache.
+- Only successful actions are recorded. An earlier version also recorded
+  rustc failures with exit code 1, on the argument that diagnostics are a
+  deterministic function of the inputs. The first end-to-end run disproved
+  that in practice: a bug in rargo itself made rustc fail, the failure was
+  recorded, and it was replayed after the bug was fixed. A failure can also
+  come from a full disk or memory pressure, none of which a trace captures.
+  Replaying a stale failure is the kind of wrong answer that makes people
+  delete caches, so failures are always recomputed. Concurrent identical
+  failing compiles are still collapsed by in-flight deduplication.
+- Test binary runs are cached only when they pass, for the same reason.
