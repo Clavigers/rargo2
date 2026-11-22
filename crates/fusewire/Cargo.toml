@@ -1,0 +1,9 @@
+[package]
+name = "fusewire"
+description = "Minimal multi-threaded FUSE kernel protocol server with passthrough support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
