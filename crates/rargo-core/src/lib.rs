@@ -3,6 +3,7 @@
 pub mod ar;
 pub mod build;
 pub mod buildview;
+pub mod chunk;
 pub mod db;
 pub mod drift;
 pub mod engine;
@@ -10,6 +11,7 @@ pub mod expand;
 pub mod flake;
 pub mod hash;
 pub mod incr;
+pub mod net;
 pub mod parse;
 pub mod policy;
 pub mod present;

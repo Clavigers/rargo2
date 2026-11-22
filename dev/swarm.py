@@ -120,8 +120,18 @@ def main():
     if a.mode == "rargo":
         sock = env.get("RARGO_SOCKET", os.path.join(WORK, "state", "rargod.sock"))
         env["RARGO_SOCKET"] = sock
-        out = subprocess.run(["pgrep", "-x", "rargod"], capture_output=True, text=True).stdout.split()
-        daemon_pid = int(out[0]) if out else None
+        # The daemon serving this socket (others may be running).
+        state = os.path.dirname(sock)
+        daemon_pid = None
+        for pid in subprocess.run(["pgrep", "-x", "rargod"], capture_output=True, text=True).stdout.split():
+            try:
+                cmdline = open(f"/proc/{pid}/cmdline").read().split("\0")
+            except OSError:
+                continue
+            if "--state" in cmdline and cmdline[cmdline.index("--state") + 1] == state:
+                daemon_pid = int(pid)
+        if daemon_pid is None:
+            sys.exit(f"no rargod found for {state}")
         cpu0 = cgroup_cpu_usec(daemon_pid)
     else:
         cpu0 = cgroup_cpu_usec(os.getpid())
