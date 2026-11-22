@@ -319,6 +319,17 @@ impl Store {
         r
     }
 
+    /// Installs a scratch file whose hash the caller has already computed
+    /// while writing it.
+    pub fn install_hashed(&self, tmp: &Path, h: Hash, size: u64) -> io::Result<()> {
+        if self.has(&h) && self.existing(&h, false).is_some() {
+            let _ = fs::remove_file(tmp);
+            self.touch(&h);
+            return Ok(());
+        }
+        self.install(tmp, h, false, size)
+    }
+
     fn install(&self, tmp: &Path, h: Hash, exec: bool, size: u64) -> io::Result<()> {
         let dst = self.path_of(&h, exec);
         fs::set_permissions(tmp, fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
