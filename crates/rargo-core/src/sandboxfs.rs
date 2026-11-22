@@ -1208,6 +1208,24 @@ impl Filesystem for SandboxFs {
         } else if is_lower {
             let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!() };
             let Src::Lower(info) = &mut f.src else { unreachable!() };
+            // Fast path: the backing file is already registered with the
+            // kernel under the identity the lookup saw. No syscalls at all.
+            if self.passthrough() {
+                let key = match &info.src {
+                    FileSrc::Blob(h) => Some(BackingKey::Blob(*h)),
+                    FileSrc::Host { sig, .. } => Some(BackingKey::Host(*sig)),
+                    FileSrc::Git { .. } => self.content.known_hash(&info.src).map(BackingKey::Blob),
+                };
+                if let Some(e) = key.and_then(|k| self.backing.get(&k)) {
+                    e.1.store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                    if f.read_src.is_none() {
+                        f.read_src = Some(info.src.clone());
+                    }
+                    f.opens += 1;
+                    f.lower_pt_opens += 1;
+                    return Ok(Opened { fh: 1, flags: FOPEN_PASSTHROUGH, backing_id: e.0 });
+                }
+            }
             let (file, key, actual) = self.content.open(&info.src)?;
             if f.read_src.is_none() {
                 f.read_src = Some(actual.clone());
