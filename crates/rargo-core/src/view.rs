@@ -381,14 +381,12 @@ pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> 
             }
             match content.known_hash(&f.src) {
                 Some(h) => h == *hash,
-                None => match &f.src {
-                    // An unknown host file has to be read to be compared.
-                    FileSrc::Host { .. } => content.hash(&f.src).map(|h| h == *hash).unwrap_or(false),
-                    // A git blob nobody has ever materialised cannot be the
-                    // content some action read: every blob that entered a
-                    // trace has its object id recorded.
-                    _ => false,
-                },
+                // Not hashed in this store yet: a host file never read
+                // before, or a git blob never extracted here (a trace
+                // imported from another machine names content this store
+                // has only ever seen by object id). Read it once; the
+                // answer is remembered.
+                None => content.hash(&f.src).map(|h| h == *hash).unwrap_or(false),
             }
         }
         _ => false,

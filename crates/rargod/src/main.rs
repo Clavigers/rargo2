@@ -250,6 +250,34 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         return Ok(());
     }
     let env: HashMap<String, String> = req.env.iter().cloned().collect();
+    if let (Some(cmd @ ("__export" | "__import")), Some(dir)) =
+        (req.args.first().map(|s| s.as_str()), req.args.get(1).cloned())
+    {
+        // Cache transfer between machines. Only root may do it: an import
+        // adds results every later build will trust.
+        let export = cmd == "__export";
+        let reply = if cred.uid() != 0 {
+            Err(anyhow::anyhow!("only root may export or import the cache"))
+        } else {
+            let d = daemon.clone();
+            tokio::task::spawn_blocking(move || {
+                let dir = PathBuf::from(dir);
+                if export { d.export_cache(&dir) } else { d.import_cache(&dir) }
+            })
+            .await?
+        };
+        let (msg, code) = match reply {
+            Ok((traces, blobs)) => (
+                format!("{} {traces} traces and {blobs} blobs\n", if export { "exported" } else { "imported" }),
+                0,
+            ),
+            Err(e) => (format!("error: {e:#}\n"), 101),
+        };
+        let _ = tx.send(if code == 0 { ServerMsg::Stdout(msg.into_bytes()) } else { ServerMsg::Stderr(msg.into_bytes()) });
+        let _ = tx.send(ServerMsg::Exit(code));
+        let _ = writer.await;
+        return Ok(());
+    }
     if req.args.first().map(|s| s.as_str()) == Some("__gc") {
         // Explicit collection: everything unreferenced, regardless of age.
         // Meant for when no build is running.

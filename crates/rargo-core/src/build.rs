@@ -281,6 +281,70 @@ impl Daemon {
         &self.engine.store
     }
 
+    /// Writes every trace and the blobs it refers to into `dir`, for
+    /// [`Daemon::import_cache`] on another machine.
+    pub fn export_cache(&self, dir: &Path) -> Result<(usize, usize)> {
+        let blobs = dir.join("blobs");
+        std::fs::create_dir_all(&blobs)?;
+        let traces = self.engine.traces.all();
+        let mut wanted: HashSet<Hash> = HashSet::new();
+        for (_, t) in &traces {
+            wanted.insert(t.result.stdout);
+            wanted.insert(t.result.stderr);
+            for (_, e) in &t.result.outputs.entries {
+                if let MEntry::File { hash, .. } = e {
+                    wanted.insert(*hash);
+                }
+            }
+        }
+        let mut written = 0;
+        for h in &wanted {
+            let dest = blobs.join(h.hex());
+            if dest.exists() {
+                continue;
+            }
+            let Ok(mut src) = self.store().open_blob(h) else { continue };
+            let mut out = std::fs::File::create(&dest)?;
+            std::io::copy(&mut src, &mut out)?;
+            written += 1;
+        }
+        let bundle = (traces, self.engine.traces.all_needs_env());
+        let raw = bincode::serialize(&bundle)?;
+        std::fs::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
+        Ok((bundle.0.len(), written))
+    }
+
+    /// Reads an export. Blob contents are hashed again on the way in, so a
+    /// damaged or forged export cannot put wrong bytes under a hash.
+    pub fn import_cache(&self, dir: &Path) -> Result<(usize, usize)> {
+        let raw = zstd::decode_all(&std::fs::read(dir.join("traces.bin"))?[..])?;
+        let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
+        let mut blobs = 0;
+        for e in std::fs::read_dir(dir.join("blobs"))?.flatten() {
+            let Some(want) = e.file_name().to_str().and_then(Hash::from_hex) else { continue };
+            if self.store().has(&want) {
+                continue;
+            }
+            let (got, _) = self.store().put_file_copy(&std::fs::File::open(e.path())?, false)?;
+            if got != want {
+                self.store().remove(&got);
+                bail!("blob {} in the export does not have the content its name claims", want);
+            }
+            blobs += 1;
+        }
+        let mut n = 0;
+        for (key, t) in traces {
+            if t.complete(self.store()) {
+                self.engine.traces.insert(&key, t);
+                n += 1;
+            }
+        }
+        for (key, vars) in needs {
+            self.engine.traces.add_needs_env(&key, &vars);
+        }
+        Ok((n, blobs))
+    }
+
     /// Removes blobs nothing refers to any more: outputs of traces that
     /// were displaced, superseded incremental states, captures of files
     /// that have since changed. Blobs used within `min_age_secs` are left

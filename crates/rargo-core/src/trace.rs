@@ -307,6 +307,32 @@ impl TraceCache {
         added
     }
 
+    /// Every recorded trace with its weak key.
+    pub fn all(&self) -> Vec<(Hash, Trace)> {
+        let mut out = Vec::new();
+        self.db.for_each(Table::Traces, |k, v| {
+            if k.len() != 40 {
+                return;
+            }
+            let Ok(raw) = zstd::decode_all(v) else { return };
+            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { return };
+            out.push((Hash(k[..32].try_into().unwrap()), t));
+        });
+        out
+    }
+
+    /// Every "this command line reads these variables" record.
+    pub fn all_needs_env(&self) -> Vec<(Hash, Vec<String>)> {
+        self.db
+            .scan_prefix(Table::Meta, b"env:")
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let key = Hash(k.get(4..36)?.try_into().ok()?);
+                Some((key, bincode::deserialize::<Vec<String>>(&v).ok()?))
+            })
+            .collect()
+    }
+
     /// Adds every blob referenced by any recorded trace to `live`.
     pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
         self.db.for_each(Table::Traces, |_, v| {

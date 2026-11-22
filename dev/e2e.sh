@@ -11,7 +11,9 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 . "$work/env.sh"
 export RARGO_STATE=$work/e2e-state
 export RARGO_SOCKET=$RARGO_STATE/rargod.sock
-R=$repo/target/release/rargo
+bin=${RARGO_BIN:-$repo/target/release}
+export RARGO_BIN=$bin
+R=$bin/rargo
 T=$work/e2e
 fails=0
 checks=0

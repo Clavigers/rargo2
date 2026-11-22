@@ -93,7 +93,19 @@ fn main() {
         Some("--rargo-gc") => Some("__gc"),
         _ => None,
     };
-    if let Some(cmd) = admin {
+    let transfer = match args.first().map(|s| s.as_str()) {
+        Some("--rargo-export") => Some("__export"),
+        Some("--rargo-import") => Some("__import"),
+        _ => None,
+    };
+    if let Some(cmd) = transfer {
+        let Some(dir) = args.get(1) else {
+            eprintln!("usage: rargo {} DIR", args[0]);
+            std::process::exit(2);
+        };
+        let dir = std::path::absolute(dir).unwrap_or_else(|_| PathBuf::from(dir));
+        args = vec![cmd.into(), dir.to_string_lossy().into_owned()];
+    } else if let Some(cmd) = admin {
         args = vec![cmd.into()];
     } else {
         match subcommand(&args) {

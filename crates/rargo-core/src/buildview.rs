@@ -574,9 +574,14 @@ impl ViewParts {
             },
             Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(this.planner.clone())), traced: true },
         ]);
-        for m in this.masks.iter().chain(this.hidden.iter()) {
-            // Hidden host paths only matter when the host is visible.
+        for m in &this.masks {
             mounts.push(Mount { at: m.clone(), region: Region::Empty, traced: true });
+        }
+        // Hidden host paths only matter when the host is visible.
+        if this.restricted.is_none() || host_root {
+            for m in &this.hidden {
+                mounts.push(Mount { at: m.clone(), region: Region::Empty, traced: true });
+            }
         }
         BaseView::new(mounts, memo, min_gen)
     }
