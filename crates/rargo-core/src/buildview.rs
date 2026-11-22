@@ -254,7 +254,10 @@ impl OutputsLayer {
             {
                 let mut d = self.dirs.entry(parent.to_vec()).or_default();
                 let list = d.children.entry(name.to_vec()).or_default();
-                list.retain(|(u, _, ent)| !(*u == unit && matches!(ent, LayerEnt::Implied)));
+                // An implied directory of this unit at the same or a later
+                // stage is superseded. One from an earlier stage must stay:
+                // viewers at that level still need the directory to exist.
+                list.retain(|(u, s, ent)| !(*u == unit && *s >= stage && matches!(ent, LayerEnt::Implied)));
                 if !list.iter().any(|(u, s, _)| *u == unit && *s == stage) {
                     list.push((unit, stage, LayerEnt::Entry(e.clone())));
                 }
@@ -510,6 +513,30 @@ mod tests {
         let mut root: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
         root.sort();
         assert_eq!(root, vec![b"hostfile".to_vec(), b"t".to_vec()]);
+    }
+
+    #[test]
+    fn explicit_directory_does_not_hide_an_earlier_stage() {
+        // A pipelined unit announces its rmeta early; its final manifest also
+        // lists the output directory itself (it was created for the unit).
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = Arc::new(OutputsLayer::new());
+        layer.add(0, LEVEL_META, &[(b"/t/debug/a/out/liba.rmeta".to_vec(), file(1))]);
+        layer.add(
+            0,
+            LEVEL_FULL,
+            &[
+                (b"/t/debug".to_vec(), MEntry::Dir),
+                (b"/t/debug/a".to_vec(), MEntry::Dir),
+                (b"/t/debug/a/out".to_vec(), MEntry::Dir),
+                (b"/t/debug/a/out/liba.rlib".to_vec(), file(2)),
+            ],
+        );
+        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_META]), untraced: vec![] };
+        assert!(matches!(v.stat(b"/t/debug/a/out"), Looked::Dir(_)));
+        assert!(matches!(v.stat(b"/t/debug/a/out/liba.rmeta"), Looked::File(_)));
+        assert!(matches!(v.stat(b"/t/debug/a/out/liba.rlib"), Looked::Absent));
+        assert_eq!(v.list(b"/t/debug/a/out").unwrap(), vec![(b"liba.rmeta".to_vec(), DType::File)]);
     }
 
     #[test]
