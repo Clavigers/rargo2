@@ -1,0 +1,1214 @@
+From f50b420c7d92a9a5e8ea00a631bd07db840a7c1b Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Sun, 22 Nov 2026 23:14:45 +0100
+Subject: [PATCH] rargo: planning mode
+
+With __RARGO_PLAN set, run the normal pipeline with process execution
+stubbed out and write a rargo_plan::Plan. Build-script results are
+placeholder tokens that rargod substitutes after running the scripts.
+With __RARGO_PARSE set, serve cargo's build-script output parser on stdio.
+---
+ Cargo.lock                            |  18 +
+ Cargo.toml                            |   1 +
+ src/bin/cargo/main.rs                 |  10 +
+ src/compiler/build_runner/mod.rs      |  15 +-
+ src/compiler/custom_build.rs          |  19 +-
+ src/compiler/job_queue/mod.rs         |  22 +-
+ src/compiler/mod.rs                   |  62 ++-
+ src/compiler/rargo.rs                 | 676 ++++++++++++++++++++++++++
+ src/compiler/unit.rs                  |   7 +
+ src/ops/cargo_compile/mod.rs          |   6 +-
+ src/ops/cargo_run.rs                  |   3 +
+ src/ops/cargo_test.rs                 |  38 +-
+ src/workspace/global_cache_tracker.rs |   6 +
+ 13 files changed, 852 insertions(+), 31 deletions(-)
+ create mode 100644 src/compiler/rargo.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index a8337c041..fb3f26076 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -222,6 +222,15 @@ dependencies = [
+  "url",
+ ]
+ 
++[[package]]
++name = "bincode"
++version = "1.3.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
++dependencies = [
++ "serde",
++]
++
+ [[package]]
+ name = "bit-set"
+ version = "0.8.0"
+@@ -420,6 +429,7 @@ dependencies = [
+  "pathdiff",
+  "portable-atomic",
+  "rand 0.10.1",
++ "rargo-plan",
+  "regex",
+  "rusqlite",
+  "rustc-hash 2.1.2",
+@@ -3777,6 +3787,14 @@ dependencies = [
+  "rand_core 0.6.4",
+ ]
+ 
++[[package]]
++name = "rargo-plan"
++version = "0.1.0"
++dependencies = [
++ "bincode",
++ "serde",
++]
++
+ [[package]]
+ name = "rayon"
+ version = "1.12.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 6d8001085..70dba523f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -210,6 +210,7 @@ rustfix.workspace = true
+ same-file.workspace = true
+ semver.workspace = true
+ serde = { workspace = true, features = ["derive"] }
++rargo-plan = { path = "/root/rargo/crates/rargo-plan" }
+ serde-untagged.workspace = true
+ serde_ignored.workspace = true
+ serde_json = { workspace = true, features = ["raw_value"] }
+diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
+index 77dd77c82..38495273a 100644
+--- a/src/bin/cargo/main.rs
++++ b/src/bin/cargo/main.rs
+@@ -15,6 +15,11 @@ mod commands;
+ use crate::command_prelude::*;
+ 
+ fn main() {
++    #[allow(clippy::disallowed_methods)]
++    if std::env::var_os(rargo_plan::PARSE_ENV).is_some() {
++        cargo::compiler::rargo::parse_service();
++    }
++    cargo::compiler::rargo::pin_toolchain();
+     let _guard = setup_logger();
+ 
+     let mut gctx = match GlobalContext::default() {
+@@ -57,6 +62,11 @@ fn main() {
+         Err(e) => cargo::exit_with_error(e, &mut *gctx.shell()),
+         Ok(()) => {}
+     }
++    if cargo::compiler::rargo::active() {
++        if let Err(e) = cargo::compiler::rargo::finish() {
++            cargo::exit_with_error(e.into(), &mut *gctx.shell())
++        }
++    }
+ }
+ 
+ fn setup_logger() -> Option<tracing_chrome::FlushGuard> {
+diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
+index 4bf69f658..87cc79acc 100644
+--- a/src/compiler/build_runner/mod.rs
++++ b/src/compiler/build_runner/mod.rs
+@@ -181,6 +181,10 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+         custom_build::build_map(&mut self)?;
+         self.check_collisions()?;
+         self.compute_metadata_for_doc_units();
++        let planning = super::rargo::active();
++        if planning {
++            super::rargo::record_global(&self)?;
++        }
+ 
+         // We need to make sure that if there were any previous docs already compiled,
+         // they were compiled with the same Rustc version that we're currently using.
+@@ -295,7 +299,9 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+                 });
+             }
+ 
+-            super::output_depinfo(&mut self, unit)?;
++            if !planning {
++                super::output_depinfo(&mut self, unit)?;
++            }
+         }
+ 
+         for (script_meta, output) in self.build_script_outputs.lock().unwrap().iter() {
+@@ -305,6 +311,13 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+                 .or_insert_with(Vec::new)
+                 .extend(output.env.iter().cloned());
+ 
++            if planning {
++                // One token stands for "every search path of every script".
++                self.compilation
++                    .native_dirs
++                    .insert(rargo_plan::token::NATIVE_DIRS.into());
++                continue;
++            }
+             for dir in output.library_paths.iter() {
+                 self.compilation
+                     .native_dirs
+diff --git a/src/compiler/custom_build.rs b/src/compiler/custom_build.rs
+index e23a2ecc7..67beb5893 100644
+--- a/src/compiler/custom_build.rs
++++ b/src/compiler/custom_build.rs
+@@ -288,6 +288,9 @@ pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
+         .contains_key(metadata)
+     {
+         // The output is already set, thus the build script is overridden.
++        if super::rargo::active() {
++            return Ok(Job::new_fresh());
++        }
+         fingerprint::prepare_target(build_runner, unit, false)
+     } else {
+         build_work(build_runner, unit)
+@@ -515,7 +518,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+         script_out_dir.clone(),
+     );
+     let build_scripts = build_runner.build_scripts.get(unit).cloned();
+-    let json_messages = bcx.build_config.emit_json();
++    let json_messages = bcx.build_config.emit_json() && !super::rargo::active();
+     let extra_verbose = bcx.gctx.extra_verbose();
+     let (prev_output, prev_script_out_dir) = prev_build_output(build_runner, unit);
+     let metadata_hash = build_runner.get_run_build_script_metadata(unit);
+@@ -600,7 +603,10 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+         let prefix = format!("[{} {}] ", id.name(), id.version());
+         let mut log_messages_in_case_of_panic = Vec::new();
+         let span = tracing::debug_span!("build_script", process = cmd.to_string());
+-        let output = span.in_scope(|| {
++        let output = if super::rargo::active() {
++            super::rargo::fake_script_run(&cmd, &metadata_hash.to_string(), &script_out_dir, &targets)
++        } else {
++        span.in_scope(|| {
+             cmd.exec_with_streaming(
+                 &mut |stdout| {
+                     if let Some(error) = stdout.strip_prefix(CARGO_ERROR_SYNTAX) {
+@@ -646,7 +652,8 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+ 
+                 build_error_context
+             })
+-        });
++        })
++        };
+ 
+         // If the build failed
+         if let Err(error) = output {
+@@ -738,7 +745,11 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+         Ok(())
+     });
+ 
+-    let mut job = fingerprint::prepare_target(build_runner, unit, false)?;
++    let mut job = if super::rargo::active() {
++        super::rargo::dirty_job()
++    } else {
++        fingerprint::prepare_target(build_runner, unit, false)?
++    };
+     if job.freshness().is_dirty() {
+         job.before(dirty);
+     } else {
+diff --git a/src/compiler/job_queue/mod.rs b/src/compiler/job_queue/mod.rs
+index a581e1135..a3aeda47c 100644
+--- a/src/compiler/job_queue/mod.rs
++++ b/src/compiler/job_queue/mod.rs
+@@ -619,11 +619,13 @@ impl<'gctx> DrainState<'gctx> {
+         let warning_handling = build_runner.bcx.gctx.warning_handling()?;
+         match event {
+             Message::Run(id, cmd) => {
+-                build_runner
+-                    .bcx
+-                    .gctx
+-                    .shell()
+-                    .verbose(|c| c.status("Running", &cmd))?;
++                if !crate::compiler::rargo::active() {
++                    build_runner
++                        .bcx
++                        .gctx
++                        .shell()
++                        .verbose(|c| c.status("Running", &cmd))?;
++                }
+                 self.timings
+                     .unit_start(build_runner, id, self.active[&id].clone());
+             }
+@@ -881,7 +883,7 @@ impl<'gctx> DrainState<'gctx> {
+         {
+             self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, e);
+         }
+-        if build_runner.bcx.build_config.emit_json() {
++        if build_runner.bcx.build_config.emit_json() && !crate::compiler::rargo::active() {
+             let mut shell = build_runner.bcx.gctx.shell();
+             let msg = machine_message::BuildFinished {
+                 success: errors.count == 0,
+@@ -896,6 +898,11 @@ impl<'gctx> DrainState<'gctx> {
+             // Any errors up to this point have already been printed via the
+             // `display_error` inside `handle_error`.
+             (Err(anyhow::Error::new(AlreadyPrintedError::new(error))),)
++        } else if crate::compiler::rargo::active()
++            && self.queue.is_empty()
++            && self.pending_queue.is_empty()
++        {
++            (Ok(()),)
+         } else if self.queue.is_empty() && self.pending_queue.is_empty() {
+             let profile_link = build_runner.bcx.gctx.shell().err_hyperlink(
+                 "https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles",
+@@ -1227,6 +1234,9 @@ impl<'gctx> DrainState<'gctx> {
+         unit: &Unit,
+         fresh: &Freshness,
+     ) -> CargoResult<()> {
++        if crate::compiler::rargo::active() {
++            return Ok(());
++        }
+         if (self.compiled.contains(&unit.pkg.package_id())
+             && !unit.mode.is_doc()
+             && !unit.mode.is_doc_scrape())
+diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
+index a2e6f3786..06aaf982d 100644
+--- a/src/compiler/mod.rs
++++ b/src/compiler/mod.rs
+@@ -72,6 +72,8 @@ use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippe
+ use regex::Regex;
+ use tracing::{debug, instrument, trace};
+ 
++pub mod rargo;
++
+ pub use self::build_config::UserIntent;
+ pub use self::build_config::{BuildConfig, CompileMode, MessageFormat};
+ pub use self::build_context::BuildContext;
+@@ -194,6 +196,11 @@ fn compile<'gctx>(
+     if !build_runner.compiled.insert(unit.clone()) {
+         return Ok(());
+     }
++    let rargo_idx = if rargo::active() {
++        Some(rargo::record_unit(build_runner, unit)?)
++    } else {
++        None
++    };
+ 
+     let lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking {
+         Some(build_runner.lock_manager.lock_shared(build_runner, unit)?)
+@@ -226,14 +233,18 @@ fn compile<'gctx>(
+         // we've got everything constructed.
+         fingerprint::prepare_init(build_runner, unit)?;
+ 
+-        let job = if unit.mode.is_run_custom_build() {
++        let mut job = if unit.mode.is_run_custom_build() {
+             custom_build::prepare(build_runner, unit)?
+         } else if unit.mode.is_doc_test() {
+             // We run these targets later, so this is just a no-op for now.
+             Job::new_fresh()
+         } else {
+             let force = exec.force_rebuild(unit) || force_rebuild;
+-            let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
++            let mut job = if rargo::active() {
++                rargo::dirty_job()
++            } else {
++                fingerprint::prepare_target(build_runner, unit, force)?
++            };
+             job.before(if job.freshness().is_dirty() {
+                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
+                     rustdoc(build_runner, unit)?
+@@ -274,6 +285,9 @@ fn compile<'gctx>(
+ 
+             job
+         };
++        if let Some(idx) = rargo_idx {
++            rargo::tag_job(&mut job, idx);
++        }
+         jobs.enqueue(build_runner, unit, job)?;
+     }
+ 
+@@ -685,7 +699,7 @@ fn link_targets(
+     let profile = unit.profile.clone();
+     let unit_mode = unit.mode;
+     let features = unit.features.iter().map(|s| s.to_string()).collect();
+-    let json_messages = bcx.build_config.emit_json();
++    let json_messages = bcx.build_config.emit_json() && !rargo::active();
+     let executable = build_runner.get_executable(unit)?;
+     let mut target = Target::clone(&unit.target);
+     if let TargetSourcePath::Metabuild = target.src_path() {
+@@ -806,6 +820,12 @@ where
+     let mut search_path = vec![];
+     for dir in paths {
+         let dir = get_dynamic_search_path(dir);
++        if rargo::active() {
++            if let Some(entry) = rargo::dyn_search_entry(dir, root_output) {
++                search_path.extend(entry);
++                continue;
++            }
++        }
+         if dir.starts_with(&root_output) {
+             search_path.push(dir.to_path_buf());
+         } else {
+@@ -1144,21 +1164,27 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
+         state.running(&rustdoc);
+         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+ 
+-        let result = rustdoc
+-            .exec_with_streaming(
+-                &mut |line| on_stdout_line(state, line, package_id, &target),
+-                &mut |line| {
+-                    on_stderr_line(
+-                        state,
+-                        line,
+-                        package_id,
+-                        &manifest,
+-                        &target,
+-                        &mut output_options,
+-                    )
+-                },
+-                false,
+-            )
++        let result = if rargo::active() {
++            rargo::record_cmd(&rustdoc).map(|()| None)
++        } else {
++            rustdoc
++                .exec_with_streaming(
++                    &mut |line| on_stdout_line(state, line, package_id, &target),
++                    &mut |line| {
++                        on_stderr_line(
++                            state,
++                            line,
++                            package_id,
++                            &manifest,
++                            &target,
++                            &mut output_options,
++                        )
++                    },
++                    false,
++                )
++                .map(Some)
++        };
++        let result = result
+             .map_err(verbose_if_simple_exit_code)
+             .with_context(|| format!("could not document `{}`", name));
+ 
+diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
+new file mode 100644
+index 000000000..df685c379
+--- /dev/null
++++ b/src/compiler/rargo.rs
+@@ -0,0 +1,676 @@
++//! rargo planning mode.
++//!
++//! With `__RARGO_PLAN=<file>` in the environment, cargo runs its normal
++//! pipeline but never starts a compiler, build script, test or binary.
++//! Each process it would have started is recorded instead, and the result is
++//! written to `<file>` as a `rargo_plan::Plan` for rargod to execute.
++//!
++//! Build scripts "run" by returning a synthetic output made of placeholder
++//! tokens, so everything cargo derives from build-script output (extra
++//! `rustc` flags, environment variables, library search paths) flows through
++//! cargo's own code and ends up in the recorded commands as tokens.
++
++use std::cell::Cell;
++use std::collections::HashMap;
++use std::ffi::OsStr;
++use std::path::Path;
++use std::sync::atomic::{AtomicU8, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++
++use cargo_util::ProcessBuilder;
++use cargo_util_schemas::manifest::TomlDebugInfo;
++use cargo_util_terminal::Verbosity;
++use rargo_plan as rp;
++use rargo_plan::token;
++
++use super::job_queue::{Job, Work};
++use super::{BuildContext, BuildRunner, CompileMode, Executor, MessageFormat, Unit};
++use crate::compiler::custom_build::LinkArgTarget;
++use crate::util::errors::CargoResult;
++use crate::util::machine_message;
++use crate::workspace::manifest::TargetSourcePath;
++use crate::workspace::{PackageId, Target};
++
++static ACTIVE: AtomicU8 = AtomicU8::new(0);
++
++/// Whether cargo is in planning mode.
++pub fn active() -> bool {
++    match ACTIVE.load(Ordering::Relaxed) {
++        1 => true,
++        2 => false,
++        _ => {
++            #[allow(clippy::disallowed_methods)]
++            let on = std::env::var_os(rp::PLAN_ENV).is_some();
++            ACTIVE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
++            on
++        }
++    }
++}
++
++#[derive(Default)]
++struct State {
++    index: HashMap<usize, u32>,
++    units: Vec<Option<rp::Unit>>,
++    roots: Vec<u32>,
++    steps: Vec<rp::Step>,
++    global: Option<Global>,
++}
++
++struct Global {
++    ws_root: String,
++    cwd: String,
++    target_dir: String,
++    build_dir: String,
++    host: String,
++    finished: String,
++    message_format: rp::MessageFormat,
++    verbosity: rp::Verbosity,
++    extra_verbose: bool,
++    keep_going: bool,
++    deny_warnings: bool,
++}
++
++fn state() -> &'static Mutex<State> {
++    static S: OnceLock<Mutex<State>> = OnceLock::new();
++    S.get_or_init(Default::default)
++}
++
++thread_local! {
++    static CURRENT: Cell<u32> = const { Cell::new(u32::MAX) };
++}
++
++fn s(p: impl AsRef<OsStr>) -> CargoResult<String> {
++    p.as_ref()
++        .to_str()
++        .map(|s| s.to_string())
++        .ok_or_else(|| anyhow::format_err!("rargo: non-UTF-8 value `{}`", p.as_ref().to_string_lossy()))
++}
++
++fn cmd_of(p: &ProcessBuilder) -> CargoResult<rp::Cmd> {
++    let mut env = Vec::new();
++    for (k, v) in p.get_envs() {
++        env.push((
++            k.clone(),
++            match v {
++                Some(v) => Some(s(v)?),
++                None => None,
++            },
++        ));
++    }
++    Ok(rp::Cmd {
++        program: s(p.get_program())?,
++        args: p.get_args().map(s).collect::<CargoResult<_>>()?,
++        env,
++        cwd: p.get_cwd().map(s).transpose()?,
++    })
++}
++
++fn index_of(st: &mut State, unit: &Unit) -> u32 {
++    if let Some(i) = st.index.get(&unit.rargo_key()) {
++        return *i;
++    }
++    let i = st.units.len() as u32;
++    st.units.push(None);
++    st.index.insert(unit.rargo_key(), i);
++    i
++}
++
++fn verbosity(v: Verbosity) -> rp::Verbosity {
++    match v {
++        Verbosity::Verbose => rp::Verbosity::Verbose,
++        Verbosity::Normal => rp::Verbosity::Normal,
++        Verbosity::Quiet => rp::Verbosity::Quiet,
++    }
++}
++
++/// Records the facts about the whole build that rargod needs.
++pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
++    let bcx: &BuildContext<'_, '_> = build_runner.bcx;
++    let gctx = bcx.gctx;
++    let profile_name = bcx.build_config.requested_profile;
++    let profile = bcx.profiles.base_profile();
++    let mut opt_type = String::from(if profile.opt_level.as_str() == "0" {
++        "unoptimized"
++    } else {
++        "optimized"
++    });
++    if profile.debuginfo.is_turned_on() {
++        opt_type += " + debuginfo";
++    }
++    let message_format = match bcx.build_config.message_format {
++        MessageFormat::Human => rp::MessageFormat::Human,
++        MessageFormat::Short => rp::MessageFormat::Short,
++        MessageFormat::Json { render_diagnostics, short, ansi } => {
++            rp::MessageFormat::Json { render_diagnostics, short, ansi }
++        }
++    };
++    let g = Global {
++        ws_root: s(bcx.ws.root())?,
++        cwd: s(gctx.cwd())?,
++        target_dir: s(bcx.ws.target_dir().into_path_unlocked())?,
++        build_dir: s(bcx.ws.build_dir().into_path_unlocked())?,
++        host: bcx.host_triple().to_string(),
++        finished: format!("`{profile_name}` profile [{opt_type}] target(s) in "),
++        message_format,
++        verbosity: verbosity(gctx.shell().verbosity()),
++        extra_verbose: gctx.extra_verbose(),
++        keep_going: bcx.build_config.keep_going,
++        deny_warnings: gctx.warning_handling()? == crate::context::WarningHandling::Deny,
++    };
++    let mut st = state().lock().unwrap();
++    st.global = Some(g);
++    for root in &bcx.roots {
++        let i = index_of(&mut st, root);
++        st.roots.push(i);
++    }
++    Ok(())
++}
++
++/// Records everything static about `unit`. Called once for every unit that
++/// is part of the build.
++pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<u32> {
++    let bcx = build_runner.bcx;
++    let gctx = bcx.gctx;
++
++    let kind = if unit.mode.is_run_custom_build() {
++        rp::UnitKind::RunScript
++    } else if unit.mode.is_doc_test() {
++        rp::UnitKind::Noop
++    } else if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
++        rp::UnitKind::Doc
++    } else {
++        rp::UnitKind::Compile
++    };
++    let verb = if unit.mode.is_run_custom_build() {
++        rp::Verb::Compiling
++    } else if unit.mode.is_doc() {
++        rp::Verb::Documenting
++    } else if unit.mode.is_doc_test() {
++        rp::Verb::Silent
++    } else if unit.mode.is_doc_scrape() {
++        rp::Verb::Scraping
++    } else if unit.mode.is_check() {
++        rp::Verb::Checking
++    } else {
++        rp::Verb::Compiling
++    };
++
++    let mut outputs = Vec::new();
++    if !unit.mode.is_run_custom_build() && !unit.mode.is_doc_test() {
++        for o in build_runner.outputs(unit)?.iter() {
++            outputs.push(rp::OutFile {
++                path: s(&o.path)?,
++                hardlink: o.hardlink.as_ref().map(s).transpose()?,
++                export_path: o.export_path.as_ref().map(s).transpose()?,
++                flavor: format!("{:?}", o.flavor),
++            });
++        }
++    }
++
++    let fix_hint = if unit.is_local() && !unit.target.is_custom_build() {
++        let mut args = format!("{} -p {}", unit.target.description_named(), unit.pkg.name());
++        if unit.mode.is_rustc_test() && !(unit.target.is_test() || unit.target.is_bench()) {
++            args.push_str(" --tests");
++        }
++        Some(args)
++    } else {
++        None
++    };
++
++    let mut target = Target::clone(&unit.target);
++    if let TargetSourcePath::Metabuild = target.src_path() {
++        let path = unit.pkg.manifest().metabuild_path(bcx.ws.build_dir());
++        target.set_src_path(TargetSourcePath::Path(path));
++    }
++    let debuginfo = match unit.profile.debuginfo.into_inner() {
++        TomlDebugInfo::None => machine_message::ArtifactDebuginfo::Int(0),
++        TomlDebugInfo::Limited => machine_message::ArtifactDebuginfo::Int(1),
++        TomlDebugInfo::Full => machine_message::ArtifactDebuginfo::Int(2),
++        TomlDebugInfo::LineDirectivesOnly => machine_message::ArtifactDebuginfo::Named("line-directives-only"),
++        TomlDebugInfo::LineTablesOnly => machine_message::ArtifactDebuginfo::Named("line-tables-only"),
++    };
++    let art_profile = machine_message::ArtifactProfile {
++        opt_level: unit.profile.opt_level.as_str(),
++        debuginfo: Some(debuginfo),
++        debug_assertions: unit.profile.debug_assertions,
++        overflow_checks: unit.profile.overflow_checks,
++        test: unit.mode.is_any_test(),
++    };
++
++    let script = if unit.mode.is_run_custom_build() {
++        let meta = build_runner.get_run_build_script_metadata(unit);
++        let overridden = build_runner.build_script_outputs.lock().unwrap().get(meta).is_some();
++        if overridden {
++            None
++        } else {
++            let out_dir = if gctx.cli_unstable().build_dir_new_layout {
++                build_runner.files().out_dir_new_layout(unit)
++            } else {
++                build_runner.files().build_script_out_dir(unit)
++            };
++            let run_dir = build_runner.files().build_script_run_dir(unit);
++            Some(rp::Script {
++                meta: meta.to_string(),
++                out_dir: s(out_dir)?,
++                run_dir: s(run_dir)?,
++                library_name: unit.pkg.library().map(|t| t.crate_name()),
++                pkg_descr: unit.pkg.to_string(),
++                nightly_features_allowed: gctx.nightly_features_allowed,
++                targets: unit.pkg.targets().iter().map(target_brief).collect(),
++                msrv: unit.pkg.rust_version().map(|v| v.to_string()),
++                links: unit.pkg.manifest().links().map(|l| l.to_string()),
++                vv_prefix: format!("[{} {}] ", unit.pkg.package_id().name(), unit.pkg.package_id().version()),
++            })
++        }
++    } else {
++        None
++    };
++    let kind = if unit.mode.is_run_custom_build() && script.is_none() { rp::UnitKind::Noop } else { kind };
++
++    let script_metas = build_runner
++        .find_build_script_metadatas(unit)
++        .unwrap_or_default()
++        .iter()
++        .map(|m| m.to_string())
++        .collect();
++    let executable = build_runner.get_executable(unit)?.map(s).transpose()?;
++    let rmeta_early = build_runner.rmeta_required(unit);
++    let scrape_can_fail = bcx.unit_can_fail_for_docscraping(unit);
++    let deps: Vec<(Unit, bool)> = build_runner
++        .unit_deps(unit)
++        .iter()
++        .map(|d| (d.unit.clone(), build_runner.only_requires_rmeta(unit, &d.unit)))
++        .collect();
++
++    let mut st = state().lock().unwrap();
++    let idx = index_of(&mut st, unit);
++    let deps = deps
++        .into_iter()
++        .map(|(u, only_rmeta)| rp::Dep { unit: index_of(&mut st, &u), only_rmeta })
++        .collect();
++    let rec = rp::Unit {
++        kind,
++        cmd: None,
++        deps,
++        outputs,
++        rmeta_early,
++        pkg: unit.pkg.to_string(),
++        pkg_id: format!("{:?}", unit.pkg.package_id()),
++        pkg_name: unit.pkg.name().to_string(),
++        pkg_version: unit.pkg.version().to_string(),
++        desc: super::descriptive_pkg_name(&unit.pkg.name(), &unit.target, &unit.mode),
++        verb,
++        is_local: unit.is_local(),
++        show_warnings: unit.show_warnings(gctx),
++        fix_hint,
++        pkg_spec: unit.pkg.package_id().to_spec().to_string(),
++        manifest_path: s(unit.pkg.manifest_path())?,
++        target_json: serde_json::to_string(&target)?,
++        profile_json: serde_json::to_string(&art_profile)?,
++        features: unit.features.iter().map(|f| f.to_string()).collect(),
++        executable,
++        script,
++        script_metas,
++        scrape_can_fail,
++    };
++    st.units[idx as usize] = Some(rec);
++    Ok(idx)
++}
++
++fn target_brief(t: &Target) -> rp::TargetBrief {
++    rp::TargetBrief {
++        name: t.name().to_string(),
++        is_bin: t.is_bin(),
++        is_cdylib: t.is_cdylib(),
++        is_test: t.is_test(),
++        is_bench: t.is_bench(),
++        is_exe_example: t.is_exe_example(),
++    }
++}
++
++/// A job that only records, bypassing fingerprints.
++pub fn dirty_job() -> Job {
++    Job::new_dirty(Work::noop(), super::DirtyReason::Forced)
++}
++
++/// Makes the job remember which unit it belongs to when it runs.
++pub fn tag_job(job: &mut Job, idx: u32) {
++    job.before(Work::new(move |_| {
++        CURRENT.with(|c| c.set(idx));
++        Ok(())
++    }));
++}
++
++/// Records the command of the unit currently "running" on this thread.
++pub fn record_cmd(cmd: &ProcessBuilder) -> CargoResult<()> {
++    let idx = CURRENT.with(|c| c.get());
++    let cmd = cmd_of(cmd)?;
++    let mut st = state().lock().unwrap();
++    match st.units.get_mut(idx as usize).and_then(|u| u.as_mut()) {
++        Some(u) => {
++            u.cmd = Some(cmd);
++            Ok(())
++        }
++        None => anyhow::bail!("rargo: command recorded for an unknown unit"),
++    }
++}
++
++/// The `Executor` used in planning mode: records instead of running rustc.
++pub struct PlanExecutor;
++
++impl Executor for PlanExecutor {
++    fn exec(
++        &self,
++        cmd: &ProcessBuilder,
++        _id: PackageId,
++        _target: &Target,
++        _mode: CompileMode,
++        _on_stdout_line: &mut dyn FnMut(&str) -> CargoResult<()>,
++        _on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
++    ) -> CargoResult<()> {
++        record_cmd(cmd)
++    }
++
++    fn force_rebuild(&self, _unit: &Unit) -> bool {
++        true
++    }
++}
++
++pub fn executor() -> Arc<dyn Executor> {
++    Arc::new(PlanExecutor)
++}
++
++/// The stand-in for running a build script: records the command and returns
++/// an output that says "everything, as tokens".
++pub fn fake_script_run(
++    cmd: &ProcessBuilder,
++    meta: &str,
++    out_dir: &Path,
++    targets: &[Target],
++) -> CargoResult<std::process::Output> {
++    record_cmd(cmd)?;
++    let mut o = String::new();
++    let mut line = |k: &str, v: String| {
++        // The single-colon syntax is accepted for every rust-version.
++        o.push_str("cargo:");
++        o.push_str(k);
++        o.push('=');
++        o.push_str(&v);
++        o.push('\n');
++    };
++    line("rustc-cfg", token::make(token::CFG, meta));
++    line("rustc-check-cfg", token::make(token::CHECK_CFG, meta));
++    line("rustc-env", format!("{}=", token::make(token::ENV, meta)));
++    line("rustc-link-lib", token::make(token::LINK_LIB, meta));
++    line(
++        "rustc-link-search",
++        format!("{}/{}", out_dir.display(), token::make(token::LIBPATH_ARTIFACT, meta)),
++    );
++    line("rustc-link-search", token::make(token::LIBPATH_EXTERNAL, meta));
++    line("rustc-link-arg", token::link_arg("ALL", meta));
++    line("rustc-link-arg-cdylib", token::link_arg("CDYLIB", meta));
++    if targets.iter().any(|t| t.is_bin()) {
++        line("rustc-link-arg-bins", token::link_arg("BIN", meta));
++        for t in targets.iter().filter(|t| t.is_bin()) {
++            line("rustc-link-arg-bin", format!("{}={}", t.name(), token::link_arg_bin(meta, t.name())));
++        }
++    }
++    if targets.iter().any(|t| t.is_test()) {
++        line("rustc-link-arg-tests", token::link_arg("TEST", meta));
++    }
++    if targets.iter().any(|t| t.is_bench()) {
++        line("rustc-link-arg-benches", token::link_arg("BENCH", meta));
++    }
++    if targets.iter().any(|t| t.is_exe_example()) {
++        line("rustc-link-arg-examples", token::link_arg("EXAMPLE", meta));
++    }
++    // An unknown key in the old syntax is metadata for dependents.
++    line(&token::make(token::METADATA, meta), String::new());
++    use std::os::unix::process::ExitStatusExt;
++    Ok(std::process::Output {
++        status: std::process::ExitStatus::from_raw(0),
++        stdout: o.into_bytes(),
++        stderr: Vec::new(),
++    })
++}
++
++/// In planning mode a dynamic-library search path entry made of a token is
++/// rewritten so rargod can apply cargo's "inside the target root" filter to
++/// the real paths later. Returns `None` for ordinary paths.
++pub fn dyn_search_entry(dir: &Path, root_output: &Path) -> Option<Option<std::path::PathBuf>> {
++    let text = dir.to_str()?;
++    if text == token::NATIVE_DIRS {
++        return Some(Some(format!("{}@{}", token::NATIVE_DIRS, root_output.display()).into()));
++    }
++    let artifact = format!("{}{}_", token::PREFIX, token::LIBPATH_ARTIFACT);
++    let external = format!("{}{}_", token::PREFIX, token::LIBPATH_EXTERNAL);
++    if let Some(pos) = text.find(&artifact) {
++        // `<out_dir>/__RARGO_S_LPA_<meta>__` stands for every search path of
++        // the script, in the order it printed them.
++        let meta = text[pos + artifact.len()..].trim_end_matches(token::SUFFIX);
++        return Some(Some(
++            format!("{}@{}", token::make(token::DYN_LIBPATHS, meta), root_output.display()).into(),
++        ));
++    }
++    if text.contains(&external) {
++        // Covered by the artifact token's expansion.
++        return Some(None);
++    }
++    None
++}
++
++/// Converts cargo's parsed build output into the wire form.
++pub fn convert_output(o: &super::BuildOutput) -> rp::BuildOutput {
++    rp::BuildOutput {
++        library_paths: o
++            .library_paths
++            .iter()
++            .map(|p| {
++                (matches!(p, super::LibraryPath::CargoArtifact(_)), p.as_ref().to_string_lossy().into_owned())
++            })
++            .collect(),
++        library_links: o.library_links.clone(),
++        linker_args: o
++            .linker_args
++            .iter()
++            .map(|(t, a)| {
++                let t = match t {
++                    LinkArgTarget::All => rp::LinkArgTarget::Kind(rp::LinkArgKind::All),
++                    LinkArgTarget::Cdylib => rp::LinkArgTarget::Kind(rp::LinkArgKind::Cdylib),
++                    LinkArgTarget::Bin => rp::LinkArgTarget::Kind(rp::LinkArgKind::Bin),
++                    LinkArgTarget::Test => rp::LinkArgTarget::Kind(rp::LinkArgKind::Test),
++                    LinkArgTarget::Bench => rp::LinkArgTarget::Kind(rp::LinkArgKind::Bench),
++                    LinkArgTarget::Example => rp::LinkArgTarget::Kind(rp::LinkArgKind::Example),
++                    LinkArgTarget::SingleBin(n) => rp::LinkArgTarget::SingleBin(n.clone()),
++                };
++                (t, a.clone())
++            })
++            .collect(),
++        cfgs: o.cfgs.clone(),
++        check_cfgs: o.check_cfgs.clone(),
++        env: o.env.clone(),
++        metadata: o.metadata.clone(),
++        rerun_if_changed: o.rerun_if_changed.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
++        rerun_if_env_changed: o.rerun_if_env_changed.clone(),
++        log_messages: o
++            .log_messages
++            .iter()
++            .map(|(sev, m)| (matches!(sev, super::custom_build::Severity::Error), m.clone()))
++            .collect(),
++    }
++}
++
++/// The parsing service: reads length-prefixed `ParseReq`s on stdin and
++/// answers each with a length-prefixed `ParseResp`, using cargo's own
++/// build-script output parser.
++pub fn parse_service() -> ! {
++    use crate::workspace::Edition;
++    use crate::workspace::manifest::Target as T;
++    use std::io::{Read, Write};
++    let stdin = std::io::stdin();
++    let stdout = std::io::stdout();
++    let mut inp = stdin.lock();
++    let mut out = stdout.lock();
++    loop {
++        let mut len = [0u8; 4];
++        if inp.read_exact(&mut len).is_err() {
++            std::process::exit(0);
++        }
++        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
++        if inp.read_exact(&mut buf).is_err() {
++            std::process::exit(1);
++        }
++        let resp: rp::ParseResp = (|| {
++            let req: rp::ParseReq = rp::decode(&buf)?;
++            let sc = &req.script;
++            let ed = Edition::Edition2021;
++            let mut targets = Vec::new();
++            for t in &sc.targets {
++                let p = std::path::PathBuf::from("/nonexistent.rs");
++                if t.is_bin {
++                    targets.push(T::bin_target(&t.name, None, p, None, ed));
++                } else if t.is_cdylib {
++                    targets.push(T::lib_target(&t.name, vec![super::CrateType::Cdylib], p, ed));
++                } else if t.is_test {
++                    targets.push(T::test_target(&t.name, p, None, ed));
++                } else if t.is_bench {
++                    targets.push(T::bench_target(&t.name, p, None, ed));
++                } else if t.is_exe_example {
++                    targets.push(T::example_target(&t.name, vec![], p, None, ed));
++                }
++            }
++            let msrv = match &sc.msrv {
++                Some(v) => Some(v.parse().map_err(|e| format!("bad rust-version: {e}"))?),
++                None => None,
++            };
++            let out_dir = Path::new(&sc.out_dir);
++            let parsed = super::BuildOutput::parse(
++                &req.stdout,
++                sc.library_name.clone(),
++                &sc.pkg_descr,
++                out_dir,
++                out_dir,
++                sc.nightly_features_allowed,
++                &targets,
++                &msrv,
++            )
++            .map_err(|e| format!("{e:#}"))?;
++            Ok(convert_output(&parsed))
++        })();
++        let bytes = rp::encode(&resp);
++        if out.write_all(&(bytes.len() as u32).to_le_bytes()).is_err()
++            || out.write_all(&bytes).is_err()
++            || out.flush().is_err()
++        {
++            std::process::exit(1);
++        }
++    }
++}
++
++/// Records a status line cargo prints after the build (`Running ...`).
++pub fn record_status(verb: &str, msg: impl std::fmt::Display, when: rp::When) {
++    state().lock().unwrap().steps.push(rp::Step::Status { verb: verb.to_string(), msg: msg.to_string(), when });
++}
++
++/// Records a test, bench or doctest process.
++pub fn record_exec(kind: rp::ExecKind, unit: &Unit, cmd: &ProcessBuilder, rerun: String) -> CargoResult<()> {
++    let cmd = cmd_of(cmd)?;
++    let mut st = state().lock().unwrap();
++    let unit_idx = index_of(&mut st, unit);
++    st.steps.push(rp::Step::Exec { kind, unit: unit_idx, cmd, rerun, harness: unit.target.harness() });
++    Ok(())
++}
++
++/// Records the process `cargo run` would replace itself with.
++pub fn record_run(cmd: &ProcessBuilder) -> CargoResult<()> {
++    let display = cmd.to_string();
++    let cmd = cmd_of(cmd)?;
++    state().lock().unwrap().steps.push(rp::Step::Run { cmd, display });
++    Ok(())
++}
++
++static TEST_FLAGS: Mutex<(bool, bool)> = Mutex::new((false, false));
++
++/// Remembers `cargo test` options rargod needs when running the steps.
++pub fn record_test_flags(no_fail_fast: bool, test_args: &[&str]) {
++    let nocapture = test_args.contains(&"--nocapture") || test_args.contains(&"--no-capture");
++    *TEST_FLAGS.lock().unwrap() = (no_fail_fast, nocapture);
++}
++
++/// Writes the plan. Called once, when the cargo command has succeeded.
++pub fn finish() -> CargoResult<()> {
++    #[allow(clippy::disallowed_methods)]
++    let Some(path) = std::env::var_os(rp::PLAN_ENV) else { return Ok(()) };
++    let mut st = state().lock().unwrap();
++    let Some(g) = st.global.take() else {
++        // The command did not build anything (for example `cargo run` that
++        // failed target selection would have errored before this point).
++        anyhow::bail!("rargo: this cargo command did not produce a build plan");
++    };
++    let mut units = Vec::with_capacity(st.units.len());
++    for (i, u) in st.units.drain(..).enumerate() {
++        match u {
++            Some(u) => units.push(u),
++            None => anyhow::bail!("rargo: unit {i} was referenced but never planned"),
++        }
++    }
++    for (i, u) in units.iter().enumerate() {
++        if u.cmd.is_none() && u.kind != rp::UnitKind::Noop {
++            anyhow::bail!("rargo: no command was recorded for unit {i} ({})", u.desc);
++        }
++    }
++    #[allow(clippy::disallowed_methods)]
++    let toolchain = std::env::var("RUSTUP_TOOLCHAIN").ok();
++    let (no_fail_fast, nocapture) = *TEST_FLAGS.lock().unwrap();
++    let plan = rp::Plan {
++        version: rp::PLAN_VERSION,
++        ws_root: g.ws_root,
++        cwd: g.cwd,
++        target_dir: g.target_dir,
++        build_dir: g.build_dir,
++        host: g.host,
++        toolchain,
++        units,
++        roots: std::mem::take(&mut st.roots),
++        steps: std::mem::take(&mut st.steps),
++        finished: g.finished,
++        message_format: g.message_format,
++        verbosity: g.verbosity,
++        extra_verbose: g.extra_verbose,
++        keep_going: g.keep_going,
++        deny_warnings: g.deny_warnings,
++        no_fail_fast,
++        nocapture,
++        dylib_var: cargo_util::paths::dylib_path_envvar().to_string(),
++        has_build: true,
++    };
++    cargo_util::paths::write(Path::new(&path), rp::encode(&plan))?;
++    Ok(())
++}
++
++/// When planning under rustup without a pinned toolchain, asks rustup which
++/// toolchain applies to the current directory and pins it, so cargo's
++/// proxy-bypass resolves the real `rustc` and every process in the plan
++/// agrees on the toolchain. Must run before any other thread exists.
++pub fn pin_toolchain() {
++    #[allow(clippy::disallowed_methods)]
++    if std::env::var_os(rp::PLAN_ENV).is_none() || std::env::var_os("RUSTUP_TOOLCHAIN").is_some() {
++        return;
++    }
++    let Ok(out) = std::process::Command::new("rustup").args(["show", "active-toolchain"]).output() else {
++        return;
++    };
++    if !out.status.success() {
++        // Let cargo's own rustc probing report the problem.
++        return;
++    }
++    let text = String::from_utf8_lossy(&out.stdout);
++    let Some(name) = text.split_whitespace().next() else { return };
++    // SAFETY: called at the very start of main, before any threads exist.
++    unsafe {
++        std::env::set_var("RUSTUP_TOOLCHAIN", name);
++        if name.starts_with("nightly") || name.starts_with("dev") {
++            std::env::set_var("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
++        }
++    }
++}
+diff --git a/src/compiler/unit.rs b/src/compiler/unit.rs
+index 7d242eb29..c3d0a0974 100644
+--- a/src/compiler/unit.rs
++++ b/src/compiler/unit.rs
+@@ -171,6 +171,13 @@ impl UnitInner {
+     }
+ }
+ 
++impl Unit {
++    /// Identity of the interned unit, usable as a `Send` map key.
++    pub(crate) fn rargo_key(&self) -> usize {
++        Rc::as_ptr(&self.inner) as usize
++    }
++}
++
+ // Just hash the pointer for fast hashing
+ impl Hash for Unit {
+     fn hash<H: Hasher>(&self, hasher: &mut H) {
+diff --git a/src/ops/cargo_compile/mod.rs b/src/ops/cargo_compile/mod.rs
+index bf55ba185..898e6fbc2 100644
+--- a/src/ops/cargo_compile/mod.rs
++++ b/src/ops/cargo_compile/mod.rs
+@@ -132,7 +132,11 @@ impl CompileOptions {
+ ///
+ /// This uses the [`DefaultExecutor`]. To use a custom [`Executor`], see [`compile_with_exec`].
+ pub fn compile<'a>(ws: &Workspace<'a>, options: &CompileOptions) -> CargoResult<Compilation<'a>> {
+-    let exec: Arc<dyn Executor> = Arc::new(DefaultExecutor);
++    let exec: Arc<dyn Executor> = if crate::compiler::rargo::active() {
++        crate::compiler::rargo::executor()
++    } else {
++        Arc::new(DefaultExecutor)
++    };
+     compile_with_exec(ws, options, &exec)
+ }
+ 
+diff --git a/src/ops/cargo_run.rs b/src/ops/cargo_run.rs
+index ef00c24d1..113b11f81 100644
+--- a/src/ops/cargo_run.rs
++++ b/src/ops/cargo_run.rs
+@@ -123,6 +123,9 @@ pub fn run(
+         process.display_env_vars();
+     }
+ 
++    if crate::compiler::rargo::active() {
++        return crate::compiler::rargo::record_run(&process);
++    }
+     gctx.shell().status("Running", process.to_string())?;
+ 
+     process.exec_replace()
+diff --git a/src/ops/cargo_test.rs b/src/ops/cargo_test.rs
+index ec9f71619..1bef114a4 100644
+--- a/src/ops/cargo_test.rs
++++ b/src/ops/cargo_test.rs
+@@ -65,6 +65,7 @@ impl UnitTestError {
+ /// On error, the returned [`CliError`] will have the appropriate process exit
+ /// code that Cargo should use.
+ pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str]) -> CliResult {
++    crate::compiler::rargo::record_test_flags(options.no_fail_fast, test_args);
+     let compilation = compile_tests(ws, options)?;
+ 
+     if options.no_run {
+@@ -85,6 +86,7 @@ pub fn run_tests(ws: &Workspace<'_>, options: &TestOptions, test_args: &[&str])
+ /// On error, the returned [`CliError`] will have the appropriate process exit
+ /// code that Cargo should use.
+ pub fn run_benches(ws: &Workspace<'_>, options: &TestOptions, args: &[&str]) -> CliResult {
++    crate::compiler::rargo::record_test_flags(options.no_fail_fast, args);
+     let compilation = compile_tests(ws, options)?;
+ 
+     if options.no_run {
+@@ -145,6 +147,21 @@ fn run_unit_tests(
+             cmd.display_env_vars();
+         }
+ 
++        if crate::compiler::rargo::active() {
++            use rargo_plan::{ExecKind, When};
++            crate::compiler::rargo::record_status("Running", &exe_display, When::Concise);
++            let unit_err = UnitTestError {
++                unit: unit.clone(),
++                kind: test_kind,
++            };
++            let kind = match test_kind {
++                TestKind::Bench => ExecKind::Bench,
++                _ => ExecKind::Test,
++            };
++            let rerun = unit_err.cli_args(ws, &options.compile_opts);
++            crate::compiler::rargo::record_exec(kind, unit, &cmd, rerun)?;
++            continue;
++        }
+         gctx.shell()
+             .concise(|shell| shell.status("Running", &exe_display))?;
+         gctx.shell()
+@@ -190,7 +207,11 @@ fn run_doc_tests(
+             env,
+         } = doctest_info;
+ 
+-        gctx.shell().status("Doc-tests", unit.target.name())?;
++        if crate::compiler::rargo::active() {
++            crate::compiler::rargo::record_status("Doc-tests", unit.target.name(), rargo_plan::When::Always);
++        } else {
++            gctx.shell().status("Doc-tests", unit.target.name())?;
++        }
+         let mut p = compilation.rustdoc_process(unit, script_metas.as_ref())?;
+ 
+         for (var, value) in env {
+@@ -252,6 +273,15 @@ fn run_doc_tests(
+             p.display_env_vars();
+         }
+ 
++        if crate::compiler::rargo::active() {
++            let unit_err = UnitTestError {
++                unit: unit.clone(),
++                kind: TestKind::Doctest,
++            };
++            let rerun = unit_err.cli_args(ws, &options.compile_opts);
++            crate::compiler::rargo::record_exec(rargo_plan::ExecKind::Doctest, unit, &p, rerun)?;
++            continue;
++        }
+         gctx.shell()
+             .verbose(|shell| shell.status("Running", p.to_string()))?;
+ 
+@@ -300,6 +330,12 @@ fn display_no_run_information(
+             compilation,
+             exec_type,
+         )?;
++        if crate::compiler::rargo::active() {
++            use rargo_plan::When;
++            crate::compiler::rargo::record_status("Executable", &exe_display, When::Concise);
++            crate::compiler::rargo::record_status("Executable", &cmd, When::Verbose);
++            continue;
++        }
+         gctx.shell()
+             .concise(|shell| shell.status("Executable", &exe_display))?;
+         gctx.shell()
+diff --git a/src/workspace/global_cache_tracker.rs b/src/workspace/global_cache_tracker.rs
+index 27adaa615..30dab64f6 100644
+--- a/src/workspace/global_cache_tracker.rs
++++ b/src/workspace/global_cache_tracker.rs
+@@ -1598,6 +1598,12 @@ impl DeferredGlobalLastUse {
+     ///
+     /// This will log or display a warning to the user.
+     pub fn save_no_error(&mut self, gctx: &GlobalContext) {
++        if crate::compiler::rargo::active() {
++            // Planning runs in a sandbox whose writes are discarded, and the
++            // tracker database must not become an input of the plan.
++            self.clear();
++            return;
++        }
+         if let Err(e) = self.save_with_gctx(gctx) {
+             // Because there is an assertion in auto-gc that checks if this is
+             // empty, be sure to clear it so that assertion doesn't fail.

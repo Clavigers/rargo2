@@ -561,6 +561,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rargo-plan"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+]
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

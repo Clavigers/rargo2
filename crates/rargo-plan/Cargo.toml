@@ -1,0 +1,10 @@
+[package]
+name = "rargo-plan"
+description = "The build plan format shared by rargo's cargo fork and rargod"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
