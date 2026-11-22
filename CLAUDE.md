@@ -8,7 +8,7 @@ the implementation run.
 A shared Hetzner box (32 threads, 124 GB RAM, ext4 on RAID1). It runs live
 services that must not be disturbed:
 
-- Do not reboot, and do not restart or stop any existing systemd service,
+- Do not reboot again, and do not restart or stop any existing systemd service,
   container or VM.
 - Do not touch `/srv/*`, `/opt/*`, or other directories under `/root` besides
   this repo and `/root/rargo-work`.
@@ -22,10 +22,8 @@ services that must not be disturbed:
 
 Facts that affect the design:
 
-- The running kernel is 6.8, which has no FUSE passthrough (needs 6.9+). A
-  7.0 HWE kernel is available in apt, but using it needs a reboot, which is
-  not allowed. Build so that passthrough is used when the kernel has it and a
-  userspace read path is used otherwise.
+- The kernel is 7.0 (upgraded from 6.8), so FUSE passthrough is available.
+  Still keep a userspace read path for kernels without it.
 - The root filesystem is ext4 (no reflinks). A loopback btrfs or XFS image
   under `/root/rargo-work` is fine for the content store.
 - Nix on this box is 2.18.
