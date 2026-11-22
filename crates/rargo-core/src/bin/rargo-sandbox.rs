@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
     let err: OwnedFd = std::io::stderr().as_fd().try_clone_to_owned()?;
     use std::os::fd::AsFd;
     let start = std::time::Instant::now();
-    let running = zygote.spawn(req, None, out, err)?;
+    let running = zygote.spawn(req, None, out, err, &[])?;
     let info = running.done.blocking_recv()?;
     let wall = start.elapsed();
     let fin = fs.finish_action(&action);

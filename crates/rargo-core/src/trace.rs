@@ -1,0 +1,316 @@
+//! Action specifications, results, traces and the trace cache.
+
+use crate::db::{Db, Table};
+use crate::hash::{Hash, KeyHasher};
+use crate::sandbox::NetMode;
+use crate::store::Store;
+use crate::view::{Content, Obs, VPath, View, obs_holds};
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum ActionKind {
+    Plan,
+    Rustc,
+    Rustdoc,
+    BuildScript,
+    Test,
+    Doctest,
+    Other,
+}
+
+/// Everything rargod decides about an action before running it. Together
+/// with what the action then observes, this determines its result.
+#[derive(Clone, Debug)]
+pub struct ActionSpec {
+    pub kind: ActionKind,
+    pub argv: Vec<Vec<u8>>,
+    pub env: BTreeMap<Vec<u8>, Vec<u8>>,
+    pub cwd: Vec<u8>,
+    pub net: NetMode,
+    /// Directories created (in the upper layer) before the process starts.
+    pub mkdirs: Vec<Vec<u8>>,
+    /// Identifies the kind of root filesystem (host, or a flake closure).
+    pub root_id: Hash,
+    /// Output paths under these prefixes are not part of the result.
+    pub discard: Vec<Vec<u8>>,
+    /// Shown in logs and errors.
+    pub label: String,
+}
+
+impl ActionSpec {
+    /// The weak key: canonical command line, working directory and
+    /// environment (DESIGN: "The trace cache").
+    pub fn weak_key(&self) -> Hash {
+        let mut h = KeyHasher::new("action-v1");
+        h.u64(self.argv.len() as u64);
+        for a in &self.argv {
+            h.field(a);
+        }
+        h.u64(self.env.len() as u64);
+        for (k, v) in &self.env {
+            h.field(k).field(v);
+        }
+        h.field(&self.cwd);
+        h.u64(match self.net {
+            NetMode::Loopback => 0,
+            NetMode::Host => 1,
+        });
+        h.u64(self.mkdirs.len() as u64);
+        for d in &self.mkdirs {
+            h.field(d);
+        }
+        h.field(&self.root_id.0);
+        h.u64(self.discard.len() as u64);
+        for d in &self.discard {
+            h.field(d);
+        }
+        h.finish()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MEntry {
+    File { hash: Hash, exec: bool, size: u64 },
+    Symlink(Vec<u8>),
+    Dir,
+    /// The action deleted this path.
+    Whiteout,
+}
+
+/// What an action wrote, sorted by path.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Manifest {
+    pub entries: Vec<(Vec<u8>, MEntry)>,
+}
+
+impl Manifest {
+    pub fn get(&self, path: &[u8]) -> Option<&MEntry> {
+        self.entries.binary_search_by(|(p, _)| p.as_slice().cmp(path)).ok().map(|i| &self.entries[i].1)
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|(_, e)| match e {
+                MEntry::File { size, .. } => *size,
+                _ => 0,
+            })
+            .sum()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct Stats {
+    pub wall_us: u64,
+    pub cpu_us: u64,
+    pub max_rss_kb: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActionResult {
+    /// Raw wait status.
+    pub status: i32,
+    pub stdout: Hash,
+    pub stderr: Hash,
+    pub outputs: Arc<Manifest>,
+    pub stats: Stats,
+}
+
+impl ActionResult {
+    pub fn code(&self) -> Option<i32> {
+        libc::WIFEXITED(self.status).then(|| libc::WEXITSTATUS(self.status))
+    }
+    pub fn signal(&self) -> Option<i32> {
+        libc::WIFSIGNALED(self.status).then(|| libc::WTERMSIG(self.status))
+    }
+    pub fn success(&self) -> bool {
+        self.code() == Some(0)
+    }
+}
+
+/// A recorded run: what was observed and what came out.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Trace {
+    pub obs: Vec<(VPath, Obs)>,
+    pub result: ActionResult,
+    /// Seconds since the epoch.
+    pub created: u64,
+}
+
+impl Trace {
+    /// Whether every observation still holds in `view`.
+    pub fn holds(&self, view: &dyn View, content: &Content) -> bool {
+        self.obs.iter().all(|(p, o)| obs_holds(view, content, p, o))
+    }
+
+    /// The first observation that no longer holds (for explaining misses).
+    pub fn first_mismatch(&self, view: &dyn View, content: &Content) -> Option<&(VPath, Obs)> {
+        self.obs.iter().find(|(p, o)| !obs_holds(view, content, p, o))
+    }
+
+    /// Whether everything the result refers to is still in the store.
+    pub fn complete(&self, store: &Store) -> bool {
+        store.has(&self.result.stdout)
+            && store.has(&self.result.stderr)
+            && self.result.outputs.entries.iter().all(|(_, e)| match e {
+                MEntry::File { hash, .. } => store.has(hash),
+                _ => true,
+            })
+    }
+
+    pub fn touch(&self, store: &Store) {
+        store.touch(&self.result.stdout);
+        store.touch(&self.result.stderr);
+        for (_, e) in &self.result.outputs.entries {
+            if let MEntry::File { hash, .. } = e {
+                store.touch(hash);
+            }
+        }
+    }
+}
+
+const MAX_TRACES_PER_KEY: usize = 24;
+
+#[derive(Default)]
+pub struct CacheStats {
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+    pub stored: AtomicU64,
+}
+
+/// Weak key -> traces, newest first. Backed by the database, cached in
+/// memory.
+pub struct TraceCache {
+    db: Arc<Db>,
+    mem: DashMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>,
+    next_id: AtomicU64,
+    pub stats: CacheStats,
+}
+
+fn trace_key(weak: &Hash, id: u64) -> Vec<u8> {
+    let mut k = weak.0.to_vec();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+impl TraceCache {
+    pub fn new(db: Arc<Db>) -> TraceCache {
+        // Ids only need to be unique and increasing within a key; seeding
+        // from the clock keeps them increasing across restarts.
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(1);
+        TraceCache { db, mem: DashMap::new(), next_id: AtomicU64::new(seed), stats: CacheStats::default() }
+    }
+
+    fn load(&self, weak: &Hash) -> Arc<Vec<(u64, Arc<Trace>)>> {
+        if let Some(v) = self.mem.get(weak) {
+            return v.clone();
+        }
+        let mut list = Vec::new();
+        for (k, v) in self.db.scan_prefix(Table::Traces, &weak.0) {
+            if k.len() != 40 {
+                continue;
+            }
+            let id = u64::from_be_bytes(k[32..40].try_into().unwrap());
+            let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
+            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
+            list.push((id, Arc::new(t)));
+        }
+        list.sort_by(|a, b| b.0.cmp(&a.0));
+        let list = Arc::new(list);
+        self.mem.insert(*weak, list.clone());
+        list
+    }
+
+    /// Traces recorded under `weak`, newest first.
+    pub fn traces(&self, weak: &Hash) -> Arc<Vec<(u64, Arc<Trace>)>> {
+        self.load(weak)
+    }
+
+    /// Finds a trace under `weak` whose observations hold in `view` and
+    /// whose outputs are still stored.
+    pub fn lookup(&self, weak: &Hash, view: &dyn View, content: &Content) -> Option<Arc<Trace>> {
+        let list = self.load(weak);
+        for (id, t) in list.iter() {
+            if !t.holds(view, content) {
+                continue;
+            }
+            if !t.complete(&content.store) {
+                self.remove(weak, *id);
+                continue;
+            }
+            t.touch(&content.store);
+            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            return Some(t.clone());
+        }
+        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    pub fn insert(&self, weak: &Hash, trace: Trace) -> Arc<Trace> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let raw = bincode::serialize(&trace).expect("trace serialises");
+        let packed = zstd::encode_all(&raw[..], 3).expect("zstd");
+        self.db.put(Table::Traces, &trace_key(weak, id), &packed);
+        let trace = Arc::new(trace);
+        let mut list: Vec<(u64, Arc<Trace>)> = self.load(weak).as_ref().clone();
+        list.insert(0, (id, trace.clone()));
+        while list.len() > MAX_TRACES_PER_KEY {
+            let (old, _) = list.pop().unwrap();
+            self.db.delete(Table::Traces, &trace_key(weak, old));
+        }
+        self.mem.insert(*weak, Arc::new(list));
+        self.stats.stored.fetch_add(1, Ordering::Relaxed);
+        trace
+    }
+
+    pub fn remove(&self, weak: &Hash, id: u64) {
+        self.db.delete(Table::Traces, &trace_key(weak, id));
+        let mut list: Vec<(u64, Arc<Trace>)> = self.load(weak).as_ref().clone();
+        list.retain(|(i, _)| *i != id);
+        self.mem.insert(*weak, Arc::new(list));
+    }
+
+    /// Environment variables that actions under `weak` have declared an
+    /// interest in.
+    pub fn needs_env(&self, weak: &Hash) -> Vec<String> {
+        let mut k = b"env:".to_vec();
+        k.extend_from_slice(&weak.0);
+        self.db
+            .get(Table::Meta, &k)
+            .and_then(|v| bincode::deserialize::<Vec<String>>(&v).ok())
+            .unwrap_or_default()
+    }
+
+    /// Adds declared variables. Returns the ones that were new.
+    pub fn add_needs_env(&self, weak: &Hash, vars: &[String]) -> Vec<String> {
+        let mut cur = self.needs_env(weak);
+        let mut added = Vec::new();
+        for v in vars {
+            if !cur.contains(v) {
+                cur.push(v.clone());
+                added.push(v.clone());
+            }
+        }
+        if !added.is_empty() {
+            cur.sort();
+            let mut k = b"env:".to_vec();
+            k.extend_from_slice(&weak.0);
+            self.db.put(Table::Meta, &k, &bincode::serialize(&cur).unwrap());
+        }
+        added
+    }
+
+    /// Calls `f` with every blob hash referenced by any cached trace of the
+    /// keys currently in memory (used to pin against eviction is not needed:
+    /// incomplete traces are dropped on lookup).
+    pub fn mem_keys(&self) -> usize {
+        self.mem.len()
+    }
+}

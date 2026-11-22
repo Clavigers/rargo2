@@ -1,0 +1,542 @@
+//! The composite view an action sees.
+//!
+//! [`BaseView`] maps sandbox paths onto regions: the host root, the worktree
+//! snapshot at `/w`, cargo home at its canonical path, and masks. On top of
+//! it, [`BuildView`] layers the outputs of the units an action depends on
+//! ([`OutputsLayer`]), each visible at the level that unit is needed
+//! (metadata only, or everything).
+
+use crate::snapshot::Snapshot;
+use crate::trace::{MEntry, Manifest};
+use crate::view::*;
+use dashmap::DashMap;
+use std::collections::HashMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Remembers host lookups for the duration of a request generation, so that
+/// checking thousands of traces stats each host path once.
+pub struct HostMemo {
+    looked: DashMap<Vec<u8>, (u64, Looked)>,
+    listed: DashMap<Vec<u8>, (u64, Arc<Listing>)>,
+    generation: AtomicU64,
+}
+
+impl Default for HostMemo {
+    fn default() -> Self {
+        HostMemo { looked: DashMap::new(), listed: DashMap::new(), generation: AtomicU64::new(1) }
+    }
+}
+
+impl HostMemo {
+    /// Starts a new generation. Lookups made by views created afterwards do
+    /// not trust anything remembered before this call.
+    pub fn advance(&self) -> u64 {
+        let g = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Bound memory: drop entries more than a few generations old.
+        if g % 64 == 0 {
+            self.looked.retain(|_, v| v.0 + 64 > g);
+            self.listed.retain(|_, v| v.0 + 64 > g);
+        }
+        g
+    }
+
+    pub fn current(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+pub enum Region {
+    Host(HostRegion),
+    Snap(Arc<Snapshot>),
+    /// An empty directory.
+    Empty,
+}
+
+pub struct Mount {
+    pub at: Vec<u8>,
+    pub region: Region,
+    /// Lookups below this mount are recorded in traces.
+    pub traced: bool,
+}
+
+/// The mount table. Immutable once built.
+pub struct BaseView {
+    mounts: Vec<Mount>,
+    memo: Arc<HostMemo>,
+    /// Host lookups remembered at or after this generation are trusted.
+    min_gen: u64,
+}
+
+const DIR_OWNER: Owner = Owner { uid: 0, gid: 0, mode: 0o755 };
+
+impl BaseView {
+    /// `mounts` may be given in any order; one of them must be at `/`.
+    pub fn new(mut mounts: Vec<Mount>, memo: Arc<HostMemo>, min_gen: u64) -> BaseView {
+        // Longest prefix first.
+        mounts.sort_by(|a, b| b.at.len().cmp(&a.at.len()));
+        assert!(mounts.iter().any(|m| m.at == b"/"), "a root mount is required");
+        BaseView { mounts, memo, min_gen }
+    }
+
+    /// The mount containing directory `dir`, and `dir` relative to it.
+    fn mount_of<'a>(&'a self, dir: &'a [u8]) -> (&'a Mount, &'a [u8]) {
+        for m in &self.mounts {
+            if vpath_starts_with(dir, &m.at) {
+                let rel = if m.at == b"/" { dir } else { &dir[m.at.len()..] };
+                return (m, if rel.is_empty() { b"/" } else { rel });
+            }
+        }
+        unreachable!("root mount always matches")
+    }
+
+    fn mount_at(&self, path: &[u8]) -> Option<&Mount> {
+        self.mounts.iter().find(|m| m.at == path)
+    }
+
+    fn host_lookup(&self, region: &HostRegion, rel_dir: &[u8], name: &[u8]) -> Looked {
+        let mut key = region.real.as_os_str().as_encoded_bytes().to_vec();
+        if rel_dir != b"/" {
+            key.extend_from_slice(rel_dir);
+        }
+        key.push(b'/');
+        key.extend_from_slice(name);
+        if let Some(e) = self.memo.looked.get(&key) {
+            if e.0 >= self.min_gen {
+                return e.1.clone();
+            }
+        }
+        let l = region.lookup(rel_dir, name);
+        self.memo.looked.insert(key, (self.memo.current(), l.clone()));
+        l
+    }
+
+    fn host_list(&self, region: &HostRegion, rel_dir: &[u8]) -> io::Result<Arc<Listing>> {
+        let mut key = region.real.as_os_str().as_encoded_bytes().to_vec();
+        if rel_dir != b"/" {
+            key.extend_from_slice(rel_dir);
+        }
+        if let Some(e) = self.memo.listed.get(&key) {
+            if e.0 >= self.min_gen {
+                return Ok(e.1.clone());
+            }
+        }
+        let l = Arc::new(region.list(rel_dir)?);
+        self.memo.listed.insert(key, (self.memo.current(), l.clone()));
+        Ok(l)
+    }
+
+    /// Whether `dir` is a real directory all the way down (no symlinked
+    /// component). The sandbox walks paths component by component and would
+    /// have followed a symlink elsewhere; a recorded path is only valid if
+    /// it can still be walked literally.
+    fn is_real_dir(&self, dir: &[u8]) -> bool {
+        match vsplit(dir) {
+            None => true,
+            Some((parent, name)) => {
+                matches!(self.lookup_unchecked(parent, name), Looked::Dir(_)) && self.is_real_dir(parent)
+            }
+        }
+    }
+
+    fn lookup_unchecked(&self, dir: &[u8], name: &[u8]) -> Looked {
+        let path = vjoin(dir, name);
+        if let Some(m) = self.mount_at(&path) {
+            return match &m.region {
+                Region::Empty | Region::Snap(_) => Looked::Dir(DIR_OWNER),
+                Region::Host(h) => {
+                    // The mount root itself may be a file (a worktree's
+                    // `.git`), so look at what is really there.
+                    let real = &h.real;
+                    match (real.parent(), real.file_name()) {
+                        (Some(p), Some(n)) => {
+                            HostRegion::new(p).lookup(b"/", n.as_encoded_bytes())
+                        }
+                        _ => Looked::Dir(DIR_OWNER),
+                    }
+                }
+            };
+        }
+        let (m, rel) = self.mount_of(dir);
+        match &m.region {
+            Region::Empty => Looked::Absent,
+            Region::Snap(s) => s.lookup(rel, name),
+            Region::Host(h) => self.host_lookup(h, rel, name),
+        }
+    }
+}
+
+impl View for BaseView {
+    fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+        self.lookup_unchecked(dir, name)
+    }
+
+    fn list(&self, dir: &[u8]) -> io::Result<Listing> {
+        let (m, rel) = self.mount_of(dir);
+        let mut out: Listing = match &m.region {
+            Region::Empty => Vec::new(),
+            Region::Snap(s) => s.list(rel)?,
+            Region::Host(h) => self.host_list(h, rel)?.as_ref().clone(),
+        };
+        // Mount points directly below this directory exist too.
+        for other in &self.mounts {
+            if let Some((parent, name)) = vsplit(&other.at) {
+                if parent == dir && !out.iter().any(|(n, _)| n == name) {
+                    let t = match self.lookup_unchecked(parent, name) {
+                        Looked::File(_) => DType::File,
+                        Looked::Symlink(_) => DType::Symlink,
+                        _ => DType::Dir,
+                    };
+                    out.push((name.to_vec(), t));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn traced(&self, dir: &[u8]) -> bool {
+        self.mount_of(dir).0.traced
+    }
+
+    fn stat(&self, path: &[u8]) -> Looked {
+        match vsplit(path) {
+            None => Looked::Dir(DIR_OWNER),
+            Some((dir, name)) => {
+                // Only host regions can have symlinked parents that the
+                // literal path hides; snapshots and masks resolve literally.
+                let (m, _) = self.mount_of(dir);
+                if matches!(m.region, Region::Host(_)) && !self.is_real_dir(dir) {
+                    return Looked::Absent;
+                }
+                self.lookup_unchecked(dir, name)
+            }
+        }
+    }
+}
+
+/// How much of a unit's output an action may see.
+pub const LEVEL_NONE: u8 = 0;
+/// Only what the unit announced early (its `.rmeta`).
+pub const LEVEL_META: u8 = 1;
+pub const LEVEL_FULL: u8 = 2;
+
+#[derive(Clone)]
+enum LayerEnt {
+    Entry(MEntry),
+    /// A directory that exists because something below it was written.
+    Implied,
+}
+
+#[derive(Default)]
+struct LayerDir {
+    /// name -> providers `(unit, stage, entry)`
+    children: HashMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
+}
+
+/// Outputs of the units of one build, indexed by directory. Grows as units
+/// finish; an action only ever sees units that finished before it started.
+#[derive(Default)]
+pub struct OutputsLayer {
+    dirs: DashMap<Vec<u8>, LayerDir>,
+}
+
+impl OutputsLayer {
+    pub fn new() -> OutputsLayer {
+        OutputsLayer::default()
+    }
+
+    /// Adds entries produced by `unit`, visible from `stage` on.
+    pub fn add(&self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
+        for (path, e) in entries {
+            let Some((parent, name)) = vsplit(path) else { continue };
+            {
+                let mut d = self.dirs.entry(parent.to_vec()).or_default();
+                let list = d.children.entry(name.to_vec()).or_default();
+                list.retain(|(u, _, ent)| !(*u == unit && matches!(ent, LayerEnt::Implied)));
+                if !list.iter().any(|(u, s, _)| *u == unit && *s == stage) {
+                    list.push((unit, stage, LayerEnt::Entry(e.clone())));
+                }
+            }
+            // Every ancestor directory exists by implication.
+            let mut cur = parent;
+            while let Some((pp, pn)) = vsplit(cur) {
+                let mut d = self.dirs.entry(pp.to_vec()).or_default();
+                let list = d.children.entry(pn.to_vec()).or_default();
+                if list.iter().any(|(u, s, _)| *u == unit && *s <= stage) {
+                    break;
+                }
+                list.push((unit, stage, LayerEnt::Implied));
+                cur = pp;
+            }
+        }
+    }
+
+    pub fn add_manifest(&self, unit: u32, stage: u8, m: &Manifest) {
+        self.add(unit, stage, &m.entries);
+    }
+
+    fn pick(list: &[(u32, u8, LayerEnt)], levels: &[u8]) -> Option<LayerEnt> {
+        let mut best: Option<(u32, &LayerEnt)> = None;
+        for (u, stage, ent) in list {
+            if levels.get(*u as usize).copied().unwrap_or(LEVEL_NONE) < *stage {
+                continue;
+            }
+            let better = match (&best, ent) {
+                (None, _) => true,
+                // A real entry beats an implied directory; among real
+                // entries the higher unit index wins, deterministically.
+                (Some((_, LayerEnt::Implied)), LayerEnt::Entry(_)) => true,
+                (Some((_, LayerEnt::Entry(_))), LayerEnt::Implied) => false,
+                (Some((bu, _)), _) => *u > *bu,
+            };
+            if better {
+                best = Some((*u, ent));
+            }
+        }
+        best.map(|(_, e)| e.clone())
+    }
+
+    fn get(&self, dir: &[u8], name: &[u8], levels: &[u8]) -> Option<LayerEnt> {
+        let d = self.dirs.get(dir)?;
+        Self::pick(d.children.get(name)?, levels)
+    }
+
+    fn names(&self, dir: &[u8], levels: &[u8]) -> Vec<(Vec<u8>, LayerEnt)> {
+        match self.dirs.get(dir) {
+            None => Vec::new(),
+            Some(d) => d
+                .children
+                .iter()
+                .filter_map(|(name, list)| Self::pick(list, levels).map(|e| (name.clone(), e)))
+                .collect(),
+        }
+    }
+}
+
+const OWN_FILE: Owner = Owner::own(0o644);
+const OWN_EXEC: Owner = Owner::own(0o755);
+const OWN_DIR: Owner = Owner::own(0o755);
+
+/// A base view with the outputs of other units layered on top.
+pub struct BuildView {
+    pub base: Arc<BaseView>,
+    pub layer: Arc<OutputsLayer>,
+    /// Visibility level per unit index.
+    pub levels: Arc<Vec<u8>>,
+    /// Directories whose content is not traced (incremental state).
+    pub untraced: Vec<Vec<u8>>,
+}
+
+impl View for BuildView {
+    fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+        match self.layer.get(dir, name, &self.levels) {
+            Some(LayerEnt::Entry(MEntry::File { hash, exec, size })) => Looked::File(FileInfo {
+                size,
+                owner: if exec { OWN_EXEC } else { OWN_FILE },
+                src: FileSrc::Blob(hash),
+            }),
+            Some(LayerEnt::Entry(MEntry::Symlink(t))) => Looked::Symlink(t),
+            Some(LayerEnt::Entry(MEntry::Whiteout)) => Looked::Absent,
+            Some(LayerEnt::Entry(MEntry::Dir)) | Some(LayerEnt::Implied) => {
+                // A directory in the layer merges with the base directory of
+                // the same name, if there is one.
+                match self.base.lookup(dir, name) {
+                    Looked::Dir(o) => Looked::Dir(o),
+                    _ => Looked::Dir(OWN_DIR),
+                }
+            }
+            None => self.base.lookup(dir, name),
+        }
+    }
+
+    fn list(&self, dir: &[u8]) -> io::Result<Listing> {
+        let layered = self.layer.names(dir, &self.levels);
+        // The directory may exist only in the layer.
+        let mut map: HashMap<Vec<u8>, DType> = match self.base_has_dir(dir) {
+            true => self.base.list(dir)?.into_iter().collect(),
+            false => HashMap::new(),
+        };
+        for (name, e) in layered {
+            match e {
+                LayerEnt::Entry(MEntry::Whiteout) => {
+                    map.remove(&name);
+                }
+                LayerEnt::Entry(MEntry::File { .. }) => {
+                    map.insert(name, DType::File);
+                }
+                LayerEnt::Entry(MEntry::Symlink(_)) => {
+                    map.insert(name, DType::Symlink);
+                }
+                LayerEnt::Entry(MEntry::Dir) | LayerEnt::Implied => {
+                    map.insert(name, DType::Dir);
+                }
+            }
+        }
+        Ok(map.into_iter().collect())
+    }
+
+    fn traced(&self, dir: &[u8]) -> bool {
+        if self.untraced.iter().any(|u| vpath_starts_with(dir, u)) {
+            return false;
+        }
+        self.base.traced(dir)
+    }
+
+    fn stat(&self, path: &[u8]) -> Looked {
+        let Some((dir, name)) = vsplit(path) else { return Looked::Dir(DIR_OWNER) };
+        match self.layer.get(dir, name, &self.levels) {
+            Some(_) => self.lookup(dir, name),
+            None => {
+                // The base checks that host parents are real directories;
+                // a parent that exists only in the layer is real by
+                // construction.
+                match self.base.stat(path) {
+                    Looked::Absent if self.layer_has_dir(dir) => self.base.lookup(dir, name),
+                    other => other,
+                }
+            }
+        }
+    }
+}
+
+impl BuildView {
+    fn base_has_dir(&self, dir: &[u8]) -> bool {
+        matches!(self.base.stat(dir), Looked::Dir(_))
+    }
+
+    fn layer_has_dir(&self, dir: &[u8]) -> bool {
+        match vsplit(dir) {
+            None => true,
+            Some((p, n)) => matches!(
+                self.layer.get(p, n, &self.levels),
+                Some(LayerEnt::Implied) | Some(LayerEnt::Entry(MEntry::Dir))
+            ),
+        }
+    }
+}
+
+/// Convenience for building the standard mount table.
+pub struct ViewParts {
+    pub snapshot: Arc<Snapshot>,
+    /// Real path of the worktree's `.git` (file or directory).
+    pub git_path: PathBuf,
+    pub cargo_home: PathBuf,
+    /// Sandbox paths shown as empty directories (the target directory).
+    pub masks: Vec<Vec<u8>>,
+    /// Real host paths hidden from the sandbox.
+    pub hidden: Vec<Vec<u8>>,
+}
+
+pub const WORKTREE_AT: &[u8] = b"/w";
+pub const CARGO_HOME_AT: &[u8] = b"/c";
+
+impl ViewParts {
+    pub fn build(self, memo: Arc<HostMemo>, min_gen: u64) -> BaseView {
+        let mut mounts = vec![
+            Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
+            Mount { at: WORKTREE_AT.to_vec(), region: Region::Snap(self.snapshot), traced: true },
+            Mount {
+                at: vjoin(WORKTREE_AT, b".git"),
+                region: Region::Host(HostRegion::new(self.git_path)),
+                traced: true,
+            },
+            Mount { at: CARGO_HOME_AT.to_vec(), region: Region::Host(HostRegion::new(self.cargo_home)), traced: true },
+        ];
+        for m in self.masks.into_iter().chain(self.hidden) {
+            mounts.push(Mount { at: m, region: Region::Empty, traced: true });
+        }
+        BaseView::new(mounts, memo, min_gen)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(n: u8) -> MEntry {
+        MEntry::File { hash: crate::hash::Hash([n; 32]), exec: false, size: n as u64 }
+    }
+
+    fn base(dir: &std::path::Path) -> Arc<BaseView> {
+        let memo = Arc::new(HostMemo::default());
+        Arc::new(BaseView::new(
+            vec![
+                Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(dir)), traced: true },
+                Mount { at: b"/t".to_vec(), region: Region::Empty, traced: true },
+            ],
+            memo,
+            0,
+        ))
+    }
+
+    #[test]
+    fn layer_visibility_by_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("hostfile"), "x").unwrap();
+        let layer = Arc::new(OutputsLayer::new());
+        // Unit 0 announces an rmeta early (stage 1) and an rlib at the end.
+        layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
+        layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
+        layer.add(1, LEVEL_FULL, &[(b"/t/debug/b/libb.rlib".to_vec(), file(3))]);
+
+        let view = |levels: Vec<u8>| BuildView {
+            base: base(tmp.path()),
+            layer: layer.clone(),
+            levels: Arc::new(levels),
+            untraced: vec![],
+        };
+        // Sees only unit 0's metadata.
+        let v = view(vec![LEVEL_META, LEVEL_NONE]);
+        assert!(matches!(v.stat(b"/t/debug/a/liba.rmeta"), Looked::File(_)));
+        assert!(matches!(v.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+        assert!(matches!(v.stat(b"/t/debug/b"), Looked::Absent));
+        assert!(matches!(v.stat(b"/t/debug"), Looked::Dir(_)));
+        let mut names: Vec<_> = v.list(b"/t/debug/a").unwrap();
+        names.sort();
+        assert_eq!(names, vec![(b"liba.rmeta".to_vec(), DType::File)]);
+        assert_eq!(v.list(b"/t/debug").unwrap(), vec![(b"a".to_vec(), DType::Dir)]);
+        // Sees everything.
+        let v = view(vec![LEVEL_FULL, LEVEL_FULL]);
+        assert!(matches!(v.stat(b"/t/debug/a/liba.rlib"), Looked::File(_)));
+        assert_eq!(v.list(b"/t/debug").unwrap().len(), 2);
+        // Sees nothing: the mask is an empty directory.
+        let v = view(vec![LEVEL_NONE, LEVEL_NONE]);
+        assert!(matches!(v.stat(b"/t"), Looked::Dir(_)));
+        assert!(v.list(b"/t").unwrap().is_empty());
+        assert!(matches!(v.stat(b"/hostfile"), Looked::File(_)));
+        // The root listing shows the mask next to host entries.
+        let mut root: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
+        root.sort();
+        assert_eq!(root, vec![b"hostfile".to_vec(), b"t".to_vec()]);
+    }
+
+    #[test]
+    fn symlinked_host_parent_is_not_a_literal_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        std::fs::write(tmp.path().join("real/f"), "x").unwrap();
+        std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
+        let b = base(tmp.path());
+        assert!(matches!(b.stat(b"/real/f"), Looked::File(_)));
+        // The file is reachable through the symlink on the host, but an
+        // action would have observed the symlink, not this literal path.
+        assert!(matches!(b.stat(b"/link/f"), Looked::Absent));
+        assert!(matches!(b.stat(b"/link"), Looked::Symlink(_)));
+    }
+
+    #[test]
+    fn whiteout_hides_base_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("gone"), "x").unwrap();
+        std::fs::write(tmp.path().join("kept"), "x").unwrap();
+        let layer = Arc::new(OutputsLayer::new());
+        layer.add(0, LEVEL_FULL, &[(b"/gone".to_vec(), MEntry::Whiteout)]);
+        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![] };
+        assert!(matches!(v.stat(b"/gone"), Looked::Absent));
+        assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
+        let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
+        assert!(!names.contains(&b"gone".to_vec()) && names.contains(&b"kept".to_vec()));
+    }
+}

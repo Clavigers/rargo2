@@ -39,6 +39,9 @@ pub struct Bind {
     pub read_only: bool,
 }
 
+/// First file descriptor number given to extra inherited descriptors.
+pub const EXTRA_FD_BASE: i32 = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnReq {
     /// Directory that becomes `/`.
@@ -80,7 +83,7 @@ impl ExitInfo {
 
 #[derive(Serialize, Deserialize)]
 enum ToZygote {
-    Spawn { id: u64, req: SpawnReq, has_stdin: bool },
+    Spawn { id: u64, req: SpawnReq, has_stdin: bool, extra: usize },
     Kill { id: u64 },
 }
 
@@ -106,7 +109,7 @@ fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> 
     let len = (payload.len() as u32).to_le_bytes();
     // The fds travel with the 4-byte length header.
     let mut iov = libc::iovec { iov_base: len.as_ptr() as *mut _, iov_len: 4 };
-    let mut cbuf = [0u8; 64];
+    let mut cbuf = [0u8; 128];
     // SAFETY: zeroed msghdr is valid; fields are filled in below.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -150,7 +153,7 @@ fn recv_msg(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     let mut fds = Vec::new();
     while got < 4 {
         let mut iov = libc::iovec { iov_base: len[got..].as_mut_ptr() as *mut _, iov_len: 4 - got };
-        let mut cbuf = [0u8; 64];
+        let mut cbuf = [0u8; 128];
         // SAFETY: zeroed msghdr is valid; fields are filled in below.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
@@ -228,22 +231,31 @@ impl Zygote {
         }))
     }
 
-    /// Spawns a sandboxed process. `stdout` and `stderr` are handed to it.
+    /// Spawns a sandboxed process. `stdout` and `stderr` are handed to it;
+    /// `extra` descriptors appear in the process as fds `EXTRA_FD_BASE..`
+    /// (they stay open in the caller).
     pub fn spawn(
         &self,
         req: SpawnReq,
         stdin: Option<OwnedFd>,
         stdout: OwnedFd,
         stderr: OwnedFd,
+        extra: &[RawFd],
     ) -> Result<Running> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending.lock().insert(id, tx);
-        let msg = bincode::serialize(&ToZygote::Spawn { id, req, has_stdin: stdin.is_some() })?;
+        let msg = bincode::serialize(&ToZygote::Spawn {
+            id,
+            req,
+            has_stdin: stdin.is_some(),
+            extra: extra.len(),
+        })?;
         let mut fds = vec![stdout.as_raw_fd(), stderr.as_raw_fd()];
         if let Some(s) = &stdin {
             fds.push(s.as_raw_fd());
         }
+        fds.extend_from_slice(extra);
         let r = send_msg(&self.sock.lock(), &msg, &fds);
         if let Err(e) = r {
             self.pending.lock().remove(&id);
@@ -319,11 +331,12 @@ pub fn zygote_main(fd: RawFd) -> ! {
         if fds[0].revents != 0 {
             match recv_msg(&sock) {
                 Ok(Some((payload, fds))) => match bincode::deserialize::<ToZygote>(&payload) {
-                    Ok(ToZygote::Spawn { id, req, has_stdin }) => {
+                    Ok(ToZygote::Spawn { id, req, has_stdin, extra }) => {
                         let mut it = fds.into_iter();
                         let (Some(out), Some(err)) = (it.next(), it.next()) else { continue };
                         let stdin = if has_stdin { it.next() } else { None };
-                        match spawn_init(&req, stdin, out, err) {
+                        let extras: Vec<OwnedFd> = it.take(extra).collect();
+                        match spawn_init(&req, stdin, out, err, extras) {
                             Ok((pid, status_pipe)) => {
                                 children.insert(pid, Child { id, status_pipe, started: std::time::Instant::now() });
                                 by_id.insert(id, pid);
@@ -418,6 +431,7 @@ fn spawn_init(
     stdin: Option<OwnedFd>,
     stdout: OwnedFd,
     stderr: OwnedFd,
+    extras: Vec<OwnedFd>,
 ) -> io::Result<(i32, OwnedFd)> {
     let (status_r, status_w) = pipe()?;
     let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
@@ -434,7 +448,7 @@ fn spawn_init(
     }
     if pid == 0 {
         drop(status_r);
-        let code = init_main(req, stdin, stdout, stderr, status_w);
+        let code = init_main(req, stdin, stdout, stderr, extras, status_w);
         // SAFETY: terminating the init process without running destructors.
         unsafe { libc::_exit(code) };
     }
@@ -552,7 +566,14 @@ fn write_all_fd(fd: RawFd, mut b: &[u8]) {
 }
 
 /// PID 1 of the sandbox.
-fn init_main(req: &SpawnReq, stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: OwnedFd, status_w: OwnedFd) -> i32 {
+fn init_main(
+    req: &SpawnReq,
+    stdin: Option<OwnedFd>,
+    stdout: OwnedFd,
+    stderr: OwnedFd,
+    extras: Vec<OwnedFd>,
+    status_w: OwnedFd,
+) -> i32 {
     let report = |status: i32, setup_failed: bool| {
         let mut buf = [0u8; 5];
         buf[..4].copy_from_slice(&status.to_le_bytes());
@@ -585,8 +606,12 @@ fn init_main(req: &SpawnReq, stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: Ow
     }
     if pid == 0 {
         drop(exec_r);
-        let err = exec_child(req, stdin, stdout, stderr);
-        write_all_fd(exec_w.as_raw_fd(), &err.raw_os_error().unwrap_or(libc::EIO).to_le_bytes());
+        // Move the error pipe out of the range the extra descriptors land in.
+        // SAFETY: duplicating a valid fd.
+        let exec_w_hi = unsafe { libc::fcntl(exec_w.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+        drop(exec_w);
+        let err = exec_child(req, stdin, stdout, stderr, extras);
+        write_all_fd(exec_w_hi, &err.raw_os_error().unwrap_or(libc::EIO).to_le_bytes());
         // SAFETY: terminating the failed child.
         unsafe { libc::_exit(127) };
     }
@@ -594,6 +619,7 @@ fn init_main(req: &SpawnReq, stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: Ow
     let stderr_fd = stderr.into_raw_fd();
     drop(stdout);
     drop(stdin);
+    drop(extras);
     let mut errbuf = [0u8; 4];
     let mut f = std::fs::File::from(exec_r);
     let exec_failed = f.read_exact(&mut errbuf).is_ok();
@@ -620,7 +646,13 @@ fn init_main(req: &SpawnReq, stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: Ow
     }
 }
 
-fn exec_child(req: &SpawnReq, stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: OwnedFd) -> io::Error {
+fn exec_child(
+    req: &SpawnReq,
+    stdin: Option<OwnedFd>,
+    stdout: OwnedFd,
+    stderr: OwnedFd,
+    extras: Vec<OwnedFd>,
+) -> io::Error {
     // SAFETY: fd juggling and credential changes in a freshly forked,
     // single-threaded child.
     unsafe {
@@ -638,6 +670,16 @@ fn exec_child(req: &SpawnReq, stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: O
         }
         libc::dup2(stdout.as_raw_fd(), 1);
         libc::dup2(stderr.as_raw_fd(), 2);
+        // Extra descriptors: first out of the way, then to their final
+        // numbers (dup2 clears close-on-exec).
+        let parked: Vec<i32> =
+            extras.iter().map(|fd| libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100)).collect();
+        drop(extras);
+        for (i, fd) in parked.iter().enumerate() {
+            if *fd < 0 || libc::dup2(*fd, EXTRA_FD_BASE + i as i32) < 0 {
+                return io::Error::last_os_error();
+            }
+        }
         // Everything else was opened O_CLOEXEC.
         let mut mask: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut mask);
