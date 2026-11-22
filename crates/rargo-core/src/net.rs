@@ -535,6 +535,33 @@ mod tests {
         });
     }
 
+    /// Not a pass/fail test: prints loopback throughput.
+    /// `cargo test -p rargo-core --release --lib net::tests::throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn throughput() {
+        rt().block_on(async {
+            let (_se, s, _ce, c) = pair().await;
+            let big = vec![7u8; 256 << 20];
+            let t = Instant::now();
+            for part in big.chunks(1 << 20) {
+                c.send(part).await.unwrap();
+            }
+            let mut got = 0usize;
+            while got < big.len() {
+                got += s.recv().await.unwrap().len();
+            }
+            let secs = t.elapsed().as_secs_f64();
+            println!(
+                "256 MiB in {secs:.2}s = {:.0} MiB/s; {} packets, {} retransmits, rtt {:?}",
+                256.0 / secs,
+                c.stats.sent_packets.load(Ordering::Relaxed),
+                c.stats.retransmits.load(Ordering::Relaxed),
+                c.rtt()
+            );
+        });
+    }
+
     #[test]
     fn survives_packet_loss_in_both_directions() {
         rt().block_on(async {

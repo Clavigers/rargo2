@@ -36,22 +36,27 @@ pub trait Observer: Send + Sync {
     fn stdout(&self, _data: &[u8]) {}
     /// One line of stderr without the newline. `live` is present while the
     /// action is actually running.
-    fn stderr_line(&self, _line: &[u8], _live: Option<&LiveCtl<'_>>) {}
+    fn stderr_line(&self, _line: &[u8], _live: Option<&dyn Live>) {}
 }
 
 pub struct NullObserver;
 impl Observer for NullObserver {}
 
 /// Access to a running action's upper layer.
+pub trait Live {
+    /// Stores a file the action has finished writing, before the action
+    /// ends, and returns its manifest entry.
+    fn ingest(&self, path: &[u8]) -> Option<MEntry>;
+}
+
+/// [`Live`] for an action running on this machine.
 pub struct LiveCtl<'a> {
     action: &'a Arc<ActionFs>,
     store: &'a Store,
 }
 
-impl LiveCtl<'_> {
-    /// Stores a file the action has finished writing, before the action
-    /// ends, and returns its manifest entry.
-    pub fn ingest(&self, path: &[u8]) -> Option<MEntry> {
+impl Live for LiveCtl<'_> {
+    fn ingest(&self, path: &[u8]) -> Option<MEntry> {
         let (scratch, exec) = self.action.upper_file_at(path)?;
         let (hash, size) = self.store.put_file_link(&scratch, exec).ok()?;
         Some(MEntry::File { hash, exec, size })
@@ -77,6 +82,26 @@ pub struct Request {
     pub observer: Arc<dyn Observer>,
 }
 
+/// Something that can run actions elsewhere.
+pub trait RemoteRunner: Send + Sync {
+    /// Runs the action on a worker if that is expected to finish sooner
+    /// than waiting for a local core. `None` means "run it locally".
+    fn try_run<'a>(
+        &'a self,
+        engine: &'a Engine,
+        spec: &'a ActionSpec,
+        key: &'a Hash,
+        req: &'a Request,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>>,
+                > + Send
+                + 'a,
+        >,
+    >;
+}
+
 pub struct Outcome {
     pub result: Arc<ActionResult>,
     /// The result was replayed from the cache.
@@ -93,6 +118,8 @@ pub struct EngineStats {
     pub joined_then_ran: AtomicU64,
     pub tainted: AtomicU64,
     pub env_reruns: AtomicU64,
+    pub remote_runs: AtomicU64,
+    pub remote_failed: AtomicU64,
     pub run_cpu_us: AtomicU64,
     pub run_wall_us: AtomicU64,
 }
@@ -107,6 +134,12 @@ pub struct Engine {
     pub sched: Arc<Scheduler>,
     inflight: Mutex<HashMap<(Hash, Hash), tokio::sync::watch::Receiver<bool>>>,
     seq: AtomicU64,
+    avg_wall_us: AtomicU64,
+    /// The newest trace per program, for guessing what an action that has
+    /// never run will look at (every rustc reads the same sysroot).
+    profiles: dashmap::DashMap<Vec<u8>, Arc<Trace>>,
+    /// Workers that can run actions, if any are configured.
+    pub remote: std::sync::OnceLock<Arc<dyn RemoteRunner>>,
     pub stats: EngineStats,
     /// Per-action cgroups are created below this directory when set.
     pub cgroup_root: Option<PathBuf>,
@@ -176,6 +209,9 @@ impl Engine {
             sched,
             inflight: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
+            avg_wall_us: AtomicU64::new(0),
+            profiles: dashmap::DashMap::new(),
+            remote: std::sync::OnceLock::new(),
             stats: EngineStats::default(),
             cgroup_root: None,
         }
@@ -229,6 +265,7 @@ impl Engine {
                         (None, FileSrc::Host { sig, .. }) => h.field(&bincode::serialize(sig).unwrap()),
                         (None, FileSrc::Git { oid, .. }) => h.field(oid),
                         (None, FileSrc::Blob(b)) => h.field(&b.0),
+                        (None, FileSrc::Lazy(_)) => h.field(b"?"),
                     }
                 }
             };
@@ -361,7 +398,7 @@ impl Engine {
             let result = Arc::new(result);
             if let Some(obs) = obs {
                 if (req.cacheable)(&result) {
-                    self.traces.insert(
+                    let stored = self.traces.insert(
                         &key,
                         Trace {
                             obs,
@@ -372,6 +409,9 @@ impl Engine {
                                 .unwrap_or(0),
                         },
                     );
+                    if let Some(program) = spec.argv.first() {
+                        self.profiles.insert(program.clone(), stored);
+                    }
                 }
             }
             drop(guard);
@@ -401,22 +441,60 @@ impl Engine {
         }
     }
 
-    /// Runs the action once in a sandbox.
+    /// Runs the action once, here or on a worker.
     async fn run(
         &self,
         spec: &ActionSpec,
         req: &Request,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         let key = spec.weak_key();
+        if let Some(remote) = self.remote.get() {
+            if let Some(r) = remote.try_run(self, spec, &key, req).await {
+                return r;
+            }
+        }
         let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind)).await;
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+        drop(permit);
+        self.note_action_wall(started.elapsed());
+        r
+    }
 
+    /// A trace of some other run of the same program, if any.
+    pub fn profile(&self, spec: &ActionSpec) -> Option<Arc<Trace>> {
+        self.profiles.get(spec.argv.first()?).map(|t| t.clone())
+    }
+
+    fn note_action_wall(&self, d: std::time::Duration) {
+        // Exponentially weighted average, for estimating queue waits.
+        let old = self.avg_wall_us.load(Ordering::Relaxed);
+        let new = if old == 0 { d.as_micros() as u64 } else { (old * 7 + d.as_micros() as u64) / 8 };
+        self.avg_wall_us.store(new, Ordering::Relaxed);
+    }
+
+    /// Average wall time of recent local actions.
+    pub fn avg_action_wall(&self) -> std::time::Duration {
+        std::time::Duration::from_micros(self.avg_wall_us.load(Ordering::Relaxed).max(200_000))
+    }
+
+    /// Runs the action in a sandbox on this machine, without consulting the
+    /// scheduler or the cache.
+    pub async fn execute(
+        &self,
+        spec: &ActionSpec,
+        view: Arc<dyn View>,
+        uid: u32,
+        gid: u32,
+        observer: &dyn Observer,
+    ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let scratch = self.store.tmp_dir(&format!("act-{}-{n}", std::process::id()))?;
         let action = self.fs.create_action(ActionFsConfig {
-            view: req.view.clone(),
-            uid: req.uid,
-            gid: req.gid,
+            view,
+            uid,
+            gid,
             scratch: scratch.clone(),
             mountpoints: vec![b"proc".to_vec(), b"dev".to_vec(), b"sys".to_vec(), b"tmp".to_vec()],
             // cargo checks that target source files exist while planning but
@@ -425,13 +503,12 @@ impl Engine {
             size_blind: spec.kind == ActionKind::Plan,
         });
         // From here on the action directory must be torn down on every path.
-        let run = self.run_in(spec, req, &action).await;
+        let run = self.run_in(spec, uid, gid, observer, &action).await;
         let fin = {
             let fs = self.fs.clone();
             let a = action.clone();
             tokio::task::spawn_blocking(move || fs.finish_action(&a)).await?
         };
-        drop(permit);
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
             Err(e) => {
@@ -518,7 +595,9 @@ impl Engine {
     async fn run_in(
         &self,
         spec: &ActionSpec,
-        req: &Request,
+        uid: u32,
+        gid: u32,
+        observer: &dyn Observer,
         action: &Arc<ActionFs>,
     ) -> Result<(crate::sandbox::ExitInfo, Vec<u8>, Vec<u8>)> {
         for d in &spec.mkdirs {
@@ -546,8 +625,8 @@ impl Engine {
             argv: spec.argv.clone(),
             env: env.into_iter().collect(),
             cwd: spec.cwd.clone(),
-            uid: req.uid,
-            gid: req.gid,
+            uid,
+            gid,
             net: spec.net,
             binds: vec![],
             cgroup: None,
@@ -555,7 +634,6 @@ impl Engine {
         let running = self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?;
         let mut out_rd = async_reader(out_r)?;
         let mut err_rd = async_reader(err_r)?;
-        let observer = req.observer.clone();
         let live = LiveCtl { action, store: &self.store };
 
         let read_out = async {

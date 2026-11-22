@@ -53,6 +53,8 @@ pub struct Daemon {
     pub worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
     pub parser: Parser,
     pub incr: crate::incr::IncrStore,
+    /// Workers, when the server accepts them.
+    pub pool: OnceLock<Arc<crate::remote::Pool>>,
     /// The most recent drift report, for `--rargo-status`.
     pub drift_report: Mutex<Option<String>>,
     /// Who last built in each worktree, for the background drift check.
@@ -265,6 +267,7 @@ impl Daemon {
         let incr = crate::incr::IncrStore::new(engine.store.clone());
         Daemon {
             incr,
+            pool: OnceLock::new(),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
             cfg,
@@ -851,7 +854,7 @@ impl Observer for UnitObserver {
         }
     }
 
-    fn stderr_line(&self, line: &[u8], live: Option<&LiveCtl<'_>>) {
+    fn stderr_line(&self, line: &[u8], live: Option<&dyn Live>) {
         let u = &self.run.pd.plan.units[self.i];
         match u.kind {
             rp::UnitKind::RunScript => {
@@ -882,7 +885,7 @@ impl Observer for TestObserver {
     fn stdout(&self, data: &[u8]) {
         self.out.out.raw_out(self.out.out.tr.text(&String::from_utf8_lossy(data)).as_bytes());
     }
-    fn stderr_line(&self, line: &[u8], _live: Option<&LiveCtl<'_>>) {
+    fn stderr_line(&self, line: &[u8], _live: Option<&dyn Live>) {
         let mut l = self.out.out.tr.text(&String::from_utf8_lossy(line));
         l.push('\n');
         self.out.out.raw_err(l.as_bytes());
@@ -1337,7 +1340,7 @@ impl Run {
     }
 
     /// One line of rustc or rustdoc stderr (cargo's `on_stderr_line_inner`).
-    fn compiler_line(&self, i: usize, line: &str, live: Option<&LiveCtl<'_>>) {
+    fn compiler_line(&self, i: usize, line: &str, live: Option<&dyn Live>) {
         let plan = self.plan();
         let u = &plan.units[i];
         if !line.starts_with('{') {

@@ -34,6 +34,10 @@ struct Opts {
     store_budget: u64,
     /// Minutes between background drift checks; 0 turns them off.
     drift_minutes: u64,
+    /// Address to accept workers on.
+    workers_listen: Option<std::net::SocketAddr>,
+    /// Run as a worker for the server at this address.
+    worker_of: Option<std::net::SocketAddr>,
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -53,6 +57,8 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         passthrough: true,
         store_budget: 100 << 30,
         drift_minutes: 360,
+        workers_listen: None,
+        worker_of: None,
     };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -65,13 +71,17 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--mem-gb" => o.mem_kb = val()?.parse::<u64>()? << 20,
             "--no-passthrough" => o.passthrough = false,
             "--drift-interval-min" => o.drift_minutes = val()?.parse()?,
+            "--workers-listen" => o.workers_listen = Some(val()?.parse()?),
+            "--worker" => o.worker_of = Some(val()?.parse()?),
             "--store-budget-gb" => o.store_budget = val()?.parse::<u64>()? << 30,
             "--store-budget-mb" => o.store_budget = val()?.parse::<u64>()? << 20,
             other => bail!("unknown option `{other}`"),
         }
     }
-    if o.state.as_os_str().is_empty() || o.planner.as_os_str().is_empty() {
-        bail!("usage: rargod --state DIR --planner PATH [--socket PATH] [--jobs N] [--mem-gb N]");
+    if o.state.as_os_str().is_empty() || (o.planner.as_os_str().is_empty() && o.worker_of.is_none()) {
+        bail!(
+            "usage: rargod --state DIR --planner PATH [--socket PATH] [--jobs N] [--mem-gb N] [--workers-listen ADDR]\n       rargod --state DIR --worker SERVER_ADDR [--jobs N]"
+        );
     }
     Ok(o)
 }
@@ -87,7 +97,10 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all(&opts.state)?;
     let state = opts.state.canonicalize()?;
-    let planner = opts.planner.canonicalize().with_context(|| format!("planner {}", opts.planner.display()))?;
+    let planner = match opts.worker_of {
+        Some(_) => PathBuf::new(),
+        None => opts.planner.canonicalize().with_context(|| format!("planner {}", opts.planner.display()))?,
+    };
     let db = Arc::new(rargo_core::db::Db::open(&state.join("db.redb"))?);
     let store = Arc::new(Store::open(&state.join("store"), db)?);
     let content = Arc::new(Content::new(store.clone()));
@@ -112,6 +125,14 @@ fn main() -> Result<()> {
 
     let sched = Scheduler::new(opts.jobs, opts.mem_kb)?;
     let engine = Arc::new(Engine::new(store.clone(), content, fs, mnt, zygote, sched));
+    if let Some(server) = opts.worker_of {
+        // A worker: no analysis, no cache of results, no clients. It
+        // executes what the server sends and keeps a content cache.
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let result = rt.block_on(rargo_core::remote::worker_main(engine, server, opts.jobs as u32));
+        session.unmount();
+        return result;
+    }
     let watcher = Watcher::start(&state.join("cookies"))?;
     let daemon = Arc::new(Daemon::new(Config { state_dir: state.clone(), planner }, engine, watcher));
 
@@ -158,6 +179,12 @@ fn main() -> Result<()> {
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    if let Some(addr) = opts.workers_listen {
+        let pool = rt.block_on(rargo_core::remote::Pool::listen(&daemon.engine, addr))?;
+        let _ = daemon.engine.remote.set(pool.clone());
+        let _ = daemon.pool.set(pool);
+        eprintln!("rargod: accepting workers on {addr}");
+    }
     if opts.drift_minutes > 0 {
         let d = daemon.clone();
         let every = std::time::Duration::from_secs(opts.drift_minutes * 60);
@@ -409,7 +436,8 @@ fn status_text(d: &Daemon) -> String {
          plans decoded       {}\n\
          incremental         {} states saved; seeds: {} same worktree, {} ancestor, {} other, {} none; {} dropped after a crash\n\
          verify              {} cached units re-run cleanly, {} differed\n\
-         drift               {}\n",
+         drift               {}\n\
+         workers             {}\n",
         d.stats.requests.load(Ordering::Relaxed),
         e.store.blob_count(),
         e.store.total_bytes() as f64 / (1 << 20) as f64,
@@ -442,5 +470,29 @@ fn status_text(d: &Daemon) -> String {
         d.stats.verify_units.load(Ordering::Relaxed),
         d.stats.verify_mismatches.load(Ordering::Relaxed),
         d.drift_report.lock().clone().unwrap_or_else(|| "not checked yet".into()).trim_end(),
+        match d.pool.get() {
+            None => "not accepting workers".to_string(),
+            Some(p) => {
+                let (pushed, skipped, fetched, reused) = p.transfer_totals();
+                let ps = &p.stats;
+                format!(
+                    "{} connected; {} actions dispatched, {} kept local (core free), {} kept local (transfer too costly), {} worker failures; \
+                     sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
+                     {} answers sent ahead, {} lookups and {} opens asked",
+                    p.worker_count(),
+                    ps.dispatched.load(Ordering::Relaxed),
+                    ps.kept_local_no_wait.load(Ordering::Relaxed),
+                    ps.kept_local_transfer.load(Ordering::Relaxed),
+                    ps.worker_failures.load(Ordering::Relaxed),
+                    pushed as f64 / 1048576.0,
+                    skipped as f64 / 1048576.0,
+                    fetched as f64 / 1048576.0,
+                    reused as f64 / 1048576.0,
+                    ps.prefilled_entries.load(Ordering::Relaxed),
+                    ps.lookups_served.load(Ordering::Relaxed),
+                    ps.opens_served.load(Ordering::Relaxed),
+                )
+            }
+        },
     )
 }

@@ -147,6 +147,11 @@ impl Store {
         self.total.load(Ordering::Relaxed)
     }
 
+    /// Every blob hash in the store.
+    pub fn all_hashes(&self) -> Vec<Hash> {
+        self.meta.iter().map(|e| *e.key()).collect()
+    }
+
     pub fn blob_count(&self) -> usize {
         self.meta.len()
     }

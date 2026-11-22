@@ -375,6 +375,19 @@ impl OutputsLayer {
         Self::pick(d.children.get(name)?, levels)
     }
 
+    /// Every file and symlink visible at `levels`.
+    fn visible_paths(&self, levels: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for d in self.dirs.iter() {
+            for (name, list) in &d.value().children {
+                if let Some(LayerEnt::Entry(MEntry::File { .. } | MEntry::Symlink(_))) = Self::pick(list, levels) {
+                    out.push(vjoin(d.key(), name));
+                }
+            }
+        }
+        out
+    }
+
     fn names(&self, dir: &[u8], levels: &[u8]) -> Vec<(Vec<u8>, LayerEnt)> {
         match self.dirs.get(dir) {
             None => Vec::new(),
@@ -472,6 +485,10 @@ impl View for BuildView {
             return false;
         }
         self.base.traced(dir)
+    }
+
+    fn hints(&self) -> Vec<Vec<u8>> {
+        self.layer.visible_paths(&self.levels)
     }
 
     fn stat(&self, path: &[u8]) -> Looked {

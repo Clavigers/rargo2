@@ -123,6 +123,9 @@ pub enum FileSrc {
     Host { path: Arc<Path>, sig: HostSig },
     /// A git blob, identified by object id, extracted on first use.
     Git { oid: [u8; 20], blob: Arc<dyn LazyBlob> },
+    /// Content whose hash is only known once it is fetched (a file on the
+    /// server, seen from a worker).
+    Lazy(Arc<dyn LazyBlob>),
 }
 
 impl std::fmt::Debug for FileSrc {
@@ -131,6 +134,7 @@ impl std::fmt::Debug for FileSrc {
             FileSrc::Blob(h) => write!(f, "Blob({h:?})"),
             FileSrc::Host { path, .. } => write!(f, "Host({})", path.display()),
             FileSrc::Git { oid, .. } => write!(f, "Git({:02x}{:02x}..)", oid[0], oid[1]),
+            FileSrc::Lazy(_) => write!(f, "Lazy"),
         }
     }
 }
@@ -227,6 +231,12 @@ pub trait View: Send + Sync {
     fn traced(&self, _dir: &[u8]) -> bool {
         true
     }
+    /// Paths an action running against this view is likely to look at,
+    /// beyond what its own history says (the outputs of the units it
+    /// depends on). Used to answer a worker's lookups in advance.
+    fn hints(&self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
     /// Looks up a full path. Every parent must be a real directory.
     fn stat(&self, path: &[u8]) -> Looked {
         match vsplit(path) {
@@ -244,15 +254,35 @@ pub enum BackingKey {
 }
 
 /// Resolves [`FileSrc`]s to bytes and hashes.
+/// Brings a blob that is not in the local store into it.
+pub type Fetcher = Arc<dyn Fn(&Hash) -> io::Result<()> + Send + Sync>;
+
 pub struct Content {
     pub store: Arc<Store>,
     host_hashes: DashMap<HostSig, Hash>,
     git_hashes: DashMap<[u8; 20], Hash>,
+    /// On a worker: how to get a blob the server has and we do not.
+    fetcher: std::sync::OnceLock<Fetcher>,
 }
 
 impl Content {
     pub fn new(store: Arc<Store>) -> Content {
-        Content { store, host_hashes: DashMap::new(), git_hashes: DashMap::new() }
+        Content { store, host_hashes: DashMap::new(), git_hashes: DashMap::new(), fetcher: std::sync::OnceLock::new() }
+    }
+
+    pub fn set_fetcher(&self, f: Fetcher) {
+        let _ = self.fetcher.set(f);
+    }
+
+    /// Opens a blob, fetching it first if this store does not have it and
+    /// there is somewhere to fetch it from.
+    fn open_blob(&self, h: &Hash) -> io::Result<File> {
+        if !self.store.has(h) {
+            if let Some(fetch) = self.fetcher.get() {
+                fetch(h)?;
+            }
+        }
+        self.store.open_blob(h)
     }
 
     fn db(&self) -> &crate::db::Db {
@@ -263,7 +293,7 @@ impl Content {
     /// the signature of the file actually opened.
     pub fn open(&self, src: &FileSrc) -> io::Result<(File, BackingKey, FileSrc)> {
         match src {
-            FileSrc::Blob(h) => Ok((self.store.open_blob(h)?, BackingKey::Blob(*h), src.clone())),
+            FileSrc::Blob(h) => Ok((self.open_blob(h)?, BackingKey::Blob(*h), src.clone())),
             FileSrc::Host { path, .. } => {
                 let f = std::fs::OpenOptions::new()
                     .read(true)
@@ -272,9 +302,9 @@ impl Content {
                 let sig = HostSig::of(&f.metadata()?);
                 Ok((f, BackingKey::Host(sig), FileSrc::Host { path: path.clone(), sig }))
             }
-            FileSrc::Git { .. } => {
+            FileSrc::Git { .. } | FileSrc::Lazy(_) => {
                 let h = self.hash(src)?;
-                Ok((self.store.open_blob(&h)?, BackingKey::Blob(h), FileSrc::Blob(h)))
+                Ok((self.open_blob(&h)?, BackingKey::Blob(h), FileSrc::Blob(h)))
             }
         }
     }
@@ -301,6 +331,7 @@ impl Content {
                 self.git_hashes.insert(*oid, h);
                 Some(h)
             }
+            FileSrc::Lazy(_) => None,
         }
     }
 
@@ -336,6 +367,7 @@ impl Content {
                 Ok(h)
             }
             FileSrc::Git { .. } => self.materialize_git(src),
+            FileSrc::Lazy(blob) => blob.materialize(&self.store),
         }
     }
 

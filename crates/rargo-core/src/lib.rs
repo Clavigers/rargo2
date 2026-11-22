@@ -14,6 +14,7 @@ pub mod incr;
 pub mod net;
 pub mod parse;
 pub mod policy;
+pub mod remote;
 pub mod present;
 pub use rargo_proto as proto;
 pub mod sandbox;
