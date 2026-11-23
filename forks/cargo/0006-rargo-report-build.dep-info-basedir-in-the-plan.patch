@@ -1,7 +1,7 @@
 From 0a5eb94e12ab41013124ddb48744eead7a95f6b0 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:03:01 +0100
-Subject: [PATCH 6/7] rargo: report build.dep-info-basedir in the plan
+Subject: [PATCH 6/8] rargo: report build.dep-info-basedir in the plan
 
 ---
  src/compiler/rargo.rs | 6 ++++++

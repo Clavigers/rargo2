@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub mod secure;
 pub mod tree;
 
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 
 pub type Digest = [u8; 32];
 
@@ -116,9 +116,28 @@ pub enum ServerMsg {
     BlobPart { hash: Digest, part: Part, last: bool },
     /// Everything named in the `Need` for delivery `id` has been sent.
     Delivered { id: u64 },
+    /// A future-incompatibility report to add to the report file in the
+    /// client's target directory (cargo's `.future-incompat-report.json`).
+    /// The client answers with [`ClientMsg::ReportId`].
+    Report(Box<FutureReport>),
     /// Another message, encoded and zstd-compressed (see [`pack`]).
     Packed(Vec<u8>),
 }
+
+/// See [`ServerMsg::Report`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FutureReport {
+    /// The report file, as a path on the client.
+    pub path: String,
+    /// Package (`name@version`) to the rendered warnings, sorted by package.
+    pub per_package: Vec<(String, String)>,
+    /// cargo's suggestions for the report. [`REPORT_ID`] stands where the
+    /// report's number belongs, which only the client can know.
+    pub suggestion: String,
+}
+
+/// Placeholder for the report number in [`FutureReport::suggestion`].
+pub const REPORT_ID: &str = "\u{1}report-id\u{1}";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Blob {
@@ -142,6 +161,8 @@ pub enum ClientMsg {
     Need { id: u64, hashes: Vec<Digest> },
     /// Another message, encoded and zstd-compressed (see [`pack`]).
     Packed(Vec<u8>),
+    /// The number under which a [`ServerMsg::Report`] is in the report file.
+    ReportId(u32),
 }
 
 /// One piece of a large file.

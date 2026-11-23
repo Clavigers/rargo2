@@ -579,6 +579,7 @@ dependencies = [
  "rargo-proto",
  "rayon",
  "serde",
+ "serde_json",
  "tempfile",
  "toml",
  "zstd",

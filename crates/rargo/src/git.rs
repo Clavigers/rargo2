@@ -145,6 +145,8 @@ pub fn thin(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
     if dir.join("HEAD").is_file() {
         return Some(dir);
     }
+    // Half-made directories of clients that were killed.
+    crate::tmp::sweep(&all, ".tmp-");
     let tmp = all.join(format!(".tmp-{}-{key}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let made = build(root, head, &tmp).and_then(|()| match std::fs::rename(&tmp, &dir) {

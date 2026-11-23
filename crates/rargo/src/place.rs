@@ -45,6 +45,7 @@ struct Dest {
 struct Part {
     tmp: PathBuf,
     file: std::fs::File,
+    _watched: crate::tmp::Temp,
 }
 
 pub struct Placer {
@@ -54,6 +55,8 @@ pub struct Placer {
     pending: HashMap<Digest, Vec<Dest>>,
     parts: HashMap<Digest, Part>,
     seq: u64,
+    /// Directories already cleared of what dead clients left behind.
+    swept: std::collections::HashSet<PathBuf>,
     pub fetched_bytes: u64,
     pub reused_files: u64,
 }
@@ -94,7 +97,10 @@ fn mode(exec: bool, writable: bool) -> std::fs::Permissions {
 
 impl Placer {
     pub fn new(cache_dir: &Path, placed: Placed) -> Placer {
+        // Downloads a killed client never finished.
+        crate::tmp::sweep(&cache_dir.join("blobs"), ".incoming-");
         Placer {
+            swept: Default::default(),
             cache: cache_dir.join("blobs"),
             placed,
             changed: false,
@@ -111,10 +117,20 @@ impl Placer {
         self.cache.join(&h[..2]).join(if exec { format!("{}.x", &h[2..]) } else { h[2..].to_string() })
     }
 
-    fn tmp_beside(&mut self, dest: &Path) -> PathBuf {
+    /// A temporary name beside `dest`. The first time a directory is
+    /// written to, temporaries that clients which no longer exist left in
+    /// it are removed.
+    fn tmp_beside(&mut self, dest: &Path) -> (PathBuf, crate::tmp::Temp) {
         self.seq += 1;
+        if let Some(dir) = dest.parent() {
+            if self.swept.insert(dir.to_path_buf()) {
+                crate::tmp::sweep(dir, crate::tmp::BESIDE);
+            }
+        }
         let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        dest.with_file_name(format!(".rargo-tmp-{}-{}-{name}", std::process::id(), self.seq))
+        let tmp = dest.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), self.seq));
+        let watched = crate::tmp::watch(&tmp);
+        (tmp, watched)
     }
 
     /// Whether `dest` already holds this content in the right form.
@@ -152,7 +168,7 @@ impl Placer {
         if std::fs::symlink_metadata(&d.path).map(|m| m.is_dir()).unwrap_or(false) {
             std::fs::remove_dir_all(&d.path)?;
         }
-        let tmp = self.tmp_beside(&d.path);
+        let (tmp, _watched) = self.tmp_beside(&d.path);
         let done = (|| -> io::Result<()> {
             if reflink(src, &tmp) {
                 std::fs::set_permissions(&tmp, mode(d.exec, true))?;
@@ -186,7 +202,7 @@ impl Placer {
                 if let Some(parent) = cp.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                let ctmp = self.tmp_beside(&cp);
+                let (ctmp, _watched) = self.tmp_beside(&cp);
                 let made = (|| -> io::Result<()> {
                     if !reflink(tmp, &ctmp) && std::fs::hard_link(tmp, &ctmp).is_err() {
                         std::fs::copy(tmp, &ctmp)?;
@@ -228,6 +244,7 @@ impl Placer {
         }
         self.fetched_bytes += bytes.len() as u64;
         let tmp = self.scratch()?;
+        let _watched = crate::tmp::watch(&tmp);
         std::fs::write(&tmp, bytes)?;
         self.arrived(hash, &tmp)
     }
@@ -236,8 +253,9 @@ impl Placer {
         self.fetched_bytes += data.len() as u64;
         if !self.parts.contains_key(&hash) {
             let tmp = self.scratch()?;
+            let watched = crate::tmp::watch(&tmp);
             let file = std::fs::File::create(&tmp)?;
-            self.parts.insert(hash, Part { tmp, file });
+            self.parts.insert(hash, Part { tmp, file, _watched: watched });
         }
         let part = self.parts.get_mut(&hash).unwrap();
         part.file.write_all(data)?;

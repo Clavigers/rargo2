@@ -974,3 +974,74 @@ nothing else wants falls idle before the worker has said anything. A file
 a worker has produced and announced early (an `.rmeta`) is recorded as
 held by that worker at once, so dependents sent there do not get it pushed
 back.
+
+## D48. A client that goes away takes its work with it
+
+Before, a disconnect stopped the request's task but not the unit tasks it
+had spawned: queued and running actions carried on and their results were
+cached. The same was true of a hedged action's losing copy (D30): "dropping
+the remote run withdraws the action" only forgot it on the server, while
+the worker kept compiling on a core the server already counted as free.
+
+Now cancellation follows ownership. A build's unit tasks are aborted when
+the build is dropped. An action whose future is dropped kills its sandbox
+(the zygote's `Kill`), waits for the process to die on a helper thread and
+then tears down the action directory, its scratch files and its cgroup. A
+remote run that is given up before the worker reports sends `Cancel`, and
+the worker aborts the task (queued: it leaves the queue; running: its
+sandbox is killed the same way).
+
+Two consequences, both accepted:
+
+- An action another build was also waiting for (in-flight deduplication)
+  is killed with its owner; the waiting build notices, takes the slot and
+  starts it again. Keeping it alive would need the action to be owned by
+  nobody, which is a larger change than the case deserves.
+- A compiler killed while its helper threads hold jobserver tokens does
+  not return them. The scheduler already refills the pipe when nothing is
+  running (it was needed for crashed compilers); until then the server
+  runs a few tokens short.
+
+Checked by e2e: a build script sleeping for ten minutes is gone within
+five seconds of its client being killed, the scheduler shows nothing
+running, and the next build works.
+
+## D49. cargo's report files: future incompatibility and `--timings`
+
+Both were gaps since D29.
+
+- **Future incompatibility.** The compilers' `future_incompat_report`
+  messages are collected per unit, rendered exactly as cargo renders them
+  (`render_report`, compiler colours kept) and sent to the client, which
+  owns `target/.future-incompat-report.json`: it merges the report into
+  the file in cargo's on-disk format (same report again: same number; five
+  kept), and answers with the number, which the server puts into cargo's
+  closing warning. `--future-incompat-report` and
+  `future-incompat-report.frequency` behave as in cargo (plan format 6
+  carries both). Protocol 6 adds the two messages. Not reproduced: cargo's
+  "update to a newer version" suggestion, which asks the registry.
+  Checked by e2e: `cargo report future-incompatibilities --id 1` shows
+  rargo's report, and its `per_package` text equals stock cargo's for the
+  same crate, byte for byte.
+- **`--timings`.** cargo's report describes cargo's job queue, which does
+  not run here, so the report is rargo's own: one HTML file without
+  scripts at `target/cargo-timings/cargo-timing.html` and a dated copy,
+  with a bar per unit run for this build (metadata and code-generation
+  phases), and a table of every unit: run or from the cache, when it was
+  asked for, how long the answer took, the action's own run time, CPU time
+  and peak memory. The planner no longer writes cargo's (empty) report
+  while planning.
+
+## D50. Temporary files of clients that did not finish
+
+The client writes every file under a temporary name beside its
+destination and renames it. A client stopped in between left the
+temporary in `target/`. Two measures: SIGINT, SIGTERM and SIGHUP now
+unlink the temporaries in use at that moment (a fixed table of paths, so
+the handler only calls `unlink`) and then die of the signal as before; and
+the first time a client writes into a directory it removes temporaries
+whose name carries the process id of a process that no longer exists
+(`kill -9`, power loss). The same sweep covers unfinished downloads in the
+client's cache and half-made git stand-ins. A process id that has been
+reused keeps a stale file until that process ends; nothing is ever removed
+that a live process may be writing.

@@ -601,6 +601,77 @@ mv .rargo.toml "$T/unused-policy"
 out=$(CARGO_TARGET_DIR="$T/stock-g" cargo run -q --offline 2>&1)
 has "$out" "$head2|trunk|third commit|${head2:0:7}|" && ok "stock cargo on the client agrees about HEAD ($out)" || bad "stock cargo on the client agrees about HEAD" "$out"
 
+# --- reports cargo writes into target/, and clients that go away ------------
+echo "== future-incompatibility report, --timings, interrupted clients"
+H=$T/h
+mkdir -p "$H/old/src" "$H/app/src"
+printf '[workspace]\nresolver = "2"\nmembers = ["old", "app"]\n' >"$H/Cargo.toml"
+printf '[package]\nname = "old"\nversion = "0.1.0"\nedition = "2021"\n' >"$H/old/Cargo.toml"
+printf '#[repr(i32, u8)]\n#[allow(conflicting_repr_hints)]\npub enum E { A = 1, B = 2 }\n' >"$H/old/src/lib.rs"
+printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\nold = { path = "../old" }\n' >"$H/app/Cargo.toml"
+printf 'fn main() { println!("{}", old::E::B as i32); }\n' >"$H/app/src/main.rs"
+cd "$H" || exit 1
+out=$("$R" build 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "will be rejected by a future version of Rust: old v0.1.0" && has "$out" "cargo report future-incompatibilities --id 1" \
+    && ok "a build names the packages a future Rust will reject and the report" || bad "a build names the packages a future Rust will reject and the report" "$out"
+out=$(cargo report future-incompatibilities --id 1 --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "conflicting representation hints" && has "$out" "The package \`old v0.1.0 ($H/old)\`" \
+    && ok "stock cargo shows the report rargo wrote" || bad "stock cargo shows the report rargo wrote" "$out"
+CARGO_TARGET_DIR="$T/stock-h" cargo build --offline >/dev/null 2>&1
+per_package() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["reports"][0]["per_package"])' "$1" 2>&1; }
+want=$(per_package "$T/stock-h/.future-incompat-report.json")
+got=$(per_package "$H/target/.future-incompat-report.json")
+[ -n "$got" ] && [ "$got" = "$want" ] && ok "the report is the one stock cargo writes" || bad "the report is the one stock cargo writes" "rargo: $got
+stock: $want"
+out=$("$R" build --future-incompat-report 2>&1)
+n=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["reports"]))' "$H/target/.future-incompat-report.json" 2>&1)
+has "$out" "this report can be shown with \`cargo report future-incompatibilities --id 1\`" && [ "$n" = 1 ] \
+    && ok "a cached build reports the same warnings under the same number" || bad "a cached build reports the same warnings under the same number" "$out ($n reports)"
+printf 'fn main() { println!("{} again", old::E::B as i32); }\n' >"$H/app/src/main.rs"
+out=$("$R" build --timings 2>&1); rc=$?
+page=$H/target/cargo-timings/cargo-timing.html
+[ $rc -eq 0 ] && has "$out" "Timing report saved to $H/target/cargo-timings/cargo-timing-" && grep -qF 'app `app` (bin ' "$page" 2>/dev/null \
+    && grep -q 'from the cache' "$page" && [ "$(ls "$H/target/cargo-timings" | wc -l)" = 2 ] \
+    && ok "--timings writes a report of what ran and what came from the cache" || bad "--timings writes a report of what ran and what came from the cache" "$out
+$(ls -la "$H/target/cargo-timings" 2>&1)"
+# A client that was killed outright left temporaries; the next one that
+# writes there removes them, and nobody else's.
+true & dead=$!; wait $dead
+: >"$H/target/debug/.rargo-tmp-$dead-7-app"
+: >"$H/target/debug/.rargo-tmp-$$-7-app"
+printf 'fn main() { println!("{} and again", old::E::B as i32); }\n' >"$H/app/src/main.rs"
+"$R" build >/dev/null 2>&1
+[ ! -e "$H/target/debug/.rargo-tmp-$dead-7-app" ] && [ -e "$H/target/debug/.rargo-tmp-$$-7-app" ] \
+    && ok "temporaries of a killed client are removed by the next one, those of a live process are kept" \
+    || bad "temporaries of a killed client are removed by the next one, those of a live process are kept" "$(ls -A "$H/target/debug")"
+rm -f "$H/target/debug/.rargo-tmp-$$-7-app"
+# A client that goes away takes its running actions with it.
+mkdir -p "$H/slowcancel/src"
+printf '[package]\nname = "slowcancel"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$H/slowcancel/Cargo.toml"
+printf 'fn main() { std::thread::sleep(std::time::Duration::from_secs(600)); }\n' >"$H/slowcancel/build.rs"
+: >"$H/slowcancel/src/lib.rs"
+printf '[workspace]\nresolver = "2"\nmembers = ["old", "app", "slowcancel"]\n' >"$H/Cargo.toml"
+"$R" build -p slowcancel >"$T/cancel.log" 2>&1 &
+client=$!
+script=""
+for _ in $(seq 1 300); do
+    script=$(pgrep -f 'build/slowcancel/[0-9a-f]*/out/build_script_build' | head -1)
+    [ -n "$script" ] && break
+    sleep 0.1
+done
+kill "$client" 2>/dev/null; wait "$client" 2>/dev/null
+gone=no
+for _ in $(seq 1 50); do
+    if [ -z "$(pgrep -f 'build/slowcancel/[0-9a-f]*/out/build_script_build')" ]; then gone=yes; break; fi
+    sleep 0.1
+done
+[ -n "$script" ] && [ $gone = yes ] && ok "an action still running when its client goes away is stopped" \
+    || bad "an action still running when its client goes away is stopped" "script pid: ${script:-never started}; $(cat "$T/cancel.log")"
+left=$(find "$H/target" -name '.rargo-tmp-*' | head -3)
+[ -z "$left" ] && ok "an interrupted client leaves no temporaries in target/" || bad "an interrupted client leaves no temporaries in target/" "$left"
+out=$("$R" build -p app 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "the server builds on after an interrupted request" || bad "the server builds on after an interrupted request" "$out"
+
 echo
 "$R" --rargo-status
 echo

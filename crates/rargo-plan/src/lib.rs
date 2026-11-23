@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the format or the fork's behaviour changes; part of the
 /// planner's cache key through the binary itself, checked on load.
-pub const PLAN_VERSION: u32 = 5;
+pub const PLAN_VERSION: u32 = 6;
 
 /// Lint mode: a JSON map from unit index to `(unit description, rustc's
 /// unused_extern message)`. The planner replays those messages so that cargo
@@ -213,6 +213,9 @@ pub struct Unit {
     pub desc: String,
     pub verb: Verb,
     pub is_local: bool,
+    /// The `repository` of the package's manifest, for the
+    /// future-incompatibility report.
+    pub repository: Option<String>,
     pub show_warnings: bool,
     /// Arguments for the `cargo fix` hint (`--lib -p foo`), when cargo would
     /// print one.
@@ -313,6 +316,12 @@ pub struct Plan {
     pub verbosity: Verbosity,
     pub extra_verbose: bool,
     pub keep_going: bool,
+    /// `--future-incompat-report` was given.
+    pub future_incompat_report: bool,
+    /// `future-incompat-report.frequency` is not `never`.
+    pub future_incompat_display: bool,
+    /// `--timings` was given.
+    pub timings: bool,
     pub deny_warnings: bool,
     pub no_fail_fast: bool,
     /// Test arguments contain `--nocapture`/`--no-capture`.

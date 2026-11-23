@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 /// Ends in the protocol version, so that a client of another version is
 /// told so instead of failing to decode.
-pub const MAGIC: &[u8; 8] = b"rargo\x05\r\n";
+pub const MAGIC: &[u8; 8] = b"rargo\x06\r\n";
 const PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Plaintext bytes per record (Noise messages are at most 65535 bytes,
 /// including the 16-byte tag).

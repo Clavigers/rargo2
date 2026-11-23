@@ -9,7 +9,9 @@
 
 mod git;
 mod place;
+mod report;
 mod scan;
+mod tmp;
 
 use rargo_proto::secure;
 use rargo_proto::{Blob, ClientMsg, Digest, ExecRequest, PROTO_VERSION, RunRequest, ServerMsg};
@@ -30,7 +32,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!(".rargo-tmp-{}-{name}", std::process::id()));
+    let tmp = path.with_file_name(format!("{}{}-{name}", tmp::BESIDE, std::process::id()));
+    let _watched = tmp::watch(&tmp);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -403,6 +406,16 @@ fn converse(cfg: &Config, req: &RunRequest, local: &mut Local, scan: Option<&sca
                     return Err(std::io::Error::other("the server did not send every file it announced"));
                 }
             }
+            ServerMsg::Report(r) => {
+                let id = match report::save(&r) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!("warning: failed to write on-disk future incompatible report {}: {e}", r.path);
+                        0
+                    }
+                };
+                wire.send(&ClientMsg::ReportId(id))?;
+            }
             ServerMsg::Packed(_) => return Err(std::io::Error::other("unexpected message from the server")),
             ServerMsg::Exit(code) => {
                 finish(&placer);
@@ -423,6 +436,7 @@ fn main() {
     if std::env::var_os("RARGO_BYPASS").is_some() {
         passthrough(&raw);
     }
+    tmp::install_handlers();
     let mut args: Vec<String> = match raw.iter().map(|a| a.clone().into_string()).collect() {
         Ok(a) => a,
         // cargo itself rejects non-UTF-8 arguments for build commands.

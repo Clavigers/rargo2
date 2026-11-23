@@ -225,6 +225,45 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
+/// What an action holds while it runs. Dropped armed (its future was
+/// cancelled), it kills the process and tears the action directory down once
+/// the process is gone.
+struct Teardown {
+    fs: Arc<SandboxFs>,
+    zygote: Arc<Zygote>,
+    action: Arc<ActionFs>,
+    scratch: PathBuf,
+    running: Option<crate::sandbox::Running>,
+    group: Option<crate::cgroup::ActionGroup>,
+    armed: bool,
+}
+
+impl Drop for Teardown {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let running = self.running.take();
+        if let Some(r) = &running {
+            self.zygote.kill(r.id);
+        }
+        let (fs, action, scratch, group) = (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
+        // Waiting for a process to die is not something to do on whichever
+        // thread happened to drop the future.
+        let work = move || {
+            if let Some(r) = running {
+                let _ = r.done.blocking_recv();
+            }
+            let _ = fs.finish_action(&action);
+            drop(group);
+            let _ = std::fs::remove_dir_all(&scratch);
+        };
+        if std::thread::Builder::new().name("cancelled-action".into()).spawn(work).is_err() {
+            eprintln!("rargod: could not start a thread to clean up a cancelled action");
+        }
+    }
+}
+
 fn default_mem_kb(kind: ActionKind) -> u64 {
     match kind {
         ActionKind::Rustc => 700 * 1024,
@@ -590,8 +629,20 @@ impl Engine {
             // every edit to a `lib.rs`.
             size_blind: spec.kind == ActionKind::Plan,
         });
-        // From here on the action directory must be torn down on every path.
-        let run = self.run_in(spec, uid, gid, observer, &action).await;
+        // From here on the action directory must be torn down on every path,
+        // including the one where nobody waits for the result any more.
+        let mut teardown = Teardown {
+            fs: self.fs.clone(),
+            zygote: self.zygote.clone(),
+            action: action.clone(),
+            scratch: scratch.clone(),
+            running: None,
+            group: None,
+            armed: true,
+        };
+        let run = self.run_in(spec, uid, gid, observer, &action, &mut teardown).await;
+        teardown.armed = false;
+        drop(teardown);
         let fin = {
             let fs = self.fs.clone();
             let a = action.clone();
@@ -687,7 +738,9 @@ impl Engine {
         gid: u32,
         observer: &dyn Observer,
         action: &Arc<ActionFs>,
+        teardown: &mut Teardown,
     ) -> Result<(crate::sandbox::ExitInfo, Vec<u8>, Vec<u8>)> {
+        let Teardown { running: slot, group: group_slot, .. } = teardown;
         for d in &spec.mkdirs {
             action
                 .mkdir_p(d)
@@ -708,7 +761,8 @@ impl Engine {
         for var in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
             env.insert(var.as_bytes().to_vec(), js.clone().into_bytes());
         }
-        let group = self.cgroup_root.as_ref().and_then(|r| crate::cgroup::ActionGroup::create(r, action.seq));
+        *group_slot = self.cgroup_root.as_ref().and_then(|r| crate::cgroup::ActionGroup::create(r, action.seq));
+        let group = group_slot.as_ref();
         let sreq = SpawnReq {
             root: self.mnt.join(SandboxFs::dir_name(action.seq)),
             argv: spec.argv.clone(),
@@ -720,7 +774,10 @@ impl Engine {
             binds: vec![],
             cgroup: group.as_ref().map(|g| g.dir.clone()),
         };
-        let running = self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?;
+        // The process is kept where the caller can reach it: if this future
+        // is dropped (the client went away, another copy of the action won),
+        // the process is killed instead of running on unobserved.
+        let running = slot.insert(self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?);
         let mut out_rd = async_reader(out_r)?;
         let mut err_rd = async_reader(err_r)?;
         let live = LiveCtl { action, store: &self.store };
@@ -766,7 +823,7 @@ impl Engine {
         // While it runs, watch how much memory all its processes hold.
         let peak_kb = std::sync::atomic::AtomicU64::new(0);
         let watch = async {
-            let Some(g) = &group else { return std::future::pending::<()>().await };
+            let Some(g) = group else { return std::future::pending::<()>().await };
             let mut every = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 every.tick().await;
@@ -774,11 +831,11 @@ impl Engine {
             }
         };
         let (stdout, stderr, info) = tokio::select! {
-            r = async { tokio::join!(read_out, read_err, running.done) } => r,
+            r = async { tokio::join!(read_out, read_err, &mut running.done) } => r,
             _ = watch => unreachable!("the memory watch never finishes"),
         };
         let mut info = info.context("the sandbox helper process died")?;
-        if let Some(g) = &group {
+        if let Some(g) = group {
             let (user, sys) = g.cpu_us();
             if user + sys > 0 {
                 info.user_us = user;
@@ -786,7 +843,8 @@ impl Engine {
             }
             info.max_rss_kb = info.max_rss_kb.max(peak_kb.load(Ordering::Relaxed));
         }
-        drop(group);
+        *slot = None;
+        *group_slot = None;
         if info.setup_failed {
             bail!(
                 "could not start `{}`: {}",

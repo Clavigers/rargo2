@@ -225,6 +225,13 @@ impl Output {
         self.err_text(&format!("{RED}error{RESET}{BOLD}:{RESET} {msg}\n"));
     }
 
+    pub fn help(&self, msg: &str) {
+        if self.quiet {
+            return;
+        }
+        self.err_text(&format!("{CYAN}help{RESET}{BOLD}:{RESET} {msg}\n"));
+    }
+
     pub fn note(&self, msg: &str) {
         if self.quiet {
             return;

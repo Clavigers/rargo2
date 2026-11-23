@@ -116,6 +116,8 @@ pub enum Msg {
     /// A file the action finished early (an `.rmeta`).
     Early { action: u64, path: Vec<u8>, entry: MEntry },
     Done { action: u64, result: Result<WDone, String> },
+    /// Nobody wants this action's result any more: stop it.
+    Cancel { action: u64 },
 }
 
 fn dtype_to_u8(t: DType) -> u8 {
@@ -656,6 +658,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
     });
     let s2 = state.clone();
     engine.content.set_fetcher(Arc::new(move |h| s2.ensure_blob(h)));
+    let tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>> = Arc::new(Mutex::new(HashMap::new()));
     peer.post(&Msg::Hello { cores, blobs: engine.store.all_hashes() });
     eprintln!("rargo worker: connected to {server}, {cores} cores");
     loop {
@@ -704,7 +707,11 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                     }
                 }
                 let state = state.clone();
-                tokio::spawn(async move {
+                let tasks2 = tasks.clone();
+                // Held across the spawn so that the task cannot finish and
+                // deregister before it is registered.
+                let mut registry = tasks.lock();
+                let task = tokio::spawn(async move {
                     let view = Arc::new(RemoteView {
                         state: state.clone(),
                         action,
@@ -743,8 +750,17 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                         }),
                         Err(e) => Err(format!("{e:#}")),
                     };
+                    tasks2.lock().remove(&action);
                     state.peer.post(&Msg::Done { action, result });
                 });
+                registry.insert(action, task.abort_handle());
+            }
+            Msg::Cancel { action } => {
+                // Dropping the task kills the action's process if it had
+                // started, or gives up its place in the queue if not.
+                if let Some(task) = tasks.lock().remove(&action) {
+                    task.abort();
+                }
             }
             _ => {}
         }
@@ -1298,14 +1314,20 @@ impl Pool {
             asked: AtomicU64::new(0),
         });
         w.actions.insert(action, ra.clone());
-        struct Cleanup<'a>(&'a Pool, &'a Worker, u64);
+        struct Cleanup<'a>(&'a Pool, &'a Worker, u64, std::cell::Cell<bool>);
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
                 self.1.actions.remove(&self.2);
+                if !self.3.get() {
+                    // Given up before the worker finished (a local core ran
+                    // it first, or the client left): the worker's core is
+                    // only free once it has stopped.
+                    self.1.peer.post(&Msg::Cancel { action: self.2 });
+                }
                 self.0.give_back(self.1);
             }
         }
-        let _cleanup = Cleanup(self, w, action);
+        let cleanup = Cleanup(self, w, action, std::cell::Cell::new(false));
 
         // Predict what the action will ask, from its last trace, and answer
         // in advance with what our view says now.
@@ -1457,7 +1479,10 @@ impl Pool {
                     stderr.extend_from_slice(&line);
                     stderr.push(b'\n');
                 }
-                Event::Done(r) => break r.map_err(|e| anyhow!("worker: {e}"))?,
+                Event::Done(r) => {
+                    cleanup.3.set(true);
+                    break r.map_err(|e| anyhow!("worker: {e}"))?;
+                }
             }
         };
 

@@ -97,6 +97,7 @@ pub struct Session {
     trees_reply: Mutex<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
     env_reply: Mutex<Option<oneshot::Sender<Vec<(String, Option<String>)>>>>,
     need_reply: Mutex<HashMap<u64, oneshot::Sender<Vec<Digest>>>>,
+    report_reply: Mutex<Option<oneshot::Sender<u32>>>,
     /// One question to the client at a time.
     asking: tokio::sync::Mutex<()>,
     arrivals: Notify,
@@ -118,6 +119,7 @@ impl Session {
             trees_reply: Mutex::new(None),
             env_reply: Mutex::new(None),
             need_reply: Mutex::new(HashMap::new()),
+            report_reply: Mutex::new(None),
             asking: tokio::sync::Mutex::new(()),
             arrivals: Notify::new(),
             changed: AtomicBool::new(false),
@@ -162,6 +164,7 @@ impl Session {
         self.trees_reply.lock().take();
         self.env_reply.lock().take();
         self.need_reply.lock().clear();
+        self.report_reply.lock().take();
         self.window.close();
         self.arrivals.notify_waiters();
         for (_, p) in self.parts.lock().drain() {
@@ -191,6 +194,11 @@ impl Session {
             ClientMsg::Env(e) => {
                 if let Some(tx) = self.env_reply.lock().take() {
                     let _ = tx.send(e);
+                }
+            }
+            ClientMsg::ReportId(id) => {
+                if let Some(tx) = self.report_reply.lock().take() {
+                    let _ = tx.send(id);
                 }
             }
             ClientMsg::Need { id, hashes } => {
@@ -255,6 +263,19 @@ impl Session {
         let (tx, rx) = oneshot::channel();
         *self.env_reply.lock() = Some(tx);
         self.send(ServerMsg::WantEnv(names));
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(self.gone());
+        }
+        rx.await.map_err(|_| self.gone())
+    }
+
+    /// Has the client add a future-incompatibility report to its report
+    /// file. Returns the report's number there.
+    pub async fn report(&self, report: rargo_proto::FutureReport) -> Result<u32> {
+        let _g = self.asking.lock().await;
+        let (tx, rx) = oneshot::channel();
+        *self.report_reply.lock() = Some(tx);
+        self.send(ServerMsg::Report(Box::new(report)));
         if self.closed.load(Ordering::SeqCst) {
             return Err(self.gone());
         }

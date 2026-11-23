@@ -366,8 +366,9 @@ struct Ui {
     seen_diag: HashSet<Hash>,
     /// rustc's `unused_extern` message, by unit.
     unused_externs: BTreeMap<usize, String>,
-    /// Packages whose compiler reported future-incompatibility lints.
-    future_incompat: std::collections::BTreeSet<String>,
+    /// The future-incompatibility warnings each unit's compiler reported,
+    /// as rendered by the compiler.
+    future_incompat: BTreeMap<usize, Vec<String>>,
     counts: HashMap<usize, Counts>,
     said_waiting: bool,
 }
@@ -381,6 +382,8 @@ struct Run {
     scripts: Mutex<Scripts>,
     states: Vec<watch::Sender<UState>>,
     results: Vec<OnceLock<(Arc<ActionResult>, bool)>>,
+    /// When each unit was asked for and answered (for `--timings`).
+    times: Mutex<Vec<crate::timings::UnitTime>>,
     early: Mutex<HashMap<usize, Vec<(Vec<u8>, MEntry)>>>,
     ui: Mutex<Ui>,
     failed: AtomicBool,
@@ -1114,6 +1117,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         scripts: Mutex::new(Scripts::new()),
         states: (0..n).map(|_| watch::channel(UState::Pending).0).collect(),
         results: (0..n).map(|_| OnceLock::new()).collect(),
+        times: Mutex::new(vec![Default::default(); n]),
         early: Mutex::new(HashMap::new()),
         ui: Mutex::new(Ui::default()),
         failed: AtomicBool::new(false),
@@ -1131,10 +1135,20 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         need: if as_build { Some(pd.needs()) } else { None },
     });
 
-    let mut tasks = Vec::with_capacity(n);
+    // If this build is dropped (its client went away), so are its units:
+    // those waiting never start, those running are killed.
+    struct Units(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for Units {
+        fn drop(&mut self) {
+            for t in &self.0 {
+                t.abort();
+            }
+        }
+    }
+    let mut tasks = Units(Vec::with_capacity(n));
     for i in 0..n {
         let r = run.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.0.push(tokio::spawn(async move {
             let st = match r.exec_unit(i).await {
                 Ok(st) => st,
                 Err(e) => {
@@ -1146,7 +1160,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
             r.states[i].send_replace(st);
         }));
     }
-    for t in tasks {
+    for t in tasks.0.iter_mut() {
         t.await.context("a unit task panicked")?;
     }
     if run.inconsistent.load(Ordering::SeqCst) {
@@ -1249,20 +1263,20 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
             }
         }
     }
+    let incompat = run.future_incompat_summary().await?;
     let finished = || {
         c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
-        let pkgs: Vec<String> = run.ui.lock().future_incompat.iter().cloned().collect();
-        if !pkgs.is_empty() {
-            c2.out.warn(&format!(
-                "the following packages contain code that will be rejected by a future version of Rust: {}",
-                pkgs.join(", ")
-            ));
-            c2.out.note(
-                "to see what the problems were, build with stock cargo and the option `--future-incompat-report` \
-                 (rargo does not keep cargo's report file)",
-            );
+        for (kind, text) in &incompat {
+            match kind {
+                'w' => c2.out.warn(text),
+                'h' => c2.out.help(text),
+                _ => c2.out.note(text),
+            }
         }
     };
+    if plan.timings {
+        run.write_timings(started);
+    }
     if run.need.is_some() {
         // A check leaves nothing in the target directory and has no steps.
         finished();
@@ -1656,6 +1670,7 @@ impl Run {
             }),
             _ => None,
         };
+        self.times.lock()[i].start = Some(std::time::Instant::now());
         let outcome = loop {
             if let Some(o) = from_full.take() {
                 break o;
@@ -1698,6 +1713,14 @@ impl Run {
             }
             break outcome;
         };
+        {
+            let st = &outcome.result.stats;
+            let mut times = self.times.lock();
+            let t = &mut times[i];
+            t.end = Some(std::time::Instant::now());
+            t.cached = outcome.cached;
+            (t.wall_us, t.cpu_us, t.rss_kb) = (st.wall_us, st.cpu_us, st.max_rss_kb);
+        }
         // After the run: a first run is what reveals declared variables.
         let _ = self.unit_keys[i].set(self.d.engine.effective_key(&spec, &self.c.env));
         if self.verify && outcome.cached && outcome.result.success() {
@@ -1920,6 +1943,147 @@ impl Run {
         }
     }
 
+    /// `--timings`: the report goes where cargo puts its own.
+    fn write_timings(&self, started: std::time::Instant) {
+        let plan = self.plan();
+        let times = self.times.lock().clone();
+        let rows: Vec<crate::timings::Row> = plan
+            .units
+            .iter()
+            .zip(times)
+            .filter(|(u, t)| u.cmd.is_some() && t.end.is_some())
+            .map(|(u, time)| crate::timings::Row { name: format!("{} {}", u.pkg_name, u.desc), time })
+            .collect();
+        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let stamp = crate::timings::stamp(unix);
+        let html = crate::timings::render(
+            &format!("cargo {}", self.c.args.join(" ")),
+            &stamp,
+            started,
+            started.elapsed(),
+            self.d.engine.sched.tokens(),
+            &rows,
+        );
+        let dir = self.c.out.tr.path(&format!("{}/cargo-timings", plan.target_dir));
+        let dated = format!("{dir}/cargo-timing-{stamp}.html");
+        self.c.deliver(
+            Vec::new(),
+            vec![
+                Write::Text { path: dated.clone(), text: Some(html.clone()) },
+                Write::Text { path: format!("{dir}/cargo-timing.html"), text: Some(html) },
+            ],
+        );
+        self.c.out.status("Timing", &format!("report saved to {dated}"));
+    }
+
+    /// cargo's `save_and_display_report`: the warnings compilers gave about
+    /// code a future Rust will reject go into the report file in the
+    /// client's target directory, where `cargo report
+    /// future-incompatibilities` finds them, and a closing message says so.
+    /// Returns the lines to show: `('w' | 'h' | 'n', text)`.
+    async fn future_incompat_summary(&self) -> Result<Vec<(char, String)>> {
+        let plan = self.plan();
+        let reports = std::mem::take(&mut self.ui.lock().future_incompat);
+        if reports.is_empty() {
+            return Ok(if plan.future_incompat_report {
+                vec![('n', "0 dependencies had future-incompatible warnings".to_string())]
+            } else {
+                Vec::new()
+            });
+        }
+        let tr = &self.c.out.tr;
+        // Per package (`name@version`): what its units reported.
+        let mut per_package: BTreeMap<String, String> = BTreeMap::new();
+        // The packages themselves, once each, in a stable order.
+        let mut pkgs: BTreeMap<String, &rp::Unit> = BTreeMap::new();
+        for (&i, items) in &reports {
+            let u = &plan.units[i];
+            let spec = format!("{}@{}", u.pkg_name, u.pkg_version);
+            let text = per_package.entry(spec).or_default();
+            text.push_str(&format!(
+                "The package `{}` currently triggers the following future incompatibility lints:\n",
+                tr.text(&u.pkg)
+            ));
+            for item in items {
+                // With the compiler's colours, as cargo keeps them; `cargo
+                // report` strips them when its output is not a terminal.
+                for l in tr.text(item).lines() {
+                    text.push_str(&format!("> {l}\n"));
+                }
+            }
+            pkgs.entry(u.pkg_id.clone()).or_insert(u);
+        }
+        let mut suggestions: Vec<String> = Vec::new();
+        if !pkgs.values().all(|u| u.is_local) {
+            // cargo would first look in the registry for newer versions of
+            // the packages; rargo does not ask the registry here.
+            let upstream: Vec<String> = pkgs
+                .values()
+                .map(|u| {
+                    let spec = format!("{}@{}", u.pkg_name, u.pkg_version);
+                    format!(
+                        "  - {spec}\n  - repository: {}\n  - detailed warning command: `cargo report future-incompatibilities --id {} --package {spec}`",
+                        u.repository.as_deref().unwrap_or("<not found>"),
+                        rargo_proto::REPORT_ID,
+                    )
+                })
+                .collect();
+            suggestions.push(format!(
+                "ensure the maintainers know of this problem (e.g. creating a bug report if needed)\n\
+                 or even helping with a fix (e.g. by creating a pull request)\n{}",
+                upstream.join("\n\n")
+            ));
+            suggestions.push(
+                "use your own version of the dependency with the `[patch]` section in `Cargo.toml`\n\
+                 For more information, see:\n\
+                 https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#the-patch-section"
+                    .to_string(),
+            );
+        }
+        let mut suggestion = String::new();
+        if !suggestions.is_empty() {
+            suggestion.push_str("to solve this problem, you can try the following approaches:\n");
+            for s in &suggestions {
+                suggestion.push_str(&format!("\n- {s}\n"));
+            }
+        }
+        let names: Vec<String> = pkgs.values().map(|u| tr.text(&u.pkg)).collect();
+        let mut out = vec![(
+            'w',
+            format!(
+                "the following packages contain code that will be rejected by a future version of Rust: {}",
+                names.join(", ")
+            ),
+        )];
+        // The report file is the client's; a build the server runs for
+        // itself has nowhere to keep one.
+        let Some(session) = &self.c.session else { return Ok(out) };
+        let id = session
+            .report(rargo_proto::FutureReport {
+                path: tr.path(&format!("{}/.future-incompat-report.json", plan.build_dir)),
+                per_package: per_package.into_iter().collect(),
+                suggestion,
+            })
+            .await?;
+        if plan.future_incompat_report {
+            for s in &suggestions {
+                out.push(('h', s.replace(rargo_proto::REPORT_ID, &id.to_string())));
+            }
+            out.push(('n', format!("this report can be shown with `cargo report future-incompatibilities --id {id}`")));
+        } else if plan.future_incompat_display {
+            out.push((
+                'n',
+                format!(
+                    "to see what the problems were, use the option `--future-incompat-report`, \
+                     or run `cargo report future-incompatibilities --id {id}`"
+                ),
+            ));
+        } else {
+            out.clear();
+        }
+        Ok(out)
+    }
+
     /// One line of rustc or rustdoc stderr (cargo's `on_stderr_line_inner`).
     fn compiler_line(&self, i: usize, line: &str, live: Option<&dyn Live>) {
         let plan = self.plan();
@@ -1932,10 +2096,14 @@ impl Run {
             self.c.out.err_text(&format!("{line}\n"));
             return;
         };
-        if v.get("future_incompat_report").is_some() {
-            // cargo collects these into a report file and a closing
-            // warning; rargo gives the warning.
-            self.ui.lock().future_incompat.insert(u.pkg.clone());
+        if let Some(items) = v.get("future_incompat_report") {
+            // Collected into the report file and a closing warning, as
+            // cargo does (`future_incompat_summary`).
+            let rendered: Vec<String> = items
+                .as_array()
+                .map(|a| a.iter().filter_map(|it| it["diagnostic"]["rendered"].as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default();
+            self.ui.lock().future_incompat.insert(i, rendered);
             return;
         }
         let is_summary = |m: &str| {
@@ -2001,6 +2169,7 @@ impl Run {
                         let ents = vec![(artifact.as_bytes().to_vec(), entry)];
                         self.layer.add(i as u32, LEVEL_META, &ents);
                         self.early.lock().entry(i).or_default().extend(ents);
+                        self.times.lock()[i].meta = Some(std::time::Instant::now());
                         self.states[i].send_replace(UState::Meta);
                     }
                 }

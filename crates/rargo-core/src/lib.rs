@@ -25,5 +25,6 @@ pub mod snapshot;
 pub mod sandboxfs;
 pub mod sched;
 pub mod store;
+pub mod timings;
 pub mod trace;
 pub mod view;

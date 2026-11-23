@@ -1,7 +1,7 @@
 From 1c522eade86d5d5ef7a0202482808f67b74765e2 Mon Sep 17 00:00:00 2001
 From: rargo <rargo@localhost>
 Date: Mon, 23 Nov 2026 08:49:40 +0100
-Subject: [PATCH 7/7] rargo: lint data may span several environment variables
+Subject: [PATCH 7/8] rargo: lint data may span several environment variables
 
 ---
  src/compiler/rargo.rs | 2 +-
