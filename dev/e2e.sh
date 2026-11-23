@@ -221,8 +221,9 @@ start=$(date +%s%N)
 out=$("$R" build 2>&1); rc=$?
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 after=$(runs)
-[ "$(asked_files)" = "$files" ] && ok "the second worktree uploaded no file contents" || bad "the second worktree uploaded no file contents" "before=$files after=$(asked_files)"
-[ $(( $(asked_trees) - trees )) -le 2 ] && ok "and at most the root manifest ($(( $(asked_trees) - trees )) manifests; it has no junk/ directory)" || bad "the second worktree uploaded at most the root manifest" "before=$trees after=$(asked_trees)"
+# Its branch is another one: what stands in for .git differs in HEAD.
+[ $(( $(asked_files) - files )) -eq 1 ] && ok "the second worktree uploaded one file: the HEAD naming its branch" || bad "the second worktree uploaded one file: the HEAD naming its branch" "before=$files after=$(asked_files)"
+[ $(( $(asked_trees) - trees )) -le 4 ] && ok "and $(( $(asked_trees) - trees )) directory manifests (the root and those on the way to its branch)" || bad "the second worktree uploaded only the manifests on the way to its branch" "before=$trees after=$(asked_trees)"
 [ $rc -eq 0 ] && [ "$before" = "$after" ] && ok "second worktree built with zero actions in ${ms}ms" || bad "second worktree built with zero actions" "rc=$rc before=$before after=$after
 $out"
 [ "$(stat -c %i "$A/target/debug/app")" = "$(stat -c %i "$B/target/debug/app")" ] && ok "artifact shares an inode with the first worktree (no extra disk)" || {
@@ -540,6 +541,57 @@ expect "a build with an excluded directory" "$R" build
 [ $(( $(asked_files) - files )) -eq 1 ] && ok "only the policy file itself was uploaded, not the excluded directory" || bad "only the policy file itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
 rm -rf .rargo.toml big-data
 expect "without the policy file the workspace builds again" "$R" build
+
+echo "== build scripts that ask git about HEAD"
+G=$T/g
+mkdir -p "$G/src"
+printf '[package]\nname = "gitinfo"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$G/Cargo.toml"
+cat >"$G/build.rs" <<'EOF'
+use std::process::Command;
+fn git(args: &[&str]) -> String {
+    match Command::new("git").args(args).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => "none".into(),
+    }
+}
+fn main() {
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rustc-env=G_HEAD={}", git(&["rev-parse", "HEAD"]));
+    println!("cargo:rustc-env=G_BRANCH={}", git(&["rev-parse", "--abbrev-ref", "HEAD"]));
+    println!("cargo:rustc-env=G_SUBJECT={}", git(&["log", "-1", "--format=%s"]));
+    println!("cargo:rustc-env=G_DESCRIBE={}", git(&["describe", "--always", "--dirty"]));
+    println!("cargo:rustc-env=G_COUNT={}", git(&["rev-list", "--count", "HEAD"]));
+}
+EOF
+cat >"$G/src/main.rs" <<'EOF'
+fn main() {
+    println!("{}|{}|{}|{}|{}", env!("G_HEAD"), env!("G_BRANCH"), env!("G_SUBJECT"), env!("G_DESCRIBE"), env!("G_COUNT"));
+}
+EOF
+printf '/target\n' >"$G/.gitignore"
+git -C "$G" init -q -b trunk && git -C "$G" add -A && git -C "$G" -c user.name=t -c user.email=t@t commit -q -m "first commit"
+cd "$G"
+"$R" build >/dev/null 2>&1   # writes Cargo.lock
+git -C "$G" add -A && git -C "$G" -c user.name=t -c user.email=t@t commit -q -m "second commit"
+head1=$(git -C "$G" rev-parse HEAD)
+out=$("$R" run -q 2>&1); rc=$?
+[ $rc -eq 0 ] && [ "$out" = "$head1|trunk|second commit|${head1:0:7}|1" ] && ok "the build script saw HEAD, the branch and a clean tree, and no history ($out)" || bad "the build script saw HEAD, the branch and a clean tree, and no history" "$out"
+[ -d "$G/.git/objects" ] && ok "the client's own .git is untouched" || bad "the client's own .git is untouched"
+echo "// dirty" >>src/main.rs
+out=$("$R" run -q 2>&1)
+has "$out" "|${head1:0:7}-dirty|" && ok "an uncommitted edit shows as dirty" || bad "an uncommitted edit shows as dirty" "$out"
+git -C "$G" -c user.name=t -c user.email=t@t commit -q -am "third commit"
+head2=$(git -C "$G" rev-parse HEAD)
+out=$("$R" run -q 2>&1)
+[ "$out" = "$head2|trunk|third commit|${head2:0:7}|1" ] && ok "a new commit is picked up" || bad "a new commit is picked up" "$out"
+size=$(du -sk "$RARGO_CACHE_DIR"/git/* | sort -n | tail -1 | cut -f1)
+[ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built)" || bad "what stands in for .git on the server is small" "${size} KiB"
+printf '[sync]\ngit = false\n' >.rargo.toml
+out=$("$R" run -q 2>&1)
+[ "$out" = "none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
+mv .rargo.toml "$T/unused-policy"
+out=$(CARGO_TARGET_DIR="$T/stock-g" cargo run -q --offline 2>&1)
+has "$out" "$head2|trunk|third commit|${head2:0:7}|" && ok "stock cargo on the client agrees about HEAD ($out)" || bad "stock cargo on the client agrees about HEAD" "$out"
 
 echo
 "$R" --rargo-status
