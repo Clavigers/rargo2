@@ -225,14 +225,18 @@ it (decisions D22 to D24).
   store per compiler): after the first commit, 350 actions with the fork
   against 351 with stock 1.100.0. Real commits add or remove lines, which
   changes the hash by design. With the fork's slower (non-PGO) compiler the
-  replay took 634 s against 375 s. The swarm run with body-only edits below
-  is the favourable case.
+  replay took 634 s against 375 s. In the favourable case, the 20-agent
+  swarm with body-only second edits, it still loses: 139.3 s wall and
+  1,749 CPU-s against 109.1 s and 1,455 CPU-s for stock 1.100.0 under
+  rargo.
 - **Separately cached metadata and codegen.** `check` with the fork runs the
   build's own compiler commands with `-Zno-codegen` (byte-identical
   metadata to the full build, verified), so a check after a build or test
   is free: on rust-analyzer 0.03 s instead of a 31 s cold check. The first
   check of a crate costs more (47 s against 31 s cold), and a build after a
-  check gains little (55 s against 58 s).
+  check gains little (55 s against 58 s). In the swarm it loses (166.8 s,
+  54.2 GB against 139.3 s, 39.4 GB with cargo-style check), so it is off by
+  default and opt-in with `RARGO_CHECK_AS_BUILD=1`.
 - **Per-codegen-unit object caching.** Not a separate mechanism: rustc's
   incremental work products plus the file-level store already keep each
   object file once (2.6 GiB logical, 0.23 GiB stored in the Ruff swarm). The

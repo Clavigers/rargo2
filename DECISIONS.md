@@ -330,8 +330,12 @@ patches on rustc 1.100.0 (`forks/rust`).
   first: 350 actions with the fork, 351 without (one commit saved one
   action). Real commits add or remove lines, and line numbers are in the
   hash on purpose. The fork is not recommended for speed; it stays
-  available, optional, for the other two patches and for `check` as a
+  available, optional, for the other patches and for `check` as a
   build (D23). Making line numbers leave the hash would require that no
+  The swarm with body-only second edits (its favourable case, D23)
+  agrees: stock 1.100.0 under rargo 109.1 s wall and 1,455 CPU-s, the fork
+  139.3 s and 1,749 CPU-s; the fork's slower compiler outweighs what it
+  saves.
   dependent's output contain a dependency's line numbers (inlined code's
   debug info and panic locations do), so it was not attempted.
 - **rargo observes fork metadata by crate hash.** An `.rmeta` whose header
@@ -390,7 +394,13 @@ includes optimised MIR for generic and inlinable functions, which
 and a build after a check gains almost nothing, because rustc cannot resume
 code generation from a metadata-only compile of a crate. See STATUS for
 which way the default was set and the swarm numbers behind it.
-`RARGO_CHECK_AS_BUILD=0` (or `=1`) overrides per request.
+
+**Default: off** (`RARGO_CHECK_AS_BUILD=1` turns it on per request). The
+20-agent rust-analyzer swarm with body-only second edits, fork compiler
+both times (`dev/bench-fork.sh`): check as a build 166.8 s wall, 1,941
+CPU-s, 54.2 GB; cargo-style check 139.3 s, 1,749 CPU-s, 39.4 GB. Every
+agent checks before it builds, so the costlier first checks are paid many
+times and the free check-after-build rarely comes up.
 
 Not done, and why: making the metadata-only compile's incremental state a
 seed for the full compile (so that a build after a check only generates
