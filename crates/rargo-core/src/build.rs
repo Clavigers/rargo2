@@ -1572,9 +1572,20 @@ impl Run {
                     format!("{}: cached as a success, but a clean run fails ({})", u.desc, describe_status(clean.result.status)),
                     Vec::new(),
                 ));
-            } else if u.kind == rp::UnitKind::RunScript
-                && self.d.store().read(&outcome.result.stdout).ok() != self.d.store().read(&clean.result.stdout).ok()
-            {
+            } else if u.kind == rp::UnitKind::RunScript && {
+                // Compared as cargo reads it (the parsed instructions), not
+                // byte for byte: build scripts also print chatter that
+                // differs between runs and that cargo ignores.
+                let parsed = |h: &Hash| -> Option<String> {
+                    let out = self.d.store().read(h).ok()?;
+                    let s = u.script.as_ref()?;
+                    match &*self.d.parser.parse(s, &out) {
+                        Ok(o) => Some(format!("{o:?}")),
+                        Err(e) => Some(format!("error: {e}")),
+                    }
+                };
+                parsed(&outcome.result.stdout) != parsed(&clean.result.stdout)
+            } {
                 // What a build script prints is what cargo acts on.
                 self.verify_mismatches
                     .lock()
@@ -2220,7 +2231,11 @@ impl Run {
         let (uid, gid) = (self.c.uid, self.c.gid);
         tokio::task::spawn_blocking(move || -> Result<()> {
             for (hash, exec, dest) in stale {
-                if store.is_linked(&hash, exec, &dest) {
+                // A link into the store, or any read-only file (an earlier
+                // rargo's link into a store since cleared): rustc would
+                // refuse to write over it, and it writes this path anyway.
+                let read_only = std::fs::metadata(&dest).map(|m| m.mode() & 0o222 == 0).unwrap_or(false);
+                if read_only || store.is_linked(&hash, exec, &dest) {
                     let _ = std::fs::remove_file(&dest);
                 }
             }
