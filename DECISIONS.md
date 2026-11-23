@@ -579,3 +579,36 @@ dispatcher keeps most actions local because their inputs (the metadata of
 every crate an edit touched, tens to hundreds of MB per compile in
 rust-analyzer) take as long to ship over 1 Gbit as waiting for a local
 core. That is the dispatcher being right, not wrong.
+
+## D32. What rargo leaves in `target/`, so that stock cargo keeps working
+
+Found by the no-drift run (`dev/nodrift.sh`): after rargo had built and
+tested rust-analyzer, Ruff and Bevy, stock `cargo build` worked but stock
+`cargo test` failed in all three: "output file ... is not writeable". rargo
+had placed test executables at their own paths inside the build directory
+as hard links into the store; store files are read-only, and the mode
+belongs to the shared inode. A writable link would have been worse: rustc
+would then have written into a store file other worktrees share.
+
+- Names cargo itself links (`target/debug/app`, `libfoo.rlib`, the
+  `--artifact-dir` copies) stay hard links into the store: cargo removes the
+  old file before it links a new one, so it never writes into them.
+- An executable at the path rustc writes it to is placed only when the
+  user asked for executables (`test --no-run`, `build --tests`), and then
+  as a file of its own (a reflink where the filesystem has them, a copy
+  otherwise), owned by the user. When rargo runs the tests itself they are
+  not placed, and a store link left at that path by an earlier rargo is
+  removed.
+- Generated documentation is placed as files of their own too: rustdoc
+  rewrites its shared files in place.
+- e2e now runs stock `cargo test` and `cargo doc` after rargo in the same
+  `target/`.
+
+The drift check on Ruff also reported `tikv-jemalloc-sys`'s build script as
+producing different output on a clean run: autoconf's `config.log` in
+OUT_DIR, which records times and process ids and which nothing reads. A
+verify difference now counts only if some unit of the build read one of
+the differing files (looked up in the units' traces, under the keys with
+declared variables folded in); otherwise it is reported as a note. What a
+build script prints to cargo is now compared as well, which it was not
+before.
