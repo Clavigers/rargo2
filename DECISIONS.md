@@ -323,6 +323,17 @@ patches on rustc 1.100.0 (`forks/rust`).
   the line numbers of everything after them; adding a line inside a body
   still changes it, and has to, because dependents bake line numbers of
   inlined and generic code into their own output.
+- **Measured on real history, it does not pay.** `dev/replay.py` moved a
+  worktree through the last 30 first-parent commits of rust-analyzer and ran
+  `rargo build -p rust-analyzer` at each, once with the fork and once with
+  stock 1.100.0, each with a fresh store. Over the 29 commits after the
+  first: 350 actions with the fork, 351 without (one commit saved one
+  action). Real commits add or remove lines, and line numbers are in the
+  hash on purpose. The fork is not recommended for speed; it stays
+  available, optional, for the other two patches and for `check` as a
+  build (D23). Making line numbers leave the hash would require that no
+  dependent's output contain a dependency's line numbers (inlined code's
+  debug info and panic locations do), so it was not attempted.
 - **rargo observes fork metadata by crate hash.** An `.rmeta` whose header
   carries the fork's marker byte is recorded in traces as its crate hash
   instead of its content hash (`Content::metadata_identity`). Bytes still

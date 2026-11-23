@@ -219,8 +219,14 @@ it (decisions D22 to D24).
   design (line numbers of inlined and generic code end up in dependents).
   A dependent compiled against the old and the new `.rmeta` produced
   byte-identical metadata; a diagnostic pointing into the edited crate
-  showed the right line. The effect on real history is being measured by
-  replaying 30 rust-analyzer commits with each compiler (`dev/replay.py`).
+  showed the right line.
+  **On real history it buys nothing.** Replaying the last 30 rust-analyzer
+  commits (`dev/replay.py`, `rargo build -p rust-analyzer` at each, fresh
+  store per compiler): after the first commit, 350 actions with the fork
+  against 351 with stock 1.100.0. Real commits add or remove lines, which
+  changes the hash by design. With the fork's slower (non-PGO) compiler the
+  replay took 634 s against 375 s. The swarm run with body-only edits below
+  is the favourable case.
 - **Separately cached metadata and codegen.** `check` with the fork runs the
   build's own compiler commands with `-Zno-codegen` (byte-identical
   metadata to the full build, verified), so a check after a build or test
