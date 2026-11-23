@@ -134,6 +134,16 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, user: String, admin: bool) {
         };
         let Some(raw) = raw else { break };
         let Ok(frame) = crate::proto::decode::<Frame<ClientMsg>>(&raw) else { break };
+        if frame.stream == crate::proto::KEEPALIVE {
+            if let ClientMsg::Ping(n) = frame.msg {
+                let pong = crate::proto::encode(&Frame { stream: crate::proto::KEEPALIVE, seq: 0, msg: ServerMsg::Pong(n) });
+                let link = link.clone();
+                tokio::spawn(async move {
+                    let _ = link.send(&pong).await;
+                });
+            }
+            continue;
+        }
         for (stream, msg) in order.push(frame) {
             let msg = match msg {
                 ClientMsg::Packed(z) => match crate::proto::unpack(&z).and_then(|b| crate::proto::decode(&b)) {

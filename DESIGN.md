@@ -51,17 +51,24 @@ worktree contains, sends what the server does not have yet, and gets back
 output and the artifacts it asked for.
 
 ```
-machine 1: worktree A ─ rargo ─┐              ┌─ worktree states (synced trees)
-machine 1: worktree B ─ rargo ─┤   encrypted  ├─ analysis (cargo, memoized)
-machine 2: worktree C ─ rargo ─┼─── TCP ───── rargod ─ scheduler (all cores, all memory)
-   ...                         │              ├─ sandboxed, traced actions ── workers
-machine n: worktree Z ─ rargo ─┘              └─ content store + trace cache
+machine 1: worktree A ─ rargo ─┐                             ┌─ worktree states (synced trees)
+machine 1: worktree B ─ rargo ─┼─ client daemon ─┐ encrypted ├─ analysis (cargo, memoized)
+machine 2: worktree C ─ rargo ─── client daemon ─┼── UDP ─── rargod ─ scheduler (all cores, all memory)
+   ...                                           │ sessions  ├─ sandboxed, traced actions ── workers
+machine n: worktree Z ─ rargo ─── client daemon ─┘           └─ content store + trace cache
 ```
 
-The client is deliberately dumb. It does not parse manifests, resolve
-dependencies, know what a crate is, or keep a daemon running. It does three
-things: describe a directory by content, pass on an allow-listed
-environment, and put files where it is told.
+The client side is deliberately dumb. It does not parse manifests, resolve
+dependencies or know what a crate is. It does three things: describe a
+directory by content, pass on an allow-listed environment, and put files
+where it is told. Those three things are done by a **client daemon**, one
+per user and server on a machine, which the first `rargo` command starts
+and every later one talks to over a Unix socket. The daemon exists for the
+link, not for the build: it holds one long-lived session to the server, so
+that no command pays for a connection, a key agreement or a slow start,
+and it watches the worktrees it has seen, so that a change is on the
+server before anyone asks for a build (see "The client daemon and its
+link").
 
 An **action** is one process the build needs: a rustc invocation, a build
 script run, a link, a test binary run. Every action runs on the server (or
@@ -82,8 +89,9 @@ ever declared.
   flake, the sandbox is restricted to that closure instead, which is
   stricter and stable across servers.
 - **Platform.** The server is Linux, x86_64 first. The client is plain
-  code that reads files and speaks TCP; it is only tested on Linux, and
-  what it brings back are Linux binaries.
+  code that reads files and speaks to one socket; it watches worktrees
+  with inotify and is only tested on Linux, and what it brings back are
+  Linux binaries.
 
 ## Mechanisms
 
@@ -96,13 +104,28 @@ root manifest therefore names the whole worktree state; two worktrees share
 every subtree they have in common; after an edit only the manifests on the
 path to the edited file are new.
 
-A command starts by scanning the worktree. The client keeps an index of
-what it hashed last time (size, times, inode), so a scan is one `lstat` per
-file plus reading what changed. It sends the root hash. The server walks
-down from it, asks for the manifests it has never seen, then for the file
-contents its store lacks, and the client uploads exactly those. For a
-second worktree at a commit the server has seen, that is nothing; after a
-one-line edit it is one file and a handful of manifests.
+The daemon scans a worktree when it first sees it and whenever its
+watcher (inotify on every synced directory) says something changed. It
+keeps an index of what it hashed last time (size, times, inode), so a scan
+is one `lstat` per file plus reading what changed; a worktree without an
+event since its last scan is not scanned at all. The watcher only says
+*that* something changed. If it cannot vouch for a worktree (events were
+dropped, a directory could not be watched), the worktree is scanned for
+every command, as a client without a watcher would.
+
+Changes are pushed, not pulled. The daemon remembers what the server holds
+(what it sent, and what the server said it had) and after an edit sends,
+in one message and without being asked, the changed files and the
+manifests on their paths. It does so as the change happens, so a build
+usually finds the server up to date; a build started in the same instant
+sends the change ahead of the request on the same ordered channel. Sync
+therefore costs no round trip of its own. A worktree the daemon has not
+seen before is different: most of it is probably on the server already
+(another agent's checkout of the same commit), so the daemon sends its
+manifests and asks, once, which file contents are missing. What the
+daemon believes is only ever a hint: the request names the root hash, the
+server checks that it holds the whole tree and asks for anything it lacks
+(after a garbage collection, say), level by level as before.
 
 Everything in the worktree is synced except `.git`, cargo's own output
 directories, and what the repo's policy file excludes. Whether git ignores
@@ -268,6 +291,14 @@ States are large and are only an optimisation, so they are evicted freely.
 If rustc crashes with a seed, the action is retried without one and that
 state is discarded.
 
+A compile that ran on a worker leaves its state there. The state is
+recorded at once, with its files still on the worker; they come home in
+the background on idle cores, or at once when a compile on the server
+starts from them. A later compile of the crate is offered to the worker
+that holds the state it would start from and uses it in place. A state
+whose files were lost with a worker is forgotten; the next best one is
+used.
+
 ### Workers
 
 An action is already self-contained: a command, a snapshot, and a filesystem
@@ -282,6 +313,37 @@ missing, predicted from the action's previous trace. The scheduler sends an
 action to a worker when the server's cores are the bottleneck and the
 transfer is cheaper than the wait.
 
+### The client daemon and its link
+
+One daemon per user and server on a client machine, started by the first
+`rargo` command and gone after half an hour without one. `rargo` itself
+only passes its arguments, directory and environment to the daemon over a
+Unix socket and relays output and the exit code; an interrupted command
+closes the socket, and the daemon withdraws the request from the server.
+
+The daemon holds one session to the server on the reliable-UDP transport
+that also carries the worker links: messages cut into datagrams,
+acknowledged and retransmitted individually, so a lost datagram delays
+its own message and nothing else. A session is known by its id, not by
+the client's address: a datagram that proves to be the session's moves
+the session to wherever it came from, so a laptop that changes networks
+keeps its session, and a keepalive every ten seconds holds a NAT's
+mapping open. The congestion window and the round-trip estimate live as
+long as the session. Every command is a stream of the session; one more
+stream carries what the daemon does on its own (pushing changes).
+Where UDP does not get through, the daemon uses one long-lived TCP
+connection with the same messages on it.
+
+Round trips are what a slow link charges for, so the protocol asks as
+little as it can. A request arrives with its worktree already there.
+Results are delivered without a question: the server remembers, per
+worktree, what it has delivered, the daemon confirms with a token that it
+placed all of it, and from then on the server sends the contents the
+worktree lacks along with the listing. Whatever the daemon still lacks
+(its cache was pruned, the server was restarted and remembers nothing)
+it fetches, which costs a round trip only then. A build with nothing to
+do is one message each way.
+
 ### Tests
 
 A test binary run is an action like any other. If nothing it read has
@@ -291,8 +353,10 @@ compile caching. `--no-cache` forces a real run.
 
 ### Who may connect
 
-A client proves who it is with a key shared with the server, one per user;
-the connection is encrypted with fresh keys per connection. The server
+A client daemon proves who it is with a key shared with the server, one
+per user; its session is encrypted with fresh keys per session, and after
+the key agreement every datagram carries a tag only the two ends can make,
+so nobody else can move or disturb a session. The server
 trusts its users with each other's work: they share one cache. It is a team
 tool, not a public service.
 
@@ -315,9 +379,14 @@ cargo.
 
 ## Risks
 
-- **The link.** Every command pays for a connection, a scan and a round
-  trip; a first sync pays for the repo, and a big binary has to come back.
-  Measured in `STATUS.md`.
+- **The link.** Every command pays for a round trip; a first sync pays
+  for the repo, and a big binary has to come back. Measured in
+  `STATUS.md`, on a LAN and with 100 ms of round-trip time.
+- **A daemon on every client machine** is one more thing that can be
+  stale or stuck. It is keyed by server, user, key and program version,
+  so a new configuration or version gets a new one; a command that cannot
+  reach or start one runs without it (`RARGO_NO_DAEMON=1` forces that),
+  slower and correct.
 - **FUSE overhead** on rustc's many small reads. Measured; the fallback is a
   forked rustc that reports its own inputs.
 - **Cargo's library API is unstable** and does not route build-script

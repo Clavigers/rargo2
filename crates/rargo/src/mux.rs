@@ -15,12 +15,14 @@ const WINDOW: usize = 32 << 20;
 /// A keepalive this often keeps a NAT's mapping alive and tells the server
 /// where the client is now.
 const PING_EVERY: Duration = Duration::from_secs(10);
-/// No answer for this long: the link is dead.
+/// Nothing heard for this long: the link is dead.
 const DEAD_AFTER: Duration = Duration::from_secs(45);
 
 struct Out {
     seq: u64,
     tx: UnboundedSender<(Vec<u8>, usize)>,
+    /// Keepalives: sent ahead of whatever is queued.
+    urgent: UnboundedSender<Vec<u8>>,
 }
 
 pub struct Mux {
@@ -39,7 +41,8 @@ pub struct Mux {
     dead: AtomicBool,
     /// Woken when the link dies.
     pub gone: tokio::sync::Notify,
-    last_pong: Mutex<Instant>,
+    /// When the server was last heard from (any frame).
+    last_heard: Mutex<Instant>,
     pub bytes_out: AtomicU64,
     pub bytes_in: AtomicU64,
 }
@@ -48,9 +51,10 @@ impl Mux {
     pub fn new(link: Link) -> Arc<Mux> {
         let link = Arc::new(link);
         let (tx, mut rx) = unbounded_channel::<(Vec<u8>, usize)>();
+        let (urgent, mut urgent_rx) = unbounded_channel::<Vec<u8>>();
         let mux = Arc::new(Mux {
             link: link.clone(),
-            out: Mutex::new(Out { seq: 0, tx }),
+            out: Mutex::new(Out { seq: 0, tx, urgent }),
             window: Arc::new(Semaphore::new(WINDOW)),
             streams: Mutex::new(HashMap::new()),
             next_stream: AtomicU32::new(1),
@@ -59,14 +63,25 @@ impl Mux {
             sent: Mutex::new(HashSet::new()),
             dead: AtomicBool::new(false),
             gone: tokio::sync::Notify::new(),
-            last_pong: Mutex::new(Instant::now()),
+            last_heard: Mutex::new(Instant::now()),
             bytes_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
         });
         // Writer: frames leave in the order they were queued.
         let m = mux.clone();
         tokio::spawn(async move {
-            while let Some((frame, bulk)) = rx.recv().await {
+            loop {
+                let (frame, bulk) = tokio::select! {
+                    biased;
+                    u = urgent_rx.recv() => match u {
+                        Some(f) => (f, 0),
+                        None => break,
+                    },
+                    f = rx.recv() => match f {
+                        Some(f) => f,
+                        None => break,
+                    },
+                };
                 m.bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
                 let sent = m.link.send(&frame).await;
                 if bulk > 0 {
@@ -84,7 +99,11 @@ impl Mux {
             let mut order: Reorder<ServerMsg> = Reorder::new(true);
             while let Some(raw) = m.link.recv().await {
                 m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
+                *m.last_heard.lock().unwrap() = Instant::now();
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
+                if frame.stream == rargo_proto::KEEPALIVE {
+                    continue;
+                }
                 for (stream, msg) in order.push(frame) {
                     let msg = match msg {
                         ServerMsg::Packed(z) => match rargo_proto::unpack(&z).and_then(|b| rargo_proto::decode(&b)) {
@@ -119,12 +138,13 @@ impl Mux {
                 if m.is_dead() {
                     break;
                 }
-                if m.last_pong.lock().unwrap().elapsed() > DEAD_AFTER {
+                if m.last_heard.lock().unwrap().elapsed() > DEAD_AFTER {
                     m.die();
                     break;
                 }
                 n += 1;
-                m.post(CONTROL, &ClientMsg::Ping(n));
+                let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
+                let _ = m.out.lock().unwrap().urgent.send(ping);
             }
         });
         mux
@@ -153,7 +173,6 @@ impl Mux {
 
     fn control(&self, msg: ServerMsg) {
         match msg {
-            ServerMsg::Pong(_) => *self.last_pong.lock().unwrap() = Instant::now(),
             ServerMsg::Missing { id, trees, blobs } => {
                 if let Some(tx) = self.missing.lock().unwrap().remove(&id) {
                     let _ = tx.send((trees, blobs));

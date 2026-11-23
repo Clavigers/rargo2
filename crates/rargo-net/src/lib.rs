@@ -9,8 +9,12 @@
 //! and bulk transfers in flight at once. Delivery order between messages is
 //! arrival order; the RPC layer above matches replies to requests by id.
 //!
-//! Congestion control is deliberately simple (slow start, additive
-//! increase, halving on timeout). A connection lives as long as its two
+//! Congestion control: a window that doubles per round trip until round
+//! trips get longer or something is lost (slow start), then grows by a
+//! twentieth per round trip and shrinks by three tenths on a loss. What the
+//! window allows is sent spread over the round trip, not at once: a burst
+//! of thousands of datagrams overflows the queue of whatever shapes the
+//! link, and the losses that follow cost more than the pacing. A connection lives as long as its two
 //! ends do: its window and round-trip estimate carry over from one command
 //! to the next, so nothing after the first exchange pays for a handshake
 //! or a slow start. A peer is known by its connection id, not its address:
@@ -40,7 +44,7 @@ const INIT_CWND: f64 = 64.0;
 const MIN_CWND: f64 = 8.0;
 const MAX_CWND: f64 = 8192.0;
 /// Unsent bytes a connection buffers before `send` waits.
-const SEND_BUFFER: usize = 32 << 20;
+const SEND_BUFFER: usize = 8 << 20;
 
 #[derive(Default)]
 pub struct NetStats {
@@ -71,6 +75,8 @@ const LOSS_BETA: f64 = 0.7;
 /// keeps a path with random loss far below its rate; this is a private
 /// build network, so more aggressive growth is fine.
 const GROWTH: f64 = 8.0;
+/// Fragments that may leave together however slow the pace.
+const PACE_BURST: u32 = 16;
 
 struct SendState {
     next_msg: u64,
@@ -83,6 +89,10 @@ struct SendState {
     srtt: Option<Duration>,
     rttvar: Duration,
     last_cut: Instant,
+    /// The shortest round trip seen: longer ones mean a queue is building.
+    min_rtt: Option<Duration>,
+    /// When the next fragment may leave (pacing).
+    next_send: Instant,
     next_seq: u64,
     /// Highest `seq` acknowledged so far.
     high_acked: u64,
@@ -213,6 +223,8 @@ impl Conn {
                 srtt: None,
                 rttvar: Duration::from_millis(50),
                 last_cut: Instant::now(),
+                min_rtt: None,
+                next_send: Instant::now(),
                 next_seq: 1,
                 high_acked: 0,
             }),
@@ -262,6 +274,22 @@ impl Conn {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The sender's state in a line, for diagnosis.
+    pub fn sender_state(&self) -> String {
+        let s = self.send.lock();
+        format!(
+            "window {:.0} (slow start below {:.0}), {} in flight, {} KiB queued, round trip {:?} (shortest {:?}), {} sent, {} retransmitted",
+            s.cwnd,
+            s.ssthresh,
+            s.inflight.len(),
+            s.queued_bytes >> 10,
+            s.srtt,
+            s.min_rtt,
+            self.stats.sent_packets.load(Ordering::Relaxed),
+            self.stats.retransmits.load(Ordering::Relaxed)
+        )
     }
 
     /// Current smoothed round-trip time, if measured.
@@ -402,7 +430,11 @@ impl Conn {
 
     fn rto(s: &SendState) -> Duration {
         match s.srtt {
-            Some(srtt) => (srtt + 4 * s.rttvar).clamp(MIN_RTO, MAX_RTO),
+            // Headroom over the round trip even when it never varies (a
+            // steady link has no variance to speak of, and acknowledgements
+            // are sent in batches): otherwise ordinary acknowledgements
+            // arrive "late" and every round trip looks like a loss.
+            Some(srtt) => (srtt + (4 * s.rttvar).max(srtt / 2).max(Duration::from_millis(5))).clamp(MIN_RTO, MAX_RTO),
             None => Duration::from_millis(200),
         }
     }
@@ -459,10 +491,28 @@ impl Conn {
             let mut batch: Vec<(u64, u32, u32, Arc<[u8]>)> = Vec::new();
             let mut resend: Vec<(u64, u32, u32, Arc<[u8]>)> = Vec::new();
             let next_deadline;
+            let mut pace_until: Option<Instant> = None;
             {
                 let mut s = self.send.lock();
                 let now = Instant::now();
                 let rto = Self::rto(&s);
+                // Pacing: the window's worth leaves spread over a round
+                // trip (twice as fast while the window is still being
+                // found), at most a couple of milliseconds' worth at once.
+                // Retransmissions are paced like everything else: sent as
+                // one burst they would be lost the way the originals were.
+                let gain = if s.cwnd < s.ssthresh { 2.0 } else { 1.25 };
+                let per_sec = s.cwnd * gain / s.srtt.map_or(0.05, |d| d.as_secs_f64()).max(0.0005);
+                let interval = Duration::from_secs_f64(1.0 / per_sec);
+                let burst = ((per_sec * 0.002) as u32).max(PACE_BURST);
+                let earliest = now.checked_sub(interval * burst).unwrap_or(now);
+                if s.next_send < earliest {
+                    s.next_send = earliest;
+                }
+                let budget =
+                    if now >= s.next_send { (now.duration_since(s.next_send).as_secs_f64() * per_sec) as u32 + 1 } else { 0 };
+                let budget = budget.min(burst);
+                let mut more_due = false;
                 // Retransmit what has timed out.
                 let mut timed_out = false;
                 let mut fast_lost = false;
@@ -472,7 +522,9 @@ impl Conn {
                 for ((m, f), inf) in s.inflight.iter_mut() {
                     let due = inf.sent_at + rto * (1 << inf.retries.min(5));
                     let overtaken = high_acked >= inf.seq + REORDER;
-                    if overtaken || due <= now {
+                    if (overtaken || due <= now) && resend.len() as u32 >= budget {
+                        more_due = true;
+                    } else if overtaken || due <= now {
                         inf.sent_at = now;
                         inf.retries += 1;
                         inf.seq = seq;
@@ -497,13 +549,27 @@ impl Conn {
                     s.cwnd = s.ssthresh;
                     s.last_cut = now;
                 }
+                let budget = budget.saturating_sub(resend.len() as u32);
+                let mut sent_new = 0u32;
                 while (s.inflight.len() as f64) < s.cwnd {
+                    if sent_new >= budget {
+                        if !s.queue.is_empty() {
+                            pace_until = Some(s.next_send + interval * (sent_new + resend.len() as u32 + 1));
+                        }
+                        break;
+                    }
+                    sent_new += 1;
                     let Some((m, f, n, data)) = s.queue.pop_front() else { break };
                     s.queued_bytes = s.queued_bytes.saturating_sub(data.len());
                     let seq = s.next_seq;
                     s.next_seq += 1;
                     s.inflight.insert((m, f), Inflight { data: data.clone(), nfrags: n, sent_at: now, retries: 0, seq });
                     batch.push((m, f, n, data));
+                }
+                let sent = sent_new.min(batch.len() as u32) + resend.len() as u32;
+                s.next_send += interval * sent;
+                if more_due {
+                    pace_until = Some(s.next_send);
                 }
                 next_deadline = soonest.or_else(|| (!s.inflight.is_empty()).then(|| now + rto));
             }
@@ -517,9 +583,13 @@ impl Conn {
             for (m, f, n, data) in &batch {
                 self.transmit(*m, *f, *n, data).await;
             }
-            if !batch.is_empty() || !resend.is_empty() {
+            if (!batch.is_empty() || !resend.is_empty()) && pace_until.is_none() {
                 continue;
             }
+            let next_deadline = match (next_deadline, pace_until) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             match next_deadline {
                 Some(d) => {
                     let wait = d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
@@ -547,11 +617,22 @@ impl Conn {
                         s.srtt = Some((srtt * 7 + sample) / 8);
                     }
                 }
+                let min = s.min_rtt.map_or(sample, |m| m.min(sample));
+                s.min_rtt = Some(min);
+                // Round trips are getting longer: a queue is filling
+                // somewhere. The window has been found; stop doubling it
+                // before the queue overflows.
+                if s.cwnd < s.ssthresh && s.cwnd >= 2.0 * INIT_CWND && sample > min + (min / 8).max(Duration::from_millis(2)) {
+                    s.ssthresh = s.cwnd;
+                }
             }
             if s.cwnd < s.ssthresh {
                 s.cwnd += 1.0;
             } else {
-                s.cwnd += GROWTH / s.cwnd;
+                // A twentieth per round trip, and never less than the
+                // fixed step: on a long round trip a fixed step takes
+                // minutes to make up for one loss.
+                s.cwnd += GROWTH.max(s.cwnd * 0.05) / s.cwnd;
             }
             s.cwnd = s.cwnd.min(MAX_CWND);
         }

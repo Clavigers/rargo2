@@ -1202,3 +1202,151 @@ section table; nothing else is parsed). Anything else that differs is
 still drift. The risk taken: a real difference that happens to look like
 one of the three would be reported as not reproducible instead of as
 drift; it would still be reported.
+
+## D56. A remote compile's incremental state stays on the worker and comes home in the background
+
+The first idea on the list of things not tried (STATUS, Workers). D31
+found that shipping incremental state both ways in the foreground cost
+more than it saved, and D55 therefore kept every workspace crate on the
+server, which is why workers could not help the swarm.
+
+- A compile on a worker sees the crate's state like a local one, and what
+  it leaves is recorded as a state at once, although its files are only
+  on the worker. `IncrStore` accepts a state whose files are in the store
+  or held by a connected worker.
+- Outputs come home in the foreground as before; state files are queued
+  and fetched one at a time on an idle-priority core (putting a file
+  together and hashing it costs CPU the builds are short of).
+  `RARGO_STATE_HOME_AFTER_MS` delays that, for tests.
+- A compile that starts from a state is offered only to workers that hold
+  that state (all but 4 MiB of it). If none does, it runs on the server:
+  a state is never shipped out. A first compile, with no state anywhere,
+  may run on any worker.
+- A compile that runs on the server while part of its state is on a
+  worker fetches that part first (counted in the status text). If the
+  worker has a core free and the server would have to fetch, the worker
+  gets the compile even though a server core is free.
+- The state's directory tree goes with the action, so the compiler's walk
+  over its previous session costs no questions.
+- A state whose files went away with a worker is dropped when it is next
+  picked, or, if the worker dies between pick and run, the action is
+  asked for again with the next best state (`SeedLost`).
+- `RARGO_REMOTE_INCR=0` restores D55; `RARGO_REMOTE_FIRST` is gone.
+
+Found on the way and fixed: requests to a peer were meant to be in flight
+together and were not (the calls were lazy), so every megabyte of an
+output fetched from a worker was its own round trip; a worker lease was
+leaked when a compile with state at home found a free local core; and
+concurrent dispatches each pushed the toolchain to a fresh worker
+(1.8 GB instead of 460 MiB). `dev/e2e-worker.sh` (27 checks) covers
+states left, used in place, fetched in the background and on demand, and
+a worker killed with states on it.
+
+Measured (STATUS has the tables): rust-analyzer cold build, 4 cores per
+machine: 48.8 s with a warm worker and 51.9 s with one that has seen
+nothing, against 56.5 s alone and 44.5 s with 8 local cores; rebuild
+after an edit unchanged. The 20-agent swarm, 8 cores per machine:
+139.9 s with a worker against 176.0 s alone and 122.4 s with 16 local
+cores (before: 182.8, 179.8, 126.4). One agent step failed in that swarm
+run with a compiler error on the worker ("required to be available in
+rlib format"); see STATUS for what is known about it.
+
+## D57. A client daemon and one long-lived session per machine (replaces D35's "no daemon" and D37's "one TCP connection per command")
+
+The user asked for it: no command should pay for connection setup, a key
+agreement or slow start, and a build should find the server already up to
+date.
+
+- **Daemon.** One per user, server, key and program version on a machine
+  (the socket's name is a hash of those, so a changed configuration or a
+  new binary gets its own daemon and the old one leaves when idle).
+  `rargo` starts it if connecting to the socket fails: a detached process
+  in its own session whose output goes to `daemon.log` in the cache
+  directory. The socket is in a 0700 directory beside the cache, or in
+  the runtime directory if that path is too long for a socket address.
+  It exits after 30 minutes without a command
+  (`RARGO_DAEMON_IDLE_SECS`), or when told (`rargo --rargo-daemon-stop`);
+  `rargo --rargo-daemon-status` says what it is doing. If no daemon can
+  be reached or started the command does the daemon's work itself, in
+  process (`RARGO_NO_DAEMON=1` forces that).
+- **`rargo` is a relay.** It decides what is cargo's business (unchanged),
+  sends arguments, directory, terminal flags and its whole environment to
+  the daemon, and prints what comes back. The daemon applies the
+  allow-list and the policy to the environment per command; nothing of
+  the daemon's own environment is used for a build. Closing the socket
+  (Ctrl-C, a closed pipe) withdraws the request on the server.
+- **Transport.** The reliable-UDP layer of the worker link, moved into
+  its own crate (`rargo-net`). For clients a connection names its user in
+  the key agreement (Noise `NNpsk0` under the user's key); from then on
+  every datagram carries a 16-byte tag keyed from the handshake hash.
+  Datagrams without it are accepted for the key agreement only, so an
+  outsider who has seen a connection id can neither inject data nor move
+  the connection. A tagged datagram from a new address moves the
+  connection there. The server listens for UDP on the port it listens
+  for TCP on.
+- **TCP fallback.** If the UDP key agreement gets no answer in 2.5 s the
+  daemon connects by TCP (the old handshake, without a request in it) and
+  uses that one connection for everything. `RARGO_TRANSPORT=udp|tcp`
+  forces one. Rejected: trying both at once and keeping the faster (two
+  sessions to tear down on every start, for a case that is decided once
+  per network).
+- **Streams.** Frames carry a stream number and a sequence number,
+  because the transport delivers messages in arrival order. Client to
+  server there is one order over all streams, so that a request is never
+  looked at before the change sent ahead of it; server to client each
+  stream is ordered by itself, so one command's bulk does not hold up
+  another's output. Stream 0 is the daemon's own.
+- **Keepalive.** A ping every 10 s; no answer for 45 s and the daemon
+  drops the link and makes a new one for the next command. A command that
+  finds its link dead before it has shown anything is retried once on a
+  new link. The server drops a link it has not heard from for 3 minutes.
+- **Watching.** inotify on every directory the scan visits (not `.git`,
+  not output directories). An event marks the worktree dirty and starts,
+  20 ms later, a scan and a push. A command in a worktree that is not
+  dirty and whose HEAD file is unchanged uses the last scan. Adding a
+  watch after scanning a directory leaves a gap, so a scan that added
+  watches is followed by one more. If a watch cannot be added (the
+  per-user limit) the worktree is scanned for every command. Worktrees
+  unused for four hours are dropped from the watcher.
+- One command at a time per worktree places files, as cargo locks its
+  build directory.
+
+Protocol 7. `dev/e2e-link.sh` (33 checks): one daemon and one link over
+many commands, an edit on the server before any command, an edit and a
+build in the same instant, new directories, checkouts, the client's
+address changing under the session, the daemon killed, the server
+restarted, a command interrupted, no daemon, UDP dropped (TCP), and
+stopping.
+
+## D58. Sync and delivery cost no round trips
+
+The user asked that every benchmark that crosses the client link be run
+with 100 ms of round-trip time, and that sync not cost extra round trips.
+
+- **Pushed deltas.** After a change the daemon sends an `Offer`: the
+  manifests it has not sent before and, if the new file contents are
+  under 1 MiB together, those contents, in one message, unasked. Above
+  that (a worktree it sees for the first time, a branch switch) it sends
+  the manifests with `ask`, the server answers with the contents it
+  lacks, and the daemon uploads those: two round trips however deep the
+  tree, where the old walk took one per level. Rejected: pushing a new
+  worktree whole (twenty agents' checkouts of one commit would upload the
+  repository twenty times).
+- The server still verifies: a request names its root, and the server
+  walks the tree it holds and asks for anything missing (D35's dialogue,
+  now the fallback). The daemon's memory of what the server holds is
+  dropped with the link.
+- **Deliveries are not asked about.** The old `Deliver`/`Need` exchange
+  cost a round trip per command, including the command with nothing to
+  do. Now the server sends the listing, the contents it believes the
+  worktree lacks, and `Delivered`, without waiting. It believes what it
+  remembers: per worktree, the set of contents delivered so far, under a
+  token the daemon stores once it has placed everything and names in its
+  next request. Without a matching token (first build, server restarted)
+  the server sends nothing blind and the daemon fetches what its cache
+  lacks, on a stream of its own (one round trip, then only).
+  Found by the tests: two commands fetching the same file at once got
+  each other's pieces when fetches shared the control stream.
+- `rargo --rargo-status` now counts files and manifests received, pushes,
+  and files the server had to ask for.
+

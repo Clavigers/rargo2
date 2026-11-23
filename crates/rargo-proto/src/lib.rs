@@ -24,6 +24,9 @@ pub const PROTO_VERSION: u32 = 7;
 
 /// The stream of a link that belongs to no command.
 pub const CONTROL: u32 = 0;
+/// Frames of this stream are keepalives: outside every order, answered at
+/// once, so that neither end mistakes a busy link for a dead one.
+pub const KEEPALIVE: u32 = u32::MAX;
 
 /// One message on a link, with the stream it belongs to and its place in
 /// the sender's order (the UDP transport delivers messages in arrival

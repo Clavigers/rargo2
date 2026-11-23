@@ -14,6 +14,12 @@
 # $RARGO_WORK/nstest/client.env; the server cannot see the directories named
 # in RARGO_HIDE.
 set -eu
+# netem keeps every packet it is delaying in one queue, 1000 packets long
+# unless told otherwise: less than a 1 Gbit link has in flight at 20 ms of
+# delay, so the emulated link would drop what a real one carries. (TCP is
+# spared only because its segments are queued in batches.) The queue is
+# sized for the fastest, longest link used here.
+qlimit=${NETEM_LIMIT:-100000}
 work=${RARGO_WORK:-/root/rargo-work}
 B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
 T=$work/nstest
@@ -84,8 +90,8 @@ up)
         ip -n "$ns" addr add "10.77.0.$((i + 1))/24" dev eth0
         ip -n "$ns" link set eth0 up
         # Shape both directions of the link.
-        ip netns exec rargo-srv tc qdisc add dev "vs$i" root netem delay "${delay}ms" loss "${loss}%" rate "$rate"
-        ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${delay}ms" loss "${loss}%" rate "$rate"
+        ip netns exec rargo-srv tc qdisc add dev "vs$i" root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
+        ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
         i=$((i + 1))
     done
     # The client machine.
@@ -97,8 +103,8 @@ up)
     ip -n rargo-cl addr add 10.77.0.200/24 dev eth0
     ip -n rargo-cl link set eth0 up
     cdelay=${CLIENT_DELAY_MS:-1}; closs=${CLIENT_LOSS_PCT:-0}; crate=${CLIENT_RATE:-1gbit}
-    ip netns exec rargo-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate"
-    ip netns exec rargo-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate"
+    ip netns exec rargo-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
+    ip netns exec rargo-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
     head -c 32 /dev/urandom >"$T/link.key"
     secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
     echo "bench $secret admin" >"$T/keys"
