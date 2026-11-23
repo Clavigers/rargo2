@@ -258,6 +258,7 @@ impl Snapshot {
                     size: *size,
                     owner: if *exec { OWN_EXEC } else { OWN_FILE },
                     src: FileSrc::Blob(*hash),
+                    sem: None,
                 }),
                 Ov::Symlink(t) => Looked::Symlink(t.clone()),
                 Ov::Deleted => Looked::Absent,
@@ -278,6 +279,7 @@ impl Snapshot {
                 size,
                 owner: if e.exec() { OWN_EXEC } else { OWN_FILE },
                 src: FileSrc::Git { oid: e.oid, blob: Arc::new(GitBlob { repo: self.repo.clone(), oid: e.oid }) },
+                sem: None,
             })
         }
     }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the format or the fork's behaviour changes; part of the
 /// planner's cache key through the binary itself, checked on load.
-pub const PLAN_VERSION: u32 = 2;
+pub const PLAN_VERSION: u32 = 3;
 
 /// Environment variable naming the file the plan is written to. Its presence
 /// switches the fork into planning mode.
@@ -256,6 +256,10 @@ pub struct Plan {
     pub host: String,
     /// The rustup toolchain the plan was made with, if rustup is in use.
     pub toolchain: Option<String>,
+    /// The compiler is rargo's rustc fork (its sysroot carries the marker
+    /// file `lib/rustlib/rargo-fork`): metadata-only compiles are available
+    /// and crate metadata is identified by its crate hash.
+    pub rustc_fork: bool,
     pub units: Vec<Unit>,
     pub roots: Vec<u32>,
     pub steps: Vec<Step>,

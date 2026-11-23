@@ -79,6 +79,8 @@ struct FileN {
     /// Size and executable bit of the view file this node started as. Kept
     /// after a copy-up: it is what the action observed.
     lower_meta: Option<(u64, bool)>,
+    /// The view's own notion of this file's identity, if it has one.
+    lower_sem: Option<crate::hash::Hash>,
 }
 
 enum Kind {
@@ -298,6 +300,7 @@ impl SandboxFs {
                     // as, even if the action later replaced its content.
                     let Some((size, exec)) = f.lower_meta else { continue };
                     match &f.read_src {
+                        Some(_) if f.lower_sem.is_some() => Obs::File { hash: f.lower_sem.unwrap(), exec },
                         Some(src) => {
                             to_hash.push((out.len(), src.clone(), exec));
                             Obs::File { hash: crate::hash::Hash::ZERO, exec }
@@ -674,6 +677,7 @@ impl ActionFs {
             Looked::File(info) => {
                 let mode = info.owner.mode;
                 let lower_meta = Some((info.size, info.exec()));
+                let lower_sem = info.sem;
                 let n = self.push(
                     st,
                     Kind::File(Box::new(FileN {
@@ -686,6 +690,7 @@ impl ActionFs {
                         read_src: None,
                         file: None,
                         lower_meta,
+                        lower_sem,
                     })),
                 )?;
                 (Slot::Lower(n), RawObs::File(n))
@@ -1074,6 +1079,7 @@ impl Filesystem for SandboxFs {
                         read_src: None,
                         file: None,
                         lower_meta: None,
+                        lower_sem: None,
                     })),
                 )?
             }
@@ -1313,6 +1319,7 @@ impl Filesystem for SandboxFs {
                 read_src: None,
                 file: None,
                 lower_meta: None,
+                lower_sem: None,
             })),
         )?;
         a.dir_mut(&mut st, p)?.entries.insert(name.into(), Slot::Upper(n, covers));

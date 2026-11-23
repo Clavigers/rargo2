@@ -258,6 +258,7 @@ impl Engine {
                 Looked::Other => h.field(b"o"),
                 Looked::Dir(_) => h.field(b"d"),
                 Looked::Symlink(t) => h.field(b"l").field(&t),
+                Looked::File(f) if f.sem.is_some() => h.field(b"s").field(&f.sem.unwrap().0),
                 Looked::File(f) => {
                     h.field(b"f").u64(f.exec() as u64);
                     match (self.content.known_hash(&f.src), &f.src) {
@@ -319,6 +320,16 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// The recorded result of an action, if one holds for this view. Never
+    /// runs anything.
+    pub fn cached(&self, req: &Request) -> Option<Outcome> {
+        let (spec, base_key) = self.effective_spec(&req.spec, &req.client_env);
+        let key = if spec.env.len() == req.spec.env.len() { base_key } else { spec.weak_key() };
+        let t = self.traces.lookup(&key, &*req.view, &self.content)?;
+        self.replay(&t.result, &*req.observer);
+        Some(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() })
     }
 
     /// Obtains the result of an action.

@@ -41,7 +41,7 @@ pub enum WLooked {
     Other,
     Dir { mode: u32, own: bool },
     Symlink(Vec<u8>),
-    File { size: u64, mode: u32, own: bool, hash: Option<Hash> },
+    File { size: u64, mode: u32, own: bool, hash: Option<Hash>, sem: Option<Hash> },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -542,8 +542,9 @@ impl RemoteView {
             WLooked::Other => Looked::Other,
             WLooked::Dir { mode, own } => Looked::Dir(owner(*mode, *own)),
             WLooked::Symlink(t) => Looked::Symlink(t.clone()),
-            WLooked::File { size, mode, own, hash } => Looked::File(FileInfo {
+            WLooked::File { size, mode, own, hash, sem } => Looked::File(FileInfo {
                 size: *size,
+                sem: *sem,
                 owner: owner(*mode, *own),
                 src: match hash {
                     Some(h) => FileSrc::Blob(*h),
@@ -825,6 +826,7 @@ fn to_wire(l: &Looked, content: &Content) -> WLooked {
             mode: f.owner.mode,
             own: f.owner.uid == OWNER_SELF,
             hash: content.known_hash(&f.src),
+            sem: f.sem,
         },
     }
 }

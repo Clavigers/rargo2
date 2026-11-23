@@ -45,6 +45,9 @@ pub struct DaemonStats {
 
 /// State shared by all requests.
 pub struct Daemon {
+    /// Per worktree and toolchain: the last plan said the compiler is
+    /// rargo's rustc fork.
+    fork_seen: DashMap<(PathBuf, String), bool>,
     pub cfg: Config,
     pub engine: Arc<Engine>,
     pub memo: Arc<HostMemo>,
@@ -84,6 +87,12 @@ pub struct PlanData {
     levels: Vec<OnceLock<Arc<Vec<u8>>>>,
     /// Sandbox paths of each unit's early-announced metadata outputs.
     meta_paths: Vec<Vec<Vec<u8>>>,
+    /// Sandbox paths of each unit's metadata outputs, announced or not.
+    rmeta_out: Vec<Vec<Vec<u8>>>,
+    /// Like `levels`, for a unit compiled for its metadata only.
+    meta_levels: Vec<OnceLock<Arc<Vec<u8>>>>,
+    /// How much of each unit a metadata-only request for the roots needs.
+    needs: OnceLock<Arc<Vec<u8>>>,
 }
 
 impl PlanData {
@@ -101,7 +110,87 @@ impl PlanData {
                 }
             })
             .collect();
-        PlanData { plan, linking, levels: (0..n).map(|_| OnceLock::new()).collect(), meta_paths }
+        let rmeta_out = plan
+            .units
+            .iter()
+            .map(|u| u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect())
+            .collect();
+        PlanData {
+            plan,
+            linking,
+            levels: (0..n).map(|_| OnceLock::new()).collect(),
+            meta_paths,
+            rmeta_out,
+            meta_levels: (0..n).map(|_| OnceLock::new()).collect(),
+            needs: OnceLock::new(),
+        }
+    }
+
+    /// The unit can stand in for itself with its metadata alone: it is a
+    /// library whose dependents compile against a `.rmeta`.
+    fn can_meta(&self, j: usize) -> bool {
+        self.plan.units[j].kind == rp::UnitKind::Compile && !self.rmeta_out[j].is_empty()
+    }
+
+    /// What unit `i` may see of every other unit when it is compiled for
+    /// its metadata only (nothing is linked, so libraries are needed as
+    /// metadata; things that are executed, such as proc macros and build
+    /// script runs, are needed whole).
+    fn meta_levels(&self, i: usize) -> Arc<Vec<u8>> {
+        self.meta_levels[i]
+            .get_or_init(|| {
+                let units = &self.plan.units;
+                let mut lv = vec![LEVEL_NONE; units.len()];
+                let mut stack: Vec<usize> = Vec::new();
+                for d in &units[i].deps {
+                    stack.push(d.unit as usize);
+                }
+                while let Some(j) = stack.pop() {
+                    if lv[j] != LEVEL_NONE {
+                        continue;
+                    }
+                    lv[j] = if self.can_meta(j) { LEVEL_META } else { LEVEL_FULL };
+                    for d in &units[j].deps {
+                        stack.push(d.unit as usize);
+                    }
+                }
+                Arc::new(lv)
+            })
+            .clone()
+    }
+
+    /// For a request that wants the roots' metadata only (`check` planned
+    /// as a build): how far each unit has to be taken. A unit nothing needs
+    /// is not run; one needed for its metadata is compiled without code
+    /// generation; one that something executes or links is built in full.
+    fn needs(&self) -> Arc<Vec<u8>> {
+        self.needs
+            .get_or_init(|| {
+                let units = &self.plan.units;
+                let mut need = vec![LEVEL_NONE; units.len()];
+                let mut work: Vec<usize> = Vec::new();
+                for &r in &self.plan.roots {
+                    let r = r as usize;
+                    need[r] = if units[r].kind == rp::UnitKind::Compile { LEVEL_META } else { LEVEL_FULL };
+                    work.push(r);
+                }
+                while let Some(i) = work.pop() {
+                    let sees = if need[i] == LEVEL_META { self.meta_levels(i) } else { self.levels(i) };
+                    for (k, &lv) in sees.iter().enumerate() {
+                        if lv == LEVEL_NONE {
+                            continue;
+                        }
+                        // Only a compile can stop at metadata.
+                        let lv = if units[k].kind == rp::UnitKind::Compile { lv } else { LEVEL_FULL };
+                        if lv > need[k] {
+                            need[k] = lv;
+                            work.push(k);
+                        }
+                    }
+                }
+                Arc::new(need)
+            })
+            .clone()
     }
 
     /// How much of every other unit's output unit `i` may see.
@@ -204,6 +293,29 @@ struct Run {
     verify: bool,
     verified: AtomicU64,
     verify_mismatches: Mutex<Vec<String>>,
+    /// Set when the request is a `check` planned as a build: how far each
+    /// unit has to be taken (see `PlanData::needs`).
+    need: Option<Arc<Vec<u8>>>,
+}
+
+/// Position of the cargo subcommand in a command line.
+fn subcommand_pos(args: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            return None;
+        }
+        if !a.starts_with('-') {
+            return Some(i);
+        }
+        // Global options that take a separate value.
+        if matches!(a.as_str(), "--config" | "-Z" | "--color" | "-C" | "--explain") {
+            i += 1;
+        }
+        i += 1;
+    }
+    None
 }
 
 fn bytes(s: &str) -> Vec<u8> {
@@ -278,6 +390,7 @@ impl Daemon {
             worktrees: Mutex::new(HashMap::new()),
             parser,
             plans: DashMap::new(),
+            fork_seen: DashMap::new(),
             masks: DashMap::new(),
             stats: DaemonStats::default(),
         }
@@ -683,10 +796,30 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
             crate::drift::LastClient { env: c.env.clone(), uid: c.uid, gid: c.gid, at: Instant::now(), checked_head: None },
         );
     }
+    // With rargo's rustc, `check` is a build that stops at metadata: the
+    // same compiler invocations as `build`, minus code generation, so the
+    // two commands (and `test`) share every crate's front-end work instead
+    // of each doing its own. Whether the compiler is the fork is only known
+    // from a plan; what the last plan for this worktree said is remembered.
+    let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
+    let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").map(|v| v.as_str()) != Some("0"));
+    let fork_key = (p.root.clone(), c.env.get("RUSTUP_TOOLCHAIN").cloned().unwrap_or_default());
+    let mut as_build = check_at.is_some() && d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
     let mut fetched = false;
     let planned = loop {
-        match plan(d, c, &p, &args).await? {
-            PlanOutcome::Ok(pl) => break pl,
+        let mut plan_args = args.clone();
+        if let (Some(i), true) = (check_at, as_build) {
+            plan_args[i] = "build".into();
+        }
+        match plan(d, c, &p, &plan_args).await? {
+            PlanOutcome::Ok(pl) => {
+                if check_at.is_some() && pl.data.plan.rustc_fork != as_build {
+                    as_build = pl.data.plan.rustc_fork;
+                    d.fork_seen.insert(fork_key.clone(), as_build);
+                    continue;
+                }
+                break pl;
+            }
             PlanOutcome::Failed { stderr, .. } if !fetched && needs_network(&stderr) => {
                 fetched = true;
                 if !fetch(d, c, &args).await? {
@@ -763,6 +896,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         verify: c.env.contains_key("RARGO_VERIFY"),
         verified: AtomicU64::new(0),
         verify_mismatches: Mutex::new(Vec::new()),
+        need: if as_build { Some(pd.needs()) } else { None },
     });
 
     let mut tasks = Vec::with_capacity(n);
@@ -807,6 +941,11 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         ));
         d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
         d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
+    }
+    if run.need.is_some() {
+        // A check leaves nothing in the target directory and has no steps.
+        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
+        return Ok(Finish::Code(0));
     }
     // Place what was asked for into the real target directory.
     run.materialize_roots(&p.root).await?;
@@ -935,9 +1074,15 @@ impl Run {
         &self.pd.plan
     }
 
+    /// The unit is compiled for its metadata only in this request.
+    fn meta_only(&self, i: usize) -> bool {
+        let u = &self.plan().units[i];
+        self.need.as_ref().is_some_and(|n| n[i] == LEVEL_META) && u.kind == rp::UnitKind::Compile && u.cmd.is_some()
+    }
+
     async fn wait_dep(&self, dep: &rp::Dep) -> bool {
         let j = dep.unit as usize;
-        let meta_ok = dep.only_rmeta && self.plan().units[j].rmeta_early;
+        let meta_ok = dep.only_rmeta && (self.plan().units[j].rmeta_early || self.meta_only(j));
         let mut rx = self.states[j].subscribe();
         loop {
             let st = *rx.borrow_and_update();
@@ -979,13 +1124,20 @@ impl Run {
         untraced: Vec<Vec<u8>>,
         seed: Option<Arc<OutputsLayer>>,
     ) -> Arc<dyn View> {
-        let mut levels = self.pd.levels(i);
+        let mut levels = if self.meta_only(i) { self.pd.meta_levels(i) } else { self.pd.levels(i) };
         if include_self {
             let mut lv = (*levels).clone();
             lv[i] = LEVEL_FULL;
             levels = Arc::new(lv);
         }
-        Arc::new(BuildView { base: self.base.clone(), layer: self.layer.clone(), levels, untraced, seed })
+        Arc::new(BuildView {
+            base: self.base.clone(),
+            layer: self.layer.clone(),
+            levels,
+            untraced,
+            seed,
+            content: Some(self.d.engine.content.clone()),
+        })
     }
 
     /// Whether `commit` is HEAD of this worktree or one of its ancestors.
@@ -1004,12 +1156,28 @@ impl Run {
     async fn exec_unit(self: &Arc<Self>, i: usize) -> Result<UState> {
         let plan = self.plan();
         let u = &plan.units[i];
-        for dep in &u.deps {
-            if !self.wait_dep(dep).await {
-                return Ok(UState::Skipped);
+        if self.need.as_ref().is_some_and(|n| n[i] == LEVEL_NONE) {
+            // Nothing in this request needs the unit.
+            return Ok(UState::Done);
+        }
+        let meta_only = self.meta_only(i);
+        if meta_only {
+            let levels = self.pd.meta_levels(i);
+            for (j, lv) in levels.iter().enumerate() {
+                if *lv != LEVEL_NONE
+                    && !self.wait_dep(&rp::Dep { unit: j as u32, only_rmeta: *lv == LEVEL_META }).await
+                {
+                    return Ok(UState::Skipped);
+                }
+            }
+        } else {
+            for dep in &u.deps {
+                if !self.wait_dep(dep).await {
+                    return Ok(UState::Skipped);
+                }
             }
         }
-        if u.needs_objects {
+        if u.needs_objects && !meta_only {
             // A linked unit needs the finished object code of everything
             // below it. A library two levels down may have let its dependent
             // start on its metadata alone and still be generating code, so
@@ -1066,7 +1234,37 @@ impl Run {
         if let Some(dir) = &incr_dir {
             mkdirs.push(dir.clone());
         }
-        let _ = &mut args;
+        // The same action as the full build's, for looking up whether the
+        // full build has already been done (its metadata is then at hand).
+        let full_argv: Option<Vec<Vec<u8>>> = meta_only.then(|| {
+            let mut v = vec![bytes(&cmd.program)];
+            v.extend(args.iter().map(|a| bytes(a)));
+            v
+        });
+        if meta_only {
+            if self.pd.can_meta(i) {
+                // Everything up to and including metadata exactly as in the
+                // full build, then stop.
+                args.push("-Zno-codegen".into());
+            } else {
+                // A linked target has no dependents; type-check it the way
+                // `cargo check` does.
+                // `cargo check` does: metadata out, libraries in as metadata.
+                let mut after_extern = false;
+                for a in args.iter_mut() {
+                    if let Some(kinds) = a.strip_prefix("--emit=") {
+                        let kinds: Vec<&str> =
+                            kinds.split(',').map(|k| if k == "link" { "metadata" } else { k }).collect();
+                        *a = format!("--emit={}", kinds.join(","));
+                    } else if after_extern {
+                        if let Some(stem) = a.strip_suffix(".rlib") {
+                            *a = format!("{stem}.rmeta");
+                        }
+                    }
+                    after_extern = a == "--extern";
+                }
+            }
+        }
         let mut argv = vec![bytes(&cmd.program)];
         argv.extend(args.iter().map(|a| bytes(a)));
         let spec = ActionSpec {
@@ -1112,7 +1310,25 @@ impl Run {
         // answer that makes people delete caches. Concurrent identical
         // failures are still shared through in-flight deduplication.
         let cacheable: Arc<dyn Fn(&ActionResult) -> bool + Send + Sync> = Arc::new(|r| r.success());
+        let mut from_full = match (&full_argv, self.verify) {
+            (Some(argv), false) => self.d.engine.cached(&Request {
+                spec: ActionSpec { argv: argv.clone(), ..spec.clone() },
+                view: self.view_for(i, false, incr_dir.iter().cloned().collect(), None),
+                client_env: self.c.env.clone(),
+                uid: self.c.uid,
+                gid: self.c.gid,
+                prio: self.c.prio,
+                no_cache: false,
+                cacheable: cacheable.clone(),
+                declared_env: declared_env.clone(),
+                observer: Arc::new(UnitObserver { run: self.clone(), i, shown: display_cmd(&cmd.program, &args) }),
+            }),
+            _ => None,
+        };
         let outcome = loop {
+            if let Some(o) = from_full.take() {
+                break o;
+            }
             let seed_layer = seed.as_ref().map(|(_, m, _)| {
                 let l = OutputsLayer::new();
                 l.add_manifest(0, LEVEL_FULL, m);
@@ -1249,7 +1465,15 @@ impl Run {
                 return Ok(UState::Failed);
             }
         }
-        let meta = &self.pd.meta_paths[i];
+        let meta = &self.pd.rmeta_out[i];
+        if meta_only {
+            // Only the metadata is this unit's result here; whatever else
+            // the compiler left behind is not the real thing.
+            let early: Vec<_> = r.outputs.entries.iter().filter(|(p, _)| meta.contains(p)).cloned().collect();
+            self.layer.add(i as u32, LEVEL_META, &early);
+            self.finish_unit_messages(i, &r, outcome.cached);
+            return Ok(UState::Done);
+        }
         if meta.is_empty() {
             self.layer.add_manifest(i as u32, LEVEL_FULL, &r.outputs);
         } else {
@@ -1332,6 +1556,7 @@ impl Run {
             rp::Verb::Documenting => (&mut ui.documented, "Documenting"),
             rp::Verb::Scraping => (&mut ui.scraped, "Scraping"),
             rp::Verb::Checking => (&mut ui.compiled, "Checking"),
+            rp::Verb::Compiling if self.meta_only(i) => (&mut ui.compiled, "Checking"),
             rp::Verb::Compiling => (&mut ui.compiled, "Compiling"),
         };
         if set.insert(u.pkg_id.clone()) {
@@ -1482,8 +1707,9 @@ impl Run {
             && matches!(u.kind, rp::UnitKind::Compile | rp::UnitKind::Doc)
         {
             let mut filenames: Vec<&str> = Vec::new();
+            let meta_only = self.meta_only(i);
             for o in &u.outputs {
-                if r.outputs.get(o.path.as_bytes()).is_none() {
+                if r.outputs.get(o.path.as_bytes()).is_none() || (meta_only && o.flavor != "Rmeta") {
                     continue;
                 }
                 filenames.push(o.hardlink.as_deref().unwrap_or(&o.path));

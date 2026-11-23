@@ -161,6 +161,10 @@ pub struct FileInfo {
     pub size: u64,
     pub owner: Owner,
     pub src: FileSrc,
+    /// What readers of this file depend on, when that is less than its
+    /// bytes (see [`Content::metadata_identity`]). Observations of the file
+    /// record this instead of the content hash.
+    pub sem: Option<Hash>,
 }
 
 impl FileInfo {
@@ -263,11 +267,50 @@ pub struct Content {
     git_hashes: DashMap<[u8; 20], Hash>,
     /// On a worker: how to get a blob the server has and we do not.
     fetcher: std::sync::OnceLock<Fetcher>,
+    meta_ids: DashMap<Hash, Option<Hash>>,
 }
 
 impl Content {
     pub fn new(store: Arc<Store>) -> Content {
-        Content { store, host_hashes: DashMap::new(), git_hashes: DashMap::new(), fetcher: std::sync::OnceLock::new() }
+        Content {
+            store,
+            host_hashes: DashMap::new(),
+            git_hashes: DashMap::new(),
+            fetcher: std::sync::OnceLock::new(),
+            meta_ids: DashMap::new(),
+        }
+    }
+
+    /// The identity of a crate metadata file (`.rmeta`) written by rargo's
+    /// rustc fork, for the purposes of whoever compiles against it.
+    ///
+    /// The fork's metadata carries a crate hash that covers everything a
+    /// dependent's compilation can depend on, and deliberately not the
+    /// positions of things that only matter for messages (see the fork's
+    /// patch notes). Two metadata files with the same crate hash are the
+    /// same input to a dependent even when their bytes differ, which is what
+    /// makes an edit inside a function body stop at the crate it is in.
+    /// Files from a stock compiler have no such identity (`None`): their
+    /// bytes are what counts.
+    pub fn metadata_identity(&self, blob: &Hash) -> Option<Hash> {
+        if let Some(v) = self.meta_ids.get(blob) {
+            return *v;
+        }
+        let id = (|| {
+            use std::io::Read;
+            let mut f = self.store.open_blob(blob).ok()?;
+            let mut head = [0u8; 40];
+            f.read_exact(&mut head).ok()?;
+            // The fork marks its metadata format in the seventh header byte.
+            if &head[..7] != b"rust\0\0\x01" {
+                return None;
+            }
+            let mut h = crate::hash::KeyHasher::new("rmeta-identity");
+            h.field(&head[7..8]).field(&head[24..40]);
+            Some(h.finish())
+        })();
+        self.meta_ids.insert(*blob, id);
+        id
     }
 
     pub fn set_fetcher(&self, f: Fetcher) {
@@ -411,6 +454,9 @@ pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> 
             if f.exec() != *exec {
                 return false;
             }
+            if let Some(sem) = f.sem {
+                return sem == *hash;
+            }
             match content.known_hash(&f.src) {
                 Some(h) => h == *hash,
                 // Not hashed in this store yet: a host file never read
@@ -460,6 +506,7 @@ impl HostRegion {
                 size: m.len(),
                 owner,
                 src: FileSrc::Host { path: Arc::from(p), sig: HostSig::of(&m) },
+                sem: None,
             })
         } else if ft.is_symlink() {
             match std::fs::read_link(&p) {

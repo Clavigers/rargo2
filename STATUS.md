@@ -7,9 +7,11 @@ capped at 24 cores (`CPUQuota=2400%`, `-j24` / 24 scheduler tokens).
 
 ## Summary so far
 
-Phases 1 to 4 are implemented and exercised; phase 5 (rustc fork work) has
-measurements and a plan but no compiler changes yet. Benchmarks on Ruff and
-Bevy and the worker benchmark are still running or pending.
+Phases 1 to 4 are implemented and exercised. The 20-agent benchmark is done
+on rust-analyzer, Ruff and Bevy: 3.3x to 5.6x less wall time, 5.3x to 8.4x
+less CPU time and 2.4x to 2.9x less disk than stock cargo, with no failed
+steps. Phase 5 (the rustc fork) is in progress; the worker benchmark is
+pending.
 
 | Area | State |
 |---|---|
@@ -70,9 +72,28 @@ Without shared incremental compilation the same rargo run took 127 s wall,
 and saves about 10 s of wall time and 470 s of CPU. That trade is what the
 design's "incremental states are large" risk predicted; see known weaknesses.
 
-Ruff (rargo side so far): 146 s wall, 32.8 GB (30.0 GB after GC), no failed
-steps; CPU figure lost to a measurement bug (fixed) and to be re-run. Stock
-Ruff and both Bevy runs are still in progress.
+| Ruff (commit as cloned) | stock cargo | rargo | ratio |
+|---|---|---|---|
+| wall time | 818 s | 146 s | 5.6x |
+| CPU time | 19,385 s | 2,703 s | 7.2x |
+| disk | 94.9 GB | 32.8 GB (30.0 GB after GC) | 2.9x |
+| failed steps | 0 | 0 | |
+| mean step times (same order) | 317 / 22.2 / 5.8 / 77.6 / 22.9 / 315 / 2.0 s | 35.3 / 14.6 / 1.0 / 16.8 / 1.6 / 71.3 / 0.3 s | |
+
+The Ruff rargo run was done twice because the first lost its CPU figure to a
+measurement bug. Wall and disk are from the first run (146 s, nothing else
+on the box); CPU is from the second (155 s wall), which shared the machine
+with a compiler build, so 2,703 s is if anything too high.
+
+| Bevy | stock cargo | rargo | ratio |
+|---|---|---|---|
+| wall time | 400 s | 83 s | 4.8x |
+| CPU time | 9,112 s | 1,086 s | 8.4x |
+| disk | 61.0 GB | 24.9 GB (21.3 GB after GC) | 2.5x |
+| failed steps | 0 | 0 | |
+| mean step times (same order) | 284 / 22.8 / 10.8 / 27.9 / 9.2 / 30.2 / 0.9 s | 32.6 / 14.7 / 4.4 / 11.1 / 0.7 / 15.7 / 0.4 s | |
+
+Zed was dropped from the set at the user's request (DECISIONS D9).
 
 ### Tracing overhead
 

@@ -195,6 +195,7 @@ impl BaseView {
                     size: *size,
                     owner: Owner { uid: 0, gid: 0, mode: 0o644 },
                     src: FileSrc::Blob(*hash),
+                    sem: None,
                 }),
                 (b"/", Some(SynthEnt::Symlink(t))) => Looked::Symlink(t.clone()),
                 _ => Looked::Absent,
@@ -414,6 +415,8 @@ pub struct BuildView {
     pub untraced: Vec<Vec<u8>>,
     /// A private extra layer for this one action (its incremental seed).
     pub seed: Option<Arc<OutputsLayer>>,
+    /// For recognising crate metadata files (see `metadata_identity`).
+    pub content: Option<Arc<Content>>,
 }
 
 const SEED_LEVELS: [u8; 1] = [LEVEL_FULL];
@@ -436,6 +439,12 @@ impl View for BuildView {
                 size,
                 owner: if exec { OWN_EXEC } else { OWN_FILE },
                 src: FileSrc::Blob(hash),
+                // Crate metadata from the rustc fork is identified by its
+                // crate hash, not its bytes.
+                sem: match (&self.content, name.ends_with(b".rmeta")) {
+                    (Some(c), true) => c.metadata_identity(&hash),
+                    _ => None,
+                },
             }),
             Some(LayerEnt::Entry(MEntry::Symlink(t))) => Looked::Symlink(t),
             Some(LayerEnt::Entry(MEntry::Whiteout)) => Looked::Absent,
@@ -640,6 +649,7 @@ mod tests {
             levels: Arc::new(levels),
             untraced: vec![],
             seed: None,
+            content: None,
         };
         // Sees only unit 0's metadata.
         let v = view(vec![LEVEL_META, LEVEL_NONE]);
@@ -683,7 +693,7 @@ mod tests {
                 (b"/t/debug/a/out/liba.rlib".to_vec(), file(2)),
             ],
         );
-        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_META]), untraced: vec![], seed: None };
+        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_META]), untraced: vec![], seed: None, content: None };
         assert!(matches!(v.stat(b"/t/debug/a/out"), Looked::Dir(_)));
         assert!(matches!(v.stat(b"/t/debug/a/out/liba.rmeta"), Looked::File(_)));
         assert!(matches!(v.stat(b"/t/debug/a/out/liba.rlib"), Looked::Absent));
@@ -711,7 +721,7 @@ mod tests {
         std::fs::write(tmp.path().join("kept"), "x").unwrap();
         let layer = Arc::new(OutputsLayer::new());
         layer.add(0, LEVEL_FULL, &[(b"/gone".to_vec(), MEntry::Whiteout)]);
-        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None };
+        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
         assert!(matches!(v.stat(b"/gone"), Looked::Absent));
         assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
         let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
@@ -733,7 +743,7 @@ mod host_listing_tests {
             memo,
             g,
         ));
-        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None };
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
         for dir in ["/usr/lib", "/etc", "/"] {
             let real = std::fs::read_dir(dir).unwrap().count();
             let seen = v.list(dir.as_bytes()).unwrap().len();
