@@ -516,3 +516,46 @@ rustc dep-info of the unit and its local dependencies, plus build scripts'
 
 Not reproduced: `--timings` (the HTML report). rargo's own per-action
 times are in `--rargo-status` and `RARGO_EXPLAIN`.
+
+## D30. Workers after measuring them
+
+The first worker benchmark (rust-analyzer cold `build`, server and workers
+in namespaces, 1 ms each way, 0.1% loss, 1 Gbit) showed workers making
+builds slower: 241.9 s with a fresh 8-core worker against 41.9 s for the
+8-core server alone, and 51.8 s with a warm one. Four changes, each from a
+measurement:
+
+- **Transport.** `netbench` across the same link: 18.8 MiB/s. Losses were
+  only detected by timeout, and each halved the window. Now a fragment is
+  resent once three later ones are acknowledged, a loss shrinks the window
+  to 0.7x at most once per round trip, and the window grows by 8 fragments
+  per round trip: 72 MiB/s. A timeout still halves.
+- **Hedging.** The fresh-worker trace: the first 8 actions went to the
+  worker, which spent about a minute fetching the toolchain while every
+  local core sat idle waiting for them. A dispatched action now also runs
+  locally as soon as a local core falls idle, if the worker has produced
+  no output for it yet; the first to finish wins and the other is
+  withdrawn. The local copy asks for a core at `Priority::Idle`, which only
+  gets a core no other request wants and is not counted as queued work.
+  Hedging stops once the worker's output has started (showing it twice,
+  or announcing metadata twice, is worse). Fresh worker: 241.9 s to 44.0 s.
+- **Compression.** Fetching outputs was most of the remaining overhead
+  (12.2 s over 59 remote actions). Messages over 4 KiB are zstd level 1
+  when that is smaller; a 478 MB rlib is 81 MB. Fetch time 12.2 s to 5.6 s.
+- **Cost model.** The guessed 300 round trips per never-run action are
+  replaced, once a worker has run three actions, by its measured overhead
+  (moving average of total minus run time), and the bandwidth by what
+  output fetches achieve. `RARGO_DISPATCH=eager` (dispatch whenever no
+  local core is free) was measured against it and is no better.
+
+What it does not change: rust-analyzer's and Bevy's cold builds do not
+scale with cores past about 8 even locally (rust-analyzer local-8 41.8 s,
+local-12 41.1 s, local-16 40.6 s; Bevy libraries with stock cargo 96.8 s at
+8 and 86.5 s at 16), because the crates on the critical path use the
+machine's cores for their own code generation, and a worker can only take
+whole actions. At 4 cores per machine, where cores still matter (local-4
+53.1 s, local-8 41.8 s), one warm worker gives 50.2 s: it takes about 38 s
+of compile time, but most of what extra local cores buy is parallelism
+inside the critical crates. The phase 4 criterion is therefore measured on
+the workload that does have parallelism across actions, the 20-agent swarm
+(STATUS).
