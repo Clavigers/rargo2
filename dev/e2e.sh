@@ -274,6 +274,14 @@ has "$out" "/ plain /" && ok "without the variable the plain build is back" || b
 out=$(E2E_COMPILE_VAR=seen "$R" build 2>&1 && ./target/debug/app)
 has "$out" "/ seen" && ok "option_env! variable reaches rustc once declared" || bad "option_env! variable reaches rustc once declared" "$out"
 
+echo "== the client's cargo configuration"
+mkdir -p "$T/client-cargo-home"
+printf '[env]\nE2E_COMPILE_VAR = "from the client cargo home"\n' >"$T/client-cargo-home/config.toml"
+out=$(CARGO_HOME="$T/client-cargo-home" "$R" build 2>&1 && ./target/debug/app)
+has "$out" "/ from the client cargo home" && ok "config.toml in the client's cargo home applies to its builds on the server" || bad "config.toml in the client's cargo home applies to its builds on the server" "$out"
+out=$("$R" build 2>&1 && ./target/debug/app)
+has "$out" "/ unset" && ok "and not to a client without it" || bad "and not to a client without it" "$out"
+
 echo "== tests"
 cd "$A"
 out=$("$R" test 2>&1); rc=$?

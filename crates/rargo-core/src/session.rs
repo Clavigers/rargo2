@@ -182,7 +182,7 @@ impl Session {
     /// task; file system work is done in place.
     pub fn incoming(&self, msg: ClientMsg) -> Result<()> {
         match msg {
-            ClientMsg::Run(_) => bail!("a second request on one connection"),
+            ClientMsg::Run(_) | ClientMsg::Packed(_) => bail!("unexpected message from the client"),
             ClientMsg::Trees(t) => {
                 if let Some(tx) = self.trees_reply.lock().take() {
                     let _ = tx.send(t);
@@ -426,7 +426,10 @@ pub async fn read_msg<R: AsyncRead + Unpin>(rd: &mut R, opener: &mut Opener) -> 
         let mut rec = vec![0u8; n];
         rd.read_exact(&mut rec).await?;
         if let Some(m) = opener.open(&rec)? {
-            return Ok(Some(rargo_proto::decode(&m)?));
+            return Ok(Some(match rargo_proto::decode(&m)? {
+                ClientMsg::Packed(z) => rargo_proto::decode(&rargo_proto::unpack(&z)?)?,
+                other => other,
+            }));
         }
     }
 }
@@ -444,7 +447,13 @@ pub async fn write_loop<W: AsyncWrite + Unpin>(
         let last = matches!(m, ServerMsg::Exit(_) | ServerMsg::Exec(_));
         let bulk = bulk_size(&m);
         buf.clear();
-        if sealer.seal(&rargo_proto::encode(&m), &mut buf).is_err() || wr.write_all(&buf).await.is_err() {
+        let mut encoded = rargo_proto::encode(&m);
+        if bulk == 0 {
+            if let Some(z) = rargo_proto::pack(&encoded) {
+                encoded = rargo_proto::encode(&ServerMsg::Packed(z));
+            }
+        }
+        if sealer.seal(&encoded, &mut buf).is_err() || wr.write_all(&buf).await.is_err() {
             break;
         }
         if bulk > 0 {

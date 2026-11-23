@@ -735,6 +735,10 @@ is the less exercised.
 - It depends only on HEAD, never on the user's index, so it is shared by
   all worktrees at a commit and does not change when the user stages
   something.
+- Its `core.abbrev` is set to the length the client's repository
+  abbreviates to. Found by comparing version strings: git picks that length
+  from the number of objects, so the stand-in said `37721d1` where the real
+  repository says `37721d141`.
 - Known inexactness: in a repository that has files committed with CRLF
   under an `eol=lf` attribute (rust-analyzer has two), `git status` in the
   sandbox reports them modified, as git does wherever it has to re-read
@@ -758,7 +762,9 @@ is the less exercised.
 - The request rides in the first handshake message when it fits (it
   usually does), encrypted under the pre-shared key, so the server starts
   working after one round trip. That one message is not forward secret; it
-  carries the command line and the allow-listed environment.
+  carries the command line and the allow-listed environment, and someone
+  who recorded it could replay it: the server would start that build
+  again and the replayer, lacking the session keys, would learn nothing.
 - Users of one server share one cache and are trusted with each other's
   source: a team tool. `admin` gates garbage collection, compaction, and
   cache export and import (which name directories on the server).

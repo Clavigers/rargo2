@@ -197,11 +197,21 @@ struct Wire {
 
 impl Wire {
     fn send(&mut self, m: &ClientMsg) -> std::io::Result<()> {
-        secure::write_msg(&mut self.wr, &mut self.sealer, &rargo_proto::encode(m))
+        let mut encoded = rargo_proto::encode(m);
+        // File contents are compressed already; manifests are not.
+        if matches!(m, ClientMsg::Trees(_) | ClientMsg::Need { .. } | ClientMsg::Env(_)) {
+            if let Some(z) = rargo_proto::pack(&encoded) {
+                encoded = rargo_proto::encode(&ClientMsg::Packed(z));
+            }
+        }
+        secure::write_msg(&mut self.wr, &mut self.sealer, &encoded)
     }
     fn recv(&mut self) -> std::io::Result<Option<ServerMsg>> {
         match secure::read_msg(&mut self.rd, &mut self.opener)? {
-            Some(b) => Ok(Some(rargo_proto::decode(&b)?)),
+            Some(b) => Ok(Some(match rargo_proto::decode(&b)? {
+                ServerMsg::Packed(z) => rargo_proto::decode(&rargo_proto::unpack(&z)?)?,
+                other => other,
+            })),
             None => Ok(None),
         }
     }
@@ -393,6 +403,7 @@ fn converse(cfg: &Config, req: &RunRequest, local: &mut Local, scan: Option<&sca
                     return Err(std::io::Error::other("the server did not send every file it announced"));
                 }
             }
+            ServerMsg::Packed(_) => return Err(std::io::Error::other("unexpected message from the server")),
             ServerMsg::Exit(code) => {
                 finish(&placer);
                 return Ok(Outcome::Exit(code));

@@ -1,129 +1,173 @@
 # Status
 
 What exists, how it was checked, what was measured, and what is weak or
-missing. Updated as the run proceeds; the newest state is at the top of each
-section. Machine: 32 threads, 124 GB RAM, kernel 7.0, ext4. All builds are
-capped at 24 cores (`CPUQuota=2400%`, `-j24` / 24 scheduler tokens).
+missing. Machine: 32 threads, 124 GB RAM, kernel 7.0, ext4. All builds are
+capped at 24 cores (`CPUQuota=2400%`, 24 scheduler tokens).
 
-## Summary (final report; updated 2026-11-23)
+## Summary (updated 2026-11-23, after the move to remote first)
 
-All phases (1 to 5) are implemented and tested. Measured against stock
-cargo with one target directory per worktree:
+rargo was first built with the server on the client's machine. That was not
+what was asked for: clients were meant to be on other machines and do
+nothing but sync files and environment, with all analysis, scheduling and
+building on a remote server. It has now been rebuilt that way (DESIGN.md,
+DECISIONS D34 to D43). The engine (planner, sandbox, trace cache,
+scheduler, shared incremental compilation, store, workers) is the same
+code; the boundary between client and server is new.
 
-- **20 agents in 20 worktrees** (24 cores): rust-analyzer 3.3x less wall
-  time, 5.3x less CPU, 2.4x less disk; Ruff 5.6x / 7.2x / 2.9x; Bevy
-  4.8x / 8.4x / 2.5x. No failed steps.
-- **Phase 1** (second worktree ~1 s, no extra disk; one edit rebuilds only
-  dependents): met (e2e). **Phase 2** (swarm wins by a wide margin): met.
-  **Phase 3** (cache entry valid on another machine with the same flake):
-  met, `dev/e2e-flake.sh`, with both "machines" on one host.
-- **Phase 4 is not met**: warm and no-op builds are no slower with a worker,
-  but a cold build is not shortened in proportion (see Workers for the
-  numbers and why).
-- **Phase 5**: rustc fork (4 patches) built and checked (`dev/fork-check.sh`,
-  13/13). Measured, it does not pay for itself: over 30 real rust-analyzer
-  commits it saves 1 action of 351, and its non-PGO compiler is slower.
-  It stays optional. Check-as-build is opt-in (slower in the swarm). The
-  incremental-state dedup item was done in the store instead (cold tier:
-  28.8 GiB to 3.9 GiB).
-- **No drift**: verified on all three repos (see No-drift). The first run
-  found that stock `cargo test` failed after rargo (read-only store links
-  in `target/`); fixed (D32), and the rerun passes everywhere.
-- **Store on a reflink filesystem** (D33, `rargod --store DIR`; the work
-  was delegated to Codex and reviewed): e2e 81/81 on btrfs and ext4; 45.5%
-  less disk growth on btrfs for the e2e workspace.
+What a client does now: scan its worktree into a content-addressed tree,
+upload what the server lacks, pass on an allow-listed environment, receive
+output, the artifacts it asked for and files the build wrote into the
+worktree. What it no longer needs: a daemon, root, a toolchain, the
+registry, or the server's file system.
 
-Tests: `cargo test -p rargo-core` (47 unit + 6 engine), `dev/e2e.sh` 81
-checks, `dev/e2e-flake.sh` 14 checks, `dev/fork-check.sh` 13 checks, all
-passing at the last commit.
+Measured with the clients in their own network namespace, one shaped link
+(1 ms each way, 1 Gbit) from a server that cannot see their files:
 
-Open, known: phase 4 criterion; one unexplained failed step in one of four
-swarm runs with a worker (not reproduced); `--timings` not reproduced; the
-worker link is not encrypted.
+- **20 agents in 20 worktrees** against stock cargo with one target
+  directory per worktree: rust-analyzer 3.0x less wall time, 5.2x less CPU;
+  Ruff 5.5x and 7.3x; Bevy 4.6x and 8.2x. No failed steps. On the client
+  machine: 11.8 GB, 2.7 GB and 2.1 GB of artifacts instead of 100 GB, 95 GB
+  and 61 GB, and 29 s, 27 s and 14 s of CPU time for all twenty clients
+  together; the server's store holds 43 GB, 33 GB and 25 GB.
+- **One client, rust-analyzer**: nothing changed, 0.04 s (stock cargo
+  0.15 s); a fresh worktree on another machine at a commit the server has
+  built, 0.9 s for a ready binary; the first sync of the repository
+  uploads 21.5 MiB and a cold check takes 24.1 s against stock cargo's
+  22.2 s locally. Over a slow link (20 ms each way, 100 Mbit): 0.12 s,
+  8.7 s and 24.8 s.
+- **No drift**, client side: after rargo built and tested them through the
+  server, rust-analyzer, Ruff and Bevy build and test with stock cargo in
+  the same worktree and `target/`; see No-drift for the run.
+
+Tests at the last commit: `cargo test` 8 (client) + 7 (protocol) + 47 unit
+and 6 engine (server); `dev/e2e.sh` 104 checks with the server in a mount
+namespace where the client's directory is empty; `dev/e2e-flake.sh` 14
+checks (two servers, a registry dependency fetched by the servers). The
+swarm and no-drift runs below were made before the last two protocol
+changes (one delivery round trip per command, compressed control
+messages); the single-client table and both e2e scripts were run after.
+
+Not met, not done, or not re-measured since the change:
+
+- Phase 4 (a worker shortens a cold build in proportion) was not met
+  before and is not now; see Workers. The worker rig was brought up once
+  with the new server and a remote client (smoke test below); its
+  benchmark series was not repeated.
+- The rustc-fork measurements (Phase 5) were not repeated; nothing in them
+  depends on where the client is.
+- The client was only run on Linux x86_64.
+- Open from before: `--timings` is not reproduced; the worker link is
+  authenticated but not encrypted (the client link is both).
 
 | Area | State |
 |---|---|
+| Client: worktree scan with index, content-addressed tree | done, unit-tested, e2e |
+| Sync: manifests and contents the server lacks, shared uploads | done, unit-tested (server), e2e (counts of files and manifests asked) |
+| Stand-in for `.git` (HEAD, branch, dirty or not; no history, no contents) | done, unit-tested against real git, e2e |
+| Environment: allow-list, ask-on-declare, client cargo configuration | done, e2e (declared variable, policy file, a `config.toml` in a cargo home the server cannot see); `credentials.toml` travels the same way but no private registry was tried |
+| Transport: TCP, Noise `NNpsk0`, per-user keys, admin users | done, unit-tested, e2e (wrong key, unknown user, non-admin) |
+| Results: artifacts by hash, client cache shared between worktrees, worktree writes | done, unit-tested, e2e |
+| Fetching and toolchain installation on the server | done; fetch exercised by e2e-flake, toolchain installation checked once by hand (see No-drift) |
+| Drift check on the server; no-drift on the client | done; see No-drift |
 | FUSE server with passthrough (`fusewire`) | done, tested |
-| Content store, reflink / hard-link placement, GC, LRU budget | done, tested |
+| Content store, GC, LRU budget, cold tier | done, tested |
 | Traced sandbox filesystem with copy-on-write upper layer | done, tested |
-| Process sandbox (zygote, namespaces, init) | done, tested |
-| Git snapshots with inotify-maintained overlay | done, tested |
+| Process sandbox (zygote, namespaces, init), per-action cgroups | done, tested |
 | Cargo fork: planning mode, parse service | done, exercised on rust-analyzer, Ruff, Bevy |
 | Trace cache, in-flight dedup, declared env vars | done, tested |
 | Scheduler: priorities, memory admission, shared jobserver | done, unit-tested |
-| Per-action cgroups (exact CPU, memory of all processes) | done, active in e2e and benchmarks when the daemon's cgroup is delegated |
-| `rargo build / check / test / run / clippy / doc`, JSON messages | done, e2e-tested (`dev/e2e.sh`, 72 checks) |
-| Shared incremental compilation | done, e2e-tested, in the 20-agent benchmark |
-| Per-repo policy file (`.rargo.toml`) | done, e2e-tested (env pass-through, test network, malformed file) |
-| Flake-restricted sandboxes | done, e2e-tested (`dev/e2e-flake.sh`, 14 checks) |
-| Cache export/import between machines | done, e2e-tested |
-| Verify mode and drift check | done, exercised on the test workspace |
-| Workers: UDP session, chunked transfer, dispatch, hedging, keyed authentication | done and benchmarked; warm builds no slower, cold builds not shortened in proportion (criterion not met, see Workers) |
-| `cargo` shim | done, e2e-tested (routing, passthrough, fallback without a daemon) |
-| Cold tier (chunk-level storage of idle blobs) | done, unit- and e2e-tested, measured on the Ruff swarm store |
-| rustc fork (phase 5) | three patches, built and linked as toolchain `rargo`; see "Phase 5" |
-| `check` as a build that stops at metadata (fork only) | done, measured on rust-analyzer (D23) |
+| `rargo build / check / test / run / clippy / doc`, JSON messages | done, e2e |
+| Shared incremental compilation | done, e2e, in the 20-agent benchmark |
+| Per-repo policy file (`.rargo.toml`) | done, e2e (env, test network, sync excludes, git switch, malformed file) |
+| Flake-restricted sandboxes, cache export/import between servers | done, e2e-flake |
+| Workers | as before; smoke-tested with the new server |
+| `cargo` shim | done, e2e (routing, passthrough, fallback without a server) |
+| rustc fork (phase 5), `check` as a build | as before, not re-measured |
 
 ## Measurements
 
-### rust-analyzer (commit 37721d1, 324 check units, 602 more for build)
+### One remote client (`dev/bench-remote.sh ra`)
 
-| | stock cargo 1.100 | rargo |
-|---|---|---|
-| `check`, cold | 22.5 s wall, 76 s CPU | 20.3 s wall, 71 s CPU |
-| `check`, nothing changed | 0.12 s | 0.02 s |
-| `build` after `check`, cold | 37.9 s wall, 160 s CPU | 32.1 s wall |
-| `build`, nothing changed | not measured yet | 0.09 s |
-| disk after check + build | 4.7 GB target dir | 2.4 GB store; worktree `target/` holds 48 hard links |
+rust-analyzer (commit 37721d1), server with 24 cores and a fresh store per
+column, client in its own network namespace. "Stock cargo" is cargo 1.100
+on the client's files with the same 24 cores, no network involved.
 
-Stock cargo here compiles workspace members incrementally (its default for
-the dev profile); rargo does not yet, which is part of why its cold numbers
-are lower. A like-for-like comparison with `CARGO_INCREMENTAL=0` is still to
-be done. The rargo-built `rust-analyzer` binary runs and reports its version.
+| | stock cargo, local | rargo, 1 ms each way, 1 Gbit | rargo, 20 ms each way, 100 Mbit |
+|---|---|---|---|
+| first `check` (rargo: includes the first sync, 21.5 MiB) | 22.2 s | 24.1 s | 24.8 s |
+| `check`, nothing changed | 0.15 s | 0.04 s | 0.12 s |
+| `check` after a one-file edit | 5.9 s | 6.1 s | 6.3 s |
+| `build -p rust-analyzer` after that (rargo: binary comes over the link) | 38.3 s | 40.2 s | 47.6 s |
+| the same build, nothing changed | 0.15 s | 0.05 s | 0.17 s |
+| the same build from a fresh worktree on a second machine | a full build | 0.9 s | 8.7 s |
+| in the worktree's `target/` afterwards | 4,607 MiB | 565 MiB | 565 MiB |
 
-### 20 agents in 20 worktrees (`dev/swarm.py`)
+The first sync asked the client for 263 directory manifests and 2,333
+files; the second machine's worktree for 4 manifests and 1 file. One run
+per figure; across three runs of this table during the work the cold
+figures moved by up to 0.7 s. On the slow link a command that changes
+nothing costs a few 40 ms round trips: connect, request and answer, and
+for a build one more to agree that the artifacts are already in place.
+
+A single cold build is not faster than local cargo: it is the same
+compiler on the same number of cores plus a link. What the client gets is
+its own cores back, a 565 MiB `target/`, and everything anyone has already
+built.
+
+### 20 agents in 20 worktrees (`dev/bench-swarm.sh`)
 
 Each agent: check; edit a file; check; test one package; edit another file;
 check; test another package; build the main binary; test again. Agents
-overlap (several make the same edit to the same file). Stock cargo gets one
-target directory per worktree and its default `-j`; both sides are capped at
-24 cores. CPU time is cgroup `cpu.stat` of everything that ran.
+overlap (several make the same edit to the same file). The rargo agents are
+20 clients in one network namespace, 1 ms each way and 1 Gbit from the
+server, sharing one client cache; the server cannot see their worktrees.
+Stock cargo gets one target directory per worktree and its default `-j`;
+both sides are capped at 24 cores. Server CPU is the cgroup's `cpu.stat`;
+client CPU is the summed process times of the `rargo` commands.
 
-| rust-analyzer | stock cargo | rargo | ratio |
+| rust-analyzer | stock cargo | rargo, remote clients | ratio |
 |---|---|---|---|
-| wall time | 380 s | 117 s | 3.3x |
-| CPU time | 8,846 s | 1,659 s | 5.3x |
-| disk | 100.1 GB | 42.6 GB (41.1 GB after GC) | 2.4x |
+| wall time | 374.5 s | 125.5 s | 3.0x |
+| CPU time | 8,680 s | 1,641 s on the server + 29 s on the client | 5.2x |
+| disk on the client machine | 100.1 GB | 11.8 GB | 8.5x |
+| disk on the server | | 42.6 GB (40.8 GB after GC) | |
 | failed steps | 0 | 0 | |
-| mean step times: check / check after edit / test / check after 2nd edit / test / build / test | 117 / 13.6 / 6.8 / 28.8 / 13.9 / 178 / 1.1 s | 23.7 / 8.8 / 1.4 / 11.0 / 1.1 / 67.5 / 0.7 s | |
+| mean step times: check / check after edit / test / check after 2nd edit / test / build / test | 109 / 13.1 / 7.9 / 31.4 / 16.3 / 173 / 1.0 s | 24.6 / 8.6 / 1.5 / 9.4 / 0.9 / 73.8 / 0.4 s | |
+| crossing the link | | 21.7 MiB up (one upload of the repository; 19 clients waited for it), 1,820 MiB of results down | |
 
-Without shared incremental compilation the same rargo run took 127 s wall,
-2,134 s CPU and 18.2 GB: incremental state costs about 23 GB of store here
-and saves about 10 s of wall time and 470 s of CPU. That trade is what the
-design's "incremental states are large" risk predicted; see known weaknesses.
-
-| Ruff (commit as cloned) | stock cargo | rargo | ratio |
+| Ruff | stock cargo (earlier run) | rargo, remote clients | ratio |
 |---|---|---|---|
-| wall time | 818 s | 146 s | 5.6x |
-| CPU time | 19,385 s | 2,703 s | 7.2x |
-| disk | 94.9 GB | 32.8 GB (30.0 GB after GC) | 2.9x |
+| wall time | 818 s | 149.3 s | 5.5x |
+| CPU time | 19,385 s | 2,643 s + 27 s | 7.3x |
+| disk on the client machine | 94.9 GB | 2.7 GB | |
+| disk on the server | | 32.9 GB (30.2 GB after GC) | |
 | failed steps | 0 | 0 | |
-| mean step times (same order) | 317 / 22.2 / 5.8 / 77.6 / 22.9 / 315 / 2.0 s | 35.3 / 14.6 / 1.0 / 16.8 / 1.6 / 71.3 / 0.3 s | |
+| mean step times (same order) | 317 / 22.2 / 5.8 / 77.6 / 22.9 / 315 / 2.0 s | 35.7 / 14.7 / 1.0 / 17.5 / 1.5 / 72.3 / 0.3 s | |
+| crossing the link | | 71.7 MiB up, 604 MiB down | |
 
-The Ruff rargo run was done twice because the first lost its CPU figure to a
-measurement bug. Wall and disk are from the first run (146 s, nothing else
-on the box); CPU is from the second (155 s wall), which shared the machine
-with a compiler build, so 2,703 s is if anything too high.
-
-| Bevy | stock cargo | rargo | ratio |
+| Bevy | stock cargo (earlier run) | rargo, remote clients | ratio |
 |---|---|---|---|
-| wall time | 400 s | 83 s | 4.8x |
-| CPU time | 9,112 s | 1,086 s | 8.4x |
-| disk | 61.0 GB | 24.9 GB (21.3 GB after GC) | 2.5x |
+| wall time | 400 s | 87.4 s | 4.6x |
+| CPU time | 9,112 s | 1,108 s + 14 s | 8.2x |
+| disk on the client machine | 61.0 GB | 2.1 GB | |
+| disk on the server | | 25.0 GB (21.2 GB after GC) | |
 | failed steps | 0 | 0 | |
-| mean step times (same order) | 284 / 22.8 / 10.8 / 27.9 / 9.2 / 30.2 / 0.9 s | 32.6 / 14.7 / 4.4 / 11.1 / 0.7 / 15.7 / 0.4 s | |
+| mean step times (same order) | 284 / 22.8 / 10.8 / 27.9 / 9.2 / 30.2 / 0.9 s | 34.8 / 15.1 / 4.7 / 11.3 / 0.8 / 16.6 / 0.4 s | |
+| crossing the link | | 84.2 MiB up, 362 MiB down | |
 
-Zed was dropped from the set at the user's request (DECISIONS D9).
+The stock cargo figures for Ruff and Bevy are from the run before the
+change (same machine, same cap; nothing about stock cargo changed); for
+rust-analyzer stock cargo was run again alongside.
+
+Against the first implementation, where client and server shared a disk
+(117 s, 146 s and 83 s wall), the link costs 4 to 9 s on these runs. The
+rust-analyzer agents each end with a different 565 MiB binary, so the
+client side is twenty binaries; where agents build the same thing the
+client cache holds it once.
+
+Most of the server's store is incremental state (about 23 GB of the
+42.6 GB for rust-analyzer). Idle blobs go to the cold tier as chunks: the
+Ruff store of the earlier run went from 28.8 GiB to 3.9 GiB.
 
 ### Tracing overhead
 
@@ -135,107 +179,167 @@ Zed was dropped from the set at the user's request (DECISIONS D9).
   than stock cargo in absolute terms (see above); the tracing share has not
   been isolated yet.
 
-### Small synthetic workspace (`dev/e2e.sh`, 48 checks, all passing)
+This was measured with the first implementation. The sandbox and its file
+system are unchanged.
 
-- Second worktree at the same commit: zero actions run, about 7 ms, artifact
-  shares an inode with the first worktree's.
-- Nothing-changed build: about 5 ms end to end.
-- One-file edit: exactly the edited crate and its dependents rerun.
+### Small synthetic workspace (`dev/e2e.sh`, 104 checks, all passing)
+
+The server runs in a mount namespace in which the client's directory is an
+empty file system, with its own cargo home, and requires a key.
+
+- A wrong key, an unknown user and a non-administrator asking for garbage
+  collection are refused.
+- Second worktree at the same commit: zero actions; one file (the `HEAD`
+  naming its branch) and at most four manifests uploaded; the artifact is
+  the same inode as the first worktree's (or a reflink).
+- A one-file edit uploads one file and the four manifests on its path, and
+  reruns exactly the edited crate and its dependents.
+- A file git ignores but the build includes is synced and built with; a
+  3 MB file travels in parts; a directory the policy excludes is not sent.
 - Eight concurrent cold builds of the same commit from eight worktrees: one
-  build's worth of actions (5), the rest joined in flight or hit the cache.
-- A test binary reruns only when something it read changed; a passing run
-  is replayed otherwise.
-- Stock cargo builds the same worktree afterwards, including into the same
-  `target/` that rargo linked artifacts into.
+  build's worth of actions.
+- A variable a build script declares is asked of the client and causes a
+  rebuild; an unrelated one changes nothing.
+- A `config.toml` in the client's cargo home, which the server cannot see,
+  applies to that client's builds and to nobody else's.
+- A test binary reruns only when something it read changed; a file a test
+  writes appears in the client's worktree.
+- A build script sees HEAD, its branch and whether the tree is dirty, and
+  no history; with `sync.git = false` it sees no repository.
+- `run` passes arguments and resolves compiled-in paths; `doc --open`
+  starts the client's browser on the client's file.
+- Stock cargo builds, tests and documents in the same `target/`
+  afterwards, and rargo works again after that.
 
 ## No-drift
 
-`dev/nodrift.sh REPO`: rargo build and test, rargo's drift check, tracked
-files untouched, then stock cargo build and test in the same worktree and
-`target/`, then rargo again. First run: every rargo step and stock build
-passed in all three repos; stock `cargo test` failed in all three (fixed,
-D32); Ruff's drift check flagged an unread autoconf log (no longer counted
-as drift, D32). **Third run, after the fixes: 0 failures in all three**
-(`dev/nodrift.sh`; rust-analyzer full test suite; Ruff `ruff_linter`,
-`ruff_python_parser`, `ruff_text_size`; Bevy `bevy_ecs`, `bevy_math`,
-`bevy_color`). rargo build and test, rargo's drift check (stock cargo plan
-against rargo, every cached unit re-run cleanly and compared), tracked
-files untouched, stock cargo build and test in the same worktree and
-`target/`, and rargo again afterwards all passed. The run started with the
-read-only leftovers of earlier runs in place, so the cleanup path for
-existing worktrees is covered too. Bevy leaves an untracked `Cargo.lock`
-(Bevy ignores it; stock cargo writes it as well).
+The server-side half and the client-side half (D42), run through a fresh
+server that cannot see the repositories (`dev/nodrift-all.sh`): rargo build
+and test; the server's drift check (stock cargo against rargo re-running
+every cached unit, on the synced state); tracked files untouched; stock
+cargo build and test in the same worktree and `target/`; rargo again.
+
+| | rust-analyzer | Ruff | Bevy |
+|---|---|---|---|
+| rargo build / test | ok / ok (full suite) | ok / ok (`ruff_linter`, `ruff_python_parser`, `ruff_text_size`) | ok / ok (`bevy_ecs`, `bevy_math`, `bevy_color`) |
+| drift check on the server | no drift (90 s) | no drift (231 s) | no drift (178 s) |
+| tracked files untouched | ok | ok | ok |
+| stock cargo build and test, same `target/` | ok | ok | ok |
+| rargo again afterwards | ok | ok | ok |
+| failures | 0 | 0 | 0 |
+
+In that run the worktrees' `target/` directories still held stock cargo's
+artifacts from earlier runs, so stock cargo had nothing to rebuild (0 s).
+For that reason one more run was made in a fresh rust-analyzer worktree:
+`rargo build -p rust-analyzer` (40.1 s) and `rargo test -p stdx --no-run`
+left 6 files, 575 MB, in `target/`; stock `cargo build -p rust-analyzer`
+then did its full cold build into the same directory (38.1 s) and
+`cargo test -p stdx` passed; rargo build and test afterwards took 0.1 s and
+0.2 s; `git status` was clean. Ruff and Bevy were not repeated that way.
+
+Bevy leaves an untracked `Cargo.lock` (Bevy ignores it; stock cargo writes
+it as well).
+
+A difference stock cargo would not have, found here and fixed: the
+server-built `rust-analyzer --version` said `37721d1` where stock cargo's
+says `37721d141`, because git abbreviates by repository size and the
+stand-in for `.git` is tiny. The stand-in now carries the client
+repository's abbreviation length; a server-built binary prints
+`rust-analyzer 0.0.0 (37721d141 2026-11-22)`, as stock cargo's does.
+
+Also checked once by hand: a project whose `rust-toolchain.toml` names a
+toolchain the server did not have (1.98.0) was built and run through the
+server in 5.7 s; the server installed the toolchain, the client has no
+part in it.
 
 ## Mechanisms
 
-### Sandbox filesystem and tracing
-Implemented in `crates/fusewire` and `rargo-core/src/sandboxfs.rs`. One FUSE
-mount; each action is pivoted into its own top-level directory. Reads and
-writes go through kernel passthrough to backing files; only lookups,
-opens, readdirs and metadata changes reach the daemon.
-Verified by: unit and integration tests (`cargo test -p rargo-core`),
-`dev/e2e.sh`, rust-analyzer builds.
-Known weaknesses: FUSE-over-io_uring is not used; a file opened read-only
-and then for writing while the first handle is still open falls back to
-direct I/O for the second handle; `O_TMPFILE` is not supported inside the
-sandbox.
+### Sync
+`rargo/src/scan.rs` (client), `rargo-core/src/snapshot.rs` and
+`session.rs` (server). Verified by: unit tests on both sides (scan skips
+and reuse, sync asks only for what is missing, evicted content is asked for
+again, a client that withholds content fails the sync, a file that changed
+since the scan restarts the command), e2e counts.
+Measured: scanning a rust-analyzer worktree (2,386 files) with a warm index
+takes 2.7 to 3.2 ms.
+Known weaknesses: every command scans the whole worktree (one `lstat` per
+file), which will show on very large trees; there is no watcher. A large
+git-ignored directory is hashed and uploaded once unless the policy file
+excludes it. The whole tree must be in the server's store before the build
+starts. Symlinks that point outside the worktree dangle on the server.
+Sparse checkouts are synced as they are on disk.
 
-### Snapshots
-`rargo-core/src/snapshot.rs`. HEAD tree plus overlay; modified, untracked and
-filter-affected files are captured into the store when a snapshot is taken;
-ignored directories and submodules are shown live.
-Verified by: five unit tests (clean tree, edits via events, HEAD moving
-without file changes, ignored directories, two worktrees sharing identity).
-Known weaknesses: sparse checkouts and `assume-unchanged` are not handled
-specially; a full rescan runs `git status` (tens of milliseconds on a large
-repository) after any change to a `.gitignore` or `.gitattributes`.
+### Stand-in for `.git`
+`rargo/src/git.rs`. Verified by: a unit test that runs real git against
+it (HEAD, log, branch, status, describe, a linked worktree, a detached
+HEAD), e2e, and rust-analyzer's build script no longer warning.
+Known weaknesses: no history (`describe --tags` fails as in a shallow
+clone) and no contents (`git diff`, `git show`); in a repository with CRLF
+files committed under `eol=lf`, `git status` in the sandbox calls them
+modified (D36); submodules' own git data is not provided.
+
+### Environment
+`rargo-proto/src/lib.rs` (`env_allowed`), `rargo-core/src/engine.rs`
+(`ClientEnv`), `build.rs` (`base_env`, `Home`).
+Known weaknesses: the build environment is the server's, so anything a
+build needs from the machine (a system library, `protoc`) has to be on the
+server or come from the repository's flake; cargo configuration in
+directories above the worktree is not synced; a client's `credentials.toml`
+is stored on the server (mode 0600, in the state directory) for as long as
+the state directory lives.
+
+### Transport and access
+`rargo-proto/src/secure.rs`, `rargo-core/src/session.rs`, `serve.rs`.
+Known weaknesses: every user shares one cache and could read another's
+source through it by guessing nothing more than a build command, which is
+the intended trust model, not an accident; the request in the first
+handshake message is not forward secret and could be replayed by someone
+who recorded it (it would start a build of an already synced tree and
+deliver nothing to the attacker); keys are plain lines in a file, with no
+rotation or revocation other than editing it and restarting.
+
+### Results on the client
+`rargo/src/place.rs`. Verified by unit tests (sharing, own copies, parts,
+forged content refused) and e2e (stock cargo in the same `target/`).
+Known weaknesses: without reflinks, shared artifacts are read-only hard
+links into the client's cache (as cargo's own are links into `deps/`); a
+client killed while placing files can leave `.rargo-tmp-*` files in
+`target/`; a client that disconnects does not stop actions already running
+for it (their results are cached).
+
+### Snapshots, fetching, flakes
+`rargo-core/src/snapshot.rs`, `build.rs` (`fetch`), `flake.rs`.
+A fetch writes the whole snapshot to a scratch directory first, which
+costs a copy of the source on file systems without reflinks; it happens
+only when cargo needs the network. A server without network access needs
+its cargo home filled beforehand (the benchmark server had none and used
+one filled earlier). A binary built in a flake sandbox needs the flake's
+store paths on the client to run there.
 
 ### Planner (cargo fork)
 `forks/cargo/*.patch` on cargo 1.100.0. Cargo's real pipeline runs with
 process execution stubbed; build-script results appear in recorded commands
 as placeholder tokens that rargod expands.
-Verified by: expansion unit tests, e2e script, rust-analyzer.
-Known weaknesses: cargo's own post-build lints (`unused_dependencies`),
-future-incompatibility reports, `--timings`, and the `target/debug/*.d`
-dep-info files are not produced; `cargo doc --open` does not open anything;
-example scraping failures are treated as hard errors.
+Known weaknesses: `--timings` is not produced; cargo's
+future-incompatibility report file is not written (the warning is shown);
+example scraping failures are treated as hard errors; the fork is pinned to
+one cargo release.
 
-### Trace cache and engine
-`rargo-core/src/{trace,engine}.rs`. Only successes are recorded.
-Verified by: `tests/engine.rs` (six tests with real sandboxed processes).
-
-### Scheduler
-`rargo-core/src/sched.rs`. Tokens are a real jobserver pipe shared with
-rustc's worker threads; requests are ordered by priority and admitted by
-expected memory.
-Verified by: four unit tests. Not yet verified under a real memory-bound
-workload. Memory estimates come from `ru_maxrss` of the largest process of a
-previous run, not from a cgroup.
+### Trace cache, engine, scheduler
+`rargo-core/src/{trace,engine,sched}.rs`. Only successes are recorded.
+Verified by `tests/engine.rs` (six tests with real sandboxed processes) and
+four scheduler unit tests. Not verified under a real memory-bound workload.
 
 ### Shared incremental compilation
-`rargo-core/src/incr.rs`. In the 20-agent rust-analyzer run: 968 states
-saved; of 4,116 seeded compiles 373 took the same worktree's state and 2,480
-an ancestor commit's; 1,263 compiles had no state to start from.
-Known weaknesses: states are the largest thing in the store (about 23 GB of
-the 42.6 GB above); remote (worker) compiles run without a seed.
-
-### Flake environments, export/import
-`rargo-core/src/flake.rs`, `dev/e2e-flake.sh`. Two daemons with separate
-stores, worktrees at different paths and different cargo homes: after
-exporting from the first and importing into the second, the second built a
-byte-identical binary and replayed the test while running one action (the
-offline planning attempt). A third store without the import ran seven.
-Known weaknesses: both "machines" are the same host, so planning (which
-observes host files) also hit; on a different host it would run once. The
-flake key covers `flake.nix`, `flake.lock` and `.nix` files at the top level
-and under `nix/`, not arbitrary files a flake might import.
+`rargo-core/src/incr.rs`. States are the largest thing in the store.
+Seeds are chosen with the commits the client names (D43). Remote (worker)
+compiles run without a seed.
 
 ### Verify mode and drift check
-`RARGO_VERIFY=1`, `rargo --rargo-drift-check`, background every six hours.
-On the test workspace: "no drift", 5 cached units re-run cleanly, 0 differed.
-Finding: rustc's incremental mode is not byte-reproducible; the object
-members of an rlib are named after a random per-invocation string. Verify
-compares such rlibs by member content. Not yet run on the large workspaces.
+`RARGO_VERIFY=1`, `rargo --rargo-drift-check`, background every six hours
+on the server for each worktree's newest synced state (D42).
+Finding from before: rustc's incremental mode is not byte-reproducible;
+verify compares such rlibs by member content.
 
 ### Workers
 `rargo-core/src/{net,chunk,remote}.rs`, `dev/netns.sh`, `dev/bench-worker.sh`,
@@ -282,6 +386,15 @@ bandwidth; remote compiles without incremental state.
 Known weaknesses: a cold worker first pulls the toolchain (about 300 MB);
 flake-rooted and host-network actions are never sent to workers; the link
 is authenticated but not encrypted.
+
+All of the above was measured with the first implementation, with the
+client on the server's machine. Since the change the rig
+(`dev/netns.sh`) also has a client machine; one smoke test was run on it with the new server: a
+client in its namespace built rust-analyzer through an 8-core server with
+one 8-core worker (1 ms each way, 0.1% loss, 1 Gbit on both links) in
+43.6 s, 10 actions were dispatched to the worker (all of them hedged
+locally as well), no worker failure. The benchmark series above was not
+repeated.
 
 ## Phase 5
 
@@ -358,6 +471,17 @@ which compiler they used.
   fast-starting action's CPU time was mostly accounted elsewhere. Fixed:
   the child moves itself before it forks anything.
 
+- (Remote first.) Build scripts that ask git for the commit saw no
+  repository once the worktree was no longer on the server's disk:
+  rust-analyzer warned and would have shipped a version string without a
+  commit. Found by the first remote build of it; fixed with the per-commit
+  stand-in (D36).
+- (Remote first.) Each step that produced something for the client cost
+  its own round trip, and cargo's `.d` file for rust-analyzer (hundreds of
+  kilobytes of paths) went uncompressed over a connection still in slow
+  start; a no-op build over a 40 ms link took 0.33 s. Fixed: one delivery
+  per command and compressed control messages (0.17 s).
+
 ## Store on XFS
 
 With `mkfs.xfs` unavailable, the reflink check used a 20 GiB loopback btrfs
@@ -368,3 +492,8 @@ Aggregate `du` counts were 122.69 MiB and 104.83 MiB respectively.
 `filefrag` confirmed shared extents on btrfs and independent copies when
 the store was on btrfs and the worktrees were on ext4. The btrfs image
 was unmounted and retained (D33).
+
+That was the first implementation, where worktrees could share the store's
+file system. The server's store can still be on a reflink file system
+(`--store`); worktrees are now on other machines, and it is the client's
+cache that shares artifacts between them.

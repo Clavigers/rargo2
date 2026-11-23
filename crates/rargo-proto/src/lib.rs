@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub mod secure;
 pub mod tree;
 
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 pub type Digest = [u8; 32];
 
@@ -116,6 +116,8 @@ pub enum ServerMsg {
     BlobPart { hash: Digest, part: Part, last: bool },
     /// Everything named in the `Need` for delivery `id` has been sent.
     Delivered { id: u64 },
+    /// Another message, encoded and zstd-compressed (see [`pack`]).
+    Packed(Vec<u8>),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -138,6 +140,8 @@ pub enum ClientMsg {
     Changed,
     Env(Vec<(String, Option<String>)>),
     Need { id: u64, hashes: Vec<Digest> },
+    /// Another message, encoded and zstd-compressed (see [`pack`]).
+    Packed(Vec<u8>),
 }
 
 /// One piece of a large file.
@@ -162,6 +166,24 @@ impl Part {
     pub fn unpack(self) -> std::io::Result<Vec<u8>> {
         if self.packed { zstd::bulk::decompress(&self.data, 2 * PART_SIZE) } else { Ok(self.data) }
     }
+}
+
+/// Compresses an encoded message that is large enough to be worth it: a
+/// delivery listing thousands of paths, a batch of directory manifests. A
+/// new connection may only send a few kilobytes per round trip at first, so
+/// on a slow link the size of such a message is latency. `None` means "send
+/// it as it is". Messages that carry file contents are compressed already.
+pub fn pack(encoded: &[u8]) -> Option<Vec<u8>> {
+    if encoded.len() < 2048 {
+        return None;
+    }
+    let z = zstd::bulk::compress(encoded, 3).ok()?;
+    (z.len() + encoded.len() / 8 < encoded.len()).then_some(z)
+}
+
+/// Undoes [`pack`].
+pub fn unpack(packed: &[u8]) -> std::io::Result<Vec<u8>> {
+    zstd::stream::decode_all(packed)
 }
 
 /// Files larger than this travel as a sequence of parts.

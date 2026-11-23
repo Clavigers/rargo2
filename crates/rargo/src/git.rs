@@ -94,7 +94,15 @@ fn build(root: &Path, head: &Head, dir: &Path) -> Option<()> {
     }
     // The history ends here, as in a clone of depth one.
     std::fs::write(dir.join("shallow"), format!("{}\n", head.commit)).ok()?;
-    std::fs::write(dir.join("config"), "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n").ok()?;
+    // git abbreviates object names to a length that grows with the
+    // repository; the stand-in is tiny, so it is told the real one's.
+    let short = git(root).args(["rev-parse", "--short", &head.commit]).output().ok().filter(|o| o.status.success())?;
+    let abbrev = String::from_utf8_lossy(&short.stdout).trim().len().clamp(4, 40);
+    std::fs::write(
+        dir.join("config"),
+        format!("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tabbrev = {abbrev}\n"),
+    )
+    .ok()?;
     // The commit and its trees, without file contents...
     let listed = git(root)
         .args(["rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", &head.commit])
@@ -131,7 +139,7 @@ fn build(root: &Path, head: &Head, dir: &Path) -> Option<()> {
 /// kept in the client's cache. `None` when the worktree is not a git
 /// checkout, has no commit yet, or git is not installed.
 pub fn thin(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
-    let key = blake3::hash(format!("v1\n{}\n{}", head.text, head.commit).as_bytes()).to_hex()[..32].to_string();
+    let key = blake3::hash(format!("v2\n{}\n{}", head.text, head.commit).as_bytes()).to_hex()[..32].to_string();
     let all = cache.join("git");
     let dir = all.join(&key);
     if dir.join("HEAD").is_file() {
@@ -206,7 +214,16 @@ mod tests {
         assert_eq!(run(&copy, &["log", "-1", "--format=%H %s"]), format!("{commit} second"));
         assert_eq!(run(&copy, &["rev-parse", "--abbrev-ref", "HEAD"]), "feature/x");
         assert_eq!(run(&copy, &["status", "--porcelain"]), "");
-        assert_eq!(run(&copy, &["describe", "--always", "--dirty"]), commit[..7]);
+        let short = run(&repo, &["rev-parse", "--short", "HEAD"]);
+        assert_eq!(run(&copy, &["describe", "--always", "--dirty"]), short);
+        assert_eq!(run(&copy, &["log", "-1", "--format=%h"]), short);
+        // A repository that abbreviates to more than the default.
+        run(&repo, &["config", "core.abbrev", "11"]);
+        let h11 = head(&repo).unwrap();
+        let other_cache = tmp.path().join("cache11");
+        let thin11 = thin(&repo, &h11, &other_cache).unwrap();
+        assert!(std::fs::read_to_string(thin11.join("config")).unwrap().contains("abbrev = 11"));
+        run(&repo, &["config", "--unset", "core.abbrev"]);
         std::fs::write(copy.join("src/lib.rs"), "pub fn c() {}\n").unwrap();
         assert_eq!(run(&copy, &["status", "--porcelain"]), "M src/lib.rs");
         assert!(run(&copy, &["describe", "--always", "--dirty"]).ends_with("-dirty"));
