@@ -1,7 +1,7 @@
 From f50b420c7d92a9a5e8ea00a631bd07db840a7c1b Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Sun, 22 Nov 2026 23:14:45 +0100
-Subject: [PATCH 1/6] rargo: planning mode
+Subject: [PATCH 1/7] rargo: planning mode
 
 With __RARGO_PLAN set, run the normal pipeline with process execution
 stubbed out and write a rargo_plan::Plan. Build-script results are

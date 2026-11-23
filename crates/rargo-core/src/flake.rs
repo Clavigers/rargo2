@@ -49,6 +49,14 @@ const DROP: &[&str] = &[
     "propagatedNativeBuildInputs",
 ];
 
+const CA_AT: &str = "/etc/ca-certificates.crt";
+
+fn host_ca_bundle() -> Option<Vec<u8>> {
+    ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+}
+
 fn nix() -> Command {
     let mut c = Command::new("nix");
     c.args(["--extra-experimental-features", "nix-command", "--extra-experimental-features", "flakes"]);
@@ -140,11 +148,34 @@ fn evaluate(root: &Path, uid: u32, gid: u32) -> Result<FlakeEnv> {
             env.insert(name.clone(), value.to_string());
         }
     }
+    // The server's certificate bundle is shown at a fixed place in the
+    // sandbox (see `etc`); a dev shell entered by hand sees the machine's.
+    if host_ca_bundle().is_some() {
+        for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"] {
+            env.entry(var.to_string()).or_insert_with(|| CA_AT.to_string());
+        }
+    }
     if roots.is_empty() || !env.contains_key("PATH") {
         bail!("the flake's devShell exports no tools (no store paths, or no PATH)");
     }
     let mut c = Command::new("nix-store");
     c.arg("-qR");
+    // A value can mention a path that is not there (a placeholder in a
+    // prefix map) or run a store path into what follows it
+    // (`-fmacro-prefix-map=/nix/store/..-dev=/nix/store/..`): `=` and `?`
+    // are legal in names.
+    let roots: BTreeSet<String> = roots
+        .into_iter()
+        .filter_map(|r| {
+            let mut name = r.as_str();
+            loop {
+                if Path::new("/nix/store").join(name).exists() {
+                    return Some(name.to_string());
+                }
+                name = name.strip_suffix(['=', '?', '.', '+'])?;
+            }
+        })
+        .collect();
     for r in &roots {
         c.arg(format!("/nix/store/{r}"));
     }
@@ -220,7 +251,16 @@ impl FlakeEnv {
         }
         file("group", group)?;
         file("hosts", "127.0.0.1 localhost\n::1 localhost\n".into())?;
-        file("nsswitch.conf", "passwd: files\ngroup: files\nhosts: files\n".into())?;
+        // Names resolve for the actions the policy gives the host's
+        // network; the others have nothing to reach a resolver with.
+        file("nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n".into())?;
+        if let Ok(resolv) = std::fs::read_to_string("/etc/resolv.conf") {
+            file("resolv.conf", resolv)?;
+        }
+        if let Some(bundle) = host_ca_bundle() {
+            let hash = store.put_bytes(&bundle)?;
+            m.insert(b"ca-certificates.crt".to_vec(), SynthEnt::File { hash, size: bundle.len() as u64 });
+        }
         Ok(Arc::new(m))
     }
 }

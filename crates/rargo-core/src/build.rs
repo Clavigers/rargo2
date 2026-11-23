@@ -792,7 +792,7 @@ async fn plan_with(
     c: &Arc<Client>,
     p: &Prepared,
     args: &[String],
-    extra_env: &[(&str, String)],
+    extra_env: &[(String, String)],
 ) -> Result<PlanOutcome> {
     let mut env: BTreeMap<Vec<u8>, Vec<u8>> =
         p.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
@@ -1233,7 +1233,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
             let map: BTreeMap<usize, (&str, &str)> =
                 unused.iter().map(|(i, l)| (*i, (plan.units[*i].desc.as_str(), l.as_str()))).collect();
             let json = serde_json::to_string(&map)?;
-            if let PlanOutcome::Ok(lint) = plan_with(d, c, &p, &plan_args, &[(rp::UNUSED_ENV, json)]).await? {
+            if let PlanOutcome::Ok(lint) = plan_with(d, c, &p, &plan_args, &rp::split_env(rp::UNUSED_ENV, &json)).await? {
                 // Whatever the planner said while loading the workspace was
                 // shown already; what is new is the lint.
                 let before = String::from_utf8_lossy(&planned.stderr).into_owned();

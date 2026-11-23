@@ -1,7 +1,7 @@
 From 6d31d772e0f56b3cb363f687e69d7aa0915d9de2 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:45:11 +0100
-Subject: [PATCH 4/6] rargo: doc's closing status and --open as plan steps
+Subject: [PATCH 4/7] rargo: doc's closing status and --open as plan steps
 
 ---
  src/compiler/rargo.rs |  7 +++++

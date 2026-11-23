@@ -20,6 +20,38 @@ pub const PLAN_VERSION: u32 = 5;
 /// emits its `unused_dependencies` warnings.
 pub const UNUSED_ENV: &str = "__RARGO_UNUSED";
 
+/// The kernel refuses a single environment string over 128 KiB, and a
+/// large workspace's lint data is bigger: a long value travels as `NAME`,
+/// `NAME_1`, `NAME_2`, ... and is put together again by [`joined_env`].
+pub fn split_env(name: &str, value: &str) -> Vec<(String, String)> {
+    const PART: usize = 96 << 10;
+    let mut out = Vec::new();
+    let mut rest = value;
+    loop {
+        let mut cut = rest.len().min(PART);
+        while !rest.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let key = if out.is_empty() { name.to_string() } else { format!("{name}_{}", out.len()) };
+        out.push((key, rest[..cut].to_string()));
+        rest = &rest[cut..];
+        if rest.is_empty() {
+            return out;
+        }
+    }
+}
+
+pub fn joined_env(name: &str) -> String {
+    let mut value = std::env::var(name).unwrap_or_default();
+    for i in 1.. {
+        match std::env::var(format!("{name}_{i}")) {
+            Ok(part) => value.push_str(&part),
+            Err(_) => break,
+        }
+    }
+    value
+}
+
 /// Environment variable naming the file the plan is written to. Its presence
 /// switches the fork into planning mode.
 pub const PLAN_ENV: &str = "__RARGO_PLAN";
@@ -341,4 +373,25 @@ pub fn encode<T: Serialize>(v: &T) -> Vec<u8> {
 
 pub fn decode<T: for<'a> Deserialize<'a>>(b: &[u8]) -> Result<T, String> {
     bincode::deserialize(b).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod env_tests {
+    use super::*;
+
+    #[test]
+    fn long_values_split_and_join() {
+        let value: String = (0..300_000).map(|i| if i % 7 == 0 { 'é' } else { 'x' }).collect();
+        let parts = split_env("__RARGO_TEST_SPLIT", &value);
+        assert!(parts.len() > 2 && parts.iter().all(|(_, v)| v.len() <= 96 << 10));
+        assert_eq!(parts[0].0, "__RARGO_TEST_SPLIT");
+        assert_eq!(parts[1].0, "__RARGO_TEST_SPLIT_1");
+        for (k, v) in &parts {
+            // SAFETY: test-only variables nothing else reads.
+            unsafe { std::env::set_var(k, v) };
+        }
+        assert_eq!(joined_env("__RARGO_TEST_SPLIT"), value);
+        assert_eq!(split_env("X", ""), vec![("X".to_string(), String::new())]);
+        assert_eq!(joined_env("__RARGO_TEST_ABSENT"), "");
+    }
 }

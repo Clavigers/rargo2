@@ -1,7 +1,7 @@
 From 044c31a4e52fa52c6774077935c6ad9d49e0aa39 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:07:23 +0100
-Subject: [PATCH 3/6] rargo: report whether the compiler is rargo's rustc fork
+Subject: [PATCH 3/7] rargo: report whether the compiler is rargo's rustc fork
  in the plan
 
 ---
