@@ -6,21 +6,50 @@ capped at 24 cores (`CPUQuota=2400%`, 24 scheduler tokens) and 90 GB.
 
 ## Summary (2026-11-23)
 
-rargo is remote cargo: a client scans its worktree into a content-addressed
-tree, uploads what the server lacks, passes on an allow-listed environment,
-and receives output, the artifacts it asked for and files the build wrote
-into the worktree. Analysis, scheduling and building happen on the server
-(DESIGN.md, DECISIONS D34 to D54).
+rargo is remote cargo. On a client machine one daemon per server keeps a
+long-lived session to the build server, watches the worktrees it has
+seen and pushes their changes as they happen; the `rargo` command hands
+its arguments and environment to the daemon and relays the output.
+Results are not copied into the worktree: `target/` is a file system the
+daemon serves, in which artifacts appear as the server makes them and
+are fetched when something opens them. Analysis, scheduling and building
+happen on the server (DESIGN.md, DECISIONS D34 to D59).
 
-Everything below was measured on 2026-11-23 at commit `a92e359` (protocol
-6, plan format 6) unless a line says otherwise. The commits after it
-change how work is given to workers and how the drift check compares
-outputs (D55), nothing a client or a server without workers runs through
-in a build; the tests and both e2e scripts were run again at the final
-commit. Measured with clients in their own
-network namespace, one shaped link (1 ms each way, 1 Gbit) from a server
-that cannot see their files.
+What was measured when:
 
+- At `a92e359` (protocol 6: one TCP connection per command, results
+  copied into `target/`), on the rig's LAN link (1 ms each way, 1 Gbit):
+  the four 20-agent swarms against stock cargo, the single-client
+  tables, tracing overhead, phase 5 and the no-drift runs. Those tables
+  are kept below and say so.
+- In this round (D56 to D59, protocol 7), at the commits named with each
+  table: incremental state on workers and the worker series; the client
+  daemon; per-command latency before and after; everything that crosses
+  the client link again **with 100 ms of round-trip time** (netem,
+  50 ms each way, 1 Gbit), beside LAN figures: one client, the swarms,
+  the history replay, the latency of one command, the fresh worktree,
+  the branch switch; no-drift with the virtual output directory.
+
+Clients are in their own network namespace, one shaped link from a
+server that cannot see their files.
+
+- **One command, 100 ms round trip** (rust-analyzer, median of 7):
+  nothing to do 0.16 s, was 0.36 s; after a one-line edit 1.29 s, was
+  2.41 s. On a LAN 0.06 s and 1.18 s, were 0.07 s and 1.22 s. A build
+  with nothing to do is one message each way; an edit is on the server
+  before the build is asked for. See "One command".
+- **The swarm at 100 ms round trip** (20 agents, no failed steps):
+  rust-analyzer 114.9 s, Ruff 147.8 s, Bevy 85.6 s, Zed 608.3 s; on
+  the LAN link rust-analyzer takes 115.1 s. With the virtual output
+  directory 2.3 MiB cross the link towards the client in the
+  rust-analyzer swarm and 0.01 GB end up on its disk; with results
+  copied it was 1,950 MiB and 11.8 GB (and 131.3 s).
+- **A branch switch** (rust-analyzer; check, build and test of a branch
+  another agent has been working on): in a fresh worktree 0.17, 0.14 and
+  0.12 s, in a worktree just switched to the branch 0.14, 0.14 and
+  0.11 s, against 0.13, 0.14 and 0.11 s for the agent already there
+  (100 ms round trip). Stock cargo: 22.5, 37.8 and 3.0 s fresh; 6.1, 9.5
+  and 1.1 s switched. See "A branch switch".
 - **20 agents in 20 worktrees** against stock cargo with one target
   directory per worktree, no failed steps on either side:
 
@@ -49,28 +78,53 @@ that cannot see their files.
   unit) finds no drift in any of them; for Zed, 25 of 1,717 re-run units
   are builds the tools themselves do not reproduce and are reported as
   such (see No-drift).
+- **Workers help the swarm now** (D56): with 8 cores per machine the
+  20-agent rust-analyzer swarm took 139.9, 145.9 and 147.7 s with a
+  worker in three runs, against 176.0, 177.8 and 172.8 s alone and
+  122.4, 125.5 and 114.2 s with 16 local cores; before, a worker made no
+  difference. In the first two of those runs 1 and 5 agent steps failed
+  with a compiler error that came from the worker not getting an input
+  from the server; such actions are now run again on the server (third
+  run: 18 of them, no failed step). Why the server lacks those inputs is
+  not known. See Workers.
 - **Gaps closed since the last report**: the worker link is encrypted
   (D44); a client that goes away takes its actions with it, on the server
   and on workers (D48); `--timings` and cargo's future-incompatibility
   report file (D49); temporaries of interrupted clients (D50); Zed builds,
   through its flake (D45), and its drift check (D51).
 
-Tests at this commit: `cargo test` 11 (client) + 8 (protocol) + 55 unit and
-6 engine (server) + 1 (plan); `dev/e2e.sh` 113 checks with the server in a
-mount namespace where the client's directory is empty; `dev/e2e-flake.sh`
-14 checks (two servers, a registry dependency fetched by the servers).
+Tests at the final commit: `cargo test` 13 (client) + 9 (protocol) +
+4 (transport) + 53 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
+113 checks, run with the virtual output directory and again with
+`RARGO_OUTPUT=copy`; `dev/e2e-flake.sh` 14 checks (two servers, a
+registry dependency fetched by the servers); `dev/e2e-link.sh` 60 checks
+(daemon, link, pushes, output directory); `dev/e2e-worker.sh` 27 checks
+(incremental state on workers). All pass.
 
 Not met, or weak:
 
 - **Phase 4 is met in part.** With 4 cores per machine a warm worker
-  shortens a cold rust-analyzer build from 56.0 s to 49.2 s, where 4 more
-  local cores give 45.2 s: about two thirds of what the cores are worth,
-  not all of it. A worker that has never seen the toolchain neither helps
-  nor hurts its first build (55.8 s). With 8 cores per machine there is
-  2 s to gain and the worker gets 0.8 s of it. A build where nothing
-  changed, and a rebuild after an edit, are no slower with a worker. The
-  20-agent swarm is not shortened by a worker at all. See Workers for
-  why and for what was tried.
+  shortens a cold rust-analyzer build from 56.5 s to 48.8 s, where 4
+  more local cores give 44.5 s: about two thirds of what the cores are
+  worth. A worker that has never seen the toolchain now helps as well
+  (51.9 s). A build where nothing changed, and a rebuild after an edit,
+  are no slower with a worker. The 20-agent swarm is shortened by a
+  worker by between 43% and 67% of what the same cores are worth
+  locally (three runs), where it was not shortened at all. And the
+  worker path has an unexplained fault: now and then the server cannot
+  give a worker a content it named to it; the affected actions are run
+  again on the server, which costs time and hides the cause, not removes
+  it. With 8 cores per machine a single cold build has 2 s to gain and
+  the series there was not repeated. See Workers.
+- **The virtual output directory needs root** (or `CAP_SYS_ADMIN`): it is
+  mounted with `mount(2)`; mounting through `fusermount3` for
+  unprivileged users is not implemented, and such a daemon copies results
+  as before. It was only ever run as root. It also disappears with its
+  daemon (see "Results on the client").
+- **A fresh worktree that runs its binary gets it no sooner than
+  before**: the binary has to cross the link either way (3.1 s at 100 ms
+  round trip, both modes). What the virtual directory saves is everything
+  that is built and never opened.
 - The rustc fork (phase 5) still buys nothing on real history; see Phase 5.
 - The client was only run on Linux x86_64.
 - Two mistakes of mine on the shared machine during this work are listed
@@ -79,11 +133,12 @@ Not met, or weak:
 | Area | State |
 |---|---|
 | Client: worktree scan with index, content-addressed tree | done, unit-tested, e2e |
-| Sync: manifests and contents the server lacks, shared uploads | done, unit-tested (server), e2e (counts of files and manifests asked) |
+| Client daemon: one per machine and server, started on demand, Unix socket, in-process fallback | done, e2e-link |
+| Sync: changes pushed as they happen (inotify), one message per edit; the server asks for what it still lacks | done, unit-tested (server), e2e (counts of files and manifests received and asked for), e2e-link |
 | Stand-in for `.git` (HEAD, branch, dirty or not; no history, no contents) | done, unit-tested against real git, e2e |
 | Environment: allow-list, ask-on-declare, client cargo configuration | done, e2e (declared variable, policy file, a `config.toml` in a cargo home the server cannot see); `credentials.toml` travels the same way but no private registry was tried |
-| Transport: TCP, Noise `NNpsk0`, per-user keys, admin users | done, unit-tested, e2e (wrong key, unknown user, non-admin) |
-| Results: artifacts by hash, client cache shared between worktrees, worktree writes, interrupted clients | done, unit-tested, e2e |
+| Transport: one session per daemon on the reliable-UDP layer (paced, follows the client's address, keepalives), TCP where UDP is blocked; Noise `NNpsk0`, per-user keys, admin users | done, unit-tested, e2e (wrong key, unknown user, non-admin), e2e-link (address change, UDP dropped) |
+| Results: `target/` served by the daemon (FUSE), listed at once, fetched by chunk on open; copying as fallback; client cache shared between worktrees; worktree writes; interrupted clients | done, unit-tested (copy mode), e2e in both modes, e2e-link; as root only |
 | Cancellation when a client leaves | done, e2e |
 | Fetching and toolchain installation on the server | done; fetch exercised by e2e-flake and by Zed, toolchain installation checked once by hand (see No-drift) |
 | Drift check on the server; no-drift on the client | done; see No-drift |
@@ -98,11 +153,112 @@ Not met, or weak:
 | Shared incremental compilation | done, e2e, in the 20-agent benchmark |
 | Per-repo policy file (`.rargo.toml`) | done, e2e (env, test network, sync excludes, git switch, malformed file); `flake.files` by a unit test and by Zed |
 | Flake-restricted sandboxes, cache export/import between servers | done, e2e-flake, Zed |
-| Workers: encrypted link, dispatch, hedging, cancellation | done; benchmark series below; phase 4 criterion met in part |
+| Workers: encrypted link, dispatch, hedging, cancellation, incremental state left on workers | done, e2e-worker; benchmark series below; phase 4 criterion met in part |
 | `cargo` shim | done, e2e (routing, passthrough, fallback without a server) |
 | rustc fork (phase 5), `check` as a build | done, re-measured; not worth using |
 
 ## Measurements
+
+### One command (`dev/bench-latency.sh`)
+
+rust-analyzer, server with 24 cores, one client. After a full build:
+the same build again; a build right after appending a comment line to
+`crates/stdx/src/lib.rs` (one crate recompiles, nothing above it); and
+the same with a second between edit and build. Median of 7 each.
+"Before" is commit `a0aa3f4` (one TCP connection per command, the
+server walks the tree to find what changed); "after" is the client
+daemon on its UDP session (`bd3ca2b` with the transport of `32f6c5e`),
+results still copied.
+
+| | LAN (2 ms round trip) | 40 ms round trip | 100 ms round trip |
+|---|---|---|---|
+| nothing to do, before | 0.069 s | 0.184 s | 0.364 s |
+| nothing to do, after | 0.060 s | 0.097 s | 0.157 s |
+| build right after an edit, before | 1.221 s | 1.671 s | 2.406 s |
+| build right after an edit, after | 1.183 s | 1.218 s | 1.289 s |
+| build a second after an edit, before | 1.216 s | 1.668 s | 2.387 s |
+| build a second after an edit, after | 1.194 s | 1.225 s | 1.278 s |
+| first build of the worktree (sync, 42 s of compiling, results back), before | 41.9 s | 45.0 s | 49.1 s |
+| first build of the worktree, after | 42.5 s | 45.9 s | 43.6 s |
+
+Before, a command with nothing to do cost about three round trips
+(connection, request, the delivery's question and answer); now it costs
+one, plus 60 ms of work at both ends. After an edit the old client paid
+for the walk down the tree as well (about a dozen round trips in all at
+100 ms); now the change travels in one message, ahead of the request or
+before it. Whether the daemon had a second to push the edit first makes
+no difference worth measuring (the push rides ahead of the request on
+the same channel). The first build on a LAN is no faster: it is
+compiling.
+
+What these figures do not include: the first command after a daemon
+starts pays for its start and the key agreement (one round trip more);
+over the TCP fallback the first command also waits 2.5 s for UDP to
+fail (e2e-link: 2.6 s for the first command with UDP dropped, then
+normal).
+
+### A fresh worktree to a usable binary (`dev/bench-fresh.sh`)
+
+100 ms round trip. The server has built rust-analyzer for one worktree.
+A fresh worktree at the same commit runs `rargo build -p rust-analyzer`
+and then `target/debug/rust-analyzer --version` (a 456 MiB binary, about
+98 MiB on the wire). "Copy" is results copied into `target/`
+(`RARGO_OUTPUT=copy`, what there was before); "virtual" is the output
+directory served by the daemon. Bytes are what the client's interface
+received. One run each, at `32f6c5e`.
+
+| | build | run | bytes down |
+|---|---|---|---|
+| same machine as the first worktree, copy | 0.17 s | 0.00 s | 8 KB |
+| same machine, virtual | 0.15 s | 0.02 s | 8 KB |
+| a machine with an empty cache, copy | 3.08 s | 0.01 s | 97 MiB |
+| a machine with an empty cache, virtual | 1.42 s | 1.71 s | 93 MiB |
+| (the first worktree, which waits for the build: copy) | 42.0 s | 0.00 s | 98 MiB |
+| (the first worktree: virtual) | 40.6 s | 1.80 s | 93 MiB |
+
+A worktree that runs its binary has it after 3.1 s either way: the
+binary has to cross the link, at the end of the build or when it is
+first run. The virtual directory moves that cost from the build to the
+first use, and removes it for what is never used (see the swarm: agents
+build the binary and never run it). On the same machine a fresh
+worktree costs 0.15 s and nothing crosses the link in either mode,
+because the client's cache is shared between worktrees.
+
+### A branch switch (`dev/bench-branch.sh`)
+
+rust-analyzer. One agent works on a branch B: three edits (`parser`,
+`syntax`, `ide-db`, a new function each), committed one by one, with
+check, build and test after each. Then check, `build -p rust-analyzer`
+and `test -p stdx -p parser -p syntax` are timed (a) in that agent's
+worktree, still on B; (b) in a fresh worktree checked out at B; (c) in a
+worktree that had been built at the base commit and was just switched to
+B with `git checkout`. Stock cargo: 24 cores, one target directory per
+worktree. rargo: server with 24 cores, final build (`bin-final2`,
+commit TBD-COMMIT). One run each.
+
+| check / build / test | (a) same agent, still on B | (b) fresh worktree at B | (c) worktree switched to B |
+|---|---|---|---|
+| stock cargo | 0.15 / 0.14 / 0.37 s | 22.5 / 37.8 / 3.0 s | 6.1 / 9.5 / 1.1 s |
+| rargo, 2 ms round trip | 0.04 / 0.04 / 0.02 s | 0.08 / 0.05 / 0.02 s | 0.04 / 0.04 / 0.02 s |
+| rargo, 100 ms round trip | 0.13 / 0.14 / 0.11 s | 0.17 / 0.14 / 0.12 s | 0.14 / 0.14 / 0.11 s |
+
+Under rargo an agent that has just arrived on a branch is as fast as
+the one that was working there: everything B needs was built once, for
+the first agent, and the other two worktrees only have to say what they
+contain. The fresh worktree's first command is 0.04 s slower (its
+manifests are new to the daemon: one push). The switched worktree's
+checkout is seen by the watcher and pushed before the check is typed.
+Stock cargo builds B from nothing in a fresh worktree and rebuilds the
+three edited crates and everything above them in the switched one.
+
+What the rargo figures rest on: the tests are not run again (their
+recorded results are replayed, because nothing they read differs), and
+the binary is listed in `target/`, not fetched; a worktree that then
+runs it on a machine whose cache lacks it pays for the transfer (see the
+fresh worktree above; on the same machine it is already in the cache).
+For comparison, the base commit's first check, build and test took
+24.0 / 39.3 / 3.3 s under rargo (LAN) and 22.6 / 37.5 / 3.0 s with
+stock cargo.
 
 ### One remote client (`dev/bench-remote.sh`)
 
@@ -144,6 +300,23 @@ Zed's environment is its flake's dev shell, evaluated on the server
 downloads a library), and passes `HTTPS_PROXY`, because the benchmark
 server sits in a network namespace without a route out and reaches the
 network through a small proxy (`dev/rigproxy.py`).
+
+The same table for rust-analyzer with the client daemon and the virtual
+output directory (`32f6c5e`), on LAN and with 100 ms of round-trip time:
+
+| rust-analyzer | rargo, 2 ms round trip | rargo, 100 ms round trip |
+|---|---|---|
+| first `check` (includes the first sync, 21.5 MiB) | 23.9 s | 25.0 s |
+| `check`, nothing changed | 0.04 s | 0.14 s |
+| `check` after a one-file edit | 6.1 s | 6.2 s |
+| `build -p rust-analyzer` after that (the binary is listed, not sent) | 39.8 s | 39.5 s |
+| the same build, nothing changed | 0.04 s | 0.14 s |
+| the same build from a fresh worktree on a second machine (binary listed, not fetched) | 0.10 s | 1.41 s |
+| shown in the worktree's `target/` afterwards | 565 MiB | 565 MiB |
+
+The first sync was one push: 263 manifests offered, the server answered
+with the 2,333 files it lacked, none asked for afterwards. Zed's table
+was not repeated at 100 ms.
 
 A single cold build is not faster than local cargo: it is the same
 compiler on the same number of cores plus a link. What the client gets is
@@ -223,6 +396,51 @@ it once. Most of the server's store is incremental state (about 23 GB of
 the 42.6 GB for rust-analyzer). Idle blobs go to the cold tier as chunks:
 the Ruff store of an earlier run went from 28.8 GiB to 3.9 GiB.
 
+**The swarms with 100 ms of round-trip time**, client daemon and
+virtual output directory (one daemon and one session for the twenty
+agents, as on one machine). Stock cargo does not cross the link; its
+figures are the ones above.
+
+| 20 agents, 100 ms round trip | wall time | server CPU | on the client's disk | bytes down / up the link | failed steps |
+|---|---|---|---|---|---|
+| rust-analyzer, results copied (before) | 131.3 s | 1,685 s | 11.83 GB | 1,950 MiB / 92 MiB | 0 |
+| rust-analyzer, virtual output directory | 114.9 s | 1,618 s | 0.01 GB | 2.3 MiB / 6.7 MiB | 0 |
+| Ruff, virtual output directory | 147.8 s | 2,647 s | 0.03 GB | 4.1 MiB / 22.7 MiB | 0 |
+| Bevy, virtual output directory | 85.6 s | 1,080 s | 0.01 GB | 7.2 MiB / 65.7 MiB | 0 |
+| Zed, virtual output directory | 608.3 s | 12,142 s | 0.01 GB | 9.5 MiB / 32.7 MiB | 0 |
+| rust-analyzer on the LAN link, virtual output directory | 115.1 s | 1,642 s | 0.01 GB | 2.6 MiB / 12.9 MiB | 0 |
+
+Against stock cargo (which does not cross the link): 380.8 s, 797.5 s,
+385.6 s and 4,244 s of wall time (Zed's in two groups of ten), 100.1,
+94.9, 61.0 and 813.9 GB of disk. With results copied over the LAN link
+(the tables above) the four swarms took 125.9, 149.2, 88.7 and 623.6 s
+and left 11.8, 2.7, 2.1 and 35.7 GB on the client.
+
+- **Bytes.** With results copied, every agent's binary and test
+  executables cross the link and land in its `target/`: 1,950 MiB down
+  for rust-analyzer. With the virtual directory the agents are told what
+  exists (40 names in 20 worktrees at the end) and open none of it:
+  2.3 MiB down. Up the link go the edits: 23 MB of worktree content in
+  all, most of it the first worktree's first sync.
+- **Disk.** What is left on the client is its cache (dependency
+  information and other small files) and empty real `target/`
+  directories: 0.01 GB instead of 11.8 GB. The figure is taken after the
+  daemon has been stopped and the directories unmounted.
+- **Time.** 100 ms of round-trip time costs the swarm nothing
+  measurable (114.9 s against 115.1 s on the LAN link); copying results
+  costs about 16 s at 100 ms.
+- **Not counted:** the client daemon's own CPU time (the client CPU
+  figure in these runs, 0.4 s, is the `rargo` commands only; the daemon
+  is a separate process whose CPU time was not recorded).
+- The rust-analyzer LAN row and the first runs of Ruff and Bevy at
+  100 ms were made one build earlier (`32f6c5e`). Those two failed
+  (2 and 20 failed steps): twenty worktrees starting at once each
+  uploaded the repository, the server took longer than 45 s to take it
+  all in, keepalive answers queued behind it and the daemon took the
+  link for dead. Both causes are fixed (first syncs of one daemon take
+  turns; a link is alive while anything arrives on it); the rows above
+  are the reruns.
+
 ### Tracing overhead (`dev/bench-trace.sh`)
 
 The same cold command twice, both capped at 24 cores: stock cargo on the
@@ -258,7 +476,7 @@ one traced sandbox took 8.4 to 8.5 s against 8.0 s native (about 5% wall,
 under 1% user CPU, 16% more system time), with all 24 compilers sharing
 one action.
 
-### Small synthetic workspace (`dev/e2e.sh`, 113 checks, all passing)
+### Small synthetic workspace (`dev/e2e.sh`, 113 checks, all passing in both output modes)
 
 The server runs in a mount namespace in which the client's directory is an
 empty file system, with its own cargo home, and requires a key.
@@ -266,8 +484,9 @@ empty file system, with its own cargo home, and requires a key.
 - A wrong key, an unknown user and a non-administrator asking for garbage
   collection are refused.
 - Second worktree at the same commit: zero actions; one file (the `HEAD`
-  naming its branch) and at most four manifests uploaded; the artifact is
-  the same inode as the first worktree's (or a reflink).
+  naming its branch) and at most four manifests received; the artifact is
+  the same content as the first worktree's (in copy mode: the same inode,
+  or a reflink).
 - A one-file edit uploads one file and the four manifests on its path, and
   reruns exactly the edited crate and its dependents.
 - A file git ignores but the build includes is synced and built with; a
@@ -295,6 +514,45 @@ empty file system, with its own cargo home, and requires a key.
   those of a live process are kept; an interrupted client leaves none.
 - A build script that sleeps for ten minutes is gone within five seconds
   of its client being killed, and the server builds on.
+
+### The link and the output directory (`dev/e2e-link.sh`, 60 checks, all passing)
+
+Server and client in separate network namespaces; the server cannot see
+the client's directories.
+
+- The first command starts a daemon; later commands use the same daemon
+  and the same UDP session; a command in an unchanged worktree needs no
+  scan.
+- An edit reaches the server without any command; the build that
+  follows finds the server with nothing to ask for; so does a build
+  started in the instant of an edit; a crate added in a new directory,
+  an edit inside it and checkouts back and forth are followed.
+- The client's address is changed under the session: the next build
+  works on the same session.
+- The daemon is killed: the next command starts another. The server is
+  restarted: the daemon connects again.
+- An interrupted command stops its build script on the server; the
+  daemon and its session stay.
+- `RARGO_NO_DAEMON=1` works; with UDP dropped in the client's namespace
+  a new daemon uses TCP (2.6 s for its first command) and
+  `RARGO_TRANSPORT=udp` fails instead of falling back.
+- `target/` is the daemon's file system; a new binary is listed with its
+  size without its content crossing the link, running it fetches it,
+  nothing is copied into the worktree; stock cargo builds and tests in
+  the same directory and rargo replaces what stock cargo left;
+  `RARGO_OUTPUT=copy` gives a plain directory with the binary in it;
+  `rargo clean` removes `target/`; a killed daemon's dead mount is
+  replaced by the next daemon; a stopped daemon leaves a plain
+  directory in which stock cargo builds the same program.
+
+### Incremental state on workers (`dev/e2e-worker.sh`, 27 checks, all passing)
+
+A server with one core and a worker with four, then with one: first
+compiles of workspace crates run on the worker and leave their state
+there; the state comes home in the background; edited crates are
+compiled on the worker from the state it holds; with the background
+fetch put off, a compile on the server fetches the state it starts
+from; a worker killed with states on it costs nothing but time.
 
 ## No-drift
 
@@ -331,6 +589,37 @@ build next to what rargo placed:
 
 Bevy leaves an untracked `Cargo.lock` (Bevy ignores it; stock cargo writes
 it as well). Zed's stock cargo runs inside its flake's dev shell.
+
+**With the virtual output directory.** Both tables above were made with
+results copied into `target/`. Repeated at the final build with
+`target/` mounted by the client daemon, so that stock cargo reads what
+rargo shows there and writes through the same mount (one client on the
+server's machine over the loopback interface, as above):
+
+| virtual output directory, in place | rust-analyzer | Ruff | Bevy |
+|---|---|---|---|
+| rargo build / test | ok (40 s) / ok (49 s) | ok (65 s) / ok (34 s) | ok (60 s) / ok (43 s) |
+| drift check on the server | no drift (92 s; 314 units re-run) | no drift (233 s; 562 units) | no drift (183 s; 508 units) |
+| tracked files untouched | ok | ok | ok |
+| stock cargo build and test, same `target/` | ok (3 s) / ok (12 s) | ok (5 s) / ok (4 s) | ok (1 s) / ok (15 s) |
+| rargo again afterwards | ok (0 s) | ok (0 s) | ok (0 s) |
+
+| virtual output directory, fresh worktree | rust-analyzer | Ruff | Bevy | Zed |
+|---|---|---|---|---|
+| rargo build / test | ok (41 s) / ok (49 s) | ok (68 s) / ok (33 s) | ok (60 s) / ok (43 s) | TBD-ZEDND1 |
+| tracked files untouched; nothing left outside `target/` | ok | ok | ok (the untracked `Cargo.lock`) | TBD-ZEDND2 |
+| stock cargo cold build through the mount | ok (41 s) | ok (67 s) | ok (56 s) | TBD-ZEDND3 |
+| stock cargo test | ok (49 s) | ok (32 s) | ok (45 s) | TBD-ZEDND4 |
+| rargo build again afterwards | ok (0 s) | ok (0 s) | ok (0 s) | TBD-ZEDND5 |
+
+Stock cargo's cold build writes everything through the daemon's file
+system: 41, 67 and 56 s here against 39, 65 and 59 s into a plain
+directory in the earlier table (one run each; the difference is within
+what single runs of these builds vary by, so no cost is shown and none
+is excluded). What this run does not cover: Zed's server-side drift
+check and the in-place run for Zed were not repeated with the virtual
+directory; a stock `cargo clean` not going through the shim fails at its
+last step (it cannot remove a mount point).
 
 **Zed's drift check** needed work and is the part to read with care.
 At `a92e359` it failed. Three things were wrong or missing, none of them
@@ -377,20 +666,34 @@ part in it.
 
 ## Mechanisms
 
-### Sync
-`rargo/src/scan.rs` (client), `rargo-core/src/snapshot.rs` and
-`session.rs` (server). Verified by: unit tests on both sides (scan skips
-and reuse, sync asks only for what is missing, evicted content is asked for
-again, a client that withholds content fails the sync, a file that changed
-since the scan restarts the command), e2e counts.
-Measured: scanning a rust-analyzer worktree (2,386 files) with a warm index
-takes 2.7 to 3.2 ms.
-Known weaknesses: every command scans the whole worktree (one `lstat` per
-file), which will show on very large trees; there is no watcher. A large
-git-ignored directory is hashed and uploaded once unless the policy file
-excludes it. The whole tree must be in the server's store before the build
-starts. Symlinks that point outside the worktree dangle on the server.
-Sparse checkouts are synced as they are on disk.
+### Client daemon and sync
+`rargo/src/daemon.rs`, `watch.rs`, `scan.rs`, `mux.rs` (client),
+`rargo-core/src/serve.rs`, `snapshot.rs`, `session.rs` (server); D57,
+D58. Verified by: unit tests (scan skips and reuse, the watcher, frames
+put back in order, sync asks only for what is missing, evicted content
+is asked for again, a client that withholds content fails the sync),
+e2e counts, `dev/e2e-link.sh` (one daemon and one link over many
+commands, an edit on the server before any command, an edit and a build
+in the same instant, new directories, checkouts, daemon killed, server
+restarted, a command interrupted, no daemon).
+Measured: a command in an unchanged, watched worktree needs no scan; a
+scan of rust-analyzer (2,386 files) with a warm index takes about 3 ms.
+Known weaknesses: the watcher is inotify, one watch per directory, and a
+worktree whose directories cannot all be watched (the per-user limit) is
+scanned for every command; a scan is always of the whole worktree, the
+watcher only says whether one is needed; the daemon's belief about what
+the server holds is per session and in memory, so a new session offers a
+worktree's manifests again (and asks once what is missing); two daemons
+on different machines that first sync the same new content at the same
+moment both upload it (within one daemon first syncs take turns, found
+by the Ruff and Bevy swarms at 100 ms, where twenty at once uploaded
+the repository twenty times). A large git-ignored directory is hashed
+and uploaded once unless the policy file excludes it. The whole tree
+must be in the server's store before the build starts. Symlinks that
+point outside the worktree dangle on the server. Sparse checkouts are
+synced as they are on disk. A daemon is one more process per machine and
+server; it is keyed by server, user, key, cache directory and program
+version, so stale ones are never talked to, only left to expire.
 
 ### Stand-in for `.git`
 `rargo/src/git.rs`. Verified by: a unit test that runs real git against
@@ -412,33 +715,65 @@ is stored on the server (mode 0600, in the state directory) for as long as
 the state directory lives.
 
 ### Transport and access
-`rargo-proto/src/secure.rs`, `rargo-core/src/session.rs`, `serve.rs`.
-Both links are encrypted with fresh keys per connection: the client link
-(TCP, Noise `NNpsk0` with a key per user) and the worker link (the
-reliable-UDP transport, the same handshake with the shared worker key,
-D44).
-Known weaknesses: every user shares one cache and could read another's
-source through it by guessing nothing more than a build command, which is
-the intended trust model, not an accident; the request in the first
-handshake message is not forward secret and could be replayed by someone
-who recorded it (it would start a build of an already synced tree and
-deliver nothing to the attacker); keys are plain lines in a file, with no
-rotation or revocation other than editing it and restarting.
+`rargo-net/src/lib.rs` and `link.rs`, `rargo-proto/src/secure.rs`,
+`rargo-core/src/serve.rs`; D57, D59. Both links are sessions of the
+reliable-UDP transport, encrypted with fresh keys per session (Noise
+`NNpsk0`): the client link under a key per user, with every datagram
+after the key agreement tagged by a key of the session, and the worker
+link under the shared worker key (D44). A client session follows its
+client's address. Where UDP gets no answer the daemon uses one TCP
+connection. Verified by unit tests (user proven, wrong key and unknown
+user refused, a forged datagram neither delivered nor able to move the
+session, the session following a changed address, loss in both
+directions) and e2e-link (address changed under a session, UDP dropped).
+Measured (`linkperf`, the rig's 1 Gbit client link): 111, 102 and
+77 MiB/s at 2, 40 and 100 ms round trip, no retransmissions; before the
+transport was paced it managed under 3 MiB/s at 40 ms.
+Known weaknesses: the congestion control is simple (slow start until
+round trips lengthen, then a twentieth more per round trip, three tenths
+less on a loss) and was only run on the rig's emulated links, never
+across a real WAN or against competing traffic; the rig's netem queues
+had to be enlarged for the emulated link to carry what a real one would
+(D59); one session per daemon means one command's large download
+shares a window with another's. Every user shares one cache and could
+read another's source through it by guessing nothing more than a build
+command, which is the intended trust model, not an accident; keys are
+plain lines in a file, with no rotation or revocation other than editing
+it and restarting.
 
 ### Results on the client
-`rargo/src/place.rs`. Verified by unit tests (sharing, own copies, parts,
-forged content refused) and e2e (stock cargo in the same `target/`).
-A client that is interrupted removes the temporaries it was writing, and
-the next client to write into a directory removes those of clients that
-were killed outright (D50; unit tests and e2e). A client that goes away
-takes its queued and running actions with it, on the server and on workers
-(D48; e2e: a build script sleeping for ten minutes is gone within five
-seconds of its client being killed).
-Known weaknesses: without reflinks, shared artifacts are read-only hard
-links into the client's cache (as cargo's own are links into `deps/`); an
-action another build was also waiting for is killed with its owner and
-started again by the waiting build; a temporary whose process id has been
-reused stays until that process ends.
+`rargo/src/outfs.rs` (the virtual output directory), `place.rs` (copying),
+`daemon.rs`; D59. `target/` is mounted by the daemon; what the server
+built is listed there at once and fetched into the client's cache when
+opened (by chunk from 1 MiB); what is written locally goes to the real
+directory underneath; files up to 64 KiB come with their names.
+Verified by: `dev/e2e-link.sh` (mounted, listed without content crossing
+the link, fetched on run, nothing copied into the worktree, stock cargo
+build and test in the same directory, rargo after stock cargo, copy mode
+and back, `clean`, a killed daemon's mount replaced, a stopped daemon
+leaving a plain directory in which stock cargo builds); `dev/e2e.sh` in
+both modes; the no-drift runs below. Copying: unit tests (sharing, own
+copies, parts, forged content refused).
+A command that is interrupted withdraws its request; its queued and
+running actions go with it, on the server and on workers (D48; e2e: a
+build script sleeping for ten minutes is gone within five seconds).
+Known weaknesses: mounting needs root or `CAP_SYS_ADMIN` (no
+`fusermount3` path), and everything here was run as root; the directory
+is only as present as its daemon: after a reboot or a stopped daemon,
+`target/` shows what was written locally until the next rargo command
+mounts it again, and a killed daemon leaves a dead mount until then;
+stock `cargo clean` cannot remove a mount point (`rargo clean` can); the
+chunk index is in the daemon's memory, so chunks are only reused from
+contents this daemon fetched by chunk; a file opened for writing is
+fetched whole and copied first; no file system test suite was run
+against it, only cargo, rustc and the tools the suites use; with the
+directory mounted, stock cargo's own reads and writes go through FUSE
+(passthrough for file contents, the daemon for names and attributes),
+whose cost shows in the no-drift table. In copy mode: without reflinks,
+shared artifacts are read-only hard links into the client's cache; a
+temporary whose process id has been reused stays until that process
+ends. An action another build was also waiting for is killed with its
+owner and started again by the waiting build.
 
 ### Snapshots, fetching, flakes
 `rargo-core/src/snapshot.rs`, `build.rs` (`fetch`), `flake.rs`.
@@ -543,6 +878,67 @@ The 8-core series and the swarm were not repeated with these two rules;
 the rules only keep work on the server that the tables above show was
 better off there.
 
+**Incremental state left on workers (D56)**, the first idea on the list
+of things not tried. A compile on a worker leaves its incremental state
+there; the state is recorded at once, used in place by the next compile
+of that crate on that worker, fetched in the background on idle cores,
+and fetched at once when a compile on the server starts from it.
+Workspace crates therefore go to workers again. Measured at `a0aa3f4`
+with the client of that commit:
+
+| rust-analyzer `build`, 4 cores per machine | cold | again | after a one-file edit |
+|---|---|---|---|
+| server alone | 56.5 s | 0.07 s | 11.6 s |
+| + 1 worker that has seen nothing | 51.9 s | 0.07 s | 11.7 s |
+| + 1 warm worker | 48.8 s | 0.07 s | 11.5 s |
+| + 2 warm workers | 47.8 s | 0.07 s | 11.7 s |
+| server with 8 cores, no worker | 44.5 s | 0.07 s | 11.1 s |
+| server with 12 cores, no worker | 43.4 s | 0.08 s | 11.1 s |
+
+| 20-agent rust-analyzer swarm, 8 cores per machine | wall | server CPU | failed steps |
+|---|---|---|---|
+| server alone | 176.0 s | 1,245 s | 0 |
+| server + worker | 139.9 s | 919 s | 1 |
+| server with 16 cores | 122.4 s | 1,404 s | 0 |
+| again at `32f6c5e` (client daemon, virtual output directory): alone / + worker / 16 cores | 177.8 / 145.9 / 125.5 s | 1,273 / 936 / 1,442 s | 0 / 5 / 0 |
+| again at the final build (starved worker actions rerun on the server): alone / + worker / 16 cores | 172.8 / 147.7 / 114.2 s | 1,236 / 949 / 1,377 s | 0 / 0 / 0 |
+
+- **The swarm**: a worker now takes 36 s off 176 s where eight more
+  local cores take 54 s: two thirds of what the cores are worth, where
+  it was nothing (182.8 s against 179.8 s). In the second run 286
+  workspace compiles ran on the worker (72 first compiles, 214 from the
+  state it held), 5.8 GB of state were left there, 0.2 GB came home in
+  the background and 1,362 files were fetched because a compile on the
+  server needed them. (The server CPU column does not include the
+  worker's.)
+- **A cold build, 4 cores per machine**: a worker that has seen nothing
+  now helps (51.9 s against 56.5 s; before it made no difference), a
+  warm one gets 7.7 s of the 12.0 s that four more local cores give
+  (64%; was 63%). The rebuild after an edit is unchanged.
+- **Failed steps with a worker.** One step failed in the first swarm
+  run with a worker and five in the second, none without a worker. The
+  worker's log of the second run (kept since then) shows the cause: 17
+  times the worker asked the server for a content the server said it
+  did not have, and once a pushed content arrived with the wrong hash.
+  The compiler on the worker then failed on a file it could not read
+  ("required to be available in rlib format", a build script that would
+  not compile), and that failure was returned as the action's result.
+  This is most likely what the unexplained failed step in D31's swarm
+  was. What was changed: an action during which the worker could not
+  fetch a content is now the worker's failure, and the server runs the
+  action itself. What is not known: why the server did not have those
+  contents. They were contents it had named to the worker; the suspects
+  are files on the server's own disk that changed after they were
+  hashed (served by path, not from the store) and the window in which a
+  pushed content is claimed to be on the worker before it has arrived.
+  Neither was confirmed. In the third run it happened again (five
+  contents the server did not have, three pushed contents with the wrong
+  hash; among the actions were compiles of `yoke`, `thin-vec` and a
+  build script of `crossbeam-utils`, all registry crates at the start of
+  the swarm): 18 actions were handed back and run on the server, no step
+  failed, and the worker's gain shrank to 25 s of the 59 s that eight
+  more local cores gave in that run (43%).
+
 Read against the criterion (a worker shortens a cold build roughly in
 proportion to the cores it adds; a warm build is no slower with one):
 
@@ -621,13 +1017,16 @@ server stay there; the transfer guard counts what is queued on the link;
 a worker without the toolchain is sent it once instead of being given
 work it cannot start.
 
-Ideas not tried, in the order I would try them: bring a remote compile's
-incremental state home in the background at low priority instead of not
-at all (workspace crates could then go to workers again, which is where
-the swarm's work is); let workers fetch
-registry crates themselves instead of through the server; a second
-transport connection for bulk data so that questions do not queue behind
-pushes.
+Ideas not tried, in the order I would try them: find out why the server
+sometimes cannot give a worker a content it named (serve every content
+from the store instead of from files on the server's disk by path, and
+claim a pushed content as held only once the worker has confirmed it);
+send incremental states to idle workers ahead of need, so that a crate
+whose state is only on the server can also go to a worker (in the swarm
+about 500 compiles stayed on the server for that reason); let workers
+fetch registry crates themselves instead of through the server; a
+second transport connection for bulk data so that questions do not
+queue behind pushes.
 
 Known weaknesses besides the above: flake-rooted and host-network actions
 are never sent to workers; a worker is trusted like the server (it sees
@@ -656,7 +1055,9 @@ first implementation it says so.
   against 352 with stock 1.100.0. Real commits add or remove lines, which
   changes the hash by design. With the fork's slower (non-PGO) compiler the
   29 later commits took 665 s against 391 s, and the first 59.9 s against
-  40.7 s. In the favourable case, the 20-agent swarm with body-only second
+  40.7 s. (Stock 1.100.0 again with the client daemon, 100 ms of
+  round-trip time on the client link: first commit 40.8 s, the 29 later
+  ones 350.7 s, 352 actions, none failed; TBD-REPLAYLAN) In the favourable case, the 20-agent swarm with body-only second
   edits, it still loses: 146.6 s wall and 1,789 CPU-s against 114.9 s and
   1,492 CPU-s for stock 1.100.0 under rargo.
 - **Separately cached metadata and codegen.** `check` with the fork runs the

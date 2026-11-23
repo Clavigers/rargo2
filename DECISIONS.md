@@ -1441,3 +1441,31 @@ run on a machine-room link):
   frame order, and a link counts as alive while anything arrives on it:
   a ping queued behind a large upload used to look like a dead server.
 
+## D60. What the 100 ms campaign found
+
+- **Twenty first syncs at once.** In the Ruff and Bevy swarms at 100 ms
+  the twenty worktrees' first offers were all answered before any upload
+  had arrived, so each uploaded what the server lacked: the repository,
+  twenty times (447 MB pushed for rust-analyzer instead of 23 MB). An
+  offer that has much to send now takes a turn in its daemon and looks
+  again at what the server holds when its turn comes; the nineteen that
+  follow have a few kilobytes to push. Two daemons on different machines
+  can still both upload the same new content; the server does not make
+  one wait for the other on this path as it does when it asks.
+- **A busy server looked dead.** While the server took in those uploads
+  (frame by frame, in order), keepalive answers waited behind them, the
+  daemon heard nothing for 45 s and dropped the link: 2 failed steps in
+  the Ruff swarm, 20 in Bevy's. On the UDP transport a link is now alive
+  while any authenticated datagram arrives (acknowledgements included);
+  over TCP, where only frames can be seen, the limit is six minutes.
+- **A worker that cannot fetch an input.** See STATUS, Workers: the
+  worker's failure to get a content from the server ended as a compiler
+  error in the build's output. Such an action is now reported as failed
+  by the worker and run on the server. The cause of the missing contents
+  is not established.
+- **Benchmarks through the rig** enter only the client's network
+  namespace (`nsenter --net`), not `ip netns exec`, which gives every
+  command a mount namespace of its own in which the daemon's output
+  directories would be invisible to the next command. A command that is
+  in another mount namespace than its daemon gets its results copied.
+

@@ -112,6 +112,13 @@ fn below(prefix: &[u8]) -> Vec<u8> {
     p
 }
 
+/// A name's place in its directory's listing: 63 bits of a hash of it,
+/// never zero.
+fn name_cookie(name: &[u8]) -> u64 {
+    let h = blake3::hash(name);
+    (u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap()) >> 1).max(1)
+}
+
 enum Kind {
     Real(std::fs::Metadata),
     Virtual(VFile),
@@ -899,9 +906,21 @@ impl Filesystem for OutFs {
             };
             names.entry(name.to_vec()).or_insert(t as u32);
         }
-        for (i, (name, t)) in names.iter().enumerate().skip(offset as usize) {
+        // A listing is read in several calls while other processes add
+        // and remove files (compilers and their temporaries, in parallel).
+        // The place in the listing is therefore not a position, which
+        // every removal before it would shift, but a number that belongs
+        // to the name: names are listed in the order of a hash of
+        // themselves, and a call continues after the hash it was given.
+        // A name that is there throughout is listed exactly once.
+        let mut listed: Vec<(u64, &Vec<u8>, u32)> = names.iter().map(|(name, t)| (name_cookie(name), name, *t)).collect();
+        listed.sort();
+        for (cookie, name, t) in listed {
+            if cookie <= offset {
+                continue;
+            }
             let ino = st.children.get(&(nodeid, name.clone())).copied().unwrap_or(u64::MAX - 1);
-            if !sink.push(ino, i as u64 + 1, *t, name) {
+            if !sink.push(ino, cookie, t, name) {
                 break;
             }
         }
@@ -926,5 +945,21 @@ impl Filesystem for OutFs {
             frsize: s.f_frsize as u32,
             ..fuse_kstatfs::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listing_cookies_are_stable_and_ordered() {
+        let names: Vec<Vec<u8>> = (0..5000).map(|i| format!("libcrate{i}-0123456789abcdef.rmeta").into_bytes()).collect();
+        let mut cookies: Vec<u64> = names.iter().map(|n| name_cookie(n)).collect();
+        assert!(cookies.iter().all(|c| *c >= 1 && *c < 1 << 63));
+        assert_eq!(name_cookie(&names[7]), name_cookie(&names[7]));
+        cookies.sort();
+        cookies.dedup();
+        assert_eq!(cookies.len(), names.len(), "no two of these names share a place");
     }
 }

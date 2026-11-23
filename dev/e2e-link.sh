@@ -172,6 +172,17 @@ out=$(cargo test --offline -q 2>&1); check $? "stock cargo test works there" "$o
 sed -i 's/{ 100 }/{ 110 }/' crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "rargo after stock cargo: the new build replaces what stock cargo left" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(the file in target/ is the new one)" "$out"
+# A directory is listed in several reads while compilers add and remove
+# their temporaries: what stays must always be listed.
+mkdir -p target/stress
+for i in $(seq 1 400); do : >"target/stress/keep-with-a-long-enough-name-$i"; done
+( for r in $(seq 1 150); do for j in 1 2 3 4 5 6 7 8 9 10 11 12; do : >"target/stress/a-temporary-$j"; done; rm -f target/stress/a-temporary-*; done ) &
+churn=$!
+short=0
+for r in $(seq 1 150); do [ "$(ls target/stress | grep -c '^keep')" = 400 ] || short=$((short + 1)); done
+wait $churn
+[ $short = 0 ]; check $? "a listing read while files come and go names every file that stays ($short of 150 listings were short)"
+rm -rf target/stress
 # Copying as a fallback, on request.
 out=$(RARGO_OUTPUT=copy R build 2>&1); check $? "RARGO_OUTPUT=copy builds" "$out"
 ! mounted; check $? "and target/ is a plain directory again"
