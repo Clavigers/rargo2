@@ -26,9 +26,12 @@ cargo with one target directory per worktree:
   It stays optional. Check-as-build is opt-in (slower in the swarm). The
   incremental-state dedup item was done in the store instead (cold tier:
   28.8 GiB to 3.9 GiB).
-- **No drift**: the first no-drift run found that stock `cargo test` failed
-  after rargo in all three repos (read-only store links in `target/`);
-  fixed (D32). The verification rerun with the fix: see "No-drift" below.
+- **No drift**: verified on all three repos (see No-drift). The first run
+  found that stock `cargo test` failed after rargo (read-only store links
+  in `target/`); fixed (D32), and the rerun passes everywhere.
+- **Store on a reflink filesystem** (D33, `rargod --store DIR`; the work
+  was delegated to Codex and reviewed): e2e 81/81 on btrfs and ext4; 45.5%
+  less disk growth on btrfs for the e2e workspace.
 
 Tests: `cargo test -p rargo-core` (47 unit + 6 engine), `dev/e2e.sh` 81
 checks, `dev/e2e-flake.sh` 14 checks, `dev/fork-check.sh` 13 checks, all
@@ -152,7 +155,16 @@ files untouched, then stock cargo build and test in the same worktree and
 `target/`, then rargo again. First run: every rargo step and stock build
 passed in all three repos; stock `cargo test` failed in all three (fixed,
 D32); Ruff's drift check flagged an unread autoconf log (no longer counted
-as drift, D32). Rerun after the fix: pending at the time of writing.
+as drift, D32). **Third run, after the fixes: 0 failures in all three**
+(`dev/nodrift.sh`; rust-analyzer full test suite; Ruff `ruff_linter`,
+`ruff_python_parser`, `ruff_text_size`; Bevy `bevy_ecs`, `bevy_math`,
+`bevy_color`). rargo build and test, rargo's drift check (stock cargo plan
+against rargo, every cached unit re-run cleanly and compared), tracked
+files untouched, stock cargo build and test in the same worktree and
+`target/`, and rargo again afterwards all passed. The run started with the
+read-only leftovers of earlier runs in place, so the cleanup path for
+existing worktrees is covered too. Bevy leaves an untracked `Cargo.lock`
+(Bevy ignores it; stock cargo writes it as well).
 
 ## Mechanisms
 
