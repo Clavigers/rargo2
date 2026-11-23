@@ -3,18 +3,24 @@
 #
 #   dev/e2e.sh            run everything
 #
-# Uses its own state directory and scratch worktrees under $RARGO_WORK, and
-# stops its daemon when done. Requires root (FUSE mount, namespaces).
+# Uses a private state directory under $RARGO_WORK. Set RARGO_E2E_ROOT to
+# an existing directory on a reflink filesystem for the store and worktrees.
+# Stops its daemon when done. Requires root (FUSE mount, namespaces).
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 . "$work/env.sh"
-export RARGO_STATE=$work/e2e-state
+RARGO_STATE=$(mktemp -d "$work/codex-e2e.XXXXXXXX") || exit 1
+export RARGO_STATE
 export RARGO_SOCKET=$RARGO_STATE/rargod.sock
 bin=${RARGO_BIN:-$repo/target/release}
 export RARGO_BIN=$bin
 R=$bin/rargo
-T=$work/e2e
+T=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/codex-e2e.XXXXXXXX") || exit 1
+T=$(cd "$T" && pwd -P) || exit 1
+# The stock Cargo checks intentionally exercise the fixture's own target/.
+unset CARGO_TARGET_DIR
+echo "e2e: state=$RARGO_STATE scratch=$T"
 fails=0
 checks=0
 
@@ -28,11 +34,11 @@ has() { grep -qF -- "$2" <<<"$1"; }
 runs() { "$R" --rargo-status | awk '/^actions run/ {print $3}'; }
 stat_field() { "$R" --rargo-status | awk -v k="$1" '$0 ~ "^"k {print $2 == "" ? $3 : $0}'; }
 
-"$repo/dev/rargod.sh" stop >/dev/null 2>&1
-rm -rf "$RARGO_STATE" "$T"
-mkdir -p "$T"
-"$repo/dev/rargod.sh" start >/dev/null || { echo "cannot start rargod"; exit 1; }
 trap '"$repo/dev/rargod.sh" stop >/dev/null 2>&1' EXIT
+"$repo/dev/rargod.sh" start --store "$T/store" >/dev/null || {
+    cat "$RARGO_STATE/rargod.log"
+    exit 1
+}
 
 # --- a small workspace -----------------------------------------------------
 A=$T/a

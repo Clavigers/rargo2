@@ -345,3 +345,14 @@ which compiler they used.
 - Actions were moved into their cgroup by the parent after the fork, so a
   fast-starting action's CPU time was mostly accounted elsewhere. Fixed:
   the child moves itself before it forks anything.
+
+## Store on XFS
+
+With `mkfs.xfs` unavailable, the reflink check used a 20 GiB loopback btrfs
+image. All 81 e2e checks passed on btrfs and on ext4, and the core suite
+passed 53 tests with one ignored. For `build` and `test --no-run` in two
+worktrees, `df` grew by 56.09 MiB on btrfs versus 102.95 MiB on ext4.
+Aggregate `du` counts were 122.69 MiB and 104.83 MiB respectively.
+`filefrag` confirmed shared extents on btrfs and independent copies when
+the store was on btrfs and the worktrees were on ext4. The btrfs image
+was unmounted and retained (D33).

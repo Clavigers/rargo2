@@ -612,3 +612,25 @@ the differing files (looked up in the units' traces, under the keys with
 declared variables folded in); otherwise it is reported as a note. What a
 build script prints to cargo is now compared as well, which it was not
 before.
+
+## D33. Put the content store on a separate filesystem
+
+Use `rargod --store DIR` to move blob, chunk and scratch I/O to a
+reflink filesystem while keeping the database, socket and sandbox mount
+under `--state`. The default store is `<state>/store`. Keep each store
+paired with its state directory because the database describes the files
+in that store.
+
+Keep worktrees on the store filesystem when shared extents matter.
+Placement into an ext4 worktree from the btrfs store makes a separate copy
+because neither reflinks nor hard links can cross those filesystems.
+`dev/e2e.sh` uses `RARGO_E2E_ROOT` for both its store and scratch worktrees
+and keeps its daemon state under `RARGO_WORK`.
+
+On this machine, btrfs was used because `mkfs.xfs` was unavailable.
+`filefrag` confirmed shared extents for the app and integration test
+executables on btrfs. After `build` and `test --no-run` in two worktrees,
+the filesystem used 56.09 MiB more on btrfs and 102.95 MiB more on ext4
+(`df` deltas). The corresponding aggregate `du` counts were 122.69 MiB
+and 104.83 MiB. `du` counts shared extents once per inode and counts hard
+links to an inode only once.

@@ -4,6 +4,7 @@
 #   dev/rargod.sh stop
 # The daemon runs in a transient systemd scope with a CPU and memory cap so
 # the other services on the box keep headroom (see CLAUDE.md).
+# Override the limits with RARGO_CPU_QUOTA and RARGO_MEMORY_MAX.
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 state=${RARGO_STATE:-$work/state}
@@ -16,7 +17,7 @@ start)
         echo "rargod already running"; exit 0
     fi
     . "$work/env.sh"
-    nohup systemd-run --scope -q --unit "rargod-dev-$$" -p CPUQuota=2400% -p MemoryMax=90G -p Delegate=yes \
+    nohup systemd-run --scope -q --unit "rargod-dev-$$" -p "CPUQuota=${RARGO_CPU_QUOTA:-2400%}" -p "MemoryMax=${RARGO_MEMORY_MAX:-90G}" -p Delegate=yes \
         "${RARGO_BIN:-$repo/target/release}/rargod" --state "$state" \
         --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" --jobs 24 "$@" \
         >"$state/rargod.log" 2>&1 &

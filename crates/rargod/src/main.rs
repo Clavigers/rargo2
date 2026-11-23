@@ -1,6 +1,6 @@
 //! rargod: the build server. One per machine.
 //!
-//!   rargod --state DIR --planner PATH [--socket PATH] [--jobs N] [--mem-gb N]
+//!   rargod --state DIR --planner PATH [--store DIR] [--socket PATH] [--jobs N] [--mem-gb N]
 //!
 //! It must run as root (or with CAP_SYS_ADMIN): it mounts a FUSE filesystem,
 //! registers passthrough backing files and creates namespaces.
@@ -25,6 +25,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 struct Opts {
     state: PathBuf,
+    store: Option<PathBuf>,
     planner: PathBuf,
     socket: Option<PathBuf>,
     jobs: usize,
@@ -54,6 +55,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         .unwrap_or(16 << 20);
     let mut o = Opts {
         state: PathBuf::new(),
+        store: None,
         planner: PathBuf::new(),
         socket: None,
         jobs: cpus,
@@ -71,6 +73,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         let mut val = || it.next().cloned().with_context(|| format!("{a} needs a value"));
         match a.as_str() {
             "--state" => o.state = val()?.into(),
+            "--store" => o.store = Some(val()?.into()),
             "--planner" => o.planner = val()?.into(),
             "--socket" => o.socket = Some(val()?.into()),
             "--jobs" => o.jobs = val()?.parse()?,
@@ -89,7 +92,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     }
     if o.state.as_os_str().is_empty() || (o.planner.as_os_str().is_empty() && o.worker_of.is_none()) {
         bail!(
-            "usage: rargod --state DIR --planner PATH [--socket PATH] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
+            "usage: rargod --state DIR --planner PATH [--store DIR] [--socket PATH] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
         );
     }
     Ok(o)
@@ -118,7 +121,9 @@ fn main() -> Result<()> {
         None => opts.planner.canonicalize().with_context(|| format!("planner {}", opts.planner.display()))?,
     };
     let db = Arc::new(rargo_core::db::Db::open(&state.join("db.redb"))?);
-    let store = Arc::new(Store::open(&state.join("store"), db)?);
+    let default_store = state.join("store");
+    let store_path = opts.store.as_deref().unwrap_or(&default_store);
+    let store = Arc::new(Store::open(store_path, db).with_context(|| format!("opening store {}", store_path.display()))?);
     let content = Arc::new(Content::new(store.clone()));
     let fs = Arc::new(SandboxFs::new(content.clone()));
     let mnt = state.join("mnt");
