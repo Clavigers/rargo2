@@ -1463,6 +1463,16 @@ run on a machine-room link):
   error in the build's output. Such an action is now reported as failed
   by the worker and run on the server. The cause of the missing contents
   is not established.
+- **Listings under churn.** Zed's no-drift run failed in stock cargo
+  with "can't find crate" for a crate that had been built: the output
+  file system continued a directory listing by position, and a
+  temporary file removed by another compiler between two reads shifted
+  everything after it by one, so a name that was there all along was
+  skipped. A listing now continues after a number that belongs to the
+  name (63 bits of a hash of it). `dev/e2e-link.sh` lists a directory
+  150 times while files come and go; the build before the fix came up
+  short 60 times. The no-drift runs of rust-analyzer, Ruff and Bevy had
+  passed with the fault in place, by luck, and were repeated.
 - **Benchmarks through the rig** enter only the client's network
   namespace (`nsenter --net`), not `ip netns exec`, which gives every
   command a mount namespace of its own in which the daemon's output

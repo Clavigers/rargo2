@@ -31,7 +31,13 @@ What was measured when:
   the branch switch; no-drift with the virtual output directory.
 
 Clients are in their own network namespace, one shaped link from a
-server that cannot see their files.
+server that cannot see their files. The 100 ms campaign ran at
+`32f6c5e` (latency: one build earlier; fresh worktree, one client,
+history) and, after the two faults it found were fixed, at `ddf3d18`
+(swarms, branch switch, worker swarm, no-drift in place). The final
+commit adds one more fix to the output file system (directory listings,
+D60), after which the suites and the fresh-worktree no-drift runs were
+repeated; no timing was repeated after it.
 
 - **One command, 100 ms round trip** (rust-analyzer, median of 7):
   nothing to do 0.16 s, was 0.36 s; after a one-line edit 1.29 s, was
@@ -93,11 +99,11 @@ server that cannot see their files.
   report file (D49); temporaries of interrupted clients (D50); Zed builds,
   through its flake (D45), and its drift check (D51).
 
-Tests at the final commit: `cargo test` 13 (client) + 9 (protocol) +
+Tests at the final commit: `cargo test` 14 (client) + 9 (protocol) +
 4 (transport) + 53 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
 113 checks, run with the virtual output directory and again with
 `RARGO_OUTPUT=copy`; `dev/e2e-flake.sh` 14 checks (two servers, a
-registry dependency fetched by the servers); `dev/e2e-link.sh` 60 checks
+registry dependency fetched by the servers); `dev/e2e-link.sh` 61 checks
 (daemon, link, pushes, output directory); `dev/e2e-worker.sh` 27 checks
 (incremental state on workers). All pass.
 
@@ -121,6 +127,11 @@ Not met, or weak:
   unprivileged users is not implemented, and such a daemon copies results
   as before. It was only ever run as root. It also disappears with its
   daemon (see "Results on the client").
+- **Stock cargo is slower in a mounted `target/` on Zed**: its cold
+  build takes 446 s there against 168 s in a plain directory, its tests
+  187 s against 29 s (for rust-analyzer, Ruff and Bevy no difference
+  shows). It works and nothing drifts; see No-drift for the likely
+  reason. `RARGO_OUTPUT=copy` avoids it.
 - **A fresh worktree that runs its binary gets it no sooner than
   before**: the binary has to cross the link either way (3.1 s at 100 ms
   round trip, both modes). What the virtual directory saves is everything
@@ -233,8 +244,8 @@ and `test -p stdx -p parser -p syntax` are timed (a) in that agent's
 worktree, still on B; (b) in a fresh worktree checked out at B; (c) in a
 worktree that had been built at the base commit and was just switched to
 B with `git checkout`. Stock cargo: 24 cores, one target directory per
-worktree. rargo: server with 24 cores, final build (`bin-final2`,
-commit TBD-COMMIT). One run each.
+worktree. rargo: server with 24 cores, the build of `ddf3d18`. One run
+each.
 
 | check / build / test | (a) same agent, still on B | (b) fresh worktree at B | (c) worktree switched to B |
 |---|---|---|---|
@@ -398,7 +409,7 @@ the Ruff store of an earlier run went from 28.8 GiB to 3.9 GiB.
 
 **The swarms with 100 ms of round-trip time**, client daemon and
 virtual output directory (one daemon and one session for the twenty
-agents, as on one machine). Stock cargo does not cross the link; its
+agents, as on one machine), at `ddf3d18`. Stock cargo does not cross the link; its
 figures are the ones above.
 
 | 20 agents, 100 ms round trip | wall time | server CPU | on the client's disk | bytes down / up the link | failed steps |
@@ -515,7 +526,7 @@ empty file system, with its own cargo home, and requires a key.
 - A build script that sleeps for ten minutes is gone within five seconds
   of its client being killed, and the server builds on.
 
-### The link and the output directory (`dev/e2e-link.sh`, 60 checks, all passing)
+### The link and the output directory (`dev/e2e-link.sh`, 61 checks, all passing)
 
 Server and client in separate network namespaces; the server cannot see
 the client's directories.
@@ -541,7 +552,10 @@ the client's directories.
   nothing is copied into the worktree; stock cargo builds and tests in
   the same directory and rargo replaces what stock cargo left;
   `RARGO_OUTPUT=copy` gives a plain directory with the binary in it;
-  `rargo clean` removes `target/`; a killed daemon's dead mount is
+  a directory listed while other processes create and remove files in
+  it names every file that stays (150 listings; the build before the
+  fix came up short in 60); `rargo clean` removes `target/`; a killed
+  daemon's dead mount is
   replaced by the next daemon; a stopped daemon leaves a plain
   directory in which stock cargo builds the same program.
 
@@ -606,17 +620,29 @@ server's machine over the loopback interface, as above):
 
 | virtual output directory, fresh worktree | rust-analyzer | Ruff | Bevy | Zed |
 |---|---|---|---|---|
-| rargo build / test | ok (41 s) / ok (49 s) | ok (68 s) / ok (33 s) | ok (60 s) / ok (43 s) | TBD-ZEDND1 |
-| tracked files untouched; nothing left outside `target/` | ok | ok | ok (the untracked `Cargo.lock`) | TBD-ZEDND2 |
-| stock cargo cold build through the mount | ok (41 s) | ok (67 s) | ok (56 s) | TBD-ZEDND3 |
-| stock cargo test | ok (49 s) | ok (32 s) | ok (45 s) | TBD-ZEDND4 |
-| rargo build again afterwards | ok (0 s) | ok (0 s) | ok (0 s) | TBD-ZEDND5 |
+| rargo build / test | ok (40 s) / ok (51 s) | ok (67 s) / ok (33 s) | ok (60 s) / ok (43 s) | ok (185 s) / ok (31 s) |
+| tracked files untouched; nothing left outside `target/` | ok | ok | ok (the untracked `Cargo.lock`) | ok |
+| stock cargo cold build through the mount | ok (40 s) | ok (65 s) | ok (59 s) | ok (446 s) |
+| stock cargo test | ok (48 s) | ok (33 s) | ok (43 s) | ok (187 s) |
+| rargo build again afterwards | ok (0 s) | ok (0 s) | ok (0 s) | ok (0 s) |
 
-Stock cargo's cold build writes everything through the daemon's file
-system: 41, 67 and 56 s here against 39, 65 and 59 s into a plain
-directory in the earlier table (one run each; the difference is within
-what single runs of these builds vary by, so no cost is shown and none
-is excluded). What this run does not cover: Zed's server-side drift
+The in-place table is from `ddf3d18`; the fresh-worktree table is from
+the final commit, after the listing fix (at `ddf3d18` the same three
+had passed, with 41, 67 and 56 s for stock cargo's cold build). Stock
+cargo's cold build writes everything through the daemon's file system:
+40, 65 and 59 s here against 39, 65 and 59 s into a plain directory in
+the earlier table (one run each): no cost that single runs can show.
+**Zed is different: 446 s against 168 s for the cold build, and 187 s
+against 29 s for the tests.** Stock cargo works there and nothing
+drifts, but it is 2.7 times slower through the mount. Zed's profile
+compiles incrementally with unpacked split debug info, which is tens of
+thousands of small files created, linked and renamed; every one of
+those operations on names goes through the daemon, which serves them
+one at a time under a single lock (file contents go straight to the
+real file). That was not measured further or improved. What I would
+try: answer name operations without the global lock, and let the kernel
+cache what it is told for directories that only hold real files.
+What this run does not cover: Zed's server-side drift
 check and the in-place run for Zed were not repeated with the virtual
 directory; a stock `cargo clean` not going through the shim fails at its
 last step (it cannot remove a mount point).
@@ -1057,7 +1083,8 @@ first implementation it says so.
   29 later commits took 665 s against 391 s, and the first 59.9 s against
   40.7 s. (Stock 1.100.0 again with the client daemon, 100 ms of
   round-trip time on the client link: first commit 40.8 s, the 29 later
-  ones 350.7 s, 352 actions, none failed; TBD-REPLAYLAN) In the favourable case, the 20-agent swarm with body-only second
+  ones 350.7 s, 352 actions, none failed; on the LAN link 39.8 s and
+  351.3 s.) In the favourable case, the 20-agent swarm with body-only second
   edits, it still loses: 146.6 s wall and 1,789 CPU-s against 114.9 s and
   1,492 CPU-s for stock 1.100.0 under rargo.
 - **Separately cached metadata and codegen.** `check` with the fork runs the
@@ -1114,6 +1141,17 @@ are mine, not rargo's.
   needs a confirmation I could not give myself; they are harmless and can
   be deleted. The 9-byte `/.gitignore` from an earlier session is in the
   same state.
+
+In the round of 2026-11-23 evening (client daemon, output directory)
+nothing outside `/root/rargo-work` and this repository was touched.
+Within them: benchmark runs that I stopped by killing their drivers left
+dead FUSE mounts on twenty `target/` directories under
+`/root/rargo-work/swarm`, which I unmounted by hand; a benchmark script
+I edited while it was running failed at its last (cleanup) lines after
+its results were written; and the rig's network namespaces, `tc` rules
+and UDP ports (7459 inside the namespaces, 7481 and 7999 on loopback
+for two short tests) were mine. No daemon, namespace or mount of mine
+is left running.
 
 ## Bugs found by running real builds (kept here because they say what to
 ## distrust)

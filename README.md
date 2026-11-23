@@ -60,11 +60,31 @@ to the `rargo` binary ahead of the real cargo on `PATH`; everything that is
 not a build is passed to the real cargo, and `RARGO_FALLBACK=cargo` passes
 builds too when the server cannot be reached.
 
+The first `rargo` command starts a daemon for that server (one per user,
+server and key on the machine); later commands talk to it over a Unix
+socket. The daemon keeps one session to the server (UDP on the server's
+port, TCP if UDP gets no answer; `RARGO_TRANSPORT=udp|tcp` forces one),
+watches the worktrees it has seen and sends their changes as they
+happen. The server must be reachable on its port over UDP and TCP.
+`rargo --rargo-daemon-status` shows what the daemon is doing,
+`rargo --rargo-daemon-stop` ends it, `RARGO_NO_DAEMON=1` runs a command
+without one. Its log is `daemon.log` in the cache directory.
+
 What is synced: the whole worktree except `.git`, cargo target directories,
 and what `.rargo.toml` excludes. What comes back: what cargo would have left
 in `target/` for the command, and files the build wrote into the worktree.
-The client keeps its index and a shared copy of artifacts in
-`~/.cache/rargo` (`RARGO_CACHE_DIR`).
+
+`target/` is a file system the daemon mounts (FUSE; as root or with
+`CAP_SYS_ADMIN`): what the server built is listed there at once and
+fetched when something opens it; what you or stock cargo write there
+goes to the real directory underneath. Stopping the daemon leaves that
+plain directory. Use `rargo clean` (or `cargo clean` through the shim),
+not a stock `cargo clean`, while it is mounted. Where it cannot be
+mounted, or with `RARGO_OUTPUT=copy`, results are copied into `target/`
+and shared between worktrees through the cache.
+
+The client keeps its index, the daemon's socket and log, and fetched
+contents in `~/.cache/rargo` (`RARGO_CACHE_DIR`).
 
 ## Per-repository policy: `.rargo.toml`
 
