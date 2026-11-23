@@ -14,12 +14,15 @@ agents=${2:-20}
 out=$work/bench/results.jsonl
 jobs=${RARGO_JOBS:-24}
 # One of Zed's git dependencies has LFS files neither build needs.
-[ "$name" = zed ] && export GIT_LFS_SKIP_SMUDGE=1
+# One of its build scripts downloads a library: the rig's server gets a
+# proxy out, named to the build through the policy file's `env.pass`.
+renv=""
+[ "$name" = zed ] && export GIT_LFS_SKIP_SMUDGE=1 RIG_PROXY=1 && renv="HTTPS_PROXY=http://127.0.0.1:3128"
 if [ "${SWARM_SKIP_RARGO:-}" != 1 ]; then
     # rargo: fresh server and store, so nothing is warm.
     RARGO_HIDE="$work/swarm" "$repo/dev/netns.sh" up "$jobs" 0 0 >/dev/null
     . "$work/nstest/client.env"
-    python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" --netns rargo-cl \
+    env $renv python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" --netns rargo-cl \
         --label "remote client ${CLIENT_DELAY_MS:-1}ms ${CLIENT_RATE:-1gbit}"
     "$repo/dev/netns.sh" down
 fi

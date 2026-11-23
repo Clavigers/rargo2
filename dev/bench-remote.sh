@@ -28,7 +28,7 @@ case $repo in
 ra) main=(build -p rust-analyzer); edit=crates/stdx/src/lib.rs ;;
 ruff) main=(build -p ruff); edit=crates/ruff_text_size/src/lib.rs ;;
 bevy) main=(build -p bevy_ecs); edit=crates/bevy_utils/src/lib.rs ;;
-zed) main=(build); edit=crates/collections/src/collections.rs; export GIT_LFS_SKIP_SMUDGE=1; stock=$here/zed-cargo.sh ;;
+zed) main=(build); edit=crates/collections/src/collections.rs; export GIT_LFS_SKIP_SMUDGE=1 RIG_PROXY=1; rargo_env="HTTPS_PROXY=http://127.0.0.1:3128"; stock=$here/zed-cargo.sh ;;
 *) echo "unknown repo $repo"; exit 2 ;;
 esac
 stock=${stock:-cargo}
@@ -62,7 +62,7 @@ while [ $# -ge 3 ]; do
     label=$1; delay=$2; rate=$3; shift 3
     RARGO_HIDE="$C" CLIENT_DELAY_MS=$delay CLIENT_RATE=$rate "$here/netns.sh" up "$jobs" 0 0 >/dev/null 2>&1
     . "$work/nstest/client.env"
-    R() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+    R() { ip netns exec rargo-cl env ${rargo_env:-} "$RARGO_BIN/rargo" "$@"; }
     export RARGO_CACHE_DIR=$C/cache-1
     rm -rf "$C/cache-1" "$C/cache-2"
     wt one

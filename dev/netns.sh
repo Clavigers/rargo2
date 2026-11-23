@@ -19,6 +19,7 @@ B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
 T=$work/nstest
 down() {
     pkill -TERM -f "rargod --state $T" 2>/dev/null || true
+    pkill -TERM -f "rigproxy.py [a-z]* $T/proxy.sock" 2>/dev/null || true
     sleep 0.5
     pkill -KILL -f "rargod --state $T" 2>/dev/null || true
     for ns in $(ip netns list 2>/dev/null | awk '/^rargo-/ {print $1}'); do
@@ -27,6 +28,14 @@ down() {
 }
 start_server() {
     mkdir -p "$T/srv"
+    # RIG_PROXY=1: the server namespace has no route out; build scripts the
+    # policy lets use the network get out through a proxy (dev/rigproxy.py)
+    # at HTTPS_PROXY=http://127.0.0.1:3128.
+    if [ "${RIG_PROXY:-}" = 1 ] && ! pgrep -f "rigproxy.py outside $T/proxy.sock" >/dev/null 2>&1; then
+        here=$(cd "$(dirname "$0")" && pwd)
+        nohup python3 "$here/rigproxy.py" outside "$T/proxy.sock" >/dev/null 2>&1 &
+        nohup ip netns exec rargo-srv python3 "$here/rigproxy.py" inside "$T/proxy.sock" 3128 >/dev/null 2>&1 &
+    fi
     hide=""
     for d in ${RARGO_HIDE:-}; do mkdir -p "$d"; hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
     nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G -p Delegate=yes \
@@ -91,7 +100,7 @@ up)
     secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
     echo "bench $secret admin" >"$T/keys"
     printf 'export RARGO_SERVER=10.77.0.1:7459 RARGO_USER=bench RARGO_KEY=%s RARGO_STATE=%s\n' "$secret" "$T/srv" >"$T/client.env"
-    echo "sj=$sj wj=$wj n=$n RARGO_HIDE='${RARGO_HIDE:-}'" >"$T/params"
+    echo "sj=$sj wj=$wj n=$n RARGO_HIDE='${RARGO_HIDE:-}' RIG_PROXY='${RIG_PROXY:-}'" >"$T/params"
     start_server
     start_workers
     sleep 2
