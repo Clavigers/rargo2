@@ -30,7 +30,7 @@ pending.
 | Flake-restricted sandboxes | done, e2e-tested (`dev/e2e-flake.sh`, 14 checks) |
 | Cache export/import between machines | done, e2e-tested |
 | Verify mode and drift check | done, exercised on the test workspace |
-| Workers: UDP session, chunked transfer, dispatch, keyed authentication | done, functional over a netem link; benchmark pending |
+| Workers: UDP session, chunked transfer, dispatch, hedging, keyed authentication | done and benchmarked; warm builds no slower, cold builds not shortened in proportion (criterion not met, see Workers) |
 | `cargo` shim | done, e2e-tested (routing, passthrough, fallback without a daemon) |
 | Cold tier (chunk-level storage of idle blobs) | done, unit- and e2e-tested, measured on the Ruff swarm store |
 | rustc fork (phase 5) | three patches, built and linked as toolchain `rargo`; see "Phase 5" |
@@ -192,18 +192,50 @@ members of an rlib are named after a random per-invocation string. Verify
 compares such rlibs by member content. Not yet run on the large workspaces.
 
 ### Workers
-`rargo-core/src/{net,chunk,remote}.rs`, `dev/netns.sh`. Transport: 118 MiB/s
-on loopback, correct under 5% loss in both directions (unit tests). Chunker:
-unit tests for size bounds, insertion locality and archive member
-boundaries. End to end: a worker in its own network namespace behind a veth
-link with 1 ms delay each way, 0.1% loss and a 1 Gbit rate limit joined,
-ran actions, returned traces and outputs; killing a worker mid-action made
-the server rerun the action locally.
-Not yet measured: the phase 4 criterion (cold build speed-up with a worker,
-warm build no slower). Known weaknesses: a cold worker first has to receive
-the toolchain (about nine seconds on loopback); remote actions have no
-incremental seed; flake-rooted and host-network actions are never sent to
-workers; there is no authentication on the worker port.
+`rargo-core/src/{net,chunk,remote}.rs`, `dev/netns.sh`, `dev/bench-worker.sh`,
+`dev/bench-worker-swarm.sh`, `examples/netbench.rs`. Server and workers in
+their own network namespaces; every link 1 ms each way, 0.1% loss, 1 Gbit
+(`tc netem`); each daemon capped at its own core count. Links are
+authenticated with a shared key (D26).
+
+**The phase 4 criterion is not met.** What was measured (D30, D31):
+
+| rust-analyzer cold `build` | 4 cores per machine | 8 cores per machine |
+|---|---|---|
+| server alone | 53.1 s | 41.9 s |
+| + 1 fresh worker | 56.2 s | 44.0 s (241.9 s before hedging) |
+| + 1 warm worker | 50.2 s | 43.2 s (51.8 s before the fixes) |
+| + 2 warm workers | 51.5 s | 46.6 s |
+| server with 2x the cores, no worker | 41.8 s | 40.6 s |
+| server with 3x the cores, no worker | 41.1 s | |
+
+| 20-agent rust-analyzer swarm | wall |
+|---|---|
+| server 8 cores | 171.1 s, 171.0 s |
+| server 8 + worker 8 | 159.6, 173.8, 172.4, 175.5 s (one failed step in the first, not reproduced) |
+| server 16 cores | 116.4 s, 115.4 s |
+
+Warm, no-op and one-edit builds are no slower with workers (no-op 0.06 s
+in every configuration; one-edit rebuild 8.8 to 10.2 s against 9.0 to
+9.8 s), so that half of the criterion holds. A cold build is not shortened
+in proportion. Why, as far as measured: past about 8 cores a cold build of
+rust-analyzer or Bevy is bound by its critical path, and what extra local
+cores buy there is code-generation parallelism inside the crates on that
+path, which a worker cannot provide; in the swarm, each remote compile
+needs the freshly changed metadata of many crates, which at 1 Gbit costs
+about as much as waiting for a local core, and the dispatcher correctly
+keeps most work local.
+
+What the measurements fixed along the way: transport 18.8 to 72 MiB/s
+(fast retransmit, gentler loss response); hedging (a dispatched action runs
+locally too when a local core falls idle before the worker has said
+anything), which bounds a worker's harm; compressed messages (fetch time
+halved); a cost model that learns each worker's overhead and the link's
+bandwidth; remote compiles without incremental state.
+
+Known weaknesses: a cold worker first pulls the toolchain (about 300 MB);
+flake-rooted and host-network actions are never sent to workers; the link
+is authenticated but not encrypted.
 
 ## Phase 5
 
