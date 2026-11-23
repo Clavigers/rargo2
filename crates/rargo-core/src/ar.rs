@@ -113,6 +113,56 @@ pub fn stable_output_hash(bytes: &[u8]) -> crate::hash::Hash {
     stable_rlib_hash(bytes).unwrap_or_else(|| crate::hash::Hash::of(&session_neutral(bytes)))
 }
 
+/// Where the linker's build id sits in an ELF file: the byte range of the
+/// section `.note.gnu.build-id`. `None` for anything that is not a 64-bit
+/// little-endian ELF file with such a section.
+fn build_id(bytes: &[u8]) -> Option<(usize, usize)> {
+    let u16_at = |o: usize| bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
+    let u32_at = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+    let u64_at = |o: usize| bytes.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize);
+    if bytes.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let (shoff, shentsize, shnum, shstrndx) = (u64_at(0x28)?, u16_at(0x3a)?, u16_at(0x3c)?, u16_at(0x3e)?);
+    let section = |i: usize| -> Option<(usize, usize, usize)> {
+        let h = shoff.checked_add(i.checked_mul(shentsize)?)?;
+        Some((u32_at(h)?, u64_at(h + 0x18)?, u64_at(h + 0x20)?))
+    };
+    let (_, names_at, names_len) = section(shstrndx)?;
+    let names = bytes.get(names_at..names_at.checked_add(names_len)?)?;
+    for i in 0..shnum {
+        let (name, at, len) = section(i)?;
+        let rest = names.get(name..)?;
+        if rest.split(|&c| c == 0).next() == Some(b".note.gnu.build-id".as_slice()) {
+            return (at.checked_add(len)? <= bytes.len()).then_some((at, at + len));
+        }
+    }
+    None
+}
+
+/// What kind of difference two versions of an output have, in words.
+pub fn describe_difference(a: &[u8], b: &[u8]) -> String {
+    if a.len() != b.len() {
+        return format!("{} and {} bytes", a.len(), b.len());
+    }
+    let (na, nb) = (session_neutral(a), session_neutral(b));
+    match differences(&na, &nb) {
+        Some(d) if d.is_empty() => "only session names inside".to_string(),
+        Some(d) => {
+            let longest = d.iter().map(|(s, e)| e - s).max().unwrap_or(0);
+            let id = build_id(&na).map(|(s, e)| format!(", build id at {s}..{e}")).unwrap_or_default();
+            format!(
+                "same size, {} places differ besides session names, the longest {} bytes, the first at byte {}{}",
+                d.len(),
+                longest,
+                d[0].0,
+                id
+            )
+        }
+        None => "different sizes".to_string(),
+    }
+}
+
 /// Length of the identifier that ties an object file to its split debug
 /// info (`DW_AT_GNU_dwo_id`, or the DWARF 5 unit header's `dwo_id`).
 const DWO_ID: usize = 8;
@@ -158,13 +208,19 @@ impl DwoIds {
     }
 
     /// Whether `a` and `b` are the same apart from session names and the
-    /// identifiers learnt.
+    /// identifiers learnt. In a linked file (an executable, a proc macro's
+    /// shared object) the linker's build id is a hash of the whole file: if
+    /// an identifier differs, so does it, and that is not one more
+    /// difference.
     fn same_bytes(&self, a: &[u8], b: &[u8]) -> bool {
         let (a, b) = (session_neutral(a), session_neutral(b));
-        match differences(&a, &b) {
-            Some(d) => d.iter().all(|&(s, e)| e - s <= DWO_ID && self.0.contains(&(a[s..e].to_vec(), b[s..e].to_vec()))),
-            None => false,
+        let Some(d) = differences(&a, &b) else { return false };
+        let known = |&(s, e): &(usize, usize)| e - s <= DWO_ID && self.0.contains(&(a[s..e].to_vec(), b[s..e].to_vec()));
+        if d.iter().all(known) {
+            return true;
         }
+        let (Some(ia), Some(ib)) = (build_id(&a), build_id(&b)) else { return false };
+        ia == ib && d.iter().any(known) && d.iter().all(|r| known(r) || (r.0 >= ia.0 && r.1 <= ia.1))
     }
 
     /// The same for a whole output file: an archive is compared member by
@@ -314,6 +370,43 @@ mod tests {
         let rc = archive(&[("lib.rmeta", b"META"), ("u-1f.0f46.9zzzzzz.rcgu.o", &obj("9zzzzzz", b"BBBBBBBB", "code"))]);
         assert!(ids.same(&ra, &rb));
         assert!(!ids.same(&ra, &rc));
+        // A linked file: its build id differs because the identifier does.
+        let elf = |id: &[u8], build: &[u8], code: &[u8]| -> Vec<u8> {
+            // Header, one 16-byte code block, the identifier, a 20-byte note
+            // section, the section name table, two section headers.
+            let mut f = vec![0u8; 0x40];
+            f[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            f.extend_from_slice(code);
+            f.extend_from_slice(id);
+            f.extend_from_slice(b"----other-sections----");
+            let note_at = f.len();
+            f.extend_from_slice(build);
+            let names_at = f.len();
+            f.extend_from_slice(b"\0.note.gnu.build-id\0.shstrtab\0");
+            let names_len = f.len() - names_at;
+            let shoff = f.len();
+            for (name, at, len) in [(1u32, note_at, build.len()), (20u32, names_at, names_len)] {
+                let mut h = vec![0u8; 0x40];
+                h[..4].copy_from_slice(&name.to_le_bytes());
+                h[0x18..0x20].copy_from_slice(&(at as u64).to_le_bytes());
+                h[0x20..0x28].copy_from_slice(&(len as u64).to_le_bytes());
+                f.extend_from_slice(&h);
+            }
+            f[0x28..0x30].copy_from_slice(&(shoff as u64).to_le_bytes());
+            f[0x3a..0x3c].copy_from_slice(&0x40u16.to_le_bytes());
+            f[0x3c..0x3e].copy_from_slice(&2u16.to_le_bytes());
+            f[0x3e..0x40].copy_from_slice(&1u16.to_le_bytes());
+            f
+        };
+        let (b1, b2) = (b"build-id-number-0001".as_slice(), b"BUILD-ID-NUMBER-0002".as_slice());
+        let exe = elf(b"AAAAAAAA", b1, b"0123456789abcdef");
+        assert_eq!(build_id(&exe).map(|(s, e)| e - s), Some(20));
+        assert!(ids.same(&exe, &elf(b"BBBBBBBB", b2, b"0123456789abcdef")));
+        // A build id that differs with nothing else to explain it, or with
+        // different code beside it, is a difference.
+        assert!(!ids.same(&exe, &elf(b"AAAAAAAA", b2, b"0123456789abcdef")));
+        assert!(!ids.same(&exe, &elf(b"BBBBBBBB", b2, b"0123456789ABCDEF")));
+        assert!(describe_difference(&exe, &elf(b"AAAAAAAA", b2, b"0123456789abcdef")).contains("build id at"));
         // Identifiers that happen to share a byte still match.
         let mut ids = DwoIds::default();
         assert!(ids.learn(&dwo(b"AAAxAAAA"), &dwo(b"BBBxBBBB")));

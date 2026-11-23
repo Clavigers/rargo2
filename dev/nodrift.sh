@@ -27,7 +27,11 @@ cap() { systemd-run --scope -q -p CPUQuota=2400% -p MemoryMax=90G "$@"; }
 before=$(git status --porcelain | grep -v '^??' | sort)
 step "rargo build" "$R" build
 step "rargo test $rtests" "$R" test $rtests
-[ "${NODRIFT_SKIP_SERVER:-}" = 1 ] || step "rargo: drift check on the server (stock cargo vs rargo)" "$R" --rargo-drift-check
+if [ "${NODRIFT_SKIP_SERVER:-}" != 1 ]; then
+    step "rargo: drift check on the server (stock cargo vs rargo)" "$R" --rargo-drift-check
+    # The verdict line, with its counts, also when it is good news.
+    echo "$out" | grep -m1 -E 'no drift|DRIFT' | sed 's/^/    | /'
+fi
 after=$(git status --porcelain | grep -v '^??' | sort)
 [ "$before" = "$after" ] && say "tracked files untouched by rargo" ok || { say "tracked files untouched by rargo" FAILED; fails=$((fails + 1)); }
 untracked=$(git status --porcelain --ignored | grep -v ' target/$' | grep -v '^!! target' || true)

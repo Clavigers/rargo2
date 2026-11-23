@@ -404,6 +404,9 @@ struct Run {
     /// `(message, canonical paths that differ)`; no paths means the
     /// difference is in what the action said or whether it succeeded.
     verify_mismatches: Mutex<Vec<(String, Vec<Vec<u8>>)>>,
+    /// Units whose two runs differ in a way the tools themselves produce
+    /// (see `exec_unit`): reported, not counted as drift.
+    verify_unreproducible: Mutex<Vec<String>>,
     /// Each unit's cache key, once known (for looking up who read what).
     unit_keys: Vec<OnceLock<Hash>>,
     /// Set when the request is a `check` planned as a build: how far each
@@ -1131,6 +1134,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         verify: c.env.contains_key("RARGO_VERIFY"),
         verified: AtomicU64::new(0),
         verify_mismatches: Mutex::new(Vec::new()),
+        verify_unreproducible: Mutex::new(Vec::new()),
         unit_keys: (0..n).map(|_| OnceLock::new()).collect(),
         need: if as_build { Some(pd.needs()) } else { None },
     });
@@ -1196,10 +1200,15 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         for m in &bad {
             c2.out.warn(&format!("verify: {m}"));
         }
+        let unreproducible = std::mem::take(&mut *run.verify_unreproducible.lock());
+        for m in &unreproducible {
+            c2.out.note(&format!("verify: not compared: {m}"));
+        }
         c2.out.note(&format!(
-            "verify: {} cached unit(s) re-run cleanly, {} differed",
+            "verify: {} cached unit(s) re-run cleanly, {} differed, {} not reproducible by the tools themselves",
             run.verified.load(Ordering::Relaxed),
-            bad.len()
+            bad.len(),
+            unreproducible.len()
         ));
         d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
         d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
@@ -1765,9 +1774,38 @@ impl Run {
                 parsed(&outcome.result.stdout) != parsed(&clean.result.stdout)
             } {
                 // What a build script prints is what cargo acts on.
-                self.verify_mismatches
-                    .lock()
-                    .push((format!("{}: a clean run prints different instructions to cargo", u.desc), Vec::new()));
+                // Say which lines: the first few `cargo:` lines only one of
+                // the two runs printed.
+                let lines = |h: &Hash| -> Vec<String> {
+                    let out = self.d.store().read(h).unwrap_or_default();
+                    String::from_utf8_lossy(&out).lines().filter(|l| l.starts_with("cargo:")).map(|l| l.to_string()).collect()
+                };
+                let (cached, clean_lines) = (lines(&outcome.result.stdout), lines(&clean.result.stdout));
+                let only = |a: &[String], b: &[String]| -> Vec<String> {
+                    a.iter().filter(|l| !b.contains(l)).take(2).map(|l| self.c.out.tr.text(l).chars().take(200).collect()).collect()
+                };
+                let sorted = |v: &[String]| {
+                    let mut v = v.to_vec();
+                    v.sort();
+                    v
+                };
+                if sorted(&cached) == sorted(&clean_lines) {
+                    // A script that compiles C in parallel prints as the
+                    // compilers finish.
+                    self.verify_unreproducible
+                        .lock()
+                        .push(format!("{}: prints the same instructions to cargo in a different order from run to run", u.desc));
+                } else {
+                    self.verify_mismatches.lock().push((
+                        format!(
+                            "{}: a clean run prints different instructions to cargo (cached only: {:?}; clean only: {:?})",
+                            u.desc,
+                            only(&cached, &clean_lines),
+                            only(&clean_lines, &cached)
+                        ),
+                        Vec::new(),
+                    ));
+                }
             } else if a != b {
                 // rustc's incremental mode names each codegen unit's files
                 // (objects inside an rlib, split debug info beside it) after
@@ -1817,12 +1855,54 @@ impl Run {
                     .map(|(_, (p, _))| (*p).clone())
                     .chain(clean_by.iter().filter(|(k, _)| !cached_by.contains_key(*k)).map(|(_, (p, _))| (*p).clone()))
                     .collect();
-                if !differing.is_empty() {
+                // Two ways in which the compiler's own output varies from
+                // run to run, both seen with stock cargo alone (D55):
+                // dependency information that lists the same files in
+                // another order (a procedural macro that tracks files in
+                // hash order; metadata and object code follow), and, with
+                // split debug info, anything linked (the linker's tables
+                // are laid out by names that include the session).
+                let reordered_inputs = differing.iter().filter(|p| p.ends_with(b".d")).any(|p| {
+                    let k = stable_path(p);
+                    let (Some((_, x)), Some((_, y))) = (cached_by.get(&k), clean_by.get(&k)) else { return false };
+                    let Some((bx, by)) = contents(x, y) else { return false };
+                    let words = |b: &[u8]| {
+                        let mut w: Vec<Vec<u8>> = b.split(|c| c.is_ascii_whitespace()).filter(|w| !w.is_empty()).map(|w| w.to_vec()).collect();
+                        w.sort();
+                        w
+                    };
+                    bx != by && words(&bx) == words(&by)
+                });
+                let compiled = |p: &[u8]| [&b".rlib"[..], b".rmeta", b".d", b".dwo", b".o"].iter().any(|e| p.ends_with(e));
+                let split_debug = a.iter().any(|(p, _)| p.ends_with(b".rcgu.dwo"));
+                let only_linked = u.needs_objects && split_debug && differing.iter().all(|p| !compiled(p));
+                if !differing.is_empty() && (reordered_inputs || only_linked) {
+                    self.verify_unreproducible.lock().push(format!(
+                        "{}: {}",
+                        u.desc,
+                        if reordered_inputs {
+                            "reports the same input files in a different order from run to run, and its output differs with that"
+                        } else {
+                            "is linked with split debug info, which the compiler and linker do not reproduce byte for byte"
+                        }
+                    ));
+                } else if !differing.is_empty() {
                     let shown: Vec<String> =
                         differing.iter().take(3).map(|p| self.c.out.tr.path(&String::from_utf8_lossy(p))).collect();
+                    // How the first of them differs, for whoever has to
+                    // decide what kind of difference this is.
+                    let how = differing
+                        .first()
+                        .and_then(|p| {
+                            let k = stable_path(p);
+                            let ((_, x), (_, y)) = (cached_by.get(&k)?, clean_by.get(&k)?);
+                            let (bx, by) = contents(x, y)?;
+                            Some(crate::ar::describe_difference(&bx, &by))
+                        })
+                        .unwrap_or_else(|| "present in only one of the two".to_string());
                     self.verify_mismatches.lock().push((
                         format!(
-                            "{}: a clean run produces different output than the cached one ({})",
+                            "{}: a clean run produces different output than the cached one ({}; the first: {how})",
                             u.desc,
                             shown.join(", ")
                         ),

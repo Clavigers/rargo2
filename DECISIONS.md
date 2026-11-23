@@ -1151,3 +1151,54 @@ build on 4, 8 and 24 cores and with a worker: from the moment `hir-def`
 starts, the build is one chain (`hir-def`, `hir-ty`, `hir`, `ide-*`,
 `rust-analyzer`) that takes 30.5 to 32.2 s in every configuration. All of
 what cores buy is in the wide phase before it. See STATUS for the figures.
+
+## D55. After the second worker series; what the drift check does not call drift
+
+**Workers.** The series at `a92e359` (STATUS) showed a warm worker taking
+7.8 s off a 56.5 s build, and two regressions: a worker that had seen
+nothing made the build 3.6 s slower, and the first rebuild after an edit
+took 16.5 s instead of 10.9 s. Two rules:
+
+- A crate that is compiled incrementally (a workspace member) is compiled
+  on the server, first compile included. D54 kept only crates that already
+  had state; but a first compile sent away leaves no state behind (D31),
+  and the next rebuild of that crate was a compile from nothing.
+  `RARGO_REMOTE_FIRST=1` restores D54's behaviour. The cost is that
+  workers only ever get dependencies and build scripts, which is why the
+  swarm (almost all workspace crates) cannot gain from them; the way out
+  is to bring incremental state home, which D31 measured as too
+  expensive when done in the foreground.
+- An action about which nothing is known (no trace of its own, no other
+  run of its program) runs on the server. A worker asked for everything
+  such an action read one question at a time, toolchain included.
+
+Measured after both: warm worker 49.2 s against 56.0 s alone and 45.2 s
+with 8 local cores; a worker that has seen nothing 55.8 s; rebuild after
+an edit 11.1 s against 11.3 s.
+
+**Drift check.** Zed's check, after D51, still reported 24 units. All
+three kinds were reproduced with stock cargo alone, two clean builds at
+the same path:
+
+- Anything linked while split debug info is on (build scripts, proc
+  macros): about 10,000 places differ in a three-line build script's
+  executable. The linker's tables are laid out by names that include the
+  compiler's session.
+- `wasmtime-wasi-io` (and with it `wasmtime-wasi`, `extension_host`): its
+  dependency information lists the same files in a different order from
+  run to run, and metadata and object code differ with it; a procedural
+  macro that tracks files in hash order.
+- Build scripts that compile C in parallel print the same `cargo:` lines
+  in a different order.
+
+Verify now recognises exactly these (a linking unit that has `.dwo`
+outputs and differs only in linked files; a unit whose `.d` differs only
+in order; a script whose sorted `cargo:` lines are equal) and reports
+them as "not reproducible by the tools themselves", separately from
+drift, with their number in the verdict. Linked files that differ only in
+session names, debug-info identifiers and the linker's build id are
+accepted as equal outright (the build id is found by reading the ELF
+section table; nothing else is parsed). Anything else that differs is
+still drift. The risk taken: a real difference that happens to look like
+one of the three would be reported as not reproducible instead of as
+drift; it would still be reported.

@@ -42,6 +42,9 @@ pub struct Report {
     pub rargo_ok: bool,
     pub verified_units: u64,
     pub mismatches: Vec<String>,
+    /// Units that could not be compared because the tools do not
+    /// reproduce their output from run to run.
+    pub unreproducible: usize,
     pub stock_secs: f64,
     pub rargo_secs: f64,
     pub detail: String,
@@ -55,14 +58,15 @@ impl Report {
     pub fn render(&self) -> String {
         let verdict = if self.agrees() { "no drift" } else { "DRIFT" };
         let mut s = format!(
-            "{verdict} at {}: stock cargo {} ({:.1}s), rargo {} ({:.1}s), {} cached unit(s) re-run cleanly, {} differed\n",
+            "{verdict} at {}: stock cargo {} ({:.1}s), rargo {} ({:.1}s), {} cached unit(s) re-run cleanly, {} differed, {} not reproducible by the tools themselves\n",
             &self.snapshot[..self.snapshot.len().min(12)],
             if self.stock_ok { "builds" } else { "fails" },
             self.stock_secs,
             if self.rargo_ok { "builds" } else { "fails" },
             self.rargo_secs,
             self.verified_units,
-            self.mismatches.len()
+            self.mismatches.len(),
+            self.unreproducible
         );
         for m in &self.mismatches {
             s.push_str(&format!("  {m}\n"));
@@ -183,6 +187,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         .lines()
         .filter_map(|l| l.strip_prefix("warning: verify: ").map(|s| s.to_string()))
         .collect();
+    let unreproducible = text.lines().filter(|l| l.starts_with("note: verify: not compared: ")).count();
     let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
     let stock_ok = stock.status.success();
     let rargo_ok = code == 0;
@@ -195,7 +200,17 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
             tail(&text)
         );
     }
-    Ok(Report { snapshot: snapshot.id.hex(), stock_ok, rargo_ok, verified_units, mismatches, stock_secs, rargo_secs, detail })
+    Ok(Report {
+        snapshot: snapshot.id.hex(),
+        stock_ok,
+        rargo_ok,
+        verified_units,
+        mismatches,
+        unreproducible,
+        stock_secs,
+        rargo_secs,
+        detail,
+    })
 }
 
 /// Background loop: every `interval`, check each worktree whose newest

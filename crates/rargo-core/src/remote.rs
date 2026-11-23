@@ -1037,6 +1037,13 @@ fn remote_incr() -> bool {
     *ON.get_or_init(|| std::env::var("RARGO_REMOTE_INCR").ok().as_deref() == Some("1"))
 }
 
+/// `RARGO_REMOTE_FIRST=1`: a workspace crate that has never been compiled
+/// here may be compiled on a worker.
+fn remote_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RARGO_REMOTE_FIRST").ok().as_deref() == Some("1"))
+}
+
 /// `RARGO_TRACE_REMOTE` in rargod's environment: one line per remote
 /// action on its stderr, with where the time went.
 fn trace_remote() -> bool {
@@ -1835,11 +1842,17 @@ impl RemoteRunner for Pool {
             if spec.kind == ActionKind::Plan || spec.net != NetMode::Loopback || spec.root_id != Hash::ZERO {
                 return None;
             }
-            // A crate that has been compiled here before has incremental
-            // state here, and remote compiles run without any (D31): after
-            // an edit the local compile is the short one, even if it has to
-            // wait for a core.
-            if !spec.discard.is_empty() && !remote_incr() && engine.traces.traces(key).first().is_some() {
+            // A crate that is compiled incrementally (a workspace member)
+            // is compiled here. Remote compiles run without incremental
+            // state and leave none behind (D31): after an edit the local
+            // compile is the short one even if it has to wait for a core,
+            // and a first compile sent away would make the next rebuild of
+            // that crate a compile from nothing. `RARGO_REMOTE_FIRST=1`
+            // lets first compiles go to workers all the same.
+            if !spec.discard.is_empty()
+                && !remote_incr()
+                && (!remote_first() || engine.traces.traces(key).first().is_some())
+            {
                 self.stats.kept_local_incremental.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -1874,6 +1887,16 @@ impl RemoteRunner for Pool {
             // from another run of the same program (the toolchain).
             let own = engine.traces.traces(key).first().map(|(_, t)| t.clone());
             let known = own.clone().or_else(|| engine.profile(spec));
+            if known.is_none() && !eager_dispatch() {
+                // Nothing is known about what it reads (the first compile a
+                // server ever runs, a build script's own run): the worker
+                // would ask for everything one question at a time,
+                // toolchain included. It runs here, and what it reads is
+                // then known for the next of its kind.
+                self.give_back(&w);
+                self.stats.kept_local_transfer.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             let missing: u64 = match &known {
                 Some(t) => {
                     let has = w.has_blobs.lock();
