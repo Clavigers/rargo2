@@ -53,6 +53,10 @@ pub struct DaemonStats {
     pub bytes_in: AtomicU64,
     /// Bytes of artifacts sent to clients.
     pub bytes_out: AtomicU64,
+    /// Client daemons that have connected.
+    pub links: AtomicU64,
+    /// File contents received from clients, asked for or pushed.
+    pub files_in: AtomicU64,
 }
 
 /// State shared by all requests.
@@ -73,13 +77,16 @@ pub struct Daemon {
     pub drift_report: Mutex<Option<String>>,
     /// Who last built in each worktree, for the background drift check.
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
+    /// Per worktree: the token of its last delivery and everything that
+    /// worktree has been delivered up to then (see `serve`).
+    pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
     plans: DashMap<Hash, Arc<PlanData>>,
     /// Target directories seen per worktree, masked in later views.
     masks: DashMap<String, Vec<Vec<u8>>>,
     /// Downloads into the shared cargo home happen one at a time.
     fetching: tokio::sync::Mutex<()>,
     scratch_seq: AtomicU64,
-    pub stats: DaemonStats,
+    pub stats: Arc<DaemonStats>,
 }
 
 /// A client's own cargo configuration, laid over the shared cargo home.
@@ -495,6 +502,7 @@ impl Daemon {
             pool: OnceLock::new(),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
+            deliveries: Mutex::new(HashMap::new()),
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),
@@ -502,7 +510,7 @@ impl Daemon {
             plans: DashMap::new(),
             fork_seen: DashMap::new(),
             masks: DashMap::new(),
-            stats: DaemonStats::default(),
+            stats: Arc::new(DaemonStats::default()),
         }
     }
 

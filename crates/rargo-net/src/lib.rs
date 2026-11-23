@@ -1,4 +1,6 @@
-//! A reliable message transport over UDP for the server-worker session.
+//! A reliable message transport over UDP, used between the server and its
+//! workers and between the server and the client daemons, and the
+//! client-server [`link`] built on it.
 //!
 //! Messages of any size are cut into datagram-sized fragments, each
 //! acknowledged individually and retransmitted on a timer. Messages are
@@ -8,8 +10,14 @@
 //! arrival order; the RPC layer above matches replies to requests by id.
 //!
 //! Congestion control is deliberately simple (slow start, additive
-//! increase, halving on timeout): the link is a machine-room network between
-//! a build server and its workers.
+//! increase, halving on timeout). A connection lives as long as its two
+//! ends do: its window and round-trip estimate carry over from one command
+//! to the next, so nothing after the first exchange pays for a handshake
+//! or a slow start. A peer is known by its connection id, not its address:
+//! an authenticated datagram from a new address moves the connection there
+//! (a client that changed networks, a NAT that picked a new port).
+
+pub mod link;
 
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -101,6 +109,33 @@ struct RecvState {
 /// an observer still sees is message sizes and timing.
 pub type LinkKey = Option<Arc<[u8; 32]>>;
 
+/// Looks up a user's pre-shared key.
+pub type UserKeys = Arc<dyn Fn(&str) -> Option<[u8; 32]> + Send + Sync>;
+
+/// How the connections of an endpoint prove who they are.
+#[derive(Clone)]
+pub enum Auth {
+    /// Not at all (tests).
+    None,
+    /// One key shared by both ends (server and workers). Every datagram
+    /// carries a tag made with it.
+    Shared(Arc<[u8; 32]>),
+    /// The accepting end of client links: each connection names its user in
+    /// the key agreement and proves that user's key. Datagrams after the
+    /// agreement carry a tag made with a key of the connection.
+    Users(UserKeys),
+    /// The connecting end of a client link.
+    User { name: String, psk: [u8; 32] },
+}
+
+fn user_handshake_key(psk: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("rargo client link handshake v1", psk)
+}
+
+/// The message id of the key agreement in each direction: the only one
+/// whose datagrams are accepted without a connection tag.
+const AGREEMENT: u64 = 1;
+
 fn handshake_key(key: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("rargo worker link handshake v2", key)
 }
@@ -131,8 +166,15 @@ fn open<'a>(key: &LinkKey, pkt: &'a [u8]) -> Option<&'a [u8]> {
 pub struct Conn {
     pub id: u64,
     key: LinkKey,
+    /// The connection agrees on keys of its own although the endpoint has
+    /// no shared key (a client link).
+    per_conn: bool,
     /// Set once the key agreement is done, on a keyed link.
     cipher: std::sync::OnceLock<rargo_proto::secure::LinkCipher>,
+    /// On a client link: the key datagrams are tagged with after the
+    /// agreement, and who the peer proved to be.
+    tag: std::sync::OnceLock<[u8; 32]>,
+    user: std::sync::OnceLock<String>,
     sock: Arc<UdpSocket>,
     peer: Mutex<SocketAddr>,
     send: Mutex<SendState>,
@@ -150,12 +192,15 @@ pub struct Conn {
 }
 
 impl Conn {
-    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey) -> Arc<Conn> {
+    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey, per_conn: bool) -> Arc<Conn> {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = Arc::new(Conn {
             id,
             key,
+            per_conn,
             cipher: std::sync::OnceLock::new(),
+            tag: std::sync::OnceLock::new(),
+            user: std::sync::OnceLock::new(),
             sock,
             peer: Mutex::new(peer),
             send: Mutex::new(SendState {
@@ -192,6 +237,15 @@ impl Conn {
         *self.loss.lock() = fraction;
     }
 
+    /// The user the peer proved to be (the accepting end of a client link).
+    pub fn user(&self) -> Option<&str> {
+        self.user.get().map(|s| s.as_str())
+    }
+
+    fn encrypted(&self) -> bool {
+        self.key.is_some() || self.per_conn
+    }
+
     pub fn peer(&self) -> SocketAddr {
         *self.peer.lock()
     }
@@ -217,11 +271,11 @@ impl Conn {
 
     /// Queues a message for reliable delivery.
     pub async fn send(&self, msg: &[u8]) -> io::Result<()> {
-        if self.key.is_none() {
+        if !self.encrypted() {
             return self.send_raw(msg).await;
         }
         let Some(cipher) = self.cipher.get() else {
-            return Err(io::Error::other("worker link: no keys agreed yet"));
+            return Err(io::Error::other("link: no keys agreed yet"));
         };
         let sealed = if msg.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.seal(msg)) } else { cipher.seal(msg) }?;
         self.send_raw(&sealed).await
@@ -257,7 +311,7 @@ impl Conn {
     /// The next complete message from the peer.
     pub async fn recv(&self) -> Option<Vec<u8>> {
         let raw = self.recv_raw().await?;
-        if self.key.is_none() {
+        if !self.encrypted() {
             return Some(raw);
         }
         let cipher = self.cipher.get()?;
@@ -299,6 +353,53 @@ impl Conn {
         self.send_raw(&m2).await
     }
 
+    /// The connecting side of a client link: names the user and proves
+    /// the user's key.
+    async fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> io::Result<()> {
+        let (hs, m1) = rargo_proto::secure::link_start(&user_handshake_key(psk))?;
+        let mut first = vec![name.len().min(255) as u8];
+        first.extend_from_slice(&name.as_bytes()[..name.len().min(255)]);
+        first.extend_from_slice(&m1);
+        self.send_raw(&first).await?;
+        let m2 = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no answer from the server"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        if m2.first() == Some(&1) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the server refused the connection: {}", String::from_utf8_lossy(&m2[1..]).trim()),
+            ));
+        }
+        let cipher = rargo_proto::secure::link_finish(hs, m2.get(1..).unwrap_or_default())?;
+        let _ = self.tag.set(cipher.binding());
+        let _ = self.cipher.set(cipher);
+        Ok(())
+    }
+
+    /// The accepting side of a client link.
+    async fn agree_with_user(&self, keys: &UserKeys) -> io::Result<()> {
+        let first = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no key agreement"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        let n = *first.first().ok_or_else(|| io::Error::other("empty key agreement"))? as usize;
+        let name = first.get(1..1 + n).and_then(|b| std::str::from_utf8(b).ok()).ok_or_else(|| io::Error::other("malformed key agreement"))?;
+        let accepted = keys(name).and_then(|psk| rargo_proto::secure::link_accept(&user_handshake_key(&psk), &first[1 + n..]).ok());
+        let Some((m2, cipher)) = accepted else {
+            let mut refusal = vec![1u8];
+            refusal.extend_from_slice(b"the server does not know this user or key");
+            let _ = self.send_raw(&refusal).await;
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("refused `{name}`: unknown user or wrong key")));
+        };
+        let _ = self.user.set(name.to_string());
+        let _ = self.tag.set(cipher.binding());
+        let _ = self.cipher.set(cipher);
+        let mut reply = vec![0u8];
+        reply.extend_from_slice(&m2);
+        self.send_raw(&reply).await
+    }
+
     fn rto(s: &SendState) -> Duration {
         match s.srtt {
             Some(srtt) => (srtt + 4 * s.rttvar).clamp(MIN_RTO, MAX_RTO),
@@ -335,7 +436,18 @@ impl Conn {
         }
         let peer = *self.peer.lock();
         seal(&self.key, &mut pkt);
+        if msg != AGREEMENT {
+            self.tag_datagram(&mut pkt);
+        }
         let _ = self.sock.send_to(&pkt, peer).await;
+    }
+
+    /// On a client link with keys agreed: appends the connection's tag.
+    fn tag_datagram(&self, pkt: &mut Vec<u8>) {
+        if let Some(k) = self.tag.get() {
+            let tag = blake3::keyed_hash(k, pkt);
+            pkt.extend_from_slice(&tag.as_bytes()[..TAG]);
+        }
     }
 
     async fn sender_loop(self: Arc<Self>) {
@@ -493,6 +605,7 @@ pub struct Endpoint {
     accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<Conn>>>,
     accepting: bool,
     key: LinkKey,
+    auth: Auth,
 }
 
 impl Endpoint {
@@ -504,6 +617,19 @@ impl Endpoint {
 
     /// Like [`Endpoint::bind`], with every datagram authenticated by `key`.
     pub async fn bind_keyed(addr: SocketAddr, accepting: bool, key: LinkKey) -> io::Result<Arc<Endpoint>> {
+        let auth = match key {
+            Some(k) => Auth::Shared(k),
+            None => Auth::None,
+        };
+        Endpoint::bind_auth(addr, accepting, auth).await
+    }
+
+    /// Binds a socket whose connections authenticate as `auth` says.
+    pub async fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> io::Result<Arc<Endpoint>> {
+        let key: LinkKey = match &auth {
+            Auth::Shared(k) => Some(k.clone()),
+            _ => None,
+        };
         let sock = Arc::new(UdpSocket::bind(addr).await?);
         // Large buffers: bursts of thousands of fragments are normal.
         {
@@ -525,6 +651,7 @@ impl Endpoint {
             accept_rx: tokio::sync::Mutex::new(rx),
             accepting,
             key,
+            auth,
         });
         let ep2 = ep.clone();
         tokio::spawn(async move { ep2.recv_loop().await });
@@ -544,11 +671,15 @@ impl Endpoint {
             unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
             u64::from_le_bytes(b) | 1
         };
-        let c = Conn::new(id, self.sock.clone(), peer, self.key.clone());
+        let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn());
         self.conns.lock().insert(id, c.clone());
-        if let Some(key) = &self.key
-            && let Err(e) = c.agree_as_initiator(key).await
-        {
+        let agreed = match &self.auth {
+            Auth::None => Ok(()),
+            Auth::Shared(key) => c.agree_as_initiator(key).await,
+            Auth::User { name, psk } => c.agree_as_user(name, psk).await,
+            Auth::Users(_) => Err(io::Error::other("an accepting endpoint does not connect")),
+        };
+        if let Err(e) = agreed {
             self.forget(id);
             return Err(e);
         }
@@ -558,6 +689,33 @@ impl Endpoint {
     /// The next connection opened by a peer.
     pub async fn accept(&self) -> Option<Arc<Conn>> {
         self.accept_rx.lock().await.recv().await
+    }
+
+    fn per_conn(&self) -> bool {
+        matches!(self.auth, Auth::Users(_) | Auth::User { .. })
+    }
+
+    /// Whether a datagram is let in, and whether it is proven to come from
+    /// the peer of its connection. With a shared key, only tagged datagrams
+    /// get in. On client links a datagram is proven by its connection's
+    /// tag; unproven ones are let in for the key agreement only.
+    fn admit<'a>(&self, pkt: &'a [u8]) -> Option<(&'a [u8], bool)> {
+        if !self.per_conn() {
+            return open(&self.key, pkt).map(|p| (p, true));
+        }
+        if pkt.len() >= 9 + TAG {
+            let id = u64::from_le_bytes(pkt[1..9].try_into().unwrap());
+            let tag_key = self.conns.lock().get(&id).and_then(|c| c.tag.get().copied());
+            if let Some(k) = tag_key {
+                let (body, tag) = pkt.split_at(pkt.len() - TAG);
+                let want = blake3::keyed_hash(&k, body);
+                let diff = want.as_bytes()[..TAG].iter().zip(tag).fold(0u8, |d, (a, b)| d | (a ^ b));
+                if diff == 0 {
+                    return Some((body, true));
+                }
+            }
+        }
+        Some((pkt, false))
     }
 
     pub fn forget(&self, id: u64) {
@@ -571,44 +729,70 @@ impl Endpoint {
         let mut acks: BTreeMap<u64, (SocketAddr, Vec<u8>)> = BTreeMap::new();
         loop {
             let Ok((n, from)) = self.sock.recv_from(&mut buf).await else { return };
-            if let Some(pkt) = open(&self.key, &buf[..n]) {
-                self.handle(pkt, from, &mut acks);
+            if let Some((pkt, proven)) = self.admit(&buf[..n]) {
+                self.handle(pkt, from, proven, &mut acks);
             }
             // Drain whatever else is already queued, then flush the
             // acknowledgements in as few datagrams as possible.
             while let Ok((n, from)) = self.sock.try_recv_from(&mut buf) {
-                if let Some(pkt) = open(&self.key, &buf[..n]) {
-                    self.handle(pkt, from, &mut acks);
+                if let Some((pkt, proven)) = self.admit(&buf[..n]) {
+                    self.handle(pkt, from, proven, &mut acks);
                 }
                 if acks.values().any(|(_, a)| a.len() > 1100) {
                     break;
                 }
             }
-            for (_, (to, mut pkt)) in std::mem::take(&mut acks) {
+            for (id, (to, mut pkt)) in std::mem::take(&mut acks) {
                 seal(&self.key, &mut pkt);
+                if self.per_conn() {
+                    let conn = self.conns.lock().get(&id).cloned();
+                    if let Some(c) = conn {
+                        c.tag_datagram(&mut pkt);
+                    }
+                }
                 let _ = self.sock.send_to(&pkt, to).await;
             }
         }
     }
 
-    fn handle(&self, pkt: &[u8], from: SocketAddr, acks: &mut BTreeMap<u64, (SocketAddr, Vec<u8>)>) {
+    fn handle(&self, pkt: &[u8], from: SocketAddr, proven: bool, acks: &mut BTreeMap<u64, (SocketAddr, Vec<u8>)>) {
         if pkt.len() < 9 {
             return;
         }
         let id = u64::from_le_bytes(pkt[1..9].try_into().unwrap());
+        // Unproven datagrams may only belong to the key agreement.
+        let first_msg = (pkt.len() >= 17).then(|| u64::from_le_bytes(pkt[9..17].try_into().unwrap()));
+        if !proven && pkt[0] == T_DATA && first_msg != Some(AGREEMENT) {
+            return;
+        }
         let conn = {
             let mut conns = self.conns.lock();
             match conns.get(&id) {
                 Some(c) => c.clone(),
                 None if self.accepting && pkt[0] == T_DATA => {
-                    let c = Conn::new(id, self.sock.clone(), from, self.key.clone());
+                    let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn());
                     conns.insert(id, c.clone());
-                    match self.key.clone() {
-                        None => {
+                    match (self.key.clone(), &self.auth) {
+                        (_, Auth::Users(keys)) => {
+                            let (c, tx, keys) = (c.clone(), self.accept_tx.clone(), keys.clone());
+                            tokio::spawn(async move {
+                                match c.agree_with_user(&keys).await {
+                                    Ok(()) => {
+                                        let _ = tx.send(c);
+                                    }
+                                    Err(_) => {
+                                        // Let the refusal reach the peer.
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                        c.close();
+                                    }
+                                }
+                            });
+                        }
+                        (None, _) => {
                             let _ = self.accept_tx.send(c.clone());
                         }
                         // Handed to `accept` once its keys are agreed.
-                        Some(key) => {
+                        (Some(key), _) => {
                             let (c, tx) = (c.clone(), self.accept_tx.clone());
                             tokio::spawn(async move {
                                 match c.agree_as_responder(&key).await {
@@ -625,9 +809,12 @@ impl Endpoint {
                 None => return,
             }
         };
-        *conn.last_heard.lock() = Instant::now();
-        // A peer behind NAT or a restarted worker may come from a new port.
-        *conn.peer.lock() = from;
+        if proven {
+            *conn.last_heard.lock() = Instant::now();
+            // A peer behind NAT, a restarted worker or a client that
+            // changed networks comes from a new address.
+            *conn.peer.lock() = from;
+        }
         conn.stats.recv_packets.fetch_add(1, Ordering::Relaxed);
         conn.stats.recv_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
         match pkt[0] {
@@ -650,7 +837,9 @@ impl Endpoint {
                 while rest.len() >= 12 {
                     let msg = u64::from_le_bytes(rest[..8].try_into().unwrap());
                     let frag = u32::from_le_bytes(rest[8..12].try_into().unwrap());
-                    conn.on_ack(msg, frag);
+                    if proven || msg == AGREEMENT {
+                        conn.on_ack(msg, frag);
+                    }
                     rest = &rest[12..];
                 }
             }
@@ -675,6 +864,78 @@ mod tests {
         let s = server.accept().await.unwrap();
         assert_eq!(s.recv().await.unwrap(), b"hello");
         (server, s, client, c)
+    }
+
+    #[test]
+    fn client_links_prove_their_user_and_follow_a_changed_address() {
+        rt().block_on(async {
+            let addr = || "127.0.0.1:0".parse().unwrap();
+            let users: UserKeys = Arc::new(|name| (name == "ann").then_some([7u8; 32]));
+            let server = Endpoint::bind_auth(addr(), true, Auth::Users(users)).await.unwrap();
+            let at = server.local_addr().unwrap();
+            let ann = Endpoint::bind_auth(addr(), false, Auth::User { name: "ann".into(), psk: [7; 32] }).await.unwrap();
+            let c = ann.connect(at).await.unwrap();
+            let big: Vec<u8> = (0..200_000u32).map(|i| (i * 7) as u8).collect();
+            c.send(&big).await.unwrap();
+            let s = server.accept().await.unwrap();
+            assert_eq!(s.user(), Some("ann"));
+            assert_eq!(s.recv().await.unwrap(), big);
+            s.send(b"back").await.unwrap();
+            assert_eq!(c.recv().await.unwrap(), b"back");
+
+            // A wrong key and an unknown user are told no.
+            for (name, psk) in [("ann", [8u8; 32]), ("eve", [7u8; 32])] {
+                let bad = Endpoint::bind_auth(addr(), false, Auth::User { name: name.into(), psk }).await.unwrap();
+                let e = tokio::time::timeout(Duration::from_secs(5), bad.connect(at)).await.unwrap().err().unwrap();
+                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{name}");
+            }
+
+            // A datagram that names the connection but lacks its tag (an
+            // outsider who saw the id) neither delivers anything nor moves
+            // the connection.
+            let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut pkt = vec![T_DATA];
+            pkt.extend_from_slice(&s.id.to_le_bytes());
+            pkt.extend_from_slice(&99u64.to_le_bytes());
+            pkt.extend_from_slice(&0u32.to_le_bytes());
+            pkt.extend_from_slice(&1u32.to_le_bytes());
+            pkt.extend_from_slice(b"forged");
+            outsider.send_to(&pkt, at).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let before = s.peer();
+            assert_ne!(before, outsider.local_addr().unwrap());
+
+            // The client's address changes (here: its socket is replaced by
+            // one on another port): the next thing it sends moves the
+            // connection, and the server's answer finds it.
+            let moved = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let relay_to = moved.clone();
+            // Forward between the client's real socket and the server
+            // through the new port, both ways.
+            let client_addr = ann.local_addr().unwrap();
+            let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            *c.peer.lock() = proxy.local_addr().unwrap();
+            let (p2, m2) = (proxy.clone(), moved.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let Ok((n, _)) = p2.recv_from(&mut buf).await else { break };
+                    let _ = m2.send_to(&buf[..n], at).await;
+                }
+            });
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let Ok((n, _)) = relay_to.recv_from(&mut buf).await else { break };
+                    let _ = proxy.send_to(&buf[..n], client_addr).await;
+                }
+            });
+            c.send(b"from somewhere else").await.unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), s.recv()).await.unwrap().unwrap(), b"from somewhere else");
+            assert_eq!(s.peer(), moved.local_addr().unwrap());
+            s.send(b"found you").await.unwrap();
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), c.recv()).await.unwrap().unwrap(), b"found you");
+        });
     }
 
     #[test]

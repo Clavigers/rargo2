@@ -265,6 +265,23 @@ fn main() -> Result<()> {
     let listen = opts.listen;
     let result = rt.block_on(async move {
         let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
+        // Client daemons connect over the UDP transport on the same port;
+        // TCP is for those whose network lets no UDP through.
+        let users: rargo_core::net::UserKeys = {
+            let keys = keys.clone();
+            Arc::new(move |user| keys.psk(user))
+        };
+        let endpoint = rargo_core::net::Endpoint::bind_auth(listener.local_addr()?, true, rargo_core::net::Auth::Users(users))
+            .await
+            .with_context(|| format!("binding UDP {listen}"))?;
+        {
+            let (d, k, ep) = (daemon.clone(), keys.clone(), endpoint.clone());
+            tokio::spawn(async move {
+                while let Some(conn) = ep.accept().await {
+                    tokio::spawn(rargo_core::serve::udp_connection(d.clone(), conn, ep.clone(), k.clone()));
+                }
+            });
+        }
         eprintln!(
             "rargod: serving clients on {} ({})",
             listener.local_addr()?,

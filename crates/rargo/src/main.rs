@@ -4,21 +4,28 @@
 //! build wrote into the worktree. Commands that are not builds are handed
 //! to the real cargo unchanged.
 //!
+//! The work is done by a daemon (`daemon`), one per user and server on the
+//! machine, which this program starts when none is running and talks to
+//! over a Unix socket: the daemon keeps the link to the server and follows
+//! the worktrees, so a command itself only passes its arguments and
+//! environment along and relays what comes back.
+//!
 //! When this binary is installed under the name `cargo` (the shim), agents
 //! that type `cargo build` get rargo without knowing.
 
+mod daemon;
 mod git;
+mod mux;
 mod place;
 mod report;
 mod scan;
 mod tmp;
+mod watch;
 
 use rargo_proto::secure;
-use rargo_proto::{Blob, ClientMsg, Digest, ExecRequest, PROTO_VERSION, RunRequest, ServerMsg};
-use rayon::prelude::*;
+use rargo_proto::{ExecRequest, LocalReply, LocalRequest};
 use std::ffi::{CString, OsString};
-use std::io::{BufReader, IsTerminal, Read, Write};
-use std::net::TcpStream;
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -46,13 +53,13 @@ fn home_dir() -> PathBuf {
 
 /// Where to find the server and how to prove who we are: the environment
 /// first, then `rargo/config.toml` in the user's configuration directory.
-struct Config {
-    server: String,
-    user: String,
-    psk: [u8; 32],
+pub struct Config {
+    pub server: String,
+    pub user: String,
+    pub psk: [u8; 32],
 }
 
-fn load_config() -> Result<Config, String> {
+pub fn load_config() -> Result<Config, String> {
     let dir = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home_dir().join(".config"));
     let path = dir.join("rargo/config.toml");
     let file: toml::Table = match std::fs::read_to_string(&path) {
@@ -79,14 +86,14 @@ fn load_config() -> Result<Config, String> {
     Ok(Config { server, user, psk })
 }
 
-fn cache_dir() -> PathBuf {
+pub fn cache_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("RARGO_CACHE_DIR") {
         return PathBuf::from(d);
     }
     std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).unwrap_or_else(|| home_dir().join(".cache")).join("rargo")
 }
 
-fn hostname() -> String {
+pub fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: the buffer is valid for its length.
     if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
@@ -99,7 +106,7 @@ fn hostname() -> String {
 /// The directory that is synced: the git worktree the current directory is
 /// in; without git, the nearest directory with a policy file, or else the
 /// outermost one with a `Cargo.toml`.
-fn find_root(cwd: &Path) -> Option<PathBuf> {
+pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     let ancestors: Vec<&Path> = cwd.ancestors().collect();
     for marker in [".git", ".rargo.toml"] {
         if let Some(d) = ancestors.iter().find(|d| d.join(marker).exists()) {
@@ -111,14 +118,14 @@ fn find_root(cwd: &Path) -> Option<PathBuf> {
 
 /// The parts of the repository's policy file the client acts on.
 #[derive(Default)]
-struct Policy {
-    pass: Vec<String>,
-    exclude: Vec<String>,
+pub struct Policy {
+    pub pass: Vec<String>,
+    pub exclude: Vec<String>,
     /// `[sync] git = false`: the sandbox gets no `.git` at all.
-    git: bool,
+    pub git: bool,
 }
 
-fn load_policy(root: &Path) -> Policy {
+pub fn load_policy(root: &Path) -> Policy {
     let none = Policy { pass: Vec::new(), exclude: Vec::new(), git: true };
     let Ok(text) = std::fs::read_to_string(root.join(".rargo.toml")) else { return none };
     // A malformed file is the server's to report, with the build.
@@ -134,7 +141,7 @@ fn load_policy(root: &Path) -> Policy {
     Policy { pass: list("env", "pass"), exclude: list("sync", "exclude"), git }
 }
 
-fn pattern_matches(pattern: &str, name: &str) -> bool {
+pub fn pattern_matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => name.starts_with(prefix),
         None => pattern == name,
@@ -155,7 +162,7 @@ fn parse_hex20(s: &str) -> Option<[u8; 20]> {
 
 /// HEAD and its recent first-parent ancestors: a hint for the server's
 /// choice of incremental state. Asked of git once per HEAD and remembered.
-fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
+pub fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
     let head = &head.commit;
     let memo = wt_cache.join("commits");
     let parse = |text: &str| -> Vec<[u8; 20]> { text.lines().filter_map(parse_hex20).collect() };
@@ -178,253 +185,187 @@ fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8; 20
     parse(&listed)
 }
 
-fn die(msg: &str) -> ! {
+pub fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(101)
 }
 
-/// What one attempt at a command came to.
-enum Outcome {
-    Exit(i32),
-    Exec(ExecRequest),
-    /// The worktree changed while it was being sent: scan again.
-    Changed,
-}
-
-struct Wire {
-    rd: BufReader<TcpStream>,
-    wr: TcpStream,
-    sealer: secure::Sealer,
-    opener: secure::Opener,
-}
-
-impl Wire {
-    fn send(&mut self, m: &ClientMsg) -> std::io::Result<()> {
-        let mut encoded = rargo_proto::encode(m);
-        // File contents are compressed already; manifests are not.
-        if matches!(m, ClientMsg::Trees(_) | ClientMsg::Need { .. } | ClientMsg::Env(_)) {
-            if let Some(z) = rargo_proto::pack(&encoded) {
-                encoded = rargo_proto::encode(&ClientMsg::Packed(z));
-            }
-        }
-        secure::write_msg(&mut self.wr, &mut self.sealer, &encoded)
-    }
-    fn recv(&mut self) -> std::io::Result<Option<ServerMsg>> {
-        match secure::read_msg(&mut self.rd, &mut self.opener)? {
-            Some(b) => Ok(Some(match rargo_proto::decode(&b)? {
-                ServerMsg::Packed(z) => rargo_proto::decode(&rargo_proto::unpack(&z)?)?,
-                other => other,
-            })),
-            None => Ok(None),
-        }
-    }
-}
-
-fn connect(cfg: &Config, req: &RunRequest) -> Result<Wire, std::io::Error> {
-    let stream = TcpStream::connect(&cfg.server)?;
-    let _ = stream.set_nodelay(true);
-    // The request rides in the first handshake message when it fits.
-    let run = ClientMsg::Run(Box::new(req.clone()));
-    let packed = zstd::stream::encode_all(&rargo_proto::encode(&run)[..], 1)?;
-    let early: &[u8] = if packed.len() <= secure::EARLY_MAX { &packed } else { &[] };
-    let (hs, first) = secure::client_start(&cfg.user, &cfg.psk, early)?;
-    let mut wr = stream.try_clone()?;
-    wr.write_all(&first)?;
-    let mut rd = BufReader::with_capacity(256 << 10, stream);
-    let mut head = [0u8; 3];
-    rd.read_exact(&mut head)?;
-    let mut body = vec![0u8; u16::from_le_bytes([head[1], head[2]]) as usize];
-    rd.read_exact(&mut body)?;
-    if head[0] != 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("the server refused the connection: {}", String::from_utf8_lossy(&body).trim()),
-        ));
-    }
-    let (sealer, opener) = secure::client_finish(hs, &body)?;
-    let mut wire = Wire { rd, wr, sealer, opener };
-    if early.is_empty() {
-        wire.send(&run)?;
-    }
-    Ok(wire)
-}
-
-/// Sends the contents the server asked for. Returns `false` if a file no
-/// longer has the content the scan saw.
-fn upload(wire: &mut Wire, scan: &scan::Scan, want: Vec<Digest>) -> std::io::Result<bool> {
-    let mut small: Vec<(Digest, PathBuf, u64)> = Vec::new();
-    let mut large: Vec<(Digest, PathBuf)> = Vec::new();
-    for h in want {
-        let Some((path, size)) = scan.files.get(&h).cloned() else { return Ok(false) };
-        if size as usize > rargo_proto::PART_SIZE { large.push((h, path)) } else { small.push((h, path, size)) }
-    }
-    // Small files travel in batches, read and compressed in parallel.
-    let mut batches: Vec<Vec<(Digest, PathBuf)>> = vec![Vec::new()];
-    let mut bytes = 0usize;
-    for (h, p, size) in small {
-        if bytes >= rargo_proto::BATCH_SIZE {
-            batches.push(Vec::new());
-            bytes = 0;
-        }
-        bytes += size as usize + 64;
-        batches.last_mut().unwrap().push((h, p));
-    }
-    for window in batches.chunks(16) {
-        let packed: Vec<Option<Vec<Blob>>> = window
-            .par_iter()
-            .map(|batch| {
-                batch
-                    .par_iter()
-                    .map(|(h, p)| {
-                        let bytes = std::fs::read(p).ok()?;
-                        (*blake3::hash(&bytes).as_bytes() == *h).then(|| Blob::pack(*h, &bytes))
-                    })
-                    .collect::<Option<Vec<Blob>>>()
-            })
-            .collect();
-        for blobs in packed {
-            let Some(blobs) = blobs else { return Ok(false) };
-            if !blobs.is_empty() {
-                wire.send(&ClientMsg::Blobs(blobs))?;
-            }
-        }
-    }
-    for (h, path) in large {
-        let Ok(mut f) = std::fs::File::open(&path) else { return Ok(false) };
-        let mut hasher = blake3::Hasher::new();
-        // One part is held back so that the last one is only sent once the
-        // whole file is known to be what the scan saw.
-        let mut held: Option<Vec<u8>> = None;
-        loop {
-            let mut buf = vec![0u8; rargo_proto::PART_SIZE];
-            let mut n = 0;
-            while n < buf.len() {
-                let got = f.read(&mut buf[n..])?;
-                if got == 0 {
-                    break;
-                }
-                n += got;
-            }
-            buf.truncate(n);
-            hasher.update(&buf);
-            if n == 0 {
-                break;
-            }
-            if let Some(prev) = held.replace(buf) {
-                wire.send(&ClientMsg::BlobPart { hash: h, part: rargo_proto::Part::pack(prev), last: false })?;
-            }
-        }
-        if *hasher.finalize().as_bytes() != h {
-            return Ok(false);
-        }
-        wire.send(&ClientMsg::BlobPart { hash: h, part: rargo_proto::Part::pack(held.unwrap_or_default()), last: true })?;
-    }
-    Ok(true)
-}
-
-struct Local {
-    cache: PathBuf,
-    wt_cache: PathBuf,
-    /// Variable names servers have asked about.
-    asked: Vec<String>,
-}
-
-fn load_asked(cache: &Path) -> Vec<String> {
+pub fn load_asked(cache: &Path) -> Vec<String> {
     std::fs::read_to_string(cache.join("env-names")).map(|t| t.lines().map(String::from).collect()).unwrap_or_default()
 }
 
-/// One conversation with the server.
-fn converse(cfg: &Config, req: &RunRequest, local: &mut Local, scan: Option<&scan::Scan>) -> std::io::Result<Outcome> {
-    let mut wire = connect(cfg, req)?;
-    let placed_path = local.wt_cache.join("placed");
-    let mut placer = place::Placer::new(&local.cache, place::Placed::load(&placed_path));
-    let stdout = std::io::stdout();
-    let stderr = std::io::stderr();
-    let finish = |placer: &place::Placer| {
-        if placer.changed {
-            let _ = placer.placed.save(&placed_path);
-            placer.prune();
+/// Where the daemon for this server, user and program listens. The name
+/// covers everything a daemon is started with, so a changed configuration
+/// or a new version of the program gets a daemon of its own and the old
+/// one goes when it has been idle.
+fn daemon_socket(cfg: &Config, cache: &Path) -> PathBuf {
+    let mut h = blake3::Hasher::new();
+    for part in [cfg.server.as_bytes(), cfg.user.as_bytes(), &cfg.psk[..], cache.as_os_str().as_bytes()] {
+        h.update(&(part.len() as u64).to_le_bytes());
+        h.update(part);
+    }
+    for name in ["RARGO_TRANSPORT", "RARGO_DAEMON_IDLE_SECS"] {
+        h.update(std::env::var(name).unwrap_or_default().as_bytes());
+        h.update(&[0]);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        h.update(exe.as_os_str().as_bytes());
+        if let Ok(md) = std::fs::metadata(&exe) {
+            use std::os::unix::fs::MetadataExt;
+            h.update(&md.len().to_le_bytes());
+            h.update(&md.mtime().to_le_bytes());
+            h.update(&md.mtime_nsec().to_le_bytes());
+        }
+    }
+    let name = format!("{}.sock", &h.finalize().to_hex()[..20]);
+    // Beside the cache if the path fits a socket address, else in the
+    // user's runtime directory.
+    let in_cache = cache.join("run").join(&name);
+    if in_cache.as_os_str().len() < 100 {
+        return in_cache;
+    }
+    // SAFETY: no arguments, cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
+        Some(d) => PathBuf::from(d).join("rargo"),
+        None => PathBuf::from(format!("/tmp/rargo-{uid}")),
+    };
+    dir.join(name)
+}
+
+/// Makes the directory the socket lives in: ours alone.
+fn private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    let md = std::fs::symlink_metadata(dir)?;
+    // SAFETY: no arguments, cannot fail.
+    if !md.is_dir() || md.uid() != unsafe { libc::getuid() } {
+        return Err(std::io::Error::other(format!("{} is not a directory of this user", dir.display())));
+    }
+    if md.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Starts a daemon on `socket`, detached from this command: a process of
+/// its own session whose parent is gone, with its output in a log file.
+fn start_daemon(socket: &Path, cache: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::fs::create_dir_all(cache)?;
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(cache.join("daemon.log"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--rargo-daemon")
+        .arg(socket)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .current_dir("/");
+    // SAFETY: only async-signal-safe calls between fork and exec. The
+    // child forks once more and exits, so the daemon is nobody's child
+    // and this command (which may turn into the user's program) never
+    // has to wait for it.
+    unsafe {
+        cmd.pre_exec(|| {
+            match libc::fork() {
+                -1 => return Err(std::io::Error::last_os_error()),
+                0 => {}
+                _ => libc::_exit(0),
+            }
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    let _ = child.wait();
+    Ok(())
+}
+
+/// Connects to the daemon, starting one if there is none.
+fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::unix::net::UnixStream;
+    let socket = daemon_socket(cfg, cache);
+    if let Ok(s) = UnixStream::connect(&socket) {
+        return Ok(s);
+    }
+    if let Some(dir) = socket.parent() {
+        private_dir(dir)?;
+    }
+    start_daemon(&socket, cache)?;
+    let started = std::time::Instant::now();
+    loop {
+        match UnixStream::connect(&socket) {
+            Ok(s) => return Ok(s),
+            Err(e) if started.elapsed() > std::time::Duration::from_secs(10) => {
+                return Err(std::io::Error::new(e.kind(), format!("the rargo daemon did not start (see {}): {e}", cache.join("daemon.log").display())));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
+
+/// Acts on one thing the daemon says. Returns only if more is to come.
+fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
+    match reply {
+        LocalReply::Stdout(b) => {
+            let mut o = std::io::stdout().lock();
+            if o.write_all(&b).and_then(|_| o.flush()).is_err() {
+                // Downstream closed (e.g. `| head`): stop like cargo does.
+                std::process::exit(141);
+            }
+        }
+        LocalReply::Stderr(b) => {
+            let _ = std::io::stderr().lock().write_all(&b);
+        }
+        LocalReply::Exit(code) => std::process::exit(code),
+        LocalReply::Exec(e) => exec(e),
+        LocalReply::Unreachable(why) => {
+            if std::env::var_os("RARGO_FALLBACK").is_some_and(|v| v == "cargo") {
+                passthrough(raw);
+            }
+            eprintln!("error: cannot reach the rargo server at {}: {why}", cfg.server);
+            eprintln!("       (set RARGO_SERVER or `server` in ~/.config/rargo/config.toml, or set RARGO_FALLBACK=cargo to use plain cargo)");
+            std::process::exit(101);
+        }
+    }
+}
+
+/// Hands the request to the daemon and relays what it says until the
+/// command is over.
+fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsString]) -> ! {
+    let no_daemon = std::env::var_os("RARGO_NO_DAEMON").is_some_and(|v| v == "1");
+    let stream = if no_daemon { Err(std::io::Error::other("RARGO_NO_DAEMON")) } else { connect_daemon(&cfg, &cache) };
+    let mut stream = match stream {
+        Ok(s) => s,
+        Err(e) => {
+            if !no_daemon && std::env::var_os("RARGO_QUIET_DAEMON").is_none() {
+                eprintln!("warning: rargo runs without its daemon ({e}); every command connects to the server anew");
+            }
+            let cfg2 = Config { server: cfg.server.clone(), user: cfg.user.clone(), psk: cfg.psk };
+            daemon::inline(cfg2, cache, req, |reply| relay(reply, &cfg, raw));
+            die("the command ended without a result");
         }
     };
+    let bytes = rargo_proto::encode(&req);
+    if stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes)).is_err() {
+        die("the rargo daemon closed the connection");
+    }
     loop {
-        let Some(msg) = wire.recv()? else {
-            return Err(std::io::Error::other("the server closed the connection"));
-        };
-        match msg {
-            ServerMsg::Stdout(b) => {
-                let mut o = stdout.lock();
-                if o.write_all(&b).and_then(|_| o.flush()).is_err() {
-                    // Downstream closed (e.g. `| head`): stop like cargo does.
-                    std::process::exit(141);
-                }
-            }
-            ServerMsg::Stderr(b) => {
-                let _ = stderr.lock().write_all(&b);
-            }
-            ServerMsg::WantTrees(want) => {
-                let trees: Vec<Vec<u8>> = want.iter().filter_map(|d| scan.and_then(|s| s.trees.get(d)).cloned()).collect();
-                wire.send(&ClientMsg::Trees(trees))?;
-            }
-            ServerMsg::WantBlobs(want) => {
-                let ok = match scan {
-                    Some(s) => upload(&mut wire, s, want)?,
-                    None => false,
-                };
-                if !ok {
-                    let _ = wire.send(&ClientMsg::Changed);
-                    return Ok(Outcome::Changed);
-                }
-            }
-            ServerMsg::WantEnv(names) => {
-                let values: Vec<(String, Option<String>)> =
-                    names.iter().map(|n| (n.clone(), std::env::var(n).ok())).collect();
-                wire.send(&ClientMsg::Env(values))?;
-                // Sent unasked from now on.
-                let before = local.asked.len();
-                for n in names {
-                    if !local.asked.contains(&n) {
-                        local.asked.push(n);
-                    }
-                }
-                if local.asked.len() != before {
-                    let _ = write_atomic(&local.cache.join("env-names"), (local.asked.join("\n") + "\n").as_bytes());
-                }
-            }
-            ServerMsg::Deliver { id, files, writes } => {
-                let hashes = placer.deliver(files, writes)?;
-                wire.send(&ClientMsg::Need { id, hashes })?;
-            }
-            ServerMsg::Blobs(blobs) => {
-                for b in blobs {
-                    let hash = b.hash;
-                    placer.blob(hash, &b.unpack()?)?;
-                }
-            }
-            ServerMsg::BlobPart { hash, part, last } => placer.part(hash, &part.unpack()?, last)?,
-            ServerMsg::Delivered { .. } => {
-                if !placer.settled() {
-                    return Err(std::io::Error::other("the server did not send every file it announced"));
-                }
-            }
-            ServerMsg::Report(r) => {
-                let id = match report::save(&r) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        eprintln!("warning: failed to write on-disk future incompatible report {}: {e}", r.path);
-                        0
-                    }
-                };
-                wire.send(&ClientMsg::ReportId(id))?;
-            }
-            ServerMsg::Packed(_) => return Err(std::io::Error::other("unexpected message from the server")),
-            ServerMsg::Exit(code) => {
-                finish(&placer);
-                return Ok(Outcome::Exit(code));
-            }
-            ServerMsg::Exec(e) => {
-                finish(&placer);
-                return Ok(Outcome::Exec(e));
-            }
+        let mut len = [0u8; 4];
+        if stream.read_exact(&mut len).is_err() {
+            die("the rargo daemon went away while the command was running");
+        }
+        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
+        if stream.read_exact(&mut buf).is_err() {
+            die("the rargo daemon went away while the command was running");
+        }
+        match rargo_proto::decode::<LocalReply>(&buf) {
+            Ok(reply) => relay(reply, &cfg, raw),
+            Err(_) => die("the rargo daemon said something this program does not understand"),
         }
     }
 }
@@ -437,6 +378,12 @@ fn main() {
         passthrough(&raw);
     }
     tmp::install_handlers();
+    if raw.first().is_some_and(|a| a == "--rargo-daemon") {
+        match raw.get(1) {
+            Some(socket) => daemon::serve(Path::new(socket)),
+            None => die("usage: rargo --rargo-daemon SOCKET"),
+        }
+    }
     let mut args: Vec<String> = match raw.iter().map(|a| a.clone().into_string()).collect() {
         Ok(a) => a,
         // cargo itself rejects non-UTF-8 arguments for build commands.
@@ -462,7 +409,15 @@ fn main() {
         _ => None,
     };
     let drift = args.first().map(|s| s.as_str()) == Some("--rargo-drift-check");
-    if let Some(cmd) = admin {
+    // Requests about the daemon on this machine.
+    let daemon_cmd = match args.first().map(|s| s.as_str()) {
+        Some("--rargo-daemon-status") => Some("status"),
+        Some("--rargo-daemon-stop") => Some("stop"),
+        _ => None,
+    };
+    if daemon_cmd.is_some() {
+        args.clear();
+    } else if let Some(cmd) = admin {
         let mut a = vec![cmd.to_string()];
         if matches!(cmd, "__export" | "__import") {
             match args.get(1) {
@@ -492,121 +447,35 @@ fn main() {
         Ok(d) => d,
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
     };
-    let cache = cache_dir();
-    let host = hostname();
-    let root = if admin.is_some() {
-        cwd.clone()
+    let kind = if daemon_cmd.is_some() {
+        daemon_cmd.unwrap()
+    } else if admin.is_some() {
+        "admin"
+    } else if drift {
+        "drift"
     } else {
-        find_root(&cwd).unwrap_or_else(|| {
-            die(&format!("`{}` is not inside a git worktree or a cargo package; rargo needs to know what to sync", cwd.display()))
-        })
+        "build"
     };
-    let wt_id = {
-        let mut h = blake3::Hasher::new();
-        h.update(host.as_bytes());
-        h.update(&[0]);
-        h.update(root.as_os_str().as_bytes());
-        h.finalize().to_hex()[..24].to_string()
+    let req = LocalRequest {
+        args,
+        kind: kind.to_string(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        vars,
+        stdout_tty: std::io::stdout().is_terminal(),
+        stderr_tty: std::io::stderr().is_terminal(),
     };
-    let mut local = Local { wt_cache: cache.join("wt").join(&wt_id), asked: load_asked(&cache), cache };
-    let policy = if admin.is_some() { Policy::default() } else { load_policy(&root) };
-    let mut policy = policy;
-    // The client's own cache, should someone keep it inside the worktree.
-    if let Ok(inside) = local.cache.canonicalize().unwrap_or_else(|_| local.cache.clone()).strip_prefix(&root) {
-        policy.exclude.push(format!("/{}", inside.to_string_lossy()));
+    let cache = cache_dir();
+    if kind == "stop" {
+        // Only a daemon that is running can be stopped.
+        let socket = daemon_socket(&cfg, &cache);
+        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket) else { std::process::exit(0) };
+        let bytes = rargo_proto::encode(&req);
+        let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes));
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
+        std::process::exit(0);
     }
-    let head = if admin.is_some() { None } else { git::head(&root) };
-    let thin_git = match &head {
-        Some(h) if policy.git => git::thin(&root, h, &local.cache),
-        _ => None,
-    };
-    let cargo_home = std::env::var_os("CARGO_HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".cargo"));
-    let mut home_files = Vec::new();
-    if admin.is_none() {
-        for name in ["config.toml", "config", "credentials.toml", "credentials"] {
-            match std::fs::read(cargo_home.join(name)) {
-                Ok(b) if b.len() <= 1 << 20 => home_files.push((name.to_string(), b)),
-                _ => {}
-            }
-        }
-    }
-    let stats = std::env::var_os("RARGO_SYNC_STATS").is_some();
-    let index_path = local.wt_cache.join("index");
-    let mut index = if admin.is_some() { scan::Index::default() } else { scan::Index::load(&index_path) };
-    for attempt in 0..5 {
-        let started = std::time::Instant::now();
-        let scanned = if admin.is_some() {
-            None
-        } else {
-            match scan::scan(&root, &index, &policy.exclude, thin_git.as_deref()) {
-                Ok(s) => Some(s),
-                Err(e) => die(&format!("scanning {}: {e}", root.display())),
-            }
-        };
-        if let Some(s) = &scanned {
-            if s.index_changed {
-                let _ = s.index.save(&index_path);
-            }
-            if stats {
-                eprintln!(
-                    "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB)",
-                    s.file_count,
-                    started.elapsed().as_secs_f64() * 1e3,
-                    s.hashed_files,
-                    s.hashed_bytes as f64 / 1048576.0
-                );
-            }
-        }
-        let env: Vec<(String, String)> = vars
-            .iter()
-            .filter(|(k, _)| {
-                rargo_proto::env_allowed(k)
-                    || policy.pass.iter().any(|p| pattern_matches(p, k))
-                    || local.asked.contains(k)
-            })
-            .cloned()
-            .collect();
-        let req = RunRequest {
-            version: PROTO_VERSION,
-            args: args.clone(),
-            root: root.to_string_lossy().into_owned(),
-            cwd: cwd.to_string_lossy().into_owned(),
-            cargo_home: cargo_home.to_string_lossy().into_owned(),
-            env,
-            env_checked: local.asked.clone(),
-            stdout_tty: std::io::stdout().is_terminal(),
-            stderr_tty: std::io::stderr().is_terminal(),
-            worktree: wt_id.clone(),
-            commits: head.as_ref().map(|h| recent_commits(&root, h, &local.wt_cache)).unwrap_or_default(),
-            tree: scanned.as_ref().map(|s| s.root).unwrap_or([0; 32]),
-            home_files: home_files.clone(),
-            who: format!("{}@{host}", cfg.user),
-        };
-        match converse(&cfg, &req, &mut local, scanned.as_ref()) {
-            Ok(Outcome::Exit(code)) => std::process::exit(code),
-            Ok(Outcome::Exec(e)) => exec(e),
-            Ok(Outcome::Changed) => {
-                if attempt == 4 {
-                    die("the worktree kept changing while it was being synced");
-                }
-                if let Some(s) = scanned {
-                    index = s.index;
-                }
-            }
-            Err(e) if attempt == 0 && matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut | std::io::ErrorKind::NotFound | std::io::ErrorKind::HostUnreachable | std::io::ErrorKind::NetworkUnreachable) => {
-                if std::env::var_os("RARGO_FALLBACK").is_some_and(|v| v == "cargo") {
-                    passthrough(&raw);
-                }
-                eprintln!("error: cannot reach the rargo server at {}: {e}", cfg.server);
-                eprintln!("       (set RARGO_SERVER or `server` in ~/.config/rargo/config.toml, or set RARGO_FALLBACK=cargo to use plain cargo)");
-                std::process::exit(101);
-            }
-            Err(e) => die(&format!("talking to the rargo server at {}: {e}", cfg.server)),
-        }
-    }
+    through_daemon(cfg, cache, req, &raw)
 }
 
 /// The first argument that is not an option: the subcommand.
@@ -821,93 +690,26 @@ fn exec(mut e: ExecRequest) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
-    /// A server that completes the handshake, asks for one file's content
-    /// and reports what the client answered.
-    fn fake_server(want: Digest) -> (String, std::thread::JoinHandle<Vec<ClientMsg>>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let handle = std::thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let mut head = [0u8; 9];
-            s.read_exact(&mut head).unwrap();
-            assert_eq!(&head[..8], secure::MAGIC);
-            let mut user = vec![0u8; head[8] as usize];
-            s.read_exact(&mut user).unwrap();
-            let mut len = [0u8; 2];
-            s.read_exact(&mut len).unwrap();
-            let mut msg1 = vec![0u8; u16::from_le_bytes(len) as usize];
-            s.read_exact(&mut msg1).unwrap();
-            let (msg2, early, mut sealer, mut opener) = secure::server_accept(&secure::open_psk(), &msg1).unwrap();
-            let mut reply = vec![0u8];
-            reply.extend_from_slice(&(msg2.len() as u16).to_le_bytes());
-            reply.extend_from_slice(&msg2);
-            s.write_all(&reply).unwrap();
-            let run: ClientMsg = rargo_proto::decode(&zstd::stream::decode_all(&early[..]).unwrap()).unwrap();
-            let mut got = vec![run];
-            secure::write_msg(&mut s, &mut sealer, &rargo_proto::encode(&ServerMsg::WantBlobs(vec![want]))).unwrap();
-            while let Ok(Some(m)) = secure::read_msg(&mut s, &mut opener) {
-                let m: ClientMsg = rargo_proto::decode(&m).unwrap();
-                let done = matches!(m, ClientMsg::Changed | ClientMsg::Blobs(_));
-                got.push(m);
-                if done {
-                    break;
-                }
-            }
-            let _ = secure::write_msg(&mut s, &mut sealer, &rargo_proto::encode(&ServerMsg::Exit(0)));
-            got
-        });
-        (addr, handle)
-    }
-
-    fn request(root: &Path, tree: Digest) -> RunRequest {
-        RunRequest {
-            version: PROTO_VERSION,
-            args: vec!["build".into()],
-            root: root.to_string_lossy().into_owned(),
-            cwd: root.to_string_lossy().into_owned(),
-            cargo_home: "/nowhere".into(),
-            env: vec![],
-            env_checked: vec![],
-            stdout_tty: false,
-            stderr_tty: false,
-            worktree: "test".into(),
-            commits: vec![],
-            tree,
-            home_files: vec![],
-            who: "test@test".into(),
-        }
+    #[test]
+    fn socket_name_follows_the_configuration() {
+        let cfg = |server: &str| Config { server: server.into(), user: "u".into(), psk: [7; 32] };
+        let cache = Path::new("/c");
+        let a = daemon_socket(&cfg("a:1"), cache);
+        assert_eq!(a, daemon_socket(&cfg("a:1"), cache));
+        assert_ne!(a, daemon_socket(&cfg("b:1"), cache));
+        assert_ne!(a, daemon_socket(&cfg("a:1"), Path::new("/d")));
+        assert!(a.starts_with("/c/run"));
+        // A cache path too long for a socket address: the runtime directory.
+        let long = PathBuf::from(format!("/{}", "x".repeat(120)));
+        assert!(!daemon_socket(&cfg("a:1"), &long).starts_with(&long));
     }
 
     #[test]
-    fn a_file_that_changed_since_the_scan_restarts_the_sync() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("wt");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.rs"), "before").unwrap();
-        let scanned = scan::scan(&root, &scan::Index::default(), &[], None).unwrap();
-        let before = *blake3::hash(b"before").as_bytes();
-        let cache = tmp.path().join("cache");
-        let mut local = Local { wt_cache: cache.join("wt"), asked: vec![], cache };
-
-        // Unchanged: the content is sent as scanned.
-        let (addr, server) = fake_server(before);
-        let cfg = Config { server: addr, user: "t".into(), psk: secure::open_psk() };
-        let out = converse(&cfg, &request(&root, scanned.root), &mut local, Some(&scanned)).unwrap();
-        assert!(matches!(out, Outcome::Exit(0)));
-        let got = server.join().unwrap();
-        assert!(matches!(&got[0], ClientMsg::Run(r) if r.tree == scanned.root));
-        let ClientMsg::Blobs(blobs) = &got[1] else { panic!("{:?}", got[1]) };
-        assert_eq!(blobs[0].hash, before);
-
-        // Edited after the scan: the client says so instead of sending
-        // content under the wrong hash, and the command starts over.
-        std::fs::write(root.join("a.rs"), "after!").unwrap();
-        let (addr, server) = fake_server(before);
-        let cfg = Config { server: addr, user: "t".into(), psk: secure::open_psk() };
-        let out = converse(&cfg, &request(&root, scanned.root), &mut local, Some(&scanned)).unwrap();
-        assert!(matches!(out, Outcome::Changed));
-        assert!(matches!(server.join().unwrap()[1], ClientMsg::Changed));
+    fn subcommands_are_found_behind_global_options() {
+        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        assert_eq!(subcommand(&a(&["--color", "always", "build"])), Some("build"));
+        assert_eq!(subcommand(&a(&["-q", "test", "--", "x"])), Some("test"));
+        assert_eq!(subcommand(&a(&["--", "build"])), None);
     }
 }

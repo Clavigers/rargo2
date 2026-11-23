@@ -12,7 +12,7 @@ pub mod flake;
 pub mod hash;
 pub mod incr;
 pub mod cgroup;
-pub mod net;
+pub use rargo_net as net;
 pub mod parse;
 pub mod policy;
 pub mod remote;

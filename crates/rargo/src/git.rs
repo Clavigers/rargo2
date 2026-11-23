@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// HEAD as found in the git directory.
+#[derive(Clone)]
 pub struct Head {
     /// The text of the `HEAD` file.
     pub text: String,

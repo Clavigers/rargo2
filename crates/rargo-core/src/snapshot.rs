@@ -48,6 +48,9 @@ pub struct SyncStats {
     pub snapshots: AtomicU64,
     /// Blobs one client waited for while another was already uploading them.
     pub shared_uploads: AtomicU64,
+    /// Changes clients pushed without being asked, and their size.
+    pub offers: AtomicU64,
+    pub offered_bytes: AtomicU64,
 }
 
 /// All trees the server knows, and the bookkeeping for syncing new ones.
@@ -179,6 +182,52 @@ impl Trees {
             return Ok(Arc::new(Snapshot::new(self.clone(), root)));
         }
         bail!("the store kept changing while the worktree was being synced")
+    }
+
+    /// What of the tree rooted at `root` the store does not hold: directory
+    /// manifests (nothing below a missing one can be known) and file
+    /// contents. Asks nobody.
+    pub fn lacking(&self, root: Hash) -> (Vec<Hash>, Vec<Hash>) {
+        let generation = self.store.generation();
+        let mut trees: Vec<Hash> = Vec::new();
+        let mut blobs: HashSet<Hash> = HashSet::new();
+        let mut visited: Vec<Hash> = Vec::new();
+        let mut seen: HashSet<Hash> = HashSet::new();
+        let mut todo = vec![root];
+        seen.insert(root);
+        while let Some(d) = todo.pop() {
+            if self.complete.get(&d).is_some_and(|g| *g == generation) {
+                continue;
+            }
+            let Some(tree) = self.get(&d) else {
+                trees.push(d);
+                continue;
+            };
+            visited.push(d);
+            for (_, node) in &tree.entries {
+                match node {
+                    Node::File { hash, .. } => {
+                        let h = Hash(*hash);
+                        if !self.store.has(&h) {
+                            blobs.insert(h);
+                        }
+                    }
+                    Node::Dir(sub) => {
+                        let sub = Hash(*sub);
+                        if seen.insert(sub) {
+                            todo.push(sub);
+                        }
+                    }
+                    Node::Symlink(_) => {}
+                }
+            }
+        }
+        if trees.is_empty() && blobs.is_empty() && self.store.generation() == generation {
+            for d in visited {
+                self.complete.insert(d, generation);
+            }
+        }
+        (trees, blobs.into_iter().collect())
     }
 
     /// Gets `missing` into the store. A blob another client is already

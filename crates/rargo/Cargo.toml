@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 rargo-proto = { path = "../rargo-proto" }
+rargo-net = { path = "../rargo-net" }
+tokio.workspace = true
 libc.workspace = true
 blake3.workspace = true
 rayon.workspace = true

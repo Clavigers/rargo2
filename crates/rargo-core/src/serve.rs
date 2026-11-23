@@ -4,10 +4,11 @@ use crate::build::{self, Client, Daemon};
 use crate::engine::{ClientEnv, EnvAsker};
 use crate::hash::Hash;
 use crate::present::Output;
-use crate::proto::{ClientMsg, PROTO_VERSION, RunRequest, ServerMsg};
+use crate::net::link::Link;
+use crate::proto::{CONTROL, ClientMsg, Frame, PROTO_VERSION, Reorder, RunRequest, ServerMsg};
 use crate::sched::Priority;
-use crate::session::{self, Keys, Session};
-use anyhow::{Context, Result, bail};
+use crate::session::{self, ClientHas, Keys, Session};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,58 +33,193 @@ fn wants_color(req: &RunRequest, env: &HashMap<String, String>, tty: bool) -> bo
     }
 }
 
-/// Handles one accepted connection.
+/// Handles one accepted TCP connection: the fallback form of a client
+/// daemon's link.
 pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>) -> Result<()> {
     let _ = stream.set_nodelay(true);
-    let (user, admin, first, sealer, mut opener) =
+    let (user, admin, sealer, opener) =
         tokio::time::timeout(std::time::Duration::from_secs(20), session::accept(&mut stream, &keys))
             .await
             .context("handshake timed out")??;
-    let (mut rd, wr) = stream.into_split();
-    let first = match first {
-        Some(m) => m,
-        None => session::read_msg(&mut rd, &mut opener).await?.context("the client sent no request")?,
+    link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin).await;
+    Ok(())
+}
+
+/// Handles one accepted connection of the UDP transport.
+pub async fn udp_connection(d: Arc<Daemon>, conn: Arc<crate::net::Conn>, endpoint: Arc<crate::net::Endpoint>, keys: Arc<Keys>) {
+    let Some(user) = conn.user().map(String::from) else {
+        endpoint.forget(conn.id);
+        return;
     };
-    let ClientMsg::Run(req) = first else { bail!("the client's first message is not a request") };
-    let (sess, rx) = Session::new(d.engine.store.clone());
-    let writer = tokio::spawn(session::write_loop(rx, sealer, tokio::io::BufWriter::with_capacity(256 << 10, wr), sess.clone()));
-    let d2 = d.clone();
-    let work = tokio::spawn(serve(d, *req, user, admin, sess.clone()));
-    // Everything the client sends while the request runs; if it goes away,
-    // stop: queued actions are dropped.
-    let abort = work.abort_handle();
-    let s2 = sess.clone();
-    let reader = tokio::spawn(async move {
-        loop {
-            match session::read_msg(&mut rd, &mut opener).await {
-                Ok(Some(m)) => {
-                    if let Err(e) = s2.incoming(m) {
-                        eprintln!("rargod: {e:#}");
-                        s2.send(ServerMsg::Stderr(format!("error: {e:#}\n").into_bytes()));
-                        break;
+    let admin = keys.admin(&user);
+    link(d, Arc::new(Link::Udp(conn, endpoint)), user, admin).await;
+}
+
+struct Stream {
+    sess: Arc<Session>,
+    abort: tokio::task::AbortHandle,
+}
+
+/// Forwards what a session queues for the client as frames of `stream`,
+/// until the command's final message or the end of the queue.
+async fn pump(link: Arc<Link>, stream: u32, mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
+    let mut seq = 0u64;
+    while let Some(m) = rx.recv().await {
+        let last = matches!(m, ServerMsg::Exit(_) | ServerMsg::Exec(_) | ServerMsg::Fetched { .. });
+        let bulk = session::bulk_of(&m);
+        // File contents are compressed already; listings are not.
+        let msg = match (bulk, crate::proto::pack(&crate::proto::encode(&m))) {
+            (0, Some(z)) => ServerMsg::Packed(z),
+            _ => m,
+        };
+        let frame = crate::proto::encode(&Frame { stream, seq, msg });
+        seq += 1;
+        if link.send(&frame).await.is_err() {
+            break;
+        }
+        if bulk > 0 {
+            sess.sent_bulk(bulk);
+        }
+        if last {
+            break;
+        }
+    }
+    sess.close_window();
+}
+
+/// Worktree content a client pushed without being asked. Returns what to
+/// answer, if the client wants to know what is still missing.
+fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
+    let stats = &d.trees.stats;
+    stats.offers.fetch_add(1, Ordering::Relaxed);
+    for t in &o.trees {
+        if d.trees.put(t).is_ok() {
+            stats.trees_received.fetch_add(1, Ordering::Relaxed);
+            stats.offered_bytes.fetch_add(t.len() as u64, Ordering::Relaxed);
+        }
+    }
+    for b in o.blobs {
+        let claimed = b.hash;
+        let Ok(bytes) = b.unpack() else { continue };
+        if Hash::of(&bytes).0 == claimed && d.engine.store.put_bytes(&bytes).is_ok() {
+            stats.offered_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            d.stats.bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            d.stats.files_in.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if !o.ask {
+        return None;
+    }
+    let (trees, blobs) = d.trees.lacking(Hash(o.root));
+    Some(ServerMsg::Missing { id: o.id, trees: trees.iter().map(|h| h.0).collect(), blobs: blobs.iter().map(|h| h.0).collect() })
+}
+
+/// Serves one client daemon for as long as its link lasts: every command
+/// is a stream; stream 0 carries what the daemon does on its own.
+pub async fn link(d: Arc<Daemon>, link: Arc<Link>, user: String, admin: bool) {
+    let has = Arc::new(ClientHas::default());
+    let (control, control_rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+    tokio::spawn(pump(link.clone(), CONTROL, control_rx, control.clone()));
+    let streams: Arc<parking_lot::Mutex<HashMap<u32, Stream>>> = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut order: Reorder<ClientMsg> = Reorder::new(false);
+    d.stats.links.fetch_add(1, Ordering::Relaxed);
+    'link: loop {
+        let raw = tokio::select! {
+            m = link.recv() => m,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                // A daemon sends something every few seconds; one that has
+                // been silent this long is gone (its machine went away).
+                if link.idle() > std::time::Duration::from_secs(180) { None } else { continue }
+            }
+        };
+        let Some(raw) = raw else { break };
+        let Ok(frame) = crate::proto::decode::<Frame<ClientMsg>>(&raw) else { break };
+        for (stream, msg) in order.push(frame) {
+            let msg = match msg {
+                ClientMsg::Packed(z) => match crate::proto::unpack(&z).and_then(|b| crate::proto::decode(&b)) {
+                    Ok(m) => m,
+                    Err(_) => break 'link,
+                },
+                m => m,
+            };
+            match (stream, msg) {
+                (CONTROL, ClientMsg::Ping(n)) => control.send(ServerMsg::Pong(n)),
+                (CONTROL, ClientMsg::Offer(o)) => {
+                    // In place: a request sent after it must find it done.
+                    if let Some(reply) = tokio::task::block_in_place(|| offer(&d, *o)) {
+                        control.send(reply);
                     }
                 }
-                Ok(None) | Err(_) => break,
+                // Contents the daemon lacks: a stream of its own, so that
+                // two fetches never mix.
+                (stream, ClientMsg::Fetch { id, hashes }) if stream != CONTROL => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    tokio::spawn(async move {
+                        let _ = sess.fetch(id, hashes).await;
+                    });
+                }
+                (CONTROL, m) => {
+                    if let Err(e) = control.incoming(m) {
+                        eprintln!("rargod: {user}: {e:#}");
+                        break 'link;
+                    }
+                }
+                (stream, ClientMsg::Run(req)) => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, sess.clone()));
+                    streams.lock().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
+                    let streams2 = streams.clone();
+                    tokio::spawn(async move {
+                        let msg = match work.await {
+                            Ok(m) => m,
+                            Err(e) if e.is_cancelled() => ServerMsg::Exit(130),
+                            Err(e) => {
+                                sess.send(ServerMsg::Stderr(format!("error: rargod internal error: {e}\n").into_bytes()));
+                                ServerMsg::Exit(101)
+                            }
+                        };
+                        sess.send(msg);
+                        let _ = pumping.await;
+                        sess.close();
+                        streams2.lock().remove(&stream);
+                    });
+                }
+                (stream, ClientMsg::Cancel) => {
+                    // The command is not wanted any more: queued actions
+                    // are dropped, running ones stopped.
+                    let gone = streams.lock().remove(&stream);
+                    if let Some(st) = gone {
+                        st.sess.close();
+                        st.abort.abort();
+                    }
+                }
+                (stream, m) => {
+                    let sess = streams.lock().get(&stream).map(|st| st.sess.clone());
+                    if let Some(sess) = sess {
+                        if let Err(e) = sess.incoming(m) {
+                            eprintln!("rargod: {e:#}");
+                            sess.send(ServerMsg::Stderr(format!("error: {e:#}\n").into_bytes()));
+                            let gone = streams.lock().remove(&stream);
+                            if let Some(st) = gone {
+                                st.sess.close();
+                                st.abort.abort();
+                            }
+                        }
+                    }
+                }
             }
         }
-        s2.close();
-        abort.abort();
-    });
-    let msg = match work.await {
-        Ok(m) => m,
-        Err(e) if e.is_cancelled() => ServerMsg::Exit(130),
-        Err(e) => {
-            sess.send(ServerMsg::Stderr(format!("error: rargod internal error: {e}\n").into_bytes()));
-            ServerMsg::Exit(101)
-        }
-    };
-    sess.send(msg);
-    d2.stats.bytes_in.fetch_add(sess.bytes_in.load(Ordering::Relaxed), Ordering::Relaxed);
-    d2.stats.bytes_out.fetch_add(sess.bytes_out.load(Ordering::Relaxed), Ordering::Relaxed);
-    let _ = writer.await;
-    reader.abort();
-    sess.close();
-    Ok(())
+    }
+    // The daemon is gone, and every command it had running with it.
+    let all: Vec<Stream> = streams.lock().drain().map(|(_, st)| st).collect();
+    for st in all {
+        st.sess.close();
+        st.abort.abort();
+    }
+    control.close();
+    link.close();
 }
 
 fn fail(sess: &Session, text: String) -> ServerMsg {
@@ -176,6 +312,16 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
         _ => {}
     }
 
+    // What this worktree holds of earlier deliveries, if the client placed
+    // the last one completely and this server remembers it.
+    let worktree = req.worktree.clone();
+    let before: Option<Arc<std::collections::HashSet<crate::proto::Digest>>> = {
+        let known = d.deliveries.lock();
+        known.get(&worktree).filter(|(token, _)| req.delivered != 0 && *token == req.delivered).map(|(_, set)| set.clone())
+    };
+    if let Some(set) = &before {
+        sess.knows(set.iter().copied());
+    }
     // The worktree: bring whatever the store lacks over from the client.
     let snapshot = match d.trees.sync(Hash(req.tree), &*sess).await {
         Ok(s) => s,
@@ -239,7 +385,22 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
         home,
         outbox: Default::default(),
     };
-    match build::handle(d, client).await {
+    let outcome = build::handle(d.clone(), client).await;
+    let mut delivered = sess.delivered();
+    if !delivered.is_empty() && !worktree.is_empty() {
+        if let Some(set) = &before {
+            if set.len() < 500_000 {
+                delivered.extend(set.iter().copied());
+            }
+        }
+        let mut b = [0u8; 8];
+        // SAFETY: filling a valid 8-byte buffer.
+        unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
+        let token = u64::from_le_bytes(b) | 1;
+        d.deliveries.lock().insert(worktree, (token, Arc::new(delivered)));
+        sess.send(ServerMsg::DeliveryToken(token));
+    }
+    match outcome {
         Ok(code) => ServerMsg::Exit(code),
         Err(exec) => ServerMsg::Exec(exec),
     }
@@ -254,7 +415,7 @@ pub fn status_text(d: &Daemon) -> String {
     let y = &d.trees.stats;
     format!(
         "requests            {}\n\
-         sync                {} worktree states, {} manifests and {} files asked of clients ({} awaited from another client's upload), {:.1} MiB received, {:.1} MiB of results sent\n\
+         sync                {} worktree states, {} manifests and {} files received from clients ({} changes pushed unasked, {} files asked for, {} awaited from another client's upload), {:.1} MiB received, {:.1} MiB of results sent; {} client daemons have connected\n\
          store               {} blobs, {:.1} MiB\n\
          cold tier           {}\n\
          cache               {} hits, {} misses, {} traces stored\n\
@@ -271,10 +432,13 @@ pub fn status_text(d: &Daemon) -> String {
         d.stats.requests.load(Ordering::Relaxed),
         y.snapshots.load(Ordering::Relaxed),
         y.trees_received.load(Ordering::Relaxed),
+        d.stats.files_in.load(Ordering::Relaxed),
+        y.offers.load(Ordering::Relaxed),
         y.blobs_requested.load(Ordering::Relaxed),
         y.shared_uploads.load(Ordering::Relaxed),
         d.stats.bytes_in.load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
         d.stats.bytes_out.load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
+        d.stats.links.load(Ordering::Relaxed),
         e.store.blob_count(),
         e.store.total_bytes() as f64 / (1 << 20) as f64,
         {

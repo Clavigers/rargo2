@@ -1,0 +1,13 @@
+[package]
+name = "rargo-net"
+description = "rargo's reliable message transport over UDP, and the client-server link built on it (with a TCP fallback)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rargo-proto = { path = "../rargo-proto" }
+libc.workspace = true
+blake3.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true

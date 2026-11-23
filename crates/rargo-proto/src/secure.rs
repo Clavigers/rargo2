@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 /// Ends in the protocol version, so that a client of another version is
 /// told so instead of failing to decode.
-pub const MAGIC: &[u8; 8] = b"rargo\x06\r\n";
+pub const MAGIC: &[u8; 8] = b"rargo\x07\r\n";
 const PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Plaintext bytes per record (Noise messages are at most 65535 bytes,
 /// including the 16-byte tag).
@@ -192,11 +192,24 @@ const LINK_PROLOGUE: &[u8] = b"rargo worker link v2";
 pub struct LinkCipher {
     keys: StatelessTransportState,
     next: std::sync::atomic::AtomicU64,
+    binding: [u8; 32],
 }
 
 impl LinkCipher {
     fn new(hs: HandshakeState) -> io::Result<LinkCipher> {
-        Ok(LinkCipher { keys: hs.into_stateless_transport_mode().map_err(err)?, next: std::sync::atomic::AtomicU64::new(0) })
+        let binding = blake3::derive_key("rargo link datagram tag v1", hs.get_handshake_hash());
+        Ok(LinkCipher {
+            keys: hs.into_stateless_transport_mode().map_err(err)?,
+            next: std::sync::atomic::AtomicU64::new(0),
+            binding,
+        })
+    }
+
+    /// A key only the two ends of this connection know, derived from the
+    /// key agreement: for authenticating what travels outside the cipher
+    /// (datagram headers and acknowledgements).
+    pub fn binding(&self) -> [u8; 32] {
+        self.binding
     }
 
     /// `u64 first nonce | records`, every record but the last carrying

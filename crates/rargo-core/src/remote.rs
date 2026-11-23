@@ -510,7 +510,10 @@ impl WorkerState {
         } else {
             self.handle.block_on(fut)
         };
-        r.map_err(|e| io::Error::other(format!("{e:#}")))
+        r.map_err(|e| {
+            eprintln!("rargo worker: content {h} could not be had from the server: {e:#}");
+            io::Error::other(format!("{e:#}"))
+        })
     }
 
     async fn on_push(self: &Arc<Self>, blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, last: bool) {
@@ -620,7 +623,22 @@ impl View for RemoteView {
         self.state.lookups_remote.fetch_add(1, Ordering::Relaxed);
         let w = match self.state.peer.call_blocking(Req::Lookup { action: self.action, dir: dir.to_vec(), name: name.to_vec() }) {
             Ok(Resp::Looked(w)) => w,
-            _ => WLooked::Absent,
+            other => {
+                // Not an answer: the action was withdrawn, or the link is
+                // in trouble. Said aloud, because "absent" is what the
+                // compiler will make of it.
+                let why = match other {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => "unexpected reply".to_string(),
+                };
+                eprintln!(
+                    "rargo worker: action {:x}: no answer about {}/{}: {why}",
+                    self.action,
+                    String::from_utf8_lossy(dir),
+                    String::from_utf8_lossy(name)
+                );
+                WLooked::Absent
+            }
         };
         let l = self.convert(dir, name, &w);
         self.entries.insert(key, w);

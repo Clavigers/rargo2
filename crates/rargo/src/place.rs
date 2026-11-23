@@ -54,7 +54,6 @@ pub struct Placer {
     pub changed: bool,
     pending: HashMap<Digest, Vec<Dest>>,
     parts: HashMap<Digest, Part>,
-    seq: u64,
     /// Directories already cleared of what dead clients left behind.
     swept: std::collections::HashSet<PathBuf>,
     pub fetched_bytes: u64,
@@ -95,6 +94,22 @@ fn mode(exec: bool, writable: bool) -> std::fs::Permissions {
     })
 }
 
+/// Temporary names are unique in the process: a daemon places for several
+/// commands at once.
+fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Drop for Placer {
+    /// A command that was interrupted leaves no half-received files.
+    fn drop(&mut self) {
+        for (_, part) in self.parts.drain() {
+            let _ = std::fs::remove_file(&part.tmp);
+        }
+    }
+}
+
 impl Placer {
     pub fn new(cache_dir: &Path, placed: Placed) -> Placer {
         // Downloads a killed client never finished.
@@ -106,7 +121,6 @@ impl Placer {
             changed: false,
             pending: HashMap::new(),
             parts: HashMap::new(),
-            seq: 0,
             fetched_bytes: 0,
             reused_files: 0,
         }
@@ -121,14 +135,13 @@ impl Placer {
     /// written to, temporaries that clients which no longer exist left in
     /// it are removed.
     fn tmp_beside(&mut self, dest: &Path) -> (PathBuf, crate::tmp::Temp) {
-        self.seq += 1;
         if let Some(dir) = dest.parent() {
             if self.swept.insert(dir.to_path_buf()) {
                 crate::tmp::sweep(dir, crate::tmp::BESIDE);
             }
         }
         let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let tmp = dest.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), self.seq));
+        let tmp = dest.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), next_seq()));
         let watched = crate::tmp::watch(&tmp);
         (tmp, watched)
     }
@@ -234,8 +247,7 @@ impl Placer {
 
     fn scratch(&mut self) -> io::Result<PathBuf> {
         std::fs::create_dir_all(&self.cache)?;
-        self.seq += 1;
-        Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), self.seq)))
+        Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), next_seq())))
     }
 
     pub fn blob(&mut self, hash: Digest, bytes: &[u8]) -> io::Result<()> {
@@ -338,6 +350,11 @@ impl Placer {
             self.pending.entry(hash).or_default().push(d);
         }
         Ok(need)
+    }
+
+    /// The contents still waited for.
+    pub fn wanting(&self) -> Vec<Digest> {
+        self.pending.keys().copied().collect()
     }
 
     /// Whether everything asked for has arrived.

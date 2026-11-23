@@ -48,8 +48,9 @@ expect() { # description, command...
 }
 has() { grep -qF -- "$2" <<<"$1"; }
 runs() { "$R" --rargo-status | awk '/^actions run/ {print $3}'; }
-# Files and directory manifests the server has asked clients for so far.
-asked_files() { "$R" --rargo-status | sed -n 's/^sync .* manifests and \([0-9]*\) files asked.*/\1/p'; }
+# Files and directory manifests the server has received from clients so
+# far (pushed by their daemons or asked for).
+asked_files() { "$R" --rargo-status | sed -n 's/^sync .* manifests and \([0-9]*\) files received.*/\1/p'; }
 asked_trees() { "$R" --rargo-status | sed -n 's/^sync .*states, \([0-9]*\) manifests.*/\1/p'; }
 
 trap '"$repo/dev/rargod.sh" stop >/dev/null 2>&1' EXIT

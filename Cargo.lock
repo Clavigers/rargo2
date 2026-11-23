@@ -576,11 +576,13 @@ dependencies = [
  "bincode",
  "blake3",
  "libc",
+ "rargo-net",
  "rargo-proto",
  "rayon",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml",
  "zstd",
 ]
@@ -596,6 +598,7 @@ dependencies = [
  "fusewire",
  "libc",
  "parking_lot",
+ "rargo-net",
  "rargo-plan",
  "rargo-proto",
  "rayon",
@@ -607,6 +610,17 @@ dependencies = [
  "tokio",
  "toml",
  "zstd",
+]
+
+[[package]]
+name = "rargo-net"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "parking_lot",
+ "rargo-proto",
+ "tokio",
 ]
 
 [[package]]

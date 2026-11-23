@@ -71,6 +71,9 @@ pub struct Scan {
     pub trees: HashMap<Digest, Vec<u8>>,
     /// Where to read each distinct file content from, and its size.
     pub files: HashMap<Digest, (PathBuf, u64)>,
+    /// Every directory of the worktree that was scanned (what a watcher
+    /// has to watch).
+    pub dirs: Vec<PathBuf>,
     pub index: Index,
     /// The index differs from the one the scan started with.
     pub index_changed: bool,
@@ -85,6 +88,7 @@ struct Ctx<'a> {
     exclude: &'a [String],
     trees: Mutex<HashMap<Digest, Vec<u8>>>,
     files: Mutex<HashMap<Digest, (PathBuf, u64)>>,
+    dirs: Mutex<Vec<PathBuf>>,
     index: Mutex<HashMap<Vec<u8>, Entry>>,
     hashed_files: AtomicU64,
     hashed_bytes: AtomicU64,
@@ -143,6 +147,7 @@ impl Ctx<'_> {
     fn dir(&self, rel: &[u8]) -> io::Result<Digest> {
         let abs = if rel.is_empty() { self.root.to_path_buf() } else { self.root.join(OsStr::from_bytes(rel)) };
         let mut names: Vec<Vec<u8>> = Vec::new();
+        self.dirs.lock().unwrap().push(abs.clone());
         for e in std::fs::read_dir(&abs)? {
             names.push(e?.file_name().as_bytes().to_vec());
         }
@@ -239,6 +244,9 @@ pub fn scan(root: &Path, old: &Index, exclude: &[String], git: Option<&Path>) ->
         let at = top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(b".git")).unwrap_or_else(|i| i);
         top.entries.insert(at, (b".git".to_vec(), Node::Dir(sub.root)));
         let encoded = top.encode();
+        // The root without `.git` is not part of the tree any more (no
+        // directory below the root can equal it).
+        scan.trees.remove(&scan.root);
         scan.root = rargo_proto::tree::digest(&encoded);
         scan.trees.insert(scan.root, encoded);
         scan.trees.extend(sub.trees);
@@ -256,6 +264,7 @@ fn scan_dir(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
         exclude,
         trees: Mutex::new(HashMap::new()),
         files: Mutex::new(HashMap::new()),
+        dirs: Mutex::new(Vec::new()),
         index: Mutex::new(HashMap::with_capacity(old.files.len())),
         hashed_files: AtomicU64::new(0),
         hashed_bytes: AtomicU64::new(0),
@@ -271,6 +280,7 @@ fn scan_dir(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
         root: root_digest,
         trees: ctx.trees.into_inner().unwrap(),
         files: ctx.files.into_inner().unwrap(),
+        dirs: ctx.dirs.into_inner().unwrap(),
         index: Index { files },
         index_changed,
         file_count: ctx.file_count.into_inner(),

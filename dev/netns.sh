@@ -18,6 +18,9 @@ work=${RARGO_WORK:-/root/rargo-work}
 B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
 T=$work/nstest
 down() {
+    # Client daemons started with these binaries (they live in the
+    # client's namespace).
+    pkill -TERM -f "$B/rargo --rargo-daemon" 2>/dev/null || true
     pkill -TERM -f "rargod --state $T" 2>/dev/null || true
     pkill -TERM -f "rigproxy.py [a-z]* $T/proxy.sock" 2>/dev/null || true
     sleep 0.5

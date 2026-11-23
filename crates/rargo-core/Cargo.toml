@@ -9,6 +9,7 @@ license.workspace = true
 fusewire = { path = "../fusewire" }
 rargo-plan = { path = "../rargo-plan" }
 rargo-proto = { path = "../rargo-proto" }
+rargo-net = { path = "../rargo-net" }
 libc.workspace = true
 blake3.workspace = true
 serde.workspace = true

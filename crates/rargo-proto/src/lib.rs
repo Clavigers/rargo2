@@ -5,17 +5,124 @@
 //! environment, and then receives output, requested artifacts and files the
 //! build wrote into the worktree. Everything else happens on the server.
 //!
-//! One TCP connection per command. The connection is encrypted and
-//! authenticated with a pre-shared key per user (Noise `NNpsk0`); see
-//! [`secure`]. Inside it, both directions carry bincode messages
-//! ([`ClientMsg`], [`ServerMsg`]).
+//! A client machine runs one daemon per server, and the daemon holds one
+//! long-lived link to it (the reliable-UDP transport of `rargo-net`, or TCP
+//! where UDP does not get through), encrypted and authenticated with a
+//! pre-shared key per user (Noise `NNpsk0`); see [`secure`]. The link
+//! carries [`Frame`]s of bincode messages ([`ClientMsg`], [`ServerMsg`]):
+//! every command is a stream of its own, and stream 0 is the daemon's own
+//! conversation with the server (worktree changes pushed as they happen,
+//! contents fetched, keepalives). The `rargo` command itself talks to the
+//! daemon over a Unix socket ([`LocalRequest`], [`LocalReply`]).
 
 use serde::{Deserialize, Serialize};
 
 pub mod secure;
 pub mod tree;
 
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
+
+/// The stream of a link that belongs to no command.
+pub const CONTROL: u32 = 0;
+
+/// One message on a link, with the stream it belongs to and its place in
+/// the sender's order (the UDP transport delivers messages in arrival
+/// order). From client to server there is one order over all streams, so
+/// that a request is never looked at before the worktree changes sent ahead
+/// of it; from server to client each stream has its own, so that one
+/// command's bulk does not hold up another's output.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Frame<M> {
+    pub stream: u32,
+    pub seq: u64,
+    pub msg: M,
+}
+
+/// Puts frames back into the sender's order.
+pub struct Reorder<M> {
+    per_stream: bool,
+    next: std::collections::HashMap<u32, u64>,
+    held: std::collections::HashMap<u32, std::collections::BTreeMap<u64, (u32, M)>>,
+}
+
+impl<M> Reorder<M> {
+    /// `per_stream`: each stream is ordered by itself; otherwise all
+    /// frames share one order.
+    pub fn new(per_stream: bool) -> Reorder<M> {
+        Reorder { per_stream, next: Default::default(), held: Default::default() }
+    }
+
+    /// Takes a frame and returns whatever is now next in order.
+    pub fn push(&mut self, f: Frame<M>) -> Vec<(u32, M)> {
+        let lane = if self.per_stream { f.stream } else { 0 };
+        let next = self.next.entry(lane).or_insert(0);
+        let mut out = Vec::new();
+        if f.seq < *next {
+            return out;
+        }
+        let held = self.held.entry(lane).or_default();
+        held.insert(f.seq, (f.stream, f.msg));
+        while let Some(m) = held.remove(next) {
+            out.push(m);
+            *next += 1;
+        }
+        if held.is_empty() {
+            self.held.remove(&lane);
+        }
+        out
+    }
+
+    /// Forgets a finished stream.
+    pub fn end(&mut self, stream: u32) {
+        if self.per_stream {
+            self.next.remove(&stream);
+            self.held.remove(&stream);
+        }
+    }
+}
+
+/// What the `rargo` command asks of the daemon on its machine.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalRequest {
+    /// Arguments as the server should get them.
+    pub args: Vec<String>,
+    /// `"build"`, `"admin"` (a request about the server; no worktree) or
+    /// `"drift"`.
+    pub kind: String,
+    pub cwd: String,
+    /// The command's whole environment (UTF-8 variables). The daemon sends
+    /// the server what the allow-list and the policy let through.
+    pub vars: Vec<(String, String)>,
+    pub stdout_tty: bool,
+    pub stderr_tty: bool,
+}
+
+/// What the daemon tells the `rargo` command.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum LocalReply {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(i32),
+    Exec(ExecRequest),
+    /// The server cannot be reached (the command may fall back to cargo).
+    Unreachable(String),
+}
+
+/// Worktree content pushed to the server without being asked for: after
+/// an edit, the changed files and the directory manifests on their paths.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Offer {
+    pub id: u64,
+    /// Digest of the root tree this brings the server up to.
+    pub root: Digest,
+    /// Encoded [`tree::Tree`]s.
+    pub trees: Vec<Vec<u8>>,
+    pub blobs: Vec<Blob>,
+    /// Answer with [`ServerMsg::Missing`]: what of `root` is still not
+    /// there (a worktree seen for the first time, whose contents another
+    /// client may have uploaded already).
+    pub ask: bool,
+}
 
 pub type Digest = [u8; 32];
 
@@ -53,6 +160,9 @@ pub struct RunRequest {
     pub home_files: Vec<(String, Vec<u8>)>,
     /// `user@host`, for the server's log.
     pub who: String,
+    /// The token of the last delivery this worktree placed completely
+    /// (see [`ServerMsg::DeliveryToken`]); 0 if none.
+    pub delivered: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -109,13 +219,24 @@ pub enum ServerMsg {
     WantBlobs(Vec<Digest>),
     /// Environment variables an action declared it reads.
     WantEnv(Vec<String>),
-    /// Files to place. The client answers with [`ClientMsg::Need`] naming
-    /// the contents it does not already have; those follow as blobs.
+    /// Files to place. The contents the server believes the client lacks
+    /// follow as blobs, then [`ServerMsg::Delivered`]; nothing is asked.
+    /// Whatever the client then still lacks it fetches
+    /// ([`ClientMsg::Fetch`]).
     Deliver { id: u64, files: Vec<Delivery>, writes: Vec<Write> },
     Blobs(Vec<Blob>),
     BlobPart { hash: Digest, part: Part, last: bool },
-    /// Everything named in the `Need` for delivery `id` has been sent.
+    /// Everything the server meant to send for delivery `id` has been sent.
     Delivered { id: u64 },
+    /// Names everything this command delivered. A client that placed it
+    /// all passes the token with its next request from the same worktree,
+    /// and the server then knows what that worktree already holds.
+    DeliveryToken(u64),
+    /// Answer to an [`Offer`] with `ask`: what the server still lacks.
+    Missing { id: u64, trees: Vec<Digest>, blobs: Vec<Digest> },
+    /// Everything asked for in fetch `id` has been sent.
+    Fetched { id: u64 },
+    Pong(u64),
     /// A future-incompatibility report to add to the report file in the
     /// client's target directory (cargo's `.future-incompat-report.json`).
     /// The client answers with [`ClientMsg::ReportId`].
@@ -158,7 +279,13 @@ pub enum ClientMsg {
     /// scan). The client will start over.
     Changed,
     Env(Vec<(String, Option<String>)>),
-    Need { id: u64, hashes: Vec<Digest> },
+    /// Contents the client lacks, to be sent on the control stream and
+    /// followed by [`ServerMsg::Fetched`].
+    Fetch { id: u64, hashes: Vec<Digest> },
+    Offer(Box<Offer>),
+    /// The command of this stream is not wanted any more.
+    Cancel,
+    Ping(u64),
     /// Another message, encoded and zstd-compressed (see [`pack`]).
     Packed(Vec<u8>),
     /// The number under which a [`ServerMsg::Report`] is in the report file.
@@ -278,6 +405,22 @@ mod tests {
         assert!(!env_allowed("RARGO_KEY"));
         assert!(!env_allowed("CARGO_REGISTRIES_MINE_TOKEN"));
         assert!(!env_allowed("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    #[test]
+    fn frames_come_out_in_the_senders_order() {
+        let f = |stream, seq, msg: &'static str| Frame { stream, seq, msg };
+        let mut one: Reorder<&str> = Reorder::new(false);
+        assert!(one.push(f(3, 1, "b")).is_empty());
+        assert_eq!(one.push(f(0, 0, "a")), vec![(0, "a"), (3, "b")]);
+        assert!(one.push(f(0, 0, "again")).is_empty());
+        let mut per: Reorder<&str> = Reorder::new(true);
+        assert_eq!(per.push(f(1, 0, "x")), vec![(1, "x")]);
+        assert!(per.push(f(2, 1, "z")).is_empty());
+        assert_eq!(per.push(f(1, 1, "y")), vec![(1, "y")]);
+        assert_eq!(per.push(f(2, 0, "w")), vec![(2, "w"), (2, "z")]);
+        per.end(2);
+        assert_eq!(per.push(f(2, 0, "new stream 2")), vec![(2, "new stream 2")]);
     }
 
     #[test]
