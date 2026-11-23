@@ -1,0 +1,22 @@
+# Configuration for building rargo's rustc fork: as close to the official
+# distribution build as is practical without profile-guided optimisation.
+change-id = "ignore"
+
+[llvm]
+download-ci-llvm = true
+
+[build]
+extended = false
+docs = false
+jobs = 16
+allocator = "jemalloc"
+
+[rust]
+channel = "stable"
+debug-assertions = false
+debug-logging = false
+debuginfo-level = 0
+incremental = false
+lld = false
+lto = "thin"
+codegen-units = 1

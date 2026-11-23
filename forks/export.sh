@@ -1,9 +1,12 @@
 #!/bin/sh
-# Regenerates forks/cargo/*.patch from the working checkout.
+# Regenerates forks/{cargo,rust}/*.patch from the working checkouts.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 work=${RARGO_WORK:-/root/rargo-work}
-base=$(cat "$here/cargo/BASE")
-rm -f "$here"/cargo/*.patch
-git -C "$work/cargo" format-patch -q --no-signature -o "$here/cargo" "$base"..HEAD
-ls "$here/cargo"
+for name in cargo rust; do
+    [ -d "$work/$name/.git" ] || continue
+    base=$(cat "$here/$name/BASE")
+    rm -f "$here/$name"/*.patch
+    git -C "$work/$name" format-patch -q --no-signature -o "$here/$name" "$base"..HEAD
+    ls "$here/$name"
+done

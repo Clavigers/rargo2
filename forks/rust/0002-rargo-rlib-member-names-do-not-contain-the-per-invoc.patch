@@ -1,0 +1,136 @@
+From 7dde8bea19c81d7a83000240096ac1b83d93e501 Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Mon, 23 Nov 2026 01:20:18 +0100
+Subject: [PATCH 2/3] rargo: rlib member names do not contain the
+ per-invocation random string
+
+In incremental mode object files are named after a random string chosen per
+compiler invocation, and the names went into the rlib, so two identical
+compilations produced different archives. The string is stripped from member
+names (and from the list of members that hold Rust object code).
+---
+ .../rustc_codegen_ssa/src/back/archive.rs     | 13 ++++++++++
+ compiler/rustc_codegen_ssa/src/back/link.rs   | 24 +++++++++++++++----
+ compiler/rustc_session/src/config.rs          |  6 +++++
+ 3 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/compiler/rustc_codegen_ssa/src/back/archive.rs b/compiler/rustc_codegen_ssa/src/back/archive.rs
+index 18b5c001f..5ef77b871 100644
+--- a/compiler/rustc_codegen_ssa/src/back/archive.rs
++++ b/compiler/rustc_codegen_ssa/src/back/archive.rs
+@@ -324,6 +324,12 @@ pub struct ArchiveSymbols {
+ pub trait ArchiveBuilder {
+     fn add_file(&mut self, path: &Path, kind: ArchiveEntryKind);
+ 
++    /// Adds a file under a member name that differs from its file name.
++    fn add_file_named(&mut self, path: &Path, name: String, kind: ArchiveEntryKind) {
++        let _ = name;
++        self.add_file(path, kind)
++    }
++
+     fn add_archive(&mut self, archive: &Path, kind: AddArchiveKind<'_>) -> io::Result<()>;
+ 
+     fn build(self: Box<Self>, output: &Path, symbols: Option<ArchiveSymbols>) -> bool;
+@@ -549,6 +555,13 @@ fn add_file(&mut self, file: &Path, kind: ArchiveEntryKind) {
+         ));
+     }
+ 
++    fn add_file_named(&mut self, file: &Path, name: String, kind: ArchiveEntryKind) {
++        self.entries.push((
++            name.into_bytes(),
++            ArchiveEntry { source: ArchiveEntrySource::File(file.to_owned()), kind },
++        ));
++    }
++
+     /// Combine the provided files, rlibs, and native libraries into a single
+     /// `Archive`.
+     fn build(self: Box<Self>, output: &Path, symbols: Option<ArchiveSymbols>) -> bool {
+diff --git a/compiler/rustc_codegen_ssa/src/back/link.rs b/compiler/rustc_codegen_ssa/src/back/link.rs
+index a9c9df94a..1412edc47 100644
+--- a/compiler/rustc_codegen_ssa/src/back/link.rs
++++ b/compiler/rustc_codegen_ssa/src/back/link.rs
+@@ -369,6 +369,7 @@ pub fn link_binary(
+                         &metadata,
+                         RlibFlavor::Normal,
+                         &path,
++                        outputs.invocation_temp(),
+                     )
+                     .build(&out_filename, None);
+                 }
+@@ -550,9 +551,23 @@ fn link_rlib<'a>(
+     metadata: &EncodedMetadata,
+     flavor: RlibFlavor,
+     tmpdir: &MaybeTempDir,
++    invocation_temp: Option<&str>,
+ ) -> Box<dyn ArchiveBuilder + 'a> {
+     let mut ab = archive_builder_builder.new_archive_builder(sess);
+ 
++    // In incremental mode object files on disk carry a random per-invocation
++    // component (`crate.cgu.<random>.rcgu.o`) so that concurrent compilers
++    // sharing a directory do not collide. Inside the archive that component
++    // serves no purpose and makes two identical compilations produce
++    // different rlibs, so members are named without it.
++    let member_name = |obj: &Path| -> String {
++        let name = obj.file_name().unwrap().to_str().unwrap();
++        match invocation_temp {
++            Some(t) => name.replacen(&format!(".{t}."), ".", 1),
++            None => name.to_string(),
++        }
++    };
++
+     // Pre-compute the list of Rust object filenames and materialize the rmeta-link
+     // wrapper file before any `add_file` calls. This lets the rmeta-link member be
+     // placed immediately after metadata in the archive, so consumers can find
+@@ -562,7 +577,7 @@ fn link_rlib<'a>(
+         .iter()
+         .filter_map(|m| m.object.as_ref())
+         .chain(compiled_modules.modules.iter().filter_map(|m| m.global_asm_object.as_ref()))
+-        .map(|obj| obj.file_name().unwrap().to_str().unwrap().to_string())
++        .map(|obj| member_name(obj))
+         .collect();
+ 
+     let native_lib_filenames: Vec<Option<Symbol>> = crate_info
+@@ -612,15 +627,15 @@ fn link_rlib<'a>(
+ 
+     for m in &compiled_modules.modules {
+         if let Some(obj) = m.object.as_ref() {
+-            ab.add_file(obj, ArchiveEntryKind::RustObj);
++            ab.add_file_named(obj, member_name(obj), ArchiveEntryKind::RustObj);
+         }
+ 
+         if let Some(obj) = m.global_asm_object.as_ref() {
+-            ab.add_file(obj, ArchiveEntryKind::RustObj);
++            ab.add_file_named(obj, member_name(obj), ArchiveEntryKind::RustObj);
+         }
+ 
+         if let Some(dwarf_obj) = m.dwarf_object.as_ref() {
+-            ab.add_file(dwarf_obj, ArchiveEntryKind::Other);
++            ab.add_file_named(dwarf_obj, member_name(dwarf_obj), ArchiveEntryKind::Other);
+         }
+     }
+ 
+@@ -770,6 +785,7 @@ fn link_staticlib(
+         metadata,
+         RlibFlavor::StaticlibBase,
+         tempdir,
++        None,
+     );
+     let mut all_native_libs = vec![];
+ 
+diff --git a/compiler/rustc_session/src/config.rs b/compiler/rustc_session/src/config.rs
+index 753a4ed0d..18c401d0b 100644
+--- a/compiler/rustc_session/src/config.rs
++++ b/compiler/rustc_session/src/config.rs
+@@ -1262,6 +1262,12 @@ pub fn new(
+         }
+     }
+ 
++    /// The per-invocation string that makes temporary file names unique
++    /// (present in incremental mode).
++    pub fn invocation_temp(&self) -> Option<&str> {
++        self.invocation_temp.as_deref()
++    }
++
+     pub fn path(&self, flavor: OutputType) -> OutFileName {
+         self.outputs
+             .get(&flavor)
