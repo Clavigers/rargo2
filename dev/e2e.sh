@@ -349,6 +349,9 @@ CARGO_TARGET_DIR="$T/stock-target" cargo build --offline >/dev/null 2>&1
 theirs=$(sed "s#$T/stock-target#$A/target#g" "$T/stock-target/debug/app.d" 2>/dev/null)
 [ -n "$mine" ] && [ "$mine" = "$theirs" ] && ok "target/debug/app.d is what stock cargo writes" || bad "target/debug/app.d is what stock cargo writes" "rargo: $mine
 cargo: $theirs"
+mine=$(CARGO_BUILD_DEP_INFO_BASEDIR="$A" "$R" build >/dev/null 2>&1; cat target/debug/app.d)
+has "$mine" "target/debug/app: crates/app/src/main.rs" && ok "build.dep-info-basedir makes the paths relative" || bad "build.dep-info-basedir makes the paths relative" "$mine"
+"$R" build >/dev/null 2>&1
 
 echo "== garbage collection keeps everything still needed"
 cd "$A"

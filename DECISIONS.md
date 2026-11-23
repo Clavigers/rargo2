@@ -491,7 +491,7 @@ cached, only on builds where the warning is due.
 `.d` files: written next to uplifted artifacts with cargo's content (the
 rustc dep-info of the unit and its local dependencies, plus build scripts'
 `rerun-if-changed`), checked equal to stock cargo's in e2e;
-`build.dep-info-basedir` is not honoured.
+`build.dep-info-basedir` is honoured (plan format 5).
 
 Not reproduced: `--timings` (the HTML report). rargo's own per-action
 times are in `--rargo-status` and `RARGO_EXPLAIN`.

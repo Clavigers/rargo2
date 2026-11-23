@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the format or the fork's behaviour changes; part of the
 /// planner's cache key through the binary itself, checked on load.
-pub const PLAN_VERSION: u32 = 4;
+pub const PLAN_VERSION: u32 = 5;
 
 /// Lint mode: a JSON map from unit index to `(unit description, rustc's
 /// unused_extern message)`. The planner replays those messages so that cargo
@@ -268,6 +268,9 @@ pub struct Plan {
     /// file `lib/rustlib/rargo-fork`): metadata-only compiles are available
     /// and crate metadata is identified by its crate hash.
     pub rustc_fork: bool,
+    /// `build.dep-info-basedir`, resolved: paths in `.d` files under it are
+    /// written relative to it.
+    pub dep_info_basedir: Option<String>,
     pub units: Vec<Unit>,
     pub roots: Vec<u32>,
     pub steps: Vec<Step>,

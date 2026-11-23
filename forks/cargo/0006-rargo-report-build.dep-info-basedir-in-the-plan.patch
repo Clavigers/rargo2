@@ -1,0 +1,40 @@
+From 0a5eb94e12ab41013124ddb48744eead7a95f6b0 Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Mon, 23 Nov 2026 02:03:01 +0100
+Subject: [PATCH 6/6] rargo: report build.dep-info-basedir in the plan
+
+---
+ src/compiler/rargo.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
+index e917f4823..4c648e1fb 100644
+--- a/src/compiler/rargo.rs
++++ b/src/compiler/rargo.rs
+@@ -69,6 +69,7 @@ struct Global {
+     keep_going: bool,
+     deny_warnings: bool,
+     rustc_fork: bool,
++    dep_info_basedir: Option<String>,
+ }
+ 
+ fn state() -> &'static Mutex<State> {
+@@ -163,6 +164,10 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+             .sysroot
+             .join("lib/rustlib/rargo-fork")
+             .exists(),
++        dep_info_basedir: match gctx.build_config()?.dep_info_basedir.clone() {
++            Some(v) => Some(s(v.resolve_path(gctx))?),
++            None => None,
++        },
+     };
+     let mut st = state().lock().unwrap();
+     st.global = Some(g);
+@@ -671,6 +676,7 @@ pub fn finish() -> CargoResult<()> {
+         host: g.host,
+         toolchain,
+         rustc_fork: g.rustc_fork,
++        dep_info_basedir: g.dep_info_basedir,
+         units,
+         roots: std::mem::take(&mut st.roots),
+         steps: std::mem::take(&mut st.steps),

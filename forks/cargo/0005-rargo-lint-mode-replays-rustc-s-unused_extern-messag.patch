@@ -1,7 +1,7 @@
 From e321a737add3bcc3a192c1e164422dd0a7878a2f Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:01:11 +0100
-Subject: [PATCH 5/5] rargo: lint mode replays rustc's unused_extern messages
+Subject: [PATCH 5/6] rargo: lint mode replays rustc's unused_extern messages
  for cargo's unused_dependencies lint
 
 ---

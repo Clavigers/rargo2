@@ -2067,7 +2067,19 @@ impl Run {
                 continue;
             }
             let files = self.depinfo_files(ri);
-            let esc = |p: String| p.replace(' ', "\\ ");
+            // cargo's `render_filename`: relative to the base directory when
+            // under it, as written otherwise.
+            let base = plan.dep_info_basedir.as_ref().map(|b| PathBuf::from(self.c.out.tr.path(b)));
+            let esc = |p: String| {
+                let p = match &base {
+                    Some(b) => match normalize(Path::new(&p)).strip_prefix(normalize(b)) {
+                        Ok(rel) => rel.to_string_lossy().into_owned(),
+                        Err(_) => p,
+                    },
+                    None => p,
+                };
+                p.replace(' ', "\\ ")
+            };
             for link in links {
                 let real = PathBuf::from(self.c.out.tr.path(link));
                 let dest = real.with_extension("d");
