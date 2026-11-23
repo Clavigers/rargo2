@@ -1,7 +1,7 @@
 From 7dde8bea19c81d7a83000240096ac1b83d93e501 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:20:18 +0100
-Subject: [PATCH 2/3] rargo: rlib member names do not contain the
+Subject: [PATCH 2/4] rargo: rlib member names do not contain the
  per-invocation random string
 
 In incremental mode object files are named after a random string chosen per

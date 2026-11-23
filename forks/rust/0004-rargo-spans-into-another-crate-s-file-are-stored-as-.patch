@@ -1,0 +1,90 @@
+From ffa3c261d81a488a88c59c635bdd90763e191fb3 Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Mon, 23 Nov 2026 02:07:51 +0100
+Subject: [PATCH 4/4] rargo: spans into another crate's file are stored as
+ lines and columns
+
+A crate that was not rebuilt after its dependency was recompiled with the
+same crate hash but different byte offsets (an edit that keeps line numbers)
+still pointed into the dependency by the old offsets; a post-monomorphization
+error inside the dependency's macro was reported 5 columns off. Such spans
+are now stored as the lines and columns of both ends and resolved against
+the dependency's current line table.
+---
+ compiler/rustc_metadata/src/rmeta/decoder.rs | 30 +++++++++++++++++---
+ compiler/rustc_metadata/src/rmeta/encoder.rs | 14 +++++++--
+ 2 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/compiler/rustc_metadata/src/rmeta/decoder.rs b/compiler/rustc_metadata/src/rmeta/decoder.rs
+index 70a1e2d8e..9c600ba93 100644
+--- a/compiler/rustc_metadata/src/rmeta/decoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/decoder.rs
+@@ -564,10 +564,15 @@ fn decode(decoder: &mut MetadataDecodeContext<'a, 'tcx>) -> SpanData {
+ 
+         debug_assert!(tag.kind() == SpanKind::Local || tag.kind() == SpanKind::Foreign);
+ 
+-        // rargo: offset and length are fixed-width (see `SpanData::encode`).
+-        let lo = BytePos(u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap()));
+-        let len = BytePos(u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap()));
+-        let hi = lo + len;
++        // rargo: fixed-width positions (see `SpanData::encode`): offset and length for a span
++        // in the crate's own files, lines and columns of both ends for a span in another
++        // crate's file.
++        let mut word = || u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap());
++        let raw = if tag.kind() == SpanKind::Foreign {
++            [word(), word(), word(), word()]
++        } else {
++            [word(), word(), 0, 0]
++        };
+ 
+         let tcx = decoder.tcx;
+ 
+@@ -628,6 +633,23 @@ fn decode(decoder: &mut MetadataDecodeContext<'a, 'tcx>) -> SpanData {
+             foreign_cdata.imported_source_file(tcx, metadata_index)
+         };
+ 
++        let (lo, hi) = if tag.kind() == SpanKind::Foreign {
++            let file = &source_file.translated_source_file;
++            let end = file.normalized_source_len.0;
++            let at = |line: u32, col: u32| {
++                let start = if line == u32::MAX {
++                    0
++                } else {
++                    file.lines().get(line as usize).map_or(end, |p| p.0)
++                };
++                BytePos(start.saturating_add(col).min(end))
++            };
++            let lo = at(raw[0], raw[1]);
++            (lo, at(raw[2], raw[3]).max(lo))
++        } else {
++            (BytePos(raw[0]), BytePos(raw[0] + raw[1]))
++        };
++
+         // Make sure our span is well-formed.
+         debug_assert!(
+             lo + source_file.original_start_pos <= source_file.original_end_pos,
+diff --git a/compiler/rustc_metadata/src/rmeta/encoder.rs b/compiler/rustc_metadata/src/rmeta/encoder.rs
+index ecf11cd00..febb7d5be 100644
+--- a/compiler/rustc_metadata/src/rmeta/encoder.rs
++++ b/compiler/rustc_metadata/src/rmeta/encoder.rs
+@@ -386,8 +386,18 @@ fn encode(&self, s: &mut EncodeContext<'a, 'tcx>) {
+             ctxt.encode(s);
+         }
+         let start = s.position();
+-        s.emit_raw_bytes(&lo.0.to_le_bytes());
+-        s.emit_raw_bytes(&len.0.to_le_bytes());
++        if kind == SpanKind::Foreign {
++            // A span into another crate's file is stored as lines and columns: that crate
++            // may be recompiled with different byte offsets and the same crate hash, and its
++            // current line table is what the reader of this span will have.
++            s.emit_raw_bytes(&line_col_lo.0.to_le_bytes());
++            s.emit_raw_bytes(&line_col_lo.1.to_le_bytes());
++            s.emit_raw_bytes(&line_col_hi.0.to_le_bytes());
++            s.emit_raw_bytes(&line_col_hi.1.to_le_bytes());
++        } else {
++            s.emit_raw_bytes(&lo.0.to_le_bytes());
++            s.emit_raw_bytes(&len.0.to_le_bytes());
++        }
+         s.skip_in_hash(start, s.position());
+         {
+             let mut buf = [0u8; 32];
