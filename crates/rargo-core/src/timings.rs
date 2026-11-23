@@ -27,6 +27,42 @@ pub struct UnitTime {
 pub struct Row {
     pub name: String,
     pub time: UnitTime,
+    /// The unit's number in the plan.
+    pub index: usize,
+    /// The units it waits for: `(number, its metadata is enough)`.
+    pub deps: Vec<(usize, bool)>,
+    /// It is linked: it needs the object code of everything below it.
+    pub needs_objects: bool,
+    /// It has a command. Units without one only tie others together; they
+    /// are part of the data and not of the page.
+    pub runs: bool,
+}
+
+/// The rows as data, for tools (`dev/sim-workers.py`). Times are seconds
+/// since the build began.
+fn data(began: Instant, total: Duration, cores: usize, rows: &[Row]) -> String {
+    let at = |t: Option<Instant>| t.map(|t| t.saturating_duration_since(began).as_secs_f64());
+    let units: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "i": r.index,
+                "name": r.name,
+                "deps": r.deps,
+                "needs_objects": r.needs_objects,
+                "runs": r.runs,
+                "cached": r.time.cached,
+                "start": at(r.time.start),
+                "meta": at(r.time.meta),
+                "end": at(r.time.end),
+                "wall": r.time.wall_us as f64 / 1e6,
+                "cpu": r.time.cpu_us as f64 / 1e6,
+                "rss_kb": r.time.rss_kb,
+            })
+        })
+        .collect();
+    // `</` must not appear inside the element that carries the data.
+    serde_json::json!({ "total": total.as_secs_f64(), "cores": cores, "units": units }).to_string().replace("</", "<\\/")
 }
 
 fn esc(s: &str) -> String {
@@ -55,8 +91,10 @@ pub fn stamp(unix: u64) -> String {
 
 /// Renders the report. `began` is when the build started, `total` how long
 /// it took, `cores` how many the server schedules on.
-pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores: usize, rows: &[Row]) -> String {
-    let ran: Vec<&Row> = rows.iter().filter(|r| !r.time.cached && r.time.start.is_some() && r.time.end.is_some()).collect();
+pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores: usize, every: &[Row]) -> String {
+    let json = data(began, total, cores, every);
+    let rows: Vec<&Row> = every.iter().filter(|r| r.runs && r.time.end.is_some()).collect();
+    let ran: Vec<&Row> = rows.iter().copied().filter(|r| !r.time.cached && r.time.start.is_some() && r.time.end.is_some()).collect();
     let cached = rows.iter().filter(|r| r.time.cached).count();
     let cpu: u64 = ran.iter().map(|r| r.time.cpu_us).sum();
     let saved: u64 = rows.iter().filter(|r| r.time.cached).map(|r| r.time.wall_us).sum();
@@ -149,7 +187,7 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
     }
 
     // The table: everything, most expensive first.
-    let mut all: Vec<&Row> = rows.iter().collect();
+    let mut all: Vec<&Row> = rows.clone();
     all.sort_by_key(|r| std::cmp::Reverse((!r.time.cached, r.time.wall_us)));
     h.push_str(
         "<h2>All units</h2>\n<table>\n<tr><th>Unit</th><th>Result</th><th class=\"n\">Asked at</th>\
@@ -169,7 +207,12 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
         h.push_str(&cell((t.rss_kb > 0).then(|| format!("{:.0} MiB", t.rss_kb as f64 / 1024.0))));
         h.push_str("</tr>\n");
     }
-    h.push_str("</table>\n</body>\n</html>\n");
+    h.push_str("</table>\n");
+    // Not a program: the same figures for tools that want to compute on them.
+    h.push_str(&format!(
+        "<script type=\"application/json\" id=\"rargo-timings\">{}</script>\n</body>\n</html>\n",
+        json
+    ));
     h
 }
 
@@ -192,10 +235,18 @@ mod tests {
             Row {
                 name: "`a` (lib)".into(),
                 time: UnitTime { start: at(0), meta: at(400), end: at(1000), cached: false, wall_us: 900_000, cpu_us: 1_500_000, rss_kb: 204_800 },
+                index: 0,
+                deps: vec![],
+                needs_objects: false,
+                runs: true,
             },
             Row {
                 name: "`b<T>` (bin)".into(),
                 time: UnitTime { start: at(400), meta: None, end: at(401), cached: true, wall_us: 2_000_000, cpu_us: 2_500_000, rss_kb: 0 },
+                index: 3,
+                deps: vec![(0, true)],
+                needs_objects: true,
+                runs: true,
             },
         ];
         let html = render("build --timings", "2026-11-23", began, Duration::from_secs(1), 8, &rows);
@@ -206,6 +257,15 @@ mod tests {
         assert!(html.contains("`b&lt;T&gt;` (bin)</td><td>from the cache"));
         assert!(html.contains("`a` (lib) 1.00s"));
         assert!(html.contains("200 MiB"));
-        assert!(!html.contains("<script"));
+        // No program in the page; the data block parses and escapes names.
+        assert!(!html.contains("<script>") && html.matches("<script").count() == 1);
+        let json = html.split("id=\"rargo-timings\">").nth(1).unwrap().split("</script>").next().unwrap();
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v["cores"], 8);
+        assert_eq!(v["units"][1]["i"], 3);
+        assert_eq!(v["units"][1]["deps"][0][0], 0);
+        assert_eq!(v["units"][1]["deps"][0][1], true);
+        assert_eq!(v["units"][0]["meta"], 0.4);
+        assert_eq!(v["units"][1]["name"], "`b<T>` (bin)");
     }
 }

@@ -1082,3 +1082,37 @@ was fetched when the compiler opened it, one round trip per dependency
 while a worker core waited. The files a command names with `--extern` are
 now part of the prediction: their lookups are answered in advance and the
 contents the worker lacks are pushed as the action is sent.
+
+## D53. Hedged copies race; idle means idle; killed compilers give their cores back
+
+Three faults in D30's hedging, found by reading it against D47 and D48:
+
+- **The local copy did not race.** Once a local core fell idle the action
+  ran here to the end and the worker's copy was abandoned, even when the
+  worker was seconds from finishing; on a build's critical path that adds
+  most of a compile. Both copies now run and the first to finish is the
+  result. Only one may be heard: the first to produce output or announce
+  metadata is kept and the other stopped at once (two announcements of
+  metadata that differ would fail the build's consistency check).
+- **"A core nothing else wants" was not that.** The scheduler fetched a
+  token for an idle-priority request from the jobserver pipe like for any
+  other, in competition with the helper threads of running compilers, and
+  handed it a finished action's token directly. A hedge could therefore
+  take a core from the code generation of the crate the build was waiting
+  for. Idle-priority requests are now served only with a token that has
+  lain in the pipe for 40 ms: a helper thread blocked on the pipe takes a
+  token the moment it appears, so one still there is wanted by nobody.
+- **A killed compiler kept its cores.** Stopping the losing copy (and
+  D48's cancellation) kills rustc while its helper threads hold jobserver
+  tokens, which then never return; the pipe was only topped up when the
+  server was completely idle. Now the action's cgroup is frozen, its
+  code-generation threads are counted (rustc names them `opt …`, `lto …`,
+  `copy …`; each holds a token, except possibly one per compiler running
+  on the compiler's own), the action is killed, and that many tokens less
+  one per compiler are put back. That is a lower bound, never too many;
+  whenever no action is running the pipe is settled to exactly its number
+  in both directions. Workers get a delegated cgroup in the rig for this.
+
+The timings report carries its figures as a data block, and
+`dev/sim-workers.py` replays them on other machine shapes (see STATUS,
+Workers).

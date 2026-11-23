@@ -771,6 +771,54 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
 // Server side
 // ---------------------------------------------------------------------------
 
+const NOBODY: u8 = 0;
+const REMOTE: u8 = 1;
+const LOCAL: u8 = 2;
+
+/// Which of two copies of one action is the one whose output is shown.
+#[derive(Default)]
+struct Voice {
+    owner: std::sync::atomic::AtomicU8,
+    changed: tokio::sync::Notify,
+}
+
+impl Voice {
+    fn owner(&self) -> u8 {
+        self.owner.load(Ordering::SeqCst)
+    }
+
+    /// `who` is about to produce output: true if it is (now) the copy being
+    /// shown.
+    fn claim(&self, who: u8) -> bool {
+        match self.owner.compare_exchange(NOBODY, who, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {
+                self.changed.notify_one();
+                true
+            }
+            Err(current) => current == who,
+        }
+    }
+}
+
+/// The observer of the local copy: silent unless it is the copy shown.
+struct Gated<'a> {
+    inner: &'a dyn Observer,
+    voice: &'a Voice,
+}
+
+impl Observer for Gated<'_> {
+    fn stdout(&self, data: &[u8]) {
+        if self.voice.claim(LOCAL) {
+            self.inner.stdout(data);
+        }
+    }
+    fn stderr_line(&self, line: &[u8], live: Option<&dyn Live>) {
+        if self.voice.claim(LOCAL) {
+            self.inner.stderr_line(line, live);
+        }
+    }
+}
+
 /// The files a compiler command names with `--extern [opts:]name=path`.
 fn extern_paths(argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -965,6 +1013,10 @@ pub struct PoolStats {
     pub worker_failures: AtomicU64,
     /// Dispatched, then run here because a local core fell idle first.
     pub hedged: AtomicU64,
+    /// Hedges where the local copy finished first.
+    pub hedge_won: AtomicU64,
+    /// Hedges whose local copy was stopped because the worker's was ahead.
+    pub hedge_stopped: AtomicU64,
     pub prefilled_entries: AtomicU64,
     pub lookups_served: AtomicU64,
     pub opens_served: AtomicU64,
@@ -1322,7 +1374,7 @@ impl Pool {
         spec: &ActionSpec,
         key: &Hash,
         req: &Request,
-        spoke: &std::sync::atomic::AtomicBool,
+        voice: &Voice,
     ) -> RunResult {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -1487,8 +1539,10 @@ impl Pool {
         let t_sent = t0.elapsed();
         let done = loop {
             let Some(ev) = rx.recv().await else { bail!("worker connection lost") };
-            if !matches!(ev, Event::Done(_)) {
-                spoke.store(true, Ordering::SeqCst);
+            if !matches!(ev, Event::Done(_)) && !voice.claim(REMOTE) {
+                // The local copy spoke first and is the one being shown;
+                // this run is about to be withdrawn.
+                std::future::pending::<()>().await;
             }
             match ev {
                 Event::Stdout(d) => {
@@ -1666,41 +1720,64 @@ impl RemoteRunner for Pool {
             }
             self.stats.dispatched.fetch_add(1, Ordering::Relaxed);
             engine.stats.remote_runs.fetch_add(1, Ordering::Relaxed);
-            // Hedge: should a local core fall idle before the worker has
-            // said anything for this action (it may be fetching a toolchain,
-            // or simply be slower), the action runs here instead. Once the
-            // worker's output has started, the remote run is kept: showing
-            // output twice, or announcing its metadata twice, is worse.
-            let spoke = std::sync::atomic::AtomicBool::new(false);
-            let remote = self.run_on(&w, engine, spec, key, req, &spoke);
-            tokio::pin!(remote);
-            let result = loop {
+            // Hedge: should a local core that nothing else wants fall idle
+            // while the worker has the action (it may be fetching a
+            // toolchain, or simply be slower), the action also runs here,
+            // and whichever copy finishes first is the result; the other is
+            // stopped. Only one copy may be heard: the first to produce
+            // output or announce metadata is kept and the other stopped at
+            // once, because showing output twice, or announcing two
+            // different metadata files, is worse than waiting.
+            let voice = Voice::default();
+            let gated = Gated { inner: &*req.observer, voice: &voice };
+            let mut remote = Some(Box::pin(self.run_on(&w, engine, spec, key, req, &voice)));
+            type Local<'f> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'f>>;
+            let mut local: Option<(Local<'_>, crate::sched::Permit, std::time::Instant)> = None;
+            loop {
+                match voice.owner() {
+                    REMOTE if local.is_some() => {
+                        self.stats.hedge_stopped.fetch_add(1, Ordering::Relaxed);
+                        local = None;
+                    }
+                    LOCAL => remote = None,
+                    _ => {}
+                }
                 tokio::select! {
-                    r = &mut remote => break r,
-                    permit = engine.sched.acquire(crate::sched::Priority::Idle, mem), if !spoke.load(Ordering::SeqCst) => {
-                        if spoke.load(Ordering::SeqCst) {
-                            drop(permit);
-                            continue;
+                    r = async { remote.as_mut().expect("guarded").await }, if remote.is_some() => match r {
+                        Ok(r) => {
+                            if local.is_some() {
+                                self.stats.hedge_stopped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Some(Ok(r));
                         }
-                        self.stats.hedged.fetch_add(1, Ordering::Relaxed);
-                        engine.stats.runs.fetch_add(1, Ordering::Relaxed);
-                        let started = std::time::Instant::now();
-                        let r = engine.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+                        Err(e) => {
+                            // The worker failed, not the action: run it here.
+                            eprintln!("rargod: worker {:x} failed `{}`: {e:#}; running locally", w.id, spec.label);
+                            self.stats.worker_failures.fetch_add(1, Ordering::Relaxed);
+                            engine.stats.remote_failed.fetch_add(1, Ordering::Relaxed);
+                            remote = None;
+                            if local.is_none() {
+                                return None;
+                            }
+                        }
+                    },
+                    r = async { (&mut local.as_mut().expect("guarded").0).await }, if local.is_some() => {
+                        let (_, permit, started) = local.take().expect("guarded");
                         drop(permit);
                         engine.note_action_wall(started.elapsed());
+                        self.stats.hedge_won.fetch_add(1, Ordering::Relaxed);
                         // Dropping `remote` withdraws the action from the worker.
                         return Some(r);
                     }
-                }
-            };
-            match result {
-                Ok(r) => Some(Ok(r)),
-                Err(e) => {
-                    // The worker failed, not the action: run it here.
-                    eprintln!("rargod: worker {:x} failed `{}`: {e:#}; running locally", w.id, spec.label);
-                    self.stats.worker_failures.fetch_add(1, Ordering::Relaxed);
-                    engine.stats.remote_failed.fetch_add(1, Ordering::Relaxed);
-                    None
+                    permit = engine.sched.acquire(crate::sched::Priority::Idle, mem),
+                        if local.is_none() && remote.is_some() && voice.owner() == NOBODY =>
+                    {
+                        self.stats.hedged.fetch_add(1, Ordering::Relaxed);
+                        engine.stats.runs.fetch_add(1, Ordering::Relaxed);
+                        let run: Local<'_> = Box::pin(engine.execute(spec, req.view.clone(), req.uid, req.gid, &gated));
+                        local = Some((run, permit, std::time::Instant::now()));
+                    }
+                    _ = voice.changed.notified() => {}
                 }
             }
         })

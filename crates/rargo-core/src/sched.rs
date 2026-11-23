@@ -9,13 +9,16 @@
 use parking_lot::{Condvar, Mutex};
 use std::collections::BinaryHeap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
     /// Only a core nothing else wants: a local copy of an action already
-    /// running on a worker. Not counted as waiting work.
+    /// running on a worker. Not counted as waiting work, and never served
+    /// ahead of a compiler's helper threads: it gets a token only once one
+    /// has lain unclaimed in the jobserver pipe.
     Idle = 0,
     /// Background work (drift checks, pre-warming).
     Background = 1,
@@ -69,7 +72,15 @@ pub struct Scheduler {
     mem_budget_kb: u64,
     pipe_r: OwnedFd,
     pipe_w: OwnedFd,
+    /// The read end again, non-blocking, for taking a token only if one is
+    /// there (the jobserver's own descriptor must stay blocking).
+    pipe_try: OwnedFd,
 }
+
+/// How long a token must lie unclaimed before an idle-priority request may
+/// have it. A helper thread blocked on the pipe takes a token the moment it
+/// appears, so one that is still there this much later is wanted by nobody.
+const IDLE_DWELL: std::time::Duration = std::time::Duration::from_millis(40);
 
 /// The right to run one action. Dropping it returns the token.
 pub struct Permit {
@@ -108,6 +119,13 @@ impl Scheduler {
         for _ in 0..tokens {
             write_token(pipe_w.as_raw_fd());
         }
+        // A second open file description of the same pipe: O_NONBLOCK set
+        // on a duplicate would apply to the jobserver's descriptor too.
+        let pipe_try: OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{}", pipe_r.as_raw_fd()))?
+            .into();
         let s = Arc::new(Scheduler {
             inner: Mutex::new(Inner {
                 running: 0,
@@ -124,6 +142,7 @@ impl Scheduler {
             mem_budget_kb,
             pipe_r,
             pipe_w,
+            pipe_try,
         });
         let weak = Arc::downgrade(&s);
         std::thread::Builder::new().name("jobserver".into()).spawn(move || broker(weak))?;
@@ -166,7 +185,7 @@ impl Scheduler {
             i.seq += 1;
             let seq = i.seq;
             i.waiters.push(Waiter { prio, seq, mem_kb, tx });
-            self.dispatch(&mut i);
+            self.dispatch(&mut i, false);
             self.wake_broker.notify_one();
             rx
         };
@@ -181,15 +200,18 @@ impl Scheduler {
         i.running == 0 || i.mem_kb + mem_kb <= self.mem_budget_kb
     }
 
-    /// Hands spare tokens to waiters. Called with the lock held.
-    fn dispatch(self: &Arc<Self>, i: &mut Inner) {
+    /// Hands spare tokens to waiters. Called with the lock held. Requests
+    /// at idle priority are passed over unless `idle_too`: a token an action
+    /// gives back belongs to whoever is waiting for the pipe before it
+    /// belongs to them.
+    fn dispatch(self: &Arc<Self>, i: &mut Inner, idle_too: bool) {
         let mut skipped: Vec<Waiter> = Vec::new();
         while i.spare_tokens > 0 {
             let Some(w) = i.waiters.pop() else { break };
             if w.tx.is_closed() {
                 continue;
             }
-            if !self.fits(i, w.mem_kb) {
+            if !self.fits(i, w.mem_kb) || (w.prio == Priority::Idle && !idle_too) {
                 skipped.push(w);
                 continue;
             }
@@ -219,15 +241,47 @@ impl Scheduler {
         // The token goes straight to the next waiter if there is one that
         // fits, otherwise back to the pipe for rustc's worker threads.
         i.spare_tokens += 1;
-        self.dispatch(&mut i);
+        self.dispatch(&mut i, false);
         self.return_spares(&mut i);
-        if i.running == 0 && i.waiters.is_empty() {
-            self.refill(&i);
+        self.wake_broker.notify_one();
+        if i.running == 0 {
+            self.reconcile(&mut i);
         }
     }
 
+    /// Puts back tokens that a killed process held and could not return
+    /// (see `cgroup::ActionGroup::helper_tokens`).
+    pub fn restore(self: &Arc<Self>, tokens: usize) {
+        let mut i = self.inner.lock();
+        i.spare_tokens += tokens;
+        self.dispatch(&mut i, false);
+        self.return_spares(&mut i);
+    }
+
+    /// Requests the broker fetches tokens for.
     fn wanted(&self, i: &Inner) -> usize {
-        i.waiters.iter().filter(|w| !w.tx.is_closed()).count()
+        i.waiters.iter().filter(|w| w.prio != Priority::Idle && !w.tx.is_closed()).count()
+    }
+
+    fn idle_wanted(&self, i: &Inner) -> bool {
+        i.waiters.iter().any(|w| w.prio == Priority::Idle && !w.tx.is_closed())
+    }
+
+    /// Tokens in the pipe right now.
+    fn in_pipe(&self) -> usize {
+        let mut avail: libc::c_int = 0;
+        // SAFETY: FIONREAD writes the number of readable bytes to `avail`.
+        if unsafe { libc::ioctl(self.pipe_r.as_raw_fd(), libc::FIONREAD, &mut avail) } != 0 {
+            return 0;
+        }
+        avail.max(0) as usize
+    }
+
+    /// Takes a token if one is there, without waiting.
+    fn try_take(&self) -> bool {
+        let mut b = 0u8;
+        // SAFETY: non-blocking read of one byte into a valid buffer.
+        unsafe { libc::read(self.pipe_try.as_raw_fd(), &mut b as *mut u8 as *mut _, 1) == 1 }
     }
 
     fn return_spares(&self, i: &mut Inner) {
@@ -238,18 +292,20 @@ impl Scheduler {
         }
     }
 
-    /// With nothing running, the pipe must hold every token. A process that
-    /// was killed while holding tokens never returned them; make up the
-    /// difference.
-    fn refill(&self, i: &Inner) {
-        let mut avail: libc::c_int = 0;
-        // SAFETY: FIONREAD writes the number of readable bytes to `avail`.
-        if unsafe { libc::ioctl(self.pipe_r.as_raw_fd(), libc::FIONREAD, &mut avail) } != 0 {
-            return;
-        }
-        let have = avail as usize + i.spare_tokens;
+    /// With no action running nobody can be holding a token: the pipe and
+    /// the scheduler's own spares must add up to all of them. A process
+    /// that was killed while holding tokens never returned them, and what
+    /// was put back on its behalf was an estimate; settle the difference
+    /// either way.
+    fn reconcile(&self, i: &mut Inner) {
+        let have = self.in_pipe() + i.spare_tokens;
         for _ in have..self.tokens {
             write_token(self.pipe_w.as_raw_fd());
+        }
+        for _ in self.tokens..have {
+            if !self.try_take() {
+                break;
+            }
         }
     }
 
@@ -269,6 +325,9 @@ fn broker(weak: std::sync::Weak<Scheduler>) {
         let Some(s) = weak.upgrade() else { return };
         {
             let mut i = s.inner.lock();
+            // A token seen in the pipe on the previous round, for idle
+            // requests.
+            let mut lay_unclaimed = false;
             loop {
                 if i.shutdown {
                     return;
@@ -276,7 +335,22 @@ fn broker(weak: std::sync::Weak<Scheduler>) {
                 if s.wanted(&i) > i.spare_tokens {
                     break;
                 }
-                s.wake_broker.wait_for(&mut i, std::time::Duration::from_secs(1));
+                if s.idle_wanted(&i) {
+                    // Nothing urgent, but someone would use a core nobody
+                    // wants: one that has stayed in the pipe for a while.
+                    if lay_unclaimed && s.in_pipe() > 0 && s.try_take() {
+                        i.spare_tokens += 1;
+                        s.dispatch(&mut i, true);
+                        s.return_spares(&mut i);
+                        lay_unclaimed = false;
+                        continue;
+                    }
+                    lay_unclaimed = s.in_pipe() > 0;
+                    s.wake_broker.wait_for(&mut i, IDLE_DWELL);
+                } else {
+                    lay_unclaimed = false;
+                    s.wake_broker.wait_for(&mut i, std::time::Duration::from_secs(1));
+                }
                 if Arc::strong_count(&s) == 1 {
                     return;
                 }
@@ -294,7 +368,7 @@ fn broker(weak: std::sync::Weak<Scheduler>) {
             return;
         }
         i.spare_tokens += 1;
-        s.dispatch(&mut i);
+        s.dispatch(&mut i, false);
         s.return_spares(&mut i);
     }
 }
@@ -305,6 +379,42 @@ mod tests {
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
+    }
+
+    #[test]
+    fn idle_requests_come_after_helper_threads() {
+        let s = Scheduler::new(1, u64::MAX).unwrap();
+        let [r, w] = s.jobserver_fds();
+        rt().block_on(async {
+            let running = s.acquire(Priority::Agent, 0).await;
+            let s2 = s.clone();
+            let idle = tokio::spawn(async move { s2.acquire(Priority::Idle, 0).await });
+            // A compiler's helper thread, blocked on the jobserver.
+            let (got_tx, got_rx) = std::sync::mpsc::channel();
+            let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
+            let helper = std::thread::spawn(move || {
+                let mut b = 0u8;
+                // SAFETY: blocking read of one byte into a valid buffer.
+                assert_eq!(unsafe { libc::read(r, &mut b as *mut u8 as *mut _, 1) }, 1);
+                got_tx.send(()).unwrap();
+                back_rx.recv().unwrap();
+                write_token(w);
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The action ends: its core goes to the helper, not to the idle
+            // request, however long that has been waiting.
+            drop(running);
+            tokio::task::spawn_blocking(move || got_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()).await.unwrap();
+            tokio::time::sleep(IDLE_DWELL * 5).await;
+            assert!(!idle.is_finished());
+            assert_eq!(s.snapshot().1, 0, "an idle request is not waiting work");
+            // The helper is done; now nobody wants the core.
+            back_tx.send(()).unwrap();
+            let p = tokio::time::timeout(std::time::Duration::from_secs(5), idle).await.unwrap().unwrap();
+            assert_eq!(s.snapshot().0, 1);
+            drop(p);
+            tokio::task::spawn_blocking(move || helper.join().unwrap()).await.unwrap();
+        });
     }
 
     #[test]

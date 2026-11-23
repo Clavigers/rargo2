@@ -230,6 +230,7 @@ impl Drop for InflightGuard<'_> {
 /// the process is gone.
 struct Teardown {
     fs: Arc<SandboxFs>,
+    sched: Arc<Scheduler>,
     zygote: Arc<Zygote>,
     action: Arc<ActionFs>,
     scratch: PathBuf,
@@ -244,15 +245,25 @@ impl Drop for Teardown {
             return;
         }
         let running = self.running.take();
-        if let Some(r) = &running {
-            self.zygote.kill(r.id);
-        }
         let (fs, action, scratch, group) = (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
-        // Waiting for a process to die is not something to do on whichever
-        // thread happened to drop the future.
+        let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
+        // Waiting for a process to stop and die is not something to do on
+        // whichever thread happened to drop the future.
         let work = move || {
+            // A compiler killed in the middle of code generation takes the
+            // jobserver tokens of its helper threads with it. Stop it
+            // first, count them, and put them back once it is dead.
+            let mut held = 0;
+            if let (Some(_), Some(g)) = (&running, &group) {
+                g.freeze();
+                held = g.helper_tokens();
+            }
             if let Some(r) = running {
+                zygote.kill(r.id);
                 let _ = r.done.blocking_recv();
+            }
+            if held > 0 {
+                sched.restore(held);
             }
             let _ = fs.finish_action(&action);
             drop(group);
@@ -633,6 +644,7 @@ impl Engine {
         // including the one where nobody waits for the result any more.
         let mut teardown = Teardown {
             fs: self.fs.clone(),
+            sched: self.sched.clone(),
             zygote: self.zygote.clone(),
             action: action.clone(),
             scratch: scratch.clone(),

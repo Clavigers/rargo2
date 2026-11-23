@@ -93,6 +93,45 @@ impl ActionGroup {
     pub fn cpu_us(&self) -> (u64, u64) {
         (self.stat("cpu.stat", &["user_usec"]), self.stat("cpu.stat", &["system_usec"]))
     }
+
+    /// Stops every process of the action where it stands, and waits (briefly)
+    /// until the kernel says they have stopped.
+    pub fn freeze(&self) {
+        if std::fs::write(self.dir.join("cgroup.freeze"), "1").is_err() {
+            return;
+        }
+        for _ in 0..50 {
+            if self.stat("cgroup.events", &["frozen"]) == 1 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A lower bound on the jobserver tokens the action's compilers hold
+    /// beyond their own. rustc runs each unit of code generation on a thread
+    /// named after the work (`opt …`, `lto …`, `copy …`); each such thread
+    /// holds a token, except that one per compiler may be running on the
+    /// compiler's own. A process killed in this state never gives them
+    /// back, so whoever kills it has to.
+    pub fn helper_tokens(&self) -> usize {
+        let Ok(procs) = std::fs::read_to_string(self.dir.join("cgroup.procs")) else { return 0 };
+        let mut held = 0;
+        for pid in procs.split_whitespace() {
+            let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+            let workers = tasks
+                .flatten()
+                .filter_map(|t| std::fs::read_to_string(t.path().join("comm")).ok())
+                .filter(|comm| is_codegen_thread(comm))
+                .count();
+            held += workers.saturating_sub(1);
+        }
+        held
+    }
+}
+
+fn is_codegen_thread(comm: &str) -> bool {
+    ["opt ", "lto ", "copy "].iter().any(|p| comm.starts_with(p))
 }
 
 impl Drop for ActionGroup {

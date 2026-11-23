@@ -52,7 +52,7 @@ start_workers() {
     i=1
     while [ "$i" -le "$n" ]; do
         mkdir -p "$T/w$i"
-        nohup systemd-run --scope -q -p CPUQuota=$((wj * 100))% -p MemoryMax=30G \
+        nohup systemd-run --scope -q -p CPUQuota=$((wj * 100))% -p MemoryMax=30G -p Delegate=yes \
             ip netns exec "rargo-w$i" "$B/rargod" --state "$T/w$i" --worker 10.77.0.1:7711 --worker-key "$T/link.key" --jobs "$wj" \
             >"$T/w$i.log" 2>&1 &
         i=$((i + 1))

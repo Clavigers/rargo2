@@ -1973,8 +1973,15 @@ impl Run {
             .units
             .iter()
             .zip(times)
-            .filter(|(u, t)| u.cmd.is_some() && t.end.is_some())
-            .map(|(u, time)| crate::timings::Row { name: format!("{} {}", u.pkg_name, u.desc), time })
+            .enumerate()
+            .map(|(index, (u, time))| crate::timings::Row {
+                runs: u.cmd.is_some() && u.kind != rp::UnitKind::Noop,
+                name: format!("{} {}", u.pkg_name, u.desc),
+                time,
+                index,
+                deps: u.deps.iter().map(|d| (d.unit as usize, d.only_rmeta)).collect(),
+                needs_objects: u.needs_objects,
+            })
             .collect();
         let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let stamp = crate::timings::stamp(unix);
