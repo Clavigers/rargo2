@@ -119,12 +119,14 @@ fn join(rel: &[u8], name: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Whether a policy pattern excludes `rel`: a pattern with a slash is a path
-/// from the root, one without matches that name at any depth.
+/// Whether a policy pattern excludes `rel`: a pattern with a slash (also
+/// just a leading one) is a path from the root, one without matches that
+/// name at any depth.
 fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
     patterns.iter().any(|p| {
+        let anchored = p.trim_end_matches('/').contains('/');
         let p = p.trim_matches('/').as_bytes();
-        if p.contains(&b'/') { p == rel } else { p == name }
+        if anchored { p == rel } else { p == name }
     })
 }
 
@@ -306,9 +308,11 @@ mod tests {
         write(r, "docs/node_modules/x", "junk");
         write(r, "vendor/skip/me", "junk");
         write(r, "vendor/keep/me", "kept");
+        write(r, "cache/x", "at the root: excluded");
+        write(r, "docs/cache/y", "deeper: kept");
         std::os::unix::fs::symlink("src", r.join("link")).unwrap();
         std::fs::create_dir(r.join("empty")).unwrap();
-        let exclude = vec!["node_modules".to_string(), "vendor/skip".to_string()];
+        let exclude = vec!["node_modules".to_string(), "vendor/skip".to_string(), "/cache".to_string()];
         let s = scan(r, &Index::default(), &exclude, None).unwrap();
         let top = tree(&s, &s.root);
         let names: Vec<&str> = top.entries.iter().map(|(n, _)| std::str::from_utf8(n).unwrap()).collect();
@@ -317,11 +321,11 @@ mod tests {
         let Some(Node::Dir(sub)) = top.get(b"sub") else { panic!() };
         assert_eq!(tree(&s, sub).entries.len(), 1);
         let Some(Node::Dir(docs)) = top.get(b"docs") else { panic!() };
-        assert!(tree(&s, docs).entries.is_empty());
+        assert_eq!(tree(&s, docs).entries.len(), 1, "only docs/cache");
         let Some(Node::Dir(vendor)) = top.get(b"vendor") else { panic!() };
         assert_eq!(tree(&s, vendor).entries.len(), 1);
-        assert_eq!(s.file_count, 4);
-        assert_eq!(s.hashed_files, 4);
+        assert_eq!(s.file_count, 5);
+        assert_eq!(s.hashed_files, 5);
         assert!(s.index_changed);
         let lib = *blake3::hash(b"pub fn a() {}").as_bytes();
         assert_eq!(s.files[&lib], (r.join("src/lib.rs"), 13));

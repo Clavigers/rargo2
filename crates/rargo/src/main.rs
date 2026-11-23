@@ -485,6 +485,11 @@ fn main() {
     };
     let mut local = Local { wt_cache: cache.join("wt").join(&wt_id), asked: load_asked(&cache), cache };
     let policy = if admin.is_some() { Policy::default() } else { load_policy(&root) };
+    let mut policy = policy;
+    // The client's own cache, should someone keep it inside the worktree.
+    if let Ok(inside) = local.cache.canonicalize().unwrap_or_else(|_| local.cache.clone()).strip_prefix(&root) {
+        policy.exclude.push(format!("/{}", inside.to_string_lossy()));
+    }
     let head = if admin.is_some() { None } else { git::head(&root) };
     let thin_git = match &head {
         Some(h) if policy.git => git::thin(&root, h, &local.cache),
@@ -786,4 +791,98 @@ fn exec(mut e: ExecRequest) -> ! {
     let err = cmd.exec();
     eprintln!("error: could not execute process `{}` (never executed)\n\nCaused by:\n  {err}", e.program);
     std::process::exit(101)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// A server that completes the handshake, asks for one file's content
+    /// and reports what the client answered.
+    fn fake_server(want: Digest) -> (String, std::thread::JoinHandle<Vec<ClientMsg>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut head = [0u8; 9];
+            s.read_exact(&mut head).unwrap();
+            assert_eq!(&head[..8], secure::MAGIC);
+            let mut user = vec![0u8; head[8] as usize];
+            s.read_exact(&mut user).unwrap();
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).unwrap();
+            let mut msg1 = vec![0u8; u16::from_le_bytes(len) as usize];
+            s.read_exact(&mut msg1).unwrap();
+            let (msg2, early, mut sealer, mut opener) = secure::server_accept(&secure::open_psk(), &msg1).unwrap();
+            let mut reply = vec![0u8];
+            reply.extend_from_slice(&(msg2.len() as u16).to_le_bytes());
+            reply.extend_from_slice(&msg2);
+            s.write_all(&reply).unwrap();
+            let run: ClientMsg = rargo_proto::decode(&zstd::stream::decode_all(&early[..]).unwrap()).unwrap();
+            let mut got = vec![run];
+            secure::write_msg(&mut s, &mut sealer, &rargo_proto::encode(&ServerMsg::WantBlobs(vec![want]))).unwrap();
+            while let Ok(Some(m)) = secure::read_msg(&mut s, &mut opener) {
+                let m: ClientMsg = rargo_proto::decode(&m).unwrap();
+                let done = matches!(m, ClientMsg::Changed | ClientMsg::Blobs(_));
+                got.push(m);
+                if done {
+                    break;
+                }
+            }
+            let _ = secure::write_msg(&mut s, &mut sealer, &rargo_proto::encode(&ServerMsg::Exit(0)));
+            got
+        });
+        (addr, handle)
+    }
+
+    fn request(root: &Path, tree: Digest) -> RunRequest {
+        RunRequest {
+            version: PROTO_VERSION,
+            args: vec!["build".into()],
+            root: root.to_string_lossy().into_owned(),
+            cwd: root.to_string_lossy().into_owned(),
+            cargo_home: "/nowhere".into(),
+            env: vec![],
+            env_checked: vec![],
+            stdout_tty: false,
+            stderr_tty: false,
+            worktree: "test".into(),
+            commits: vec![],
+            tree,
+            home_files: vec![],
+            who: "test@test".into(),
+        }
+    }
+
+    #[test]
+    fn a_file_that_changed_since_the_scan_restarts_the_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "before").unwrap();
+        let scanned = scan::scan(&root, &scan::Index::default(), &[], None).unwrap();
+        let before = *blake3::hash(b"before").as_bytes();
+        let cache = tmp.path().join("cache");
+        let mut local = Local { wt_cache: cache.join("wt"), asked: vec![], cache };
+
+        // Unchanged: the content is sent as scanned.
+        let (addr, server) = fake_server(before);
+        let cfg = Config { server: addr, user: "t".into(), psk: secure::open_psk() };
+        let out = converse(&cfg, &request(&root, scanned.root), &mut local, Some(&scanned)).unwrap();
+        assert!(matches!(out, Outcome::Exit(0)));
+        let got = server.join().unwrap();
+        assert!(matches!(&got[0], ClientMsg::Run(r) if r.tree == scanned.root));
+        let ClientMsg::Blobs(blobs) = &got[1] else { panic!("{:?}", got[1]) };
+        assert_eq!(blobs[0].hash, before);
+
+        // Edited after the scan: the client says so instead of sending
+        // content under the wrong hash, and the command starts over.
+        std::fs::write(root.join("a.rs"), "after!").unwrap();
+        let (addr, server) = fake_server(before);
+        let cfg = Config { server: addr, user: "t".into(), psk: secure::open_psk() };
+        let out = converse(&cfg, &request(&root, scanned.root), &mut local, Some(&scanned)).unwrap();
+        assert!(matches!(out, Outcome::Changed));
+        assert!(matches!(server.join().unwrap()[1], ClientMsg::Changed));
+    }
 }
