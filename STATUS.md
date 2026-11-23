@@ -22,17 +22,19 @@ pending.
 | Git snapshots with inotify-maintained overlay | done, tested |
 | Cargo fork: planning mode, parse service | done, exercised on rust-analyzer, Ruff, Bevy |
 | Trace cache, in-flight dedup, declared env vars | done, tested |
-| Scheduler: priorities, memory admission, shared jobserver | done, unit-tested; memory figures are rusage, not cgroup |
-| `rargo build / check / test / run / clippy`, JSON messages | done, e2e-tested (52 checks) |
+| Scheduler: priorities, memory admission, shared jobserver | done, unit-tested |
+| Per-action cgroups (exact CPU, memory of all processes) | done, active in e2e and benchmarks when the daemon's cgroup is delegated |
+| `rargo build / check / test / run / clippy / doc`, JSON messages | done, e2e-tested (`dev/e2e.sh`, 72 checks) |
 | Shared incremental compilation | done, e2e-tested, in the 20-agent benchmark |
-| Per-repo policy file (`.rargo.toml`) | done, unit-tested; not yet in an e2e test |
+| Per-repo policy file (`.rargo.toml`) | done, e2e-tested (env pass-through, test network, malformed file) |
 | Flake-restricted sandboxes | done, e2e-tested (`dev/e2e-flake.sh`, 14 checks) |
 | Cache export/import between machines | done, e2e-tested |
 | Verify mode and drift check | done, exercised on the test workspace |
-| Workers: UDP session, chunked transfer, dispatch | done, functional over a netem link; not benchmarked yet |
-| `cargo` shim | client supports being installed as `cargo`; not yet e2e-tested |
-| Cold tier (chunk-level storage of old blobs) | not started |
-| rustc fork work (phase 5) | not started; see "Phase 5 evidence" |
+| Workers: UDP session, chunked transfer, dispatch, keyed authentication | done, functional over a netem link; benchmark pending |
+| `cargo` shim | done, e2e-tested (routing, passthrough, fallback without a daemon) |
+| Cold tier (chunk-level storage of idle blobs) | done, unit- and e2e-tested, measured on the Ruff swarm store |
+| rustc fork (phase 5) | three patches, built and linked as toolchain `rargo`; see "Phase 5" |
+| `check` as a build that stops at metadata (fork only) | done, measured on rust-analyzer (D23) |
 
 ## Measurements
 
@@ -203,18 +205,48 @@ the toolchain (about nine seconds on loopback); remote actions have no
 incremental seed; flake-rooted and host-network actions are never sent to
 workers; there is no authentication on the worker port.
 
-## Phase 5 evidence
+## Phase 5
 
-Measurements that justify (or not) each phase 5 item, collected so far:
+What each item of the design's phase 5 became, and the measurement behind
+it (decisions D22 to D24).
 
-- Stable object names: rlibs built incrementally differ between identical
-  compilations only in member names (see verify). A recompiled-but-unchanged
-  library therefore relinks every binary that uses it.
-- Metadata and codegen as separate cached actions: in the swarm, `check`
-  (23.7 s) followed later by `build` (67.5 s) compiles every dependency's
-  front end twice, once per mode.
-- Body-only-edit-stable metadata, object caching per codegen unit, and a
-  deduplicating incremental format: not yet measured.
+- **Metadata stable under body-only edits.** rustc 1.100 fork, patch 1. On
+  a three-function library, stock 1.100 changed the `.rmeta` on every edit
+  tried; with the fork, edits that keep line numbers of later code (a
+  changed literal, a longer line, an edit in the last function) keep the
+  crate hash, and rargo observes fork metadata by crate hash, so dependents
+  are not rerun. Adding lines inside a body still changes the hash, by
+  design (line numbers of inlined and generic code end up in dependents).
+  A dependent compiled against the old and the new `.rmeta` produced
+  byte-identical metadata; a diagnostic pointing into the edited crate
+  showed the right line. The effect on real history is being measured by
+  replaying 30 rust-analyzer commits with each compiler (`dev/replay.py`).
+- **Separately cached metadata and codegen.** `check` with the fork runs the
+  build's own compiler commands with `-Zno-codegen` (byte-identical
+  metadata to the full build, verified), so a check after a build or test
+  is free: on rust-analyzer 0.03 s instead of a 31 s cold check. The first
+  check of a crate costs more (47 s against 31 s cold), and a build after a
+  check gains little (55 s against 58 s).
+- **Per-codegen-unit object caching.** Not a separate mechanism: rustc's
+  incremental work products plus the file-level store already keep each
+  object file once (2.6 GiB logical, 0.23 GiB stored in the Ruff swarm). The
+  fork's patch 2 makes incrementally built rlibs reproducible (member names
+  without the per-session random string), so an unchanged library rebuilt
+  from scratch no longer relinks its dependents.
+- **Incremental state that deduplicates between snapshots.** Done in the
+  store instead of the compiler: the cold tier. The Ruff swarm store's
+  21.8 GiB of incremental state is 6.9 GiB as compressed chunks; the whole
+  store went from 28.8 GiB to 3.9 GiB.
+- **Persistent in-memory cargo graph.** Not built. Planning is itself a
+  cached action: a no-op `build` of rust-analyzer takes 0.02 s end to end,
+  and the plan is decoded once per distinct plan (`plans decoded` in the
+  status). A resident graph would save the planner run after edits that
+  change a manifest, which the benchmarks do not do.
+
+Fork compiler cost: it is built without profile-guided optimisation, and
+`cargo check` of rust-analyzer takes 91 CPU-seconds with it against 64 with
+the official 1.100.0. Fork measurements compare the fork with itself or say
+which compiler they used.
 
 ## Bugs found by running real builds (kept here because they say what to
 ## distrust)
@@ -231,3 +263,9 @@ Measurements that justify (or not) each phase 5 item, collected so far:
   manifest listed its output directory. Fixed in the output layer.
 - A view file truncated by an action was recorded with size 0, so that
   action never hit the cache again. Fixed.
+- `rargo doc` never placed documentation into `target/doc`, and rustdoc's
+  cross-crate files would have covered one crate each. Found by a new e2e
+  check; fixed by chaining rustdoc runs per output directory (D25).
+- Actions were moved into their cgroup by the parent after the fork, so a
+  fast-starting action's CPU time was mostly accounted elsewhere. Fixed:
+  the child moves itself before it forks anything.
