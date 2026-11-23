@@ -7,7 +7,12 @@ overlapping check / test / build commands with edits in between.
 Prints wall time, CPU time and disk use. `stock` gives every worktree its own
 target directory, which is what a swarm of agents using plain cargo gets.
 CPU time is read from the cgroup the work ran in: this script's own cgroup
-for stock (run it under `systemd-run --scope`), rargod's for rargo.
+for stock (run it under `systemd-run --scope`), the server's for rargo (the
+clients' own CPU time is reported separately).
+
+In rargo mode the agents are clients of the build server at RARGO_SERVER
+whose state directory is RARGO_STATE; with --netns they run in that network
+namespace (see dev/netns.sh), so every byte crosses the shaped link.
 """
 import argparse, os, subprocess, sys, time, shutil, threading, json
 
@@ -65,9 +70,9 @@ def du(path):
     real = subprocess.run(["du", "-sB1", path], capture_output=True, text=True).stdout.split()
     return (int(out[0]) if out else 0, int(real[0]) if real else 0)
 
-def agent(i, wt, cfg, mode, env, log, results, edit_kind="api"):
+def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=()):
     def run(args):
-        cmd = ([RARGO] if mode == "rargo" else ["cargo"]) + args
+        cmd = (list(prefix) + [RARGO] if mode == "rargo" else ["cargo"]) + args
         if mode == "stock":
             cmd.append("--offline")
         t = time.time()
@@ -119,6 +124,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--label", default=None, help="recorded with the result")
     ap.add_argument("--toolchain", default=None, help="RUSTUP_TOOLCHAIN for the agents")
+    ap.add_argument("--netns", default=None, help="network namespace the rargo clients run in")
     ap.add_argument("--edit", default="api", choices=["api", "body"],
                     help="api: both edits add a public function; body: the second edit changes only a function body")
     a = ap.parse_args()
@@ -141,12 +147,12 @@ def main():
     if a.toolchain:
         env["RUSTUP_TOOLCHAIN"] = a.toolchain
     daemon_pid = None
+    prefix = ["ip", "netns", "exec", a.netns] if a.netns else []
+    state = env.get("RARGO_STATE", os.path.join(WORK, "state"))
+    client_cache = os.path.join(root, "client-cache")
     if a.mode == "rargo":
-        sock = env.get("RARGO_SOCKET", os.path.join(WORK, "state", "rargod.sock"))
-        env["RARGO_SOCKET"] = sock
-        # The daemon serving this socket (others may be running).
-        state = os.path.dirname(sock)
-        daemon_pid = None
+        env["RARGO_CACHE_DIR"] = client_cache
+        # The server with this state directory (others may be running).
         for pid in subprocess.run(["pgrep", "-x", "rargod"], capture_output=True, text=True).stdout.split():
             try:
                 cmdline = open(f"/proc/{pid}/cmdline").read().split("\0")
@@ -159,27 +165,41 @@ def main():
         cpu0 = cgroup_cpu_usec(daemon_pid)
     else:
         cpu0 = cgroup_cpu_usec(os.getpid())
+    self0 = os.times()
 
     results = {}
     logs = [open(os.path.join(root, f"agent{i:02d}.log"), "wb") for i in range(a.agents)]
     t0 = time.time()
-    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit)) for i in range(a.agents)]
+    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, prefix)) for i in range(a.agents)]
     for t in threads: t.start()
     for t in threads: t.join()
     wall = time.time() - t0
     cpu1 = cgroup_cpu_usec(daemon_pid) if a.mode == "rargo" else cgroup_cpu_usec(os.getpid())
 
+    self1 = os.times()
+    client_cpu = (self1.children_user + self1.children_system) - (self0.children_user + self0.children_system)
     failures = [(i, s) for i, steps in results.items() for s in steps if s[1] != 0]
-    apparent = real = 0
-    for wt in wts:
-        ap_, re_ = du(os.path.join(wt, "target"))
-        apparent += ap_; real += re_
+    targets = [os.path.join(wt, "target") for wt in wts]
+    # One `du` over everything on the client side, so that an artifact
+    # shared between worktrees through the client's cache counts once.
+    def du_all(paths):
+        paths = [p for p in paths if os.path.exists(p)]
+        if not paths:
+            return 0
+        out = subprocess.run(["du", "-scB1"] + paths, capture_output=True, text=True).stdout.strip().splitlines()
+        return int(out[-1].split()[0]) if out else 0
+    real = du_all(targets + [client_cache])
+    apparent = sum(du(t)[0] for t in targets)
     store = (0, 0)
     store_after_gc = (0, 0)
+    sync_line = ""
     if a.mode == "rargo":
-        store = du(os.path.join(os.path.dirname(env["RARGO_SOCKET"]), "store"))
-        subprocess.run([RARGO, "--rargo-gc"], env=env, capture_output=True)
-        store_after_gc = du(os.path.join(os.path.dirname(env["RARGO_SOCKET"]), "store"))
+        store_dir = env.get("RARGO_STORE", os.path.join(state, "store"))
+        store = du(store_dir)
+        status = subprocess.run(prefix + [RARGO, "--rargo-status"], env=env, capture_output=True, text=True).stdout
+        sync_line = next((l for l in status.splitlines() if l.startswith("sync")), "")
+        subprocess.run(prefix + [RARGO, "--rargo-gc"], env=env, capture_output=True)
+        store_after_gc = du(store_dir)
     per_step = {}
     for steps in results.values():
         for n, (name, rc, dt) in enumerate(steps):
@@ -187,10 +207,12 @@ def main():
     summary = dict(
         repo=a.repo, mode=a.mode, agents=a.agents, label=a.label, toolchain=a.toolchain, edit=a.edit,
         wall_s=round(wall, 1), cpu_s=round((cpu1 - cpu0) / 1e6, 1),
-        worktree_target_bytes=real, worktree_target_apparent_bytes=apparent,
+        client_cpu_s=round(client_cpu, 1) if a.mode == "rargo" else 0,
+        client_bytes=real, worktree_target_apparent_bytes=apparent,
         store_bytes=store[1],
         store_after_gc_bytes=store_after_gc[1],
-        disk_total_bytes=(real if a.mode == "stock" else store[1]),
+        disk_total_bytes=real + store[1],
+        netns=a.netns, sync=sync_line,
         failures=len(failures),
         # Which step of which agent, and the end of that agent's log.
         failed_steps=[dict(agent=i, step=st[0], rc=st[1],

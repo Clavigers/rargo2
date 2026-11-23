@@ -1,13 +1,18 @@
 #!/bin/sh
-# A server and workers in separate network namespaces on one machine, joined
-# by veth pairs with injected latency, loss and a rate limit (tc netem).
-# Nothing is configured in the host's own network namespace.
+# A server, its workers and a client machine in separate network namespaces
+# on one machine, joined by veth pairs with injected latency, loss and a
+# rate limit (tc netem). Nothing is configured in the host's own network
+# namespace.
 #
 #   dev/netns.sh up SERVER_JOBS WORKER_JOBS [N_WORKERS] [DELAY_MS] [LOSS_PCT] [RATE]
 #   dev/netns.sh reset-server     (fresh server state, workers keep theirs)
 #   dev/netns.sh down
 #
-# The server's client socket is $RARGO_WORK/nstest/srv/rargod.sock.
+# The client's link is shaped separately: CLIENT_DELAY_MS (each way, default
+# 1), CLIENT_LOSS_PCT (default 0) and CLIENT_RATE (default 1gbit).
+# Clients run as `ip netns exec rargo-cl` with the variables in
+# $RARGO_WORK/nstest/client.env; the server cannot see the directories named
+# in RARGO_HIDE.
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
@@ -22,10 +27,17 @@ down() {
 }
 start_server() {
     mkdir -p "$T/srv"
-    nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G \
-        ip netns exec rargo-srv "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
+    hide=""
+    for d in ${RARGO_HIDE:-}; do mkdir -p "$d"; hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
+    nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G -p Delegate=yes \
+        ip netns exec rargo-srv unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
+        "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
+        --listen 10.77.0.1:7459 --keys "$T/keys" --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
-    sleep 1
+    for i in $(seq 1 100); do
+        grep -q "serving clients" "$T/srv.log" 2>/dev/null && break
+        sleep 0.1
+    done
 }
 start_workers() {
     i=1
@@ -64,13 +76,28 @@ up)
         ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${delay}ms" loss "${loss}%" rate "$rate"
         i=$((i + 1))
     done
+    # The client machine.
+    ip netns add rargo-cl
+    ip -n rargo-cl link set lo up
+    ip link add vcl netns rargo-srv type veth peer name eth0 netns rargo-cl
+    ip -n rargo-srv link set vcl master br0
+    ip -n rargo-srv link set vcl up
+    ip -n rargo-cl addr add 10.77.0.200/24 dev eth0
+    ip -n rargo-cl link set eth0 up
+    cdelay=${CLIENT_DELAY_MS:-1}; closs=${CLIENT_LOSS_PCT:-0}; crate=${CLIENT_RATE:-1gbit}
+    ip netns exec rargo-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate"
+    ip netns exec rargo-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate"
     head -c 32 /dev/urandom >"$T/link.key"
-    echo "sj=$sj wj=$wj n=$n" >"$T/params"
+    secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    echo "bench $secret admin" >"$T/keys"
+    printf 'export RARGO_SERVER=10.77.0.1:7459 RARGO_USER=bench RARGO_KEY=%s RARGO_STATE=%s\n' "$secret" "$T/srv" >"$T/client.env"
+    echo "sj=$sj wj=$wj n=$n RARGO_HIDE='${RARGO_HIDE:-}'" >"$T/params"
     start_server
     start_workers
     sleep 2
     cat "$T/srv.log"
     [ "$n" -ge 1 ] && ip netns exec rargo-w1 ping -c 3 -q 10.77.0.1 | tail -2
+    ip netns exec rargo-cl ping -c 3 -q 10.77.0.1 | tail -1
     true
     ;;
 reset-server)

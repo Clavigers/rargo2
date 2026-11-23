@@ -1,10 +1,12 @@
 #!/bin/bash
 # Flake-restricted sandboxes and cache portability between "machines".
 #
-# Two rargod instances with separate state directories, worktrees at
-# different paths and different cargo homes stand in for two machines. A
-# build on A is exported, imported on B, and B must then build the same
-# commit without running any compiler, build script or test.
+# Two build servers with separate state directories and cargo homes, each
+# with a client whose worktree is at a different path and hidden from both
+# servers, stand in for two sites. A build on A is exported, imported on B,
+# and B must then build the same commit without running any compiler, build
+# script or test. The project has a registry dependency, so the servers
+# also fetch it themselves.
 #
 # Needs Nix with flakes and network access for the first evaluation.
 set -u
@@ -20,12 +22,14 @@ ok() { checks=$((checks + 1)); echo "  ok   $1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/       | /' | head -30; }
 has() { grep -qF -- "$2" <<<"$1"; }
 
+port() { case $1 in a) echo 7471 ;; b) echo 7472 ;; esac; }
 daemon() { # name action
-    RARGO_STATE=$T/state-$1 "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
+    RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
+        RARGO_HIDE="$T/a $T/b $T/home-a $T/home-b" "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
 }
 on() { # machine, command...
     local m=$1; shift
-    RARGO_SOCKET=$T/state-$m/rargod.sock HOME=$T/home-$m CARGO_HOME=$T/home-$m/.cargo "$@"
+    RARGO_SERVER=127.0.0.1:$(port "$m") RARGO_CACHE_DIR=$T/home-$m/.cache/rargo HOME=$T/home-$m CARGO_HOME=$T/home-$m/.cargo "$@"
 }
 runs() { on "$1" "$R" --rargo-status | awk '/^actions run/ {print $3}'; }
 
@@ -88,7 +92,7 @@ git -C "$P" add -A
 git -C "$P" add -A
 git -C "$P" -c user.name=t -c user.email=t@t commit -q -m init
 
-echo "== machine A: flake build"
+echo "== site A: flake build"
 daemon a start || { echo "cannot start rargod A"; exit 1; }
 cd "$P"
 out=$(on a "$R" build 2>&1); rc=$?
@@ -115,7 +119,7 @@ echo "== export from A"
 out=$(on a "$R" --rargo-export "$T/export" 2>&1)
 has "$out" "exported" && ok "$out" || bad "export" "$out"
 
-echo "== machine B: different paths, different cargo home, separate store"
+echo "== site B: another server, a client at a different path, separate store and cargo home"
 Q=$T/b/somewhere/else/checkout
 git clone -q "$P" "$Q"
 daemon b start || { echo "cannot start rargod B"; exit 1; }

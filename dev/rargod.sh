@@ -26,7 +26,7 @@ start)
     # server then runs in its own mount namespace with an empty file system
     # over each of them.
     hide=""
-    for d in ${RARGO_HIDE:-}; do hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
+    for d in ${RARGO_HIDE:-}; do mkdir -p "$d"; hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
     nohup systemd-run --scope -q --unit "rargod-dev-$$" -p "CPUQuota=${RARGO_CPU_QUOTA:-2400%}" -p "MemoryMax=${RARGO_MEMORY_MAX:-90G}" -p Delegate=yes \
         unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
         "${RARGO_BIN:-$repo/target/release}/rargod" --state "$state" --listen "$addr" \

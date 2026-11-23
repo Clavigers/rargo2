@@ -44,6 +44,7 @@ fn main() {
                 println!("step exec {kind:?} unit={unit} rerun=`{rerun}`\n   {} {}", cmd.program, cmd.args.join(" "))
             }
             rargo_plan::Step::Run { display, .. } => println!("step run {display}"),
+            rargo_plan::Step::Open { cmd } => println!("step open {} {}", cmd.program, cmd.args.join(" ")),
         }
     }
 }

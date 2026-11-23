@@ -331,7 +331,6 @@ impl Engine {
                     match (self.content.known_hash(&f.src), &f.src) {
                         (Some(hash), _) => h.field(&hash.0),
                         (None, FileSrc::Host { sig, .. }) => h.field(&bincode::serialize(sig).unwrap()),
-                        (None, FileSrc::Git { oid, .. }) => h.field(oid),
                         (None, FileSrc::Blob(b)) => h.field(&b.0),
                         (None, FileSrc::Lazy(_)) => h.field(b"?"),
                     }

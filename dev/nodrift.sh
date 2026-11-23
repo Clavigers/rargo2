@@ -1,9 +1,11 @@
 #!/bin/bash
 # No-drift check for a benchmark repository: after rargo has built and tested
-# it, the repository must still build and test with stock cargo, in the same
-# worktree and the same target directory rargo linked artifacts into.
+# it through a build server, the repository must still build and test with
+# stock cargo, in the same worktree and the same target directory rargo
+# placed artifacts into.
 #   dev/nodrift.sh REPO 'test args for stock cargo' ['rargo test args']
-# Needs a running rargod (RARGO_SOCKET) and RARGO_BIN.
+# Needs a running build server (RARGO_SERVER and, if it wants one,
+# RARGO_KEY) and RARGO_BIN.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 . "$work/env.sh"
@@ -22,7 +24,7 @@ cap() { systemd-run --scope -q -p CPUQuota=2400% -p MemoryMax=90G "$@"; }
 before=$(git status --porcelain | grep -v '^??' | sort)
 step "rargo build" "$R" build
 step "rargo test $rtests" "$R" test $rtests
-step "rargo: drift check (stock cargo plan vs rargo)" "$R" --rargo-drift-check
+step "rargo: drift check on the server (stock cargo vs rargo)" "$R" --rargo-drift-check
 after=$(git status --porcelain | grep -v '^??' | sort)
 [ "$before" = "$after" ] && say "tracked files untouched by rargo" ok || { say "tracked files untouched by rargo" FAILED; fails=$((fails + 1)); }
 untracked=$(git status --porcelain --ignored | grep -v ' target/$' | grep -v '^!! target' || true)

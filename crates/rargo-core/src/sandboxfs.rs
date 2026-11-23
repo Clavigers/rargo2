@@ -1258,7 +1258,7 @@ impl Filesystem for SandboxFs {
                 let key = match &info.src {
                     FileSrc::Blob(h) => Some(BackingKey::Blob(*h)),
                     FileSrc::Host { sig, .. } => Some(BackingKey::Host(*sig)),
-                    FileSrc::Git { .. } | FileSrc::Lazy(_) => {
+                    FileSrc::Lazy(_) => {
                         self.content.known_hash(&info.src).map(BackingKey::Blob)
                     }
                 };

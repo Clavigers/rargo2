@@ -108,7 +108,7 @@ impl HostSig {
     }
 }
 
-/// A blob that can be produced on demand (a git object).
+/// A blob that can be produced on demand.
 pub trait LazyBlob: Send + Sync {
     /// Writes the content into the store and returns its hash.
     fn materialize(&self, store: &Store) -> io::Result<Hash>;
@@ -121,8 +121,6 @@ pub enum FileSrc {
     Blob(Hash),
     /// A file on the host, read in place.
     Host { path: Arc<Path>, sig: HostSig },
-    /// A git blob, identified by object id, extracted on first use.
-    Git { oid: [u8; 20], blob: Arc<dyn LazyBlob> },
     /// Content whose hash is only known once it is fetched (a file on the
     /// server, seen from a worker).
     Lazy(Arc<dyn LazyBlob>),
@@ -133,7 +131,6 @@ impl std::fmt::Debug for FileSrc {
         match self {
             FileSrc::Blob(h) => write!(f, "Blob({h:?})"),
             FileSrc::Host { path, .. } => write!(f, "Host({})", path.display()),
-            FileSrc::Git { oid, .. } => write!(f, "Git({:02x}{:02x}..)", oid[0], oid[1]),
             FileSrc::Lazy(_) => write!(f, "Lazy"),
         }
     }
@@ -264,7 +261,6 @@ pub type Fetcher = Arc<dyn Fn(&Hash) -> io::Result<()> + Send + Sync>;
 pub struct Content {
     pub store: Arc<Store>,
     host_hashes: DashMap<HostSig, Hash>,
-    git_hashes: DashMap<[u8; 20], Hash>,
     /// On a worker: how to get a blob the server has and we do not.
     fetcher: std::sync::OnceLock<Fetcher>,
     meta_ids: DashMap<Hash, Option<Hash>>,
@@ -275,7 +271,6 @@ impl Content {
         Content {
             store,
             host_hashes: DashMap::new(),
-            git_hashes: DashMap::new(),
             fetcher: std::sync::OnceLock::new(),
             meta_ids: DashMap::new(),
         }
@@ -345,7 +340,7 @@ impl Content {
                 let sig = HostSig::of(&f.metadata()?);
                 Ok((f, BackingKey::Host(sig), FileSrc::Host { path: path.clone(), sig }))
             }
-            FileSrc::Git { .. } | FileSrc::Lazy(_) => {
+            FileSrc::Lazy(_) => {
                 let h = self.hash(src)?;
                 Ok((self.open_blob(&h)?, BackingKey::Blob(h), FileSrc::Blob(h)))
             }
@@ -365,15 +360,6 @@ impl Content {
                 self.host_hashes.insert(*sig, h);
                 Some(h)
             }
-            FileSrc::Git { oid, .. } => {
-                if let Some(h) = self.git_hashes.get(oid) {
-                    return Some(*h);
-                }
-                let v = self.db().get(crate::db::Table::GitOids, oid)?;
-                let h = Hash(v[..].try_into().ok()?);
-                self.git_hashes.insert(*oid, h);
-                Some(h)
-            }
             FileSrc::Lazy(_) => None,
         }
     }
@@ -383,11 +369,6 @@ impl Content {
     /// source was created with.
     pub fn hash(&self, src: &FileSrc) -> io::Result<Hash> {
         if let Some(h) = self.known_hash(src) {
-            if let FileSrc::Git { .. } = src {
-                if !self.store.has(&h) {
-                    return self.materialize_git(src);
-                }
-            }
             return Ok(h);
         }
         match src {
@@ -409,28 +390,13 @@ impl Content {
                 self.record_host(*sig, h);
                 Ok(h)
             }
-            FileSrc::Git { .. } => self.materialize_git(src),
             FileSrc::Lazy(blob) => blob.materialize(&self.store),
         }
-    }
-
-    fn materialize_git(&self, src: &FileSrc) -> io::Result<Hash> {
-        let FileSrc::Git { oid, blob } = src else { unreachable!() };
-        let h = blob.materialize(&self.store)?;
-        self.record_git(*oid, h);
-        Ok(h)
     }
 
     pub fn record_host(&self, sig: HostSig, h: Hash) {
         self.host_hashes.insert(sig, h);
         self.db().put(crate::db::Table::HostSigs, &sig.key(), &h.0);
-    }
-
-    /// Remembers that git blob `oid` has content hash `h`.
-    pub fn record_git(&self, oid: [u8; 20], h: Hash) {
-        if self.git_hashes.insert(oid, h).is_none() {
-            self.db().put(crate::db::Table::GitOids, &oid, &h.0);
-        }
     }
 }
 
@@ -460,10 +426,7 @@ pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> 
             match content.known_hash(&f.src) {
                 Some(h) => h == *hash,
                 // Not hashed in this store yet: a host file never read
-                // before, or a git blob never extracted here (a trace
-                // imported from another machine names content this store
-                // has only ever seen by object id). Read it once; the
-                // answer is remembered.
+                // before. Read it once; the answer is remembered.
                 None => content.hash(&f.src).map(|h| h == *hash).unwrap_or(false),
             }
         }

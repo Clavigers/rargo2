@@ -13,12 +13,14 @@ repo=${1:-ra}; agents=${2:-20}
 . "$work/env.sh"
 export RARGO_BIN=${RARGO_BIN:-$work/dev-target/release}
 export RARGO_STATE=$work/state-fork-bench
+export RARGO_SERVER=127.0.0.1:7473
+export RARGO_HIDE=$work/swarm
 out=$work/bench/results.jsonl
 run() { # label toolchain check-as-build
     "$here/rargod.sh" stop >/dev/null 2>&1 || true
     rm -rf "$RARGO_STATE"
     "$here/rargod.sh" start >/dev/null
-    RARGO_SOCKET=$RARGO_STATE/rargod.sock RARGO_CHECK_AS_BUILD=$3 \
+    RARGO_CHECK_AS_BUILD=$3 \
         python3 "$here/swarm.py" --repo "$repo" --mode rargo --agents "$agents" --edit body \
         --toolchain "$2" --label "$1" --out "$out"
     "$here/rargod.sh" stop >/dev/null 2>&1 || true

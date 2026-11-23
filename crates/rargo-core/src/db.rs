@@ -19,8 +19,6 @@ pub enum Table {
     Blobs,
     /// weak key ++ trace id (u64 BE) -> encoded trace
     Traces,
-    /// git blob oid (20 bytes) -> blake3
-    GitOids,
     /// host file signature -> blake3
     HostSigs,
     /// misc counters and settings
@@ -33,10 +31,9 @@ pub enum Table {
     Cold,
 }
 
-const ALL: [Table; 8] = [
+const ALL: [Table; 7] = [
     Table::Blobs,
     Table::Traces,
-    Table::GitOids,
     Table::HostSigs,
     Table::Meta,
     Table::Incr,
@@ -49,7 +46,6 @@ impl Table {
         TableDefinition::new(match self {
             Table::Blobs => "blobs",
             Table::Traces => "traces",
-            Table::GitOids => "gitoids",
             Table::HostSigs => "hostsigs",
             Table::Meta => "meta",
             Table::Incr => "incr",

@@ -22,8 +22,10 @@ export RARGO_BIN=${RARGO_BIN:-$work/dev-target/release}
 repo=${1:-ra}; shift || true
 args=("$@"); [ ${#args[@]} -eq 0 ] && args=(build)
 out=$work/bench/worker.jsonl
-R=$RARGO_BIN/rargo
-export RARGO_SOCKET=$work/nstest/srv/rargod.sock
+# The client runs in its own namespace, one shaped link from the server.
+R() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+export RARGO_HIDE=$work/bench/worker-wt
+export RARGO_CACHE_DIR=$work/bench/worker-client-cache
 base=$work/bench/$repo
 wt=$work/bench/worker-wt
 edit_file=$(cd "$base" && git ls-files 'crates/*/src/lib.rs' | head -1)
@@ -35,13 +37,15 @@ fresh_wt() {
     git -C "$base" worktree add -q --detach "$wt" HEAD
 }
 measure() { # label
+    . "$work/nstest/client.env"
+    rm -rf "$RARGO_CACHE_DIR"
     fresh_wt
     cd "$wt" || exit 2
-    read cold rc1 < <(secs "$R" "${args[@]}")
-    read again rc2 < <(secs "$R" "${args[@]}")
+    read cold rc1 < <(secs R "${args[@]}")
+    read again rc2 < <(secs R "${args[@]}")
     printf '\n#[allow(dead_code)]\npub fn rargo_worker_bench() -> u32 { 7 }\n' >>"$edit_file"
-    read edit rc3 < <(secs "$R" "${args[@]}")
-    local st; st=$("$R" --rargo-status)
+    read edit rc3 < <(secs R "${args[@]}")
+    local st; st=$(R --rargo-status)
     local workers; workers=$(grep -A8 '^workers' <<<"$st" | tr '\n' ' ' | tr -s ' ')
     local incr; incr=$(grep '^incremental' <<<"$st" | tr -s ' ')
     printf '{"repo":"%s","config":"%s","cold_s":%.1f,"again_s":%.2f,"edit_s":%.1f,"rc":[%s,%s,%s],"workers":"%s","incremental":"%s"}\n' \
