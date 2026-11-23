@@ -278,6 +278,8 @@ pub struct Session {
     mountpoint: PathBuf,
     caps: Caps,
     unmounted: AtomicBool,
+    /// Mounted by `fusermount3`, and to be unmounted by it.
+    helper: bool,
 }
 
 /// Mount options.
@@ -339,14 +341,26 @@ impl Session {
                 cdata.as_ptr() as *const libc::c_void,
             )
         };
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let mut helper = false;
+        let dev = if r == 0 {
+            dev
+        } else {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EPERM) {
+                return Err(e);
+            }
+            // Not allowed to mount: the set-uid helper every FUSE
+            // installation has does it for its user.
+            helper = true;
+            mount_with_helper(mountpoint, opts)
+                .map_err(|h| io::Error::new(h.kind(), format!("mount: {e}; fusermount3: {h}")))?
+        };
         let mut sess = Session {
             dev,
             mountpoint: mountpoint.to_path_buf(),
             caps: Caps::default(),
             unmounted: AtomicBool::new(false),
+            helper,
         };
         if let Err(e) = sess.handshake(opts) {
             sess.unmount();
@@ -516,7 +530,9 @@ impl Session {
         if self.unmounted.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Ok(tgt) = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()) {
+        if self.helper {
+            unmount_with_helper(&self.mountpoint);
+        } else if let Ok(tgt) = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()) {
             // SAFETY: valid C string.
             unsafe { libc::umount2(tgt.as_ptr(), libc::MNT_DETACH) };
         }
@@ -527,6 +543,75 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.unmount();
     }
+}
+
+/// Unmounts (lazily) through `fusermount3`, for mounts a user without the
+/// right to unmount made through it.
+pub fn unmount_with_helper(mountpoint: &Path) {
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", "-z", "-q", "--"])
+        .arg(mountpoint)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Has `fusermount3` mount at `mountpoint` and hand over the descriptor of
+/// the connection (it sends it over the socket named in `_FUSE_COMMFD`).
+fn mount_with_helper(mountpoint: &Path, opts: &MountOptions) -> io::Result<OwnedFd> {
+    let mut pair = [0 as libc::c_int; 2];
+    // SAFETY: a valid two-element array for the descriptors.
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both were just returned by socketpair.
+    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+    // SAFETY: plain fcntl on our own descriptor.
+    unsafe { libc::fcntl(ours.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+    let mut options = format!("rw,nosuid,nodev,noatime,fsname={0},subtype={0}", opts.fsname);
+    if opts.default_permissions {
+        options.push_str(",default_permissions");
+    }
+    if opts.allow_other {
+        options.push_str(",allow_other");
+    }
+    let mut cmd = std::process::Command::new("fusermount3");
+    cmd.arg("-o").arg(options).arg("--").arg(mountpoint).env("_FUSE_COMMFD", theirs.as_raw_fd().to_string());
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd.output()?;
+    drop(theirs);
+    if !out.status.success() {
+        return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    // One message with one descriptor in its control data.
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut libc::c_void, iov_len: 1 };
+    let mut control = [0u8; 64];
+    // SAFETY: zeroed msghdr filled with valid pointers below.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = control.len() as _;
+    // SAFETY: valid socket and message header.
+    let n = unsafe { libc::recvmsg(ours.as_raw_fd(), &mut msg, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the kernel filled the control buffer; the macros walk it.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(&msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let fd = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::c_int);
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                return Ok(OwnedFd::from_raw_fd(fd));
+            }
+            c = libc::CMSG_NXTHDR(&msg, c);
+        }
+    }
+    Err(io::Error::other("fusermount3 did not hand over the connection"))
 }
 
 fn open_dev() -> io::Result<OwnedFd> {

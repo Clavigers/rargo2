@@ -199,6 +199,27 @@ pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"; sleep 0.3
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "the next command's daemon replaces it and builds" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and shows the binary" "$out"
 
+echo "== a user who may not mount"
+# An unprivileged user gets the virtual directory through fusermount3.
+# The user has to be able to reach the files, which nothing under /root
+# allows: this one part of the suite uses a directory in /tmp.
+U=$(mktemp -d /tmp/rargo-e2e-user.XXXXXX)
+mkdir -p "$U/bin" "$U/home"
+cp "$RARGO_BIN/rargo" "$U/bin/"
+cp -r "$proj/Cargo.toml" "$proj/crates" "$U/"
+[ -f "$proj/Cargo.lock" ] && cp "$proj/Cargo.lock" "$U/"
+chown -R nobody:nogroup "$U"; chmod 755 "$U"
+asuser() { (cd "$U" && nsenter --net=/run/netns/rargo-cl setpriv --reuid=nobody --regid=nogroup --clear-groups \
+    env HOME="$U/home" RARGO_CACHE_DIR="$U/cache" "$@"); }
+out=$(asuser "$U/bin/rargo" build 2>&1); check $? "an unprivileged user builds" "$out"
+grep -q " $U/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo; check $? "and has the virtual output directory (mounted through fusermount3)" "$(grep "$U" /proc/self/mountinfo; tail -3 "$U/cache/daemon.log")"
+out=$(asuser "$U/target/debug/app" 2>&1); [ "$out" = "value 113" ]; check $? "the binary runs out of it" "$out"
+out=$(asuser sh -c 'echo x >target/note && cat target/note' 2>&1); [ "$out" = x ]; check $? "the user can write there" "$out"
+asuser "$U/bin/rargo" --rargo-daemon-stop; sleep 0.5
+! grep -q " $U/target " /proc/self/mountinfo; check $? "stopping the daemon unmounts it"
+[ -f "$U/target/note" ]; check $? "and what the user wrote is in the plain directory"
+rm -rf "$U"
+
 echo "== daemons go when told"
 RARGO_CACHE_DIR=$E/cache-tcp R --rargo-daemon-stop; RARGO_CACHE_DIR=$E/cache R --rargo-daemon-stop
 sleep 0.5

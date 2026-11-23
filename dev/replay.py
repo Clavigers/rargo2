@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--label", default=None)
     ap.add_argument("--out", default=None)
     ap.add_argument("--netns", default=None, help="network namespace the rargo client runs in (dev/netns.sh)")
+    ap.add_argument("--stock", action="store_true", help="stock cargo (24 cores) in the worktree instead of rargo")
     ap.add_argument("cmd", nargs="+")
     a = ap.parse_args()
     if a.netns:
@@ -57,11 +58,18 @@ def main():
         files = 0
         if n:
             files = len(git("diff", "--name-only", commits[n - 1], c, "--", "*.rs", cwd=wt).split())
-        a0, cpu0, hit0 = status(a.rargo, env)
-        t = time.time()
-        p = subprocess.run([*PREFIX, a.rargo, *a.cmd], cwd=wt, env=env, capture_output=True, text=True)
-        dt = time.time() - t
-        a1, cpu1, hit1 = status(a.rargo, env)
+        if a.stock:
+            a0 = cpu0 = hit0 = a1 = cpu1 = hit1 = 0
+            t = time.time()
+            p = subprocess.run(["systemd-run", "--scope", "-q", "-p", "CPUQuota=2400%", "-p", "MemoryMax=90G",
+                                "cargo", *a.cmd, "--offline", "-j24"], cwd=wt, env=env, capture_output=True, text=True)
+            dt = time.time() - t
+        else:
+            a0, cpu0, hit0 = status(a.rargo, env)
+            t = time.time()
+            p = subprocess.run([*PREFIX, a.rargo, *a.cmd], cwd=wt, env=env, capture_output=True, text=True)
+            dt = time.time() - t
+            a1, cpu1, hit1 = status(a.rargo, env)
         row = dict(commit=c[:9], rs_files=files, wall_s=round(dt, 2), actions=a1 - a0, cpu_s=round(cpu1 - cpu0, 1),
                    hits=hit1 - hit0, ok=p.returncode == 0)
         rows.append(row)
@@ -69,6 +77,8 @@ def main():
         if p.returncode != 0:
             sys.stderr.write(p.stderr[-2000:])
     later = rows[1:]
+    walls = sorted(r["wall_s"] for r in later)
+    pick = lambda q: walls[min(len(walls) - 1, int(q * len(walls)))] if walls else 0
     summary = dict(
         label=a.label or a.toolchain or "default",
         repo=a.repo,
@@ -76,6 +86,7 @@ def main():
         commits=len(rows),
         cold=rows[0],
         later_wall_s=round(sum(r["wall_s"] for r in later), 1),
+        later_median_s=pick(0.5), later_p90_s=pick(0.9), later_max_s=walls[-1] if walls else 0,
         later_actions=sum(r["actions"] for r in later),
         later_cpu_s=round(sum(r["cpu_s"] for r in later), 1),
         failed=sum(1 for r in rows if not r["ok"]),
@@ -87,8 +98,9 @@ def main():
             f.write(json.dumps(summary) + "\n")
     # The client daemon's output directory is unmounted before the
     # worktree goes.
-    subprocess.run([*PREFIX, a.rargo, "--rargo-daemon-stop"], env=env, capture_output=True)
-    time.sleep(1)
+    if not a.stock:
+        subprocess.run([*PREFIX, a.rargo, "--rargo-daemon-stop"], env=env, capture_output=True)
+        time.sleep(1)
     git("worktree", "remove", "--force", wt)
 
 

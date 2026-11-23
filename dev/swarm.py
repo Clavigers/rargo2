@@ -212,11 +212,20 @@ def main():
     wall = time.time() - t0
     link1 = link_bytes()
     daemon_status = ""
+    daemon_cpu = 0.0
     if a.mode == "rargo":
         # What the client daemon did, and then its end: its virtual output
         # directories are unmounted, so that what is measured below is what
         # is really on the client's disk.
         daemon_status = subprocess.run(prefix + [RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
+        # The daemon's own CPU time (it is not a child of the commands).
+        tick = os.sysconf("SC_CLK_TCK")
+        for pid in subprocess.run(["pgrep", "-f", f"--rargo-daemon {client_cache}"], capture_output=True, text=True).stdout.split():
+            try:
+                fields = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
+                daemon_cpu += (int(fields[11]) + int(fields[12])) / tick
+            except (OSError, IndexError, ValueError):
+                pass
         subprocess.run(prefix + [RARGO, "--rargo-daemon-stop"], env=env, capture_output=True)
         time.sleep(1)
     cpu1 = cgroup_cpu_usec(daemon_pid) if a.mode == "rargo" else cgroup_cpu_usec(os.getpid())
@@ -260,6 +269,7 @@ def main():
         netns=a.netns, sync=sync_line,
         link_down_bytes=link1[0] - link0[0], link_up_bytes=link1[1] - link0[1],
         output_mode=env.get("RARGO_OUTPUT", "fuse") if a.mode == "rargo" else None,
+        client_daemon_cpu_s=round(daemon_cpu, 1),
         client_daemon=" | ".join(l.strip() for l in daemon_status.splitlines() if l.startswith(("link", "scans", "pushed", "outputs"))),
         failures=len(failures),
         # Which step of which agent, and the end of that agent's log.

@@ -114,7 +114,10 @@ pub enum Msg {
     },
     /// Part of a blob the worker is expected to need: its recipe and the
     /// chunks the server believes the worker lacks.
-    Push { blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, last: bool },
+    /// One of `of` messages that together push a blob. They may arrive
+    /// in any order (the transport delivers messages independently); the
+    /// recipe is in the one numbered 0.
+    Push { blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, part: u32, of: u32 },
     Stdout { action: u64, data: Vec<u8> },
     StderrLine { action: u64, line: Vec<u8> },
     /// A file the action finished early (an `.rmeta`).
@@ -461,8 +464,9 @@ const FETCH_TOGETHER: usize = 8;
 // ---------------------------------------------------------------------------
 
 struct Incoming {
-    recipe: Recipe,
+    recipe: Option<Recipe>,
     chunks: HashMap<u32, Vec<u8>>,
+    parts: u32,
 }
 
 pub struct WorkerState {
@@ -519,15 +523,26 @@ impl WorkerState {
         })
     }
 
-    async fn on_push(self: &Arc<Self>, blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, last: bool) {
+    async fn on_push(self: &Arc<Self>, blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, part: u32, of: u32) {
+        // The messages of one push overtake each other: the blob is put
+        // together when all of them are here, whichever came last. (It
+        // used to be put together when the one sent last arrived, with
+        // whatever recipe the first to arrive had carried: an empty one if
+        // that was not the first sent, and the content then failed its
+        // check. The server went on believing the worker held it.)
         let complete = {
             let mut partial = self.partial.lock();
-            let inc = partial.entry(blob).or_insert_with(|| Incoming { recipe: recipe.clone(), chunks: HashMap::new() });
+            let inc = partial.entry(blob).or_insert_with(|| Incoming { recipe: None, chunks: HashMap::new(), parts: 0 });
+            if part == 0 {
+                inc.recipe = Some(recipe);
+            }
             inc.chunks.extend(chunks);
-            if last { partial.remove(&blob) } else { None }
+            inc.parts += 1;
+            if inc.parts >= of.max(1) && inc.recipe.is_some() { partial.remove(&blob) } else { None }
         };
         if let Some(inc) = complete {
-            if let Err(e) = self.blobs.assemble(&self.peer, &blob, &inc.recipe, inc.chunks).await {
+            let recipe = inc.recipe.unwrap_or_default();
+            if let Err(e) = self.blobs.assemble(&self.peer, &blob, &recipe, inc.chunks).await {
                 eprintln!("rargo worker: pushed blob {blob} could not be assembled: {e:#}");
             }
             self.announced.lock().remove(&blob);
@@ -755,9 +770,9 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                     peer.post(&Msg::Resp { rid, body: resp });
                 });
             }
-            Msg::Push { blob, recipe, chunks, last } => {
+            Msg::Push { blob, recipe, chunks, part, of } => {
                 let s = state.clone();
-                tokio::spawn(async move { s.on_push(blob, recipe, chunks, last).await });
+                tokio::spawn(async move { s.on_push(blob, recipe, chunks, part, of).await });
             }
             Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed } => {
                 {
@@ -1232,6 +1247,9 @@ pub struct Pool {
     /// the order they were made.
     home_queue: Mutex<std::collections::VecDeque<(Arc<Worker>, Hash, u64, std::time::Instant)>>,
     home_wake: tokio::sync::Notify,
+    /// Files of incremental states that compiles left on workers: which
+    /// worker, and the action that made them (for diagnosis).
+    left_on: DashMap<Hash, (u64, String)>,
 }
 
 fn to_wire(l: &Looked, content: &Content) -> WLooked {
@@ -1285,6 +1303,7 @@ impl Pool {
             freed: tokio::sync::Notify::new(),
             home_queue: Mutex::new(std::collections::VecDeque::new()),
             home_wake: tokio::sync::Notify::new(),
+            left_on: DashMap::new(),
         });
         tokio::spawn(pool.clone().bring_states_home(engine.clone()));
         let p = pool.clone();
@@ -1456,7 +1475,31 @@ impl Pool {
                 Err(e) => Resp::Err(format!("{e:#}")),
             },
             Req::Blob { blob } => {
-                let Some(r) = self.blobs.recipe(&blob) else { return Resp::Blob(None) };
+                let Some(r) = self.blobs.recipe(&blob) else {
+                    let why = if self.blobs.store.has(&blob) {
+                        "in the store, but unreadable".to_string()
+                    } else {
+                        match self.host_srcs.get(&blob).map(|s| s.clone()) {
+                            Some(FileSrc::Host { path, sig }) => match std::fs::symlink_metadata(&path) {
+                                Ok(m) if HostSig::of(&m) == sig => format!("{} is unchanged but could not be read", path.display()),
+                                Ok(_) => format!("{} has changed since it was shown", path.display()),
+                                Err(e) => format!("{}: {e}", path.display()),
+                            },
+                            Some(_) => "known, but not as a file on this machine".to_string(),
+                            None => match self.left_on.get(&blob) {
+                                Some(l) => format!(
+                                    "part of the incremental state `{}` left on worker {:x}{}",
+                                    l.1,
+                                    l.0,
+                                    if w.has_blobs.lock().contains(&blob) { " (believed to be on the asking worker)" } else { "" }
+                                ),
+                                None => "not in the store and never shown from a file".to_string(),
+                            },
+                        }
+                    };
+                    eprintln!("rargod: worker {:x} asked for content {blob}, which cannot be served: {why}", w.id);
+                    return Resp::Blob(None);
+                };
                 let idx = {
                     let has = w.has_chunks.lock();
                     inline_indices(&r, &|h| has.contains(h))
@@ -1582,6 +1625,7 @@ impl Pool {
         }
         let Some(recipe) = self.blobs.recipe(&h) else {
             w.has_blobs.lock().remove(&h);
+            eprintln!("rargod: content {h} was to be sent ahead to worker {:x} but cannot be read here", w.id);
             return;
         };
         let missing: Vec<u32> = {
@@ -1598,27 +1642,35 @@ impl Pool {
             let mut free_at = w.link_free_at.lock();
             *free_at = (*free_at).max(std::time::Instant::now()) + Duration::from_secs_f64(secs);
         }
-        let mut batch: Vec<u32> = Vec::new();
+        // Cut into messages of about a megabyte, counted first: the
+        // worker has to know when it has them all.
+        let mut batches: Vec<Vec<u32>> = vec![Vec::new()];
         let mut bytes = 0usize;
-        let mut sent_any = false;
-        let mut flush = |batch: &mut Vec<u32>, last: bool| {
-            let chunks = match self.blobs.serve_chunks(&h, batch) {
-                Ok(c) => batch.iter().copied().zip(c).collect(),
-                Err(_) => Vec::new(),
-            };
-            w.peer.post(&Msg::Push { blob: h, recipe: if sent_any { Vec::new() } else { (*recipe).clone() }, chunks, last });
-            sent_any = true;
-            batch.clear();
-        };
         for i in missing {
-            if bytes + recipe[i as usize].len as usize > BATCH_BYTES && !batch.is_empty() {
-                flush(&mut batch, false);
+            if bytes + recipe[i as usize].len as usize > BATCH_BYTES && !batches.last().unwrap().is_empty() {
+                batches.push(Vec::new());
                 bytes = 0;
             }
             bytes += recipe[i as usize].len as usize;
-            batch.push(i);
+            batches.last_mut().unwrap().push(i);
         }
-        flush(&mut batch, true);
+        let of = batches.len() as u32;
+        for (part, batch) in batches.iter().enumerate() {
+            let chunks = match self.blobs.serve_chunks(&h, batch) {
+                Ok(c) => batch.iter().copied().zip(c).collect(),
+                Err(e) => {
+                    eprintln!("rargod: content {h} could not be read for worker {:x}: {e:#}", w.id);
+                    Vec::new()
+                }
+            };
+            w.peer.post(&Msg::Push {
+                blob: h,
+                recipe: if part == 0 { (*recipe).clone() } else { Vec::new() },
+                chunks,
+                part: part as u32,
+                of,
+            });
+        }
         w.has_chunks.lock().extend(recipe.iter().map(|c| c.hash));
     }
 }
@@ -1753,6 +1805,18 @@ impl Pool {
                         }
                         let looked = view.lookup(&dir, &name);
                         let mut w = to_wire(&looked, &content);
+                        // An answer that names a content (one this server
+                        // has hashed before) promises that the content can
+                        // be asked for by that name. For a file on this
+                        // machine's disk that means remembering where it
+                        // is; without this the worker's request for it was
+                        // refused and its compiler failed on the file.
+                        if let (Looked::File(f), WLooked::File { hash: Some(h), .. }) = (&looked, &w) {
+                            if let FileSrc::Host { .. } = &f.src {
+                                host_srcs.entry(*h).or_insert_with(|| f.src.clone());
+                                ra2.served.lock().push(f.src.clone());
+                            }
+                        }
                         // Content the action read last time will be read
                         // again: resolve its hash now and send the bytes
                         // ahead.
@@ -1943,6 +2007,9 @@ impl Pool {
             left.sort();
             left.dedup();
             if !left.is_empty() {
+                for (h, _) in &left {
+                    self.left_on.insert(*h, (w.id, spec.label.clone()));
+                }
                 self.stats.state_left_blobs.fetch_add(left.len() as u64, Ordering::Relaxed);
                 self.stats.state_left_bytes.fetch_add(left.iter().map(|(_, s)| s).sum::<u64>(), Ordering::Relaxed);
                 let now = std::time::Instant::now();

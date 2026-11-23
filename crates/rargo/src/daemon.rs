@@ -548,7 +548,11 @@ impl Daemon {
         let opts = fusewire::MountOptions { fsname: "rargo".into(), allow_other: root, default_permissions: true, passthrough: true };
         let session = Arc::new(fusewire::Session::mount(&dir, &opts)?);
         fs.attach(session.clone());
-        session.spawn_workers(fs.clone(), 8)?;
+        // Enough threads that a parallel build's name operations (a
+        // compiler per core, each creating and renaming files) do not
+        // queue behind each other.
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(8, 32);
+        session.spawn_workers(fs.clone(), threads)?;
         let dev = {
             use std::os::unix::fs::MetadataExt;
             std::fs::metadata(&dir)?.dev()
@@ -1122,7 +1126,10 @@ fn release_mounts(dir: &Path) {
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
     for _ in 0..mounts {
         // SAFETY: valid NUL-terminated path.
-        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+        if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } != 0 {
+            // Not allowed to: the helper that mounted it unmounts it.
+            fusewire::unmount_with_helper(dir);
+        }
     }
 }
 
