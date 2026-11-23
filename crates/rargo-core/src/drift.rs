@@ -137,6 +137,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         worktree: String::new(),
         commits: Arc::new(Vec::new()),
         home: who.home.clone(),
+        outbox: Default::default(),
     };
     let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
     let started = Instant::now();

@@ -113,11 +113,23 @@ pub struct Client {
     /// HEAD and recent ancestors on the client (a hint, see D16).
     pub commits: Arc<Vec<[u8; 20]>>,
     pub home: Arc<Home>,
+    /// Files and writes waiting to go to the client.
+    pub outbox: Arc<Mutex<(Vec<Delivery>, Vec<Write>)>>,
 }
 
 impl Client {
-    /// Places files and applies writes on the client.
-    pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) -> Result<()> {
+    /// Queues files to place and writes to apply on the client. They go
+    /// out together when the request ends ([`Client::flush`]): one round
+    /// trip, however many steps produced something.
+    pub fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) {
+        let mut q = self.outbox.lock();
+        q.0.extend(files);
+        q.1.extend(writes);
+    }
+
+    /// Sends everything queued.
+    pub async fn flush(&self) -> Result<()> {
+        let (files, writes) = std::mem::take(&mut *self.outbox.lock());
         match &self.session {
             Some(s) => s.deliver(files, writes).await,
             None => Ok(()),
@@ -616,22 +628,29 @@ pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
     // An inconsistency between an early-announced artifact and the final
     // one invalidates work that started on the early one; everything is
     // cached, so starting over is cheap.
+    let mut result = Ok(101);
     for attempt in 0..3 {
         match run_request(&d, &c).await {
-            Ok(Finish::Code(code)) => return Ok(code),
-            Ok(Finish::Exec(e)) => return Err(e),
-            Ok(Finish::Retry) if attempt < 2 => continue,
-            Ok(Finish::Retry) => {
-                c.out.error("the build kept producing inconsistent intermediate artifacts");
-                return Ok(101);
+            Ok(Finish::Code(code)) => result = Ok(code),
+            Ok(Finish::Exec(e)) => result = Err(e),
+            Ok(Finish::Retry) if attempt < 2 => {
+                // Whatever the abandoned attempt meant to place is stale.
+                c.outbox.lock().0.clear();
+                continue;
             }
-            Err(e) => {
-                c.out.error(&format!("{e:#}"));
-                return Ok(101);
-            }
+            Ok(Finish::Retry) => c.out.error("the build kept producing inconsistent intermediate artifacts"),
+            Err(e) => c.out.error(&format!("{e:#}")),
         }
+        break;
     }
-    Ok(101)
+    // What the request produced for the client goes out whatever the
+    // outcome: cargo would have left a lockfile it wrote, or files tests
+    // wrote before one failed, behind as well.
+    if let Err(e) = c.flush().await {
+        c.out.error(&format!("delivering results: {e:#}"));
+        return Ok(101);
+    }
+    result
 }
 
 enum Finish {
@@ -829,7 +848,7 @@ async fn plan_with(
     let lock_writes = Manifest {
         entries: r.outputs.entries.iter().filter(|(p, _)| p.ends_with(b"/Cargo.lock")).cloned().collect(),
     };
-    apply_writes(c, &p.tr, &[], &lock_writes).await?;
+    apply_writes(c, &p.tr, &[], &lock_writes);
     let data = match d.plans.get(hash) {
         Some(pd) => pd.clone(),
         None => {
@@ -957,7 +976,7 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) 
     if !out.status.success() {
         return Ok(None);
     }
-    c.deliver(Vec::new(), writes).await?;
+    c.deliver(Vec::new(), writes);
     Ok(Some(snapshot))
 }
 
@@ -1071,6 +1090,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         worktree: c.worktree.clone(),
         commits: c.commits.clone(),
         home: c.home.clone(),
+        outbox: c.outbox.clone(),
     });
     c2.out.err_text(&String::from_utf8_lossy(&planned.stderr));
 
@@ -1243,8 +1263,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         return Ok(Finish::Code(0));
     }
     // Place what was asked for into the real target directory.
-    run.materialize_roots().await?;
-    run.write_depinfo().await?;
+    run.materialize_roots();
+    run.write_depinfo();
     finished();
 
     run.steps().await
@@ -1825,7 +1845,7 @@ impl Run {
         if !uplifted.is_empty() {
             self.layer.add(i as u32, LEVEL_FULL, &uplifted);
         }
-        self.apply_worktree_writes(&r.outputs).await?;
+        self.apply_worktree_writes(&r.outputs);
         self.finish_unit_messages(i, &r, outcome.cached);
         Ok(UState::Done)
     }
@@ -2168,9 +2188,9 @@ impl Run {
     /// Files an action wrote into the worktree itself (outside the target
     /// directory) are written to the real worktree, as cargo would have let
     /// the process do directly.
-    async fn apply_worktree_writes(&self, m: &Manifest) -> Result<()> {
+    fn apply_worktree_writes(&self, m: &Manifest) {
         let plan = self.plan();
-        apply_writes(&self.c, &self.c.out.tr, &[&plan.target_dir, &plan.build_dir], m).await
+        apply_writes(&self.c, &self.c.out.tr, &[&plan.target_dir, &plan.build_dir], m)
     }
 
     /// The files cargo's `.d` file for root unit `root` lists (cargo's
@@ -2223,7 +2243,7 @@ impl Run {
     }
 
     /// Writes cargo's `.d` files next to the uplifted artifacts of the roots.
-    async fn write_depinfo(&self) -> Result<()> {
+    fn write_depinfo(&self) {
         let plan = self.plan();
         let mut writes: Vec<(PathBuf, Option<String>)> = Vec::new();
         for &ri in &plan.roots {
@@ -2274,11 +2294,11 @@ impl Run {
             .into_iter()
             .map(|(dest, text)| Write::Text { path: dest.to_string_lossy().into_owned(), text })
             .collect();
-        self.c.deliver(Vec::new(), writes).await
+        self.c.deliver(Vec::new(), writes);
     }
 
     /// Sends the requested artifacts to the client's target directory.
-    async fn materialize_roots(&self) -> Result<()> {
+    fn materialize_roots(&self) {
         let plan = self.plan();
         let tr = &self.c.out.tr;
         let mut files: Vec<Delivery> = Vec::new();
@@ -2333,7 +2353,7 @@ impl Run {
             push(&mut files, tr.path(&String::from_utf8_lossy(path)), &hash, exec, size, true);
         }
         if files.is_empty() {
-            return Ok(());
+            return;
         }
         // What cargo leaves at the top of a target directory it creates.
         let mut writes = Vec::new();
@@ -2347,7 +2367,7 @@ impl Run {
                 });
             }
         }
-        self.c.deliver(files, writes).await
+        self.c.deliver(files, writes);
     }
 
     /// Runs what cargo does after the build: tests, doctests, `cargo run`.
@@ -2457,7 +2477,7 @@ impl Run {
                         .await?;
                     let r = &outcome.result;
                     if r.success() {
-                        self.apply_worktree_writes(&r.outputs).await?;
+                        self.apply_worktree_writes(&r.outputs);
                         continue;
                     }
                     let which = match kind {
@@ -2499,7 +2519,7 @@ impl Run {
 }
 
 /// Sends the worktree part of an action's outputs to the client's worktree.
-async fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manifest) -> Result<()> {
+fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manifest) {
     let inside = |p: &[u8]| {
         vpath_starts_with(p, WORKTREE_AT)
             && p != WORKTREE_AT
@@ -2521,7 +2541,7 @@ async fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &
             }
         })
         .collect();
-    c.deliver(Vec::new(), writes).await
+    c.deliver(Vec::new(), writes);
 }
 
 /// The prerequisites named in a Makefile-style dep-info file (rustc's).

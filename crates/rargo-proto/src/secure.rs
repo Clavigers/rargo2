@@ -22,7 +22,9 @@ use snow::{HandshakeState, StatelessTransportState};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-pub const MAGIC: &[u8; 8] = b"rargo\x03\r\n";
+/// Ends in the protocol version, so that a client of another version is
+/// told so instead of failing to decode.
+pub const MAGIC: &[u8; 8] = b"rargo\x04\r\n";
 const PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 /// Plaintext bytes per record (Noise messages are at most 65535 bytes,
 /// including the 16-byte tag).
@@ -208,6 +210,11 @@ mod tests {
             assert_eq!(read_msg(&mut &wire[..], &mut co).unwrap().unwrap(), msg);
         }
         assert!(read_msg(&mut &[][..], &mut co).unwrap().is_none());
+    }
+
+    #[test]
+    fn magic_names_the_protocol_version() {
+        assert_eq!(MAGIC[5] as u32, crate::PROTO_VERSION);
     }
 
     #[test]

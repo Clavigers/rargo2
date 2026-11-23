@@ -179,7 +179,10 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
     // The worktree: bring whatever the store lacks over from the client.
     let snapshot = match d.trees.sync(Hash(req.tree), &*sess).await {
         Ok(s) => s,
-        Err(e) => return fail(&sess, format!("syncing the worktree: {e:#}")),
+        Err(e) => {
+            eprintln!("rargod: {}: syncing {}: {e:#}", req.who, req.root);
+            return fail(&sess, format!("syncing the worktree: {e:#}"));
+        }
     };
     let home = match d.home(&req.home_files) {
         Ok(h) => h,
@@ -234,6 +237,7 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
         worktree: req.worktree,
         commits: Arc::new(req.commits),
         home,
+        outbox: Default::default(),
     };
     match build::handle(d, client).await {
         Ok(code) => ServerMsg::Exit(code),
@@ -250,7 +254,7 @@ pub fn status_text(d: &Daemon) -> String {
     let y = &d.trees.stats;
     format!(
         "requests            {}\n\
-         sync                {} worktree states, {} manifests and {} files asked of clients ({} awaited from another client's upload), {:.1} MiB received\n\
+         sync                {} worktree states, {} manifests and {} files asked of clients ({} awaited from another client's upload), {:.1} MiB received, {:.1} MiB of results sent\n\
          store               {} blobs, {:.1} MiB\n\
          cold tier           {}\n\
          cache               {} hits, {} misses, {} traces stored\n\
@@ -270,6 +274,7 @@ pub fn status_text(d: &Daemon) -> String {
         y.blobs_requested.load(Ordering::Relaxed),
         y.shared_uploads.load(Ordering::Relaxed),
         d.stats.bytes_in.load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
+        d.stats.bytes_out.load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
         e.store.blob_count(),
         e.store.total_bytes() as f64 / (1 << 20) as f64,
         {
