@@ -78,7 +78,8 @@ def agent(i, wt, cfg, mode, env, log, results, edit_kind="api"):
 
     def edit(n):
         # Agents overlap: several make the same edit to the same file.
-        f = cfg["edits"][(i + n) % len(cfg["edits"])]
+        # A body-only second edit changes the function the first one added.
+        f = cfg["edits"][(i + (0 if edit_kind == "body" else n)) % len(cfg["edits"])]
         variant = (i // len(cfg["edits"]) + n) % 3
         path = os.path.join(wt, f)
         if edit_kind == "body" and n > 0:

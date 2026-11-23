@@ -2,8 +2,8 @@
 # The 20-agent swarm with rargo's rustc fork against the stock compiler, all
 # under rargo, with a body-only second edit (dev/swarm.py --edit body):
 #   stable          stock rustc 1.100.0
-#   fork            the fork, check planned as a build (the default with it)
-#   fork-cargo-check  the fork, check the cargo way (RARGO_CHECK_AS_BUILD=0)
+#   fork            the fork, check planned as a build (RARGO_CHECK_AS_BUILD=1)
+#   fork-cargo-check  the fork, check the cargo way (the default)
 # Results go to $RARGO_WORK/bench/results.jsonl with these labels.
 #   dev/bench-fork.sh [REPO] [AGENTS]
 set -eu

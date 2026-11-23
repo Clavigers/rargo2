@@ -865,7 +865,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     // of each doing its own. Whether the compiler is the fork is only known
     // from a plan; what the last plan for this worktree said is remembered.
     let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
-    let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").map(|v| v.as_str()) != Some("0"));
+    // Opt-in: measured slower and larger in the 20-agent benchmark (D23).
+    let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").map(|v| v.as_str()) == Some("1"));
     let fork_key = (p.root.clone(), c.env.get("RUSTUP_TOOLCHAIN").cloned().unwrap_or_default());
     let mut as_build = check_at.is_some() && d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
     let mut fetched = false;
