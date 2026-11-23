@@ -476,6 +476,8 @@ pub struct WorkerState {
     partial: Mutex<HashMap<Hash, Incoming>>,
     pub lookups_local: AtomicU64,
     pub lookups_remote: AtomicU64,
+    /// Contents an action needed that could not be had from the server.
+    starved: AtomicU64,
 }
 
 impl WorkerState {
@@ -511,6 +513,7 @@ impl WorkerState {
             self.handle.block_on(fut)
         };
         r.map_err(|e| {
+            self.starved.fetch_add(1, Ordering::SeqCst);
             eprintln!("rargo worker: content {h} could not be had from the server: {e:#}");
             io::Error::other(format!("{e:#}"))
         })
@@ -716,6 +719,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
         partial: Mutex::new(HashMap::new()),
         lookups_local: AtomicU64::new(0),
         lookups_remote: AtomicU64::new(0),
+        starved: AtomicU64::new(0),
     });
     let s2 = state.clone();
     engine.content.set_fetcher(Arc::new(move |h| s2.ensure_blob(h)));
@@ -799,8 +803,18 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                     // the actions it was given and their helper threads.
                     let permit = state.engine.sched.acquire(crate::sched::Priority::Agent, 0).await;
                     let obs = WorkerObserver { peer: state.peer.clone(), action };
+                    let starved_before = state.starved.load(Ordering::SeqCst);
                     let r = state.engine.execute(&aspec, view, uid, gid, &obs).await;
                     drop(permit);
+                    // A file the action was shown could not be fetched: what
+                    // the action made of that (a compiler error about a
+                    // missing or unreadable file) is this worker's failure,
+                    // not the action's result. The server runs it itself.
+                    let r = if state.starved.load(Ordering::SeqCst) != starved_before {
+                        Err(anyhow!("an input's content could not be fetched from the server while the action ran"))
+                    } else {
+                        r
+                    };
                     let result = match r {
                         Ok((res, obs, tainted, side)) => Ok(WDone {
                             status: res.status,

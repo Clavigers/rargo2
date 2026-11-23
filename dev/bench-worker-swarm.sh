@@ -17,7 +17,12 @@ run() { # label
     . "$work/nstest/client.env"
     python3 "$here/swarm.py" --repo "$repo" --mode rargo --agents "$agents" --label "worker-swarm $1" \
         --netns rargo-cl --out "$work/bench/results.jsonl"
-    nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" --rargo-status | grep -A2 '^workers' | tr -s ' ' | head -c 400; echo
+    nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" --rargo-status | grep -A2 '^workers' | tr -s ' ' | head -c 1400; echo
+    # Kept: the next configuration starts from an empty rig.
+    mkdir -p "$work/bench/logs"
+    for f in srv w1; do
+        [ -f "$work/nstest/$f.log" ] && cp "$work/nstest/$f.log" "$work/bench/logs/worker-swarm-${1// /_}-$f.log"
+    done
 }
 "$here/netns.sh" up $c $c 0 >/dev/null 2>&1;            run "local-$c"
 "$here/netns.sh" up $c $c 1 1 0.1 1gbit >/dev/null 2>&1; run "$c+$c"

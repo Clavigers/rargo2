@@ -111,6 +111,8 @@ pub struct Daemon {
     active: AtomicUsize,
     last_active: Mutex<Instant>,
     pub counters: Counters,
+    /// One first sync of a worktree at a time (see `offer`).
+    big_sync: tokio::sync::Mutex<()>,
     /// One fetch per content at a time.
     fetching: Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
     /// Chunks the cache holds: in which content, where.
@@ -160,6 +162,7 @@ impl Daemon {
             active: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             counters: Counters::default(),
+            big_sync: tokio::sync::Mutex::new(()),
             fetching: Mutex::new(HashMap::new()),
             chunks: Mutex::new(HashMap::new()),
             handle: tokio::runtime::Handle::current(),
@@ -352,16 +355,31 @@ impl Daemon {
     /// it the server is not believed to hold. Returns `false` if a file no
     /// longer has the content the scan saw.
     async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>) -> std::io::Result<bool> {
-        let (trees, blobs): (Vec<Digest>, Vec<(Digest, u64)>) = {
+        let delta = || -> (Vec<Digest>, Vec<(Digest, u64)>) {
             let sent = mux.sent.lock().unwrap();
             (
                 snap.scan.trees.keys().filter(|d| !sent.contains(*d)).copied().collect(),
                 snap.scan.files.iter().filter(|(d, _)| !sent.contains(*d)).map(|(d, (_, size))| (*d, *size)).collect(),
             )
         };
+        let (mut trees, mut blobs) = delta();
         if trees.is_empty() && blobs.is_empty() {
             return Ok(true);
         }
+        // Much to send: one such sync at a time. Twenty worktrees of one
+        // commit that start together would otherwise each upload the
+        // repository; after the first, the others have next to nothing
+        // to send.
+        let _one_at_a_time = if blobs.iter().map(|(_, s)| *s).sum::<u64>() > PUSH_BLIND {
+            let turn = self.big_sync.lock().await;
+            (trees, blobs) = delta();
+            if trees.is_empty() && blobs.is_empty() {
+                return Ok(true);
+            }
+            Some(turn)
+        } else {
+            None
+        };
         self.counters.offers.fetch_add(1, Ordering::Relaxed);
         if std::env::var_os("RARGO_DAEMON_TRACE").is_some() {
             // Which directories the new manifests are.

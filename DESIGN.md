@@ -344,6 +344,39 @@ worktree lacks along with the listing. Whatever the daemon still lacks
 it fetches, which costs a round trip only then. A build with nothing to
 do is one message each way.
 
+### The output directory
+
+rargo is meant to be for cargo what clearmake was for make: builds whose
+inputs are audited rather than declared, and derived objects that are
+winked in rather than rebuilt or copied. On the server that is the trace
+cache and the shared store. On the client it is the output directory:
+`target/` in a worktree is a file system the daemon serves (FUSE), not a
+directory that results are copied into.
+
+- What the server built appears there as soon as the server has it: a
+  name, a size, an executable bit and a content hash, sent while the
+  build is still running. Nothing is copied into the worktree.
+- Content is fetched when something opens the file, into the client's
+  cache, which all worktrees of the machine share. Large contents are
+  fetched by chunk (content-defined chunks, the same as between server and
+  workers), so the next version of a binary costs the chunks that
+  changed. Small files (dependency information, fingerprints, generated
+  sources) are sent along with their names, because fetching each on open
+  would cost a round trip apiece.
+- Underneath the mount is the real `target/` directory. Everything that
+  is written locally lands there: what stock cargo builds, what a test
+  writes. A name is real if the real directory has it, otherwise virtual
+  if the server delivered it. Writing to a virtual file makes it real
+  first; deleting or renaming one edits the table of delivered names.
+  So stock cargo works in the same directory, mounted or not: unmounted,
+  `target/` is an ordinary cargo output directory that lacks what was
+  never materialised, and stock cargo rebuilds that.
+- Where a file system cannot be mounted (no FUSE, no permission, an
+  output directory of the command's own choosing, a command in another
+  mount namespace than the daemon) results are copied into place as
+  before, shared between worktrees through the cache by hard link or
+  reflink. `RARGO_OUTPUT=copy` asks for that.
+
 ### Tests
 
 A test binary run is an action like any other. If nothing it read has
@@ -382,6 +415,13 @@ cargo.
 - **The link.** Every command pays for a round trip; a first sync pays
   for the repo, and a big binary has to come back. Measured in
   `STATUS.md`, on a LAN and with 100 ms of round-trip time.
+- **A mounted output directory** disappears with its daemon: after a
+  reboot, or when the daemon is stopped, `target/` shows only what was
+  written locally until the next rargo command mounts it again (the
+  listing is kept; contents are still in the cache or on the server). A
+  daemon that is killed outright leaves a dead mount until the next
+  command replaces it. Stock `cargo clean` cannot remove a mount point;
+  through the shim it can, because the daemon lets go first.
 - **A daemon on every client machine** is one more thing that can be
   stale or stuck. It is keyed by server, user, key and program version,
   so a new configuration or version gets a new one; a command that cannot

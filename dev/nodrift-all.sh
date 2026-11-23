@@ -40,6 +40,8 @@ for r in "${repos[@]}"; do
         # tools resolve the same versions.
         [ -f "$wt/Cargo.lock" ] || cp "$base/Cargo.lock" "$wt/" 2>/dev/null
         NODRIFT_DIR=$wt NODRIFT_SKIP_SERVER=1 "$here/nodrift.sh" "$r" "$tests" || fails=$((fails + 1))
+        # The daemon's output directory is unmounted before the worktree goes.
+        "$RARGO_BIN/rargo" --rargo-daemon-stop
         git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1
     else
         "$here/nodrift.sh" "$r" "$tests" || fails=$((fails + 1))

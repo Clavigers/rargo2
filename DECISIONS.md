@@ -1350,3 +1350,94 @@ with 100 ms of round-trip time, and that sync not cost extra round trips.
 - `rargo --rargo-status` now counts files and manifests received, pushes,
   and files the server had to ask for.
 
+## D59. The output directory is a file system served by the client daemon
+
+The user's original ask, restated: the clearmake of cargo, audited builds
+plus wink-in of derived objects into a dynamic view. The server side had
+both; on the client, results were copied (or hard-linked) into `target/`.
+
+- **Mount.** The daemon mounts a FUSE file system (`fuse.rargo`, the
+  repo's own `fusewire`) over `<worktree>/target` at the first build in a
+  worktree. The real directory stays underneath and is reached through a
+  descriptor opened before mounting. Rejected: kernel overlayfs over a
+  read-only FUSE lower layer (needs root or a user namespace, so other
+  processes would not see it); a mount somewhere else with `target` a
+  symlink to it (cargo and tools resolve and compare paths; stock cargo
+  without the daemon would find a dangling link).
+- **What is shown.** A table of delivered names (path, hash, size,
+  executable bit, time), kept in the client's cache per worktree and
+  reloaded when the directory is mounted again. A name is real if the
+  directory underneath has it, else virtual if the table has it. No
+  whiteouts: removing or renaming a virtual file edits the table;
+  delivering a name removes a real file of that name.
+- **Reading** a virtual file opens its content in the client cache,
+  fetching it first if it is not there. Contents of 1 MiB and more are
+  fetched by chunk: the client asks for the content's recipe, takes the
+  chunks it knows from contents in its cache, asks for the rest, and
+  checks the whole against its hash. The chunk index is in the daemon's
+  memory and covers what it fetched by chunk; a persistent index is not
+  kept.
+- **Writing** (open for writing, truncation) makes the file real first:
+  its content is fetched and copied into the real directory, unless the
+  open truncates. Times and the executable bit of a virtual file change
+  in the table.
+- **Passthrough.** Real files are read and written by the kernel directly
+  (FUSE passthrough) where the kernel has it, with one backing handle per
+  file shared by all its opens (found by the tests: the kernel refuses a
+  second, different one while the first is in use, and two processes
+  reading one generated file got an I/O error). Virtual files and
+  kernels without passthrough go through the daemon.
+- **Lazy delivery.** A request says `lazy`; the server then sends each
+  delivery as it is produced instead of at the end, with the contents of
+  files up to 64 KiB that the daemon is not known to hold, and nothing
+  else. Deliveries outside the mount (a worktree file a build wrote, such
+  as `Cargo.lock`) are placed as files as before.
+- **When not.** No mount if the command sets `CARGO_TARGET_DIR` or
+  `--target-dir`, if `target` is a symlink, if the command runs in
+  another mount namespace than the daemon (it would not see the mount;
+  `rargo` sends its namespace with each request), without a daemon, or
+  with `RARGO_OUTPUT=copy`. If mounting fails the daemon says so once in
+  its log and copies. Mounting uses `mount(2)` directly, which needs root
+  or `CAP_SYS_ADMIN`; going through `fusermount3` for unprivileged users
+  is not implemented, so an unprivileged daemon copies.
+- **Lifetime.** A daemon with mounted directories does not leave when
+  idle. On `--rargo-daemon-stop`, SIGTERM or SIGINT it unmounts first. A
+  mount whose daemon was killed, or that another daemon (another server
+  or version) put there, is detached by the next daemon that needs the
+  directory; a daemon checks that the directory still shows its own
+  mount (by device number) before it delivers into it.
+- **`cargo clean`.** cargo cannot remove a mount point. `rargo clean`
+  (the shim) asks the daemon to let go of the worktree's output directory
+  and forget what was delivered, then hands over to cargo.
+- **Temporaries.** Copying clients' leftovers (`.rargo-tmp-<pid>-...`) of
+  processes that no longer exist are removed from a directory when a
+  delivery puts something into it.
+
+`dev/e2e-link.sh` has the checks (27 of its 60): mounted, listed at once
+without content crossing the link, fetched on run, nothing made real,
+stock cargo build and test in the same directory, rargo after stock
+cargo, copy mode and back, clean, a killed daemon's dead mount replaced,
+stop leaves a plain directory in which stock cargo builds. `dev/e2e.sh`
+passes in both modes (113 checks each).
+
+Also in this round, for links with latency (D57's transport was only ever
+run on a machine-room link):
+
+- The transport sent a whole window at once and retransmitted in bursts;
+  on the rig's client link at 20 ms each way it fell to under 3 MiB/s.
+  It now paces what the window allows over a round trip (retransmissions
+  included), ends slow start when round trips lengthen, grows the window
+  by a twentieth per round trip and has a retransmission timeout with
+  headroom over the round trip (it used to sit a hair above a steady
+  round-trip time, so ordinary acknowledgements looked late and every
+  round was taken for a loss). Measured with `linkperf` (an example in
+  `rargo-net`): 111, 102 and 77 MiB/s at 2, 40 and 100 ms round trip on
+  the 1 Gbit rig link, no retransmissions.
+- The rig's netem queues were 1,000 packets, less than a 1 Gbit link has
+  in flight at 20 ms: the emulated link dropped what a real one carries
+  (TCP was spared because its segments are queued in batches). They are
+  now sized for the link (`NETEM_LIMIT`, 100,000).
+- Keepalives travel outside the daemon's send queue and outside the
+  frame order, and a link counts as alive while anything arrives on it:
+  a ping queued behind a large upload used to look like a dead server.
+

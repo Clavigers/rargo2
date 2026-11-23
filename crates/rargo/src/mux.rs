@@ -138,7 +138,15 @@ impl Mux {
                 if m.is_dead() {
                     break;
                 }
-                if m.last_heard.lock().unwrap().elapsed() > DEAD_AFTER {
+                // Alive while anything arrives: frames, or (on the UDP
+                // transport) so much as an acknowledgement. A server busy
+                // taking in a large upload answers keepalives late, and
+                // that must not look like a dead link; over TCP, where
+                // only frames can be seen, the patience is longer.
+                let frames = m.last_heard.lock().unwrap().elapsed();
+                let quiet = if m.link.kind() == "udp" { frames.min(m.link.idle()) } else { frames };
+                let limit = if m.link.kind() == "udp" { DEAD_AFTER } else { DEAD_AFTER * 8 };
+                if quiet > limit {
                     m.die();
                     break;
                 }

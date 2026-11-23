@@ -85,6 +85,10 @@ def main():
     if a.out:
         with open(a.out, "a") as f:
             f.write(json.dumps(summary) + "\n")
+    # The client daemon's output directory is unmounted before the
+    # worktree goes.
+    subprocess.run([*PREFIX, a.rargo, "--rargo-daemon-stop"], env=env, capture_output=True)
+    time.sleep(1)
     git("worktree", "remove", "--force", wt)
 
 
