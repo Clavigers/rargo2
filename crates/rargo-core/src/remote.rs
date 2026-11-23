@@ -806,6 +806,47 @@ fn eager_dispatch() -> bool {
     *ON.get_or_init(|| std::env::var("RARGO_DISPATCH").ok().as_deref() == Some("eager"))
 }
 
+/// The view a worker is answered from, without what is under the action's
+/// side directories (its incremental state): a remote compile starts from
+/// nothing rather than have hundreds of megabytes of state shipped out, and
+/// its new state is not shipped back (see D31).
+struct WithoutSide {
+    inner: Arc<dyn View>,
+    side: Vec<Vec<u8>>,
+}
+
+impl WithoutSide {
+    fn hidden(&self, dir: &[u8], name: &[u8]) -> bool {
+        let path = vjoin(dir, name);
+        self.side.iter().any(|d| vpath_starts_with(&path, d) && path != *d)
+    }
+}
+
+impl View for WithoutSide {
+    fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+        if self.hidden(dir, name) { Looked::Absent } else { self.inner.lookup(dir, name) }
+    }
+    fn list(&self, dir: &[u8]) -> io::Result<Listing> {
+        if self.side.iter().any(|d| vpath_starts_with(dir, d)) {
+            return Ok(Vec::new());
+        }
+        self.inner.list(dir)
+    }
+    fn traced(&self, dir: &[u8]) -> bool {
+        self.inner.traced(dir)
+    }
+    fn hints(&self) -> Vec<Vec<u8>> {
+        self.inner.hints()
+    }
+}
+
+/// `RARGO_REMOTE_INCR=1`: remote compiles get their incremental seed and
+/// bring their state back, as local ones do.
+fn remote_incr() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RARGO_REMOTE_INCR").ok().as_deref() == Some("1"))
+}
+
 /// `RARGO_TRACE_REMOTE` in rargod's environment: one line per remote
 /// action on its stderr, with where the time went.
 fn trace_remote() -> bool {
@@ -1204,8 +1245,13 @@ impl Pool {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let t0 = std::time::Instant::now();
+        let view: Arc<dyn View> = if spec.discard.is_empty() || remote_incr() {
+            req.view.clone()
+        } else {
+            Arc::new(WithoutSide { inner: req.view.clone(), side: spec.discard.clone() })
+        };
         let ra = Arc::new(RemoteAction {
-            view: req.view.clone(),
+            view: view.clone(),
             events: tx,
             served: Mutex::new(Vec::new()),
             asked: AtomicU64::new(0),
@@ -1244,12 +1290,12 @@ impl Pool {
                     })
                     .unwrap_or_default();
                 // Hinted paths are looked up, not necessarily read.
-                obs.extend(req.view.hints().into_iter().map(|p| (VPath::from(p), Obs::Dir)));
+                obs.extend(view.hints().into_iter().map(|p| (VPath::from(p), Obs::Dir)));
                 (!obs.is_empty()).then_some(obs)
             }
         };
         if let Some(obs) = predicted {
-            let view = req.view.clone();
+            let view = view.clone();
             let content = self.content.clone();
             let ra2 = ra.clone();
             let host_srcs = self.host_srcs.clone();
@@ -1377,7 +1423,7 @@ impl Pool {
             .entries
             .iter()
             .filter(|(p, _)| !spec.discard.iter().any(|d| vpath_starts_with(p, d)))
-            .chain(done.side.iter())
+            .chain(done.side.iter().filter(|_| remote_incr()))
             .filter_map(|(_, e)| match e {
                 MEntry::File { hash, .. } if !engine.store.has(hash) => Some(*hash),
                 _ => None,
@@ -1421,7 +1467,7 @@ impl Pool {
             .into_iter()
             .filter(|(p, _)| !spec.discard.iter().any(|d| vpath_starts_with(p, d)))
             .collect();
-        let side = done.side;
+        let side = if remote_incr() { done.side } else { Vec::new() };
         let result = ActionResult {
             status: done.status,
             stdout: engine.store.put_bytes(&stdout)?,

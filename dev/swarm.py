@@ -192,6 +192,10 @@ def main():
         store_after_gc_bytes=store_after_gc[1],
         disk_total_bytes=(real if a.mode == "stock" else store[1]),
         failures=len(failures),
+        # Which step of which agent, and the end of that agent's log.
+        failed_steps=[dict(agent=i, step=st[0], rc=st[1],
+                           log_tail=open(os.path.join(root, f"agent{i:02d}.log"), errors="replace").read()[-3000:])
+                      for i, st in failures[:5]],
         step_mean_s=[round(sum(v) / len(v), 2) for _, v in sorted(per_step.items())],
         step_max_s=[round(max(v), 2) for _, v in sorted(per_step.items())],
     )

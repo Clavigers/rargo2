@@ -559,3 +559,23 @@ of compile time, but most of what extra local cores buy is parallelism
 inside the critical crates. The phase 4 criterion is therefore measured on
 the workload that does have parallelism across actions, the 20-agent swarm
 (STATUS).
+
+## D31. Remote compiles run without incremental state (replaces D28)
+
+The 20-agent swarm with a worker (`dev/bench-worker-swarm.sh`, server 8
+cores, worker 8, the D30 link) fetched 3.6 GB back from the worker: remote
+compiles of workspace crates shipped their seed out and their new state
+(hundreds of MB per crate with debug info) back. Swarm wall time: local-8
+171.1 s, 8+8 181.7 s. Remote compiles now see an empty incremental
+directory and their state is not brought back; the crate's next compile
+seeds from the latest local state. `RARGO_REMOTE_INCR=1` restores D28.
+
+Measured after the change, four runs of 8+8: 159.6, 173.8, 172.4, 175.5 s,
+against local-8 171.0 s and local-16 115.4 s. One of the four had a failed
+step, which did not recur in the next three; its logs were lost to the next
+run's cleanup, so the swarm script now records failed steps with the end of
+the agent's log. The worker does not reliably shorten the swarm: the
+dispatcher keeps most actions local because their inputs (the metadata of
+every crate an edit touched, tens to hundreds of MB per compile in
+rust-analyzer) take as long to ship over 1 Gbit as waiting for a local
+core. That is the dispatcher being right, not wrong.

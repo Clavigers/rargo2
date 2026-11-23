@@ -1589,7 +1589,11 @@ impl Run {
                 }
             }
         }
-        if let (Some(dir), true, false) = (&incr_dir, outcome.result.success(), outcome.cached) {
+        // No side changes: nothing new to keep (a remote compile that ran
+        // without incremental state, D31).
+        if let (Some(dir), true, false, false) =
+            (&incr_dir, outcome.result.success(), outcome.cached, outcome.side.is_empty())
+        {
             let state = crate::incr::apply_changes(dir, seed.as_ref().map(|(_, m, _)| &**m), &outcome.side);
             if !state.entries.is_empty() {
                 self.d.incr.save(&crate_key, &wt, self.head, &state);
