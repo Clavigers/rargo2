@@ -312,7 +312,9 @@ fn to_real(s: &str, binds: &[(String, String)]) -> String {
 fn exec(mut e: ExecRequest) -> ! {
     // The fork must happen in a child so that this process (the one the
     // shell is waiting for) keeps its place: unshare changes only us.
-    if let Err(err) = enter_namespace(&e.binds) {
+    if e.binds.is_empty() {
+        // Nothing to make appear anywhere: a plain process.
+    } else if let Err(err) = enter_namespace(&e.binds) {
         if std::env::var_os("RARGO_QUIET_NS").is_none() {
             eprintln!(
                 "warning: cannot create a mount namespace ({err}); running without it. \

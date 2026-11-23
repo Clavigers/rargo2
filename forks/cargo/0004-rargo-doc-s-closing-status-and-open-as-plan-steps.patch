@@ -1,0 +1,108 @@
+From 6d31d772e0f56b3cb363f687e69d7aa0915d9de2 Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Mon, 23 Nov 2026 01:45:11 +0100
+Subject: [PATCH 4/4] rargo: doc's closing status and --open as plan steps
+
+---
+ src/compiler/rargo.rs |  7 +++++
+ src/ops/cargo_doc.rs  | 62 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 69 insertions(+)
+
+diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
+index 44ccd28c4..fc50c9cfc 100644
+--- a/src/compiler/rargo.rs
++++ b/src/compiler/rargo.rs
+@@ -601,6 +601,13 @@ pub fn record_run(cmd: &ProcessBuilder) -> CargoResult<()> {
+     Ok(())
+ }
+ 
++/// Records the command that opens generated documentation.
++pub fn record_open(cmd: &ProcessBuilder) -> CargoResult<()> {
++    let cmd = cmd_of(cmd)?;
++    state().lock().unwrap().steps.push(rp::Step::Open { cmd });
++    Ok(())
++}
++
+ static TEST_FLAGS: Mutex<(bool, bool)> = Mutex::new((false, false));
+ 
+ /// Remembers `cargo test` options rargod needs when running the steps.
+diff --git a/src/ops/cargo_doc.rs b/src/ops/cargo_doc.rs
+index 9292c8a74..cf9974ed7 100644
+--- a/src/ops/cargo_doc.rs
++++ b/src/ops/cargo_doc.rs
+@@ -63,6 +63,10 @@ pub fn doc(ws: &Workspace<'_>, options: &DocOptions) -> CargoResult<()> {
+         merge_cross_crate_info(ws, &compilation)?;
+     }
+ 
++    if crate::compiler::rargo::active() {
++        return rargo_doc_steps(ws, options, &compilation);
++    }
++
+     if options.open_result {
+         let name = &compilation.root_crate_names.get(0).ok_or_else(|| {
+             anyhow::anyhow!(
+@@ -118,6 +122,64 @@ pub fn doc(ws: &Workspace<'_>, options: &DocOptions) -> CargoResult<()> {
+     Ok(())
+ }
+ 
++/// rargo: while planning nothing has been generated yet, so what `doc` does
++/// after the build is recorded as steps instead: the closing status line, and
++/// for `--open` the command that opens the documentation (run by the client,
++/// in the user's session).
++fn rargo_doc_steps(
++    ws: &Workspace<'_>,
++    options: &DocOptions,
++    compilation: &Compilation<'_>,
++) -> CargoResult<()> {
++    use crate::compiler::rargo;
++    use rargo_plan::When;
++    let gctx = ws.gctx();
++    if options.open_result {
++        let name = &compilation.root_crate_names.get(0).ok_or_else(|| {
++            anyhow::anyhow!(
++                "cannot open specified crate's documentation: no documentation generated"
++            )
++        })?;
++        let kind = options.compile_opts.build_config.single_requested_kind()?;
++        let path = path_by_output_format(compilation, &kind, name, &options.output_format);
++        rargo::record_status("Opening", path.display(), When::Always);
++        let cfg: Option<crate::context::PathAndArgs> = gctx.get(["doc", "browser"])?;
++        let browser = cfg
++            .map(|pa| (pa.path.resolve_program(gctx), pa.args))
++            .or_else(|| Some((PathBuf::from(gctx.get_env_os("BROWSER")?), Vec::new())));
++        let mut cmd = match browser {
++            Some((browser, args)) => {
++                let mut cmd = ProcessBuilder::new(browser);
++                cmd.args(&args);
++                cmd
++            }
++            None => ProcessBuilder::new("xdg-open"),
++        };
++        cmd.arg(&path);
++        rargo::record_open(&cmd)?;
++        return Ok(());
++    }
++    let mut paths = Vec::new();
++    for name in &compilation.root_crate_names {
++        for kind in &options.compile_opts.build_config.requested_kinds {
++            paths.push(path_by_output_format(compilation, kind, name, &options.output_format));
++        }
++    }
++    if gctx.shell().verbosity() == Verbosity::Verbose {
++        for path in &paths {
++            rargo::record_status("Generated", path.display(), When::Always);
++        }
++    } else if let Some(first) = paths.first() {
++        let remaining = match paths.len() - 1 {
++            0 => "".to_owned(),
++            1 => " and 1 other file".to_owned(),
++            n => format!(" and {n} other files"),
++        };
++        rargo::record_status("Generated", format!("{}{remaining}", first.display()), When::Always);
++    }
++    Ok(())
++}
++
+ fn merge_cross_crate_info(ws: &Workspace<'_>, compilation: &Compilation<'_>) -> CargoResult<()> {
+     let Some(fingerprints) = compilation.rustdoc_fingerprints.as_ref() else {
+         return Ok(());

@@ -645,6 +645,13 @@ impl Store {
         Ok(want)
     }
 
+    /// Whether `dest` is already a hard link to the blob (nothing to place
+    /// and nothing to read to find that out).
+    pub fn is_linked(&self, h: &Hash, exec: bool, dest: &Path) -> bool {
+        let (Ok(d), Ok(s)) = (fs::metadata(dest), fs::metadata(self.path_of(h, exec))) else { return false };
+        d.dev() == s.dev() && d.ino() == s.ino()
+    }
+
     /// Places a blob at `dest` without using extra space where the
     /// filesystems allow it: reflink, then hard link, then copy. An existing
     /// `dest` is replaced atomically.

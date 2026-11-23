@@ -310,6 +310,9 @@ struct LayerDir {
 #[derive(Default)]
 pub struct OutputsLayer {
     dirs: DashMap<Vec<u8>, LayerDir>,
+    /// Which unit's file wins when several wrote the same path: the higher
+    /// rank. A unit's rank is its index unless set otherwise.
+    ranks: DashMap<u32, u64>,
 }
 
 impl OutputsLayer {
@@ -350,7 +353,17 @@ impl OutputsLayer {
         self.add(unit, stage, &m.entries);
     }
 
-    fn pick(list: &[(u32, u8, LayerEnt)], levels: &[u8]) -> Option<LayerEnt> {
+    /// Makes `unit`'s files win over those of every unit with a lower rank
+    /// (units that deliberately rewrite each other's files in sequence).
+    pub fn set_rank(&self, unit: u32, rank: u64) {
+        self.ranks.insert(unit, rank);
+    }
+
+    fn rank(&self, unit: u32) -> u64 {
+        self.ranks.get(&unit).map(|r| *r).unwrap_or(unit as u64)
+    }
+
+    fn pick(&self, list: &[(u32, u8, LayerEnt)], levels: &[u8]) -> Option<LayerEnt> {
         let mut best: Option<(u32, &LayerEnt)> = None;
         for (u, stage, ent) in list {
             if levels.get(*u as usize).copied().unwrap_or(LEVEL_NONE) < *stage {
@@ -359,10 +372,10 @@ impl OutputsLayer {
             let better = match (&best, ent) {
                 (None, _) => true,
                 // A real entry beats an implied directory; among real
-                // entries the higher unit index wins, deterministically.
+                // entries the higher-ranked unit wins, deterministically.
                 (Some((_, LayerEnt::Implied)), LayerEnt::Entry(_)) => true,
                 (Some((_, LayerEnt::Entry(_))), LayerEnt::Implied) => false,
-                (Some((bu, _)), _) => *u > *bu,
+                (Some((bu, _)), _) => self.rank(*u) > self.rank(*bu),
             };
             if better {
                 best = Some((*u, ent));
@@ -373,7 +386,7 @@ impl OutputsLayer {
 
     fn get(&self, dir: &[u8], name: &[u8], levels: &[u8]) -> Option<LayerEnt> {
         let d = self.dirs.get(dir)?;
-        Self::pick(d.children.get(name)?, levels)
+        self.pick(d.children.get(name)?, levels)
     }
 
     /// Every file and symlink visible at `levels`.
@@ -381,7 +394,7 @@ impl OutputsLayer {
         let mut out = Vec::new();
         for d in self.dirs.iter() {
             for (name, list) in &d.value().children {
-                if let Some(LayerEnt::Entry(MEntry::File { .. } | MEntry::Symlink(_))) = Self::pick(list, levels) {
+                if let Some(LayerEnt::Entry(MEntry::File { .. } | MEntry::Symlink(_))) = self.pick(list, levels) {
                     out.push(vjoin(d.key(), name));
                 }
             }
@@ -395,7 +408,7 @@ impl OutputsLayer {
             Some(d) => d
                 .children
                 .iter()
-                .filter_map(|(name, list)| Self::pick(list, levels).map(|e| (name.clone(), e)))
+                .filter_map(|(name, list)| self.pick(list, levels).map(|e| (name.clone(), e)))
                 .collect(),
         }
     }

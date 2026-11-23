@@ -360,6 +360,24 @@ cd "$A"
 before=$(runs); "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1; after=$(runs)
 [ "$before" = "$after" ] && ok "after compaction and gc, build and test are still fully cached" || bad "after compaction and gc, build and test are still fully cached" "delta=$((after - before))"
 
+echo "== doc"
+cd "$A"
+out=$("$R" doc 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "Generated $A/target/doc/" && ok "doc ends with cargo's Generated line and a real path" || bad "doc ends with cargo's Generated line and a real path" "$out"
+[ -f "$A/target/doc/app/index.html" ] && [ -f "$A/target/doc/util/index.html" ] && ok "documentation is in target/doc" || bad "documentation is in target/doc" "$(ls "$A/target/doc" 2>&1)"
+crates=$(head -1 "$A/target/doc/crates.js" 2>/dev/null)
+has "$crates" '"app"' && has "$crates" '"mac"' && has "$crates" '"util"' && ok "the cross-crate files cover every crate ($crates)" || bad "the cross-crate files cover every crate" "$crates"
+cat >"$T/fake-browser" <<EOF
+#!/bin/sh
+echo "\$@" >"$T/opened"
+EOF
+chmod +x "$T/fake-browser"
+rm -f "$T/opened"
+out=$(BROWSER="$T/fake-browser" "$R" doc --open -p app 2>&1); rc=$?
+opened=$(cat "$T/opened" 2>/dev/null)
+[ $rc -eq 0 ] && has "$out" "Opening $A/target/doc/app/index.html" && [ "$opened" = "$A/target/doc/app/index.html" ] && [ -f "$opened" ] && ok "doc --open starts the browser on the real file" || bad "doc --open starts the browser on the real file" "$out
+opened: $opened"
+
 echo "== the cargo shim"
 cd "$A"
 mkdir -p "$T/shim"

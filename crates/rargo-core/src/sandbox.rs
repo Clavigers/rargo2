@@ -448,12 +448,14 @@ fn spawn_init(
     }
     if pid == 0 {
         drop(status_r);
+        // Into the action's cgroup before anything else is forked, so that
+        // every process of the action is accounted there ("0" is "me").
+        if let Some(cg) = &req.cgroup {
+            let _ = std::fs::write(cg.join("cgroup.procs"), "0");
+        }
         let code = init_main(req, stdin, stdout, stderr, extras, status_w);
         // SAFETY: terminating the init process without running destructors.
         unsafe { libc::_exit(code) };
-    }
-    if let Some(cg) = &req.cgroup {
-        let _ = std::fs::write(cg.join("cgroup.procs"), pid.to_string());
     }
     Ok((pid, status_r))
 }

@@ -87,6 +87,12 @@ pub struct PlanData {
     levels: Vec<OnceLock<Arc<Vec<u8>>>>,
     /// Sandbox paths of each unit's metadata outputs, announced or not.
     rmeta_out: Vec<Vec<Vec<u8>>>,
+    /// For a documentation unit: the directory rustdoc writes to.
+    doc_dir: Vec<Option<Vec<u8>>>,
+    /// Documentation units in the order they run (see `PlanData::new`).
+    doc_order: Vec<usize>,
+    /// For a documentation unit: its place in `doc_order`.
+    doc_pos: Vec<Option<usize>>,
     /// Like `levels`, for a unit compiled for its metadata only.
     meta_levels: Vec<OnceLock<Arc<Vec<u8>>>>,
     /// How much of each unit a metadata-only request for the roots needs.
@@ -102,9 +108,56 @@ impl PlanData {
             .iter()
             .map(|u| u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect())
             .collect();
+        // rustdoc keeps files that cover all crates (the search index, the
+        // crate list) in the output directory and extends them on every
+        // run. cargo lets the runs race under rustdoc's own lock; here the
+        // runs for one directory form a chain, each seeing its
+        // predecessors' output, so the last one's shared files are complete.
+        let doc_dir = plan
+            .units
+            .iter()
+            .map(|u| match (&u.kind, &u.cmd) {
+                (rp::UnitKind::Doc, Some(cmd)) => {
+                    ["-o", "--out-dir"].iter().find_map(|f| arg_value(&cmd.args, f)).map(|d| d.as_bytes().to_vec())
+                }
+                _ => None,
+            })
+            .collect();
+        let doc_dir: Vec<Option<Vec<u8>>> = doc_dir;
+        // The chain's order: dependencies first (cargo documents a crate
+        // after the crates it links to), otherwise by unit index.
+        let mut doc_order: Vec<usize> = Vec::new();
+        {
+            let mut seen = vec![false; n];
+            fn visit(i: usize, units: &[rp::Unit], is_doc: &dyn Fn(usize) -> bool, seen: &mut [bool], out: &mut Vec<usize>) {
+                if seen[i] {
+                    return;
+                }
+                seen[i] = true;
+                let mut deps: Vec<usize> = units[i].deps.iter().map(|d| d.unit as usize).filter(|&j| is_doc(j)).collect();
+                deps.sort_unstable();
+                for j in deps {
+                    visit(j, units, is_doc, seen, out);
+                }
+                out.push(i);
+            }
+            let is_doc = |j: usize| doc_dir[j].is_some();
+            for i in 0..n {
+                if is_doc(i) {
+                    visit(i, &plan.units, &is_doc, &mut seen, &mut doc_order);
+                }
+            }
+        }
+        let mut doc_pos = vec![None; n];
+        for (pos, &i) in doc_order.iter().enumerate() {
+            doc_pos[i] = Some(pos);
+        }
         PlanData {
             plan,
             linking,
+            doc_dir,
+            doc_order,
+            doc_pos,
             levels: (0..n).map(|_| OnceLock::new()).collect(),
             rmeta_out,
             meta_levels: (0..n).map(|_| OnceLock::new()).collect(),
@@ -212,6 +265,13 @@ impl PlanData {
                         }
                     }
                 }
+                if let Some(pos) = self.doc_pos[i] {
+                    for &j in &self.doc_order[..pos] {
+                        if self.doc_dir[j] == self.doc_dir[i] {
+                            lv[j] = LEVEL_FULL;
+                        }
+                    }
+                }
                 Arc::new(lv)
             })
             .clone()
@@ -246,6 +306,8 @@ struct Ui {
     documented: HashSet<String>,
     scraped: HashSet<String>,
     seen_diag: HashSet<Hash>,
+    /// Packages whose compiler reported future-incompatibility lints.
+    future_incompat: std::collections::BTreeSet<String>,
     counts: HashMap<usize, Counts>,
     said_waiting: bool,
 }
@@ -928,14 +990,28 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
         d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
     }
+    let finished = || {
+        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
+        let pkgs: Vec<String> = run.ui.lock().future_incompat.iter().cloned().collect();
+        if !pkgs.is_empty() {
+            c2.out.warn(&format!(
+                "the following packages contain code that will be rejected by a future version of Rust: {}",
+                pkgs.join(", ")
+            ));
+            c2.out.note(
+                "to see what the problems were, build with stock cargo and the option `--future-incompat-report` \
+                 (rargo does not keep cargo's report file)",
+            );
+        }
+    };
     if run.need.is_some() {
         // A check leaves nothing in the target directory and has no steps.
-        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
+        finished();
         return Ok(Finish::Code(0));
     }
     // Place what was asked for into the real target directory.
     run.materialize_roots(&p.root).await?;
-    c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
+    finished();
 
     run.steps(&p).await
 }
@@ -1160,6 +1236,22 @@ impl Run {
             for dep in &u.deps {
                 if !self.wait_dep(dep).await {
                     return Ok(UState::Skipped);
+                }
+            }
+        }
+        if self.pd.doc_dir[i].is_some() {
+            // The documentation chain: after the previous run for the same
+            // directory, however that one ended.
+            let pos = self.pd.doc_pos[i].unwrap_or(0);
+            // Later runs rewrite the files earlier ones wrote.
+            self.layer.set_rank(i as u32, (plan.units.len() + pos) as u64);
+            let before = &self.pd.doc_order[..pos];
+            if let Some(&prev) = before.iter().rev().find(|&&j| self.pd.doc_dir[j] == self.pd.doc_dir[i]) {
+                let mut rx = self.states[prev].subscribe();
+                while matches!(*rx.borrow_and_update(), UState::Pending | UState::Meta) {
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -1563,6 +1655,9 @@ impl Run {
             return;
         };
         if v.get("future_incompat_report").is_some() {
+            // cargo collects these into a report file and a closing
+            // warning; rargo gives the warning.
+            self.ui.lock().future_incompat.insert(u.pkg.clone());
             return;
         }
         let is_summary = |m: &str| {
@@ -1847,17 +1942,37 @@ impl Run {
                 }
             }
         }
+        // Generated documentation: every file rustdoc wrote, the later run
+        // winning where several wrote the same file.
+        let mut docs: BTreeMap<&[u8], (Hash, bool)> = BTreeMap::new();
+        for &i in &self.pd.doc_order {
+            let (Some(dir), Some((r, _))) = (&self.pd.doc_dir[i], self.results[i].get()) else { continue };
+            for (path, e) in &r.outputs.entries {
+                if let (MEntry::File { hash, exec, .. }, true) = (e, vpath_starts_with(path, dir)) {
+                    docs.insert(path, (*hash, *exec));
+                }
+            }
+        }
+        for (path, (hash, exec)) in docs {
+            jobs.push((hash, exec, PathBuf::from(self.c.out.tr.path(&String::from_utf8_lossy(path)))));
+        }
         if jobs.is_empty() {
             return Ok(());
         }
         let store = self.d.store().clone();
         let (uid, gid) = (self.c.uid, self.c.gid);
         tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut made: HashSet<PathBuf> = HashSet::new();
             for (hash, exec, dest) in jobs {
-                if let Some(parent) = dest.parent() {
-                    mkdir_owned(parent, uid, gid)?;
+                if store.is_linked(&hash, exec, &dest) {
+                    continue;
                 }
-                // Already the same inode or content: nothing to do.
+                if let Some(parent) = dest.parent() {
+                    if made.insert(parent.to_path_buf()) {
+                        mkdir_owned(parent, uid, gid)?;
+                    }
+                }
+                // Already the same content: nothing to do.
                 if let (Ok(md), Some(size)) = (std::fs::metadata(&dest), store.size_of(&hash)) {
                     if md.len() == size && (md.mode() & 0o111 != 0) == exec {
                         if let Ok((h, _)) = Hash::of_path(&dest) {
@@ -1923,6 +2038,26 @@ impl Run {
                                 String::from_utf8_lossy(CARGO_HOME_AT).into_owned(),
                             ),
                         ],
+                    }));
+                }
+                rp::Step::Open { cmd } => {
+                    // Whatever opens the documentation lives outside any
+                    // sandbox and has to be given the real path.
+                    let real = |s: &String| out.tr.path(s);
+                    // The planner does not see the user's `$BROWSER` (it is
+                    // not an input to any build); cargo's order is the
+                    // configured browser, then `$BROWSER`, then the system
+                    // opener, which is what the plan falls back to.
+                    let program = match self.c.env.get("BROWSER") {
+                        Some(b) if cmd.program == "xdg-open" && !b.is_empty() => b.clone(),
+                        _ => real(&cmd.program),
+                    };
+                    return Ok(Finish::Exec(ExecRequest {
+                        program,
+                        args: cmd.args.iter().map(real).collect(),
+                        env: self.c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        cwd: self.c.cwd.to_string_lossy().into_owned(),
+                        binds: vec![],
                     }));
                 }
                 rp::Step::Exec { kind, unit, cmd, rerun, harness } => {

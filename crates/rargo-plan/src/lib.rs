@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever the format or the fork's behaviour changes; part of the
 /// planner's cache key through the binary itself, checked on load.
-pub const PLAN_VERSION: u32 = 3;
+pub const PLAN_VERSION: u32 = 4;
 
 /// Environment variable naming the file the plan is written to. Its presence
 /// switches the fork into planning mode.
@@ -230,6 +230,9 @@ pub enum Step {
     },
     /// `cargo run`: the client replaces itself with this process.
     Run { cmd: Cmd, display: String },
+    /// `cargo doc --open`: the client starts this (a browser or the system
+    /// opener) in the user's session, with real paths.
+    Open { cmd: Cmd },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
