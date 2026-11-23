@@ -193,6 +193,15 @@ def main():
 
     results = {}
     logs = [open(os.path.join(root, f"agent{i:02d}.log"), "wb") for i in range(a.agents)]
+    # Bytes crossing the client link, both ways, as the client's interface
+    # counts them.
+    def link_bytes():
+        if not a.netns:
+            return (0, 0)
+        read = lambda f: int(subprocess.run(["ip", "netns", "exec", a.netns, "cat", f"/sys/class/net/eth0/statistics/{f}"],
+                                            capture_output=True, text=True).stdout.strip() or 0)
+        return (read("rx_bytes"), read("tx_bytes"))
+    link0 = link_bytes()
     t0 = time.time()
     threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, prefix)) for i in range(a.agents)]
     size = a.batch if a.batch > 0 else a.agents
@@ -201,6 +210,15 @@ def main():
         for t in group: t.start()
         for t in group: t.join()
     wall = time.time() - t0
+    link1 = link_bytes()
+    daemon_status = ""
+    if a.mode == "rargo":
+        # What the client daemon did, and then its end: its virtual output
+        # directories are unmounted, so that what is measured below is what
+        # is really on the client's disk.
+        daemon_status = subprocess.run(prefix + [RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
+        subprocess.run(prefix + [RARGO, "--rargo-daemon-stop"], env=env, capture_output=True)
+        time.sleep(1)
     cpu1 = cgroup_cpu_usec(daemon_pid) if a.mode == "rargo" else cgroup_cpu_usec(os.getpid())
 
     self1 = os.times()
@@ -240,6 +258,9 @@ def main():
         store_after_gc_bytes=store_after_gc[1],
         disk_total_bytes=real + store[1],
         netns=a.netns, sync=sync_line,
+        link_down_bytes=link1[0] - link0[0], link_up_bytes=link1[1] - link0[1],
+        output_mode=env.get("RARGO_OUTPUT", "fuse") if a.mode == "rargo" else None,
+        client_daemon=" | ".join(l.strip() for l in daemon_status.splitlines() if l.startswith(("link", "scans", "pushed", "outputs"))),
         failures=len(failures),
         # Which step of which agent, and the end of that agent's log.
         failed_steps=[dict(agent=i, step=st[0], rc=st[1], output=st[3]) for i, st in failures[:5]],

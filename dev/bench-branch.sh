@@ -73,8 +73,9 @@ status=""
 [ "$mode" = rargo ] && status=$(run --rargo-status | grep -E '^(sync|cache|actions run)' | tr -s ' ' | tr '\n' ';')
 printf '{"label":"%s","base_first":[%.2f,%.2f,%.2f],"a_same_agent":[%.2f,%.2f,%.2f],"b_fresh_worktree":[%.2f,%.2f,%.2f],"c_switched_worktree":[%.2f,%.2f,%.2f],"status":"%s"}\n' \
     "$label" "$c0" "$b0" "$s0" "$ca" "$ba" "$sa" "$cb" "$bb" "$sb" "$cc" "$bc" "$sc" "$status" | tee -a "$out"
-grep -c FAILED "$C/last.log" >/dev/null 2>&1
 cd /
+# The daemon's output directories are unmounted before the worktrees go.
+[ "$mode" = rargo ] && run --rargo-daemon-stop
 for w in a b c; do git -C "$base" worktree remove --force "$C/$w" >/dev/null 2>&1; done
 git -C "$base" branch -D rargo-bench-b >/dev/null 2>&1
 "$here/netns.sh" down >/dev/null 2>&1

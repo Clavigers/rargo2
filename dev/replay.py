@@ -15,10 +15,12 @@ see): same daemon options, same history, different RUSTUP_TOOLCHAIN.
 import argparse, json, os, re, subprocess, sys, time
 
 WORK = os.environ.get("RARGO_WORK", "/root/rargo-work")
+# Set by --netns: the command that puts the client into its network namespace.
+PREFIX = []
 
 
 def status(rargo, env):
-    out = subprocess.run([rargo, "--rargo-status"], env=env, capture_output=True, text=True).stdout
+    out = subprocess.run([*PREFIX, rargo, "--rargo-status"], env=env, capture_output=True, text=True).stdout
     m = re.search(r"actions run\s+(\d+) \(([\d.]+)s cpu", out)
     c = re.search(r"cache\s+(\d+) hits, (\d+) misses", out)
     return int(m.group(1)), float(m.group(2)), int(c.group(1))
@@ -32,8 +34,11 @@ def main():
     ap.add_argument("--rargo", default=os.path.join(WORK, "dev-target/release/rargo"))
     ap.add_argument("--label", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--netns", default=None, help="network namespace the rargo client runs in (dev/netns.sh)")
     ap.add_argument("cmd", nargs="+")
     a = ap.parse_args()
+    if a.netns:
+        PREFIX.extend(["nsenter", f"--net=/run/netns/{a.netns}"])
 
     repo = os.path.join(WORK, "bench", a.repo)
     wt = os.path.join(WORK, "bench", f"replay-{a.repo}")
@@ -54,7 +59,7 @@ def main():
             files = len(git("diff", "--name-only", commits[n - 1], c, "--", "*.rs", cwd=wt).split())
         a0, cpu0, hit0 = status(a.rargo, env)
         t = time.time()
-        p = subprocess.run([a.rargo, *a.cmd], cwd=wt, env=env, capture_output=True, text=True)
+        p = subprocess.run([*PREFIX, a.rargo, *a.cmd], cwd=wt, env=env, capture_output=True, text=True)
         dt = time.time() - t
         a1, cpu1, hit1 = status(a.rargo, env)
         row = dict(commit=c[:9], rs_files=files, wall_s=round(dt, 2), actions=a1 - a0, cpu_s=round(cpu1 - cpu0, 1),
