@@ -634,3 +634,236 @@ the filesystem used 56.09 MiB more on btrfs and 102.95 MiB more on ext4
 (`df` deltas). The corresponding aggregate `du` counts were 122.69 MiB
 and 104.83 MiB. `du` counts shared extents once per inode and counts hard
 links to an inode only once.
+
+## D34. Remote first: the client syncs, the server does everything
+
+The first implementation (D1 to D33) had `rargod` on the client's machine:
+it opened worktrees on its own disk through libgit2 and inotify, was
+reached over a Unix socket, ran actions as the calling user, and
+hard-linked artifacts from its store into `target/`. The user had asked for
+the opposite: clients that only sync files and environment, on any machine,
+with all analysis, scheduling and building on a remote server ("remote
+cargo"). `DESIGN.md` had misread "builds run on the same machine the rargo
+clients talk to" as "the clients are on that machine".
+
+What changed, and what did not:
+
+- Unchanged: the planner (cargo fork), sandbox and tracing, trace cache,
+  in-flight deduplication, scheduler, shared incremental compilation,
+  store, cold tier, workers, verify mode.
+- Replaced: how the server learns a worktree's content (D35, D36), the
+  transport and who may connect (D37), where the environment comes from
+  (D38), how results reach the worktree (D39), and everything that used to
+  open the real worktree: fetching (D40), flake evaluation (D41), the drift
+  check (D42), incremental seed selection (D43).
+- Gone from the server: libgit2, inotify, the git-object-id table, the
+  Unix socket, peer credentials.
+
+Earlier decisions this replaces in part: D6 (actions ran as the client's
+user; now as the server's build user), D7 (clean files were identified by
+git object id; now every file by its content hash, computed on the client),
+D10 (the client's `PATH`, `HOME` and `RUSTUP_HOME` were given to actions;
+now the server's), D12 and D13 (writes into the worktree and `target/` were
+done by the server on the shared disk; now sent to the client), D14, D19
+(export and import were for root; now for users marked `admin`), D20, D32,
+D33 (worktrees no longer share a file system with the store, so reflinks
+only matter inside the server and inside the client's cache).
+
+There is one code path. A server on the client's own machine is reached
+over the loopback interface like any other; there is no local mode.
+Reason: two paths would mean the remote one, the one that was asked for,
+is the less exercised.
+
+## D35. A worktree is a content-addressed tree; everything in it is synced
+
+- A directory is a manifest: entries sorted by name, each a file (blake3 of
+  its content, size, executable bit), a symlink (target) or a directory
+  (hash of its manifest). Manifests are stored in the content store as
+  blobs under the hash of their encoding, so they are deduplicated, evicted
+  and collected like file contents, and a client is asked again for
+  anything that has gone.
+- The client sends the root hash. The server walks down level by level,
+  asking for the manifests it lacks, then for the file contents it lacks.
+  It remembers, per store generation, which subtrees were complete, so an
+  unchanged tree is not walked again.
+- The build starts when the whole tree is in the store. Rejected: starting
+  at once and fetching contents from the client as actions open them. It
+  would shorten the very first sync of a repository and nothing else, and
+  it would make every snapshot depend on a client staying connected.
+- Synced: everything except `.git` (D36), any directory holding a
+  `CACHEDIR.TAG` (cargo writes one into every target directory, and the
+  client writes it into the ones it creates), `target` at the root, special
+  files, and what `.rargo.toml` lists under `[sync] exclude`. Git-ignored
+  files are synced. Reason: Bevy ignores its `Cargo.lock`; without it the
+  server would resolve dependencies afresh and build other versions than
+  stock cargo does on the client, which is drift. Ignored generated sources
+  are the same case. The cost is that a large ignored directory is hashed
+  once on the client and uploaded once; `[sync] exclude` is the way out.
+- The client has no daemon and no file watcher. Every command scans the
+  worktree: one `lstat` per file, in parallel, against an index of what was
+  hashed before (size, mtime, ctime, inode). A file whose timestamps are
+  within 50 ms of when it was hashed is hashed once more on the next scan,
+  because it may have changed again without its timestamps moving. Reason
+  for no watcher: the user asked for a dumb client; measured, the scan of
+  rust-analyzer is a few milliseconds (STATUS).
+- Uploads: small files in batches, read and compressed in parallel; files
+  over 1 MiB as compressed parts. The server re-hashes everything it
+  receives. If a file no longer has the content the scan saw, the client
+  says so and starts over (five attempts).
+- Two clients missing the same content: one uploads, the other waits for
+  that upload and is only asked itself if the first fails.
+- The newest snapshot of each worktree is kept from garbage collection, so
+  an idle worktree does not have to upload again after `--rargo-gc`.
+
+## D36. `.git` is not synced; a per-commit stand-in is
+
+- The first remote build of rust-analyzer printed `Could not find
+  .git/HEAD`: its build script, like Ruff's, asks git for the commit to put
+  in `--version`. With the daemon on the client's machine the real `.git`
+  had been visible. Not showing one would make remote builds differ from
+  stock cargo's for every project that stamps a version.
+- The client builds, once per commit, a directory that is to git a
+  depth-one clone without file contents: `HEAD`, the branch it names, a
+  `shallow` file, a pack with the commit, its trees and the targets of
+  tracked symlinks (git compares those by reading the object), and an index
+  made with `git read-tree` from the commit. It is grafted into the synced
+  tree as `.git`. rust-analyzer's is 420 KiB and takes 9 ms to make.
+- Works in the sandbox: `rev-parse`, `log -1`, the branch name, `status`,
+  `describe --always --dirty`. Does not: history (`describe --tags` fails
+  as in any shallow clone, which build scripts already meet in CI) and file
+  contents from git.
+- It depends only on HEAD, never on the user's index, so it is shared by
+  all worktrees at a commit and does not change when the user stages
+  something.
+- Known inexactness: in a repository that has files committed with CRLF
+  under an `eol=lf` attribute (rust-analyzer has two), `git status` in the
+  sandbox reports them modified, as git does wherever it has to re-read
+  such a file. `--dirty` is then set where it is not on the client.
+- `[sync] git = false` in `.rargo.toml` leaves the sandbox without a
+  repository.
+- Rejected: syncing the real `.git` (size); syncing nothing (drift);
+  a depth-one clone with contents (doubles the upload for one feature).
+
+## D37. Transport and who may connect
+
+- One TCP connection per command. Rejected: the workers' reliable-UDP
+  layer (TCP is right for a stream to a client behind arbitrary networks);
+  SSH as the transport (hundreds of milliseconds of connection setup per
+  command against a no-op build that takes tens).
+- Noise `NNpsk0` (X25519, ChaCha20-Poly1305, BLAKE2s) with a pre-shared key
+  per user: mutual proof of the key, fresh session keys, no certificates to
+  manage. The key file on the server has a line per user, `name secret
+  [admin]`. Without a key file rargod only listens on loopback and accepts
+  anyone on the machine; it refuses to listen elsewhere without one.
+- The request rides in the first handshake message when it fits (it
+  usually does), encrypted under the pre-shared key, so the server starts
+  working after one round trip. That one message is not forward secret; it
+  carries the command line and the allow-listed environment.
+- Users of one server share one cache and are trusted with each other's
+  source: a team tool. `admin` gates garbage collection, compaction, and
+  cache export and import (which name directories on the server).
+- The client finds the server in `RARGO_SERVER`, `RARGO_USER`, `RARGO_KEY`
+  or `RARGO_KEY_FILE`, else in `~/.config/rargo/config.toml` (`server`,
+  `user`, `key`, `key-file`). `RARGO_FALLBACK=cargo` runs plain cargo when
+  the server cannot be reached.
+- Output to the client is one ordered queue; file contents in it are
+  additionally held to a 32 MiB window, so a slow link slows the sender
+  down instead of filling the server's memory.
+
+## D38. The environment is the server's, steered by the client
+
+- `PATH`, `HOME`, `RUSTUP_HOME`, certificate paths and `NIX_*` given to
+  actions are rargod's own. The client's values name things on another
+  machine.
+- The client sends, unasked, variables on a fixed allow-list (cargo, rustc
+  and rustdoc settings, `RUSTUP_TOOLCHAIN`, locale, colour, `RARGO_*`) and
+  those `.rargo.toml` names under `[env] pass`. Never sent: `CARGO_HOME`,
+  registry tokens, rustc wrappers, rargo's own key.
+- Any other variable reaches an action only after an action declared it
+  (as before, D10). The server then asks the connected client for its
+  value, and the client remembers the name and sends it unasked from then
+  on. Reason for asking instead of sending the whole environment: the
+  client's environment holds secrets no build has asked for.
+- The cargo home is the server's, one for all clients: one copy of each
+  downloaded crate, shared by everyone. A client's own `config.toml` and
+  `credentials.toml` are sent with each request and laid over it for that
+  request only (file mounts in the sandbox; a private directory linking to
+  the shared downloads for unsandboxed fetches). Not synced: cargo
+  configuration in directories above the worktree other than the cargo
+  home; paths in a configuration that name things on the client.
+- Actions run as one user of the server's choosing (`--uid`, `--gid`;
+  rargod's own by default). Who the client is does not enter any key.
+- Messages and arguments are translated between `/w` and the client's
+  worktree path, and `/c` and the client's cargo home path, so the user
+  sees and types their own paths.
+
+## D39. Results
+
+- The server offers files by hash and size; the client answers with the
+  hashes it lacks; contents follow. A file already in place is recognised
+  by a `stat` against what the client recorded when it placed it.
+- What cargo would hard-link into place (`target/debug/app`,
+  `libfoo.rlib`) is kept in the client's cache (`~/.cache/rargo/blobs`) and
+  placed by reflink where the file system has them, by read-only hard link
+  otherwise, by copy across file systems. Twenty worktrees on one machine
+  therefore hold one copy of a binary and download it once. A cache entry
+  is re-hashed before it is used: someone may have written through a link.
+- What other tools rewrite in place (an executable at the path rustc
+  writes it to, documentation, anything written into the source tree) is
+  always an ordinary writable file of its own (D32's finding, now enforced
+  on the client).
+- Test executables are not brought over unless asked for (`test --no-run`,
+  `build --tests`): tests run on the server.
+- `rargo run` and `doc --open`: the server sends the command; the client
+  runs it, with its own environment plus what cargo adds. The mount
+  namespace that makes `/w` resolve at run time is entered on the client,
+  as before.
+- A target directory outside the worktree works as long as the client
+  names it (`CARGO_TARGET_DIR`); artifacts are written where the translated
+  path says. The client writes wherever the server says: the server
+  already decides what the binaries it hands over do.
+- Cache entries unlinked for three days are removed from the client's
+  cache, checked at most once an hour.
+
+## D40. Fetching happens on the server
+
+Planning runs offline (D14). When cargo says it needs the network, the
+server writes the snapshot into a scratch directory, runs `rustc -V` there
+(which makes rustup install the toolchain the repo names) and the forked
+cargo's `fetch`, unsandboxed, as the build user, with the client's cargo
+configuration and into the shared cargo home; one fetch at a time. A
+`Cargo.lock` cargo wrote or changed is sent to the client's worktree, and
+the build continues on the snapshot with that file applied, without
+another round trip. A server without network access needs its cargo home
+filled beforehand.
+
+## D41. Flake evaluation
+
+The flake's defining files (`flake.nix`, `flake.lock`, `.nix` files at the
+top and under `nix/`, and now `rust-toolchain` and `rust-toolchain.toml`,
+which devShells commonly read) are written into a scratch directory and
+evaluated there; the result is remembered under their hash as before. A
+flake that reads other files of the repository during evaluation fails to
+evaluate; the error names the switch (`flake.enabled = false`).
+
+A binary built in a flake sandbox is linked against the flake's libraries.
+`rargo run` starts it on the client, which therefore needs those store
+paths (entering the same devShell there provides them).
+
+## D42. The drift check, both halves
+
+- On the server (`--rargo-drift-check`, and in the background for each
+  worktree's newest synced state): the snapshot is written to a scratch
+  directory and built there with stock cargo, and built by rargo in verify
+  mode. It checks exactly what a client synced, uncommitted changes
+  included, where the old check cloned HEAD.
+- On the client, `dev/nodrift.sh` and the e2e script run stock cargo in the
+  worktree and `target/` rargo has used, and rargo again afterwards.
+
+## D43. Incremental seeds without the repository
+
+The server cannot ask git whether one commit is an ancestor of another. The
+client sends HEAD and its last 64 first-parent ancestors (asked of git once
+per HEAD and remembered), and a stable identifier of the worktree (host
+name and path). Seed choice is as in D16 with "ancestor" meaning "in that
+list". A hint only: any state is a valid seed.
