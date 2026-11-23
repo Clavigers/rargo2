@@ -5,13 +5,38 @@ missing. Updated as the run proceeds; the newest state is at the top of each
 section. Machine: 32 threads, 124 GB RAM, kernel 7.0, ext4. All builds are
 capped at 24 cores (`CPUQuota=2400%`, `-j24` / 24 scheduler tokens).
 
-## Summary so far
+## Summary (final report; updated 2026-11-23)
 
-Phases 1 to 4 are implemented and exercised. The 20-agent benchmark is done
-on rust-analyzer, Ruff and Bevy: 3.3x to 5.6x less wall time, 5.3x to 8.4x
-less CPU time and 2.4x to 2.9x less disk than stock cargo, with no failed
-steps. Phase 5 (the rustc fork) is in progress; the worker benchmark is
-pending.
+All phases (1 to 5) are implemented and tested. Measured against stock
+cargo with one target directory per worktree:
+
+- **20 agents in 20 worktrees** (24 cores): rust-analyzer 3.3x less wall
+  time, 5.3x less CPU, 2.4x less disk; Ruff 5.6x / 7.2x / 2.9x; Bevy
+  4.8x / 8.4x / 2.5x. No failed steps.
+- **Phase 1** (second worktree ~1 s, no extra disk; one edit rebuilds only
+  dependents): met (e2e). **Phase 2** (swarm wins by a wide margin): met.
+  **Phase 3** (cache entry valid on another machine with the same flake):
+  met, `dev/e2e-flake.sh`, with both "machines" on one host.
+- **Phase 4 is not met**: warm and no-op builds are no slower with a worker,
+  but a cold build is not shortened in proportion (see Workers for the
+  numbers and why).
+- **Phase 5**: rustc fork (4 patches) built and checked (`dev/fork-check.sh`,
+  13/13). Measured, it does not pay for itself: over 30 real rust-analyzer
+  commits it saves 1 action of 351, and its non-PGO compiler is slower.
+  It stays optional. Check-as-build is opt-in (slower in the swarm). The
+  incremental-state dedup item was done in the store instead (cold tier:
+  28.8 GiB to 3.9 GiB).
+- **No drift**: the first no-drift run found that stock `cargo test` failed
+  after rargo in all three repos (read-only store links in `target/`);
+  fixed (D32). The verification rerun with the fix: see "No-drift" below.
+
+Tests: `cargo test -p rargo-core` (47 unit + 6 engine), `dev/e2e.sh` 81
+checks, `dev/e2e-flake.sh` 14 checks, `dev/fork-check.sh` 13 checks, all
+passing at the last commit.
+
+Open, known: phase 4 criterion; one unexplained failed step in one of four
+swarm runs with a worker (not reproduced); `--timings` not reproduced; the
+worker link is not encrypted.
 
 | Area | State |
 |---|---|
@@ -119,6 +144,15 @@ Zed was dropped from the set at the user's request (DECISIONS D9).
   is replayed otherwise.
 - Stock cargo builds the same worktree afterwards, including into the same
   `target/` that rargo linked artifacts into.
+
+## No-drift
+
+`dev/nodrift.sh REPO`: rargo build and test, rargo's drift check, tracked
+files untouched, then stock cargo build and test in the same worktree and
+`target/`, then rargo again. First run: every rargo step and stock build
+passed in all three repos; stock `cargo test` failed in all three (fixed,
+D32); Ruff's drift check flagged an unread autoconf log (no longer counted
+as drift, D32). Rerun after the fix: pending at the time of writing.
 
 ## Mechanisms
 
