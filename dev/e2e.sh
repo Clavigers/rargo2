@@ -676,5 +676,10 @@ out=$("$R" build -p app 2>&1); rc=$?
 echo
 "$R" --rargo-status
 echo
+if [ $fails -ne 0 ]; then
+    echo "client daemon log:"
+    grep -v ': pushing ' "$RARGO_CACHE_DIR/daemon.log" 2>/dev/null | tail -40
+    echo
+fi
 if [ $fails -eq 0 ]; then echo "e2e: all $checks checks passed"; else echo "e2e: $fails of $checks checks FAILED"; fi
 exit $fails

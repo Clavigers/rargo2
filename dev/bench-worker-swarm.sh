@@ -17,7 +17,7 @@ run() { # label
     . "$work/nstest/client.env"
     python3 "$here/swarm.py" --repo "$repo" --mode rargo --agents "$agents" --label "worker-swarm $1" \
         --netns rargo-cl --out "$work/bench/results.jsonl"
-    ip netns exec rargo-cl "$RARGO_BIN/rargo" --rargo-status | grep -A2 '^workers' | tr -s ' ' | head -c 400; echo
+    nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" --rargo-status | grep -A2 '^workers' | tr -s ' ' | head -c 400; echo
 }
 "$here/netns.sh" up $c $c 0 >/dev/null 2>&1;            run "local-$c"
 "$here/netns.sh" up $c $c 1 1 0.1 1gbit >/dev/null 2>&1; run "$c+$c"

@@ -23,7 +23,7 @@ repo=${1:-ra}; shift || true
 args=("$@"); [ ${#args[@]} -eq 0 ] && args=(build)
 out=$work/bench/worker.jsonl
 # The client runs in its own namespace, one shaped link from the server.
-R() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
 export RARGO_HIDE=$work/bench/worker-wt
 export RARGO_CACHE_DIR=$work/bench/worker-client-cache
 base=$work/bench/$repo

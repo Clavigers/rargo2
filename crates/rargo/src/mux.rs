@@ -247,10 +247,16 @@ impl Mux {
     /// Asks the server for contents, on a stream of its own; they arrive
     /// on `to`, followed by [`ServerMsg::Fetched`] with the returned id.
     pub fn fetch(&self, hashes: Vec<Digest>, to: &UnboundedSender<ServerMsg>) -> u64 {
+        self.ask(to, |id| ClientMsg::Fetch { id, hashes })
+    }
+
+    /// Sends a question on a stream of its own; the answer arrives on
+    /// `to`, ending with [`ServerMsg::Fetched`] with the returned id.
+    pub fn ask(&self, to: &UnboundedSender<ServerMsg>, question: impl FnOnce(u64) -> ClientMsg) -> u64 {
         let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
         self.streams.lock().unwrap().insert(stream, to.clone());
         let id = stream as u64;
-        self.post(stream, &ClientMsg::Fetch { id, hashes });
+        self.post(stream, &question(id));
         id
     }
 }

@@ -38,7 +38,7 @@ wt() { # name
     git -C "$base" worktree prune
     git -C "$base" worktree add -q --detach "$C/$1" HEAD
 }
-field() { ip netns exec rargo-cl "$RARGO_BIN/rargo" --rargo-status | sed -n "s/^$1 *//p"; }
+field() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" --rargo-status | sed -n "s/^$1 *//p"; }
 mkdir -p "$C"
 
 if [ "${REMOTE_SKIP_STOCK:-}" != 1 ]; then
@@ -62,7 +62,7 @@ while [ $# -ge 3 ]; do
     label=$1; delay=$2; rate=$3; shift 3
     RARGO_HIDE="$C" CLIENT_DELAY_MS=$delay CLIENT_RATE=$rate "$here/netns.sh" up "$jobs" 0 0 >/dev/null 2>&1
     . "$work/nstest/client.env"
-    R() { ip netns exec rargo-cl env ${rargo_env:-} "$RARGO_BIN/rargo" "$@"; }
+    R() { nsenter --net=/run/netns/rargo-cl env ${rargo_env:-} "$RARGO_BIN/rargo" "$@"; }
     export RARGO_CACHE_DIR=$C/cache-1
     rm -rf "$C/cache-1" "$C/cache-2"
     wt one

@@ -175,6 +175,32 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, user: String, admin: bool) {
                         break 'link;
                     }
                 }
+                (stream, ClientMsg::Recipe { id, hash }) if stream != CONTROL => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let blobs = d.client_blobs.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let chunks = blobs.recipe(&Hash(hash)).map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect()).unwrap_or_default();
+                        sess.send(ServerMsg::Recipe { hash, chunks });
+                        sess.send(ServerMsg::Fetched { id });
+                    });
+                }
+                (stream, ClientMsg::Chunks { id, hash, idx }) if stream != CONTROL => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let blobs = d.client_blobs.clone();
+                    tokio::task::spawn_blocking(move || {
+                        // About a megabyte per message.
+                        for group in idx.chunks(16) {
+                            let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
+                            let chunks: Vec<(u32, crate::proto::Part)> =
+                                group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect();
+                            sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
+                            sess.send(ServerMsg::Chunks { hash, chunks });
+                        }
+                        sess.send(ServerMsg::Fetched { id });
+                    });
+                }
                 (stream, ClientMsg::Run(req)) => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
                     let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
@@ -331,6 +357,9 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
     };
     if let Some(set) = &before {
         sess.knows(set.iter().copied());
+    }
+    if req.lazy {
+        sess.set_lazy();
     }
     // The worktree: bring whatever the store lacks over from the client.
     let snapshot = match d.trees.sync(Hash(req.tree), &*sess).await {

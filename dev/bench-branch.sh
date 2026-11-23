@@ -29,7 +29,7 @@ edits=(crates/parser/src/lib.rs crates/syntax/src/lib.rs crates/ide-db/src/lib.r
 tests=(test -p stdx -p parser -p syntax)
 if [ "$mode" = rargo ]; then
     export RARGO_HIDE=$C RARGO_CACHE_DIR=$C/cache
-    run() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+    run() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
     label="rargo, $((2 * delay)) ms round trip"
 else
     run() { systemd-run --scope -q -p CPUQuota=2400% -p MemoryMax=90G cargo "$@" -j 24; }

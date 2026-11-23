@@ -10,6 +10,7 @@
 //! about the build is decided here.
 
 use crate::mux::Mux;
+use crate::outfs::{OutFs, VFile};
 use crate::place::{Placed, Placer};
 use crate::watch::{Event, Watcher};
 use crate::{Config, Policy, git, report, scan};
@@ -44,6 +45,22 @@ pub struct Counters {
     pub offers: AtomicU64,
     pub offered_bytes: AtomicU64,
     pub links: AtomicU64,
+    /// Contents fetched because something opened them: whole, by chunk,
+    /// and the bytes of them that the cache already held.
+    pub fetched_contents: AtomicU64,
+    pub fetched_bytes: AtomicU64,
+    pub reused_bytes: AtomicU64,
+}
+
+/// A worktree's output directory, mounted.
+struct Mounted {
+    fs: Arc<OutFs>,
+    session: Arc<fusewire::Session>,
+    dir: PathBuf,
+    /// The device number the mount has: if the directory shows another,
+    /// something else has been mounted over it (another daemon for the
+    /// same worktree) or it was unmounted.
+    dev: u64,
 }
 
 /// A worktree as one scan saw it.
@@ -75,6 +92,9 @@ struct Worktree {
     /// directory).
     running: tokio::sync::Mutex<()>,
     last_used: Mutex<Instant>,
+    /// The virtual output directory, if this worktree has one.
+    out: Mutex<Option<Mounted>>,
+    out_failed: AtomicBool,
 }
 
 pub struct Daemon {
@@ -91,6 +111,11 @@ pub struct Daemon {
     active: AtomicUsize,
     last_active: Mutex<Instant>,
     pub counters: Counters,
+    /// One fetch per content at a time.
+    fetching: Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
+    /// Chunks the cache holds: in which content, where.
+    chunks: Mutex<HashMap<Digest, (Digest, u64, u32)>>,
+    handle: tokio::runtime::Handle,
 }
 
 enum Outcome {
@@ -135,6 +160,9 @@ impl Daemon {
             active: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             counters: Counters::default(),
+            fetching: Mutex::new(HashMap::new()),
+            chunks: Mutex::new(HashMap::new()),
+            handle: tokio::runtime::Handle::current(),
         });
         if let Some(w) = d.watcher.clone() {
             let d2 = d.clone();
@@ -209,6 +237,8 @@ impl Daemon {
             changed: tokio::sync::Notify::new(),
             running: tokio::sync::Mutex::new(()),
             last_used: Mutex::new(Instant::now()),
+            out: Mutex::new(None),
+            out_failed: AtomicBool::new(false),
         });
         all.insert(root.to_path_buf(), wt.clone());
         if self.watcher.is_some() {
@@ -423,6 +453,240 @@ impl Daemon {
         Ok(true)
     }
 
+    /// The worktree's virtual output directory, mounted if it can be and
+    /// the command does not say otherwise (`RARGO_OUTPUT=copy`, an output
+    /// directory of its own choosing).
+    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> Option<(Arc<OutFs>, PathBuf)> {
+        let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
+            || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
+            || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
+        // A command in another mount namespace (a container, a sandbox)
+        // would not see what this daemon mounts.
+        let same_ns = req.mount_ns == crate::mount_ns();
+        let want = self.watcher.is_some() && var(&req.vars, "RARGO_OUTPUT") != Some("copy") && !elsewhere && same_ns;
+        let mut g = wt.out.lock().unwrap();
+        if !want {
+            if let Some(m) = g.take() {
+                m.fs.save();
+                m.session.unmount();
+            }
+            return None;
+        }
+        if let Some(m) = &*g {
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
+                return Some((m.fs.clone(), m.dir.clone()));
+            }
+            // No longer what is seen at the directory: start over.
+            if let Some(m) = g.take() {
+                m.fs.save();
+                m.session.unmount();
+            }
+        }
+        if wt.out_failed.load(Ordering::SeqCst) && var(&req.vars, "RARGO_OUTPUT") != Some("fuse") {
+            return None;
+        }
+        match self.mount_out(wt) {
+            Ok(m) => {
+                let r = (m.fs.clone(), m.dir.clone());
+                *g = Some(m);
+                Some(r)
+            }
+            Err(e) => {
+                if !wt.out_failed.swap(true, Ordering::SeqCst) {
+                    eprintln!("rargo daemon: {}: no virtual output directory ({e}); results are copied into it", wt.root.display());
+                }
+                None
+            }
+        }
+    }
+
+    fn mount_out(self: &Arc<Self>, wt: &Arc<Worktree>) -> std::io::Result<Mounted> {
+        let dir = wt.root.join("target");
+        // What a daemon that is gone, or another version of this one, left
+        // mounted there.
+        release_mounts(&dir);
+        if std::fs::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            return Err(std::io::Error::other("`target` is a symbolic link"));
+        }
+        std::fs::create_dir_all(&dir)?;
+        let tag = dir.join("CACHEDIR.TAG");
+        if !tag.exists() {
+            std::fs::write(&tag, rargo_proto::CACHEDIR_TAG)?;
+        }
+        let weak = Arc::downgrade(self);
+        let handle = self.handle.clone();
+        let fs = OutFs::new(
+            &dir,
+            &wt.wt_cache.join("virtual"),
+            Box::new(move |hash, size| {
+                let d = weak.upgrade().ok_or_else(|| std::io::Error::other("the daemon is stopping"))?;
+                let (hash, handle) = (*hash, handle.clone());
+                handle.block_on(async move { d.fetch_content(hash, size).await })
+            }),
+        )?;
+        // SAFETY: no arguments, cannot fail.
+        let root = unsafe { libc::geteuid() } == 0;
+        let opts = fusewire::MountOptions { fsname: "rargo".into(), allow_other: root, default_permissions: true, passthrough: true };
+        let session = Arc::new(fusewire::Session::mount(&dir, &opts)?);
+        fs.attach(session.clone());
+        session.spawn_workers(fs.clone(), 8)?;
+        let dev = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&dir)?.dev()
+        };
+        Ok(Mounted { fs, session, dir, dev })
+    }
+
+    /// Unmounts every virtual output directory (the daemon is going).
+    fn unmount_all(&self) {
+        let all: Vec<Arc<Worktree>> = self.worktrees.lock().unwrap().values().cloned().collect();
+        for wt in all {
+            if let Some(m) = wt.out.lock().unwrap().take() {
+                m.fs.save();
+                m.session.unmount();
+            }
+        }
+    }
+
+    /// Gives a worktree's output directory back to plain files: unmounted,
+    /// and nothing delivered remembered (`cargo clean` is about to run).
+    fn release(&self, cwd: &Path) {
+        let Some(root) = crate::find_root(cwd) else { return };
+        let wt = self.worktrees.lock().unwrap().get(&root).cloned();
+        if let Some(wt) = wt {
+            if let Some(m) = wt.out.lock().unwrap().take() {
+                m.session.unmount();
+            }
+            let _ = std::fs::remove_file(wt.wt_cache.join("virtual"));
+            let _ = std::fs::remove_file(wt.wt_cache.join("delivered"));
+        }
+    }
+
+    /// Makes sure a content is in the cache, fetching it from the server
+    /// if need be: by chunk when it is large, so that what the cache holds
+    /// of it already (an earlier version of the same binary, say) is not
+    /// sent again.
+    async fn fetch_content(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<PathBuf> {
+        if let Some(p) = crate::place::cached(&self.cache, &hash, size) {
+            return Ok(p);
+        }
+        let turn = self.fetching.lock().unwrap().entry(hash).or_default().clone();
+        let _turn = turn.lock().await;
+        if let Some(p) = crate::place::cached(&self.cache, &hash, size) {
+            return Ok(p);
+        }
+        let mux = self.mux().await?;
+        self.counters.fetched_contents.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = unbounded_channel();
+        if size >= rargo_proto::CHUNKED_FROM {
+            let id = mux.ask(&tx, |id| ClientMsg::Recipe { id, hash });
+            let mut recipe: Vec<(Digest, u32)> = Vec::new();
+            loop {
+                match next_msg(&mux, &mut rx).await? {
+                    ServerMsg::Recipe { chunks, .. } => recipe = chunks,
+                    ServerMsg::Fetched { id: got } if got == id => break,
+                    _ => {}
+                }
+            }
+            if !recipe.is_empty() {
+                let slot = crate::place::cache_slot(&self.cache, &hash);
+                let tmp = slot.with_file_name(format!(".incoming-{}-{}", std::process::id(), mux.next_id()));
+                if let Some(parent) = slot.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let file = std::fs::File::create(&tmp)?;
+                let mut offsets = Vec::with_capacity(recipe.len());
+                let mut at = 0u64;
+                for (_, len) in &recipe {
+                    offsets.push(at);
+                    at += *len as u64;
+                }
+                // What the cache holds already.
+                let mut need: Vec<u32> = Vec::new();
+                tokio::task::block_in_place(|| {
+                    use std::os::unix::fs::FileExt;
+                    for (i, (chunk, len)) in recipe.iter().enumerate() {
+                        let held = self.chunks.lock().unwrap().get(chunk).copied();
+                        let local = held.and_then(|(blob, off, l)| {
+                            let path = crate::place::cached(&self.cache, &blob, std::fs::metadata(crate::place::cache_slot(&self.cache, &blob)).ok()?.len())?;
+                            let mut buf = vec![0u8; l as usize];
+                            std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
+                            (l == *len && *blake3::hash(&buf).as_bytes() == *chunk).then_some(buf)
+                        });
+                        match local {
+                            Some(buf) => {
+                                self.counters.reused_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                                let _ = file.write_all_at(&buf, offsets[i]);
+                            }
+                            None => need.push(i as u32),
+                        }
+                    }
+                });
+                if !need.is_empty() {
+                    let id = mux.ask(&tx, |id| ClientMsg::Chunks { id, hash, idx: need });
+                    loop {
+                        match next_msg(&mux, &mut rx).await? {
+                            ServerMsg::Chunks { chunks, .. } => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                                use std::os::unix::fs::FileExt;
+                                for (i, part) in chunks {
+                                    let data = part.unpack()?;
+                                    self.counters.fetched_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                    let at = *offsets.get(i as usize).ok_or_else(|| std::io::Error::other("chunk out of range"))?;
+                                    file.write_all_at(&data, at)?;
+                                }
+                                Ok(())
+                            })?,
+                            ServerMsg::Fetched { id: got } if got == id => break,
+                            _ => {}
+                        }
+                    }
+                }
+                drop(file);
+                let whole = tokio::task::block_in_place(|| scan::hash_file(&tmp, size));
+                if whole.ok() != Some(hash) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(std::io::Error::other("the server sent content that does not match its hash"));
+                }
+                let _ = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
+                std::fs::rename(&tmp, &slot)?;
+                let mut index = self.chunks.lock().unwrap();
+                if index.len() > 4_000_000 {
+                    index.clear();
+                }
+                for (i, (chunk, len)) in recipe.iter().enumerate() {
+                    index.insert(*chunk, (hash, offsets[i], *len));
+                }
+                return Ok(slot);
+            }
+        }
+        // Small, or unknown to the server's chunker: whole.
+        let id = mux.fetch(vec![hash], &tx);
+        let mut placer = Placer::new(&self.cache, Placed::default());
+        loop {
+            match next_msg(&mux, &mut rx).await? {
+                ServerMsg::Blobs(blobs) => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                    for b in blobs {
+                        let h = b.hash;
+                        let bytes = b.unpack()?;
+                        self.counters.fetched_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        placer.blob(h, &bytes)?;
+                    }
+                    Ok(())
+                })?,
+                ServerMsg::BlobPart { hash: h, part, last } => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                    let bytes = part.unpack()?;
+                    self.counters.fetched_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    placer.part(h, &bytes, last)
+                })?,
+                ServerMsg::Fetched { id: got } if got == id => break,
+                _ => {}
+            }
+        }
+        crate::place::cached(&self.cache, &hash, size)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the server no longer has this content"))
+    }
+
     /// Runs one command for the `rargo` program at the other end of `out`.
     pub async fn command(self: Arc<Self>, req: LocalRequest, out: UnboundedSender<LocalReply>) {
         self.active.fetch_add(1, Ordering::SeqCst);
@@ -480,6 +744,7 @@ impl Daemon {
             home_files: Vec::new(),
             who: format!("{}@{}", self.cfg.user, self.host),
             delivered: 0,
+            lazy: false,
         };
         let env_for = |policy: &Policy| -> (Vec<(String, String)>, Vec<String>) {
             let asked = self.asked.lock().unwrap().clone();
@@ -500,7 +765,7 @@ impl Daemon {
                 let (env, env_checked) = env_for(&Policy::default());
                 let run = RunRequest { env, env_checked, ..base.clone() };
                 let said = AtomicBool::new(false);
-                match self.converse(&mux, run, None, None, req, out, &said).await {
+                match self.converse(&mux, run, None, None, None, req, out, &said).await {
                     Ok(Outcome::Final(reply)) => return Ok(reply),
                     Ok(Outcome::Changed) => return Err(std::io::Error::other("unexpected answer from the server")),
                     // A link that died between commands: once more on a new one.
@@ -517,6 +782,7 @@ impl Daemon {
         };
         let wt = self.worktree(&root);
         let _running = wt.running.lock().await;
+        let shown = self.out_for(&wt, req);
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
             match std::fs::read(cargo_home.join(name)) {
@@ -583,10 +849,11 @@ impl Daemon {
                 tree: snap.scan.root,
                 home_files: home_files.clone(),
                 delivered,
+                lazy: shown.is_some(),
                 ..base.clone()
             };
             let said = AtomicBool::new(false);
-            match self.converse(&mux, run, Some(&snap), Some(&wt), req, out, &said).await {
+            match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &said).await {
                 Ok(Outcome::Final(reply)) => return Ok(reply),
                 Ok(Outcome::Changed) => {
                     wt.dirty.store(true, Ordering::SeqCst);
@@ -609,6 +876,7 @@ impl Daemon {
         run: RunRequest,
         snap: Option<&Arc<Snap>>,
         wt: Option<&Arc<Worktree>>,
+        shown: Option<&(Arc<OutFs>, PathBuf)>,
         req: &LocalRequest,
         out: &UnboundedSender<LocalReply>,
         said: &AtomicBool,
@@ -685,7 +953,16 @@ impl Daemon {
                 }
                 ServerMsg::Deliver { files, writes, .. } => {
                     said.store(true, Ordering::SeqCst);
-                    tokio::task::block_in_place(|| placer.deliver(files, writes))?;
+                    tokio::task::block_in_place(|| -> std::io::Result<()> {
+                        // What belongs in a virtual output directory is
+                        // shown there; the rest is placed as files.
+                        let (files, writes) = match shown {
+                            Some((fs, dir)) => show(fs, dir, files, writes)?,
+                            None => (files, writes),
+                        };
+                        placer.deliver(files, writes)?;
+                        Ok(())
+                    })?;
                 }
                 ServerMsg::Blobs(blobs) => tokio::task::block_in_place(|| -> std::io::Result<()> {
                     for b in blobs {
@@ -727,8 +1004,15 @@ impl Daemon {
                 }
                 ServerMsg::Exit(code) => last = Some(LocalReply::Exit(code)),
                 ServerMsg::Exec(e) => last = Some(LocalReply::Exec(e)),
-                ServerMsg::Packed(_) | ServerMsg::Missing { .. } | ServerMsg::Pong(_) => {}
+                ServerMsg::Packed(_)
+                | ServerMsg::Missing { .. }
+                | ServerMsg::Pong(_)
+                | ServerMsg::Recipe { .. }
+                | ServerMsg::Chunks { .. } => {}
             }
+        }
+        if let Some((fs, _)) = shown {
+            tokio::task::block_in_place(|| fs.save());
         }
         if !placer.settled() {
             return Err(std::io::Error::other("the server did not send every file it announced"));
@@ -757,11 +1041,25 @@ impl Daemon {
             let all = self.worktrees.lock().unwrap();
             (all.len(), all.values().filter(|w| w.vouched.load(Ordering::SeqCst)).count())
         };
+        let outs = {
+            let all = self.worktrees.lock().unwrap();
+            let mut t = (0usize, 0usize, 0u64, 0u64);
+            for w in all.values() {
+                if let Some(m) = &*w.out.lock().unwrap() {
+                    t.0 += 1;
+                    t.1 += m.fs.virtual_count();
+                    t.2 += m.fs.opened_virtual.load(Ordering::Relaxed);
+                    t.3 += m.fs.made_real.load(Ordering::Relaxed);
+                }
+            }
+            t
+        };
         let text = format!(
             "server              {}\nlink                {kind}; {} made; {bytes_out} bytes sent, {bytes_in} bytes received on the current one\n\
              commands            {}\nworktrees           {worktrees} known, {watched} watched completely\n\
              scans               {} done, {} spared (nothing had changed)\n\
-             pushed              {} changes, {} bytes\n",
+             pushed              {} changes, {} bytes\n\
+             outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on open, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
             c.links.load(Ordering::Relaxed),
             c.commands.load(Ordering::Relaxed),
@@ -769,10 +1067,117 @@ impl Daemon {
             c.scans_spared.load(Ordering::Relaxed),
             c.offers.load(Ordering::Relaxed),
             c.offered_bytes.load(Ordering::Relaxed),
+            outs.0,
+            outs.1,
+            outs.2,
+            outs.3,
+            c.fetched_contents.load(Ordering::Relaxed),
+            c.fetched_bytes.load(Ordering::Relaxed),
+            c.reused_bytes.load(Ordering::Relaxed),
         );
         let _ = out.send(LocalReply::Stdout(text.into_bytes()));
         LocalReply::Exit(0)
     }
+}
+
+/// The next message on a channel the link feeds, or an error once the
+/// link is dead.
+async fn next_msg(mux: &Arc<Mux>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMsg>) -> std::io::Result<ServerMsg> {
+    loop {
+        tokio::select! {
+            m = rx.recv() => return m.ok_or_else(lost),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                if mux.is_dead() {
+                    return Err(lost());
+                }
+            }
+        }
+    }
+}
+
+/// Unmounts whatever is mounted at `dir` (lazily: a file system whose
+/// daemon is gone cannot be asked).
+fn release_mounts(dir: &Path) {
+    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else { return };
+    let here = dir.to_string_lossy();
+    let mounts = info.lines().filter(|l| l.split(' ').nth(4) == Some(here.as_ref())).count();
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
+    for _ in 0..mounts {
+        // SAFETY: valid NUL-terminated path.
+        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
+/// Shows the part of a delivery that lies in the virtual output directory
+/// mounted at `dir`, and returns the rest.
+fn show(
+    fs: &Arc<OutFs>,
+    dir: &Path,
+    files: Vec<rargo_proto::Delivery>,
+    writes: Vec<rargo_proto::Write>,
+) -> std::io::Result<(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>)> {
+    use rargo_proto::Write;
+    let inside = |path: &str| -> Option<Vec<u8>> {
+        Path::new(path).strip_prefix(dir).ok().filter(|r| !r.as_os_str().is_empty()).map(|r| r.as_os_str().as_bytes().to_vec())
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
+    fs.begin_delivery();
+    let mut rest_writes = Vec::new();
+    for w in writes {
+        let path = match &w {
+            Write::Dir { path } | Write::Remove { path } | Write::Symlink { path, .. } | Write::File { path, .. } | Write::Text { path, .. } => path,
+        };
+        let Some(rel) = inside(path) else {
+            rest_writes.push(w);
+            continue;
+        };
+        match w {
+            Write::Dir { .. } => {
+                std::fs::create_dir_all(fs.real_for_write(&join_rel(&rel))?)?;
+                fs.wrote(&rel);
+            }
+            Write::Remove { .. } | Write::Text { text: None, .. } => fs.remove(&rel),
+            Write::Symlink { target, .. } => {
+                let real = fs.real_for_write(&rel)?;
+                let _ = std::fs::remove_file(&real);
+                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
+                fs.wrote(&rel);
+            }
+            Write::Text { text: Some(text), .. } => {
+                let real = fs.real_for_write(&rel)?;
+                // Unchanged: leave the file (and its mtime) alone.
+                if std::fs::read_to_string(&real).ok().as_deref() != Some(text.as_str()) {
+                    crate::write_atomic(&real, text.as_bytes())?;
+                    fs.wrote(&rel);
+                }
+            }
+            Write::File { hash, size, exec, .. } => {
+                if !fs.shows(&rel, &hash) {
+                    fs.deliver(&rel, VFile { hash, size, exec, mtime_ns: now });
+                }
+            }
+        }
+    }
+    let mut rest_files = Vec::new();
+    for f in files {
+        match inside(&f.path) {
+            Some(rel) => {
+                if !fs.shows(&rel, &f.hash) {
+                    fs.deliver(&rel, VFile { hash: f.hash, size: f.size, exec: f.exec, mtime_ns: now });
+                }
+            }
+            None => rest_files.push(f),
+        }
+    }
+    Ok((rest_files, rest_writes))
+}
+
+/// The path of a directory inside the mount, as `real_for_write` wants it
+/// (it makes the parents of what it is given).
+fn join_rel(rel: &[u8]) -> Vec<u8> {
+    let mut p = rel.to_vec();
+    p.extend_from_slice(b"/.");
+    p
 }
 
 /// Sends the contents the server lacks. Returns `false` if a file no
@@ -884,7 +1289,15 @@ async fn serve_command(d: Arc<Daemon>, stream: tokio::net::UnixStream, socket: P
     let (mut rd, mut wr) = stream.into_split();
     let Ok(raw) = read_frame(&mut rd).await else { return };
     let Ok(req) = rargo_proto::decode::<LocalRequest>(&raw) else { return };
+    if req.kind == "release" {
+        d.release(Path::new(&req.cwd));
+        let done = rargo_proto::encode(&LocalReply::Exit(0));
+        let _ = wr.write_all(&(done.len() as u32).to_le_bytes()).await;
+        let _ = wr.write_all(&done).await;
+        return;
+    }
     if req.kind == "stop" {
+        d.unmount_all();
         let _ = std::fs::remove_file(&socket);
         let done = rargo_proto::encode(&LocalReply::Exit(0));
         let _ = wr.write_all(&(done.len() as u32).to_le_bytes()).await;
@@ -952,8 +1365,22 @@ pub fn serve(socket: &Path) -> ! {
             std::env::var("RARGO_DAEMON_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800),
         );
         eprintln!("rargo daemon: {} serving {} on {}", std::process::id(), d.cfg.server, socket.display());
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
+        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("signal handler");
         loop {
             tokio::select! {
+                // Told to go: the output directories go back to being
+                // plain directories first.
+                _ = term.recv() => {
+                    d.unmount_all();
+                    let _ = std::fs::remove_file(&socket);
+                    break;
+                }
+                _ = int.recv() => {
+                    d.unmount_all();
+                    let _ = std::fs::remove_file(&socket);
+                    break;
+                }
                 conn = listener.accept() => {
                     if let Ok((stream, _)) = conn {
                         *d.last_active.lock().unwrap() = Instant::now();
@@ -961,9 +1388,13 @@ pub fn serve(socket: &Path) -> ! {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    let quiet = d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
+                    // A daemon that shows output directories stays: what
+                    // it shows would vanish with it.
+                    let showing = d.worktrees.lock().unwrap().values().any(|w| w.out.lock().unwrap().is_some());
+                    let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
                     // Someone removed the socket: nobody can reach us.
                     if quiet || !socket.exists() {
+                        d.unmount_all();
                         if quiet {
                             let _ = std::fs::remove_file(&socket);
                         }
@@ -975,7 +1406,7 @@ pub fn serve(socket: &Path) -> ! {
                         let mut all = d.worktrees.lock().unwrap();
                         let old: Vec<PathBuf> = all
                             .iter()
-                            .filter(|(_, w)| w.last_used.lock().unwrap().elapsed() > Duration::from_secs(4 * 3600))
+                            .filter(|(_, w)| w.out.lock().unwrap().is_none() && w.last_used.lock().unwrap().elapsed() > Duration::from_secs(4 * 3600))
                             .map(|(p, _)| p.clone())
                             .collect();
                         old.iter().filter_map(|p| all.remove(p)).collect()

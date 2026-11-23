@@ -121,6 +121,8 @@ pub struct Session {
     knows: AtomicBool,
     /// Everything this command delivered.
     delivered: Mutex<HashSet<Digest>>,
+    /// The client fetches contents itself; see `RunRequest::lazy`.
+    lazy: AtomicBool,
     window: Arc<Semaphore>,
     store: Arc<Store>,
     trees_reply: Mutex<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
@@ -154,6 +156,7 @@ impl Session {
             has,
             knows: AtomicBool::new(false),
             delivered: Mutex::new(HashSet::new()),
+            lazy: AtomicBool::new(false),
             window: Arc::new(Semaphore::new(WINDOW)),
             store,
             trees_reply: Mutex::new(None),
@@ -175,6 +178,54 @@ impl Session {
     pub fn knows(&self, digests: impl IntoIterator<Item = Digest>) {
         self.has.extend(digests);
         self.knows.store(true, Ordering::SeqCst);
+    }
+
+    pub fn set_lazy(&self) {
+        self.lazy.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_lazy(&self) -> bool {
+        self.lazy.load(Ordering::SeqCst)
+    }
+
+    /// A delivery to a client that fetches contents itself: the names go
+    /// out now, with the contents of small files the client is not known
+    /// to hold. Nothing is waited for.
+    pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>) {
+        if files.is_empty() && writes.is_empty() {
+            return;
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut sizes: HashMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
+        for w in &writes {
+            if let Write::File { hash, size, .. } = w {
+                sizes.insert(*hash, *size);
+            }
+        }
+        let small: Vec<Digest> = {
+            let mut has = self.has.set.lock();
+            sizes.iter().filter(|(h, size)| **size <= rargo_proto::LAZY_SMALL && has.insert(**h)).map(|(h, _)| *h).collect()
+        };
+        self.delivered.lock().extend(sizes.keys().copied());
+        self.send(ServerMsg::Deliver { id, files, writes });
+        let mut batch: Vec<Blob> = Vec::new();
+        let mut bytes = 0usize;
+        for h in small {
+            let Ok(content) = self.store.read(&Hash(h)) else { continue };
+            let b = Blob::pack(h, &content);
+            bytes += b.data.len();
+            batch.push(b);
+            if bytes >= 1 << 20 {
+                self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
+                self.send(ServerMsg::Blobs(std::mem::take(&mut batch)));
+                bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
+            self.send(ServerMsg::Blobs(batch));
+        }
+        self.send(ServerMsg::Delivered { id });
     }
 
     /// Everything this command has delivered so far.
@@ -247,6 +298,8 @@ impl Session {
             ClientMsg::Run(_)
             | ClientMsg::Packed(_)
             | ClientMsg::Fetch { .. }
+            | ClientMsg::Recipe { .. }
+            | ClientMsg::Chunks { .. }
             | ClientMsg::Offer(_)
             | ClientMsg::Cancel
             | ClientMsg::Ping(_) => bail!("unexpected message from the client"),
@@ -376,6 +429,11 @@ impl Session {
         self.send_blobs(push).await?;
         self.send(ServerMsg::Delivered { id });
         Ok(())
+    }
+
+    /// Counts chunk data sent to a client.
+    pub fn count_out(&self, bytes: usize) {
+        self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Sends contents the client asked for, then says that that was all.

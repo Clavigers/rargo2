@@ -80,6 +80,8 @@ pub struct Daemon {
     /// Per worktree: the token of its last delivery and everything that
     /// worktree has been delivered up to then (see `serve`).
     pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
+    /// Chunk recipes of contents clients fetch by chunk.
+    pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     /// Target directories seen per worktree, masked in later views.
     masks: DashMap<String, Vec<Vec<u8>>>,
@@ -129,6 +131,11 @@ impl Client {
     /// out together when the request ends ([`Client::flush`]): one round
     /// trip, however many steps produced something.
     pub fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) {
+        // A client with a virtual output directory is told at once.
+        if let Some(s) = self.session.as_ref().filter(|s| s.is_lazy()) {
+            s.deliver_lazy(files, writes);
+            return;
+        }
         let mut q = self.outbox.lock();
         q.0.extend(files);
         q.1.extend(writes);
@@ -503,6 +510,7 @@ impl Daemon {
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
             deliveries: Mutex::new(HashMap::new()),
+            client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),

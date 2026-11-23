@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -49,7 +49,10 @@ struct Node {
     /// Handles open on it, by how they do their I/O: the kernel does not
     /// let one file be open both ways.
     cached: u32,
-    through: u32,
+    /// The kernel's handle on the real file behind this node while it is
+    /// open for passthrough, and how many opens share it: the kernel
+    /// refuses a second, different one.
+    backing: Option<(i32, u32)>,
 }
 
 struct State {
@@ -62,7 +65,6 @@ struct State {
 
 struct Handle {
     file: File,
-    backing_id: Option<i32>,
     node: u64,
     through: bool,
 }
@@ -82,6 +84,8 @@ pub struct OutFs {
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
+    /// Directories already cleared of dead clients' temporaries.
+    swept: Mutex<std::collections::HashSet<Vec<u8>>>,
     uid: u32,
     gid: u32,
     pub opened_virtual: AtomicU64,
@@ -127,7 +131,7 @@ impl OutFs {
             .and_then(|plain| bincode::deserialize(&plain).ok())
             .unwrap_or_default();
         let mut nodes = HashMap::new();
-        nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, through: 0 });
+        nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
         // SAFETY: no arguments, cannot fail.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Ok(Arc::new(OutFs {
@@ -140,6 +144,7 @@ impl OutFs {
             session: OnceLock::new(),
             table: table.to_path_buf(),
             dirty: AtomicBool::new(false),
+            swept: Mutex::new(Default::default()),
             uid,
             gid,
             opened_virtual: AtomicU64::new(0),
@@ -167,7 +172,8 @@ impl OutFs {
     }
 
     fn real(&self, rel: &[u8]) -> PathBuf {
-        if rel.is_empty() { self.under.clone() } else { self.under.join(std::ffi::OsStr::from_bytes(rel)) }
+        // (`under` is a link in /proc; "." makes it the directory.)
+        if rel.is_empty() { self.under.join(".") } else { self.under.join(std::ffi::OsStr::from_bytes(rel)) }
     }
 
     fn path_of(st: &State, mut id: u64) -> Res<Vec<u8>> {
@@ -260,7 +266,7 @@ impl OutFs {
         }
         let id = st.next;
         st.next += 1;
-        st.nodes.insert(id, Node { parent, name: name.to_vec(), nlookup: 1, kids: 0, cached: 0, through: 0 });
+        st.nodes.insert(id, Node { parent, name: name.to_vec(), nlookup: 1, kids: 0, cached: 0, backing: None });
         st.children.insert((parent, name.to_vec()), id);
         if let Some(p) = st.nodes.get_mut(&parent) {
             p.kids += 1;
@@ -310,29 +316,39 @@ impl OutFs {
         Ok(())
     }
 
-    fn open_handle(&self, node: u64, file: File, may_pass: bool) -> Opened {
+    /// Registers an open file. `real` is the real file's path when the
+    /// kernel may do the I/O itself (passthrough).
+    fn open_handle(&self, node: u64, file: File, real: Option<&Path>) -> Opened {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
-        let n = st.nodes.get_mut(&node);
-        let cached_open = n.as_ref().is_some_and(|n| n.cached > 0);
         let mut backing_id = None;
-        if may_pass && !cached_open {
-            if let Some(s) = self.session.get() {
-                if s.caps().passthrough {
-                    backing_id = s.backing_open(file.as_raw_fd()).ok();
+        if let (Some(n), Some(path), Some(s)) = (st.nodes.get_mut(&node), real, self.session.get()) {
+            if n.cached == 0 && s.caps().passthrough {
+                match &mut n.backing {
+                    Some((id, refs)) => {
+                        *refs += 1;
+                        backing_id = Some(*id);
+                    }
+                    None => {
+                        // Opened for everything a later open may want:
+                        // all opens of the file share this one.
+                        let both = std::fs::OpenOptions::new().read(true).write(true).open(path);
+                        let fd = both.or_else(|_| File::open(path));
+                        if let Some(id) = fd.ok().and_then(|f| s.backing_open(f.as_raw_fd()).ok()) {
+                            n.backing = Some((id, 1));
+                            backing_id = Some(id);
+                        }
+                    }
                 }
             }
         }
-        let through = backing_id.is_some();
-        if let Some(n) = n {
-            if through {
-                n.through += 1;
-            } else {
+        if backing_id.is_none() {
+            if let Some(n) = st.nodes.get_mut(&node) {
                 n.cached += 1;
             }
         }
         drop(st);
-        self.handles.lock().unwrap().insert(fh, Handle { file, backing_id, node, through });
+        self.handles.lock().unwrap().insert(fh, Handle { file, node, through: backing_id.is_some() });
         match backing_id {
             Some(id) => Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: id },
             None => Opened { fh, flags: FOPEN_KEEP_CACHE, backing_id: 0 },
@@ -378,6 +394,7 @@ impl OutFs {
     /// A file the server built: it appears at `rel` now, its content
     /// stays where it is until something opens it.
     pub fn deliver(&self, rel: &[u8], v: VFile) {
+        self.sweep_beside(rel);
         {
             let st = self.state.lock().unwrap();
             if st.virt.get(rel).is_some_and(|old| old.hash == v.hash && old.exec == v.exec) && std::fs::symlink_metadata(self.real(rel)).is_err() {
@@ -397,6 +414,37 @@ impl OutFs {
         self.state.lock().unwrap().virt.insert(rel.to_vec(), v);
         self.dirty.store(true, Ordering::SeqCst);
         self.changed(rel);
+    }
+
+    /// A new delivery begins: directories are swept once per delivery.
+    pub fn begin_delivery(&self) {
+        self.swept.lock().unwrap().clear();
+    }
+
+    /// The first time a delivery puts something into a directory: removes
+    /// the temporaries that copying clients which no longer exist left in
+    /// it (`.rargo-tmp-<pid>-...`).
+    fn sweep_beside(&self, rel: &[u8]) {
+        let dir = match rel.iter().rposition(|&b| b == b'/') {
+            Some(i) => rel[..i].to_vec(),
+            None => Vec::new(),
+        };
+        if !self.swept.lock().unwrap().insert(dir.clone()) {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(self.real(&dir)) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(text) = name.to_str() else { continue };
+            let Some(pid) = text.strip_prefix(crate::tmp::BESIDE).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<i32>().ok()) else {
+                continue;
+            };
+            // SAFETY: signal 0 only checks for existence.
+            let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            if !alive && std::fs::remove_file(e.path()).is_ok() {
+                self.changed(&join(&dir, name.as_bytes()));
+            }
+        }
     }
 
     /// Whether `rel` already shows this content.
@@ -610,7 +658,13 @@ impl Filesystem for OutFs {
         if st.virt.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix)) {
             return Err(Errno(libc::ENOTEMPTY));
         }
-        std::fs::remove_dir(self.real(&rel)).map_err(errno)?;
+        match std::fs::remove_dir(self.real(&rel)) {
+            Ok(()) => {}
+            // It was a directory only by the delivered files below it,
+            // and those are gone.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(errno(e)),
+        }
         self.detach(&mut st, parent, name);
         Ok(())
     }
@@ -724,9 +778,16 @@ impl Filesystem for OutFs {
             if !writing {
                 // Reading: straight from the client's cache.
                 self.opened_virtual.fetch_add(1, Ordering::Relaxed);
-                let path = if v.size == 0 { PathBuf::from("/dev/null") } else { (self.fetch)(&v.hash, v.size).map_err(errno)? };
+                let path = if v.size == 0 {
+                    PathBuf::from("/dev/null")
+                } else {
+                    (self.fetch)(&v.hash, v.size).map_err(|e| {
+                        eprintln!("rargo daemon: target/{}: its content could not be fetched: {e}", String::from_utf8_lossy(&rel));
+                        errno(e)
+                    })?
+                };
                 let file = File::open(path).map_err(errno)?;
-                return Ok(self.open_handle(nodeid, file, false));
+                return Ok(self.open_handle(nodeid, file, None));
             }
             self.make_real(&rel, v, flags as i32 & libc::O_TRUNC == 0)?;
         }
@@ -737,7 +798,7 @@ impl Filesystem for OutFs {
             .custom_flags(flags as i32 & keep)
             .open(self.real(&rel))
             .map_err(errno)?;
-        Ok(self.open_handle(nodeid, file, true))
+        Ok(self.open_handle(nodeid, file, Some(&self.real(&rel))))
     }
 
     fn create(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32, flags: u32) -> Res<(Entry, Opened)> {
@@ -766,7 +827,7 @@ impl Filesystem for OutFs {
         let kind = self.kind(&st, &rel).ok_or(Errno(libc::EIO))?;
         let entry = self.entry(&mut st, parent, name, &kind);
         drop(st);
-        Ok((entry, self.open_handle(entry.nodeid, file, true)))
+        Ok((entry, self.open_handle(entry.nodeid, file, Some(&self.real(&rel)))))
     }
 
     fn read(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
@@ -793,15 +854,18 @@ impl Filesystem for OutFs {
 
     fn release(&self, _nodeid: u64, fh: u64, _flags: u32) {
         let Some(h) = self.handles.lock().unwrap().remove(&fh) else { return };
-        if let (Some(id), Some(s)) = (h.backing_id, self.session.get()) {
-            let _ = s.backing_close(id);
-        }
         let mut st = self.state.lock().unwrap();
         if let Some(n) = st.nodes.get_mut(&h.node) {
-            if h.through {
-                n.through = n.through.saturating_sub(1);
-            } else {
+            if !h.through {
                 n.cached = n.cached.saturating_sub(1);
+            } else if let Some((id, refs)) = &mut n.backing {
+                *refs -= 1;
+                if *refs == 0 {
+                    if let Some(s) = self.session.get() {
+                        let _ = s.backing_close(*id);
+                    }
+                    n.backing = None;
+                }
             }
         }
     }

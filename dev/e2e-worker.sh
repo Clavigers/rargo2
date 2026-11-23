@@ -19,7 +19,7 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail -15 | sed 's/^/        /'; }
 check() { if [ "$1" = 0 ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
-R() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
 # A figure from the workers part of the status text: the number before PATTERN.
 stat() { R --rargo-status | tr '\n' ' ' | grep -oE "[0-9.]+ $1" | head -1 | cut -d' ' -f1; }
 

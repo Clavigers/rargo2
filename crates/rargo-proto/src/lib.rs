@@ -98,6 +98,9 @@ pub struct LocalRequest {
     pub vars: Vec<(String, String)>,
     pub stdout_tty: bool,
     pub stderr_tty: bool,
+    /// The command's mount namespace (the link `/proc/self/ns/mnt`). What
+    /// the daemon mounts is only seen by commands in its own.
+    pub mount_ns: String,
 }
 
 /// What the daemon tells the `rargo` command.
@@ -166,6 +169,10 @@ pub struct RunRequest {
     /// The token of the last delivery this worktree placed completely
     /// (see [`ServerMsg::DeliveryToken`]); 0 if none.
     pub delivered: u64,
+    /// The client shows results in a virtual output directory: it wants to
+    /// be told of every artifact as soon as it exists, and fetches contents
+    /// itself when something opens them. Only small files are sent along.
+    pub lazy: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -239,6 +246,11 @@ pub enum ServerMsg {
     Missing { id: u64, trees: Vec<Digest>, blobs: Vec<Digest> },
     /// Everything asked for in fetch `id` has been sent.
     Fetched { id: u64 },
+    /// How a content is cut into chunks: `(hash, length)` in order. Empty
+    /// if the server does not have the content.
+    Recipe { hash: Digest, chunks: Vec<(Digest, u32)> },
+    /// Chunks of a content, by their place in its recipe.
+    Chunks { hash: Digest, chunks: Vec<(u32, Part)> },
     Pong(u64),
     /// A future-incompatibility report to add to the report file in the
     /// client's target directory (cargo's `.future-incompat-report.json`).
@@ -285,6 +297,13 @@ pub enum ClientMsg {
     /// Contents the client lacks, to be sent on the control stream and
     /// followed by [`ServerMsg::Fetched`].
     Fetch { id: u64, hashes: Vec<Digest> },
+    /// Asks how a content is cut into chunks (a stream of its own,
+    /// answered with [`ServerMsg::Recipe`] and [`ServerMsg::Fetched`]).
+    Recipe { id: u64, hash: Digest },
+    /// Asks for chunks of a content by their place in its recipe (a stream
+    /// of its own, answered with [`ServerMsg::Chunks`] and
+    /// [`ServerMsg::Fetched`]).
+    Chunks { id: u64, hash: Digest, idx: Vec<u32> },
     Offer(Box<Offer>),
     /// The command of this stream is not wanted any more.
     Cancel,
@@ -336,6 +355,13 @@ pub fn pack(encoded: &[u8]) -> Option<Vec<u8>> {
 pub fn unpack(packed: &[u8]) -> std::io::Result<Vec<u8>> {
     zstd::stream::decode_all(packed)
 }
+
+/// In a lazy delivery, files up to this size are sent along with their
+/// names: fetching each when it is opened would cost a round trip apiece.
+pub const LAZY_SMALL: u64 = 64 << 10;
+/// Contents at least this large are fetched by chunk, so that what the
+/// client's cache already holds of them is not sent again.
+pub const CHUNKED_FROM: u64 = 1 << 20;
 
 /// Files larger than this travel as a sequence of parts.
 pub const PART_SIZE: usize = 1 << 20;

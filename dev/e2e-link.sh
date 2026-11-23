@@ -12,6 +12,7 @@ set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
+. "$work/env.sh"
 E=$work/e2e-link
 proj=$E/ws
 export RARGO_HIDE=$E
@@ -20,7 +21,7 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail -15 | sed 's/^/        /'; }
 check() { if [ "$1" = 0 ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
-R() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
 dstat() { R --rargo-daemon-status 2>&1; }
 # A figure from the server's sync line: the number before PATTERN.
 sync_n() { R --rargo-status | grep '^sync' | grep -oE "[0-9]+ $1" | head -1 | cut -d' ' -f1; }
@@ -107,7 +108,7 @@ mkdir -p crates/slow/src
 printf '[package]\nname = "slow"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >crates/slow/Cargo.toml
 echo 'fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }' >crates/slow/build.rs
 echo '' >crates/slow/src/lib.rs
-ip netns exec rargo-cl "$RARGO_BIN/rargo" build -p slow >/dev/null 2>&1 &
+nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" build -p slow >/dev/null 2>&1 &
 cl=$!
 for i in $(seq 1 100); do
     pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null && break
@@ -147,10 +148,53 @@ out=$(RARGO_TRANSPORT=udp RARGO_NO_DAEMON=1 RARGO_CACHE_DIR=$E/cache-udp R build
 [ $rc = 101 ] && grep -q "cannot reach the rargo server" <<<"$out"; check $? "RARGO_TRANSPORT=udp does not fall back" "$out"
 ip netns exec rargo-cl tc qdisc del dev eth0 root 2>/dev/null
 
+echo "== the output directory is virtual"
+export RARGO_CACHE_DIR=$E/cache
+mounted() { grep -q " $proj/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo; }
+shown() { dstat | grep '^outputs' | grep -oE "[0-9]+ $1" | head -1 | cut -d' ' -f1; }
+out=$(R build 2>&1); check $? "a build through the first daemon again" "$out"
+mounted; check $? "target/ is a file system of the daemon's" "$(grep "$proj" /proc/self/mountinfo)"
+[ "$(shown 'worktrees with')" = 1 ]; check $? "which shows what the server built" "$(dstat)"
+before=$(shown 'bytes fetched')
+sed -i 's/{ 90 }/{ 100 }/' crates/extra/src/lib.rs
+out=$(R build 2>&1); check $? "a build after an edit" "$out"
+[ -x target/debug/app ] && [ "$(stat -c %s target/debug/app)" -gt 100000 ]; check $? "the new binary is listed with its size at once"
+[ "$(shown 'bytes fetched')" = "$before" ]; check $? "without its content having crossed the link ($before bytes fetched before and after)" "$(dstat)"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 103" ]; check $? "running it fetches it" "$out"
+after=$(shown 'bytes fetched')
+[ "$after" -gt "$before" ]; check $? "($((after - before)) bytes fetched, $(shown 'bytes reused') reused from the cache)" "$(dstat)"
+real=$(find "$E/cache/blobs" -type f | wc -l)
+! find target -maxdepth 0 -newer "$E/cache" -type f | grep -q .; [ "$(shown 'made real')" = 0 ]; check $? "nothing was copied into the worktree ($(shown 'made real') files made real)" "$(dstat)"
+# Stock cargo in the same directory: it reads what is shown and writes its own.
+out=$(cargo build --offline 2>&1); check $? "stock cargo builds in the same target/" "$out"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 103" ]; check $? "and its binary runs" "$out"
+out=$(cargo test --offline -q 2>&1); check $? "stock cargo test works there" "$out"
+sed -i 's/{ 100 }/{ 110 }/' crates/extra/src/lib.rs
+out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "rargo after stock cargo: the new build replaces what stock cargo left" "$out"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(the file in target/ is the new one)" "$out"
+# Copying as a fallback, on request.
+out=$(RARGO_OUTPUT=copy R build 2>&1); check $? "RARGO_OUTPUT=copy builds" "$out"
+! mounted; check $? "and target/ is a plain directory again"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "with the binary copied into it" "$out"
+out=$(R build 2>&1); mounted; check $? "the next command without it shows results again" "$out"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(same binary)" "$out"
+# cargo clean has to be able to remove the directory.
+out=$(R clean 2>&1); rc=$?
+[ $rc = 0 ] && [ ! -e target ]; check $? "clean removes target/" "$out"
+out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "and the next build fills it again" "$out"
+# A daemon that is killed leaves a dead mount; the next one replaces it.
+pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"; sleep 0.3
+! ls target >/dev/null 2>&1; check $? "after the daemon is killed target/ is a dead mount"
+out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "the next command's daemon replaces it and builds" "$out"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and shows the binary" "$out"
+
 echo "== daemons go when told"
-R --rargo-daemon-stop; RARGO_CACHE_DIR=$E/cache R --rargo-daemon-stop
+RARGO_CACHE_DIR=$E/cache-tcp R --rargo-daemon-stop; RARGO_CACHE_DIR=$E/cache R --rargo-daemon-stop
 sleep 0.5
 [ "$(daemons)" = 0 ]; check $? "--rargo-daemon-stop ends them ($(daemons) left)"
+! mounted && [ -d target ]; check $? "and leaves target/ a plain directory"
+out=$(cargo build --offline 2>&1); check $? "in which stock cargo builds" "$out"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "the same program" "$out"
 grep -c "panicked" "$work/nstest/srv.log" "$E"/cache*/daemon.log 2>/dev/null | grep -v ':0$' | { ! grep -q .; }; check $? "nothing panicked"
 
 cd /

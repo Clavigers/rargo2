@@ -16,6 +16,7 @@
 mod daemon;
 mod git;
 mod mux;
+mod outfs;
 mod place;
 mod report;
 mod scan;
@@ -308,6 +309,32 @@ fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::
     }
 }
 
+/// This process's mount namespace, as the kernel names it.
+pub fn mount_ns() -> String {
+    std::fs::read_link("/proc/self/ns/mnt").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// Asks a running daemon to give this worktree's output directory back to
+/// plain files.
+fn release_output() {
+    let (Ok(cfg), Ok(cwd)) = (load_config(), std::env::current_dir().and_then(|d| d.canonicalize())) else { return };
+    let socket = daemon_socket(&cfg, &cache_dir());
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket) else { return };
+    let req = LocalRequest {
+        args: Vec::new(),
+        kind: "release".into(),
+        cwd: cwd.to_string_lossy().into_owned(),
+        vars: Vec::new(),
+        stdout_tty: false,
+        stderr_tty: false,
+        mount_ns: mount_ns(),
+    };
+    let bytes = rargo_proto::encode(&req);
+    let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes));
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
+}
+
 /// Acts on one thing the daemon says. Returns only if more is to come.
 fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
     match reply {
@@ -377,13 +404,14 @@ fn main() {
     if std::env::var_os("RARGO_BYPASS").is_some() {
         passthrough(&raw);
     }
-    tmp::install_handlers();
+    // The daemon handles signals itself (it has directories to unmount).
     if raw.first().is_some_and(|a| a == "--rargo-daemon") {
         match raw.get(1) {
             Some(socket) => daemon::serve(Path::new(socket)),
             None => die("usage: rargo --rargo-daemon SOCKET"),
         }
     }
+    tmp::install_handlers();
     let mut args: Vec<String> = match raw.iter().map(|a| a.clone().into_string()).collect() {
         Ok(a) => a,
         // cargo itself rejects non-UTF-8 arguments for build commands.
@@ -435,6 +463,13 @@ fn main() {
     } else {
         match subcommand(&args) {
             Some(cmd) if ROUTED.contains(&cmd) => {}
+            // `cargo clean` removes the output directory, which it cannot
+            // while the daemon shows results in it: the daemon lets go of
+            // it first.
+            Some("clean") => {
+                release_output();
+                passthrough(&raw)
+            }
             _ => passthrough(&raw),
         }
         // Asking for help or version is cargo's business.
@@ -463,6 +498,7 @@ fn main() {
         vars,
         stdout_tty: std::io::stdout().is_terminal(),
         stderr_tty: std::io::stderr().is_terminal(),
+        mount_ns: mount_ns(),
     };
     let cache = cache_dir();
     if kind == "stop" {

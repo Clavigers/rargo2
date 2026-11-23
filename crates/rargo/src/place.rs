@@ -94,6 +94,22 @@ fn mode(exec: bool, writable: bool) -> std::fs::Permissions {
     })
 }
 
+/// Where the cache holds a content, if it does (in either of its two
+/// modes) with the right size.
+pub fn cached(cache_dir: &Path, hash: &Digest, size: u64) -> Option<PathBuf> {
+    let h = hex(hash);
+    let dir = cache_dir.join("blobs").join(&h[..2]);
+    [dir.join(&h[2..]), dir.join(format!("{}.x", &h[2..]))]
+        .into_iter()
+        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() == size).unwrap_or(false))
+}
+
+/// Where a content fetched for the cache alone goes.
+pub fn cache_slot(cache_dir: &Path, hash: &Digest) -> PathBuf {
+    let h = hex(hash);
+    cache_dir.join("blobs").join(&h[..2]).join(&h[2..])
+}
+
 /// Temporary names are unique in the process: a daemon places for several
 /// commands at once.
 fn next_seq() -> u64 {
@@ -201,9 +217,20 @@ impl Placer {
         Ok(())
     }
 
-    /// A finished download at `tmp` goes to everyone waiting for it.
+    /// A finished download at `tmp` goes to everyone waiting for it; if
+    /// nobody is (content for a virtual output directory), into the cache.
     fn arrived(&mut self, hash: Digest, tmp: &Path) -> io::Result<()> {
         let dests = self.pending.remove(&hash).unwrap_or_default();
+        if dests.is_empty() {
+            let cp = self.cache_path(&hash, false);
+            if let Some(parent) = cp.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::set_permissions(tmp, mode(false, false));
+            return std::fs::rename(tmp, &cp).inspect_err(|_| {
+                let _ = std::fs::remove_file(tmp);
+            });
+        }
         let result = (|| -> io::Result<()> {
             // Anything shareable goes through the cache, once per mode.
             let mut cached: HashMap<bool, PathBuf> = HashMap::new();

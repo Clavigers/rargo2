@@ -27,7 +27,7 @@ ruff) edit=crates/ruff_text_size/src/lib.rs ;;
 *) echo "unknown repo $repo"; exit 2 ;;
 esac
 export RARGO_HIDE=$C RARGO_CACHE_DIR=$C/cache
-R() { ip netns exec rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
 t() { local t0=$(date +%s.%N); "$@" >"$C/last.log" 2>&1 || echo "FAILED: $*" >&2; echo "$(date +%s.%N) - $t0" | bc; }
 median() { sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
 set -- "${links[@]}"

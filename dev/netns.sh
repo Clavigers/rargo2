@@ -10,7 +10,9 @@
 #
 # The client's link is shaped separately: CLIENT_DELAY_MS (each way, default
 # 1), CLIENT_LOSS_PCT (default 0) and CLIENT_RATE (default 1gbit).
-# Clients run as `ip netns exec rargo-cl` with the variables in
+# Clients run as `nsenter --net=/run/netns/rargo-cl` (their network
+# namespace only: the mount namespace stays the host's, where the client
+# daemon's output directories are mounted) with the variables in
 # $RARGO_WORK/nstest/client.env; the server cannot see the directories named
 # in RARGO_HIDE.
 set -eu

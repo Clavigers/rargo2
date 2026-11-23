@@ -168,7 +168,10 @@ def main():
     if a.toolchain:
         env["RUSTUP_TOOLCHAIN"] = a.toolchain
     daemon_pid = None
-    prefix = ["ip", "netns", "exec", a.netns] if a.netns else []
+    # Only the network namespace is entered (`ip netns exec` would also give
+    # every command a mount namespace of its own, and the client daemon's
+    # virtual output directories would be invisible to the next command).
+    prefix = ["nsenter", f"--net=/run/netns/{a.netns}"] if a.netns else []
     state = env.get("RARGO_STATE", os.path.join(WORK, "state"))
     client_cache = os.path.join(root, "client-cache")
     if a.mode == "rargo":
