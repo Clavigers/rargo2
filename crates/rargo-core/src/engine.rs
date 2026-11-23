@@ -147,10 +147,36 @@ pub struct Request {
     /// from its outputs.
     pub declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String> + Send + Sync>,
     pub observer: Arc<dyn Observer>,
+    /// The files of the state the view shows under the spec's `discard`
+    /// prefixes (an incremental seed), by content and size. Some of them
+    /// may be on a worker rather than in the store.
+    pub seed_blobs: Arc<Vec<(Hash, u64)>>,
 }
+
+/// The seed a request was given cannot be completed: files of it were on a
+/// worker that is gone. The request is to be made again with another seed.
+#[derive(Debug)]
+pub struct SeedLost;
+
+impl std::fmt::Display for SeedLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("files of the incremental state are no longer available")
+    }
+}
+
+impl std::error::Error for SeedLost {}
 
 /// Something that can run actions elsewhere.
 pub trait RemoteRunner: Send + Sync {
+    /// Whether a connected worker holds this blob.
+    fn holds(&self, blob: &Hash) -> bool;
+
+    /// Fetches blobs that are held by workers into the store.
+    fn bring_home<'a>(
+        &'a self,
+        blobs: &'a [Hash],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+
     /// Runs the action on a worker if that is expected to finish sooner
     /// than waiting for a local core. `None` means "run it locally".
     fn try_run<'a>(
@@ -608,6 +634,8 @@ impl Engine {
                 return r;
             }
         }
+        // Bytes can cross the link while the action waits for a core.
+        self.seed_home(req).await?;
         let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind)).await;
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
@@ -615,6 +643,28 @@ impl Engine {
         drop(permit);
         self.note_action_wall(started.elapsed());
         r
+    }
+
+    /// The files of the request's seed that are not in the store.
+    pub fn seed_away(&self, req: &Request) -> Vec<(Hash, u64)> {
+        req.seed_blobs.iter().filter(|(h, _)| !self.store.has(h)).copied().collect()
+    }
+
+    /// Makes sure the request's seed is in the store, as an action that
+    /// runs here needs it: what is still on a worker is fetched now.
+    pub async fn seed_home(&self, req: &Request) -> Result<()> {
+        let away: Vec<Hash> = self.seed_away(req).into_iter().map(|(h, _)| h).collect();
+        if away.is_empty() {
+            return Ok(());
+        }
+        let fetched = match self.remote.get() {
+            Some(remote) => remote.bring_home(&away).await,
+            None => Err(anyhow::anyhow!("no worker is connected")),
+        };
+        fetched.map_err(|e| {
+            eprintln!("rargod: `{}`: its incremental state could not be completed: {e:#}", req.spec.label);
+            SeedLost.into()
+        })
     }
 
     /// A trace of some other run of the same program, if any.

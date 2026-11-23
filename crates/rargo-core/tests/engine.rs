@@ -103,6 +103,7 @@ impl Fx {
             gid: 0,
             prio: Priority::Agent,
             no_cache: false,
+            seed_blobs: Default::default(),
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(move |_, _| declared.clone()),
             observer: Arc::new(NullObserver),

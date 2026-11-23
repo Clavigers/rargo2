@@ -207,12 +207,18 @@ impl Peer {
         rx
     }
 
-    pub async fn call(&self, body: Req) -> Result<Resp> {
-        match tokio::time::timeout(Duration::from_secs(120), self.start(body)).await {
-            Ok(Ok(Resp::Err(e))) => bail!("peer: {e}"),
-            Ok(Ok(r)) => Ok(r),
-            Ok(Err(_)) => bail!("connection to peer lost"),
-            Err(_) => bail!("peer did not answer"),
+    /// Sends a request now; the returned future waits for its answer.
+    /// Several calls made before the first is awaited are in flight
+    /// together.
+    pub fn call(&self, body: Req) -> impl std::future::Future<Output = Result<Resp>> + Send + 'static {
+        let rx = self.start(body);
+        async move {
+            match tokio::time::timeout(Duration::from_secs(120), rx).await {
+                Ok(Ok(Resp::Err(e))) => bail!("peer: {e}"),
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(_)) => bail!("connection to peer lost"),
+                Err(_) => bail!("peer did not answer"),
+            }
         }
     }
 
@@ -422,7 +428,33 @@ impl Blobs {
         };
         self.assemble(peer, h, &recipe, chunks.into_iter().collect()).await
     }
+
+    /// Fetches several blobs from the peer, a few at a time.
+    pub async fn fetch_all(self: &Arc<Self>, peer: &Arc<Peer>, blobs: &[Hash]) -> Result<()> {
+        for group in blobs.chunks(FETCH_TOGETHER) {
+            let tasks: Vec<_> = group
+                .iter()
+                .filter(|h| !self.store.has(h))
+                .map(|h| {
+                    let (this, peer, h) = (self.clone(), peer.clone(), *h);
+                    tokio::spawn(async move { this.fetch(&peer, &h).await })
+                })
+                .collect();
+            let mut first: Result<()> = Ok(());
+            for t in tasks {
+                let r = t.await.map_err(|e| anyhow!("fetch task: {e}")).and_then(|r| r);
+                if first.is_ok() {
+                    first = r;
+                }
+            }
+            first?;
+        }
+        Ok(())
+    }
 }
+
+/// Blobs fetched from a peer at the same time.
+const FETCH_TOGETHER: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Worker side
@@ -938,6 +970,38 @@ fn extern_paths(argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Everything below `dirs` in `view`: what a lookup of each entry answers
+/// (files with their content hash) and the listing of each directory.
+#[allow(clippy::type_complexity)]
+fn side_tree(
+    view: &dyn View,
+    content: &Content,
+    dirs: &[Vec<u8>],
+) -> (Vec<(Vec<u8>, Vec<u8>, WLooked)>, Vec<(Vec<u8>, Vec<(Vec<u8>, u8)>)>) {
+    let mut prefill = Vec::new();
+    let mut listings = Vec::new();
+    let mut todo: Vec<Vec<u8>> = dirs.to_vec();
+    while let Some(dir) = todo.pop() {
+        let Ok(listing) = view.list(&dir) else { continue };
+        for (name, _) in &listing {
+            let looked = view.lookup(&dir, name);
+            let mut w = to_wire(&looked, content);
+            match &looked {
+                Looked::Dir(_) => todo.push(vjoin(&dir, name)),
+                Looked::File(f) => {
+                    if let (Ok(h), WLooked::File { hash, .. }) = (content.hash(&f.src), &mut w) {
+                        *hash = Some(h);
+                    }
+                }
+                _ => {}
+            }
+            prefill.push((dir.clone(), name.clone(), w));
+        }
+        listings.push((dir, listing.into_iter().map(|(n, t)| (n, dtype_to_u8(t))).collect()));
+    }
+    (prefill, listings)
+}
+
 enum Event {
     Stdout(Vec<u8>),
     Line(Vec<u8>),
@@ -996,53 +1060,28 @@ fn eager_dispatch() -> bool {
     *ON.get_or_init(|| std::env::var("RARGO_DISPATCH").ok().as_deref() == Some("eager"))
 }
 
-/// The view a worker is answered from, without what is under the action's
-/// side directories (its incremental state): a remote compile starts from
-/// nothing rather than have hundreds of megabytes of state shipped out, and
-/// its new state is not shipped back (see D31).
-struct WithoutSide {
-    inner: Arc<dyn View>,
-    side: Vec<Vec<u8>>,
-}
-
-impl WithoutSide {
-    fn hidden(&self, dir: &[u8], name: &[u8]) -> bool {
-        let path = vjoin(dir, name);
-        self.side.iter().any(|d| vpath_starts_with(&path, d) && path != *d)
-    }
-}
-
-impl View for WithoutSide {
-    fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        if self.hidden(dir, name) { Looked::Absent } else { self.inner.lookup(dir, name) }
-    }
-    fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        if self.side.iter().any(|d| vpath_starts_with(dir, d)) {
-            return Ok(Vec::new());
-        }
-        self.inner.list(dir)
-    }
-    fn traced(&self, dir: &[u8]) -> bool {
-        self.inner.traced(dir)
-    }
-    fn hints(&self) -> Vec<Vec<u8>> {
-        self.inner.hints()
-    }
-}
-
-/// `RARGO_REMOTE_INCR=1`: remote compiles get their incremental seed and
-/// bring their state back, as local ones do.
+/// `RARGO_REMOTE_INCR=0` in rargod's environment: crates that are compiled
+/// incrementally are never compiled on a worker (the rule of D55).
 fn remote_incr() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_REMOTE_INCR").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| std::env::var("RARGO_REMOTE_INCR").ok().as_deref() != Some("0"))
 }
 
-/// `RARGO_REMOTE_FIRST=1`: a workspace crate that has never been compiled
-/// here may be compiled on a worker.
-fn remote_first() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_REMOTE_FIRST").ok().as_deref() == Some("1"))
+/// `RARGO_STATE_HOME_AFTER_MS` in rargod's environment: how long a state
+/// lies on the worker that made it before it is fetched in the background
+/// (default: not at all). A compile here that needs it fetches it at once
+/// whatever this says.
+fn state_home_after() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("RARGO_STATE_HOME_AFTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    }))
 }
+
+/// How much of an incremental state a worker may lack and still be given
+/// the compile: that much is sent along; a state it does not have is not
+/// (D31).
+const SEED_GAP: u64 = 4 << 20;
 
 /// `RARGO_TRACE_REMOTE` in rargod's environment: one line per remote
 /// action on its stderr, with where the time went.
@@ -1116,8 +1155,21 @@ pub struct PoolStats {
     /// Queued for both; a local core came free before a worker's.
     pub kept_local_first: AtomicU64,
     pub worker_failures: AtomicU64,
-    /// Not offered to workers: the crate has incremental state here.
+    /// Not offered to workers: no worker has the crate's incremental state.
     pub kept_local_incremental: AtomicU64,
+    /// Dispatched with the incremental state the worker already held.
+    pub seeded_in_place: AtomicU64,
+    /// Incrementally compiled crates dispatched without any state (their
+    /// first compile).
+    pub unseeded_remote: AtomicU64,
+    /// Files of incremental states left on workers, to come home later.
+    pub state_left_blobs: AtomicU64,
+    pub state_left_bytes: AtomicU64,
+    /// Of those, fetched in the background on an idle core.
+    pub state_homed_blobs: AtomicU64,
+    pub state_homed_bytes: AtomicU64,
+    /// Fetched because a compile here needed them.
+    pub state_needed_blobs: AtomicU64,
     /// Dispatched, then run here because a local core fell idle first.
     pub hedged: AtomicU64,
     /// Hedges where the local copy finished first.
@@ -1144,6 +1196,10 @@ pub struct Pool {
     pub stats: PoolStats,
     /// Signalled whenever a worker core becomes free.
     freed: tokio::sync::Notify,
+    /// Files of incremental states that are on a worker and not here, in
+    /// the order they were made.
+    home_queue: Mutex<std::collections::VecDeque<(Arc<Worker>, Hash, u64, std::time::Instant)>>,
+    home_wake: tokio::sync::Notify,
 }
 
 fn to_wire(l: &Looked, content: &Content) -> WLooked {
@@ -1195,7 +1251,10 @@ impl Pool {
             bandwidth: AtomicU64::new(100 << 20),
             stats: PoolStats::default(),
             freed: tokio::sync::Notify::new(),
+            home_queue: Mutex::new(std::collections::VecDeque::new()),
+            home_wake: tokio::sync::Notify::new(),
         });
+        tokio::spawn(pool.clone().bring_states_home(engine.clone()));
         let p = pool.clone();
         tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
@@ -1385,11 +1444,11 @@ impl Pool {
         }
     }
 
-    /// Picks a worker with a free core.
-    fn lease(&self) -> Option<Arc<Worker>> {
+    /// Picks a worker with a free core; with `among`, only one of those.
+    fn lease(&self, among: Option<&[u64]>) -> Option<Arc<Worker>> {
         let ws = self.workers.lock();
         let mut best: Option<&Arc<Worker>> = None;
-        for w in ws.iter().filter(|w| w.alive.load(Ordering::Relaxed)) {
+        for w in ws.iter().filter(|w| w.alive.load(Ordering::Relaxed) && among.is_none_or(|ids| ids.contains(&w.id))) {
             if w.free.load(Ordering::Relaxed) > 0 && best.is_none_or(|b| w.free.load(Ordering::Relaxed) > b.free.load(Ordering::Relaxed)) {
                 best = Some(w);
             }
@@ -1403,27 +1462,96 @@ impl Pool {
 
     fn give_back(&self, w: &Worker) {
         w.free.fetch_add(1, Ordering::Relaxed);
-        self.freed.notify_one();
+        // Whoever is woken may be waiting for another worker's core.
+        self.freed.notify_waiters();
     }
 
     /// A worker core, as soon as there is one.
-    async fn lease_wait(&self) -> Arc<Worker> {
+    async fn lease_wait(&self, among: Option<&[u64]>) -> Arc<Worker> {
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             // Registered before looking, so a core freed in between is not missed.
             freed.as_mut().enable();
-            if let Some(w) = self.lease() {
+            if let Some(w) = self.lease(among) {
                 return w;
             }
             freed.await;
         }
     }
 
+    /// The workers that hold the state `blobs` (all but `SEED_GAP` of it,
+    /// and that remainder is here to be sent).
+    fn seed_holders(&self, blobs: &[(Hash, u64)], store: &Store) -> Vec<u64> {
+        let ws = self.workers.lock();
+        ws.iter()
+            .filter(|w| w.alive.load(Ordering::Relaxed))
+            .filter(|w| {
+                let has = w.has_blobs.lock();
+                let mut gap = 0u64;
+                for (h, size) in blobs {
+                    if has.contains(h) {
+                        continue;
+                    }
+                    gap += size;
+                    if gap > SEED_GAP || !store.has(h) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|w| w.id)
+            .collect()
+    }
+
+    /// A connected worker that holds `blob`.
+    fn holder(&self, blob: &Hash) -> Option<Arc<Worker>> {
+        let ws = self.workers.lock();
+        ws.iter().find(|w| w.alive.load(Ordering::Relaxed) && w.has_blobs.lock().contains(blob)).cloned()
+    }
+
+    /// Fetches the files of incremental states that compiles left on
+    /// workers, oldest first, one at a time and only on a core nothing else
+    /// wants: putting a file together and checking it costs the CPU time
+    /// the builds are short of. A compile that needs a state sooner fetches
+    /// it itself (`bring_home`).
+    async fn bring_states_home(self: Arc<Self>, engine: Arc<Engine>) {
+        loop {
+            let next = self.home_queue.lock().pop_front();
+            let Some((w, h, size, since)) = next else {
+                self.home_wake.notified().await;
+                continue;
+            };
+            if let Some(wait) = state_home_after().checked_sub(since.elapsed()) {
+                tokio::time::sleep(wait).await;
+            }
+            if engine.store.has(&h) || !w.alive.load(Ordering::Relaxed) {
+                continue;
+            }
+            let permit = engine.sched.acquire(crate::sched::Priority::Idle, 0).await;
+            match self.blobs.fetch(&w.peer, &h).await {
+                Ok(()) => {
+                    self.stats.state_homed_blobs.fetch_add(1, Ordering::Relaxed);
+                    self.stats.state_homed_bytes.fetch_add(size, Ordering::Relaxed);
+                }
+                Err(e) => eprintln!("rargod: a file of an incremental state did not come home from worker {:x}: {e:#}", w.id),
+            }
+            drop(permit);
+        }
+    }
+
     /// Sends a blob the worker is expected to need, leaving out the chunks
     /// it is known to hold.
     fn push_blob(&self, w: &Worker, h: Hash) {
-        let Some(recipe) = self.blobs.recipe(&h) else { return };
+        // Another action's push may have sent it since this one was planned.
+        // (Claimed before sending: pushes planned together run together.)
+        if !w.has_blobs.lock().insert(h) {
+            return;
+        }
+        let Some(recipe) = self.blobs.recipe(&h) else {
+            w.has_blobs.lock().remove(&h);
+            return;
+        };
         let missing: Vec<u32> = {
             let has = w.has_chunks.lock();
             (0..recipe.len() as u32).filter(|i| !has.contains(&recipe[*i as usize].hash)).collect()
@@ -1460,7 +1588,6 @@ impl Pool {
         }
         flush(&mut batch, true);
         w.has_chunks.lock().extend(recipe.iter().map(|c| c.hash));
-        w.has_blobs.lock().insert(h);
     }
 }
 
@@ -1639,11 +1766,9 @@ impl Pool {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let t0 = std::time::Instant::now();
-        let view: Arc<dyn View> = if spec.discard.is_empty() || remote_incr() {
-            req.view.clone()
-        } else {
-            Arc::new(WithoutSide { inner: req.view.clone(), side: spec.discard.clone() })
-        };
+        // The action's side directories (its incremental state) are shown
+        // as they are: it is only sent to a worker that holds that state.
+        let view: Arc<dyn View> = req.view.clone();
         let ra = Arc::new(RemoteAction {
             view: view.clone(),
             events: tx,
@@ -1666,7 +1791,16 @@ impl Pool {
         }
         let cleanup = Cleanup(self, w, action, std::cell::Cell::new(false));
 
-        let (prefill, listings, incoming, closed) = self.predict(w, engine, spec, key, &view, &ra).await?;
+        let (mut prefill, mut listings, incoming, mut closed) = self.predict(w, engine, spec, key, &view, &ra).await?;
+        if !req.seed_blobs.is_empty() {
+            // The compiler walks its whole state before anything else: the
+            // tree goes with the action instead of one question per file.
+            let (view, content, dirs) = (view.clone(), self.content.clone(), spec.discard.clone());
+            let (p, l) = tokio::task::spawn_blocking(move || side_tree(&*view, &content, &dirs)).await?;
+            closed.extend(l.iter().map(|(d, _)| d.clone()));
+            prefill.extend(p);
+            listings.extend(l);
+        }
         self.stats.prefilled_entries.fetch_add(prefill.len() as u64, Ordering::Relaxed);
         w.peer.post(&Msg::Run {
             action,
@@ -1741,40 +1875,47 @@ impl Pool {
         };
 
         let t_done = t0.elapsed();
-        // Bring the outputs home, and what the action left in the
-        // directories that are kept on the side (its incremental state: the
-        // next compile of this crate, wherever it runs, starts from it).
-        let wanted: Vec<Hash> = done
-            .entries
-            .iter()
-            .filter(|(p, _)| !spec.discard.iter().any(|d| vpath_starts_with(p, d)))
-            .chain(done.side.iter().filter(|_| remote_incr()))
-            .filter_map(|(_, e)| match e {
-                MEntry::File { hash, .. } if !engine.store.has(hash) => Some(*hash),
-                _ => None,
-            })
-            .collect();
-        let wanted_bytes: u64 = done
-            .entries
-            .iter()
-            .chain(done.side.iter())
-            .filter_map(|(_, e)| match e {
-                MEntry::File { hash, size, .. } if wanted.contains(hash) => Some(*size),
-                _ => None,
-            })
-            .sum();
-        for group in wanted.chunks(16) {
-            let fetches: Vec<_> = group.iter().map(|h| self.blobs.fetch(&w.peer, h)).collect();
-            for f in fetches {
-                f.await.context("fetching an output from the worker")?;
+        // Bring the outputs home. What the action left in the directories
+        // that are kept on the side (its incremental state) stays on the
+        // worker for now: the next compile of the crate there uses it in
+        // place, and it comes home in the background or when a compile
+        // here needs it.
+        let mut wanted: Vec<Hash> = Vec::new();
+        let mut wanted_bytes = 0u64;
+        for (p, e) in &done.entries {
+            if let MEntry::File { hash, size, .. } = e {
+                if !spec.discard.iter().any(|d| vpath_starts_with(p, d)) && !engine.store.has(hash) && !wanted.contains(hash) {
+                    wanted.push(*hash);
+                    wanted_bytes += size;
+                }
             }
         }
+        self.blobs.fetch_all(&w.peer, &wanted).await.context("fetching an output from the worker")?;
         {
             let mut has = w.has_blobs.lock();
             for (_, e) in done.entries.iter().chain(done.side.iter()) {
                 if let MEntry::File { hash, .. } = e {
                     has.insert(*hash);
                 }
+            }
+        }
+        {
+            let mut left: Vec<(Hash, u64)> = done
+                .side
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    MEntry::File { hash, size, .. } if !engine.store.has(hash) => Some((*hash, *size)),
+                    _ => None,
+                })
+                .collect();
+            left.sort();
+            left.dedup();
+            if !left.is_empty() {
+                self.stats.state_left_blobs.fetch_add(left.len() as u64, Ordering::Relaxed);
+                self.stats.state_left_bytes.fetch_add(left.iter().map(|(_, s)| s).sum::<u64>(), Ordering::Relaxed);
+                let now = std::time::Instant::now();
+                self.home_queue.lock().extend(left.into_iter().map(|(h, s)| (w.clone(), h, s, now)));
+                self.home_wake.notify_one();
             }
         }
         // A host file we served may have changed since.
@@ -1792,7 +1933,7 @@ impl Pool {
             .into_iter()
             .filter(|(p, _)| !spec.discard.iter().any(|d| vpath_starts_with(p, d)))
             .collect();
-        let side = if remote_incr() { done.side } else { Vec::new() };
+        let side = done.side;
         let result = ActionResult {
             status: done.status,
             stdout: engine.store.put_bytes(&stdout)?,
@@ -1829,6 +1970,35 @@ impl Pool {
 }
 
 impl RemoteRunner for Pool {
+    fn holds(&self, blob: &Hash) -> bool {
+        self.holder(blob).is_some()
+    }
+
+    fn bring_home<'a>(
+        &'a self,
+        blobs: &'a [Hash],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move {
+            // Grouped by the worker that holds them.
+            let mut by_worker: Vec<(Arc<Worker>, Vec<Hash>)> = Vec::new();
+            for h in blobs {
+                if self.blobs.store.has(h) {
+                    continue;
+                }
+                let Some(w) = self.holder(h) else { bail!("no connected worker holds {h}") };
+                match by_worker.iter_mut().find(|(x, _)| x.id == w.id) {
+                    Some((_, v)) => v.push(*h),
+                    None => by_worker.push((w, vec![*h])),
+                }
+            }
+            for (w, hashes) in by_worker {
+                self.stats.state_needed_blobs.fetch_add(hashes.len() as u64, Ordering::Relaxed);
+                self.blobs.fetch_all(&w.peer, &hashes).await?;
+            }
+            Ok(())
+        })
+    }
+
     fn try_run<'a>(
         &'a self,
         engine: &'a Engine,
@@ -1843,41 +2013,75 @@ impl RemoteRunner for Pool {
                 return None;
             }
             // A crate that is compiled incrementally (a workspace member)
-            // is compiled here. Remote compiles run without incremental
-            // state and leave none behind (D31): after an edit the local
-            // compile is the short one even if it has to wait for a core,
-            // and a first compile sent away would make the next rebuild of
-            // that crate a compile from nothing. `RARGO_REMOTE_FIRST=1`
-            // lets first compiles go to workers all the same.
-            if !spec.discard.is_empty()
-                && !remote_incr()
-                && (!remote_first() || engine.traces.traces(key).first().is_some())
-            {
-                self.stats.kept_local_incremental.fetch_add(1, Ordering::Relaxed);
-                return None;
+            // goes where its state is. A compile that starts from a state
+            // is short only with that state at hand, and states are too
+            // big to send along (D31): such a compile is offered only to
+            // workers that hold the state it would start from, because
+            // they made it or one like it. A first compile, with no state
+            // anywhere, can run on any worker; what it leaves stays there
+            // and comes home later.
+            let seeded = !spec.discard.is_empty();
+            let mut holders: Option<Vec<u64>> = None;
+            let mut away = false;
+            if seeded {
+                if !remote_incr() {
+                    self.stats.kept_local_incremental.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                if !req.seed_blobs.is_empty() {
+                    let ids = self.seed_holders(&req.seed_blobs, &engine.store);
+                    if ids.is_empty() {
+                        self.stats.kept_local_incremental.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                    away = !engine.seed_away(req).is_empty();
+                    holders = Some(ids);
+                }
             }
-            // A free local core is always the better place. A core held
-            // by a compiler's helper thread is as busy as one held by an
+            // A free local core is the better place, unless the state the
+            // compile starts from would have to be fetched first and the
+            // worker that holds it has a core free as well. A core held by
+            // a compiler's helper thread is as busy as one held by an
             // action.
-            let (_, waiting, _, _) = engine.sched.snapshot();
-            if engine.sched.free_tokens() > 0 && waiting == 0 {
-                self.stats.kept_local_no_wait.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            // Every local core is busy: the action goes to whichever comes
-            // free first, a core here or a core on a worker.
             let mem = engine.estimate_mem_kb(key, spec.kind);
-            let w = tokio::select! {
-                biased;
-                w = self.lease_wait() => w,
-                permit = engine.sched.acquire(req.prio, mem) => {
-                    self.stats.kept_local_first.fetch_add(1, Ordering::Relaxed);
-                    engine.stats.runs.fetch_add(1, Ordering::Relaxed);
-                    let started = std::time::Instant::now();
-                    let r = engine.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
-                    drop(permit);
-                    engine.note_action_wall(started.elapsed());
-                    return Some(r);
+            let (_, waiting, _, _) = engine.sched.snapshot();
+            if trace_remote() && seeded {
+                eprintln!(
+                    "rargod: `{}`: state of {} files, {} of them not here, held by {:?}; {} local cores free, {} waiting",
+                    spec.label,
+                    req.seed_blobs.len(),
+                    engine.seed_away(req).len(),
+                    holders,
+                    engine.sched.free_tokens(),
+                    waiting
+                );
+            }
+            let w = if engine.sched.free_tokens() > 0 && waiting == 0 {
+                match if away { self.lease(holders.as_deref()) } else { None } {
+                    Some(w) => w,
+                    None => {
+                        self.stats.kept_local_no_wait.fetch_add(1, Ordering::Relaxed);
+                        return None;
+                    }
+                }
+            } else {
+                // Every local core is busy: the action goes to whichever
+                // comes free first, a core here or a core on a worker.
+                tokio::select! {
+                    biased;
+                    w = self.lease_wait(holders.as_deref()) => w,
+                    permit = engine.sched.acquire(req.prio, mem) => {
+                        self.stats.kept_local_first.fetch_add(1, Ordering::Relaxed);
+                        if let Err(e) = engine.seed_home(req).await {
+                            return Some(Err(e));
+                        }
+                        engine.stats.runs.fetch_add(1, Ordering::Relaxed);
+                        let started = std::time::Instant::now();
+                        let r = engine.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+                        drop(permit);
+                        engine.note_action_wall(started.elapsed());
+                        return Some(r);
+                    }
                 }
             };
             // Not when its inputs would take longer to arrive than it takes
@@ -1913,6 +2117,16 @@ impl RemoteRunner for Pool {
             };
             let queued = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
             let bytes_time = queued + Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64);
+            if trace_remote() && bytes_time > engine.avg_action_wall() {
+                eprintln!(
+                    "rargod: `{}` not sent to {:x}: {:.1} MiB to send, link busy for {:.2}s, an action takes {:.2}s",
+                    spec.label,
+                    w.id,
+                    missing as f64 / 1048576.0,
+                    queued.as_secs_f64(),
+                    engine.avg_action_wall().as_secs_f64()
+                );
+            }
             if bytes_time > engine.avg_action_wall() && !eager_dispatch() {
                 // A worker that lacks the toolchain would never be given
                 // anything; send it what every compile reads, once, so that
@@ -1939,6 +2153,10 @@ impl RemoteRunner for Pool {
             }
             self.stats.dispatched.fetch_add(1, Ordering::Relaxed);
             engine.stats.remote_runs.fetch_add(1, Ordering::Relaxed);
+            if seeded {
+                let which = if req.seed_blobs.is_empty() { &self.stats.unseeded_remote } else { &self.stats.seeded_in_place };
+                which.fetch_add(1, Ordering::Relaxed);
+            }
             // Hedge: should a local core that nothing else wants fall idle
             // while the worker has the action (it may be fetching a
             // toolchain, or simply be slower), the action also runs here,
@@ -1988,8 +2206,11 @@ impl RemoteRunner for Pool {
                         // Dropping `remote` withdraws the action from the worker.
                         return Some(r);
                     }
+                    // (Not while the state the compile starts from is on
+                    // the worker: fetching it would cost more than the
+                    // idle core is worth.)
                     permit = engine.sched.acquire(crate::sched::Priority::Idle, mem),
-                        if local.is_none() && remote.is_some() && voice.owner() == NOBODY =>
+                        if local.is_none() && remote.is_some() && !away && voice.owner() == NOBODY =>
                     {
                         self.stats.hedged.fetch_add(1, Ordering::Relaxed);
                         engine.stats.runs.fetch_add(1, Ordering::Relaxed);

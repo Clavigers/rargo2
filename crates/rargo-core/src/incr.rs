@@ -9,6 +9,12 @@
 //!
 //! "Best": the same worktree's last state, else the newest state made at an
 //! ancestor of the worktree's HEAD, else the newest state of all.
+//!
+//! A state made by a compile on a worker is recorded at once, while its
+//! files are still on the worker: they come home in the background, or
+//! when a compile here needs them, and a later compile on that worker uses
+//! them where they are. Such a state is usable for as long as every file
+//! is either here or held by a connected worker.
 
 use crate::db::{Db, Table};
 use crate::hash::Hash;
@@ -50,7 +56,20 @@ pub struct IncrStore {
     db: Arc<Db>,
     store: Arc<Store>,
     next: AtomicU64,
+    /// Whether a blob that is not in the store can be had from elsewhere
+    /// (a connected worker holds it).
+    held: std::sync::OnceLock<Box<dyn Fn(&Hash) -> bool + Send + Sync>>,
     pub stats: IncrStats,
+}
+
+/// A state chosen as the starting point of a compile.
+#[derive(Clone)]
+pub struct Seed {
+    pub id: u64,
+    pub manifest: Arc<Manifest>,
+    pub kind: SeedKind,
+    /// Every file of the state, by content and size.
+    pub blobs: Arc<Vec<(Hash, u64)>>,
 }
 
 fn key(crate_key: &Hash, id: u64) -> Vec<u8> {
@@ -77,7 +96,19 @@ impl IncrStore {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(1);
-        IncrStore { db: store.db().clone(), store, next: AtomicU64::new(seed), stats: IncrStats::default() }
+        IncrStore {
+            db: store.db().clone(),
+            store,
+            next: AtomicU64::new(seed),
+            held: std::sync::OnceLock::new(),
+            stats: IncrStats::default(),
+        }
+    }
+
+    /// Says how to tell whether a blob that is not here is held by a
+    /// connected worker.
+    pub fn set_held(&self, f: Box<dyn Fn(&Hash) -> bool + Send + Sync>) {
+        let _ = self.held.set(f);
     }
 
     fn list(&self, crate_key: &Hash) -> Vec<(u64, StateMeta)> {
@@ -95,23 +126,26 @@ impl IncrStore {
         v
     }
 
-    fn load(&self, meta: &StateMeta) -> Option<Arc<Manifest>> {
+    fn load(&self, meta: &StateMeta) -> Option<(Arc<Manifest>, Arc<Vec<(Hash, u64)>>)> {
         let raw = self.store.read(&meta.manifest).ok()?;
         let m: Manifest = bincode::deserialize(&raw).ok()?;
-        // Every file must still be there; states are evicted freely.
+        // Every file must still be there, or with a worker; states are
+        // evicted freely.
+        let mut blobs: Vec<(Hash, u64)> = Vec::new();
         for (_, e) in &m.entries {
-            if let MEntry::File { hash, .. } = e {
-                if !self.store.has(hash) {
+            if let MEntry::File { hash, size, .. } = e {
+                if !self.store.has(hash) && !self.held.get().is_some_and(|held| held(hash)) {
                     return None;
                 }
+                blobs.push((*hash, *size));
             }
         }
-        for (_, e) in &m.entries {
-            if let MEntry::File { hash, .. } = e {
-                self.store.touch(hash);
-            }
+        blobs.sort();
+        blobs.dedup();
+        for (hash, _) in &blobs {
+            self.store.touch(hash);
         }
-        Some(Arc::new(m))
+        Some((Arc::new(m), Arc::new(blobs)))
     }
 
     /// Picks a seed for `crate_key`. `is_ancestor(c)` says whether commit
@@ -121,7 +155,7 @@ impl IncrStore {
         crate_key: &Hash,
         worktree: &str,
         is_ancestor: &dyn Fn(&[u8; 20]) -> bool,
-    ) -> Option<(u64, Arc<Manifest>, SeedKind)> {
+    ) -> Option<Seed> {
         let all = self.list(crate_key);
         let mut order: Vec<(&(u64, StateMeta), SeedKind)> = Vec::new();
         order.extend(all.iter().filter(|(_, m)| m.worktree == worktree).map(|s| (s, SeedKind::SameWorktree)));
@@ -133,14 +167,14 @@ impl IncrStore {
         order.extend(all.iter().map(|s| (s, SeedKind::Other)));
         for ((id, meta), kind) in order {
             match self.load(meta) {
-                Some(m) => {
+                Some((manifest, blobs)) => {
                     let counter = match kind {
                         SeedKind::SameWorktree => &self.stats.seeded_same_worktree,
                         SeedKind::Ancestor => &self.stats.seeded_ancestor,
                         SeedKind::Other => &self.stats.seeded_other,
                     };
                     counter.fetch_add(1, Ordering::Relaxed);
-                    return Some((*id, m, kind));
+                    return Some(Seed { id: *id, manifest, kind, blobs });
                 }
                 None => self.db.delete(Table::Incr, &key(crate_key, *id)),
             }
@@ -189,6 +223,11 @@ impl IncrStore {
     pub fn discard(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
         self.stats.discarded_after_crash.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Forgets a state whose files were lost with a worker.
+    pub fn forget(&self, crate_key: &Hash, id: u64) {
+        self.db.delete(Table::Incr, &key(crate_key, id));
     }
 
     /// Adds every blob referenced by a kept state to `live`.
@@ -379,19 +418,20 @@ mod tests {
         };
         // A new worktree branched from main: the ancestor's state wins over
         // the newer unrelated one.
-        let (_, m, kind) = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
-        assert_eq!((content(&m).as_str(), kind), ("main state", SeedKind::Ancestor));
+        let s1 = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
+        assert_eq!((content(&s1.manifest).as_str(), s1.kind), ("main state", SeedKind::Ancestor));
+        assert_eq!(s1.blobs.len(), 1);
         // With no ancestry information, the newest of all.
-        let (_, m, kind) = incr.pick(&k, "/wt/new", &|_| false).unwrap();
-        assert_eq!((content(&m).as_str(), kind), ("side state", SeedKind::Other));
+        let s2 = incr.pick(&k, "/wt/new", &|_| false).unwrap();
+        assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
         // Once the worktree has its own state, that one.
         incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]));
-        let (id, m, kind) = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
-        assert_eq!((content(&m).as_str(), kind), ("own state", SeedKind::SameWorktree));
+        let s3 = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
+        assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
         // A state rustc crashed on is not offered again.
-        incr.discard(&k, id);
-        let (_, m, _) = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
-        assert_eq!(content(&m), "main state");
+        incr.discard(&k, s3.id);
+        let s4 = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
+        assert_eq!(content(&s4.manifest), "main state");
     }
 
     #[test]
@@ -404,6 +444,27 @@ mod tests {
         if let MEntry::File { hash, .. } = &m.entries[0].1 {
             s.remove(hash);
         }
+        assert!(incr.pick(&k, "/wt/a", &|_| false).is_none());
+        assert_eq!(incr.state_count(&k), 0);
+    }
+
+    #[test]
+    fn state_with_files_on_a_worker_is_usable_while_the_worker_holds_them() {
+        let (_d, s) = store();
+        let incr = IncrStore::new(s.clone());
+        let k = Hash::of(b"crate");
+        let away = Hash::of(b"made on a worker, not fetched yet");
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let c2 = connected.clone();
+        incr.set_held(Box::new(move |h| *h == away && c2.load(Ordering::Relaxed)));
+        let mut m = manifest(&s, &[("/i/here", "at home")]);
+        m.entries.push((b"/i/there".to_vec(), MEntry::File { hash: away, exec: false, size: 33 }));
+        incr.save(&k, "/wt/a", None, &m);
+        let seed = incr.pick(&k, "/wt/a", &|_| false).unwrap();
+        assert!(seed.blobs.contains(&(away, 33)));
+        assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
+        // The worker goes away: the state cannot be completed any more.
+        connected.store(false, Ordering::Relaxed);
         assert!(incr.pick(&k, "/wt/a", &|_| false).is_none());
         assert_eq!(incr.state_count(&k), 0);
     }

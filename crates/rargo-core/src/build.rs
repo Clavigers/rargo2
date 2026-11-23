@@ -482,6 +482,10 @@ impl Daemon {
     pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
         let incr = crate::incr::IncrStore::new(engine.store.clone());
+        {
+            let engine = engine.clone();
+            incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
+        }
         let trees = Trees::new(engine.store.clone());
         Daemon {
             trees,
@@ -841,6 +845,7 @@ async fn plan_with(
             gid: c.gid,
             prio: c.prio,
             no_cache: false,
+            seed_blobs: Default::default(),
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(PlanObserver { client: c.clone() }),
@@ -1673,6 +1678,7 @@ impl Run {
                 gid: self.c.gid,
                 prio: self.c.prio,
                 no_cache: false,
+                seed_blobs: Default::default(),
                 cacheable: cacheable.clone(),
                 declared_env: declared_env.clone(),
                 observer: Arc::new(UnitObserver { run: self.clone(), i, shown: display_cmd(&cmd.program, &args) }),
@@ -1684,9 +1690,9 @@ impl Run {
             if let Some(o) = from_full.take() {
                 break o;
             }
-            let seed_layer = seed.as_ref().map(|(_, m, _)| {
+            let seed_layer = seed.as_ref().map(|s| {
                 let l = OutputsLayer::new();
-                l.add_manifest(0, LEVEL_FULL, m);
+                l.add_manifest(0, LEVEL_FULL, &s.manifest);
                 Arc::new(l)
             });
             let outcome = self
@@ -1700,6 +1706,7 @@ impl Run {
                     gid: self.c.gid,
                     prio: self.c.prio,
                     no_cache: false,
+                    seed_blobs: seed.as_ref().map(|s| s.blobs.clone()).unwrap_or_default(),
                     cacheable: cacheable.clone(),
                     declared_env: declared_env.clone(),
                     observer: Arc::new(UnitObserver {
@@ -1708,15 +1715,27 @@ impl Run {
                         shown: display_cmd(&cmd.program, &args),
                     }),
                 })
-                .await?;
+                .await;
+            let outcome = match outcome {
+                // Files of the seed were on a worker that has gone: the
+                // state is lost, the next best one will do.
+                Err(e) if e.downcast_ref::<crate::engine::SeedLost>().is_some() && seed.is_some() => {
+                    if let Some(lost) = seed.take() {
+                        self.d.incr.forget(&crate_key, lost.id);
+                    }
+                    seed = self.d.incr.pick(&crate_key, &wt, &|c| self.is_ancestor_of_head(c));
+                    continue;
+                }
+                other => other?,
+            };
             let r = &outcome.result;
             // A compiler that crashed (signal, or the exit code of an
             // internal error) while reading someone's incremental state may
             // have crashed because of that state: drop it and compile clean.
             let crashed = r.signal().is_some() || r.code() == Some(101);
             if crashed && !outcome.cached {
-                if let Some((id, _, _)) = seed.take() {
-                    self.d.incr.discard(&crate_key, id);
+                if let Some(bad) = seed.take() {
+                    self.d.incr.discard(&crate_key, bad.id);
                     continue;
                 }
             }
@@ -1747,6 +1766,7 @@ impl Run {
                     gid: self.c.gid,
                     prio: self.c.prio,
                     no_cache: true,
+                    seed_blobs: Default::default(),
                     cacheable: Arc::new(|_| false),
                     declared_env: Arc::new(|_, _| Vec::new()),
                     observer: Arc::new(NullObserver),
@@ -1911,12 +1931,12 @@ impl Run {
                 }
             }
         }
-        // No side changes: nothing new to keep (a remote compile that ran
-        // without incremental state, D31).
+        // The state is recorded whether its files are here or still on the
+        // worker that ran the compile (see `incr`).
         if let (Some(dir), true, false, false) =
             (&incr_dir, outcome.result.success(), outcome.cached, outcome.side.is_empty())
         {
-            let state = crate::incr::apply_changes(dir, seed.as_ref().map(|(_, m, _)| &**m), &outcome.side);
+            let state = crate::incr::apply_changes(dir, seed.as_ref().map(|s| &*s.manifest), &outcome.side);
             if !state.entries.is_empty() {
                 self.d.incr.save(&crate_key, &wt, self.c.commits.first().copied(), &state);
             }
@@ -2748,6 +2768,7 @@ impl Run {
                             gid: self.c.gid,
                             prio: self.c.prio,
                             no_cache: self.no_cache_tests,
+                            seed_blobs: Default::default(),
                             // A passing run is a fact about its inputs; a
                             // failing one may be a flake and is run again.
                             cacheable: Arc::new(|r| r.success()),
