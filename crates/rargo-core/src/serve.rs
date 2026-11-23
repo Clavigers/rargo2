@@ -320,7 +320,7 @@ pub fn status_text(d: &Daemon) -> String {
                 let (pushed, skipped, fetched, reused) = p.transfer_totals();
                 let ps = &p.stats;
                 format!(
-                    "{} connected; {} actions dispatched ({} of them also started here on an idle core: {} finished here first, {} were stopped because the worker was ahead), {} kept local (core free), {} kept local (a local core came free first), {} kept local (transfer too costly), {} worker failures; overhead per remote action {}; \
+                    "{} connected; {} actions dispatched ({} of them also started here on an idle core: {} finished here first, {} were stopped because the worker was ahead), {} kept local (core free), {} kept local (a local core came free first), {} kept local (transfer too costly), {} kept local (incremental state here), {} worker failures; overhead per remote action {}; \
                      sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
                      {} answers sent ahead, {} lookups and {} opens asked",
                     p.worker_count(),
@@ -331,6 +331,7 @@ pub fn status_text(d: &Daemon) -> String {
                     ps.kept_local_no_wait.load(Ordering::Relaxed),
                     ps.kept_local_first.load(Ordering::Relaxed),
                     ps.kept_local_transfer.load(Ordering::Relaxed),
+                    ps.kept_local_incremental.load(Ordering::Relaxed),
                     ps.worker_failures.load(Ordering::Relaxed),
                     p.overhead_text(),
                     pushed as f64 / 1048576.0,

@@ -275,6 +275,23 @@ impl Drop for Teardown {
     }
 }
 
+/// What runs of the same kind share: the program, and for a compiler what it
+/// produces (a compile that links reads the standard library's object code
+/// and runs a linker; one that makes a library does neither).
+fn profile_key(spec: &ActionSpec) -> Option<Vec<u8>> {
+    let mut key = spec.argv.first()?.clone();
+    let mut it = spec.argv.iter();
+    while let Some(a) = it.next() {
+        if a == b"--crate-type" {
+            if let Some(t) = it.next() {
+                key.push(0);
+                key.extend_from_slice(t);
+            }
+        }
+    }
+    Some(key)
+}
+
 fn default_mem_kb(kind: ActionKind) -> u64 {
     match kind {
         ActionKind::Rustc => 700 * 1024,
@@ -546,8 +563,8 @@ impl Engine {
                                 .unwrap_or(0),
                         },
                     );
-                    if let Some(program) = spec.argv.first() {
-                        self.profiles.insert(program.clone(), stored);
+                    if let Some(k) = profile_key(&spec) {
+                        self.profiles.insert(k, stored);
                     }
                 }
             }
@@ -602,7 +619,7 @@ impl Engine {
 
     /// A trace of some other run of the same program, if any.
     pub fn profile(&self, spec: &ActionSpec) -> Option<Arc<Trace>> {
-        self.profiles.get(spec.argv.first()?).map(|t| t.clone())
+        self.profiles.get(&profile_key(spec)?).map(|t| t.clone())
     }
 
     pub(crate) fn note_action_wall(&self, d: std::time::Duration) {

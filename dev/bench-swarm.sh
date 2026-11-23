@@ -29,5 +29,6 @@ fi
 if [ "${SWARM_SKIP_STOCK:-}" != 1 ]; then
     # stock: same CPU and memory cap as the server gets.
     systemd-run --scope -q -p CPUQuota=$((jobs * 100))% -p MemoryMax=90G \
-        python3 "$repo/dev/swarm.py" --repo "$name" --mode stock --agents "$agents" --out "$out"
+        python3 "$repo/dev/swarm.py" --repo "$name" --mode stock --agents "$agents" --out "$out" \
+        ${STOCK_BATCH:+--batch "$STOCK_BATCH" --label "stock cargo, agents in groups of $STOCK_BATCH"}
 fi

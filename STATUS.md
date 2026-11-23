@@ -301,11 +301,17 @@ rotation or revocation other than editing it and restarting.
 ### Results on the client
 `rargo/src/place.rs`. Verified by unit tests (sharing, own copies, parts,
 forged content refused) and e2e (stock cargo in the same `target/`).
+A client that is interrupted removes the temporaries it was writing, and
+the next client to write into a directory removes those of clients that
+were killed outright (D50; unit tests and e2e). A client that goes away
+takes its queued and running actions with it, on the server and on workers
+(D48; e2e: a build script sleeping for ten minutes is gone within five
+seconds of its client being killed).
 Known weaknesses: without reflinks, shared artifacts are read-only hard
-links into the client's cache (as cargo's own are links into `deps/`); a
-client killed while placing files can leave `.rargo-tmp-*` files in
-`target/`; a client that disconnects does not stop actions already running
-for it (their results are cached).
+links into the client's cache (as cargo's own are links into `deps/`); an
+action another build was also waiting for is killed with its owner and
+started again by the waiting build; a temporary whose process id has been
+reused stays until that process ends.
 
 ### Snapshots, fetching, flakes
 `rargo-core/src/snapshot.rs`, `build.rs` (`fetch`), `flake.rs`.
@@ -320,15 +326,24 @@ store paths on the client to run there.
 `forks/cargo/*.patch` on cargo 1.100.0. Cargo's real pipeline runs with
 process execution stubbed; build-script results appear in recorded commands
 as placeholder tokens that rargod expands.
-Known weaknesses: `--timings` is not produced; cargo's
-future-incompatibility report file is not written (the warning is shown);
-example scraping failures are treated as hard errors; the fork is pinned to
-one cargo release.
+`--timings` writes rargo's own report where cargo puts its own, and the
+future-incompatibility report goes into cargo's report file on the client
+(D49; e2e: `cargo report future-incompatibilities` shows it, and its text
+equals stock cargo's for the same crate).
+Known weaknesses: the timings report is not cargo's (it describes what the
+server did: runs, cache hits, queueing); the report's "newer version
+available" suggestion is not reproduced; example scraping failures are
+treated as hard errors; the fork is pinned to one cargo release.
 
 ### Trace cache, engine, scheduler
 `rargo-core/src/{trace,engine,sched}.rs`. Only successes are recorded.
 Verified by `tests/engine.rs` (six tests with real sandboxed processes) and
-four scheduler unit tests. Not verified under a real memory-bound workload.
+five scheduler unit tests. Not verified under a real memory-bound workload.
+A compiler that is killed (a cancelled client, the losing copy of a hedged
+action) has its helper threads' jobserver tokens put back from a count of
+its code-generation threads, a lower bound, and the pipe is settled exactly
+whenever nothing runs (D53); without per-action cgroups only the second
+half applies.
 
 ### Shared incremental compilation
 `rargo-core/src/incr.rs`. States are the largest thing in the store.
@@ -338,8 +353,14 @@ compiles run without a seed.
 ### Verify mode and drift check
 `RARGO_VERIFY=1`, `rargo --rargo-drift-check`, background every six hours
 on the server for each worktree's newest synced state (D42).
-Finding from before: rustc's incremental mode is not byte-reproducible;
-verify compares such rlibs by member content.
+Findings: rustc's incremental mode is not byte-reproducible. Verify pairs
+outputs by name without the per-session component and compares contents
+with session names blanked; with split debug info it also accepts the
+eight-byte identifier that ties an object to its `.dwo`, when that
+substitution is the one the unit's own `.dwo` files show (D51; unit tests,
+and a three-crate workspace with `split-debuginfo` unpacked, packed and
+off). For a repository with a flake the stock-cargo half runs in the
+flake's environment.
 
 ### Workers
 `rargo-core/src/{net,chunk,remote}.rs`, `dev/netns.sh`, `dev/bench-worker.sh`,

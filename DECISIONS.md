@@ -1116,3 +1116,38 @@ Three faults in D30's hedging, found by reading it against D47 and D48:
 The timings report carries its figures as a data block, and
 `dev/sim-workers.py` replays them on other machine shapes (see STATUS,
 Workers).
+
+## D54. What the worker series showed, and what was changed for it
+
+Measured on the build of D53 (rust-analyzer cold build, remote client,
+4 cores per machine): server alone 55.8 s, with one warm worker 51.0 s,
+server with 8 cores 45.9 s; a one-file edit rebuilt in 20.9 s with the
+worker against 10.7 s without. Four changes followed, each from a trace:
+
+- **A crate with incremental state here is rebuilt here.** Remote compiles
+  run without incremental state (D31), so after an edit the remote compile
+  of a large crate was the slow one. An action with an incremental
+  directory and a trace of its own is no longer offered to workers.
+- **A crate's sources travel ahead.** A traced run showed about 66
+  questions per remote compile, each a round trip: the crate's own source
+  files, and names beside them that do not exist (`foo.rs` or
+  `foo/mod.rs`?). The source tree below the crate root now goes with the
+  action: its listings, declared complete so that a name not listed is
+  absent without asking, and its `.rs` files. A crate root beside its
+  `Cargo.toml` takes only its own directory. Questions per build went from
+  about 6,100 to about 2,300.
+- **Histories per kind of compile.** The "other run of the same program"
+  used to predict a new compile's reads is now kept per crate type, and a
+  linking compile without any history gets the toolchain's library
+  directory.
+- **A worker without the toolchain is not given work it cannot start.**
+  The transfer guard now counts what is already queued on the link and,
+  for an action that has never run, the toolchain files the worker lacks.
+  The first time it trips for a worker, those files are sent; actions go
+  there once the link has drained.
+
+Where the build's time goes was read off `--timings` reports of the same
+build on 4, 8 and 24 cores and with a worker: from the moment `hir-def`
+starts, the build is one chain (`hir-def`, `hir-ty`, `hir`, `ide-*`,
+`rust-analyzer`) that takes 30.5 to 32.2 s in every configuration. All of
+what cores buy is in the wide phase before it. See STATUS for the figures.

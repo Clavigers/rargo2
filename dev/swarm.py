@@ -143,6 +143,9 @@ def main():
     ap.add_argument("--label", default=None, help="recorded with the result")
     ap.add_argument("--toolchain", default=None, help="RUSTUP_TOOLCHAIN for the agents")
     ap.add_argument("--netns", default=None, help="network namespace the rargo clients run in")
+    ap.add_argument("--batch", type=int, default=0,
+                    help="run the agents in consecutive groups of this size (all worktrees and target directories are kept "
+                         "until the end); for a stock swarm that does not fit in memory at once")
     ap.add_argument("--edit", default="api", choices=["api", "body"],
                     help="api: both edits add a public function; body: the second edit changes only a function body")
     a = ap.parse_args()
@@ -189,8 +192,11 @@ def main():
     logs = [open(os.path.join(root, f"agent{i:02d}.log"), "wb") for i in range(a.agents)]
     t0 = time.time()
     threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, prefix)) for i in range(a.agents)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    size = a.batch if a.batch > 0 else a.agents
+    for first in range(0, a.agents, size):
+        group = threads[first:first + size]
+        for t in group: t.start()
+        for t in group: t.join()
     wall = time.time() - t0
     cpu1 = cgroup_cpu_usec(daemon_pid) if a.mode == "rargo" else cgroup_cpu_usec(os.getpid())
 

@@ -107,6 +107,10 @@ pub enum Msg {
         untraced: Vec<Vec<u8>>,
         /// Blobs the server is about to push.
         incoming: Vec<Hash>,
+        /// Directories among `listings` that nothing will be added to while
+        /// the action runs (the crate's sources): a name that is not listed
+        /// does not exist, without asking.
+        closed: Vec<Vec<u8>>,
     },
     /// Part of a blob the worker is expected to need: its recipe and the
     /// chunks the server believes the worker lacks.
@@ -536,6 +540,8 @@ pub struct RemoteView {
     entries: DashMap<(Vec<u8>, Vec<u8>), WLooked>,
     listings: DashMap<Vec<u8>, Listing>,
     untraced: Vec<Vec<u8>>,
+    /// Directories whose listing in `listings` is complete.
+    closed: HashSet<Vec<u8>>,
 }
 
 impl RemoteView {
@@ -573,6 +579,11 @@ impl View for RemoteView {
         if let Some(w) = self.entries.get(&key) {
             self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
             return self.convert(dir, name, &w);
+        }
+        if self.closed.contains(dir) && self.listings.get(dir).is_some_and(|l| !l.iter().any(|(n, _)| n == name)) {
+            self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
+            self.entries.insert(key, WLooked::Absent);
+            return Looked::Absent;
         }
         self.state.lookups_remote.fetch_add(1, Ordering::Relaxed);
         let w = match self.state.peer.call_blocking(Req::Lookup { action: self.action, dir: dir.to_vec(), name: name.to_vec() }) {
@@ -694,7 +705,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                 let s = state.clone();
                 tokio::spawn(async move { s.on_push(blob, recipe, chunks, last).await });
             }
-            Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming } => {
+            Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed } => {
                 {
                     let mut ann = state.announced.lock();
                     let mut txs = state.announce_tx.lock();
@@ -721,6 +732,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                             .map(|(d, l)| (d, l.into_iter().map(|(n, t)| (n, dtype_from_u8(t))).collect()))
                             .collect(),
                         untraced,
+                        closed: closed.into_iter().collect(),
                     });
                     let aspec = ActionSpec {
                         kind: spec.kind,
@@ -817,6 +829,88 @@ impl Observer for Gated<'_> {
             self.inner.stderr_line(line, live);
         }
     }
+}
+
+/// The crate root a compiler command names: its first argument that is a
+/// Rust source file, made absolute.
+fn crate_root(argv: &[Vec<u8>], cwd: &[u8]) -> Option<Vec<u8>> {
+    let file = argv.iter().skip(1).find(|a| a.ends_with(b".rs") && !a.starts_with(b"-"))?;
+    Some(if file.starts_with(b"/") { file.clone() } else { vjoin(cwd, file) })
+}
+
+/// Whether a compiler command produces something that is linked.
+fn links(argv: &[Vec<u8>]) -> bool {
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if a == b"--test" {
+            return true;
+        }
+        if a == b"--crate-type" {
+            if let Some(t) = it.next() {
+                if t.split(|&c| c == b',').any(|t| matches!(t, b"bin" | b"proc-macro" | b"dylib" | b"cdylib")) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// The libraries of the toolchain `program` (`<sysroot>/bin/rustc`) belongs
+/// to: everything in `<sysroot>/lib/rustlib/<target>/lib`.
+fn sysroot_libs(view: &dyn View, program: &[u8]) -> Vec<Vec<u8>> {
+    let Some(sysroot) = vsplit(program).and_then(|(bin, _)| vsplit(bin)).map(|(root, _)| root.to_vec()) else {
+        return Vec::new();
+    };
+    let rustlib = vjoin(&vjoin(&sysroot, b"lib"), b"rustlib");
+    let mut out = Vec::new();
+    for (target, kind) in view.list(&rustlib).unwrap_or_default() {
+        if kind != DType::Dir {
+            continue;
+        }
+        let dir = vjoin(&vjoin(&rustlib, &target), b"lib");
+        for (name, kind) in view.list(&dir).unwrap_or_default() {
+            if kind == DType::File {
+                out.push(vjoin(&dir, &name));
+            }
+        }
+    }
+    out
+}
+
+/// At most this many directories and files of a crate travel ahead.
+const SOURCE_TREE_DIRS: usize = 300;
+const SOURCE_TREE_FILES: usize = 3000;
+
+/// The directories and `.rs` files below the directory of a crate root.
+/// A crate root that sits beside its `Cargo.toml` (a build script, a crate
+/// without `src/`) has the whole package below it, tests, vendored code and
+/// all: then only the root's own directory is taken, not what is below.
+fn source_tree(view: &dyn View, root: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let Some((top, _)) = vsplit(root) else { return (Vec::new(), Vec::new()) };
+    let (mut dirs, mut files) = (Vec::new(), vec![root.to_vec()]);
+    let mut queue = vec![top.to_vec()];
+    let mut recurse = true;
+    while let Some(dir) = queue.pop() {
+        if dirs.len() >= SOURCE_TREE_DIRS || files.len() >= SOURCE_TREE_FILES {
+            // Too large to be worth it; what was not listed is asked for.
+            break;
+        }
+        let Ok(listing) = view.list(&dir) else { continue };
+        if dir == top && listing.iter().any(|(n, _)| n == b"Cargo.toml") {
+            recurse = false;
+        }
+        for (name, kind) in &listing {
+            let path = vjoin(&dir, name);
+            match kind {
+                DType::Dir if recurse => queue.push(path),
+                DType::File if name.ends_with(b".rs") && path != root => files.push(path),
+                _ => {}
+            }
+        }
+        dirs.push(dir);
+    }
+    (dirs, files)
 }
 
 /// The files a compiler command names with `--extern [opts:]name=path`.
@@ -965,6 +1059,10 @@ pub struct Worker {
     /// beyond the action itself (questions, pushes, bringing outputs home).
     overhead_us: AtomicU64,
     overhead_samples: AtomicU64,
+    /// When what has been queued for the worker will have crossed the link.
+    link_free_at: Mutex<std::time::Instant>,
+    /// The files every compile reads (the toolchain) are on their way.
+    warmed: std::sync::atomic::AtomicBool,
 }
 
 impl Worker {
@@ -1011,6 +1109,8 @@ pub struct PoolStats {
     /// Queued for both; a local core came free before a worker's.
     pub kept_local_first: AtomicU64,
     pub worker_failures: AtomicU64,
+    /// Not offered to workers: the crate has incremental state here.
+    pub kept_local_incremental: AtomicU64,
     /// Dispatched, then run here because a local core fell idle first.
     pub hedged: AtomicU64,
     /// Hedges where the local copy finished first.
@@ -1151,6 +1251,8 @@ impl Pool {
                         skipped_bytes: AtomicU64::new(0),
                         overhead_us: AtomicU64::new(0),
                         overhead_samples: AtomicU64::new(0),
+                        link_free_at: Mutex::new(std::time::Instant::now()),
+                        warmed: std::sync::atomic::AtomicBool::new(false),
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
                     self.workers.lock().push(w.clone());
@@ -1201,6 +1303,15 @@ impl Pool {
                 self.stats.lookups_served.fetch_add(1, Ordering::Relaxed);
                 a.asked.fetch_add(1, Ordering::Relaxed);
                 let looked = a.view.lookup(&dir, &name);
+                if trace_remote() {
+                    let kind = match &looked {
+                        Looked::File(_) => "file",
+                        Looked::Dir(_) => "dir",
+                        Looked::Absent => "absent",
+                        _ => "other",
+                    };
+                    eprintln!("rargod: asked lookup {kind} {}/{}", String::from_utf8_lossy(&dir), String::from_utf8_lossy(&name));
+                }
                 let wire = to_wire(&looked, &self.content);
                 // If the answer names a hash, the worker may ask for those
                 // bytes; for a host file we must remember where they are.
@@ -1314,6 +1425,12 @@ impl Pool {
         let need: u64 = missing.iter().map(|i| recipe[*i as usize].len as u64).sum();
         w.pushed_bytes.fetch_add(need, Ordering::Relaxed);
         w.skipped_bytes.fetch_add(total - need, Ordering::Relaxed);
+        // When the link will have carried this, at the rate seen so far.
+        {
+            let secs = need as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64;
+            let mut free_at = w.link_free_at.lock();
+            *free_at = (*free_at).max(std::time::Instant::now()) + Duration::from_secs_f64(secs);
+        }
         let mut batch: Vec<u32> = Vec::new();
         let mut bytes = 0usize;
         let mut sent_any = false;
@@ -1367,47 +1484,22 @@ impl Live for RemoteLive<'_> {
 type RunResult = Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>;
 
 impl Pool {
-    async fn run_on(
+    /// Predicts what an action will ask, from its last trace (or, for one
+    /// that has never run, from another run of the same program and its
+    /// command line), and answers in advance with what the view says now.
+    /// Returns the answers, the directory listings, and the contents the
+    /// worker lacks.
+    #[allow(clippy::type_complexity)]
+    async fn predict(
         &self,
         w: &Arc<Worker>,
         engine: &Engine,
         spec: &ActionSpec,
         key: &Hash,
-        req: &Request,
-        voice: &Voice,
-    ) -> RunResult {
-        let action = self.next_action.fetch_add(1, Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let t0 = std::time::Instant::now();
-        let view: Arc<dyn View> = if spec.discard.is_empty() || remote_incr() {
-            req.view.clone()
-        } else {
-            Arc::new(WithoutSide { inner: req.view.clone(), side: spec.discard.clone() })
-        };
-        let ra = Arc::new(RemoteAction {
-            view: view.clone(),
-            events: tx,
-            served: Mutex::new(Vec::new()),
-            asked: AtomicU64::new(0),
-        });
-        w.actions.insert(action, ra.clone());
-        struct Cleanup<'a>(&'a Pool, &'a Worker, u64, std::cell::Cell<bool>);
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                self.1.actions.remove(&self.2);
-                if !self.3.get() {
-                    // Given up before the worker finished (a local core ran
-                    // it first, or the client left): the worker's core is
-                    // only free once it has stopped.
-                    self.1.peer.post(&Msg::Cancel { action: self.2 });
-                }
-                self.0.give_back(self.1);
-            }
-        }
-        let cleanup = Cleanup(self, w, action, std::cell::Cell::new(false));
-
-        // Predict what the action will ask, from its last trace, and answer
-        // in advance with what our view says now.
+        view: &Arc<dyn View>,
+        ra: &Arc<RemoteAction>,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>, WLooked)>, Vec<(Vec<u8>, Vec<(Vec<u8>, u8)>)>, Vec<Hash>, Vec<Vec<u8>>)> {
+        let mut closed: Vec<Vec<u8>> = Vec::new();
         let mut prefill = Vec::new();
         let mut listings = Vec::new();
         let mut incoming: Vec<Hash> = Vec::new();
@@ -1437,6 +1529,30 @@ impl Pool {
                 obs.extend(
                     extern_paths(&spec.argv).into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })),
                 );
+                // A compiler reads its crate's sources, and asks for many
+                // names beside them that do not exist (`foo.rs` or
+                // `foo/mod.rs`?). The source tree goes along whole: its
+                // listings, which answer those questions, and its files.
+                // A compile that links reads the standard library's object
+                // code; until one such compile has run here there is no
+                // history to say so.
+                if spec.kind == ActionKind::Rustc && links(&spec.argv) && engine.profile(spec).is_none() {
+                    if let Some(program) = spec.argv.first() {
+                        let view = view.clone();
+                        let program = program.clone();
+                        let libs = tokio::task::spawn_blocking(move || sysroot_libs(&*view, &program)).await?;
+                        obs.extend(libs.into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })));
+                    }
+                }
+                if spec.kind == ActionKind::Rustc {
+                    if let Some(root) = crate_root(&spec.argv, &spec.cwd) {
+                        let view = view.clone();
+                        let (dirs, files) = tokio::task::spawn_blocking(move || source_tree(&*view, &root)).await?;
+                        obs.extend(files.into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })));
+                        obs.extend(dirs.iter().map(|d| (VPath::from(d.clone()), Obs::Listing(Hash::ZERO))));
+                        closed = dirs;
+                    }
+                }
                 (!obs.is_empty()).then_some(obs)
             }
         };
@@ -1499,6 +1615,51 @@ impl Pool {
             incoming.sort();
             incoming.dedup();
         }
+        // Only what was really listed counts as complete.
+        closed.retain(|d| listings.iter().any(|(l, _)| l == d));
+        Ok((prefill, listings, incoming, closed))
+    }
+
+    async fn run_on(
+        &self,
+        w: &Arc<Worker>,
+        engine: &Engine,
+        spec: &ActionSpec,
+        key: &Hash,
+        req: &Request,
+        voice: &Voice,
+    ) -> RunResult {
+        let action = self.next_action.fetch_add(1, Ordering::Relaxed);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let t0 = std::time::Instant::now();
+        let view: Arc<dyn View> = if spec.discard.is_empty() || remote_incr() {
+            req.view.clone()
+        } else {
+            Arc::new(WithoutSide { inner: req.view.clone(), side: spec.discard.clone() })
+        };
+        let ra = Arc::new(RemoteAction {
+            view: view.clone(),
+            events: tx,
+            served: Mutex::new(Vec::new()),
+            asked: AtomicU64::new(0),
+        });
+        w.actions.insert(action, ra.clone());
+        struct Cleanup<'a>(&'a Pool, &'a Worker, u64, std::cell::Cell<bool>);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                self.1.actions.remove(&self.2);
+                if !self.3.get() {
+                    // Given up before the worker finished (a local core ran
+                    // it first, or the client left): the worker's core is
+                    // only free once it has stopped.
+                    self.1.peer.post(&Msg::Cancel { action: self.2 });
+                }
+                self.0.give_back(self.1);
+            }
+        }
+        let cleanup = Cleanup(self, w, action, std::cell::Cell::new(false));
+
+        let (prefill, listings, incoming, closed) = self.predict(w, engine, spec, key, &view, &ra).await?;
         self.stats.prefilled_entries.fetch_add(prefill.len() as u64, Ordering::Relaxed);
         w.peer.post(&Msg::Run {
             action,
@@ -1517,6 +1678,7 @@ impl Pool {
             listings,
             untraced: spec.discard.clone(),
             incoming: incoming.clone(),
+            closed,
         });
         if !incoming.is_empty() {
             // Push in the background; the action starts meanwhile and waits
@@ -1673,6 +1835,14 @@ impl RemoteRunner for Pool {
             if spec.kind == ActionKind::Plan || spec.net != NetMode::Loopback || spec.root_id != Hash::ZERO {
                 return None;
             }
+            // A crate that has been compiled here before has incremental
+            // state here, and remote compiles run without any (D31): after
+            // an edit the local compile is the short one, even if it has to
+            // wait for a core.
+            if !spec.discard.is_empty() && !remote_incr() && engine.traces.traces(key).first().is_some() {
+                self.stats.kept_local_incremental.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             // A free local core is always the better place. A core held
             // by a compiler's helper thread is as busy as one held by an
             // action.
@@ -1697,13 +1867,19 @@ impl RemoteRunner for Pool {
                     return Some(r);
                 }
             };
-            // Not when shipping its known inputs would take longer than
-            // running it: the worker would sit waiting for bytes.
-            let missing: u64 = match engine.traces.traces(key).first() {
-                Some((_, t)) => {
+            // Not when its inputs would take longer to arrive than it takes
+            // to run: the worker would sit waiting for bytes. That counts
+            // what is already queued on the link and what this action is
+            // known to read: from its last trace, or, if it has never run,
+            // from another run of the same program (the toolchain).
+            let own = engine.traces.traces(key).first().map(|(_, t)| t.clone());
+            let known = own.clone().or_else(|| engine.profile(spec));
+            let missing: u64 = match &known {
+                Some(t) => {
                     let has = w.has_blobs.lock();
                     t.obs
                         .iter()
+                        .filter(|(p, _)| own.is_some() || !self.profile_exclude.iter().any(|x| vpath_starts_with(p, x)))
                         .filter_map(|(_, o)| match o {
                             Obs::File { hash, .. } if !has.contains(hash) => Some(engine.store.size_of(hash).unwrap_or(256 << 10)),
                             _ => None,
@@ -1712,8 +1888,28 @@ impl RemoteRunner for Pool {
                 }
                 None => 0,
             };
-            let bytes_time = Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64);
+            let queued = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
+            let bytes_time = queued + Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64);
             if bytes_time > engine.avg_action_wall() && !eager_dispatch() {
+                // A worker that lacks the toolchain would never be given
+                // anything; send it what every compile reads, once, so that
+                // it is useful a few seconds from now.
+                if own.is_none() && !w.warmed.swap(true, Ordering::SeqCst) {
+                    let (tx, _rx) = mpsc::unbounded_channel();
+                    let ra = Arc::new(RemoteAction {
+                        view: req.view.clone(),
+                        events: tx,
+                        served: Mutex::new(Vec::new()),
+                        asked: AtomicU64::new(0),
+                    });
+                    if let Ok((_, _, incoming, _)) = self.predict(&w, engine, spec, key, &req.view, &ra).await {
+                        tokio::task::block_in_place(|| {
+                            for h in incoming {
+                                self.push_blob(&w, h);
+                            }
+                        });
+                    }
+                }
                 self.give_back(&w);
                 self.stats.kept_local_transfer.fetch_add(1, Ordering::Relaxed);
                 return None;
@@ -1786,6 +1982,20 @@ impl RemoteRunner for Pool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn crate_roots_are_found_and_made_absolute() {
+        let argv = |a: &[&str]| -> Vec<Vec<u8>> { a.iter().map(|s| s.as_bytes().to_vec()).collect() };
+        assert_eq!(
+            super::crate_root(&argv(&["rustc", "--crate-name", "x", "--edition=2021", "crates/x/src/lib.rs", "--out-dir", "/w/t"]), b"/w"),
+            Some(b"/w/crates/x/src/lib.rs".to_vec())
+        );
+        assert_eq!(
+            super::crate_root(&argv(&["rustc", "--crate-name", "y", "/c/registry/src/i/y-1.0/src/lib.rs"]), b"/c/registry/src/i/y-1.0"),
+            Some(b"/c/registry/src/i/y-1.0/src/lib.rs".to_vec())
+        );
+        assert_eq!(super::crate_root(&argv(&["rustc", "-vV"]), b"/w"), None);
+    }
+
     #[test]
     fn extern_files_are_read_from_the_command_line() {
         let argv: Vec<Vec<u8>> = [
