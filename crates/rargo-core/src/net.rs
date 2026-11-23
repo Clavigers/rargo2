@@ -50,7 +50,19 @@ struct Inflight {
     nfrags: u32,
     sent_at: Instant,
     retries: u32,
+    /// Order of its latest transmission on this connection.
+    seq: u64,
 }
+
+/// A fragment counts as lost once this many fragments sent after it have
+/// been acknowledged (fast retransmit), without waiting for its timer.
+const REORDER: u64 = 3;
+/// Window after a loss, as a fraction of the window before.
+const LOSS_BETA: f64 = 0.7;
+/// Window growth per round trip after slow start, in fragments. Reno's 1
+/// keeps a path with random loss far below its rate; this is a private
+/// build network, so more aggressive growth is fine.
+const GROWTH: f64 = 8.0;
 
 struct SendState {
     next_msg: u64,
@@ -63,6 +75,9 @@ struct SendState {
     srtt: Option<Duration>,
     rttvar: Duration,
     last_cut: Instant,
+    next_seq: u64,
+    /// Highest `seq` acknowledged so far.
+    high_acked: u64,
 }
 
 struct Partial {
@@ -142,6 +157,8 @@ impl Conn {
                 srtt: None,
                 rttvar: Duration::from_millis(50),
                 last_cut: Instant::now(),
+                next_seq: 1,
+                high_acked: 0,
             }),
             recv: Mutex::new(RecvState { partial: HashMap::new(), done_below: 1, done: HashSet::new() }),
             wake_sender: Notify::new(),
@@ -274,27 +291,44 @@ impl Conn {
                 let rto = Self::rto(&s);
                 // Retransmit what has timed out.
                 let mut timed_out = false;
+                let mut fast_lost = false;
                 let mut soonest: Option<Instant> = None;
+                let high_acked = s.high_acked;
+                let mut seq = s.next_seq;
                 for ((m, f), inf) in s.inflight.iter_mut() {
                     let due = inf.sent_at + rto * (1 << inf.retries.min(5));
-                    if due <= now {
+                    let overtaken = high_acked >= inf.seq + REORDER;
+                    if overtaken || due <= now {
                         inf.sent_at = now;
                         inf.retries += 1;
+                        inf.seq = seq;
+                        seq += 1;
                         resend.push((*m, *f, inf.nfrags, inf.data.clone()));
-                        timed_out = true;
+                        if overtaken {
+                            fast_lost = true;
+                        } else {
+                            timed_out = true;
+                        }
                     } else {
                         soonest = Some(soonest.map_or(due, |x| x.min(due)));
                     }
                 }
-                if timed_out && now.duration_since(s.last_cut) > s.srtt.unwrap_or(Duration::from_millis(100)) {
-                    s.ssthresh = (s.cwnd / 2.0).max(MIN_CWND);
+                s.next_seq = seq;
+                // One reduction per round trip, however many fragments of
+                // that round were lost. A timeout means the path stalled and
+                // is answered harder than a loss found by acknowledgements.
+                if (timed_out || fast_lost) && now.duration_since(s.last_cut) > s.srtt.unwrap_or(Duration::from_millis(100)) {
+                    let beta = if timed_out { 0.5 } else { LOSS_BETA };
+                    s.ssthresh = (s.cwnd * beta).max(MIN_CWND);
                     s.cwnd = s.ssthresh;
                     s.last_cut = now;
                 }
                 while (s.inflight.len() as f64) < s.cwnd {
                     let Some((m, f, n, data)) = s.queue.pop_front() else { break };
                     s.queued_bytes = s.queued_bytes.saturating_sub(data.len());
-                    s.inflight.insert((m, f), Inflight { data: data.clone(), nfrags: n, sent_at: now, retries: 0 });
+                    let seq = s.next_seq;
+                    s.next_seq += 1;
+                    s.inflight.insert((m, f), Inflight { data: data.clone(), nfrags: n, sent_at: now, retries: 0, seq });
                     batch.push((m, f, n, data));
                 }
                 next_deadline = soonest.or_else(|| (!s.inflight.is_empty()).then(|| now + rto));
@@ -325,6 +359,7 @@ impl Conn {
     fn on_ack(&self, msg: u64, frag: u32) {
         let mut s = self.send.lock();
         if let Some(inf) = s.inflight.remove(&(msg, frag)) {
+            s.high_acked = s.high_acked.max(inf.seq);
             if inf.retries == 0 {
                 let sample = inf.sent_at.elapsed();
                 match s.srtt {
@@ -342,7 +377,7 @@ impl Conn {
             if s.cwnd < s.ssthresh {
                 s.cwnd += 1.0;
             } else {
-                s.cwnd += 1.0 / s.cwnd;
+                s.cwnd += GROWTH / s.cwnd;
             }
             s.cwnd = s.cwnd.min(MAX_CWND);
         }

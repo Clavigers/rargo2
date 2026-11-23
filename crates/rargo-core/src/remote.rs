@@ -798,6 +798,8 @@ pub struct PoolStats {
     pub kept_local_no_wait: AtomicU64,
     pub kept_local_transfer: AtomicU64,
     pub worker_failures: AtomicU64,
+    /// Dispatched, then run here because a local core fell idle first.
+    pub hedged: AtomicU64,
     pub prefilled_entries: AtomicU64,
     pub lookups_served: AtomicU64,
     pub opens_served: AtomicU64,
@@ -1112,7 +1114,15 @@ impl Live for RemoteLive<'_> {
 type RunResult = Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>;
 
 impl Pool {
-    async fn run_on(&self, w: &Arc<Worker>, engine: &Engine, spec: &ActionSpec, key: &Hash, req: &Request) -> RunResult {
+    async fn run_on(
+        &self,
+        w: &Arc<Worker>,
+        engine: &Engine,
+        spec: &ActionSpec,
+        key: &Hash,
+        req: &Request,
+        spoke: &std::sync::atomic::AtomicBool,
+    ) -> RunResult {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let ra = Arc::new(RemoteAction { view: req.view.clone(), events: tx, served: Mutex::new(Vec::new()) });
@@ -1252,6 +1262,9 @@ impl Pool {
         let mut stderr: Vec<u8> = Vec::new();
         let done = loop {
             let Some(ev) = rx.recv().await else { bail!("worker connection lost") };
+            if !matches!(ev, Event::Done(_)) {
+                spoke.store(true, Ordering::SeqCst);
+            }
             match ev {
                 Event::Stdout(d) => {
                     req.observer.stdout(&d);
@@ -1375,7 +1388,35 @@ impl RemoteRunner for Pool {
             }
             self.stats.dispatched.fetch_add(1, Ordering::Relaxed);
             engine.stats.remote_runs.fetch_add(1, Ordering::Relaxed);
-            match self.run_on(&w, engine, spec, key, req).await {
+            // Hedge: should a local core fall idle before the worker has
+            // said anything for this action (it may be fetching a toolchain,
+            // or simply be slower), the action runs here instead. Once the
+            // worker's output has started, the remote run is kept: showing
+            // output twice, or announcing its metadata twice, is worse.
+            let spoke = std::sync::atomic::AtomicBool::new(false);
+            let remote = self.run_on(&w, engine, spec, key, req, &spoke);
+            tokio::pin!(remote);
+            let mem = engine.estimate_mem_kb(key, spec.kind);
+            let result = loop {
+                tokio::select! {
+                    r = &mut remote => break r,
+                    permit = engine.sched.acquire(crate::sched::Priority::Idle, mem), if !spoke.load(Ordering::SeqCst) => {
+                        if spoke.load(Ordering::SeqCst) {
+                            drop(permit);
+                            continue;
+                        }
+                        self.stats.hedged.fetch_add(1, Ordering::Relaxed);
+                        engine.stats.runs.fetch_add(1, Ordering::Relaxed);
+                        let started = std::time::Instant::now();
+                        let r = engine.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+                        drop(permit);
+                        engine.note_action_wall(started.elapsed());
+                        // Dropping `remote` withdraws the action from the worker.
+                        return Some(r);
+                    }
+                }
+            };
+            match result {
                 Ok(r) => Some(Ok(r)),
                 Err(e) => {
                     // The worker failed, not the action: run it here.

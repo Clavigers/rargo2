@@ -445,7 +445,7 @@ impl Engine {
         }
     }
 
-    fn estimate_mem_kb(&self, key: &Hash, kind: ActionKind) -> u64 {
+    pub(crate) fn estimate_mem_kb(&self, key: &Hash, kind: ActionKind) -> u64 {
         match self.traces.traces(key).first() {
             Some((_, t)) if t.result.stats.max_rss_kb > 0 => t.result.stats.max_rss_kb,
             _ => default_mem_kb(kind),
@@ -478,7 +478,7 @@ impl Engine {
         self.profiles.get(spec.argv.first()?).map(|t| t.clone())
     }
 
-    fn note_action_wall(&self, d: std::time::Duration) {
+    pub(crate) fn note_action_wall(&self, d: std::time::Duration) {
         // Exponentially weighted average, for estimating queue waits.
         let old = self.avg_wall_us.load(Ordering::Relaxed);
         let new = if old == 0 { d.as_micros() as u64 } else { (old * 7 + d.as_micros() as u64) / 8 };

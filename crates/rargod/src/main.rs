@@ -565,11 +565,12 @@ fn status_text(d: &Daemon) -> String {
                 let (pushed, skipped, fetched, reused) = p.transfer_totals();
                 let ps = &p.stats;
                 format!(
-                    "{} connected; {} actions dispatched, {} kept local (core free), {} kept local (transfer too costly), {} worker failures; \
+                    "{} connected; {} actions dispatched ({} of them then run here on an idle core), {} kept local (core free), {} kept local (transfer too costly), {} worker failures; \
                      sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
                      {} answers sent ahead, {} lookups and {} opens asked",
                     p.worker_count(),
                     ps.dispatched.load(Ordering::Relaxed),
+                    ps.hedged.load(Ordering::Relaxed),
                     ps.kept_local_no_wait.load(Ordering::Relaxed),
                     ps.kept_local_transfer.load(Ordering::Relaxed),
                     ps.worker_failures.load(Ordering::Relaxed),

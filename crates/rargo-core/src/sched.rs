@@ -14,12 +14,15 @@ use tokio::sync::oneshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
+    /// Only a core nothing else wants: a local copy of an action already
+    /// running on a worker. Not counted as waiting work.
+    Idle = 0,
     /// Background work (drift checks, pre-warming).
-    Background = 0,
+    Background = 1,
     /// A coding agent.
-    Agent = 1,
+    Agent = 2,
     /// A person at a terminal.
-    Human = 2,
+    Human = 3,
 }
 
 struct Waiter {
@@ -139,7 +142,8 @@ impl Scheduler {
     /// `(running, waiting, peak running, total granted)`.
     pub fn snapshot(&self) -> (usize, usize, usize, u64) {
         let i = self.inner.lock();
-        (i.running, i.waiters.len(), i.peak_running, i.granted)
+        let waiting = i.waiters.iter().filter(|w| w.prio != Priority::Idle && !w.tx.is_closed()).count();
+        (i.running, waiting, i.peak_running, i.granted)
     }
 
     /// Waits for a core and `mem_kb` of memory budget.
