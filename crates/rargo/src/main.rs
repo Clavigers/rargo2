@@ -96,6 +96,8 @@ fn main() {
     let admin = match args.first().map(|s| s.as_str()) {
         Some("--rargo-status") => Some("__status"),
         Some("--rargo-gc") => Some("__gc"),
+        Some("--rargo-incr-stats") => Some("__incr"),
+        Some("--rargo-compact") => Some("__compact"),
         Some("--rargo-drift-check") => Some("__drift"),
         _ => None,
     };

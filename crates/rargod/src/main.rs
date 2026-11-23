@@ -32,6 +32,8 @@ struct Opts {
     passthrough: bool,
     /// Size the content store is kept under.
     store_budget: u64,
+    /// Whole blobs unused for this long are turned into chunks; 0 = never.
+    cold_after_secs: u64,
     /// Minutes between background drift checks; 0 turns them off.
     drift_minutes: u64,
     /// Address to accept workers on.
@@ -56,6 +58,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         mem_kb: total_kb / 10 * 7,
         passthrough: true,
         store_budget: 100 << 30,
+        cold_after_secs: 30 * 60,
         drift_minutes: 360,
         workers_listen: None,
         worker_of: None,
@@ -75,6 +78,8 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--worker" => o.worker_of = Some(val()?.parse()?),
             "--store-budget-gb" => o.store_budget = val()?.parse::<u64>()? << 30,
             "--store-budget-mb" => o.store_budget = val()?.parse::<u64>()? << 20,
+            "--cold-after-min" => o.cold_after_secs = val()?.parse::<u64>()? * 60,
+            "--cold-after-secs" => o.cold_after_secs = val()?.parse::<u64>()?,
             other => bail!("unknown option `{other}`"),
         }
     }
@@ -154,6 +159,7 @@ fn main() -> Result<()> {
     {
         let d = daemon.clone();
         let budget = opts.store_budget;
+        let cold_after = opts.cold_after_secs;
         std::thread::Builder::new().name("evict".into()).spawn(move || {
             let mut tick = 0u64;
             loop {
@@ -164,6 +170,14 @@ fn main() -> Result<()> {
                     let (n, bytes) = d.collect_garbage(600);
                     if n > 0 {
                         eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
+                    }
+                }
+                // What nobody has used for a while is kept as chunks.
+                if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
+                    let fs = d.engine.fs.clone();
+                    let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
+                    if n > 0 {
+                        eprintln!("rargod: {n} blobs went cold, {} MiB freed", freed >> 20);
                     }
                 }
                 tick += 1;
@@ -364,6 +378,39 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         let _ = writer.await;
         return Ok(());
     }
+    if req.args.first().map(|s| s.as_str()) == Some("__compact") {
+        // Everything not linked into a worktree goes cold now.
+        let d = daemon.clone();
+        let (n, freed) = tokio::task::spawn_blocking(move || {
+            let fs = d.engine.fs.clone();
+            d.engine.store.freeze_idle(0, &|h| fs.forget_backing(h))
+        })
+        .await
+        .unwrap_or((0, 0));
+        daemon.engine.store.db().flush();
+        let (cn, logical, disk) = daemon.engine.store.cold_stats();
+        let mib = |b: u64| b as f64 / (1 << 20) as f64;
+        let _ = tx.send(ServerMsg::Stdout(
+            format!(
+                "{n} blobs went cold, {:.1} MiB freed; cold tier holds {cn} blobs of {:.1} MiB as {:.1} MiB of chunks\n",
+                mib(freed),
+                mib(logical),
+                mib(disk)
+            )
+            .into_bytes(),
+        ));
+        let _ = tx.send(ServerMsg::Exit(0));
+        let _ = writer.await;
+        return Ok(());
+    }
+    if req.args.first().map(|s| s.as_str()) == Some("__incr") {
+        let d = daemon.clone();
+        let text = tokio::task::spawn_blocking(move || d.incr.analyze()).await.unwrap_or_default();
+        let _ = tx.send(ServerMsg::Stdout(text.into_bytes()));
+        let _ = tx.send(ServerMsg::Exit(0));
+        let _ = writer.await;
+        return Ok(());
+    }
     if req.args.first().map(|s| s.as_str()) == Some("__status") {
         let _ = tx.send(ServerMsg::Stdout(status_text(&daemon).into_bytes()));
         let _ = tx.send(ServerMsg::Exit(0));
@@ -427,6 +474,7 @@ fn status_text(d: &Daemon) -> String {
     format!(
         "requests            {}\n\
          store               {} blobs, {:.1} MiB\n\
+         cold tier           {}\n\
          cache               {} hits, {} misses, {} traces stored\n\
          actions run         {} ({:.1}s cpu, {:.1}s wall)\n\
          in-flight dedup     {} joined, {} of those ran anyway\n\
@@ -441,6 +489,14 @@ fn status_text(d: &Daemon) -> String {
         d.stats.requests.load(Ordering::Relaxed),
         e.store.blob_count(),
         e.store.total_bytes() as f64 / (1 << 20) as f64,
+        {
+            let (n, logical, disk) = e.store.cold_stats();
+            format!(
+                "{n} blobs of {:.1} MiB kept as {:.1} MiB of chunks",
+                logical as f64 / (1 << 20) as f64,
+                disk as f64 / (1 << 20) as f64
+            )
+        },
         t.hits.load(Ordering::Relaxed),
         t.misses.load(Ordering::Relaxed),
         t.stored.load(Ordering::Relaxed),

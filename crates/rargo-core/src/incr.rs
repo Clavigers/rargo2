@@ -211,6 +211,100 @@ impl IncrStore {
         }
     }
 
+    /// Where the bytes of the stored states are, and how much of them a
+    /// chunk-level store would share that the file-level store does not.
+    /// Reads every state file once; meant for an idle daemon.
+    pub fn analyze(&self) -> String {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        fn kind(path: &[u8]) -> &'static str {
+            let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
+            match name {
+                b"dep-graph.bin" => "dep-graph.bin",
+                b"query-cache.bin" => "query-cache.bin",
+                b"work-products.bin" => "work-products.bin",
+                b"metadata.rmeta" => "metadata.rmeta",
+                n if n.ends_with(b".o") => "object files",
+                n if n.ends_with(b".dwo") => "split debuginfo",
+                n if n.ends_with(b".bc") => "bitcode",
+                _ => "other",
+            }
+        }
+        #[derive(Default)]
+        struct Row {
+            files: u64,
+            logical: u64,
+            blobs: HashSet<Hash>,
+            unique: u64,
+            chunks: HashSet<Hash>,
+            chunk_unique: u64,
+        }
+        let mut states = 0u64;
+        let mut crates: HashSet<[u8; 32]> = HashSet::new();
+        let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
+        let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
+        self.db.for_each(Table::Incr, |k, v| {
+            if let Ok(m) = bincode::deserialize::<StateMeta>(v) {
+                entries.push((k.to_vec(), m));
+            }
+        });
+        let mut sizes: HashMap<Hash, u64> = HashMap::new();
+        for (k, meta) in &entries {
+            let Ok(raw) = self.store.read(&meta.manifest) else { continue };
+            let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
+            states += 1;
+            if let Some(c) = k.get(..32) {
+                crates.insert(c.try_into().unwrap());
+            }
+            for (path, e) in &m.entries {
+                let MEntry::File { hash, size, .. } = e else { continue };
+                let row = rows.entry(kind(path)).or_default();
+                row.files += 1;
+                row.logical += size;
+                if row.blobs.insert(*hash) {
+                    row.unique += size;
+                    sizes.insert(*hash, *size);
+                }
+            }
+        }
+        for row in rows.values_mut() {
+            for blob in &row.blobs {
+                let Ok(f) = self.store.open_blob(blob) else { continue };
+                let Ok(recipe) = crate::chunk::chunk_file(&f) else { continue };
+                for c in recipe {
+                    if row.chunks.insert(c.hash) {
+                        row.chunk_unique += c.len as u64;
+                    }
+                }
+            }
+        }
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        let mut out = format!(
+            "{states} states of {} crates\n{:<20} {:>8} {:>12} {:>14} {:>16}\n",
+            crates.len(),
+            "",
+            "files",
+            "logical GiB",
+            "as files GiB",
+            "as chunks GiB"
+        );
+        let (mut tl, mut tu, mut tc) = (0u64, 0u64, 0u64);
+        for (name, row) in &rows {
+            out += &format!(
+                "{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n",
+                name,
+                row.files,
+                gib(row.logical),
+                gib(row.unique),
+                gib(row.chunk_unique)
+            );
+            tl += row.logical;
+            tu += row.unique;
+            tc += row.chunk_unique;
+        }
+        out += &format!("{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n", "total", "", gib(tl), gib(tu), gib(tc));
+        out
+    }
+
     pub fn state_count(&self, crate_key: &Hash) -> usize {
         self.list(crate_key).len()
     }

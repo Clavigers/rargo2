@@ -335,6 +335,31 @@ echo "// post-gc edit" >>crates/util/src/lib.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "after gc, an incremental rebuild works" || bad "after gc, an incremental rebuild works" "$out"
 
+echo "== cold tier: everything not linked into a worktree is kept as chunks and comes back on demand"
+cd "$A"
+"$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1
+out=$("$R" --rargo-compact 2>&1)
+n=$(sed -n 's/^\([0-9][0-9]*\) blobs went cold.*/\1/p' <<<"$out")
+[ "${n:-0}" -gt 0 ] && ok "compaction: $out" || bad "compaction moved blobs to the cold tier" "$out"
+before=$(runs); "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1; after=$(runs)
+[ "$before" = "$after" ] && ok "after compaction, build and test are still fully cached" || bad "after compaction, build and test are still fully cached" "delta=$((after - before))"
+C2="$T/wt-cold"
+git -C "$A" worktree add -q --detach "$C2" HEAD 2>/dev/null
+cd "$C2"
+before=$(runs); out=$("$R" build 2>&1); rc=$?; after=$(runs)
+[ $rc -eq 0 ] && ok "a fresh worktree builds from the cold tier" || bad "a fresh worktree builds from the cold tier" "$out"
+out=$(./target/debug/app 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "the binary put together from chunks runs" || bad "the binary put together from chunks runs" "$out"
+echo "// post-compaction edit" >>crates/util/src/lib.rs
+out=$("$R" build 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "after compaction, an incremental rebuild works" || bad "after compaction, an incremental rebuild works" "$out"
+"$R" --rargo-compact >/dev/null 2>&1
+out=$("$R" --rargo-gc 2>&1)
+has "$out" "collected" && ok "gc with a cold tier: $out" || bad "gc with a cold tier" "$out"
+cd "$A"
+before=$(runs); "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1; after=$(runs)
+[ "$before" = "$after" ] && ok "after compaction and gc, build and test are still fully cached" || bad "after compaction and gc, build and test are still fully cached" "delta=$((after - before))"
+
 echo
 "$R" --rargo-status
 echo

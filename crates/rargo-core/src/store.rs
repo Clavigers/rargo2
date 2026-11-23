@@ -4,7 +4,16 @@
 //! may exist in two variants, plain (`<hex>`, mode 0444) and executable
 //! (`<hex>.x`, mode 0555), because a hard link shares its inode's mode with
 //! the file it is linked from.
+//!
+//! Blobs nobody has used for a while go cold: the file is cut into
+//! content-defined chunks (see `chunk`), each chunk is kept once, compressed,
+//! under `chunks/xx/`, and the whole file is deleted. A cold blob is put back
+//! together the moment anything asks for it, so the rest of rargo never sees
+//! the difference. This is what makes many near-identical large files cheap
+//! to keep, above all the incremental compilation states of successive
+//! snapshots of one crate.
 
+use crate::chunk::ChunkRef;
 use crate::db::{Db, Table};
 use crate::hash::Hash;
 use anyhow::{Context, Result};
@@ -31,6 +40,21 @@ pub struct BlobMeta {
     pub last_used: u64,
 }
 
+/// A blob held as chunks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ColdMeta {
+    size: u64,
+    last_used: u64,
+    /// Bytes of chunk files that had to be written when it went cold (what
+    /// keeping it cost at the time; an estimate of what dropping it frees).
+    added: u64,
+    recipe: Vec<ChunkRef>,
+}
+
+/// Blobs smaller than this stay whole: there is nothing to share.
+const COLD_MIN_SIZE: u64 = 64 << 10;
+const COLD_DISK_KEY: &[u8] = b"cold-disk-bytes";
+
 /// How a blob ended up at a destination path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
@@ -49,6 +73,12 @@ pub struct Store {
     dev: u64,
     tmp_seq: AtomicU64,
     total: AtomicU64,
+    chunks: PathBuf,
+    cold: DashMap<Hash, ColdMeta>,
+    /// Bytes of chunk files on disk.
+    cold_disk: AtomicU64,
+    /// Readers: anything reading or adding chunks. Writer: chunk collection.
+    cold_lock: std::sync::RwLock<()>,
 }
 
 fn now_secs() -> u64 {
@@ -92,6 +122,28 @@ impl Store {
                 fs::create_dir(&d)?;
             }
         }
+        let chunks = root.join("chunks");
+        fs::create_dir_all(&chunks)?;
+        for i in 0..256 {
+            let d = chunks.join(format!("{i:02x}"));
+            if !d.exists() {
+                fs::create_dir(&d)?;
+            }
+        }
+        let cold = DashMap::new();
+        db.for_each(Table::Cold, |k, v| {
+            if k.len() == 32 {
+                if let Ok(m) = bincode::deserialize::<ColdMeta>(v) {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(k);
+                    cold.insert(Hash(h), m);
+                }
+            }
+        });
+        let cold_disk = match db.get(Table::Meta, COLD_DISK_KEY) {
+            Some(v) if v.len() == 8 => u64::from_le_bytes(v[..8].try_into().unwrap()),
+            _ => 0,
+        };
         let dev = fs::metadata(&blobs)?.dev();
         let reflink = {
             let a = tmp.join("reflink-probe-a");
@@ -127,6 +179,10 @@ impl Store {
             dev,
             tmp_seq: AtomicU64::new(0),
             total: AtomicU64::new(total),
+            chunks,
+            cold,
+            cold_disk: AtomicU64::new(cold_disk),
+            cold_lock: std::sync::RwLock::new(()),
         })
     }
 
@@ -142,14 +198,21 @@ impl Store {
         self.reflink
     }
 
-    /// Bytes of blob content the store believes it holds.
+    /// Bytes the store believes it occupies: whole blobs plus chunk files.
     pub fn total_bytes(&self) -> u64 {
-        self.total.load(Ordering::Relaxed)
+        self.total.load(Ordering::Relaxed) + self.cold_disk.load(Ordering::Relaxed)
     }
 
-    /// Every blob hash in the store.
+    /// `(blobs, bytes they stand for, bytes of chunk files on disk)` of the
+    /// cold tier.
+    pub fn cold_stats(&self) -> (usize, u64, u64) {
+        let logical = self.cold.iter().map(|e| e.value().size).sum();
+        (self.cold.len(), logical, self.cold_disk.load(Ordering::Relaxed))
+    }
+
+    /// Every blob hash in the store, whole or cold.
     pub fn all_hashes(&self) -> Vec<Hash> {
-        self.meta.iter().map(|e| *e.key()).collect()
+        self.meta.iter().map(|e| *e.key()).chain(self.cold.iter().map(|e| *e.key())).collect()
     }
 
     pub fn blob_count(&self) -> usize {
@@ -178,14 +241,216 @@ impl Store {
     }
 
     pub fn has(&self, h: &Hash) -> bool {
-        self.meta.contains_key(h)
+        self.meta.contains_key(h) || self.cold.contains_key(h)
     }
 
     pub fn size_of(&self, h: &Hash) -> Option<u64> {
-        self.meta.get(h).map(|m| m.size)
+        self.meta.get(h).map(|m| m.size).or_else(|| self.cold.get(h).map(|m| m.size))
+    }
+
+    fn chunk_path(&self, c: &Hash) -> PathBuf {
+        let hex = c.hex();
+        let mut p = self.chunks.join(&hex[..2]);
+        p.push(&hex[2..]);
+        p
+    }
+
+    fn set_cold_disk(&self) {
+        self.db.put(Table::Meta, COLD_DISK_KEY, &self.cold_disk.load(Ordering::Relaxed).to_le_bytes());
+    }
+
+    /// Stores one chunk if it is not there yet. Returns the bytes written.
+    fn write_chunk(&self, c: &Hash, data: &[u8]) -> io::Result<u64> {
+        let dst = self.chunk_path(c);
+        if dst.exists() {
+            return Ok(0);
+        }
+        let packed = zstd::bulk::compress(data, 3)?;
+        let (tag, body): (u8, &[u8]) = if packed.len() < data.len() { (1, &packed) } else { (0, data) };
+        let tmp = self.tmp_path();
+        {
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            f.write_all(&[tag])?;
+            f.write_all(body)?;
+        }
+        // Link rather than rename: of two writers of one chunk, one counts.
+        let linked = fs::hard_link(&tmp, &dst);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(body.len() as u64 + 1),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_chunk(&self, c: &ChunkRef) -> io::Result<Vec<u8>> {
+        let raw = fs::read(self.chunk_path(&c.hash))?;
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("chunk {} is damaged", c.hash));
+        let data = match raw.split_first() {
+            Some((0, body)) => body.to_vec(),
+            Some((1, body)) => zstd::bulk::decompress(body, c.len as usize).map_err(|_| bad())?,
+            _ => return Err(bad()),
+        };
+        if data.len() != c.len as usize {
+            return Err(bad());
+        }
+        Ok(data)
+    }
+
+    /// Turns a whole blob into chunks and deletes the file. Blobs that are
+    /// small, or linked into a worktree (deleting the store's name would
+    /// free nothing), are left alone. `before` is called once the blob is
+    /// certain to go, before its file does. Returns the bytes freed.
+    pub fn freeze(&self, h: &Hash, before: &dyn Fn(&Hash)) -> io::Result<Option<u64>> {
+        let _g = self.cold_lock.read().unwrap();
+        let Some(meta) = self.meta.get(h).map(|m| *m) else { return Ok(None) };
+        if meta.size < COLD_MIN_SIZE {
+            return Ok(None);
+        }
+        let variants: Vec<PathBuf> =
+            [self.path_of(h, false), self.path_of(h, true)].into_iter().filter(|p| p.exists()).collect();
+        let Some(first) = variants.first() else { return Ok(None) };
+        for v in &variants {
+            if fs::metadata(v)?.nlink() != 1 {
+                return Ok(None);
+            }
+        }
+        let f = File::open(first)?;
+        let m = f.metadata()?;
+        if m.len() != meta.size || (variants.len() == 1 && mtime_ns(&m) != meta.mtime_ns) {
+            // Not the file that was stored; `open_blob` deals with that.
+            return Ok(None);
+        }
+        let recipe = crate::chunk::chunk_file(&f)?;
+        let mut added = 0u64;
+        let mut off = 0u64;
+        let mut buf = Vec::new();
+        for c in &recipe {
+            if !self.chunk_path(&c.hash).exists() {
+                use std::os::unix::fs::FileExt;
+                buf.resize(c.len as usize, 0);
+                f.read_exact_at(&mut buf, off)?;
+                if Hash::of(&buf) != c.hash {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("blob {h} changed while going cold")));
+                }
+                added += self.write_chunk(&c.hash, &buf)?;
+            }
+            off += c.len as u64;
+        }
+        self.cold_disk.fetch_add(added, Ordering::Relaxed);
+        // Used again while we were at it: leave it whole.
+        if self.meta.get(h).map(|x| x.last_used != meta.last_used).unwrap_or(true) {
+            return Ok(None);
+        }
+        before(h);
+        let cm = ColdMeta { size: meta.size, last_used: meta.last_used, added, recipe };
+        self.db.put(Table::Cold, &h.0, &bincode::serialize(&cm).unwrap());
+        self.cold.insert(*h, cm);
+        self.forget_hot(h);
+        for v in &variants {
+            let _ = fs::remove_file(v);
+        }
+        self.set_cold_disk();
+        Ok(Some((meta.size * variants.len() as u64).saturating_sub(added)))
+    }
+
+    /// Freezes every whole blob not used for `min_idle_secs`. Returns
+    /// `(blobs, bytes freed)`.
+    pub fn freeze_idle(&self, min_idle_secs: u64, before: &dyn Fn(&Hash)) -> (usize, u64) {
+        let cutoff = now_secs().saturating_sub(min_idle_secs);
+        let mut idle: Vec<(u64, Hash)> = self
+            .meta
+            .iter()
+            .filter(|e| e.value().last_used <= cutoff && e.value().size >= COLD_MIN_SIZE)
+            .map(|e| (e.value().last_used, *e.key()))
+            .collect();
+        idle.sort_unstable();
+        let (mut n, mut freed) = (0, 0);
+        for (_, h) in idle {
+            if let Ok(Some(b)) = self.freeze(&h, before) {
+                n += 1;
+                freed += b;
+            }
+        }
+        (n, freed)
+    }
+
+    /// Puts a cold blob back together as a whole file.
+    fn thaw(&self, h: &Hash) -> io::Result<()> {
+        let _g = self.cold_lock.read().unwrap();
+        let Some(cm) = self.cold.get(h).map(|m| m.clone()) else { return Ok(()) };
+        let tmp = self.tmp_path();
+        let built = (|| -> io::Result<()> {
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut hasher = blake3::Hasher::new();
+            for c in &cm.recipe {
+                let data = self.read_chunk(c)?;
+                hasher.update(&data);
+                f.write_all(&data)?;
+            }
+            if Hash(*hasher.finalize().as_bytes()) != *h {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("cold blob {h} does not add up")));
+            }
+            Ok(())
+        })();
+        if let Err(e) = built {
+            let _ = fs::remove_file(&tmp);
+            // Whatever is wrong with it will not get better: the blob is
+            // gone, and what needed it is rebuilt.
+            self.drop_cold(h);
+            return Err(e);
+        }
+        // `install` records the blob as whole and drops the cold entry.
+        self.install(&tmp, *h, false, cm.size)
+    }
+
+    fn ensure_whole(&self, h: &Hash) -> io::Result<()> {
+        if !self.meta.contains_key(h) && self.cold.contains_key(h) {
+            self.thaw(h)?;
+        }
+        Ok(())
+    }
+
+    fn drop_cold(&self, h: &Hash) -> Option<u64> {
+        let (_, cm) = self.cold.remove(h)?;
+        self.db.delete(Table::Cold, &h.0);
+        Some(cm.added)
+    }
+
+    /// Deletes chunk files no cold blob refers to.
+    pub fn collect_chunks(&self) -> (usize, u64) {
+        let _g = self.cold_lock.write().unwrap();
+        let mut live: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        for e in self.cold.iter() {
+            live.extend(e.value().recipe.iter().map(|c| c.hash));
+        }
+        let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
+        for i in 0..256 {
+            let prefix = format!("{i:02x}");
+            let Ok(rd) = fs::read_dir(self.chunks.join(&prefix)) else { continue };
+            for ent in rd.flatten() {
+                let name = ent.file_name();
+                let len = ent.metadata().map(|m| m.len()).unwrap_or(0);
+                let hash = name.to_str().and_then(|rest| Hash::from_hex(&format!("{prefix}{rest}")));
+                match hash {
+                    Some(c) if live.contains(&c) => kept += len,
+                    _ => {
+                        if fs::remove_file(ent.path()).is_ok() {
+                            n += 1;
+                            freed += len;
+                        }
+                    }
+                }
+            }
+        }
+        self.cold_disk.store(kept, Ordering::Relaxed);
+        self.set_cold_disk();
+        (n, freed)
     }
 
     fn record(&self, h: Hash, size: u64, mtime_ns: i64) {
+        // A blob that is whole again is not cold any more.
+        self.drop_cold(&h);
         let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
         if self.meta.insert(h, m).is_none() {
             self.total.fetch_add(size, Ordering::Relaxed);
@@ -203,6 +468,8 @@ impl Store {
             if stale {
                 self.db.put(Table::Blobs, &h.0, &bincode::serialize(&*m).unwrap());
             }
+        } else if let Some(mut m) = self.cold.get_mut(h) {
+            m.last_used = now;
         }
     }
 
@@ -219,15 +486,23 @@ impl Store {
     /// Opens a blob for reading, checking that the file is still the one that
     /// was stored. A blob that fails the check is forgotten.
     pub fn open_blob(&self, h: &Hash) -> io::Result<File> {
+        self.ensure_whole(h)?;
         let meta = self.meta.get(h).map(|m| *m);
         let Some(meta) = meta else {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("blob {h} not in store")));
         };
         let Some(p) = self.existing(h, false) else {
+            if self.cold.contains_key(h) {
+                // It went cold between the two looks.
+                return self.open_blob(h);
+            }
             self.forget(h);
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("blob {h} missing")));
         };
-        let f = File::open(&p)?;
+        let f = match File::open(&p) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.cold.contains_key(h) => return self.open_blob(h),
+            r => r?,
+        };
         let m = f.metadata()?;
         if m.len() != meta.size || mtime_ns(&m) != meta.mtime_ns {
             // Verify by content before giving up: a touch does not corrupt.
@@ -253,11 +528,16 @@ impl Store {
         self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
     }
 
-    fn forget(&self, h: &Hash) {
+    fn forget_hot(&self, h: &Hash) {
         if let Some((_, m)) = self.meta.remove(h) {
             self.total.fetch_sub(m.size, Ordering::Relaxed);
         }
         self.db.delete(Table::Blobs, &h.0);
+    }
+
+    fn forget(&self, h: &Hash) {
+        self.forget_hot(h);
+        self.drop_cold(h);
     }
 
     pub fn read(&self, h: &Hash) -> io::Result<Vec<u8>> {
@@ -369,6 +649,7 @@ impl Store {
     /// filesystems allow it: reflink, then hard link, then copy. An existing
     /// `dest` is replaced atomically.
     pub fn materialize(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
+        self.ensure_whole(h)?;
         let meta = self.meta.get(h).map(|m| *m).with_context(|| format!("blob {h} not in store"))?;
         self.touch(h);
         let parent = dest.parent().context("destination has no parent")?;
@@ -439,15 +720,31 @@ impl Store {
             return 0;
         }
         let cutoff = now_secs().saturating_sub(min_age_secs);
-        let mut all: Vec<(u64, Hash, u64)> =
-            self.meta.iter().map(|e| (e.value().last_used, *e.key(), e.value().size)).collect();
+        // Whole blobs free their size; cold ones roughly what they added.
+        let mut all: Vec<(u64, Hash, u64, bool)> = self
+            .meta
+            .iter()
+            .map(|e| (e.value().last_used, *e.key(), e.value().size, false))
+            .chain(self.cold.iter().map(|e| (e.value().last_used, *e.key(), e.value().added, true)))
+            .collect();
         all.sort_unstable();
         let mut freed = 0u64;
-        for (seen_used, h, size) in all {
-            if total - freed <= budget {
+        let mut dropped_cold = false;
+        for (seen_used, h, size, cold) in all {
+            if total.saturating_sub(freed) <= budget {
                 break;
             }
             if pinned(&h) || (min_age_secs > 0 && seen_used > cutoff) {
+                continue;
+            }
+            if cold {
+                if self.cold.get(&h).map(|m| m.last_used != seen_used).unwrap_or(true) {
+                    continue;
+                }
+                on_evict(&h);
+                self.drop_cold(&h);
+                dropped_cold = true;
+                freed += size;
                 continue;
             }
             // Skip anything touched since the scan.
@@ -459,6 +756,9 @@ impl Store {
             let _ = fs::remove_file(self.path_of(&h, false));
             let _ = fs::remove_file(self.path_of(&h, true));
             freed += size;
+        }
+        if dropped_cold {
+            self.collect_chunks();
         }
         freed
     }
@@ -486,7 +786,20 @@ impl Store {
             let _ = fs::remove_file(self.path_of(h, true));
             bytes += size;
         }
-        (dead.len(), bytes)
+        let dead_cold: Vec<Hash> = self
+            .cold
+            .iter()
+            .filter(|e| !live.contains(e.key()) && (min_age_secs == 0 || e.value().last_used <= cutoff))
+            .map(|e| *e.key())
+            .collect();
+        for h in &dead_cold {
+            on_evict(h);
+            self.drop_cold(h);
+        }
+        if !dead_cold.is_empty() {
+            bytes += self.collect_chunks().1;
+        }
+        (dead.len() + dead_cold.len(), bytes)
     }
 
     /// Removes a blob outright (used when its content turns out to be bad).
@@ -554,6 +867,62 @@ mod tests {
         let freed = s.evict_to(1500, &|h| *h == a);
         assert_eq!(freed, 2000);
         assert!(s.has(&a) && !s.has(&b) && !s.has(&c));
+    }
+
+    #[test]
+    fn cold_blobs_come_back_and_share_chunks() {
+        let (_d, s) = store();
+        // Two large files that differ in a few bytes in the middle.
+        let mut a = vec![0u8; 3 << 20];
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for b in a.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        let mut b = a.clone();
+        b[1 << 20..(1 << 20) + 16].copy_from_slice(b"sixteen new byte");
+        let (ha, hb) = (s.put_bytes(&a).unwrap(), s.put_bytes(&b).unwrap());
+        let small = s.put_bytes(b"tiny").unwrap();
+        assert_eq!(s.freeze(&small, &|_| {}).unwrap(), None);
+        let whole = s.total_bytes();
+        assert!(s.freeze(&ha, &|_| {}).unwrap().is_some());
+        assert!(s.freeze(&hb, &|_| {}).unwrap().is_some());
+        assert_eq!(s.cold_stats().0, 2);
+        // The second file cost little beyond the first.
+        assert!(s.total_bytes() < whole * 6 / 10, "{} vs {}", s.total_bytes(), whole);
+        assert!(s.has(&ha) && s.size_of(&hb) == Some(b.len() as u64));
+        // Reading brings a blob back, byte for byte.
+        assert_eq!(s.read(&hb).unwrap(), b);
+        assert_eq!(s.cold_stats().0, 1);
+        // Dropping the other and collecting leaves no chunks behind.
+        s.remove(&ha);
+        s.collect_chunks();
+        assert_eq!(s.cold_stats(), (0, 0, 0));
+        assert_eq!(s.read(&hb).unwrap(), b);
+        assert!(s.read(&ha).is_err());
+    }
+
+    #[test]
+    fn linked_blobs_stay_whole_and_cold_ones_are_evicted() {
+        let (d, s) = store();
+        let data = vec![7u8; 1 << 20];
+        let h = s.put_bytes(&data).unwrap();
+        let out = d.path().join("out");
+        assert_eq!(s.materialize(&h, false, &out).unwrap(), Placed::Hardlink);
+        assert_eq!(s.freeze(&h, &|_| {}).unwrap(), None);
+        std::fs::remove_file(&out).unwrap();
+        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+        // Materializing a cold blob thaws it first.
+        s.materialize(&h, true, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), data);
+        std::fs::remove_file(&out).unwrap();
+        let _ = std::fs::remove_file(s.path_of(&h, true));
+        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+        s.evict_to(0, &|_| false);
+        assert!(!s.has(&h));
+        assert_eq!(s.cold_stats(), (0, 0, 0));
     }
 
     #[test]

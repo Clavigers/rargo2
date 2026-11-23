@@ -1,0 +1,43 @@
+From 044c31a4e52fa52c6774077935c6ad9d49e0aa39 Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Mon, 23 Nov 2026 01:07:23 +0100
+Subject: [PATCH 3/3] rargo: report whether the compiler is rargo's rustc fork
+ in the plan
+
+---
+ src/compiler/rargo.rs | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
+index f1c62befc..44ccd28c4 100644
+--- a/src/compiler/rargo.rs
++++ b/src/compiler/rargo.rs
+@@ -68,6 +68,7 @@ struct Global {
+     extra_verbose: bool,
+     keep_going: bool,
+     deny_warnings: bool,
++    rustc_fork: bool,
+ }
+ 
+ fn state() -> &'static Mutex<State> {
+@@ -156,6 +157,12 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+         extra_verbose: gctx.extra_verbose(),
+         keep_going: bcx.build_config.keep_going,
+         deny_warnings: gctx.warning_handling()? == crate::context::WarningHandling::Deny,
++        rustc_fork: bcx
++            .target_data
++            .info(crate::compiler::CompileKind::Host)
++            .sysroot
++            .join("lib/rustlib/rargo-fork")
++            .exists(),
+     };
+     let mut st = state().lock().unwrap();
+     st.global = Some(g);
+@@ -635,6 +642,7 @@ pub fn finish() -> CargoResult<()> {
+         build_dir: g.build_dir,
+         host: g.host,
+         toolchain,
++        rustc_fork: g.rustc_fork,
+         units,
+         roots: std::mem::take(&mut st.roots),
+         steps: std::mem::take(&mut st.steps),

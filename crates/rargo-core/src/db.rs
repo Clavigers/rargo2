@@ -29,9 +29,11 @@ pub enum Table {
     Incr,
     /// chunk index: blob hash -> chunk list
     Chunks,
+    /// cold blobs: blob hash -> size, last use, chunk list
+    Cold,
 }
 
-const ALL: [Table; 7] = [
+const ALL: [Table; 8] = [
     Table::Blobs,
     Table::Traces,
     Table::GitOids,
@@ -39,6 +41,7 @@ const ALL: [Table; 7] = [
     Table::Meta,
     Table::Incr,
     Table::Chunks,
+    Table::Cold,
 ];
 
 impl Table {
@@ -51,6 +54,7 @@ impl Table {
             Table::Meta => "meta",
             Table::Incr => "incr",
             Table::Chunks => "chunks",
+            Table::Cold => "cold",
         })
     }
 }
