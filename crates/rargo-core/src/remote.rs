@@ -158,6 +158,7 @@ impl Peer {
         let c = conn.clone();
         tokio::spawn(async move {
             while let Some(m) = out_rx.recv().await {
+                let m = if m.len() >= COMPRESS_FROM { tokio::task::block_in_place(|| frame(m)) } else { frame(m) };
                 if c.send(&m).await.is_err() {
                     break;
                 }
@@ -166,6 +167,7 @@ impl Peer {
         let p = peer.clone();
         tokio::spawn(async move {
             while let Some(raw) = conn.recv().await {
+                let Some(raw) = unframe(&raw) else { continue };
                 let Ok(msg) = bincode::deserialize::<Msg>(&raw) else { continue };
                 match msg {
                     Msg::Resp { rid, body } => {
@@ -758,6 +760,57 @@ struct RemoteAction {
     events: mpsc::UnboundedSender<Event>,
     /// Host files whose content was served; rechecked when the action ends.
     served: Mutex<Vec<FileSrc>>,
+    /// Questions the worker asked for this action (for `RARGO_TRACE_REMOTE`).
+    asked: AtomicU64,
+}
+
+/// Messages bigger than this are compressed (zstd level 1) when that makes
+/// them smaller. rustc's outputs shrink several times (a 478 MB rlib with
+/// debug info to 81 MB) at a few hundred MB/s, which is much faster than
+/// the link.
+const COMPRESS_FROM: usize = 4 << 10;
+
+fn frame(b: Vec<u8>) -> Vec<u8> {
+    if b.len() >= COMPRESS_FROM {
+        if let Ok(z) = zstd::bulk::compress(&b, 1) {
+            if z.len() < b.len() {
+                let mut out = Vec::with_capacity(z.len() + 9);
+                out.push(1);
+                out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+                out.extend_from_slice(&z);
+                return out;
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(b.len() + 1);
+    out.push(0);
+    out.extend_from_slice(&b);
+    out
+}
+
+fn unframe(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    match raw.split_first()? {
+        (0, rest) => Some(std::borrow::Cow::Borrowed(rest)),
+        (1, rest) if rest.len() >= 8 => {
+            let len = u64::from_le_bytes(rest[..8].try_into().ok()?) as usize;
+            zstd::bulk::decompress(&rest[8..], len).ok().map(std::borrow::Cow::Owned)
+        }
+        _ => None,
+    }
+}
+
+/// `RARGO_DISPATCH=eager` in rargod's environment: dispatch whenever no
+/// local core is free, without weighing transfer against waiting.
+fn eager_dispatch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RARGO_DISPATCH").ok().as_deref() == Some("eager"))
+}
+
+/// `RARGO_TRACE_REMOTE` in rargod's environment: one line per remote
+/// action on its stderr, with where the time went.
+fn trace_remote() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RARGO_TRACE_REMOTE").is_some())
 }
 
 pub struct Worker {
@@ -771,6 +824,27 @@ pub struct Worker {
     alive: std::sync::atomic::AtomicBool,
     pub pushed_bytes: AtomicU64,
     pub skipped_bytes: AtomicU64,
+    /// Moving average, in microseconds, of what running an action here cost
+    /// beyond the action itself (questions, pushes, bringing outputs home).
+    overhead_us: AtomicU64,
+    overhead_samples: AtomicU64,
+}
+
+impl Worker {
+    fn note_overhead(&self, d: Duration) {
+        let us = d.as_micros() as u64;
+        let n = self.overhead_samples.fetch_add(1, Ordering::Relaxed);
+        let old = self.overhead_us.load(Ordering::Relaxed);
+        // The first samples count fully, later ones by a quarter.
+        let new = if n == 0 { us } else { (old * 3 + us) / 4 };
+        self.overhead_us.store(new, Ordering::Relaxed);
+    }
+
+    /// What dispatching costs beyond the action, once measured.
+    fn overhead(&self) -> Option<Duration> {
+        (self.overhead_samples.load(Ordering::Relaxed) >= 3)
+            .then(|| Duration::from_micros(self.overhead_us.load(Ordering::Relaxed)))
+    }
 }
 
 /// Serves blobs by hash: from the store, or from the host file an action
@@ -922,6 +996,8 @@ impl Pool {
                         alive: std::sync::atomic::AtomicBool::new(true),
                         pushed_bytes: AtomicU64::new(0),
                         skipped_bytes: AtomicU64::new(0),
+                        overhead_us: AtomicU64::new(0),
+                        overhead_samples: AtomicU64::new(0),
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
                     self.workers.lock().push(w.clone());
@@ -967,6 +1043,7 @@ impl Pool {
             Req::Lookup { action, dir, name } => {
                 let Some(a) = w.actions.get(&action).map(|a| a.clone()) else { return Resp::Err("no such action".into()) };
                 self.stats.lookups_served.fetch_add(1, Ordering::Relaxed);
+                a.asked.fetch_add(1, Ordering::Relaxed);
                 let looked = a.view.lookup(&dir, &name);
                 let wire = to_wire(&looked, &self.content);
                 // If the answer names a hash, the worker may ask for those
@@ -988,6 +1065,7 @@ impl Pool {
             Req::Open { action, dir, name } => {
                 let Some(a) = w.actions.get(&action).map(|a| a.clone()) else { return Resp::Err("no such action".into()) };
                 self.stats.opens_served.fetch_add(1, Ordering::Relaxed);
+                a.asked.fetch_add(1, Ordering::Relaxed);
                 let Looked::File(f) = a.view.lookup(&dir, &name) else {
                     return Resp::Opened(Err(libc::ENOENT));
                 };
@@ -1125,7 +1203,13 @@ impl Pool {
     ) -> RunResult {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let ra = Arc::new(RemoteAction { view: req.view.clone(), events: tx, served: Mutex::new(Vec::new()) });
+        let t0 = std::time::Instant::now();
+        let ra = Arc::new(RemoteAction {
+            view: req.view.clone(),
+            events: tx,
+            served: Mutex::new(Vec::new()),
+            asked: AtomicU64::new(0),
+        });
         w.actions.insert(action, ra.clone());
         struct Cleanup<'a>(&'a Worker, u64);
         impl Drop for Cleanup<'_> {
@@ -1260,6 +1344,7 @@ impl Pool {
         let early: Mutex<HashMap<Vec<u8>, MEntry>> = Mutex::new(HashMap::new());
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
+        let t_sent = t0.elapsed();
         let done = loop {
             let Some(ev) = rx.recv().await else { bail!("worker connection lost") };
             if !matches!(ev, Event::Done(_)) {
@@ -1284,6 +1369,7 @@ impl Pool {
             }
         };
 
+        let t_done = t0.elapsed();
         // Bring the outputs home, and what the action left in the
         // directories that are kept on the side (its incremental state: the
         // next compile of this crate, wherever it runs, starts from it).
@@ -1297,6 +1383,15 @@ impl Pool {
                 _ => None,
             })
             .collect();
+        let wanted_bytes: u64 = done
+            .entries
+            .iter()
+            .chain(done.side.iter())
+            .filter_map(|(_, e)| match e {
+                MEntry::File { hash, size, .. } if wanted.contains(hash) => Some(*size),
+                _ => None,
+            })
+            .sum();
         for group in wanted.chunks(16) {
             let fetches: Vec<_> = group.iter().map(|h| self.blobs.fetch(&w.peer, h)).collect();
             for f in fetches {
@@ -1334,6 +1429,30 @@ impl Pool {
             outputs: Arc::new(Manifest { entries }),
             stats: done.stats,
         };
+        w.note_overhead(t0.elapsed().saturating_sub(Duration::from_micros(result.stats.wall_us)));
+        // Bandwidth as seen by output fetches of a meaningful size.
+        {
+            let bytes: u64 = wanted_bytes;
+            let secs = (t0.elapsed() - t_done).as_secs_f64();
+            if bytes > (4 << 20) && secs > 0.01 {
+                let seen = (bytes as f64 / secs) as u64;
+                let old = self.bandwidth.load(Ordering::Relaxed);
+                self.bandwidth.store((old * 3 + seen) / 4, Ordering::Relaxed);
+            }
+        }
+        if trace_remote() {
+            eprintln!(
+                "rargod: remote {:x} `{}`: {:.2}s total = {:.2}s to send, {:.2}s until done (worker ran it {:.2}s, {} questions), {:.2}s fetching outputs",
+                w.id,
+                spec.label,
+                t0.elapsed().as_secs_f64(),
+                t_sent.as_secs_f64(),
+                (t_done - t_sent).as_secs_f64(),
+                result.stats.wall_us as f64 / 1e6,
+                ra.asked.load(Ordering::Relaxed),
+                (t0.elapsed() - t_done).as_secs_f64(),
+            );
+        }
         Ok((result, done.obs, tainted, side))
     }
 }
@@ -1379,9 +1498,14 @@ impl RemoteRunner for Pool {
                 None => (8 << 20, 300),
             };
             let rtt = w.peer.conn.rtt().unwrap_or(Duration::from_millis(1));
-            let transfer = Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64)
-                + rtt * unknown;
-            if transfer > wait {
+            let bytes_time = Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64);
+            // Once this worker has run a few actions, what they really cost
+            // beyond running replaces the guess about round trips.
+            let transfer = match w.overhead() {
+                Some(o) => bytes_time + o,
+                None => bytes_time + rtt * unknown,
+            };
+            if transfer > wait && !eager_dispatch() {
                 w.free.fetch_add(1, Ordering::Relaxed);
                 self.stats.kept_local_transfer.fetch_add(1, Ordering::Relaxed);
                 return None;

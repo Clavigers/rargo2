@@ -2,7 +2,7 @@
 # The phase 4 measurement: does a worker shorten a cold build roughly in
 # proportion to the cores it adds, and is a warm build no slower with one?
 #
-#   dev/bench-worker.sh [REPO] [BUILD ARGS...]      (default: ra, build)
+#   [CORES=8] dev/bench-worker.sh [REPO] [BUILD ARGS...]      (default: ra, build)
 #
 # Server and workers run in separate network namespaces (dev/netns.sh) with
 # 1 ms delay each way, 0.1% loss and a 1 Gbit rate limit on every link. Each
@@ -49,11 +49,13 @@ measure() { # label
     cd /
 }
 
-"$here/netns.sh" up 8 8 0 >/dev/null 2>&1;            measure "local-8"
-"$here/netns.sh" up 8 8 1 1 0.1 1gbit >/dev/null 2>&1; measure "8+8 fresh worker"
-"$here/netns.sh" reset-server >/dev/null 2>&1;         measure "8+8 warm worker"
-"$here/netns.sh" up 8 8 2 1 0.1 1gbit >/dev/null 2>&1; measure "8+8+8 fresh workers" >/dev/null
-"$here/netns.sh" reset-server >/dev/null 2>&1;         measure "8+8+8 warm workers"
-"$here/netns.sh" up 16 8 0 >/dev/null 2>&1;           measure "local-16"
+c=${CORES:-8}
+"$here/netns.sh" up $c $c 0 >/dev/null 2>&1;              measure "local-$c"
+"$here/netns.sh" up $c $c 1 1 0.1 1gbit >/dev/null 2>&1;   measure "$c+$c fresh worker"
+"$here/netns.sh" reset-server >/dev/null 2>&1;            measure "$c+$c warm worker"
+"$here/netns.sh" up $c $c 2 1 0.1 1gbit >/dev/null 2>&1;   measure "$c+$c+$c fresh workers" >/dev/null
+"$here/netns.sh" reset-server >/dev/null 2>&1;            measure "$c+$c+$c warm workers"
+"$here/netns.sh" up $((2 * c)) $c 0 >/dev/null 2>&1;      measure "local-$((2 * c))"
+"$here/netns.sh" up $((3 * c)) $c 0 >/dev/null 2>&1;      measure "local-$((3 * c))"
 "$here/netns.sh" down >/dev/null 2>&1
 git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1
