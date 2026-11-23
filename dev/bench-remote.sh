@@ -28,8 +28,10 @@ case $repo in
 ra) main=(build -p rust-analyzer); edit=crates/stdx/src/lib.rs ;;
 ruff) main=(build -p ruff); edit=crates/ruff_text_size/src/lib.rs ;;
 bevy) main=(build -p bevy_ecs); edit=crates/bevy_utils/src/lib.rs ;;
+zed) main=(build); edit=crates/collections/src/collections.rs; export GIT_LFS_SKIP_SMUDGE=1; stock=$here/zed-cargo.sh ;;
 *) echo "unknown repo $repo"; exit 2 ;;
 esac
+stock=${stock:-cargo}
 secs() { local t0=$(date +%s.%N); "$@" >"$C/last.log" 2>&1; local rc=$?; printf '%.2f %s' "$(echo "$(date +%s.%N) - $t0" | bc)" "$rc"; }
 wt() { # name
     git -C "$base" worktree remove --force "$C/$1" >/dev/null 2>&1
@@ -43,12 +45,12 @@ if [ "${REMOTE_SKIP_STOCK:-}" != 1 ]; then
     wt stock
     cd "$C/stock" || exit 2
     cap() { systemd-run --scope -q -p CPUQuota=$((jobs * 100))% -p MemoryMax=90G "$@"; }
-    read c1 r1 < <(secs cap cargo check --offline -j"$jobs")
-    read c2 r2 < <(secs cap cargo check --offline -j"$jobs")
+    read c1 r1 < <(secs cap "$stock" check --offline -j"$jobs")
+    read c2 r2 < <(secs cap "$stock" check --offline -j"$jobs")
     printf '\n#[allow(dead_code)]\npub fn rargo_remote_bench() -> u32 { 7 }\n' >>"$edit"
-    read c3 r3 < <(secs cap cargo check --offline -j"$jobs")
-    read c4 r4 < <(secs cap cargo "${main[@]}" --offline -j"$jobs")
-    read c5 r5 < <(secs cap cargo "${main[@]}" --offline -j"$jobs")
+    read c3 r3 < <(secs cap "$stock" check --offline -j"$jobs")
+    read c4 r4 < <(secs cap "$stock" "${main[@]}" --offline -j"$jobs")
+    read c5 r5 < <(secs cap "$stock" "${main[@]}" --offline -j"$jobs")
     printf '{"repo":"%s","config":"stock cargo, local","cold_check_s":%s,"noop_check_s":%s,"edit_check_s":%s,"build_s":%s,"noop_build_s":%s,"rc":[%s,%s,%s,%s,%s],"target_mib":%s}\n' \
         "$repo" "$c1" "$c2" "$c3" "$c4" "$c5" "$r1" "$r2" "$r3" "$r4" "$r5" "$(du -sm target | cut -f1)" | tee -a "$out"
     cd /

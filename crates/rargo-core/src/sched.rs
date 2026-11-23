@@ -146,6 +146,18 @@ impl Scheduler {
         (i.running, waiting, i.peak_running, i.granted)
     }
 
+    /// Cores nothing is using right now: tokens neither held by an action
+    /// nor taken from the pipe by a compiler's helper threads.
+    pub fn free_tokens(&self) -> usize {
+        let spare = self.inner.lock().spare_tokens;
+        let mut avail: libc::c_int = 0;
+        // SAFETY: FIONREAD writes the number of readable bytes to `avail`.
+        if unsafe { libc::ioctl(self.pipe_r.as_raw_fd(), libc::FIONREAD, &mut avail) } != 0 {
+            return spare;
+        }
+        spare + avail.max(0) as usize
+    }
+
     /// Waits for a core and `mem_kb` of memory budget.
     pub async fn acquire(self: &Arc<Self>, prio: Priority, mem_kb: u64) -> Permit {
         let rx = {
@@ -366,11 +378,14 @@ mod tests {
     fn tokens_are_shared_with_jobserver_clients() {
         let s = Scheduler::new(2, u64::MAX).unwrap();
         rt().block_on(async {
+            assert_eq!(s.free_tokens(), 2);
             // A "rustc worker thread" takes a token straight from the pipe.
             let [r, w] = s.jobserver_fds();
             let mut b = 0u8;
             assert_eq!(unsafe { libc::read(r, &mut b as *mut u8 as *mut _, 1) }, 1);
+            assert_eq!(s.free_tokens(), 1);
             let _a = s.acquire(Priority::Agent, 0).await;
+            assert_eq!(s.free_tokens(), 0);
             // Both tokens are in use now; a second action must wait.
             let s2 = s.clone();
             let second = tokio::spawn(async move { s2.acquire(Priority::Agent, 0).await });

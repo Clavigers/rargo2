@@ -59,19 +59,31 @@ fn nix() -> Command {
 /// define the flake: `flake.nix`, `flake.lock`, every other `.nix` file at
 /// the top level or under `nix/`, and the toolchain file a devShell
 /// commonly reads.
-fn defines_flake(rel: &[u8]) -> bool {
+fn defines_flake(rel: &[u8], extra: &[String]) -> bool {
     let top = !rel.contains(&b'/');
     let nix = rel.ends_with(b".nix");
     (top && (nix || rel == b"flake.lock" || rel == b"rust-toolchain" || rel == b"rust-toolchain.toml"))
         || (rel.starts_with(b"nix/") && nix)
+        || extra.iter().any(|e| under(rel, e.as_bytes()))
+}
+
+/// `rel` is `dir` or inside it.
+fn under(rel: &[u8], dir: &[u8]) -> bool {
+    let dir = dir.strip_suffix(b"/").unwrap_or(dir);
+    rel == dir || (rel.starts_with(dir) && rel.get(dir.len()) == Some(&b'/'))
+}
+
+/// Whether the walk has to enter directory `rel` to find defining files.
+fn may_hold(rel: &[u8], extra: &[String]) -> bool {
+    rel == b"nix" || rel.starts_with(b"nix/") || extra.iter().any(|e| under(rel, e.as_bytes()) || under(e.as_bytes(), rel))
 }
 
 /// Hash of the files that define the flake.
-pub fn source_key(snap: &Snapshot) -> Hash {
+pub fn source_key(snap: &Snapshot, extra: &[String]) -> Hash {
     let mut h = KeyHasher::new("flake-source-v2");
     snap.walk(&mut |rel, node| match node {
-        Node::Dir(_) => rel == b"nix" || rel.starts_with(b"nix/"),
-        Node::File { hash, .. } if defines_flake(rel) => {
+        Node::Dir(_) => may_hold(rel, extra),
+        Node::File { hash, .. } if defines_flake(rel, extra) => {
             h.field(rel).field(hash);
             false
         }
@@ -152,9 +164,9 @@ fn evaluate(root: &Path, uid: u32, gid: u32) -> Result<FlakeEnv> {
 /// The flake environment of a snapshot, evaluated once per distinct set of
 /// flake files. Evaluation happens in a scratch directory holding just
 /// those files.
-pub fn resolve(d: &Daemon, snap: &Snapshot, uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
+pub fn resolve(d: &Daemon, snap: &Snapshot, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
     let store = &d.engine.store;
-    let key = source_key(snap);
+    let key = source_key(snap, extra);
     let mut k = b"flake:".to_vec();
     k.extend_from_slice(&key.0);
     if let Some(v) = store.db().get(Table::Meta, &k) {
@@ -168,8 +180,8 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, uid: u32, gid: u32) -> Result<Arc<Fl
     let scratch = d.scratch("flake")?;
     let env = snap
         .materialize(&scratch, uid, gid, &|rel, node| match node {
-            Node::Dir(_) => rel == b"nix" || rel.starts_with(b"nix/"),
-            _ => defines_flake(rel),
+            Node::Dir(_) => may_hold(rel, extra),
+            _ => defines_flake(rel, extra),
         })
         .and_then(|()| evaluate(&scratch, uid, gid));
     let _ = std::fs::remove_dir_all(&scratch);
@@ -216,6 +228,27 @@ impl FlakeEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn files_that_define_a_flake() {
+        let none: Vec<String> = Vec::new();
+        for f in ["flake.nix", "flake.lock", "shell.nix", "rust-toolchain.toml", "nix/a/b.nix"] {
+            assert!(defines_flake(f.as_bytes(), &none), "{f}");
+        }
+        for f in ["Cargo.lock", "src/flake.nix", "nix/patch.diff", "script/cargo"] {
+            assert!(!defines_flake(f.as_bytes(), &none), "{f}");
+        }
+        let extra = vec!["Cargo.lock".to_string(), "script/cargo".to_string(), "nix/".to_string(), "crates/zed".to_string()];
+        for f in ["Cargo.lock", "script/cargo", "nix/patch.diff", "crates/zed/Cargo.toml"] {
+            assert!(defines_flake(f.as_bytes(), &extra), "{f}");
+        }
+        for f in ["script/cargo2", "script/other", "crates/zed2/Cargo.toml", "Cargo.lock.bak"] {
+            assert!(!defines_flake(f.as_bytes(), &extra), "{f}");
+        }
+        // Directories on the way to a named file are entered, others not.
+        assert!(may_hold(b"script", &extra) && may_hold(b"crates", &extra) && may_hold(b"crates/zed/src", &extra));
+        assert!(!may_hold(b"crates/gpui", &extra) && !may_hold(b"docs", &extra));
+    }
 
     #[test]
     fn finds_store_path_names() {

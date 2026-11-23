@@ -515,6 +515,9 @@ impl Daemon {
         }
         let dir = self.cfg.state_dir.join("homes").join(h.finish().hex());
         let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        // Many clients with the same configuration arrive at once.
+        static MAKING: Mutex<()> = Mutex::new(());
+        let _one = MAKING.lock();
         if !dir.join(".complete").exists() {
             use std::os::unix::fs::PermissionsExt;
             std::fs::create_dir_all(&dir)?;
@@ -702,11 +705,14 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     // A flake, when present and not switched off, defines the environment.
     let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
     let flake = if has_flake && policy.flake.enabled != Some(false) {
-        let (dd, snap, uid, gid) = (d.clone(), snapshot.clone(), c.uid, c.gid);
+        let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
         Some(
-            tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, uid, gid))
+            tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &files, uid, gid))
                 .await?
-                .context("evaluating the repository's flake (set `flake.enabled = false` in .rargo.toml to build without it)")?,
+                .context(
+                    "evaluating the repository's flake (if it reads files of the repository, name them in `flake.files` in .rargo.toml; \
+                     `flake.enabled = false` builds without it)",
+                )?,
         )
     } else {
         None

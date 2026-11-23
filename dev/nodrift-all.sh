@@ -1,7 +1,10 @@
 #!/bin/bash
 # The no-drift check (dev/nodrift.sh) for the three benchmark repositories,
 # against a fresh build server that cannot see them.
-#   dev/nodrift-all.sh [ra|ruff|bevy ...]
+#   dev/nodrift-all.sh [ra|ruff|bevy|zed ...]
+# FRESH=1: in a new worktree of each repository with an empty target/, so
+# that stock cargo afterwards has everything to build next to what rargo
+# placed (the server-side drift check is left out; the plain run has it).
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -10,9 +13,12 @@ export RARGO_STATE=$work/state-nodrift
 export RARGO_SERVER=127.0.0.1:7474
 export RARGO_HIDE=$work/bench
 export RARGO_CACHE_DIR=$work/nodrift-client-cache
-repos=("$@"); [ ${#repos[@]} -eq 0 ] && repos=(ra ruff bevy)
+repos=("$@"); [ ${#repos[@]} -eq 0 ] && repos=(ra ruff bevy zed)
 "$here/rargod.sh" stop >/dev/null 2>&1
 rm -rf "$RARGO_STATE" "$RARGO_CACHE_DIR"
+# Zed needs system libraries from its flake's dev shell; one of its git
+# dependencies has LFS files neither build needs.
+export GIT_LFS_SKIP_SMUDGE=1
 "$here/rargod.sh" start --drift-interval-min 0 >/dev/null || exit 1
 trap '"$here/rargod.sh" stop >/dev/null 2>&1' EXIT
 fails=0
@@ -21,9 +27,22 @@ for r in "${repos[@]}"; do
     ra) tests="" ;;
     ruff) tests="-p ruff_linter -p ruff_python_parser -p ruff_text_size" ;;
     bevy) tests="-p bevy_ecs -p bevy_math -p bevy_color" ;;
+    zed) tests="-p util -p rope -p sum_tree"; export NODRIFT_CARGO="$here/zed-cargo.sh" ;;
     *) echo "unknown repository $r"; exit 2 ;;
     esac
-    echo "== $r"
-    "$here/nodrift.sh" "$r" "$tests" || fails=$((fails + 1))
+    [ "$r" = zed ] || unset NODRIFT_CARGO
+    echo "== $r${FRESH:+ (fresh worktree)}"
+    if [ "${FRESH:-}" = 1 ]; then
+        base=$work/bench/$r; wt=$work/bench/fresh-$r
+        git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1; git -C "$base" worktree prune
+        git -C "$base" worktree add -q --detach "$wt" HEAD || exit 2
+        # A lock file the repository ignores (Bevy) comes along, so both
+        # tools resolve the same versions.
+        [ -f "$wt/Cargo.lock" ] || cp "$base/Cargo.lock" "$wt/" 2>/dev/null
+        NODRIFT_DIR=$wt NODRIFT_SKIP_SERVER=1 "$here/nodrift.sh" "$r" "$tests" || fails=$((fails + 1))
+        git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1
+    else
+        "$here/nodrift.sh" "$r" "$tests" || fails=$((fails + 1))
+    fi
 done
 exit $fails

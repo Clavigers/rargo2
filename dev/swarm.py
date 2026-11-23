@@ -43,6 +43,16 @@ REPOS = {
         tests=[["test", "-p", "bevy_utils"], ["test", "-p", "bevy_color"], ["test", "-p", "bevy_ptr"]],
         build=["build", "-p", "bevy_ecs"],
     ),
+    # Zed needs the dev shell of its flake for system libraries: rargo
+    # evaluates it on the server, stock cargo runs inside it (zed-cargo.sh).
+    "zed": dict(
+        dir="zed",
+        check=["check"],
+        edits=["crates/collections/src/collections.rs", "crates/sum_tree/src/sum_tree.rs", "crates/rope/src/rope.rs", "crates/text/src/text.rs"],
+        tests=[["test", "-p", "collections"], ["test", "-p", "sum_tree"], ["test", "-p", "rope"]],
+        build=["build"],
+        cargo=os.path.join(os.path.dirname(os.path.abspath(__file__)), "zed-cargo.sh"),
+    ),
 }
 
 def cgroup_cpu_usec(pid):
@@ -72,14 +82,22 @@ def du(path):
 
 def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=()):
     def run(args):
-        cmd = (list(prefix) + [RARGO] if mode == "rargo" else ["cargo"]) + args
+        cmd = (list(prefix) + [RARGO] if mode == "rargo" else [cfg.get("cargo", "cargo")]) + args
         if mode == "stock":
             cmd.append("--offline")
         t = time.time()
+        log.flush()
+        at = os.path.getsize(log.name)
         p = subprocess.run(cmd, cwd=wt, env=env, stdout=log, stderr=subprocess.STDOUT)
         log.write(f"### agent {i} {' '.join(args)} -> {p.returncode} in {time.time()-t:.2f}s\n".encode())
         log.flush()
-        return (" ".join(args), p.returncode, time.time() - t)
+        out = ""
+        if p.returncode != 0:
+            # What the failed command itself printed.
+            with open(log.name, "rb") as f:
+                f.seek(at)
+                out = f.read().decode(errors="replace")[-3000:]
+        return (" ".join(args), p.returncode, time.time() - t, out)
 
     def edit(n):
         # Agents overlap: several make the same edit to the same file.
@@ -202,7 +220,7 @@ def main():
         store_after_gc = du(store_dir)
     per_step = {}
     for steps in results.values():
-        for n, (name, rc, dt) in enumerate(steps):
+        for n, (name, rc, dt, _) in enumerate(steps):
             per_step.setdefault(n, []).append(dt)
     summary = dict(
         repo=a.repo, mode=a.mode, agents=a.agents, label=a.label, toolchain=a.toolchain, edit=a.edit,
@@ -215,15 +233,13 @@ def main():
         netns=a.netns, sync=sync_line,
         failures=len(failures),
         # Which step of which agent, and the end of that agent's log.
-        failed_steps=[dict(agent=i, step=st[0], rc=st[1],
-                           log_tail=open(os.path.join(root, f"agent{i:02d}.log"), errors="replace").read()[-3000:])
-                      for i, st in failures[:5]],
+        failed_steps=[dict(agent=i, step=st[0], rc=st[1], output=st[3]) for i, st in failures[:5]],
         step_mean_s=[round(sum(v) / len(v), 2) for _, v in sorted(per_step.items())],
         step_max_s=[round(max(v), 2) for _, v in sorted(per_step.items())],
     )
     print(json.dumps(summary))
     if failures:
-        print("failed steps:", failures[:10], file=sys.stderr)
+        print("failed steps:", [f[1][:3] for f in failures[:10]], file=sys.stderr)
     if a.out:
         with open(a.out, "a") as f:
             f.write(json.dumps(summary) + "\n")

@@ -919,6 +919,8 @@ pub struct PoolStats {
     pub dispatched: AtomicU64,
     pub kept_local_no_wait: AtomicU64,
     pub kept_local_transfer: AtomicU64,
+    /// Queued for both; a local core came free before a worker's.
+    pub kept_local_first: AtomicU64,
     pub worker_failures: AtomicU64,
     /// Dispatched, then run here because a local core fell idle first.
     pub hedged: AtomicU64,
@@ -940,6 +942,8 @@ pub struct Pool {
     /// Bytes per second assumed for transfer estimates.
     pub bandwidth: AtomicU64,
     pub stats: PoolStats,
+    /// Signalled whenever a worker core becomes free.
+    freed: tokio::sync::Notify,
 }
 
 fn to_wire(l: &Looked, content: &Content) -> WLooked {
@@ -990,6 +994,7 @@ impl Pool {
             ],
             bandwidth: AtomicU64::new(100 << 20),
             stats: PoolStats::default(),
+            freed: tokio::sync::Notify::new(),
         });
         let p = pool.clone();
         tokio::spawn(async move {
@@ -999,6 +1004,13 @@ impl Pool {
             }
         });
         Ok(pool)
+    }
+
+    /// Measured cost of a remote action beyond running it, per worker.
+    pub fn overhead_text(&self) -> String {
+        let ws = self.workers.lock();
+        let v: Vec<String> = ws.iter().filter_map(|w| w.overhead()).map(|d| format!("{:.2} s", d.as_secs_f64())).collect();
+        if v.is_empty() { "not measured yet".into() } else { v.join(", ") }
     }
 
     pub fn worker_count(&self) -> usize {
@@ -1049,6 +1061,9 @@ impl Pool {
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
                     self.workers.lock().push(w.clone());
+                    for _ in 0..cores {
+                        self.freed.notify_one();
+                    }
                     worker = Some(w);
                     peer.post(&Msg::Welcome);
                 }
@@ -1175,6 +1190,25 @@ impl Pool {
         Some(w)
     }
 
+    fn give_back(&self, w: &Worker) {
+        w.free.fetch_add(1, Ordering::Relaxed);
+        self.freed.notify_one();
+    }
+
+    /// A worker core, as soon as there is one.
+    async fn lease_wait(&self) -> Arc<Worker> {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            // Registered before looking, so a core freed in between is not missed.
+            freed.as_mut().enable();
+            if let Some(w) = self.lease() {
+                return w;
+            }
+            freed.await;
+        }
+    }
+
     /// Sends a blob the worker is expected to need, leaving out the chunks
     /// it is known to hold.
     fn push_blob(&self, w: &Worker, h: Hash) {
@@ -1264,14 +1298,14 @@ impl Pool {
             asked: AtomicU64::new(0),
         });
         w.actions.insert(action, ra.clone());
-        struct Cleanup<'a>(&'a Worker, u64);
+        struct Cleanup<'a>(&'a Pool, &'a Worker, u64);
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
-                self.0.actions.remove(&self.1);
-                self.0.free.fetch_add(1, Ordering::Relaxed);
+                self.1.actions.remove(&self.2);
+                self.0.give_back(self.1);
             }
         }
-        let _cleanup = Cleanup(w, action);
+        let _cleanup = Cleanup(self, w, action);
 
         // Predict what the action will ask, from its last trace, and answer
         // in advance with what our view says now.
@@ -1409,6 +1443,11 @@ impl Pool {
                     stdout.extend_from_slice(&d);
                 }
                 Event::Early(path, entry) => {
+                    // The worker made this file: dependents sent to it do
+                    // not need it pushed back.
+                    if let MEntry::File { hash, .. } = &entry {
+                        w.has_blobs.lock().insert(*hash);
+                    }
                     early.lock().insert(path, entry);
                 }
                 Event::Line(line) => {
@@ -1524,42 +1563,48 @@ impl RemoteRunner for Pool {
             if spec.kind == ActionKind::Plan || spec.net != NetMode::Loopback || spec.root_id != Hash::ZERO {
                 return None;
             }
-            // Only when a local core is not available right now.
-            let (running, waiting, _, _) = engine.sched.snapshot();
-            if running < engine.sched.tokens() && waiting == 0 {
+            // A free local core is always the better place. A core held
+            // by a compiler's helper thread is as busy as one held by an
+            // action.
+            let (_, waiting, _, _) = engine.sched.snapshot();
+            if engine.sched.free_tokens() > 0 && waiting == 0 {
                 self.stats.kept_local_no_wait.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-            let w = self.lease()?;
-            // Is shipping the inputs cheaper than waiting for a core?
-            let wait = engine.avg_action_wall().mul_f64((waiting + 1) as f64 / engine.sched.tokens().max(1) as f64);
-            let (missing, unknown) = match engine.traces.traces(key).first() {
+            // Every local core is busy: the action goes to whichever comes
+            // free first, a core here or a core on a worker.
+            let mem = engine.estimate_mem_kb(key, spec.kind);
+            let w = tokio::select! {
+                biased;
+                w = self.lease_wait() => w,
+                permit = engine.sched.acquire(req.prio, mem) => {
+                    self.stats.kept_local_first.fetch_add(1, Ordering::Relaxed);
+                    engine.stats.runs.fetch_add(1, Ordering::Relaxed);
+                    let started = std::time::Instant::now();
+                    let r = engine.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+                    drop(permit);
+                    engine.note_action_wall(started.elapsed());
+                    return Some(r);
+                }
+            };
+            // Not when shipping its known inputs would take longer than
+            // running it: the worker would sit waiting for bytes.
+            let missing: u64 = match engine.traces.traces(key).first() {
                 Some((_, t)) => {
                     let has = w.has_blobs.lock();
-                    let bytes: u64 = t
-                        .obs
+                    t.obs
                         .iter()
                         .filter_map(|(_, o)| match o {
                             Obs::File { hash, .. } if !has.contains(hash) => Some(engine.store.size_of(hash).unwrap_or(256 << 10)),
                             _ => None,
                         })
-                        .sum();
-                    (bytes, 10u32)
+                        .sum()
                 }
-                // Never run before: nothing to predict; each lookup is a
-                // round trip.
-                None => (8 << 20, 300),
+                None => 0,
             };
-            let rtt = w.peer.conn.rtt().unwrap_or(Duration::from_millis(1));
             let bytes_time = Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64);
-            // Once this worker has run a few actions, what they really cost
-            // beyond running replaces the guess about round trips.
-            let transfer = match w.overhead() {
-                Some(o) => bytes_time + o,
-                None => bytes_time + rtt * unknown,
-            };
-            if transfer > wait && !eager_dispatch() {
-                w.free.fetch_add(1, Ordering::Relaxed);
+            if bytes_time > engine.avg_action_wall() && !eager_dispatch() {
+                self.give_back(&w);
                 self.stats.kept_local_transfer.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
@@ -1573,7 +1618,6 @@ impl RemoteRunner for Pool {
             let spoke = std::sync::atomic::AtomicBool::new(false);
             let remote = self.run_on(&w, engine, spec, key, req, &spoke);
             tokio::pin!(remote);
-            let mem = engine.estimate_mem_kb(key, spec.kind);
             let result = loop {
                 tokio::select! {
                     r = &mut remote => break r,

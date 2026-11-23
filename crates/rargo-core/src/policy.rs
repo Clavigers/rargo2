@@ -22,6 +22,10 @@
 //! # Use the repository's flake devShell as the environment (default: true
 //! # when flake.nix exists).
 //! enabled = true
+//! # Files and directories the flake reads besides `flake.nix`,
+//! # `flake.lock`, `rust-toolchain(.toml)` and `.nix` files at the top and
+//! # under `nix/`. The environment is evaluated again when one changes.
+//! files = ["Cargo.lock", "script/cargo", "nix"]
 //!
 //! [sync]
 //! # Never sent to the build server, in addition to `.git` and cargo target
@@ -86,6 +90,8 @@ pub struct NetPolicy {
 #[serde(deny_unknown_fields)]
 pub struct FlakePolicy {
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub files: Vec<String>,
 }
 
 pub const POLICY_FILE: &str = ".rargo.toml";
