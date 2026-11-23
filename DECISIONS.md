@@ -475,5 +475,23 @@ started from an older one.
 
 rargo prints cargo's future-incompatibility warning with the affected
 packages when the compiler reports any, including on a replayed build. It
-does not write cargo's report file, and says so in the note. The
-`unused_dependencies` post-build lint and `--timings` are not reproduced.
+does not write cargo's report file, and says so in the note.
+
+`unused_dependencies` (on by default in cargo 1.100): rustc's per-unit
+`unused_extern` reports are collected, replayed ones included. When cargo's
+own grouping (package x dependency kind; dev-dependencies are never linted)
+leaves an unused extern in a local package, the planner is run once more
+with the reports in `__RARGO_UNUSED`; its stub executor feeds them through
+cargo's normal stderr handling, and cargo's post-build lint prints exactly
+what stock cargo prints (checked word for word in e2e). Why this way:
+reimplementing the lint would mean reimplementing its manifest snippets and
+lint-level rules; replaying into cargo reuses them. Cost: one planner run,
+cached, only on builds where the warning is due.
+
+`.d` files: written next to uplifted artifacts with cargo's content (the
+rustc dep-info of the unit and its local dependencies, plus build scripts'
+`rerun-if-changed`), checked equal to stock cargo's in e2e;
+`build.dep-info-basedir` is not honoured.
+
+Not reproduced: `--timings` (the HTML report). rargo's own per-action
+times are in `--rargo-status` and `RARGO_EXPLAIN`.
