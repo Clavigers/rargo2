@@ -322,6 +322,25 @@ out=$(cargo build --offline 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "stock cargo builds into the same target/ that rargo linked into" || bad "stock cargo builds into the same target/" "$out"
 expect "and rargo still works afterwards" "$R" build
 
+echo "== cargo's unused_dependencies lint"
+cd "$A"
+cp crates/app/Cargo.toml "$T/app-Cargo.toml"
+mkdir -p crates/unused/src && echo "" >crates/unused/src/lib.rs
+printf '[package]\nname = "unused"\nversion = "0.1.0"\nedition = "2021"\n' >crates/unused/Cargo.toml
+printf 'unused = { path = "../unused" }\n' >>crates/app/Cargo.toml
+out=$("$R" build 2>&1); rc=$?
+stock=$(CARGO_TARGET_DIR="$T/stock-target" cargo build --offline 2>&1 | grep -v "Compiling\|Finished\|hello from")
+mine=$(grep -v "Compiling\|Finished\|hello from" <<<"$out")
+[ $rc -eq 0 ] && has "$out" "warning: unused dependency \`unused\`" && [ "$mine" = "$stock" ] && ok "an unused path dependency gets stock cargo's warning, word for word" || bad "an unused path dependency gets stock cargo's warning" "rargo:
+$mine
+cargo:
+$stock"
+out=$("$R" build 2>&1)
+has "$out" "warning: unused dependency \`unused\`" && ok "and again when the build is replayed" || bad "and again when the build is replayed" "$out"
+cp "$T/app-Cargo.toml" crates/app/Cargo.toml; rm -rf crates/unused
+out=$("$R" build 2>&1)
+has "$out" "unused dependency" && bad "no lint once the dependency is gone" "$out" || ok "no lint once the dependency is gone"
+
 echo "== cargo's .d files"
 cd "$A"
 "$R" build >/dev/null 2>&1

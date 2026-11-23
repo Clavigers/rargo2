@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 /// planner's cache key through the binary itself, checked on load.
 pub const PLAN_VERSION: u32 = 4;
 
+/// Lint mode: a JSON map from unit index to `(unit description, rustc's
+/// unused_extern message)`. The planner replays those messages so that cargo
+/// emits its `unused_dependencies` warnings.
+pub const UNUSED_ENV: &str = "__RARGO_UNUSED";
+
 /// Environment variable naming the file the plan is written to. Its presence
 /// switches the fork into planning mode.
 pub const PLAN_ENV: &str = "__RARGO_PLAN";

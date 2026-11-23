@@ -18,7 +18,7 @@ start)
     . "$work/env.sh"
     nohup systemd-run --scope -q --unit "rargod-dev-$$" -p CPUQuota=2400% -p MemoryMax=90G -p Delegate=yes \
         "${RARGO_BIN:-$repo/target/release}/rargod" --state "$state" \
-        --planner "$work/cargo/target/release/cargo" --jobs 24 "$@" \
+        --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" --jobs 24 "$@" \
         >"$state/rargod.log" 2>&1 &
     for i in $(seq 1 100); do
         [ -S "$state/rargod.sock" ] && { echo "rargod started (log: $state/rargod.log)"; exit 0; }

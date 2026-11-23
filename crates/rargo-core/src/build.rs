@@ -306,6 +306,8 @@ struct Ui {
     documented: HashSet<String>,
     scraped: HashSet<String>,
     seen_diag: HashSet<Hash>,
+    /// rustc's `unused_extern` message, by unit.
+    unused_externs: BTreeMap<usize, String>,
     /// Packages whose compiler reported future-incompatibility lints.
     future_incompat: std::collections::BTreeSet<String>,
     counts: HashMap<usize, Counts>,
@@ -701,8 +703,21 @@ enum PlanOutcome {
 }
 
 async fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -> Result<PlanOutcome> {
+    plan_with(d, c, p, args, &[]).await
+}
+
+async fn plan_with(
+    d: &Arc<Daemon>,
+    c: &Arc<Client>,
+    p: &Prepared,
+    args: &[String],
+    extra_env: &[(&str, String)],
+) -> Result<PlanOutcome> {
     let mut env: BTreeMap<Vec<u8>, Vec<u8>> =
         p.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
+    for (k, v) in extra_env {
+        env.insert(bytes(k), bytes(v));
+    }
     env.insert(bytes(rp::PLAN_ENV), bytes(PLAN_PATH));
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
     env.insert(bytes("CARGO_CACHE_RUSTC_INFO"), bytes("0"));
@@ -854,8 +869,9 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     let fork_key = (p.root.clone(), c.env.get("RUSTUP_TOOLCHAIN").cloned().unwrap_or_default());
     let mut as_build = check_at.is_some() && d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
     let mut fetched = false;
+    let mut plan_args;
     let planned = loop {
-        let mut plan_args = args.clone();
+        plan_args = args.clone();
         if let (Some(i), true) = (check_at, as_build) {
             plan_args[i] = "build".into();
         }
@@ -989,6 +1005,65 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         ));
         d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
         d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
+    }
+    // cargo's unused_dependencies lint, when a local crate has an unused
+    // extern: the planner is run once more with rustc's reports and its
+    // post-build lint speaks for itself.
+    {
+        let unused = std::mem::take(&mut run.ui.lock().unused_externs);
+        // Only when cargo would say something: an extern of a local package
+        // that every unit of the same dependency kind left unused (cargo's
+        // `dep_kind_of`; dev-dependencies are never linted).
+        let mut groups: HashMap<(&str, &str), Option<std::collections::BTreeSet<String>>> = HashMap::new();
+        for (i, line) in &unused {
+            let u = &plan.units[*i];
+            if !u.is_local {
+                continue;
+            }
+            let target: serde_json::Value = serde_json::from_str(&u.target_json).unwrap_or_default();
+            let profile: serde_json::Value = serde_json::from_str(&u.profile_json).unwrap_or_default();
+            let kinds: Vec<&str> = target["kind"].as_array().map(|a| a.iter().filter_map(|k| k.as_str()).collect()).unwrap_or_default();
+            let dep_kind = if kinds.contains(&"custom-build") {
+                "build"
+            } else if kinds.contains(&"bin") {
+                "normal"
+            } else if kinds.iter().any(|k| matches!(*k, "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"))
+                && profile["test"] != serde_json::Value::Bool(true)
+            {
+                "normal"
+            } else {
+                continue;
+            };
+            let names: std::collections::BTreeSet<String> = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| v["unused_extern_names"].as_array().map(|a| a.iter().filter_map(|n| n.as_str().map(String::from)).collect()))
+                .unwrap_or_default();
+            let g = groups.entry((u.pkg_id.as_str(), dep_kind)).or_default();
+            match g {
+                Some(set) => set.retain(|n| names.contains(n)),
+                None => *g = Some(names),
+            }
+        }
+        let any = groups.values().any(|g| g.as_ref().is_some_and(|s| !s.is_empty()));
+        if any {
+            let map: BTreeMap<usize, (&str, &str)> =
+                unused.iter().map(|(i, l)| (*i, (plan.units[*i].desc.as_str(), l.as_str()))).collect();
+            let json = serde_json::to_string(&map)?;
+            if let PlanOutcome::Ok(lint) = plan_with(d, c, &p, &plan_args, &[(rp::UNUSED_ENV, json)]).await? {
+                // Whatever the planner said while loading the workspace was
+                // shown already; what is new is the lint.
+                let before = String::from_utf8_lossy(&planned.stderr).into_owned();
+                let after = String::from_utf8_lossy(&lint.stderr).into_owned();
+                let new = match after.strip_prefix(before.as_str()) {
+                    Some(rest) => rest.to_string(),
+                    None => {
+                        let seen: HashSet<&str> = before.lines().collect();
+                        after.lines().filter(|l| !seen.contains(l)).map(|l| format!("{l}\n")).collect()
+                    }
+                };
+                c2.out.err_text(&new);
+            }
+        }
     }
     let finished = || {
         c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
@@ -1731,6 +1806,8 @@ impl Run {
             return;
         }
         if v.get("unused_extern_names").is_some() {
+            // For cargo's unused_dependencies lint, after the build.
+            self.ui.lock().unused_externs.insert(i, line.to_string());
             return;
         }
         // JSON mode: forward the compiler's message wrapped like cargo does.

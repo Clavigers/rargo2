@@ -1,0 +1,54 @@
+From e321a737add3bcc3a192c1e164422dd0a7878a2f Mon Sep 17 00:00:00 2001
+From: sadosystems <noreply@rargo.invalid>
+Date: Mon, 23 Nov 2026 02:01:11 +0100
+Subject: [PATCH 5/5] rargo: lint mode replays rustc's unused_extern messages
+ for cargo's unused_dependencies lint
+
+---
+ src/compiler/rargo.rs | 25 +++++++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
+index fc50c9cfc..e917f4823 100644
+--- a/src/compiler/rargo.rs
++++ b/src/compiler/rargo.rs
+@@ -363,6 +363,23 @@ pub fn record_cmd(cmd: &ProcessBuilder) -> CargoResult<()> {
+     }
+ }
+ 
++/// Lint mode: rustc's `unused_extern` messages of the build that just ran,
++/// by unit index (with the unit's description, to be sure it is the same
++/// unit). Fed back through cargo's own stderr handling, so that cargo's
++/// post-build `unused_dependencies` lint says exactly what it would have.
++fn unused_externs_of(idx: u32) -> Option<String> {
++    static LINES: OnceLock<HashMap<u32, (String, String)>> = OnceLock::new();
++    let lines = LINES.get_or_init(|| {
++        #[allow(clippy::disallowed_methods)]
++        let raw = std::env::var(rp::UNUSED_ENV).unwrap_or_default();
++        serde_json::from_str(&raw).unwrap_or_default()
++    });
++    let (desc, line) = lines.get(&idx)?;
++    let st = state().lock().unwrap();
++    let u = st.units.get(idx as usize)?.as_ref()?;
++    (u.desc == *desc).then(|| line.clone())
++}
++
+ /// The `Executor` used in planning mode: records instead of running rustc.
+ pub struct PlanExecutor;
+ 
+@@ -374,9 +391,13 @@ impl Executor for PlanExecutor {
+         _target: &Target,
+         _mode: CompileMode,
+         _on_stdout_line: &mut dyn FnMut(&str) -> CargoResult<()>,
+-        _on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
++        on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
+     ) -> CargoResult<()> {
+-        record_cmd(cmd)
++        record_cmd(cmd)?;
++        if let Some(line) = unused_externs_of(CURRENT.with(|c| c.get())) {
++            on_stderr_line(&line)?;
++        }
++        Ok(())
+     }
+ 
+     fn force_rebuild(&self, _unit: &Unit) -> bool {
