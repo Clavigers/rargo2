@@ -627,8 +627,8 @@ impl Observer for WorkerObserver {
 }
 
 /// Runs a worker: connects to the server and executes what it is sent.
-pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32) -> Result<()> {
-    let endpoint = Endpoint::bind("0.0.0.0:0".parse().unwrap(), false).await?;
+pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: crate::net::LinkKey) -> Result<()> {
+    let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key).await?;
     let conn = endpoint.connect(server);
     let (peer, mut inbox) = Peer::new(conn.clone());
     let blobs = Arc::new(Blobs::new(engine.store.clone(), None));
@@ -833,8 +833,8 @@ fn to_wire(l: &Looked, content: &Content) -> WLooked {
 
 impl Pool {
     /// Starts listening for workers.
-    pub async fn listen(engine: &Arc<Engine>, addr: SocketAddr) -> Result<Arc<Pool>> {
-        let endpoint = Endpoint::bind(addr, true).await.with_context(|| format!("binding {addr}"))?;
+    pub async fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey) -> Result<Arc<Pool>> {
+        let endpoint = Endpoint::bind_keyed(addr, true, key).await.with_context(|| format!("binding {addr}"))?;
         let host_srcs: Arc<DashMap<Hash, FileSrc>> = Arc::new(DashMap::new());
         let blobs = Arc::new(Blobs::new(
             engine.store.clone(),
@@ -849,7 +849,14 @@ impl Pool {
             blobs,
             host_srcs,
             content: engine.content.clone(),
-            next_action: AtomicU64::new(1),
+            // Action ids start somewhere unpredictable, so that messages
+            // recorded from an earlier session mean nothing in this one.
+            next_action: AtomicU64::new({
+                let mut b = [0u8; 8];
+                // SAFETY: filling a valid 8-byte buffer.
+                unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
+                u64::from_le_bytes(b) >> 1
+            }),
             profile_exclude: vec![
                 crate::buildview::WORKTREE_AT.to_vec(),
                 crate::buildview::CARGO_HOME_AT.to_vec(),

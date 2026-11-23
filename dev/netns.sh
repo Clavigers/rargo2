@@ -46,15 +46,16 @@ up)
         ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${delay}ms" loss "${loss}%" rate "$rate"
         i=$((i + 1))
     done
+    head -c 32 /dev/urandom >"$T/link.key"
     nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G \
         ip netns exec rargo-srv "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
-        --jobs "$sj" --workers-listen 10.77.0.1:7711 --drift-interval-min 0 >"$T/srv.log" 2>&1 &
+        --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
     sleep 1
     i=1
     while [ "$i" -le "$n" ]; do
         mkdir -p "$T/w$i"
         nohup systemd-run --scope -q -p CPUQuota=$((wj * 100))% -p MemoryMax=30G \
-            ip netns exec "rargo-w$i" "$B/rargod" --state "$T/w$i" --worker 10.77.0.1:7711 --jobs "$wj" \
+            ip netns exec "rargo-w$i" "$B/rargod" --state "$T/w$i" --worker 10.77.0.1:7711 --worker-key "$T/link.key" --jobs "$wj" \
             >"$T/w$i.log" 2>&1 &
         i=$((i + 1))
     done

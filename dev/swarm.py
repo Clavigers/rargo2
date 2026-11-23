@@ -12,7 +12,7 @@ for stock (run it under `systemd-run --scope`), rargod's for rargo.
 import argparse, os, subprocess, sys, time, shutil, threading, json
 
 WORK = os.environ.get("RARGO_WORK", "/root/rargo-work")
-RARGO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release", "rargo")
+RARGO = os.path.join(os.environ.get("RARGO_BIN") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release"), "rargo")
 
 # Per repository: files agents edit (cheap leaf-ish and deep ones) and the
 # packages they test.
@@ -62,7 +62,7 @@ def du(path):
     real = subprocess.run(["du", "-sB1", path], capture_output=True, text=True).stdout.split()
     return (int(out[0]) if out else 0, int(real[0]) if real else 0)
 
-def agent(i, wt, cfg, mode, env, log, results):
+def agent(i, wt, cfg, mode, env, log, results, edit_kind="api"):
     def run(args):
         cmd = ([RARGO] if mode == "rargo" else ["cargo"]) + args
         if mode == "stock":
@@ -77,8 +77,22 @@ def agent(i, wt, cfg, mode, env, log, results):
         # Agents overlap: several make the same edit to the same file.
         f = cfg["edits"][(i + n) % len(cfg["edits"])]
         variant = (i // len(cfg["edits"]) + n) % 3
-        with open(os.path.join(wt, f), "a") as fh:
-            fh.write(f"\n#[allow(dead_code)]\npub fn rargo_bench_{n}_{variant}() -> u32 {{ {variant} + {n} }}\n")
+        path = os.path.join(wt, f)
+        if edit_kind == "body" and n > 0:
+            # Change only the inside of the function the first edit added:
+            # nothing other crates can see moves.
+            text = open(path).read()
+            marker = "    let rargo_bench_value = "
+            at = text.rindex(marker)
+            end = text.index("\n", at)
+            text = text[:at] + f"{marker}{variant} * 7 + {n};" + text[end:]
+            open(path, "w").write(text)
+            return
+        with open(path, "a") as fh:
+            if edit_kind == "body":
+                fh.write(f"\n#[allow(dead_code)]\npub fn rargo_bench_{variant}() -> u32 {{\n    let rargo_bench_value = {variant} + {n};\n    rargo_bench_value\n}}\n")
+            else:
+                fh.write(f"\n#[allow(dead_code)]\npub fn rargo_bench_{n}_{variant}() -> u32 {{ {variant} + {n} }}\n")
 
     steps = []
     steps.append(run(cfg["check"]))
@@ -99,6 +113,10 @@ def main():
     ap.add_argument("--agents", type=int, default=20)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--label", default=None, help="recorded with the result")
+    ap.add_argument("--toolchain", default=None, help="RUSTUP_TOOLCHAIN for the agents")
+    ap.add_argument("--edit", default="api", choices=["api", "body"],
+                    help="api: both edits add a public function; body: the second edit changes only a function body")
     a = ap.parse_args()
     cfg = REPOS[a.repo]
     base = os.path.join(WORK, "bench", cfg["dir"])
@@ -116,6 +134,8 @@ def main():
         wts.append(wt)
 
     env = dict(os.environ)
+    if a.toolchain:
+        env["RUSTUP_TOOLCHAIN"] = a.toolchain
     daemon_pid = None
     if a.mode == "rargo":
         sock = env.get("RARGO_SOCKET", os.path.join(WORK, "state", "rargod.sock"))
@@ -139,7 +159,7 @@ def main():
     results = {}
     logs = [open(os.path.join(root, f"agent{i:02d}.log"), "wb") for i in range(a.agents)]
     t0 = time.time()
-    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results)) for i in range(a.agents)]
+    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit)) for i in range(a.agents)]
     for t in threads: t.start()
     for t in threads: t.join()
     wall = time.time() - t0
@@ -161,7 +181,7 @@ def main():
         for n, (name, rc, dt) in enumerate(steps):
             per_step.setdefault(n, []).append(dt)
     summary = dict(
-        repo=a.repo, mode=a.mode, agents=a.agents,
+        repo=a.repo, mode=a.mode, agents=a.agents, label=a.label, toolchain=a.toolchain, edit=a.edit,
         wall_s=round(wall, 1), cpu_s=round((cpu1 - cpu0) / 1e6, 1),
         worktree_target_bytes=real, worktree_target_apparent_bytes=apparent,
         store_bytes=store[1],

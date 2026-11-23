@@ -77,9 +77,37 @@ struct RecvState {
     done: HashSet<u64>,
 }
 
+/// A key shared by server and workers. Every datagram carries a tag made
+/// with it; datagrams without a valid tag are dropped before anything looks
+/// at them. This authenticates the link (a worker runs whatever commands
+/// the server sends, and the server trusts the results), it does not hide
+/// its content.
+pub type LinkKey = Option<Arc<[u8; 32]>>;
+const TAG: usize = 16;
+
+fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
+    if let Some(k) = key {
+        let tag = blake3::keyed_hash(k, pkt);
+        pkt.extend_from_slice(&tag.as_bytes()[..TAG]);
+    }
+}
+
+fn open<'a>(key: &LinkKey, pkt: &'a [u8]) -> Option<&'a [u8]> {
+    let Some(k) = key else { return Some(pkt) };
+    if pkt.len() < TAG {
+        return None;
+    }
+    let (body, tag) = pkt.split_at(pkt.len() - TAG);
+    let want = blake3::keyed_hash(k, body);
+    // Compared without an early exit.
+    let diff = want.as_bytes()[..TAG].iter().zip(tag).fold(0u8, |d, (a, b)| d | (a ^ b));
+    (diff == 0).then_some(body)
+}
+
 /// One end of a session with one peer.
 pub struct Conn {
     pub id: u64,
+    key: LinkKey,
     sock: Arc<UdpSocket>,
     peer: Mutex<SocketAddr>,
     send: Mutex<SendState>,
@@ -97,10 +125,11 @@ pub struct Conn {
 }
 
 impl Conn {
-    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr) -> Arc<Conn> {
+    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey) -> Arc<Conn> {
         let (tx, rx) = mpsc::unbounded_channel();
         let c = Arc::new(Conn {
             id,
+            key,
             sock,
             peer: Mutex::new(peer),
             send: Mutex::new(SendState {
@@ -226,6 +255,7 @@ impl Conn {
             return;
         }
         let peer = *self.peer.lock();
+        seal(&self.key, &mut pkt);
         let _ = self.sock.send_to(&pkt, peer).await;
     }
 
@@ -365,12 +395,18 @@ pub struct Endpoint {
     accept_tx: mpsc::UnboundedSender<Arc<Conn>>,
     accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<Conn>>>,
     accepting: bool,
+    key: LinkKey,
 }
 
 impl Endpoint {
     /// Binds a socket. With `accepting`, unknown connection ids from peers
     /// create new connections (the server side).
     pub async fn bind(addr: SocketAddr, accepting: bool) -> io::Result<Arc<Endpoint>> {
+        Endpoint::bind_keyed(addr, accepting, None).await
+    }
+
+    /// Like [`Endpoint::bind`], with every datagram authenticated by `key`.
+    pub async fn bind_keyed(addr: SocketAddr, accepting: bool, key: LinkKey) -> io::Result<Arc<Endpoint>> {
         let sock = Arc::new(UdpSocket::bind(addr).await?);
         // Large buffers: bursts of thousands of fragments are normal.
         {
@@ -391,6 +427,7 @@ impl Endpoint {
             accept_tx: tx,
             accept_rx: tokio::sync::Mutex::new(rx),
             accepting,
+            key,
         });
         let ep2 = ep.clone();
         tokio::spawn(async move { ep2.recv_loop().await });
@@ -409,7 +446,7 @@ impl Endpoint {
             unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
             u64::from_le_bytes(b) | 1
         };
-        let c = Conn::new(id, self.sock.clone(), peer);
+        let c = Conn::new(id, self.sock.clone(), peer, self.key.clone());
         self.conns.lock().insert(id, c.clone());
         c
     }
@@ -430,16 +467,21 @@ impl Endpoint {
         let mut acks: BTreeMap<u64, (SocketAddr, Vec<u8>)> = BTreeMap::new();
         loop {
             let Ok((n, from)) = self.sock.recv_from(&mut buf).await else { return };
-            self.handle(&buf[..n], from, &mut acks);
+            if let Some(pkt) = open(&self.key, &buf[..n]) {
+                self.handle(pkt, from, &mut acks);
+            }
             // Drain whatever else is already queued, then flush the
             // acknowledgements in as few datagrams as possible.
             while let Ok((n, from)) = self.sock.try_recv_from(&mut buf) {
-                self.handle(&buf[..n], from, &mut acks);
+                if let Some(pkt) = open(&self.key, &buf[..n]) {
+                    self.handle(pkt, from, &mut acks);
+                }
                 if acks.values().any(|(_, a)| a.len() > 1100) {
                     break;
                 }
             }
-            for (_, (to, pkt)) in std::mem::take(&mut acks) {
+            for (_, (to, mut pkt)) in std::mem::take(&mut acks) {
+                seal(&self.key, &mut pkt);
                 let _ = self.sock.send_to(&pkt, to).await;
             }
         }
@@ -455,7 +497,7 @@ impl Endpoint {
             match conns.get(&id) {
                 Some(c) => c.clone(),
                 None if self.accepting && pkt[0] == T_DATA => {
-                    let c = Conn::new(id, self.sock.clone(), from);
+                    let c = Conn::new(id, self.sock.clone(), from, self.key.clone());
                     conns.insert(id, c.clone());
                     let _ = self.accept_tx.send(c.clone());
                     c
@@ -513,6 +555,32 @@ mod tests {
         let s = server.accept().await.unwrap();
         assert_eq!(s.recv().await.unwrap(), b"hello");
         (server, s, client, c)
+    }
+
+    #[test]
+    fn keyed_link_carries_messages_and_rejects_other_keys() {
+        rt().block_on(async {
+            let key = |b: u8| -> LinkKey { Some(Arc::new([b; 32])) };
+            let addr = || "127.0.0.1:0".parse().unwrap();
+            let server = Endpoint::bind_keyed(addr(), true, key(1)).await.unwrap();
+            let good = Endpoint::bind_keyed(addr(), false, key(1)).await.unwrap();
+            let c = good.connect(server.local_addr().unwrap());
+            let big: Vec<u8> = (0..300_000u32).map(|i| i as u8).collect();
+            c.send(&big).await.unwrap();
+            let s = server.accept().await.unwrap();
+            assert_eq!(s.recv().await.unwrap(), big);
+            s.send(b"back").await.unwrap();
+            assert_eq!(c.recv().await.unwrap(), b"back");
+
+            // Wrong key, and no key at all: nothing is accepted.
+            for k in [key(2), None] {
+                let bad = Endpoint::bind_keyed(addr(), false, k).await.unwrap();
+                let b = bad.connect(server.local_addr().unwrap());
+                let _ = tokio::time::timeout(Duration::from_millis(300), b.send(b"let me in")).await;
+                let got = tokio::time::timeout(Duration::from_millis(300), server.accept()).await;
+                assert!(got.is_err(), "a connection with the wrong key was accepted");
+            }
+        });
     }
 
     #[test]

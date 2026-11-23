@@ -40,6 +40,8 @@ struct Opts {
     workers_listen: Option<std::net::SocketAddr>,
     /// Run as a worker for the server at this address.
     worker_of: Option<std::net::SocketAddr>,
+    /// File holding the secret shared by the server and its workers.
+    worker_key: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -62,6 +64,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         drift_minutes: 360,
         workers_listen: None,
         worker_of: None,
+        worker_key: None,
     };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -76,6 +79,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--drift-interval-min" => o.drift_minutes = val()?.parse()?,
             "--workers-listen" => o.workers_listen = Some(val()?.parse()?),
             "--worker" => o.worker_of = Some(val()?.parse()?),
+            "--worker-key" => o.worker_key = Some(PathBuf::from(val()?)),
             "--store-budget-gb" => o.store_budget = val()?.parse::<u64>()? << 30,
             "--store-budget-mb" => o.store_budget = val()?.parse::<u64>()? << 20,
             "--cold-after-min" => o.cold_after_secs = val()?.parse::<u64>()? * 60,
@@ -85,7 +89,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     }
     if o.state.as_os_str().is_empty() || (o.planner.as_os_str().is_empty() && o.worker_of.is_none()) {
         bail!(
-            "usage: rargod --state DIR --planner PATH [--socket PATH] [--jobs N] [--mem-gb N] [--workers-listen ADDR]\n       rargod --state DIR --worker SERVER_ADDR [--jobs N]"
+            "usage: rargod --state DIR --planner PATH [--socket PATH] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
         );
     }
     Ok(o)
@@ -134,7 +138,8 @@ fn main() -> Result<()> {
         // A worker: no analysis, no cache of results, no clients. It
         // executes what the server sends and keeps a content cache.
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let result = rt.block_on(rargo_core::remote::worker_main(engine, server, opts.jobs as u32));
+        let key = link_key(&opts, server)?;
+        let result = rt.block_on(rargo_core::remote::worker_main(engine, server, opts.jobs as u32, key));
         session.unmount();
         return result;
     }
@@ -194,7 +199,8 @@ fn main() -> Result<()> {
 
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     if let Some(addr) = opts.workers_listen {
-        let pool = rt.block_on(rargo_core::remote::Pool::listen(&daemon.engine, addr))?;
+        let key = link_key(&opts, addr)?;
+        let pool = rt.block_on(rargo_core::remote::Pool::listen(&daemon.engine, addr, key))?;
         let _ = daemon.engine.remote.set(pool.clone());
         let _ = daemon.pool.set(pool);
         eprintln!("rargod: accepting workers on {addr}");
@@ -463,6 +469,23 @@ async fn connection(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let _ = writer.await;
     watch_client.abort();
     Ok(())
+}
+
+/// The key for the server-worker link. A worker runs any command the server
+/// sends and the server believes the results, so a link that leaves this
+/// machine must have one.
+fn link_key(opts: &Opts, addr: std::net::SocketAddr) -> Result<rargo_core::net::LinkKey> {
+    match &opts.worker_key {
+        Some(path) => {
+            let secret = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            if secret.len() < 16 {
+                anyhow::bail!("{}: a worker key needs at least 16 bytes", path.display());
+            }
+            Ok(Some(Arc::new(rargo_core::hash::Hash::of(&secret).0)))
+        }
+        None if addr.ip().is_loopback() => Ok(None),
+        None => anyhow::bail!("--worker-key FILE is required unless the worker link is on the loopback interface"),
+    }
 }
 
 fn status_text(d: &Daemon) -> String {
