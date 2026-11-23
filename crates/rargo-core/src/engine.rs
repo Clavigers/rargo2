@@ -63,12 +63,79 @@ impl Live for LiveCtl<'_> {
     }
 }
 
+/// Asks a connected client for the values of variables.
+pub type EnvAsker = Arc<
+    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<(String, Option<String>)>>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// What the server knows of a client's environment.
+///
+/// A client sends the variables on the protocol's allow-list with its
+/// request. Any other variable is unknown until some action declares that it
+/// reads it; the client is then asked for it (and remembers to send it next
+/// time).
+pub struct ClientEnv {
+    vars: parking_lot::RwLock<HashMap<String, String>>,
+    /// Names outside the allow-list the client has answered for.
+    checked: parking_lot::RwLock<std::collections::HashSet<String>>,
+    asker: Option<EnvAsker>,
+}
+
+impl ClientEnv {
+    pub fn new(vars: HashMap<String, String>, checked: Vec<String>, asker: Option<EnvAsker>) -> ClientEnv {
+        ClientEnv {
+            vars: parking_lot::RwLock::new(vars),
+            checked: parking_lot::RwLock::new(checked.into_iter().collect()),
+            asker,
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<String> {
+        self.vars.read().get(name).cloned()
+    }
+
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.vars.read().contains_key(name)
+    }
+
+    pub fn to_map(&self) -> HashMap<String, String> {
+        self.vars.read().clone()
+    }
+
+    /// Makes sure the client's values of `names` are known.
+    pub async fn ensure(&self, names: &[String]) -> Result<()> {
+        let Some(asker) = &self.asker else { return Ok(()) };
+        let unknown: Vec<String> = {
+            let (vars, checked) = (self.vars.read(), self.checked.read());
+            names
+                .iter()
+                .filter(|n| !rargo_proto::env_allowed(n) && !vars.contains_key(*n) && !checked.contains(*n))
+                .cloned()
+                .collect()
+        };
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let answers = asker(unknown.clone()).await?;
+        let (mut vars, mut checked) = (self.vars.write(), self.checked.write());
+        for (name, value) in answers {
+            if let Some(v) = value {
+                vars.insert(name, v);
+            }
+        }
+        checked.extend(unknown);
+        Ok(())
+    }
+}
+
 pub struct Request {
     pub spec: ActionSpec,
     pub view: Arc<dyn View>,
     /// The requesting client's environment, consulted for variables the
     /// action declares an interest in.
-    pub client_env: Arc<HashMap<String, String>>,
+    pub client_env: Arc<ClientEnv>,
     pub uid: u32,
     pub gid: u32,
     pub prio: Priority,
@@ -219,7 +286,7 @@ impl Engine {
 
     /// The spec with the client's values for every variable actions under
     /// this key have declared an interest in.
-    fn effective_spec(&self, base: &ActionSpec, client_env: &HashMap<String, String>) -> (ActionSpec, Hash) {
+    fn effective_spec(&self, base: &ActionSpec, client_env: &ClientEnv) -> (ActionSpec, Hash) {
         let base_key = base.weak_key();
         let needs = self.traces.needs_env(&base_key);
         if needs.is_empty() {
@@ -231,7 +298,7 @@ impl Engine {
                 continue;
             }
             if let Some(val) = client_env.get(&v) {
-                spec.env.insert(v.into_bytes(), val.clone().into_bytes());
+                spec.env.insert(v.into_bytes(), val.into_bytes());
             }
         }
         (spec, base_key)
@@ -334,7 +401,7 @@ impl Engine {
 
     /// The key the action's traces are stored under (its declared
     /// environment variables folded in).
-    pub fn effective_key(&self, spec: &ActionSpec, client_env: &HashMap<String, String>) -> Hash {
+    pub fn effective_key(&self, spec: &ActionSpec, client_env: &ClientEnv) -> Hash {
         let (eff, base_key) = self.effective_spec(spec, client_env);
         if eff.env.len() == spec.env.len() { base_key } else { eff.weak_key() }
     }
@@ -344,6 +411,9 @@ impl Engine {
         let mut announced = false;
         let mut waited: Option<(Hash, Hash)> = None;
         loop {
+            // Variables actions under this key declared: the client's
+            // values must be known before the key can be formed.
+            req.client_env.ensure(&self.traces.needs_env(&req.spec.weak_key())).await?;
             let (spec, base_key) = self.effective_spec(&req.spec, &req.client_env);
             let key = if spec.env.len() == req.spec.env.len() { base_key } else { spec.weak_key() };
 
@@ -439,6 +509,7 @@ impl Engine {
             let declared = (req.declared_env)(&result, &self.store);
             if !declared.is_empty() {
                 let added = self.traces.add_needs_env(&base_key, &declared);
+                req.client_env.ensure(&added).await?;
                 let relevant = added
                     .iter()
                     .any(|v| !spec.env.contains_key(v.as_bytes()) && req.client_env.contains_key(v));

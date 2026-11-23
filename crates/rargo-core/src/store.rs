@@ -79,6 +79,8 @@ pub struct Store {
     cold_disk: AtomicU64,
     /// Readers: anything reading or adding chunks. Writer: chunk collection.
     cold_lock: std::sync::RwLock<()>,
+    /// Bumped whenever a blob stops being whole or stops existing.
+    generation: AtomicU64,
 }
 
 fn now_secs() -> u64 {
@@ -178,6 +180,7 @@ impl Store {
             reflink,
             dev,
             tmp_seq: AtomicU64::new(0),
+            generation: AtomicU64::new(1),
             total: AtomicU64::new(total),
             chunks,
             cold,
@@ -411,8 +414,15 @@ impl Store {
         Ok(())
     }
 
+    /// Changes whenever something may have left the store. Whoever
+    /// remembers "everything under X is present" remembers it per generation.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     fn drop_cold(&self, h: &Hash) -> Option<u64> {
         let (_, cm) = self.cold.remove(h)?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.db.delete(Table::Cold, &h.0);
         Some(cm.added)
     }
@@ -530,6 +540,7 @@ impl Store {
 
     fn forget_hot(&self, h: &Hash) {
         if let Some((_, m)) = self.meta.remove(h) {
+            self.generation.fetch_add(1, Ordering::SeqCst);
             self.total.fetch_sub(m.size, Ordering::Relaxed);
         }
         self.db.delete(Table::Blobs, &h.0);

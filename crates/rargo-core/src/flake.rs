@@ -14,7 +14,10 @@
 use crate::buildview::SynthEnt;
 use crate::db::Table;
 use crate::hash::{Hash, KeyHasher};
+use crate::build::Daemon;
+use crate::snapshot::Snapshot;
 use crate::store::Store;
+use rargo_proto::tree::Node;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -52,34 +55,29 @@ fn nix() -> Command {
     c
 }
 
-/// Hash of the files that define the flake: `flake.nix`, `flake.lock` and
-/// every other `.nix` file at the top level or under `nix/`.
-pub fn source_key(root: &Path) -> Result<Hash> {
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for e in std::fs::read_dir(root)?.flatten() {
-        let p = e.path();
-        if p.is_file() && (p.extension().is_some_and(|x| x == "nix") || p.file_name().is_some_and(|n| n == "flake.lock")) {
-            files.push(p);
+/// Whether a path (relative to the worktree root) is one of the files that
+/// define the flake: `flake.nix`, `flake.lock`, every other `.nix` file at
+/// the top level or under `nix/`, and the toolchain file a devShell
+/// commonly reads.
+fn defines_flake(rel: &[u8]) -> bool {
+    let top = !rel.contains(&b'/');
+    let nix = rel.ends_with(b".nix");
+    (top && (nix || rel == b"flake.lock" || rel == b"rust-toolchain" || rel == b"rust-toolchain.toml"))
+        || (rel.starts_with(b"nix/") && nix)
+}
+
+/// Hash of the files that define the flake.
+pub fn source_key(snap: &Snapshot) -> Hash {
+    let mut h = KeyHasher::new("flake-source-v2");
+    snap.walk(&mut |rel, node| match node {
+        Node::Dir(_) => rel == b"nix" || rel.starts_with(b"nix/"),
+        Node::File { hash, .. } if defines_flake(rel) => {
+            h.field(rel).field(hash);
+            false
         }
-    }
-    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "nix") {
-                out.push(p);
-            }
-        }
-    }
-    walk(&root.join("nix"), &mut files);
-    files.sort();
-    let mut h = KeyHasher::new("flake-source-v1");
-    for f in files {
-        h.field(f.strip_prefix(root).unwrap_or(&f).as_os_str().as_encoded_bytes());
-        h.field(&std::fs::read(&f)?);
-    }
-    Ok(h.finish())
+        _ => false,
+    });
+    h.finish()
 }
 
 fn store_names(text: &str, out: &mut BTreeSet<String>) {
@@ -151,10 +149,12 @@ fn evaluate(root: &Path, uid: u32, gid: u32) -> Result<FlakeEnv> {
     Ok(FlakeEnv { env, closure, id: h.finish() })
 }
 
-/// The flake environment of the worktree at `root`, evaluated once per
-/// distinct set of flake files.
-pub fn resolve(store: &Store, root: &Path, uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
-    let key = source_key(root)?;
+/// The flake environment of a snapshot, evaluated once per distinct set of
+/// flake files. Evaluation happens in a scratch directory holding just
+/// those files.
+pub fn resolve(d: &Daemon, snap: &Snapshot, uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
+    let store = &d.engine.store;
+    let key = source_key(snap);
     let mut k = b"flake:".to_vec();
     k.extend_from_slice(&key.0);
     if let Some(v) = store.db().get(Table::Meta, &k) {
@@ -165,7 +165,15 @@ pub fn resolve(store: &Store, root: &Path, uid: u32, gid: u32) -> Result<Arc<Fla
             }
         }
     }
-    let env = evaluate(root, uid, gid)?;
+    let scratch = d.scratch("flake")?;
+    let env = snap
+        .materialize(&scratch, uid, gid, &|rel, node| match node {
+            Node::Dir(_) => rel == b"nix" || rel.starts_with(b"nix/"),
+            _ => defines_flake(rel),
+        })
+        .and_then(|()| evaluate(&scratch, uid, gid));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let env = env?;
     store.db().put(Table::Meta, &k, &bincode::serialize(&env)?);
     Ok(Arc::new(env))
 }

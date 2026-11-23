@@ -1,6 +1,6 @@
 [package]
 name = "rargo"
-description = "The rargo client: a drop-in for cargo build, check, test and run"
+description = "The rargo client: syncs a worktree and its environment to a rargo build server and brings back the results"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,12 @@ license.workspace = true
 [dependencies]
 rargo-proto = { path = "../rargo-proto" }
 libc.workspace = true
+blake3.workspace = true
+rayon.workspace = true
+serde.workspace = true
+bincode.workspace = true
+zstd.workspace = true
+toml = "0.8"
+
+[dev-dependencies]
+tempfile.workspace = true

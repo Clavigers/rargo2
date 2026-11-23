@@ -1,4 +1,4 @@
-//! Handling one client request: snapshot, plan, execute, present.
+//! Handling one client request: sync, plan, execute, present, deliver.
 
 use crate::buildview::*;
 use crate::engine::*;
@@ -6,10 +6,11 @@ use crate::expand::{self, EnvRule, Scripts};
 use crate::hash::Hash;
 use crate::parse::Parser;
 use crate::present::*;
-use crate::proto::ExecRequest;
+use crate::proto::{Delivery, ExecRequest, Write};
+use crate::session::Session;
 use crate::sandbox::NetMode;
 use crate::sched::Priority;
-use crate::snapshot::{RepoCache, Watcher, Worktree};
+use crate::snapshot::{Snapshot, Trees};
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
@@ -18,7 +19,6 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use rargo_plan as rp;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -29,10 +29,18 @@ use tokio::sync::watch;
 const PLAN_PATH: &str = "/.rargo-plan";
 
 pub struct Config {
-    /// rargod's private directory (store, mount point, socket).
+    /// rargod's private directory (store, mount point, scratch space).
     pub state_dir: PathBuf,
     /// The forked cargo.
     pub planner: PathBuf,
+    /// The server's cargo home: registry and git checkouts shared by every
+    /// client. Clients' own cargo configuration is laid over it per request.
+    pub cargo_home: PathBuf,
+    /// The user actions run as.
+    pub uid: u32,
+    pub gid: u32,
+    /// The server's own environment: where its toolchains and tools are.
+    pub server_env: HashMap<String, String>,
 }
 
 #[derive(Default)]
@@ -41,19 +49,22 @@ pub struct DaemonStats {
     pub plans_decoded: AtomicU64,
     pub verify_units: AtomicU64,
     pub verify_mismatches: AtomicU64,
+    /// Bytes of worktree content received from clients.
+    pub bytes_in: AtomicU64,
+    /// Bytes of artifacts sent to clients.
+    pub bytes_out: AtomicU64,
 }
 
 /// State shared by all requests.
 pub struct Daemon {
     /// Per worktree and toolchain: the last plan said the compiler is
     /// rargo's rustc fork.
-    fork_seen: DashMap<(PathBuf, String), bool>,
+    fork_seen: DashMap<(String, String), bool>,
     pub cfg: Config,
     pub engine: Arc<Engine>,
     pub memo: Arc<HostMemo>,
-    pub watcher: Arc<Watcher>,
-    pub repos: RepoCache,
-    pub worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
+    /// Every worktree state clients have synced.
+    pub trees: Arc<Trees>,
     pub parser: Parser,
     pub incr: crate::incr::IncrStore,
     /// Workers, when the server accepts them.
@@ -61,22 +72,57 @@ pub struct Daemon {
     /// The most recent drift report, for `--rargo-status`.
     pub drift_report: Mutex<Option<String>>,
     /// Who last built in each worktree, for the background drift check.
-    pub last_clients: Mutex<HashMap<PathBuf, crate::drift::LastClient>>,
+    pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
     plans: DashMap<Hash, Arc<PlanData>>,
     /// Target directories seen per worktree, masked in later views.
-    masks: DashMap<PathBuf, Vec<Vec<u8>>>,
+    masks: DashMap<String, Vec<Vec<u8>>>,
+    /// Downloads into the shared cargo home happen one at a time.
+    fetching: tokio::sync::Mutex<()>,
+    scratch_seq: AtomicU64,
     pub stats: DaemonStats,
+}
+
+/// A client's own cargo configuration, laid over the shared cargo home.
+pub struct Home {
+    /// A cargo home for unsandboxed cargo runs on behalf of this client:
+    /// its configuration files plus links to the shared downloads.
+    pub dir: PathBuf,
+    /// The configuration files present in `dir`.
+    pub files: Vec<String>,
 }
 
 /// One client request.
 pub struct Client {
     pub args: Vec<String>,
-    pub cwd: PathBuf,
-    pub env: Arc<HashMap<String, String>>,
+    /// The worktree root, current directory and cargo home as the client
+    /// knows them. Never opened here: they translate paths in messages and
+    /// arguments, and name where artifacts go on the client.
+    pub root: String,
+    pub cwd: String,
+    pub cargo_home: String,
+    pub env: Arc<ClientEnv>,
     pub uid: u32,
     pub gid: u32,
     pub prio: Priority,
     pub out: Output,
+    /// The connection, absent for builds the server runs for itself.
+    pub session: Option<Arc<Session>>,
+    pub snapshot: Arc<Snapshot>,
+    /// Stable identity of the client's worktree.
+    pub worktree: String,
+    /// HEAD and recent ancestors on the client (a hint, see D16).
+    pub commits: Arc<Vec<[u8; 20]>>,
+    pub home: Arc<Home>,
+}
+
+impl Client {
+    /// Places files and applies writes on the client.
+    pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) -> Result<()> {
+        match &self.session {
+            Some(s) => s.deliver(files, writes).await,
+            None => Ok(()),
+        }
+    }
 }
 
 /// A decoded plan with derived per-unit data.
@@ -336,8 +382,6 @@ struct Run {
     /// In a flake sandbox the forked cargo cannot run (its libraries are
     /// the host's); processes that ask for `$CARGO` get the flake's cargo.
     cargo_override: Option<String>,
-    wt_root: PathBuf,
-    head: Option<[u8; 20]>,
     policy: crate::policy::Policy,
     /// Re-run every unit that came from the cache, cleanly, and compare.
     verify: bool,
@@ -376,17 +420,18 @@ fn bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
-/// Variables passed from the client to every action. Everything else is
-/// withheld unless an action declares that it reads it.
-fn base_env(client: &HashMap<String, String>) -> BTreeMap<String, String> {
-    const EXACT: &[&str] = &[
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN",
-        "SSL_CERT_FILE", "SSL_CERT_DIR", "RUSTFLAGS", "RUSTDOCFLAGS",
-    ];
-    const PREFIXES: &[&str] = &["CARGO_", "RUSTC", "RUSTDOC", "RUST_", "LC_", "NIX_", "__CARGO"];
+/// The environment every action starts from: where things are on the
+/// server, and how the client wants cargo and rustc to behave. Everything
+/// else is withheld unless an action declares that it reads it.
+fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) -> BTreeMap<String, String> {
+    const SERVER: &[&str] =
+        &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"];
+    // Allowed through the protocol but only about presentation, which is
+    // applied when output is shown, or about rargo itself.
+    const NOT_FOR_ACTIONS: &[&str] = &["TERM", "NO_COLOR", "BROWSER", "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM"];
     const DROP_PREFIXES: &[&str] = &[
         "CARGO_PKG_", "CARGO_MANIFEST_", "CARGO_CRATE_", "CARGO_BIN_", "CARGO_CFG_", "CARGO_FEATURE_",
-        "CARGO_TERM_", "CARGO_DEP_",
+        "CARGO_TERM_", "CARGO_DEP_", "RARGO_",
     ];
     const DROP: &[&str] = &[
         "CARGO_HOME", "CARGO_MAKEFLAGS", "CARGO_PRIMARY_PACKAGE", "CARGO_TARGET_TMPDIR", "CARGO_SBOM_PATH",
@@ -394,10 +439,16 @@ fn base_env(client: &HashMap<String, String>) -> BTreeMap<String, String> {
         "CARGO_RUSTC_CURRENT_DIR",
     ];
     let mut out = BTreeMap::new();
+    for (k, v) in server {
+        if SERVER.contains(&k.as_str()) || k.starts_with("NIX_") {
+            out.insert(k.clone(), v.clone());
+        }
+    }
     for (k, v) in client {
-        let wanted = EXACT.contains(&k.as_str()) || PREFIXES.iter().any(|p| k.starts_with(p));
-        let dropped = DROP.contains(&k.as_str()) || DROP_PREFIXES.iter().any(|p| k.starts_with(p));
-        if wanted && !dropped {
+        let dropped = DROP.contains(&k.as_str())
+            || NOT_FOR_ACTIONS.contains(&k.as_str())
+            || DROP_PREFIXES.iter().any(|p| k.starts_with(p));
+        if rargo_proto::env_allowed(k) && !dropped {
             out.insert(k.clone(), v.clone());
         }
     }
@@ -409,29 +460,15 @@ fn base_env(client: &HashMap<String, String>) -> BTreeMap<String, String> {
     out
 }
 
-fn find_worktree_root(cwd: &Path) -> Result<PathBuf> {
-    let mut cur = Some(cwd);
-    while let Some(d) = cur {
-        if d.join(".git").exists() {
-            return Ok(d.to_path_buf());
-        }
-        cur = d.parent();
-    }
-    bail!("`{}` is not inside a git worktree; rargo needs one to take snapshots", cwd.display())
-}
-
-fn real_cargo_home(env: &HashMap<String, String>) -> PathBuf {
-    match env.get("CARGO_HOME") {
-        Some(h) if !h.is_empty() => PathBuf::from(h),
-        _ => PathBuf::from(env.get("HOME").map(|s| s.as_str()).unwrap_or("/root")).join(".cargo"),
-    }
-}
-
 impl Daemon {
-    pub fn new(cfg: Config, engine: Arc<Engine>, watcher: Arc<Watcher>) -> Daemon {
+    pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
         let incr = crate::incr::IncrStore::new(engine.store.clone());
+        let trees = Trees::new(engine.store.clone());
         Daemon {
+            trees,
+            fetching: tokio::sync::Mutex::new(()),
+            scratch_seq: AtomicU64::new(0),
             incr,
             pool: OnceLock::new(),
             drift_report: Mutex::new(None),
@@ -439,9 +476,6 @@ impl Daemon {
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),
-            watcher,
-            repos: RepoCache::default(),
-            worktrees: Mutex::new(HashMap::new()),
             parser,
             plans: DashMap::new(),
             fork_seen: DashMap::new(),
@@ -450,13 +484,46 @@ impl Daemon {
         }
     }
 
-    fn worktree(&self, root: &Path) -> Result<Arc<Worktree>> {
-        if let Some(w) = self.worktrees.lock().get(root) {
-            return Ok(w.clone());
+    /// A fresh scratch directory on the store's filesystem. The caller
+    /// removes it.
+    pub fn scratch(&self, what: &str) -> Result<PathBuf> {
+        let n = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
+        let dir = self.store().tmp_dir(&format!("{what}-{}-{n}", std::process::id()))?;
+        Ok(dir)
+    }
+
+    /// The cargo home overlay for a client's configuration files.
+    pub fn home(&self, files: &[(String, Vec<u8>)]) -> Result<Arc<Home>> {
+        const ALLOWED: &[&str] = &["config.toml", "config", "credentials.toml", "credentials"];
+        let mut files: Vec<&(String, Vec<u8>)> = files.iter().filter(|(n, _)| ALLOWED.contains(&n.as_str())).collect();
+        files.sort();
+        let mut h = crate::hash::KeyHasher::new("cargo-home-overlay");
+        for (name, content) in &files {
+            h.field(name.as_bytes()).field(content);
         }
-        let w = Worktree::open(root, self.engine.content.clone(), self.watcher.clone(), &self.repos)?;
-        self.worktrees.lock().insert(root.to_path_buf(), w.clone());
-        Ok(w)
+        let dir = self.cfg.state_dir.join("homes").join(h.finish().hex());
+        let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+        if !dir.join(".complete").exists() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            crate::snapshot::chown(&dir, self.cfg.uid, self.cfg.gid);
+            for (name, content) in &files {
+                let p = dir.join(name);
+                std::fs::write(&p, content)?;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                crate::snapshot::chown(&p, self.cfg.uid, self.cfg.gid);
+            }
+            // Downloads and the locks that guard them are the shared ones.
+            for shared in ["registry", "git", ".package-cache", ".package-cache-mutate", ".global-cache"] {
+                let link = dir.join(shared);
+                if std::fs::symlink_metadata(&link).is_err() {
+                    std::os::unix::fs::symlink(self.cfg.cargo_home.join(shared), &link)?;
+                }
+            }
+            std::fs::write(dir.join(".complete"), b"")?;
+        }
+        Ok(Arc::new(Home { dir, files: names }))
     }
 
     fn store(&self) -> &Arc<Store> {
@@ -535,9 +602,7 @@ impl Daemon {
         let mut live = HashSet::new();
         self.engine.traces.mark(&mut live);
         self.incr.mark(&mut live);
-        for wt in self.worktrees.lock().values() {
-            wt.mark(&mut live);
-        }
+        self.trees.mark(&mut live);
         let fs = self.engine.fs.clone();
         self.store().sweep(&live, min_age_secs, &|h| fs.forget_backing(h))
     }
@@ -589,11 +654,8 @@ impl Observer for PlanObserver {
 }
 
 struct Prepared {
-    root: PathBuf,
-    /// HEAD commit of the worktree, if it has one.
-    head: Option<[u8; 20]>,
+    snapshot: Arc<Snapshot>,
     policy: crate::policy::Policy,
-    cargo_home: PathBuf,
     /// The view the planner runs against (always the host root).
     plan_base: Arc<BaseView>,
     flake: Option<Arc<crate::flake::FlakeEnv>>,
@@ -603,25 +665,15 @@ struct Prepared {
     env: BTreeMap<String, String>,
 }
 
-async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
-    let root = find_worktree_root(&c.cwd)?;
-    let worktree = d.worktree(&root)?;
-    let root = worktree.root.clone();
-    let wt = worktree.clone();
-    let snapshot = tokio::task::spawn_blocking(move || wt.snapshot()).await??;
+async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
     // The repository's policy file, as of this snapshot.
-    let policy = match snapshot.lookup(b"/", crate::policy::POLICY_FILE.as_bytes()) {
-        Looked::File(f) => {
-            let hash = d.engine.content.hash(&f.src)?;
-            let text = d.store().read(&hash)?;
-            crate::policy::Policy::parse(&String::from_utf8_lossy(&text)).map_err(|e| anyhow!(e))?
-        }
-        _ => Default::default(),
+    let policy = match snapshot.read(crate::policy::POLICY_FILE.as_bytes()) {
+        Some(text) => crate::policy::Policy::parse(&String::from_utf8_lossy(&text)).map_err(|e| anyhow!(e))?,
+        None => Default::default(),
     };
-    let cargo_home = real_cargo_home(&c.env);
     let generation = d.memo.advance();
     let mut masks = vec![vjoin(WORKTREE_AT, b"target")];
-    if let Some(extra) = d.masks.get(&root) {
+    if let Some(extra) = d.masks.get(&c.worktree) {
         for m in extra.iter() {
             if !masks.contains(m) {
                 masks.push(m.clone());
@@ -629,10 +681,11 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
         }
     }
     // A flake, when present and not switched off, defines the environment.
-    let flake = if root.join("flake.nix").is_file() && policy.flake.enabled != Some(false) {
-        let (store, r, uid, gid) = (d.store().clone(), root.clone(), c.uid, c.gid);
+    let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
+    let flake = if has_flake && policy.flake.enabled != Some(false) {
+        let (dd, snap, uid, gid) = (d.clone(), snapshot.clone(), c.uid, c.gid);
         Some(
-            tokio::task::spawn_blocking(move || crate::flake::resolve(&store, &r, uid, gid))
+            tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, uid, gid))
                 .await?
                 .context("evaluating the repository's flake (set `flake.enabled = false` in .rargo.toml to build without it)")?,
         )
@@ -652,9 +705,9 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
         None => None,
     };
     let parts = ViewParts {
-        snapshot,
-        git_path: root.join(".git"),
-        cargo_home: cargo_home.clone(),
+        snapshot: snapshot.clone(),
+        cargo_home: d.cfg.cargo_home.clone(),
+        home_files: c.home.files.iter().map(|n| (vjoin(CARGO_HOME_AT, n.as_bytes()), c.home.dir.join(n))).collect(),
         masks,
         hidden: vec![d.cfg.state_dir.as_os_str().as_encoded_bytes().to_vec()],
         planner: d.cfg.planner.clone(),
@@ -663,18 +716,17 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
     let base = parts.build(d.memo.clone(), generation, false);
     let plan_base = if flake.is_some() { Arc::new(parts.build(d.memo.clone(), generation, true)) } else { Arc::new(parts.build(d.memo.clone(), generation, false)) };
     let tr = Translator::new(vec![
-        (String::from_utf8_lossy(WORKTREE_AT).into_owned(), root.to_string_lossy().into_owned()),
-        (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), cargo_home.to_string_lossy().into_owned()),
+        (String::from_utf8_lossy(WORKTREE_AT).into_owned(), c.root.clone()),
+        (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), c.cargo_home.clone()),
     ]);
-    let cwd = c.cwd.canonicalize().unwrap_or_else(|_| c.cwd.clone());
-    let sandbox_cwd = tr.to_canonical(&cwd.to_string_lossy());
-    let head = git2::Repository::open(&root)
-        .ok()
-        .and_then(|r| r.head().ok().and_then(|h| h.target()))
-        .and_then(|o| <[u8; 20]>::try_from(o.as_bytes()).ok());
-    let mut env = base_env(&c.env);
+    let sandbox_cwd = tr.to_canonical(&c.cwd);
+    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
+        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
+    }
+    let client_env = c.env.to_map();
+    let mut env = base_env(&d.cfg.server_env, &client_env);
     if let Some(f) = &flake {
-        // The flake's variables replace the host's: PATH, compilers and
+        // The flake's variables replace the server's: PATH, compilers and
         // their flags all come from the devShell. HOME is a scratch place.
         for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
             env.remove(k);
@@ -688,10 +740,10 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Prepared> {
         env.insert("RUSTC_WRAPPER".into(), String::new());
         env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     }
-    for (k, v) in policy.passed_env(&c.env) {
+    for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
-    Ok(Prepared { root, head, policy, cargo_home, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
+    Ok(Prepared { snapshot, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
 }
 
 struct Planned {
@@ -777,7 +829,7 @@ async fn plan_with(
     let lock_writes = Manifest {
         entries: r.outputs.entries.iter().filter(|(p, _)| p.ends_with(b"/Cargo.lock")).cloned().collect(),
     };
-    apply_writes(d.store().clone(), &p.tr, c.uid, c.gid, &[], &lock_writes).await?;
+    apply_writes(c, &p.tr, &[], &lock_writes).await?;
     let data = match d.plans.get(hash) {
         Some(pd) => pd.clone(),
         None => {
@@ -796,14 +848,23 @@ async fn plan_with(
 }
 
 /// Runs things only a networked, unsandboxed cargo can do (installing the
-/// toolchain, updating the index, downloading crates, writing the lockfile),
-/// as the client, in the real worktree.
-async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, args: &[String]) -> Result<bool> {
-    let planner = d.cfg.planner.clone();
-    let cwd = c.cwd.clone();
-    let env: HashMap<String, String> = (*c.env).clone();
-    let (uid, gid) = (c.uid, c.gid);
+/// toolchain, updating the index, downloading crates, writing the lockfile)
+/// on the server, in a scratch copy of the snapshot, into the shared cargo
+/// home. A lockfile cargo wrote or changed goes back to the client, and the
+/// returned snapshot is the client's worktree with it applied. `None` when
+/// the fetch failed or was not allowed.
+async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -> Result<Option<Arc<Snapshot>>> {
     let mut fetch_args = vec!["fetch".to_string()];
+    let scratch = d.scratch("fetch")?;
+    let scratch_s = scratch.to_string_lossy().into_owned();
+    // Paths the user typed refer to the client's worktree.
+    let local = |v: &str| -> String {
+        let canon = p.tr.to_canonical(v);
+        match canon.strip_prefix("/w") {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("{scratch_s}{rest}"),
+            _ => v.to_string(),
+        }
+    };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -811,19 +872,38 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, args: &[String]) -> Result<bool
             "--manifest-path" | "--config" | "--lockfile-path" => {
                 fetch_args.push(a.clone());
                 if let Some(v) = it.next() {
-                    fetch_args.push(v.clone());
+                    fetch_args.push(if a == "--config" { v.clone() } else { local(v) });
                 }
             }
-            "--locked" | "--frozen" | "--offline" => return Ok(false),
-            _ if a.starts_with("--manifest-path=") || a.starts_with("--config=") => fetch_args.push(a.clone()),
+            "--locked" | "--frozen" | "--offline" => {
+                let _ = std::fs::remove_dir_all(&scratch);
+                return Ok(None);
+            }
+            _ if a.starts_with("--manifest-path=") => {
+                fetch_args.push(format!("--manifest-path={}", local(&a["--manifest-path=".len()..])))
+            }
+            _ if a.starts_with("--config=") => fetch_args.push(a.clone()),
             _ => {}
         }
     }
-    let out = tokio::task::spawn_blocking(move || {
+    let _one_at_a_time = d.fetching.lock().await;
+    let planner = d.cfg.planner.clone();
+    let cwd = PathBuf::from(format!("{scratch_s}{}", &p.sandbox_cwd[2..]));
+    // The server's own environment (so the toolchain manager and the
+    // network work), steered by what the client is allowed to pass.
+    let mut env: HashMap<String, String> = d.cfg.server_env.clone();
+    for (k, v) in base_env(&d.cfg.server_env, &c.env.to_map()) {
+        env.insert(k, v);
+    }
+    env.insert("CARGO_HOME".into(), c.home.dir.to_string_lossy().into_owned());
+    let (uid, gid) = (c.uid, c.gid);
+    let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
+    let out = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
+        snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         let run = |program: &Path, args: &[String]| {
             let mut cmd = std::process::Command::new(program);
-            cmd.args(args).current_dir(&cwd).env_clear().envs(&env).env("RUSTC_WRAPPER", "");
+            cmd.args(args).current_dir(&cwd).env_clear().envs(&env);
             cmd.stdin(std::process::Stdio::null());
             if uid != unsafe { libc::geteuid() } {
                 cmd.uid(uid).gid(gid);
@@ -832,11 +912,53 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, args: &[String]) -> Result<bool
         };
         // Asking the proxy for its version installs a missing toolchain.
         let _ = run(Path::new("rustc"), &["-V".to_string()]);
-        run(&planner, &fetch_args)
+        Ok(run(&planner, &fetch_args)?)
     })
-    .await??;
-    c.out.raw_err(&out.stderr);
-    Ok(out.status.success())
+    .await?;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            return Err(e);
+        }
+    };
+    c.out.raw_err(String::from_utf8_lossy(&out.stderr).replace(&scratch_s, &c.root).as_bytes());
+    let mut snapshot = p.snapshot.clone();
+    let mut writes = Vec::new();
+    if out.status.success() {
+        // Lockfiles cargo wrote or changed.
+        let mut stack = vec![scratch.clone()];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let Ok(ft) = e.file_type() else { continue };
+                let path = e.path();
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_file() && e.file_name() == "Cargo.lock" {
+                    let Ok(rel) = path.strip_prefix(&scratch) else { continue };
+                    let rel_b = rel.as_os_str().as_encoded_bytes();
+                    let content = std::fs::read(&path)?;
+                    let hash = d.store().put_bytes(&content)?;
+                    let node = rargo_proto::tree::Node::File { hash: hash.0, size: content.len() as u64, exec: false };
+                    if snapshot.node(rel_b).as_ref() != Some(&node) {
+                        snapshot = snapshot.with_file(rel_b, Some(node))?;
+                        writes.push(Write::File {
+                            path: format!("{}/{}", c.root, rel.to_string_lossy()),
+                            hash: hash.0,
+                            size: content.len() as u64,
+                            exec: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+    if !out.status.success() {
+        return Ok(None);
+    }
+    c.deliver(Vec::new(), writes).await?;
+    Ok(Some(snapshot))
 }
 
 fn needs_network(stderr: &[u8]) -> bool {
@@ -856,11 +978,20 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         no_cache_tests = true;
     }
 
-    let mut p = prepare(d, c).await?;
-    if !c.env.contains_key("RARGO_DRIFT_CHECK") {
-        d.last_clients.lock().insert(
-            p.root.clone(),
-            crate::drift::LastClient { env: c.env.clone(), uid: c.uid, gid: c.gid, at: Instant::now(), checked_head: None },
+    let mut p = prepare(d, c, c.snapshot.clone()).await?;
+    if c.session.is_some() && !c.worktree.is_empty() {
+        d.trees.remember(&c.worktree, &c.snapshot);
+        let mut last = d.last_clients.lock();
+        let checked = last.get(&c.worktree).and_then(|l| l.checked);
+        last.insert(
+            c.worktree.clone(),
+            crate::drift::LastClient {
+                env: Arc::new(c.env.to_map()),
+                home: c.home.clone(),
+                root: c.root.clone(),
+                at: Instant::now(),
+                checked,
+            },
         );
     }
     // With rargo's rustc, `check` is a build that stops at metadata: the
@@ -870,8 +1001,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     // from a plan; what the last plan for this worktree said is remembered.
     let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
     // Opt-in: measured slower and larger in the 20-agent benchmark (D23).
-    let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").map(|v| v.as_str()) == Some("1"));
-    let fork_key = (p.root.clone(), c.env.get("RUSTUP_TOOLCHAIN").cloned().unwrap_or_default());
+    let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").as_deref() == Some("1"));
+    let fork_key = (c.worktree.clone(), c.env.get("RUSTUP_TOOLCHAIN").unwrap_or_default());
     let mut as_build = check_at.is_some() && d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
     let mut fetched = false;
     let mut plan_args;
@@ -891,10 +1022,10 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
             }
             PlanOutcome::Failed { stderr, .. } if !fetched && needs_network(&stderr) => {
                 fetched = true;
-                if !fetch(d, c, &args).await? {
+                let Some(snapshot) = fetch(d, c, &p, &args).await? else {
                     return Ok(Finish::Code(101));
-                }
-                p = prepare(d, c).await?;
+                };
+                p = prepare(d, c, snapshot).await?;
             }
             PlanOutcome::Failed { stderr, stdout, code } => {
                 c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&stdout)).as_bytes());
@@ -911,7 +1042,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     for dir in [&plan.target_dir, &plan.build_dir] {
         let b = dir.as_bytes().to_vec();
         if vpath_starts_with(&b, WORKTREE_AT) && b != vjoin(WORKTREE_AT, b"target") {
-            let mut m = d.masks.entry(p.root.clone()).or_default();
+            let mut m = d.masks.entry(c.worktree.clone()).or_default();
             if !m.contains(&b) {
                 m.push(b);
             }
@@ -927,12 +1058,19 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     );
     let c2 = Arc::new(Client {
         args: c.args.clone(),
+        root: c.root.clone(),
         cwd: c.cwd.clone(),
+        cargo_home: c.cargo_home.clone(),
         env: c.env.clone(),
         uid: c.uid,
         gid: c.gid,
         prio: c.prio,
         out,
+        session: c.session.clone(),
+        snapshot: p.snapshot.clone(),
+        worktree: c.worktree.clone(),
+        commits: c.commits.clone(),
+        home: c.home.clone(),
     });
     c2.out.err_text(&String::from_utf8_lossy(&planned.stderr));
 
@@ -959,8 +1097,6 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         explain: c.env.contains_key("RARGO_EXPLAIN"),
         root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
         cargo_override: p.flake.as_ref().and_then(|f| f.which("cargo")),
-        wt_root: p.root.clone(),
-        head: p.head,
         policy: p.policy.clone(),
         verify: c.env.contains_key("RARGO_VERIFY"),
         verified: AtomicU64::new(0),
@@ -1107,11 +1243,11 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         return Ok(Finish::Code(0));
     }
     // Place what was asked for into the real target directory.
-    run.materialize_roots(&p.root).await?;
+    run.materialize_roots().await?;
     run.write_depinfo().await?;
     finished();
 
-    run.steps(&p).await
+    run.steps().await
 }
 
 struct UnitObserver {
@@ -1300,17 +1436,10 @@ impl Run {
         })
     }
 
-    /// Whether `commit` is HEAD of this worktree or one of its ancestors.
+    /// Whether `commit` is HEAD of the client's worktree or one of the
+    /// recent ancestors it named.
     fn is_ancestor_of_head(&self, commit: &[u8; 20]) -> bool {
-        let Some(head) = self.head else { return false };
-        if head == *commit {
-            return true;
-        }
-        let Ok(repo) = git2::Repository::open(&self.wt_root) else { return false };
-        match (git2::Oid::from_bytes(&head), git2::Oid::from_bytes(commit)) {
-            (Ok(h), Ok(c)) => repo.graph_descendant_of(h, c).unwrap_or(false),
-            _ => false,
-        }
+        self.c.commits.contains(commit)
     }
 
     async fn exec_unit(self: &Arc<Self>, i: usize) -> Result<UState> {
@@ -1459,7 +1588,7 @@ impl Run {
             label: u.desc.clone(),
         };
         let crate_key = spec.weak_key();
-        let wt = self.wt_root.to_string_lossy().into_owned();
+        let wt = self.c.worktree.clone();
         let mut seed = match &incr_dir {
             Some(_) => self.d.incr.pick(&crate_key, &wt, &|c| self.is_ancestor_of_head(c)),
             None => None,
@@ -1638,7 +1767,7 @@ impl Run {
         {
             let state = crate::incr::apply_changes(dir, seed.as_ref().map(|(_, m, _)| &**m), &outcome.side);
             if !state.entries.is_empty() {
-                self.d.incr.save(&crate_key, &wt, self.head, &state);
+                self.d.incr.save(&crate_key, &wt, self.c.commits.first().copied(), &state);
             }
         }
         let r = outcome.result.clone();
@@ -2041,8 +2170,7 @@ impl Run {
     /// the process do directly.
     async fn apply_worktree_writes(&self, m: &Manifest) -> Result<()> {
         let plan = self.plan();
-        apply_writes(self.d.store().clone(), &self.c.out.tr, self.c.uid, self.c.gid, &[&plan.target_dir, &plan.build_dir], m)
-            .await
+        apply_writes(&self.c, &self.c.out.tr, &[&plan.target_dir, &plan.build_dir], m).await
     }
 
     /// The files cargo's `.d` file for root unit `root` lists (cargo's
@@ -2142,37 +2270,24 @@ impl Run {
                 writes.push((dest, text));
             }
         }
-        let (uid, gid) = (self.c.uid, self.c.gid);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            for (dest, text) in writes {
-                match text {
-                    // Unchanged: leave the file (and its mtime) alone.
-                    Some(t) if std::fs::read_to_string(&dest).ok().as_deref() == Some(t.as_str()) => {}
-                    Some(t) => {
-                        if let Some(parent) = dest.parent() {
-                            mkdir_owned(parent, uid, gid)?;
-                        }
-                        let tmp = dest.with_extension("d.rargo-tmp");
-                        std::fs::write(&tmp, t)?;
-                        chown(&tmp, uid, gid);
-                        std::fs::rename(&tmp, &dest)?;
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(&dest);
-                    }
-                }
-            }
-            Ok(())
-        })
-        .await?
+        let writes: Vec<Write> = writes
+            .into_iter()
+            .map(|(dest, text)| Write::Text { path: dest.to_string_lossy().into_owned(), text })
+            .collect();
+        self.c.deliver(Vec::new(), writes).await
     }
 
-    /// Links the requested artifacts into the real target directory.
-    async fn materialize_roots(&self, _root: &Path) -> Result<()> {
+    /// Sends the requested artifacts to the client's target directory.
+    async fn materialize_roots(&self) -> Result<()> {
         let plan = self.plan();
-        // `(blob, executable, destination, own copy)`.
-        let mut jobs: Vec<(Hash, bool, PathBuf, bool)> = Vec::new();
-        let mut stale: Vec<(Hash, bool, PathBuf)> = Vec::new();
+        let tr = &self.c.out.tr;
+        let mut files: Vec<Delivery> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut push = |files: &mut Vec<Delivery>, path: String, hash: &Hash, exec: bool, size: u64, own: bool| {
+            if seen.insert(path.clone()) {
+                files.push(Delivery { path, hash: hash.0, size, exec, own });
+            }
+        };
         // Units whose executables rargo runs itself in this request.
         let run_here: HashSet<u32> = plan
             .steps
@@ -2186,95 +2301,57 @@ impl Run {
             let u = &plan.units[ri as usize];
             let Some((r, _)) = self.results[ri as usize].get() else { continue };
             for o in &u.outputs {
-                let Some(MEntry::File { hash, exec, .. }) = r.outputs.get(o.path.as_bytes()) else { continue };
-                // Names cargo links (it removes the old file first): shared.
+                let Some(MEntry::File { hash, exec, size }) = r.outputs.get(o.path.as_bytes()) else { continue };
+                // Names cargo links (it removes the old file first): the
+                // client may share one copy between worktrees.
                 for d in o.hardlink.iter().chain(o.export_path.iter()) {
-                    jobs.push((*hash, *exec, PathBuf::from(self.c.out.tr.path(d)), false));
+                    push(&mut files, tr.path(d), hash, *exec, *size, false);
                 }
                 // An executable at its own path, where rustc writes it in
                 // place. Wanted when the user asked for executables (test
-                // binaries have no other name), not when rargo ran them.
-                // A file of its own: a read-only shared inode would make
-                // stock cargo's next compile of it fail, and a writable one
-                // would let it overwrite the store.
-                if u.executable.as_deref() == Some(o.path.as_str()) {
-                    let dest = PathBuf::from(self.c.out.tr.path(&o.path));
-                    if run_here.contains(&ri) {
-                        // Not placed; but a link into the store left there
-                        // by an older rargo would break stock cargo.
-                        stale.push((*hash, *exec, dest));
-                    } else {
-                        jobs.push((*hash, *exec, dest, true));
-                    }
+                // binaries have no other name), not when rargo ran them
+                // here. A file of its own: stock cargo's next compile
+                // writes over it.
+                if u.executable.as_deref() == Some(o.path.as_str()) && !run_here.contains(&ri) {
+                    push(&mut files, tr.path(&o.path), hash, *exec, *size, true);
                 }
             }
         }
         // Generated documentation: every file rustdoc wrote, the later run
         // winning where several wrote the same file.
-        let mut docs: BTreeMap<&[u8], (Hash, bool)> = BTreeMap::new();
+        let mut docs: BTreeMap<&[u8], (Hash, bool, u64)> = BTreeMap::new();
         for &i in &self.pd.doc_order {
             let (Some(dir), Some((r, _))) = (&self.pd.doc_dir[i], self.results[i].get()) else { continue };
             for (path, e) in &r.outputs.entries {
-                if let (MEntry::File { hash, exec, .. }, true) = (e, vpath_starts_with(path, dir)) {
-                    docs.insert(path, (*hash, *exec));
+                if let (MEntry::File { hash, exec, size }, true) = (e, vpath_starts_with(path, dir)) {
+                    docs.insert(path, (*hash, *exec, *size));
                 }
             }
         }
-        for (path, (hash, exec)) in docs {
+        for (path, (hash, exec, size)) in docs {
             // rustdoc rewrites its shared files in place on the next run.
-            jobs.push((hash, exec, PathBuf::from(self.c.out.tr.path(&String::from_utf8_lossy(path))), true));
+            push(&mut files, tr.path(&String::from_utf8_lossy(path)), &hash, exec, size, true);
         }
-        if jobs.is_empty() && stale.is_empty() {
+        if files.is_empty() {
             return Ok(());
         }
-        let store = self.d.store().clone();
-        let (uid, gid) = (self.c.uid, self.c.gid);
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            for (hash, exec, dest) in stale {
-                // A link into the store, or any read-only file (an earlier
-                // rargo's link into a store since cleared): rustc would
-                // refuse to write over it, and it writes this path anyway.
-                let read_only = std::fs::metadata(&dest).map(|m| m.mode() & 0o222 == 0).unwrap_or(false);
-                if read_only || store.is_linked(&hash, exec, &dest) {
-                    let _ = std::fs::remove_file(&dest);
-                }
+        // What cargo leaves at the top of a target directory it creates.
+        let mut writes = Vec::new();
+        let mut tagged: HashSet<String> = HashSet::new();
+        for dir in [&plan.target_dir, &plan.build_dir] {
+            let dir = tr.path(dir);
+            if tagged.insert(dir.clone()) {
+                writes.push(Write::Text {
+                    path: format!("{dir}/CACHEDIR.TAG"),
+                    text: Some(rargo_proto::CACHEDIR_TAG.to_string()),
+                });
             }
-            let mut made: HashSet<PathBuf> = HashSet::new();
-            for (hash, exec, dest, own) in jobs {
-                if !own && store.is_linked(&hash, exec, &dest) {
-                    continue;
-                }
-                if let Some(parent) = dest.parent() {
-                    if made.insert(parent.to_path_buf()) {
-                        mkdir_owned(parent, uid, gid)?;
-                    }
-                }
-                // Already the same content (and, for an own copy, not the
-                // store's inode): nothing to do.
-                let shared = own && store.is_linked(&hash, exec, &dest);
-                if let (Ok(md), Some(size), false) = (std::fs::metadata(&dest), store.size_of(&hash), shared) {
-                    if md.len() == size && (md.mode() & 0o111 != 0) == exec {
-                        if let Ok((h, _)) = Hash::of_path(&dest) {
-                            if h == hash {
-                                continue;
-                            }
-                        }
-                    }
-                }
-                if own {
-                    store.materialize_owned(&hash, exec, &dest)?;
-                    chown(&dest, uid, gid);
-                } else {
-                    store.materialize(&hash, exec, &dest)?;
-                }
-            }
-            Ok(())
-        })
-        .await?
+        }
+        self.c.deliver(files, writes).await
     }
 
     /// Runs what cargo does after the build: tests, doctests, `cargo run`.
-    async fn steps(self: &Arc<Self>, p: &Prepared) -> Result<Finish> {
+    async fn steps(self: &Arc<Self>) -> Result<Finish> {
         let plan = self.plan();
         let out = &self.c.out;
         let mut failed: Vec<String> = Vec::new();
@@ -2296,31 +2373,17 @@ impl Run {
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
                     out.status("Running", &display_cmd(&cmd.program, &cmd.args));
-                    // The program is the user's: it gets the user's whole
-                    // environment plus what cargo adds.
-                    let mut env: BTreeMap<String, String> =
-                        self.c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    for (k, v) in &cmd.env {
-                        match v {
-                            Some(v) => {
-                                env.insert(k.clone(), v.clone());
-                            }
-                            None => {
-                                env.remove(k);
-                            }
-                        }
-                    }
+                    // The program is the user's and runs on the user's
+                    // machine: it gets the user's whole environment there
+                    // plus what cargo adds.
                     return Ok(Finish::Exec(ExecRequest {
                         program: cmd.program.clone(),
                         args: cmd.args.clone(),
-                        env: env.into_iter().collect(),
-                        cwd: self.c.cwd.to_string_lossy().into_owned(),
+                        env: cmd.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        cwd: self.c.cwd.clone(),
                         binds: vec![
-                            (p.root.to_string_lossy().into_owned(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
-                            (
-                                p.cargo_home.to_string_lossy().into_owned(),
-                                String::from_utf8_lossy(CARGO_HOME_AT).into_owned(),
-                            ),
+                            (self.c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
+                            (self.c.cargo_home.clone(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned()),
                         ],
                     }));
                 }
@@ -2333,14 +2396,14 @@ impl Run {
                     // configured browser, then `$BROWSER`, then the system
                     // opener, which is what the plan falls back to.
                     let program = match self.c.env.get("BROWSER") {
-                        Some(b) if cmd.program == "xdg-open" && !b.is_empty() => b.clone(),
+                        Some(b) if cmd.program == "xdg-open" && !b.is_empty() => b,
                         _ => real(&cmd.program),
                     };
                     return Ok(Finish::Exec(ExecRequest {
                         program,
                         args: cmd.args.iter().map(real).collect(),
-                        env: self.c.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                        cwd: self.c.cwd.to_string_lossy().into_owned(),
+                        env: Vec::new(),
+                        cwd: self.c.cwd.clone(),
                         binds: vec![],
                     }));
                 }
@@ -2435,15 +2498,8 @@ impl Run {
     }
 }
 
-/// Writes the worktree part of an action's outputs to the real worktree.
-async fn apply_writes(
-    store: Arc<Store>,
-    tr: &Translator,
-    uid: u32,
-    gid: u32,
-    target_dirs: &[&String],
-    m: &Manifest,
-) -> Result<()> {
+/// Sends the worktree part of an action's outputs to the client's worktree.
+async fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manifest) -> Result<()> {
     let inside = |p: &[u8]| {
         vpath_starts_with(p, WORKTREE_AT)
             && p != WORKTREE_AT
@@ -2451,69 +2507,21 @@ async fn apply_writes(
             && !vpath_starts_with(p, &vjoin(WORKTREE_AT, b"target"))
             && !vpath_starts_with(p, &vjoin(WORKTREE_AT, b".git"))
     };
-    let writes: Vec<(String, MEntry)> = m
+    let writes: Vec<Write> = m
         .entries
         .iter()
         .filter(|(p, _)| inside(p))
-        .map(|(p, e)| (tr.path(&String::from_utf8_lossy(p)), e.clone()))
-        .collect();
-    if writes.is_empty() {
-        return Ok(());
-    }
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        for (path, e) in writes {
-            let path = PathBuf::from(path);
+        .map(|(p, e)| {
+            let path = tr.path(&String::from_utf8_lossy(p));
             match e {
-                MEntry::Dir => {
-                    if !path.is_dir() {
-                        std::fs::create_dir_all(&path)?;
-                        chown(&path, uid, gid);
-                    }
-                }
-                MEntry::Whiteout => {
-                    if let Ok(md) = std::fs::symlink_metadata(&path) {
-                        if md.is_dir() {
-                            let _ = std::fs::remove_dir_all(&path);
-                        } else {
-                            let _ = std::fs::remove_file(&path);
-                        }
-                    }
-                }
-                MEntry::Symlink(t) => {
-                    use std::os::unix::ffi::OsStrExt;
-                    let _ = std::fs::remove_file(&path);
-                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&t), &path)?;
-                }
-                MEntry::File { hash, exec, size } => {
-                    // Leave an identical file alone so its mtime and any
-                    // watchers stay quiet.
-                    let same = std::fs::metadata(&path)
-                        .ok()
-                        .filter(|md| md.is_file() && md.len() == size)
-                        .and_then(|_| crate::hash::Hash::of_path(&path).ok())
-                        .is_some_and(|(h, _)| h == hash);
-                    if same {
-                        continue;
-                    }
-                    if let Some(parent) = path.parent() {
-                        if !parent.is_dir() {
-                            std::fs::create_dir_all(parent)?;
-                            chown(parent, uid, gid);
-                        }
-                    }
-                    // A source file must be an ordinary writable file, never
-                    // a link into the store.
-                    use std::os::unix::fs::PermissionsExt;
-                    let bytes = store.read(&hash)?;
-                    std::fs::write(&path, bytes)?;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(if exec { 0o755 } else { 0o644 }))?;
-                    chown(&path, uid, gid);
-                }
+                MEntry::Dir => Write::Dir { path },
+                MEntry::Whiteout => Write::Remove { path },
+                MEntry::Symlink(t) => Write::Symlink { path, target: t.clone() },
+                MEntry::File { hash, exec, size } => Write::File { path, hash: hash.0, size: *size, exec: *exec },
             }
-        }
-        Ok(())
-    })
-    .await?
+        })
+        .collect();
+    c.deliver(Vec::new(), writes).await
 }
 
 /// The prerequisites named in a Makefile-style dep-info file (rustc's).
@@ -2561,33 +2569,4 @@ fn normalize(p: &Path) -> PathBuf {
         }
     }
     out
-}
-
-fn chown(path: &Path, uid: u32, gid: u32) {
-    use std::os::unix::ffi::OsStrExt;
-    if unsafe { libc::geteuid() } != 0 {
-        return;
-    }
-    if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        // SAFETY: valid C string.
-        unsafe { libc::lchown(c.as_ptr(), uid, gid) };
-    }
-}
-
-/// `mkdir -p`, giving directories this call creates to the client.
-fn mkdir_owned(dir: &Path, uid: u32, gid: u32) -> Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = dir.parent() {
-        mkdir_owned(parent, uid, gid)?;
-    }
-    match std::fs::create_dir(dir) {
-        Ok(()) => {
-            chown(dir, uid, gid);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("creating {}", dir.display())),
-    }
 }

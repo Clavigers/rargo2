@@ -1,33 +1,38 @@
-//! rargod: the build server. One per machine.
+//! rargod: the build server. Clients on any machine sync their worktree and
+//! environment to it; all analysis, scheduling and building happens here.
 //!
-//!   rargod --state DIR --planner PATH [--store DIR] [--socket PATH] [--jobs N] [--mem-gb N]
+//!   rargod --state DIR --planner PATH [--listen ADDR] [--keys FILE] [--cargo-home DIR]
+//!          [--store DIR] [--jobs N] [--mem-gb N]
 //!
 //! It must run as root (or with CAP_SYS_ADMIN): it mounts a FUSE filesystem,
 //! registers passthrough backing files and creates namespaces.
 
 use anyhow::{Context, Result, bail};
-use rargo_core::build::{self, Client, Config, Daemon};
+use rargo_core::build::{Config, Daemon};
 use rargo_core::engine::Engine;
-use rargo_core::present::Output;
-use rargo_core::proto::{PROTO_VERSION, RunRequest, ServerMsg};
 use rargo_core::sandbox::Zygote;
 use rargo_core::sandboxfs::SandboxFs;
-use rargo_core::sched::{Priority, Scheduler};
-use rargo_core::snapshot::Watcher;
+use rargo_core::sched::Scheduler;
+use rargo_core::session::Keys;
 use rargo_core::store::Store;
 use rargo_core::view::Content;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::TcpListener;
 
 struct Opts {
     state: PathBuf,
     store: Option<PathBuf>,
     planner: PathBuf,
-    socket: Option<PathBuf>,
+    /// Address clients connect to.
+    listen: std::net::SocketAddr,
+    /// File naming the users and their keys.
+    keys: Option<PathBuf>,
+    /// The shared cargo home (registry and git checkouts).
+    cargo_home: Option<PathBuf>,
+    /// The user actions run as; rargod's own by default.
+    uid: Option<u32>,
+    gid: Option<u32>,
     jobs: usize,
     mem_kb: u64,
     passthrough: bool,
@@ -57,7 +62,11 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         state: PathBuf::new(),
         store: None,
         planner: PathBuf::new(),
-        socket: None,
+        listen: "127.0.0.1:7459".parse().unwrap(),
+        keys: None,
+        cargo_home: None,
+        uid: None,
+        gid: None,
         jobs: cpus,
         mem_kb: total_kb / 10 * 7,
         passthrough: true,
@@ -75,7 +84,11 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--state" => o.state = val()?.into(),
             "--store" => o.store = Some(val()?.into()),
             "--planner" => o.planner = val()?.into(),
-            "--socket" => o.socket = Some(val()?.into()),
+            "--listen" => o.listen = val()?.parse().context("--listen takes ADDRESS:PORT")?,
+            "--keys" => o.keys = Some(val()?.into()),
+            "--cargo-home" => o.cargo_home = Some(val()?.into()),
+            "--uid" => o.uid = Some(val()?.parse()?),
+            "--gid" => o.gid = Some(val()?.parse()?),
             "--jobs" => o.jobs = val()?.parse()?,
             "--mem-gb" => o.mem_kb = val()?.parse::<u64>()? << 20,
             "--no-passthrough" => o.passthrough = false,
@@ -92,7 +105,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     }
     if o.state.as_os_str().is_empty() || (o.planner.as_os_str().is_empty() && o.worker_of.is_none()) {
         bail!(
-            "usage: rargod --state DIR --planner PATH [--store DIR] [--socket PATH] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
+"usage: rargod --state DIR --planner PATH [--listen ADDR:PORT] [--keys FILE] [--cargo-home DIR] [--uid N --gid N] [--store DIR] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
         );
     }
     Ok(o)
@@ -157,20 +170,43 @@ fn main() -> Result<()> {
         session.unmount();
         return result;
     }
-    let watcher = Watcher::start(&state.join("cookies"))?;
-    let daemon = Arc::new(Daemon::new(Config { state_dir: state.clone(), planner }, engine, watcher));
-
-    let socket = opts.socket.clone().unwrap_or_else(|| state.join("rargod.sock"));
-    let _ = std::fs::remove_file(&socket);
+    // Who may connect. Without a key file only this machine can.
+    let keys = match &opts.keys {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            Keys::parse(&text).with_context(|| format!("{}", path.display()))?
+        }
+        None if opts.listen.ip().is_loopback() => Keys::open(),
+        None => bail!("--keys FILE is required unless rargod listens on the loopback interface"),
+    };
+    let cargo_home = opts.cargo_home.clone().unwrap_or_else(|| state.join("cargo-home"));
+    std::fs::create_dir_all(&cargo_home)?;
+    let cargo_home = cargo_home.canonicalize()?;
+    // SAFETY: plain syscalls.
+    let (uid, gid) = (opts.uid.unwrap_or(unsafe { libc::geteuid() }), opts.gid.unwrap_or(unsafe { libc::getegid() }));
+    for dir in ["registry", "git"] {
+        let p = cargo_home.join(dir);
+        if !p.exists() {
+            std::fs::create_dir_all(&p)?;
+            rargo_core::snapshot::chown(&p, uid, gid);
+        }
+    }
+    let server_env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let daemon = Arc::new(Daemon::new(
+        Config { state_dir: state.clone(), planner, cargo_home: cargo_home.clone(), uid, gid, server_env },
+        engine,
+    ));
     eprintln!(
-        "rargod: store {} ({}), passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, socket {}",
+        "rargod: store {} ({}), cargo home {}, passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, actions run as uid {uid}",
         store.root().display(),
         if store.supports_reflink() { "reflinks" } else { "hard links" },
+        cargo_home.display(),
         session.caps().passthrough,
         cgroup_root.is_some(),
         opts.jobs,
         opts.mem_kb >> 20,
-        socket.display()
     );
 
     // Eviction replaces `cargo clean`: least recently used blobs go first,
@@ -225,18 +261,22 @@ fn main() -> Result<()> {
         let every = std::time::Duration::from_secs(opts.drift_minutes * 60);
         rt.spawn(rargo_core::drift::background(d, every));
     }
-    let result = rt.block_on(serve(daemon, &socket));
+    let keys = Arc::new(keys);
+    let listen = opts.listen;
+    let result = rt.block_on(async move {
+        let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
+        eprintln!(
+            "rargod: serving clients on {} ({})",
+            listener.local_addr()?,
+            if keys.is_open() { "no key file: loopback only, anyone on this machine" } else { "keys required" }
+        );
+        serve(daemon, listener, keys).await
+    });
     session.unmount();
-    let _ = std::fs::remove_file(&socket);
     result
 }
 
-async fn serve(daemon: Arc<Daemon>, socket: &Path) -> Result<()> {
-    let listener = UnixListener::bind(socket).with_context(|| format!("binding {}", socket.display()))?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o666))?;
-    }
+async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>) -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -244,11 +284,19 @@ async fn serve(daemon: Arc<Daemon>, socket: &Path) -> Result<()> {
             _ = term.recv() => break,
             _ = int.recv() => break,
             conn = listener.accept() => {
-                let (stream, _) = conn?;
-                let d = daemon.clone();
+                let (stream, peer) = match conn {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Out of descriptors or the like: keep serving.
+                        eprintln!("rargod: accept failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
+                let (d, k) = (daemon.clone(), keys.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = connection(d, stream).await {
-                        eprintln!("rargod: connection error: {e:#}");
+                    if let Err(e) = rargo_core::serve::connection(d, stream, k).await {
+                        eprintln!("rargod: connection from {peer}: {e:#}");
                     }
                 });
             }
@@ -256,233 +304,6 @@ async fn serve(daemon: Arc<Daemon>, socket: &Path) -> Result<()> {
     }
     eprintln!("rargod: shutting down");
     daemon.engine.store.db().flush();
-    Ok(())
-}
-
-async fn read_frame<T: for<'a> serde::Deserialize<'a>>(s: &mut (impl AsyncReadExt + Unpin)) -> Result<Option<T>> {
-    let mut len = [0u8; 4];
-    match s.read_exact(&mut len).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    let n = u32::from_le_bytes(len) as usize;
-    if n > 64 << 20 {
-        bail!("oversized request");
-    }
-    let mut buf = vec![0u8; n];
-    s.read_exact(&mut buf).await?;
-    Ok(Some(bincode::deserialize(&buf)?))
-}
-
-fn wants_color(req: &RunRequest, env: &HashMap<String, String>, tty: bool) -> bool {
-    let mut choice: Option<&str> = None;
-    let mut it = req.args.iter().take_while(|a| *a != "--");
-    while let Some(a) = it.next() {
-        if a == "--color" {
-            choice = it.next().map(|s| s.as_str());
-        } else if let Some(v) = a.strip_prefix("--color=") {
-            choice = Some(v);
-        }
-    }
-    let choice = choice.or(env.get("CARGO_TERM_COLOR").map(|s| s.as_str()));
-    match choice {
-        Some("always") => true,
-        Some("never") => false,
-        _ => tty && !env.contains_key("NO_COLOR") && env.get("TERM").map(|t| t != "dumb").unwrap_or(false),
-    }
-}
-
-async fn connection(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
-    let cred = stream.peer_cred()?;
-    let (mut rd, mut wr) = stream.into_split();
-    let Some(req): Option<RunRequest> = read_frame(&mut rd).await? else { return Ok(()) };
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ServerMsg>();
-    let writer = tokio::spawn(async move {
-        while let Some(m) = rx.recv().await {
-            let last = matches!(m, ServerMsg::Exit(_) | ServerMsg::Exec(_));
-            let Ok(b) = bincode::serialize(&m) else { break };
-            if wr.write_all(&(b.len() as u32).to_le_bytes()).await.is_err() || wr.write_all(&b).await.is_err() {
-                break;
-            }
-            if last {
-                let _ = wr.shutdown().await;
-                break;
-            }
-        }
-    });
-    if req.version != PROTO_VERSION {
-        let _ = tx.send(ServerMsg::Stderr(
-            format!("error: rargo client (protocol {}) does not match rargod (protocol {PROTO_VERSION})\n", req.version)
-                .into_bytes(),
-        ));
-        let _ = tx.send(ServerMsg::Exit(101));
-        let _ = writer.await;
-        return Ok(());
-    }
-    let env: HashMap<String, String> = req.env.iter().cloned().collect();
-    if let (Some(cmd @ ("__export" | "__import")), Some(dir)) =
-        (req.args.first().map(|s| s.as_str()), req.args.get(1).cloned())
-    {
-        // Cache transfer between machines. Only root may do it: an import
-        // adds results every later build will trust.
-        let export = cmd == "__export";
-        let reply = if cred.uid() != 0 {
-            Err(anyhow::anyhow!("only root may export or import the cache"))
-        } else {
-            let d = daemon.clone();
-            tokio::task::spawn_blocking(move || {
-                let dir = PathBuf::from(dir);
-                if export { d.export_cache(&dir) } else { d.import_cache(&dir) }
-            })
-            .await?
-        };
-        let (msg, code) = match reply {
-            Ok((traces, blobs)) => (
-                format!("{} {traces} traces and {blobs} blobs\n", if export { "exported" } else { "imported" }),
-                0,
-            ),
-            Err(e) => (format!("error: {e:#}\n"), 101),
-        };
-        let _ = tx.send(if code == 0 { ServerMsg::Stdout(msg.into_bytes()) } else { ServerMsg::Stderr(msg.into_bytes()) });
-        let _ = tx.send(ServerMsg::Exit(code));
-        let _ = writer.await;
-        return Ok(());
-    }
-    if req.args.first().map(|s| s.as_str()) == Some("__drift") {
-        // On-demand drift check of the worktree the client is in.
-        let who = rargo_core::drift::LastClient {
-            env: Arc::new(env.clone()),
-            uid: cred.uid(),
-            gid: cred.gid(),
-            at: std::time::Instant::now(),
-            checked_head: None,
-        };
-        let mut root = PathBuf::from(&req.cwd);
-        while !root.join(".git").exists() {
-            if !root.pop() {
-                break;
-            }
-        }
-        let (msg, code) = match rargo_core::drift::check(&daemon, &root, &who).await {
-            Ok(r) => {
-                let text = r.render();
-                *daemon.drift_report.lock() = Some(format!("{}: {text}", root.display()));
-                (text, if r.agrees() { 0 } else { 1 })
-            }
-            Err(e) => (format!("error: drift check could not run: {e:#}\n"), 101),
-        };
-        let _ = tx.send(ServerMsg::Stdout(msg.into_bytes()));
-        let _ = tx.send(ServerMsg::Exit(code));
-        let _ = writer.await;
-        return Ok(());
-    }
-    if req.args.first().map(|s| s.as_str()) == Some("__gc") {
-        // Explicit collection: everything unreferenced, regardless of age.
-        // Meant for when no build is running.
-        let d = daemon.clone();
-        // While anything is running or queued, recently used blobs may be
-        // outputs not yet recorded anywhere; keep the usual grace period.
-        let (running, waiting, _, _) = daemon.engine.sched.snapshot();
-        let age = if running + waiting == 0 { 0 } else { 600 };
-        let (n, bytes) = tokio::task::spawn_blocking(move || d.collect_garbage(age)).await.unwrap_or((0, 0));
-        daemon.engine.store.db().flush();
-        let _ = tx.send(ServerMsg::Stdout(
-            format!(
-                "collected {n} unreferenced blobs, {:.1} MiB; store is now {:.1} MiB\n",
-                bytes as f64 / (1 << 20) as f64,
-                daemon.engine.store.total_bytes() as f64 / (1 << 20) as f64
-            )
-            .into_bytes(),
-        ));
-        let _ = tx.send(ServerMsg::Exit(0));
-        let _ = writer.await;
-        return Ok(());
-    }
-    if req.args.first().map(|s| s.as_str()) == Some("__compact") {
-        // Everything not linked into a worktree goes cold now.
-        let d = daemon.clone();
-        let (n, freed) = tokio::task::spawn_blocking(move || {
-            let fs = d.engine.fs.clone();
-            d.engine.store.freeze_idle(0, &|h| fs.forget_backing(h))
-        })
-        .await
-        .unwrap_or((0, 0));
-        daemon.engine.store.db().flush();
-        let (cn, logical, disk) = daemon.engine.store.cold_stats();
-        let mib = |b: u64| b as f64 / (1 << 20) as f64;
-        let _ = tx.send(ServerMsg::Stdout(
-            format!(
-                "{n} blobs went cold, {:.1} MiB freed; cold tier holds {cn} blobs of {:.1} MiB as {:.1} MiB of chunks\n",
-                mib(freed),
-                mib(logical),
-                mib(disk)
-            )
-            .into_bytes(),
-        ));
-        let _ = tx.send(ServerMsg::Exit(0));
-        let _ = writer.await;
-        return Ok(());
-    }
-    if req.args.first().map(|s| s.as_str()) == Some("__incr") {
-        let d = daemon.clone();
-        let text = tokio::task::spawn_blocking(move || d.incr.analyze()).await.unwrap_or_default();
-        let _ = tx.send(ServerMsg::Stdout(text.into_bytes()));
-        let _ = tx.send(ServerMsg::Exit(0));
-        let _ = writer.await;
-        return Ok(());
-    }
-    if req.args.first().map(|s| s.as_str()) == Some("__status") {
-        let _ = tx.send(ServerMsg::Stdout(status_text(&daemon).into_bytes()));
-        let _ = tx.send(ServerMsg::Exit(0));
-        let _ = writer.await;
-        return Ok(());
-    }
-    let prio = match env.get("RARGO_PRIORITY").map(|s| s.as_str()) {
-        Some("human") => Priority::Human,
-        Some("agent") => Priority::Agent,
-        Some("background") => Priority::Background,
-        _ if req.stderr_tty => Priority::Human,
-        _ => Priority::Agent,
-    };
-    let out = Output::new(tx.clone(), wants_color(&req, &env, req.stderr_tty), wants_color(&req, &env, req.stdout_tty));
-    let client = Client {
-        args: req.args.clone(),
-        cwd: PathBuf::from(&req.cwd),
-        env: Arc::new(env),
-        uid: cred.uid(),
-        gid: cred.gid(),
-        prio,
-        out,
-    };
-    let work = tokio::spawn(build::handle(daemon, client));
-    // If the client goes away, stop: queued actions are dropped.
-    let abort = work.abort_handle();
-    let watch_client = tokio::spawn(async move {
-        let mut buf = [0u8; 64];
-        loop {
-            match rd.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    abort.abort();
-                    break;
-                }
-                Ok(_) => {}
-            }
-        }
-    });
-    let msg = match work.await {
-        Ok(Ok(code)) => ServerMsg::Exit(code),
-        Ok(Err(exec)) => ServerMsg::Exec(exec),
-        Err(e) if e.is_cancelled() => ServerMsg::Exit(130),
-        Err(e) => {
-            let _ = tx.send(ServerMsg::Stderr(format!("error: rargod internal error: {e}\n").into_bytes()));
-            ServerMsg::Exit(101)
-        }
-    };
-    let _ = tx.send(msg);
-    drop(tx);
-    let _ = writer.await;
-    watch_client.abort();
     Ok(())
 }
 
@@ -501,93 +322,4 @@ fn link_key(opts: &Opts, addr: std::net::SocketAddr) -> Result<rargo_core::net::
         None if addr.ip().is_loopback() => Ok(None),
         None => anyhow::bail!("--worker-key FILE is required unless the worker link is on the loopback interface"),
     }
-}
-
-fn status_text(d: &Daemon) -> String {
-    let e = &d.engine;
-    let (running, waiting, peak, granted) = e.sched.snapshot();
-    let t = &e.traces.stats;
-    let s = &e.stats;
-    let f = e.fs.stats();
-    format!(
-        "requests            {}\n\
-         store               {} blobs, {:.1} MiB\n\
-         cold tier           {}\n\
-         cache               {} hits, {} misses, {} traces stored\n\
-         actions run         {} ({:.1}s cpu, {:.1}s wall)\n\
-         in-flight dedup     {} joined, {} of those ran anyway\n\
-         reruns              {} changed-input, {} environment\n\
-         scheduler           {} running, {} waiting, peak {}, {} granted, {} tokens\n\
-         fuse                {} lookups, {} opens, {} userspace reads, {} userspace writes\n\
-         plans decoded       {}\n\
-         incremental         {} states saved; seeds: {} same worktree, {} ancestor, {} other, {} none; {} dropped after a crash\n\
-         verify              {} cached units re-run cleanly, {} differed\n\
-         drift               {}\n\
-         workers             {}\n",
-        d.stats.requests.load(Ordering::Relaxed),
-        e.store.blob_count(),
-        e.store.total_bytes() as f64 / (1 << 20) as f64,
-        {
-            let (n, logical, disk) = e.store.cold_stats();
-            format!(
-                "{n} blobs of {:.1} MiB kept as {:.1} MiB of chunks",
-                logical as f64 / (1 << 20) as f64,
-                disk as f64 / (1 << 20) as f64
-            )
-        },
-        t.hits.load(Ordering::Relaxed),
-        t.misses.load(Ordering::Relaxed),
-        t.stored.load(Ordering::Relaxed),
-        s.runs.load(Ordering::Relaxed),
-        s.run_cpu_us.load(Ordering::Relaxed) as f64 / 1e6,
-        s.run_wall_us.load(Ordering::Relaxed) as f64 / 1e6,
-        s.joined.load(Ordering::Relaxed),
-        s.joined_then_ran.load(Ordering::Relaxed),
-        s.tainted.load(Ordering::Relaxed),
-        s.env_reruns.load(Ordering::Relaxed),
-        running,
-        waiting,
-        peak,
-        granted,
-        e.sched.tokens(),
-        f.lookups.load(Ordering::Relaxed),
-        f.opens.load(Ordering::Relaxed),
-        f.reads.load(Ordering::Relaxed),
-        f.writes.load(Ordering::Relaxed),
-        d.stats.plans_decoded.load(Ordering::Relaxed),
-        d.incr.stats.saved.load(Ordering::Relaxed),
-        d.incr.stats.seeded_same_worktree.load(Ordering::Relaxed),
-        d.incr.stats.seeded_ancestor.load(Ordering::Relaxed),
-        d.incr.stats.seeded_other.load(Ordering::Relaxed),
-        d.incr.stats.unseeded.load(Ordering::Relaxed),
-        d.incr.stats.discarded_after_crash.load(Ordering::Relaxed),
-        d.stats.verify_units.load(Ordering::Relaxed),
-        d.stats.verify_mismatches.load(Ordering::Relaxed),
-        d.drift_report.lock().clone().unwrap_or_else(|| "not checked yet".into()).trim_end(),
-        match d.pool.get() {
-            None => "not accepting workers".to_string(),
-            Some(p) => {
-                let (pushed, skipped, fetched, reused) = p.transfer_totals();
-                let ps = &p.stats;
-                format!(
-                    "{} connected; {} actions dispatched ({} of them then run here on an idle core), {} kept local (core free), {} kept local (transfer too costly), {} worker failures; \
-                     sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
-                     {} answers sent ahead, {} lookups and {} opens asked",
-                    p.worker_count(),
-                    ps.dispatched.load(Ordering::Relaxed),
-                    ps.hedged.load(Ordering::Relaxed),
-                    ps.kept_local_no_wait.load(Ordering::Relaxed),
-                    ps.kept_local_transfer.load(Ordering::Relaxed),
-                    ps.worker_failures.load(Ordering::Relaxed),
-                    pushed as f64 / 1048576.0,
-                    skipped as f64 / 1048576.0,
-                    fetched as f64 / 1048576.0,
-                    reused as f64 / 1048576.0,
-                    ps.prefilled_entries.load(Ordering::Relaxed),
-                    ps.lookups_served.load(Ordering::Relaxed),
-                    ps.opens_served.load(Ordering::Relaxed),
-                )
-            }
-        },
-    )
 }

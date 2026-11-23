@@ -22,6 +22,12 @@
 //! # Use the repository's flake devShell as the environment (default: true
 //! # when flake.nix exists).
 //! enabled = true
+//!
+//! [sync]
+//! # Never sent to the build server, in addition to `.git` and cargo target
+//! # directories. A name matches at any depth; a path with a slash is taken
+//! # from the worktree root.
+//! exclude = ["node_modules", "data/fixtures-large"]
 //! ```
 //!
 //! The file is read from the snapshot, so editing it takes effect on the
@@ -40,6 +46,17 @@ pub struct Policy {
     pub network: NetPolicy,
     #[serde(default)]
     pub flake: FlakePolicy,
+    /// Read by the client, which decides what is synced; accepted here so
+    /// that the file means the same thing at both ends.
+    #[serde(default)]
+    pub sync: SyncPolicy,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SyncPolicy {
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]

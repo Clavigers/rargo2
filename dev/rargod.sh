@@ -1,39 +1,43 @@
 #!/bin/sh
-# Starts or stops the development rargod on this machine.
+# Starts or stops the development build server on this machine.
 #   dev/rargod.sh start [extra rargod options]
 #   dev/rargod.sh stop
-# The daemon runs in a transient systemd scope with a CPU and memory cap so
+# The server runs in a transient systemd scope with a CPU and memory cap so
 # the other services on the box keep headroom (see CLAUDE.md).
-# Override the limits with RARGO_CPU_QUOTA and RARGO_MEMORY_MAX.
+# Override the limits with RARGO_CPU_QUOTA and RARGO_MEMORY_MAX, the address
+# with RARGO_SERVER (default 127.0.0.1:7459).
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 state=${RARGO_STATE:-$work/state}
+addr=${RARGO_SERVER:-127.0.0.1:7459}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 case "${1:-}" in
 start)
     shift
     mkdir -p "$state"
-    if [ -S "$state/rargod.sock" ] && pgrep -f "rargod --state $state" >/dev/null 2>&1; then
+    if pgrep -f "rargod --state $state " >/dev/null 2>&1; then
         echo "rargod already running"; exit 0
     fi
     . "$work/env.sh"
+    : >"$state/rargod.log"
     nohup systemd-run --scope -q --unit "rargod-dev-$$" -p "CPUQuota=${RARGO_CPU_QUOTA:-2400%}" -p "MemoryMax=${RARGO_MEMORY_MAX:-90G}" -p Delegate=yes \
-        "${RARGO_BIN:-$repo/target/release}/rargod" --state "$state" \
-        --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" --jobs 24 "$@" \
-        >"$state/rargod.log" 2>&1 &
+        "${RARGO_BIN:-$repo/target/release}/rargod" --state "$state" --listen "$addr" \
+        --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
+        --cargo-home "${RARGO_SERVER_CARGO_HOME:-$work/cargo-home}" --jobs "${RARGO_JOBS:-24}" "$@" \
+        >>"$state/rargod.log" 2>&1 &
     for i in $(seq 1 100); do
-        [ -S "$state/rargod.sock" ] && { echo "rargod started (log: $state/rargod.log)"; exit 0; }
+        grep -q "serving clients" "$state/rargod.log" 2>/dev/null && { echo "rargod started on $addr (log: $state/rargod.log)"; exit 0; }
         sleep 0.1
     done
     echo "rargod did not start:"; tail -20 "$state/rargod.log"; exit 1
     ;;
 stop)
-    pkill -TERM -f "rargod --state $state" 2>/dev/null || true
+    pkill -TERM -f "rargod --state $state " 2>/dev/null || true
     for i in $(seq 1 50); do
-        pgrep -f "rargod --state $state" >/dev/null 2>&1 || { echo "rargod stopped"; exit 0; }
+        pgrep -f "rargod --state $state " >/dev/null 2>&1 || { echo "rargod stopped"; exit 0; }
         sleep 0.1
     done
-    pkill -KILL -f "rargod --state $state" 2>/dev/null || true
+    pkill -KILL -f "rargod --state $state " 2>/dev/null || true
     umount -l "$state/mnt" 2>/dev/null || true
     echo "rargod killed"
     ;;

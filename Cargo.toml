@@ -18,10 +18,8 @@ dashmap = "6"
 rayon = "1"
 zstd = "0.13"
 redb = "2"
-git2 = { version = "0.20", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal", "process", "fs"] }
 tempfile = "3"
-sha1 = "0.10"
 
 [profile.dev]
 opt-level = 1

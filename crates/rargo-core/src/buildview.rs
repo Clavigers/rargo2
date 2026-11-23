@@ -549,9 +549,11 @@ impl BuildView {
 #[derive(Clone)]
 pub struct ViewParts {
     pub snapshot: Arc<Snapshot>,
-    /// Real path of the worktree's `.git` (file or directory).
-    pub git_path: PathBuf,
+    /// The server's shared cargo home.
     pub cargo_home: PathBuf,
+    /// The client's own cargo configuration files: `(sandbox path, real
+    /// file)`, shown over the shared cargo home.
+    pub home_files: Vec<(Vec<u8>, PathBuf)>,
     /// Sandbox paths shown as empty directories (the target directory).
     pub masks: Vec<Vec<u8>>,
     /// Real host paths hidden from the sandbox.
@@ -602,17 +604,15 @@ impl ViewParts {
         mounts.extend([
             Mount { at: WORKTREE_AT.to_vec(), region: Region::Snap(this.snapshot.clone()), traced: true },
             Mount {
-                at: vjoin(WORKTREE_AT, b".git"),
-                region: Region::Host(HostRegion::new(this.git_path.clone())),
-                traced: true,
-            },
-            Mount {
                 at: CARGO_HOME_AT.to_vec(),
                 region: Region::Host(HostRegion::new(this.cargo_home.clone())),
                 traced: true,
             },
             Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(this.planner.clone())), traced: true },
         ]);
+        for (at, real) in &this.home_files {
+            mounts.push(Mount { at: at.clone(), region: Region::Host(HostRegion::new(real.clone())), traced: true });
+        }
         for m in &this.masks {
             mounts.push(Mount { at: m.clone(), region: Region::Empty, traced: true });
         }

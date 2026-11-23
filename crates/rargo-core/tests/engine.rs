@@ -94,7 +94,11 @@ impl Fx {
                 label: script.to_string(),
             },
             view: self.view(),
-            client_env: Arc::new(client_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>()),
+            client_env: Arc::new(ClientEnv::new(
+                client_env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>(),
+                Vec::new(),
+                None,
+            )),
             uid: 0,
             gid: 0,
             prio: Priority::Agent,

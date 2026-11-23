@@ -1,1316 +1,616 @@
-//! Worktree snapshots: HEAD tree plus a dirty overlay.
+//! Worktree snapshots: content-addressed trees synced from clients.
 //!
-//! A [`Snapshot`] is an immutable description of every file in a worktree at
-//! one moment. Clean tracked files are identified by their git object id and
-//! never touched. Everything that differs from HEAD (modified, untracked,
-//! deleted, files behind a smudge filter) is captured into the content store
-//! when the snapshot is taken. Ignored directories and submodules are not
-//! captured; they are shown live, like host files.
+//! The server never sees a client's worktree. A client describes it as a
+//! tree of directory manifests ([`Tree`]) whose leaves are content hashes,
+//! and uploads whatever manifests and file contents the server's store does
+//! not hold. A [`Snapshot`] is one such tree, identified by the digest of its
+//! root: immutable, and identical for identical source no matter which
+//! machine, user or directory it came from.
 //!
-//! A [`Worktree`] keeps the overlay current from inotify events, so taking a
-//! snapshot costs time proportional to what changed since the last one.
+//! Manifests are kept in the content store like any other blob, under the
+//! hash of their encoding, so they are deduplicated, evicted and collected
+//! by the same rules as file contents; a client is simply asked again for
+//! whatever has gone.
 
 use crate::hash::Hash;
 use crate::store::Store;
 use crate::view::*;
 use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
-use parking_lot::{Condvar, Mutex};
-use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsStr;
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use parking_lot::Mutex;
+use rargo_proto::tree::{Node, Tree};
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type Oid = [u8; 20];
-
-#[derive(Clone, Copy, Debug)]
-pub struct TreeEnt {
-    pub mode: u32,
-    pub oid: Oid,
+/// What a snapshot needs from the client it came from while it is being
+/// brought into the store.
+pub trait Uploader: Send + Sync {
+    /// The encoded trees with these digests, in any order.
+    fn trees<'a>(&'a self, want: Vec<Hash>) -> futures::BoxFuture<'a, Result<Vec<Vec<u8>>>>;
+    /// Uploads these file contents into the store; returns when all of them
+    /// are there.
+    fn blobs<'a>(&'a self, want: Vec<Hash>) -> futures::BoxFuture<'a, Result<()>>;
 }
 
-impl TreeEnt {
-    fn is_tree(&self) -> bool {
-        self.mode == 0o040000
-    }
-    fn is_link(&self) -> bool {
-        self.mode == 0o120000
-    }
-    fn is_gitlink(&self) -> bool {
-        self.mode == 0o160000
-    }
-    fn exec(&self) -> bool {
-        self.mode & 0o111 != 0
-    }
+pub mod futures {
+    pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 }
 
-pub type TreeMap = HashMap<Box<[u8]>, TreeEnt>;
-
-/// Shared object access for one git repository (all of its worktrees).
-pub struct GitRepo {
-    repo: Mutex<git2::Repository>,
-    trees: DashMap<Oid, Arc<TreeMap>>,
-    sizes: DashMap<Oid, u64>,
-    links: DashMap<Oid, Arc<[u8]>>,
+#[derive(Default)]
+pub struct SyncStats {
+    pub trees_received: AtomicU64,
+    pub blobs_requested: AtomicU64,
+    pub bytes_received: AtomicU64,
+    pub snapshots: AtomicU64,
+    /// Blobs one client waited for while another was already uploading them.
+    pub shared_uploads: AtomicU64,
 }
 
-fn oid_of(o: git2::Oid) -> Oid {
-    let mut out = [0u8; 20];
-    out.copy_from_slice(o.as_bytes());
-    out
+/// All trees the server knows, and the bookkeeping for syncing new ones.
+pub struct Trees {
+    pub store: Arc<Store>,
+    decoded: DashMap<Hash, Arc<Tree>>,
+    /// Trees whose whole subtree (manifests and file contents) was in the
+    /// store at the given store generation.
+    complete: DashMap<Hash, u64>,
+    /// File contents some client is uploading right now.
+    uploading: Mutex<HashMap<Hash, Arc<tokio::sync::Notify>>>,
+    /// The newest snapshot of each worktree: kept from garbage collection.
+    recent: Mutex<HashMap<String, Arc<Snapshot>>>,
+    pub stats: SyncStats,
 }
 
-fn git_err(e: git2::Error) -> io::Error {
-    io::Error::other(e.message().to_string())
-}
-
-impl GitRepo {
-    pub fn open(path: &Path) -> Result<Arc<GitRepo>> {
-        let repo = git2::Repository::open(path)
-            .with_context(|| format!("{} is not a git worktree", path.display()))?;
-        Ok(Arc::new(GitRepo {
-            repo: Mutex::new(repo),
-            trees: DashMap::new(),
-            sizes: DashMap::new(),
-            links: DashMap::new(),
-        }))
+impl Trees {
+    pub fn new(store: Arc<Store>) -> Arc<Trees> {
+        Arc::new(Trees {
+            store,
+            decoded: DashMap::new(),
+            complete: DashMap::new(),
+            uploading: Mutex::new(HashMap::new()),
+            recent: Mutex::new(HashMap::new()),
+            stats: SyncStats::default(),
+        })
     }
 
-    pub fn tree(&self, oid: &Oid) -> io::Result<Arc<TreeMap>> {
-        if let Some(t) = self.trees.get(oid) {
-            return Ok(t.clone());
+    /// The tree with this digest, if the store has it.
+    pub fn get(&self, digest: &Hash) -> Option<Arc<Tree>> {
+        if let Some(t) = self.decoded.get(digest) {
+            return Some(t.clone());
         }
-        let repo = self.repo.lock();
-        let tree = repo.find_tree(git2::Oid::from_bytes(oid).map_err(git_err)?).map_err(git_err)?;
-        let mut map = TreeMap::with_capacity(tree.len());
-        for e in tree.iter() {
-            map.insert(e.name_bytes().into(), TreeEnt { mode: e.filemode() as u32, oid: oid_of(e.id()) });
+        if !self.store.has(digest) {
+            return None;
         }
-        let map = Arc::new(map);
-        self.trees.insert(*oid, map.clone());
-        Ok(map)
-    }
-
-    pub fn blob_size(&self, oid: &Oid) -> io::Result<u64> {
-        if let Some(s) = self.sizes.get(oid) {
-            return Ok(*s);
+        let bytes = self.store.read(digest).ok()?;
+        let tree = Arc::new(Tree::decode(&bytes).ok()?);
+        if self.decoded.len() > 200_000 {
+            self.decoded.clear();
         }
-        let repo = self.repo.lock();
-        let odb = repo.odb().map_err(git_err)?;
-        let (size, _) = odb.read_header(git2::Oid::from_bytes(oid).map_err(git_err)?).map_err(git_err)?;
-        self.sizes.insert(*oid, size as u64);
-        Ok(size as u64)
+        self.decoded.insert(*digest, tree.clone());
+        Some(tree)
     }
 
-    pub fn blob(&self, oid: &Oid) -> io::Result<Vec<u8>> {
-        let repo = self.repo.lock();
-        let blob = repo.find_blob(git2::Oid::from_bytes(oid).map_err(git_err)?).map_err(git_err)?;
-        Ok(blob.content().to_vec())
+    /// Stores an encoded tree and returns its digest.
+    pub fn put(&self, encoded: &[u8]) -> Result<Hash> {
+        let tree = Tree::decode(encoded)?;
+        let digest = self.store.put_bytes(encoded)?;
+        self.decoded.insert(digest, Arc::new(tree));
+        Ok(digest)
     }
 
-    fn link_target(&self, oid: &Oid) -> io::Result<Arc<[u8]>> {
-        if let Some(t) = self.links.get(oid) {
-            return Ok(t.clone());
+    /// Stores a tree built on the server.
+    pub fn put_tree(&self, tree: &Tree) -> Result<Hash> {
+        self.put(&tree.encode())
+    }
+
+    /// Brings the tree rooted at `root` completely into the store, asking
+    /// `from` for what is missing, and returns it as a snapshot.
+    pub async fn sync(self: &Arc<Self>, root: Hash, from: &dyn Uploader) -> Result<Arc<Snapshot>> {
+        for _ in 0..4 {
+            let generation = self.store.generation();
+            if self.complete.get(&root).is_some_and(|g| *g == generation) {
+                return Ok(Arc::new(Snapshot::new(self.clone(), root)));
+            }
+            // Walk level by level: fetch the manifests this level lacks,
+            // then descend into every directory not known to be complete.
+            let mut visited: Vec<Hash> = Vec::new();
+            let mut seen: HashSet<Hash> = HashSet::new();
+            let mut missing_blobs: HashSet<Hash> = HashSet::new();
+            let mut level = vec![root];
+            seen.insert(root);
+            while !level.is_empty() {
+                let lacking: Vec<Hash> = level.iter().filter(|d| self.get(d).is_none()).copied().collect();
+                if !lacking.is_empty() {
+                    let got = from.trees(lacking.clone()).await?;
+                    self.stats.trees_received.fetch_add(got.len() as u64, Ordering::Relaxed);
+                    let this = self.clone();
+                    let stored: Result<HashSet<Hash>> = tokio::task::spawn_blocking(move || {
+                        got.iter().map(|enc| this.put(enc)).collect()
+                    })
+                    .await?;
+                    let stored = stored.context("the client sent a malformed directory manifest")?;
+                    if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
+                        bail!("the client did not send directory manifest {d}");
+                    }
+                }
+                let mut next = Vec::new();
+                for d in &level {
+                    let tree = self.get(d).context("a directory manifest vanished from the store during sync")?;
+                    visited.push(*d);
+                    for (_, node) in &tree.entries {
+                        match node {
+                            Node::File { hash, .. } => {
+                                let h = Hash(*hash);
+                                if self.store.has(&h) {
+                                    self.store.touch(&h);
+                                } else {
+                                    missing_blobs.insert(h);
+                                }
+                            }
+                            Node::Dir(sub) => {
+                                let sub = Hash(*sub);
+                                if seen.insert(sub) && !self.complete.get(&sub).is_some_and(|g| *g == generation) {
+                                    next.push(sub);
+                                }
+                            }
+                            Node::Symlink(_) => {}
+                        }
+                    }
+                }
+                level = next;
+            }
+            if !missing_blobs.is_empty() {
+                self.upload(missing_blobs.into_iter().collect(), from).await?;
+            }
+            // Something was evicted while we were looking: look again.
+            if self.store.generation() != generation {
+                continue;
+            }
+            for d in visited {
+                self.complete.insert(d, generation);
+            }
+            if self.complete.len() > 2_000_000 {
+                self.complete.retain(|_, g| *g == generation);
+            }
+            self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
+            return Ok(Arc::new(Snapshot::new(self.clone(), root)));
         }
-        let t: Arc<[u8]> = self.blob(oid)?.into();
-        self.links.insert(*oid, t.clone());
-        Ok(t)
+        bail!("the store kept changing while the worktree was being synced")
     }
 
-    /// Paths (files only) that differ between two trees.
-    pub fn diff_trees(&self, old: &Oid, new: &Oid) -> io::Result<Vec<Vec<u8>>> {
-        let repo = self.repo.lock();
-        let find = |o: &Oid| -> Result<Option<git2::Tree<'_>>, git2::Error> {
-            if *o == [0u8; 20] { Ok(None) } else { Ok(Some(repo.find_tree(git2::Oid::from_bytes(o)?)?)) }
-        };
-        let a = find(old).map_err(git_err)?;
-        let b = find(new).map_err(git_err)?;
-        let diff = repo.diff_tree_to_tree(a.as_ref(), b.as_ref(), None).map_err(git_err)?;
-        let mut out = Vec::new();
-        for d in diff.deltas() {
-            for f in [d.old_file(), d.new_file()] {
-                if let Some(p) = f.path_bytes() {
-                    out.push(p.to_vec());
+    /// Gets `missing` into the store. A blob another client is already
+    /// uploading is waited for rather than uploaded twice.
+    async fn upload(&self, missing: Vec<Hash>, from: &dyn Uploader) -> Result<()> {
+        let mut pending = missing;
+        while !pending.is_empty() {
+            let mut mine = Vec::new();
+            let mut theirs: Vec<(Hash, Arc<tokio::sync::Notify>)> = Vec::new();
+            {
+                let mut up = self.uploading.lock();
+                for h in pending.drain(..) {
+                    if self.store.has(&h) {
+                        continue;
+                    }
+                    match up.get(&h) {
+                        Some(n) => theirs.push((h, n.clone())),
+                        None => {
+                            up.insert(h, Arc::new(tokio::sync::Notify::new()));
+                            mine.push(h);
+                        }
+                    }
+                }
+            }
+            let result = if mine.is_empty() {
+                Ok(())
+            } else {
+                self.stats.blobs_requested.fetch_add(mine.len() as u64, Ordering::Relaxed);
+                from.blobs(mine.clone()).await
+            };
+            {
+                let mut up = self.uploading.lock();
+                for h in &mine {
+                    if let Some(n) = up.remove(h) {
+                        n.notify_waiters();
+                    }
+                }
+            }
+            result?;
+            if let Some(h) = mine.iter().find(|h| !self.store.has(h)) {
+                bail!("the client did not upload file content {h}");
+            }
+            // Wait for the other uploaders; whatever they failed to bring is
+            // ours to ask for on the next round.
+            self.stats.shared_uploads.fetch_add(theirs.len() as u64, Ordering::Relaxed);
+            for (h, n) in theirs {
+                loop {
+                    let notified = n.notified();
+                    if self.store.has(&h) {
+                        break;
+                    }
+                    let gone = !self.uploading.lock().get(&h).is_some_and(|cur| Arc::ptr_eq(cur, &n));
+                    if gone {
+                        if !self.store.has(&h) {
+                            pending.push(h);
+                        }
+                        break;
+                    }
+                    let _ = tokio::time::timeout(std::time::Duration::from_millis(200), notified).await;
                 }
             }
         }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        Ok(())
     }
-}
 
-struct GitBlob {
-    repo: Arc<GitRepo>,
-    oid: Oid,
-}
-
-impl LazyBlob for GitBlob {
-    fn materialize(&self, store: &Store) -> io::Result<Hash> {
-        let bytes = self.repo.blob(&self.oid)?;
-        store.put_bytes(&bytes)
+    /// Remembers `snap` as the newest state of `worktree`.
+    pub fn remember(&self, worktree: &str, snap: &Arc<Snapshot>) {
+        let mut r = self.recent.lock();
+        if r.len() > 4096 {
+            r.clear();
+        }
+        r.insert(worktree.to_string(), snap.clone());
     }
-}
 
-/// One overlay entry.
-#[derive(Clone, Debug)]
-pub enum Ov {
-    File { hash: Hash, exec: bool, size: u64 },
-    Symlink(Vec<u8>),
-    /// A path HEAD has that the worktree does not.
-    Deleted,
-    Dir(Arc<OvDir>),
-    /// A directory shown live from the host (ignored directory, submodule).
-    Live(Arc<Path>),
-}
+    pub fn recent(&self) -> Vec<(String, Arc<Snapshot>)> {
+        self.recent.lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
 
-#[derive(Clone, Debug, Default)]
-pub struct OvDir {
-    /// The directory exists in the worktree even if HEAD has nothing here.
-    pub entries: BTreeMap<Vec<u8>, Ov>,
-}
-
-#[derive(Clone)]
-struct DirState {
-    tree: Option<Arc<TreeMap>>,
-    ov: Option<Arc<OvDir>>,
-    live: Option<(Arc<Path>, Vec<u8>)>,
-}
-
-/// An immutable view of a worktree.
-pub struct Snapshot {
-    pub repo: Arc<GitRepo>,
-    /// HEAD tree, or zeros when HEAD is unborn.
-    pub tree: Oid,
-    pub overlay: Arc<OvDir>,
-    /// Identifies the snapshot's content.
-    pub id: Hash,
-    dirs: DashMap<Vec<u8>, Option<DirState>>,
-    /// Paths (relative, no leading slash) that are hidden, e.g. `.git`.
-    hidden: Vec<Vec<u8>>,
+    /// Adds everything the remembered snapshots consist of to `live`.
+    pub fn mark(&self, live: &mut HashSet<Hash>) {
+        let roots: Vec<Hash> = self.recent.lock().values().map(|s| s.id).collect();
+        let mut stack = roots;
+        while let Some(d) = stack.pop() {
+            if !live.insert(d) {
+                continue;
+            }
+            let Some(tree) = self.get(&d) else { continue };
+            for (_, node) in &tree.entries {
+                match node {
+                    Node::File { hash, .. } => {
+                        live.insert(Hash(*hash));
+                    }
+                    Node::Dir(sub) => stack.push(Hash(*sub)),
+                    Node::Symlink(_) => {}
+                }
+            }
+        }
+    }
 }
 
 const OWN_FILE: Owner = Owner::own(0o644);
 const OWN_EXEC: Owner = Owner::own(0o755);
 const OWN_DIR: Owner = Owner::own(0o755);
 
-impl Snapshot {
-    pub fn new(repo: Arc<GitRepo>, tree: Oid, overlay: Arc<OvDir>) -> Snapshot {
-        let mut h = crate::hash::KeyHasher::new("snapshot");
-        h.field(&tree);
-        hash_ov(&overlay, &mut h);
-        Snapshot { repo, tree, overlay, id: h.finish(), dirs: DashMap::new(), hidden: vec![b".git".to_vec()] }
-    }
+/// An immutable view of a worktree.
+pub struct Snapshot {
+    trees: Arc<Trees>,
+    /// The root tree's digest: identifies the snapshot's content.
+    pub id: Hash,
+    dirs: DashMap<Vec<u8>, Option<Arc<Tree>>>,
+}
 
-    fn root_state(&self) -> Option<DirState> {
-        let tree = if self.tree == [0u8; 20] { None } else { self.repo.tree(&self.tree).ok() };
-        Some(DirState { tree, ov: Some(self.overlay.clone()), live: None })
+impl Snapshot {
+    pub fn new(trees: Arc<Trees>, root: Hash) -> Snapshot {
+        Snapshot { trees, id: root, dirs: DashMap::new() }
     }
 
     /// `rel_dir` is `/` for the worktree root or `/a/b`.
-    fn dir_state(&self, rel_dir: &[u8]) -> Option<DirState> {
+    fn dir(&self, rel_dir: &[u8]) -> Option<Arc<Tree>> {
         if rel_dir == b"/" || rel_dir.is_empty() {
-            return self.root_state();
+            return self.trees.get(&self.id);
         }
-        if let Some(s) = self.dirs.get(rel_dir) {
-            return s.clone();
+        if let Some(t) = self.dirs.get(rel_dir) {
+            return t.clone();
         }
         let (parent, name) = vsplit(rel_dir)?;
-        let st = self.dir_state(parent).and_then(|p| self.child_dir(&p, name));
-        self.dirs.insert(rel_dir.to_vec(), st.clone());
-        st
-    }
-
-    fn child_dir(&self, p: &DirState, name: &[u8]) -> Option<DirState> {
-        if let Some((real, rel)) = &p.live {
-            return Some(DirState { tree: None, ov: None, live: Some((real.clone(), vjoin(rel, name))) });
-        }
-        let tree_child = || -> Option<Arc<TreeMap>> {
-            let e = p.tree.as_ref()?.get(name)?;
-            if e.is_tree() { self.repo.tree(&e.oid).ok() } else { None }
-        };
-        match p.ov.as_ref().and_then(|o| o.entries.get(name)) {
-            Some(Ov::Dir(d)) => Some(DirState { tree: tree_child(), ov: Some(d.clone()), live: None }),
-            Some(Ov::Live(real)) => Some(DirState { tree: None, ov: None, live: Some((real.clone(), b"/".to_vec())) }),
-            Some(_) => None,
-            None => tree_child().map(|t| DirState { tree: Some(t), ov: None, live: None }),
-        }
+        let t = self.dir(parent).and_then(|p| match p.get(name) {
+            Some(Node::Dir(d)) => self.trees.get(&Hash(*d)),
+            _ => None,
+        });
+        self.dirs.insert(rel_dir.to_vec(), t.clone());
+        t
     }
 
     pub fn lookup(&self, rel_dir: &[u8], name: &[u8]) -> Looked {
-        if (rel_dir == b"/" || rel_dir.is_empty()) && self.hidden.iter().any(|h| h == name) {
-            return Looked::Absent;
-        }
-        let Some(st) = self.dir_state(rel_dir) else { return Looked::Absent };
-        if let Some((real, rel)) = &st.live {
-            return HostRegion::new(real.to_path_buf()).lookup(rel, name);
-        }
-        if let Some(e) = st.ov.as_ref().and_then(|o| o.entries.get(name)) {
-            return match e {
-                Ov::File { hash, exec, size } => Looked::File(FileInfo {
-                    size: *size,
-                    owner: if *exec { OWN_EXEC } else { OWN_FILE },
-                    src: FileSrc::Blob(*hash),
-                    sem: None,
-                }),
-                Ov::Symlink(t) => Looked::Symlink(t.clone()),
-                Ov::Deleted => Looked::Absent,
-                Ov::Dir(_) | Ov::Live(_) => Looked::Dir(OWN_DIR),
-            };
-        }
-        let Some(e) = st.tree.as_ref().and_then(|t| t.get(name)) else { return Looked::Absent };
-        if e.is_tree() || e.is_gitlink() {
-            Looked::Dir(OWN_DIR)
-        } else if e.is_link() {
-            match self.repo.link_target(&e.oid) {
-                Ok(t) => Looked::Symlink(t.to_vec()),
-                Err(_) => Looked::Absent,
-            }
-        } else {
-            let Ok(size) = self.repo.blob_size(&e.oid) else { return Looked::Absent };
-            Looked::File(FileInfo {
-                size,
-                owner: if e.exec() { OWN_EXEC } else { OWN_FILE },
-                src: FileSrc::Git { oid: e.oid, blob: Arc::new(GitBlob { repo: self.repo.clone(), oid: e.oid }) },
+        let Some(tree) = self.dir(rel_dir) else { return Looked::Absent };
+        match tree.get(name) {
+            None => Looked::Absent,
+            Some(Node::Dir(_)) => Looked::Dir(OWN_DIR),
+            Some(Node::Symlink(t)) => Looked::Symlink(t.clone()),
+            Some(Node::File { hash, size, exec }) => Looked::File(FileInfo {
+                size: *size,
+                owner: if *exec { OWN_EXEC } else { OWN_FILE },
+                src: FileSrc::Blob(Hash(*hash)),
                 sem: None,
-            })
+            }),
         }
     }
 
     pub fn list(&self, rel_dir: &[u8]) -> io::Result<Listing> {
-        let st = self.dir_state(rel_dir).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-        if let Some((real, rel)) = &st.live {
-            return HostRegion::new(real.to_path_buf()).list(rel);
-        }
-        let mut names: BTreeMap<Vec<u8>, DType> = BTreeMap::new();
-        if let Some(t) = &st.tree {
-            for (name, e) in t.iter() {
-                let dt = if e.is_tree() || e.is_gitlink() {
-                    DType::Dir
-                } else if e.is_link() {
-                    DType::Symlink
-                } else {
-                    DType::File
+        let tree = self.dir(rel_dir).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        Ok(tree
+            .entries
+            .iter()
+            .map(|(name, node)| {
+                let t = match node {
+                    Node::Dir(_) => DType::Dir,
+                    Node::Symlink(_) => DType::Symlink,
+                    Node::File { .. } => DType::File,
                 };
-                names.insert(name.to_vec(), dt);
-            }
+                (name.clone(), t)
+            })
+            .collect())
+    }
+
+    /// The node at a path relative to the root (`a/b/c`).
+    pub fn node(&self, rel: &[u8]) -> Option<Node> {
+        let mut abs = b"/".to_vec();
+        abs.extend_from_slice(rel);
+        let (dir, name) = vsplit(&abs)?;
+        self.dir(dir)?.get(name).cloned()
+    }
+
+    /// The content of the file at a path relative to the root.
+    pub fn read(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        match self.node(rel)? {
+            Node::File { hash, .. } => self.trees.store.read(&Hash(hash)).ok(),
+            _ => None,
         }
-        if let Some(o) = &st.ov {
-            for (name, e) in &o.entries {
-                match e {
-                    Ov::Deleted => {
-                        names.remove(name);
-                    }
-                    Ov::File { .. } => {
-                        names.insert(name.clone(), DType::File);
-                    }
-                    Ov::Symlink(_) => {
-                        names.insert(name.clone(), DType::Symlink);
-                    }
-                    Ov::Dir(_) | Ov::Live(_) => {
-                        names.insert(name.clone(), DType::Dir);
+    }
+
+    /// Calls `f` with every entry, parents before children; `f` returns
+    /// whether to descend into a directory.
+    pub fn walk(&self, f: &mut dyn FnMut(&[u8], &Node) -> bool) {
+        fn go(s: &Snapshot, tree: &Tree, prefix: &[u8], f: &mut dyn FnMut(&[u8], &Node) -> bool) {
+            for (name, node) in &tree.entries {
+                let mut path = prefix.to_vec();
+                if !path.is_empty() {
+                    path.push(b'/');
+                }
+                path.extend_from_slice(name);
+                let descend = f(&path, node);
+                if let (Node::Dir(d), true) = (node, descend) {
+                    if let Some(sub) = s.trees.get(&Hash(*d)) {
+                        go(s, &sub, &path, f);
                     }
                 }
             }
         }
-        if rel_dir == b"/" || rel_dir.is_empty() {
-            for h in &self.hidden {
-                names.remove(h);
-            }
-        }
-        Ok(names.into_iter().collect())
-    }
-}
-
-fn hash_ov(d: &OvDir, h: &mut crate::hash::KeyHasher) {
-    h.u64(d.entries.len() as u64);
-    for (name, e) in &d.entries {
-        h.field(name);
-        match e {
-            Ov::File { hash, exec, .. } => {
-                h.field(b"f").field(&hash.0).u64(*exec as u64);
-            }
-            Ov::Symlink(t) => {
-                h.field(b"l").field(t);
-            }
-            Ov::Deleted => {
-                h.field(b"x");
-            }
-            Ov::Dir(d) => {
-                h.field(b"d");
-                hash_ov(d, h);
-            }
-            Ov::Live(p) => {
-                h.field(b"L").field(p.as_os_str().as_bytes());
-            }
+        if let Some(root) = self.trees.get(&self.id) {
+            go(self, &root, b"", f);
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Worktree: keeps the overlay current
-// ---------------------------------------------------------------------------
-
-/// Flat overlay entry, keyed by path relative to the worktree root.
-#[derive(Clone, Debug, PartialEq)]
-enum Change {
-    File { hash: Hash, exec: bool, size: u64 },
-    Symlink(Vec<u8>),
-    Deleted,
-    /// A directory that exists in the worktree. Only recorded when HEAD has
-    /// no directory there.
-    Dir,
-    Live,
-}
-
-struct WtState {
-    tree: Oid,
-    changes: BTreeMap<Vec<u8>, Change>,
-    /// Directories being watched, relative paths (`""` is the root).
-    watched: HashMap<Vec<u8>, i32>,
-    /// Paths behind a smudge filter or eol conversion: never taken from git.
-    filtered: HashSet<Vec<u8>>,
-    snapshot: Option<Arc<Snapshot>>,
-    scanned: bool,
-}
-
-pub struct Worktree {
-    pub root: PathBuf,
-    /// The worktree's own git directory (where HEAD and index live).
-    pub git_dir: PathBuf,
-    pub repo: Arc<GitRepo>,
-    content: Arc<Content>,
-    watcher: Arc<Watcher>,
-    id: u64,
-    st: Mutex<WtState>,
-    suspects: Mutex<HashSet<Vec<u8>>>,
-    rescan: AtomicBool,
-    /// Counters for tests and status output.
-    pub full_scans: AtomicU64,
-    pub refreshed_paths: AtomicU64,
-}
-
-fn rel_join(dir: &[u8], name: &[u8]) -> Vec<u8> {
-    if dir.is_empty() {
-        name.to_vec()
-    } else {
-        let mut v = dir.to_vec();
-        v.push(b'/');
-        v.extend_from_slice(name);
-        v
-    }
-}
-
-fn rel_parent(p: &[u8]) -> &[u8] {
-    match p.iter().rposition(|&c| c == b'/') {
-        Some(i) => &p[..i],
-        None => b"",
-    }
-}
-
-fn git_cmd(root: &Path) -> Command {
-    let mut c = Command::new("git");
-    c.arg("-C").arg(root).arg("--no-optional-locks");
-    // The daemon may run as a different user than the repository owner.
-    c.env("GIT_CONFIG_COUNT", "1").env("GIT_CONFIG_KEY_0", "safe.directory").env("GIT_CONFIG_VALUE_0", "*");
-    c
-}
-
-impl Worktree {
-    pub fn open(root: &Path, content: Arc<Content>, watcher: Arc<Watcher>, repos: &RepoCache) -> Result<Arc<Worktree>> {
-        let root = root.canonicalize()?;
-        let probe = git2::Repository::open(&root)
-            .with_context(|| format!("{} is not the root of a git worktree", root.display()))?;
-        let workdir = probe.workdir().map(|p| p.canonicalize()).transpose()?;
-        if workdir.as_deref() != Some(&root) {
-            bail!("{} is not the root of a git worktree", root.display());
-        }
-        let git_dir = probe.path().canonicalize()?;
-        let common = probe.commondir().canonicalize()?;
-        drop(probe);
-        let repo = repos.get(&common, &root)?;
-        let wt = Arc::new(Worktree {
-            root,
-            git_dir,
-            repo,
-            content,
-            watcher: watcher.clone(),
-            id: watcher.next_id.fetch_add(1, Ordering::Relaxed),
-            st: Mutex::new(WtState {
-                tree: [0u8; 20],
-                changes: BTreeMap::new(),
-                watched: HashMap::new(),
-                filtered: HashSet::new(),
-                snapshot: None,
-                scanned: false,
-            }),
-            suspects: Mutex::new(HashSet::new()),
-            rescan: AtomicBool::new(false),
-            full_scans: AtomicU64::new(0),
-            refreshed_paths: AtomicU64::new(0),
-        });
-        watcher.register(&wt);
-        Ok(wt)
-    }
-
-    fn head_tree(&self) -> Result<Oid> {
-        let repo = git2::Repository::open(&self.root)?;
-        let head = match repo.head() {
-            Ok(h) => h,
-            Err(e) if e.code() == git2::ErrorCode::UnbornBranch || e.code() == git2::ErrorCode::NotFound => {
-                return Ok([0u8; 20]);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        Ok(oid_of(head.peel_to_tree()?.id()))
-    }
-
-    /// Returns a snapshot of the worktree as it is now.
-    pub fn snapshot(self: &Arc<Self>) -> Result<Arc<Snapshot>> {
-        let mut st = self.st.lock();
-        // Everything that happened before this point has been delivered once
-        // the cookie comes back.
-        let overflowed = self.watcher.sync(self)?;
-        let tree = self.head_tree()?;
-        let mut changed = false;
-        if !st.scanned || overflowed || self.rescan.swap(false, Ordering::SeqCst) {
-            self.full_scan(&mut st, tree)?;
-            changed = true;
-        } else {
-            let mut suspects: HashSet<Vec<u8>> = std::mem::take(&mut *self.suspects.lock());
-            if tree != st.tree {
-                for p in self.repo.diff_trees(&st.tree, &tree)? {
-                    suspects.insert(p);
-                }
-                // Entries recorded against the old tree may be redundant or
-                // meaningless against the new one.
-                suspects.extend(st.changes.keys().cloned());
-                st.tree = tree;
-                changed = true;
-            }
-            if suspects.iter().any(|p| {
-                let name = p.rsplit(|&c| c == b'/').next().unwrap_or(p);
-                name == b".gitattributes" || name == b".gitignore"
-            }) {
-                self.full_scan(&mut st, tree)?;
-                changed = true;
-            } else if !suspects.is_empty() {
-                let mut list: Vec<Vec<u8>> = suspects.into_iter().collect();
-                list.sort();
-                for p in list {
-                    changed |= self.refresh(&mut st, &p)?;
-                }
-            }
-        }
-        if changed || st.snapshot.is_none() {
-            let overlay = build_overlay(&self.root, &st.changes);
-            let reuse = st.snapshot.as_ref().filter(|s| s.tree == st.tree);
-            let snap = Snapshot::new(self.repo.clone(), st.tree, Arc::new(overlay));
-            // Keep the same object (and its memoised directory states) when
-            // nothing actually changed.
-            match reuse {
-                Some(old) if old.id == snap.id => {}
-                _ => st.snapshot = Some(Arc::new(snap)),
-            }
-        }
-        Ok(st.snapshot.clone().unwrap())
-    }
-
-    fn tree_entry(&self, tree: &Oid, rel: &[u8]) -> Option<TreeEnt> {
-        if *tree == [0u8; 20] {
-            return None;
-        }
-        let mut cur = self.repo.tree(tree).ok()?;
-        let mut comps = rel.split(|&c| c == b'/').peekable();
-        while let Some(c) = comps.next() {
-            let e = *cur.get(c)?;
-            if comps.peek().is_none() {
-                return Some(e);
-            }
-            if !e.is_tree() {
-                return None;
-            }
-            cur = self.repo.tree(&e.oid).ok()?;
-        }
-        None
-    }
-
-    fn real(&self, rel: &[u8]) -> PathBuf {
-        if rel.is_empty() { self.root.clone() } else { self.root.join(OsStr::from_bytes(rel)) }
-    }
-
-    fn in_live(&self, st: &WtState, rel: &[u8]) -> bool {
-        let mut p = rel;
-        loop {
-            if matches!(st.changes.get(p), Some(Change::Live)) {
-                return true;
-            }
-            if p.is_empty() {
+    /// Writes the snapshot out as ordinary files owned by `uid`/`gid`:
+    /// for the few things that need a real directory (evaluating a flake,
+    /// fetching dependencies, the drift check's stock cargo build).
+    /// `keep` chooses what to write; a directory it rejects is skipped whole.
+    pub fn materialize(&self, dest: &Path, uid: u32, gid: u32, keep: &dyn Fn(&[u8], &Node) -> bool) -> Result<()> {
+        let store = self.trees.store.clone();
+        std::fs::create_dir_all(dest)?;
+        chown(dest, uid, gid);
+        let mut failure: Option<anyhow::Error> = None;
+        self.walk(&mut |rel, node| {
+            if failure.is_some() || !keep(rel, node) {
                 return false;
             }
-            p = rel_parent(p);
-        }
-    }
-
-    fn remove_under(st: &mut WtState, rel: &[u8]) -> bool {
-        let mut prefix = rel.to_vec();
-        prefix.push(b'/');
-        let doomed: Vec<Vec<u8>> = st
-            .changes
-            .range(prefix.clone()..)
-            .take_while(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, _)| k.clone())
-            .collect();
-        let any = !doomed.is_empty();
-        for k in doomed {
-            st.changes.remove(&k);
-        }
-        any
-    }
-
-    fn set(st: &mut WtState, rel: &[u8], c: Option<Change>) -> bool {
-        match c {
-            Some(c) => st.changes.insert(rel.to_vec(), c.clone()) != Some(c),
-            None => st.changes.remove(rel).is_some(),
-        }
-    }
-
-    /// Brings the overlay entry for one path in line with the worktree.
-    /// Returns whether the overlay changed.
-    fn refresh(&self, st: &mut WtState, rel: &[u8]) -> Result<bool> {
-        if rel.is_empty() || rel == b".git" || rel.starts_with(b".git/") {
-            return Ok(false);
-        }
-        // A path below a live directory is served from disk directly.
-        if self.in_live(st, rel_parent(rel)) {
-            return Ok(false);
-        }
-        self.refreshed_paths.fetch_add(1, Ordering::Relaxed);
-        let real = self.real(rel);
-        let head = self.tree_entry(&st.tree, rel);
-        let meta = match std::fs::symlink_metadata(&real) {
-            Ok(m) => m,
-            Err(_) => {
-                let mut changed = Self::remove_under(st, rel);
-                changed |= Self::set(st, rel, head.map(|_| Change::Deleted));
-                return Ok(changed);
-            }
-        };
-        let ft = meta.file_type();
-        if ft.is_dir() {
-            if matches!(st.changes.get(rel), Some(Change::Live)) {
-                return Ok(false);
-            }
-            let known = st.watched.contains_key(rel);
-            let mut changed = false;
-            let head_is_dir = head.map(|e| e.is_tree()).unwrap_or(false);
-            if head.map(|e| e.is_gitlink()).unwrap_or(false) || (!known && self.is_ignored(rel)) {
-                changed |= Self::remove_under(st, rel);
-                changed |= Self::set(st, rel, Some(Change::Live));
-                return Ok(changed);
-            }
-            changed |= Self::set(st, rel, (!head_is_dir).then_some(Change::Dir));
-            if !known {
-                // New directory: watch first, then look inside, so nothing
-                // created in between is missed.
-                self.watch_dir(st, rel);
-                for e in std::fs::read_dir(&real).into_iter().flatten().flatten() {
-                    let child = rel_join(rel, e.file_name().as_bytes());
-                    changed |= self.refresh(st, &child)?;
-                }
-            }
-            return Ok(changed);
-        }
-        // Not a directory any more: forget anything recorded below.
-        let mut changed = Self::remove_under(st, rel);
-        if let Some(wd) = st.watched.remove(rel) {
-            self.watcher.unwatch(wd);
-        }
-        if ft.is_symlink() {
-            let target = std::fs::read_link(&real)?.into_os_string().into_encoded_bytes();
-            let same = head.map(|e| e.is_link() && self.repo.link_target(&e.oid).map(|t| &t[..] == &target[..]).unwrap_or(false)).unwrap_or(false);
-            changed |= Self::set(st, rel, (!same).then_some(Change::Symlink(target)));
-            return Ok(changed);
-        }
-        if !ft.is_file() {
-            // Sockets, fifos, devices: not part of a snapshot.
-            changed |= Self::set(st, rel, head.map(|_| Change::Deleted));
-            return Ok(changed);
-        }
-        let exec = meta.mode() & 0o111 != 0;
-        let (hash, oid, size) = self.capture(&real)?;
-        let clean = head
-            .map(|e| !e.is_tree() && !e.is_link() && !e.is_gitlink() && e.oid == oid && e.exec() == exec)
-            .unwrap_or(false)
-            && !st.filtered.contains(rel);
-        changed |= Self::set(st, rel, (!clean).then_some(Change::File { hash, exec, size }));
-        Ok(changed)
-    }
-
-    /// Copies a worktree file into the store, computing its blake3 and git
-    /// blob id. Memoised by file identity.
-    fn capture(&self, real: &Path) -> Result<(Hash, Oid, u64)> {
-        for _ in 0..5 {
-            let mut f = std::fs::File::open(real)?;
-            let sig = HostSig::of(&f.metadata()?);
-            let memo_key = capture_key(&sig);
-            if let Some(v) = self.content.store.db().get(crate::db::Table::Meta, &memo_key) {
-                if v.len() == 52 {
-                    let hash = Hash(v[..32].try_into().unwrap());
-                    if self.content.store.has(&hash) {
-                        self.content.store.touch(&hash);
-                        return Ok((hash, v[32..52].try_into().unwrap(), sig.size));
+            let path = dest.join(std::ffi::OsStr::from_bytes(rel));
+            let done: Result<()> = (|| {
+                match node {
+                    Node::Dir(_) => std::fs::create_dir_all(&path)?,
+                    Node::Symlink(t) => std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(t), &path)?,
+                    Node::File { hash, exec, .. } => {
+                        store.materialize_owned(&Hash(*hash), *exec, &path)?;
                     }
                 }
+                chown(&path, uid, gid);
+                Ok(())
+            })();
+            if let Err(e) = done {
+                failure = Some(e.context(format!("writing {}", path.display())));
             }
-            let mut b3 = blake3::Hasher::new();
-            let mut s1 = Sha1::new();
-            s1.update(format!("blob {}\0", sig.size).as_bytes());
-            let tmp = self.content.store.tmp_path();
-            let mut out = std::fs::File::create(&tmp)?;
-            let mut buf = vec![0u8; 256 * 1024];
-            let mut total = 0u64;
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                b3.update(&buf[..n]);
-                s1.update(&buf[..n]);
-                out.write_all(&buf[..n])?;
-                total += n as u64;
-            }
-            drop(out);
-            // The file must not have changed while it was being read.
-            if total != sig.size || HostSig::of(&f.metadata()?) != sig {
-                let _ = std::fs::remove_file(&tmp);
-                continue;
-            }
-            let hash = Hash(*b3.finalize().as_bytes());
-            let oid: Oid = s1.finalize().into();
-            self.content.store.install_hashed(&tmp, hash, total)?;
-            self.content.record_git(oid, hash);
-            let mut v = Vec::with_capacity(52);
-            v.extend_from_slice(&hash.0);
-            v.extend_from_slice(&oid);
-            self.content.store.db().put(crate::db::Table::Meta, &memo_key, &v);
-            return Ok((hash, oid, total));
-        }
-        bail!("{} keeps changing while being captured", real.display())
-    }
-
-    fn is_ignored(&self, rel: &[u8]) -> bool {
-        git_cmd(&self.root)
-            .arg("check-ignore")
-            .arg("-q")
-            .arg("--")
-            .arg(OsStr::from_bytes(rel))
-            .status()
-            .map(|s| s.code() == Some(0))
-            .unwrap_or(false)
-    }
-
-    fn watch_dir(&self, st: &mut WtState, rel: &[u8]) {
-        if st.watched.contains_key(rel) {
-            return;
-        }
-        if let Some(wd) = self.watcher.watch(self.id, &self.real(rel), rel) {
-            st.watched.insert(rel.to_vec(), wd);
-        }
-    }
-
-    /// Rebuilds the overlay from `git status` and a directory walk.
-    fn full_scan(&self, st: &mut WtState, tree: Oid) -> Result<()> {
-        self.full_scans.fetch_add(1, Ordering::Relaxed);
-        // Events for anything that changes from here on will be seen by the
-        // next snapshot; drop what is queued, the scan supersedes it.
-        self.suspects.lock().clear();
-        st.tree = tree;
-        st.changes.clear();
-        st.scanned = true;
-        self.watch_dir(st, b"");
-
-        let out = git_cmd(&self.root)
-            .args(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignored=matching", "--no-renames"])
-            .output()
-            .context("running git status")?;
-        if !out.status.success() {
-            bail!("git status failed: {}", String::from_utf8_lossy(&out.stderr));
-        }
-        let mut suspects: Vec<Vec<u8>> = Vec::new();
-        let mut ignored_dirs: Vec<Vec<u8>> = Vec::new();
-        for rec in out.stdout.split(|&c| c == 0) {
-            if rec.len() < 3 {
-                continue;
-            }
-            let path = match rec[0] {
-                b'1' => rec.splitn(9, |&c| c == b' ').nth(8),
-                b'u' => rec.splitn(11, |&c| c == b' ').nth(10),
-                b'?' => Some(&rec[2..]),
-                b'!' => {
-                    let p = &rec[2..];
-                    if let Some(dir) = p.strip_suffix(b"/") {
-                        ignored_dirs.push(dir.to_vec());
-                        None
-                    } else {
-                        Some(p)
-                    }
-                }
-                _ => None,
-            };
-            if let Some(p) = path {
-                suspects.push(p.to_vec());
-            }
-        }
-        for d in &ignored_dirs {
-            st.changes.insert(d.clone(), Change::Live);
-        }
-        st.filtered = self.filtered_paths()?;
-        suspects.extend(st.filtered.iter().cloned());
-
-        // Walk every directory that is not live: set up watches and find
-        // directories HEAD does not know (git does not report empty ones).
-        let mut seen_dirs: HashSet<Vec<u8>> = HashSet::new();
-        let mut stack: Vec<Vec<u8>> = vec![Vec::new()];
-        while let Some(dir) = stack.pop() {
-            self.watch_dir(st, &dir);
-            seen_dirs.insert(dir.clone());
-            let Ok(rd) = std::fs::read_dir(self.real(&dir)) else { continue };
-            for e in rd.flatten() {
-                let Ok(ft) = e.file_type() else { continue };
-                if !ft.is_dir() {
-                    continue;
-                }
-                let child = rel_join(&dir, e.file_name().as_bytes());
-                if child == b".git" || matches!(st.changes.get(&child), Some(Change::Live)) {
-                    continue;
-                }
-                match self.tree_entry(&tree, &child) {
-                    Some(te) if te.is_gitlink() => {
-                        st.changes.insert(child, Change::Live);
-                        continue;
-                    }
-                    Some(te) if te.is_tree() => {}
-                    _ => {
-                        st.changes.insert(child.clone(), Change::Dir);
-                    }
-                }
-                stack.push(child);
-            }
-        }
-        // Drop watches for directories that are gone.
-        let gone: Vec<Vec<u8>> = st.watched.keys().filter(|k| !seen_dirs.contains(*k)).cloned().collect();
-        for k in gone {
-            if let Some(wd) = st.watched.remove(&k) {
-                self.watcher.unwatch(wd);
-            }
-        }
-        // Tracked directories missing from disk: mark the topmost one.
-        self.mark_missing_dirs(st, &tree, b"", &seen_dirs);
-
-        suspects.sort();
-        suspects.dedup();
-        for p in suspects {
-            self.refresh(st, &p)?;
-        }
-        Ok(())
-    }
-
-    fn mark_missing_dirs(&self, st: &mut WtState, tree: &Oid, dir: &[u8], seen: &HashSet<Vec<u8>>) {
-        let Ok(t) = self.repo.tree(tree) else { return };
-        for (name, e) in t.iter() {
-            if !e.is_tree() {
-                continue;
-            }
-            let child = rel_join(dir, name);
-            if seen.contains(&child) {
-                self.mark_missing_dirs(st, &e.oid, &child, seen);
-            } else if !st.changes.contains_key(&child) && std::fs::symlink_metadata(self.real(&child)).is_err() {
-                st.changes.insert(child, Change::Deleted);
-            }
-        }
-    }
-
-    /// Tracked paths whose worktree bytes are not the blob's bytes.
-    fn filtered_paths(&self) -> Result<HashSet<Vec<u8>>> {
-        let mut out = HashSet::new();
-        // Without any attributes file and without autocrlf nothing is filtered.
-        let cfg = git_cmd(&self.root).args(["config", "--get", "core.autocrlf"]).output()?;
-        let autocrlf = String::from_utf8_lossy(&cfg.stdout).trim() == "true";
-        let ls = git_cmd(&self.root).args(["ls-files", "-z"]).output()?;
-        if !ls.status.success() {
-            return Ok(out);
-        }
-        if autocrlf {
-            for p in ls.stdout.split(|&c| c == 0).filter(|p| !p.is_empty()) {
-                out.insert(p.to_vec());
-            }
-            return Ok(out);
-        }
-        let has_attrs = ls.stdout.split(|&c| c == 0).any(|p| p == b".gitattributes" || p.ends_with(b"/.gitattributes"))
-            || self.git_dir.join("info/attributes").exists()
-            || self.root.join(".gitattributes").exists();
-        if !has_attrs {
-            return Ok(out);
-        }
-        let mut child = git_cmd(&self.root)
-            .args(["check-attr", "-z", "--stdin", "filter", "eol", "working-tree-encoding", "ident"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().unwrap();
-        let input = ls.stdout;
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
+            true
         });
-        let mut res = Vec::new();
-        child.stdout.take().unwrap().read_to_end(&mut res)?;
-        let _ = writer.join();
-        let _ = child.wait();
-        let mut it = res.split(|&c| c == 0);
-        while let (Some(path), Some(attr), Some(value)) = (it.next(), it.next(), it.next()) {
-            let risky = match attr {
-                b"eol" => value == b"crlf",
-                b"filter" | b"working-tree-encoding" | b"ident" => {
-                    value != b"unspecified" && value != b"unset"
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// A snapshot that differs from this one in one file.
+    pub fn with_file(&self, rel: &[u8], node: Option<Node>) -> Result<Arc<Snapshot>> {
+        fn set(trees: &Trees, tree: &Tree, comps: &[&[u8]], node: Option<Node>) -> Result<Tree> {
+            let mut out = tree.clone();
+            let pos = out.entries.binary_search_by(|(n, _)| n.as_slice().cmp(comps[0]));
+            let new = if comps.len() == 1 {
+                node
+            } else {
+                let sub = match pos.ok().map(|i| &out.entries[i].1) {
+                    Some(Node::Dir(d)) => (*trees.get(&Hash(*d)).context("subtree missing")?).clone(),
+                    _ => Tree::default(),
+                };
+                let sub = set(trees, &sub, &comps[1..], node)?;
+                Some(Node::Dir(trees.put_tree(&sub)?.0))
+            };
+            match (pos, new) {
+                (Ok(i), Some(n)) => out.entries[i].1 = n,
+                (Ok(i), None) => {
+                    out.entries.remove(i);
                 }
-                _ => false,
-            };
-            if risky {
-                out.insert(path.to_vec());
+                (Err(i), Some(n)) => out.entries.insert(i, (comps[0].to_vec(), n)),
+                (Err(_), None) => {}
             }
+            Ok(out)
         }
-        Ok(out)
-    }
-
-    /// Adds the blobs of every captured file to `live`.
-    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
-        for c in self.st.lock().changes.values() {
-            if let Change::File { hash, .. } = c {
-                live.insert(*hash);
-            }
+        let comps: Vec<&[u8]> = rel.split(|&c| c == b'/').filter(|c| !c.is_empty()).collect();
+        if comps.is_empty() {
+            bail!("empty path");
         }
-    }
-
-    /// Number of overlay entries (for status and tests).
-    pub fn dirty_count(&self) -> usize {
-        self.st.lock().changes.len()
+        let root = self.trees.get(&self.id).context("root tree missing")?;
+        let new_root = set(&self.trees, &root, &comps, node)?;
+        let id = self.trees.put_tree(&new_root)?;
+        Ok(Arc::new(Snapshot::new(self.trees.clone(), id)))
     }
 }
 
-fn capture_key(sig: &HostSig) -> Vec<u8> {
-    let mut k = b"cap:".to_vec();
-    k.extend_from_slice(&bincode::serialize(sig).unwrap());
-    k
-}
-
-fn build_overlay(root: &Path, changes: &BTreeMap<Vec<u8>, Change>) -> OvDir {
-    #[derive(Default)]
-    struct B {
-        leaf: Option<Change>,
-        kids: BTreeMap<Vec<u8>, B>,
+pub fn chown(path: &Path, uid: u32, gid: u32) {
+    if unsafe { libc::geteuid() } != 0 {
+        return;
     }
-    let mut top = B::default();
-    for (path, c) in changes {
-        let mut cur = &mut top;
-        for comp in path.split(|&c| c == b'/') {
-            cur = cur.kids.entry(comp.to_vec()).or_default();
-        }
-        cur.leaf = Some(c.clone());
-    }
-    fn conv(root: &Path, rel: &[u8], b: &B) -> OvDir {
-        let mut d = OvDir::default();
-        for (name, kid) in &b.kids {
-            let child_rel = rel_join(rel, name);
-            let ov = match &kid.leaf {
-                Some(Change::File { hash, exec, size }) => Ov::File { hash: *hash, exec: *exec, size: *size },
-                Some(Change::Symlink(t)) => Ov::Symlink(t.clone()),
-                Some(Change::Deleted) => Ov::Deleted,
-                Some(Change::Live) => Ov::Live(Arc::from(root.join(OsStr::from_bytes(&child_rel)))),
-                Some(Change::Dir) | None => Ov::Dir(Arc::new(conv(root, &child_rel, kid))),
-            };
-            d.entries.insert(name.clone(), ov);
-        }
-        d
-    }
-    conv(root, b"", &top)
-}
-
-/// Caches one [`GitRepo`] per git common directory.
-#[derive(Default)]
-pub struct RepoCache {
-    repos: Mutex<HashMap<PathBuf, Arc<GitRepo>>>,
-}
-
-impl RepoCache {
-    fn get(&self, common: &Path, worktree: &Path) -> Result<Arc<GitRepo>> {
-        let mut m = self.repos.lock();
-        if let Some(r) = m.get(common) {
-            return Ok(r.clone());
-        }
-        let r = GitRepo::open(worktree)?;
-        m.insert(common.to_path_buf(), r.clone());
-        Ok(r)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// inotify watcher
-// ---------------------------------------------------------------------------
-
-struct Watch {
-    wt: u64,
-    rel: Vec<u8>,
-}
-
-/// One inotify instance for all worktrees.
-pub struct Watcher {
-    fd: OwnedFd,
-    watches: Mutex<HashMap<i32, Watch>>,
-    worktrees: Mutex<HashMap<u64, std::sync::Weak<Worktree>>>,
-    next_id: AtomicU64,
-    cookie_seq: AtomicU64,
-    cookies_seen: Mutex<HashSet<u64>>,
-    cookie_cv: Condvar,
-    /// Bumped on every queue overflow.
-    overflows: AtomicU64,
-    seen_overflow: Mutex<HashMap<u64, u64>>,
-    cookie_dir: PathBuf,
-    cookie_wd: i32,
-}
-
-const WATCH_MASK: u32 = libc::IN_CREATE
-    | libc::IN_DELETE
-    | libc::IN_MODIFY
-    | libc::IN_CLOSE_WRITE
-    | libc::IN_MOVED_FROM
-    | libc::IN_MOVED_TO
-    | libc::IN_ATTRIB
-    | libc::IN_DONT_FOLLOW
-    | libc::IN_ONLYDIR;
-
-impl Watcher {
-    /// `cookie_dir` is a private directory used to synchronise with the
-    /// event stream.
-    pub fn start(cookie_dir: &Path) -> Result<Arc<Watcher>> {
-        std::fs::create_dir_all(cookie_dir)?;
-        // SAFETY: plain syscall.
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: fd was just created.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let c = std::ffi::CString::new(cookie_dir.as_os_str().as_bytes())?;
-        // SAFETY: valid fd and C string.
-        let cookie_wd = unsafe { libc::inotify_add_watch(fd.as_raw_fd(), c.as_ptr(), libc::IN_CREATE | libc::IN_ONLYDIR) };
-        if cookie_wd < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let w = Arc::new(Watcher {
-            fd,
-            watches: Mutex::new(HashMap::new()),
-            worktrees: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
-            cookie_seq: AtomicU64::new(1),
-            cookies_seen: Mutex::new(HashSet::new()),
-            cookie_cv: Condvar::new(),
-            overflows: AtomicU64::new(0),
-            seen_overflow: Mutex::new(HashMap::new()),
-            cookie_dir: cookie_dir.to_path_buf(),
-            cookie_wd,
-        });
-        let w2 = Arc::downgrade(&w);
-        std::thread::Builder::new().name("inotify".into()).spawn(move || watcher_loop(w2))?;
-        Ok(w)
-    }
-
-    fn register(&self, wt: &Arc<Worktree>) {
-        self.worktrees.lock().insert(wt.id, Arc::downgrade(wt));
-    }
-
-    fn watch(&self, wt: u64, real: &Path, rel: &[u8]) -> Option<i32> {
-        let c = std::ffi::CString::new(real.as_os_str().as_bytes()).ok()?;
-        // Hold the map lock across the syscall so the reader thread cannot
-        // see an event for a descriptor it does not know yet.
-        let mut watches = self.watches.lock();
-        // SAFETY: valid fd and C string.
-        let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), c.as_ptr(), WATCH_MASK) };
-        if wd < 0 {
-            return None;
-        }
-        watches.insert(wd, Watch { wt, rel: rel.to_vec() });
-        Some(wd)
-    }
-
-    fn unwatch(&self, wd: i32) {
-        self.watches.lock().remove(&wd);
-        // SAFETY: valid fd; removing a stale descriptor is harmless.
-        unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
-    }
-
-    /// Waits until every event queued before this call has been processed.
-    /// Returns true if events were lost since this worktree last synced.
-    fn sync(&self, wt: &Worktree) -> Result<bool> {
-        let n = self.cookie_seq.fetch_add(1, Ordering::Relaxed);
-        let path = self.cookie_dir.join(format!("c{n}"));
-        std::fs::File::create(&path)?;
-        let mut seen = self.cookies_seen.lock();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !seen.remove(&n) {
-            if self.cookie_cv.wait_until(&mut seen, deadline).timed_out() {
-                drop(seen);
-                let _ = std::fs::remove_file(&path);
-                bail!("file watcher did not respond");
-            }
-        }
-        drop(seen);
-        let _ = std::fs::remove_file(&path);
-        let now = self.overflows.load(Ordering::SeqCst);
-        let mut so = self.seen_overflow.lock();
-        let prev = so.insert(wt.id, now).unwrap_or(0);
-        Ok(prev != now)
-    }
-}
-
-fn watcher_loop(w: std::sync::Weak<Watcher>) {
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let Some(this) = w.upgrade() else { return };
-        let fd = this.fd.as_raw_fd();
-        drop(this);
-        let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        // Wake periodically so the thread notices the watcher being dropped.
-        // SAFETY: valid pollfd.
-        let r = unsafe { libc::poll(&mut pfd, 1, 1000) };
-        if r <= 0 {
-            continue;
-        }
-        let Some(this) = w.upgrade() else { return };
-        // SAFETY: reading into a valid buffer.
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-        if n <= 0 {
-            continue;
-        }
-        let mut off = 0usize;
-        let n = n as usize;
-        let hdr = std::mem::size_of::<libc::inotify_event>();
-        while off + hdr <= n {
-            // SAFETY: the kernel wrote a complete inotify_event at this offset.
-            let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off) as *const _) };
-            let name_bytes = &buf[off + hdr..off + hdr + ev.len as usize];
-            let name = match name_bytes.iter().position(|&c| c == 0) {
-                Some(i) => &name_bytes[..i],
-                None => name_bytes,
-            };
-            off += hdr + ev.len as usize;
-            if ev.mask & libc::IN_Q_OVERFLOW != 0 {
-                this.overflows.fetch_add(1, Ordering::SeqCst);
-                continue;
-            }
-            if ev.wd == this.cookie_wd {
-                if let Some(n) = std::str::from_utf8(name).ok().and_then(|s| s.strip_prefix('c')).and_then(|s| s.parse().ok()) {
-                    this.cookies_seen.lock().insert(n);
-                    this.cookie_cv.notify_all();
-                }
-                continue;
-            }
-            if ev.mask & libc::IN_IGNORED != 0 {
-                this.watches.lock().remove(&ev.wd);
-                continue;
-            }
-            let target = {
-                let watches = this.watches.lock();
-                watches.get(&ev.wd).map(|wa| (wa.wt, rel_join(&wa.rel, name)))
-            };
-            let Some((wt_id, rel)) = target else { continue };
-            let wt = this.worktrees.lock().get(&wt_id).and_then(|w| w.upgrade());
-            if let Some(wt) = wt {
-                wt.suspects.lock().insert(rel);
-            }
-        }
+    if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        // SAFETY: valid C string.
+        unsafe { libc::lchown(c.as_ptr(), uid, gid) };
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::db::Db;
 
-    fn git(dir: &Path, args: &[&str]) {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    /// A client: trees and blobs by digest.
+    #[derive(Default)]
+    struct Fake {
+        trees: Mutex<HashMap<Hash, Vec<u8>>>,
+        blobs: Mutex<HashMap<Hash, Vec<u8>>>,
+        store: Option<Arc<Store>>,
+        asked_trees: AtomicU64,
+        asked_blobs: AtomicU64,
     }
 
-    struct Fx {
-        _tmp: tempfile::TempDir,
-        root: PathBuf,
-        content: Arc<Content>,
-        watcher: Arc<Watcher>,
-        repos: RepoCache,
-    }
-
-    fn fixture() -> Fx {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("repo");
-        fs::create_dir_all(root.join("src/deep")).unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        fs::write(root.join("src/deep/x.rs"), "x\n").unwrap();
-        fs::write(root.join("run.sh"), "#!/bin/sh\n").unwrap();
-        fs::write(root.join(".gitignore"), "/target\n*.log\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
-        std::os::unix::fs::symlink("src/lib.rs", root.join("link")).unwrap();
-        git(tmp.path(), &["init", "-q", "-b", "main", "repo"]);
-        git(&root, &["add", "-A"]);
-        git(&root, &["commit", "-q", "-m", "init"]);
-        let db = Arc::new(crate::db::Db::open(&tmp.path().join("db.redb")).unwrap());
-        let store = Arc::new(Store::open(&tmp.path().join("store"), db).unwrap());
-        let content = Arc::new(Content::new(store));
-        let watcher = Watcher::start(&tmp.path().join("cookies")).unwrap();
-        Fx { root, content, watcher, repos: RepoCache::default(), _tmp: tmp }
-    }
-
-    fn read(fx: &Fx, s: &Snapshot, dir: &[u8], name: &[u8]) -> Option<Vec<u8>> {
-        match s.lookup(dir, name) {
-            Looked::File(f) => {
-                let h = fx.content.hash(&f.src).unwrap();
-                let bytes = fx.content.store.read(&h).unwrap();
-                assert_eq!(bytes.len() as u64, f.size);
-                Some(bytes)
-            }
-            _ => None,
+    impl Fake {
+        fn file(&self, content: &[u8]) -> Node {
+            let h = Hash::of(content);
+            self.blobs.lock().insert(h, content.to_vec());
+            Node::File { hash: h.0, size: content.len() as u64, exec: false }
+        }
+        fn dir(&self, mut entries: Vec<(&str, Node)>) -> Node {
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let t = Tree { entries: entries.into_iter().map(|(n, e)| (n.as_bytes().to_vec(), e)).collect() };
+            let enc = t.encode();
+            let d = Hash::of(&enc);
+            self.trees.lock().insert(d, enc);
+            Node::Dir(d.0)
         }
     }
 
-    #[test]
-    fn clean_tree_is_served_from_git() {
-        let fx = fixture();
-        let wt = Worktree::open(&fx.root, fx.content.clone(), fx.watcher.clone(), &fx.repos).unwrap();
-        let s = wt.snapshot().unwrap();
-        assert_eq!(wt.dirty_count(), 0);
-        assert_eq!(read(&fx, &s, b"/src", b"lib.rs").unwrap(), b"pub fn a() {}\n");
-        assert_eq!(read(&fx, &s, b"/src/deep", b"x.rs").unwrap(), b"x\n");
-        assert!(matches!(s.lookup(b"/", b"link"), Looked::Symlink(t) if t == b"src/lib.rs"));
-        assert!(matches!(s.lookup(b"/", b"run.sh"), Looked::File(f) if f.exec()));
-        assert!(matches!(s.lookup(b"/", b"nope"), Looked::Absent));
-        assert!(matches!(s.lookup(b"/", b".git"), Looked::Absent));
-        let mut names: Vec<Vec<u8>> = s.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
-        names.sort();
-        assert_eq!(names, vec![b".gitignore".to_vec(), b"link".to_vec(), b"run.sh".to_vec(), b"src".to_vec()]);
-        // A second snapshot with nothing changed is the same object and costs
-        // no scan.
-        let s2 = wt.snapshot().unwrap();
-        assert!(Arc::ptr_eq(&s, &s2));
-        assert_eq!(wt.full_scans.load(Ordering::Relaxed), 1);
+    impl Uploader for Fake {
+        fn trees<'a>(&'a self, want: Vec<Hash>) -> futures::BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+            Box::pin(async move {
+                self.asked_trees.fetch_add(want.len() as u64, Ordering::Relaxed);
+                Ok(want.iter().filter_map(|d| self.trees.lock().get(d).cloned()).collect())
+            })
+        }
+        fn blobs<'a>(&'a self, want: Vec<Hash>) -> futures::BoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.asked_blobs.fetch_add(want.len() as u64, Ordering::Relaxed);
+                for h in want {
+                    if let Some(b) = self.blobs.lock().get(&h) {
+                        self.store.as_ref().unwrap().put_bytes(b)?;
+                    }
+                }
+                Ok(())
+            })
+        }
     }
 
-    #[test]
-    fn edits_are_picked_up_from_events() {
-        let fx = fixture();
-        let wt = Worktree::open(&fx.root, fx.content.clone(), fx.watcher.clone(), &fx.repos).unwrap();
-        let s1 = wt.snapshot().unwrap();
-        fs::write(fx.root.join("src/lib.rs"), "pub fn b() {}\n").unwrap();
-        fs::write(fx.root.join("src/new.rs"), "new\n").unwrap();
-        fs::remove_file(fx.root.join("src/deep/x.rs")).unwrap();
-        fs::create_dir_all(fx.root.join("fresh/inner")).unwrap();
-        fs::write(fx.root.join("fresh/inner/f.txt"), "f\n").unwrap();
-        fs::create_dir(fx.root.join("emptydir")).unwrap();
-        let s2 = wt.snapshot().unwrap();
-        assert_eq!(wt.full_scans.load(Ordering::Relaxed), 1, "no rescan needed");
+    fn setup() -> (tempfile::TempDir, Arc<Trees>, Fake) {
+        let d = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&d.path().join("db.redb")).unwrap());
+        let store = Arc::new(Store::open(&d.path().join("store"), db).unwrap());
+        let fake = Fake { store: Some(store.clone()), ..Default::default() };
+        (d, Trees::new(store), fake)
+    }
+
+    fn root_of(n: &Node) -> Hash {
+        match n {
+            Node::Dir(d) => Hash(*d),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn syncs_only_what_is_missing() {
+        let (_d, trees, fake) = setup();
+        let src = fake.dir(vec![("lib.rs", fake.file(b"pub fn a() {}")), ("util.rs", fake.file(b"// util"))]);
+        let v1 = fake.dir(vec![
+            ("Cargo.toml", fake.file(b"[package]")),
+            ("src", src.clone()),
+            ("link", Node::Symlink(b"src".to_vec())),
+        ]);
+        let s1 = trees.sync(root_of(&v1), &fake).await.unwrap();
+        assert_eq!(fake.asked_trees.load(Ordering::Relaxed), 2);
+        assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 3);
+        assert!(matches!(s1.lookup(b"/", b"src"), Looked::Dir(_)));
+        assert!(matches!(s1.lookup(b"/", b"link"), Looked::Symlink(t) if t == b"src"));
+        assert!(matches!(s1.lookup(b"/", b"nope"), Looked::Absent));
+        assert!(matches!(s1.lookup(b"/src", b"lib.rs"), Looked::File(f) if f.size == 13));
+        assert_eq!(s1.read(b"src/util.rs").unwrap(), b"// util");
+        assert_eq!(s1.list(b"/").unwrap().len(), 3);
+        assert!(s1.list(b"/missing").is_err());
+
+        // The same tree again: nothing is asked.
+        trees.sync(root_of(&v1), &fake).await.unwrap();
+        assert_eq!(fake.asked_trees.load(Ordering::Relaxed), 2);
+
+        // One file edited: the two manifests on its path and one blob.
+        let src2 = fake.dir(vec![("lib.rs", fake.file(b"pub fn b() {}")), ("util.rs", fake.file(b"// util"))]);
+        let v2 = fake.dir(vec![
+            ("Cargo.toml", fake.file(b"[package]")),
+            ("src", src2),
+            ("link", Node::Symlink(b"src".to_vec())),
+        ]);
+        let s2 = trees.sync(root_of(&v2), &fake).await.unwrap();
+        assert_eq!(fake.asked_trees.load(Ordering::Relaxed), 4);
+        assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 4);
         assert_ne!(s1.id, s2.id);
-        // The old snapshot is unchanged.
-        assert_eq!(read(&fx, &s1, b"/src", b"lib.rs").unwrap(), b"pub fn a() {}\n");
-        assert_eq!(read(&fx, &s2, b"/src", b"lib.rs").unwrap(), b"pub fn b() {}\n");
-        assert_eq!(read(&fx, &s2, b"/src", b"new.rs").unwrap(), b"new\n");
-        assert!(matches!(s2.lookup(b"/src/deep", b"x.rs"), Looked::Absent));
-        assert_eq!(read(&fx, &s2, b"/fresh/inner", b"f.txt").unwrap(), b"f\n");
-        assert!(matches!(s2.lookup(b"/", b"emptydir"), Looked::Dir(_)));
-        assert!(s2.list(b"/emptydir").unwrap().is_empty());
-        // Reverting an edit makes the path clean again.
-        fs::write(fx.root.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        fs::remove_file(fx.root.join("src/new.rs")).unwrap();
-        let s3 = wt.snapshot().unwrap();
-        assert!(matches!(s3.lookup(b"/src", b"lib.rs"), Looked::File(f) if matches!(f.src, FileSrc::Git { .. })));
-        assert!(matches!(s3.lookup(b"/src", b"new.rs"), Looked::Absent));
+        assert_eq!(s2.read(b"src/lib.rs").unwrap(), b"pub fn b() {}");
     }
 
-    #[test]
-    fn head_moves_without_touching_files() {
-        let fx = fixture();
-        let wt = Worktree::open(&fx.root, fx.content.clone(), fx.watcher.clone(), &fx.repos).unwrap();
-        fs::write(fx.root.join("src/lib.rs"), "pub fn c() {}\n").unwrap();
-        let s1 = wt.snapshot().unwrap();
-        assert_eq!(wt.dirty_count(), 1);
-        git(&fx.root, &["commit", "-q", "-am", "second"]);
-        let s2 = wt.snapshot().unwrap();
-        assert_eq!(wt.dirty_count(), 0, "committed file is clean again");
-        assert_ne!(s1.tree, s2.tree);
-        assert_eq!(read(&fx, &s2, b"/src", b"lib.rs").unwrap(), b"pub fn c() {}\n");
-        // Soft reset: HEAD moves back, the file on disk stays.
-        git(&fx.root, &["reset", "-q", "--soft", "HEAD~1"]);
-        let s3 = wt.snapshot().unwrap();
-        assert_eq!(wt.dirty_count(), 1);
-        assert_eq!(read(&fx, &s3, b"/src", b"lib.rs").unwrap(), b"pub fn c() {}\n");
-        assert_eq!(s3.id, s1.id, "same tree and same overlay give the same snapshot id");
+    #[tokio::test]
+    async fn evicted_content_is_asked_for_again() {
+        let (_d, trees, fake) = setup();
+        let v = fake.dir(vec![("a", fake.file(b"content a")), ("b", fake.file(b"content b"))]);
+        trees.sync(root_of(&v), &fake).await.unwrap();
+        trees.store.remove(&Hash::of(b"content a"));
+        let s = trees.sync(root_of(&v), &fake).await.unwrap();
+        assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 3);
+        assert_eq!(s.read(b"a").unwrap(), b"content a");
     }
 
-    #[test]
-    fn ignored_dirs_are_live_and_ignored_files_are_captured() {
-        let fx = fixture();
-        fs::create_dir_all(fx.root.join("target/debug")).unwrap();
-        fs::write(fx.root.join("target/debug/out"), "artifact").unwrap();
-        fs::write(fx.root.join("build.log"), "log line\n").unwrap();
-        let wt = Worktree::open(&fx.root, fx.content.clone(), fx.watcher.clone(), &fx.repos).unwrap();
-        let s = wt.snapshot().unwrap();
-        assert!(matches!(s.lookup(b"/", b"target"), Looked::Dir(_)));
-        assert!(matches!(s.lookup(b"/target/debug", b"out"), Looked::File(f) if matches!(f.src, FileSrc::Host { .. })));
-        assert_eq!(read(&fx, &s, b"/", b"build.log").unwrap(), b"log line\n");
-        // Changes inside the live directory do not make the snapshot new.
-        fs::write(fx.root.join("target/debug/out2"), "more").unwrap();
-        let s2 = wt.snapshot().unwrap();
-        assert!(Arc::ptr_eq(&s, &s2));
+    #[tokio::test]
+    async fn a_client_that_withholds_content_fails_the_sync() {
+        let (_d, trees, fake) = setup();
+        let v = fake.dir(vec![("a", fake.file(b"content a"))]);
+        fake.blobs.lock().clear();
+        assert!(trees.sync(root_of(&v), &fake).await.is_err());
+        let ghost = Hash::of(b"no such tree");
+        assert!(trees.sync(ghost, &fake).await.is_err());
     }
 
-    #[test]
-    fn two_worktrees_share_identity() {
-        let fx = fixture();
-        let other = fx.root.parent().unwrap().join("wt2");
-        git(&fx.root, &["worktree", "add", "-q", other.to_str().unwrap(), "-b", "other"]);
-        let a = Worktree::open(&fx.root, fx.content.clone(), fx.watcher.clone(), &fx.repos).unwrap();
-        let b = Worktree::open(&other, fx.content.clone(), fx.watcher.clone(), &fx.repos).unwrap();
-        assert!(Arc::ptr_eq(&a.repo, &b.repo));
-        let sa = a.snapshot().unwrap();
-        let sb = b.snapshot().unwrap();
-        assert_eq!(sa.id, sb.id);
-        // The same edit in both gives the same snapshot again.
-        fs::write(fx.root.join("src/lib.rs"), "edited\n").unwrap();
-        fs::write(other.join("src/lib.rs"), "edited\n").unwrap();
-        assert_eq!(a.snapshot().unwrap().id, b.snapshot().unwrap().id);
-        // Dirty in one, committed in the other: content hashes agree.
-        git(&other, &["commit", "-q", "-am", "edit"]);
-        let sb = b.snapshot().unwrap();
-        let sa = a.snapshot().unwrap();
-        let (Looked::File(fa), Looked::File(fb)) = (sa.lookup(b"/src", b"lib.rs"), sb.lookup(b"/src", b"lib.rs")) else {
-            panic!()
-        };
-        assert!(matches!(fb.src, FileSrc::Git { .. }));
-        assert_eq!(fx.content.known_hash(&fa.src), fx.content.known_hash(&fb.src));
+    #[tokio::test]
+    async fn derived_snapshot_and_materialize() {
+        let (d, trees, fake) = setup();
+        let v = fake.dir(vec![("Cargo.toml", fake.file(b"[package]")), ("src", fake.dir(vec![("lib.rs", fake.file(b"x"))]))]);
+        let s = trees.sync(root_of(&v), &fake).await.unwrap();
+        let lock = trees.store.put_bytes(b"# lock").unwrap();
+        let s2 = s.with_file(b"sub/Cargo.lock", Some(Node::File { hash: lock.0, size: 6, exec: false })).unwrap();
+        assert_eq!(s2.read(b"sub/Cargo.lock").unwrap(), b"# lock");
+        assert_eq!(s2.read(b"src/lib.rs").unwrap(), b"x");
+        let s3 = s2.with_file(b"src/lib.rs", None).unwrap();
+        assert!(s3.node(b"src/lib.rs").is_none());
+        let out = d.path().join("out");
+        s2.materialize(&out, 0, 0, &|rel, _| rel != b"src").unwrap();
+        assert_eq!(std::fs::read(out.join("sub/Cargo.lock")).unwrap(), b"# lock");
+        assert!(!out.join("src").exists());
+        // An ordinary writable file, not a link into the store.
+        std::fs::write(out.join("Cargo.toml"), b"changed").unwrap();
+        assert_eq!(s2.read(b"Cargo.toml").unwrap(), b"[package]");
+        let mut live = HashSet::new();
+        trees.remember("wt", &s2);
+        trees.mark(&mut live);
+        assert!(live.contains(&lock) && live.contains(&s2.id));
     }
 }
