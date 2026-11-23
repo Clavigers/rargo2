@@ -415,3 +415,65 @@ Chunks are one file each rather than packs: simpler to collect (mark from
 the cold blobs' recipes, delete the rest) and the count stays modest
 (64 KiB average). Eviction treats a cold blob as costing what it added when
 it went cold.
+
+## D25. Documentation builds
+
+rustdoc keeps files that cover every crate (the search index, `crates.js`,
+the source-file list) in the output directory and extends them on each run.
+Stock cargo lets the runs race under rustdoc's own lock on one real
+directory. An action in rargo sees only what it is given, so two rustdoc
+runs that do not see each other would each write a one-crate index.
+
+- The rustdoc runs for one output directory form a chain: each sees the
+  output of those before it and its files win over theirs. The order is
+  dependencies first, then unit index, which is also an order cargo could
+  have run them in.
+- Cost: rustdoc runs for one directory do not run in parallel, and changing
+  one crate's documentation reruns the runs after it in the chain. rustdoc's
+  mergeable cross-crate info would remove both, but is unstable in 1.100.
+- All files the runs wrote are linked into the real `target/doc` when the
+  build finishes (before this decision nothing was; found by a test).
+- `doc --open`: the planner cannot open anything, so it records the opener
+  as a step; the client starts it outside any sandbox with real paths. The
+  browser is cargo's `doc.browser`, else the client's `$BROWSER`, else
+  `xdg-open`.
+
+## D26. Worker link authentication
+
+A worker runs whatever commands its server sends, and the server believes
+the results, so the link is authenticated: `--worker-key FILE` on both
+ends, and every datagram carries a 16-byte keyed BLAKE3 tag; datagrams
+without a valid tag are dropped before parsing. rargod refuses to listen
+for workers, or to become one, on a non-loopback address without a key.
+Action ids start at a random value per server start, so traffic recorded
+from an earlier session cannot answer for an action in this one. The link
+is not encrypted: build inputs and outputs travel in the clear, which fits
+a private build network and nothing else.
+
+## D27. Per-action cgroups
+
+When rargod runs in a cgroup systemd delegated to it (`Delegate=yes`), each
+action gets its own cgroup: CPU time is read from it, and memory is the
+peak, sampled every 100 ms, of the anonymous memory of all the action's
+processes (never less than the largest process's peak RSS). The memory
+figure feeds the scheduler's admission. Without delegation the old `rusage`
+figures are used. Only the memory controller is enabled for the children:
+with the CPU controller the kernel would share CPU per action instead of
+per thread. The child moves itself into the cgroup before it forks anything
+(the first version moved it from outside, after the fork, and lost most of
+the CPU time of anything that started quickly).
+
+## D28. Incremental state and workers (replaces the last point of D21)
+
+A compile sent to a worker now gets its incremental seed like a local one
+(the seed is part of the view the server answers lookups from) and its new
+state comes back with the outputs and is stored. Before this, any crate
+compiled remotely lost its state, and the next compile of it anywhere
+started from an older one.
+
+## D29. cargo's closing messages
+
+rargo prints cargo's future-incompatibility warning with the affected
+packages when the compiler reports any, including on a replayed build. It
+does not write cargo's report file, and says so in the note. The
+`unused_dependencies` post-build lint and `--timings` are not reproduced.
