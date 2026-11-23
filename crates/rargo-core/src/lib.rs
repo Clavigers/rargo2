@@ -11,6 +11,7 @@ pub mod expand;
 pub mod flake;
 pub mod hash;
 pub mod incr;
+pub mod cgroup;
 pub mod net;
 pub mod parse;
 pub mod policy;

@@ -631,6 +631,7 @@ impl Engine {
         for var in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
             env.insert(var.as_bytes().to_vec(), js.clone().into_bytes());
         }
+        let group = self.cgroup_root.as_ref().and_then(|r| crate::cgroup::ActionGroup::create(r, action.seq));
         let sreq = SpawnReq {
             root: self.mnt.join(SandboxFs::dir_name(action.seq)),
             argv: spec.argv.clone(),
@@ -640,7 +641,7 @@ impl Engine {
             gid,
             net: spec.net,
             binds: vec![],
-            cgroup: None,
+            cgroup: group.as_ref().map(|g| g.dir.clone()),
         };
         let running = self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?;
         let mut out_rd = async_reader(out_r)?;
@@ -685,8 +686,30 @@ impl Engine {
             }
             all
         };
-        let (stdout, stderr, info) = tokio::join!(read_out, read_err, running.done);
-        let info = info.context("the sandbox helper process died")?;
+        // While it runs, watch how much memory all its processes hold.
+        let peak_kb = std::sync::atomic::AtomicU64::new(0);
+        let watch = async {
+            let Some(g) = &group else { return std::future::pending::<()>().await };
+            let mut every = tokio::time::interval(std::time::Duration::from_millis(100));
+            loop {
+                every.tick().await;
+                peak_kb.fetch_max(g.anon_kb(), Ordering::Relaxed);
+            }
+        };
+        let (stdout, stderr, info) = tokio::select! {
+            r = async { tokio::join!(read_out, read_err, running.done) } => r,
+            _ = watch => unreachable!("the memory watch never finishes"),
+        };
+        let mut info = info.context("the sandbox helper process died")?;
+        if let Some(g) = &group {
+            let (user, sys) = g.cpu_us();
+            if user + sys > 0 {
+                info.user_us = user;
+                info.sys_us = sys;
+            }
+            info.max_rss_kb = info.max_rss_kb.max(peak_kb.load(Ordering::Relaxed));
+        }
+        drop(group);
         if info.setup_failed {
             bail!(
                 "could not start `{}`: {}",

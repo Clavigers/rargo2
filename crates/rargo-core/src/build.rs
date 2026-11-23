@@ -85,8 +85,6 @@ pub struct PlanData {
     /// Unit links against its dependencies (needs their object code).
     linking: Vec<bool>,
     levels: Vec<OnceLock<Arc<Vec<u8>>>>,
-    /// Sandbox paths of each unit's early-announced metadata outputs.
-    meta_paths: Vec<Vec<Vec<u8>>>,
     /// Sandbox paths of each unit's metadata outputs, announced or not.
     rmeta_out: Vec<Vec<Vec<u8>>>,
     /// Like `levels`, for a unit compiled for its metadata only.
@@ -99,17 +97,6 @@ impl PlanData {
     fn new(plan: rp::Plan) -> PlanData {
         let n = plan.units.len();
         let linking = plan.units.iter().map(|u| u.needs_objects).collect();
-        let meta_paths = plan
-            .units
-            .iter()
-            .map(|u| {
-                if u.rmeta_early {
-                    u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect()
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect();
         let rmeta_out = plan
             .units
             .iter()
@@ -119,7 +106,6 @@ impl PlanData {
             plan,
             linking,
             levels: (0..n).map(|_| OnceLock::new()).collect(),
-            meta_paths,
             rmeta_out,
             meta_levels: (0..n).map(|_| OnceLock::new()).collect(),
             needs: OnceLock::new(),

@@ -101,6 +101,13 @@ fn main() -> Result<()> {
         rargo_core::sandbox::zygote_main(args[2].parse()?);
     }
     let opts = parse_args(&args)?;
+    // Before anything is forked: arrange our cgroup so that each action can
+    // have its own (a no-op unless the cgroup was delegated to us).
+    let cgroup_root = if std::env::var_os("RARGO_NO_CGROUPS").is_some() {
+        None
+    } else {
+        rargo_core::cgroup::setup()
+    };
     // The zygote must exist before this process grows threads.
     let zygote = Zygote::start(&std::env::current_exe()?)?;
 
@@ -133,7 +140,9 @@ fn main() -> Result<()> {
     session.spawn_workers(fs.clone(), fuse_threads)?;
 
     let sched = Scheduler::new(opts.jobs, opts.mem_kb)?;
-    let engine = Arc::new(Engine::new(store.clone(), content, fs, mnt, zygote, sched));
+    let mut engine = Engine::new(store.clone(), content, fs, mnt, zygote, sched);
+    engine.cgroup_root = cgroup_root.clone();
+    let engine = Arc::new(engine);
     if let Some(server) = opts.worker_of {
         // A worker: no analysis, no cache of results, no clients. It
         // executes what the server sends and keeps a content cache.
@@ -149,10 +158,11 @@ fn main() -> Result<()> {
     let socket = opts.socket.clone().unwrap_or_else(|| state.join("rargod.sock"));
     let _ = std::fs::remove_file(&socket);
     eprintln!(
-        "rargod: store {} ({}), passthrough {}, {} jobs, {} GiB memory budget, socket {}",
+        "rargod: store {} ({}), passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, socket {}",
         store.root().display(),
         if store.supports_reflink() { "reflinks" } else { "hard links" },
         session.caps().passthrough,
+        cgroup_root.is_some(),
         opts.jobs,
         opts.mem_kb >> 20,
         socket.display()

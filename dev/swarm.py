@@ -43,7 +43,10 @@ REPOS = {
 def cgroup_cpu_usec(pid):
     with open(f"/proc/{pid}/cgroup") as f:
         rel = f.read().strip().split("::", 1)[1]
-    # rargod moves nothing; its scope is the parent of where it runs.
+    # rargod puts itself in a `daemon` child of its scope and each action in
+    # a sibling; the scope is what everything ran in.
+    if rel.endswith("/daemon"):
+        rel = os.path.dirname(rel)
     path = "/sys/fs/cgroup" + rel
     while True:
         try:

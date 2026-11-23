@@ -61,6 +61,8 @@ pub struct WDone {
     pub stats: Stats,
     pub obs: Vec<(VPath, Obs)>,
     pub entries: Vec<(Vec<u8>, MEntry)>,
+    /// What changed in the directories kept on the side (see `ActionSpec::discard`).
+    side: Vec<(Vec<u8>, MEntry)>,
     pub tainted: bool,
 }
 
@@ -722,11 +724,12 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                     let r = state.engine.execute(&aspec, view, uid, gid, &obs).await;
                     drop(permit);
                     let result = match r {
-                        Ok((res, obs, tainted, _side)) => Ok(WDone {
+                        Ok((res, obs, tainted, side)) => Ok(WDone {
                             status: res.status,
                             stats: res.stats,
                             obs,
                             entries: res.outputs.entries.clone(),
+                            side,
                             tainted,
                         }),
                         Err(e) => Err(format!("{e:#}")),
@@ -1268,11 +1271,14 @@ impl Pool {
             }
         };
 
-        // Bring the outputs home.
+        // Bring the outputs home, and what the action left in the
+        // directories that are kept on the side (its incremental state: the
+        // next compile of this crate, wherever it runs, starts from it).
         let wanted: Vec<Hash> = done
             .entries
             .iter()
             .filter(|(p, _)| !spec.discard.iter().any(|d| vpath_starts_with(p, d)))
+            .chain(done.side.iter())
             .filter_map(|(_, e)| match e {
                 MEntry::File { hash, .. } if !engine.store.has(hash) => Some(*hash),
                 _ => None,
@@ -1286,7 +1292,7 @@ impl Pool {
         }
         {
             let mut has = w.has_blobs.lock();
-            for (_, e) in &done.entries {
+            for (_, e) in done.entries.iter().chain(done.side.iter()) {
                 if let MEntry::File { hash, .. } = e {
                     has.insert(*hash);
                 }
@@ -1302,9 +1308,12 @@ impl Pool {
                 }
             }
         }
-        let (side, entries): (Vec<_>, Vec<_>) =
-            done.entries.into_iter().partition(|(p, _)| spec.discard.iter().any(|d| vpath_starts_with(p, d)));
-        let _ = side;
+        let entries: Vec<_> = done
+            .entries
+            .into_iter()
+            .filter(|(p, _)| !spec.discard.iter().any(|d| vpath_starts_with(p, d)))
+            .collect();
+        let side = done.side;
         let result = ActionResult {
             status: done.status,
             stdout: engine.store.put_bytes(&stdout)?,
@@ -1312,7 +1321,7 @@ impl Pool {
             outputs: Arc::new(Manifest { entries }),
             stats: done.stats,
         };
-        Ok((result, done.obs, tainted, Vec::new()))
+        Ok((result, done.obs, tainted, side))
     }
 }
 
