@@ -332,12 +332,12 @@ patches on rustc 1.100.0 (`forks/rust`).
   hash on purpose. The fork is not recommended for speed; it stays
   available, optional, for the other patches and for `check` as a
   build (D23). Making line numbers leave the hash would require that no
+  dependent's output contain a dependency's line numbers (inlined code's
+  debug info and panic locations do), so it was not attempted.
   The swarm with body-only second edits (its favourable case, D23)
   agrees: stock 1.100.0 under rargo 109.1 s wall and 1,455 CPU-s, the fork
   139.3 s and 1,749 CPU-s; the fork's slower compiler outweighs what it
   saves.
-  dependent's output contain a dependency's line numbers (inlined code's
-  debug info and panic locations do), so it was not attempted.
 - **rargo observes fork metadata by crate hash.** An `.rmeta` whose header
   carries the fork's marker byte is recorded in traces as its crate hash
   instead of its content hash (`Content::metadata_identity`). Bytes still
