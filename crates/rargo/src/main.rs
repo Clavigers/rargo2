@@ -7,6 +7,7 @@
 //! When this binary is installed under the name `cargo` (the shim), agents
 //! that type `cargo build` get rargo without knowing.
 
+mod git;
 mod place;
 mod scan;
 
@@ -110,12 +111,15 @@ fn find_root(cwd: &Path) -> Option<PathBuf> {
 struct Policy {
     pass: Vec<String>,
     exclude: Vec<String>,
+    /// `[sync] git = false`: the sandbox gets no `.git` at all.
+    git: bool,
 }
 
 fn load_policy(root: &Path) -> Policy {
-    let Ok(text) = std::fs::read_to_string(root.join(".rargo.toml")) else { return Policy::default() };
+    let none = Policy { pass: Vec::new(), exclude: Vec::new(), git: true };
+    let Ok(text) = std::fs::read_to_string(root.join(".rargo.toml")) else { return none };
     // A malformed file is the server's to report, with the build.
-    let Ok(t) = text.parse::<toml::Table>() else { return Policy::default() };
+    let Ok(t) = text.parse::<toml::Table>() else { return none };
     let list = |section: &str, key: &str| -> Vec<String> {
         t.get(section)
             .and_then(|s| s.get(key))
@@ -123,7 +127,8 @@ fn load_policy(root: &Path) -> Policy {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default()
     };
-    Policy { pass: list("env", "pass"), exclude: list("sync", "exclude") }
+    let git = t.get("sync").and_then(|s| s.get("git")).and_then(|v| v.as_bool()).unwrap_or(true);
+    Policy { pass: list("env", "pass"), exclude: list("sync", "exclude"), git }
 }
 
 fn pattern_matches(pattern: &str, name: &str) -> bool {
@@ -145,39 +150,10 @@ fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-/// HEAD's commit id, read straight from the git directory.
-fn head_commit(root: &Path) -> Option<String> {
-    let dot_git = root.join(".git");
-    let git_dir = if dot_git.is_file() {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        let p = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
-        if p.is_absolute() { p } else { root.join(p) }
-    } else {
-        dot_git
-    };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    let Some(name) = head.strip_prefix("ref: ") else { return parse_hex20(head).map(|_| head.to_string()) };
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(c) => {
-            let c = PathBuf::from(c.trim());
-            if c.is_absolute() { c } else { git_dir.join(c) }
-        }
-        Err(_) => git_dir.clone(),
-    };
-    for dir in [&git_dir, &common] {
-        if let Ok(id) = std::fs::read_to_string(dir.join(name)) {
-            return parse_hex20(&id).map(|_| id.trim().to_string());
-        }
-    }
-    let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
-    packed.lines().find_map(|l| l.strip_suffix(name).map(|id| id.trim().to_string())).filter(|id| parse_hex20(id).is_some())
-}
-
 /// HEAD and its recent first-parent ancestors: a hint for the server's
 /// choice of incremental state. Asked of git once per HEAD and remembered.
-fn recent_commits(root: &Path, wt_cache: &Path) -> Vec<[u8; 20]> {
-    let Some(head) = head_commit(root) else { return Vec::new() };
+fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
+    let head = &head.commit;
     let memo = wt_cache.join("commits");
     let parse = |text: &str| -> Vec<[u8; 20]> { text.lines().filter_map(parse_hex20).collect() };
     if let Ok(text) = std::fs::read_to_string(&memo) {
@@ -188,7 +164,7 @@ fn recent_commits(root: &Path, wt_cache: &Path) -> Vec<[u8; 20]> {
     let listed = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["rev-list", "--first-parent", "-n", "64", &head])
+        .args(["rev-list", "--first-parent", "-n", "64", head])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
@@ -262,12 +238,11 @@ fn connect(cfg: &Config, req: &RunRequest) -> Result<Wire, std::io::Error> {
 
 /// Sends the contents the server asked for. Returns `false` if a file no
 /// longer has the content the scan saw.
-fn upload(wire: &mut Wire, root: &Path, scan: &scan::Scan, want: Vec<Digest>) -> std::io::Result<bool> {
+fn upload(wire: &mut Wire, scan: &scan::Scan, want: Vec<Digest>) -> std::io::Result<bool> {
     let mut small: Vec<(Digest, PathBuf, u64)> = Vec::new();
     let mut large: Vec<(Digest, PathBuf)> = Vec::new();
     for h in want {
-        let (Some(rel), Some(path)) = (scan.files.get(&h), scan::path_of(scan, root, &h)) else { return Ok(false) };
-        let size = scan.index.files.get(rel).map(|e| e.size).unwrap_or(0);
+        let Some((path, size)) = scan.files.get(&h).cloned() else { return Ok(false) };
         if size as usize > rargo_proto::PART_SIZE { large.push((h, path)) } else { small.push((h, path, size)) }
     }
     // Small files travel in batches, read and compressed in parallel.
@@ -323,13 +298,13 @@ fn upload(wire: &mut Wire, root: &Path, scan: &scan::Scan, want: Vec<Digest>) ->
                 break;
             }
             if let Some(prev) = held.replace(buf) {
-                wire.send(&ClientMsg::BlobPart { hash: h, data: prev, last: false })?;
+                wire.send(&ClientMsg::BlobPart { hash: h, part: rargo_proto::Part::pack(prev), last: false })?;
             }
         }
         if *hasher.finalize().as_bytes() != h {
             return Ok(false);
         }
-        wire.send(&ClientMsg::BlobPart { hash: h, data: held.unwrap_or_default(), last: true })?;
+        wire.send(&ClientMsg::BlobPart { hash: h, part: rargo_proto::Part::pack(held.unwrap_or_default()), last: true })?;
     }
     Ok(true)
 }
@@ -337,7 +312,6 @@ fn upload(wire: &mut Wire, root: &Path, scan: &scan::Scan, want: Vec<Digest>) ->
 struct Local {
     cache: PathBuf,
     wt_cache: PathBuf,
-    root: PathBuf,
     /// Variable names servers have asked about.
     asked: Vec<String>,
 }
@@ -380,7 +354,7 @@ fn converse(cfg: &Config, req: &RunRequest, local: &mut Local, scan: Option<&sca
             }
             ServerMsg::WantBlobs(want) => {
                 let ok = match scan {
-                    Some(s) => upload(&mut wire, &local.root, s, want)?,
+                    Some(s) => upload(&mut wire, s, want)?,
                     None => false,
                 };
                 if !ok {
@@ -413,7 +387,7 @@ fn converse(cfg: &Config, req: &RunRequest, local: &mut Local, scan: Option<&sca
                     placer.blob(hash, &b.unpack()?)?;
                 }
             }
-            ServerMsg::BlobPart { hash, data, last } => placer.part(hash, &data, last)?,
+            ServerMsg::BlobPart { hash, part, last } => placer.part(hash, &part.unpack()?, last)?,
             ServerMsg::Delivered { .. } => {
                 if !placer.settled() {
                     return Err(std::io::Error::other("the server did not send every file it announced"));
@@ -509,8 +483,13 @@ fn main() {
         h.update(root.as_os_str().as_bytes());
         h.finalize().to_hex()[..24].to_string()
     };
-    let mut local = Local { wt_cache: cache.join("wt").join(&wt_id), asked: load_asked(&cache), cache, root: root.clone() };
+    let mut local = Local { wt_cache: cache.join("wt").join(&wt_id), asked: load_asked(&cache), cache };
     let policy = if admin.is_some() { Policy::default() } else { load_policy(&root) };
+    let head = if admin.is_some() { None } else { git::head(&root) };
+    let thin_git = match &head {
+        Some(h) if policy.git => git::thin(&root, h, &local.cache),
+        _ => None,
+    };
     let cargo_home = std::env::var_os("CARGO_HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
@@ -532,7 +511,7 @@ fn main() {
         let scanned = if admin.is_some() {
             None
         } else {
-            match scan::scan(&root, &index, &policy.exclude) {
+            match scan::scan(&root, &index, &policy.exclude, thin_git.as_deref()) {
                 Ok(s) => Some(s),
                 Err(e) => die(&format!("scanning {}: {e}", root.display())),
             }
@@ -571,7 +550,7 @@ fn main() {
             stdout_tty: std::io::stdout().is_terminal(),
             stderr_tty: std::io::stderr().is_terminal(),
             worktree: wt_id.clone(),
-            commits: if admin.is_some() { Vec::new() } else { recent_commits(&root, &local.wt_cache) },
+            commits: head.as_ref().map(|h| recent_commits(&root, h, &local.wt_cache)).unwrap_or_default(),
             tree: scanned.as_ref().map(|s| s.root).unwrap_or([0; 32]),
             home_files: home_files.clone(),
             who: format!("{}@{host}", cfg.user),

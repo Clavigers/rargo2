@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub mod secure;
 pub mod tree;
 
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 pub type Digest = [u8; 32];
 
@@ -113,7 +113,7 @@ pub enum ServerMsg {
     /// the contents it does not already have; those follow as blobs.
     Deliver { id: u64, files: Vec<Delivery>, writes: Vec<Write> },
     Blobs(Vec<Blob>),
-    BlobPart { hash: Digest, data: Vec<u8>, last: bool },
+    BlobPart { hash: Digest, part: Part, last: bool },
     /// Everything named in the `Need` for delivery `id` has been sent.
     Delivered { id: u64 },
 }
@@ -132,12 +132,36 @@ pub enum ClientMsg {
     /// Encoded [`tree::Tree`]s, in answer to `WantTrees`.
     Trees(Vec<Vec<u8>>),
     Blobs(Vec<Blob>),
-    BlobPart { hash: Digest, data: Vec<u8>, last: bool },
+    BlobPart { hash: Digest, part: Part, last: bool },
     /// A wanted blob cannot be sent (the file changed or vanished since the
     /// scan). The client will start over.
     Changed,
     Env(Vec<(String, Option<String>)>),
     Need { id: u64, hashes: Vec<Digest> },
+}
+
+/// One piece of a large file.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Part {
+    /// zstd-compressed when `packed`.
+    pub data: Vec<u8>,
+    pub packed: bool,
+}
+
+impl Part {
+    pub fn pack(bytes: Vec<u8>) -> Part {
+        if let Ok(z) = zstd::bulk::compress(&bytes, 1) {
+            // Worth it only when it saves a tenth or more.
+            if z.len() + bytes.len() / 10 < bytes.len() {
+                return Part { data: z, packed: true };
+            }
+        }
+        Part { data: bytes, packed: false }
+    }
+
+    pub fn unpack(self) -> std::io::Result<Vec<u8>> {
+        if self.packed { zstd::bulk::decompress(&self.data, 2 * PART_SIZE) } else { Ok(self.data) }
+    }
 }
 
 /// Files larger than this travel as a sequence of parts.

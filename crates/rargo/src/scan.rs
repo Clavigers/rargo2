@@ -69,8 +69,8 @@ pub struct Scan {
     pub root: Digest,
     /// Encoded trees by digest.
     pub trees: HashMap<Digest, Vec<u8>>,
-    /// One path (relative to the root) per distinct file content.
-    pub files: HashMap<Digest, Vec<u8>>,
+    /// Where to read each distinct file content from, and its size.
+    pub files: HashMap<Digest, (PathBuf, u64)>,
     pub index: Index,
     /// The index differs from the one the scan started with.
     pub index_changed: bool,
@@ -84,7 +84,7 @@ struct Ctx<'a> {
     old: &'a Index,
     exclude: &'a [String],
     trees: Mutex<HashMap<Digest, Vec<u8>>>,
-    files: Mutex<HashMap<Digest, Vec<u8>>>,
+    files: Mutex<HashMap<Digest, (PathBuf, u64)>>,
     index: Mutex<HashMap<Vec<u8>, Entry>>,
     hashed_files: AtomicU64,
     hashed_bytes: AtomicU64,
@@ -207,9 +207,9 @@ impl Ctx<'_> {
         let mut files_add = Vec::new();
         for n in nodes {
             let Some((name, node, entry)) = n? else { continue };
-            if let (Node::File { hash, .. }, Some(e)) = (&node, entry) {
+            if let (Node::File { hash, size, .. }, Some(e)) = (&node, entry) {
                 let child_rel = join(rel, &name);
-                files_add.push((*hash, child_rel.clone()));
+                files_add.push((*hash, (abs.join(OsStr::from_bytes(&name)), *size)));
                 index_add.push((child_rel, e));
             }
             entries.push((name, node));
@@ -226,8 +226,28 @@ impl Ctx<'_> {
     }
 }
 
-/// Scans the worktree at `root`.
-pub fn scan(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
+/// Scans the worktree at `root`. `git`, when given, is a directory shown
+/// as the worktree's `.git` (see `git::thin`).
+pub fn scan(root: &Path, old: &Index, exclude: &[String], git: Option<&Path>) -> io::Result<Scan> {
+    let mut scan = scan_dir(root, old, exclude)?;
+    if let Some(git) = git {
+        // Small and immutable: scanned from scratch, grafted into the root.
+        let sub = scan_dir(git, &Index::default(), &[])?;
+        let mut top = Tree::decode(&scan.trees[&scan.root])?;
+        let at = top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(b".git")).unwrap_or_else(|i| i);
+        top.entries.insert(at, (b".git".to_vec(), Node::Dir(sub.root)));
+        let encoded = top.encode();
+        scan.root = rargo_proto::tree::digest(&encoded);
+        scan.trees.insert(scan.root, encoded);
+        scan.trees.extend(sub.trees);
+        for (h, at) in sub.files {
+            scan.files.entry(h).or_insert(at);
+        }
+    }
+    Ok(scan)
+}
+
+fn scan_dir(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
     let ctx = Ctx {
         root,
         old,
@@ -255,11 +275,6 @@ pub fn scan(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
         hashed_files,
         hashed_bytes: ctx.hashed_bytes.into_inner(),
     })
-}
-
-/// The path of a file with content `hash`, for uploading.
-pub fn path_of(scan: &Scan, root: &Path, hash: &Digest) -> Option<PathBuf> {
-    scan.files.get(hash).map(|rel| root.join(OsStr::from_bytes(rel)))
 }
 
 #[cfg(test)]
@@ -294,7 +309,7 @@ mod tests {
         std::os::unix::fs::symlink("src", r.join("link")).unwrap();
         std::fs::create_dir(r.join("empty")).unwrap();
         let exclude = vec!["node_modules".to_string(), "vendor/skip".to_string()];
-        let s = scan(r, &Index::default(), &exclude).unwrap();
+        let s = scan(r, &Index::default(), &exclude, None).unwrap();
         let top = tree(&s, &s.root);
         let names: Vec<&str> = top.entries.iter().map(|(n, _)| std::str::from_utf8(n).unwrap()).collect();
         assert_eq!(names, ["Cargo.toml", "docs", "empty", "link", "src", "sub", "vendor"]);
@@ -309,7 +324,17 @@ mod tests {
         assert_eq!(s.hashed_files, 4);
         assert!(s.index_changed);
         let lib = *blake3::hash(b"pub fn a() {}").as_bytes();
-        assert_eq!(path_of(&s, r, &lib).unwrap(), r.join("src/lib.rs"));
+        assert_eq!(s.files[&lib], (r.join("src/lib.rs"), 13));
+        // A directory grafted in as `.git`.
+        write(tmp.path(), "thin/HEAD", "ref: refs/heads/main\n");
+        let g = scan(r, &Index::default(), &exclude, Some(&tmp.path().join("thin"))).unwrap();
+        assert_ne!(g.root, s.root);
+        let top = tree(&g, &g.root);
+        let Some(Node::Dir(git)) = top.get(b".git") else { panic!() };
+        assert_eq!(tree(&g, git).entries.len(), 1);
+        assert_eq!(top.entries[0].0, b".git");
+        let head = *blake3::hash(b"ref: refs/heads/main\n").as_bytes();
+        assert_eq!(g.files[&head].0, tmp.path().join("thin/HEAD"));
     }
 
     #[test]
@@ -318,26 +343,26 @@ mod tests {
         let r = tmp.path();
         write(r, "a.rs", "one");
         write(r, "d/b.rs", "two");
-        let s1 = scan(r, &Index::default(), &[]).unwrap();
+        let s1 = scan(r, &Index::default(), &[], None).unwrap();
         // Hashed just after being written: not trusted yet.
-        let s2 = scan(r, &s1.index, &[]).unwrap();
+        let s2 = scan(r, &s1.index, &[], None).unwrap();
         assert_eq!(s2.hashed_files, 2);
         assert_eq!(s2.root, s1.root);
         std::thread::sleep(std::time::Duration::from_millis(120));
-        let s3 = scan(r, &s2.index, &[]).unwrap();
+        let s3 = scan(r, &s2.index, &[], None).unwrap();
         assert_eq!(s3.hashed_files, 2, "hashed within the racy window of the write");
-        let s4 = scan(r, &s3.index, &[]).unwrap();
+        let s4 = scan(r, &s3.index, &[], None).unwrap();
         assert_eq!(s4.hashed_files, 0);
         assert!(!s4.index_changed);
         assert_eq!(s4.root, s1.root);
         // An edit changes the root and is the only thing read.
         write(r, "d/b.rs", "two!");
-        let s5 = scan(r, &s4.index, &[]).unwrap();
+        let s5 = scan(r, &s4.index, &[], None).unwrap();
         assert_eq!(s5.hashed_files, 1);
         assert_ne!(s5.root, s1.root);
         // Same size, same content hash path: a removed file leaves the index.
         std::fs::remove_file(r.join("a.rs")).unwrap();
-        let s6 = scan(r, &s5.index, &[]).unwrap();
+        let s6 = scan(r, &s5.index, &[], None).unwrap();
         assert!(s6.index_changed);
         assert_eq!(s6.index.files.len(), 1);
     }
@@ -346,7 +371,7 @@ mod tests {
     fn index_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "wt/a", "x");
-        let s = scan(&tmp.path().join("wt"), &Index::default(), &[]).unwrap();
+        let s = scan(&tmp.path().join("wt"), &Index::default(), &[], None).unwrap();
         let p = tmp.path().join("cache/index");
         s.index.save(&p).unwrap();
         assert_eq!(Index::load(&p).files, s.index.files);

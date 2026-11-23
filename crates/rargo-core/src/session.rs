@@ -78,7 +78,7 @@ const WINDOW: usize = 32 << 20;
 fn bulk_size(m: &ServerMsg) -> usize {
     match m {
         ServerMsg::Blobs(v) => v.iter().map(|b| b.data.len()).sum(),
-        ServerMsg::BlobPart { data, .. } => data.len(),
+        ServerMsg::BlobPart { part, .. } => part.data.len(),
         _ => 0,
     }
 }
@@ -212,9 +212,10 @@ impl Session {
                 })?;
                 self.arrivals.notify_waiters();
             }
-            ClientMsg::BlobPart { hash, data, last } => {
+            ClientMsg::BlobPart { hash, part, last } => {
                 let done = tokio::task::block_in_place(|| -> Result<bool> {
-                    self.bytes_in.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    self.bytes_in.fetch_add(part.data.len() as u64, Ordering::Relaxed);
+                    let data = part.unpack()?;
                     let mut parts = self.parts.lock();
                     let part = match parts.entry(hash) {
                         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -315,7 +316,8 @@ impl Session {
                 data.truncate(n);
                 sent += n as u64;
                 let last = sent >= size || n == 0;
-                self.send_bulk(ServerMsg::BlobPart { hash: h, data, last }).await?;
+                let part = tokio::task::spawn_blocking(move || rargo_proto::Part::pack(data)).await?;
+                self.send_bulk(ServerMsg::BlobPart { hash: h, part, last }).await?;
                 if last {
                     break;
                 }

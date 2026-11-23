@@ -28,6 +28,9 @@
 //! # directories. A name matches at any depth; a path with a slash is taken
 //! # from the worktree root.
 //! exclude = ["node_modules", "data/fixtures-large"]
+//! # Show build scripts a `.git` that answers questions about HEAD (commit,
+//! # branch, dirty or not) without history or file contents. Default: true.
+//! git = true
 //! ```
 //!
 //! The file is read from the snapshot, so editing it takes effect on the
@@ -57,6 +60,8 @@ pub struct Policy {
 pub struct SyncPolicy {
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Whether the sandbox gets a thin `.git` describing HEAD.
+    pub git: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
