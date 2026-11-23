@@ -360,6 +360,58 @@ cd "$A"
 before=$(runs); "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1; after=$(runs)
 [ "$before" = "$after" ] && ok "after compaction and gc, build and test are still fully cached" || bad "after compaction and gc, build and test are still fully cached" "delta=$((after - before))"
 
+echo "== the cargo shim"
+cd "$A"
+mkdir -p "$T/shim"
+ln -sf "$R" "$T/shim/cargo"
+reqs() { "$R" --rargo-status | awk '/^requests/ {print $2}'; }
+before=$(reqs); out=$(PATH="$T/shim:$PATH" cargo build 2>&1); rc=$?; after=$(reqs)
+[ $rc -eq 0 ] && [ "$after" -gt "$before" ] && ok "'cargo build' through the shim is served by rargod" || bad "'cargo build' through the shim is served by rargod" "$out"
+out=$(PATH="$T/shim:$PATH" cargo metadata --format-version 1 --no-deps 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" '"workspace_root"' && ok "other subcommands go to the real cargo" || bad "other subcommands go to the real cargo" "$out"
+out=$(PATH="$T/shim:$PATH" cargo --version 2>&1)
+has "$out" "cargo 1." && ok "'cargo --version' is the real cargo's" || bad "'cargo --version' is the real cargo's" "$out"
+out=$(PATH="$T/shim:$PATH" RARGO_SOCKET="$T/no-such-socket" RARGO_FALLBACK=cargo CARGO_TARGET_DIR="$T/shim-target" cargo build --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -x "$T/shim-target/debug/app" ] && ok "without a daemon the shim falls back to the real cargo" || bad "without a daemon the shim falls back to the real cargo" "$out"
+
+echo "== policy file (.rargo.toml)"
+cd "$A"
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+python3 -c "
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $port)); s.listen(8)
+while True:
+    c, _ = s.accept(); c.sendall(b'hello'); c.close()
+" &
+listener=$!
+cat >crates/app/tests/policy.rs <<EOF
+#[test]
+fn probe() {
+    println!("env={:?}", std::env::var("POLICY_PROBE").ok());
+    let net = std::net::TcpStream::connect(("127.0.0.1", $port)).is_ok();
+    println!("net={net}");
+}
+EOF
+out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
+has "$out" "env=None" && has "$out" "net=false" && ok "by default a test sees neither an undeclared variable nor the host's network" || bad "by default a test sees neither an undeclared variable nor the host's network" "$out"
+cat >.rargo.toml <<'EOF'
+[env]
+pass = ["POLICY_PROBE"]
+[network]
+test-packages = ["app"]
+EOF
+out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
+has "$out" 'env=Some("seen")' && has "$out" "net=true" && ok "the policy file passes the variable and gives the package's tests the network" || bad "the policy file passes the variable and gives the package's tests the network" "$out"
+out=$(POLICY_PROBE=other "$R" test -p app --test policy -- --nocapture 2>&1)
+has "$out" 'env=Some("other")' && ok "a passed variable is part of the key (new value, new run)" || bad "a passed variable is part of the key" "$out"
+echo 'bogus = 1' >>.rargo.toml
+out=$("$R" build 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
+rm -f .rargo.toml crates/app/tests/policy.rs
+kill $listener 2>/dev/null
+expect "without the policy file the workspace builds again" "$R" build
+
 echo
 "$R" --rargo-status
 echo
