@@ -771,6 +771,31 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
 // Server side
 // ---------------------------------------------------------------------------
 
+/// The files a compiler command names with `--extern [opts:]name=path`.
+fn extern_paths(argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        let value: &[u8] = if a == b"--extern" {
+            match it.next() {
+                Some(v) => v,
+                None => break,
+            }
+        } else if let Some(v) = a.strip_prefix(b"--extern=") {
+            v
+        } else {
+            continue;
+        };
+        if let Some(eq) = value.iter().position(|&c| c == b'=') {
+            let path = &value[eq + 1..];
+            if path.starts_with(b"/") {
+                out.push(path.to_vec());
+            }
+        }
+    }
+    out
+}
+
 enum Event {
     Stdout(Vec<u8>),
     Line(Vec<u8>),
@@ -1354,6 +1379,12 @@ impl Pool {
                     .unwrap_or_default();
                 // Hinted paths are looked up, not necessarily read.
                 obs.extend(view.hints().into_iter().map(|p| (VPath::from(p), Obs::Dir)));
+                // What the command line names as a dependency is read for
+                // certain: sent ahead, it is there when the compiler opens
+                // it, instead of one round trip per crate while it waits.
+                obs.extend(
+                    extern_paths(&spec.argv).into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })),
+                );
                 (!obs.is_empty()).then_some(obs)
             }
         };
@@ -1673,5 +1704,31 @@ impl RemoteRunner for Pool {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn extern_files_are_read_from_the_command_line() {
+        let argv: Vec<Vec<u8>> = [
+            "rustc",
+            "--crate-name",
+            "app",
+            "--extern",
+            "util=/w/target/debug/deps/libutil-1.rmeta",
+            "--extern",
+            "noprelude:alloc=/w/t/liballoc.rlib",
+            "--extern=mac=/w/t/libmac.so",
+            "--extern",
+            "proc_macro",
+            "-L",
+            "dependency=/w/target/debug/deps",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        let got: Vec<String> = super::extern_paths(&argv).into_iter().map(|p| String::from_utf8(p).unwrap()).collect();
+        assert_eq!(got, ["/w/target/debug/deps/libutil-1.rmeta", "/w/t/liballoc.rlib", "/w/t/libmac.so"]);
     }
 }

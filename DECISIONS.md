@@ -1045,3 +1045,40 @@ whose name carries the process id of a process that no longer exists
 client's cache and half-made git stand-ins. A process id that has been
 reused keeps a stale file until that process ends; nothing is ever removed
 that a live process may be writing.
+
+## D51. The drift check on a repository like Zed
+
+The first drift check of Zed failed twice over, and neither was drift.
+
+- **The stock half ran outside the flake.** The check built with plain
+  `cargo` in the server's own environment, where Zed's system libraries do
+  not exist (`glib-2.0` not found). A repository whose environment is a
+  flake is now built by stock cargo in that environment too: the devShell's
+  variables and its `cargo`, unsandboxed, with the variables the policy
+  file passes. That is what its users run (`nix develop -c cargo build`).
+- **Verify called 228 units different.** Zed's dev profile combines
+  `incremental = true` with `split-debuginfo = "unpacked"`. rustc names
+  each codegen unit's `.dwo` file after the compilation session, the
+  object names its `.dwo`, and the identifier that ties the two together
+  (`DW_AT_GNU_dwo_id`) is a hash that covers that name. Two clean builds
+  by stock cargo itself differ in exactly these places and nowhere else
+  (checked on a three-function crate: the session component of the names,
+  and eight bytes per codegen unit in the object and in its `.dwo`).
+  Verify now compares such outputs the way D43's finding already did for
+  member names: files are paired by name without the session component,
+  contents are compared with session names blanked, and a remaining
+  difference is accepted only if it is at most eight bytes long and is one
+  of the substitutions learnt from that unit's own `.dwo` pairs (packed
+  split debug info: from the `.dwo` members of the archive). A difference
+  in code, metadata or any other byte is still a difference. No DWARF is
+  parsed; the rule is structural, and a `.dwo` pair that differs in more
+  than one such place teaches nothing and is reported.
+
+## D52. Dependencies named on the command line travel ahead of the action
+
+A compile sent to a worker without a trace of its own (every compile of a
+cold build) had only the toolchain files predicted; each `--extern` file
+was fetched when the compiler opened it, one round trip per dependency
+while a worker core waited. The files a command names with `--extern` are
+now part of the prediction: their lookups are answered in advance and the
+contents the worker lacks are pushed as the action is sent.

@@ -59,17 +59,137 @@ pub fn members(bytes: &[u8]) -> Option<Vec<Member<'_>>> {
     Some(out)
 }
 
-/// Removes the incremental session component from a codegen-unit object
-/// name: `util.129s3nt2.1sb40i6.rcgu.o` becomes `util.129s3nt2.rcgu.o`.
-/// Other names are returned unchanged.
+/// Removes the incremental session component from a codegen-unit file
+/// name: `util.129s3nt2.1sb40i6.rcgu.o` becomes `util.129s3nt2.rcgu.o`
+/// (likewise `.rcgu.dwo`, the unit's split debug info). Other names are
+/// returned unchanged.
 pub fn stable_member_name(name: &str) -> String {
-    let Some(stem) = name.strip_suffix(".rcgu.o") else { return name.to_string() };
-    let parts: Vec<&str> = stem.split('.').collect();
-    // crate . cgu . session
-    if parts.len() >= 3 && parts[parts.len() - 1].len() == 7 && parts[parts.len() - 1].bytes().all(|b| b.is_ascii_alphanumeric()) {
-        format!("{}.rcgu.o", parts[..parts.len() - 1].join("."))
-    } else {
-        name.to_string()
+    for ext in [".rcgu.o", ".rcgu.dwo"] {
+        let Some(stem) = name.strip_suffix(ext) else { continue };
+        let parts: Vec<&str> = stem.split('.').collect();
+        // crate . cgu . session
+        if parts.len() >= 3 && parts[parts.len() - 1].len() == SESSION && parts[parts.len() - 1].bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return format!("{}{ext}", parts[..parts.len() - 1].join("."));
+        }
+    }
+    name.to_string()
+}
+
+/// Length of the session component in a codegen-unit file name.
+const SESSION: usize = 7;
+
+/// `bytes` with the session component of every codegen-unit file name
+/// mentioned in it blanked (an object file names its `.dwo` file, an
+/// archive's name table names its members). The length is unchanged, so
+/// everything else stays where it was.
+pub fn session_neutral(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const MARK: &[u8] = b".rcgu.";
+    let mut out = std::borrow::Cow::Borrowed(bytes);
+    let mut from = 0;
+    while let Some(at) = bytes[from..].windows(MARK.len()).position(|w| w == MARK).map(|p| p + from) {
+        from = at + 1;
+        // `.<cgu>.<session>` must precede the mark.
+        if at < SESSION + 2 {
+            continue;
+        }
+        let session = &bytes[at - SESSION..at];
+        let cgu_end = at - SESSION - 1;
+        if bytes[cgu_end] != b'.' || !session.iter().all(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let cgu_len = bytes[..cgu_end].iter().rev().take_while(|b| b.is_ascii_alphanumeric()).count();
+        if cgu_len == 0 || cgu_end == cgu_len || bytes[cgu_end - cgu_len - 1] != b'.' {
+            continue;
+        }
+        out.to_mut()[at - SESSION..at].fill(b'0');
+    }
+    out
+}
+
+/// A hash of a compiler output that ignores the session component of
+/// codegen-unit file names, in an archive's member names and inside any
+/// file's content.
+pub fn stable_output_hash(bytes: &[u8]) -> crate::hash::Hash {
+    stable_rlib_hash(bytes).unwrap_or_else(|| crate::hash::Hash::of(&session_neutral(bytes)))
+}
+
+/// Length of the identifier that ties an object file to its split debug
+/// info (`DW_AT_GNU_dwo_id`, or the DWARF 5 unit header's `dwo_id`).
+const DWO_ID: usize = 8;
+
+/// Where two equally long byte strings differ, as `(start, end)` ranges;
+/// differences fewer than [`DWO_ID`] bytes apart are one range.
+fn differences(a: &[u8], b: &[u8]) -> Option<Vec<(usize, usize)>> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for i in (0..a.len()).filter(|&i| a[i] != b[i]) {
+        match out.last_mut() {
+            Some((_, end)) if i < *end + DWO_ID => *end = i + 1,
+            _ => out.push((i, i + 1)),
+        }
+    }
+    Some(out)
+}
+
+/// The debug-info identifiers by which two compilations of one codegen unit
+/// differ. With split debug info and incremental compilation, rustc names a
+/// unit's `.dwo` file after the session, and the identifier stored in the
+/// `.dwo` and in the object that refers to it is a hash that covers that
+/// name: two compilations of the same source differ in it and in nothing
+/// else. A substitution is the differing bytes of one against the other.
+#[derive(Default)]
+pub struct DwoIds(std::collections::HashSet<(Vec<u8>, Vec<u8>)>);
+
+impl DwoIds {
+    /// Learns the substitution from two versions of a `.dwo` file. `false`
+    /// if they differ in more than one identifier.
+    pub fn learn(&mut self, a: &[u8], b: &[u8]) -> bool {
+        let (a, b) = (session_neutral(a), session_neutral(b));
+        match differences(&a, &b).as_deref() {
+            Some([]) => true,
+            Some(&[(s, e)]) if e - s <= DWO_ID => {
+                self.0.insert((a[s..e].to_vec(), b[s..e].to_vec()));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `a` and `b` are the same apart from session names and the
+    /// identifiers learnt.
+    fn same_bytes(&self, a: &[u8], b: &[u8]) -> bool {
+        let (a, b) = (session_neutral(a), session_neutral(b));
+        match differences(&a, &b) {
+            Some(d) => d.iter().all(|&(s, e)| e - s <= DWO_ID && self.0.contains(&(a[s..e].to_vec(), b[s..e].to_vec()))),
+            None => false,
+        }
+    }
+
+    /// The same for a whole output file: an archive is compared member by
+    /// member (its tables only restate member names and offsets).
+    pub fn same(&self, a: &[u8], b: &[u8]) -> bool {
+        let (Some(ma), Some(mb)) = (members(a), members(b)) else { return self.same_bytes(a, b) };
+        let table = |n: &str| matches!(n, "/" | "//" | "/SYM64/" | "lib.rmeta-link");
+        let list = |ms: Vec<Member<'_>>| -> Vec<(String, Vec<u8>)> {
+            let mut v: Vec<(String, Vec<u8>)> =
+                ms.into_iter().filter(|m| !table(&m.name)).map(|m| (stable_member_name(&m.name), m.data.to_vec())).collect();
+            v.sort();
+            v
+        };
+        let (la, lb) = (list(ma), list(mb));
+        if la.len() != lb.len() || la.iter().zip(&lb).any(|((na, _), (nb, _))| na != nb) {
+            return false;
+        }
+        // Packed split debug info: the `.dwo` files are members themselves.
+        let mut ids = DwoIds(self.0.clone());
+        for ((name, da), (_, db)) in la.iter().zip(&lb) {
+            if name.ends_with(".rcgu.dwo") && !ids.learn(da, db) {
+                return false;
+            }
+        }
+        la.iter().zip(&lb).all(|((_, da), (_, db))| ids.same_bytes(da, db))
     }
 }
 
@@ -81,7 +201,7 @@ pub fn stable_rlib_hash(bytes: &[u8]) -> Option<crate::hash::Hash> {
     let mut items: Vec<(String, crate::hash::Hash)> = ms
         .iter()
         .filter(|m| !matches!(m.name.as_str(), "/" | "//" | "/SYM64/" | "lib.rmeta-link"))
-        .map(|m| (stable_member_name(&m.name), crate::hash::Hash::of(m.data)))
+        .map(|m| (stable_member_name(&m.name), crate::hash::Hash::of(&session_neutral(m.data))))
         .collect();
     items.sort();
     let mut h = crate::hash::KeyHasher::new("stable-rlib");
@@ -146,5 +266,57 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(stable_rlib_hash(&a), stable_rlib_hash(&b));
         assert_ne!(stable_rlib_hash(&a), stable_rlib_hash(&c));
+    }
+
+    #[test]
+    fn split_debug_info_names_are_neutral_too() {
+        assert_eq!(stable_member_name("git_ui-1f09.0f4631ej.0183sso.rcgu.dwo"), "git_ui-1f09.0f4631ej.rcgu.dwo");
+        // An object names its `.dwo`; only the session differs.
+        let a = b"\x7fELF..skeleton..git_ui-1f09.0f4631ej.0183sso.rcgu.dwo\0..more".to_vec();
+        let b = b"\x7fELF..skeleton..git_ui-1f09.0f4631ej.9zzzzzz.rcgu.dwo\0..more".to_vec();
+        let c = b"\x7fELF..skeleton..git_ui-1f09.0f4631ej.9zzzzzz.rcgu.dwo\0..MORE".to_vec();
+        assert_ne!(a, b);
+        assert_eq!(session_neutral(&a).len(), a.len());
+        assert_eq!(stable_output_hash(&a), stable_output_hash(&b));
+        assert_ne!(stable_output_hash(&a), stable_output_hash(&c));
+        // Names without a session component are left alone.
+        let plain = b"util.util.4f2a.rcgu.o and .rcgu. alone".to_vec();
+        assert!(matches!(session_neutral(&plain), std::borrow::Cow::Borrowed(_)));
+        // Inside an archive member as well.
+        let ra = archive(&[("util.129s3nt2zs5kd4xxpejw9mare.1sb40i6.rcgu.o", &a)]);
+        let rb = archive(&[("util.129s3nt2zs5kd4xxpejw9mare.0ebyr4y.rcgu.o", &b)]);
+        let rc = archive(&[("util.129s3nt2zs5kd4xxpejw9mare.0ebyr4y.rcgu.o", &c)]);
+        assert_eq!(stable_output_hash(&ra), stable_output_hash(&rb));
+        assert_ne!(stable_output_hash(&ra), stable_output_hash(&rc));
+    }
+
+    #[test]
+    fn debug_info_identifiers_pair_objects_with_their_dwo() {
+        // Two compilations: session `0183sso` with identifier `AAAAAAAA`,
+        // session `9zzzzzz` with `BBBBBBBB`.
+        let dwo = |id: &[u8]| [b"dwo-header.".as_slice(), id, b".types-and-lines"].concat();
+        let obj = |sess: &str, id: &[u8], code: &str| {
+            [b"ELF.".as_slice(), id, format!(".u-1f.0f46.{sess}.rcgu.dwo.").as_bytes(), id, code.as_bytes()].concat()
+        };
+        let mut ids = DwoIds::default();
+        assert!(ids.learn(&dwo(b"AAAAAAAA"), &dwo(b"BBBBBBBB")));
+        assert!(ids.same(&obj("0183sso", b"AAAAAAAA", "code"), &obj("9zzzzzz", b"BBBBBBBB", "code")));
+        // Different code is different, whatever the identifiers.
+        assert!(!ids.same(&obj("0183sso", b"AAAAAAAA", "code"), &obj("9zzzzzz", b"BBBBBBBB", "CODE")));
+        // An identifier nobody's `.dwo` carries is a difference.
+        assert!(!ids.same(&obj("0183sso", b"AAAAAAAA", "code"), &obj("9zzzzzz", b"CCCCCCCC", "code")));
+        // A `.dwo` that differs in more than its identifier teaches nothing.
+        assert!(!DwoIds::default().learn(&dwo(b"AAAAAAAA"), &[dwo(b"BBBBBBBB"), b"x".to_vec()].concat()));
+        assert!(!DwoIds::default().learn(b"0123456789abcdefghijklmnopqrstuvwxyz", b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+        // Inside an archive, with the member renamed as well.
+        let ra = archive(&[("lib.rmeta", b"meta"), ("u-1f.0f46.0183sso.rcgu.o", &obj("0183sso", b"AAAAAAAA", "code"))]);
+        let rb = archive(&[("lib.rmeta", b"meta"), ("u-1f.0f46.9zzzzzz.rcgu.o", &obj("9zzzzzz", b"BBBBBBBB", "code"))]);
+        let rc = archive(&[("lib.rmeta", b"META"), ("u-1f.0f46.9zzzzzz.rcgu.o", &obj("9zzzzzz", b"BBBBBBBB", "code"))]);
+        assert!(ids.same(&ra, &rb));
+        assert!(!ids.same(&ra, &rc));
+        // Identifiers that happen to share a byte still match.
+        let mut ids = DwoIds::default();
+        assert!(ids.learn(&dwo(b"AAAxAAAA"), &dwo(b"BBBxBBBB")));
+        assert!(ids.same(&obj("0183sso", b"AAAxAAAA", "code"), &obj("9zzzzzz", b"BBBxBBBB", "code")));
     }
 }

@@ -1769,31 +1769,53 @@ impl Run {
                     .lock()
                     .push((format!("{}: a clean run prints different instructions to cargo", u.desc), Vec::new()));
             } else if a != b {
-                // rustc's incremental mode names the object files inside an
-                // rlib after the compilation session; two rlibs that differ
-                // only in those names are the same result.
+                // rustc's incremental mode names each codegen unit's files
+                // (objects inside an rlib, split debug info beside it) after
+                // the compilation session, and an object names its debug
+                // info file. Outputs that differ only in that session
+                // component are the same result.
                 let store = self.d.store().clone();
-                let same = |x: &MEntry, y: Option<&MEntry>, path: &[u8]| -> bool {
-                    if Some(x) == y {
-                        return true;
-                    }
-                    let (MEntry::File { hash: hx, .. }, Some(MEntry::File { hash: hy, .. })) = (x, y) else { return false };
-                    if incr_dir.is_none() || !path.ends_with(b".rlib") {
-                        return false;
-                    }
-                    match (store.read(hx), store.read(hy)) {
-                        (Ok(bx), Ok(by)) => {
-                            let (sx, sy) = (crate::ar::stable_rlib_hash(&bx), crate::ar::stable_rlib_hash(&by));
-                            sx.is_some() && sx == sy
+                let neutral = incr_dir.is_some();
+                let stable_path = |p: &[u8]| -> Vec<u8> {
+                    match p.iter().rposition(|&c| c == b'/') {
+                        Some(cut) if neutral => {
+                            let mut v = p[..=cut].to_vec();
+                            v.extend_from_slice(crate::ar::stable_member_name(&String::from_utf8_lossy(&p[cut + 1..])).as_bytes());
+                            v
                         }
-                        _ => false,
+                        _ => p.to_vec(),
                     }
                 };
-                let differing: Vec<Vec<u8>> = a
+                let cached_by: BTreeMap<Vec<u8>, (&Vec<u8>, &MEntry)> = a.iter().map(|(p, e)| (stable_path(p), (p, e))).collect();
+                let clean_by: BTreeMap<Vec<u8>, (&Vec<u8>, &MEntry)> = b.iter().map(|(p, e)| (stable_path(p), (p, e))).collect();
+                let contents = |x: &MEntry, y: &MEntry| -> Option<(Vec<u8>, Vec<u8>)> {
+                    let (MEntry::File { hash: hx, .. }, MEntry::File { hash: hy, .. }) = (x, y) else { return None };
+                    Some((store.read(hx).ok()?, store.read(hy).ok()?))
+                };
+                // The identifier that ties an object to its split debug
+                // info covers the session name as well: learn, from each
+                // `.dwo` pair, which identifier stands for which.
+                let mut ids = crate::ar::DwoIds::default();
+                let mut odd_dwo: HashSet<&Vec<u8>> = HashSet::new();
+                if neutral {
+                    for (k, (_, e)) in cached_by.iter().filter(|(k, _)| k.ends_with(b".rcgu.dwo")) {
+                        let Some((_, e2)) = clean_by.get(k) else { continue };
+                        if e != e2 && !contents(e, e2).is_some_and(|(x, y)| ids.learn(&x, &y)) {
+                            odd_dwo.insert(k);
+                        }
+                    }
+                }
+                let same = |k: &Vec<u8>, x: &MEntry, y: &MEntry| -> bool {
+                    if x == y {
+                        return true;
+                    }
+                    neutral && !odd_dwo.contains(k) && contents(x, y).is_some_and(|(bx, by)| ids.same(&bx, &by))
+                };
+                let differing: Vec<Vec<u8>> = cached_by
                     .iter()
-                    .filter(|(p, e)| !same(e, clean.result.outputs.get(p), p))
-                    .map(|(p, _)| p.clone())
-                    .chain(b.iter().filter(|(p, _)| outcome.result.outputs.get(p).is_none()).map(|(p, _)| p.clone()))
+                    .filter(|(k, (_, e))| !clean_by.get(*k).is_some_and(|(_, e2)| same(k, e, e2)))
+                    .map(|(_, (p, _))| (*p).clone())
+                    .chain(clean_by.iter().filter(|(k, _)| !cached_by.contains_key(*k)).map(|(_, (p, _))| (*p).clone()))
                     .collect();
                 if !differing.is_empty() {
                     let shown: Vec<String> =

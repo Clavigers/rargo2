@@ -91,13 +91,43 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
             env.insert(k.clone(), v.clone());
         }
     }
+    // A repository whose environment is a flake is built by stock cargo in
+    // that environment too (the devShell's tools and variables), as its
+    // users would: `nix develop -c cargo build`. Unsandboxed, so the store
+    // paths are simply the host's.
+    let policy = match snapshot.read(crate::policy::POLICY_FILE.as_bytes()) {
+        Some(text) => crate::policy::Policy::parse(&String::from_utf8_lossy(&text)).map_err(|e| anyhow::anyhow!(e))?,
+        None => Default::default(),
+    };
+    let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
+    let mut cargo = "cargo".to_string();
+    if has_flake && policy.flake.enabled != Some(false) {
+        let (dd, snap, files) = (d.clone(), snapshot.clone(), policy.flake.files.clone());
+        let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &files, uid, gid))
+            .await?
+            .context("evaluating the repository's flake for the drift check")?;
+        for k in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+            env.remove(k);
+        }
+        env.retain(|k, _| !k.starts_with("NIX_"));
+        for (k, v) in &flake.env {
+            env.insert(k.clone(), v.clone());
+        }
+        if let Some(found) = flake.which("cargo") {
+            cargo = found;
+        }
+    }
+    let client_env: HashMap<String, String> = (*who.env).clone();
+    for (k, v) in policy.passed_env(&client_env) {
+        env.entry(k).or_insert(v);
+    }
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
     let started = Instant::now();
     let stock = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
         snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         let mut c = std::process::Command::new("nice");
-        c.args(["-n", "19", "cargo", "build", "--offline", "-j", "4"])
+        c.args(["-n", "19", cargo.as_str(), "build", "--offline", "-j", "4"])
             .current_dir(&scratch2)
             .env_clear()
             .envs(env.iter())
