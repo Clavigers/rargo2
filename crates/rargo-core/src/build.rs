@@ -1011,6 +1011,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     }
     // Place what was asked for into the real target directory.
     run.materialize_roots(&p.root).await?;
+    run.write_depinfo().await?;
     finished();
 
     run.steps(&p).await
@@ -1920,6 +1921,116 @@ impl Run {
             .await
     }
 
+    /// The files cargo's `.d` file for root unit `root` lists (cargo's
+    /// `output_depinfo`): what rustc's dep-info names for the unit and for
+    /// every local unit below it, plus their build scripts'
+    /// `rerun-if-changed` paths. Canonical paths. `None` when a dep-info file
+    /// is missing, in which case cargo removes the `.d` file.
+    fn depinfo_files(&self, root: usize) -> Option<std::collections::BTreeSet<PathBuf>> {
+        let plan = self.plan();
+        let store = self.d.store();
+        let mut files = std::collections::BTreeSet::new();
+        let mut seen = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(j) = stack.pop() {
+            if !seen.insert(j) {
+                continue;
+            }
+            let u = &plan.units[j];
+            if u.kind == rp::UnitKind::Compile {
+                let cmd = u.cmd.as_ref()?;
+                let out_dir = arg_value(&cmd.args, "--out-dir")?;
+                let (r, _) = self.results[j].get()?;
+                let (_, e) = r.outputs.entries.iter().find(|(p, _)| {
+                    p.ends_with(b".d") && vpath_starts_with(p, out_dir.as_bytes())
+                })?;
+                let MEntry::File { hash, .. } = e else { return None };
+                let text = store.read(hash).ok()?;
+                let cwd = PathBuf::from(cmd.cwd.as_deref().unwrap_or(&plan.cwd));
+                for f in parse_dep_info(&String::from_utf8_lossy(&text)) {
+                    files.insert(normalize(&cwd.join(f)));
+                }
+            }
+            if let Some(root_dir) = Path::new(&u.manifest_path).parent() {
+                let scripts = self.scripts.lock();
+                for meta in &u.script_metas {
+                    if let Some(o) = scripts.get(meta) {
+                        for f in &o.rerun_if_changed {
+                            files.insert(if f.is_empty() { root_dir.to_path_buf() } else { normalize(&root_dir.join(f)) });
+                        }
+                    }
+                }
+            }
+            for d in &u.deps {
+                if plan.units[d.unit as usize].is_local {
+                    stack.push(d.unit as usize);
+                }
+            }
+        }
+        Some(files)
+    }
+
+    /// Writes cargo's `.d` files next to the uplifted artifacts of the roots.
+    async fn write_depinfo(&self) -> Result<()> {
+        let plan = self.plan();
+        let mut writes: Vec<(PathBuf, Option<String>)> = Vec::new();
+        for &ri in &plan.roots {
+            let ri = ri as usize;
+            let u = &plan.units[ri];
+            if u.kind != rp::UnitKind::Compile {
+                continue;
+            }
+            let links: Vec<&str> = u
+                .outputs
+                .iter()
+                .filter(|o| !matches!(o.flavor.as_str(), "DebugInfo" | "Auxiliary" | "Sbom" | "Unremap"))
+                .filter_map(|o| o.hardlink.as_deref())
+                .collect();
+            if links.is_empty() {
+                continue;
+            }
+            let files = self.depinfo_files(ri);
+            let esc = |p: String| p.replace(' ', "\\ ");
+            for link in links {
+                let real = PathBuf::from(self.c.out.tr.path(link));
+                let dest = real.with_extension("d");
+                let text = files.as_ref().map(|files| {
+                    let mut t = format!("{}:", esc(real.to_string_lossy().into_owned()));
+                    for f in files {
+                        t.push(' ');
+                        t.push_str(&esc(self.c.out.tr.path(&f.to_string_lossy())));
+                    }
+                    t.push('\n');
+                    t
+                });
+                writes.push((dest, text));
+            }
+        }
+        let (uid, gid) = (self.c.uid, self.c.gid);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            for (dest, text) in writes {
+                match text {
+                    // Unchanged: leave the file (and its mtime) alone.
+                    Some(t) if std::fs::read_to_string(&dest).ok().as_deref() == Some(t.as_str()) => {}
+                    Some(t) => {
+                        if let Some(parent) = dest.parent() {
+                            mkdir_owned(parent, uid, gid)?;
+                        }
+                        let tmp = dest.with_extension("d.rargo-tmp");
+                        std::fs::write(&tmp, t)?;
+                        chown(&tmp, uid, gid);
+                        std::fs::rename(&tmp, &dest)?;
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&dest);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .await?
+    }
+
     /// Links the requested artifacts into the real target directory.
     async fn materialize_roots(&self, _root: &Path) -> Result<()> {
         let plan = self.plan();
@@ -2230,6 +2341,53 @@ async fn apply_writes(
         Ok(())
     })
     .await?
+}
+
+/// The prerequisites named in a Makefile-style dep-info file (rustc's).
+fn parse_dep_info(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        // `target: a b\ c`: everything after the first unescaped `: `.
+        let Some(at) = line.find(": ") else { continue };
+        let mut cur = String::new();
+        let mut chars = line[at + 2..].chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if chars.peek() == Some(&' ') => {
+                    cur.push(' ');
+                    chars.next();
+                }
+                ' ' => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    out
+}
+
+/// Removes `.` and `..` components without looking at the file system.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn chown(path: &Path, uid: u32, gid: u32) {

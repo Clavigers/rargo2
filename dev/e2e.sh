@@ -147,7 +147,7 @@ has "$out" "Finished \`dev\` profile [unoptimized + debuginfo] target(s) in" && 
 out=$(./target/debug/app 2>&1)
 has "$out" "from build script / built-by-script / plain / 42 / unset" && ok "binary output" || bad "binary output" "$out"
 [ -f Cargo.lock ] && ok "Cargo.lock written to the worktree" || bad "Cargo.lock written to the worktree"
-n=$(find target -type f | wc -l)
+n=$(find target -type f ! -name "*.d" | wc -l)
 [ "$n" -le 4 ] && ok "target/ holds only requested artifacts ($n files)" || bad "target/ holds only requested artifacts" "$(find target -type f)"
 git -C "$A" add Cargo.lock && git -C "$A" -c user.name=t -c user.email=t@t commit -q -m lock
 
@@ -321,6 +321,15 @@ out=$(CARGO_TARGET_DIR="$T/stock-target" cargo build --offline 2>&1); rc=$?
 out=$(cargo build --offline 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "stock cargo builds into the same target/ that rargo linked into" || bad "stock cargo builds into the same target/" "$out"
 expect "and rargo still works afterwards" "$R" build
+
+echo "== cargo's .d files"
+cd "$A"
+"$R" build >/dev/null 2>&1
+mine=$(cat target/debug/app.d 2>/dev/null)
+CARGO_TARGET_DIR="$T/stock-target" cargo build --offline >/dev/null 2>&1
+theirs=$(sed "s#$T/stock-target#$A/target#g" "$T/stock-target/debug/app.d" 2>/dev/null)
+[ -n "$mine" ] && [ "$mine" = "$theirs" ] && ok "target/debug/app.d is what stock cargo writes" || bad "target/debug/app.d is what stock cargo writes" "rargo: $mine
+cargo: $theirs"
 
 echo "== garbage collection keeps everything still needed"
 cd "$A"
