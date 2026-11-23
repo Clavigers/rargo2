@@ -633,7 +633,14 @@ impl Observer for WorkerObserver {
 /// Runs a worker: connects to the server and executes what it is sent.
 pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: crate::net::LinkKey) -> Result<()> {
     let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key).await?;
-    let conn = endpoint.connect(server);
+    let conn = loop {
+        match endpoint.connect(server).await {
+            Ok(c) => break c,
+            // The server may simply not be up yet.
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => eprintln!("rargo worker: {server}: {e}; trying again"),
+            Err(e) => return Err(e).with_context(|| format!("connecting to the server at {server}")),
+        }
+    };
     let (peer, mut inbox) = Peer::new(conn.clone());
     let blobs = Arc::new(Blobs::new(engine.store.clone(), None));
     let state = Arc::new(WorkerState {

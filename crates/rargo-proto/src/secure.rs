@@ -179,6 +179,89 @@ pub fn read_msg<R: Read>(r: &mut R, opener: &mut Opener) -> io::Result<Option<Ve
     }
 }
 
+// ---------------------------------------------------------------------------
+// The server-worker link
+// ---------------------------------------------------------------------------
+
+const LINK_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+const LINK_PROLOGUE: &[u8] = b"rargo worker link v2";
+
+/// Encryption for a link whose messages arrive in any order (the transport
+/// between server and workers): every message names the nonces it was
+/// sealed with, and no nonce is used twice. Keys are fresh per connection.
+pub struct LinkCipher {
+    keys: StatelessTransportState,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl LinkCipher {
+    fn new(hs: HandshakeState) -> io::Result<LinkCipher> {
+        Ok(LinkCipher { keys: hs.into_stateless_transport_mode().map_err(err)?, next: std::sync::atomic::AtomicU64::new(0) })
+    }
+
+    /// `u64 first nonce | records`, every record but the last carrying
+    /// [`RECORD`] bytes of plaintext.
+    pub fn seal(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
+        let records = msg.len().div_ceil(RECORD).max(1);
+        let base = self.next.fetch_add(records as u64, std::sync::atomic::Ordering::Relaxed);
+        let mut out = vec![0u8; 8 + msg.len() + records * 16];
+        out[..8].copy_from_slice(&base.to_le_bytes());
+        let mut at = 8;
+        for i in 0..records {
+            let chunk = &msg[i * RECORD..((i + 1) * RECORD).min(msg.len())];
+            at += self.keys.write_message(base + i as u64, chunk, &mut out[at..]).map_err(err)?;
+        }
+        debug_assert_eq!(at, out.len());
+        Ok(out)
+    }
+
+    pub fn open(&self, wire: &[u8]) -> io::Result<Vec<u8>> {
+        if wire.len() < 8 + 16 {
+            return Err(io::Error::other("secure link: short message"));
+        }
+        let base = u64::from_le_bytes(wire[..8].try_into().unwrap());
+        let body = &wire[8..];
+        let mut out = vec![0u8; body.len()];
+        let mut at = 0;
+        for (i, rec) in body.chunks(RECORD + 16).enumerate() {
+            at += self.keys.read_message(base + i as u64, rec, &mut out[at..]).map_err(err)?;
+        }
+        out.truncate(at);
+        Ok(out)
+    }
+}
+
+fn link_builder(psk: &[u8; 32]) -> io::Result<snow::Builder<'_>> {
+    snow::Builder::new(LINK_PARAMS.parse().map_err(err)?).prologue(LINK_PROLOGUE).map_err(err)?.psk(0, psk).map_err(err)
+}
+
+/// The connecting side's first message.
+pub fn link_start(psk: &[u8; 32]) -> io::Result<(HandshakeState, Vec<u8>)> {
+    let mut hs = link_builder(psk)?.build_initiator().map_err(err)?;
+    let mut msg = vec![0u8; 128];
+    let n = hs.write_message(&[], &mut msg).map_err(err)?;
+    msg.truncate(n);
+    Ok((hs, msg))
+}
+
+/// The accepting side: the reply and the cipher. Fails if the peer does
+/// not hold `psk`.
+pub fn link_accept(psk: &[u8; 32], msg1: &[u8]) -> io::Result<(Vec<u8>, LinkCipher)> {
+    let mut hs = link_builder(psk)?.build_responder().map_err(err)?;
+    let mut scratch = vec![0u8; msg1.len() + 16];
+    hs.read_message(msg1, &mut scratch).map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "link key mismatch"))?;
+    let mut msg2 = vec![0u8; 128];
+    let n = hs.write_message(&[], &mut msg2).map_err(err)?;
+    msg2.truncate(n);
+    Ok((msg2, LinkCipher::new(hs)?))
+}
+
+pub fn link_finish(mut hs: HandshakeState, msg2: &[u8]) -> io::Result<LinkCipher> {
+    let mut scratch = vec![0u8; msg2.len() + 16];
+    hs.read_message(msg2, &mut scratch).map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "link key mismatch"))?;
+    LinkCipher::new(hs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +316,27 @@ mod tests {
         let last = wire.len() - 1;
         wire[last] ^= 1;
         assert!(read_msg(&mut &wire[..], &mut so).is_err());
+    }
+
+    #[test]
+    fn link_messages_open_in_any_order_and_only_with_the_key() {
+        let k = psk_from_secret(b"link");
+        let (hs, m1) = link_start(&k).unwrap();
+        let (m2, server) = link_accept(&k, &m1).unwrap();
+        let client = link_finish(hs, &m2).unwrap();
+        let msgs = [vec![], vec![1u8; 10], vec![2u8; RECORD], vec![3u8; RECORD * 2 + 5]];
+        let sealed: Vec<Vec<u8>> = msgs.iter().map(|m| client.seal(m).unwrap()).collect();
+        for (m, w) in msgs.iter().zip(&sealed).rev() {
+            assert!(m.len() < 8 || !w.windows(8).any(|x| x == &m[..8]), "plaintext on the wire");
+            assert_eq!(&server.open(w).unwrap(), m);
+        }
+        assert_eq!(client.open(&server.seal(b"back").unwrap()).unwrap(), b"back");
+        let mut bad = sealed[3].clone();
+        bad[RECORD + 100] ^= 1;
+        assert!(server.open(&bad).is_err());
+        // The client cannot open its own messages (directions have their own keys).
+        assert!(client.open(&sealed[1]).is_err());
+        let (_, m1) = link_start(&psk_from_secret(b"other")).unwrap();
+        assert!(link_accept(&k, &m1).is_err());
     }
 }

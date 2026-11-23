@@ -33,7 +33,8 @@ asks for are installed on first use, crates are downloaded into
 `--mem-gb N`, `--store DIR` (put the content store on another file system),
 `--store-budget-gb N`, `--uid N --gid N` (the user builds run as),
 `--workers-listen ADDR --worker-key FILE` (accept workers; a worker is
-`rargod --state DIR --worker SERVER:PORT --worker-key FILE`).
+`rargod --state DIR --worker SERVER:PORT --worker-key FILE`; the link is
+authenticated and encrypted with that key).
 
 Without `--keys`, rargod listens on `127.0.0.1` only and accepts anyone on
 the machine.

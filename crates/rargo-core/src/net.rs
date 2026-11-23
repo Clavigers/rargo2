@@ -94,10 +94,18 @@ struct RecvState {
 
 /// A key shared by server and workers. Every datagram carries a tag made
 /// with it; datagrams without a valid tag are dropped before anything looks
-/// at them. This authenticates the link (a worker runs whatever commands
-/// the server sends, and the server trusts the results), it does not hide
-/// its content.
+/// at them (a worker runs whatever commands the server sends, and the
+/// server trusts the results). On a keyed link every message is also
+/// encrypted, with keys agreed per connection (Noise `NNpsk0` over this
+/// key, so recorded traffic stays unreadable if the key leaks later); what
+/// an observer still sees is message sizes and timing.
 pub type LinkKey = Option<Arc<[u8; 32]>>;
+
+fn handshake_key(key: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("rargo worker link handshake v2", key)
+}
+/// How long either side waits for the other's half of the key agreement.
+const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 const TAG: usize = 16;
 
 fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
@@ -123,6 +131,8 @@ fn open<'a>(key: &LinkKey, pkt: &'a [u8]) -> Option<&'a [u8]> {
 pub struct Conn {
     pub id: u64,
     key: LinkKey,
+    /// Set once the key agreement is done, on a keyed link.
+    cipher: std::sync::OnceLock<rargo_proto::secure::LinkCipher>,
     sock: Arc<UdpSocket>,
     peer: Mutex<SocketAddr>,
     send: Mutex<SendState>,
@@ -145,6 +155,7 @@ impl Conn {
         let c = Arc::new(Conn {
             id,
             key,
+            cipher: std::sync::OnceLock::new(),
             sock,
             peer: Mutex::new(peer),
             send: Mutex::new(SendState {
@@ -206,6 +217,17 @@ impl Conn {
 
     /// Queues a message for reliable delivery.
     pub async fn send(&self, msg: &[u8]) -> io::Result<()> {
+        if self.key.is_none() {
+            return self.send_raw(msg).await;
+        }
+        let Some(cipher) = self.cipher.get() else {
+            return Err(io::Error::other("worker link: no keys agreed yet"));
+        };
+        let sealed = if msg.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.seal(msg)) } else { cipher.seal(msg) }?;
+        self.send_raw(&sealed).await
+    }
+
+    async fn send_raw(&self, msg: &[u8]) -> io::Result<()> {
         loop {
             if self.is_closed() {
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
@@ -234,7 +256,47 @@ impl Conn {
 
     /// The next complete message from the peer.
     pub async fn recv(&self) -> Option<Vec<u8>> {
+        let raw = self.recv_raw().await?;
+        if self.key.is_none() {
+            return Some(raw);
+        }
+        let cipher = self.cipher.get()?;
+        let opened = if raw.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.open(&raw)) } else { cipher.open(&raw) };
+        match opened {
+            Ok(m) => Some(m),
+            Err(_) => {
+                // Only a peer holding the link key can get a message this
+                // far; one that does not decrypt means a broken peer.
+                self.close();
+                None
+            }
+        }
+    }
+
+    async fn recv_raw(&self) -> Option<Vec<u8>> {
         self.inbound_rx.lock().await.recv().await
+    }
+
+    /// The connecting side of the key agreement.
+    async fn agree_as_initiator(&self, key: &[u8; 32]) -> io::Result<()> {
+        let (hs, m1) = rargo_proto::secure::link_start(&handshake_key(key))?;
+        self.send_raw(&m1).await?;
+        let m2 = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no answer from the server (is it running, and is the worker key the same?)"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        let _ = self.cipher.set(rargo_proto::secure::link_finish(hs, &m2)?);
+        Ok(())
+    }
+
+    async fn agree_as_responder(&self, key: &[u8; 32]) -> io::Result<()> {
+        let m1 = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no key agreement"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
+        let (m2, cipher) = rargo_proto::secure::link_accept(&handshake_key(key), &m1)?;
+        let _ = self.cipher.set(cipher);
+        self.send_raw(&m2).await
     }
 
     fn rto(s: &SendState) -> Duration {
@@ -473,8 +535,9 @@ impl Endpoint {
         self.sock.local_addr()
     }
 
-    /// Opens a connection to a peer (the worker side).
-    pub fn connect(&self, peer: SocketAddr) -> Arc<Conn> {
+    /// Opens a connection to a peer (the worker side). On a keyed link
+    /// this agrees on the connection's keys before returning.
+    pub async fn connect(&self, peer: SocketAddr) -> io::Result<Arc<Conn>> {
         let id = {
             let mut b = [0u8; 8];
             // SAFETY: filling a valid 8-byte buffer.
@@ -483,7 +546,13 @@ impl Endpoint {
         };
         let c = Conn::new(id, self.sock.clone(), peer, self.key.clone());
         self.conns.lock().insert(id, c.clone());
-        c
+        if let Some(key) = &self.key
+            && let Err(e) = c.agree_as_initiator(key).await
+        {
+            self.forget(id);
+            return Err(e);
+        }
+        Ok(c)
     }
 
     /// The next connection opened by a peer.
@@ -534,7 +603,23 @@ impl Endpoint {
                 None if self.accepting && pkt[0] == T_DATA => {
                     let c = Conn::new(id, self.sock.clone(), from, self.key.clone());
                     conns.insert(id, c.clone());
-                    let _ = self.accept_tx.send(c.clone());
+                    match self.key.clone() {
+                        None => {
+                            let _ = self.accept_tx.send(c.clone());
+                        }
+                        // Handed to `accept` once its keys are agreed.
+                        Some(key) => {
+                            let (c, tx) = (c.clone(), self.accept_tx.clone());
+                            tokio::spawn(async move {
+                                match c.agree_as_responder(&key).await {
+                                    Ok(()) => {
+                                        let _ = tx.send(c);
+                                    }
+                                    Err(_) => c.close(),
+                                }
+                            });
+                        }
+                    }
                     c
                 }
                 None => return,
@@ -585,7 +670,7 @@ mod tests {
     async fn pair() -> (Arc<Endpoint>, Arc<Conn>, Arc<Endpoint>, Arc<Conn>) {
         let server = Endpoint::bind("127.0.0.1:0".parse().unwrap(), true).await.unwrap();
         let client = Endpoint::bind("127.0.0.1:0".parse().unwrap(), false).await.unwrap();
-        let c = client.connect(server.local_addr().unwrap());
+        let c = client.connect(server.local_addr().unwrap()).await.unwrap();
         c.send(b"hello").await.unwrap();
         let s = server.accept().await.unwrap();
         assert_eq!(s.recv().await.unwrap(), b"hello");
@@ -599,7 +684,7 @@ mod tests {
             let addr = || "127.0.0.1:0".parse().unwrap();
             let server = Endpoint::bind_keyed(addr(), true, key(1)).await.unwrap();
             let good = Endpoint::bind_keyed(addr(), false, key(1)).await.unwrap();
-            let c = good.connect(server.local_addr().unwrap());
+            let c = good.connect(server.local_addr().unwrap()).await.unwrap();
             let big: Vec<u8> = (0..300_000u32).map(|i| i as u8).collect();
             c.send(&big).await.unwrap();
             let s = server.accept().await.unwrap();
@@ -609,9 +694,14 @@ mod tests {
 
             // Wrong key, and no key at all: nothing is accepted.
             for k in [key(2), None] {
+                let keyed = k.is_some();
                 let bad = Endpoint::bind_keyed(addr(), false, k).await.unwrap();
-                let b = bad.connect(server.local_addr().unwrap());
-                let _ = tokio::time::timeout(Duration::from_millis(300), b.send(b"let me in")).await;
+                let b = tokio::time::timeout(Duration::from_millis(300), bad.connect(server.local_addr().unwrap())).await;
+                if keyed {
+                    assert!(b.is_err(), "the key agreement must not complete with another key");
+                } else {
+                    let _ = b.unwrap().unwrap().send(b"let me in").await;
+                }
                 let got = tokio::time::timeout(Duration::from_millis(300), server.accept()).await;
                 assert!(got.is_err(), "a connection with the wrong key was accepted");
             }

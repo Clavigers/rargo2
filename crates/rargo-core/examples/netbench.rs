@@ -29,7 +29,7 @@ async fn main() {
         "send" => {
             let mib: usize = args[3].parse().unwrap();
             let ep = Endpoint::bind("0.0.0.0:0".parse().unwrap(), false).await.unwrap();
-            let c = ep.connect(addr);
+            let c = ep.connect(addr).await.unwrap();
             let chunk = vec![7u8; 1 << 20];
             let t = Instant::now();
             for _ in 0..mib {

@@ -873,3 +873,25 @@ client sends HEAD and its last 64 first-parent ancestors (asked of git once
 per HEAD and remembered), and a stable identifier of the worktree (host
 name and path). Seed choice is as in D16 with "ancestor" meaning "in that
 list". A hint only: any state is a valid seed.
+
+## D44. The worker link is encrypted
+
+Supersedes the last sentence of D26. On a keyed link (any link that leaves
+the machine) each connection starts with a Noise `NNpsk0` exchange over
+the worker key, carried as the first message each way on the existing
+reliable transport, and every message after it is sealed with the
+connection's keys (ChaCha20-Poly1305). Recorded traffic stays unreadable
+if the key leaks later; a session recorded earlier cannot be replayed
+because the keys are new each time.
+
+- Messages, not datagrams, are encrypted: the transport delivers messages
+  in arrival order, so each message carries the nonces it was sealed with
+  and the sender never reuses one. The per-datagram keyed tag stays, so
+  the transport's own headers (connection id, message id, fragment index)
+  are still authenticated, though visible.
+- What an observer still learns: message sizes and timing.
+- A worker that gets no answer (server not up yet, or another key) keeps
+  trying and says so, instead of exiting.
+- Measured cost: none visible (rust-analyzer cold build through an 8-core
+  server with one 8-core worker, 306 MiB sent to the worker: 46.5 s, in
+  the range of the unencrypted runs).
