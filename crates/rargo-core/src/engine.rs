@@ -332,6 +332,13 @@ impl Engine {
         Some(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() })
     }
 
+    /// The key the action's traces are stored under (its declared
+    /// environment variables folded in).
+    pub fn effective_key(&self, spec: &ActionSpec, client_env: &HashMap<String, String>) -> Hash {
+        let (eff, base_key) = self.effective_spec(spec, client_env);
+        if eff.env.len() == spec.env.len() { base_key } else { eff.weak_key() }
+    }
+
     /// Obtains the result of an action.
     pub async fn obtain(&self, req: Request) -> Result<Outcome> {
         let mut announced = false;

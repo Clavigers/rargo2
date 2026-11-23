@@ -341,6 +341,20 @@ cp "$T/app-Cargo.toml" crates/app/Cargo.toml; rm -rf crates/unused
 out=$("$R" build 2>&1)
 has "$out" "unused dependency" && bad "no lint once the dependency is gone" "$out" || ok "no lint once the dependency is gone"
 
+echo "== stock cargo can rebuild and test in the target/ rargo filled"
+cd "$A"
+"$R" test >/dev/null 2>&1
+out=$("$R" test --no-run 2>&1); rc=$?
+exe=$(grep -o "target/debug/[^)]*/it-[0-9a-f]*" <<<"$out" | head -1)
+[ $rc -eq 0 ] && [ -x "$exe" ] && [ -w "$exe" ] && [ "$(stat -c %h "$exe")" = 1 ] && ok "test --no-run leaves its executables as ordinary files ($exe)" || bad "test --no-run leaves its executables as ordinary files" "$out
+$(ls -la "$exe" 2>&1)"
+"$R" doc >/dev/null 2>&1
+out=$(cargo test --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "stock cargo test in the same target/" || bad "stock cargo test in the same target/" "$out"
+out=$(cargo doc --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "stock cargo doc in the same target/" || bad "stock cargo doc in the same target/" "$out"
+expect "and rargo test still works afterwards" "$R" test
+
 echo "== cargo's .d files"
 cd "$A"
 "$R" build >/dev/null 2>&1

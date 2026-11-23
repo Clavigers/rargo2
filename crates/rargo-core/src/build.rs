@@ -342,7 +342,11 @@ struct Run {
     /// Re-run every unit that came from the cache, cleanly, and compare.
     verify: bool,
     verified: AtomicU64,
-    verify_mismatches: Mutex<Vec<String>>,
+    /// `(message, canonical paths that differ)`; no paths means the
+    /// difference is in what the action said or whether it succeeded.
+    verify_mismatches: Mutex<Vec<(String, Vec<Vec<u8>>)>>,
+    /// Each unit's cache key, once known (for looking up who read what).
+    unit_keys: Vec<OnceLock<Hash>>,
     /// Set when the request is a `check` planned as a build: how far each
     /// unit has to be taken (see `PlanData::needs`).
     need: Option<Arc<Vec<u8>>>,
@@ -961,6 +965,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         verify: c.env.contains_key("RARGO_VERIFY"),
         verified: AtomicU64::new(0),
         verify_mismatches: Mutex::new(Vec::new()),
+        unit_keys: (0..n).map(|_| OnceLock::new()).collect(),
         need: if as_build { Some(pd.needs()) } else { None },
     });
 
@@ -995,7 +1000,23 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     }
 
     if run.verify {
-        let bad = run.verify_mismatches.lock().clone();
+        let all = run.verify_mismatches.lock().clone();
+        // A file that differs but that no unit of this build read (an
+        // autoconf `config.log` left in OUT_DIR, say) cannot have changed
+        // anything; only differences someone consumed count.
+        let read_by_someone = |path: &[u8]| -> bool {
+            run.unit_keys.iter().filter_map(|k| k.get()).any(|k| {
+                d.engine.traces.traces(k).iter().any(|(_, t)| t.obs.iter().any(|(p, _)| p.as_ref() == path))
+            })
+        };
+        let mut bad: Vec<String> = Vec::new();
+        for (msg, paths) in &all {
+            if paths.is_empty() || paths.iter().any(|p| read_by_someone(p)) {
+                bad.push(msg.clone());
+            } else {
+                c2.out.note(&format!("verify: {msg}; nothing in this build reads those files, so this is not drift"));
+            }
+        }
         for m in &bad {
             c2.out.warn(&format!("verify: {m}"));
         }
@@ -1522,6 +1543,8 @@ impl Run {
             }
             break outcome;
         };
+        // After the run: a first run is what reveals declared variables.
+        let _ = self.unit_keys[i].set(self.d.engine.effective_key(&spec, &self.c.env));
         if self.verify && outcome.cached && outcome.result.success() {
             // The cached result claims to be what this action produces from
             // these inputs. Run it again from nothing (no cache, no
@@ -1545,9 +1568,17 @@ impl Run {
             self.verified.fetch_add(1, Ordering::Relaxed);
             let (a, b) = (&outcome.result.outputs.entries, &clean.result.outputs.entries);
             if !clean.result.success() {
+                self.verify_mismatches.lock().push((
+                    format!("{}: cached as a success, but a clean run fails ({})", u.desc, describe_status(clean.result.status)),
+                    Vec::new(),
+                ));
+            } else if u.kind == rp::UnitKind::RunScript
+                && self.d.store().read(&outcome.result.stdout).ok() != self.d.store().read(&clean.result.stdout).ok()
+            {
+                // What a build script prints is what cargo acts on.
                 self.verify_mismatches
                     .lock()
-                    .push(format!("{}: cached as a success, but a clean run fails ({})", u.desc, describe_status(clean.result.status)));
+                    .push((format!("{}: a clean run prints different instructions to cargo", u.desc), Vec::new()));
             } else if a != b {
                 // rustc's incremental mode names the object files inside an
                 // rlib after the compilation session; two rlibs that differ
@@ -1569,22 +1600,22 @@ impl Run {
                         _ => false,
                     }
                 };
-                let differing: Vec<String> = a
+                let differing: Vec<Vec<u8>> = a
                     .iter()
                     .filter(|(p, e)| !same(e, clean.result.outputs.get(p), p))
-                    .map(|(p, _)| self.c.out.tr.path(&String::from_utf8_lossy(p)))
-                    .chain(
-                        b.iter()
-                            .filter(|(p, _)| outcome.result.outputs.get(p).is_none())
-                            .map(|(p, _)| self.c.out.tr.path(&String::from_utf8_lossy(p))),
-                    )
-                    .take(3)
+                    .map(|(p, _)| p.clone())
+                    .chain(b.iter().filter(|(p, _)| outcome.result.outputs.get(p).is_none()).map(|(p, _)| p.clone()))
                     .collect();
                 if !differing.is_empty() {
-                    self.verify_mismatches.lock().push(format!(
-                        "{}: a clean run produces different output than the cached one ({})",
-                        u.desc,
-                        differing.join(", ")
+                    let shown: Vec<String> =
+                        differing.iter().take(3).map(|p| self.c.out.tr.path(&String::from_utf8_lossy(p))).collect();
+                    self.verify_mismatches.lock().push((
+                        format!(
+                            "{}: a clean run produces different output than the cached one ({})",
+                            u.desc,
+                            shown.join(", ")
+                        ),
+                        differing,
                     ));
                 }
             }
@@ -2128,22 +2159,42 @@ impl Run {
     /// Links the requested artifacts into the real target directory.
     async fn materialize_roots(&self, _root: &Path) -> Result<()> {
         let plan = self.plan();
-        let mut jobs: Vec<(Hash, bool, PathBuf)> = Vec::new();
+        // `(blob, executable, destination, own copy)`.
+        let mut jobs: Vec<(Hash, bool, PathBuf, bool)> = Vec::new();
+        let mut stale: Vec<(Hash, bool, PathBuf)> = Vec::new();
+        // Units whose executables rargo runs itself in this request.
+        let run_here: HashSet<u32> = plan
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                rp::Step::Exec { unit, .. } => Some(*unit),
+                _ => None,
+            })
+            .collect();
         for &ri in &plan.roots {
             let u = &plan.units[ri as usize];
             let Some((r, _)) = self.results[ri as usize].get() else { continue };
             for o in &u.outputs {
                 let Some(MEntry::File { hash, exec, .. }) = r.outputs.get(o.path.as_bytes()) else { continue };
-                let mut dests: Vec<&str> = Vec::new();
-                dests.extend(o.hardlink.as_deref());
-                dests.extend(o.export_path.as_deref());
-                // Executables are also wanted at their own path: test
-                // binaries have no uplifted name.
-                if u.executable.as_deref() == Some(o.path.as_str()) {
-                    dests.push(&o.path);
+                // Names cargo links (it removes the old file first): shared.
+                for d in o.hardlink.iter().chain(o.export_path.iter()) {
+                    jobs.push((*hash, *exec, PathBuf::from(self.c.out.tr.path(d)), false));
                 }
-                for d in dests {
-                    jobs.push((*hash, *exec, PathBuf::from(self.c.out.tr.path(d))));
+                // An executable at its own path, where rustc writes it in
+                // place. Wanted when the user asked for executables (test
+                // binaries have no other name), not when rargo ran them.
+                // A file of its own: a read-only shared inode would make
+                // stock cargo's next compile of it fail, and a writable one
+                // would let it overwrite the store.
+                if u.executable.as_deref() == Some(o.path.as_str()) {
+                    let dest = PathBuf::from(self.c.out.tr.path(&o.path));
+                    if run_here.contains(&ri) {
+                        // Not placed; but a link into the store left there
+                        // by an older rargo would break stock cargo.
+                        stale.push((*hash, *exec, dest));
+                    } else {
+                        jobs.push((*hash, *exec, dest, true));
+                    }
                 }
             }
         }
@@ -2159,17 +2210,23 @@ impl Run {
             }
         }
         for (path, (hash, exec)) in docs {
-            jobs.push((hash, exec, PathBuf::from(self.c.out.tr.path(&String::from_utf8_lossy(path)))));
+            // rustdoc rewrites its shared files in place on the next run.
+            jobs.push((hash, exec, PathBuf::from(self.c.out.tr.path(&String::from_utf8_lossy(path))), true));
         }
-        if jobs.is_empty() {
+        if jobs.is_empty() && stale.is_empty() {
             return Ok(());
         }
         let store = self.d.store().clone();
         let (uid, gid) = (self.c.uid, self.c.gid);
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut made: HashSet<PathBuf> = HashSet::new();
-            for (hash, exec, dest) in jobs {
+            for (hash, exec, dest) in stale {
                 if store.is_linked(&hash, exec, &dest) {
+                    let _ = std::fs::remove_file(&dest);
+                }
+            }
+            let mut made: HashSet<PathBuf> = HashSet::new();
+            for (hash, exec, dest, own) in jobs {
+                if !own && store.is_linked(&hash, exec, &dest) {
                     continue;
                 }
                 if let Some(parent) = dest.parent() {
@@ -2177,8 +2234,10 @@ impl Run {
                         mkdir_owned(parent, uid, gid)?;
                     }
                 }
-                // Already the same content: nothing to do.
-                if let (Ok(md), Some(size)) = (std::fs::metadata(&dest), store.size_of(&hash)) {
+                // Already the same content (and, for an own copy, not the
+                // store's inode): nothing to do.
+                let shared = own && store.is_linked(&hash, exec, &dest);
+                if let (Ok(md), Some(size), false) = (std::fs::metadata(&dest), store.size_of(&hash), shared) {
                     if md.len() == size && (md.mode() & 0o111 != 0) == exec {
                         if let Ok((h, _)) = Hash::of_path(&dest) {
                             if h == hash {
@@ -2187,7 +2246,12 @@ impl Run {
                         }
                     }
                 }
-                store.materialize(&hash, exec, &dest)?;
+                if own {
+                    store.materialize_owned(&hash, exec, &dest)?;
+                    chown(&dest, uid, gid);
+                } else {
+                    store.materialize(&hash, exec, &dest)?;
+                }
             }
             Ok(())
         })

@@ -645,6 +645,35 @@ impl Store {
         Ok(want)
     }
 
+    /// Places a blob at `dest` as a file of its own (writable, not sharing
+    /// an inode with the store): a reflink where the filesystem has them,
+    /// a copy otherwise. For paths that other tools write in place.
+    pub fn materialize_owned(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
+        self.ensure_whole(h)?;
+        let parent = dest.parent().context("destination has no parent")?;
+        let tmp = parent.join(format!(
+            ".rargo-tmp-{}-{}",
+            std::process::id(),
+            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mode = if exec { 0o755 } else { 0o644 };
+        let placed = (|| -> Result<Placed> {
+            let src = self.open_blob(h)?;
+            let dst = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+            Ok(if clone_or_copy(&src, &dst)? { Placed::Reflink } else { Placed::Copy })
+        })();
+        match placed {
+            Ok(p) => {
+                fs::rename(&tmp, dest).with_context(|| format!("placing {}", dest.display()))?;
+                Ok(p)
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
+    }
+
     /// Whether `dest` is already a hard link to the blob (nothing to place
     /// and nothing to read to find that out).
     pub fn is_linked(&self, h: &Hash, exec: bool, dest: &Path) -> bool {
