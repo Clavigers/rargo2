@@ -1,26 +1,42 @@
 #!/bin/bash
-# End-to-end checks against a private rargod instance.
+# End-to-end checks against a private build server.
 #
 #   dev/e2e.sh            run everything
 #
-# Uses a private state directory under $RARGO_WORK. Set RARGO_E2E_ROOT to
-# an existing directory on a reflink filesystem for the store and worktrees.
-# Stops its daemon when done. Requires root (FUSE mount, namespaces).
+# The server and the client run on this machine but share nothing except a
+# TCP port: the server runs in a mount namespace in which the client's
+# directory (worktrees, cache, cargo home) is an empty file system, has its
+# own cargo home, and requires a key.
+#
+# Uses private directories under $RARGO_WORK. Set RARGO_E2E_ROOT to an
+# existing directory on a reflink filesystem to put the store and the client
+# there. Stops its server when done. Requires root (FUSE mount, namespaces).
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 . "$work/env.sh"
-RARGO_STATE=$(mktemp -d "$work/codex-e2e.XXXXXXXX") || exit 1
+RARGO_STATE=$(mktemp -d "$work/e2e-state.XXXXXXXX") || exit 1
 export RARGO_STATE
-export RARGO_SOCKET=$RARGO_STATE/rargod.sock
 bin=${RARGO_BIN:-$repo/target/release}
 export RARGO_BIN=$bin
 R=$bin/rargo
-T=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/codex-e2e.XXXXXXXX") || exit 1
-T=$(cd "$T" && pwd -P) || exit 1
+E=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/e2e.XXXXXXXX") || exit 1
+E=$(cd "$E" && pwd -P) || exit 1
+# Everything the client owns lives under $T; the server cannot see it.
+T=$E/client
+mkdir -p "$T" "$E/store"
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+export RARGO_SERVER=127.0.0.1:$port
+export RARGO_HIDE=$T
+export RARGO_CACHE_DIR=$T/.rargo-cache
+export RARGO_USER=e2e
+export RARGO_KEY=e2e-client-secret-0123456789
+printf 'e2e %s admin\nguest guest-secret-0123456789abcdef\n' "$RARGO_KEY" >"$RARGO_STATE/keys"
+# The server gets a cargo home of its own.
+export RARGO_SERVER_CARGO_HOME=$RARGO_STATE/cargo-home
 # The stock Cargo checks intentionally exercise the fixture's own target/.
 unset CARGO_TARGET_DIR
-echo "e2e: state=$RARGO_STATE scratch=$T"
+echo "e2e: state=$RARGO_STATE client=$T server=$RARGO_SERVER"
 fails=0
 checks=0
 
@@ -32,13 +48,27 @@ expect() { # description, command...
 }
 has() { grep -qF -- "$2" <<<"$1"; }
 runs() { "$R" --rargo-status | awk '/^actions run/ {print $3}'; }
-stat_field() { "$R" --rargo-status | awk -v k="$1" '$0 ~ "^"k {print $2 == "" ? $3 : $0}'; }
+# Files and directory manifests the server has asked clients for so far.
+asked_files() { "$R" --rargo-status | sed -n 's/^sync .* manifests and \([0-9]*\) files asked.*/\1/p'; }
+asked_trees() { "$R" --rargo-status | sed -n 's/^sync .*states, \([0-9]*\) manifests.*/\1/p'; }
 
 trap '"$repo/dev/rargod.sh" stop >/dev/null 2>&1' EXIT
-"$repo/dev/rargod.sh" start --store "$T/store" >/dev/null || {
+"$repo/dev/rargod.sh" start --store "$E/store" --keys "$RARGO_STATE/keys" >/dev/null || {
     cat "$RARGO_STATE/rargod.log"
     exit 1
 }
+
+echo "== client and server are apart"
+pid=$(pgrep -f "rargod --state $RARGO_STATE " | head -1)
+echo marker >"$T/marker"
+[ -n "$pid" ] && [ -d "/proc/$pid/root$T" ] && [ -z "$(ls -A "/proc/$pid/root$T" 2>/dev/null)" ] && ok "the server sees an empty directory where the client's files are" || bad "the server sees an empty directory where the client's files are" "$(ls -A "/proc/$pid/root$T" 2>&1)"
+out=$(RARGO_KEY=wrong-secret-0123456789 "$R" --rargo-status 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "key" && ok "a wrong key is refused" || bad "a wrong key is refused" "$out"
+out=$(RARGO_USER=nobody "$R" --rargo-status 2>&1); rc=$?
+[ $rc -ne 0 ] && ok "an unknown user is refused" || bad "an unknown user is refused" "$out"
+out=$(RARGO_USER=guest RARGO_KEY=guest-secret-0123456789abcdef "$R" --rargo-gc 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "may not administer" && ok "a user who is not an administrator cannot collect garbage" || bad "a user who is not an administrator cannot collect garbage" "$out"
+expect "the right key is accepted" "$R" --rargo-status
 
 # --- a small workspace -----------------------------------------------------
 A=$T/a
@@ -94,6 +124,7 @@ pub fn note() -> &'static str { env!("UTIL_BUILD_NOTE") }
 pub fn flavor() -> &'static str { option_env!("UTIL_FLAVOR_BAKED").unwrap_or("plain") }
 pub fn compile_time() -> &'static str { option_env!("E2E_COMPILE_VAR").unwrap_or("unset") }
 pub fn answer() -> i32 { mac::answer!() }
+pub fn local_note() -> &'static str { include_str!("../local-note.txt").trim() }
 /// ```
 /// assert_eq!(util::double(2), 4);
 /// ```
@@ -117,6 +148,7 @@ fn main() {
     println!("{} / {} / {} / {} / {}", util::GENERATED, util::note(), util::flavor(), util::answer(), util::compile_time());
     println!("args: {:?}", std::env::args().skip(1).collect::<Vec<_>>());
     println!("fixture via manifest dir: {}", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture.txt").exists());
+    println!("note: {}", util::local_note());
 }
 EOF
 cat >"$A/crates/app/tests/it.rs" <<'EOF'
@@ -131,13 +163,22 @@ fn reads_a_fixture() {
     assert_eq!(std::fs::read_to_string(p).unwrap().trim(), "fixture");
 }
 #[test]
+fn reads_a_large_file() {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/large.bin");
+    assert_eq!(std::fs::read(p).unwrap().len(), 3000000);
+}
+#[test]
 fn writes_a_snapshot() {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/written-by-test.txt");
     std::fs::write(p, "snapshot\n").unwrap();
 }
 EOF
 echo fixture >"$A/crates/app/tests/fixture.txt"
-printf '/target\n' >"$A/.gitignore"
+# A file git ignores but the build reads, and a large one a test reads.
+printf '/target\nlocal-note.txt\n/junk\n' >"$A/.gitignore"
+echo "ignored by git" >"$A/crates/util/local-note.txt"
+head -c 3000000 /dev/urandom >"$A/crates/app/tests/large.bin"
+mkdir -p "$A/junk" && head -c 2000000 /dev/urandom >"$A/junk/blob"
 git -C "$A" init -q -b main
 git -C "$A" add -A
 git -C "$A" -c user.name=t -c user.email=t@t commit -q -m init
@@ -152,8 +193,11 @@ has "$out" "Finished \`dev\` profile [unoptimized + debuginfo] target(s) in" && 
 [ -x target/debug/app ] && ok "binary linked into target/" || bad "binary linked into target/"
 out=$(./target/debug/app 2>&1)
 has "$out" "from build script / built-by-script / plain / 42 / unset" && ok "binary output" || bad "binary output" "$out"
+has "$out" "note: ignored by git" && ok "a file git ignores is synced and built with" || bad "a file git ignores is synced and built with" "$out"
+[ -w target/debug/app ] || [ "$(stat -c %h target/debug/app)" -gt 1 ] && ok "the artifact is a reflink or a link into the client's cache" || bad "the artifact is a reflink or a link into the client's cache" "$(ls -la target/debug/app)"
 [ -f Cargo.lock ] && ok "Cargo.lock written to the worktree" || bad "Cargo.lock written to the worktree"
-n=$(find target -type f ! -name "*.d" | wc -l)
+n=$(find target -type f ! -name "*.d" ! -name CACHEDIR.TAG | wc -l)
+[ -f target/CACHEDIR.TAG ] && ok "target/ is tagged as a cache directory, as cargo does" || bad "target/ is tagged as a cache directory"
 [ "$n" -le 4 ] && ok "target/ holds only requested artifacts ($n files)" || bad "target/ holds only requested artifacts" "$(find target -type f)"
 git -C "$A" add Cargo.lock && git -C "$A" -c user.name=t -c user.email=t@t commit -q -m lock
 
@@ -170,11 +214,15 @@ echo "== second worktree at the same commit"
 B=$T/b
 git -C "$A" worktree add -q "$B" -b other
 cd "$B"
-before=$(runs)
+# git does not check out ignored files; the build needs this one.
+cp "$A/crates/util/local-note.txt" crates/util/
+before=$(runs); files=$(asked_files); trees=$(asked_trees)
 start=$(date +%s%N)
 out=$("$R" build 2>&1); rc=$?
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 after=$(runs)
+[ "$(asked_files)" = "$files" ] && ok "the second worktree uploaded no file contents" || bad "the second worktree uploaded no file contents" "before=$files after=$(asked_files)"
+[ $(( $(asked_trees) - trees )) -le 2 ] && ok "and at most the root manifest ($(( $(asked_trees) - trees )) manifests; it has no junk/ directory)" || bad "the second worktree uploaded at most the root manifest" "before=$trees after=$(asked_trees)"
 [ $rc -eq 0 ] && [ "$before" = "$after" ] && ok "second worktree built with zero actions in ${ms}ms" || bad "second worktree built with zero actions" "rc=$rc before=$before after=$after
 $out"
 [ "$(stat -c %i "$A/target/debug/app")" = "$(stat -c %i "$B/target/debug/app")" ] && ok "artifact shares an inode with the first worktree (no extra disk)" || {
@@ -187,10 +235,11 @@ has "$out" "from build script" && ok "second worktree's binary runs" || bad "sec
 echo "== one-file edit rebuilds only dependents"
 cd "$B"
 sed -i 's/pub fn double(x: i32) -> i32 { x \* 2 }/pub fn double(x: i32) -> i32 { x + x }/' crates/util/src/lib.rs
-before=$(runs)
+before=$(runs); files=$(asked_files); trees=$(asked_trees)
 out=$("$R" build 2>&1); rc=$?
 after=$(runs)
 delta=$((after - before))
+[ $(( $(asked_files) - files )) -eq 1 ] && [ $(( $(asked_trees) - trees )) -eq 4 ] && ok "the edit uploaded one file and the four manifests on its path" || bad "the edit uploaded one file and the four manifests on its path" "files $files -> $(asked_files), manifests $trees -> $(asked_trees)"
 [ $rc -eq 0 ] && [ "$delta" -eq 2 ] && ok "edit to util reran util and app only ($delta actions)" || bad "edit to util reran util and app only" "delta=$delta
 $out"
 has "$out" "Compiling mac" && bad "proc macro not rebuilt" "$out" || ok "proc macro not rebuilt"
@@ -238,7 +287,7 @@ before=$(runs); "$R" test >/dev/null 2>&1; after=$(runs)
 before=$(runs)
 out=$("$R" test 2>&1)
 after=$(runs)
-[ "$before" = "$after" ] && has "$out" "test result: ok. 3 passed" && ok "second test run replayed from cache" || bad "second test run replayed from cache" "before=$before after=$after
+[ "$before" = "$after" ] && has "$out" "test result: ok. 4 passed" && ok "second test run replayed from cache" || bad "second test run replayed from cache" "before=$before after=$after
 $out"
 echo changed >crates/app/tests/fixture.txt
 before=$(runs)
@@ -298,7 +347,8 @@ fi
 echo "== concurrent cold builds from many worktrees"
 C=$T/c
 mkdir -p "$C"
-cp -r "$A/crates" "$A/Cargo.toml" "$A/Cargo.lock" "$A/.gitignore" "$C/"
+cp -r "$A/crates" "$A/Cargo.toml" "$A/Cargo.lock" "$C/"
+printf '/target\n' >"$C/.gitignore"
 # A different crate name makes every action new to the cache.
 sed -i 's/name = "app"/name = "app2"/' "$C/crates/app/Cargo.toml"
 sed -i 's/CARGO_BIN_EXE_app/CARGO_BIN_EXE_app2/' "$C/crates/app/tests/it.rs"
@@ -386,7 +436,7 @@ echo "// post-gc edit" >>crates/util/src/lib.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "after gc, an incremental rebuild works" || bad "after gc, an incremental rebuild works" "$out"
 
-echo "== cold tier: everything not linked into a worktree is kept as chunks and comes back on demand"
+echo "== cold tier: idle content is kept as chunks and comes back on demand"
 cd "$A"
 "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1
 out=$("$R" --rargo-compact 2>&1)
@@ -397,6 +447,7 @@ before=$(runs); "$R" build >/dev/null 2>&1; "$R" test >/dev/null 2>&1; after=$(r
 C2="$T/wt-cold"
 git -C "$A" worktree add -q --detach "$C2" HEAD 2>/dev/null
 cd "$C2"
+cp "$A/crates/util/local-note.txt" crates/util/
 before=$(runs); out=$("$R" build 2>&1); rc=$?; after=$(runs)
 [ $rc -eq 0 ] && ok "a fresh worktree builds from the cold tier" || bad "a fresh worktree builds from the cold tier" "$out"
 out=$(./target/debug/app 2>&1); rc=$?
@@ -440,8 +491,10 @@ out=$(PATH="$T/shim:$PATH" cargo metadata --format-version 1 --no-deps 2>&1); rc
 [ $rc -eq 0 ] && has "$out" '"workspace_root"' && ok "other subcommands go to the real cargo" || bad "other subcommands go to the real cargo" "$out"
 out=$(PATH="$T/shim:$PATH" cargo --version 2>&1)
 has "$out" "cargo 1." && ok "'cargo --version' is the real cargo's" || bad "'cargo --version' is the real cargo's" "$out"
-out=$(PATH="$T/shim:$PATH" RARGO_SOCKET="$T/no-such-socket" RARGO_FALLBACK=cargo CARGO_TARGET_DIR="$T/shim-target" cargo build --offline 2>&1); rc=$?
-[ $rc -eq 0 ] && [ -x "$T/shim-target/debug/app" ] && ok "without a daemon the shim falls back to the real cargo" || bad "without a daemon the shim falls back to the real cargo" "$out"
+out=$(PATH="$T/shim:$PATH" RARGO_SERVER=127.0.0.1:1 RARGO_FALLBACK=cargo CARGO_TARGET_DIR="$T/shim-target" cargo build --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -x "$T/shim-target/debug/app" ] && ok "without a server the shim falls back to the real cargo" || bad "without a server the shim falls back to the real cargo" "$out"
+out=$(RARGO_SERVER=127.0.0.1:1 "$R" build 2>&1); rc=$?
+[ $rc -eq 101 ] && has "$out" "cannot reach the rargo server" && ok "without a server and without the fallback, the error says so" || bad "without a server and without the fallback, the error says so" "$out"
 
 echo "== policy file (.rargo.toml)"
 cd "$A"
@@ -479,6 +532,13 @@ out=$("$R" build 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
 rm -f .rargo.toml crates/app/tests/policy.rs
 kill $listener 2>/dev/null
+# What the policy excludes is never uploaded.
+mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
+printf '[sync]\nexclude = ["big-data"]\n' >.rargo.toml
+files=$(asked_files)
+expect "a build with an excluded directory" "$R" build
+[ $(( $(asked_files) - files )) -eq 1 ] && ok "only the policy file itself was uploaded, not the excluded directory" || bad "only the policy file itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
+rm -rf .rargo.toml big-data
 expect "without the policy file the workspace builds again" "$R" build
 
 echo

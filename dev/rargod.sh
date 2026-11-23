@@ -5,7 +5,8 @@
 # The server runs in a transient systemd scope with a CPU and memory cap so
 # the other services on the box keep headroom (see CLAUDE.md).
 # Override the limits with RARGO_CPU_QUOTA and RARGO_MEMORY_MAX, the address
-# with RARGO_SERVER (default 127.0.0.1:7459).
+# with RARGO_SERVER (default 127.0.0.1:7459). RARGO_HIDE names directories
+# the server must not see.
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 state=${RARGO_STATE:-$work/state}
@@ -20,7 +21,14 @@ start)
     fi
     . "$work/env.sh"
     : >"$state/rargod.log"
+    # RARGO_HIDE: directories (space separated) the server must not be able
+    # to see, e.g. the client worktrees of a test on the same machine. The
+    # server then runs in its own mount namespace with an empty file system
+    # over each of them.
+    hide=""
+    for d in ${RARGO_HIDE:-}; do hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
     nohup systemd-run --scope -q --unit "rargod-dev-$$" -p "CPUQuota=${RARGO_CPU_QUOTA:-2400%}" -p "MemoryMax=${RARGO_MEMORY_MAX:-90G}" -p Delegate=yes \
+        unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
         "${RARGO_BIN:-$repo/target/release}/rargod" --state "$state" --listen "$addr" \
         --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
         --cargo-home "${RARGO_SERVER_CARGO_HOME:-$work/cargo-home}" --jobs "${RARGO_JOBS:-24}" "$@" \
