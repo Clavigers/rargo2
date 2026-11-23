@@ -304,3 +304,114 @@ how its open ends were closed.
 - Test rig: server and workers in separate network namespaces joined by a
   bridge inside the server's namespace, `tc netem` on both ends of every
   link. Nothing is configured in the host's own namespace.
+
+## D22. The rustc fork: what it changes and how rargo recognises it
+
+The fork is optional (rargo works with any toolchain) and small: three
+patches on rustc 1.100.0 (`forks/rust`).
+
+- **Crate hash that ignores what dependents cannot see.** In 1.100 the crate
+  hash is a digest of the encoded metadata plus the hash of the whole HIR.
+  Measured on a three-function library: every edit, including one that
+  changes a single literal inside a private function body, changed the
+  `.rmeta`, so every dependent reran. The fork leaves three things out of the
+  hash: span byte offsets (written fixed-width so nothing after them moves;
+  the file, line and column of both ends are hashed instead), the
+  source-file tables, and the HIR hash (replaced by the hash of global
+  assembly items, the one kind of item that leaves no trace in metadata).
+  After the patch the same edits leave the crate hash alone when they keep
+  the line numbers of everything after them; adding a line inside a body
+  still changes it, and has to, because dependents bake line numbers of
+  inlined and generic code into their own output.
+- **rargo observes fork metadata by crate hash.** An `.rmeta` whose header
+  carries the fork's marker byte is recorded in traces as its crate hash
+  instead of its content hash (`Content::metadata_identity`). Bytes still
+  differ between two such files (offsets, the source file's content hash),
+  so without this the compiler change would buy nothing.
+  Known cost: a dependent that was not rebuilt keeps debug info whose
+  source-file checksum for the dependency's file is the old one, and cached
+  warnings of a dependent never get refreshed line numbers from the
+  dependency (they cannot have changed, by construction).
+- **Reproducible rlibs in incremental mode.** Member names no longer contain
+  the per-invocation random string. Verified: two incremental compilations
+  from scratch give byte-identical rlibs with the fork and different ones
+  with stock rustc.
+- **`-Zno-codegen` accepted on stable.** Needed by D23; `RUSTC_BOOTSTRAP`
+  cannot be used because it changes the crate hash.
+- **Recognition.** The fork's sysroot carries a marker file,
+  `lib/rustlib/rargo-fork`; the planner reports it in the plan. Nothing about
+  `rustc -vV` changes, so cargo's own fingerprinting is unaffected. The
+  toolchain is chosen the usual rustup way (`RUSTUP_TOOLCHAIN=rargo`,
+  `rargo +rargo`); rargod never substitutes it silently, because building
+  with a different compiler than the repository asks for is drift.
+- **Build.** Distribution settings (thin LTO, one codegen unit, jemalloc)
+  but no profile-guided optimisation, which needs the full `opt-dist`
+  pipeline and a from-source LLVM. Measured cost: `cargo check` of
+  rust-analyzer takes 91 CPU-seconds with the fork against 64 with the
+  official 1.100.0 (1.4x). All fork measurements therefore compare the fork
+  with itself (feature on and off) or say which compiler was used.
+
+## D23. `check` as a build that stops at metadata (fork only)
+
+With the fork, `rargo check` asks the planner for the *build* plan and takes
+each unit only as far as the request needs: not at all, to metadata
+(`-Zno-codegen` appended to the build's own command line, which yields
+byte-identical metadata to the full build), or in full (proc macros, build
+scripts and what they link). A metadata-only unit first looks for the full
+build's cached result. Linked targets are type-checked the way `cargo check`
+does (`--emit=metadata`, libraries passed as `.rmeta`).
+
+Why: stock cargo's check and build are two disjoint sets of artifacts, so a
+workspace that is both checked and built compiles every crate's front end
+once per mode and stores both.
+
+Measured on rust-analyzer with the fork compiler, cold store each time:
+
+| | check as build | cargo-style check |
+|---|---|---|
+| cold `check` | 47.3 s, 128 CPU-s | 31.4 s, 103 CPU-s |
+| `build` after it | 55.1 s | 58.3 s |
+| `check` after a `build` | 0.03 s | 31 s (a full cold check) |
+
+So it is a trade: the first check of a crate is slower (the build's metadata
+includes optimised MIR for generic and inlinable functions, which
+`cargo check` skips), a check of anything already built or tested is free,
+and a build after a check gains almost nothing, because rustc cannot resume
+code generation from a metadata-only compile of a crate. See STATUS for
+which way the default was set and the swarm numbers behind it.
+`RARGO_CHECK_AS_BUILD=0` (or `=1`) overrides per request.
+
+Not done, and why: making the metadata-only compile's incremental state a
+seed for the full compile (so that a build after a check only generates
+code). The compiler discards work products it did not reuse in a session,
+so alternating check and build would throw away unchanged object files each
+time; keeping the two lineages separate, as stock cargo also does, reuses
+more.
+
+## D24. Cold tier
+
+Whole blobs not used for 30 minutes (`--cold-after-min`) and not linked into
+any worktree are cut into content-defined chunks; each distinct chunk is
+kept once, zstd-compressed, as a file under `store/chunks`; the blob file is
+deleted. Anything that asks for a cold blob gets it reassembled and
+re-verified against its hash first. `rargo --rargo-compact` does it now for
+everything.
+
+Why: `rargo --rargo-incr-stats` on the store of the 20-agent Ruff run showed
+21.8 GiB of incremental state, 15.8 GiB of it `dep-graph.bin` files of which
+no two are identical, but which shrink to 4.2 GiB as chunks; object files
+were already shared at file level (2.6 GiB logical, 0.23 GiB stored).
+Compacting that store took it from 28.8 GiB to 3.9 GiB in about a minute.
+
+This is also the decision on the phase 5 item "an incremental state format
+that deduplicates well between snapshots": the existing format already
+deduplicates 3.8x under content-defined chunking plus compression, with no
+compiler change, and "per-codegen-unit object caching" is what rustc's
+incremental mode plus the file-level store already give (11x on object
+files). A new on-disk format in the compiler was not written; nothing
+measured asks for it.
+
+Chunks are one file each rather than packs: simpler to collect (mark from
+the cold blobs' recipes, delete the rest) and the count stays modest
+(64 KiB average). Eviction treats a cold blob as costing what it added when
+it went cold.
