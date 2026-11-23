@@ -895,3 +895,82 @@ because the keys are new each time.
 - Measured cost: none visible (rust-analyzer cold build through an 8-core
   server with one 8-core worker, 306 MiB sent to the worker: 46.5 s, in
   the range of the unencrypted runs).
+
+## D45. Zed is back in the benchmark set (reverses D9)
+
+The user asked for Zed in all acceptance work. What D9 gave up on is
+handled this way:
+
+- **System libraries.** This machine lacks several of Zed's (glib and
+  others), and installing packages on a shared box is out. Zed ships a
+  flake, and building in a flake's dev shell is what rargo does by default,
+  so rargo evaluates it on the server; stock cargo, for the comparison,
+  runs inside the same dev shell (`dev/zed-cargo.sh`, the shell's real
+  cargo rather than Zed's timing wrapper around it).
+- **`flake.files`.** Zed's flake reads repository files beyond the ones
+  D41 writes out for evaluation (`Cargo.lock`, `script/cargo`, fonts,
+  patches under `nix/`). A new policy key names them; they are written out
+  with the rest and are part of the evaluation's cache key. Evaluating
+  with the whole worktree visible was rejected: every edit would then
+  re-evaluate the flake.
+- **What a flake sandbox sees of the server.** Found by Zed's `webrtc-sys`
+  build script, which downloads a library: a flake sandbox's synthetic
+  `/etc` had no resolver configuration and no certificates, so an action
+  the policy gave the network still could not use it. `/etc/resolv.conf`
+  is now shown, name lookups use DNS, and the server's certificate bundle
+  is shown at `/etc/ca-certificates.crt` with `SSL_CERT_FILE` and its
+  relatives pointing at it unless the flake sets them.
+- **Store paths in values.** `-fmacro-prefix-map=/nix/store/a=/nix/store/b`
+  parsed as a store path ending in `=` (legal in names), and one of the two
+  is a placeholder that does not exist. Paths that do not exist are tried
+  without trailing punctuation and otherwise left out.
+- **Lint data.** The unused-dependency data handed to the planner as one
+  environment variable passed the kernel's 128 KiB limit per string on a
+  workspace of Zed's size. It now travels in as many variables as needed
+  (cargo fork patch 0007).
+- **Benchmark-local pieces**, none of them in rargo: a commit in the Zed
+  checkout adding `.rargo.toml` (`flake.files`, network for `webrtc-sys`,
+  `HTTPS_PROXY` passed through); `GIT_LFS_SKIP_SMUDGE=1` for Nix, because
+  one git dependency has LFS files that this machine's git-lfs cannot
+  fetch and that no build needs; and `dev/rigproxy.py`, which gives the
+  namespaced rig's server a way out to the internet over a unix socket
+  without touching host network configuration.
+- **Twenty stock target directories do not fit.** One is 37.5 GB after a
+  check and a build; twenty with tests would need about 900 GB and the
+  disk has 714 GB free, shared with live services. Stock cargo is measured
+  with 10 agents, rargo with 10 and with 20, and the 20-agent stock
+  figures are given as twice the 10-agent ones (the stock runs are bound
+  by the 24-core cap, so work scales with agents); STATUS says which
+  figures are measured and which extrapolated.
+
+## D46. The server makes each cargo home overlay once
+
+Found by the swarm reruns: three and eight failed steps in two runs,
+"setting up the cargo configuration: File exists". Twenty clients with the
+same cargo configuration arriving at a fresh server raced to create the
+overlay directory's links. Creation is serialised. The earlier clean runs
+were luck.
+
+## D47. Dispatch to workers: first free core wins
+
+Replaces the cost model of D30. Three things were wrong with deciding
+once, on arrival, whether an action goes to a worker:
+
+- "A local core is free" was judged by the number of running actions. A
+  compiler's code-generation threads take cores from the same jobserver
+  without being actions, so the server looked idle exactly when it was
+  busiest. It is now judged by free tokens.
+- An action that found the worker full queued for a local core only, and
+  could never take a worker core that came free a moment later. It now
+  waits for both and takes the first.
+- The wait for a local core was estimated from the queue length, which is
+  zero while helper threads hold every core; most actions were kept local
+  as "transfer too costly". The estimate is gone. An action is kept from a
+  worker only when its known inputs (from its last trace) would take
+  longer to send than an average action takes to run.
+
+Hedging (D30) stays: a dispatched action also runs locally when a core
+nothing else wants falls idle before the worker has said anything. A file
+a worker has produced and announced early (an `.rmeta`) is recorded as
+held by that worker at once, so dependents sent there do not get it pushed
+back.
