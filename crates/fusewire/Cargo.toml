@@ -4,6 +4,8 @@ description = "Minimal multi-threaded FUSE kernel protocol server with passthrou
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 libc.workspace = true

@@ -113,6 +113,10 @@ fn parse_args(args: &[String]) -> Result<Opts> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if matches!(args.get(1).map(|s| s.as_str()), Some("--version" | "-V")) {
+        println!("rargod {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_core::proto::PROTO_VERSION);
+        return Ok(());
+    }
     if args.get(1).map(|s| s.as_str()) == Some("--internal-zygote") {
         rargo_core::sandbox::zygote_main(args[2].parse()?);
     }

@@ -4,6 +4,8 @@ description = "The rargo client: syncs a worktree and its environment to a rargo
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 rargo-proto = { path = "../rargo-proto" }

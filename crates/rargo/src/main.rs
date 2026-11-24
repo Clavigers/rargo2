@@ -405,6 +405,11 @@ fn main() {
         passthrough(&raw);
     }
     // The daemon handles signals itself (it has directories to unmount).
+    if raw.first().is_some_and(|a| a == "--rargo-version") {
+        // rargo's own version (`--version` is cargo's and is passed on).
+        println!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION);
+        return;
+    }
     if raw.first().is_some_and(|a| a == "--rargo-daemon") {
         match raw.get(1) {
             Some(socket) => daemon::serve(Path::new(socket)),
