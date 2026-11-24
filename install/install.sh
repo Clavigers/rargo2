@@ -20,6 +20,11 @@ else dir=$HOME/.local/bin
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# "latest" is turned into its number first, so that every file comes from
+# an address that never changes what it holds.
+if [ "$version" = latest ]; then
+    version=$(curl -fsSL "$base/VERSION") || { echo "cannot read $base/VERSION" >&2; exit 1; }
+fi
 echo "downloading $base/$version/$asset"
 curl -fsSL -o "$tmp/$asset" "$base/$version/$asset"
 curl -fsSL -o "$tmp/SHA256SUMS" "$base/$version/SHA256SUMS"
@@ -32,4 +37,4 @@ case ":$PATH:" in
 *) echo "note: $dir is not on your PATH" ;;
 esac
 [ -e /dev/fuse ] || echo "note: no /dev/fuse here; results will be copied into target/ instead of served from it"
-echo "next: tell it your server (https://rargo.rs/reference), then run rargo build in a cargo project"
+echo "next, in a cargo project: rargo @HOST (the server, for example rargo.rs), rargo auth, rargo build"
