@@ -28,11 +28,13 @@ pub struct Keys {
     /// No key file: anyone who can reach the (loopback) port is accepted,
     /// and is an administrator.
     open: bool,
+    /// Tokens made while the server runs (`rargod token`, `rargo auth`).
+    tokens: Option<Arc<crate::tokens::TokenStore>>,
 }
 
 impl Keys {
     pub fn open() -> Keys {
-        Keys { users: HashMap::new(), open: true }
+        Keys { users: HashMap::new(), open: true, tokens: None }
     }
 
     /// One user per line: `name secret [admin]`. `#` starts a comment.
@@ -60,11 +62,49 @@ impl Keys {
         if users.is_empty() {
             bail!("the key file names no users");
         }
-        Ok(Keys { users, open: false })
+        Ok(Keys { users, open: false, tokens: None })
     }
 
+    /// Nobody from a key file: only tokens admit.
+    pub fn tokens_only() -> Keys {
+        Keys { users: HashMap::new(), open: false, tokens: None }
+    }
+
+    /// Tokens kept in `store` admit too; they are looked up as they are
+    /// at that moment, so one made or revoked takes effect at once.
+    pub fn with_tokens(mut self, store: Arc<crate::tokens::TokenStore>) -> Keys {
+        self.tokens = Some(store);
+        self
+    }
+
+    pub fn tokens(&self) -> Option<&Arc<crate::tokens::TokenStore>> {
+        self.tokens.as_ref()
+    }
+
+    /// The key and standing of what a client presents as its user name: a
+    /// name of the key file or the id of a token.
     fn lookup(&self, user: &str) -> Option<([u8; 32], bool)> {
-        if self.open { Some((secure::open_psk(), true)) } else { self.users.get(user).copied() }
+        if self.open {
+            return Some((secure::open_psk(), true));
+        }
+        if let Some(found) = self.users.get(user) {
+            return Some(*found);
+        }
+        self.tokens.as_ref()?.lookup(user).map(|(key, admin, _)| (key, admin))
+    }
+
+    /// Whether what a client presented still admits it (a token may have
+    /// been revoked or have expired since).
+    pub fn still_valid(&self, user: &str) -> bool {
+        self.lookup(user).is_some()
+    }
+
+    /// Who a client is, for display: the token's user, or the name itself.
+    pub fn name_of(&self, user: &str) -> String {
+        if self.open || self.users.contains_key(user) {
+            return user.to_string();
+        }
+        self.tokens.as_ref().and_then(|t| t.lookup(user)).map(|(_, _, name)| name).unwrap_or_else(|| user.to_string())
     }
 
     /// The user's key, for the UDP transport's key agreement.

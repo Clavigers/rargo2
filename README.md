@@ -41,21 +41,27 @@ the machine.
 
 ## The client
 
-Any machine with the `rargo` binary; git if the worktree is a git checkout.
+Linux; git if the worktree is a git checkout.
 
 ```sh
-mkdir -p ~/.config/rargo
-cat >~/.config/rargo/config.toml <<EOF
-server = "build.example:7459"
-user = "ann"
-key = "the secret from the server's key file"     # or: key-file = "/path"
-EOF
-
-cd my-project && rargo build
+cargo install rargo                 # or: curl -fsSL https://rargo.rs/install.sh | sh
+cd my-project
+rargo @build.example                # names the server in Cargo.toml ([workspace.metadata.rargo])
+rargo auth                          # a page in your browser; enter the invitation the server's admin gave you
+rargo build
 ```
 
-`RARGO_SERVER`, `RARGO_USER`, `RARGO_KEY` and `RARGO_KEY_FILE` override the
-file. To make agents that type `cargo` use rargo, put a link named `cargo`
+`rargo @host` takes a name (asked over HTTPS where its server is) or
+`name:port` (the server itself). `rargo auth status` shows which server a
+project builds on and as whom; `rargo auth remove` forgets the token. On
+the server, `rargod token invite|create|list|revoke --state DIR` manage
+who may connect, without a restart.
+
+The older way still works: `~/.config/rargo/config.toml` with `server`,
+`user` and `key` (or `key-file`) for a user of the server's key file.
+
+`RARGO_SERVER`, `RARGO_TOKEN`, `RARGO_USER`, `RARGO_KEY` and `RARGO_KEY_FILE`
+override all of it. To make agents that type `cargo` use rargo, put a link named `cargo`
 to the `rargo` binary ahead of the real cargo on `PATH`; everything that is
 not a build is passed to the real cargo, and `RARGO_FALLBACK=cargo` passes
 builds too when the server cannot be reached.

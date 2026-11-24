@@ -1814,3 +1814,104 @@ sent again. Nothing can have been built or printed for a tree the
 server did not have. Measured on rust-analyzer at 100 ms: the offer
 phase 0.10 s to 0. No protocol change.
 
+## D67. The easy path: `rargo @host`, `rargo auth`, tokens (issues 5, 13, 14: the smallest complete version)
+
+What a new user does, with nothing edited by hand: `cargo install rargo`
+(or `curl -fsSL https://rargo.rs/install.sh | sh`), `rargo @rargo.rs` in a
+project, `rargo auth`, `rargo build`. This entry is the design of the
+smallest version of each piece that makes that path whole; what each
+initiative still lacks is listed at the end.
+
+**The server is a property of the project (14).** `rargo @host` writes
+`host` under `[workspace.metadata.rargo]` of the workspace's `Cargo.toml`
+(`[package.metadata.rargo]` for a package outside a workspace) with
+`toml_edit`, so the rest of the file stays as it was; cargo ignores
+`metadata` tables, so stock cargo sees no difference. A build takes the
+server from `RARGO_SERVER`, else from the project, else from the old
+`~/.config/rargo/config.toml`, which keeps working.
+
+**From a name to an address: an HTTPS lookup.** A host is written as
+`name:port`, which is the server's address, or as a bare name. A bare
+name is asked `https://name/.well-known/rargo.json`, which answers with
+the server's address (`{"server": "build.rargo.rs:7459", ...}`); the
+answer is kept for a day in the client's cache and an old answer is
+used if the name cannot be asked. Chosen over a DNS SRV record because
+`rargo auth` needs HTTPS to that name anyway (one mechanism, one thing
+for the owner of a name to set up), because the client would otherwise
+need a resolver library to read SRV records, and because a web server
+is easier to stand up and to check than a DNS record of an unusual
+type. Cost: the client carries an HTTPS client (`ureq` with `rustls`;
+the static binary grew from 4.4 to about 6 MB stripped).
+
+**rargod answers HTTP on its TCP port.** A client's TCP link starts
+with the protocol's magic; a connection that starts with `GET `, `POST`
+or `HEAD` is answered as HTTP instead: the lookup above and the pages
+and calls of `rargo auth`. No second port to open, and a server on a
+private network is asked directly (`rargo @build.lan:7459` uses
+`http://build.lan:7459`). A public name puts something that speaks
+HTTPS in front and forwards `/.well-known/rargo.json` and `/auth*` to
+that port; rargo.rs does. `--public HOST:PORT` says which address the
+lookup hands out when it is not the name the request came to.
+
+**`rargo auth` (13)** is a device flow. The client asks `/auth/start`
+and gets a device secret, which it keeps, and an eight-character code,
+which it prints with the address of the page (and opens the page if
+there is a display). On the page a person sees the code, checks it
+against the terminal, and enters an invitation. The client, polling
+`/auth/poll` with its device secret, then receives a token and stores
+it in `~/.config/rargo/credentials.toml` (mode 600), under the host as
+the project writes it. It works without a browser on that machine: the
+page can be opened anywhere. `rargo auth status` says which server and
+who; `rargo auth remove` forgets the token; `rargo auth --token T`
+stores one an administrator made. `login` and `logout` are cargo's and
+are passed to cargo as before.
+
+**How the page knows who you are: an invitation, for now.** An
+administrator makes one (`rargod token invite --state DIR --user ann`):
+a code that is good for a number of uses and days and may carry the
+user's name and standing. The eight-character code of the flow grants
+nothing by itself, a wrong invitation is counted against it (five, then
+the flow has to be started again), and the token goes only to the
+holder of the device secret. Signing in with GitHub is the better
+answer for a public server and is not built: it needs an OAuth
+application registered by the owner of the name, with its secret given
+to the server. Until then the first step for a new person is being
+handed an invitation.
+
+**Tokens (5).** A token is an id and a secret; the client presents the
+id as the user name of the handshake and the secret as its key, so the
+wire protocol is unchanged (protocol 7). They live in `tokens.json` in
+the server's state directory, rewritten whole under a lock by whoever
+changes it and read again by the server whenever the file has changed:
+`rargod token create|list|revoke|invite` on the server's machine take
+effect at once, with no restart. A token may expire. A session whose
+token was revoked or has expired is closed within seconds (looked at
+when anything arrives on the link, at most every other second). The
+key file keeps working beside it; a server may also run with tokens
+only.
+
+*Secrets are not kept in plain text*, with a limit that has to be said:
+the file holds the key derived from the secret, not the secret, and an
+invitation's code only as a hash. But the handshake (Noise NNpsk0) is
+symmetric, so the derived key is all a thief of that file would need
+to connect as the user. The file is therefore as sensitive as the key
+file (mode 600), and "not in plain text" protects only the secret
+itself. Removing that limit means a handshake with a key pair per
+client, the server holding public keys: a protocol change, not done
+here.
+
+**Not in this version, by initiative.**
+- 14: the contents of `.rargo.toml` (`[env]`, `[network]`, `[flake]`,
+  `[sync]`) have not moved into `Cargo.toml`; no migration command for
+  the old files.
+- 13: GitHub sign-in; revoking a token from the client (`rargo auth
+  remove` forgets it locally and says how it is revoked on the server).
+- 5: token commands for an administrator from a client (they run on
+  the server's machine); key pairs.
+
+Tested by `dev/e2e-auth.sh` (36 checks: the whole path against a
+server with tokens only, the browser played by curl; a second project
+needs no second `rargo auth`; create, list, revoke while the server
+runs; a revoked token's open session is closed) and unit tests of the
+token store, the flow and the manifest edit.
+
