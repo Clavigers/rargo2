@@ -1479,3 +1479,74 @@ run on a machine-room link):
   directories would be invisible to the next command. A command that is
   in another mount namespace than its daemon gets its results copied.
 
+## D61. The worker fault's cause; the output file system without one lock; fusermount3; the history benchmark
+
+**The worker fault** (D60, STATUS) had two causes, both found by logging
+on the server why a content could not be served and on the worker what
+arrived.
+
+- *Answers sent ahead named contents that could not be asked for.* When
+  an action goes to a worker, the server sends ahead what it expects the
+  action to look up. A file on the server's own disk (toolchain, registry
+  sources) that the server had hashed before was sent with its hash; but
+  only for files the action was predicted to read was it also remembered
+  where that content could be read from. For the others (directories on
+  the way, files predicted to be looked at but not read) the hash went
+  out and the source did not. If the action then opened such a file, the
+  worker asked for the content by hash and the server said it had none:
+  "not in the store and never shown from a file", 161 to 190 times per
+  swarm run. The compiler failed on the file. Now every answer that names
+  a content remembers its source.
+- *Pushes were put together too early.* A push of a content is several
+  messages; the transport delivers messages independently, so they can
+  overtake each other. The worker assembled the content when the message
+  sent last arrived, with the recipe from whichever arrived first: an
+  empty recipe if that was not the first sent. The content then failed
+  its check ("arrived with the wrong content"), while the server went on
+  believing the worker held it. Messages of a push are now numbered and
+  counted, and the content is assembled when all are there.
+
+After both: no content refused, no failed assembly, no worker failure in
+the swarm (the fallback of D60, which reruns such an action on the
+server, stays, and did not fire).
+
+**The output file system** held one lock around every operation,
+system calls included, and answered a lookup of a name that does not
+exist without letting the kernel remember it. Zed's profile (incremental
+compilation with unpacked split debug info) makes tens of thousands of
+small files, and stock cargo in the mounted directory took 446 s for a
+cold build against 168 s in a plain one.
+
+- The table of delivered names is behind a reader-writer lock that
+  ordinary operations on real files only read; the map from node
+  numbers to paths has its own short lock; no lock is held across a
+  system call.
+- A lookup that finds nothing is answered as a negative entry the
+  kernel may keep, like positive ones. A delivery, the only thing that
+  makes a name exist behind the kernel's back, invalidates the entry at
+  the deepest directory the kernel knows on the way to the name.
+- As many FUSE worker threads as cores (8 to 32), where there were 8.
+
+Zed, stock cargo through the mount, after: 198 s cold build, 55 s tests
+(168 s and 29 s in a plain directory). Not done: avoiding the extra
+`lstat`s and the second open per create, which is where I would look
+for the rest.
+
+**fusermount3.** If `mount(2)` is refused, `fusewire` runs `fusermount3`
+with a socket in `_FUSE_COMMFD`, takes the connection's descriptor from
+it, and unmounts through `fusermount3 -u -z`. Without privilege there is
+no `allow_other` (the mount is the user's alone) and no passthrough
+(file contents go through the daemon). `dev/e2e-link.sh` runs a build
+as `nobody`; that part uses a directory in `/tmp`, because an
+unprivileged user cannot reach anything under `/root`.
+
+**The history benchmark.** The brief asks for it as (a) to (d) with
+median, 90th percentile, maximum and total, without saying what (a) to
+(d) are; nothing in KICKOFF or DESIGN does. I took them to be, on the
+last 30 first-parent commits of rust-analyzer with `build -p
+rust-analyzer` at each: (a) stock cargo in one worktree; (b) rargo
+against a server that has built nothing; (c) rargo again from a second
+machine's fresh worktree against the server of (b); (d) rargo with the
+rustc fork against a server that has built nothing. The statistics are
+over the 29 commits after the first.
+

@@ -32,7 +32,11 @@ edit_file=$(cd "$base" && git ls-files 'crates/*/src/lib.rs' | head -1)
 
 secs() { local t0=$(date +%s.%N); "$@" >"$work/bench/worker-last.log" 2>&1; local rc=$?; echo "$(echo "$(date +%s.%N) - $t0" | bc) $rc"; }
 fresh_wt() {
+    # The previous configuration's daemon is gone with its rig; what it
+    # had mounted on the worktree's output directory may still be there.
+    umount -l "$wt/target" 2>/dev/null
     git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1
+    rm -rf "$wt"
     git -C "$base" worktree prune
     git -C "$base" worktree add -q --detach "$wt" HEAD
 }

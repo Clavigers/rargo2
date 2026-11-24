@@ -220,7 +220,7 @@ def main():
         daemon_status = subprocess.run(prefix + [RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
         # The daemon's own CPU time (it is not a child of the commands).
         tick = os.sysconf("SC_CLK_TCK")
-        for pid in subprocess.run(["pgrep", "-f", f"--rargo-daemon {client_cache}"], capture_output=True, text=True).stdout.split():
+        for pid in subprocess.run(["pgrep", "-f", "--", f"--rargo-daemon {client_cache}"], capture_output=True, text=True).stdout.split():
             try:
                 fields = open(f"/proc/{pid}/stat").read().rsplit(")", 1)[1].split()
                 daemon_cpu += (int(fields[11]) + int(fields[12])) / tick
