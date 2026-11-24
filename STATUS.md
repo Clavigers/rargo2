@@ -252,6 +252,30 @@ over the TCP fallback the first command also waits 2.5 s for UDP to
 fail (e2e-link: 2.6 s for the first command with UDP dropped, then
 normal).
 
+### The first command of a new client daemon (`dev/bench-restart.sh`, 2026-11-24)
+
+rust-analyzer on the rig. Before each command the daemon was stopped (and
+one second passed). Median of 7. "before" is 0.6.2 (0a472bc), "after" is
+main at the #9 merge (PR #85), where what the server holds outlives the
+daemon (D80).
+
+| Link | No edit (before → after) | After a one-line edit (before → after) |
+|---|---|---|
+| LAN (2 ms RTT) | 0.100 → 0.094 s | 1.227 → 1.222 s |
+| 100 ms RTT | 0.291 → 0.297 s | 1.763 → 1.432 s |
+
+### Scanning after a change (`scan::rescan`, 2026-11-24)
+
+One change, timed in-process (median of 5), against a whole scan with a
+warm stat cache (D79, issue 10). Each result was checked to equal a
+whole scan:
+
+| Worktree | Files | Directories | Whole scan | Rescan | Rescan, scan shared |
+|---|---|---|---|---|---|
+| rustc | 243,970 | 21,412 | 329 ms | 12 ms | 99 ms |
+| Ruff | 11,338 | 908 | 11.2 ms | 0.86 ms | 2.2 ms |
+| Zed | 3,698 | 830 | 4.5 ms | 0.91 ms | 1.5 ms |
+
 ### A fresh worktree to a usable binary (`dev/bench-fresh.sh`)
 
 100 ms round trip. The server has built rust-analyzer for one worktree.
