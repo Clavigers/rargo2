@@ -2240,3 +2240,21 @@ numbers in `STATUS.md` depend on it.
   (`bin-hist`), so nothing fixed later is in its numbers, issue 40's
   sync failure included.
 
+## D73. Stock `cargo clean` on a served `target/` (issue 7)
+
+`cargo clean` removes what is in `target/` and then the directory. The
+directory is a mount point while the daemon serves it, and the kernel
+refuses to remove a mount point before the file system is even asked.
+So the daemon lets go at the right moment: when a removal through the
+mount leaves the directory with no entry, real or delivered, the daemon
+unmounts it before it answers that removal, and forgets what it had
+delivered there. What cargo removes next is a plain, empty directory.
+Stock cargo builds in the worktree as in any other; the next rargo
+command mounts `target/` again and shows the results again (they are in
+the server's cache, so nothing is built).
+
+Nothing tells a clean from any other emptying (`rm -rf target/*`), and
+nothing needs to: an empty output directory holds nothing worth serving.
+`cargo clean -p NAME` and `--release` leave other entries and never
+reach this.
+
