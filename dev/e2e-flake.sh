@@ -25,7 +25,7 @@ has() { grep -qF -- "$2" <<<"$1"; }
 base=${RARGO_E2E_FLAKE_PORT:-7471}
 port() { case $1 in a) echo $base ;; b) echo $((base + 1)) ;; esac; }
 daemon() { # name action
-    RARGO_CACHE_DIR=$T/home-$1/.cache/rargo RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
+    RARGO_LOG_ACTIONS=1 RARGO_CACHE_DIR=$T/home-$1/.cache/rargo RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
         RARGO_HIDE="$T/a $T/b $T/home-a $T/home-b" "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
 }
 on() { # machine, command...
@@ -33,6 +33,7 @@ on() { # machine, command...
     RARGO_SERVER=127.0.0.1:$(port "$m") RARGO_CACHE_DIR=$T/home-$m/.cache/rargo HOME=$T/home-$m CARGO_HOME=$T/home-$m/.cargo "$@"
 }
 runs() { on "$1" "$R" --rargo-status | awk '/^actions run/ {print $3}'; }
+actions_since() { tail -n "+$(($1 + 1))" "$log" | sed -n 's/^rargod: action //p'; }
 
 daemon a stop; daemon b stop
 rm -rf "$T"; mkdir -p "$T/home-a" "$T/home-b" "$T/a" "$T/b/somewhere/else"
@@ -105,7 +106,6 @@ out=$(on a "$R" test 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "1 passed" && ok "test confirms the host filesystem is not visible" || bad "test confirms the host filesystem is not visible" "$out"
 git -C "$P" add Cargo.lock; git -C "$P" -c user.name=t -c user.email=t@t commit -q -m lock
 on a "$R" build >/dev/null 2>&1; on a "$R" test >/dev/null 2>&1
-a_runs=$(runs a)
 a_hash=$(sha256sum target/debug/flaky | cut -d' ' -f1)
 
 echo "== without the flake (policy switch) the host toolchain is used"
@@ -161,20 +161,41 @@ cd "$Q"
 out=$(on b "$R" --rargo-import "$T/export" 2>&1)
 has "$out" "imported" && ok "$out" || bad "import" "$out"
 before=$(runs b)
-out=$(on b "$R" build 2>&1); rc=$?
+log=$T/state-b/rargod.log
+start_line=$(wc -l <"$log")
+# Use a different planner command line to exercise cold planning on B.
+# Color affects presentation, so the compiler and script traces still match.
+out=$(RARGO_EXPLAIN=1 on b "$R" build --color never 2>&1); rc=$?
 after=$(runs b)
+actions=$(actions_since "$start_line")
 [ $rc -eq 0 ] && ok "B builds" || bad "B builds" "$out"
-# Planning observes the host (the forked cargo needs host libraries), so it
-# may run on B. No compiler or build script may.
-[ $((after - before)) -le 1 ] && ok "B ran $((after - before)) action(s): compilers and build scripts all came from A's cache" || bad "B reused A's cache" "ran $((after - before)) actions
-$(RARGO_EXPLAIN=1 on b "$R" build 2>&1 | grep note:)"
+# The imported cache does not populate B's Cargo registry. Offline planning
+# can fail until Cargo downloads the locked dependency, then planning runs
+# again. The compiler and build script actions must all be cache hits.
+plan_ok='Plan [cargo (planning)] exit=Some(0) tainted=false'
+plan_offline='Plan [cargo (planning)] exit=Some(101) tainted=false'
+case "$((after - before)):$actions" in
+    "0:"|"1:$plan_ok"|"1:$plan_offline"|"2:$plan_offline"$'\n'"$plan_ok")
+        ok "B ran $((after - before)) planning action(s): compilers and build scripts all came from A's cache" ;;
+    *)
+        bad "B reused A's cache" "ran $((after - before)) actions
+$actions
+$out" ;;
+esac
 has "$out" "Compiling" && bad "B printed no Compiling lines" "$out" || ok "B printed no Compiling lines"
 [ "$(sha256sum target/debug/flaky | cut -d' ' -f1)" = "$a_hash" ] && ok "B's binary is byte-identical to A's" || bad "B's binary is byte-identical to A's"
 before=$(runs b)
-out=$(on b "$R" test 2>&1); rc=$?
+start_line=$(wc -l <"$log")
+out=$(RARGO_EXPLAIN=1 on b "$R" test 2>&1); rc=$?
 after=$(runs b)
-[ $rc -eq 0 ] && [ $((after - before)) -le 1 ] && ok "B's test run was replayed from A's cache" || bad "B's test run was replayed from A's cache" "ran $((after - before)) actions
+actions=$(actions_since "$start_line")
+if [ "$rc" -eq 0 ] && { [ "$((after - before)):$actions" = '0:' ] || [ "$((after - before)):$actions" = "1:$plan_ok" ]; }; then
+    ok "B's test run was replayed from A's cache"
+else
+    bad "B's test run was replayed from A's cache" "ran $((after - before)) actions
+$actions
 $out"
+fi
 
 echo "== control: a third store without the import has to build"
 daemon b stop
