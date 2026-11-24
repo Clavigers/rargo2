@@ -39,7 +39,7 @@ def checkout(wt, commit):
     """Moves a worktree to a commit; files earlier commits had and this one
     does not go, the output directory stays."""
     git("checkout", "-q", "-f", "--detach", commit, cwd=wt)
-    git("clean", "-fdq", "-e", "target", cwd=wt, check=False)
+    git("clean", "-ffdq", "-e", "target", cwd=wt, check=False)
 
 
 def worktree(name, commit):
