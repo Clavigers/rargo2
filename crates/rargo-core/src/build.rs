@@ -1506,10 +1506,10 @@ impl Run {
         })
     }
 
-    /// Whether `commit` is HEAD of the client's worktree or one of the
-    /// recent ancestors it named.
-    fn is_ancestor_of_head(&self, commit: &[u8; 20]) -> bool {
-        self.c.commits.contains(commit)
+    /// How many commits back from HEAD `commit` is, if it is HEAD or one
+    /// of the recent ancestors the client named.
+    fn commits_back(&self, commit: &[u8; 20]) -> Option<usize> {
+        self.c.commits.iter().position(|c| c == commit)
     }
 
     async fn exec_unit(self: &Arc<Self>, i: usize) -> Result<UState> {
@@ -1660,7 +1660,7 @@ impl Run {
         let crate_key = spec.weak_key();
         let wt = self.c.worktree.clone();
         let mut seed = match &incr_dir {
-            Some(_) => self.d.incr.pick(&crate_key, &wt, &|c| self.is_ancestor_of_head(c)),
+            Some(_) => self.d.incr.pick(&crate_key, &wt, &|c| self.commits_back(c)),
             None => None,
         };
 
@@ -1739,7 +1739,7 @@ impl Run {
                     if let Some(lost) = seed.take() {
                         self.d.incr.forget(&crate_key, lost.id);
                     }
-                    seed = self.d.incr.pick(&crate_key, &wt, &|c| self.is_ancestor_of_head(c));
+                    seed = self.d.incr.pick(&crate_key, &wt, &|c| self.commits_back(c));
                     continue;
                 }
                 other => other?,

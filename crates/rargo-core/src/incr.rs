@@ -7,8 +7,12 @@
 //! the next compile of that crate, anywhere, the best available state is
 //! shown to rustc as a private copy-on-write layer.
 //!
-//! "Best": the same worktree's last state, else the newest state made at an
-//! ancestor of the worktree's HEAD, else the newest state of all.
+//! "Best": the state made nearest to the worktree's HEAD. That is the
+//! worktree's own last state if it was made at HEAD or nearer to it than
+//! anyone else's (an agent editing where it stands); otherwise the state
+//! another worktree made at the nearest ancestor (an agent that has just
+//! arrived at a commit finds what was built one commit earlier, not what
+//! it built itself ten commits ago); else the newest state of all.
 //!
 //! A state made by a compile on a worker is recorded at once, while its
 //! files are still on the worker: they come home in the background, or
@@ -148,22 +152,44 @@ impl IncrStore {
         Some((Arc::new(m), Arc::new(blobs)))
     }
 
-    /// Picks a seed for `crate_key`. `is_ancestor(c)` says whether commit
-    /// `c` is an ancestor of (or equal to) the requesting worktree's HEAD.
+    /// Picks a seed for `crate_key`. `distance(c)` says how many commits
+    /// back from the requesting worktree's HEAD commit `c` is (0 for HEAD
+    /// itself), or `None` if it is not HEAD or one of its recent ancestors.
     pub fn pick(
         &self,
         crate_key: &Hash,
         worktree: &str,
-        is_ancestor: &dyn Fn(&[u8; 20]) -> bool,
+        distance: &dyn Fn(&[u8; 20]) -> Option<usize>,
     ) -> Option<Seed> {
         let all = self.list(crate_key);
+        let own: Vec<&(u64, StateMeta)> = all.iter().filter(|(_, m)| m.worktree == worktree).collect();
+        let mut near: Vec<(usize, &(u64, StateMeta))> = all
+            .iter()
+            .filter(|(_, m)| m.worktree != worktree)
+            .filter_map(|s| s.1.commit.as_ref().and_then(distance).map(|d| (d, s)))
+            .collect();
+        // Nearest first; among equals the newest (the list is newest first).
+        near.sort_by_key(|(d, _)| *d);
+        // The worktree's own state leads unless someone else's was made
+        // nearer to HEAD: at HEAD when its own is from further back, or at
+        // an ancestor when its own is from somewhere that is none.
+        let own_first = match (own.first(), near.first()) {
+            (Some(_), None) => true,
+            (Some((_, m)), Some((best, _))) => match &m.commit {
+                None => true,
+                Some(c) => distance(c).is_some_and(|d| d <= *best),
+            },
+            (None, _) => false,
+        };
         let mut order: Vec<(&(u64, StateMeta), SeedKind)> = Vec::new();
-        order.extend(all.iter().filter(|(_, m)| m.worktree == worktree).map(|s| (s, SeedKind::SameWorktree)));
-        order.extend(
-            all.iter()
-                .filter(|(_, m)| m.worktree != worktree && m.commit.as_ref().is_some_and(is_ancestor))
-                .map(|s| (s, SeedKind::Ancestor)),
-        );
+        let ancestors = near.iter().map(|(_, s)| (*s, SeedKind::Ancestor));
+        if own_first {
+            order.extend(own.iter().map(|s| (*s, SeedKind::SameWorktree)));
+            order.extend(ancestors);
+        } else {
+            order.extend(ancestors);
+            order.extend(own.iter().map(|s| (*s, SeedKind::SameWorktree)));
+        }
         order.extend(all.iter().map(|s| (s, SeedKind::Other)));
         for ((id, meta), kind) in order {
             match self.load(meta) {
@@ -409,7 +435,7 @@ mod tests {
         let k = Hash::of(b"crate");
         let main = [1u8; 20];
         let side = [2u8; 20];
-        assert!(incr.pick(&k, "/wt/a", &|_| false).is_none());
+        assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
         incr.save(&k, "/wt/main", Some(main), &manifest(&s, &[("/i/x", "main state")]));
         incr.save(&k, "/wt/side", Some(side), &manifest(&s, &[("/i/x", "side state")]));
         let content = |m: &Manifest| match &m.entries[0].1 {
@@ -418,19 +444,28 @@ mod tests {
         };
         // A new worktree branched from main: the ancestor's state wins over
         // the newer unrelated one.
-        let s1 = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
+        let s1 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
         assert_eq!((content(&s1.manifest).as_str(), s1.kind), ("main state", SeedKind::Ancestor));
         assert_eq!(s1.blobs.len(), 1);
         // With no ancestry information, the newest of all.
-        let s2 = incr.pick(&k, "/wt/new", &|_| false).unwrap();
+        let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
         assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
         // Once the worktree has its own state, that one.
         incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]));
-        let s3 = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
+        // Its own state, made at HEAD, beats the ancestor's.
+        let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
+        let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
         assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
+        // The worktree moves on ten commits; another worktree has built
+        // at the commit just before: that state is nearer than its own.
+        incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]));
+        let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
+        let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
+        assert_eq!((content(&s5.manifest).as_str(), s5.kind), ("one commit back", SeedKind::Ancestor));
+        incr.forget(&k, s5.id);
         // A state rustc crashed on is not offered again.
         incr.discard(&k, s3.id);
-        let s4 = incr.pick(&k, "/wt/new", &|c| *c == main).unwrap();
+        let s4 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
         assert_eq!(content(&s4.manifest), "main state");
     }
 
@@ -444,7 +479,7 @@ mod tests {
         if let MEntry::File { hash, .. } = &m.entries[0].1 {
             s.remove(hash);
         }
-        assert!(incr.pick(&k, "/wt/a", &|_| false).is_none());
+        assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
         assert_eq!(incr.state_count(&k), 0);
     }
 
@@ -460,12 +495,12 @@ mod tests {
         let mut m = manifest(&s, &[("/i/here", "at home")]);
         m.entries.push((b"/i/there".to_vec(), MEntry::File { hash: away, exec: false, size: 33 }));
         incr.save(&k, "/wt/a", None, &m);
-        let seed = incr.pick(&k, "/wt/a", &|_| false).unwrap();
+        let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
         assert!(seed.blobs.contains(&(away, 33)));
         assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
         // The worker goes away: the state cannot be completed any more.
         connected.store(false, Ordering::Relaxed);
-        assert!(incr.pick(&k, "/wt/a", &|_| false).is_none());
+        assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
         assert_eq!(incr.state_count(&k), 0);
     }
 
