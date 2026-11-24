@@ -2044,6 +2044,7 @@ daemon can run at that moment, so something outside it has to.
   and killed the guard with it. It renames itself and overwrites its
   argument strings, and shows as `unmount-guard: DIRECTORY`, which
   neither `pkill rargo` nor `pkill -f 'rargo --rargo-daemon'` matches.
+  Mounting returns only when the guard has said it is set up.
 - It unmounts only its own mount: the kernel's mount id (statx, Linux
   5.8; asked without a question to the file system, which cannot answer)
   is recorded at mount and compared before unmounting, in the guard and

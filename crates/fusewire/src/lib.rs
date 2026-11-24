@@ -662,14 +662,29 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
         return Err(io::Error::last_os_error());
     }
     let (r, w) = (p[0], p[1]);
+    // A second pipe on which the guard says that it is set up. Until then
+    // it still looks like this process, and nobody is told of the mount.
+    let mut q = [0 as libc::c_int; 2];
+    // SAFETY: a valid two-element array; r and w were just returned.
+    if unsafe { libc::pipe2(q.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        let e = io::Error::last_os_error();
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+        return Err(e);
+    }
+    let (ready_r, ready_w) = (q[0], q[1]);
     // SAFETY: fork; the child calls only async-signal-safe functions.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = io::Error::last_os_error();
-        // SAFETY: both were just returned by pipe2.
+        // SAFETY: all four were just returned by pipe2.
         unsafe {
             libc::close(r);
             libc::close(w);
+            libc::close(ready_r);
+            libc::close(ready_w);
         }
         return Err(e);
     }
@@ -688,6 +703,7 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
             for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGPIPE] {
                 libc::signal(sig, libc::SIG_IGN);
             }
+            libc::write(ready_w, [1u8].as_ptr() as *const libc::c_void, 1);
             // Keep nothing of the parent's but the pipe: not its end of
             // the pipe (we would never see it close), not the FUSE
             // connection, not its sockets and files.
@@ -728,9 +744,16 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
             libc::_exit(0);
         }
     }
-    // SAFETY: r is ours to close; w was just returned by pipe2.
+    // SAFETY: descriptors of ours; w was just returned by pipe2. The read
+    // ends with the guard's byte, or with end of file if it died.
     unsafe {
         libc::close(r);
+        libc::close(ready_w);
+        let mut byte = [0u8; 1];
+        while libc::read(ready_r, byte.as_mut_ptr() as *mut libc::c_void, 1) < 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
+        libc::close(ready_r);
         Ok(Guard { pipe: OwnedFd::from_raw_fd(w), pid })
     }
 }
