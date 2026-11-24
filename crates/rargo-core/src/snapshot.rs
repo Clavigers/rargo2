@@ -639,10 +639,12 @@ mod tests {
     #[tokio::test]
     async fn a_store_that_evicts_other_content_all_the_time_fails_no_sync() {
         let (_d, trees, fake) = setup();
-        let v = fake.dir(vec![
-            ("a", fake.file(b"content a")),
-            ("sub", fake.dir(vec![("b", fake.file(b"content b")), ("c", fake.file(b"content c"))])),
-        ]);
+        // A tree large enough that walking it takes longer than the store
+        // stays unchanged: every walk sees a change.
+        let names: Vec<String> = (0..4000).map(|i| format!("f{i:04}")).collect();
+        let mut files: Vec<(&str, Node)> = names.iter().map(|n| (n.as_str(), fake.file(n.as_bytes()))).collect();
+        files.push(("b", fake.file(b"content b")));
+        let v = fake.dir(vec![("a", fake.file(b"content a")), ("sub", fake.dir(files))]);
         // Another build's content comes and goes without pause.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let churn = {
@@ -659,7 +661,7 @@ mod tests {
             })
         };
         let before = trees.store.generation();
-        for i in 0..300 {
+        for i in 0..40 {
             // (A changed tree each time, so that every sync walks.)
             let extra = format!("edit {i}");
             let w = fake.dir(vec![("tree", v.clone()), ("edit", fake.file(extra.as_bytes()))]);
@@ -669,7 +671,7 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         let churned = churn.join().unwrap();
-        assert!(trees.store.generation() > before + 300, "the store did change throughout ({churned} rounds)");
+        assert!(trees.store.generation() > before + 400, "the store did change throughout ({churned} rounds)");
     }
 
     #[tokio::test]
