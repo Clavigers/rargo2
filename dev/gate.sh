@@ -58,6 +58,7 @@ fi
 B=$L/bin
 mkdir -p "$B"
 cp "${CARGO_TARGET_DIR:-target}"/release/{rargo,rargod,rargo-sandbox} "$B/"
+unset CARGO_TARGET_DIR
 export RARGO_BIN=$B RARGO_JOBS=$jobs
 export RIG=${RIG:-rargo2} RIG_STATE=${RIG_STATE:-rig2}
 step e2e dev/e2e.sh

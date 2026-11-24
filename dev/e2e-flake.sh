@@ -22,10 +22,7 @@ ok() { checks=$((checks + 1)); echo "  ok   $1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/       | /' | head -30; }
 has() { grep -qF -- "$2" <<<"$1"; }
 
-port() {
-    local first=${RARGO_E2E_FLAKE_PORT:-7471}
-    case $1 in a) echo "$first" ;; b) echo "$((first + 1))" ;; esac
-}
+port() { case $1 in a) echo 7471 ;; b) echo 7472 ;; esac; }
 daemon() { # name action
     RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
         RARGO_HIDE="$T/a $T/b $T/home-a $T/home-b" "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
