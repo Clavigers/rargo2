@@ -25,7 +25,9 @@ jobs:
       RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32
+      - name: Realise the flake closure for binaries from the build server
+        run: nix develop --command true
       - name: rargo, signed in to the server this repository names
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
@@ -41,7 +43,7 @@ jobs:
       - name: The shipped client
         run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
       - name: The crates that are published
-        run: cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
+        run: nix develop --command cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh
   new-user-path:
     # The path a new user takes (rargo @host, rargo auth, rargo build) and
@@ -52,7 +54,11 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32
+      - name: Realise the flake closure for binaries from the build server
+        run: nix develop --command true
+      - name: Rust toolchain for the no-flake auth fixture
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: rargo, signed in to the server this repository names
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
