@@ -17,6 +17,18 @@ services that must not be disturbed:
 - Keep heavy builds under a CPU and memory cap (for example
   `systemd-run --scope -p CPUQuota=2400% -p MemoryMax=90G`), so the existing
   services keep headroom.
+- Two exceptions to the above, given by the owner on 2026-11-24 (issue 3):
+  the rargo.rs site may be changed (the `rargo-hq` container and its
+  source, the bare repository `/root/rargo-hq/deploy.git`; a push to
+  `main` replaces the container), and so may the main Cloudflare tunnel
+  configuration, `/etc/cloudflared/config.yml`, where a route is needed
+  for the installers, the downloads or the `rargo auth` page. The other
+  sites behind that tunnel (the wikis, ludlike, supervalent) must keep
+  working: back the config up before changing it, validate it before
+  restarting anything, and check every hostname afterwards.
+- The `rargod.service` unit is ours (the server for real use); it is
+  replaced only by `deploy/update-service.sh`. Never run
+  `install-server.sh` on this machine: it would overwrite that unit.
 - Put large scratch data (rustc and cargo checkouts, benchmark workspaces,
   loopback filesystems) under `/root/rargo-work`. About 1 TB is free.
 
