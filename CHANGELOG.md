@@ -10,6 +10,11 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- `[workspace.metadata.rargo.sync] gitignored = false` leaves out
+  everything git ignores (not scanned, watched or sent); `include` names
+  what is sent all the same. A failed build that reads a file left out
+  this way ends with a note naming the file and the option. By default
+  what git ignores is synced. (#62)
 - After a command for another server in a worktree (`RARGO_SERVER=...`),
   `target/` shows this server's builds: a daemon notices that another
   one replaced its mount, also when the kernel gave the new mount the
