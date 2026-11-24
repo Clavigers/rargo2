@@ -1144,11 +1144,13 @@ fn state_home_after() -> Duration {
     }))
 }
 
-/// `RARGO_STATE_AHEAD=0` in rargod's environment: incremental states made
-/// on the server are not sent to workers ahead of need.
+/// `RARGO_STATE_AHEAD=1` in rargod's environment: incremental states made
+/// on the server are sent to workers ahead of need. Off unless asked for:
+/// measured, the states' bytes cost the link more than the compiles that
+/// could then leave the server gained (D65).
 fn state_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_STATE_AHEAD").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| std::env::var("RARGO_STATE_AHEAD").ok().as_deref() == Some("1"))
 }
 
 /// A state larger than this in what a worker lacks of it is not sent ahead.

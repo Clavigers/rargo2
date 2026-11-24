@@ -129,6 +129,31 @@ enum Outcome {
     Final(LocalReply),
     /// The worktree changed while it was being sent: scan again.
     Changed,
+    /// The request went out on the bet that the server had the worktree's
+    /// tree, and it had not: offer it (in the way given) and ask again.
+    NotThere(Probe),
+}
+
+/// How a tree that is new to this daemon is offered.
+#[derive(Clone, Copy, PartialEq)]
+enum Probe {
+    /// By its root first, and the server's answer is waited for.
+    Wait,
+    /// By its root, and the answer is left to the caller, who sends the
+    /// request at once: a server that has the tree (a commit someone
+    /// built) then answers the request one round trip earlier.
+    Bet,
+    /// With all its manifests (the server is known to lack some).
+    Whole,
+}
+
+enum Offered {
+    /// The server has what the snapshot holds.
+    Sent,
+    /// The worktree changed while it was read.
+    Changed,
+    /// The root went out; the answer says what the server lacks.
+    Bet(tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>),
 }
 
 fn lost() -> std::io::Error {
@@ -264,7 +289,7 @@ impl Daemon {
                     let Some(mux) = d.mux_if_up().await else { continue };
                     let mut st = wt.state.lock().await;
                     if let Ok((snap, _)) = d.fresh(&wt, &mut st).await {
-                        let _ = d.offer(&mux, &wt, &snap).await;
+                        let _ = d.offer(&mux, &wt, &snap, Probe::Wait).await;
                     }
                 }
             });
@@ -359,7 +384,7 @@ impl Daemon {
     /// Brings the server up to `snap` without being asked: everything of
     /// it the server is not believed to hold. Returns `false` if a file no
     /// longer has the content the scan saw.
-    async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>) -> std::io::Result<bool> {
+    async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>, probe: Probe) -> std::io::Result<Offered> {
         let delta = || -> (Vec<Digest>, Vec<(Digest, u64)>) {
             let sent = mux.sent.lock().unwrap();
             (
@@ -369,7 +394,7 @@ impl Daemon {
         };
         let (mut trees, mut blobs) = delta();
         if trees.is_empty() && blobs.is_empty() {
-            return Ok(true);
+            return Ok(Offered::Sent);
         }
         // Much to send: one such sync at a time. Twenty worktrees of one
         // commit that start together would otherwise each upload the
@@ -379,7 +404,7 @@ impl Daemon {
             let turn = self.big_sync.lock().await;
             (trees, blobs) = delta();
             if trees.is_empty() && blobs.is_empty() {
-                return Ok(true);
+                return Ok(Offered::Sent);
             }
             Some(turn)
         } else {
@@ -433,7 +458,7 @@ impl Daemon {
             .map_err(std::io::Error::other)?;
             let Some(packed) = packed else {
                 wt.dirty.store(true, Ordering::SeqCst);
-                return Ok(false);
+                return Ok(Offered::Changed);
             };
             self.counters.offered_bytes.fetch_add(tree_bytes + blob_bytes, Ordering::Relaxed);
             let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: packed, ask: false }));
@@ -448,10 +473,13 @@ impl Daemon {
             // one small round trip, where the manifests of a repository
             // take several to get through a link that is just starting.
             // One that lacks any manifest is sent them all, as before.
-            let mut known = if tree_bytes > PROBE_FROM {
+            let mut known = if tree_bytes > PROBE_FROM && probe != Probe::Whole {
                 let answer = mux.expect_missing(id);
                 let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: Vec::new(), blobs: Vec::new(), ask: true }));
                 mux.post_bulk(CONTROL, &msg, 0).await?;
+                if probe == Probe::Bet {
+                    return Ok(Offered::Bet(answer));
+                }
                 let (lacking_trees, lacking_blobs) = answer.await.map_err(|_| lost())?;
                 lacking_trees.is_empty().then_some(lacking_blobs)
             } else {
@@ -481,9 +509,15 @@ impl Daemon {
             self.counters.offered_bytes.fetch_add(bytes, Ordering::Relaxed);
             if !upload(mux, CONTROL, snap, missing).await? {
                 wt.dirty.store(true, Ordering::SeqCst);
-                return Ok(false);
+                return Ok(Offered::Changed);
             }
         }
+        Self::has_now(mux, snap);
+        Ok(Offered::Sent)
+    }
+
+    /// Notes that the server holds everything of `snap`.
+    fn has_now(mux: &Mux, snap: &Snap) {
         let mut sent = mux.sent.lock().unwrap();
         // The belief is only a hint; kept from growing without bound.
         if sent.len() > 4_000_000 {
@@ -491,7 +525,6 @@ impl Daemon {
         }
         sent.extend(snap.scan.trees.keys().copied());
         sent.extend(snap.scan.files.keys().copied());
-        Ok(true)
     }
 
     /// The worktree's virtual output directory, mounted if it can be and
@@ -810,9 +843,9 @@ impl Daemon {
                 let (env, env_checked) = env_for(&Policy::default());
                 let run = RunRequest { env, env_checked, ..base.clone() };
                 let said = AtomicBool::new(false);
-                match self.converse(&mux, run, None, None, None, req, out, &said).await {
+                match self.converse(&mux, run, None, None, None, req, out, &said, None).await {
                     Ok(Outcome::Final(reply)) => return Ok(reply),
-                    Ok(Outcome::Changed) => return Err(std::io::Error::other("unexpected answer from the server")),
+                    Ok(Outcome::Changed | Outcome::NotThere(_)) => return Err(std::io::Error::other("unexpected answer from the server")),
                     // A link that died between commands: once more on a new one.
                     Err(_) if mux.is_dead() && !said.load(Ordering::SeqCst) && !retried => retried = true,
                     Err(e) => return Err(e),
@@ -843,10 +876,14 @@ impl Daemon {
                 let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
             }
         };
+        // `RARGO_OFFER_WAIT=1` on a command: no request is sent before the
+        // server has said that it holds the worktree's tree.
+        let mut probe = if var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
         loop {
             let mux = self.mux().await?;
             phase("link to the server ready");
             let started = Instant::now();
+            let mut bet = None;
             let snap = {
                 let mut st = wt.state.lock().await;
                 let (snap, scanned) = self.fresh(&wt, &mut st).await?;
@@ -867,9 +904,13 @@ impl Daemon {
                 // Sent before the request and in order with it, so the
                 // server has the change when it looks at the request.
                 phase("worktree read");
-                match self.offer(&mux, &wt, &snap).await {
-                    Ok(true) => phase("worktree offered and what the server lacked sent"),
-                    Ok(false) => {
+                match self.offer(&mux, &wt, &snap, probe).await {
+                    Ok(Offered::Sent) => phase("worktree offered and what the server lacked sent"),
+                    Ok(Offered::Bet(answer)) => {
+                        phase("worktree offered by its root, answer not awaited");
+                        bet = Some(answer);
+                    }
+                    Ok(Offered::Changed) => {
                         changes += 1;
                         if changes >= 5 {
                             return Ok(Self::fail(out, "the worktree kept changing while it was being synced".into()));
@@ -907,10 +948,14 @@ impl Daemon {
             };
             let said = AtomicBool::new(false);
             phase("request sent");
-            match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &said).await {
+            match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &said, bet).await {
                 Ok(Outcome::Final(reply)) => {
                     phase("answer complete");
                     return Ok(reply);
+                }
+                Ok(Outcome::NotThere(how)) => {
+                    phase("the server lacked the tree: offering it");
+                    probe = how;
                 }
                 Ok(Outcome::Changed) => {
                     wt.dirty.store(true, Ordering::SeqCst);
@@ -937,6 +982,7 @@ impl Daemon {
         req: &LocalRequest,
         out: &UnboundedSender<LocalReply>,
         said: &AtomicBool,
+        mut bet: Option<tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
     ) -> std::io::Result<Outcome> {
         let (stream, tx, mut rx) = mux.open();
         // Whatever ends this conversation early (the command was
@@ -961,12 +1007,34 @@ impl Daemon {
                 break;
             }
             let msg = tokio::select! {
+                // The answer to the root this request was sent behind.
+                lacking = async { bet.as_mut().unwrap().await }, if bet.is_some() => {
+                    bet = None;
+                    let (trees, blobs) = lacking.map_err(|_| lost())?;
+                    if trees.is_empty() && blobs.is_empty() {
+                        if let Some(s) = snap {
+                            Self::has_now(mux, s);
+                        }
+                        self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    // The server could not have started on it: withdrawn,
+                    // and asked again when it has the tree.
+                    mux.post(stream, &ClientMsg::Changed);
+                    return Ok(Outcome::NotThere(if trees.is_empty() { Probe::Wait } else { Probe::Whole }));
+                }
                 m = rx.recv() => m,
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {
                     if mux.is_dead() { None } else { continue }
                 }
             };
             let Some(msg) = msg else { return Err(lost()) };
+            if bet.is_some() && matches!(msg, ServerMsg::WantTrees(_) | ServerMsg::WantBlobs(_)) {
+                // The server is asking for the tree piece by piece: it
+                // lacks it. Sent whole instead.
+                mux.post(stream, &ClientMsg::Changed);
+                return Ok(Outcome::NotThere(Probe::Whole));
+            }
             match msg {
                 ServerMsg::Stdout(b) => {
                     said.store(true, Ordering::SeqCst);

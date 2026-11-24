@@ -1791,3 +1791,26 @@ the case that goes on to upload files. Measured on rust-analyzer: the
 offer 0.24 s to 0.10 s, the command 0.66 s to 0.52 s. The daemon's
 status counts the trees answered this way.
 
+**D65 measured (2026-11-24).** Cold series at 4 cores per machine:
+55.1 s alone, 47.7 s with a warm worker, 43.4 s with 8 local cores:
+63%, unchanged. Swarm at 8 cores per machine: 178.9 s alone, 154.7 s
+with a worker, 160.6 s with a worker and states sent ahead, 127.9 s
+with 16 local cores. Sending states ahead moved 5.5 GiB and made the
+scheduler keep more actions local for the busy link than it freed for
+the worker, so it is off unless `RARGO_STATE_AHEAD=1`; the code and its
+suite check stay, because the idea may pay with a cheaper way to send a
+state (only what changed since the state the worker holds). Contents
+behind questions stays on.
+
+**D66, third step: the request does not wait for the offer's answer.**
+The daemon sends the root (asking what is lacking) and the request one
+after the other. The server handles a link's messages in order and the
+offer in place, so the request finds the tree if the server has it. The
+daemon reads the offer's answer while the conversation runs: nothing
+lacking, and the tree is noted as known; anything lacking (or the
+server asking for the tree piece by piece), and the request is
+withdrawn (`Changed`), the tree offered as before, and the request
+sent again. Nothing can have been built or printed for a tree the
+server did not have. Measured on rust-analyzer at 100 ms: the offer
+phase 0.10 s to 0. No protocol change.
+

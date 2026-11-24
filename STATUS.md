@@ -96,16 +96,16 @@ earlier figure is quoted beside it, the text says so.
   report file (D49); temporaries of interrupted clients (D50); Zed builds,
   through its flake (D45), and its drift check (D51).
 
-Tests at `6862973`: `cargo test` 15 (client) + 9 (protocol) + 4
-(transport) + 56 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
-(113 checks, virtual output directory); `dev/e2e-link.sh` (67 checks);
-`dev/e2e-worker.sh` (28 checks; 27 before D65 added one). The link and
-worker suites ran in a second rig (`RIG=rargo2`, see `dev/netns.sh`)
-beside the history benchmark, which holds the first; they also pass at
-`f507fb5`. Not run again since `fd599de`: `dev/e2e-flake.sh` (14) and
-`dev/e2e.sh` with `RARGO_OUTPUT=copy`. An earlier version of this
-paragraph said all suites passed at the final commit when the link and
-worker suites had last run eleven commits before it.
+Tests at this commit (the one after `5f8bc7a`): `cargo test` 15
+(client) + 9 (protocol) + 4 (transport) + 56 unit and 6 engine (server)
++ 1 (plan) at `6862973`, not rerun; `dev/e2e.sh` 113 of 113 (virtual
+output directory) and 113 of 113 with `RARGO_OUTPUT=copy`;
+`dev/e2e-flake.sh` 14 of 14 (at `5f8bc7a`); `dev/e2e-link.sh` 67 of 67;
+`dev/e2e-worker.sh` 28 of 28. The link and worker suites run in a
+second rig (`RIG=rargo2`) beside the history benchmark. The copy-mode
+run first failed one check, which read its counters after making the
+edit it counts and lost a race with the daemon pushing that edit; the
+check now reads them before.
 
 Not met, or weak:
 
@@ -237,10 +237,22 @@ steps (D66):
 | the server asks for environment variables once, not nine times in a row | 0.66 to 0.69 s | 0.24 s | 0.26 s |
 | a tree the server may have is offered by its root first | 0.52 to 0.56 s | 0.10 s | 0.25 s |
 
-What is left is three round trips one after the other (key agreement,
-offer, request) and one beside the planning (the environment question,
-asked of a machine once in its life), plus about 0.1 s of work on the
-two sides. The table above was not run again.
+Then the request stopped waiting for the offer's answer: the daemon
+sends the root and the request together, and the server, which handles
+them in order, answers the request if it has the tree. The offer phase
+went from 0.10 s to nothing (request sent 0.004 s after the worktree
+is read). If the server lacks the tree the request is withdrawn and the
+tree offered whole, which costs what the probe cost before (measured on
+the first worktree: 0.10 s, then the offer as it was). The whole
+command was 0.66 to 0.71 s in that run because reading the worktree
+took 0.28 to 0.33 s instead of 0.05 s beside the history benchmark; by
+phases it is 0.10 s (link) + reading + 0.26 s. `RARGO_OFFER_WAIT=1` on
+a command restores the wait.
+
+What is left is two round trips one after the other (key agreement,
+request) and one beside the planning (the environment question, asked
+of a machine once in its life), plus about 0.1 s of work on the two
+sides. The table above was not run again.
 
 A worktree that runs its binary has it after 3.1 s either way: the
 binary has to cross the link, at the end of the build or when it is
@@ -1223,29 +1235,49 @@ server stay there; the transfer guard counts what is queued on the link;
 a worker without the toolchain is sent it once instead of being given
 work it cannot start.
 
-Done since, in code and tests, **not yet measured** (the worker
-benchmarks need 24 cores and the history benchmark has them; D65):
+**D65, measured** (2026-11-24, second rig, history benchmark paused;
+one run each):
 
-- **Incremental states made on the server are sent to workers ahead of
-  need**, newest first, when a worker's link has nothing else to carry,
-  by chunk, up to 256 MiB per state. A crate whose state was only on the
-  server had to stay there (in the swarm about 500 compiles; in
-  `dev/e2e-worker.sh` 12 compiles "kept local (no worker has the
-  incremental state)", 3 to 6 with this). `RARGO_STATE_AHEAD=0` turns it
-  off. What it may cost and is not known: the bytes (in the suite's
-  three-line crates 19 states were 220 MiB, about 11 MiB each, which I
-  did not look into), and the link being busy with a state when an
-  action wants it.
-- **File contents go behind everything else on the worker link** in
-  both directions: a question, an answer to one, an action or its
-  result is sent before contents that were queued earlier. It is what
-  the "second connection for bulk data" was for, without a second
-  connection: the transport already delivers messages independently.
-  An action is told which contents are still on their way, since it can
-  now arrive before them.
+| rust-analyzer `build`, 4 cores per machine | cold | again | after a one-file edit |
+|---|---|---|---|
+| server alone | 55.1 s | 0.06 s | 9.4 s |
+| + 1 worker that has seen nothing | 51.2 s | 0.06 s | 9.9 s |
+| + 1 warm worker | 47.7 s | 0.06 s | 9.6 s |
+| + 2 warm workers | 46.0 s | 0.06 s | 9.3 s |
+| server with 8 cores | 43.4 s | 0.06 s | 8.3 s |
+| server with 12 cores | 41.2 s | 0.07 s | 8.4 s |
+
+| 20-agent rust-analyzer swarm, 8 cores per machine | wall | server CPU |
+|---|---|---|
+| server alone | 178.9 s | 1,281 s |
+| + 1 worker, states sent ahead | 160.6 s | 1,032 s |
+| + 1 worker, states not sent ahead | 154.7 s | 960 s |
+| server with 16 cores | 127.9 s | 1,476 s |
+
+- A warm worker is worth 7.4 s of the 11.7 s that four more local cores
+  give: 63%, where it was (63% and 66% in the two series before). D65
+  did not move the cold build. A worker that has seen nothing now helps
+  in its first build (51.2 s against 55.1 s; it used to cost nothing
+  and gain nothing).
+- **Sending states ahead does not pay and is now off unless asked for**
+  (`RARGO_STATE_AHEAD=1`). It did what it was for: compiles kept on the
+  server for lack of a state on the worker fell from 500 to 85. But it
+  put 5.5 GiB of states on the link in one swarm, and the scheduler
+  then kept 360 actions local because the transfer was judged too
+  costly (231 without) and 278 because a local core came free first
+  (78 without). The swarm took 160.6 s with it and 154.7 s without.
+- Contents behind questions stays: the overhead per remote action in
+  the cold series is 0.12 to 0.17 s (0.16 to 0.45 s before). Its effect
+  on wall time is not separable from run-to-run differences: the swarm
+  with a worker was 150.6 s at `fd599de` and is 154.7 s now, and the
+  16-core server alone was 116.5 s then and 127.9 s now, so sessions
+  differ by more than the change could be worth.
+- In the swarm a worker gives 24 s of the 51 s that eight more local
+  cores give (47%).
 
 Not tried: letting workers fetch registry crates themselves instead of
-through the server.
+through the server. The profile of the remaining gap (where the
+worker's cores idle during the wide phase) is still owed.
 
 Known weaknesses besides the above: flake-rooted and host-network actions
 are never sent to workers; a worker is trusted like the server (it sees

@@ -237,8 +237,9 @@ has "$out" "from build script" && ok "second worktree's binary runs" || bad "sec
 
 echo "== one-file edit rebuilds only dependents"
 cd "$B"
-sed -i 's/pub fn double(x: i32) -> i32 { x \* 2 }/pub fn double(x: i32) -> i32 { x + x }/' crates/util/src/lib.rs
+# (Counted before the edit: the daemon may push it as soon as it is made.)
 before=$(runs); files=$(asked_files); trees=$(asked_trees)
+sed -i 's/pub fn double(x: i32) -> i32 { x \* 2 }/pub fn double(x: i32) -> i32 { x + x }/' crates/util/src/lib.rs
 out=$("$R" build 2>&1); rc=$?
 after=$(runs)
 delta=$((after - before))

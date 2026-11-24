@@ -14,6 +14,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
 proj=$work/e2e-worker/ws
 export RARGO_HIDE=$work/e2e-worker
+# Off unless asked for (D65); the suite checks it.
+export RARGO_STATE_AHEAD=1
 export RARGO_CACHE_DIR=$work/e2e-worker/client-cache
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
