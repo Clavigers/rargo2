@@ -753,13 +753,20 @@ and left 11.8, 2.7, 2.1 and 35.7 GB on the client.
 - nextest costs the rargo swarm about 8 s of wall time and about 330 s of
   server CPU.
 - **Test steps take longer than with `rargo test`:** 3.2, 2.2 and 2.4 s
-  against 1.4, 0.8 and 0.4 s. Each step runs nextest two or three
-  times, and every test process is its own action.
-- **A test step whose tests all replay costs 2.4 s, against stock's
-  1.4 s.** Every replay is still a run of nextest and a shell per test,
-  in the sandbox.
-- The `stdx`, `parser` and `syntax` suites are many small tests, so this
-  is the case where per-test caching costs the most.
+  against 1.4, 0.8 and 0.4 s. A rerun of the rargo side gave 3.9, 2.6
+  and 2.1 s.
+- **One client alone does not show that gap.** `rargo nextest run -p
+  stdx` against `rargo test -p stdx`, one client at 100 ms round trip,
+  medians of three:
+  - everything replayed: 0.33 s against 0.11 s;
+  - every test run again (`--no-cache`): 0.35 s against 0.12 s, the same
+    while another worktree rebuilds rust-analyzer on the server;
+  - first run after a test is added (the test binary changed): 0.60 s
+    against 0.35 s.
+
+  So nextest's rounds cost about 0.25 s per command. What makes up the
+  rest of the 1.5 to 2 s in the swarm, where twenty agents share the
+  server, is not measured.
 
 ### Tracing overhead (`dev/bench-trace.sh`)
 
