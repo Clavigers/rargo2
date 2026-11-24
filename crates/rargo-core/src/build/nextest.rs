@@ -302,11 +302,11 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         }
     };
 
-    // The run the user sees: what nextest printed, then how many tests
-    // rargo replayed.
+    // The run the user sees: what nextest printed (but for its word about
+    // rargo's runner), then how many tests rargo replayed.
     let store = d.store();
     c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
-    c.out.err_text(&String::from_utf8_lossy(&store.read(&r.stderr)?));
+    c.out.err_text(&without_runner_note(&String::from_utf8_lossy(&store.read(&r.stderr)?)));
     if replayed + run_now > 0 {
         c.out.status(
             "Replayed",
@@ -324,6 +324,12 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             Ok(101)
         }
     }
+}
+
+/// nextest's stderr without the line in which it says it uses rargo's
+/// runner (it names every runner it uses; this one is rargo's business).
+fn without_runner_note(err: &str) -> String {
+    err.split_inclusive('\n').filter(|l| !l.contains("using target runner `/rargo/nextest/runner`")).collect()
 }
 
 /// More runs of nextest than this, each asking for tests the last did
@@ -921,6 +927,12 @@ mod tests {
         // Cut short, or about something else: no question.
         assert_eq!(parse_question(b"build\n--color=auto\0te"), None);
         assert_eq!(parse_question(b"install\nx\0"), None);
+    }
+
+    #[test]
+    fn nextest_s_word_about_rargo_s_runner_is_not_shown() {
+        let err = "\x1b[32minfo\x1b[0m: using target runner `/rargo/nextest/runner` defined by environment variable `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER`\n    Starting 1 test\ninfo: using target runner `valgrind` defined by `target.x.runner`\n";
+        assert_eq!(without_runner_note(err), "    Starting 1 test\ninfo: using target runner `valgrind` defined by `target.x.runner`\n");
     }
 
     #[test]
