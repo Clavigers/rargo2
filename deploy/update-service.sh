@@ -45,7 +45,12 @@ if [ ! -x "$rel/rargod" ]; then
     n=$(ls "$S/src/forks/cargo/"*.patch | wc -l)
     [ "$(git -C "$planner" rev-parse --short=9 "HEAD~$n")" = "$(cat "$S/src/forks/cargo/BASE")" ] || { echo "the planner checkout is not BASE + $n patches" >&2; exit 1; }
     last=$(ls "$S/src/forks/cargo/"*.patch | tail -n 1)
-    [ "$(git -C "$planner" log -1 --format=%s)" = "$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last" | head -n 1)" ] || { echo "the planner's last commit is not the last patch" >&2; exit 1; }
+    # (A long subject continues on the patch's next line: compared by its start.)
+    subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last" | head -n 1)
+    case "$(git -C "$planner" log -1 --format=%s)" in
+    "$subject"*) ;;
+    *) echo "the planner's last commit is not the last patch" >&2; exit 1 ;;
+    esac
     cp "$planner/target/release/cargo" "$rel.tmp/planner-cargo"
     mv "$rel.tmp" "$rel"
 fi
