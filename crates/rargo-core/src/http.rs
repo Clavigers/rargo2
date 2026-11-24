@@ -551,7 +551,7 @@ mod tests {
     fn http() -> (tempfile::TempDir, Http) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(tokens::TokenStore::new(dir.path().join("tokens.json")));
-        let keys = Arc::new(Keys::tokens_only().with_tokens(store));
+        let keys = Arc::new(Keys::with_tokens(store));
         (dir, Http::new(keys, None, 7459))
     }
 
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(h.server_for("build.example"), "build.example:7459");
         assert_eq!(h.server_for("build.example:8080"), "build.example:7459");
         let dir = tempfile::tempdir().unwrap();
-        let keys = Arc::new(Keys::tokens_only().with_tokens(Arc::new(tokens::TokenStore::new(dir.path().join("t.json")))));
+        let keys = Arc::new(Keys::with_tokens(Arc::new(tokens::TokenStore::new(dir.path().join("t.json")))));
         assert_eq!(Http::new(keys, Some("b.example:1".into()), 7459).server_for("rargo.rs"), "b.example:1");
         assert_eq!(form("code=AB%2DCD&name=a+b")["code"], "AB-CD");
         assert_eq!(form("code=AB%2DCD&name=a+b")["name"], "a b");

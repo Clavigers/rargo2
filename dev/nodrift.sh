@@ -4,8 +4,8 @@
 # stock cargo, in the same worktree and the same target directory rargo
 # placed artifacts into.
 #   dev/nodrift.sh REPO 'test args for stock cargo' ['rargo test args']
-# Needs a running build server (RARGO_SERVER and, if it wants one,
-# RARGO_KEY) and RARGO_BIN. NODRIFT_DIR: the worktree to use instead of the
+# Needs a running build server (RARGO_SERVER and, if it issues tokens,
+# RARGO_TOKEN) and RARGO_BIN. NODRIFT_DIR: the worktree to use instead of the
 # repository's main one; NODRIFT_SKIP_SERVER=1 leaves out the server-side
 # drift check; NODRIFT_CARGO: the stock cargo command (default `cargo`).
 set -u

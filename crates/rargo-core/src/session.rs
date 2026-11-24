@@ -22,73 +22,35 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore, oneshot};
 
-/// Who may connect, and with which key.
+/// Who may connect: the holders of tokens, or, for a server that has
+/// none and listens on the loopback interface, anyone on its machine.
 pub struct Keys {
-    users: HashMap<String, ([u8; 32], bool)>,
-    /// No key file: anyone who can reach the (loopback) port is accepted,
-    /// and is an administrator.
+    /// Anyone who can reach the (loopback) port is accepted, as an
+    /// administrator.
     open: bool,
-    /// Tokens made while the server runs (`rargod token`, `rargo auth`).
+    /// Tokens (`rargod token`, `rargo auth`), looked up as they are at that
+    /// moment: one made or revoked takes effect at once.
     tokens: Option<Arc<crate::tokens::TokenStore>>,
 }
 
 impl Keys {
     pub fn open() -> Keys {
-        Keys { users: HashMap::new(), open: true, tokens: None }
+        Keys { open: true, tokens: None }
     }
 
-    /// One user per line: `name secret [admin]`. `#` starts a comment.
-    pub fn parse(text: &str) -> Result<Keys> {
-        let mut users = HashMap::new();
-        for (i, line) in text.lines().enumerate() {
-            let line = line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            let mut it = line.split_whitespace();
-            let (Some(name), Some(secret)) = (it.next(), it.next()) else {
-                bail!("key file line {}: expected `name secret [admin]`", i + 1);
-            };
-            if secret.len() < 16 {
-                bail!("key file line {}: the secret of `{name}` needs at least 16 characters", i + 1);
-            }
-            let admin = match it.next() {
-                None => false,
-                Some("admin") => true,
-                Some(other) => bail!("key file line {}: unknown word `{other}`", i + 1),
-            };
-            users.insert(name.to_string(), (secure::psk_from_secret(secret.as_bytes()), admin));
-        }
-        if users.is_empty() {
-            bail!("the key file names no users");
-        }
-        Ok(Keys { users, open: false, tokens: None })
-    }
-
-    /// Nobody from a key file: only tokens admit.
-    pub fn tokens_only() -> Keys {
-        Keys { users: HashMap::new(), open: false, tokens: None }
-    }
-
-    /// Tokens kept in `store` admit too; they are looked up as they are
-    /// at that moment, so one made or revoked takes effect at once.
-    pub fn with_tokens(mut self, store: Arc<crate::tokens::TokenStore>) -> Keys {
-        self.tokens = Some(store);
-        self
+    pub fn with_tokens(store: Arc<crate::tokens::TokenStore>) -> Keys {
+        Keys { open: false, tokens: Some(store) }
     }
 
     pub fn tokens(&self) -> Option<&Arc<crate::tokens::TokenStore>> {
         self.tokens.as_ref()
     }
 
-    /// The key and standing of what a client presents as its user name: a
-    /// name of the key file or the id of a token.
+    /// The key and standing of what a client presents as its user name:
+    /// the id of a token.
     fn lookup(&self, user: &str) -> Option<([u8; 32], bool)> {
         if self.open {
             return Some((secure::open_psk(), true));
-        }
-        if let Some(found) = self.users.get(user) {
-            return Some(*found);
         }
         self.tokens.as_ref()?.lookup(user).map(|(key, admin, _)| (key, admin))
     }
@@ -99,9 +61,10 @@ impl Keys {
         self.lookup(user).is_some()
     }
 
-    /// Who a client is, for display: the token's user, or the name itself.
+    /// Who a client is, for display: the token's user; on an open server,
+    /// the name the client gave.
     pub fn name_of(&self, user: &str) -> String {
-        if self.open || self.users.contains_key(user) {
+        if self.open {
             return user.to_string();
         }
         self.tokens.as_ref().and_then(|t| t.lookup(user)).map(|(_, _, name)| name).unwrap_or_else(|| user.to_string())
@@ -623,15 +586,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_file() {
-        let k = Keys::parse("# team\nann 0123456789abcdef0123 admin\nbob  another-long-secret-here\n\n").unwrap();
-        assert!(k.lookup("ann").unwrap().1);
-        assert!(!k.lookup("bob").unwrap().1);
-        assert!(k.lookup("eve").is_none());
-        assert_ne!(k.lookup("ann").unwrap().0, k.lookup("bob").unwrap().0);
-        assert!(Keys::parse("ann short").is_err());
-        assert!(Keys::parse("ann 0123456789abcdef0123 root").is_err());
-        assert!(Keys::parse("# nothing\n").is_err());
+    fn an_open_server_admits_anyone_and_one_with_tokens_their_holders() {
         assert!(Keys::open().lookup("anyone").unwrap().1);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::tokens::TokenStore::new(dir.path().join("tokens.json")));
+        let (ann, secret) = store.create("ann", true, None, "test").unwrap();
+        let (bob, _) = store.create("bob", false, None, "test").unwrap();
+        let k = Keys::with_tokens(store.clone());
+        assert_eq!(k.lookup(&ann.id).unwrap(), (secure::psk_from_secret(secret.as_bytes()), true));
+        assert!(!k.lookup(&bob.id).unwrap().1);
+        assert!(k.lookup("ann").is_none(), "a name is not a token");
+        assert_eq!(k.name_of(&bob.id), "bob");
+        store.revoke(&bob.id).unwrap();
+        assert!(!k.still_valid(&bob.id));
     }
 }

@@ -1,7 +1,7 @@
 //! rargod: the build server. Clients on any machine sync their worktree and
 //! environment to it; all analysis, scheduling and building happens here.
 //!
-//!   rargod --state DIR --planner PATH [--listen ADDR] [--keys FILE] [--cargo-home DIR]
+//!   rargod --state DIR --planner PATH [--listen ADDR] [--cargo-home DIR]
 //!          [--store DIR] [--jobs N] [--mem-gb N]
 //!
 //! It must run as root (or with CAP_SYS_ADMIN): it mounts a FUSE filesystem,
@@ -26,8 +26,6 @@ struct Opts {
     planner: PathBuf,
     /// Address clients connect to.
     listen: std::net::SocketAddr,
-    /// File naming the users and their keys.
-    keys: Option<PathBuf>,
     /// The shared cargo home (registry and git checkouts).
     cargo_home: Option<PathBuf>,
     /// The user actions run as; rargod's own by default.
@@ -66,7 +64,6 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         store: None,
         planner: PathBuf::new(),
         listen: "127.0.0.1:7459".parse().unwrap(),
-        keys: None,
         cargo_home: None,
         uid: None,
         gid: None,
@@ -89,7 +86,6 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--store" => o.store = Some(val()?.into()),
             "--planner" => o.planner = val()?.into(),
             "--listen" => o.listen = val()?.parse().context("--listen takes ADDRESS:PORT")?,
-            "--keys" => o.keys = Some(val()?.into()),
             "--cargo-home" => o.cargo_home = Some(val()?.into()),
             "--uid" => o.uid = Some(val()?.parse()?),
             "--gid" => o.gid = Some(val()?.parse()?),
@@ -110,7 +106,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
     }
     if o.state.as_os_str().is_empty() || (o.planner.as_os_str().is_empty() && o.worker_of.is_none()) {
         bail!(
-"usage: rargod --state DIR --planner PATH [--listen ADDR:PORT] [--keys FILE] [--cargo-home DIR] [--uid N --gid N] [--store DIR] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
+"usage: rargod --state DIR --planner PATH [--listen ADDR:PORT] [--cargo-home DIR] [--uid N --gid N] [--store DIR] [--jobs N] [--mem-gb N] [--workers-listen ADDR --worker-key FILE]\n       rargod --state DIR --worker SERVER_ADDR --worker-key FILE [--jobs N]"
         );
     }
     Ok(o)
@@ -142,20 +138,18 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&opts.state)?;
     let state = opts.state.canonicalize()?;
     // (Decided before anything is mounted: a refusal leaves nothing behind.)
-    // Who may connect. Without a key file only this machine can.
+    // Who may connect: the holders of tokens; where there are none and
+    // the server listens on the loopback interface, anyone on its machine.
     let tokens = Arc::new(rargo_core::tokens::TokenStore::new(state.join("tokens.json")));
-    let keys = match &opts.keys {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            Keys::parse(&text).with_context(|| format!("{}", path.display()))?.with_tokens(tokens.clone())
-        }
-        None if opts.listen.ip().is_loopback() && !tokens.path().exists() => Keys::open(),
-        // No key file: tokens only (`rargod token invite`, then `rargo auth`).
-        None if tokens.path().exists() => Keys::tokens_only().with_tokens(tokens.clone()),
-        None => bail!(
-            "nobody could connect: give --keys FILE, or make an invitation first (rargod token invite --state {}), or listen on the loopback interface",
+    let keys = if tokens.path().exists() {
+        Keys::with_tokens(tokens.clone())
+    } else if opts.listen.ip().is_loopback() {
+        Keys::open()
+    } else {
+        bail!(
+            "nobody could connect: make an invitation first (rargod token invite --state {}), or listen on the loopback interface",
             state.display()
-        ),
+        );
     };
     let planner = match opts.worker_of {
         Some(_) => PathBuf::new(),
@@ -306,7 +300,7 @@ fn main() -> Result<()> {
         eprintln!(
             "rargod: serving clients on {} ({})",
             listener.local_addr()?,
-            if keys.is_open() { "no key file: loopback only, anyone on this machine" } else { "keys or tokens required" }
+            if keys.is_open() { "no tokens: loopback only, anyone on this machine" } else { "tokens required" }
         );
         let http = Arc::new(rargo_core::http::Http::new(keys.clone(), public, listen.port()).with_state(http_state));
         serve(daemon, listener, keys, http).await

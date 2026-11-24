@@ -403,8 +403,8 @@ pub fn env_allowed(name: &str) -> bool {
     ];
     const PREFIXES: &[&str] = &["CARGO_", "RUSTC", "RUSTDOC", "RUST_", "LC_", "__CARGO", "RARGO_"];
     const DROP: &[&str] = &[
-        "CARGO_HOME", "CARGO_MAKEFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RARGO_KEY", "RARGO_KEY_FILE",
-        "RARGO_SERVER", "RARGO_USER", "RARGO_CACHE_DIR", "RARGO_REAL_CARGO", "CARGO_REGISTRY_TOKEN",
+        "CARGO_HOME", "CARGO_MAKEFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RARGO_TOKEN",
+        "RARGO_SERVER", "RARGO_CACHE_DIR", "RARGO_REAL_CARGO", "CARGO_REGISTRY_TOKEN",
     ];
     if DROP.contains(&name) || (name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_TOKEN")) {
         return false;
@@ -437,7 +437,7 @@ mod tests {
         assert!(!env_allowed("PATH"));
         assert!(!env_allowed("HOME"));
         assert!(!env_allowed("CARGO_HOME"));
-        assert!(!env_allowed("RARGO_KEY"));
+        assert!(!env_allowed("RARGO_TOKEN"), "a token stays on the client");
         assert!(!env_allowed("CARGO_REGISTRIES_MINE_TOKEN"));
         assert!(!env_allowed("AWS_SECRET_ACCESS_KEY"));
     }

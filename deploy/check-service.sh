@@ -2,13 +2,13 @@
 # Builds, runs and tests a small workspace through a rargo server, over UDP
 # and over TCP: the check that a deployed service works for a client.
 #
-#   RARGO_SERVER=host:port RARGO_USER=name RARGO_KEY=secret deploy/check-service.sh [path/to/rargo]
+#   RARGO_SERVER=host:port RARGO_TOKEN=token deploy/check-service.sh [path/to/rargo]
 #
 # The workspace has a registry dependency and a rust-toolchain.toml, so it
 # also checks that the server can download crates and install toolchains.
 set -u
 R=$(command -v "${1:-rargo}") || { echo "no rargo binary: $1" >&2; exit 2; }
-: "${RARGO_SERVER:?}" "${RARGO_USER:?}" "${RARGO_KEY:?}"
+: "${RARGO_SERVER:?}" "${RARGO_TOKEN:?}"
 T=$(mktemp -d "${TMPDIR:-/tmp}/rargo-check.XXXXXX")
 export HOME=$T/home RARGO_CACHE_DIR=$T/cache
 mkdir -p "$T/home" "$T/proj/src"
