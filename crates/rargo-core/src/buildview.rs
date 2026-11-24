@@ -746,22 +746,29 @@ mod tests {
 mod host_listing_tests {
     use super::*;
 
-    /// A build view over the real root lists a real directory completely.
     #[test]
     fn build_view_lists_host_directories() {
+        let host = tempfile::tempdir().unwrap();
+        let nested = host.path().join("lib");
+        std::fs::create_dir(&nested).unwrap();
+        for i in 0..256 {
+            std::fs::write(nested.join(format!("file-{i}")), b"").unwrap();
+        }
         let memo = Arc::new(HostMemo::default());
         let g = memo.advance();
         let base = Arc::new(BaseView::new(
-            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true }],
+            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(host.path())), traced: true }],
             memo,
             g,
         ));
         let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
-        for dir in ["/usr/lib", "/etc", "/"] {
-            let real = std::fs::read_dir(dir).unwrap().count();
-            let seen = v.list(dir.as_bytes()).unwrap().len();
-            assert_eq!(seen, real, "listing of {dir}");
-            assert!(matches!(v.stat(dir.as_bytes()), Looked::Dir(_)));
+        for (virt, real) in [("/", host.path()), ("/lib", nested.as_path())] {
+            let mut expected: Vec<_> = std::fs::read_dir(real).unwrap().map(|e| e.unwrap().file_name().into_encoded_bytes()).collect();
+            let mut seen: Vec<_> = v.list(virt.as_bytes()).unwrap().into_iter().map(|e| e.0).collect();
+            expected.sort();
+            seen.sort();
+            assert_eq!(seen, expected, "listing of {virt}");
+            assert!(matches!(v.stat(virt.as_bytes()), Looked::Dir(_)));
         }
     }
 }
