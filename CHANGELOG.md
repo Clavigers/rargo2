@@ -6,6 +6,26 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.0
+
+Protocol 7 (unchanged).
+
+- `rargo @host` names a project's server in its `Cargo.toml`
+  (`[workspace.metadata.rargo]`); a bare name such as `rargo.rs` is asked
+  over HTTPS where its server is. (#14)
+- `rargo auth` gets a machine a token through a page in the browser, with
+  an invitation from the server's administrator; `rargo auth status` and
+  `rargo auth remove`. No file is edited by hand. (#13)
+- Tokens on the server: `rargod token invite|create|list|revoke`, in
+  effect at once without a restart, with optional expiry; a revoked
+  token's open sessions are closed. A server can run with tokens only.
+  (#5)
+- rargod answers HTTP on its TCP port for the lookup and the auth pages.
+- A build against a server that does not know the machine says to run
+  `rargo auth`.
+- Fixed: a rargod that refused to start (no keys) left its file system
+  mounted in the state directory.
+
 ## 0.2.1
 
 Protocol 7 (unchanged: works with a 0.2.0 server or client).

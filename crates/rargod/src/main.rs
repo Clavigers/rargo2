@@ -48,6 +48,9 @@ struct Opts {
     worker_of: Option<std::net::SocketAddr>,
     /// File holding the secret shared by the server and its workers.
     worker_key: Option<PathBuf>,
+    /// The address clients are told to connect to when they ask by name
+    /// (`/.well-known/rargo.json`): `HOST:PORT`.
+    public: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Opts> {
@@ -76,6 +79,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         workers_listen: None,
         worker_of: None,
         worker_key: None,
+        public: None,
     };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
@@ -96,6 +100,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--workers-listen" => o.workers_listen = Some(val()?.parse()?),
             "--worker" => o.worker_of = Some(val()?.parse()?),
             "--worker-key" => o.worker_key = Some(PathBuf::from(val()?)),
+            "--public" => o.public = Some(val()?),
             "--store-budget-gb" => o.store_budget = val()?.parse::<u64>()? << 30,
             "--store-budget-mb" => o.store_budget = val()?.parse::<u64>()? << 20,
             "--cold-after-min" => o.cold_after_secs = val()?.parse::<u64>()? * 60,
@@ -117,6 +122,9 @@ fn main() -> Result<()> {
         println!("rargod {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_core::proto::PROTO_VERSION);
         return Ok(());
     }
+    if args.get(1).map(|s| s.as_str()) == Some("token") {
+        return token_command(&args[2..]);
+    }
     if args.get(1).map(|s| s.as_str()) == Some("--internal-zygote") {
         rargo_core::sandbox::zygote_main(args[2].parse()?);
     }
@@ -133,6 +141,22 @@ fn main() -> Result<()> {
 
     std::fs::create_dir_all(&opts.state)?;
     let state = opts.state.canonicalize()?;
+    // (Decided before anything is mounted: a refusal leaves nothing behind.)
+    // Who may connect. Without a key file only this machine can.
+    let tokens = Arc::new(rargo_core::tokens::TokenStore::new(state.join("tokens.json")));
+    let keys = match &opts.keys {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+            Keys::parse(&text).with_context(|| format!("{}", path.display()))?.with_tokens(tokens.clone())
+        }
+        None if opts.listen.ip().is_loopback() && !tokens.path().exists() => Keys::open(),
+        // No key file: tokens only (`rargod token invite`, then `rargo auth`).
+        None if tokens.path().exists() => Keys::tokens_only().with_tokens(tokens.clone()),
+        None => bail!(
+            "nobody could connect: give --keys FILE, or make an invitation first (rargod token invite --state {}), or listen on the loopback interface",
+            state.display()
+        ),
+    };
     let planner = match opts.worker_of {
         Some(_) => PathBuf::new(),
         None => opts.planner.canonicalize().with_context(|| format!("planner {}", opts.planner.display()))?,
@@ -174,15 +198,6 @@ fn main() -> Result<()> {
         session.unmount();
         return result;
     }
-    // Who may connect. Without a key file only this machine can.
-    let keys = match &opts.keys {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            Keys::parse(&text).with_context(|| format!("{}", path.display()))?
-        }
-        None if opts.listen.ip().is_loopback() => Keys::open(),
-        None => bail!("--keys FILE is required unless rargod listens on the loopback interface"),
-    };
     let cargo_home = opts.cargo_home.clone().unwrap_or_else(|| state.join("cargo-home"));
     std::fs::create_dir_all(&cargo_home)?;
     let cargo_home = cargo_home.canonicalize()?;
@@ -267,6 +282,7 @@ fn main() -> Result<()> {
     }
     let keys = Arc::new(keys);
     let listen = opts.listen;
+    let public = opts.public.clone();
     let result = rt.block_on(async move {
         let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
         // Client daemons connect over the UDP transport on the same port;
@@ -289,15 +305,98 @@ fn main() -> Result<()> {
         eprintln!(
             "rargod: serving clients on {} ({})",
             listener.local_addr()?,
-            if keys.is_open() { "no key file: loopback only, anyone on this machine" } else { "keys required" }
+            if keys.is_open() { "no key file: loopback only, anyone on this machine" } else { "keys or tokens required" }
         );
-        serve(daemon, listener, keys).await
+        let http = Arc::new(rargo_core::http::Http::new(keys.clone(), public, listen.port()));
+        serve(daemon, listener, keys, http).await
     });
     session.unmount();
     result
 }
 
-async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>) -> Result<()> {
+/// `rargod token ...`: tokens and invitations, kept in the state directory
+/// of a server that may be running; it sees every change at once.
+fn token_command(args: &[String]) -> Result<()> {
+    let usage = "usage: rargod token invite --state DIR [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
+                 rargod token create --state DIR --user NAME [--admin] [--days N]\n       \
+                 rargod token list --state DIR\n       \
+                 rargod token revoke --state DIR ID-OR-USER";
+    let Some(what) = args.first().map(String::as_str) else { bail!("{usage}") };
+    let mut state: Option<PathBuf> = None;
+    let (mut user, mut admin, mut days, mut uses, mut token_days) = (None::<String>, false, None::<u32>, 1u32, None::<u32>);
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let mut val = || -> Result<&String> {
+            i += 1;
+            args.get(i).with_context(|| format!("`{arg}` needs a value"))
+        };
+        match arg {
+            "--state" => state = Some(val()?.into()),
+            "--user" => user = Some(val()?.clone()),
+            "--admin" => admin = true,
+            "--days" => days = Some(val()?.parse().context("--days takes a number")?),
+            "--uses" => uses = val()?.parse().context("--uses takes a number")?,
+            "--token-days" => token_days = Some(val()?.parse().context("--token-days takes a number")?),
+            other if other.starts_with("--") => bail!("unknown option `{other}`\n{usage}"),
+            other => rest.push(other),
+        }
+        i += 1;
+    }
+    let Some(state) = state else { bail!("{usage}") };
+    let store = rargo_core::tokens::TokenStore::new(state.join("tokens.json"));
+    let when = |t: Option<u64>| match t {
+        None => "never".to_string(),
+        Some(t) if t <= rargo_core::tokens::now() => "expired".to_string(),
+        Some(t) => format!("in {} days", (t - rargo_core::tokens::now()).div_ceil(86400)),
+    };
+    match what {
+        "invite" => {
+            let code = store.invite(user.as_deref(), admin, days.or(Some(7)), uses, token_days)?;
+            println!("{code}");
+            eprintln!(
+                "An invitation for {}{}, good for {} use(s), {}. Whoever has it runs `rargo auth` and enters it on the page that opens.",
+                user.as_deref().unwrap_or("whoever redeems it"),
+                if admin { " (administrator)" } else { "" },
+                uses.max(1),
+                when(Some(rargo_core::tokens::now() + days.unwrap_or(7) as u64 * 86400)).replace("in ", "for "),
+            );
+        }
+        "create" => {
+            let user = user.context("--user NAME is required")?;
+            let (t, secret) = store.create(&user, admin, days, "command line")?;
+            println!("{}", rargo_core::tokens::token_text(&t, &secret));
+            eprintln!("A token for {user}; it is shown this once. A client uses it as RARGO_TOKEN or through `rargo auth --token`.");
+        }
+        "list" => {
+            println!("{:<16} {:<20} {:<6} {:<12} {}", "ID", "USER", "ADMIN", "EXPIRES", "FROM");
+            for t in store.list() {
+                let state = if t.revoked { "revoked".to_string() } else { when(t.expires) };
+                println!("{:<16} {:<20} {:<6} {:<12} {}", t.id, t.user, if t.admin { "yes" } else { "" }, state, t.note);
+            }
+            let open: Vec<_> = store.invites().into_iter().filter(|i| i.uses_left > 0 && i.expires.is_none_or(|e| e > rargo_core::tokens::now())).collect();
+            if !open.is_empty() {
+                println!("\ninvitations not used up: {}", open.len());
+                for i in open {
+                    println!("  for {}{}: {} use(s) left, expires {}", i.user.as_deref().unwrap_or("anyone"), if i.admin { " (administrator)" } else { "" }, i.uses_left, when(i.expires));
+                }
+            }
+        }
+        "revoke" => {
+            let Some(id) = rest.first() else { bail!("{usage}") };
+            let n = store.revoke(id)?;
+            if n == 0 {
+                bail!("no token that still works has the id or user `{id}`");
+            }
+            println!("revoked {n} token(s); their sessions end within seconds");
+        }
+        _ => bail!("{usage}"),
+    }
+    Ok(())
+}
+
+async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>, http: Arc<rargo_core::http::Http>) -> Result<()> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
@@ -314,9 +413,9 @@ async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>) -> R
                         continue;
                     }
                 };
-                let (d, k) = (daemon.clone(), keys.clone());
+                let (d, k, h) = (daemon.clone(), keys.clone(), http.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = rargo_core::serve::connection(d, stream, k).await {
+                    if let Err(e) = rargo_core::serve::connection(d, stream, k, h).await {
                         eprintln!("rargod: connection from {peer}: {e:#}");
                     }
                 });

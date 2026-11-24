@@ -35,13 +35,20 @@ fn wants_color(req: &RunRequest, env: &HashMap<String, String>, tty: bool) -> bo
 
 /// Handles one accepted TCP connection: the fallback form of a client
 /// daemon's link.
-pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>) -> Result<()> {
+pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>, http: Arc<crate::http::Http>) -> Result<()> {
     let _ = stream.set_nodelay(true);
+    // The same port answers HTTP: what a browser or `rargo auth` asks
+    // before there is a key to speak the protocol with.
+    let mut first = [0u8; 4];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.peek(&mut first)).await.context("nothing was sent")??;
+    if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
+        return http.serve(stream).await;
+    }
     let (user, admin, sealer, opener) =
         tokio::time::timeout(std::time::Duration::from_secs(20), session::accept(&mut stream, &keys))
             .await
             .context("handshake timed out")??;
-    link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin).await;
+    link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin, keys).await;
     Ok(())
 }
 
@@ -52,7 +59,7 @@ pub async fn udp_connection(d: Arc<Daemon>, conn: Arc<crate::net::Conn>, endpoin
         return;
     };
     let admin = keys.admin(&user);
-    link(d, Arc::new(Link::Udp(conn, endpoint)), user, admin).await;
+    link(d, Arc::new(Link::Udp(conn, endpoint)), user, admin, keys).await;
 }
 
 struct Stream {
@@ -116,7 +123,11 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
 
 /// Serves one client daemon for as long as its link lasts: every command
 /// is a stream; stream 0 carries what the daemon does on its own.
-pub async fn link(d: Arc<Daemon>, link: Arc<Link>, user: String, admin: bool) {
+pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
+    // What the client presented is a name of the key file or a token's id;
+    // the name shown and recorded is the person's.
+    let user = keys.name_of(&presented);
+    let mut checked = std::time::Instant::now();
     let has = Arc::new(ClientHas::default());
     let (control, control_rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
     tokio::spawn(pump(link.clone(), CONTROL, control_rx, control.clone()));
@@ -124,6 +135,16 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, user: String, admin: bool) {
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
     d.stats.links.fetch_add(1, Ordering::Relaxed);
     'link: loop {
+        // A token that was revoked or has expired ends its sessions: looked
+        // at whenever something arrives (a daemon sends something every
+        // few seconds), at most every other second.
+        if checked.elapsed() > std::time::Duration::from_secs(2) {
+            if !keys.still_valid(&presented) {
+                eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
+                break;
+            }
+            checked = std::time::Instant::now();
+        }
         let raw = tokio::select! {
             m = link.recv() => m,
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {

@@ -784,8 +784,15 @@ impl Daemon {
                 if matches!(e.kind(), ConnectionRefused | TimedOut | NotFound | HostUnreachable | NetworkUnreachable) {
                     LocalReply::Unreachable(e.to_string())
                 } else {
+                    // A server that does not know us: no token, or one that
+                    // was revoked or has expired.
+                    let hint = if e.to_string().contains("does not know this user or key") {
+                        "       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n"
+                    } else {
+                        ""
+                    };
                     let _ = out.send(LocalReply::Stderr(
-                        format!("error: talking to the rargo server at {}: {e}\n", self.cfg.server).into_bytes(),
+                        format!("error: talking to the rargo server at {}: {e}\n{hint}", self.cfg.server).into_bytes(),
                     ));
                     LocalReply::Exit(101)
                 }
