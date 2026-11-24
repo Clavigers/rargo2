@@ -392,7 +392,9 @@ mod tests {
             // A compiler's helper thread, blocked on the jobserver.
             let (got_tx, got_rx) = std::sync::mpsc::channel();
             let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
+            let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
             let helper = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
                 let mut b = 0u8;
                 // SAFETY: blocking read of one byte into a valid buffer.
                 assert_eq!(unsafe { libc::read(r, &mut b as *mut u8 as *mut _, 1) }, 1);
@@ -400,7 +402,11 @@ mod tests {
                 back_rx.recv().unwrap();
                 write_token(w);
             });
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // The helper must be in its read before the action ends, on a
+            // machine however busy: it has said that it runs, and is then
+            // given time to block.
+            tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
             // The action ends: its core goes to the helper, not to the idle
             // request, however long that has been waiting.
             drop(running);
