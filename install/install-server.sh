@@ -53,6 +53,8 @@ home=$P/var/lib/rargo
 state=$home/state
 mkdir -p "$lib/$real" "$state" "$P/etc/rargo"
 install -m 755 "$tmp/rargo-server/rargod" "$tmp/rargo-server/rargo-sandbox" "$tmp/rargo-server/planner-cargo" "$lib/$real/"
+install -d "$lib/$real/default-flake"
+install -m 644 "$tmp/rargo-server/default-flake/flake.nix" "$tmp/rargo-server/default-flake/flake.lock" "$lib/$real/default-flake/"
 ln -sfn "$lib/$real" "$lib/current"
 # Toolchains: rargod uses rustup and installs what a project asks for.
 export RUSTUP_HOME=$home/rustup CARGO_HOME=$home/cargo-home
