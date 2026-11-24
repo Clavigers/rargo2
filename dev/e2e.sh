@@ -397,7 +397,7 @@ mkdir -p crates/unused/src && echo "" >crates/unused/src/lib.rs
 printf '[package]\nname = "unused"\nversion = "0.1.0"\nedition = "2021"\n' >crates/unused/Cargo.toml
 printf 'unused = { path = "../unused" }\n' >>crates/app/Cargo.toml
 out=$("$R" build 2>&1); rc=$?
-stock=$(CARGO_TARGET_DIR="$T/stock-target" cargo build --offline 2>&1 | grep -v "Compiling\|Finished\|hello from")
+stock=$(CARGO_TARGET_DIR="$T/stock-target" cargo build --offline 2>&1 | grep -v "Compiling\|Finished\|hello from\|Blocking waiting for file lock")
 mine=$(grep -v "Compiling\|Finished\|hello from" <<<"$out")
 [ $rc -eq 0 ] && has "$out" "warning: unused dependency \`unused\`" && [ "$mine" = "$stock" ] && ok "an unused path dependency gets stock cargo's warning, word for word" || bad "an unused path dependency gets stock cargo's warning" "rargo:
 $mine
