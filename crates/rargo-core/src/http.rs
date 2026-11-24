@@ -194,6 +194,19 @@ impl Http {
                 };
                 json(self.poll(device.as_deref().unwrap_or("")))
             }
+            // A client forgetting its token ends it here too (`rargo auth
+            // remove`): the token's own text is the authority.
+            ("POST", "/auth/revoke") => {
+                let token = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|v| v.get("token")?.as_str().map(String::from));
+                let done = match (self.keys.tokens(), token) {
+                    (Some(store), Some(t)) => store.revoke_self(&t).unwrap_or(false),
+                    _ => false,
+                };
+                if done {
+                    eprintln!("rargod: a token was revoked by its holder (`rargo auth remove`)");
+                }
+                json(serde_json::json!({ "revoked": done }))
+            }
             ("GET", "/auth") => (200, "text/html; charset=utf-8", self.auth_page(req.query.get("code").map(String::as_str).unwrap_or(""), None)),
             ("GET", "/auth/github") => match self.to_github(req.query.get("code").map(String::as_str).unwrap_or("")) {
                 Ok(location) => (302, "location", location),

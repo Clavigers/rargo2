@@ -6,6 +6,15 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.3
+
+Protocol 7 (unchanged).
+
+- `rargo auth remove` revokes the token on the server before forgetting
+  it, so a copy kept anywhere stops working and its open sessions end. If
+  the server cannot be reached it says so and names what an administrator
+  can run. (#22)
+
 ## 0.3.2
 
 Protocol 7 (unchanged).

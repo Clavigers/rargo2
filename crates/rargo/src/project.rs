@@ -210,6 +210,24 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
     save_credentials(&all)
 }
 
+/// Tells the host's server to revoke the token this machine holds for it.
+/// `Ok(true)`: revoked there; `Ok(false)`: the server did not know it as a
+/// token that works (already revoked, expired, or a user of a key file).
+pub fn revoke_on_server(host: &str) -> Result<bool, String> {
+    let Some(c) = credential(host) else { return Ok(false) };
+    let url = format!("{}/auth/revoke", base_url(host));
+    let body = serde_json::json!({ "token": format!("{}.{}", c.user, c.key) });
+    let text = agent()
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("{url}: {e}"))?
+        .into_string()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
+    Ok(v.get("revoked").and_then(|r| r.as_bool()).unwrap_or(false))
+}
+
 pub fn forget(host: &str) -> Result<bool, String> {
     let mut all = credentials();
     let had = all.remove(host).is_some();
