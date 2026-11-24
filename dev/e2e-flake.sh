@@ -163,25 +163,38 @@ has "$out" "imported" && ok "$out" || bad "import" "$out"
 before=$(runs b)
 log=$T/state-b/rargod.log
 start_line=$(wc -l <"$log")
-# Use a different planner command line to exercise cold planning on B.
-# Color affects presentation, so the compiler and script traces still match.
-out=$(RARGO_EXPLAIN=1 on b "$R" build --color never 2>&1); rc=$?
+# Use A's command line so it can also replay the imported plan.
+out=$(RARGO_EXPLAIN=1 on b "$R" build 2>&1); rc=$?
 after=$(runs b)
 actions=$(actions_since "$start_line")
 [ $rc -eq 0 ] && ok "B builds" || bad "B builds" "$out"
 # The imported cache does not populate B's Cargo registry. Offline planning
-# can fail until Cargo downloads the locked dependency, then planning runs
-# again. The compiler and build script actions must all be cache hits.
+# can fail until Cargo downloads the locked dependency. After the fetch
+# reuse the imported plan when its observations still match. Compiler and
+# build script actions must all be cache hits.
 plan_ok='Plan [cargo (planning)] exit=Some(0) tainted=false'
 plan_offline='Plan [cargo (planning)] exit=Some(101) tainted=false'
+reuse=
 case "$((after - before)):$actions" in
-    "0:"|"1:$plan_ok"|"1:$plan_offline"|"2:$plan_offline"$'\n'"$plan_ok")
-        ok "B ran $((after - before)) planning action(s): compilers and build scripts all came from A's cache" ;;
-    *)
-        bad "B reused A's cache" "ran $((after - before)) actions
-$actions
-$out" ;;
+    "0:"|"1:$plan_ok"|"1:$plan_offline")
+        reuse="B ran $((after - before)) planning action(s): compilers and build scripts all came from A's cache" ;;
+    "2:$plan_offline"$'\n'"$plan_ok")
+        # The sparse index stores an HTTP cache validator alongside package
+        # records. Cargo can fetch different index bytes for the exact same
+        # locked crate. The planner observes the index; the build units do
+        # not. Allow a second plan only when its explanation names this.
+        index_change=$(grep '^note: planning runs because /c/registry/index/[^/]*/\.cache/an/yh/anyhow was File .* is now a file of ' <<<"$out")
+        if [ -n "$index_change" ] && [ "$(grep '^note: planning runs because ' <<<"$out" | tail -n 1)" = "$index_change" ]; then
+            reuse="B replanned because the sparse index for the locked anyhow crate changed: $index_change"
+        fi ;;
 esac
+if [ -n "$reuse" ]; then
+    ok "$reuse"
+else
+    bad "B reused A's cache" "ran $((after - before)) actions
+$actions
+$out"
+fi
 has "$out" "Compiling" && bad "B printed no Compiling lines" "$out" || ok "B printed no Compiling lines"
 [ "$(sha256sum target/debug/flaky | cut -d' ' -f1)" = "$a_hash" ] && ok "B's binary is byte-identical to A's" || bad "B's binary is byte-identical to A's"
 before=$(runs b)
