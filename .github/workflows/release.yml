@@ -49,19 +49,33 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --title "rargo ${GITHUB_REF_NAME#v}" --notes-file notes.md assets/*
   crates:
-    # Needs the one-time trusted-publishing setup on crates.io (STATUS.md,
-    # "Releasing"); until then this job fails and the release above stands.
+    # With the secret CARGO_REGISTRY_TOKEN set, that token publishes (needed
+    # the first time: trusted publishing can only be set up for a crate that
+    # exists). Without it, crates.io trusted publishing is used (STATUS.md,
+    # "Releasing"). If neither is in place this job fails and the release
+    # above stands.
     needs: assets
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
       contents: read
+    env:
+      HAVE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal && rustup default stable
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      - name: Publish, dependencies first
+        if: env.HAVE_TOKEN != 'true'
+      - name: Publish, dependencies first (versions already there are skipped)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN || steps.auth.outputs.token }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          for c in fusewire rargo-proto rargo-net rargo; do
+            if curl -fsS -A "rargo-release-workflow" "https://crates.io/api/v1/crates/$c/$v" >/dev/null 2>&1; then
+              echo "$c $v is already published"
+            else
+              cargo publish --locked -p "$c"
+            fi
+          done
