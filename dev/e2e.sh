@@ -791,6 +791,36 @@ has "$st" "1 known, 0 watched completely" && ok "the daemon's status says the wo
 RARGO_CACHE_DIR=$WC "$R" --rargo-daemon-stop >/dev/null 2>&1
 cd "$A"
 
+echo "== what the server holds outlives the daemon"
+K=$T/k
+mkdir -p "$K/src"
+printf '[package]\nname = "kept"\nversion = "0.1.0"\nedition = "2021"\n' >"$K/Cargo.toml"
+printf 'fn main() {\n    println!("{}", include_str!("../note.txt").trim());\n}\n' >"$K/src/main.rs"
+first="first $$ $RANDOM"
+echo "$first" >"$K/note.txt"
+cd "$K"
+out=$("$R" run -q 2>&1); [ "$out" = "$first" ] && ok "built" || bad "built" "$out"
+held=$("$R" --rargo-daemon-status 2>&1 | sed -n 's/^held *\([0-9]*\) .*/\1/p')
+"$R" --rargo-daemon-stop >/dev/null 2>&1
+ls "$RARGO_CACHE_DIR"/held/* >/dev/null 2>&1 && ok "a stopped daemon leaves what the server holds in the cache ($held trees and contents)" || bad "a stopped daemon leaves what the server holds in the cache"
+echo "// one more line" >>src/main.rs
+out=$("$R" run -q 2>&1); [ "$out" = "$first" ] && ok "a new daemon starts at once and builds" || bad "a new daemon starts at once and builds" "$out"
+st=$("$R" --rargo-daemon-status 2>&1)
+pushed=$(sed -n 's/^pushed *\([0-9]*\) changes, \([0-9]*\) bytes.*/\2/p' <<<"$st")
+size=$(wc -c <src/main.rs)
+[ -n "$pushed" ] && [ "$pushed" -gt "$size" ] && [ "$pushed" -lt $((size + 2000)) ] && ok "and offers only what changed: $pushed bytes, the edited file and the manifests on its path" || bad "and offers only what changed" "$st"
+# The server lets go of a content the record says it has; the content
+# comes back to the worktree. The server asks for it.
+echo second >note.txt
+out=$("$R" run -q 2>&1); [ "$out" = second ] && ok "built again ($out)" || bad "built again" "$out"
+gc=$("$R" --rargo-gc 2>&1)
+n=$(sed -n 's/.*collected \([0-9]*\) unreferenced blobs.*/\1/p' <<<"$gc")
+[ "${n:-0}" -gt 0 ] && ok "the server's gc let go of what nothing refers to any more ($n contents)" || bad "the server's gc let go of what nothing refers to any more" "$gc"
+"$R" --rargo-daemon-stop >/dev/null 2>&1
+echo "$first" >note.txt
+out=$("$R" run -q 2>&1); [ "$out" = "$first" ] && ok "a content the record wrongly says the server holds is asked for and built with" || bad "a content the record wrongly says the server holds is asked for and built with" "$out"
+cd "$A"
+
 echo "== future-incompatibility report, --timings, interrupted clients"
 H=$T/h
 mkdir -p "$H/old/src" "$H/app/src"

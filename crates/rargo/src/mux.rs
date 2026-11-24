@@ -3,7 +3,7 @@
 
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -34,10 +34,6 @@ pub struct Mux {
     next_id: AtomicU64,
     /// Who waits for the answer to an offer.
     missing: Mutex<HashMap<u64, oneshot::Sender<(Vec<Digest>, Vec<Digest>)>>>,
-    /// Trees and file contents the server is believed to hold: what this
-    /// daemon sent it or was told it has. Only ever a hint: the server asks
-    /// for whatever it turns out to lack.
-    pub sent: Mutex<HashSet<Digest>>,
     dead: AtomicBool,
     /// Woken when the link dies.
     pub gone: tokio::sync::Notify,
@@ -60,7 +56,6 @@ impl Mux {
             next_stream: AtomicU32::new(1),
             next_id: AtomicU64::new(1),
             missing: Mutex::new(HashMap::new()),
-            sent: Mutex::new(HashSet::new()),
             dead: AtomicBool::new(false),
             gone: tokio::sync::Notify::new(),
             last_heard: Mutex::new(Instant::now()),
