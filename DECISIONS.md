@@ -2203,3 +2203,40 @@ toolchain, or use their project's own dev shell when it supplies one.
 Release documentation leads with the default package list, shows how to
 inspect and enter the shell, and shows how to extend it by committing a
 project flake and lockfile.
+
+## D72. The two-year history benchmark as it was run (completes D62)
+
+D62 defines the benchmark; this records how the run went, because the
+numbers in `STATUS.md` depend on it.
+
+- **Stopped before the end, by the owner, on 2026-11-24.** Lane (a)
+  built 1,391 of 2,672 commits, (b) 2,014, (d) 915. Lane (c) starts
+  when (a) ends, so it has no builds, and the comparison the brief
+  names as the key one, (d)'s 10th-commit builds against (c), is not in
+  the data. `STATUS.md` reports (a) and (b) at the same 10th commits
+  instead, as the bounds (c) lies between, and says so.
+- **Pauses.** The benchmark was stopped with SIGSTOP several times for
+  measurements that needed the machine's cores. Builds in progress
+  during a pause are listed in `bench/history-tainted.json` and left
+  out of the statistics by `dev/history.py stats`.
+- **The map from commit to toolchain was wrong in places.** It follows
+  the `rust-version` the repository declares, which was raised some
+  commits after newer language features were first used. For commits
+  782 to 810 the map said 1.86 where 1.88 is needed, and for 969 to
+  1278 it said 1.88 where 1.91 is needed; 339 stock builds failed
+  there. The map was corrected (`bench/hist-remap.py`), lane (a) was
+  started again from commit 782 (it is a chain: what follows a failed
+  build is not what the lane measures), and lane (b)'s failed builds
+  were made again. Beyond commit 1,400 the map was not checked, and 141
+  of lane (b)'s later builds failed the same way.
+- **The checkout step** removed untracked files but not a nested
+  repository an earlier commit had left behind, which made cargo see
+  two workspace roots at five commits. `dev/history.py` now uses
+  `git clean -ffd`.
+- **Each lane had four cores**, six lanes side by side under one cap of
+  24, so the figures compare with each other and not with the 24-core
+  tables.
+- **The rargo lane ran the binaries of commit `a635703` throughout**
+  (`bin-hist`), so nothing fixed later is in its numbers, issue 40's
+  sync failure included.
+

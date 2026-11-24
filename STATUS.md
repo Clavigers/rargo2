@@ -367,10 +367,60 @@ figures compare with each other, not with the 24-core tables. Each
 commit is built with the toolchain of its time (1.82 to 1.98, nine of
 them): older commits do not compile with today's.
 
-The run takes about a day and was still going when this was written
-(2026-11-24, 04:00: 200 of 2,672 commits in (a), 290 in (b), 48 in
-(d); (c) starts when (a) ends; no build had failed for a reason of its
-own). The distributions are added here when it ends.
+**What was measured.** The run was stopped by the owner on 2026-11-24
+before it reached the end of the history; lane (c) starts when (a)
+ends and therefore never ran. The figures are for the commits each
+lane built, with builds that were in progress during a pause of the
+benchmark left out (8 in (a), 30 in (b), 7 in (d)).
+
+| lane | commits built | median | p90 | max | total |
+|---|---|---|---|---|---|
+| (a) stock cargo, persistent target, every commit | 1,386 of 2,672 | 14.6 s | 38.8 s | 62.7 s | 23,998 s |
+| (b) stock cargo, cold at every commit | 1,863 | 58.2 s | 63.0 s | 73.4 s | 108,713 s |
+| (c) stock cargo, persistent target, every 10th commit | none | | | | |
+| (d) rargo at 100 ms, the agent building every commit but the 10th | 821 | 23.9 s | 45.2 s | 78.1 s | 23,250 s |
+| (d) rargo at 100 ms, the agent building only the 10th commits | 91 | 22.6 s | 38.6 s | 57.2 s | 2,395 s |
+
+**The key comparison, (d)'s 10th-commit builds against (c), cannot be
+made: there is no (c).** What the data does give for those builds, on
+the 87 10th commits that (d), (a) and (b) all built:
+
+| the 10th commits (87) | median | p90 | max | total |
+|---|---|---|---|---|
+| rargo, the agent that builds only these, arriving from ten commits back | 22.2 s | 37.7 s | 57.2 s | 2,269 s |
+| stock cargo arriving from one commit back (lane (a) at the same commits) | 15.2 s | 35.2 s | 51.3 s | 1,495 s |
+| stock cargo cold (lane (b) at the same commits) | 57.2 s | 62.3 s | 65.6 s | 5,005 s |
+
+Lane (c), stock cargo arriving from ten commits back with its own
+target directory, lies somewhere between the last two rows; where is
+not known. What can be said without it:
+
+- **Under rargo a hole costs nothing extra.** The agent that builds
+  only every 10th commit takes 22.2 s at the median; the agent that
+  builds every other commit takes 23.8 s on its 788 commits common to
+  all lanes. The 10th-commit agent starts from the other agent's state
+  one commit back (the choice of incremental state nearest to HEAD,
+  D62), which is the design's point.
+- **A single agent walking forward is slower under rargo than under
+  stock cargo**: 23.8 s against 16.3 s at the median on those 788
+  commits (p90 44.9 s against 39.4 s, in all 22,208 s against 14,978 s,
+  48% more), on four cores with 100 ms of round-trip time for rargo and
+  none for stock cargo. The breakdown below says where it goes.
+- Against cold builds rargo's steps take 41% of the time (23.8 s
+  against 57.9 s at the median).
+
+Failed builds, and why: in (d), 2 of 915 failed with "the store kept
+changing while the worktree was being synced" (a fault of rargo's,
+issue 40, fixed in 0.3.6 and 0.3.7; the benchmark ran the earlier
+binaries throughout), and the others failed because the benchmark was
+paused or stopped under them. In (a) and (b), 5 commits each failed on
+a nested directory an earlier checkout had left in the lane's worktree
+(the benchmark's checkout step, corrected in `dev/history.py`), and 141
+later commits of (b) failed because the map from commit to toolchain
+names a compiler too old for them. That map was found wrong once
+during the run, for commits 782 to 810 and 969 to 1278 (339 stock
+builds failed there), corrected, and those builds were made again;
+beyond commit 1,400 it was not checked, which is where the 141 are.
 
 **Why one agent alone is slower under rargo than under stock cargo.**
 Measured per action on single steps of this history (24 cores, LAN;
