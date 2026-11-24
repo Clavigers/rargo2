@@ -21,7 +21,7 @@ report() {
 }
 summary() {
     awk '
-        /test result:/ { pass += $4; fail += $6; ignored += $8; unit = 1 }
+        $1 == "test" && $2 == "result:" { pass += $4; fail += $6; ignored += $8; unit = 1 }
         /^e2e.*: (all|[0-9]+ of)/ || /^[0-9]+ passed, [0-9]+ failed$/ { suite = $0 }
         END {
             if (unit) printf "%d passed, %d failed, %d ignored", pass, fail, ignored
