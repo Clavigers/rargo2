@@ -18,8 +18,10 @@ client_help = subprocess.check_output([rargo, "auth", "--help"], text=True)
 server_help = subprocess.run(
     [rargod, "token"], capture_output=True, text=True, check=False
 ).stderr
-routed = re.search(r'const ROUTED: &\[&str\] = &\[(.*?)\];', client_main).group(1)
-client_commands = set(re.findall(r'"([a-z-]+)"', routed))
+routed = re.search(r'const ROUTED: &\[&str\]\s*=\s*&\[(.*?)\];', client_main, re.DOTALL)
+if routed is None:
+    sys.exit("could not find the routed command list in main.rs")
+client_commands = set(re.findall(r'"([a-z-]+)"', routed.group(1)))
 if 'Some("clean") =>' in client_main:
     client_commands.add("clean")
 client_flags = set(re.findall(r'"(--rargo-[a-z-]+)"', client_main))
