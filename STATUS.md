@@ -753,8 +753,8 @@ the client's directories.
   a directory listed while other processes create and remove files in
   it names every file that stays (150 listings; the build before the
   fix came up short in 60); `rargo clean` removes `target/`; a killed
-  daemon's dead mount is
-  replaced by the next daemon; a stopped daemon leaves a plain
+  daemon's mount is unmounted at once with no rargo command run, and
+  stock cargo builds and tests in the worktree (D70); a stopped daemon leaves a plain
   directory in which stock cargo builds the same program.
 - As the user `nobody` (in a directory under `/tmp`, which that user
   can reach): a build mounts the output directory through
@@ -990,7 +990,8 @@ directory underneath; files up to 64 KiB come with their names.
 Verified by: `dev/e2e-link.sh` (mounted, listed without content crossing
 the link, fetched on run, nothing copied into the worktree, stock cargo
 build and test in the same directory, rargo after stock cargo, copy mode
-and back, `clean`, a killed daemon's mount replaced, a stopped daemon
+and back, `clean`, a daemon killed with SIGKILL leaving a plain
+directory in which stock cargo builds and tests, a stopped daemon
 leaving a plain directory in which stock cargo builds); `dev/e2e.sh` in
 both modes; the no-drift runs below. Copying: unit tests (sharing, own
 copies, parts, forged content refused).
@@ -1002,8 +1003,9 @@ through `fusermount3` and file contents then go through the daemon
 instead of straight to the real file (one e2e check as `nobody`; every
 measurement was made as root); the directory
 is only as present as its daemon: after a reboot or a stopped daemon,
-`target/` shows what was written locally until the next rargo command
-mounts it again, and a killed daemon leaves a dead mount until then;
+or a killed one, `target/` is a plain directory that shows what was
+written locally until the next rargo command mounts it again (stock
+cargo works in it, and builds again what it does not find);
 stock `cargo clean` cannot remove a mount point (`rargo clean` can); the
 chunk index is in the daemon's memory, so chunks are only reused from
 contents this daemon fetched by chunk; a file opened for writing is

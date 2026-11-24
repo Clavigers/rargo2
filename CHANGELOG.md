@@ -24,6 +24,13 @@ Protocol 7 (unchanged).
   it, so a copy kept anywhere stops working and its open sessions end. If
   the server cannot be reached it says so and names what an administrator
   can run. (#22)
+- Fixed: a client daemon that was killed (SIGKILL, a crash, the
+  out-of-memory killer) left `target/` as a dead mount, and everything
+  that touched it (an editor, rust-analyzer, stock cargo, `ls`) got
+  "Transport endpoint is not connected" until the next rargo command.
+  The directory is now unmounted the moment its daemon is gone, with no
+  rargo command run, and is an ordinary directory stock cargo builds in.
+  (#6)
 
 ## 0.3.2
 

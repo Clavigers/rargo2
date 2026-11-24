@@ -345,6 +345,7 @@ name = "fusewire"
 version = "0.3.4"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]
