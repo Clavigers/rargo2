@@ -1,15 +1,46 @@
 {
-  description = "rargo's default system build dependencies";
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  description = "Rargo's default system build dependencies";
 
-  outputs = { nixpkgs, ... }:
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { nixpkgs, rust-overlay, ... }:
     let
       system = "x86_64-linux";
-      pkgs = nixpkgs.legacyPackages.${system};
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ rust-overlay.overlays.default ];
+      };
+      toolchainFile =
+        if builtins.pathExists ./rust-toolchain.toml then ./rust-toolchain.toml
+        else if builtins.pathExists ./rust-toolchain then ./rust-toolchain
+        else null;
+      toolchainText = if toolchainFile == null then "" else builtins.readFile toolchainFile;
+      legacyChannel = builtins.match "([^\r\n]+)\r?\n?" toolchainText;
+      toolchain =
+        if toolchainFile == null then { channel = "stable"; }
+        else if legacyChannel != null then { channel = builtins.head legacyChannel; }
+        else (builtins.fromTOML toolchainText).toolchain;
+      rust = pkgs.rust-bin.fromRustupToolchain (toolchain // {
+        components = pkgs.lib.unique ((toolchain.components or []) ++ [ "clippy" "rustfmt" ]);
+      });
+      tools = with pkgs; [ gcc binutils pkg-config cmake gnumake perl python3 git ];
+      libs = with pkgs; [ openssl zlib sqlite ];
     in {
-      devShells.${system}.default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [ gcc binutils pkg-config cmake gnumake ];
-        buildInputs = with pkgs; [ openssl zlib sqlite ];
+      devShells.${system} = {
+        system = pkgs.mkShell {
+          nativeBuildInputs = tools;
+          buildInputs = libs;
+        };
+        default = pkgs.mkShell {
+          nativeBuildInputs = [ rust ] ++ tools;
+          buildInputs = libs;
+        };
       };
     };
 }

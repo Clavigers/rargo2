@@ -30,6 +30,8 @@ leaf() { # name value
     mkdir -p "$proj/$1/src"
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$1" >"$proj/$1/Cargo.toml"
     {
+        echo '// This is set by the selected Nix shell on every compiler action.'
+        echo 'const _: &str = env!("NIX_CC");'
         echo "pub fn value() -> u64 { $2 }"
         for i in $(seq 1 1500); do
             echo "pub fn f$i(v: &[u64]) -> String { let mut s = String::new(); for (i, x) in v.iter().enumerate() { s.push_str(&format!(\"{}:{}:{} \", i, x, $i)); } s }"

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Installs a rargo build server on this machine (Linux x86_64, glibc 2.39 or
-# newer, root, FUSE) and starts it as a systemd service.
+# newer, root, FUSE, Nix with flakes) and starts it as a systemd service.
 #
 #   curl -fsSL https://rargo.rs/install-server.sh | sudo sh
 #   curl -fsSL https://rargo.rs/install-server.sh | sudo sh -s -- 0.2.1
@@ -33,6 +33,12 @@ admin=${RARGO_ADMIN:-admin}
 for tool in curl tar sha256sum git cc; do
     command -v "$tool" >/dev/null || { echo "missing: $tool (builds also need a C compiler and linker; on Debian/Ubuntu: apt install build-essential git curl)" >&2; exit 1; }
 done
+nix=$(command -v nix || true)
+if [ -z "$nix" ] && [ -x /nix/var/nix/profiles/default/bin/nix ]; then
+    nix=/nix/var/nix/profiles/default/bin/nix
+fi
+[ -n "$nix" ] && [ -x "${nix%/*}/nix-store" ] || { echo "install Nix with flakes to run rargod" >&2; exit 1; }
+nix_bin=${nix%/*}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 # "latest" is turned into its number first, so that every file comes from
@@ -74,7 +80,7 @@ public=${RARGO_PUBLIC:+--public $RARGO_PUBLIC}
 run="$lib/current/rargod --state $state --planner $lib/current/planner-cargo --listen $listen $public --cargo-home $CARGO_HOME $jobs $mem"
 if [ "${RARGO_NO_SERVICE:-}" = 1 ]; then
     echo "installed rargod $real; not started. To run it:"
-    echo "  RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME PATH=$CARGO_HOME/bin:\$PATH $run"
+    echo "  RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME PATH=$CARGO_HOME/bin:$nix_bin:\$PATH $run"
 else
     cat >"$P/etc/systemd/system/rargod.service" <<UNIT
 [Unit]
@@ -86,7 +92,7 @@ Wants=network-online.target
 [Service]
 Environment=RUSTUP_HOME=$RUSTUP_HOME
 Environment=CARGO_HOME=$CARGO_HOME
-Environment=PATH=$CARGO_HOME/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=$CARGO_HOME/bin:$nix_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=$run
 Restart=on-failure
 RestartSec=2

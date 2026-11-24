@@ -1,7 +1,6 @@
 //! Flake-restricted environments.
 //!
-//! When a repository has a `flake.nix`, its default devShell defines the
-//! build environment: the variables it exports become the action
+//! A workspace flake or the bundled flake defines the build environment: the variables it exports become the action
 //! environment, and the sandbox root contains only the closure of store
 //! paths those variables refer to (plus the worktree, cargo home and a
 //! minimal `/etc`). Nothing of the host's `/usr` or `/home` is visible, so
@@ -21,6 +20,7 @@ use rargo_proto::tree::Node;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -86,18 +86,24 @@ fn may_hold(rel: &[u8], extra: &[String]) -> bool {
     rel == b"nix" || rel.starts_with(b"nix/") || extra.iter().any(|e| under(rel, e.as_bytes()) || under(e.as_bytes(), rel))
 }
 
-/// Hash of the files that define the flake.
-pub fn source_key(snap: &Snapshot, extra: &[String]) -> Hash {
-    let mut h = KeyHasher::new("flake-source-v2");
-    snap.walk(&mut |rel, node| match node {
-        Node::Dir(_) => may_hold(rel, extra),
-        Node::File { hash, .. } if defines_flake(rel, extra) => {
-            h.field(rel).field(hash);
-            false
+const DEFAULT_FLAKE: &[u8] = include_bytes!("../../../nix/default/flake.nix");
+const DEFAULT_LOCK: &[u8] = include_bytes!("../../../nix/default/flake.lock");
+
+fn workspace_entry(root: &[u8], rel: &[u8], node: &Node, extra: &[String]) -> bool {
+    if let Node::Dir(_) = node {
+        if !root.is_empty() && under(root, rel) {
+            return true;
         }
-        _ => false,
-    });
-    h.finish()
+    }
+    let inside = if root.is_empty() {
+        Some(rel)
+    } else {
+        rel.strip_prefix(root).and_then(|suffix| suffix.strip_prefix(b"/"))
+    };
+    inside.is_some_and(|p| match node {
+        Node::Dir(_) => may_hold(p, extra),
+        _ => defines_flake(p, extra),
+    })
 }
 
 fn store_names(text: &str, out: &mut BTreeSet<String>) {
@@ -117,7 +123,7 @@ fn store_names(text: &str, out: &mut BTreeSet<String>) {
 }
 
 /// Evaluates the flake's devShell (as `uid`/`gid`, in `root`).
-fn evaluate(root: &Path, uid: u32, gid: u32) -> Result<FlakeEnv> {
+fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     use std::os::unix::process::CommandExt;
     let run = |mut c: Command| -> Result<Vec<u8>> {
         c.current_dir(root).stdin(std::process::Stdio::null());
@@ -131,7 +137,7 @@ fn evaluate(root: &Path, uid: u32, gid: u32) -> Result<FlakeEnv> {
         Ok(out.stdout)
     };
     let mut c = nix();
-    c.args(["print-dev-env", "--json"]);
+    c.args(["print-dev-env", "--json", "--no-write-lock-file", shell]);
     let json: serde_json::Value = serde_json::from_slice(&run(c)?).context("parsing `nix print-dev-env`")?;
     let mut env = BTreeMap::new();
     let mut roots = BTreeSet::new();
@@ -192,12 +198,56 @@ fn evaluate(root: &Path, uid: u32, gid: u32) -> Result<FlakeEnv> {
     Ok(FlakeEnv { env, closure, id: h.finish() })
 }
 
-/// The flake environment of a snapshot, evaluated once per distinct set of
-/// flake files. Evaluation happens in a scratch directory holding just
-/// those files.
-pub fn resolve(d: &Daemon, snap: &Snapshot, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
+/// Resolve the workspace flake or the bundled shell for a workspace
+/// without one. The action key includes both the evaluated environment
+/// and the source bytes that select it.
+pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
+    static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    NIX_READY.get_or_init(|| match nix().arg("--version").output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+        Err(e) => Err(e.to_string()),
+    }).as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
+
+    let manifest = rargo_proto::workspace::manifest_for(dir, |path| {
+        snap.read(path.as_os_str().as_bytes()).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    });
+    let workspace = manifest.as_ref().and_then(|(path, _)| path.parent()).unwrap_or(dir);
+    let root = workspace.ancestors().find(|p| {
+        matches!(snap.node(p.join("flake.nix").as_os_str().as_bytes()), Some(Node::File { .. }))
+    });
+    let toolchain = if root.is_none() {
+        dir.ancestors().find_map(|parent| {
+            ["rust-toolchain.toml", "rust-toolchain"].into_iter().find_map(|name| {
+                snap.read(parent.join(name).as_os_str().as_bytes()).map(|data| (name, data))
+            })
+        })
+    } else {
+        None
+    };
+    let mut h = KeyHasher::new("flake-source-v3");
+    if let Some(root) = root {
+        let root = root.as_os_str().as_bytes();
+        h.field(b"workspace");
+        snap.walk(&mut |rel, node| {
+            if !workspace_entry(root, rel, node, extra) {
+                return false;
+            }
+            match node {
+                Node::File { hash, .. } => { h.field(rel).field(b"file").field(hash); }
+                Node::Symlink(target) => { h.field(rel).field(b"symlink").field(target); }
+                Node::Dir(_) => { h.field(rel).field(b"directory"); }
+            }
+            true
+        });
+    } else {
+        h.field(b"bundled").field(DEFAULT_FLAKE).field(DEFAULT_LOCK);
+        if let Some((name, src)) = &toolchain {
+            h.field(name.as_bytes()).field(src);
+        }
+    }
+    let key = h.finish();
     let store = &d.engine.store;
-    let key = source_key(snap, extra);
     let mut k = b"flake:".to_vec();
     k.extend_from_slice(&key.0);
     if let Some(v) = store.db().get(Table::Meta, &k) {
@@ -209,14 +259,25 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, extra: &[String], uid: u32, gid: u32
         }
     }
     let scratch = d.scratch("flake")?;
-    let env = snap
-        .materialize(&scratch, uid, gid, &|rel, node| match node {
-            Node::Dir(_) => may_hold(rel, extra),
-            _ => defines_flake(rel, extra),
-        })
-        .and_then(|()| evaluate(&scratch, uid, gid));
+    let env = (|| {
+        if let Some(root) = root {
+            snap.materialize(&scratch, uid, gid, &|rel, node| {
+                workspace_entry(root.as_os_str().as_bytes(), rel, node, extra)
+            })?;
+            evaluate(&scratch.join(root), ".#default", uid, gid)
+        } else {
+            crate::snapshot::chown(&scratch, uid, gid);
+            std::fs::write(scratch.join("flake.nix"), DEFAULT_FLAKE)?;
+            std::fs::write(scratch.join("flake.lock"), DEFAULT_LOCK)?;
+            if let Some((name, src)) = &toolchain {
+                std::fs::write(scratch.join(name), src)?;
+            }
+            evaluate(&scratch, ".#default", uid, gid)
+        }
+    })();
     let _ = std::fs::remove_dir_all(&scratch);
-    let env = env?;
+    let mut env = env?;
+    env.id = KeyHasher::new("flake-action-v1").field(&key.0).field(&env.id.0).finish();
     store.db().put(Table::Meta, &k, &bincode::serialize(&env)?);
     Ok(Arc::new(env))
 }

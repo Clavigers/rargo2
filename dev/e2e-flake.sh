@@ -108,21 +108,22 @@ on a "$R" build >/dev/null 2>&1; on a "$R" test >/dev/null 2>&1
 a_runs=$(runs a)
 a_hash=$(sha256sum target/debug/flaky | cut -d' ' -f1)
 
-echo "== without the flake (policy switch) the host toolchain is used"
-cp "$P/Cargo.toml" "$T/Cargo.toml.with-flake"
-printf '\n[package.metadata.rargo.flake]\nenabled = false\n' >>"$P/Cargo.toml"
-out=$(on a "$R" build 2>&1); rc=$?
-[ $rc -eq 0 ] && file target/debug/flaky | grep -q "interpreter /lib64/" && ok "flake.enabled = false builds against the host" || bad "flake.enabled = false builds against the host" "$out $(file target/debug/flaky)"
-cp "$T/Cargo.toml.with-flake" "$P/Cargo.toml"
-on a "$R" build >/dev/null 2>&1
-[ "$(sha256sum target/debug/flaky | cut -d' ' -f1)" = "$a_hash" ] && ok "removing the switch brings back the identical flake build" || bad "removing the switch brings back the identical flake build"
+echo "== flake source and lock are in the cache key"
+for input in flake.nix flake.lock; do
+    cp "$P/$input" "$T/$input.saved"
+    before=$(runs a)
+    printf '\n' >>"$P/$input"
+    out=$(on a "$R" build 2>&1); rc=$?
+    after=$(runs a)
+    [ "$rc" -eq 0 ] && [ "$((after - before))" -gt 1 ] && ok "editing $input invalidates the build cache" || bad "editing $input invalidates the build cache" "$out"
+    cp "$T/$input.saved" "$P/$input"
+    out=$(on a "$R" build 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && [ "$(sha256sum target/debug/flaky | cut -d' ' -f1)" = "$a_hash" ] && ok "restoring $input restores the identical build" || bad "restoring $input restores the identical build" "$out"
+done
 
-echo "== the default flake (install/flake): the build essentials"
-# A project that copies rargo's default flake finds a C compiler, cmake,
-# make, pkg-config and the common libraries, none of them the host's.
+echo "== a project without a flake uses the bundled shell"
 D=$T/a/essentials
 mkdir -p "$D/src"
-cp "$repo/install/flake/flake.nix" "$repo/install/flake/flake.lock" "$D/"
 printf '[package]\nname = "essentials"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$D/Cargo.toml"
 cat >"$D/build.rs" <<'RS'
 use std::process::Command;
@@ -132,6 +133,8 @@ fn say(cmd: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string()
 }
 fn main() {
+    assert!(!std::path::Path::new("/usr/lib").exists());
+    assert!(!std::path::Path::new("/root").exists());
     let libs = ["openssl", "zlib", "sqlite3"].map(|l| format!("{l} {}", say("pkg-config", &["--modversion", l])));
     let where_ssl = say("pkg-config", &["--variable=libdir", "openssl"]);
     println!("cargo:rustc-env=ESSENTIALS={}; {}; {}; {}; {}", say("cc", &["--version"]), say("cmake", &["--version"]), say("make", &["--version"]), libs.join(", "), where_ssl);
@@ -142,7 +145,7 @@ printf '/target\n' >"$D/.gitignore"
 git -C "$D" init -q -b main; git -C "$D" add -A; git -C "$D" -c user.name=t -c user.email=t@t commit -q -m init
 cd "$D"
 out=$(on a "$R" build 2>&1); rc=$?
-[ $rc -eq 0 ] && ok "a project with the default flake builds" || bad "a project with the default flake builds" "$out"
+[ $rc -eq 0 ] && ok "a project without a flake builds with the bundled shell" || bad "a project without a flake builds with the bundled shell" "$out"
 out=$(./target/debug/essentials 2>&1)
 has "$out" "gcc (GCC)" && has "$out" "cmake version" && has "$out" "GNU Make" && ok "its build script finds cc, cmake and make" || bad "its build script finds cc, cmake and make" "$out"
 has "$out" "openssl 3" && has "$out" "zlib 1" && has "$out" "sqlite3 3" && ok "pkg-config finds openssl, zlib and sqlite" || bad "pkg-config finds openssl, zlib and sqlite" "$out"
@@ -184,6 +187,23 @@ before=$(runs b)
 on b "$R" build >/dev/null 2>&1
 after=$(runs b)
 [ $((after - before)) -ge 4 ] && ok "without the import B ran $((after - before)) actions" || bad "without the import B has to run the build" "ran $((after - before))"
+
+echo "== a server without Nix rejects a build"
+daemon b stop
+PATH="$T/no-tools" "$bin/rargod" --state "$T/no-nix" --listen "127.0.0.1:$(port b)" \
+    --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" --jobs 1 >"$T/no-nix.log" 2>&1 &
+no_nix=$!
+trap 'kill "$no_nix" 2>/dev/null; wait "$no_nix" 2>/dev/null; daemon a stop; daemon b stop' EXIT
+for _ in $(seq 1 100); do
+    grep -q "serving clients" "$T/no-nix.log" && break
+    kill -0 "$no_nix" 2>/dev/null || break
+    sleep .1
+done
+out=$(on b "$R" build 2>&1); rc=$?
+[ "$rc" -ne 0 ] && has "$out" "rargod needs Nix with flakes to build" \
+    && ok "the client is told that the server requires Nix with flakes" \
+    || bad "the client is told that the server requires Nix with flakes" "$out
+$(cat "$T/no-nix.log")"
 
 echo
 if [ $fails -eq 0 ]; then echo "e2e-flake: all $checks checks passed"; else echo "e2e-flake: $fails of $checks checks FAILED"; fi

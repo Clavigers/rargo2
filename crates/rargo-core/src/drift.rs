@@ -97,29 +97,18 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
             env.insert(k.clone(), v.clone());
         }
     }
-    // A repository whose environment is a flake is built by stock cargo in
-    // that environment too (the devShell's tools and variables), as its
-    // users would: `nix develop -c cargo build`. Unsandboxed, so the store
-    // paths are simply the host's.
+    // Stock Cargo uses the same shell as the remote build.
     let policy = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
-    let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
-    let mut cargo = "cargo".to_string();
-    if has_flake && policy.flake.enabled != Some(false) {
-        let (dd, snap, files) = (d.clone(), snapshot.clone(), policy.flake.files.clone());
-        let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &files, uid, gid))
-            .await?
-            .context("evaluating the repository's flake for the drift check")?;
-        for k in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
-            env.remove(k);
-        }
-        env.retain(|k, _| !k.starts_with("NIX_"));
-        for (k, v) in &flake.env {
-            env.insert(k.clone(), v.clone());
-        }
-        if let Some(found) = flake.which("cargo") {
-            cargo = found;
-        }
+    let (dd, snap, dir, files) = (d.clone(), snapshot.clone(), who.dir.clone(), policy.flake.files.clone());
+    let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
+        .await?
+        .context("evaluating the build flake for the drift check")?;
+    for k in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+        env.remove(k);
     }
+    env.retain(|k, _| !k.starts_with("NIX_"));
+    env.extend(flake.env.clone());
+    let cargo = flake.which("cargo").context("the build flake does not provide Cargo")?;
     let client_env: HashMap<String, String> = (*who.env).clone();
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);

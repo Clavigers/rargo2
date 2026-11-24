@@ -124,7 +124,6 @@ pub struct NetPolicy {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FlakePolicy {
-    pub enabled: Option<bool>,
     #[serde(default)]
     pub files: Vec<String>,
 }
@@ -232,7 +231,6 @@ mod tests {
         assert_eq!(passed, ["DATABASE_URL", "PROTOC", "PROTOC_INCLUDE"]);
         assert!(p.test_network("it") && !p.test_network("other"));
         assert!(p.build_script_network("fetcher-sys") && !p.build_script_network("util"));
-        assert_eq!(p.flake.enabled, None);
     }
 
     #[test]

@@ -79,10 +79,10 @@ ever declared.
   workers. The server is the single owner of analysis, the cache and
   scheduling; workers only execute; clients only sync. A server on the same
   machine as its clients is the same thing over the loopback interface.
-- **Nix.** Optional. By default the environment (toolchain, linker, system
-  libraries) is the server's, captured by tracing it. If the repo has a
-  flake, the sandbox is restricted to that closure instead, which is
-  stricter and stable across servers.
+- **Nix.** Each build uses the workspace flake or rargo's bundled,
+  pinned build shell. The sandbox exposes the selected closure, workspace
+  and dedicated Cargo cache. The flake source and lock are part of the
+  analysis and action cache keys.
 - **Platform.** The server is Linux, x86_64 first. The client is plain
   code that reads files and speaks to one socket; it watches worktrees
   with inotify and is only tested on Linux, and what it brings back are
