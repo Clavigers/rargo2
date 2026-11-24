@@ -551,10 +551,11 @@ impl Daemon {
         }
         if let Some(m) = &*g {
             use std::os::unix::fs::MetadataExt;
-            if std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
+            if m.session.shown() && std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
                 return Some((m.fs.clone(), m.dir.clone()));
             }
-            // No longer what is seen at the directory: start over.
+            // No longer what is seen at the directory (another daemon, for
+            // another server, mounted its own there): start over.
             if let Some(m) = g.take() {
                 m.fs.save();
                 m.session.unmount();

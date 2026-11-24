@@ -282,8 +282,11 @@ pub struct Session {
     helper: bool,
     /// What unmounts the directory if this process dies without doing so.
     guard: std::sync::Mutex<Option<Guard>>,
-    /// The kernel's id for this mount, where it tells (Linux 5.8).
+    /// The kernel's id for this mount, where it tells (see `mount_id`).
     mount_id: Option<u64>,
+    /// The kernel still serves this mount through us: no worker has been
+    /// told that it is gone.
+    connected: AtomicBool,
 }
 
 /// Something outside this process that unmounts the directory when the
@@ -394,6 +397,7 @@ impl Session {
             helper,
             guard: std::sync::Mutex::new(guard),
             mount_id,
+            connected: AtomicBool::new(true),
         };
         if let Err(e) = sess.handshake(opts) {
             sess.unmount();
@@ -564,6 +568,23 @@ impl Session {
         self.guard.lock().unwrap().is_some()
     }
 
+    /// Whether the mount point still shows this file system: it was not
+    /// unmounted, by us or by anyone else (who may have mounted something
+    /// else there since, with this mount's device number and, before Linux
+    /// 6.8, its mount id).
+    pub fn shown(&self) -> bool {
+        if self.unmounted.load(Ordering::SeqCst) || !self.connected.load(Ordering::SeqCst) {
+            return false;
+        }
+        let Ok(tgt) = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()) else { return false };
+        match (self.mount_id, mount_id(&tgt)) {
+            (Some(mine), Some(there)) => mine == there,
+            (Some(_), None) => false,
+            // The kernel tells no ids; the caller compares device numbers.
+            (None, _) => true,
+        }
+    }
+
     /// Lazily unmounts. Worker threads exit once the kernel reports ENODEV.
     pub fn unmount(&self) {
         if self.unmounted.swap(true, Ordering::SeqCst) {
@@ -603,11 +624,16 @@ impl Session {
 
 /// The kernel's id of the mount `path` is the root of or lies in, without
 /// asking the file system anything (a dead FUSE mount cannot answer).
-/// `None` where the kernel does not tell (before Linux 5.8) or the path
-/// cannot be reached. Only system calls: safe in a forked child.
+/// The id is the one the kernel never gives to another mount (Linux 6.8)
+/// where it has one, else the one it reuses once a mount is gone (Linux
+/// 5.8): a mount that replaced ours at the same directory can have our
+/// old reused id, and the same device number. `None` where the kernel
+/// tells neither or the path cannot be reached. Only system calls: safe
+/// in a forked child.
 fn mount_id(path: &std::ffi::CStr) -> Option<u64> {
     const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
     const STATX_MNT_ID: u32 = 0x1000;
+    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
     // struct statx is 256 bytes; stx_mask is its first field and
     // stx_mnt_id the 64-bit field at offset 144.
     let mut buf = [0u64; 32];
@@ -618,12 +644,12 @@ fn mount_id(path: &std::ffi::CStr) -> Option<u64> {
             libc::AT_FDCWD,
             path.as_ptr(),
             libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
-            STATX_MNT_ID,
+            STATX_MNT_ID | STATX_MNT_ID_UNIQUE,
             buf.as_mut_ptr(),
         )
     };
     let mask = (buf[0] & 0xffff_ffff) as u32;
-    (r == 0 && mask & STATX_MNT_ID != 0).then_some(buf[18])
+    (r == 0 && mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE) != 0).then_some(buf[18])
 }
 
 /// Forks the process that unmounts `tgt` if this one dies without telling
@@ -906,7 +932,10 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
             match io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::ENOENT) => continue,
                 // Unmounted or connection aborted.
-                _ => break,
+                _ => {
+                    sess.connected.store(false, Ordering::SeqCst);
+                    break;
+                }
             }
         }
         let n = n as usize;
@@ -915,6 +944,7 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
         let Some(hdr) = read_struct::<fuse_in_header>(buf) else { continue };
         let body = &buf[std::mem::size_of::<fuse_in_header>()..];
         if hdr.opcode == FUSE_DESTROY {
+            sess.connected.store(false, Ordering::SeqCst);
             fs.destroy();
             let _ = reply(fd, hdr.unique, 0, &[]);
             break;
