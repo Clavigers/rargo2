@@ -96,15 +96,14 @@ earlier figure is quoted beside it, the text says so.
   report file (D49); temporaries of interrupted clients (D50); Zed builds,
   through its flake (D45), and its drift check (D51).
 
-Tests at the current commit: `cargo test` 15 (client) + 9 (protocol) +
-4 (transport) + 56 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
-(113 checks, virtual output directory) at `f507fb5`, whose client is
-unchanged since; `dev/e2e-link.sh` (67 checks) and `dev/e2e-worker.sh`
-(27 checks at `f507fb5`, 28 with the check added for D65) at `f507fb5`
-and again at the current commit. Both of those ran in a second rig
-(`RIG=rargo2`, see `dev/netns.sh`) beside the history benchmark, which
-holds the first. Not run again since `fd599de`: `dev/e2e-flake.sh` (14)
-and `dev/e2e.sh` with `RARGO_OUTPUT=copy`. An earlier version of this
+Tests at `6862973`: `cargo test` 15 (client) + 9 (protocol) + 4
+(transport) + 56 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
+(113 checks, virtual output directory); `dev/e2e-link.sh` (67 checks);
+`dev/e2e-worker.sh` (28 checks; 27 before D65 added one). The link and
+worker suites ran in a second rig (`RIG=rargo2`, see `dev/netns.sh`)
+beside the history benchmark, which holds the first; they also pass at
+`f507fb5`. Not run again since `fd599de`: `dev/e2e-flake.sh` (14) and
+`dev/e2e.sh` with `RARGO_OUTPUT=copy`. An earlier version of this
 paragraph said all suites passed at the final commit when the link and
 worker suites had last run eleven commits before it.
 
