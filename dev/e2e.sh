@@ -510,6 +510,14 @@ out=$(PATH="$T/shim:$PATH" RARGO_SERVER=127.0.0.1:1 RARGO_FALLBACK=cargo CARGO_T
 [ $rc -eq 0 ] && [ -x "$T/shim-target/debug/app" ] && ok "without a server the shim falls back to the real cargo" || bad "without a server the shim falls back to the real cargo" "$out"
 out=$(RARGO_SERVER=127.0.0.1:1 "$R" build 2>&1); rc=$?
 [ $rc -eq 101 ] && has "$out" "cannot reach the rargo server" && ok "without a server and without the fallback, the error says so" || bad "without a server and without the fallback, the error says so" "$out"
+# That command's daemon (for another server) mounted target/ in its turn.
+echo "after another server" >crates/util/local-note.txt
+out=$("$R" build 2>&1); rc=$?
+ran=$(./target/debug/app 2>&1)
+[ $rc -eq 0 ] && has "$ran" "note: after another server" && ok "after a command for another server, target/ shows this server's builds again" || bad "after a command for another server, target/ shows this server's builds again" "$out
+$ran"
+echo "ignored by git" >crates/util/local-note.txt
+"$R" build >/dev/null 2>&1
 
 echo "== policy in Cargo.toml ([workspace.metadata.rargo])"
 cd "$A"

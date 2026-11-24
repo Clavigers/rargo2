@@ -6,6 +6,14 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.2
+
+Protocol 7 (unchanged).
+
+- A command for another server in a worktree (`RARGO_SERVER=...`) no
+  longer leaves its `target/` showing stale results afterwards: the
+  daemon notices its mount was replaced and mounts again. (#76)
+
 ## 0.6.1
 
 Protocol 7 (unchanged).
