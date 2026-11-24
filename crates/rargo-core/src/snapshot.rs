@@ -67,6 +67,10 @@ pub struct Trees {
     pub stats: SyncStats,
 }
 
+/// How often a sync starts over because content of its own tree was
+/// evicted while it ran.
+const SYNC_ATTEMPTS: usize = 8;
+
 impl Trees {
     pub fn new(store: Arc<Store>) -> Arc<Trees> {
         Arc::new(Trees {
@@ -111,8 +115,15 @@ impl Trees {
 
     /// Brings the tree rooted at `root` completely into the store, asking
     /// `from` for what is missing, and returns it as a snapshot.
+    ///
+    /// The store may be evicting while this goes on (a server at its budget
+    /// does so all the time). That is no reason to start over, and never a
+    /// reason to fail, unless content of this very tree went missing: when
+    /// the store has changed during the walk, the whole tree is checked
+    /// once more against the store as it is, and if all of it is there the
+    /// sync is done.
     pub async fn sync(self: &Arc<Self>, root: Hash, from: &dyn Uploader) -> Result<Arc<Snapshot>> {
-        for _ in 0..4 {
+        for _ in 0..SYNC_ATTEMPTS {
             let generation = self.store.generation();
             if self.complete.get(&root).is_some_and(|g| *g == generation) {
                 return Ok(Arc::new(Snapshot::new(self.clone(), root)));
@@ -168,8 +179,15 @@ impl Trees {
             if !missing_blobs.is_empty() {
                 self.upload(missing_blobs.into_iter().collect(), from).await?;
             }
-            // Something was evicted while we were looking: look again.
+            // Something was evicted while we were looking. Was any of it
+            // ours? (What the walk found present was marked as just used,
+            // so an eviction by age takes other things first.)
             if self.store.generation() != generation {
+                let (trees, blobs) = self.lacking(root);
+                if trees.is_empty() && blobs.is_empty() {
+                    self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Arc::new(Snapshot::new(self.clone(), root)));
+                }
                 continue;
             }
             for d in visited {
@@ -181,7 +199,7 @@ impl Trees {
             self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::new(Snapshot::new(self.clone(), root)));
         }
-        bail!("the store kept changing while the worktree was being synced")
+        bail!("content of the worktree was evicted from the store {SYNC_ATTEMPTS} times while it was being synced (is the store's budget smaller than the worktree?)")
     }
 
     /// What of the tree rooted at `root` the store does not hold: directory
@@ -616,6 +634,44 @@ mod tests {
         assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 4);
         assert_ne!(s1.id, s2.id);
         assert_eq!(s2.read(b"src/lib.rs").unwrap(), b"pub fn b() {}");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_evicts_other_content_all_the_time_fails_no_sync() {
+        let (_d, trees, fake) = setup();
+        // A tree large enough that walking it takes longer than the store
+        // stays unchanged: every walk sees a change.
+        let names: Vec<String> = (0..4000).map(|i| format!("f{i:04}")).collect();
+        let mut files: Vec<(&str, Node)> = names.iter().map(|n| (n.as_str(), fake.file(n.as_bytes()))).collect();
+        files.push(("b", fake.file(b"content b")));
+        let v = fake.dir(vec![("a", fake.file(b"content a")), ("sub", fake.dir(files))]);
+        // Another build's content comes and goes without pause.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn = {
+            let (store, stop) = (trees.store.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let junk = format!("someone else's output {n}");
+                    store.put_bytes(junk.as_bytes()).unwrap();
+                    store.remove(&Hash::of(junk.as_bytes()));
+                    n += 1;
+                }
+                n
+            })
+        };
+        let before = trees.store.generation();
+        for i in 0..40 {
+            // (A changed tree each time, so that every sync walks.)
+            let extra = format!("edit {i}");
+            let w = fake.dir(vec![("tree", v.clone()), ("edit", fake.file(extra.as_bytes()))]);
+            let s = trees.sync(root_of(&w), &fake).await.unwrap_or_else(|e| panic!("sync {i} failed: {e:#}"));
+            assert_eq!(s.read(b"tree/sub/b").unwrap(), b"content b");
+            assert_eq!(s.read(b"edit").unwrap(), extra.as_bytes());
+        }
+        stop.store(true, Ordering::Relaxed);
+        let churned = churn.join().unwrap();
+        assert!(trees.store.generation() > before + 400, "the store did change throughout ({churned} rounds)");
     }
 
     #[tokio::test]
