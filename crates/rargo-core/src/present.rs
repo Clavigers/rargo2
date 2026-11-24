@@ -183,7 +183,7 @@ impl Output {
 
     /// Likewise for a note; shown even with `--quiet` off only.
     pub fn note_once(&self, msg: &str) {
-        if !self.quiet && self.said.lock().insert(msg.to_string()) {
+        if self.said.lock().insert(msg.to_string()) {
             self.note(msg);
         }
     }

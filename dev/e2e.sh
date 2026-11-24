@@ -558,10 +558,12 @@ out=$("$R" build 2>&1); rc=$?
 rm -f .rargo.toml crates/app/tests/policy.rs
 kill $listener 2>/dev/null
 # What the policy excludes is never uploaded.
-mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
-# (Counted before the edit: the daemon may push it as soon as it is made.)
+# (Counted before the edit, and the directory made after it is excluded:
+# the daemon may push a change as soon as it is made.)
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
+sleep 0.3
+mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
 expect "a build with a directory the manifest excludes" "$R" build
 [ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest itself was uploaded, not the excluded directory" || bad "only the manifest itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
 cp "$T/Cargo.toml.before-policy" Cargo.toml
@@ -613,7 +615,7 @@ out=$("$R" run -q 2>&1)
 size=$(du -sk "$RARGO_CACHE_DIR"/git/* | sort -n | tail -1 | cut -f1)
 [ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built)" || bad "what stands in for .git on the server is small" "${size} KiB"
 printf '[sync]\ngit = false\n' >.rargo.toml
-out=$("$R" run -q 2>&1)
+out=$(RARGO_QUIET_DEPRECATIONS=1 "$R" run -q 2>&1)
 [ "$out" = "none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
 mv .rargo.toml "$T/unused-policy"
 out=$(CARGO_TARGET_DIR="$T/stock-g" cargo run -q --offline 2>&1)
