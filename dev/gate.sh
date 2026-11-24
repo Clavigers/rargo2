@@ -20,8 +20,16 @@ step() { # name, command...
     if "$@" >"$L/$name.log" 2>&1; then echo "ok    $name: $(grep -E 'passed|test result' "$L/$name.log" | tail -n 1 | sed 's/^ *//')"
     else echo "FAIL  $name (see $L/$name.log)"; fail=1; fi
 }
-step build cap cargo build --release --locked
-step unit cap cargo test --release --locked --workspace
+client=$(dev/self-build-client.sh) || exit 1
+step build cap "$client" build --release --locked --workspace
+farm_tests() {
+    "$client" test --locked --release --workspace --lib --bins &&
+    "$client" test --locked --release --workspace --doc &&
+    "$client" test --locked --release --workspace --test auto_unmount --test engine --no-run --message-format=json >"$L/mount-tests.jsonl" &&
+    cap dev/test-mounts.py <"$L/mount-tests.jsonl"
+}
+step unit farm_tests
+[ "$fail" -eq 0 ] || exit 1
 B=$work/gate/bin; rm -rf "$B"; mkdir -p "$B"; cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
 step e2e dev/e2e.sh

@@ -42,6 +42,11 @@ Facts that affect the design:
 
 ## Working rules
 
+- Build and test this workspace on the shared rargo.rs farm. Use the pinned
+  client and commands in the README section “Building Rargo with Rargo”.
+  A test that exercises rargod itself starts its fixture server with the
+  farm-built binaries.
+
 - **Greenfield, always (the owner's rule).** Treat rargo as a greenfield
   prototype at all times and assume zero existing users or deployments.
   Describe the design in the present tense everywhere, including code

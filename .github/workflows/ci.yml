@@ -1,8 +1,3 @@
-# What every push must pass: the workspace builds without warnings, the unit
-# and engine tests pass, the client builds as the static binary that is
-# shipped, and the crates that go to crates.io package and build from their
-# packaged form. The end-to-end suites need root, FUSE and the planner; they
-# are run on the build machine before a release (dev/gate.sh).
 name: ci
 on:
   push:
@@ -18,54 +13,63 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
-      RUSTFLAGS: -D warnings
+      RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
-      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: cargo build --locked --workspace
-      - name: Unit and engine tests, as root (they mount and create namespaces)
-        run: sudo -E env "PATH=$PATH" cargo test --locked --workspace
-      - name: The shipped client
-        run: CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc cargo build --locked --release -p rargo --target x86_64-unknown-linux-musl
-      - name: The crates that are published
-        run: cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
-      - run: sh -n install/install.sh && sh -n install/install-server.sh
-  new-user-path:
-    # The path a new user takes (rargo @host, rargo auth, rargo build) and
-    # the token commands, against a server of this commit started on the
-    # runner (dev/e2e-auth.sh). The planner is the one of the latest
-    # release: building the cargo fork takes longer than everything else.
-    runs-on: ubuntu-24.04
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: path-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: cargo build --locked --release -p rargo -p rargod -p rargo-core
-      - name: The planner of the latest release
+      - name: Install the pinned Rargo client
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download --pattern 'rargo-server-x86_64-unknown-linux-gnu.tar.gz' --pattern SHA256SUMS
+          client=$(dev/self-build-client.sh)
+          echo "RARGO=$client" >> "$GITHUB_ENV"
+      - name: Authenticate to the shared farm
+        env:
+          CI_TOKEN: ${{ secrets.RARGO_CI_TOKEN }}
+        run: |
+          "$RARGO" auth --token "${CI_TOKEN:?missing RARGO_CI_TOKEN}" rargo.rs
+          "$RARGO" auth status
+      - name: Build the workspace on rargo.rs and report cache reuse
+        run: |
+          set -o pipefail
+          "$RARGO" build --workspace --message-format=json-render-diagnostics |
+            jq -s 'map(select(.reason == "compiler-artifact")) |
+              if length == 0 then error("no compiler artifacts reported")
+              else {artifacts: length, cache_hits: map(select(.fresh)) | length} end'
+          git diff --exit-code -- Cargo.lock
+      - name: Test on the farm
+        run: |
+          "$RARGO" test --locked --workspace --lib --bins
+          "$RARGO" test --locked --workspace --doc
+      - name: Build the shipped static client on the farm
+        run: |
+          "$RARGO" build --locked --release -p rargo --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/rargo --rargo-version
+      - name: Install the pinned runtime for farm-built GNU/Linux binaries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nix-bin
+          mkdir "$RUNNER_TEMP/rargo-shell"
+          cp flake.nix flake.lock "$RUNNER_TEMP/rargo-shell/"
+          sudo nix --extra-experimental-features 'nix-command flakes' develop "path:$RUNNER_TEMP/rargo-shell" --command true
+      - name: Run mount tests on the runner with root and FUSE
+        run: |
+          "$RARGO" test --locked --workspace --test auto_unmount --test engine --no-run --message-format=json > "$RUNNER_TEMP/mount-tests.jsonl"
+          sudo dev/test-mounts.py < "$RUNNER_TEMP/mount-tests.jsonl"
+      - name: Verify Cargo packages and installers
+        run: |
+          cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
+          sh -n install/install.sh
+          sh -n install/install-server.sh
+      - name: Download the released planner
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: ${{ runner.temp }}
+        run: |
+          gh release download v0.3.6 -R sadosystems/rargo2 --pattern 'rargo-server-x86_64-unknown-linux-gnu.tar.gz' --pattern SHA256SUMS
           grep ' rargo-server-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum -c -
           tar -xzf rargo-server-x86_64-unknown-linux-gnu.tar.gz
-      - name: rargo @host, rargo auth, rargo build, tokens
+      - name: Exercise sign-in and a build against the PR server
         run: |
-          sudo -E env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
-            RARGO_WORK=/tmp/rargo-work RARGO_BIN=$PWD/target/release PLANNER=$PWD/rargo-server/planner-cargo \
+          sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            RARGO_WORK=/tmp/rargo-work RARGO_BIN="$PWD/target/debug" PLANNER="$RUNNER_TEMP/rargo-server/planner-cargo" \
             dev/e2e-auth.sh
-

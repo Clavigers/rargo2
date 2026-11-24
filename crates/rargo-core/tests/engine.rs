@@ -47,7 +47,8 @@ fn fixture() -> Fx {
     );
     fs.attach(session.clone());
     session.spawn_workers(fs.clone(), 4).unwrap();
-    let zygote = Zygote::start(Path::new(env!("CARGO_BIN_EXE_rargo-sandbox"))).unwrap();
+    let helper = std::env::var_os("RARGO_TEST_SANDBOX").unwrap_or_else(|| env!("CARGO_BIN_EXE_rargo-sandbox").into());
+    let zygote = Zygote::start(Path::new(&helper)).unwrap();
     let sched = Scheduler::new(8, u64::MAX).unwrap();
     let engine = Arc::new(Engine::new(store, content, fs, mnt, zygote, sched));
     let work = tmp.path().join("work");

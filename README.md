@@ -9,6 +9,31 @@ artifacts you asked for.
 `DESIGN.md` says why and how, `STATUS.md` what was verified and measured,
 `DECISIONS.md` how each open end was closed.
 
+## Building Rargo with Rargo
+
+The workspace manifest selects rargo.rs. CI, the release gate and developer
+worktrees use its shared action cache. On x86-64 Linux, these commands obtain
+the pinned release client, authenticate your machine and build the checkout:
+
+```sh
+R=$(dev/self-build-client.sh)
+"$R" auth
+"$R" build --locked --workspace
+"$R" test --locked --workspace --lib --bins
+```
+
+The bootstrap script downloads the release with `gh` and verifies its SHA-256.
+The farm evaluates the checked-in Nix flake and lock for the Rust toolchain,
+C compiler and native libraries. Use `nix develop` for that shell locally.
+CI authenticates with its own build-only token in the `RARGO_CI_TOKEN`
+repository secret. Its build log counts compiler artifacts that the farm
+reports as fresh, including results produced by other worktrees.
+
+The mount tests create FUSE mounts and Linux namespaces. CI and
+`dev/gate.sh` compile them with Rargo and execute the delivered binaries
+as root on their Linux hosts with `/dev/fuse`. The new-user check runs its
+own server from the same farm-built workspace.
+
 ## The server
 
 Linux, root (it mounts a FUSE filesystem and creates namespaces).
