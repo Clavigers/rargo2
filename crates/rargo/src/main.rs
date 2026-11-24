@@ -444,7 +444,7 @@ fn auth_command(args: &[OsString]) -> ! {
         });
         match stored {
             Ok(name) => {
-                println!("stored the token for {host}: it is {name}'s");
+                println!("stored the token for {host}, held by {name}");
                 std::process::exit(0)
             }
             Err(e) => die(&format!("rargo auth: {e}")),

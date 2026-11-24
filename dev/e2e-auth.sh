@@ -135,7 +135,7 @@ mkdir -p "$HOME"
 cd "$T/proj" || exit 2
 tok3=$("$D" token create --state "$T/state" --user dave 2>/dev/null)
 out=$("$R" auth --token "$tok3" 2>&1); check $? "rargo auth --token stores a token an administrator made" "$out"
-grep -q "it is dave's" <<<"$out"; check $? "and says whose it is" "$out"
+grep -q "held by dave" <<<"$out"; check $? "and says whose it is" "$out"
 out=$("$R" auth status 2>&1); grep -q "authenticated as dave (token ${tok3%%.*})" <<<"$out"; check $? "rargo auth status names its holder, as the server said" "$out"
 echo "// dave" >>src/main.rs
 out=$("$R" build 2>&1); check $? "and builds with it" "$out"
