@@ -48,6 +48,10 @@ earlier figure is quoted beside it, the text says so.
   rust-analyzer swarm and 0.01 GB end up on its disk; with results
   copied it was 1,959 MiB and 11.8 GB (and 133.3 s). The client daemon
   uses 3 to 12 s of CPU over a swarm.
+- **The swarm with nextest at 100 ms round trip** (rust-analyzer, each
+  test step a `nextest run`): 124.1 s against stock `cargo nextest`'s
+  418.2 s; 1,974 s of server CPU against 9,816 s; 8.8 MiB over the link.
+  See "The nextest variant".
 - **A branch switch** (rust-analyzer; check, build and test of a branch
   another agent has been working on): in a fresh worktree 0.17, 0.14 and
   0.12 s, in a worktree just switched to the branch 0.14, 0.14 and
@@ -723,6 +727,39 @@ and left 11.8, 2.7, 2.1 and 35.7 GB on the client.
   uploaded the repository, the server took longer than 45 s to take it
   all in, keepalive answers queued behind it and the daemon took the
   link for dead. Both causes are fixed (D60).
+
+#### The nextest variant (2026-11-24, `b22ecdf`, issue 33)
+
+`SWARM_TESTS=nextest dev/bench-swarm.sh ra`: the same swarm, with every
+`test -p PKG` step run as `nextest run -p PKG` (nextest 0.9.152).
+- **rargo:** 20 clients at 100 ms round trip (`CLIENT_DELAY_MS=50`),
+  virtual output directory. Under rargo each test is a cached action of
+  its own (D83).
+- **stock:** `cargo nextest` with the same nextest on `PATH`, one target
+  directory per worktree. Both sides are capped at 24 cores and 90 GB.
+- No failed steps on either side.
+
+| rust-analyzer, nextest | stock cargo nextest | rargo nextest, 100 ms RTT | ratio |
+|---|---|---|---|
+| wall time | 418.2 s | 124.1 s | 3.4x |
+| CPU time | 9,816 s | 1,974 s on the server + 0.4 s in the commands + 3.5 s in the client daemon | 5.0x |
+| disk on the client machine | 100.1 GB | 0.015 GB | |
+| disk on the server | | 42.6 GB (40.6 GB after GC) | |
+| crossing the link | | 6.7 MiB up, 2.1 MiB down | |
+| mean step times: check / check after edit / test / check after 2nd edit / test / build / test | 125.7 / 13.0 / 7.9 / 31.9 / 19.6 / 208.4 / 1.4 s | 25.5 / 9.2 / 3.2 / 11.7 / 2.2 / 66.0 / 2.4 s | |
+
+**Against the `test` swarm at 100 ms** (114.9 to 116.4 s, about 1,620 to
+1,650 s of server CPU):
+- nextest costs the rargo swarm about 8 s of wall time and about 330 s of
+  server CPU.
+- **Test steps take longer than with `rargo test`:** 3.2, 2.2 and 2.4 s
+  against 1.4, 0.8 and 0.4 s. Each step runs nextest two or three
+  times, and every test process is its own action.
+- **A test step whose tests all replay costs 2.4 s, against stock's
+  1.4 s.** Every replay is still a run of nextest and a shell per test,
+  in the sandbox.
+- The `stdx`, `parser` and `syntax` suites are many small tests, so this
+  is the case where per-test caching costs the most.
 
 ### Tracing overhead (`dev/bench-trace.sh`)
 
