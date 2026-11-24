@@ -16,6 +16,7 @@ dl=${RARGO_SITE_DATA:-/root/rargo-hq/data}/dl
 mkdir -p "$dl/$v.tmp"
 (cd "$repo" && gh release download "$tag" --dir "$dl/$v.tmp" --clobber)
 (cd "$dl/$v.tmp" && sha256sum -c SHA256SUMS >/dev/null)
+"$repo/deploy/render-site-doc.sh" "$dl/$v.tmp/protocol.md" "$dl/$v.tmp/protocol.html"
 rm -rf "$dl/$v"; mv "$dl/$v.tmp" "$dl/$v"
 chmod 644 "$dl/$v"/*
 ln -sfn "$v" "$dl/latest"
