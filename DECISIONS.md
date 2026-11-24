@@ -2280,3 +2280,17 @@ a build's environment on the server does not contain it.
 The secret shared by a server and its workers (`--worker-key`) is a
 different matter and is unchanged.
 
+
+## D75. A token's holder is asked of the server (issue 68)
+
+`rargo auth --token T` asks `POST /auth/whoami` with the token's whole
+text and keeps the token only if the server names its holder; the name is
+stored beside it, so `rargo auth status` always says whose it is. The
+token's own text is the authority, as for `/auth/revoke`: the answer
+tells whoever holds the secret nothing they could not learn by building.
+Rejected: learning the name from the build session's handshake (it would
+store a token before anything checked it, and needs a protocol change).
+
+A refusal is one sentence, `rargo_proto::REFUSED`, on both transports;
+the client recognises it by that text. The credentials file holds a
+token as `id`, `secret` and `name`.
