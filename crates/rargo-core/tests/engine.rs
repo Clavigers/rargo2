@@ -11,7 +11,8 @@ use rargo_core::store::Store;
 use rargo_core::trace::*;
 use rargo_core::view::*;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -41,10 +42,16 @@ fn sandbox_helper() -> std::path::PathBuf {
     me.ancestors().map(|d| d.join("rargo-sandbox")).find(|p| p.is_file()).unwrap_or_else(|| named.to_path_buf())
 }
 
+/// Where the tests make their stores and mounts: RARGO_TEST_TMP, or the
+/// work area's (on a filesystem FUSE passthrough can stack on, and not in
+/// the sandbox's /tmp).
+fn test_tmp() -> PathBuf {
+    std::env::var_os("RARGO_TEST_TMP").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/root/rargo-work/test-tmp"))
+}
+
 fn fixture() -> Fx {
-    // The store must be on a filesystem FUSE passthrough can stack on, and
-    // not in /tmp of the sandbox; a directory under the work area does.
-    let base = Path::new("/root/rargo-work/test-tmp");
+    let base = test_tmp();
+    let base = base.as_path();
     std::fs::create_dir_all(base).unwrap();
     let tmp = tempfile::tempdir_in(base).unwrap();
     let db = Arc::new(rargo_core::db::Db::open(&tmp.path().join("db.redb")).unwrap());
@@ -79,7 +86,7 @@ impl Fx {
                 Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
                 Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(work)), traced: true },
                 // Keep the test's own scratch area out of the sandbox.
-                Mount { at: b"/root/rargo-work/test-tmp".to_vec(), region: Region::Empty, traced: true },
+                Mount { at: test_tmp().into_os_string().into_vec(), region: Region::Empty, traced: true },
             ],
             self.memo.clone(),
             g,
@@ -312,7 +319,7 @@ fn large_directories_list_completely_through_a_build_view() {
                 vec![
                     Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
                     Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(&fx.work)), traced: true },
-                    Mount { at: b"/root/rargo-work/test-tmp".to_vec(), region: Region::Empty, traced: true },
+                    Mount { at: test_tmp().into_os_string().into_vec(), region: Region::Empty, traced: true },
                 ],
                 fx.memo.clone(),
                 g,

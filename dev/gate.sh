@@ -47,7 +47,13 @@ step() {
     fi
     report "$name" "$status" "${description:-$status}"
 }
-# Use the repository's build server and mount tests at their normal paths.
+# Every suite's files are under this gate's directory (the mount tests'
+# scratch area too), so that two gates with different gate directories
+# share nothing.
+mkdir -p "$L/work/tmp"
+export RARGO_TEST_TMP=${RARGO_TEST_TMP:-$L/work/tmp}
+export RARGO_E2E_ROOT=${RARGO_E2E_ROOT:-$L/work/tmp}
+# Use the repository's build server.
 unset CARGO_TARGET_DIR
 step build rargo build --release --locked
 step unit rargo test --release --locked --workspace --lib --bins
@@ -61,10 +67,11 @@ B=$L/bin
 mkdir -p "$B"
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
-export RIG=${RIG:-rargo2} RIG_STATE=${RIG_STATE:-rig2}
-# Each suite's files are under this gate's directory, and the suites that
-# listen on fixed ports get free ones: two gates with different gate
-# directories (one per agent) share nothing. What the environment already
+# The rig (dev/netns.sh) too: its network namespaces are named after the
+# gate directory, and its servers' state is in it.
+export RIG=${RIG:-g$(printf '%s' "$L" | sha256sum | cut -c1-6)} RIG_STATE=${RIG_STATE:-$L/work/rig}
+# Each suite's directory is under this gate's directory, and the suites
+# that listen on fixed ports get free ones. What the environment already
 # names stays.
 free_pair() { # a port P such that P and P + 1 are free on loopback
     python3 -I -c '
