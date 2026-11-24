@@ -10,11 +10,10 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
-- Who may connect to a server is a matter of tokens: `rargod token
-  invite|create|list|revoke`, `rargo auth`, `RARGO_TOKEN`. rargod has no
-  `--keys` option and the client reads no `RARGO_USER`, `RARGO_KEY` or
-  `RARGO_KEY_FILE`. A server that has issued no token listens on the
-  loopback interface and admits anyone on its machine. (#56)
+- Tokens are the one way to say who may connect to a server: `rargod
+  token invite|create|list|revoke`, `rargo auth`, `RARGO_TOKEN`. A server
+  that has issued no token listens on the loopback interface and admits
+  anyone on its machine. (#56)
 - `RARGO_TOKEN` stays on the client: it is not among the variables a
   build on the server sees.
 

@@ -755,10 +755,10 @@ is the less exercised.
   SSH as the transport (hundreds of milliseconds of connection setup per
   command against a no-op build that takes tens).
 - Noise `NNpsk0` (X25519, ChaCha20-Poly1305, BLAKE2s) with a pre-shared key
-  per user: mutual proof of the key, fresh session keys, no certificates to
-  manage. The key file on the server has a line per user, `name secret
-  [admin]`. Without a key file rargod only listens on loopback and accepts
-  anyone on the machine; it refuses to listen elsewhere without one.
+  per token (its secret): mutual proof of the token, fresh session keys,
+  no certificates to manage. Tokens are D74. A server that has issued no
+  token only listens on loopback and accepts anyone on the machine; it
+  refuses to listen elsewhere.
 - The request rides in the first handshake message when it fits (it
   usually does), encrypted under the pre-shared key, so the server starts
   working after one round trip. That one message is not forward secret; it
@@ -768,10 +768,11 @@ is the less exercised.
 - Users of one server share one cache and are trusted with each other's
   source: a team tool. `admin` gates garbage collection, compaction, and
   cache export and import (which name directories on the server).
-- The client finds the server in `RARGO_SERVER`, `RARGO_USER`, `RARGO_KEY`
-  or `RARGO_KEY_FILE`, else in `~/.config/rargo/config.toml` (`server`,
-  `user`, `key`, `key-file`). `RARGO_FALLBACK=cargo` runs plain cargo when
-  the server cannot be reached.
+- The client finds the server in `RARGO_SERVER`, else in the project's
+  `Cargo.toml` (`rargo @host`), and its token in `RARGO_TOKEN`, else in
+  `~/.config/rargo/credentials.toml` (`rargo auth`).
+  `RARGO_FALLBACK=cargo` runs plain cargo when the server cannot be
+  reached.
 - Output to the client is one ordered queue; file contents in it are
   additionally held to a 32 MiB window, so a slow link slows the sender
   down instead of filling the server's memory.
