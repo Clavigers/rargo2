@@ -99,46 +99,54 @@ A bare name like `rargo.rs` is asked over HTTPS where its server is. To use one,
 
 ## What builds can see
 
-Builds run on the server, in a sandbox, inside the dev shell of the project's `flake.nix`. What the shell has is what the build sees: the compiler, the linker, `pkg-config`, the system libraries. Nothing is installed on the server for a project, and a commit builds the same way on every server.
+A project without a `flake.nix` builds in rargo's pinned default Nix
+shell. It provides Rust with Cargo, Clippy and rustfmt, GCC for C and
+C++, binutils, Make, CMake, pkg-config, Perl, Python 3, Git, OpenSSL,
+zlib and SQLite. The project's `rust-toolchain.toml` or
+`rust-toolchain` selects Rust. The sandbox exposes the selected closure and keeps
+the server's system libraries outside the build. The server needs Nix with flakes.
 
-Every project has a flake. One that has no needs of its own starts from the default, the build essentials, as `flake.nix` at the top of the repository:
+From your Cargo workspace, download the shell for the release you use
+and inspect its files. Here `version` is the version published at
+rargo.rs:
 
 <figure class="example">
-```nix
-{
-  description = "Build environment (rargo's default: the build essentials)";
-
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-
-  outputs = { self, nixpkgs }:
-    let
-      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      forAll = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
-    in {
-      devShells = forAll (pkgs: {
-        default = pkgs.mkShell {
-          packages = with pkgs; [
-            # Rust
-            rustc cargo clippy rustfmt
-            # C and C++, and what build scripts call
-            gcc gnumake cmake pkg-config perl python3 git
-            # Libraries Rust projects most often link
-            openssl zlib sqlite
-          ];
-        };
-      });
-    };
-}
+```sh
+version=$(curl -fsSL https://rargo.rs/dl/VERSION)
+shell_dir=$(mktemp -d)
+curl -fsSL "https://rargo.rs/dl/$version/rargo-default-flake.tar.gz" \
+  | tar -xz -C "$shell_dir"
+cat "$shell_dir/default-flake/flake.nix"
 ```
 </figure>
 
-<cmd>nix flake lock && git add flake.nix flake.lock</cmd>
+To run stock Cargo in the same system environment with your local Rust
+toolchain, enter the bundle's `system` shell. Run these commands from
+the workspace:
 
-A project that needs another library adds it to `packages`. `nix develop` gives the same environment on your own machine.
+<figure class="example">
+```sh
+nix develop "path:$shell_dir/default-flake#system" --command \
+  pkg-config --modversion openssl zlib sqlite3
+nix develop "path:$shell_dir/default-flake#system" --command cargo build
+```
+</figure>
 
-<aside>
-A build of a project with no `flake.nix` sees whatever the server happens to have installed, which is nothing to rely on.
-</aside>
+If the project needs another library, copy the bundled `flake.nix` and
+`flake.lock` into the workspace. For example, add `xz` to the `libs`
+list to build against liblzma. Commit both files. The workspace's
+`default` dev shell then supplies the tools and libraries for
+`rargo build` and local `nix develop --command cargo build`.
+
+<figure class="example">
+```sh
+cp "$shell_dir/default-flake/flake.nix" "$shell_dir/default-flake/flake.lock" .
+# Edit flake.nix before committing it.
+git add flake.nix flake.lock
+git commit -m "Set the workspace build environment"
+rargo build
+```
+</figure>
 
 # How It Works
 
@@ -184,7 +192,7 @@ include = ["config/local.toml"]      # but this, although git ignores it
 git = "history"                      # build scripts see every commit and tag
 
 [workspace.metadata.rargo.flake]
-enabled = false                      # do not build inside the repo's flake dev shell
+files = ["nix/build-settings.json"]   # extra files the workspace flake reads
 ```
 </figure>
 
@@ -204,7 +212,7 @@ On your machine, rargo keeps two things: the tokens in `~/.config/rargo/credenti
 
 **"cannot reach the rargo server".** Check the name with `rargo auth status`. Then check that the server's port is open for UDP and TCP. `RARGO_TRANSPORT=tcp rargo build` tells you whether only UDP is blocked.
 
-**A library is missing** (`pkg-config`, `cannot find -lfoo`). The build ran on the server and the server does not have it. See *What builds can see*.
+**A library is missing** (`pkg-config`, `cannot find -lfoo`). Add it to the workspace flake and commit `flake.nix` and `flake.lock`. See [What builds can see](#what-builds-can-see).
 
 **A build script cannot download something.** Build scripts have no network unless the project allows it under `network` in its manifest (see *Configuration*).
 
