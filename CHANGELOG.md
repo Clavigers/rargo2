@@ -10,6 +10,10 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- A build step that needs a toolchain component the server lacks (a build
+  script that runs `rustfmt`) gets it installed there and runs again; the
+  client sees the build succeed. A component that does not exist for the
+  toolchain fails the build with rustup's own message. (#69)
 - Build scripts that ask git about history get the client's answers:
   `git describe --tags`, `rev-list --count HEAD` and
   `%(describe:tags)` agree with stock cargo where a `build.rs` mentions
