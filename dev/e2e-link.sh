@@ -108,19 +108,24 @@ mkdir -p crates/slow/src
 printf '[package]\nname = "slow"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >crates/slow/Cargo.toml
 echo 'fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }' >crates/slow/build.rs
 echo '' >crates/slow/src/lib.rs
-nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" build -p slow >/dev/null 2>&1 &
+nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" build -p slow >"$E/slow.log" 2>&1 &
 cl=$!
-for i in $(seq 1 100); do
-    pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null && break
+# The pattern is the script running, as a command of one word: its
+# compiler and its linker name the same file among their arguments, and
+# were taken for it when they were looked at first.
+t0=$(date +%s.%N)
+for i in $(seq 1 300); do
+    pgrep -f '^[^ ]*build/slow/[0-9a-f]*/out/build_script_build[^ ]*$' >/dev/null && break
     sleep 0.1
 done
-pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null; check $? "a slow build script is running on the server"
+took=$(echo "$(date +%s.%N) - $t0" | bc | cut -c1-5)
+pgrep -f '^[^ ]*build/slow/[0-9a-f]*/out/build_script_build[^ ]*$' >/dev/null; check $? "a slow build script is running on the server (${took}s after the command)" "$(cat "$E/slow.log"; kill -0 $cl 2>/dev/null && echo "(the command is still running)")"
 pkill -INT -P $cl 2>/dev/null; kill -INT $cl 2>/dev/null; wait $cl 2>/dev/null
 for i in $(seq 1 50); do
-    pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null || break
+    pgrep -f '^[^ ]*build/slow/[0-9a-f]*/out/build_script_build[^ ]*$' >/dev/null || break
     sleep 0.1
 done
-! pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null; check $? "interrupting the command stops it there, though the daemon and its link stay"
+! pgrep -f '^[^ ]*build/slow/[0-9a-f]*/out/build_script_build[^ ]*$' >/dev/null; check $? "interrupting the command stops it there, though the daemon and its link stay"
 rm -rf crates/slow
 out=$(R run -q 2>&1); [ "$out" = "value 83" ]; check $? "the next command works on the same link" "$out"
 grep -q '^link  *udp; 2 made' <<<"$(dstat)"; check $? "(no new connection)" "$(dstat)"
