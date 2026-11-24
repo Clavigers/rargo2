@@ -650,6 +650,14 @@ impl Engine {
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
         drop(permit);
         self.note_action_wall(started.elapsed());
+        static LOG_ACTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG_ACTIONS.get_or_init(|| std::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
+            let outcome = match &r {
+                Ok((result, _, tainted, _)) => format!("exit={:?} tainted={tainted}", result.code()),
+                Err(e) => format!("error={e:#}"),
+            };
+            eprintln!("rargod: action {:?} [{}] {outcome}", spec.kind, spec.label);
+        }
         r
     }
 
