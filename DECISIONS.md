@@ -2178,3 +2178,28 @@ people who implement the other side.
 The site is deployed by a push to its own repository on the build
 machine; it is not GitHub Pages.
 
+## D72. A default Nix development shell (initiative 45)
+
+The repository ships a default `flake.nix` and `flake.lock` and publishes
+both with each release. The shell provides GCC (including C++), binutils,
+pkg-config, CMake, Make, OpenSSL, zlib and SQLite. This covers the build
+tools and native libraries a typical Rust workspace needs and gives
+projects a small starting point for their own shell. The lock pins nixpkgs.
+The project's Rust toolchain selection continues to determine rustc and
+Cargo independently of the system dependencies.
+
+A workspace with a flake selects its own development shell. Every other
+workspace selects the bundled shell. The host environment is unavailable
+as a build mode. A server without usable Nix refuses builds with a
+diagnostic that explains how to enable Nix with flakes. Analysis and
+execution see the selected closure and environment. Its identity includes
+the flake source, lock and selected shell, so changes invalidate the
+affected cached analysis and actions and workers execute in the same
+environment.
+
+The release provides the exact shell sources for stock Cargo. A developer
+can enter that shell with `nix develop` and use the project's Rust
+toolchain, or use their project's own dev shell when it supplies one.
+Release documentation leads with the default package list, shows how to
+inspect and enter the shell, and shows how to extend it by committing a
+project flake and lockfile.
