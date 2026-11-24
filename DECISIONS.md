@@ -2579,3 +2579,76 @@ installed version is used.
 
 A version that is not of the form X.Y.Z is refused before anything is
 tried.
+
+## D83. Every test nextest starts is a cached action (issue 31)
+
+D69 described a runner that hands each test process to rargod and waits
+for the result. From inside the sandbox nothing can reach rargod, and an
+action cannot wait on another. So the runner works the way the stand-in
+cargo of D81 does: it answers from what rargod recorded, and anything it
+cannot answer is a question for the next round.
+
+**The runner.**
+- nextest starts every test process through the target's runner
+  (`CARGO_TARGET_<TRIPLE>_RUNNER`). That covers listing a binary's tests
+  (`--list --format terse`, with and without `--ignored`) and running one
+  test (`--exact NAME --nocapture`).
+- In rargo's sandbox the runner is a short `sh` script. It names a process
+  by its working directory, `NEXTEST_ATTEMPT` and command line, and looks
+  for a recorded run of that process: the POSIX `cksum` of the name gives
+  the directory, and the name itself is compared.
+- **A recorded run is replayed**: its output, and its exit code or signal.
+- **Without one, the process becomes a question.** The runner writes down
+  the name, the arguments and the environment (`env -0`), then exits 0
+  with no output. The round goes on: a listing then shows no tests, and a
+  test passes.
+
+**Rounds.**
+- rargod runs nextest. Every question the run left is run as an action of
+  its own:
+  - `Test` kind, sandboxed and traced like a `rargo test` binary;
+  - the view of the build, nextest's environment for the process, the
+    package's network policy;
+  - cached under the command line and what the process read;
+  - run concurrently under rargod's scheduler, and on workers when there
+    are workers.
+  Then nextest runs again, until a round asks nothing. That round's output
+  is what the user sees, followed by one line of rargo's: `Replayed N of
+  M test runs from rargo's cache`.
+- A first run takes three rounds: lists, tests, replay. Each retry a
+  failing test earns adds a round, because each attempt is its own
+  question (the attempt is in the name). Sixteen rounds at most.
+
+**What this gives.**
+- **Caching per test and per listing**, with nextest deciding everything
+  else:
+  - filters, partitions and `--no-fail-fast` decide which processes are
+    started;
+  - retries and flaky reports come from nextest's own retry logic;
+  - JUnit files and profiles stay nextest's own.
+- **Failures are never cached**, as for `rargo test`. So a retry runs for
+  real, and a test that fails and then passes is reported FLAKY exactly
+  as stock nextest reports it (the e2e check compares the lines).
+- `--no-cache` runs every test again.
+
+**Variables nextest gives a test that change from run to run** are not
+given to the action, because they would change its key every time:
+`NEXTEST_RUN_ID`, `NEXTEST_ATTEMPT_ID`, `NEXTEST_TEST_GLOBAL_SLOT`,
+`NEXTEST_TEST_GROUP_SLOT`.
+- `NEXTEST_ATTEMPT` is kept: a passing second attempt is a fact about
+  attempt 2.
+- `CARGO` is the real cargo, as under `rargo test`.
+- `NEXTEST_TEST_THREADS` defaults to the server's job tokens. It only
+  paces the replays, because the tests themselves are scheduled by
+  rargod.
+
+**What it costs and what it does not do.**
+- **Each replayed test is a shell, a `cksum` and two `cat`s in the
+  sandbox**, a few milliseconds.
+- **Output is not live.** It is shown once the last round ends, and each
+  test action's own output is not streamed.
+- **nextest's timeouts do not reach the test actions.** A slow-timeout
+  `terminate-after` cannot stop a hanging test, because nextest only ever
+  sees a replay.
+- **A runner the repository configures for the host target is replaced.**
+  The variable outranks cargo configuration.

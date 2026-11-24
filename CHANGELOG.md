@@ -20,6 +20,12 @@ Protocol 7 (unchanged).
   `.config/nextest.toml`), else the client's own nextest's, else the
   newest release. The server installs each version on first use, checked
   against the release's checksum, and keeps them side by side. (#32)
+- Under `rargo nextest`, every test process nextest starts is an action of
+  its own on the server, cached under its command line and what it read.
+  An unchanged test is replayed (nextest shows it as it did), an edit to a
+  fixture runs only the tests that read it, and a failure is never
+  cached, so retries and flaky reports are nextest's own. A line after
+  nextest's output says how many test runs were replayed. (#31)
 - After stock cargo built a test binary and rargo then put its own at the
   same path (`rargo test --no-run`, `rargo nextest`), stock `cargo test`
   ran rargo's executable and failed. rargo now removes stock cargo's

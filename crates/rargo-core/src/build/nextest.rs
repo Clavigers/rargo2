@@ -53,6 +53,25 @@ fi
 exec "$__RARGO_NEXTEST_CARGO" "$@"
 "#;
 
+const RUNNER: &str = r#"#!/bin/sh
+# A test binary, as nextest starts it in rargo's sandbox (D83): rargod's
+# recorded run of that process, or, while rargod has none, a question for
+# it (the process then does nothing).
+q=$(printf '%s\n' "$PWD" "${NEXTEST_ATTEMPT:-1}" "$@")
+read sum len <<EOF
+$(printf '%s' "$q" | cksum)
+EOF
+for a in /rargo/nextest/t/$sum-$len/*; do
+    [ -f "$a/q" ] && [ "$(cat "$a/q")" = "$q" ] || continue
+    cat "$a/out" && cat "$a/err" >&2 || exit 101
+    read how n <"$a/status"
+    [ "$how" = signal ] && kill -"$n" $$
+    exit "$n"
+done
+mkdir -p /.rargo-nextest-q
+{ printf '%s\0' "$PWD" "${NEXTEST_ATTEMPT:-1}" "$#" "$@"; /usr/bin/env -0; } >/.rargo-nextest-q/$sum-$len-$$
+"#;
+
 /// What cargo said, or what rargod says in its place.
 #[derive(Clone, Debug)]
 struct Answer {
@@ -120,7 +139,7 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             layer: Arc::new(OutputsLayer::new()),
             levels: Arc::new(Vec::new()),
             untraced: Vec::new(),
-            seed: Some(answer_layer(d, &answers)?),
+            seed: Some(answer_layer(d, &answers, &HashMap::new())?),
             content: Some(d.engine.content.clone()),
         });
         let env = action_env(&p.env, None, c);
@@ -173,65 +192,293 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         }
     };
 
+    let host = answers.metadata.as_ref().and_then(|m| {
+        m.args.iter().find_map(|a| a.strip_prefix("--filter-platform=").map(String::from))
+    });
+    let target = arg_value(&build_args, "--target").map(String::from);
     let (answer, built) = build(d, c, build_args).await?;
     answers.build = Some(answer);
 
-    // The run the user sees: against the build's results.
+    // The runs against the build's results. Each test process nextest
+    // starts is a question until rargod has run that test as an action of
+    // its own; the run that asks nothing more is the one the user sees.
     let base = with_nextest(d, &p, &nextest);
     let (layer, levels) = match &built {
         Some(b) => (b.layer.clone(), Arc::new(vec![LEVEL_FULL; b.units])),
         None => (Arc::new(OutputsLayer::new()), Arc::new(Vec::new())),
     };
-    let view: Arc<dyn View> = Arc::new(BuildView {
-        base,
-        layer,
-        levels,
-        untraced: Vec::new(),
-        seed: Some(answer_layer(d, &answers)?),
-        content: Some(d.engine.content.clone()),
-    });
-    let env = match &built {
+    let mut env = match &built {
         Some(b) => action_env(&b.env, b.cargo_override.as_deref(), c),
         None => action_env(&p.env, None, c),
     };
-    let net = match &built {
-        Some(b) if b.local_packages.iter().any(|pkg| p.policy.test_network(pkg)) => NetMode::Host,
-        _ => NetMode::Loopback,
+    let runner = vjoin(AT, b"runner");
+    for triple in host.iter().chain(target.iter()) {
+        let var = format!("CARGO_TARGET_{}_RUNNER", triple.to_uppercase().replace(['-', '.'], "_"));
+        env.insert(bytes(&var), runner.clone());
+    }
+    // nextest's own parallelism only paces the replays; the tests
+    // themselves are scheduled by rargod.
+    if !c.env.contains_key("NEXTEST_TEST_THREADS") {
+        env.insert(bytes("NEXTEST_TEST_THREADS"), bytes(&d.engine.sched.tokens().to_string()));
+    }
+    let tests_view: Arc<dyn View> =
+        Arc::new(BuildView { base: p.base.clone(), layer: layer.clone(), levels: levels.clone(), untraced: Vec::new(), seed: None, content: Some(d.engine.content.clone()) });
+    let mut ran: HashMap<String, Ran> = HashMap::new();
+    let (mut replayed, mut run_now) = (0usize, 0usize);
+    let mut round = 0;
+    let r = loop {
+        round += 1;
+        let view: Arc<dyn View> = Arc::new(BuildView {
+            base: base.clone(),
+            layer: layer.clone(),
+            levels: levels.clone(),
+            untraced: Vec::new(),
+            seed: Some(answer_layer(d, &answers, &ran)?),
+            content: Some(d.engine.content.clone()),
+        });
+        let r = d
+            .engine
+            .obtain(Request {
+                spec: spec(&p, argv.clone(), env.clone(), NetMode::Loopback),
+                view,
+                client_env: c.env.clone(),
+                uid: c.uid,
+                gid: c.gid,
+                prio: c.prio,
+                no_cache: false,
+                seed_blobs: Default::default(),
+                // A run that asked is a function of what it was given; so
+                // is one that passed. A failing one may be a flake.
+                cacheable: Arc::new(|r| r.success() || r.outputs.entries.iter().any(|(p, _)| is_test_question(p))),
+                declared_env: Arc::new(|_, _| Vec::new()),
+                observer: Arc::new(Explaining {
+                    c: c.clone(),
+                    label: "nextest".into(),
+                }),
+            })
+            .await?
+            .result;
+        let store = d.store();
+        let mut questions = Vec::new();
+        for (path, e) in &r.outputs.entries {
+            if let (true, MEntry::File { hash, .. }) = (is_test_question(path), e)
+                && let Some(q) = TestQuestion::parse(&store.read(hash)?)
+                && !ran.contains_key(&q.key)
+                && !questions.iter().any(|o: &TestQuestion| o.key == q.key)
+            {
+                questions.push(q);
+            }
+        }
+        if questions.is_empty() || round == MOST_ROUNDS {
+            break r;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for q in questions {
+            let (d, c, p_policy, view) = (d.clone(), c.clone(), p.policy.clone(), tests_view.clone());
+            let (root_id, no_cache) = (p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO), no_cache);
+            set.spawn(async move {
+                let ran = run_test(&d, &c, &p_policy, view, root_id, no_cache, &q).await;
+                (q, ran)
+            });
+        }
+        while let Some(done) = set.join_next().await {
+            let (q, outcome) = done?;
+            let (result, cached) = outcome?;
+            if !q.listing {
+                if cached { replayed += 1 } else { run_now += 1 }
+            }
+            // What a test wrote goes where a test's writes go.
+            deliver_writes(c, &p, built.as_ref(), &result.outputs);
+            let store = d.store();
+            ran.insert(q.key.clone(), Ran {
+                q: q.key.clone(),
+                out: store.read(&result.stdout)?,
+                err: store.read(&result.stderr)?,
+                status: match result.signal() {
+                    Some(sig) => format!("signal {sig}"),
+                    None => format!("exit {}", result.code().unwrap_or(101)),
+                },
+            });
+        }
+    };
+
+    // The run the user sees: what nextest printed, then how many tests
+    // rargo replayed.
+    let store = d.store();
+    c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
+    c.out.err_text(&String::from_utf8_lossy(&store.read(&r.stderr)?));
+    if replayed + run_now > 0 {
+        c.out.status(
+            "Replayed",
+            &format!(
+                "{replayed} of {} test runs from rargo's cache ({run_now} run on the server; `--no-cache` runs every test)",
+                replayed + run_now
+            ),
+        );
+    }
+    deliver_writes(c, &p, built.as_ref(), &r.outputs);
+    match r.code() {
+        Some(code) => Ok(code),
+        None => {
+            c.out.error(&format!("nextest did not exit normally ({})", describe_status(r.status)));
+            Ok(101)
+        }
+    }
+}
+
+/// More runs of nextest than this, each asking for tests the last did
+/// not, means something keeps asking; the last run's word stands.
+const MOST_ROUNDS: usize = 16;
+
+/// What the runner writes when a test process has no recorded run.
+const TEST_QUESTIONS: &[u8] = b"/.rargo-nextest-q";
+
+fn is_test_question(path: &[u8]) -> bool {
+    vpath_starts_with(path, TEST_QUESTIONS) && path != TEST_QUESTIONS
+}
+
+/// One test process nextest started (to list a binary's tests, or to run
+/// one of them), as the runner recorded it.
+#[derive(Debug, Clone, PartialEq)]
+struct TestQuestion {
+    /// The working directory, the attempt and the command line, one per
+    /// line: what the runner compares to find a recorded run.
+    key: String,
+    cwd: String,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+    listing: bool,
+}
+
+impl TestQuestion {
+    /// The runner's note: the working directory, the attempt, the number of
+    /// arguments, the arguments, then the environment (`env -0`), each
+    /// ended by a NUL.
+    fn parse(raw: &[u8]) -> Option<TestQuestion> {
+        let mut fields = raw.split(|&b| b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
+        let cwd = fields.next()?;
+        let attempt = fields.next()?;
+        let argc: usize = fields.next()?.parse().ok()?;
+        let argv: Vec<String> = (0..argc).map(|_| fields.next()).collect::<Option<_>>()?;
+        if argv.is_empty() {
+            return None;
+        }
+        let env: Vec<(String, String)> = fields
+            .filter(|f| !f.is_empty())
+            .filter_map(|f| f.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        let mut key = format!("{cwd}\n{attempt}");
+        for a in &argv {
+            key.push('\n');
+            key.push_str(a);
+        }
+        let listing = argv.iter().any(|a| a == "--list");
+        Some(TestQuestion { key, cwd, argv, env, listing })
+    }
+}
+
+/// A recorded run of a test process, as the runner replays it.
+struct Ran {
+    q: String,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    /// `exit N` or `signal N`.
+    status: String,
+}
+
+/// Variables nextest gives a test that differ from one run to the next
+/// for the same test: not given to the action, whose key they would
+/// change every time.
+const PER_RUN: &[&str] =
+    &["NEXTEST_RUN_ID", "NEXTEST_ATTEMPT_ID", "NEXTEST_TEST_GLOBAL_SLOT", "NEXTEST_TEST_GROUP_SLOT"];
+
+/// One test process as an action of its own: sandboxed, traced, cached
+/// under the binary, the command line and what it read. A failure is not
+/// cached, so a retry runs again.
+async fn run_test(
+    d: &Arc<Daemon>,
+    c: &Arc<Client>,
+    policy: &crate::policy::Policy,
+    view: Arc<dyn View>,
+    root_id: Hash,
+    no_cache: bool,
+    q: &TestQuestion,
+) -> Result<(Arc<ActionResult>, bool)> {
+    let real_cargo = q.env.iter().find(|(k, _)| k == REAL_CARGO_VAR).map(|(_, v)| v.clone());
+    let mut env: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    for (k, v) in &q.env {
+        if PER_RUN.contains(&k.as_str()) || k == REAL_CARGO_VAR || (k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER")) {
+            continue;
+        }
+        // A test that runs cargo gets the real one, as under `rargo test`.
+        let v = if k == "CARGO" { real_cargo.clone().unwrap_or_else(|| v.clone()) } else { v.clone() };
+        env.insert(bytes(k), bytes(&v));
+    }
+    let package = q.env.iter().find(|(k, _)| k == "CARGO_PKG_NAME").map(|(_, v)| v.as_str()).unwrap_or_default();
+    let name = q.env.iter().find(|(k, _)| k == "NEXTEST_TEST_NAME").map(|(_, v)| v.as_str());
+    let binary = q.env.iter().find(|(k, _)| k == "NEXTEST_BINARY_ID").map(|(_, v)| v.as_str()).unwrap_or(&q.argv[0]);
+    let label = match name {
+        Some(n) if !q.listing => format!("test {binary} {n}"),
+        _ => format!("test list of {binary}"),
+    };
+    let spec = ActionSpec {
+        kind: ActionKind::Test,
+        argv: q.argv.iter().map(|a| bytes(a)).collect(),
+        env,
+        cwd: bytes(&q.cwd),
+        net: if policy.test_network(package) { NetMode::Host } else { NetMode::Loopback },
+        mkdirs: vec![],
+        root_id,
+        discard: vec![],
+        label: label.clone(),
     };
     let outcome = d
         .engine
         .obtain(Request {
-            spec: spec(&p, argv, env, net),
+            spec,
             view,
             client_env: c.env.clone(),
             uid: c.uid,
             gid: c.gid,
             prio: c.prio,
-            no_cache,
+            no_cache: no_cache && !q.listing,
             seed_blobs: Default::default(),
             // A passing run is a fact about its inputs; a failing one may
             // be a flake and is run again.
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
-            observer: Arc::new(TestObserver {
-                out: c.clone(),
-                explain: c.env.contains_key("RARGO_EXPLAIN"),
-                label: "nextest".into(),
-            }),
+            observer: Arc::new(Explaining { c: c.clone(), label }),
         })
         .await?;
-    let r = &outcome.result;
+    Ok((outcome.result, outcome.cached))
+}
 
-    // What nextest and the tests wrote: the worktree part as tests' writes
-    // go, the target directory's files (a JUnit report) as artifacts do.
-    let target_dirs: Vec<String> = match &built {
+/// Says why an action runs, with `RARGO_EXPLAIN`; shows nothing else
+/// (nextest shows the output).
+struct Explaining {
+    c: Arc<Client>,
+    label: String,
+}
+
+impl Observer for Explaining {
+    fn wants_explanation(&self) -> bool {
+        self.c.env.contains_key("RARGO_EXPLAIN")
+    }
+    fn explain(&self, why: &str) {
+        self.c.out.note(&format!("{} runs because {why}", self.label));
+    }
+}
+
+/// What a test or nextest wrote: the worktree part as tests' writes go,
+/// the target directory's files (a JUnit report) as artifacts do.
+fn deliver_writes(c: &Client, p: &Prepared, built: Option<&Built>, outputs: &Manifest) {
+    let target_dirs: Vec<String> = match built {
         Some(b) => b.target_dirs.clone(),
         None => vec![String::from_utf8_lossy(&vjoin(WORKTREE_AT, b"target")).into_owned()],
     };
     let dirs: Vec<&String> = target_dirs.iter().collect();
-    apply_writes(c, &p.tr, &dirs, &r.outputs);
-    let files: Vec<Delivery> = r
-        .outputs
+    apply_writes(c, &p.tr, &dirs, outputs);
+    let files: Vec<Delivery> = outputs
         .entries
         .iter()
         .filter(|(path, _)| target_dirs.iter().any(|t| vpath_starts_with(path, t.as_bytes())))
@@ -246,14 +493,30 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             _ => None,
         })
         .collect();
-    c.deliver(files, Vec::new());
-    match r.code() {
-        Some(code) => Ok(code),
-        None => {
-            c.out.error(&format!("nextest did not exit normally ({})", describe_status(r.status)));
-            Ok(101)
-        }
+    if !files.is_empty() {
+        c.deliver(files, Vec::new());
     }
+}
+
+/// POSIX `cksum` of `data`: the CRC the runner names a recorded run's
+/// directory by, with the length beside it.
+fn cksum(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0;
+    let mut feed = |b: u8| {
+        crc ^= (b as u32) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04C1_1DB7 } else { crc << 1 };
+        }
+    };
+    for &b in data {
+        feed(b);
+    }
+    let mut len = data.len();
+    while len > 0 {
+        feed((len & 0xff) as u8);
+        len >>= 8;
+    }
+    !crc
 }
 
 /// An argument as the sandbox sees it: paths the user typed refer to the
@@ -301,8 +564,8 @@ fn action_env(base: &BTreeMap<String, String>, cargo: Option<&str>, c: &Client) 
     env
 }
 
-/// The stand-in, and the answers rargod has, as files for the sandbox.
-fn answer_layer(d: &Daemon, answers: &Answers) -> Result<Arc<OutputsLayer>> {
+/// The stand-ins, and the answers rargod has, as files for the sandbox.
+fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Result<Arc<OutputsLayer>> {
     let store = d.store();
     let mut entries = Vec::new();
     let mut file = |name: &str, content: &[u8], exec: bool| -> Result<()> {
@@ -311,6 +574,20 @@ fn answer_layer(d: &Daemon, answers: &Answers) -> Result<Arc<OutputsLayer>> {
         Ok(())
     };
     file("cargo", STAND_IN.as_bytes(), true)?;
+    file("runner", RUNNER.as_bytes(), true)?;
+    // Recorded test runs, under the directory the runner looks in: the
+    // POSIX checksum and length of the question, then one directory per
+    // question with that checksum.
+    let mut slots: HashMap<String, usize> = HashMap::new();
+    for r in ran.values() {
+        let dir = format!("t/{}-{}", cksum(r.q.as_bytes()), r.q.len());
+        let n = slots.entry(dir.clone()).or_default();
+        *n += 1;
+        file(&format!("{dir}/{n}/q"), r.q.as_bytes(), false)?;
+        file(&format!("{dir}/{n}/out"), &r.out, false)?;
+        file(&format!("{dir}/{n}/err"), &r.err, false)?;
+        file(&format!("{dir}/{n}/status"), format!("{}\n", r.status).as_bytes(), false)?;
+    }
     for (what, a) in [("metadata", &answers.metadata), ("build", &answers.build)] {
         let Some(a) = a else { continue };
         let mut args = a.args.join("\n");
@@ -644,6 +921,29 @@ mod tests {
         // Cut short, or about something else: no question.
         assert_eq!(parse_question(b"build\n--color=auto\0te"), None);
         assert_eq!(parse_question(b"install\nx\0"), None);
+    }
+
+    #[test]
+    fn the_runner_s_checksum_is_posix_cksum() {
+        assert_eq!(cksum(b""), 4294967295);
+        assert_eq!(cksum(b"hello"), 3287646509);
+        assert_eq!(cksum(b"/w/crates/app\n1\n/w/target/x\n--exact\nt"), 414427659);
+    }
+
+    #[test]
+    fn the_runner_s_question_is_read_back() {
+        let mut raw = Vec::new();
+        for f in ["/w/crates/app", "2", "3", "/w/target/debug/it-1", "--exact", "reads a fixture", "NEXTEST_ATTEMPT=2", "A=b=c"] {
+            raw.extend_from_slice(f.as_bytes());
+            raw.push(0);
+        }
+        let q = TestQuestion::parse(&raw).unwrap();
+        assert_eq!(q.key, "/w/crates/app\n2\n/w/target/debug/it-1\n--exact\nreads a fixture");
+        assert_eq!(q.argv, vec!["/w/target/debug/it-1", "--exact", "reads a fixture"]);
+        assert_eq!(q.env, vec![("NEXTEST_ATTEMPT".into(), "2".into()), ("A".into(), "b=c".into())]);
+        assert!(!q.listing);
+        // Cut short: no question.
+        assert_eq!(TestQuestion::parse(b"/w\x001\x003\x00/w/x\x00"), None);
     }
 
     #[test]
