@@ -10,6 +10,14 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- Build scripts that ask git about history get the client's answers:
+  `git describe --tags`, `rev-list --count HEAD` and
+  `%(describe:tags)` agree with stock cargo where a `build.rs` mentions
+  `describe` or `rev-list`, or `Cargo.lock` names vergen, shadow-rs,
+  git-version, built or git-testament. Then the server is sent the
+  commits (not their contents) and the tags. `[sync] git = "history"`
+  asks for that always, and `git = "head"` never. The tags on HEAD come
+  along in any case. (#11)
 - `[workspace.metadata.rargo.sync] gitignored = false` leaves out
   everything git ignores (not scanned, watched or sent); `include` names
   what is sent all the same. A failed build that reads a file left out

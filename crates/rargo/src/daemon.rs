@@ -309,7 +309,7 @@ impl Daemon {
         if let Some(last) = &st.last {
             let same_head = match (&last.head, &head) {
                 (None, None) => true,
-                (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text,
+                (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text && a.tags == b.tags,
                 _ => false,
             };
             if same_head && wt.vouched.load(Ordering::SeqCst) && !wt.dirty.load(Ordering::SeqCst) {
@@ -329,10 +329,6 @@ impl Daemon {
             if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
-            let thin_git = match &head {
-                Some(h) if policy.git => git::thin(&root, h, &cache),
-                _ => None,
-            };
             let empty = scan::Index::default();
             let old = match (&previous, &loaded) {
                 (Some(p), _) => &p.scan.index,
@@ -340,10 +336,37 @@ impl Daemon {
                 (None, None) => &empty,
             };
             let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
-            let scan = scan::scan(&root, old, &policy.exclude, left_out.as_ref(), thin_git.as_deref())
+            let mut scan = scan::scan(&root, old, &policy.exclude, left_out.as_ref())
                 .map_err(|e| std::io::Error::new(e.kind(), format!("scanning {}: {e}", root.display())))?;
             if scan.index_changed {
                 let _ = scan.index.save(&wt_cache.join("index"));
+            }
+            if let Some(h) = &head {
+                let history = match policy.git {
+                    git::Mode::Off => None,
+                    git::Mode::Head => Some(false),
+                    git::Mode::History => Some(true),
+                    git::Mode::Detect => Some(git::asks_for_history(&root, scan.index.files.keys().map(|k| k.as_slice()))),
+                };
+                // History that cannot be had (git failed) leaves HEAD.
+                let objects = if history == Some(true) { git::history(&root, h, &cache) } else { None };
+                let thin = history.and_then(|_| git::thin(&root, h, &cache, objects.is_some()));
+                if let Some(thin) = thin {
+                    let stored = match &objects {
+                        Some(dir) => {
+                            // One index for all of a repository's HEADs:
+                            // they link the same pieces under the same names.
+                            let at = dir.parent().and_then(Path::parent).unwrap_or(dir).join("index");
+                            let s = scan::scan_store(dir, &scan::Index::load(&at))?;
+                            if s.index_changed {
+                                let _ = s.index.save(&at);
+                            }
+                            Some(s)
+                        }
+                        None => None,
+                    };
+                    scan::graft_git(&mut scan, &root, &thin, stored)?;
+                }
             }
             Ok(Snap { scan, policy, head, left_out })
         })

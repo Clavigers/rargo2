@@ -680,7 +680,9 @@ expect "an explicit nested manifest selects the inner workspace policy" policy_t
 out=$(cd "$nested/rust/member" && "$R" --rargo-drift-check 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "stock cargo builds" && has "$out" "rargo builds" && ok "the drift check builds the nested package on both sides" || bad "the drift check builds the nested package on both sides" "$out"
 
-echo "== build scripts that ask git about HEAD"
+echo "== build scripts that ask git about HEAD and history"
+# No build so far asked git for history: none was sent.
+[ ! -e "$RARGO_CACHE_DIR/git-history" ] && ok "builds whose scripts ask git nothing about history send none" || bad "builds whose scripts ask git nothing about history send none" "$(ls "$RARGO_CACHE_DIR/git-history")"
 G=$T/g
 mkdir -p "$G/src"
 printf '[package]\nname = "gitinfo"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$G/Cargo.toml"
@@ -699,37 +701,53 @@ fn main() {
     println!("cargo:rustc-env=G_SUBJECT={}", git(&["log", "-1", "--format=%s"]));
     println!("cargo:rustc-env=G_DESCRIBE={}", git(&["describe", "--always", "--dirty"]));
     println!("cargo:rustc-env=G_COUNT={}", git(&["rev-list", "--count", "HEAD"]));
+    println!("cargo:rustc-env=G_LAST={}", git(&["log", "-1", "--format=%(describe:tags)"]));
 }
 EOF
 cat >"$G/src/main.rs" <<'EOF'
 fn main() {
-    println!("{}|{}|{}|{}|{}", env!("G_HEAD"), env!("G_BRANCH"), env!("G_SUBJECT"), env!("G_DESCRIBE"), env!("G_COUNT"));
+    println!("{}|{}|{}|{}|{}|{}", env!("G_HEAD"), env!("G_BRANCH"), env!("G_SUBJECT"), env!("G_DESCRIBE"), env!("G_COUNT"), env!("G_LAST"));
 }
 EOF
 printf '/target\n' >"$G/.gitignore"
-git -C "$G" init -q -b trunk && git -C "$G" add -A && git -C "$G" -c user.name=t -c user.email=t@t commit -q -m "first commit"
+gc() { git -C "$G" -c user.name=t -c user.email=t@t "$@"; }
+git -C "$G" init -q -b trunk && git -C "$G" add -A && gc commit -q -m "first commit"
+gc tag -a v0.1.0 -m "first release"
 cd "$G"
 "$R" build >/dev/null 2>&1   # writes Cargo.lock
-git -C "$G" add -A && git -C "$G" -c user.name=t -c user.email=t@t commit -q -m "second commit"
+git -C "$G" add -A && gc commit -q -m "second commit"
+gc checkout -q -b side HEAD~1 && echo side >side.txt && git -C "$G" add side.txt && gc commit -q -m "side commit" && gc tag side-light
+gc checkout -q trunk && gc merge -q --no-ff -m "merge side" side
 head1=$(git -C "$G" rev-parse HEAD)
+# Stock cargo reruns this build script only when .git/HEAD changes: each
+# of its runs starts from an empty target directory.
+stock() { CARGO_TARGET_DIR=$(mktemp -d "$T/stock-g.XXXXXX") cargo run -q --offline 2>&1; }
 out=$("$R" run -q 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "$head1|trunk|second commit|${head1:0:7}|1" ] && ok "the build script saw HEAD, the branch and a clean tree, and no history ($out)" || bad "the build script saw HEAD, the branch and a clean tree, and no history" "$out"
+want=$(stock)
+[ $rc -eq 0 ] && [ "$out" = "$want" ] && [ "$out" = "$head1|trunk|merge side|v0.1.0-3-g${head1:0:7}|4|side-light-2-g${head1:0:7}" ] && ok "the build script saw HEAD, the branch, a clean tree and the history, as stock cargo does ($out)" || bad "the build script saw HEAD, the branch, a clean tree and the history, as stock cargo does" "rargo: $out
+stock: $want"
+[ -d "$RARGO_CACHE_DIR/git-history" ] && ok "a build script that describes gets the history" || bad "a build script that describes gets the history"
 [ -d "$G/.git/objects" ] && ok "the client's own .git is untouched" || bad "the client's own .git is untouched"
 echo "// dirty" >>src/main.rs
 out=$("$R" run -q 2>&1)
-has "$out" "|${head1:0:7}-dirty|" && ok "an uncommitted edit shows as dirty" || bad "an uncommitted edit shows as dirty" "$out"
-git -C "$G" -c user.name=t -c user.email=t@t commit -q -am "third commit"
+has "$out" "|v0.1.0-3-g${head1:0:7}-dirty|" && ok "an uncommitted edit shows as dirty" || bad "an uncommitted edit shows as dirty" "$out"
+gc commit -q -am "third commit"
 head2=$(git -C "$G" rev-parse HEAD)
 out=$("$R" run -q 2>&1)
-[ "$out" = "$head2|trunk|third commit|${head2:0:7}|1" ] && ok "a new commit is picked up" || bad "a new commit is picked up" "$out"
+[ "$out" = "$(stock)" ] && [ "$out" = "$head2|trunk|third commit|v0.1.0-4-g${head2:0:7}|5|side-light-3-g${head2:0:7}" ] && ok "a new commit is picked up ($out)" || bad "a new commit is picked up" "$out"
+gc tag -a v0.2.0 -m "second release"
+out=$("$R" run -q 2>&1)
+[ "$out" = "$(stock)" ] && [ "$out" = "$head2|trunk|third commit|v0.2.0|5|v0.2.0" ] && ok "a tag made without a commit is picked up" || bad "a tag made without a commit is picked up" "$out"
 size=$(du -sk "$RARGO_CACHE_DIR"/git/* | sort -n | tail -1 | cut -f1)
-[ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built)" || bad "what stands in for .git on the server is small" "${size} KiB"
+[ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built, history aside)" || bad "what stands in for .git on the server is small" "${size} KiB"
+printf '\n[package.metadata.rargo.sync]\ngit = "head"\n' >>Cargo.toml
+out=$("$R" run -q 2>&1)
+[ "$out" = "$head2|trunk|third commit|v0.2.0-dirty|1|v0.2.0" ] && ok "with sync.git = \"head\", HEAD and its tags and no history ($out)" || bad "with sync.git = \"head\", HEAD and its tags and no history" "$out"
+git -C "$G" checkout -q Cargo.toml
 printf '\n[package.metadata.rargo.sync]\ngit = false\n' >>Cargo.toml
 out=$("$R" run -q 2>&1)
-[ "$out" = "none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
+[ "$out" = "none|none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
 git -C "$G" checkout -q Cargo.toml
-out=$(CARGO_TARGET_DIR="$T/stock-g" cargo run -q --offline 2>&1)
-has "$out" "$head2|trunk|third commit|${head2:0:7}|" && ok "stock cargo on the client agrees about HEAD ($out)" || bad "stock cargo on the client agrees about HEAD" "$out"
 
 # --- reports cargo writes into target/, and clients that go away ------------
 echo "== future-incompatibility report, --timings, interrupted clients"

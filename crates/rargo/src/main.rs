@@ -141,8 +141,8 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
 pub struct Policy {
     pub pass: Vec<String>,
     pub exclude: Vec<String>,
-    /// `[sync] git = false`: the sandbox gets no `.git` at all.
-    pub git: bool,
+    /// `[sync] git`: what the sandbox gets as `.git`.
+    pub git: git::Mode,
     /// `[sync] gitignored = false`: what git ignores is not synced, except
     /// what `include` names.
     pub gitignored: bool,
@@ -168,7 +168,12 @@ pub fn load_policy(root: &Path, start: &Path) -> Policy {
     Policy {
         pass: list("env", "pass"),
         exclude: list("sync", "exclude"),
-        git: flag("git"),
+        git: match policy.get("sync").and_then(|s| s.get("git")) {
+            Some(toml::Value::Boolean(false)) => git::Mode::Off,
+            Some(toml::Value::String(s)) if s == "head" => git::Mode::Head,
+            Some(toml::Value::String(s)) if s == "history" => git::Mode::History,
+            _ => git::Mode::Detect,
+        },
         gitignored: flag("gitignored"),
         include: list("sync", "include"),
     }

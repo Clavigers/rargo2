@@ -2331,3 +2331,50 @@ way ends with a note naming the path, the option and `include`. The
 daemon keeps the command's error output (up to 1 MiB) only while the
 option is set, and matches the paths in it against what git ignores, so
 an error about another file is not blamed on the option.
+
+## D78. History for the build scripts that ask for it (issue 11)
+
+What build scripts ask git, in the four benchmark repositories:
+rust-analyzer `log -1 --format=%H %h %cd`, Zed `rev-parse HEAD`, Ruff and
+ty `log -1 --format=%H %h %cd %(describe:tags)`, Bevy nothing. Ruff turns the last field
+into its last release and the distance to it, which is history; the rest
+is HEAD. The crates that build scripts and macros use for this (vergen,
+shadow-rs, git-version, built, git-testament) add `describe --tags` and
+`rev-list --count`.
+
+- `[sync] git = "history"` adds to the stand-in every commit HEAD reaches,
+  without trees, and every tag on them. `describe` in every form,
+  `rev-list --count`, `%(describe:tags)` and `log` without paths then
+  answer as on the client. On rust-analyzer's real history (42,000
+  commits), five such queries agreed at six commits from two years back
+  to HEAD. `git = "head"` is HEAD and the tags on it (a build at a release
+  tag describes as that tag); `false` is no `.git`.
+- The default (`true`) decides per worktree: history where a `build.rs`
+  mentions `describe` or `rev-list`, or a `Cargo.lock` names one of those
+  crates; else HEAD. History is not the default for everyone because of
+  what it costs. rust-analyzer's commits are 26 MiB, 11 MiB compressed,
+  where its sources compress to 4 MiB, so a first upload would grow
+  nearly fourfold for a feature most builds never use.
+- The commits travel as packs over pieces of the first-parent chain of
+  4096, 256, 16 and 1 commits, each starting at a multiple of its size
+  counted from the root, with whatever was merged into them. A piece never
+  changes once its last commit exists. So a new commit adds a pack of one
+  (2 to 3 KB for rust-analyzer, 70 to 90 ms), and a HEAD's history is a
+  few dozen packs at most (10 for rust-analyzer's HEAD, 19 MB). The pieces
+  are kept once per repository in the client's cache and hard-linked into
+  a directory per HEAD, which the scan shows inside `.git/objects` beside
+  the stand-in's own pack.
+- Rejected:
+  - Loose objects, one file per commit. They are deterministic across
+    machines, but cost 165 MB of disk for rust-analyzer (a 4 KiB block
+    each, at both ends).
+  - A commit-graph file in place of the commits. git checks that every
+    commit it names exists ("exists in commit-graph but not in the object
+    database").
+  - Only the commits `describe` reads, found by tracing git's pack
+    accesses. Exact only by accident of git's caches. In a repository
+    without annotated tags, plain `describe` walks the whole history
+    anyway.
+- A tag made, moved or removed makes another stand-in without a new
+  commit: HEAD carries a seal of `packed-refs` and `refs/tags`, read
+  without starting git on every command.

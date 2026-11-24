@@ -40,9 +40,15 @@
 //! # file inside an ignored directory is named by its path).
 //! gitignored = false
 //! include = ["data/schema.sql"]
-//! # Show build scripts a `.git` that answers questions about HEAD (commit,
-//! # branch, dirty or not) without history or file contents. Default: true.
-//! git = true
+//! # What build scripts see as `.git`, never file contents from git:
+//! # "head": HEAD (commit, branch, dirty or not) and the tags on it;
+//! # "history": also every commit before it and the tags on them, so that
+//! # `git describe --tags` and `git rev-list --count` answer as on the
+//! # client; false: no `.git` at all. Default (true): "history" where a
+//! # build script mentions `describe` or `rev-list`, or Cargo.lock names
+//! # a crate that asks git for history (vergen, shadow-rs, git-version,
+//! # built, git-testament), else "head".
+//! git = "history"
 //! ```
 //!
 //! The manifest is read from the snapshot, so editing it takes effect on
@@ -77,8 +83,24 @@ pub struct SyncPolicy {
     /// What is synced although git ignores it, with `gitignored = false`.
     #[serde(default)]
     pub include: Vec<String>,
-    /// Whether the sandbox gets a thin `.git` describing HEAD.
-    pub git: Option<bool>,
+    /// What the sandbox gets as `.git`.
+    pub git: Option<GitSync>,
+}
+
+/// `[sync] git`: `true` (decided by what the build scripts ask), `false`
+/// (no `.git`), `"head"` or `"history"`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum GitSync {
+    Flag(bool),
+    Depth(GitDepth),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitDepth {
+    Head,
+    History,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -220,7 +242,12 @@ mod tests {
         assert_eq!(Policy::load(Some(only_host)).unwrap(), Policy::default());
         // A package outside a workspace; other tools' metadata is not ours.
         let package = "[package]\nname = \"a\"\n[package.metadata.docs.rs]\nall-features = true\n[package.metadata.rargo.sync]\ngit = false\n";
-        assert_eq!(Policy::load(Some(package)).unwrap().sync.git, Some(false));
+        assert_eq!(Policy::load(Some(package)).unwrap().sync.git, Some(GitSync::Flag(false)));
+        let history = "[workspace.metadata.rargo.sync]\ngit = \"history\"\n";
+        assert_eq!(Policy::load(Some(history)).unwrap().sync.git, Some(GitSync::Depth(GitDepth::History)));
+        let head = "[workspace.metadata.rargo.sync]\ngit = \"head\"\n";
+        assert_eq!(Policy::load(Some(head)).unwrap().sync.git, Some(GitSync::Depth(GitDepth::Head)));
+        assert!(Policy::load(Some("[workspace.metadata.rargo.sync]\ngit = \"all\"\n")).is_err());
         // A workspace table comes before a package table of the same file.
         let both = "[workspace.metadata.rargo.sync]\nexclude = [\"a\"]\n[package]\nname = \"p\"\n[package.metadata.rargo.sync]\nexclude = [\"b\"]\n";
         assert_eq!(Policy::load(Some(both)).unwrap().sync.exclude, ["a"]);
