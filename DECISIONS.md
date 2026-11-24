@@ -1627,3 +1627,37 @@ commit it is, which stock cargo in a linked worktree gets wrong. A
 repository that prefers cargo's behaviour can set `[sync] git = false`.
 Rejected: honouring `rerun-if-changed` over what was observed (it would
 make rargo's cache as stale as cargo's in exactly this case).
+
+## D63. The output file system: listings built once, fewer system calls per operation
+
+STATUS named the extra `lstat`s and the second open per create as where
+to look for what stock cargo still lost in a mounted `target/` on Zed
+(198 s against 168 s cold, 55 s against 29 s for the tests).
+
+- **Fewer system calls**, done first: a real file is opened once, for
+  reading and writing, and that descriptor is both the handle and what
+  the kernel reads and writes through (it was `lstat`, open, open); a
+  create looks at what it opened instead of looking the name up again
+  and makes parent directories only when the open says they are
+  missing; rename, link and mkdir of names the table of delivered files
+  has nothing to say about go straight to the real directory. Measured:
+  203 s and 56 s. No difference. Kept, because it is less work per
+  operation, but it was not the cause.
+- **Listings**, the cause: the kernel reads a directory in calls of
+  about a hundred names, and each call put the whole listing together
+  again (read the real directory, merge the delivered names, hash every
+  name for its cookie, sort). With Zed's unpacked debug information
+  `deps` holds tens of thousands of files and every compiler lists it
+  to find its dependencies: five hundred times the work per listing. A
+  listing is now built when its reading starts and the calls that
+  continue it use that one (kept for 30 s by directory). Names created
+  after a reading began are not in it and names removed still are,
+  which POSIX allows; a name that is there throughout is listed once,
+  as before (the stress check: 150 listings against churn, none short).
+  Measured: 175 s and 30 s.
+
+Both measurements were made in windows during which the history
+benchmark (D62) was stopped with SIGSTOP; the builds that were in
+progress in those windows are left out of its statistics
+(`history-tainted.json`).
+

@@ -31,6 +31,8 @@ use std::time::Duration;
 
 const TTL: Duration = Duration::from_secs(3600);
 const ROOT: u64 = 1;
+/// How long a listing whose reading has begun may be continued from.
+const LISTING_KEPT: Duration = Duration::from_secs(30);
 
 /// A delivered file that has not been made real.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +91,8 @@ pub struct OutFs {
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
+    /// Listings being read, by directory node (see `readdir`).
+    listings: Mutex<HashMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
     /// Directories already cleared of dead clients' temporaries.
     swept: Mutex<std::collections::HashSet<Vec<u8>>>,
     uid: u32,
@@ -157,6 +161,7 @@ impl OutFs {
             session: OnceLock::new(),
             table: table.to_path_buf(),
             dirty: AtomicBool::new(false),
+            listings: Mutex::new(HashMap::new()),
             swept: Mutex::new(Default::default()),
             uid,
             gid,
@@ -340,13 +345,14 @@ impl OutFs {
         Ok(())
     }
 
-    /// Registers an open file. `real` is the real file's path when the
-    /// kernel may do the I/O itself (passthrough).
-    fn open_handle(&self, node: u64, file: File, real: Option<&Path>) -> Opened {
+    /// Registers an open file. With `real`, the file is a real one that
+    /// the kernel may read and write itself (passthrough), through this
+    /// very descriptor: no second open.
+    fn open_handle(&self, node: u64, file: File, real: bool) -> Opened {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         let mut backing_id = None;
-        if let (Some(n), Some(path), Some(s)) = (st.nodes.get_mut(&node), real, self.session.get()) {
+        if let (Some(n), true, Some(s)) = (st.nodes.get_mut(&node), real, self.session.get()) {
             if n.cached == 0 && s.caps().passthrough {
                 match &mut n.backing {
                     Some((id, refs)) => {
@@ -354,11 +360,7 @@ impl OutFs {
                         backing_id = Some(*id);
                     }
                     None => {
-                        // Opened for everything a later open may want:
-                        // all opens of the file share this one.
-                        let both = std::fs::OpenOptions::new().read(true).write(true).open(path);
-                        let fd = both.or_else(|_| File::open(path));
-                        if let Some(id) = fd.ok().and_then(|f| s.backing_open(f.as_raw_fd()).ok()) {
+                        if let Ok(id) = s.backing_open(file.as_raw_fd()) {
                             n.backing = Some((id, 1));
                             backing_id = Some(id);
                         }
@@ -377,6 +379,86 @@ impl OutFs {
             Some(id) => Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: id },
             None => Opened { fh, flags: FOPEN_KEEP_CACHE, backing_id: 0 },
         }
+    }
+
+    /// Opens a real file for as much as the caller may later want: all
+    /// opens of a file share the first one's descriptor in the kernel, so
+    /// it is opened for reading and writing where that is allowed.
+    fn open_wide(path: &Path, acc: i32, extra: i32, create: Option<u32>) -> std::io::Result<File> {
+        let mut wide = std::fs::OpenOptions::new();
+        wide.read(true).write(true).custom_flags(extra);
+        let mut asked = std::fs::OpenOptions::new();
+        asked.read(acc != libc::O_WRONLY).write(acc != libc::O_RDONLY || create.is_some()).custom_flags(extra);
+        if let Some(mode) = create {
+            wide.create(true).mode(mode);
+            asked.create(true).mode(mode);
+        }
+        match wide.open(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => asked.open(path),
+            r => r,
+        }
+    }
+
+    /// The names in the directory `rel`, real ones and delivered ones that
+    /// are not also real, in the order of their cookies.
+    fn listing(&self, rel: &[u8]) -> Vec<(u64, Vec<u8>, u32)> {
+        let mut out: Vec<(u64, Vec<u8>, u32)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(self.real(rel)) {
+            for e in rd.flatten() {
+                let t = match e.file_type() {
+                    Ok(t) if t.is_dir() => libc::DT_DIR,
+                    Ok(t) if t.is_symlink() => libc::DT_LNK,
+                    _ => libc::DT_REG,
+                };
+                let name = e.file_name().as_bytes().to_vec();
+                out.push((name_cookie(&name), name, t as u32));
+            }
+        }
+        let real = out.len();
+        {
+            let virt = self.virt.read().unwrap();
+            if !virt.is_empty() {
+                let prefix = if rel.is_empty() { Vec::new() } else { below(rel) };
+                let mut last: Option<&[u8]> = None;
+                for (k, _) in virt.range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)) {
+                    let rest = &k[prefix.len()..];
+                    let (name, t) = match rest.iter().position(|&b| b == b'/') {
+                        Some(i) => (&rest[..i], libc::DT_DIR),
+                        None => (rest, libc::DT_REG),
+                    };
+                    // (The table is sorted: a directory's files are together.)
+                    if last != Some(name) {
+                        out.push((name_cookie(name), name.to_vec(), t as u32));
+                        last = Some(name);
+                    }
+                }
+            }
+        }
+        // Real first among equal names, so that a real name hides a
+        // delivered one.
+        let delivered = out.split_off(real);
+        out.sort();
+        for d in delivered {
+            if let Err(at) = out.binary_search_by(|x| (x.0, &x.1).cmp(&(d.0, &d.1))) {
+                out.insert(at, d);
+            }
+        }
+        out
+    }
+
+    /// Whether the table of delivered names has anything at `rel` or
+    /// below it. Most names a build touches have not: those operations go
+    /// straight to the real directory.
+    fn touches_virtual(&self, rel: &[u8]) -> bool {
+        let virt = self.virt.read().unwrap();
+        if virt.is_empty() {
+            return false;
+        }
+        if virt.contains_key(rel) {
+            return true;
+        }
+        let prefix = below(rel);
+        virt.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
     }
 
     fn inval(&self, parent: u64, name: &[u8]) {
@@ -637,19 +719,27 @@ impl Filesystem for OutFs {
 
     fn mkdir(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32) -> Res<Entry> {
         let rel = join(&self.path(parent)?, name);
-        if self.kind(&rel).is_some() {
+        if self.touches_virtual(&rel) {
             return Err(Errno(libc::EEXIST));
         }
-        self.make_parents(&rel)?;
-        std::fs::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel)).map_err(errno)?;
-        let kind = self.kind(&rel).ok_or(Errno(libc::EIO))?;
-        Ok(self.entry(parent, name, &kind))
+        let make = || std::fs::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
+        match make() {
+            // The parent may exist only by the delivered files below it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.make_parents(&rel)?;
+                make().map_err(errno)?
+            }
+            r => r.map_err(errno)?,
+        }
+        let md = std::fs::symlink_metadata(self.real(&rel)).map_err(errno)?;
+        Ok(self.entry(parent, name, &Kind::Real(md)))
     }
 
     fn unlink(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
         let rel = join(&self.path(parent)?, name);
         let real = std::fs::remove_file(self.real(&rel));
-        let virt = self.virt.write().unwrap().remove(&rel).is_some();
+        let listed = self.virt.read().unwrap().contains_key(&rel);
+        let virt = listed && self.virt.write().unwrap().remove(&rel).is_some();
         if virt {
             self.dirty.store(true, Ordering::SeqCst);
         }
@@ -687,13 +777,27 @@ impl Filesystem for OutFs {
             let st = self.state.lock().unwrap();
             (join(&Self::path_of(&st, parent)?, name), join(&Self::path_of(&st, newparent)?, newname))
         };
-        let src = self.kind(&from).ok_or(Errno(libc::ENOENT))?;
-        let dst = self.kind(&to);
+        // Nothing delivered at either name or below: the real directory's
+        // rename, and nothing else (what compilers do thousands of times).
+        let plain = flags == 0 && !self.touches_virtual(&from) && !self.touches_virtual(&to);
+        if plain {
+            let go = || std::fs::rename(self.real(&from), self.real(&to));
+            match go() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(self.real(&from)).is_ok() => {
+                    self.make_parents(&to)?;
+                    go().map_err(errno)?
+                }
+                r => r.map_err(errno)?,
+            }
+        }
+        let src = if plain { Kind::VDir } else { self.kind(&from).ok_or(Errno(libc::ENOENT))? };
+        let dst = if plain { None } else { self.kind(&to) };
         if flags & NOREPLACE != 0 && dst.is_some() {
             return Err(Errno(libc::EEXIST));
         }
         let (from_below, to_below) = (below(&from), below(&to));
         match &src {
+            _ if plain => {}
             Kind::Real(md) => {
                 if md.is_dir() && self.has_virtual_below(&to) {
                     return Err(Errno(libc::ENOTEMPTY));
@@ -765,6 +869,19 @@ impl Filesystem for OutFs {
             let st = self.state.lock().unwrap();
             (Self::path_of(&st, nodeid)?, join(&Self::path_of(&st, newparent)?, newname))
         };
+        if !self.touches_virtual(&to) && !self.virt.read().unwrap().contains_key(&from) {
+            // Real to real: one link, one look at the result.
+            let go = || std::fs::hard_link(self.real(&from), self.real(&to));
+            match go() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.make_parents(&to)?;
+                    go().map_err(errno)?
+                }
+                r => r.map_err(errno)?,
+            }
+            let md = std::fs::symlink_metadata(self.real(&to)).map_err(errno)?;
+            return Ok(self.entry(newparent, newname, &Kind::Real(md)));
+        }
         if self.kind(&to).is_some() {
             return Err(Errno(libc::EEXIST));
         }
@@ -786,61 +903,66 @@ impl Filesystem for OutFs {
 
     fn open(&self, _ctx: &Ctx, nodeid: u64, flags: u32) -> Res<Opened> {
         let rel = self.path(nodeid)?;
-        let kind = self.kind(&rel).ok_or(Errno(libc::ENOENT))?;
         let acc = flags as i32 & libc::O_ACCMODE;
-        let writing = acc != libc::O_RDONLY || flags as i32 & libc::O_TRUNC != 0;
-        if let Kind::Virtual(v) = &kind {
-            if !writing {
-                // Reading: straight from the client's cache.
-                self.opened_virtual.fetch_add(1, Ordering::Relaxed);
-                let path = if v.size == 0 {
-                    PathBuf::from("/dev/null")
-                } else {
-                    (self.fetch)(&v.hash, v.size).map_err(|e| {
-                        eprintln!("rargo daemon: target/{}: its content could not be fetched: {e}", String::from_utf8_lossy(&rel));
-                        errno(e)
-                    })?
-                };
-                let file = File::open(path).map_err(errno)?;
-                return Ok(self.open_handle(nodeid, file, None));
-            }
-            self.make_real(&rel, v, flags as i32 & libc::O_TRUNC == 0)?;
+        let keep = flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW);
+        // A real file wins over a delivered one of the same name, so the
+        // real directory is simply tried first: one system call for the
+        // usual case.
+        match Self::open_wide(&self.real(&rel), acc, keep, None) {
+            Ok(file) => return Ok(self.open_handle(nodeid, file, true)),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(errno(e)),
+            Err(_) => {}
         }
-        let keep = libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW;
-        let file = std::fs::OpenOptions::new()
-            .read(acc != libc::O_WRONLY)
-            .write(acc != libc::O_RDONLY)
-            .custom_flags(flags as i32 & keep)
-            .open(self.real(&rel))
-            .map_err(errno)?;
-        Ok(self.open_handle(nodeid, file, Some(&self.real(&rel))))
+        let Some(v) = self.virt.read().unwrap().get(&rel).cloned() else { return Err(Errno(libc::ENOENT)) };
+        let writing = acc != libc::O_RDONLY || keep & libc::O_TRUNC != 0;
+        if !writing {
+            // Reading: straight from the client's cache.
+            self.opened_virtual.fetch_add(1, Ordering::Relaxed);
+            let path = if v.size == 0 {
+                PathBuf::from("/dev/null")
+            } else {
+                (self.fetch)(&v.hash, v.size).map_err(|e| {
+                    eprintln!("rargo daemon: target/{}: its content could not be fetched: {e}", String::from_utf8_lossy(&rel));
+                    errno(e)
+                })?
+            };
+            let file = File::open(path).map_err(errno)?;
+            return Ok(self.open_handle(nodeid, file, false));
+        }
+        self.make_real(&rel, &v, keep & libc::O_TRUNC == 0)?;
+        let file = Self::open_wide(&self.real(&rel), acc, keep, None).map_err(errno)?;
+        Ok(self.open_handle(nodeid, file, true))
     }
 
     fn create(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32, flags: u32) -> Res<(Entry, Opened)> {
         let rel = join(&self.path(parent)?, name);
-        let had_virtual = self.virt.read().unwrap().contains_key(&rel);
+        let had_virtual = {
+            let virt = self.virt.read().unwrap();
+            !virt.is_empty() && virt.contains_key(&rel)
+        };
         if had_virtual && flags as i32 & libc::O_EXCL != 0 {
             return Err(Errno(libc::EEXIST));
         }
-        self.make_parents(&rel)?;
         let acc = flags as i32 & libc::O_ACCMODE;
-        let keep = libc::O_TRUNC | libc::O_APPEND | libc::O_EXCL | libc::O_NOFOLLOW;
-        let file = std::fs::OpenOptions::new()
-            .read(acc != libc::O_WRONLY)
-            .write(true)
-            .create(true)
-            .mode(mode & 0o7777)
-            .custom_flags(flags as i32 & keep)
-            .open(self.real(&rel))
-            .map_err(errno)?;
+        let keep = flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_EXCL | libc::O_NOFOLLOW);
+        let open = || Self::open_wide(&self.real(&rel), acc, keep, Some(mode & 0o7777));
+        let file = match open() {
+            // The directory may exist only by the delivered files in it.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.make_parents(&rel)?;
+                open().map_err(errno)?
+            }
+            r => r.map_err(errno)?,
+        };
         if had_virtual && self.virt.write().unwrap().remove(&rel).is_some() {
             // The delivered file of that name is replaced: a new node.
             self.dirty.store(true, Ordering::SeqCst);
             self.detach(parent, name);
         }
-        let kind = self.kind(&rel).ok_or(Errno(libc::EIO))?;
-        let entry = self.entry(parent, name, &kind);
-        Ok((entry, self.open_handle(entry.nodeid, file, Some(&self.real(&rel)))))
+        // What was just opened is what the name is: no second look.
+        let md = file.metadata().map_err(errno)?;
+        let entry = self.entry(parent, name, &Kind::Real(md));
+        Ok((entry, self.open_handle(entry.nodeid, file, true)))
     }
 
     fn read(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
@@ -889,44 +1011,34 @@ impl Filesystem for OutFs {
     }
 
     fn readdir(&self, _ctx: &Ctx, nodeid: u64, _fh: u64, offset: u64, sink: &mut DirSink) -> Res<()> {
-        let rel = self.path(nodeid)?;
-        // Real names, then delivered ones that are not also real.
-        let mut names: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-        if let Ok(rd) = std::fs::read_dir(self.real(&rel)) {
-            for e in rd.flatten() {
-                let t = match e.file_type() {
-                    Ok(t) if t.is_dir() => libc::DT_DIR,
-                    Ok(t) if t.is_symlink() => libc::DT_LNK,
-                    _ => libc::DT_REG,
-                };
-                names.insert(e.file_name().as_bytes().to_vec(), t as u32);
+        // The kernel reads a directory about a hundred names at a time. A
+        // listing is put together once, when its reading starts, and the
+        // calls that continue it use that: putting it together for every
+        // call made a compiler's look through a directory of fifty
+        // thousand files (Zed's `deps`, with unpacked debug information)
+        // five hundred times as expensive as it is, and every compiler
+        // looks through that directory.
+        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| at.elapsed() < LISTING_KEPT).map(|(_, l)| l.clone()) };
+        let listing = match cached {
+            Some(l) => l,
+            None => {
+                let l = Arc::new(self.listing(&self.path(nodeid)?));
+                let mut all = self.listings.lock().unwrap();
+                if all.len() > 256 {
+                    all.retain(|_, (at, _)| at.elapsed() < LISTING_KEPT);
+                }
+                all.insert(nodeid, (std::time::Instant::now(), l.clone()));
+                l
             }
-        }
-        let prefix = if rel.is_empty() { Vec::new() } else { below(&rel) };
-        for (k, _) in self.virt.read().unwrap().range(prefix.clone()..).take_while(|(k, _)| k.starts_with(&prefix)) {
-            let rest = &k[prefix.len()..];
-            let (name, t) = match rest.iter().position(|&b| b == b'/') {
-                Some(i) => (&rest[..i], libc::DT_DIR),
-                None => (rest, libc::DT_REG),
-            };
-            names.entry(name.to_vec()).or_insert(t as u32);
-        }
-        // A listing is read in several calls while other processes add
-        // and remove files (compilers and their temporaries, in parallel).
-        // The place in the listing is therefore not a position, which
-        // every removal before it would shift, but a number that belongs
-        // to the name: names are listed in the order of a hash of
-        // themselves, and a call continues after the hash it was given.
-        // A name that is there throughout is listed exactly once.
-        let mut listed: Vec<(u64, &Vec<u8>, u32)> = names.iter().map(|(name, t)| (name_cookie(name), name, *t)).collect();
-        listed.sort();
-        let st = self.state.lock().unwrap();
-        for (cookie, name, t) in listed {
-            if cookie <= offset {
-                continue;
-            }
-            let ino = st.children.get(&(nodeid, name.clone())).copied().unwrap_or(u64::MAX - 1);
-            if !sink.push(ino, cookie, t, name) {
+        };
+        // The place in a listing is not a position, which every removal
+        // before it would shift, but a number that belongs to the name:
+        // names are listed in the order of a hash of themselves, and a
+        // call continues after the hash it was given. A name that is there
+        // throughout is listed exactly once.
+        let from = listing.partition_point(|(cookie, _, _)| *cookie <= offset);
+        for (cookie, name, t) in &listing[from..] {
+            if !sink.push(u64::MAX - 1, *cookie, *t, name) {
                 break;
             }
         }

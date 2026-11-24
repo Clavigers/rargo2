@@ -123,11 +123,10 @@ Not met, or weak:
   so stock cargo in such a mount will be slower than measured here. The
   directory also disappears with its daemon (see "Results on the
   client").
-- **Stock cargo is slower in a mounted `target/` on Zed**: its cold
-  build takes 198 s there against 168 s in a plain directory, its tests
-  55 s against 29 s (it was 446 s and 187 s before the file system's
-  global lock went; for rust-analyzer, Ruff and Bevy no difference
-  shows). `RARGO_OUTPUT=copy` avoids it.
+- **Stock cargo in a mounted `target/` on Zed** is now within 4% of a
+  plain directory on a cold build (175 s against 168 s) and level on
+  the tests (30 s against 29 s); it was 446 s and 187 s, then 198 s and
+  55 s. See No-drift.
 - **A fresh worktree that runs its binary gets it no sooner than
   before**: the binary has to cross the link either way (3.1 s at 100 ms
   round trip, both modes). What the virtual directory saves is everything
@@ -671,10 +670,10 @@ server's machine over the loopback interface, as above):
 
 | virtual output directory, fresh worktree | rust-analyzer | Ruff | Bevy | Zed |
 |---|---|---|---|---|
-| rargo build / test | ok (40 s) / ok (51 s) | ok (67 s) / ok (33 s) | ok (60 s) / ok (43 s) | ok (185 s) / ok (31 s) |
+| rargo build / test | ok (40 s) / ok (51 s) | ok (67 s) / ok (33 s) | ok (60 s) / ok (43 s) | ok (186 s) / ok (31 s) |
 | tracked files untouched; nothing left outside `target/` | ok | ok | ok (the untracked `Cargo.lock`) | ok |
-| stock cargo cold build through the mount | ok (40 s) | ok (65 s) | ok (59 s) | ok (198 s) |
-| stock cargo test | ok (48 s) | ok (33 s) | ok (43 s) | ok (55 s) |
+| stock cargo cold build through the mount | ok (40 s) | ok (65 s) | ok (59 s) | ok (175 s) |
+| stock cargo test | ok (48 s) | ok (33 s) | ok (43 s) | ok (30 s) |
 | rargo build again afterwards | ok (0 s) | ok (0 s) | ok (0 s) | ok (0 s) |
 
 The in-place table is from `ddf3d18`; the fresh-worktree table is from
@@ -683,16 +682,23 @@ had passed, with 41, 67 and 56 s for stock cargo's cold build). Stock
 cargo's cold build writes everything through the daemon's file system:
 40, 65 and 59 s here against 39, 65 and 59 s into a plain directory in
 the earlier table (one run each): no cost that single runs can show.
-**Zed still pays: 198 s against 168 s for the cold build, and 55 s
-against 29 s for the tests** (Zed's columns are from `fd599de`). Zed's
-profile compiles incrementally with unpacked split debug info, which is
-tens of thousands of small files created, linked and renamed, and every
-operation on a name is a round trip to the daemon. Before `fd599de` it
-was 446 s and 187 s: every operation, system calls included, ran under
-one lock, and a lookup of a name that does not exist was not remembered
-by the kernel. Both are fixed (D61). What is left is the cost of the
-round trip itself and of two or three `lstat`s per operation that could
-be saved; not attempted.
+**Zed: 175 s against 168 s for the cold build, 30 s against 29 s for
+the tests** (Zed's column is from the build after D63, measured while
+the history benchmark was paused). It was 446 s and 187 s, then 198 s
+and 55 s. Zed's profile compiles incrementally with unpacked split
+debug info, which puts tens of thousands of small files into
+`target/debug/deps`, and every compiler looks through that directory.
+Three things were wrong, found in this order: every operation ran
+under one lock, system calls included, and names that do not exist
+were not remembered by the kernel (D61: 446 s to 198 s); and a
+directory listing, which the kernel reads about a hundred names at a
+time, was put together from scratch for every one of those reads, so
+listing fifty thousand names cost five hundred times what it should
+(D63: 198 s to 175 s, tests 55 s to 30 s). Saving system calls per
+operation (one open instead of three, no `lstat` before a rename or a
+link) was tried first and made no measurable difference by itself
+(203 s and 56 s); it is kept. The 7 s that are left on the cold build
+were not looked into.
 What this run does not cover: a stock `cargo clean` not going through
 the shim fails at its last step (it cannot remove a mount point).
 
