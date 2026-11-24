@@ -31,8 +31,7 @@ jobs:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
           curl -fsSL https://rargo.rs/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/rargo" auth --token "$RARGO_TOKEN"
+          rargo auth --token "$RARGO_TOKEN"
       - name: Build (on the server, on the cache every other build of this commit uses)
         run: rargo build --locked --workspace
       - name: Unit tests (on the server)
@@ -59,8 +58,7 @@ jobs:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
           curl -fsSL https://rargo.rs/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/rargo" auth --token "$RARGO_TOKEN"
+          rargo auth --token "$RARGO_TOKEN"
       - run: RARGO_OUTPUT=copy rargo build --locked --release -p rargo -p rargod -p rargo-core
       - name: The planner of the latest release
         env:
