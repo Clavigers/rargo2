@@ -384,6 +384,10 @@ impl Placer {
         self.pending.keys().copied().collect()
     }
 
+    pub fn awaiting(&self, hash: &Digest) -> bool {
+        self.pending.contains_key(hash) || self.parts.contains_key(hash)
+    }
+
     /// Whether everything asked for has arrived.
     pub fn settled(&self) -> bool {
         self.pending.is_empty() && self.parts.is_empty()

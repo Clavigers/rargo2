@@ -51,6 +51,14 @@ Everything that is not a build (`cargo add`, `cargo login`, `cargo fmt`) is hand
 | `rargo --rargo-daemon-status` | what the local daemon is doing |
 | `rargo --rargo-daemon-stop` | stop the local daemon |
 
+## Nextest
+
+`rargo nextest` builds the test binaries and runs nextest on the build server. It returns nextest's output, exit status, and reports such as JUnit XML. The client passes `NEXTEST_*` variables.
+
+Set `nextest = "X.Y.Z"` under `[workspace.metadata.rargo]`, or set `nextest-version` in `.config/nextest.toml`, to pin the version. Without a project version, rargo uses the version installed on the client if available, then the newest release. The server verifies the download's checksum and keeps each version installed separately.
+
+Each test process is cached by its command line and what it reads. A changed fixture reruns the tests that read it. Failures are always rerun, so nextest handles retries and flaky reports.
+
 ## Environment variables
 
 | | |

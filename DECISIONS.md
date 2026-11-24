@@ -2456,3 +2456,199 @@ shadow-rs, git-version, built, git-testament) add `describe --tags` and
   - After an edit, the new daemon used to offer every manifest of the
     worktree and wait for the server to say which it lacked. It now
     offers the edited file and the manifests on its path, unasked.
+
+## D81. `rargo nextest`: nextest on the server, asking a stand-in cargo (issue 30)
+
+D69 chose real nextest running on the server against rargo's build. D69
+named nextest's reuse-build mode (`--binaries-metadata`,
+`--cargo-metadata`) as the way to hand nextest that build. It is not used:
+
+- The binaries file is nextest's own format: build-script out directories,
+  linked paths, the host's library directory and the target layout. rargo
+  would have to write it.
+- The mode refuses cargo's options on the command line (`-p`, `--release`,
+  features). So rargo would have to know which of nextest's options are
+  cargo's, and how nextest renames them (`--cargo-profile`,
+  `--build-jobs`).
+
+**Instead, nextest asks cargo, and rargo answers.** nextest gets what it
+needs from cargo in two requests: `cargo metadata ...` and `cargo test
+--no-run --message-format=json-render-diagnostics ...`. In the sandbox,
+nextest's `CARGO` is a stand-in, a short `sh` script that rargod puts into
+the view together with its answers.
+
+- **A request with no answer yet is a question.** The stand-in writes the
+  request's arguments to a file and exits, so nextest stops. rargod answers
+  it, then runs nextest again:
+  - **the metadata**: from the cargo fork, as planning runs it (host root,
+    offline). A refusal that needs the network gets the usual fetch and is
+    asked again;
+  - **the build**: from rargo's own pipeline, with exactly the arguments
+    nextest gave. Its status and diagnostics go to the client as they
+    happen. Its JSON messages, with paths translated back to the
+    sandbox's, become the answer, together with the exit code.
+- **The run with both answers is the one the user sees.** Its output
+  streams to the client, and its exit code is the command's. nextest
+  decides everything from there: `-E` filters, retries, partitions,
+  profiles, JUnit files, a failed build reported as nextest reports it.
+- **Other cargo calls are passed through.** The stand-in replays an answer
+  only for the arguments it answers. Anything else goes to the real cargo
+  (the fork, or the Nix shell's cargo): a test that runs cargo itself
+  works as under `rargo test`.
+- **Commands that never build** (`--version`, `show-config`, a mistake on
+  the command line) stop without a question, and what nextest printed is
+  the answer.
+
+**Cost.** Each question is one extra nextest start in the sandbox. The two
+runs that stop at a question are cached (they are a function of their
+inputs). The command's compiles are the same actions as `rargo test`'s and
+are hits after it: the e2e check counts rustc runs.
+
+**Where the run's files go.**
+- In the worktree: as a test's writes do.
+- In the target directory (a JUnit report): as artifacts do.
+
+The final run is cached when it passes, as tests are, and `--no-cache`
+runs it again. Caching per test, and the runner, are issue 31.
+
+**nextest on the server.** On first use the server installs the newest
+release from nextest's GitHub releases into `STATE/nextest/VERSION/`:
+- it uses the statically linked (musl) build, which runs in any root,
+  a Nix shell's included;
+- the archive is checked against the release's SHA-256 file;
+- the newest installed version is the one used.
+Choosing the version (the repository's pin, the client's) is issue 32.
+nextest actions stay on the server and are never offered to workers.
+
+**Found on the way: stock cargo after rargo's test executables.**
+- The failure: stock cargo built a test binary, then `rargo test --no-run`
+  (or `rargo nextest`) put rargo's executable at the same path. Stock
+  cargo's fingerprint still said fresh, so its next `cargo test` ran
+  rargo's executable, which names `/w` paths, and failed.
+- The cause: the two layouts agree because the fork plans with the
+  layout of current cargo.
+- The fix: when rargo delivers an executable at its own path, it also
+  removes stock cargo's fingerprint of that unit:
+  - `build/PKG/HASH/fingerprint` in the current layout;
+  - `.fingerprint/PKG-HASH` in the older one.
+  Stock cargo then compiles that unit again.
+
+**Counters.** `--rargo-status` lists actions run by kind (planning,
+rustc, rustdoc, build scripts, tests, doctests, nextest, other).
+
+## D82. The nextest a command runs (issue 32)
+
+**Which version.** The first of these that applies:
+1. `nextest = "X.Y.Z"` under `[workspace.metadata.rargo]` (or
+   `[package.metadata.rargo]`), rargo's own key;
+2. nextest's own `nextest-version` in the workspace's
+   `.config/nextest.toml`:
+   - a plain string is the version;
+   - in the table form, the recommended version where it names one, else
+     the required one;
+3. the client's own nextest:
+   - the client runs `cargo-nextest nextest --version` when one is on its
+     PATH and sends the version as `RARGO_NEXTEST_VERSION` (a user may
+     set that variable too);
+4. the newest release.
+
+**Why rargo's key comes first.** It is the one that exists only for
+rargo.
+
+**Why `nextest-version` is taken as exact.** nextest reads it as a
+minimum. Installing the named version itself meets the minimum, and it
+gives the same nextest on every machine and in every run. That is what
+pinning in a repository is for.
+
+**How it is installed.** Every version is installed on first use, without
+a restart, into `STATE/nextest/VERSION/cargo-nextest`:
+- the static musl build from nextest's GitHub release, checked against the
+  release's `.sha256`;
+- the client sees a status line, `Installing nextest X on the server`;
+- installs happen one at a time, and versions stay side by side.
+
+**The newest release** is asked of GitHub (`releases/latest` redirects to
+its tag) at most once a day. The answer is kept in
+`STATE/nextest/newest-release`. When GitHub cannot be asked, the newest
+installed version is used.
+
+**When the version cannot be had**, the command fails, naming:
+- the version;
+- what asked for it;
+- the URL that failed.
+
+A version that is not of the form X.Y.Z is refused before anything is
+tried.
+
+## D83. Every test nextest starts is a cached action (issue 31)
+
+D69 described a runner that hands each test process to rargod and waits
+for the result. From inside the sandbox nothing can reach rargod, and an
+action cannot wait on another. So the runner works the way the stand-in
+cargo of D81 does: it answers from what rargod recorded, and anything it
+cannot answer is a question for the next round.
+
+**The runner.**
+- nextest starts every test process through the target's runner
+  (`CARGO_TARGET_<TRIPLE>_RUNNER`). That covers listing a binary's tests
+  (`--list --format terse`, with and without `--ignored`) and running one
+  test (`--exact NAME --nocapture`).
+- In rargo's sandbox the runner is a short `sh` script. It names a process
+  by its working directory, `NEXTEST_ATTEMPT` and command line, and looks
+  for a recorded run of that process: the POSIX `cksum` of the name gives
+  the directory, and the name itself is compared.
+- **A recorded run is replayed**: its output, and its exit code or signal.
+- **Without one, the process becomes a question.** The runner writes down
+  the name, the arguments and the environment (`env -0`), then exits 0
+  with no output. The round goes on: a listing then shows no tests, and a
+  test passes.
+
+**Rounds.**
+- rargod runs nextest. Every question the run left is run as an action of
+  its own:
+  - `Test` kind, sandboxed and traced like a `rargo test` binary;
+  - the view of the build, nextest's environment for the process, the
+    package's network policy;
+  - cached under the command line and what the process read;
+  - run concurrently under rargod's scheduler, and on workers when there
+    are workers.
+  Then nextest runs again, until a round asks nothing. That round's output
+  is what the user sees, followed by one line of rargo's: `Replayed N of
+  M test runs from rargo's cache`.
+- A first run takes three rounds: lists, tests, replay. Each retry a
+  failing test earns adds a round, because each attempt is its own
+  question (the attempt is in the name). Sixteen rounds at most.
+
+**What this gives.**
+- **Caching per test and per listing**, with nextest deciding everything
+  else:
+  - filters, partitions and `--no-fail-fast` decide which processes are
+    started;
+  - retries and flaky reports come from nextest's own retry logic;
+  - JUnit files and profiles stay nextest's own.
+- **Failures are never cached**, as for `rargo test`. So a retry runs for
+  real, and a test that fails and then passes is reported FLAKY exactly
+  as stock nextest reports it (the e2e check compares the lines).
+- `--no-cache` runs every test again.
+
+**Variables nextest gives a test that change from run to run** are not
+given to the action, because they would change its key every time:
+`NEXTEST_RUN_ID`, `NEXTEST_ATTEMPT_ID`, `NEXTEST_TEST_GLOBAL_SLOT`,
+`NEXTEST_TEST_GROUP_SLOT`.
+- `NEXTEST_ATTEMPT` is kept: a passing second attempt is a fact about
+  attempt 2.
+- `CARGO` is the real cargo, as under `rargo test`.
+- `NEXTEST_TEST_THREADS` defaults to the server's job tokens. It only
+  paces the replays, because the tests themselves are scheduled by
+  rargod.
+
+**What it costs and what it does not do.**
+- **Each replayed test is a shell, a `cksum` and two `cat`s in the
+  sandbox**, a few milliseconds.
+- **Output is not live.** It is shown once the last round ends, and each
+  test action's own output is not streamed.
+- **nextest's timeouts do not reach the test actions.** A slow-timeout
+  `terminate-after` cannot stop a hanging test, because nextest only ever
+  sees a replay.
+- **A runner the repository configures for the host target is replaced.**
+  The variable outranks cargo configuration.
