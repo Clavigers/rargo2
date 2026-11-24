@@ -21,7 +21,10 @@ for _ in $(seq 1 30); do
     sleep 5
 done
 if gh pr checks "$url" --watch --fail-fast --interval 20 >/dev/null; then
-    gh pr merge "$url" --squash --delete-branch
+    # (The branch is deleted here and not by gh, which would try to check
+    # out main in this worktree to do it.)
+    gh pr merge "$url" --squash
+    git push -q origin ":$branch" 2>/dev/null || true
     # In the main checkout: back on main. In a second worktree (main is
     # checked out elsewhere): at what was merged.
     git fetch -q origin
