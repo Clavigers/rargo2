@@ -118,4 +118,5 @@ if [ -n "$invite" ]; then
     echo "    rargo build"
     echo
 fi
-echo "More people: $lib/current/rargod token invite --state $state --user NAME   (token list, token revoke: likewise; no restart)"
+echo "More people: \`rargo auth invite --user NAME\` from your machine once you are signed in (tokens, revoke: likewise),"
+echo "or $lib/current/rargod token invite --state $state --user NAME here. No restart either way."
