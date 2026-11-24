@@ -130,8 +130,8 @@ pub enum Auth {
     /// One key shared by both ends (server and workers). Every datagram
     /// carries a tag made with it.
     Shared(Arc<[u8; 32]>),
-    /// The accepting end of client links: each connection names its user in
-    /// the key agreement and proves that user's key. Datagrams after the
+    /// The accepting end of client links: each connection names its token
+    /// in the key agreement and proves that token's key. Datagrams after the
     /// agreement carry a tag made with a key of the connection.
     Users(UserKeys),
     /// The connecting end of a client link.
@@ -381,8 +381,8 @@ impl Conn {
         self.send_raw(&m2).await
     }
 
-    /// The connecting side of a client link: names the user and proves
-    /// the user's key.
+    /// The connecting side of a client link: names the token and proves
+    /// its key.
     async fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> io::Result<()> {
         let (hs, m1) = rargo_proto::secure::link_start(&user_handshake_key(psk))?;
         let mut first = vec![name.len().min(255) as u8];
@@ -416,9 +416,9 @@ impl Conn {
         let accepted = keys(name).and_then(|psk| rargo_proto::secure::link_accept(&user_handshake_key(&psk), &first[1 + n..]).ok());
         let Some((m2, cipher)) = accepted else {
             let mut refusal = vec![1u8];
-            refusal.extend_from_slice(b"the server does not know this user or key");
+            refusal.extend_from_slice(rargo_proto::REFUSED.as_bytes());
             let _ = self.send_raw(&refusal).await;
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("refused `{name}`: unknown user or wrong key")));
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("refused token `{name}`: unknown, revoked, expired or a wrong secret")));
         };
         let _ = self.user.set(name.to_string());
         let _ = self.tag.set(cipher.binding());

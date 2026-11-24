@@ -29,6 +29,18 @@ impl Drop for Fx {
     }
 }
 
+/// The sandbox helper: where cargo says it built it, or, for a test program
+/// that a build server compiled (the path it names is the server's), the
+/// one in the output directory this program lies in.
+fn sandbox_helper() -> std::path::PathBuf {
+    let named = Path::new(env!("CARGO_BIN_EXE_rargo-sandbox"));
+    if named.exists() {
+        return named.to_path_buf();
+    }
+    let me = std::env::current_exe().unwrap();
+    me.ancestors().map(|d| d.join("rargo-sandbox")).find(|p| p.is_file()).unwrap_or_else(|| named.to_path_buf())
+}
+
 fn fixture() -> Fx {
     // The store must be on a filesystem FUSE passthrough can stack on, and
     // not in /tmp of the sandbox; a directory under the work area does.
@@ -47,7 +59,7 @@ fn fixture() -> Fx {
     );
     fs.attach(session.clone());
     session.spawn_workers(fs.clone(), 4).unwrap();
-    let zygote = Zygote::start(Path::new(env!("CARGO_BIN_EXE_rargo-sandbox"))).unwrap();
+    let zygote = Zygote::start(&sandbox_helper()).unwrap();
     let sched = Scheduler::new(8, u64::MAX).unwrap();
     let engine = Arc::new(Engine::new(store, content, fs, mnt, zygote, sched));
     let work = tmp.path().join("work");

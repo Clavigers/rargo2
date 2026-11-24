@@ -9,14 +9,10 @@ artifacts you asked for.
 ```sh
 cargo install rargo
 
-mkdir -p ~/.config/rargo
-cat >~/.config/rargo/config.toml <<EOF
-server = "build.example:7459"
-user = "ann"
-key = "the secret from the server's key file"
-EOF
-
-cd my-project && rargo build
+cd my-project
+rargo @build.example        # names the server in Cargo.toml
+rargo auth                  # a page in your browser
+rargo build
 ```
 
 This crate is the client. It needs a rargo server of the same version to

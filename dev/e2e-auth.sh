@@ -2,7 +2,8 @@
 # End-to-end checks of the path a new user takes (D67):
 #   rargo @host   ->   rargo auth   ->   rargo build
 # against a server that admits tokens only, with nothing edited by hand, and
-# of what an administrator does with tokens while the server runs.
+# of what an administrator does with tokens while the server runs, from a
+# client (`rargo auth invite|create|tokens|revoke|allow|disallow`).
 #
 #   dev/e2e-auth.sh
 #
@@ -20,8 +21,8 @@ B=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
 planner=${PLANNER:-$work/cargo/target/release/cargo}
 [ -x "$planner" ] || { echo "no planner at $planner (set PLANNER)" >&2; exit 2; }
 mkdir -p "$work"
-unset RARGO_SERVER RARGO_USER RARGO_KEY RARGO_TOKEN RARGO_KEY_FILE RARGO_STATE RARGO_HIDE
-T=$work/e2e-auth
+unset RARGO_SERVER RARGO_TOKEN RARGO_STATE RARGO_HIDE
+T=${RARGO_E2E_AUTH:-$work/e2e-auth}
 port=${E2E_AUTH_PORT:-7466}
 host=127.0.0.1:$port
 pass=0; fail=0
@@ -29,7 +30,7 @@ ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/        /'; }
 check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else bad "$name" "$@"; fi; }
 
-umount -l "$T/proj/target" "$T/proj2/target" "$T/proj4/target" 2>/dev/null
+umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
 pkill -KILL -f "fake-github.py $((${E2E_AUTH_PORT:-7466} + 1)) " 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
@@ -39,10 +40,9 @@ D="$B/rargod"
 
 echo "== an administrator, before the server runs"
 out=$("$B/rargod" --state "$T/state" --planner "$planner" --listen 0.0.0.0:$port --jobs 2 2>&1)
-grep -q "nobody could connect" <<<"$out"; check $? "a public server without keys or tokens refuses to start" "$out"
-invite=$("$D" token invite --state "$T/state" --user ann --uses 2 2>/dev/null)
-[[ "$invite" =~ ^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$ ]]; check $? "rargod token invite prints a code" "$invite"
-! grep -q "${invite//-/}" "$T/state/tokens.json"; check $? "the code is not in the token file"
+grep -q "nobody could connect" <<<"$out"; check $? "a public server without tokens refuses to start" "$out"
+admin=$("$D" token create --state "$T/state" --user admin --admin 2>/dev/null)
+[[ "$admin" == t-*.* ]]; check $? "rargod token create makes the administrator's own token, on the server's machine" "$admin"
 [ "$(stat -c %a "$T/state/tokens.json")" = 600 ]; check $? "the token file is readable by its owner only"
 
 # What stands in for GitHub in the sign-in checks further down.
@@ -54,7 +54,16 @@ export RARGO_GITHUB_URL=http://127.0.0.1:$ghport RARGO_GITHUB_API=http://127.0.0
 "$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
 srv=$!
 for _ in $(seq 1 100); do grep -q "serving clients" "$T/srv.log" && break; sleep 0.1; done
-grep -q "keys or tokens required" "$T/srv.log"; check $? "the server runs with tokens only" "$(cat "$T/srv.log")"
+grep -q "tokens required" "$T/srv.log"; check $? "the server runs with tokens" "$(cat "$T/srv.log")"
+
+echo "== the administrator, from a client"
+# Their own machine: a home, a cache and a token of their own, and no project.
+adm() { (cd "$T/admin" && HOME=$T/admin XDG_CONFIG_HOME=$T/admin/.config RARGO_CACHE_DIR=$T/cache-admin RARGO_SERVER=$host RARGO_TOKEN=$admin "$R" auth "$@"); }
+mkdir -p "$T/admin"
+invite=$(adm invite --user ann --uses 2 2>"$T/invite.err")
+[[ "$invite" =~ ^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$ ]]; check $? "rargo auth invite prints a code" "$invite" "$(cat "$T/invite.err")"
+grep -q "An invitation for ann, good for 2 use(s)" "$T/invite.err"; check $? "and says for whom, and how often" "$(cat "$T/invite.err")"
+! grep -q "${invite//-/}" "$T/state/tokens.json"; check $? "the code is not in the token file"
 
 echo "== what the server says over HTTP on its port"
 out=$(curl -fsS "http://$host/.well-known/rargo.json")
@@ -89,7 +98,9 @@ out=$(curl -s -w '\n%{http_code}' --data-urlencode "code=$code" --data-urlencode
 wait $auth; rc=$?
 [ $rc = 0 ] && grep -q "Authenticated to $host as ann" "$T/auth.out"; check $? "rargo auth ends authenticated" "$(cat "$T/auth.out")"
 cred=$XDG_CONFIG_HOME/rargo/credentials.toml
-[ "$(stat -c %a "$cred")" = 600 ] && grep -q "^\[\"$host\"\]" "$cred"; check $? "the token is stored for that host, readable by its owner only" "$(ls -la "$cred"; sed 's/^key = .*/key = (hidden)/' "$cred")"
+[ "$(stat -c %a "$cred")" = 600 ] && grep -q "^\[\"$host\"\]" "$cred"; check $? "the token is stored for that host, readable by its owner only" "$(ls -la "$cred"; sed 's/^secret = .*/secret = (hidden)/' "$cred")"
+grep -q '^id = "t-' "$cred" && grep -q '^secret = "' "$cred" && grep -q '^name = "ann"' "$cred" && ! grep -q '^\(user\|key\) = ' "$cred"
+check $? "it is stored as the token's id, secret and holder" "$(sed 's/^secret = .*/secret = (hidden)/' "$cred")"
 out=$("$R" auth status 2>&1); grep -q "authenticated as ann" <<<"$out"; check $? "rargo auth status names the user" "$out"
 out=$("$R" build 2>&1); check $? "rargo build works" "$out"
 out=$(./target/debug/hello 2>&1); [ "$out" = "built by the path" ]; check $? "and its binary runs" "$out"
@@ -108,30 +119,42 @@ out=$("$R" run -q 2>&1); [ "$out" = "second" ]; check $? "rargo run works there"
     "$("$R" --rargo-daemon-status 2>&1 | tail -n 6)" "$(tail -n 15 "$RARGO_CACHE_DIR/daemon.log" 2>&1)"
 cargo metadata --format-version 1 --no-deps >/dev/null 2>"$T/cargo.err"; check $? "stock cargo reads the manifest as before" "$(cat "$T/cargo.err")"
 
-echo "== an administrator, while the server runs"
-out=$("$D" token list --state "$T/state" 2>&1); id=$(awk '$2=="ann"{print $1}' <<<"$out" | head -n 1)
-[[ "$id" == t-* ]]; check $? "rargod token list shows ann's token" "$out"
-grep -q "1 use(s) left" <<<"$out"; check $? "and the invitation's remaining use" "$out"
-tok=$("$D" token create --state "$T/state" --user bob --days 30 2>/dev/null)
+echo "== the administrator, from a client, while ann builds"
+out=$(adm tokens 2>&1); id=$(awk '$2=="ann"{print $1}' <<<"$out" | head -n 1)
+[[ "$id" == t-* ]]; check $? "rargo auth tokens shows ann's token" "$out"
+grep -q "for ann: 1 use(s) left" <<<"$out"; check $? "and the invitation's remaining use" "$out"
+! grep -q -e "${admin#*.}" -e "$invite" <<<"$out"; check $? "and no secret: neither a token's nor an invitation's" "$out"
+tok=$(adm create --user bob --days 30 2>/dev/null)
+[[ "$tok" == t-*.* ]]; check $? "rargo auth create makes a token for bob" "$tok"
 cd "$T/proj" || exit 2
-out=$(RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" build 2>&1); check $? "a token made on the command line works at once (RARGO_TOKEN)" "$out"
+out=$(RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" build 2>&1); check $? "it works at once (RARGO_TOKEN)" "$out"
 RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" --rargo-daemon-stop >/dev/null 2>&1
-out=$("$D" token revoke --state "$T/state" "$id" 2>&1); check $? "rargod token revoke" "$out"
+out=$("$R" auth invite --user mallory 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "user \`ann\` may not administer this server" <<<"$out"; check $? "ann, who is not an administrator, may not make an invitation" "$out"
+out=$("$R" auth allow mallory 2>&1); [ $? != 0 ] && grep -q "may not administer" <<<"$out"; check $? "nor put an account on the allow list" "$out"
+out=$("$R" auth tokens 2>&1); [ $? = 0 ] && grep -q "^$id " <<<"$out" && ! grep -q -e " bob " -e " admin " -e "invitations not used up" -e "may sign in" <<<"$out"; check $? "she lists her own tokens, and nobody else's" "$out"
+out=$("$R" auth revoke bob 2>&1); [ $? != 0 ] && grep -q "only your own" <<<"$out"; check $? "and may not revoke bob's" "$out"
+out=$(RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" build 2>&1); check $? "which still works" "$out"
+RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" --rargo-daemon-stop >/dev/null 2>&1
+out=$(adm revoke "$id" 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargo auth revoke, by the administrator, ends ann's token" "$out"
 sleep 4
 echo "// changed" >>src/main.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc != 0 ]; check $? "a build with the revoked token fails, the session it had open included" "$out"
-grep -q -i "does not know this user or key\|rargo auth" <<<"$out"; check $? "and says why" "$out"
+grep -q "does not know this token, or it was revoked or has expired" <<<"$out" && grep -q "run \`rargo auth\`" <<<"$out"; check $? "and says why, and what to do" "$out"
 grep -q "no longer valid" "$T/srv.log"; check $? "the server closed the open session" "$(tail -n 5 "$T/srv.log")"
 out=$("$R" auth remove 2>&1); check $? "rargo auth remove forgets the token" "$out"
 ! grep -q "^\[\"$host\"\]" "$cred"; check $? "it is gone from the credentials file"
 
 echo "== rargo auth remove ends the token on the server too"
 export HOME=$T/home3 XDG_CONFIG_HOME=$T/home3/.config RARGO_CACHE_DIR=$T/cache3
+cred=$XDG_CONFIG_HOME/rargo/credentials.toml
 mkdir -p "$HOME"
 cd "$T/proj" || exit 2
-tok3=$("$D" token create --state "$T/state" --user dave 2>/dev/null)
+tok3=$(adm create --user dave 2>/dev/null)
 out=$("$R" auth --token "$tok3" 2>&1); check $? "rargo auth --token stores a token an administrator made" "$out"
+grep -q "held by dave" <<<"$out"; check $? "and says whose it is" "$out"
+out=$("$R" auth status 2>&1); grep -q "authenticated as dave (token ${tok3%%.*})" <<<"$out"; check $? "rargo auth status names its holder, as the server said" "$out"
 echo "// dave" >>src/main.rs
 out=$("$R" build 2>&1); check $? "and builds with it" "$out"
 out=$("$R" auth remove 2>&1); rc=$?
@@ -139,46 +162,23 @@ out=$("$R" auth remove 2>&1); rc=$?
 sleep 3
 echo "// dave again" >>src/main.rs
 out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
-[ $rc != 0 ] && grep -q "does not know this user or key" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
+[ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
+out=$(RARGO_TRANSPORT=tcp RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3c "$R" build 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "over TCP too, in the same words" "$out"
+out=$("$R" auth --token "$tok3" 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "does not know this token" <<<"$out" && ! grep -q "^\[\"$host\"\]" "$cred"; check $? "rargo auth --token refuses a revoked token and keeps nothing" "$out" "$(sed 's/^secret = .*/secret = (hidden)/' "$cred" 2>&1)"
+out=$("$R" auth --token "${tok3%%.*}.wrong-secret-wrong-secret" 2>&1); [ $? != 0 ] && grep -q "does not know this token" <<<"$out"; check $? "and one with the wrong secret" "$out"
+out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"$tok\"}" "http://$host/auth/whoami"); grep -q '"user":"bob"' <<<"$out"; check $? "/auth/whoami names the holder of a token that works" "$out"
+out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok%%.*}\"}" "http://$host/auth/whoami"); grep -q '"user":null' <<<"$out"; check $? "and nobody for a token's id alone" "$out"
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok3%%.*}.wrong-secret-wrong-secret\"}" "http://$host/auth/revoke"); grep -q '"revoked":false' <<<"$out"; check $? "a token cannot be revoked by its id alone" "$out"
 out=$("$R" auth remove 2>&1); [ $? != 0 ]; check $? "a second rargo auth remove has nothing to remove" "$out"
-for c in "$T/cache3" "$T/cache3b"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
-
-echo "== the older configuration files: a notice, and rargo --rargo-migrate"
-export HOME=$T/home4 XDG_CONFIG_HOME=$T/home4/.config RARGO_CACHE_DIR=$T/cache4
-mkdir -p "$XDG_CONFIG_HOME/rargo" "$T/proj4/src" "$T/proj4/tests"
-tok4=$("$D" token create --state "$T/state" --user legacy 2>/dev/null)
-printf 'server = "%s"\nuser = "%s"\nkey = "%s"\n' "$host" "${tok4%%.*}" "${tok4#*.}" >"$XDG_CONFIG_HOME/rargo/config.toml"
-cd "$T/proj4" || exit 2
-git init -q .
-printf '# an old project\n[package]\nname = "old"\nversion = "0.1.0"\nedition = "2021"\n' >Cargo.toml
-printf 'pub fn one() -> u32 { 1 }\n' >src/lib.rs
-printf '#[test]\nfn probe() {\n    println!("probe={:?}", std::env::var("LEGACY_PROBE").ok());\n}\n' >tests/probe.rs
-printf '# what tests may see\n[env]\npass = ["LEGACY_PROBE"]\n' >.rargo.toml
-git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
-out=$(LEGACY_PROBE=seen "$R" test --test probe -- --nocapture 2>&1); rc=$?
-[ $rc = 0 ] && grep -q 'probe=Some("seen")' <<<"$out"; check $? "a project with the old files still builds and its policy file still counts" "$out"
-[ "$(grep -c "config.toml, which is read until rargo" <<<"$out")" = 1 ] && grep -q "the server and the key come from" <<<"$out"; check $? "the build says once that server and key come from the old file, and what replaces it" "$out"
-[ "$(grep -c "\.rargo\.toml is still read, until rargo" <<<"$out")" = 1 ]; check $? "and once that .rargo.toml is still read" "$out"
-out=$(LEGACY_PROBE=seen RARGO_QUIET_DEPRECATIONS=1 "$R" test --test probe -- --nocapture 2>&1)
-! grep -q "is read until rargo\|is still read" <<<"$out"; check $? "RARGO_QUIET_DEPRECATIONS=1 silences both" "$out"
-out=$("$R" --rargo-migrate 2>&1); rc=$?
-[ $rc = 0 ] && grep -q "host = \"$host\"" <<<"$out" && grep -q "the key of" <<<"$out" && grep -q "removed .*\.rargo\.toml" <<<"$out"; check $? "rargo --rargo-migrate says what it moved" "$out"
-grep -q '^# an old project' Cargo.toml && grep -q '^\[package.metadata.rargo\]' Cargo.toml && grep -q "^host = \"$host\"" Cargo.toml && grep -q '^\[package.metadata.rargo.env\]' Cargo.toml && grep -q '^# what tests may see' Cargo.toml; check $? "the manifest has the host and the policy table, comments kept" "$(cat Cargo.toml)"
-[ ! -e .rargo.toml ]; check $? ".rargo.toml is gone"
-[ "$(stat -c %a "$XDG_CONFIG_HOME/rargo/credentials.toml")" = 600 ] && grep -q "^\[\"$host\"\]" "$XDG_CONFIG_HOME/rargo/credentials.toml"; check $? "the old key is a credential for that server"
-rm "$XDG_CONFIG_HOME/rargo/config.toml"
-out=$(LEGACY_PROBE=again "$R" test --test probe -- --nocapture 2>&1); rc=$?
-[ $rc = 0 ] && grep -q 'probe=Some("again")' <<<"$out"; check $? "with neither old file left, the project builds and its policy counts" "$out"
-! grep -q "is read until rargo\|is still read" <<<"$out"; check $? "and nothing is said about old files any more" "$out"
-out=$("$R" --rargo-migrate 2>&1); grep -q "nothing to move" <<<"$out"; check $? "a second rargo --rargo-migrate has nothing to move" "$out"
-RARGO_CACHE_DIR=$T/cache4 "$R" --rargo-daemon-stop >/dev/null 2>&1
+for c in "$T/cache3" "$T/cache3b" "$T/cache3c"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
 
 echo "== signing in with GitHub (a stand-in for it), with an allow list"
 printf 'the-app-secret\n' >"$T/app-secret"
 out=$("$D" token github --state "$T/state" --client-id the-app-id --client-secret-file "$T/app-secret" --url "http://$host" 2>&1); check $? "rargod token github sets the application up, without a restart" "$out"
 [ "$(stat -c %a "$T/state/github.json")" = 600 ]; check $? "its secret is readable by the owner only"
-out=$("$D" token allow --state "$T/state" Carol 2>&1); check $? "rargod token allow puts an account on the allow list" "$out"
+out=$(adm allow Carol 2>&1); check $? "rargo auth allow puts an account on the allow list" "$out"
 out=$(curl -fsS "http://$host/.well-known/rargo.json"); grep -q '"github":true' <<<"$out"; check $? "the server says that it signs in with GitHub" "$out"
 export HOME=$T/home2 XDG_CONFIG_HOME=$T/home2/.config RARGO_CACHE_DIR=$T/cache2
 mkdir -p "$HOME"
@@ -202,13 +202,13 @@ wait $auth; rc=$?
 [ $rc = 0 ] && grep -q "Authenticated to $host as Carol" "$T/auth2.out"; check $? "rargo auth ends authenticated as that account" "$(cat "$T/auth2.out")"
 echo "// carol" >>src/main.rs
 out=$("$R" build 2>&1); check $? "rargo build works with the token" "$out"
-out=$("$D" token list --state "$T/state" 2>&1); grep -q "Carol.*github" <<<"$out" && grep -q "may sign in: Carol" <<<"$out"; check $? "rargod token list shows the token and the allow list" "$out"
-out=$("$D" token disallow --state "$T/state" carol 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargod token disallow revokes what the account signed in for" "$out"
+out=$(adm tokens 2>&1); grep -q "Carol.*github" <<<"$out" && grep -q "may sign in: Carol" <<<"$out"; check $? "rargo auth tokens shows the token and the allow list" "$out"
+out=$(adm disallow carol 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargo auth disallow revokes what the account signed in for" "$out"
 sleep 4
 echo "// again" >>src/main.rs
 out=$("$R" build 2>&1); [ $? != 0 ]; check $? "and its builds stop" "$out"
 
-for c in "$T/cache" "$T/cache-bob" "$T/cache2"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+for c in "$T/cache" "$T/cache-bob" "$T/cache2" "$T/cache-admin"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
 kill $gh 2>/dev/null
 cd /
 kill $srv 2>/dev/null; wait $srv 2>/dev/null

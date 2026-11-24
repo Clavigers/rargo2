@@ -73,6 +73,8 @@ struct Snap {
     scan: scan::Scan,
     policy: Policy,
     head: Option<git::Head>,
+    /// What the scan left out because git ignores it (`gitignored = false`).
+    left_out: Option<scan::Ignored>,
 }
 
 struct WtState {
@@ -307,7 +309,7 @@ impl Daemon {
         if let Some(last) = &st.last {
             let same_head = match (&last.head, &head) {
                 (None, None) => true,
-                (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text,
+                (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text && a.tags == b.tags,
                 _ => false,
             };
             if same_head && wt.vouched.load(Ordering::SeqCst) && !wt.dirty.load(Ordering::SeqCst) {
@@ -327,22 +329,46 @@ impl Daemon {
             if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
-            let thin_git = match &head {
-                Some(h) if policy.git => git::thin(&root, h, &cache),
-                _ => None,
-            };
             let empty = scan::Index::default();
             let old = match (&previous, &loaded) {
                 (Some(p), _) => &p.scan.index,
                 (None, Some(l)) => l,
                 (None, None) => &empty,
             };
-            let scan = scan::scan(&root, old, &policy.exclude, thin_git.as_deref())
+            let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
+            let mut scan = scan::scan(&root, old, &policy.exclude, left_out.as_ref())
                 .map_err(|e| std::io::Error::new(e.kind(), format!("scanning {}: {e}", root.display())))?;
             if scan.index_changed {
                 let _ = scan.index.save(&wt_cache.join("index"));
             }
-            Ok(Snap { scan, policy, head })
+            if let Some(h) = &head {
+                let history = match policy.git {
+                    git::Mode::Off => None,
+                    git::Mode::Head => Some(false),
+                    git::Mode::History => Some(true),
+                    git::Mode::Detect => Some(git::asks_for_history(&root, scan.index.files.keys().map(|k| k.as_slice()))),
+                };
+                // History that cannot be had (git failed) leaves HEAD.
+                let objects = if history == Some(true) { git::history(&root, h, &cache) } else { None };
+                let thin = history.and_then(|_| git::thin(&root, h, &cache, objects.is_some()));
+                if let Some(thin) = thin {
+                    let stored = match &objects {
+                        Some(dir) => {
+                            // One index for all of a repository's HEADs:
+                            // they link the same pieces under the same names.
+                            let at = dir.parent().and_then(Path::parent).unwrap_or(dir).join("index");
+                            let s = scan::scan_store(dir, &scan::Index::load(&at))?;
+                            if s.index_changed {
+                                let _ = s.index.save(&at);
+                            }
+                            Some(s)
+                        }
+                        None => None,
+                    };
+                    scan::graft_git(&mut scan, &root, &thin, stored)?;
+                }
+            }
+            Ok(Snap { scan, policy, head, left_out })
         })
         .await
         .map_err(std::io::Error::other)??;
@@ -551,10 +577,11 @@ impl Daemon {
         }
         if let Some(m) = &*g {
             use std::os::unix::fs::MetadataExt;
-            if std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
+            if m.session.shown() && std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
                 return Some((m.fs.clone(), m.dir.clone()));
             }
-            // No longer what is seen at the directory: start over.
+            // No longer what is seen at the directory (another daemon, for
+            // another server, mounted its own there): start over.
             if let Some(m) = g.take() {
                 m.fs.save();
                 m.session.unmount();
@@ -797,7 +824,7 @@ impl Daemon {
                 } else {
                     // A server that does not know us: no token, or one that
                     // was revoked or has expired.
-                    let hint = if e.to_string().contains("does not know this user or key") {
+                    let hint = if e.to_string().contains(rargo_proto::REFUSED) {
                         "       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n"
                     } else {
                         ""
@@ -1027,6 +1054,10 @@ impl Daemon {
         let mut fetching: Option<u64> = None;
         let mut last: Option<LocalReply> = None;
         let mut token: Option<u64> = None;
+        // What the server said on stderr, kept while the worktree leaves out
+        // what git ignores: a failure that names such a path is explained.
+        let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
+        let mut heard: Vec<u8> = Vec::new();
         loop {
             if let (Some(_), None) = (&last, fetching) {
                 break;
@@ -1067,6 +1098,9 @@ impl Daemon {
                 }
                 ServerMsg::Stderr(b) => {
                     said.store(true, Ordering::SeqCst);
+                    if left_out.is_some() && heard.len() < HEARD_MAX {
+                        heard.extend_from_slice(&b[..b.len().min(HEARD_MAX - heard.len())]);
+                    }
                     let _ = out.send(LocalReply::Stderr(b));
                 }
                 ServerMsg::WantTrees(want) => {
@@ -1152,7 +1186,14 @@ impl Daemon {
                     };
                     mux.post(stream, &ClientMsg::ReportId(id));
                 }
-                ServerMsg::Exit(code) => last = Some(LocalReply::Exit(code)),
+                ServerMsg::Exit(code) => {
+                    if let (true, Some((ignored, wt))) = (code != 0, left_out) {
+                        if let Some(note) = left_out_note(ignored, &wt.root, &heard) {
+                            let _ = out.send(LocalReply::Stderr(note.into_bytes()));
+                        }
+                    }
+                    last = Some(LocalReply::Exit(code))
+                }
                 ServerMsg::Exec(e) => last = Some(LocalReply::Exec(e)),
                 ServerMsg::Packed(_)
                 | ServerMsg::Missing { .. }
@@ -1601,4 +1642,90 @@ pub fn inline(cfg: Config, cache: PathBuf, req: LocalRequest, mut each: impl FnM
         each(reply);
     }
     let _ = worker.join();
+}
+
+/// How much of a command's stderr is kept to explain a failure.
+const HEARD_MAX: usize = 1 << 20;
+
+/// A note for a failed command whose error output names a path the
+/// worktree leaves out because git ignores it: the build server never had
+/// it. At most three paths are named.
+fn left_out_note(ignored: &scan::Ignored, root: &Path, heard: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(heard);
+    let mut named: Vec<String> = Vec::new();
+    for rel in paths_in(&text, &root.to_string_lossy()) {
+        if named.len() == 3 {
+            break;
+        }
+        if ignored.left_out(rel.as_bytes()) && !named.contains(&rel) {
+            named.push(rel);
+        }
+    }
+    if named.is_empty() {
+        return None;
+    }
+    let one = named.len() == 1;
+    let list = named.iter().map(|p| format!("`{p}`")).collect::<Vec<_>>().join(", ");
+    let (is, it) = if one { ("is", "it") } else { ("are", "them") };
+    Some(format!(
+        "note: {list} {is} not on the build server: git ignores {it}, and the project's `metadata.rargo.sync` says \
+         `gitignored = false`.\n      To send {it}, name {it} in `include` there.\n"
+    ))
+}
+
+/// The paths in `text` that lie in the worktree at `root`, from its root,
+/// with `.` and `..` resolved: absolute ones under the root, and relative
+/// ones taken from the root.
+fn paths_in<'t>(text: &'t str, root: &'t str) -> impl Iterator<Item = String> + 't {
+    let path_char = |c: char| c.is_alphanumeric() || "._-/+@".contains(c);
+    let rooted = format!("{}/", root.trim_end_matches('/'));
+    text.split(move |c: char| !path_char(c)).filter_map(move |token| {
+        let token = token.trim_end_matches('.');
+        let rel = match token.strip_prefix(rooted.as_str()) {
+            Some(rel) => rel,
+            None if token.starts_with('/') || !token.contains(['/', '.']) => return None,
+            None => token,
+        };
+        let mut parts: Vec<&str> = Vec::new();
+        for part in rel.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                p => parts.push(p),
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("/"))
+    })
+}
+
+#[cfg(test)]
+mod left_out_tests {
+    use super::*;
+
+    #[test]
+    fn a_failure_that_names_a_path_git_ignores_is_explained() {
+        let root = "/home/ann/proj";
+        let found = |text: &str| paths_in(text, root).collect::<Vec<_>>();
+        // As rustc and build scripts write paths.
+        assert_eq!(found("error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`: No such file"), ["crates/util/local-note.txt"]);
+        assert_eq!(found("open data/big.bin: not found."), ["data/big.bin"]);
+        assert_eq!(found("at /home/ann/proj/src/main.rs:12:5"), ["src/main.rs"]);
+        // Not elsewhere, and not above the root.
+        assert!(found("couldn't read `/elsewhere/data/big.bin` or /home/ann/proj/../x").is_empty());
+
+        let ignored = scan::Ignored::for_test(&["junk/", "crates/util/local-note.txt"], &[]);
+        let failed = b"error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`: No such file or directory\n";
+        let note = left_out_note(&ignored, Path::new(root), failed).unwrap();
+        assert!(
+            note.starts_with("note: `crates/util/local-note.txt` is not on the build server: git ignores it")
+                && note.contains("gitignored = false")
+                && note.contains("`include`"),
+            "{note}"
+        );
+        let note = left_out_note(&ignored, Path::new(root), b"cannot open /home/ann/proj/junk/blob and local-note.txt\n").unwrap();
+        assert!(note.starts_with("note: `junk/blob` is not"), "a file inside an ignored directory: {note}");
+        assert!(left_out_note(&ignored, Path::new(root), b"error[E0308]: mismatched types\n  --> src/main.rs:3:5\n").is_none());
+    }
 }

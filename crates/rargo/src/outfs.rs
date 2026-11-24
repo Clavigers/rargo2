@@ -229,6 +229,26 @@ impl OutFs {
         let _ = self.session.set(session);
     }
 
+    /// When the last entry of the output directory has been removed (a
+    /// stock `cargo clean`, an `rm -rf target/*`), the directory is given
+    /// back: unmounted before the removal is answered, so that whoever
+    /// emptied it finds a plain, empty directory it can remove, and nothing
+    /// delivered is remembered. The next rargo command mounts it again.
+    fn give_back_if_empty(&self, parent: u64) {
+        if parent != ROOT || !self.virt.read().unwrap().is_empty() {
+            return;
+        }
+        if std::fs::read_dir(&self.under).map(|mut d| d.next().is_some()).unwrap_or(true) {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.table);
+        let _ = std::fs::remove_file(self.table.with_file_name("delivered"));
+        self.dirty.store(false, Ordering::SeqCst);
+        if let Some(session) = self.session.get() {
+            session.unmount();
+        }
+    }
+
     /// Writes the table of delivered names if it changed.
     pub fn save(&self) {
         if !self.dirty.swap(false, Ordering::SeqCst) {
@@ -854,6 +874,7 @@ impl Filesystem for OutFs {
         }
         self.patch(parent, Patch::Del(name.to_vec()));
         self.detach(parent, name);
+        self.give_back_if_empty(parent);
         Ok(())
     }
 
@@ -872,6 +893,7 @@ impl Filesystem for OutFs {
         }
         self.patch(parent, Patch::Del(name.to_vec()));
         self.detach(parent, name);
+        self.give_back_if_empty(parent);
         Ok(())
     }
 

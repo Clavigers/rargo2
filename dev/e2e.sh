@@ -6,7 +6,7 @@
 # The server and the client run on this machine but share nothing except a
 # TCP port: the server runs in a mount namespace in which the client's
 # directory (worktrees, cache, cargo home) is an empty file system, has its
-# own cargo home, and requires a key.
+# own cargo home, and requires a token.
 #
 # Uses private directories under $RARGO_WORK. Set RARGO_E2E_ROOT to an
 # existing directory on a reflink filesystem to put the store and the client
@@ -29,9 +29,12 @@ port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); pr
 export RARGO_SERVER=127.0.0.1:$port
 export RARGO_HIDE=$T
 export RARGO_CACHE_DIR=$T/.rargo-cache
-export RARGO_USER=e2e
-export RARGO_KEY=e2e-client-secret-0123456789
-printf 'e2e %s admin\nguest guest-secret-0123456789abcdef\n' "$RARGO_KEY" >"$RARGO_STATE/keys"
+# Two users of the server: an administrator, whose token the suite uses,
+# and one who is not.
+mkdir -p "$RARGO_STATE"
+RARGO_TOKEN=$("$bin/rargod" token create --state "$RARGO_STATE" --user e2e --admin 2>/dev/null)
+export RARGO_TOKEN
+guest_token=$("$bin/rargod" token create --state "$RARGO_STATE" --user guest 2>/dev/null)
 # The server gets a cargo home of its own.
 export RARGO_SERVER_CARGO_HOME=$RARGO_STATE/cargo-home
 # The stock Cargo checks intentionally exercise the fixture's own target/.
@@ -54,7 +57,7 @@ asked_files() { "$R" --rargo-status | sed -n 's/^sync .* manifests and \([0-9]*\
 asked_trees() { "$R" --rargo-status | sed -n 's/^sync .*states, \([0-9]*\) manifests.*/\1/p'; }
 
 trap '"$repo/dev/rargod.sh" stop >/dev/null 2>&1' EXIT
-"$repo/dev/rargod.sh" start --store "$E/store" --keys "$RARGO_STATE/keys" >/dev/null || {
+"$repo/dev/rargod.sh" start --store "$E/store" >/dev/null || {
     cat "$RARGO_STATE/rargod.log"
     exit 1
 }
@@ -63,13 +66,13 @@ echo "== client and server are apart"
 pid=$(pgrep -f "rargod --state $RARGO_STATE " | head -1)
 echo marker >"$T/marker"
 [ -n "$pid" ] && [ -d "/proc/$pid/root$T" ] && [ -z "$(ls -A "/proc/$pid/root$T" 2>/dev/null)" ] && ok "the server sees an empty directory where the client's files are" || bad "the server sees an empty directory where the client's files are" "$(ls -A "/proc/$pid/root$T" 2>&1)"
-out=$(RARGO_KEY=wrong-secret-0123456789 "$R" --rargo-status 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" "key" && ok "a wrong key is refused" || bad "a wrong key is refused" "$out"
-out=$(RARGO_USER=nobody "$R" --rargo-status 2>&1); rc=$?
-[ $rc -ne 0 ] && ok "an unknown user is refused" || bad "an unknown user is refused" "$out"
-out=$(RARGO_USER=guest RARGO_KEY=guest-secret-0123456789abcdef "$R" --rargo-gc 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" "may not administer" && ok "a user who is not an administrator cannot collect garbage" || bad "a user who is not an administrator cannot collect garbage" "$out"
-expect "the right key is accepted" "$R" --rargo-status
+out=$(RARGO_TOKEN="${RARGO_TOKEN%%.*}.wrong-secret-0123456789" "$R" --rargo-status 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "rargo auth" && ok "a token with a wrong secret is refused" || bad "a token with a wrong secret is refused" "$out"
+out=$(RARGO_TOKEN=t-nobody000000.some-secret-0123456789 "$R" --rargo-status 2>&1); rc=$?
+[ $rc -ne 0 ] && ok "a token the server does not know is refused" || bad "a token the server does not know is refused" "$out"
+out=$(RARGO_TOKEN=$guest_token "$R" --rargo-gc 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "may not administer" && has "$out" "rargod token create --admin" && ok "a user who is not an administrator cannot collect garbage, and is told how an administrator is made" || bad "a user who is not an administrator cannot collect garbage, and is told how an administrator is made" "$out"
+expect "the right token is accepted" "$R" --rargo-status
 
 # --- a small workspace -----------------------------------------------------
 A=$T/a
@@ -507,6 +510,14 @@ out=$(PATH="$T/shim:$PATH" RARGO_SERVER=127.0.0.1:1 RARGO_FALLBACK=cargo CARGO_T
 [ $rc -eq 0 ] && [ -x "$T/shim-target/debug/app" ] && ok "without a server the shim falls back to the real cargo" || bad "without a server the shim falls back to the real cargo" "$out"
 out=$(RARGO_SERVER=127.0.0.1:1 "$R" build 2>&1); rc=$?
 [ $rc -eq 101 ] && has "$out" "cannot reach the rargo server" && ok "without a server and without the fallback, the error says so" || bad "without a server and without the fallback, the error says so" "$out"
+# That command's daemon (for another server) mounted target/ in its turn.
+echo "after another server" >crates/util/local-note.txt
+out=$("$R" build 2>&1); rc=$?
+ran=$(./target/debug/app 2>&1)
+[ $rc -eq 0 ] && has "$ran" "note: after another server" && ok "after a command for another server, target/ shows this server's builds again" || bad "after a command for another server, target/ shows this server's builds again" "$out
+$ran"
+echo "ignored by git" >crates/util/local-note.txt
+"$R" build >/dev/null 2>&1
 
 echo "== policy in Cargo.toml ([workspace.metadata.rargo])"
 cd "$A"
@@ -537,25 +548,16 @@ pass = ["POLICY_PROBE"]
 [workspace.metadata.rargo.network]
 test-packages = ["app"]
 EOF
-[ ! -e .rargo.toml ] && ok "the worktree has no .rargo.toml" || bad "the worktree has no .rargo.toml"
 out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
 has "$out" 'env=Some("seen")' && has "$out" "net=true" && ok "the manifest's policy passes the variable and gives the package's tests the network" || bad "the manifest's policy passes the variable and gives the package's tests the network" "$out"
 out=$(cargo metadata --format-version 1 --no-deps --offline 2>&1 >/dev/null); [ -z "$out" ] && ok "stock cargo reads that manifest without a word" || bad "stock cargo reads that manifest without a word" "$out"
-# The older file beside it: a table the manifest has wins, and the build says so.
-printf '[env]\npass = ["SOMETHING_ELSE"]\n' >.rargo.toml
-out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
-has "$out" 'env=Some("seen")' && has "$out" ".rargo.toml: [env] is ignored" && ok "with both, the manifest's table wins and the build says the file's is ignored" || bad "with both, the manifest's table wins and the build says the file's is ignored" "$out"
-rm -f .rargo.toml
 out=$(POLICY_PROBE=other "$R" test -p app --test policy -- --nocapture 2>&1)
 has "$out" 'env=Some("other")' && ok "a passed variable is part of the key (new value, new run)" || bad "a passed variable is part of the key" "$out"
 echo 'bogus = 1' >>Cargo.toml
 out=$("$R" build 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" "Cargo.toml: [workspace.metadata.rargo]" && ok "an unknown key in the manifest's policy is an error that names the table" || bad "an unknown key in the manifest's policy is an error that names the table" "$out"
 cp "$T/Cargo.toml.before-policy" Cargo.toml
-echo 'bogus = 1' >.rargo.toml
-out=$("$R" build 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file (the older place) is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
-rm -f .rargo.toml crates/app/tests/policy.rs
+rm -f crates/app/tests/policy.rs
 # Build scripts: the one the manifest names may use the network, another may not.
 for c in netprobe netprobe2; do
     mkdir -p crates/$c/src
@@ -590,6 +592,32 @@ expect "a build with a directory the manifest excludes" "$R" build
 cp "$T/Cargo.toml.before-policy" Cargo.toml
 rm -rf big-data
 expect "without the policy the workspace builds again" "$R" build
+
+echo "== what git ignores, left out (sync.gitignored = false) and taken back (sync.include)"
+# The fixture's util crate reads local-note.txt, which git ignores (the
+# first build shows it is synced by default), and git ignores /junk.
+echo "ignored by git" >crates/util/local-note.txt
+# Counted before the edit, the ignored files changed after it (see above).
+files=$(asked_files)
+printf '\n[workspace.metadata.rargo.sync]\ngitignored = false\n' >>Cargo.toml
+sleep 0.3
+echo "changed, and still ignored" >crates/util/local-note.txt
+head -c 1500000 /dev/urandom >junk/blob2
+out=$("$R" build 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "local-note.txt" && ok "with gitignored = false a file git ignores is not on the server: the build that reads it fails" || bad "with gitignored = false a file git ignores is not on the server: the build that reads it fails" "$out"
+has "$out" 'note: `crates/util/local-note.txt` is not on the build server: git ignores it' && has "$out" "gitignored = false" && has "$out" '`include`' && ok "and the failure says why, naming the option and include" || bad "and the failure says why, naming the option and include" "$out"
+[ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest was uploaded: neither the ignored file nor the ignored directory" || bad "only the manifest was uploaded: neither the ignored file nor the ignored directory" "files $files -> $(asked_files)"
+files=$(asked_files)
+printf 'include = ["local-note.txt"]\n' >>Cargo.toml
+out=$("$R" build 2>&1); rc=$?
+ran=$(./target/debug/app 2>&1)
+[ $rc -eq 0 ] && has "$ran" "note: changed, and still ignored" && ok "a file include names is sent although git ignores it" || bad "a file include names is sent although git ignores it" "$out
+$ran"
+[ $(( $(asked_files) - files )) -eq 2 ] && ok "and only it and the manifest were uploaded, not the ignored directory" || bad "and only it and the manifest were uploaded, not the ignored directory" "files $files -> $(asked_files)"
+cp "$T/Cargo.toml.before-policy" Cargo.toml
+echo "ignored by git" >crates/util/local-note.txt
+rm -f junk/blob2
+out=$("$R" build 2>&1) && has "$(./target/debug/app 2>&1)" "note: ignored by git" && ok "without the option, what git ignores is synced again" || bad "without the option, what git ignores is synced again" "$out"
 
 echo "== workspace policy inside a Git worktree"
 nested=$T/nested-policy
@@ -652,7 +680,9 @@ expect "an explicit nested manifest selects the inner workspace policy" policy_t
 out=$(cd "$nested/rust/member" && "$R" --rargo-drift-check 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "stock cargo builds" && has "$out" "rargo builds" && ok "the drift check builds the nested package on both sides" || bad "the drift check builds the nested package on both sides" "$out"
 
-echo "== build scripts that ask git about HEAD"
+echo "== build scripts that ask git about HEAD and history"
+# No build so far asked git for history: none was sent.
+[ ! -e "$RARGO_CACHE_DIR/git-history" ] && ok "builds whose scripts ask git nothing about history send none" || bad "builds whose scripts ask git nothing about history send none" "$(ls "$RARGO_CACHE_DIR/git-history")"
 G=$T/g
 mkdir -p "$G/src"
 printf '[package]\nname = "gitinfo"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$G/Cargo.toml"
@@ -671,37 +701,53 @@ fn main() {
     println!("cargo:rustc-env=G_SUBJECT={}", git(&["log", "-1", "--format=%s"]));
     println!("cargo:rustc-env=G_DESCRIBE={}", git(&["describe", "--always", "--dirty"]));
     println!("cargo:rustc-env=G_COUNT={}", git(&["rev-list", "--count", "HEAD"]));
+    println!("cargo:rustc-env=G_LAST={}", git(&["log", "-1", "--format=%(describe:tags)"]));
 }
 EOF
 cat >"$G/src/main.rs" <<'EOF'
 fn main() {
-    println!("{}|{}|{}|{}|{}", env!("G_HEAD"), env!("G_BRANCH"), env!("G_SUBJECT"), env!("G_DESCRIBE"), env!("G_COUNT"));
+    println!("{}|{}|{}|{}|{}|{}", env!("G_HEAD"), env!("G_BRANCH"), env!("G_SUBJECT"), env!("G_DESCRIBE"), env!("G_COUNT"), env!("G_LAST"));
 }
 EOF
 printf '/target\n' >"$G/.gitignore"
-git -C "$G" init -q -b trunk && git -C "$G" add -A && git -C "$G" -c user.name=t -c user.email=t@t commit -q -m "first commit"
+gc() { git -C "$G" -c user.name=t -c user.email=t@t "$@"; }
+git -C "$G" init -q -b trunk && git -C "$G" add -A && gc commit -q -m "first commit"
+gc tag -a v0.1.0 -m "first release"
 cd "$G"
 "$R" build >/dev/null 2>&1   # writes Cargo.lock
-git -C "$G" add -A && git -C "$G" -c user.name=t -c user.email=t@t commit -q -m "second commit"
+git -C "$G" add -A && gc commit -q -m "second commit"
+gc checkout -q -b side HEAD~1 && echo side >side.txt && git -C "$G" add side.txt && gc commit -q -m "side commit" && gc tag side-light
+gc checkout -q trunk && gc merge -q --no-ff -m "merge side" side
 head1=$(git -C "$G" rev-parse HEAD)
+# Stock cargo reruns this build script only when .git/HEAD changes: each
+# of its runs starts from an empty target directory.
+stock() { CARGO_TARGET_DIR=$(mktemp -d "$T/stock-g.XXXXXX") cargo run -q --offline 2>&1; }
 out=$("$R" run -q 2>&1); rc=$?
-[ $rc -eq 0 ] && [ "$out" = "$head1|trunk|second commit|${head1:0:7}|1" ] && ok "the build script saw HEAD, the branch and a clean tree, and no history ($out)" || bad "the build script saw HEAD, the branch and a clean tree, and no history" "$out"
+want=$(stock)
+[ $rc -eq 0 ] && [ "$out" = "$want" ] && [ "$out" = "$head1|trunk|merge side|v0.1.0-3-g${head1:0:7}|4|side-light-2-g${head1:0:7}" ] && ok "the build script saw HEAD, the branch, a clean tree and the history, as stock cargo does ($out)" || bad "the build script saw HEAD, the branch, a clean tree and the history, as stock cargo does" "rargo: $out
+stock: $want"
+[ -d "$RARGO_CACHE_DIR/git-history" ] && ok "a build script that describes gets the history" || bad "a build script that describes gets the history"
 [ -d "$G/.git/objects" ] && ok "the client's own .git is untouched" || bad "the client's own .git is untouched"
 echo "// dirty" >>src/main.rs
 out=$("$R" run -q 2>&1)
-has "$out" "|${head1:0:7}-dirty|" && ok "an uncommitted edit shows as dirty" || bad "an uncommitted edit shows as dirty" "$out"
-git -C "$G" -c user.name=t -c user.email=t@t commit -q -am "third commit"
+has "$out" "|v0.1.0-3-g${head1:0:7}-dirty|" && ok "an uncommitted edit shows as dirty" || bad "an uncommitted edit shows as dirty" "$out"
+gc commit -q -am "third commit"
 head2=$(git -C "$G" rev-parse HEAD)
 out=$("$R" run -q 2>&1)
-[ "$out" = "$head2|trunk|third commit|${head2:0:7}|1" ] && ok "a new commit is picked up" || bad "a new commit is picked up" "$out"
+[ "$out" = "$(stock)" ] && [ "$out" = "$head2|trunk|third commit|v0.1.0-4-g${head2:0:7}|5|side-light-3-g${head2:0:7}" ] && ok "a new commit is picked up ($out)" || bad "a new commit is picked up" "$out"
+gc tag -a v0.2.0 -m "second release"
+out=$("$R" run -q 2>&1)
+[ "$out" = "$(stock)" ] && [ "$out" = "$head2|trunk|third commit|v0.2.0|5|v0.2.0" ] && ok "a tag made without a commit is picked up" || bad "a tag made without a commit is picked up" "$out"
 size=$(du -sk "$RARGO_CACHE_DIR"/git/* | sort -n | tail -1 | cut -f1)
-[ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built)" || bad "what stands in for .git on the server is small" "${size} KiB"
-printf '[sync]\ngit = false\n' >.rargo.toml
-out=$(RARGO_QUIET_DEPRECATIONS=1 "$R" run -q 2>&1)
-[ "$out" = "none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
-mv .rargo.toml "$T/unused-policy"
-out=$(CARGO_TARGET_DIR="$T/stock-g" cargo run -q --offline 2>&1)
-has "$out" "$head2|trunk|third commit|${head2:0:7}|" && ok "stock cargo on the client agrees about HEAD ($out)" || bad "stock cargo on the client agrees about HEAD" "$out"
+[ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built, history aside)" || bad "what stands in for .git on the server is small" "${size} KiB"
+printf '\n[package.metadata.rargo.sync]\ngit = "head"\n' >>Cargo.toml
+out=$("$R" run -q 2>&1)
+[ "$out" = "$head2|trunk|third commit|v0.2.0-dirty|1|v0.2.0" ] && ok "with sync.git = \"head\", HEAD and its tags and no history ($out)" || bad "with sync.git = \"head\", HEAD and its tags and no history" "$out"
+git -C "$G" checkout -q Cargo.toml
+printf '\n[package.metadata.rargo.sync]\ngit = false\n' >>Cargo.toml
+out=$("$R" run -q 2>&1)
+[ "$out" = "none|none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
+git -C "$G" checkout -q Cargo.toml
 
 # --- reports cargo writes into target/, and clients that go away ------------
 echo "== future-incompatibility report, --timings, interrupted clients"

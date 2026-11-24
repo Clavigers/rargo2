@@ -205,6 +205,18 @@ out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(same binary
 out=$(R clean 2>&1); rc=$?
 [ $rc = 0 ] && [ ! -e target ]; check $? "clean removes target/" "$out"
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "and the next build fills it again" "$out"
+# Stock cargo's clean, typed by someone who knows nothing of the mount:
+# when the directory's last entry goes, the daemon gives the directory back
+# before cargo comes to remove it.
+mounted; check $? "target/ is served again"
+out=$(cargo clean 2>&1); rc=$?
+[ $rc = 0 ] && [ ! -e target ]; check $? "stock cargo clean succeeds on a served target/ and removes it" "$out"
+! mounted; check $? "nothing is mounted there afterwards"
+out=$(cargo build --offline 2>&1); rc=$?
+[ $rc = 0 ] && [ "$(./target/debug/app 2>&1)" = "value 113" ]; check $? "stock cargo builds in the worktree after its clean" "$out"
+out=$(cargo clean 2>&1); check $? "(and cleans a plain target/ as ever)" "$out"
+out=$(R run -q 2>&1); [ "$out" = "value 113" ] && mounted; check $? "rargo builds there after a stock clean, and serves target/ again" "$out"
+[ -x target/debug/app ]; check $? "with its results shown"
 # A daemon that is killed outright cannot unmount. What it left watching
 # does, at once and with no rargo command run: target/ is never a dead
 # mount, and stock cargo works in the worktree.

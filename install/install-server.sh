@@ -19,8 +19,8 @@
 #   RARGO_PUBLIC  HOST:PORT clients are told to connect to, if not the
 #                 name they asked
 #   RARGO_NO_SERVICE=1  install the files and print the command, start nothing
-# Running it again with a newer version upgrades in place; the state, the
-# tokens and a key file of an older install (/etc/rargo/keys) are kept. The server must be reachable on its port over UDP and TCP.
+# Running it again with a newer version upgrades in place; the state and
+# the tokens are kept. The server must be reachable on its port over UDP and TCP.
 set -eu
 version=${1:-latest}
 base=${RARGO_DL:-https://rargo.rs/dl}
@@ -51,7 +51,7 @@ real=$("$tmp/rargo-server/rargod" --version | awk '{print $2}') || { echo "rargo
 lib=$P/usr/local/lib/rargo
 home=$P/var/lib/rargo
 state=$home/state
-mkdir -p "$lib/$real" "$state" "$P/etc/rargo"
+mkdir -p "$lib/$real" "$state"
 install -m 755 "$tmp/rargo-server/rargod" "$tmp/rargo-server/rargo-sandbox" "$tmp/rargo-server/planner-cargo" "$lib/$real/"
 install -d "$lib/$real/default-flake"
 install -m 644 "$tmp/rargo-server/default-flake/flake.nix" "$tmp/rargo-server/default-flake/flake.lock" "$lib/$real/default-flake/"
@@ -62,19 +62,16 @@ if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     echo "installing rustup into $home"
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable >/dev/null
 fi
-# Who may connect: tokens, made through invitations (`rargo auth`). A key
-# file from an older install keeps working beside them.
-keys=$P/etc/rargo/keys
-keyopt=""
-[ -s "$keys" ] && keyopt="--keys $keys"
+# Who may connect: the holders of tokens, which people get through an
+# invitation (`rargo auth`). The first user is invited here.
 invite=""
-if [ ! -s "$keys" ] && [ ! -s "$state/tokens.json" ]; then
+if [ ! -s "$state/tokens.json" ]; then
     invite=$("$lib/current/rargod" token invite --state "$state" --user "$admin" --admin --uses 5 --days 30 2>/dev/null)
 fi
 jobs=${RARGO_JOBS:+--jobs $RARGO_JOBS}
 mem=${RARGO_MEM_GB:+--mem-gb $RARGO_MEM_GB}
 public=${RARGO_PUBLIC:+--public $RARGO_PUBLIC}
-run="$lib/current/rargod --state $state --planner $lib/current/planner-cargo --listen $listen $public $keyopt --cargo-home $CARGO_HOME $jobs $mem"
+run="$lib/current/rargod --state $state --planner $lib/current/planner-cargo --listen $listen $public --cargo-home $CARGO_HOME $jobs $mem"
 if [ "${RARGO_NO_SERVICE:-}" = 1 ]; then
     echo "installed rargod $real; not started. To run it:"
     echo "  RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME PATH=$CARGO_HOME/bin:\$PATH $run"
@@ -121,4 +118,5 @@ if [ -n "$invite" ]; then
     echo "    rargo build"
     echo
 fi
-echo "More people: $lib/current/rargod token invite --state $state --user NAME   (token list, token revoke: likewise; no restart)"
+echo "More people: \`rargo auth invite --user NAME\` from your machine once you are signed in (tokens, revoke: likewise),"
+echo "or $lib/current/rargod token invite --state $state --user NAME here. No restart either way."

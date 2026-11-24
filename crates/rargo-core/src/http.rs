@@ -207,6 +207,16 @@ impl Http {
                 }
                 json(serde_json::json!({ "revoked": done }))
             }
+            // Whose token this is (`rargo auth --token`): its own text again,
+            // and nothing for a token that does not work.
+            ("POST", "/auth/whoami") => {
+                let token = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|v| v.get("token")?.as_str().map(String::from));
+                let user = match (self.keys.tokens(), token) {
+                    (Some(store), Some(t)) => store.holder(&t),
+                    _ => None,
+                };
+                json(serde_json::json!({ "user": user }))
+            }
             ("GET", "/auth") => (200, "text/html; charset=utf-8", self.auth_page(req.query.get("code").map(String::as_str).unwrap_or(""), None)),
             ("GET", "/auth/github") => match self.to_github(req.query.get("code").map(String::as_str).unwrap_or("")) {
                 Ok(location) => (302, "location", location),
@@ -551,7 +561,7 @@ mod tests {
     fn http() -> (tempfile::TempDir, Http) {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(tokens::TokenStore::new(dir.path().join("tokens.json")));
-        let keys = Arc::new(Keys::tokens_only().with_tokens(store));
+        let keys = Arc::new(Keys::with_tokens(store));
         (dir, Http::new(keys, None, 7459))
     }
 
@@ -596,7 +606,7 @@ mod tests {
         assert_eq!(h.server_for("build.example"), "build.example:7459");
         assert_eq!(h.server_for("build.example:8080"), "build.example:7459");
         let dir = tempfile::tempdir().unwrap();
-        let keys = Arc::new(Keys::tokens_only().with_tokens(Arc::new(tokens::TokenStore::new(dir.path().join("t.json")))));
+        let keys = Arc::new(Keys::with_tokens(Arc::new(tokens::TokenStore::new(dir.path().join("t.json")))));
         assert_eq!(Http::new(keys, Some("b.example:1".into()), 7459).server_for("rargo.rs"), "b.example:1");
         assert_eq!(form("code=AB%2DCD&name=a+b")["code"], "AB-CD");
         assert_eq!(form("code=AB%2DCD&name=a+b")["name"], "a b");

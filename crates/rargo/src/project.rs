@@ -4,8 +4,8 @@
 //! The server is a property of the project: `host` under
 //! `[workspace.metadata.rargo]` (or `[package.metadata.rargo]`) in its
 //! `Cargo.toml`, a table cargo ignores. What is personal stays on the
-//! machine: one token per server in `credentials.toml` beside the old
-//! `config.toml`, readable by its owner only.
+//! machine: one token per server in `~/.config/rargo/credentials.toml`,
+//! readable by its owner only.
 //!
 //! A host is written either as `name:port`, which is the server's address,
 //! or as a bare name, which is asked over HTTPS where its server is
@@ -83,103 +83,6 @@ pub fn set_host(cwd: &Path, host: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// `rargo --rargo-migrate`: moves what the older files hold into the
-/// project's manifest and this machine's credentials. Returns what it did.
-///   - `server` of `~/.config/rargo/config.toml` becomes the project's
-///     `host`, if the project names none;
-///   - its `user` and `key` become the credential for that host, if there
-///     is none (the file itself is left: other projects may still use it);
-///   - the tables of `.rargo.toml` at the top of the repository move under
-///     `[workspace.metadata.rargo]` of its manifest, and the file is removed.
-pub fn migrate(cwd: &Path) -> Result<Vec<String>, String> {
-    let mut done = Vec::new();
-    let config_path = config_dir().join("config.toml");
-    let config: toml::Table = std::fs::read_to_string(&config_path).ok().and_then(|t| t.parse().ok()).unwrap_or_default();
-    let old = |k: &str| config.get(k).and_then(|v| v.as_str()).map(String::from);
-    let mut host = project_host(cwd);
-    if host.is_none() {
-        if let Some(server) = old("server") {
-            let path = set_host(cwd, &server)?;
-            done.push(format!("{}: host = \"{server}\" (from {})", path.display(), config_path.display()));
-            host = Some(server);
-        }
-    }
-    if let Some(host) = &host {
-        let key = match (old("key"), old("key-file")) {
-            (Some(k), _) => Some(k),
-            (None, Some(f)) => std::fs::read_to_string(&f).ok().map(|s| s.trim().to_string()),
-            (None, None) => None,
-        };
-        if let (None, Some(user), Some(key)) = (credential(host), old("user"), key) {
-            // Only if the old file was about this server.
-            if old("server").as_deref() == Some(host.as_str()) || old("server").is_none() {
-                let mut all = credentials();
-                let mut c = toml::Table::new();
-                c.insert("user".into(), user.clone().into());
-                c.insert("key".into(), key.into());
-                c.insert("name".into(), user.clone().into());
-                all.insert(host.clone(), toml::Value::Table(c));
-                save_credentials(&all)?;
-                done.push(format!("{}: the key of {user} for {host} (from {})", credentials_path().display(), config_path.display()));
-            }
-        }
-    }
-    // The policy file lies at the top of what is synced.
-    let Some(root) = crate::find_root(cwd) else { return Ok(done) };
-    let policy_path = root.join(".rargo.toml");
-    let Ok(policy_text) = std::fs::read_to_string(&policy_path) else { return Ok(done) };
-    let policy: toml_edit::DocumentMut = policy_text.parse().map_err(|e| format!("{}: {e}", policy_path.display()))?;
-    let manifest_path = root.join("Cargo.toml");
-    let text = std::fs::read_to_string(&manifest_path)
-        .map_err(|_| format!("{} has a policy file but no Cargo.toml to move it into", root.display()))?;
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    let kind = if doc.contains_key("workspace") || !doc.contains_key("package") { "workspace" } else { "package" };
-    {
-        let section = doc[kind].or_insert(toml_edit::table());
-        let metadata = section["metadata"].or_insert(toml_edit::table());
-        if let Some(t) = metadata.as_table_mut() {
-            t.set_implicit(true);
-        }
-        let rargo = metadata["rargo"].or_insert(toml_edit::table());
-        if let Some(t) = rargo.as_table_mut() {
-            t.set_implicit(true);
-        }
-        let mut moved = Vec::new();
-        for (name, item) in policy.iter() {
-            if !matches!(name, "env" | "network" | "flake" | "sync") {
-                return Err(format!("{}: `{name}` is not a table of the policy; nothing was changed", policy_path.display()));
-            }
-            if rargo.get(name).is_some() {
-                // The manifest's table already wins; the file's goes.
-                continue;
-            }
-            // After everything the manifest has, in the file's order (a
-            // table brought from another document keeps the place it had
-            // there, which would put it among the manifest's own).
-            let mut item = item.clone();
-            if let Some(t) = item.as_table_mut() {
-                t.set_position(100_000 + moved.len());
-                let before = t.decor().prefix().and_then(|p| p.as_str()).unwrap_or("").to_string();
-                if !before.starts_with('\n') {
-                    t.decor_mut().set_prefix(format!("\n{before}"));
-                }
-            }
-            rargo[name] = item;
-            moved.push(format!("[{name}]"));
-        }
-        if !moved.is_empty() {
-            done.push(format!("{}: {} under [{kind}.metadata.rargo] (from {})", manifest_path.display(), moved.join(", "), policy_path.display()));
-        }
-    }
-    let new = doc.to_string();
-    if new != text {
-        crate::write_atomic(&manifest_path, new.as_bytes()).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
-    }
-    std::fs::remove_file(&policy_path).map_err(|e| format!("{}: {e}", policy_path.display()))?;
-    done.push(format!("removed {}", policy_path.display()));
-    Ok(done)
-}
-
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build()
 }
@@ -232,10 +135,10 @@ pub fn resolve(host: &str) -> Result<String, String> {
 
 #[derive(Clone)]
 pub struct Credential {
-    /// What is presented as the user: a token's id.
-    pub user: String,
-    pub key: String,
-    /// Who the server says this is.
+    /// The token's id, presented as who is connecting.
+    pub id: String,
+    pub secret: String,
+    /// Whose token it is, as the server said.
     pub name: String,
 }
 
@@ -251,7 +154,7 @@ pub fn credential(host: &str) -> Option<Credential> {
     let all = credentials();
     let c = all.get(host)?.as_table()?;
     let get = |k: &str| c.get(k).and_then(|v| v.as_str()).map(String::from);
-    Some(Credential { user: get("user")?, key: get("key")?, name: get("name").unwrap_or_default() })
+    Some(Credential { id: get("id")?, secret: get("secret")?, name: get("name").unwrap_or_default() })
 }
 
 fn save_credentials(all: &toml::Table) -> Result<(), String> {
@@ -281,8 +184,8 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
     let (id, secret) = split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
     let mut all = credentials();
     let mut c = toml::Table::new();
-    c.insert("user".into(), id.into());
-    c.insert("key".into(), secret.into());
+    c.insert("id".into(), id.into());
+    c.insert("secret".into(), secret.into());
     c.insert("name".into(), name.into());
     all.insert(host.to_string(), toml::Value::Table(c));
     save_credentials(&all)
@@ -290,11 +193,11 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
 
 /// Tells the host's server to revoke the token this machine holds for it.
 /// `Ok(true)`: revoked there; `Ok(false)`: the server did not know it as a
-/// token that works (already revoked, expired, or a user of a key file).
+/// token that works (already revoked, or expired).
 pub fn revoke_on_server(host: &str) -> Result<bool, String> {
     let Some(c) = credential(host) else { return Ok(false) };
     let url = format!("{}/auth/revoke", base_url(host));
-    let body = serde_json::json!({ "token": format!("{}.{}", c.user, c.key) });
+    let body = serde_json::json!({ "token": format!("{}.{}", c.id, c.secret) });
     let text = agent()
         .post(&url)
         .set("Content-Type", "application/json")
@@ -304,6 +207,23 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
     Ok(v.get("revoked").and_then(|r| r.as_bool()).unwrap_or(false))
+}
+
+/// Whose token this is, as the host's server says; `None` for a token it
+/// does not admit.
+pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
+    split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
+    let url = format!("{}/auth/whoami", base_url(host));
+    let body = serde_json::json!({ "token": token.trim() });
+    let text = agent()
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("{url}: {e}"))?
+        .into_string()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
+    Ok(v.get("user").and_then(|u| u.as_str()).map(String::from))
 }
 
 pub fn forget(host: &str) -> Result<bool, String> {
@@ -418,32 +338,6 @@ mod tests {
         assert_eq!(text.matches("host =").count(), 1);
         assert_eq!(project_host(ws).as_deref(), Some("build.example:7459"));
         assert!(std::fs::read_to_string(ws.join("crates/a/Cargo.toml")).unwrap().find("metadata").is_none());
-    }
-
-    #[test]
-    fn the_policy_file_moves_into_the_manifest_and_is_removed() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path();
-        std::fs::create_dir(ws.join(".git")).unwrap();
-        let manifest = "# ours\n[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.metadata.rargo]\nhost = \"build.example:7459\"\n";
-        std::fs::write(ws.join("Cargo.toml"), manifest).unwrap();
-        std::fs::write(ws.join(".rargo.toml"), "# what tests may see\n[env]\npass = [\"DATABASE_URL\"]   # the test database\n\n[sync]\nexclude = [\"node_modules\"]\n").unwrap();
-        let done = migrate(ws).unwrap();
-        assert!(done.iter().any(|l| l.contains("[env], [sync]")), "{done:?}");
-        assert!(!ws.join(".rargo.toml").exists());
-        let text = std::fs::read_to_string(ws.join("Cargo.toml")).unwrap();
-        assert!(text.starts_with(manifest), "what was there is untouched:\n{text}");
-        assert!(text.contains("[workspace.metadata.rargo.env]\npass = [\"DATABASE_URL\"]   # the test database"), "{text}");
-        assert!(text.contains("[workspace.metadata.rargo.sync]\nexclude = [\"node_modules\"]"), "{text}");
-        // What it wrote is what the policy reader takes.
-        let t: toml::Table = text.parse().unwrap();
-        assert_eq!(t["workspace"]["metadata"]["rargo"]["env"]["pass"][0].as_str(), Some("DATABASE_URL"));
-        // Nothing left to do.
-        assert!(migrate(ws).unwrap().is_empty());
-        // A file with something that is no policy table changes nothing.
-        std::fs::write(ws.join(".rargo.toml"), "[bogus]\nx = 1\n").unwrap();
-        assert!(migrate(ws).is_err());
-        assert!(ws.join(".rargo.toml").exists());
     }
 
     #[test]

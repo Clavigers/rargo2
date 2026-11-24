@@ -43,6 +43,7 @@ down() {
 }
 start_server() {
     mkdir -p "$T/srv"
+    [ -f "$T/srv/tokens.json" ] || cp "$T/tokens.json" "$T/srv/tokens.json"
     # RIG_PROXY=1: the server namespace has no route out; build scripts the
     # policy lets use the network get out through a proxy (dev/rigproxy.py)
     # at HTTPS_PROXY=http://127.0.0.1:3128.
@@ -56,7 +57,7 @@ start_server() {
     nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G -p Delegate=yes \
         ip netns exec $RIG-srv unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
         "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
-        --listen 10.77.0.1:7459 --keys "$T/keys" --cargo-home "$work/cargo-home" \
+        --listen 10.77.0.1:7459 --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
     for i in $(seq 1 100); do
         grep -q "serving clients" "$T/srv.log" 2>/dev/null && break
@@ -112,9 +113,11 @@ up)
     ip netns exec $RIG-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
     ip netns exec $RIG-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
     head -c 32 /dev/urandom >"$T/link.key"
-    secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-    echo "bench $secret admin" >"$T/keys"
-    printf 'export RARGO_SERVER=10.77.0.1:7459 RARGO_USER=bench RARGO_KEY=%s RARGO_STATE=%s\n' "$secret" "$T/srv" >"$T/client.env"
+    # The rig's one user: a token, kept beside the server's state so that
+    # a server started on an emptied state directory admits it too.
+    token=$("$B/rargod" token create --state "$T/srv" --user bench --admin 2>/dev/null)
+    cp "$T/srv/tokens.json" "$T/tokens.json"
+    printf 'export RARGO_SERVER=10.77.0.1:7459 RARGO_TOKEN=%s RARGO_STATE=%s\n' "$token" "$T/srv" >"$T/client.env"
     echo "sj=$sj wj=$wj n=$n RARGO_HIDE='${RARGO_HIDE:-}' RIG_PROXY='${RIG_PROXY:-}'" >"$T/params"
     start_server
     start_workers

@@ -8,10 +8,6 @@
 //! plain cargo as before, and it needs no file of rargo's own. The tables
 //! are the ones below, each prefixed with `workspace.metadata.rargo.`.
 //!
-//! The older place, `.rargo.toml` at the worktree root with the same tables
-//! unprefixed, is still read. A table the manifest has wins over the same
-//! table in the file, and the build says so.
-//!
 //! ```toml
 //! [env]
 //! # Always given to every action (and therefore part of every key).
@@ -38,13 +34,25 @@
 //! # directories. A name matches at any depth; a path with a slash is taken
 //! # from the worktree root.
 //! exclude = ["node_modules", "data/fixtures-large"]
-//! # Show build scripts a `.git` that answers questions about HEAD (commit,
-//! # branch, dirty or not) without history or file contents. Default: true.
-//! git = true
+//! # Whether what git ignores is synced. Default: true (a generated file or
+//! # a local `.env` may be an input). With false, it is not scanned, watched
+//! # or sent, except what `include` names (same patterns as `exclude`; a
+//! # file inside an ignored directory is named by its path).
+//! gitignored = false
+//! include = ["data/schema.sql"]
+//! # What build scripts see as `.git`, never file contents from git:
+//! # "head": HEAD (commit, branch, dirty or not) and the tags on it;
+//! # "history": also every commit before it and the tags on them, so that
+//! # `git describe --tags` and `git rev-list --count` answer as on the
+//! # client; false: no `.git` at all. Default (true): "history" where a
+//! # build script mentions `describe` or `rev-list`, or Cargo.lock names
+//! # a crate that asks git for history (vergen, shadow-rs, git-version,
+//! # built, git-testament), else "head".
+//! git = "history"
 //! ```
 //!
-//! The file is read from the snapshot, so editing it takes effect on the
-//! next command and its content flows into action keys through the
+//! The manifest is read from the snapshot, so editing it takes effect on
+//! the next command and the policy flows into action keys through the
 //! environment and network settings it produces.
 
 use serde::Deserialize;
@@ -70,8 +78,29 @@ pub struct Policy {
 pub struct SyncPolicy {
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Whether the sandbox gets a thin `.git` describing HEAD.
-    pub git: Option<bool>,
+    /// Whether what git ignores is synced (default: yes).
+    pub gitignored: Option<bool>,
+    /// What is synced although git ignores it, with `gitignored = false`.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// What the sandbox gets as `.git`.
+    pub git: Option<GitSync>,
+}
+
+/// `[sync] git`: `true` (decided by what the build scripts ask), `false`
+/// (no `.git`), `"head"` or `"history"`.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum GitSync {
+    Flag(bool),
+    Depth(GitDepth),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum GitDepth {
+    Head,
+    History,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -100,35 +129,24 @@ pub struct FlakePolicy {
     pub files: Vec<String>,
 }
 
-pub const POLICY_FILE: &str = ".rargo.toml";
 pub const MANIFEST: &str = "Cargo.toml";
 
-/// What `[workspace.metadata.rargo]` may hold: the policy's tables and the
+/// What `[workspace.metadata.rargo]` holds: the policy's tables and the
 /// server's name (which the client reads; D67).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct InManifest {
     #[allow(dead_code)]
     host: Option<String>,
-    env: Option<EnvPolicy>,
-    network: Option<NetPolicy>,
-    flake: Option<FlakePolicy>,
-    sync: Option<SyncPolicy>,
+    #[serde(default)]
+    env: EnvPolicy,
+    #[serde(default)]
+    network: NetPolicy,
+    #[serde(default)]
+    flake: FlakePolicy,
+    #[serde(default)]
+    sync: SyncPolicy,
 }
-
-/// A repository's policy and what should be said about how it was found.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Loaded {
-    pub policy: Policy,
-    pub notices: Vec<String>,
-    /// Said once per command unless the client asks for quiet about it:
-    /// the older file is still what the policy comes from.
-    pub deprecations: Vec<String>,
-}
-
-/// The release in which `.rargo.toml` and `~/.config/rargo/config.toml`
-/// stop being read.
-pub const OLD_FILES_UNTIL: &str = "0.5.0";
 
 fn matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_suffix('*') {
@@ -137,65 +155,28 @@ fn matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-pub fn snapshot_policy(snapshot: &crate::snapshot::Snapshot, dir: &std::path::Path) -> Result<Loaded, String> {
+/// The policy of the workspace or package that `dir` of the snapshot is in.
+pub fn snapshot_policy(snapshot: &crate::snapshot::Snapshot, dir: &std::path::Path) -> Result<Policy, String> {
     use std::os::unix::ffi::OsStrExt;
     let read = |path: &std::path::Path| snapshot.read(path.as_os_str().as_bytes()).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
     let manifest = rargo_proto::workspace::manifest_for(dir, read).and_then(|(path, _)| read(&path));
-    Policy::load(manifest.as_deref(), read(std::path::Path::new(POLICY_FILE)).as_deref())
+    Policy::load(manifest.as_deref())
 }
 
 impl Policy {
-    pub fn parse(text: &str) -> Result<Policy, String> {
-        toml::from_str(text).map_err(|e| format!("{POLICY_FILE}: {}", e.message()))
-    }
-
-    /// Parse policy tables from the selected Cargo manifest and the worktree policy file.
-    pub fn load(manifest: Option<&str>, file: Option<&str>) -> Result<Loaded, String> {
-        let mut out = Loaded { policy: match file {
-            Some(text) => Policy::parse(text)?,
-            None => Policy::default(),
-        }, notices: Vec::new(), deprecations: Vec::new() };
-        if file.is_some() {
-            out.deprecations.push(format!(
-                "{POLICY_FILE} is still read, until rargo {OLD_FILES_UNTIL}: its tables belong in {MANIFEST} under [workspace.metadata.rargo] (`rargo --rargo-migrate` moves them)"
-            ));
-        }
-        let Some(manifest) = manifest else { return Ok(out) };
-        // A manifest cargo itself would reject is cargo's to report.
-        let Ok(table) = manifest.parse::<toml::Table>() else { return Ok(out) };
+    /// The policy a manifest holds under `[workspace.metadata.rargo]`
+    /// (`[package.metadata.rargo]` where it has no workspace table); the
+    /// default policy where it holds none.
+    pub fn load(manifest: Option<&str>) -> Result<Policy, String> {
+        let Some(manifest) = manifest else { return Ok(Policy::default()) };
+        // A manifest cargo itself rejects is cargo's to report.
+        let Ok(table) = manifest.parse::<toml::Table>() else { return Ok(Policy::default()) };
         let found = ["workspace", "package"]
             .iter()
             .find_map(|kind| Some((*kind, table.get(*kind)?.get("metadata")?.get("rargo")?.clone())));
-        let Some((kind, value)) = found else { return Ok(out) };
+        let Some((kind, value)) = found else { return Ok(Policy::default()) };
         let m: InManifest = value.try_into().map_err(|e: toml::de::Error| format!("{MANIFEST}: [{kind}.metadata.rargo]: {}", e.message()))?;
-        let in_file = file.and_then(|t| t.parse::<toml::Table>().ok()).unwrap_or_default();
-        let mut shadowed: Vec<&str> = Vec::new();
-        let mut take = |name: &'static str, has: bool| {
-            if has && in_file.contains_key(name) {
-                shadowed.push(name);
-            }
-            has
-        };
-        if take("env", m.env.is_some()) {
-            out.policy.env = m.env.unwrap_or_default();
-        }
-        if take("network", m.network.is_some()) {
-            out.policy.network = m.network.unwrap_or_default();
-        }
-        if take("flake", m.flake.is_some()) {
-            out.policy.flake = m.flake.unwrap_or_default();
-        }
-        if take("sync", m.sync.is_some()) {
-            out.policy.sync = m.sync.unwrap_or_default();
-        }
-        if !shadowed.is_empty() {
-            out.notices.push(format!(
-                "{POLICY_FILE}: {} ignored: {MANIFEST} has {} under [{kind}.metadata.rargo]",
-                shadowed.iter().map(|t| format!("[{t}]")).collect::<Vec<_>>().join(", ") + if shadowed.len() == 1 { " is" } else { " are" },
-                if shadowed.len() == 1 { "that table" } else { "those tables" },
-            ));
-        }
-        Ok(out)
+        Ok(Policy { env: m.env, network: m.network, flake: m.flake, sync: m.sync })
     }
 
     /// Client variables the policy passes to every action.
@@ -224,15 +205,19 @@ mod tests {
 
     #[test]
     fn parses_and_applies() {
-        let p = Policy::parse(
+        let p = Policy::load(Some(
             r#"
-            [env]
+            [workspace]
+            members = ["crates/*"]
+            [workspace.metadata.rargo]
+            host = "rargo.rs"
+            [workspace.metadata.rargo.env]
             pass = ["DATABASE_URL", "PROTOC*"]
-            [network]
+            [workspace.metadata.rargo.network]
             test-packages = ["it"]
             build-scripts = ["fetcher-sys"]
             "#,
-        )
+        ))
         .unwrap();
         let client: HashMap<String, String> = [
             ("DATABASE_URL", "postgres://x"),
@@ -251,52 +236,35 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_holds_the_policy_and_wins_over_the_file_table_by_table() {
-        let manifest = r#"
-            [workspace]
-            members = ["crates/*"]
-            [workspace.metadata.rargo]
-            host = "rargo.rs"
-            [workspace.metadata.rargo.env]
-            pass = ["DATABASE_URL"]
-            [workspace.metadata.rargo.network]
-            build-scripts = ["fetcher-sys"]
-        "#;
-        // The manifest alone.
-        let l = Policy::load(Some(manifest), None).unwrap();
-        assert_eq!(l.policy.env.pass, ["DATABASE_URL"]);
-        assert!(l.policy.build_script_network("fetcher-sys"));
-        assert!(l.notices.is_empty());
-        // With a file: its [env] is ignored and said to be; its [sync], which
-        // the manifest does not have, still counts.
-        let file = "[env]\npass = [\"OLD\"]\n[sync]\nexclude = [\"node_modules\"]\n";
-        let l = Policy::load(Some(manifest), Some(file)).unwrap();
-        assert_eq!(l.policy.env.pass, ["DATABASE_URL"]);
-        assert_eq!(l.policy.sync.exclude, ["node_modules"]);
-        assert_eq!(l.notices.len(), 1);
-        assert_eq!(l.deprecations.len(), 1, "the file is still read, and that is said");
-        assert!(Policy::load(Some(manifest), None).unwrap().deprecations.is_empty());
-        assert!(l.notices[0].contains("[env] is ignored") && l.notices[0].contains("[workspace.metadata.rargo]"), "{}", l.notices[0]);
-        // A manifest that only names the server changes nothing.
+    fn the_policy_is_the_manifests_table() {
+        // A manifest that only names the server holds the default policy.
         let only_host = "[package]\nname = \"a\"\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n";
-        let l = Policy::load(Some(only_host), Some(file)).unwrap();
-        assert_eq!(l.policy.env.pass, ["OLD"]);
-        assert!(l.notices.is_empty());
+        assert_eq!(Policy::load(Some(only_host)).unwrap(), Policy::default());
         // A package outside a workspace; other tools' metadata is not ours.
         let package = "[package]\nname = \"a\"\n[package.metadata.docs.rs]\nall-features = true\n[package.metadata.rargo.sync]\ngit = false\n";
-        assert_eq!(Policy::load(Some(package), None).unwrap().policy.sync.git, Some(false));
-        // Unknown keys are errors there too, and name the place.
-        let bad = "[workspace.metadata.rargo.env]\npas = []\n";
-        let e = Policy::load(Some(bad), None).unwrap_err();
-        assert!(e.contains("Cargo.toml") && e.contains("workspace.metadata.rargo"), "{e}");
-        // No manifest, no file.
-        assert_eq!(Policy::load(None, None).unwrap(), Loaded::default());
+        assert_eq!(Policy::load(Some(package)).unwrap().sync.git, Some(GitSync::Flag(false)));
+        let history = "[workspace.metadata.rargo.sync]\ngit = \"history\"\n";
+        assert_eq!(Policy::load(Some(history)).unwrap().sync.git, Some(GitSync::Depth(GitDepth::History)));
+        let head = "[workspace.metadata.rargo.sync]\ngit = \"head\"\n";
+        assert_eq!(Policy::load(Some(head)).unwrap().sync.git, Some(GitSync::Depth(GitDepth::Head)));
+        assert!(Policy::load(Some("[workspace.metadata.rargo.sync]\ngit = \"all\"\n")).is_err());
+        // A workspace table comes before a package table of the same file.
+        let both = "[workspace.metadata.rargo.sync]\nexclude = [\"a\"]\n[package]\nname = \"p\"\n[package.metadata.rargo.sync]\nexclude = [\"b\"]\n";
+        assert_eq!(Policy::load(Some(both)).unwrap().sync.exclude, ["a"]);
+        // What git ignores, left out but for one path.
+        let ignored = "[workspace.metadata.rargo.sync]\ngitignored = false\ninclude = [\"data/schema.sql\"]\n";
+        let sync = Policy::load(Some(ignored)).unwrap().sync;
+        assert_eq!((sync.gitignored, sync.include), (Some(false), vec!["data/schema.sql".to_string()]));
+        // No manifest, or one without the table.
+        assert_eq!(Policy::load(None).unwrap(), Policy::default());
+        assert_eq!(Policy::load(Some("[package]\nname = \"a\"\n")).unwrap(), Policy::default());
     }
 
     #[test]
-    fn empty_and_invalid() {
-        assert_eq!(Policy::parse("").unwrap(), Policy::default());
-        assert!(Policy::parse("[env]\npas = []").is_err(), "unknown keys are errors, not silently ignored");
-        assert!(Policy::parse("[network]\ntests = \"yes\"").is_err());
+    fn unknown_keys_and_wrong_types_are_errors_that_name_the_table() {
+        let e = Policy::load(Some("[workspace.metadata.rargo.env]\npas = []\n")).unwrap_err();
+        assert!(e.contains("Cargo.toml") && e.contains("workspace.metadata.rargo"), "{e}");
+        assert!(Policy::load(Some("[workspace.metadata.rargo.network]\ntests = \"yes\"\n")).is_err());
+        assert!(Policy::load(Some("[package.metadata.rargo]\nbogus = 1\n")).is_err());
     }
 }

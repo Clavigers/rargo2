@@ -755,10 +755,10 @@ is the less exercised.
   SSH as the transport (hundreds of milliseconds of connection setup per
   command against a no-op build that takes tens).
 - Noise `NNpsk0` (X25519, ChaCha20-Poly1305, BLAKE2s) with a pre-shared key
-  per user: mutual proof of the key, fresh session keys, no certificates to
-  manage. The key file on the server has a line per user, `name secret
-  [admin]`. Without a key file rargod only listens on loopback and accepts
-  anyone on the machine; it refuses to listen elsewhere without one.
+  per token (its secret): mutual proof of the token, fresh session keys,
+  no certificates to manage. Tokens are D74. A server that has issued no
+  token only listens on loopback and accepts anyone on the machine; it
+  refuses to listen elsewhere.
 - The request rides in the first handshake message when it fits (it
   usually does), encrypted under the pre-shared key, so the server starts
   working after one round trip. That one message is not forward secret; it
@@ -768,10 +768,11 @@ is the less exercised.
 - Users of one server share one cache and are trusted with each other's
   source: a team tool. `admin` gates garbage collection, compaction, and
   cache export and import (which name directories on the server).
-- The client finds the server in `RARGO_SERVER`, `RARGO_USER`, `RARGO_KEY`
-  or `RARGO_KEY_FILE`, else in `~/.config/rargo/config.toml` (`server`,
-  `user`, `key`, `key-file`). `RARGO_FALLBACK=cargo` runs plain cargo when
-  the server cannot be reached.
+- The client finds the server in `RARGO_SERVER`, else in the project's
+  `Cargo.toml` (`rargo @host`), and its token in `RARGO_TOKEN`, else in
+  `~/.config/rargo/credentials.toml` (`rargo auth`).
+  `RARGO_FALLBACK=cargo` runs plain cargo when the server cannot be
+  reached.
 - Output to the client is one ordered queue; file contents in it are
   additionally held to a 32 MiB window, so a slow link slows the sender
   down instead of filling the server's memory.
@@ -1276,8 +1277,8 @@ date.
   the daemon's own environment is used for a build. Closing the socket
   (Ctrl-C, a closed pipe) withdraws the request on the server.
 - **Transport.** The reliable-UDP layer of the worker link, moved into
-  its own crate (`rargo-net`). For clients a connection names its user in
-  the key agreement (Noise `NNpsk0` under the user's key); from then on
+  its own crate (`rargo-net`). For clients a connection names its token in
+  the key agreement (Noise `NNpsk0` under the token's key); from then on
   every datagram carries a 16-byte tag keyed from the handshake hash.
   Datagrams without it are accepted for the key agreement only, so an
   outsider who has seen a connection id can neither inject data nor move
@@ -1886,17 +1887,16 @@ changes it and read again by the server whenever the file has changed:
 `rargod token create|list|revoke|invite` on the server's machine take
 effect at once, with no restart. A token may expire. A session whose
 token was revoked or has expired is closed within seconds (looked at
-when anything arrives on the link, at most every other second). The
-key file keeps working beside it; a server may also run with tokens
-only.
+when anything arrives on the link, at most every other second). Tokens
+are the one way to say who may connect (D74).
 
 *Secrets are not kept in plain text*, with a limit that has to be said:
 the file holds the key derived from the secret, not the secret, and an
 invitation's code only as a hash. But the handshake (Noise NNpsk0) is
 symmetric, so the derived key is all a thief of that file would need
-to connect as the user. The file is therefore as sensitive as the key
-file (mode 600), and "not in plain text" protects only the secret
-itself. Removing that limit means a handshake with a key pair per
+to connect as the user. The file is therefore as sensitive as the
+secrets themselves (mode 600), and "not in plain text" protects only the
+secret itself. Removing that limit means a handshake with a key pair per
 client, the server holding public keys: a protocol change, not done
 here.
 
@@ -2203,3 +2203,178 @@ toolchain, or use their project's own dev shell when it supplies one.
 Release documentation leads with the default package list, shows how to
 inspect and enter the shell, and shows how to extend it by committing a
 project flake and lockfile.
+
+## D72. The two-year history benchmark as it was run (completes D62)
+
+D62 defines the benchmark; this records how the run went, because the
+numbers in `STATUS.md` depend on it.
+
+- **Stopped before the end, by the owner, on 2026-11-24.** Lane (a)
+  built 1,391 of 2,672 commits, (b) 2,014, (d) 915. Lane (c) starts
+  when (a) ends, so it has no builds, and the comparison the brief
+  names as the key one, (d)'s 10th-commit builds against (c), is not in
+  the data. `STATUS.md` reports (a) and (b) at the same 10th commits
+  instead, as the bounds (c) lies between, and says so.
+- **Pauses.** The benchmark was stopped with SIGSTOP several times for
+  measurements that needed the machine's cores. Builds in progress
+  during a pause are listed in `bench/history-tainted.json` and left
+  out of the statistics by `dev/history.py stats`.
+- **The map from commit to toolchain was wrong in places.** It follows
+  the `rust-version` the repository declares, which was raised some
+  commits after newer language features were first used. For commits
+  782 to 810 the map said 1.86 where 1.88 is needed, and for 969 to
+  1278 it said 1.88 where 1.91 is needed; 339 stock builds failed
+  there. The map was corrected (`bench/hist-remap.py`), lane (a) was
+  started again from commit 782 (it is a chain: what follows a failed
+  build is not what the lane measures), and lane (b)'s failed builds
+  were made again. Beyond commit 1,400 the map was not checked, and 141
+  of lane (b)'s later builds failed the same way.
+- **The checkout step** removed untracked files but not a nested
+  repository an earlier commit had left behind, which made cargo see
+  two workspace roots at five commits. `dev/history.py` now uses
+  `git clean -ffd`.
+- **Each lane had four cores**, six lanes side by side under one cap of
+  24, so the figures compare with each other and not with the 24-core
+  tables.
+- **The rargo lane ran the binaries of commit `a635703` throughout**
+  (`bin-hist`), so nothing fixed later is in its numbers, issue 40's
+  sync failure included.
+
+## D73. Stock `cargo clean` on a served `target/` (issue 7)
+
+`cargo clean` removes what is in `target/` and then the directory. The
+directory is a mount point while the daemon serves it, and the kernel
+refuses to remove a mount point before the file system is even asked.
+So the daemon lets go at the right moment: when a removal through the
+mount leaves the directory with no entry, real or delivered, the daemon
+unmounts it before it answers that removal, and forgets what it had
+delivered there. What cargo removes next is a plain, empty directory.
+Stock cargo builds in the worktree as in any other; the next rargo
+command mounts `target/` again and shows the results again (they are in
+the server's cache, so nothing is built).
+
+Nothing tells a clean from any other emptying (`rm -rf target/*`), and
+nothing needs to: an empty output directory holds nothing worth serving.
+`cargo clean -p NAME` and `--release` leave other entries and never
+reach this.
+
+## D74. Tokens are the one way to say who may connect (issue 56)
+
+A server admits the holders of tokens. A token is made by an
+administrator (`rargod token create`), by an invitation being redeemed
+or by a GitHub account on the allow list signing in (`rargo auth`); it
+may expire and can be revoked while the server runs. A client presents
+`RARGO_TOKEN` or the token stored for the project's host. A server with
+no `tokens.json` in its state directory admits anyone on its machine and
+therefore starts only on the loopback interface.
+
+The rigs and suites make their users with `rargod token create` before
+the server starts (`dev/netns.sh` keeps the rig's token file beside the
+server's state, so a server started on an emptied state directory admits
+the same token), and `deploy/check-service.sh` takes `RARGO_TOKEN`.
+
+`RARGO_TOKEN` is on the list of variables that never leave the client:
+a build's environment on the server does not contain it.
+
+The secret shared by a server and its workers (`--worker-key`) is a
+different matter and is unchanged.
+
+
+## D75. A token's holder is asked of the server (issue 68)
+
+`rargo auth --token T` asks `POST /auth/whoami` with the token's whole
+text and keeps the token only if the server names its holder; the name is
+stored beside it, so `rargo auth status` always says whose it is. The
+token's own text is the authority, as for `/auth/revoke`: the answer
+tells whoever holds the secret nothing they could not learn by building.
+Rejected: learning the name from the build session's handshake (it would
+store a token before anything checked it, and needs a protocol change).
+
+A refusal is one sentence, `rargo_proto::REFUSED`, on both transports;
+the client recognises it by that text. The credentials file holds a
+token as `id`, `secret` and `name`.
+
+## D76. Token commands from a client (issue 24)
+
+`rargo auth invite|create|tokens|revoke|allow|disallow` are requests on
+the client's session, like `--rargo-gc`, not calls to the server's HTTP
+paths: the session is encrypted and already knows who is asking and
+whether they administer the server, while the HTTP port is plain on a
+server that no HTTPS proxy fronts, and an invitation's code or a new
+token's secret would cross it in the clear. One function
+(`rargo_core::tokens::command`) serves them and `rargod token`, so the
+two cannot drift apart. Someone who is not an administrator may list
+and revoke their own tokens and nothing else; the list shows no secret
+and no invitation code. `rargod token github` stays on the server's
+machine: it reads the application's secret from a file there.
+
+## D77. What git ignores is synced unless the project says otherwise (issue 62)
+
+`[workspace.metadata.rargo.sync] gitignored = false` leaves out everything
+git ignores: it is not scanned, not watched and not sent. `include` names
+what is sent all the same, with `exclude`'s patterns; a file inside an
+ignored directory is named by its path, and only the way to it is entered.
+The default stays `true`: a build may read an ignored file (a generated
+source, a local `.env`, a file `include_str!` embeds), and a build that
+quietly lacks an input is a worse surprise than an upload of things it
+never reads. A project with large ignored trees says so in one line.
+
+Git itself says what it ignores (`git ls-files --others --ignored
+--exclude-standard --directory`, once per scan with the option), so
+nested `.gitignore` files, `.git/info/exclude` and the user's global
+excludes all count, exactly as `git status` counts them; rargo does not
+reimplement gitignore matching. Outside a git repository, or where git
+cannot answer, nothing is left out.
+
+A failed command whose error output names a path that was left out this
+way ends with a note naming the path, the option and `include`. The
+daemon keeps the command's error output (up to 1 MiB) only while the
+option is set, and matches the paths in it against what git ignores, so
+an error about another file is not blamed on the option.
+
+## D78. History for the build scripts that ask for it (issue 11)
+
+What build scripts ask git, in the four benchmark repositories:
+rust-analyzer `log -1 --format=%H %h %cd`, Zed `rev-parse HEAD`, Ruff and
+ty `log -1 --format=%H %h %cd %(describe:tags)`, Bevy nothing. Ruff turns the last field
+into its last release and the distance to it, which is history; the rest
+is HEAD. The crates that build scripts and macros use for this (vergen,
+shadow-rs, git-version, built, git-testament) add `describe --tags` and
+`rev-list --count`.
+
+- `[sync] git = "history"` adds to the stand-in every commit HEAD reaches,
+  without trees, and every tag on them. `describe` in every form,
+  `rev-list --count`, `%(describe:tags)` and `log` without paths then
+  answer as on the client. On rust-analyzer's real history (42,000
+  commits), five such queries agreed at six commits from two years back
+  to HEAD. `git = "head"` is HEAD and the tags on it (a build at a release
+  tag describes as that tag); `false` is no `.git`.
+- The default (`true`) decides per worktree: history where a `build.rs`
+  mentions `describe` or `rev-list`, or a `Cargo.lock` names one of those
+  crates; else HEAD. History is not the default for everyone because of
+  what it costs. rust-analyzer's commits are 26 MiB, 11 MiB compressed,
+  where its sources compress to 4 MiB, so a first upload would grow
+  nearly fourfold for a feature most builds never use.
+- The commits travel as packs over pieces of the first-parent chain of
+  4096, 256, 16 and 1 commits, each starting at a multiple of its size
+  counted from the root, with whatever was merged into them. A piece never
+  changes once its last commit exists. So a new commit adds a pack of one
+  (2 to 3 KB for rust-analyzer, 70 to 90 ms), and a HEAD's history is a
+  few dozen packs at most (10 for rust-analyzer's HEAD, 19 MB). The pieces
+  are kept once per repository in the client's cache and hard-linked into
+  a directory per HEAD, which the scan shows inside `.git/objects` beside
+  the stand-in's own pack.
+- Rejected:
+  - Loose objects, one file per commit. They are deterministic across
+    machines, but cost 165 MB of disk for rust-analyzer (a 4 KiB block
+    each, at both ends).
+  - A commit-graph file in place of the commits. git checks that every
+    commit it names exists ("exists in commit-graph but not in the object
+    database").
+  - Only the commits `describe` reads, found by tracing git's pack
+    accesses. Exact only by accident of git's caches. In a repository
+    without annotated tags, plain `describe` walks the whole history
+    anyway.
+- A tag made, moved or removed makes another stand-in without a new
+  commit: HEAD carries a seal of `packed-refs` and `refs/tags`, read
+  without starting git on every command.

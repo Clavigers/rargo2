@@ -14,7 +14,6 @@ L=${RARGO_GATE_DIR:-$work/gate}
 mkdir -p "$L"
 . "$work/env.sh"
 jobs=${RARGO_JOBS:-4}
-cap() { systemd-run --scope -q -p CPUQuota=600% -p MemoryMax=30G "$@"; }
 report() {
     gh api --method POST "repos/$repo/statuses/$commit" \
         -f "context=gate/$1" -f "state=$2" -f "description=${3:0:140}" >/dev/null
@@ -29,7 +28,7 @@ summary() {
         }
     ' "$1"
 }
-suites=(build unit e2e e2e-copy e2e-flake e2e-auth e2e-link e2e-worker)
+suites=(build unit mount-tests e2e e2e-copy e2e-flake e2e-auth e2e-components e2e-link e2e-worker)
 report all pending "Running ${#suites[@]} gate steps"
 for suite in "${suites[@]}"; do report "$suite" pending "Waiting for gate"; done
 passed=0
@@ -48,23 +47,26 @@ step() {
     fi
     report "$name" "$status" "${description:-$status}"
 }
-step build cap cargo build --release --locked
-step unit cap cargo test --release --locked --workspace
-if [ "$passed" -ne 2 ]; then
-    for suite in "${suites[@]:2}"; do report "$suite" error "Build or unit tests failed"; done
+# Use the repository's build server and mount tests at their normal paths.
+unset CARGO_TARGET_DIR
+step build rargo build --release --locked
+step unit rargo test --release --locked --workspace --lib --bins
+step mount-tests dev/mount-tests.sh --release
+if [ "$passed" -ne 3 ]; then
+    for suite in "${suites[@]:3}"; do report "$suite" error "Build or tests failed"; done
     report all failure "$passed of ${#suites[@]} gate steps passed"
     exit 1
 fi
 B=$L/bin
 mkdir -p "$B"
-cp "${CARGO_TARGET_DIR:-target}"/release/{rargo,rargod,rargo-sandbox} "$B/"
-unset CARGO_TARGET_DIR
+cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
 export RIG=${RIG:-rargo2} RIG_STATE=${RIG_STATE:-rig2}
 step e2e dev/e2e.sh
 step e2e-copy env RARGO_OUTPUT=copy dev/e2e.sh
 step e2e-flake dev/e2e-flake.sh
 step e2e-auth dev/e2e-auth.sh
+step e2e-components dev/e2e-components.sh
 step e2e-link dev/e2e-link.sh
 step e2e-worker dev/e2e-worker.sh
 if ! clean || [ "$(git rev-parse HEAD)" != "$commit" ]; then

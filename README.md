@@ -17,14 +17,11 @@ Linux, root (it mounts a FUSE filesystem and creates namespaces).
 forks/setup.sh                      # clones cargo at the pinned commit, applies the patches, builds the planner
 cargo build --release               # rargod and rargo
 
-cat >/etc/rargo.keys <<EOF          # one user per line: name, secret (16+ characters), optionally `admin`
-ann  $(head -c 24 /dev/urandom | base64)  admin
-bob  $(head -c 24 /dev/urandom | base64)
-EOF
+rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation for the first user
 
 rargod --state /var/lib/rargo \
        --planner /path/to/cargo-fork/target/release/cargo \
-       --listen 0.0.0.0:7459 --keys /etc/rargo.keys
+       --listen 0.0.0.0:7459
 ```
 
 rargod uses the rustup and `PATH` it is started with; toolchains a repo
@@ -36,8 +33,9 @@ asks for are installed on first use, crates are downloaded into
 `rargod --state DIR --worker SERVER:PORT --worker-key FILE`; the link is
 authenticated and encrypted with that key).
 
-Without `--keys`, rargod listens on `127.0.0.1` only and accepts anyone on
-the machine.
+Who may connect is a matter of tokens (`rargod token invite|create|list|
+revoke`, in effect while the server runs). A server that has issued none
+listens on `127.0.0.1` only and accepts anyone on the machine.
 
 ## The client
 
@@ -57,11 +55,8 @@ project builds on and as whom; `rargo auth remove` forgets the token. On
 the server, `rargod token invite|create|list|revoke --state DIR` manage
 who may connect, without a restart.
 
-The older way still works: `~/.config/rargo/config.toml` with `server`,
-`user` and `key` (or `key-file`) for a user of the server's key file.
-
-`RARGO_SERVER`, `RARGO_TOKEN`, `RARGO_USER`, `RARGO_KEY` and `RARGO_KEY_FILE`
-override all of it. To make agents that type `cargo` use rargo, put a link named `cargo`
+`RARGO_SERVER` and `RARGO_TOKEN` override the project's server and the
+stored token. To make agents that type `cargo` use rargo, put a link named `cargo`
 to the `rargo` binary ahead of the real cargo on `PATH`; everything that is
 not a build is passed to the real cargo, and `RARGO_FALLBACK=cargo` passes
 builds too when the server cannot be reached.
@@ -77,15 +72,15 @@ happen. The server must be reachable on its port over UDP and TCP.
 without one. Its log is `daemon.log` in the cache directory.
 
 What is synced: the whole worktree except `.git`, cargo target directories,
-and what `.rargo.toml` excludes. What comes back: what cargo would have left
+and what the project's policy excludes. What comes back: what cargo would have left
 in `target/` for the command, and files the build wrote into the worktree.
 
 `target/` is a file system the daemon mounts (FUSE; as root or with
 `CAP_SYS_ADMIN`): what the server built is listed there at once and
 fetched when something opens it; what you or stock cargo write there
 goes to the real directory underneath. Stopping the daemon leaves that
-plain directory. Use `rargo clean` (or `cargo clean` through the shim),
-not a stock `cargo clean`, while it is mounted. Where it cannot be
+plain directory. `cargo clean`, stock or through rargo, removes it as it
+removes any `target/`. Where it cannot be
 mounted, or with `RARGO_OUTPUT=copy`, results are copied into `target/`
 and shared between worktrees through the cache.
 
@@ -118,8 +113,19 @@ enabled = true                         # build in the repo's flake devShell (def
 
 [workspace.metadata.rargo.sync]
 exclude = ["node_modules"]             # never sent to the server
-git = true                             # show build scripts a history-free .git for HEAD
+gitignored = false                     # nor anything git ignores (default: synced)
+include = ["config/local.toml"]        # ... but this, although git ignores it
+git = "history"                        # build scripts see every commit (default: where they ask)
 ```
+
+## rargo builds rargo
+
+This repository's `Cargo.toml` names `rargo.rs` as its server, so `rargo
+build` here, on a laptop, for an agent or in CI, is one build on one
+cache: what was built for a commit anywhere is a cache hit everywhere
+else. CI installs the released client, signs in with a token and runs
+`rargo build` and `rargo test`; the tests that mount file systems are
+compiled by the server and run on the runner (`dev/mount-tests.sh`).
 
 ## The build environment is the project's flake
 
@@ -139,10 +145,6 @@ cd YOUR-PROJECT && git add flake.nix flake.lock
 
 A project that needs another library adds it to `packages` in its
 `flake.nix`. `nix develop` gives the same environment on your machine.
-
-The older place, a `.rargo.toml` at the top of the repository with the
-same tables unprefixed, is still read. A table the manifest has wins over
-the same table of the file, and the build says so.
 
 ## Other commands
 

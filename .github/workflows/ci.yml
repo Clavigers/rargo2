@@ -1,5 +1,6 @@
 # What every push must pass: the workspace builds without warnings, the unit
-# and engine tests pass, the client builds as the static binary that is
+# and engine tests pass (rargo builds rargo: every build here runs on the
+# server Cargo.toml names, with the cache the developers' builds fill), the client builds as the static binary that is
 # shipped, and the crates that go to crates.io package and build from their
 # packaged form. The end-to-end suites need root, FUSE and the planner; they
 # are run on the build machine before a release (dev/gate.sh).
@@ -19,22 +20,26 @@ jobs:
     timeout-minutes: 40
     env:
       RUSTFLAGS: -D warnings
+      # Plain files in target/: root runs the mount tests out of it, and a
+      # runner's user cannot show root a file system of its own.
+      RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
-      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: cargo build --locked --workspace
-      - name: Unit and engine tests, as root (they mount and create namespaces)
-        run: sudo -E env "PATH=$PATH" cargo test --locked --workspace
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: rargo, signed in to the server this repository names
+        env:
+          RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
+        run: |
+          curl -fsSL https://rargo.rs/install.sh | sh
+          rargo auth --token "$RARGO_TOKEN"
+      - name: Build (on the server, on the cache every other build of this commit uses)
+        run: rargo build --locked --workspace
+      - name: Unit tests (on the server)
+        run: rargo test --locked --workspace --lib --bins
+      - name: The tests that mount and make namespaces (built on the server, run here as root)
+        run: dev/mount-tests.sh
       - name: The shipped client
-        run: CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc cargo build --locked --release -p rargo --target x86_64-unknown-linux-musl
+        run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
       - name: The crates that are published
         run: cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh
@@ -48,14 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal && rustup default stable
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: path-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      - run: cargo build --locked --release -p rargo -p rargod -p rargo-core
+      - name: rargo, signed in to the server this repository names
+        env:
+          RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
+        run: |
+          curl -fsSL https://rargo.rs/install.sh | sh
+          rargo auth --token "$RARGO_TOKEN"
+      - run: RARGO_OUTPUT=copy rargo build --locked --release -p rargo -p rargod -p rargo-core
       - name: The planner of the latest release
         env:
           GH_TOKEN: ${{ github.token }}

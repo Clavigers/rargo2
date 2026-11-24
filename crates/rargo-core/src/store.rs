@@ -81,6 +81,14 @@ pub struct Store {
     cold_lock: std::sync::RwLock<()>,
     /// Bumped whenever a blob stops being whole or stops existing.
     generation: AtomicU64,
+    /// Content that requests in progress hold: never evicted or swept. A
+    /// count per blob, one for each holder ([`Store::pin_all`]).
+    pins: DashMap<Hash, u32>,
+    /// Held for reading while content is checked and pinned in one step,
+    /// and for writing by whoever removes a blob, around its look at the
+    /// pins and the removal: a blob is either pinned before it could be
+    /// removed or seen missing by the one who wanted to pin it.
+    pin_gate: parking_lot::RwLock<()>,
 }
 
 fn now_secs() -> u64 {
@@ -181,6 +189,8 @@ impl Store {
             dev,
             tmp_seq: AtomicU64::new(0),
             generation: AtomicU64::new(1),
+            pins: DashMap::new(),
+            pin_gate: parking_lot::RwLock::new(()),
             total: AtomicU64::new(total),
             chunks,
             cold,
@@ -746,6 +756,36 @@ impl Store {
         }
     }
 
+    /// Pins every one of `hashes` if the store holds them all (and says
+    /// whether it did). Pinned content stays until [`Store::unpin_all`],
+    /// whatever the budget; this is how a request keeps the worktree it
+    /// was given for as long as it runs.
+    pub fn pin_all(&self, hashes: &[Hash]) -> bool {
+        let _gate = self.pin_gate.read();
+        if !hashes.iter().all(|h| self.has(h)) {
+            return false;
+        }
+        for h in hashes {
+            *self.pins.entry(*h).or_insert(0) += 1;
+        }
+        true
+    }
+
+    pub fn unpin_all(&self, hashes: &[Hash]) {
+        for h in hashes {
+            if let dashmap::mapref::entry::Entry::Occupied(mut e) = self.pins.entry(*h) {
+                *e.get_mut() -= 1;
+                if *e.get() == 0 {
+                    e.remove();
+                }
+            }
+        }
+    }
+
+    pub fn is_pinned(&self, h: &Hash) -> bool {
+        self.pins.contains_key(h)
+    }
+
     /// Evicts least-recently-used blobs until the store is under `budget`
     /// bytes. `pinned` blobs are never evicted. Returns bytes freed.
     pub fn evict_to(&self, budget: u64, pinned: &dyn Fn(&Hash) -> bool) -> u64 {
@@ -782,6 +822,10 @@ impl Store {
                 break;
             }
             if pinned(&h) || (min_age_secs > 0 && seen_used > cutoff) {
+                continue;
+            }
+            let _gate = self.pin_gate.write();
+            if self.is_pinned(&h) {
                 continue;
             }
             if cold {
@@ -827,6 +871,10 @@ impl Store {
             .collect();
         let mut bytes = 0;
         for (h, size) in &dead {
+            let _gate = self.pin_gate.write();
+            if self.is_pinned(h) {
+                continue;
+            }
             on_evict(h);
             self.forget(h);
             let _ = fs::remove_file(self.path_of(h, false));
@@ -840,6 +888,10 @@ impl Store {
             .map(|e| *e.key())
             .collect();
         for h in &dead_cold {
+            let _gate = self.pin_gate.write();
+            if self.is_pinned(h) {
+                continue;
+            }
             on_evict(h);
             self.drop_cold(h);
         }

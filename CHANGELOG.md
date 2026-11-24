@@ -6,6 +6,98 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.2
+
+Protocol 7 (unchanged).
+
+- A build step that needs a toolchain component the server lacks (a build
+  script that runs `rustfmt`) gets it installed there and runs again; the
+  client sees the build succeed. A component that does not exist for the
+  toolchain fails the build with rustup's own message. (#69)
+- Build scripts that ask git about history get the client's answers:
+  `git describe --tags`, `rev-list --count HEAD` and
+  `%(describe:tags)` agree with stock cargo where a `build.rs` mentions
+  `describe` or `rev-list`, or `Cargo.lock` names vergen, shadow-rs,
+  git-version, built or git-testament. Then the server is sent the
+  commits (not their contents) and the tags. `[sync] git = "history"`
+  asks for that always, and `git = "head"` never. The tags on HEAD come
+  along in any case. (#11)
+- `[workspace.metadata.rargo.sync] gitignored = false` leaves out
+  everything git ignores (not scanned, watched or sent); `include` names
+  what is sent all the same. A failed build that reads a file left out
+  this way ends with a note naming the file and the option. By default
+  what git ignores is synced. (#62)
+- After a command for another server in a worktree (`RARGO_SERVER=...`),
+  `target/` shows this server's builds: a daemon notices that another
+  one replaced its mount, also when the kernel gave the new mount the
+  same device number and mount id, and mounts again. (#76)
+
+## 0.6.1
+
+Protocol 7 (unchanged).
+
+- A command that needs a toolchain component the server lacks (clippy for
+  `rargo clippy`) gets it installed on the server on first use, also with
+  `--locked`, `--frozen` or `--offline`. (#69)
+- An administrator manages tokens from any machine authenticated to the
+  server: `rargo auth invite|create|tokens|revoke|allow|disallow`, with
+  the options of `rargod token`. Anyone may list and revoke their own
+  tokens. (#24)
+- A token that is not an administrator's, refused an administrator's
+  command, is told how one is made (`rargod token create --admin`, `token
+  invite --admin`, `token allow --admin`). (#56)
+
+## 0.6.0
+
+Protocol 7 (unchanged).
+
+- `~/.config/rargo/credentials.toml` holds a token as `id`, `secret` and
+  `name`.
+- `rargo auth --token T` asks the server whose token it is before keeping
+  it: it stores the holder's name, which `rargo auth status` shows, and
+  refuses a token the server does not admit. (#68)
+- A server refuses a client it does not admit with "the server does not
+  know this token, or it was revoked or has expired", over UDP and TCP.
+  (#68)
+
+## 0.5.0
+
+Protocol 7 (unchanged).
+
+- Tokens are the one way to say who may connect to a server: `rargod
+  token invite|create|list|revoke`, `rargo auth`, `RARGO_TOKEN`. A server
+  that has issued no token listens on the loopback interface and admits
+  anyone on its machine. (#56)
+- `RARGO_TOKEN` stays on the client: it is not among the variables a
+  build on the server sees.
+
+## 0.4.1
+
+Protocol 7 (unchanged).
+
+- Stock `cargo clean` works in a worktree whose `target/` the daemon
+  serves: when the directory's last entry is removed the daemon gives the
+  directory back, and cargo removes it. Stock cargo and rargo both build
+  there afterwards. (#7)
+
+## 0.4.0
+
+Protocol 7 (unchanged).
+
+- A project's server and policy are in its `Cargo.toml`
+  (`[workspace.metadata.rargo]`); a machine's token is in
+  `~/.config/rargo/credentials.toml` or `RARGO_TOKEN`. Those are the only
+  places rargo reads them from. (#55)
+
+## 0.3.7
+
+Protocol 7 (unchanged).
+
+- A worktree that was synced for a request is pinned in the server's
+  store for as long as the request holds it: a store at its budget
+  evicts other content, never the sources of a build that is running.
+  (#40)
+
 ## 0.3.6
 
 Protocol 7 (unchanged).
@@ -26,14 +118,6 @@ Protocol 7 (unchanged).
   The directory is now unmounted the moment its daemon is gone, with no
   rargo command run, and is an ordinary directory stock cargo builds in.
   (#6)
-- The older configuration files say that they are old: a build that takes
-  its server or key from `~/.config/rargo/config.toml`, or its policy from
-  `.rargo.toml`, notes it once per command and names what replaces it.
-  `RARGO_QUIET_DEPRECATIONS=1` silences that. Both files are read until
-  **0.5.0**. (#21)
-- `rargo --rargo-migrate` moves them: the old server becomes the project's
-  `host`, the old key a credential for it, and the tables of `.rargo.toml`
-  go into `Cargo.toml` with their comments; `.rargo.toml` is removed. (#21)
 
 ## 0.3.4
 
@@ -42,8 +126,7 @@ Protocol 7 (unchanged).
 - A project's policy (`env`, `network`, `flake`, `sync`) is read from its
   `Cargo.toml`, under `[workspace.metadata.rargo]` (`[package.metadata.rargo]`
   for a package outside a workspace), so a repository needs no rargo file
-  of its own. `.rargo.toml` is still read; where both have a table the
-  manifest's wins and the build says the file's is ignored. (#20)
+  of its own. (#20)
 
 ## 0.3.3
 

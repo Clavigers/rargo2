@@ -8,7 +8,7 @@
 //! A client machine runs one daemon per server, and the daemon holds one
 //! long-lived link to it (the reliable-UDP transport of `rargo-net`, or TCP
 //! where UDP does not get through), encrypted and authenticated with a
-//! pre-shared key per user (Noise `NNpsk0`); see [`secure`]. The link
+//! pre-shared key per token (Noise `NNpsk0`); see [`secure`]. The link
 //! carries [`Frame`]s of bincode messages ([`ClientMsg`], [`ServerMsg`]):
 //! every command is a stream of its own, and stream 0 is the daemon's own
 //! conversation with the server (worktree changes pushed as they happen,
@@ -22,6 +22,10 @@ pub mod tree;
 pub mod workspace;
 
 pub const PROTO_VERSION: u32 = 7;
+
+/// What a server says to a client whose token it does not admit, on either
+/// transport; the client recognises it by this text.
+pub const REFUSED: &str = "the server does not know this token, or it was revoked or has expired";
 
 /// Where the stand-in for a linked worktree's git directory is shown: the
 /// worktree's `.git` is a file there, as on the client, and names this
@@ -403,8 +407,8 @@ pub fn env_allowed(name: &str) -> bool {
     ];
     const PREFIXES: &[&str] = &["CARGO_", "RUSTC", "RUSTDOC", "RUST_", "LC_", "__CARGO", "RARGO_"];
     const DROP: &[&str] = &[
-        "CARGO_HOME", "CARGO_MAKEFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RARGO_KEY", "RARGO_KEY_FILE",
-        "RARGO_SERVER", "RARGO_USER", "RARGO_CACHE_DIR", "RARGO_REAL_CARGO", "CARGO_REGISTRY_TOKEN",
+        "CARGO_HOME", "CARGO_MAKEFLAGS", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "RARGO_TOKEN",
+        "RARGO_SERVER", "RARGO_CACHE_DIR", "RARGO_REAL_CARGO", "CARGO_REGISTRY_TOKEN",
     ];
     if DROP.contains(&name) || (name.starts_with("CARGO_REGISTRIES_") && name.ends_with("_TOKEN")) {
         return false;
@@ -437,7 +441,7 @@ mod tests {
         assert!(!env_allowed("PATH"));
         assert!(!env_allowed("HOME"));
         assert!(!env_allowed("CARGO_HOME"));
-        assert!(!env_allowed("RARGO_KEY"));
+        assert!(!env_allowed("RARGO_TOKEN"), "a token stays on the client");
         assert!(!env_allowed("CARGO_REGISTRIES_MINE_TOKEN"));
         assert!(!env_allowed("AWS_SECRET_ACCESS_KEY"));
     }

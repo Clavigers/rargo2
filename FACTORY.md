@@ -108,8 +108,9 @@ released.
 - `rargod.service`: the server for real use. `/root/rargo-work/service`
   holds `releases/VERSION-COMMIT/`, `current`, `state/` (with
   `tokens.json`), `keys`, its own `rustup/` and `cargo-home/`. Port 7459,
-  UDP and TCP, public name `build.rargo.rs`. Capped at 8 threads and 32 GB
-  with a low CPU and IO weight. It is only ever replaced by
+  UDP and TCP, public name `build.rargo.rs`. It has almost the whole machine (the
+  owner's setting): 28 of the 32 threads and 96 GB, at the normal CPU and
+  IO weight; the unit is `/etc/systemd/system/rargod.service`. It is only ever replaced by
   `deploy/update-service.sh`.
 - rargo.rs: the owner's site, in the bare repository
   `/root/rargo-hq/deploy.git`; a push to `main` rebuilds and replaces its

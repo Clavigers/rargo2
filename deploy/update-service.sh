@@ -9,7 +9,7 @@
 #   releases/VERSION-COMMIT/   rargod, rargo-sandbox, rargo (same commit,
 #                        static, the one clients install), planner-cargo
 #   current -> releases/...    what rargod.service runs
-#   state/ keys cargo-home/ rustup/   kept across updates
+#   state/ cargo-home/ rustup/   kept across updates
 # Nothing is built from a working tree. The unit is restarted only when
 # the release changed; builds in progress end with it and are simply run
 # again by their clients.
@@ -62,5 +62,7 @@ if [ "$(readlink "$S/current" 2>/dev/null)" != "$rel" ]; then
     systemctl restart rargod.service
     sleep 1
 fi
+# The client the agents and the gate build rargo with is the service's.
+install -m 755 "$rel/rargo" /usr/local/bin/rargo
 systemctl is-active rargod.service
 echo "running: $rel"

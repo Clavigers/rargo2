@@ -43,7 +43,8 @@ if [ "$(gh pr checks "$url" --json name -q 'map(select(.name == "build-and-test"
     exit 1
 fi
 if gh pr checks "$url" --watch --fail-fast --interval 20 >/dev/null; then
-    gh pr merge "$url" --squash --delete-branch --match-head-commit "$commit"
+    gh pr merge "$url" --squash --match-head-commit "$commit"
+    git push -q origin ":$branch" 2>/dev/null || true
     # In the main checkout: back on main. In a second worktree (main is
     # checked out elsewhere): at what was merged.
     git fetch -q origin
