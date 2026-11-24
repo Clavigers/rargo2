@@ -42,6 +42,26 @@ Facts that affect the design:
 
 ## Working rules
 
+- **Greenfield, always (the owner's rule).** Treat rargo as a greenfield
+  prototype at all times and assume zero existing users or deployments.
+  Describe the design in the present tense everywhere, including code
+  comments, documentation, diagnostics and tests; never narrate what used
+  to exist, what replaced it, or how to transition between the two.
+  Delete superseded behavior outright and never add migrations,
+  deprecation warnings, compatibility shims, legacy fallbacks, or cautions
+  about breaking users.
+- **Two agents work here, each in a checkout of its own** (`/root/rargo`
+  and `/root/rargo-codex`); neither touches the other's. An issue is
+  locked before it is worked on: the label `wip-claude` or `wip-codex`.
+  Take only an issue with no `wip-` label that is not assigned to
+  `sadosystems`; add your label, look again, and if the other label is
+  there too, remove yours and take a different issue. The label stays
+  while the issue is yours, also when the review reopens it. The agents
+  share the machine: the limits above are for both together, and each
+  uses rigs, state and build directories of its own for the suites (the
+  second agent: `RIG=codex RIG_STATE=rig-codex`,
+  `RARGO_E2E_LINK=$RARGO_WORK/e2e-link-codex`, its own `CARGO_TARGET_DIR`
+  and gate directory), never the other's.
 - Work that closes an issue happens on a branch and lands through a pull
   request whose description says `Closes #N`, what changed, how it was
   tested and what was measured. Nobody reviews it: it merges (squash) when

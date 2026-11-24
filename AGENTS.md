@@ -1,1 +1,3 @@
-Treat Rargo as a greenfield prototype at all times and assume zero existing users or deployments. Describe the design in the present tense everywhere, including code comments, documentation, diagnostics, and tests; never narrate what used to exist, what replaced it, or how to transition between the two. Delete superseded behavior outright and never add migrations, deprecation warnings, compatibility shims, legacy fallbacks, or cautions about breaking users.
+# rargo
+
+The rules for agents working in this repository are in `CLAUDE.md` (the machine and the working rules) and `FACTORY.md` (how work gets from an issue to a release). Read both before anything else; they apply to every agent, whatever its name.
