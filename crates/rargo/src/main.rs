@@ -617,6 +617,14 @@ fn main() {
         vars.retain(|(k, _)| k != "RUSTUP_TOOLCHAIN");
         vars.push(("RUSTUP_TOOLCHAIN".into(), tc));
     }
+    // `nextest` runs the version the repository names, else this machine's
+    // own nextest's, which the server is told.
+    if subcommand(&args) == Some("nextest")
+        && !vars.iter().any(|(k, _)| k == "RARGO_NEXTEST_VERSION")
+        && let Some(v) = own_nextest_version()
+    {
+        vars.push(("RARGO_NEXTEST_VERSION".into(), v));
+    }
     // Requests about the server itself need no worktree.
     let admin = match args.first().map(|s| s.as_str()) {
         Some("auth") if token_command => Some("__token"),
@@ -736,6 +744,20 @@ fn subcommand(args: &[String]) -> Option<&str> {
         return Some(a);
     }
     None
+}
+
+/// The version of the `cargo-nextest` on PATH, if there is one: the second
+/// word of `cargo-nextest nextest --version` (`cargo-nextest 0.9.100 (...)`).
+fn own_nextest_version() -> Option<String> {
+    let out = std::process::Command::new("cargo-nextest")
+        .args(["nextest", "--version"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let mut words = text.lines().next()?.split_whitespace();
+    (words.next()? == "cargo-nextest").then(|| words.next().map(String::from)).flatten()
 }
 
 /// Finds the real cargo: the first `cargo` on PATH that is not this program.
