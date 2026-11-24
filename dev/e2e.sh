@@ -394,6 +394,50 @@ out=$(cd "$T/nx-d" && "$R" nextest run 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" "nextest 9.9.9, which the \`nextest\` key of rargo's metadata in Cargo.toml asks for, cannot be installed on this server" && has "$out" "cargo-nextest-9.9.9/cargo-nextest-9.9.9-x86_64-unknown-linux-musl" && ok "a version the server cannot get: the error names it and what was tried" || bad "a version the server cannot get: the error names it and what was tried" "rc=$rc
 $out"
 
+echo "== nextest: every test a cached action"
+cd "$A"
+"$R" nextest run >/dev/null 2>&1
+before=$(kind_runs tests)
+out=$("$R" nextest run 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 0 ] && [ "$before" = "$after" ] && grep -qE "5 tests run: 5 passed" <<<"$out" && has "$out" "Replayed 5 of 5 test runs from rargo's cache (0 run on the server" && ok "a second rargo nextest run replays every test and runs none" || bad "a second rargo nextest run replays every test and runs none" "rc=$rc tests run: $before -> $after
+$out"
+echo changed >crates/app/tests/fixture.txt
+before=$(kind_runs tests)
+out=$("$R" nextest run --no-fail-fast 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 100 ] && [ $((after - before)) -eq 1 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && has "$out" "Replayed 4 of 5 test runs from rargo's cache (1 run on the server" && ok "after an edit to one fixture, exactly the test that reads it runs (and fails)" || bad "after an edit to one fixture, exactly the test that reads it runs" "rc=$rc tests run: $before -> $after
+$out"
+echo fixture >crates/app/tests/fixture.txt
+before=$(kind_runs tests)
+out=$("$R" nextest run 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 0 ] && [ "$before" = "$after" ] && ok "the fixture restored: its earlier passing run is replayed" || bad "the fixture restored: its earlier passing run is replayed" "rc=$rc tests run: $before -> $after
+$out"
+before=$(kind_runs tests)
+out=$("$R" nextest run --no-cache 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 0 ] && [ $((after - before)) -eq 5 ] && has "$out" "Replayed 0 of 5 test runs" && ok "--no-cache runs every test" || bad "--no-cache runs every test" "rc=$rc tests run: $before -> $after
+$out"
+# A test that fails on its first attempt and passes on the second.
+nx_project "$T/nx-flaky" ""
+cat >"$T/nx-flaky/src/lib.rs" <<'EOF'
+#[test]
+fn flaky() {
+    assert_ne!(std::env::var("NEXTEST_ATTEMPT").as_deref(), Ok("1"), "fails on its first attempt");
+}
+EOF
+norm() { sed -E 's/\[ *[0-9.]+s\]/[time]/g; s/run ID [0-9a-f-]+/run ID X/' | grep -E 'FLAKY|TRY|FAIL|PASS|Summary|Starting|fails on its first'; }
+out=$(cd "$T/nx-flaky" && "$R" nextest run --retries 2 2>&1); rc=$?
+newest=$(cat "$RARGO_STATE/nextest/newest-release")
+mkdir -p "$T/nextest-newest" && ln -sf "$RARGO_STATE/nextest/$newest/cargo-nextest" "$T/nextest-newest/cargo-nextest"
+stock=$(cd "$T/nx-flaky" && PATH="$T/nextest-newest:$PATH" cargo nextest run --offline --retries 2 2>&1); src=$?
+[ $rc -eq 0 ] && [ $src -eq 0 ] && has "$out" "FLAKY 2/3" && [ "$(norm <<<"$out")" = "$(norm <<<"$stock")" ] && ok "a test that fails and then passes is reported flaky, as stock nextest reports it" || bad "a test that fails and then passes is reported flaky, as stock nextest reports it" "rc=$rc stock=$src
+--- rargo
+$(norm <<<"$out")
+--- stock
+$(norm <<<"$stock")"
+
 echo "== errors"
 cd "$A"
 cp crates/app/src/main.rs "$T/main.rs.bak"
