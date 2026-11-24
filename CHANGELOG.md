@@ -6,6 +6,14 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.1
+
+Protocol 7 (unchanged).
+
+- Fixed: `rargo run` and `rargo test` could not start the program of a
+  worktree that lies under `/tmp` while its `target/` was served by the
+  daemon ("could not execute process ... No such file or directory").
+
 ## 0.3.0
 
 Protocol 7 (unchanged).
