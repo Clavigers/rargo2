@@ -281,7 +281,7 @@ fn spec(p: &Prepared, argv: Vec<Vec<u8>>, env: BTreeMap<Vec<u8>, Vec<u8>>, net: 
         cwd: bytes(&p.sandbox_cwd),
         net,
         mkdirs: vec![],
-        root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
+        root_id: p.flake.id,
         discard: vec![],
         label: "nextest".into(),
     }
@@ -339,7 +339,7 @@ async fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<Stri
         cwd: bytes(&p.sandbox_cwd),
         net: NetMode::Loopback,
         mkdirs: vec![],
-        root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
+        root_id: p.flake.id,
         discard: vec![],
         label: "cargo metadata (for nextest)".into(),
     };
