@@ -537,25 +537,16 @@ pass = ["POLICY_PROBE"]
 [workspace.metadata.rargo.network]
 test-packages = ["app"]
 EOF
-[ ! -e .rargo.toml ] && ok "the worktree has no .rargo.toml" || bad "the worktree has no .rargo.toml"
 out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
 has "$out" 'env=Some("seen")' && has "$out" "net=true" && ok "the manifest's policy passes the variable and gives the package's tests the network" || bad "the manifest's policy passes the variable and gives the package's tests the network" "$out"
 out=$(cargo metadata --format-version 1 --no-deps --offline 2>&1 >/dev/null); [ -z "$out" ] && ok "stock cargo reads that manifest without a word" || bad "stock cargo reads that manifest without a word" "$out"
-# The older file beside it: a table the manifest has wins, and the build says so.
-printf '[env]\npass = ["SOMETHING_ELSE"]\n' >.rargo.toml
-out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
-has "$out" 'env=Some("seen")' && has "$out" ".rargo.toml: [env] is ignored" && ok "with both, the manifest's table wins and the build says the file's is ignored" || bad "with both, the manifest's table wins and the build says the file's is ignored" "$out"
-rm -f .rargo.toml
 out=$(POLICY_PROBE=other "$R" test -p app --test policy -- --nocapture 2>&1)
 has "$out" 'env=Some("other")' && ok "a passed variable is part of the key (new value, new run)" || bad "a passed variable is part of the key" "$out"
 echo 'bogus = 1' >>Cargo.toml
 out=$("$R" build 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" "Cargo.toml: [workspace.metadata.rargo]" && ok "an unknown key in the manifest's policy is an error that names the table" || bad "an unknown key in the manifest's policy is an error that names the table" "$out"
 cp "$T/Cargo.toml.before-policy" Cargo.toml
-echo 'bogus = 1' >.rargo.toml
-out=$("$R" build 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file (the older place) is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
-rm -f .rargo.toml crates/app/tests/policy.rs
+rm -f crates/app/tests/policy.rs
 # Build scripts: the one the manifest names may use the network, another may not.
 for c in netprobe netprobe2; do
     mkdir -p crates/$c/src
@@ -696,10 +687,10 @@ out=$("$R" run -q 2>&1)
 [ "$out" = "$head2|trunk|third commit|${head2:0:7}|1" ] && ok "a new commit is picked up" || bad "a new commit is picked up" "$out"
 size=$(du -sk "$RARGO_CACHE_DIR"/git/* | sort -n | tail -1 | cut -f1)
 [ "$size" -lt 100 ] && ok "what stands in for .git on the server is small (${size} KiB for the largest commit built)" || bad "what stands in for .git on the server is small" "${size} KiB"
-printf '[sync]\ngit = false\n' >.rargo.toml
-out=$(RARGO_QUIET_DEPRECATIONS=1 "$R" run -q 2>&1)
+printf '\n[package.metadata.rargo.sync]\ngit = false\n' >>Cargo.toml
+out=$("$R" run -q 2>&1)
 [ "$out" = "none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
-mv .rargo.toml "$T/unused-policy"
+git -C "$G" checkout -q Cargo.toml
 out=$(CARGO_TARGET_DIR="$T/stock-g" cargo run -q --offline 2>&1)
 has "$out" "$head2|trunk|third commit|${head2:0:7}|" && ok "stock cargo on the client agrees about HEAD ($out)" || bad "stock cargo on the client agrees about HEAD" "$out"
 

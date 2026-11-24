@@ -109,10 +109,11 @@ a_runs=$(runs a)
 a_hash=$(sha256sum target/debug/flaky | cut -d' ' -f1)
 
 echo "== without the flake (policy switch) the host toolchain is used"
-printf '[flake]\nenabled = false\n' >"$P/.rargo.toml"
+cp "$P/Cargo.toml" "$T/Cargo.toml.with-flake"
+printf '\n[package.metadata.rargo.flake]\nenabled = false\n' >>"$P/Cargo.toml"
 out=$(on a "$R" build 2>&1); rc=$?
 [ $rc -eq 0 ] && file target/debug/flaky | grep -q "interpreter /lib64/" && ok "flake.enabled = false builds against the host" || bad "flake.enabled = false builds against the host" "$out $(file target/debug/flaky)"
-rm "$P/.rargo.toml"
+cp "$T/Cargo.toml.with-flake" "$P/Cargo.toml"
 on a "$R" build >/dev/null 2>&1
 [ "$(sha256sum target/debug/flaky | cut -d' ' -f1)" = "$a_hash" ] && ok "removing the switch brings back the identical flake build" || bad "removing the switch brings back the identical flake build"
 

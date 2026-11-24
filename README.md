@@ -57,9 +57,6 @@ project builds on and as whom; `rargo auth remove` forgets the token. On
 the server, `rargod token invite|create|list|revoke --state DIR` manage
 who may connect, without a restart.
 
-The older way still works: `~/.config/rargo/config.toml` with `server`,
-`user` and `key` (or `key-file`) for a user of the server's key file.
-
 `RARGO_SERVER`, `RARGO_TOKEN`, `RARGO_USER`, `RARGO_KEY` and `RARGO_KEY_FILE`
 override all of it. To make agents that type `cargo` use rargo, put a link named `cargo`
 to the `rargo` binary ahead of the real cargo on `PATH`; everything that is
@@ -77,7 +74,7 @@ happen. The server must be reachable on its port over UDP and TCP.
 without one. Its log is `daemon.log` in the cache directory.
 
 What is synced: the whole worktree except `.git`, cargo target directories,
-and what `.rargo.toml` excludes. What comes back: what cargo would have left
+and what the project's policy excludes. What comes back: what cargo would have left
 in `target/` for the command, and files the build wrote into the worktree.
 
 `target/` is a file system the daemon mounts (FUSE; as root or with
@@ -148,10 +145,6 @@ cd YOUR-PROJECT && git add flake.nix flake.lock
 
 A project that needs another library adds it to `packages` in its
 `flake.nix`. `nix develop` gives the same environment on your machine.
-
-The older place, a `.rargo.toml` at the top of the repository with the
-same tables unprefixed, is still read. A table the manifest has wins over
-the same table of the file, and the build says so.
 
 ## Other commands
 
