@@ -50,6 +50,12 @@ Facts that affect the design:
   Delete superseded behavior outright and never add migrations,
   deprecation warnings, compatibility shims, legacy fallbacks, or cautions
   about breaking users.
+- **The history benchmark is stopped, by the owner (2026-11-24), and is
+  not started again** unless the owner asks: not `dev/history.py`, not
+  the `hist-*.sh` scripts under `$RARGO_WORK/bench`. Its results so far
+  are in `$RARGO_WORK/bench/history2y.jsonl` (`dev/history.py stats`);
+  they are enough for now. The Downworld services on this machine were
+  stopped by the owner too and stay stopped.
 - **Two agents work here, each in a checkout of its own** (`/root/rargo`
   and `/root/rargo-codex`); neither touches the other's. An issue is
   locked before it is worked on: the label `wip-claude` or `wip-codex`.
