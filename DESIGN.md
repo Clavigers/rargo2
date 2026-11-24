@@ -3,11 +3,6 @@
 rargo is remote cargo. Status: built; `STATUS.md` says what was verified
 and measured, `DECISIONS.md` how the open ends were closed.
 
-An earlier version of this document put the server on the client's machine,
-reading worktrees from its own disk. That was a misreading of what was
-asked for, and the first implementation followed it. This version is the
-intended design; `DECISIONS.md` D34 onward records the change.
-
 ## What this is for
 
 A small team of humans each directs dozens of coding agents. The agents work
