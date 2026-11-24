@@ -41,6 +41,9 @@ jobs:
           git clone -q https://github.com/rust-lang/cargo.git planner
           git -C planner checkout -q -b rargo "$(cat forks/cargo/BASE)"
           git -C planner -c user.name=rargo -c user.email=noreply@rargo.invalid am "$PWD"/forks/cargo/*.patch
+          # The fork's manifest names rargo-plan where it lies on the build machine.
+          sed -i "s|/root/rargo/crates/rargo-plan|$PWD/crates/rargo-plan|" planner/Cargo.toml
+          grep -q "$PWD/crates/rargo-plan" planner/Cargo.toml
           (cd planner && CFG_RELEASE_CHANNEL=stable cargo build --release --bin cargo)
       - name: Assets
         run: deploy/make-assets.sh assets target/x86_64-unknown-linux-musl/release/rargo target/release/rargod target/release/rargo-sandbox planner/target/release/cargo
