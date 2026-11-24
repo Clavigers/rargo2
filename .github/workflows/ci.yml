@@ -1,0 +1,40 @@
+# What every push must pass: the workspace builds without warnings, the unit
+# and engine tests pass, the client builds as the static binary that is
+# shipped, and the crates that go to crates.io package and build from their
+# packaged form. The end-to-end suites need root, FUSE and the planner; they
+# are run on the build machine before a release (dev/gate.sh).
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --locked --workspace
+      - name: Unit and engine tests (as root: they mount and create namespaces)
+        run: sudo -E env "PATH=$PATH" cargo test --locked --workspace
+      - name: The shipped client
+        run: CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc cargo build --locked --release -p rargo --target x86_64-unknown-linux-musl
+      - name: The crates that are published
+        run: cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
+      - run: sh -n install/install.sh && sh -n install/install-server.sh

@@ -1,5 +1,6 @@
 [package]
 name = "rargo-core"
+publish = false
 description = "rargo daemon internals: store, views, sandbox filesystem, sandbox, cache, scheduler"
 version.workspace = true
 edition.workspace = true

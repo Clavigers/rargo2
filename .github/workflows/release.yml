@@ -1,0 +1,67 @@
+# A release: push a tag vX.Y.Z whose commit has version X.Y.Z in Cargo.toml
+# and a section "## X.Y.Z" in CHANGELOG.md. Builds the static client, the
+# server archive (rargod, rargo-sandbox and the planner: cargo at
+# forks/cargo/BASE with forks/cargo's patches), publishes them with the
+# installers and the changelog section as a GitHub release, then publishes
+# the client's crates to crates.io through trusted publishing.
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag, manifest and changelog agree
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          [ "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)" = "$v" ] || { echo "Cargo.toml is not at $v"; exit 1; }
+          awk -v v="$v" '$0 == "## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md >notes.md
+          [ -s notes.md ] || { echo "CHANGELOG.md has no section for $v"; exit 1; }
+      - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools libssl-dev zlib1g-dev pkg-config
+      - name: Client (static) and server
+        run: |
+          CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+            cargo build --locked --release -p rargo --target x86_64-unknown-linux-musl
+          cargo build --locked --release -p rargod -p rargo-core
+          strip target/x86_64-unknown-linux-musl/release/rargo
+      - uses: actions/cache@v4
+        id: planner
+        with:
+          path: planner/target/release/cargo
+          key: planner-${{ hashFiles('forks/cargo/**') }}
+      - name: Planner (the cargo fork)
+        if: steps.planner.outputs.cache-hit != 'true'
+        run: |
+          git clone -q https://github.com/rust-lang/cargo.git planner
+          git -C planner checkout -q -b rargo "$(cat forks/cargo/BASE)"
+          git -C planner -c user.name=rargo -c user.email=noreply@rargo.invalid am "$PWD"/forks/cargo/*.patch
+          (cd planner && CFG_RELEASE_CHANNEL=stable cargo build --release --bin cargo)
+      - name: Assets
+        run: deploy/make-assets.sh assets target/x86_64-unknown-linux-musl/release/rargo target/release/rargod target/release/rargo-sandbox planner/target/release/cargo
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "rargo ${GITHUB_REF_NAME#v}" --notes-file notes.md assets/*
+  crates:
+    # Needs the one-time trusted-publishing setup on crates.io (STATUS.md,
+    # "Releasing"); until then this job fails and the release above stands.
+    needs: assets
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish, dependencies first
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p fusewire -p rargo-proto -p rargo-net -p rargo

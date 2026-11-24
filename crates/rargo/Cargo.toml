@@ -6,11 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["cargo", "build", "remote", "cache"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
 
 [dependencies]
-rargo-proto = { path = "../rargo-proto" }
-rargo-net = { path = "../rargo-net" }
-fusewire = { path = "../fusewire" }
+rargo-proto = { path = "../rargo-proto", version = "0.2.1" }
+rargo-net = { path = "../rargo-net", version = "0.2.1" }
+fusewire = { path = "../fusewire", version = "0.2.1" }
 tokio.workspace = true
 libc.workspace = true
 blake3.workspace = true

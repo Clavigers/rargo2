@@ -1,5 +1,6 @@
 [package]
 name = "rargod"
+publish = false
 description = "The rargo build server"
 version.workspace = true
 edition.workspace = true

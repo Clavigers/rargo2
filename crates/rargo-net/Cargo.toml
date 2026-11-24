@@ -6,9 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 
 [dependencies]
-rargo-proto = { path = "../rargo-proto" }
+rargo-proto = { path = "../rargo-proto", version = "0.2.1" }
 libc.workspace = true
 blake3.workspace = true
 parking_lot.workspace = true
