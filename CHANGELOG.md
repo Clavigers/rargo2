@@ -31,7 +31,13 @@ Protocol 7 (unchanged).
   ran rargo's executable and failed. rargo now removes stock cargo's
   fingerprint of that unit, so stock cargo compiles it again.
 - `--rargo-status` counts the actions run by kind.
-
+- Linked worktrees of one repository running their first commands at once
+  no longer fail one of them with "cannot reach the rargo server ... No
+  such file or directory": two writes of the same file in the client's
+  cache each get a temporary file of their own. "Cannot reach the rargo
+  server" (and `RARGO_FALLBACK=cargo`) now means only that the link to
+  the server could not be made; any other error is reported as itself.
+  (#100)
 - What the server holds, and where the cache holds chunks, outlive the
   client daemon: the first command of a new daemon (after a reboot, an
   idle timeout, or `--rargo-daemon-stop`) offers only what changed. The

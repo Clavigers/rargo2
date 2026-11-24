@@ -12,7 +12,7 @@
 use std::cell::UnsafeCell;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const SLOTS: usize = 64;
 const PATH_MAX: usize = 4096;
@@ -146,6 +146,13 @@ pub fn sweep(dir: &Path, prefix: &str) -> usize {
 
 /// The prefix of temporaries written beside their destination.
 pub const BESIDE: &str = ".rargo-tmp-";
+
+/// A number no other temporary of this process has: two threads writing
+/// the same destination at once each get a temporary of their own.
+pub fn seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
 
 #[cfg(test)]
 mod tests {

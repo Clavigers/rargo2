@@ -551,6 +551,20 @@ delta=$((after - before))
 # The proc macro is byte-identical to the first workspace's and is a hit.
 [ "$delta" -ge 5 ] && [ "$delta" -le 6 ] && ok "8 identical cold builds ran $delta actions in total (one build's worth)" || bad "8 identical cold builds ran about one build's worth of actions" "delta=$delta"
 
+echo "== the first commands of many linked worktrees at once, in a new daemon"
+# Linked worktrees of one repository share files in the client's cache
+# (the \`.git\` file they are shown); a new daemon writes them as each
+# worktree's first command scans it.
+for i in $(seq 8 23); do git -C "$C" worktree add -q --detach "$T/c$i" HEAD; done
+FC=$T/.rargo-cache-first
+pids=""
+for i in $(seq 8 23); do (cd "$T/c$i" && RARGO_CACHE_DIR=$FC "$R" check >"$T/c$i/.check.log" 2>&1) & pids="$pids $!"; done
+failed=0
+for p in $pids; do wait "$p" || failed=$((failed + 1)); done
+[ $failed -eq 0 ] && ! grep -q "cannot reach" "$T"/c*/.check.log && ok "16 first commands at once in a new daemon all succeed" || bad "16 first commands at once in a new daemon all succeed" "$failed failed
+$(grep -h -B2 -A2 error "$T"/c*/.check.log | head -20)"
+RARGO_CACHE_DIR=$FC "$R" --rargo-daemon-stop >/dev/null 2>&1
+
 echo "== stock cargo still works (no drift)"
 cd "$A"
 git -C "$A" status --porcelain | grep -v '^??' >/dev/null && bad "rargo left tracked files modified" "$(git -C "$A" status --porcelain)" || ok "no tracked file modified by rargo"
