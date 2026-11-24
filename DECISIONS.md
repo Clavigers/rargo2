@@ -1961,3 +1961,62 @@ signed in and its build works; taking it off the list stops its builds.
 **Not tested against github.com itself**: that needs the application,
 which is the owner's to register.
 
+## D69. `cargo nextest`: real nextest drives, every test process is a cached action (initiative 15; design, not built)
+
+**The choice.** The issue offers two ways: run real nextest in the
+sandbox and intercept the test processes it starts, or take nextest's
+test list and schedule each test as an action of rargo's own. This takes
+the first, in a form that also gives what the second promises.
+
+- rargo builds the test binaries the way it builds for `cargo test
+  --no-run`: on the server, from the shared cache, nothing on the
+  client. nextest is then run on the server against that build without
+  building anything itself (its reuse-build mode: `--binaries-metadata`
+  and `--cargo-metadata`, produced by rargo's planner for the same
+  command line).
+- nextest starts every test in a process of its own. Those processes are
+  started through a runner (cargo's `target.<triple>.runner`, which
+  nextest honours): a small program that hands the test's command line
+  to rargod as an action. The action runs in rargo's sandbox, is traced
+  like any other, and its result (exit status, output, files it wrote)
+  is cached under the test binary, the test's name and what it read.
+  The runner prints the recorded output and exits with the recorded
+  status, so nextest sees a test process that behaved as the real one
+  did. A test whose binary and inputs did not change is replayed.
+- So nextest itself decides everything a user sees: progress and failure
+  output, `--no-fail-fast`, retries and flaky handling, `-E` filters,
+  partitioning, profiles from `.config/nextest.toml`, JUnit files. It is
+  exact by construction, and caching is per test because nextest's unit
+  of work is the process the runner stands in for. Listing (`nextest
+  list`) runs each binary with `--list` through the same runner and is
+  cached per binary.
+- Parallelism is nextest's `--test-threads`, set by default to the
+  cores rargo may use for this client; each test action is scheduled
+  by rargo's scheduler and may go to a worker.
+
+**What it costs and risks.** A replayed test still costs a process (the
+runner) and a round trip inside the server, a few milliseconds each; a
+suite of ten thousand replayed tests is seconds, not zero. Timing in
+nextest's output is the replay's, not the original run's: a replayed
+test is shown by nextest as passed in a few milliseconds, and the
+summary line rargo adds says how many were replayed (`--no-cache` runs
+them for real). Retries of a failing test must not be served from the
+cache: a failed result is not cached (as for `cargo test` today), so a
+retry runs again, which is what makes flaky detection work.
+
+**The nextest version** is the one the repository pins (`.config/
+nextest.toml`'s `nextest-version`, or `[workspace.metadata.rargo]`), else
+the client's, sent with the request; the server installs it on first
+use beside the toolchains.
+
+**Other third-party subcommands that compile** (`cargo fix`, `cargo
+install`, `cargo llvm-cov`, `cargo miri`, `cargo hack`, ...) are passed to
+the real cargo and build locally. That stays so for now; rargo will say
+so in one line when it passes on a subcommand it knows to compile.
+
+**Order of work** (the issues filed from the initiative): route nextest
+and run it on the server from rargo's build; the runner and per-test
+caching; the pinned version; output checked against stock on a failing
+and a flaky test; the swarm variant measured; the notice for other
+subcommands.
+
