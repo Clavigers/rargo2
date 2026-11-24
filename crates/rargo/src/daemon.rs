@@ -76,6 +76,7 @@ struct Snap {
 }
 
 struct WtState {
+    policy_dir: PathBuf,
     /// The index to start from before the first scan.
     loaded: Option<scan::Index>,
     last: Option<Arc<Snap>>,
@@ -259,6 +260,7 @@ impl Daemon {
             id: self.next_wt.fetch_add(1, Ordering::Relaxed),
             root: root.to_path_buf(),
             state: tokio::sync::Mutex::new(WtState {
+                policy_dir: PathBuf::new(),
                 loaded: Some(scan::Index::load(&wt_cache.join("index"))),
                 last: None,
                 watched: HashSet::new(),
@@ -318,8 +320,9 @@ impl Daemon {
         self.counters.scans.fetch_add(1, Ordering::Relaxed);
         let (root, cache, wt_cache) = (wt.root.clone(), self.cache.clone(), wt.wt_cache.clone());
         let (previous, loaded) = (st.last.clone(), st.loaded.take());
+        let policy_dir = st.policy_dir.clone();
         let snap = tokio::task::spawn_blocking(move || -> std::io::Result<Snap> {
-            let mut policy = crate::load_policy(&root);
+            let mut policy = crate::load_policy(&root, &policy_dir);
             // The client's own cache, should someone keep it in the worktree.
             if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
@@ -873,6 +876,9 @@ impl Daemon {
                 format!("`{}` is not inside a git worktree or a cargo package; rargo needs to know what to sync", cwd.display()),
             ));
         };
+        let Some(policy_dir) = rargo_proto::workspace::command_dir(&root, &cwd, &req.args) else {
+            return Ok(Self::fail(out, "the manifest must be inside the synced worktree".into()));
+        };
         let wt = self.worktree(&root);
         let _running = wt.running.lock().await;
         let shown = self.out_for(&wt, req);
@@ -901,6 +907,10 @@ impl Daemon {
             let mut bet = None;
             let snap = {
                 let mut st = wt.state.lock().await;
+                if st.policy_dir != policy_dir {
+                    st.policy_dir.clone_from(&policy_dir);
+                    wt.dirty.store(true, Ordering::SeqCst);
+                }
                 let (snap, scanned) = self.fresh(&wt, &mut st).await?;
                 if stats {
                     let text = if scanned {

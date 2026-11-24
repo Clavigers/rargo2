@@ -801,6 +801,7 @@ dependencies = [
  "blake3",
  "serde",
  "snow",
+ "toml",
  "zstd",
 ]
 

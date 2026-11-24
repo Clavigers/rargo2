@@ -30,6 +30,8 @@ pub struct LastClient {
     pub home: Arc<Home>,
     /// The worktree root on the client, for reports.
     pub root: String,
+    /// Cargo invocation directory relative to the snapshot root.
+    pub dir: std::path::PathBuf,
     pub at: Instant,
     /// The snapshot the last drift check looked at.
     pub checked: Option<crate::hash::Hash>,
@@ -99,10 +101,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     // that environment too (the devShell's tools and variables), as its
     // users would: `nix develop -c cargo build`. Unsandboxed, so the store
     // paths are simply the host's.
-    let loaded = {
-        let text = |name: &str| snapshot.read(name.as_bytes()).map(|b| String::from_utf8_lossy(&b).into_owned());
-        crate::policy::Policy::load(text(crate::policy::MANIFEST).as_deref(), text(crate::policy::POLICY_FILE).as_deref()).map_err(|e| anyhow::anyhow!(e))?
-    };
+    let loaded = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
     let policy = loaded.policy;
     let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
     let mut cargo = "cargo".to_string();
@@ -128,12 +127,15 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     }
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
     let started = Instant::now();
+    let stock_cwd = scratch.join(&who.dir);
     let stock = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
         snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
+        let stock_cwd = stock_cwd.canonicalize()?;
+        anyhow::ensure!(stock_cwd.starts_with(scratch2.canonicalize()?), "drift check directory is outside the snapshot");
         let mut c = std::process::Command::new("nice");
         c.args(["-n", "19", cargo.as_str(), "build", "--offline", "-j", "4"])
-            .current_dir(&scratch2)
+            .current_dir(&stock_cwd)
             .env_clear()
             .envs(env.iter())
             // If `cargo` on PATH is the rargo shim, it must step aside.
@@ -160,7 +162,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     let client = Client {
         args: vec!["build".into()],
         root: "/w".into(),
-        cwd: "/w".into(),
+        cwd: std::path::Path::new("/w").join(&who.dir).to_string_lossy().into_owned(),
         cargo_home: "/c".into(),
         env: Arc::new(ClientEnv::new(env, Vec::new(), None)),
         uid,
@@ -235,7 +237,7 @@ pub async fn background(d: Arc<Daemon>, interval: std::time::Duration) {
             };
             eprint!("rargod: drift check: {text}");
             *d.drift_report.lock() = Some(text);
-            if let Some(c) = d.last_clients.lock().get_mut(&worktree) {
+            if let Some(c) = d.last_clients.lock().get_mut(&worktree).filter(|c| c.at == who.at) {
                 c.checked = Some(snapshot.id);
             }
         }
