@@ -13,7 +13,7 @@
 //! owner only (D67). An invitation is a code an administrator hands to a person;
 //! redeeming it (through `rargo auth`) makes a token.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rargo_proto::secure;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -301,6 +301,19 @@ impl TokenStore {
         })
     }
 
+    /// Revokes the tokens of `user` that have the id, or (given the user's
+    /// own name) all of them.
+    pub fn revoke_own(&self, id: &str, user: &str) -> Result<usize> {
+        self.change(|f| {
+            let mut n = 0;
+            for t in f.tokens.iter_mut().filter(|t| !t.revoked && t.user == user && (t.id == id || t.user == id)) {
+                t.revoked = true;
+                n += 1;
+            }
+            Ok(n)
+        })
+    }
+
     /// Puts a GitHub account on the allow list (or changes its standing).
     pub fn allow(&self, login: &str, admin: bool) -> Result<()> {
         if !valid_login(login) {
@@ -424,6 +437,139 @@ pub fn token_text(t: &Token, secret: &str) -> String {
     format!("{}.{secret}", t.id)
 }
 
+/// Who asks for a token command: an administrator of the server, or the
+/// holder of a token who is not one.
+pub struct Asker<'a> {
+    pub user: &'a str,
+    pub admin: bool,
+    /// Where the request came from, kept with a token it makes.
+    pub from: &'a str,
+}
+
+/// What a token command prints: for the terminal's standard output and its
+/// standard error.
+pub type Said = (String, String);
+
+/// The token commands of `rargod token` (on the server's machine) and of
+/// `rargo auth` (from a client, over its session): `invite`, `create`,
+/// `list`, `revoke`, `allow` and `disallow`, with their options. Someone
+/// who is not an administrator may list and revoke their own tokens and
+/// nothing else. A secret is in what this says only when it is made.
+pub fn command(store: &TokenStore, args: &[String], asker: &Asker, usage: &str) -> Result<Said> {
+    let Some(what) = args.first().map(String::as_str) else { bail!("{usage}") };
+    let (mut user, mut admin, mut days, mut uses, mut token_days) = (None::<String>, false, None::<u32>, 1u32, None::<u32>);
+    let mut rest: Vec<&str> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let mut val = || -> Result<&String> {
+            i += 1;
+            args.get(i).with_context(|| format!("`{arg}` needs a value"))
+        };
+        match arg {
+            "--user" => user = Some(val()?.clone()),
+            "--admin" => admin = true,
+            "--days" => days = Some(val()?.parse().context("--days takes a number")?),
+            "--uses" => uses = val()?.parse().context("--uses takes a number")?,
+            "--token-days" => token_days = Some(val()?.parse().context("--token-days takes a number")?),
+            other if other.starts_with("--") => bail!("unknown option `{other}`\n{usage}"),
+            other => rest.push(other),
+        }
+        i += 1;
+    }
+    let refuse = || {
+        anyhow!(
+            "user `{}` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)",
+            asker.user
+        )
+    };
+    let when = |t: Option<u64>| match t {
+        None => "never".to_string(),
+        Some(t) if t <= now() => "expired".to_string(),
+        Some(t) => format!("in {} days", (t - now()).div_ceil(86400)),
+    };
+    let (mut out, mut err) = (String::new(), String::new());
+    use std::fmt::Write as _;
+    match what {
+        "list" => {
+            let _ = writeln!(out, "{:<16} {:<20} {:<6} {:<12} FROM", "ID", "USER", "ADMIN", "EXPIRES");
+            for t in store.list().into_iter().filter(|t| asker.admin || t.user == asker.user) {
+                let state = if t.revoked { "revoked".to_string() } else { when(t.expires) };
+                let _ = writeln!(out, "{:<16} {:<20} {:<6} {:<12} {}", t.id, t.user, if t.admin { "yes" } else { "" }, state, t.note);
+            }
+            if asker.admin {
+                let allowed = store.allow_list();
+                if !allowed.is_empty() {
+                    let names: Vec<String> = allowed.iter().map(|a| format!("{}{}", a.login, if a.admin { " (administrator)" } else { "" })).collect();
+                    let _ = writeln!(out, "\nGitHub accounts that may sign in: {}", names.join(", "));
+                }
+                let open: Vec<_> = store.invites().into_iter().filter(|i| i.uses_left > 0 && i.expires.is_none_or(|e| e > now())).collect();
+                if !open.is_empty() {
+                    let _ = writeln!(out, "\ninvitations not used up: {}", open.len());
+                    for i in open {
+                        let _ = writeln!(
+                            out,
+                            "  for {}{}: {} use(s) left, expires {}",
+                            i.user.as_deref().unwrap_or("anyone"),
+                            if i.admin { " (administrator)" } else { "" },
+                            i.uses_left,
+                            when(i.expires)
+                        );
+                    }
+                }
+            }
+        }
+        "revoke" => {
+            let Some(id) = rest.first() else { bail!("{usage}") };
+            let n = if asker.admin { store.revoke(id)? } else { store.revoke_own(id, asker.user)? };
+            if n == 0 {
+                if asker.admin {
+                    bail!("no token that still works has the id or user `{id}`");
+                }
+                bail!("none of your tokens that still work has the id `{id}` (you may revoke only your own)");
+            }
+            let _ = writeln!(out, "revoked {n} token(s); their sessions end within seconds");
+        }
+        _ if !asker.admin => return Err(refuse()),
+        "invite" => {
+            let code = store.invite(user.as_deref(), admin, days.or(Some(7)), uses, token_days)?;
+            let _ = writeln!(out, "{code}");
+            let _ = writeln!(
+                err,
+                "An invitation for {}{}, good for {} use(s), {}. Whoever has it runs `rargo auth` and enters it on the page that opens.",
+                user.as_deref().unwrap_or("whoever redeems it"),
+                if admin { " (administrator)" } else { "" },
+                uses.max(1),
+                when(Some(now() + days.unwrap_or(7) as u64 * 86400)).replace("in ", "for "),
+            );
+        }
+        "create" => {
+            let user = user.context("--user NAME is required")?;
+            let (t, secret) = store.create(&user, admin, days, asker.from)?;
+            let _ = writeln!(out, "{}", token_text(&t, &secret));
+            let _ = writeln!(err, "A token for {user}; it is shown this once. A client uses it as RARGO_TOKEN or through `rargo auth --token`.");
+        }
+        "allow" => {
+            let Some(login) = rest.first() else { bail!("{usage}") };
+            store.allow(login, admin)?;
+            let _ = writeln!(out, "{login} may sign in with GitHub{}", if admin { " (administrator)" } else { "" });
+            if store.path().parent().and_then(Github::load).is_none() {
+                let _ = writeln!(err, "note: this server has no GitHub application yet (rargod token github ...); until then `rargo auth` asks for an invitation");
+            }
+        }
+        "disallow" => {
+            let Some(login) = rest.first() else { bail!("{usage}") };
+            let (was, n) = store.disallow(login)?;
+            if !was && n == 0 {
+                bail!("`{login}` is not on the allow list");
+            }
+            let _ = writeln!(out, "{login} may no longer sign in; revoked {n} token(s) it had signed in for");
+        }
+        _ => bail!("{usage}"),
+    }
+    Ok((out, err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,6 +611,40 @@ mod tests {
         assert_eq!(store.holder(&token_text(&t3, &secret3)), None, "revoked");
         assert!(!store.revoke_self(&token_text(&t3, &secret3)).unwrap(), "once");
         assert_eq!(store.list().len(), 3);
+    }
+
+    #[test]
+    fn token_commands_do_everything_for_an_administrator_and_a_users_own_tokens_for_anyone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let boss = Asker { user: "boss", admin: true, from: "test" };
+        let ann = Asker { user: "ann", admin: false, from: "test" };
+        let (out, _) = command(&store, &args("create --user ann"), &boss, "usage").unwrap();
+        let ann_token = out.trim().to_string();
+        let ann_id = ann_token.split('.').next().unwrap().to_string();
+        command(&store, &args("create --user bob"), &boss, "usage").unwrap();
+        let (code, err) = command(&store, &args("invite --user cat --admin"), &boss, "usage").unwrap();
+        assert!(err.contains("An invitation for cat (administrator)"), "{err}");
+        command(&store, &args("allow some-login"), &boss, "usage").unwrap();
+        // The administrator sees everything, and no secret.
+        let (all, _) = command(&store, &args("list"), &boss, "usage").unwrap();
+        assert!(all.contains(" ann ") && all.contains(" bob ") && all.contains("some-login") && all.contains("for cat (administrator)"), "{all}");
+        assert!(!all.contains(ann_token.split('.').nth(1).unwrap()) && !all.contains(code.trim()), "{all}");
+        // ann sees her own tokens only, and nothing of the allow list or the invitations.
+        let (own, _) = command(&store, &args("list"), &ann, "usage").unwrap();
+        assert!(own.contains(&ann_id) && !own.contains(" bob ") && !own.contains("some-login") && !own.contains("cat"), "{own}");
+        for refused in ["invite", "create --user ann2", "allow x", "disallow some-login"] {
+            let e = command(&store, &args(refused), &ann, "usage").unwrap_err().to_string();
+            assert!(e.contains("may not administer") && e.contains("rargod token create --admin"), "{refused}: {e}");
+        }
+        assert!(command(&store, &args("revoke bob"), &ann, "usage").is_err(), "not someone else's");
+        assert!(store.list().iter().any(|t| t.user == "bob" && !t.revoked));
+        command(&store, &args(&format!("revoke {ann_id}")), &ann, "usage").unwrap();
+        assert!(store.lookup(&ann_id).is_none(), "her own");
+        let (n, _) = command(&store, &args("revoke bob"), &boss, "usage").unwrap();
+        assert!(n.contains("revoked 1 token"), "{n}");
+        assert!(command(&store, &args("frobnicate"), &boss, "usage").unwrap_err().to_string().contains("usage"));
     }
 
     #[test]

@@ -310,7 +310,9 @@ fn main() -> Result<()> {
 }
 
 /// `rargod token ...`: tokens and invitations, kept in the state directory
-/// of a server that may be running; it sees every change at once.
+/// of a server that may be running; it sees every change at once. All but
+/// `github` are also `rargo auth` commands for an administrator, from a
+/// client (`rargo_core::tokens::command`).
 fn token_command(args: &[String]) -> Result<()> {
     let usage = "usage: rargod token invite --state DIR [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
                  rargod token create --state DIR --user NAME [--admin] [--days N]\n       \
@@ -319,12 +321,10 @@ fn token_command(args: &[String]) -> Result<()> {
                  rargod token allow --state DIR GITHUB-LOGIN [--admin]      (may sign in with GitHub through `rargo auth`)\n       \
                  rargod token disallow --state DIR GITHUB-LOGIN             (and revokes the tokens it signed in for)\n       \
                  rargod token github --state DIR --client-id ID --client-secret-file FILE --url https://NAME";
-    let Some(what) = args.first().map(String::as_str) else { bail!("{usage}") };
     let mut state: Option<PathBuf> = None;
-    let (mut user, mut admin, mut days, mut uses, mut token_days) = (None::<String>, false, None::<u32>, 1u32, None::<u32>);
     let (mut client_id, mut secret_file, mut url) = (None::<String>, None::<PathBuf>, None::<String>);
-    let mut rest: Vec<&str> = Vec::new();
-    let mut i = 1;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
         let mut val = || -> Result<&String> {
@@ -333,97 +333,29 @@ fn token_command(args: &[String]) -> Result<()> {
         };
         match arg {
             "--state" => state = Some(val()?.into()),
-            "--user" => user = Some(val()?.clone()),
-            "--admin" => admin = true,
-            "--days" => days = Some(val()?.parse().context("--days takes a number")?),
-            "--uses" => uses = val()?.parse().context("--uses takes a number")?,
-            "--token-days" => token_days = Some(val()?.parse().context("--token-days takes a number")?),
             "--client-id" => client_id = Some(val()?.clone()),
             "--client-secret-file" => secret_file = Some(val()?.into()),
             "--url" => url = Some(val()?.trim_end_matches('/').to_string()),
-            other if other.starts_with("--") => bail!("unknown option `{other}`\n{usage}"),
-            other => rest.push(other),
+            _ => rest.push(arg.to_string()),
         }
         i += 1;
     }
     let Some(state) = state else { bail!("{usage}") };
-    let store = rargo_core::tokens::TokenStore::new(state.join("tokens.json"));
-    let when = |t: Option<u64>| match t {
-        None => "never".to_string(),
-        Some(t) if t <= rargo_core::tokens::now() => "expired".to_string(),
-        Some(t) => format!("in {} days", (t - rargo_core::tokens::now()).div_ceil(86400)),
-    };
-    match what {
-        "invite" => {
-            let code = store.invite(user.as_deref(), admin, days.or(Some(7)), uses, token_days)?;
-            println!("{code}");
-            eprintln!(
-                "An invitation for {}{}, good for {} use(s), {}. Whoever has it runs `rargo auth` and enters it on the page that opens.",
-                user.as_deref().unwrap_or("whoever redeems it"),
-                if admin { " (administrator)" } else { "" },
-                uses.max(1),
-                when(Some(rargo_core::tokens::now() + days.unwrap_or(7) as u64 * 86400)).replace("in ", "for "),
-            );
+    if rest.first().map(String::as_str) == Some("github") {
+        let (Some(client_id), Some(file), Some(url)) = (client_id, secret_file, url) else { bail!("{usage}") };
+        let client_secret = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?.trim().to_string();
+        if client_id.is_empty() || client_secret.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+            bail!("a client id, a secret and an address starting with https:// are needed");
         }
-        "create" => {
-            let user = user.context("--user NAME is required")?;
-            let (t, secret) = store.create(&user, admin, days, "command line")?;
-            println!("{}", rargo_core::tokens::token_text(&t, &secret));
-            eprintln!("A token for {user}; it is shown this once. A client uses it as RARGO_TOKEN or through `rargo auth --token`.");
-        }
-        "list" => {
-            println!("{:<16} {:<20} {:<6} {:<12} {}", "ID", "USER", "ADMIN", "EXPIRES", "FROM");
-            for t in store.list() {
-                let state = if t.revoked { "revoked".to_string() } else { when(t.expires) };
-                println!("{:<16} {:<20} {:<6} {:<12} {}", t.id, t.user, if t.admin { "yes" } else { "" }, state, t.note);
-            }
-            let allowed = store.allow_list();
-            if !allowed.is_empty() {
-                println!("\nGitHub accounts that may sign in: {}", allowed.iter().map(|a| format!("{}{}", a.login, if a.admin { " (administrator)" } else { "" })).collect::<Vec<_>>().join(", "));
-            }
-            let open: Vec<_> = store.invites().into_iter().filter(|i| i.uses_left > 0 && i.expires.is_none_or(|e| e > rargo_core::tokens::now())).collect();
-            if !open.is_empty() {
-                println!("\ninvitations not used up: {}", open.len());
-                for i in open {
-                    println!("  for {}{}: {} use(s) left, expires {}", i.user.as_deref().unwrap_or("anyone"), if i.admin { " (administrator)" } else { "" }, i.uses_left, when(i.expires));
-                }
-            }
-        }
-        "allow" => {
-            let Some(login) = rest.first() else { bail!("{usage}") };
-            store.allow(login, admin)?;
-            println!("{login} may sign in with GitHub{}", if admin { " (administrator)" } else { "" });
-            if rargo_core::tokens::Github::load(&state).is_none() {
-                eprintln!("note: this server has no GitHub application yet (rargod token github ...); until then `rargo auth` asks for an invitation");
-            }
-        }
-        "disallow" => {
-            let Some(login) = rest.first() else { bail!("{usage}") };
-            let (was, n) = store.disallow(login)?;
-            if !was && n == 0 {
-                bail!("`{login}` is not on the allow list");
-            }
-            println!("{login} may no longer sign in; revoked {n} token(s) it had signed in for");
-        }
-        "github" => {
-            let (Some(client_id), Some(file), Some(url)) = (client_id, secret_file, url) else { bail!("{usage}") };
-            let client_secret = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?.trim().to_string();
-            if client_id.is_empty() || client_secret.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
-                bail!("a client id, a secret and an address starting with https:// are needed");
-            }
-            rargo_core::tokens::Github { client_id, client_secret, url: url.clone() }.save(&state)?;
-            println!("`rargo auth` now signs people in with GitHub. The application's callback address must be {url}/auth/github/callback");
-        }
-        "revoke" => {
-            let Some(id) = rest.first() else { bail!("{usage}") };
-            let n = store.revoke(id)?;
-            if n == 0 {
-                bail!("no token that still works has the id or user `{id}`");
-            }
-            println!("revoked {n} token(s); their sessions end within seconds");
-        }
-        _ => bail!("{usage}"),
+        rargo_core::tokens::Github { client_id, client_secret, url: url.clone() }.save(&state)?;
+        println!("`rargo auth` now signs people in with GitHub. The application's callback address must be {url}/auth/github/callback");
+        return Ok(());
     }
+    let store = rargo_core::tokens::TokenStore::new(state.join("tokens.json"));
+    let asker = rargo_core::tokens::Asker { user: "", admin: true, from: "command line" };
+    let (out, err) = rargo_core::tokens::command(&store, &rest, &asker, usage)?;
+    print!("{out}");
+    eprint!("{err}");
     Ok(())
 }
 

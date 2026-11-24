@@ -2293,3 +2293,17 @@ store a token before anything checked it, and needs a protocol change).
 A refusal is one sentence, `rargo_proto::REFUSED`, on both transports;
 the client recognises it by that text. The credentials file holds a
 token as `id`, `secret` and `name`.
+
+## D76. Token commands from a client (issue 24)
+
+`rargo auth invite|create|tokens|revoke|allow|disallow` are requests on
+the client's session, like `--rargo-gc`, not calls to the server's HTTP
+paths: the session is encrypted and already knows who is asking and
+whether they administer the server, while the HTTP port is plain on a
+server that no HTTPS proxy fronts, and an invitation's code or a new
+token's secret would cross it in the clear. One function
+(`rargo_core::tokens::command`) serves them and `rargod token`, so the
+two cannot drift apart. Someone who is not an administrator may list
+and revoke their own tokens and nothing else; the list shows no secret
+and no invitation code. `rargod token github` stays on the server's
+machine: it reads the application's secret from a file there.

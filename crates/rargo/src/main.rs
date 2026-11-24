@@ -337,6 +337,9 @@ fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::
     }
 }
 
+/// `rargo auth` commands that the server answers.
+const TOKEN_COMMANDS: &[&str] = &["invite", "create", "tokens", "revoke", "allow", "disallow"];
+
 /// This process's mount namespace, as the kernel names it.
 pub fn mount_ns() -> String {
     std::fs::read_link("/proc/self/ns/mnt").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
@@ -387,7 +390,15 @@ fn auth_command(args: &[OsString]) -> ! {
                     "rargo auth [HOST]            get this machine a token for the project's server (or HOST), confirmed in a browser\n\
                      rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
                      rargo auth status            which server this project builds on, and as whom\n\
-                     rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here"
+                     rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here\n\
+                     \n\
+                     On the project's server, for an administrator (anyone may list and revoke their own tokens):\n\
+                     rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n\
+                     rargo auth create --user NAME [--admin] [--days N]\n\
+                     rargo auth tokens\n\
+                     rargo auth revoke ID-OR-USER\n\
+                     rargo auth allow GITHUB-LOGIN [--admin]\n\
+                     rargo auth disallow GITHUB-LOGIN"
                 );
                 std::process::exit(0)
             }
@@ -560,7 +571,12 @@ fn main() {
     if let Some(host) = raw.first().and_then(|a| a.to_str()).and_then(|a| a.strip_prefix('@')) {
         at_host(host);
     }
-    if raw.first().is_some_and(|a| a == "auth") {
+    // The token commands of an administrator (and a user's own tokens) are
+    // requests to the server like any other; the rest of `rargo auth` is
+    // this machine's.
+    let token_command = raw.first().is_some_and(|a| a == "auth")
+        && raw.get(1).and_then(|a| a.to_str()).is_some_and(|a| TOKEN_COMMANDS.contains(&a));
+    if raw.first().is_some_and(|a| a == "auth") && !token_command {
         auth_command(&raw[1..]);
     }
     if raw.first().is_some_and(|a| a == "--rargo-daemon") {
@@ -586,6 +602,7 @@ fn main() {
     }
     // Requests about the server itself need no worktree.
     let admin = match args.first().map(|s| s.as_str()) {
+        Some("auth") if token_command => Some("__token"),
         Some("--rargo-status") => Some("__status"),
         Some("--rargo-gc") => Some("__gc"),
         Some("--rargo-incr-stats") => Some("__incr"),
@@ -614,6 +631,12 @@ fn main() {
                     std::process::exit(2);
                 }
             }
+        }
+        if cmd == "__token" {
+            // `tokens` is what the server calls `list`.
+            let what = if args[1] == "tokens" { "list".to_string() } else { args[1].clone() };
+            a.push(what);
+            a.extend(args[2..].iter().cloned());
         }
         args = a;
     } else if drift {

@@ -225,7 +225,7 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                 (stream, ClientMsg::Run(req)) => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
                     let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, sess.clone()));
+                    let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, keys.clone(), sess.clone()));
                     streams.lock().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
                     let streams2 = streams.clone();
                     tokio::spawn(async move {
@@ -279,6 +279,14 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
     link.close();
 }
 
+/// The token commands as a client types them.
+const TOKEN_USAGE: &str = "usage: rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
+                           rargo auth create --user NAME [--admin] [--days N]\n       \
+                           rargo auth tokens\n       \
+                           rargo auth revoke ID-OR-USER\n       \
+                           rargo auth allow GITHUB-LOGIN [--admin]\n       \
+                           rargo auth disallow GITHUB-LOGIN";
+
 fn fail(sess: &Session, text: String) -> ServerMsg {
     sess.send(ServerMsg::Stderr(format!("error: {text}\n").into_bytes()));
     ServerMsg::Exit(101)
@@ -289,7 +297,7 @@ fn say(sess: &Session, text: String) -> ServerMsg {
     ServerMsg::Exit(0)
 }
 
-async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess: Arc<Session>) -> ServerMsg {
+async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys: Arc<Keys>, sess: Arc<Session>) -> ServerMsg {
     if req.version != PROTO_VERSION {
         return fail(
             &sess,
@@ -302,6 +310,29 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
     }
     match command {
         "__status" => return say(&sess, status_text(&d)),
+        // `rargo auth invite|create|tokens|revoke|allow|disallow`.
+        "__token" => {
+            let Some(store) = keys.tokens().cloned() else {
+                return fail(&sess, "this server has issued no tokens: it admits anyone on its machine, and its tokens are made there (`rargod token`)".into());
+            };
+            let args = req.args[1..].to_vec();
+            let (asker_user, from) = (user.clone(), format!("rargo auth, by {user}"));
+            let said = tokio::task::spawn_blocking(move || {
+                let asker = crate::tokens::Asker { user: &asker_user, admin, from: &from };
+                crate::tokens::command(&store, &args, &asker, TOKEN_USAGE)
+            })
+            .await;
+            return match said {
+                Ok(Ok((out, err))) => {
+                    if !err.is_empty() {
+                        sess.send(ServerMsg::Stderr(err.into_bytes()));
+                    }
+                    say(&sess, out)
+                }
+                Ok(Err(e)) => fail(&sess, format!("{e:#}")),
+                Err(e) => fail(&sess, format!("{e}")),
+            };
+        }
         "__incr" => {
             let d2 = d.clone();
             return say(&sess, tokio::task::spawn_blocking(move || d2.incr.analyze()).await.unwrap_or_default());
