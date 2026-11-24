@@ -566,6 +566,8 @@ pub struct ViewParts {
     pub hidden: Vec<Vec<u8>>,
     /// The forked cargo, shown at [`PLANNER_AT`].
     pub planner: PathBuf,
+    /// Programs the server provides: `(sandbox path, real file)`.
+    pub tools: Vec<(Vec<u8>, PathBuf)>,
     /// Restrict the root to a Nix closure instead of showing the host.
     pub restricted: Option<Restricted>,
 }
@@ -616,7 +618,7 @@ impl ViewParts {
             },
             Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(this.planner.clone())), traced: true },
         ]);
-        for (at, real) in &this.home_files {
+        for (at, real) in this.home_files.iter().chain(&this.tools) {
             mounts.push(Mount { at: at.clone(), region: Region::Host(HostRegion::new(real.clone())), traced: true });
         }
         for m in &this.masks {
@@ -752,19 +754,24 @@ mod tests {
 mod host_listing_tests {
     use super::*;
 
-    /// A build view over the real root lists a real directory completely.
+    /// A build view over a host directory lists each entry.
     #[test]
     fn build_view_lists_host_directories() {
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(host.path().join("usr/lib")).unwrap();
+        std::fs::create_dir(host.path().join("etc")).unwrap();
+        std::fs::write(host.path().join("usr/lib/sample"), b"library").unwrap();
+        std::fs::write(host.path().join("etc/settings"), b"config").unwrap();
         let memo = Arc::new(HostMemo::default());
         let g = memo.advance();
         let base = Arc::new(BaseView::new(
-            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true }],
+            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(host.path())), traced: true }],
             memo,
             g,
         ));
         let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
         for dir in ["/usr/lib", "/etc", "/"] {
-            let real = std::fs::read_dir(dir).unwrap().count();
+            let real = std::fs::read_dir(host.path().join(dir.trim_start_matches('/'))).unwrap().count();
             let seen = v.list(dir.as_bytes()).unwrap().len();
             assert_eq!(seen, real, "listing of {dir}");
             assert!(matches!(v.stat(dir.as_bytes()), Looked::Dir(_)));

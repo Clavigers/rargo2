@@ -2,7 +2,7 @@
 """Simulated agent swarm: N agents in N git worktrees of one repository run
 overlapping check / test / build commands with edits in between.
 
-  swarm.py --repo ra --mode stock|rargo [--agents 20] [--keep]
+  swarm.py --repo ra --mode stock|rargo [--agents 20] [--keep] [--tests nextest]
 
 Prints wall time, CPU time and disk use. `stock` gives every worktree its own
 target directory, which is what a swarm of agents using plain cargo gets.
@@ -80,8 +80,11 @@ def du(path):
     real = subprocess.run(["du", "-sB1", path], capture_output=True, text=True).stdout.split()
     return (int(out[0]) if out else 0, int(real[0]) if real else 0)
 
-def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=()):
+def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=(), tests="test"):
     def run(args):
+        # The nextest variant: `nextest run` where the agents run `test`.
+        if tests == "nextest" and args[0] == "test":
+            args = ["nextest", "run"] + args[1:]
         cmd = (list(prefix) + [RARGO] if mode == "rargo" else [cfg.get("cargo", "cargo")]) + args
         if mode == "stock":
             cmd.append("--offline")
@@ -146,6 +149,8 @@ def main():
     ap.add_argument("--batch", type=int, default=0,
                     help="run the agents in consecutive groups of this size (all worktrees and target directories are kept "
                          "until the end); for a stock swarm that does not fit in memory at once")
+    ap.add_argument("--tests", default="test", choices=["test", "nextest"],
+                    help="what the agents test with: `test`, or `nextest run` (on PATH for stock cargo)")
     ap.add_argument("--edit", default="api", choices=["api", "body"],
                     help="api: both edits add a public function; body: the second edit changes only a function body")
     a = ap.parse_args()
@@ -203,7 +208,7 @@ def main():
         return (read("rx_bytes"), read("tx_bytes"))
     link0 = link_bytes()
     t0 = time.time()
-    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, prefix)) for i in range(a.agents)]
+    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, prefix, a.tests)) for i in range(a.agents)]
     size = a.batch if a.batch > 0 else a.agents
     for first in range(0, a.agents, size):
         group = threads[first:first + size]
@@ -259,7 +264,7 @@ def main():
         for n, (name, rc, dt, _) in enumerate(steps):
             per_step.setdefault(n, []).append(dt)
     summary = dict(
-        repo=a.repo, mode=a.mode, agents=a.agents, label=a.label, toolchain=a.toolchain, edit=a.edit,
+        repo=a.repo, mode=a.mode, agents=a.agents, label=a.label, toolchain=a.toolchain, edit=a.edit, tests=a.tests,
         wall_s=round(wall, 1), cpu_s=round((cpu1 - cpu0) / 1e6, 1),
         client_cpu_s=round(client_cpu, 1) if a.mode == "rargo" else 0,
         client_bytes=real, worktree_target_apparent_bytes=apparent,

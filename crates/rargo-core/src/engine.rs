@@ -212,6 +212,8 @@ pub struct Outcome {
 #[derive(Default)]
 pub struct EngineStats {
     pub runs: AtomicU64,
+    /// Runs per [`ActionKind`], in the order of [`ActionKind::ALL`].
+    pub runs_by_kind: [AtomicU64; 8],
     pub joined: AtomicU64,
     pub joined_then_ran: AtomicU64,
     pub tainted: AtomicU64,
@@ -327,7 +329,7 @@ fn default_mem_kb(kind: ActionKind) -> u64 {
     match kind {
         ActionKind::Rustc => 700 * 1024,
         ActionKind::Rustdoc | ActionKind::Doctest => 700 * 1024,
-        ActionKind::Test => 400 * 1024,
+        ActionKind::Test | ActionKind::Nextest => 400 * 1024,
         ActionKind::BuildScript => 200 * 1024,
         ActionKind::Plan => 300 * 1024,
         ActionKind::Other => 300 * 1024,
@@ -643,6 +645,7 @@ impl Engine {
         self.seed_home(req).await?;
         let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind)).await;
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
+        self.stats.runs_by_kind[spec.kind as usize].fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
         drop(permit);

@@ -10,6 +10,28 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- `rargo nextest` (and `cargo nextest` through the cargo link) runs
+  nextest on the server. The client needs no nextest. The test binaries
+  come from rargo's build and share its cache with `rargo test`, and
+  nextest's output, exit code and the files it writes (a JUnit report)
+  come back. The client passes `NEXTEST_*` variables. (#30)
+- The nextest that runs is the version the repository names (`nextest =
+  "X.Y.Z"` under `[workspace.metadata.rargo]`, or `nextest-version` in
+  `.config/nextest.toml`), else the client's own nextest's, else the
+  newest release. The server installs each version on first use, checked
+  against the release's checksum, and keeps them side by side. (#32)
+- Under `rargo nextest`, every test process nextest starts is an action of
+  its own on the server, cached under its command line and what it read.
+  An unchanged test is replayed (nextest shows it as it did), an edit to a
+  fixture runs only the tests that read it, and a failure is never
+  cached, so retries and flaky reports are nextest's own. A line after
+  nextest's output says how many test runs were replayed. (#31)
+- After stock cargo built a test binary and rargo then put its own at the
+  same path (`rargo test --no-run`, `rargo nextest`), stock `cargo test`
+  ran rargo's executable and failed. rargo now removes stock cargo's
+  fingerprint of that unit, so stock cargo compiles it again.
+- `--rargo-status` counts the actions run by kind.
+
 - What the server holds, and where the cache holds chunks, outlive the
   client daemon: the first command of a new daemon (after a reboot, an
   idle timeout, or `--rargo-daemon-stop`) offers only what changed. The

@@ -316,6 +316,171 @@ out=$("$R" test 2>&1); rc=$?
 before=$(runs); "$R" test --no-cache >/dev/null 2>&1; after=$(runs)
 [ $((after - before)) -ge 3 ] && ok "--no-cache really runs the tests ($((after - before)) actions)" || bad "--no-cache really runs the tests" "delta=$((after - before))"
 
+echo "== nextest on the server"
+cd "$A"
+# Runs of one kind of action so far (`actions by kind` in the status).
+kind_runs() { "$R" --rargo-status | sed -n "s/^actions by kind.* $1 \([0-9]*\).*/\1/p"; }
+command -v cargo-nextest >/dev/null 2>&1 && bad "the client has no nextest" "$(command -v cargo-nextest)" || ok "the client has no nextest"
+"$R" test >/dev/null 2>&1
+rustc_before=$(kind_runs rustc); scripts_before=$(kind_runs "build scripts")
+out=$("$R" nextest run 2>&1); rc=$?
+rustc_after=$(kind_runs rustc); scripts_after=$(kind_runs "build scripts")
+[ $rc -eq 0 ] && has "$out" "Starting 5 tests across 4 binaries" && grep -qE "Summary \[ *[0-9.]+s\] 5 tests run: 5 passed" <<<"$out" && ok "rargo nextest run: nextest's summary, exit 0" || bad "rargo nextest run: nextest's summary, exit 0" "rc=$rc
+$out"
+[ -n "$rustc_after" ] && [ "$rustc_before" = "$rustc_after" ] && [ "$scripts_before" = "$scripts_after" ] && ok "after rargo test, every compile of rargo nextest was a cache hit (rustc runs: $rustc_before before, $rustc_after after)" || bad "after rargo test, every compile of rargo nextest was a cache hit" "rustc $rustc_before -> $rustc_after, build scripts $scripts_before -> $scripts_after"
+echo changed >crates/app/tests/fixture.txt
+out=$("$R" nextest run 2>&1); rc=$?
+[ $rc -eq 100 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && grep -qE "5 tests run: 4 passed, 1 failed" <<<"$out" && ok "a failing test: nextest's failure output and summary, exit 100" || bad "a failing test: nextest's failure output and summary, exit 100" "rc=$rc
+$out"
+echo fixture >crates/app/tests/fixture.txt
+mkdir -p "$T/shim" && ln -sf "$R" "$T/shim/cargo"
+out=$(PATH="$T/shim:$PATH" cargo nextest run -E 'test(reads_a_fixture)' 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -qE "1 test run: 1 passed, 4 skipped" <<<"$out" && ok "cargo nextest through the shim, with a filter expression" || bad "cargo nextest through the shim, with a filter expression" "rc=$rc
+$out"
+out=$("$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "cargo-nextest 0." && ok "rargo nextest --version is the server's nextest ($(head -1 <<<"$out"))" || bad "rargo nextest --version is the server's nextest" "$out"
+mkdir -p .config
+printf '[profile.ci.junit]\npath = "junit.xml"\n' >.config/nextest.toml
+out=$("$R" nextest run --profile ci 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -q '<testcase name="reads_a_fixture"' target/nextest/ci/junit.xml 2>/dev/null && ok "the JUnit file a nextest profile asks for comes back" || bad "the JUnit file a nextest profile asks for comes back" "rc=$rc
+$out
+$(ls -la target/nextest/ci 2>&1)"
+rm -rf .config
+# Stock nextest (the server's copy, on the client's PATH) with stock cargo.
+mkdir -p "$T/nextest-bin" && ln -sf "$(ls "$RARGO_STATE"/nextest/*/cargo-nextest | head -1)" "$T/nextest-bin/cargo-nextest"
+out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -qE "5 tests run: 5 passed" <<<"$out" && ok "stock cargo nextest in the same worktree" || bad "stock cargo nextest in the same worktree" "rc=$rc
+$out"
+expect "and rargo nextest still works afterwards" "$R" nextest run
+# rargo's test executables replaced stock's: stock's next build compiles
+# them again rather than run rargo's.
+out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -qE "5 tests run: 5 passed" <<<"$out" && ok "and stock cargo nextest again after it" || bad "and stock cargo nextest again after it" "rc=$rc
+$out"
+"$R" nextest run >/dev/null 2>&1
+
+echo "== nextest: the version a project names"
+nx_project() { # directory, manifest lines, [.config/nextest.toml]
+    mkdir -p "$1/src" && git init -q "$1"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n%s' "$(basename "$1")" "$2" >"$1/Cargo.toml"
+    echo '#[test] fn t() {}' >"$1/src/lib.rs"
+    if [ -n "${3:-}" ]; then mkdir -p "$1/.config" && printf '%s' "$3" >"$1/.config/nextest.toml"; fi
+}
+nx_project "$T/nx-a" "" 'nextest-version = "0.9.100"
+'
+nx_project "$T/nx-b" '[package.metadata.rargo]
+nextest = "0.9.120"
+'
+out=$(cd "$T/nx-a" && "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "Installing nextest 0.9.100 on the server" && has "$out" "cargo-nextest 0.9.100 (" && ok "nextest-version in .config/nextest.toml: the server installs and runs nextest 0.9.100" || bad "nextest-version in .config/nextest.toml: the server installs and runs nextest 0.9.100" "$out"
+out=$(cd "$T/nx-b" && "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "cargo-nextest 0.9.120 (" && ok "nextest under [package.metadata.rargo]: the same server runs nextest 0.9.120 for this project" || bad "nextest under [package.metadata.rargo]: the same server runs nextest 0.9.120 for this project" "$out"
+out=$(cd "$T/nx-a" && "$R" nextest run 2>&1); rc=$?
+[ $rc -eq 0 ] && ! has "$out" "Installing" && grep -qE "1 test run: 1 passed" <<<"$out" && ok "the first project's tests run on its 0.9.100, already installed beside the others ($(ls "$RARGO_STATE/nextest" | grep -v newest | tr '\n' ' '))" || bad "the first project's tests run on its 0.9.100, already installed" "$out"
+mkdir -p "$T/fake-nextest"
+printf '#!/bin/sh\necho "cargo-nextest 0.9.120 (client 2026-01-01)"\n' >"$T/fake-nextest/cargo-nextest"
+chmod +x "$T/fake-nextest/cargo-nextest"
+nx_project "$T/nx-c" ""
+out=$(cd "$T/nx-c" && PATH="$T/fake-nextest:$PATH" "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "cargo-nextest 0.9.120 (" && ! has "$out" "client 2026" && ok "a project that names no version runs the client's own nextest version, on the server" || bad "a project that names no version runs the client's own nextest version, on the server" "$out"
+newest=$(cat "$RARGO_STATE/nextest/newest-release" 2>/dev/null)
+out=$(cd "$T/nx-c" && "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -n "$newest" ] && has "$out" "cargo-nextest $newest (" && ok "with no version named and none on the client, the newest release ($newest)" || bad "with no version named and none on the client, the newest release" "newest=$newest
+$out"
+nx_project "$T/nx-d" '[package.metadata.rargo]
+nextest = "9.9.9"
+'
+out=$(cd "$T/nx-d" && "$R" nextest run 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "nextest 9.9.9, which the \`nextest\` key of rargo's metadata in Cargo.toml asks for, cannot be installed on this server" && has "$out" "cargo-nextest-9.9.9/cargo-nextest-9.9.9-x86_64-unknown-linux-musl" && ok "a version the server cannot get: the error names it and what was tried" || bad "a version the server cannot get: the error names it and what was tried" "rc=$rc
+$out"
+
+echo "== nextest: every test a cached action"
+cd "$A"
+"$R" nextest run >/dev/null 2>&1
+before=$(kind_runs tests)
+out=$("$R" nextest run 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 0 ] && [ "$before" = "$after" ] && grep -qE "5 tests run: 5 passed" <<<"$out" && has "$out" "Replayed 5 of 5 test runs from rargo's cache (0 run on the server" && ok "a second rargo nextest run replays every test and runs none" || bad "a second rargo nextest run replays every test and runs none" "rc=$rc tests run: $before -> $after
+$out"
+echo changed >crates/app/tests/fixture.txt
+before=$(kind_runs tests)
+out=$("$R" nextest run --no-fail-fast 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 100 ] && [ $((after - before)) -eq 1 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && has "$out" "Replayed 4 of 5 test runs from rargo's cache (1 run on the server" && ok "after an edit to one fixture, exactly the test that reads it runs (and fails)" || bad "after an edit to one fixture, exactly the test that reads it runs" "rc=$rc tests run: $before -> $after
+$out"
+echo fixture >crates/app/tests/fixture.txt
+before=$(kind_runs tests)
+out=$("$R" nextest run 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 0 ] && [ "$before" = "$after" ] && ok "the fixture restored: its earlier passing run is replayed" || bad "the fixture restored: its earlier passing run is replayed" "rc=$rc tests run: $before -> $after
+$out"
+before=$(kind_runs tests)
+out=$("$R" nextest run --no-cache 2>&1); rc=$?
+after=$(kind_runs tests)
+[ $rc -eq 0 ] && [ $((after - before)) -eq 5 ] && has "$out" "Replayed 0 of 5 test runs" && ok "--no-cache runs every test" || bad "--no-cache runs every test" "rc=$rc tests run: $before -> $after
+$out"
+# A test that fails on its first attempt and passes on the second.
+nx_project "$T/nx-flaky" ""
+cat >"$T/nx-flaky/src/lib.rs" <<'EOF'
+#[test]
+fn flaky() {
+    assert_ne!(std::env::var("NEXTEST_ATTEMPT").as_deref(), Ok("1"), "fails on its first attempt");
+}
+EOF
+norm() { sed -E 's/\[ *[0-9.]+s\]/[time]/g; s/run ID [0-9a-f-]+/run ID X/' | grep -E 'FLAKY|TRY|FAIL|PASS|Summary|Starting|fails on its first'; }
+out=$(cd "$T/nx-flaky" && "$R" nextest run --retries 2 2>&1); rc=$?
+newest=$(cat "$RARGO_STATE/nextest/newest-release")
+mkdir -p "$T/nextest-newest" && ln -sf "$RARGO_STATE/nextest/$newest/cargo-nextest" "$T/nextest-newest/cargo-nextest"
+stock=$(cd "$T/nx-flaky" && PATH="$T/nextest-newest:$PATH" cargo nextest run --offline --retries 2 2>&1); src=$?
+[ $rc -eq 0 ] && [ $src -eq 0 ] && has "$out" "FLAKY 2/3" && [ "$(norm <<<"$out")" = "$(norm <<<"$stock")" ] && ok "a test that fails and then passes is reported flaky, as stock nextest reports it" || bad "a test that fails and then passes is reported flaky, as stock nextest reports it" "rc=$rc stock=$src
+--- rargo
+$(norm <<<"$out")
+--- stock
+$(norm <<<"$stock")"
+
+echo "== nextest: rargo's against stock's, in the same worktree"
+cd "$A"
+# What may differ: timings, run IDs, thread IDs, and the lines of the
+# build (cargo's and rargo's) and rargo's own.
+nnorm() {
+    sed -E -e 's/\[ *[0-9.]+s\]/[time]/g' -e 's/run ID [0-9a-f-]+/run ID X/' -e "s/(thread '[^']*') \([0-9]+\)/\1 (N)/g" \
+        -e 's/finished in [0-9.]+s/finished in Ns/' |
+        grep -vE '^ *(Compiling|Finished|Replayed|Installing|Blocking|Locking|Downloaded|Running|Executable) |^warning: util@'
+}
+jnorm() { sed -E -e 's/ (uuid|timestamp|time)="[^"]*"//g' -e "s/(thread &apos;[^&]*&apos;) \([0-9]+\)/\1 (N)/g" -e 's/finished in [0-9.]+s/finished in Ns/g' "$1"; }
+against_stock() { # description, arguments for `nextest run`...
+    local d=$1; shift
+    stock=$(PATH="$T/nextest-newest:$PATH" cargo nextest run --offline "$@" 2>&1); src=$?
+    out=$("$R" nextest run "$@" 2>&1); rc=$?
+    if [ $rc -eq $src ] && [ "$(nnorm <<<"$out")" = "$(nnorm <<<"$stock")" ]; then
+        ok "$d: output and exit code ($rc) as stock nextest's"
+    else
+        bad "$d: output and exit code as stock nextest's" "rargo $rc, stock $src
+$(diff <(nnorm <<<"$stock") <(nnorm <<<"$out"))"
+    fi
+}
+echo changed >crates/app/tests/fixture.txt
+against_stock "a failing test" --test-threads 1
+against_stock "a failing test with --no-fail-fast" --test-threads 1 --no-fail-fast
+echo fixture >crates/app/tests/fixture.txt
+against_stock "a filter expression" --test-threads 1 -E 'test(=reads_a_fixture) | test(answers)'
+against_stock "a partition" --test-threads 1 --partition count:2/2
+cd "$T/nx-flaky"
+against_stock "a flaky test with retries" --test-threads 1 --retries 2
+cd "$A"
+# The JUnit file a profile asks for, with a failure in it.
+mkdir -p .config
+printf '[profile.ci.junit]\npath = "junit.xml"\nstore-success-output = true\n' >.config/nextest.toml
+echo changed >crates/app/tests/fixture.txt
+PATH="$T/nextest-newest:$PATH" cargo nextest run --offline --profile ci --no-fail-fast --test-threads 1 >/dev/null 2>&1; src=$?
+cp target/nextest/ci/junit.xml "$T/junit-stock.xml" 2>/dev/null
+rm -f target/nextest/ci/junit.xml
+"$R" nextest run --profile ci --no-fail-fast --test-threads 1 >/dev/null 2>&1; rc=$?
+[ $rc -eq $src ] && [ -s "$T/junit-stock.xml" ] && grep -q '<failure' target/nextest/ci/junit.xml && [ "$(jnorm target/nextest/ci/junit.xml)" = "$(jnorm "$T/junit-stock.xml")" ] && ok "the JUnit file of a run with a failure is stock nextest's (timestamps aside)" || bad "the JUnit file of a run with a failure is stock nextest's" "rargo $rc, stock $src
+$(diff <(jnorm "$T/junit-stock.xml") <(jnorm target/nextest/ci/junit.xml) 2>&1 | head -30)"
+echo fixture >crates/app/tests/fixture.txt
+rm -rf .config
+
 echo "== errors"
 cd "$A"
 cp crates/app/src/main.rs "$T/main.rs.bak"
@@ -696,6 +861,20 @@ policy_test() ( cd "$1" && shift && INNER_PROBE=inner OUTER_PROBE=outer "$R" tes
 expect "the workspace member uses its enclosing manifest's environment and exclusions" policy_test "$nested/rust/member"
 expect "the same daemon selects the outer workspace policy" policy_test "$nested"
 expect "an explicit nested manifest selects the inner workspace policy" policy_test "$nested" --manifest-path rust/member/Cargo.toml
+
+cat >"$nested/rust/member/src/main.rs" <<'EOF'
+static PAYLOAD: [u8; 2 * 1024 * 1024] = [42; 2 * 1024 * 1024];
+
+fn main() {
+    let payload = std::hint::black_box(&PAYLOAD);
+    println!("nested artifact: {}", payload[0]);
+}
+EOF
+out=$(cd "$nested" && "$R" build --manifest-path rust/member/Cargo.toml --bin inner 2>&1); rc=$?
+nested_bin=$nested/rust/target/debug/inner
+[ "$rc" -eq 0 ] && [ "$(stat -c %s "$nested_bin")" -gt 1048576 ] && [ "$("$nested_bin")" = "nested artifact: 42" ] \
+    && ok "the explicit nested manifest delivers a runnable multipart artifact" \
+    || bad "the explicit nested manifest delivers a runnable multipart artifact" "$out"
 
 out=$(cd "$nested/rust/member" && "$R" --rargo-drift-check 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "stock cargo builds" && has "$out" "rargo builds" && ok "the drift check builds the nested package on both sides" || bad "the drift check builds the nested package on both sides" "$out"

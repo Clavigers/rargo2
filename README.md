@@ -127,6 +127,13 @@ else. CI installs the released client, signs in with a token and runs
 `rargo build` and `rargo test`; the tests that mount file systems are
 compiled by the server and run on the runner (`dev/mount-tests.sh`).
 
+The repository's `flake.nix` and `flake.lock` select the native build
+environment and provide the Rust standard library and C linker for
+`x86_64-unknown-linux-musl`. Use `rargo build` or `rargo test` to build
+on the server in that environment. Run `nix develop --command true` on
+a machine that runs the native binaries or mount tests, so their loader
+and libraries are available under `/nix/store`.
+
 ## The build environment is the project's flake
 
 A build sees what the dev shell of the project's `flake.nix` has: the
@@ -145,6 +152,19 @@ cd YOUR-PROJECT && git add flake.nix flake.lock
 
 A project that needs another library adds it to `packages` in its
 `flake.nix`. `nix develop` gives the same environment on your machine.
+
+## nextest
+
+`rargo nextest run` (or `cargo nextest run` through the cargo link) runs
+[nextest](https://nexte.st) on the server; the client needs no nextest.
+The test binaries are rargo's build, shared with `rargo test`, and
+nextest's output, exit code and JUnit files come back as from any build.
+Every test is cached on its own: a test whose binary and inputs did not
+change is replayed, and a failure is never cached, so retries run.
+The version is the one the repository names (`nextest = "0.9.100"` under
+`[workspace.metadata.rargo]`, or `nextest-version` in
+`.config/nextest.toml`), else the client's own nextest's, else the newest;
+the server installs each version the first time it is asked.
 
 ## Other commands
 
