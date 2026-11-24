@@ -73,7 +73,7 @@ fn reflink(src: &Path, dst: &Path) -> bool {
         return false;
     };
     // SAFETY: both descriptors are valid for the duration of the call.
-    let ok = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) } == 0;
+    let ok = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as libc::Ioctl, s.as_raw_fd()) } == 0;
     if !ok {
         let _ = std::fs::remove_file(dst);
     }

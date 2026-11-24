@@ -475,7 +475,7 @@ impl Session {
         let fd = open_dev()?;
         let master: u32 = self.dev.as_raw_fd() as u32;
         // SAFETY: valid fd and pointer to a u32.
-        let r = unsafe { libc::ioctl(fd.as_raw_fd(), FUSE_DEV_IOC_CLONE, &master as *const u32) };
+        let r = unsafe { libc::ioctl(fd.as_raw_fd(), FUSE_DEV_IOC_CLONE as libc::Ioctl, &master as *const u32) };
         if r != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -488,7 +488,7 @@ impl Session {
         let map = fuse_backing_map { fd, flags: 0, padding: 0 };
         // SAFETY: valid fd and pointer to the ioctl argument struct.
         let r = unsafe {
-            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_OPEN, &map as *const _)
+            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _)
         };
         if r < 0 {
             return Err(io::Error::last_os_error());
@@ -500,7 +500,7 @@ impl Session {
         let id = id as u32;
         // SAFETY: valid fd and pointer to a u32.
         let r = unsafe {
-            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_CLOSE, &id as *const u32)
+            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const u32)
         };
         if r < 0 {
             return Err(io::Error::last_os_error());
