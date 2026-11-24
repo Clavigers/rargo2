@@ -77,10 +77,15 @@ Facts that affect the design:
   while the issue is yours, also when the review reopens it. The agents
   share the machine: the limits above are for both together, and each
   uses rigs, state and build directories of its own for the suites (the
-  second agent: `RIG=codex RIG_STATE=rig-codex`,
-  `RARGO_E2E_LINK=$RARGO_WORK/e2e-link-codex`,
-  `RARGO_COMPONENTS_RUSTUP=$RARGO_WORK/rustup-components-codex`, its own
-  `CARGO_TARGET_DIR` and gate directory), never the other's.
+  second agent: `RIG=codex RIG_STATE=rig-codex`, its own
+  `CARGO_TARGET_DIR` and gate directory), never the other's. `dev/gate.sh`
+  keeps every suite's directory under its gate directory
+  (`RARGO_GATE_DIR`) and picks free ports, so within a gate those are
+  enough. A suite run by hand outside the gate is pointed elsewhere with
+  `RARGO_E2E_FLAKE`, `RARGO_E2E_AUTH`, `RARGO_E2E_LINK`,
+  `RARGO_E2E_WORKER` and `RARGO_COMPONENTS_RUSTUP` (the second agent:
+  `$RARGO_WORK/<name>-codex`), and with free ports in
+  `RARGO_E2E_FLAKE_PORT` and `E2E_AUTH_PORT`.
 - Work that closes an issue happens on a branch and lands through a pull
   request whose description says `Closes #N`, what changed, how it was
   tested and what was measured. Nobody reviews it: it merges (squash) when
