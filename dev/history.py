@@ -13,7 +13,7 @@ build at its commits, four ways.
 
   dev/history.py fetch --commits FILE
   dev/history.py a|b|c|d --commits FILE --out FILE.jsonl [--cores N]
-                 [--lane K --lanes M]       (b: this process takes every M-th commit)
+                 [--lane K]                 (b: one of several workers, each with its own worktree)
                  [--netns NS --rargo PATH]  (d: the rig of dev/netns.sh)
   dev/history.py stats --out FILE.jsonl
 
@@ -33,6 +33,13 @@ TARGET = ["build", "-p", "rust-analyzer"]
 
 def git(*args, cwd=REPO, check=True):
     return subprocess.run(["git", *args], cwd=cwd, check=check, capture_output=True, text=True).stdout
+
+
+def checkout(wt, commit):
+    """Moves a worktree to a commit; files earlier commits had and this one
+    does not go, the output directory stays."""
+    git("checkout", "-q", "-f", "--detach", commit, cwd=wt)
+    git("clean", "-fdq", "-e", "target", cwd=wt, check=False)
 
 
 def worktree(name, commit):
@@ -81,7 +88,6 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--cores", type=int, default=6)
     ap.add_argument("--lane", type=int, default=0)
-    ap.add_argument("--lanes", type=int, default=1)
     ap.add_argument("--netns", default=None)
     ap.add_argument("--rargo", default=os.path.join(WORK, "bin-hist", "rargo"))
     a = ap.parse_args()
@@ -97,8 +103,10 @@ def main():
             if prev and not git("diff", "--name-only", prev, c, "--", "Cargo.lock").strip() and commits[i - 2][1] == tc:
                 prev = c
                 continue
-            git("checkout", "-q", "--detach", c, cwd=wt)
-            p = subprocess.run(["cargo", f"+{tc}", "fetch"], cwd=wt, capture_output=True, text=True)
+            checkout(wt, c)
+            p = subprocess.run(["cargo", f"+{tc}", "fetch", "--locked"], cwd=wt, capture_output=True, text=True)
+            if p.returncode != 0:
+                p = subprocess.run(["cargo", f"+{tc}", "fetch"], cwd=wt, capture_output=True, text=True)
             if p.returncode != 0:
                 print(i, c[:9], "fetch failed:", p.stderr[-200:], flush=True)
             prev = c
@@ -110,15 +118,23 @@ def main():
         for i, (c, tc) in enumerate(commits, 1):
             if (a.variant == "c" and i % 10 != 0) or i in seen:
                 continue
-            git("checkout", "-q", "--detach", c, cwd=wt)
+            checkout(wt, c)
             dt, p = stock(wt, tc, a.cores)
             record(a.out, dict(variant=a.variant, i=i, commit=c[:10], toolchain=tc, wall_s=round(dt, 2), rc=p.returncode, err=tail(p)))
     elif a.variant == "b":
+        # Any number of these run side by side (cold builds do not depend
+        # on each other): each takes the next commit nobody has claimed.
         wt = worktree(f"b{a.lane}", commits[0][0])
+        claims = os.path.join(ROOT, "claims")
+        os.makedirs(claims, exist_ok=True)
         for i, (c, tc) in enumerate(commits, 1):
-            if i % a.lanes != a.lane or i in seen:
+            if i in seen:
                 continue
-            git("checkout", "-q", "--detach", c, cwd=wt)
+            try:
+                os.close(os.open(os.path.join(claims, f"b-{i}"), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                continue
+            checkout(wt, c)
             subprocess.run(["rm", "-rf", os.path.join(wt, "target")])
             dt, p = stock(wt, tc, a.cores)
             record(a.out, dict(variant="b", i=i, commit=c[:10], toolchain=tc, wall_s=round(dt, 2), rc=p.returncode, err=tail(p)))
@@ -130,7 +146,7 @@ def main():
                 continue
             agent = "tenth" if i % 10 == 0 else "every"
             wt = wts[agent]
-            git("checkout", "-q", "--detach", c, cwd=wt)
+            checkout(wt, c)
             env = dict(os.environ, RUSTUP_TOOLCHAIN=tc)
             t = time.time()
             p = subprocess.run([*prefix, a.rargo, *TARGET], cwd=wt, env=env, capture_output=True, text=True)
