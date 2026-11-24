@@ -8,7 +8,7 @@
 //! A client machine runs one daemon per server, and the daemon holds one
 //! long-lived link to it (the reliable-UDP transport of `rargo-net`, or TCP
 //! where UDP does not get through), encrypted and authenticated with a
-//! pre-shared key per user (Noise `NNpsk0`); see [`secure`]. The link
+//! pre-shared key per token (Noise `NNpsk0`); see [`secure`]. The link
 //! carries [`Frame`]s of bincode messages ([`ClientMsg`], [`ServerMsg`]):
 //! every command is a stream of its own, and stream 0 is the daemon's own
 //! conversation with the server (worktree changes pushed as they happen,

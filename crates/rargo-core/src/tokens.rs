@@ -1,4 +1,4 @@
-//! Tokens and invitations: who may connect besides the users of the key file.
+//! Tokens and invitations: who may connect.
 //!
 //! One JSON file in the state directory (`tokens.json`), rewritten whole
 //! under a lock by whoever changes it (`rargod token ...` on the server's
@@ -9,8 +9,8 @@
 //! A token is what a client presents: an id (sent as the user name of the
 //! handshake) and a secret. The file holds the key derived from the secret,
 //! not the secret; the derived key is what the handshake needs, so the file
-//! is still as sensitive as a key file and is kept readable by its owner
-//! only (D67). An invitation is a code an administrator hands to a person;
+//! is as sensitive as the secrets themselves and is kept readable by its
+//! owner only (D67). An invitation is a code an administrator hands to a person;
 //! redeeming it (through `rargo auth`) makes a token.
 
 use anyhow::{Context, Result, bail};

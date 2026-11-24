@@ -1277,8 +1277,8 @@ date.
   the daemon's own environment is used for a build. Closing the socket
   (Ctrl-C, a closed pipe) withdraws the request on the server.
 - **Transport.** The reliable-UDP layer of the worker link, moved into
-  its own crate (`rargo-net`). For clients a connection names its user in
-  the key agreement (Noise `NNpsk0` under the user's key); from then on
+  its own crate (`rargo-net`). For clients a connection names its token in
+  the key agreement (Noise `NNpsk0` under the token's key); from then on
   every datagram carries a 16-byte tag keyed from the handshake hash.
   Datagrams without it are accepted for the key agreement only, so an
   outsider who has seen a connection id can neither inject data nor move
@@ -1887,17 +1887,16 @@ changes it and read again by the server whenever the file has changed:
 `rargod token create|list|revoke|invite` on the server's machine take
 effect at once, with no restart. A token may expire. A session whose
 token was revoked or has expired is closed within seconds (looked at
-when anything arrives on the link, at most every other second). The
-key file keeps working beside it; a server may also run with tokens
-only.
+when anything arrives on the link, at most every other second). Tokens
+are the one way to say who may connect (D74).
 
 *Secrets are not kept in plain text*, with a limit that has to be said:
 the file holds the key derived from the secret, not the secret, and an
 invitation's code only as a hash. But the handshake (Noise NNpsk0) is
 symmetric, so the derived key is all a thief of that file would need
-to connect as the user. The file is therefore as sensitive as the key
-file (mode 600), and "not in plain text" protects only the secret
-itself. Removing that limit means a handshake with a key pair per
+to connect as the user. The file is therefore as sensitive as the
+secrets themselves (mode 600), and "not in plain text" protects only the
+secret itself. Removing that limit means a handshake with a key pair per
 client, the server holding public keys: a protocol change, not done
 here.
 

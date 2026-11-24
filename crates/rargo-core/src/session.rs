@@ -70,7 +70,8 @@ impl Keys {
         self.tokens.as_ref().and_then(|t| t.lookup(user)).map(|(_, _, name)| name).unwrap_or_else(|| user.to_string())
     }
 
-    /// The user's key, for the UDP transport's key agreement.
+    /// The key of the token `user` names, for the UDP transport's key
+    /// agreement.
     pub fn psk(&self, user: &str) -> Option<[u8; 32]> {
         self.lookup(user).map(|(k, _)| k)
     }

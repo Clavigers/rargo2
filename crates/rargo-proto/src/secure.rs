@@ -1,6 +1,6 @@
 //! The encrypted channel between client and server.
 //!
-//! Noise `NNpsk0` with a pre-shared key per user: both ends prove knowledge
+//! Noise `NNpsk0` with a pre-shared key per token: both ends prove knowledge
 //! of the key, the session keys are fresh per connection, and everything
 //! after the first message is forward secret.
 //!
@@ -38,14 +38,13 @@ fn err(e: snow::Error) -> io::Error {
     io::Error::other(format!("secure channel: {e}"))
 }
 
-/// The key shared with a user, derived from whatever secret text the key
-/// file holds.
+/// The key shared with the holder of a token, derived from its secret.
 pub fn psk_from_secret(secret: &[u8]) -> [u8; 32] {
     let trimmed = secret.trim_ascii();
     *blake3::Hasher::new_derive_key("rargo client key v1").update(trimmed).finalize().as_bytes()
 }
 
-/// The key used on a loopback-only server started without a key file.
+/// The key used on a loopback-only server that has issued no token.
 pub fn open_psk() -> [u8; 32] {
     psk_from_secret(b"rargo: no key configured (loopback only)")
 }
