@@ -20,6 +20,35 @@ pub enum ActionKind {
     Test,
     Doctest,
     Other,
+    /// nextest, run on the test binaries of a build (`rargo nextest`).
+    Nextest,
+}
+
+impl ActionKind {
+    pub const ALL: [ActionKind; 8] = [
+        ActionKind::Plan,
+        ActionKind::Rustc,
+        ActionKind::Rustdoc,
+        ActionKind::BuildScript,
+        ActionKind::Test,
+        ActionKind::Doctest,
+        ActionKind::Other,
+        ActionKind::Nextest,
+    ];
+
+    /// How `--rargo-status` names the kind.
+    pub fn name(self) -> &'static str {
+        match self {
+            ActionKind::Plan => "planning",
+            ActionKind::Rustc => "rustc",
+            ActionKind::Rustdoc => "rustdoc",
+            ActionKind::BuildScript => "build scripts",
+            ActionKind::Test => "tests",
+            ActionKind::Doctest => "doctests",
+            ActionKind::Other => "other",
+            ActionKind::Nextest => "nextest",
+        }
+    }
 }
 
 /// Everything rargod decides about an action before running it. Together

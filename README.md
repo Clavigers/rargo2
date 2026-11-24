@@ -146,6 +146,14 @@ cd YOUR-PROJECT && git add flake.nix flake.lock
 A project that needs another library adds it to `packages` in its
 `flake.nix`. `nix develop` gives the same environment on your machine.
 
+## nextest
+
+`rargo nextest run` (or `cargo nextest run` through the cargo link) runs
+[nextest](https://nexte.st) on the server; the client needs no nextest.
+The test binaries are rargo's build, shared with `rargo test`, and
+nextest's output, exit code and JUnit files come back as from any build.
+The server installs the newest nextest the first time it is asked.
+
 ## Other commands
 
 `rargo --rargo-status`, `--rargo-drift-check` (stock cargo against rargo on
