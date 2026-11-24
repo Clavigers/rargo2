@@ -82,22 +82,14 @@ Versions are `X.Y.Z`; before 1.0 a change of `Y` may break something (the
 protocol, a file format, an option) and a change of `Z` does not.
 `CHANGELOG.md` has a section per version, naming the issues.
 
-1. `Cargo.toml` (workspace version and the versions of the path
-   dependencies) and `CHANGELOG.md` are at the new version on `main`.
-2. `dev/gate.sh` passes on that commit.
-3. `git tag -a vX.Y.Z && git push origin vX.Y.Z`. The release workflow
-   builds the static client and the server archive (rargod, its sandbox
-   helper, the planner), makes the GitHub release with the changelog
-   section as its notes and the installers as files, and publishes the
-   client's crates (`fusewire`, `rargo-proto`, `rargo-net`, `rargo`) to
-   crates.io.
-4. `deploy/release-local.sh vX.Y.Z` on the build machine: the release's
-   files go where rargo.rs serves them (`/dl/X.Y.Z/`, `/dl/latest/`,
-   `/install.sh`, `/install-server.sh`), and the rargod service here is
-   rebuilt from a clean checkout of the tag and restarted
-   (`deploy/update-service.sh`).
-5. `deploy/check-service.sh`, or the service check workflow, against the
-   updated server.
+Set the workspace version and the path dependency versions in
+`Cargo.toml`, and add the version's section to `CHANGELOG.md` on `main`.
+Run `dev/release.sh X.Y.Z` on the build machine. It runs the gate, pushes
+the tag and waits for GitHub to publish the assets and crates. It serves
+the release files, installs the tagged service, checks it over UDP and
+TCP, and comments on the issues named by the changelog. Run the same
+command to resume after a failure. The release workflow requires a
+successful gate on the tagged commit.
 
 So the installers, the binaries, the crates and the site's downloads all
 come from the tag, and the site cannot offer a version that is not
