@@ -434,9 +434,29 @@ CARGO_TARGET_DIR="$T/stock-target" cargo build --offline >/dev/null 2>&1
 theirs=$(sed "s#$T/stock-target#$A/target#g" "$T/stock-target/debug/app.d" 2>/dev/null)
 [ -n "$mine" ] && [ "$mine" = "$theirs" ] && ok "target/debug/app.d is what stock cargo writes" || bad "target/debug/app.d is what stock cargo writes" "rargo: $mine
 cargo: $theirs"
-mine=$(CARGO_BUILD_DEP_INFO_BASEDIR="$A" "$R" build >/dev/null 2>&1; cat target/debug/app.d)
-has "$mine" "target/debug/app: crates/app/src/main.rs" && ok "build.dep-info-basedir makes the paths relative" || bad "build.dep-info-basedir makes the paths relative" "$mine"
-"$R" build >/dev/null 2>&1
+depinfo_rounds=0
+for _ in $(seq 1 20); do
+    if ! out=$(CARGO_BUILD_DEP_INFO_BASEDIR="$A" "$R" build 2>&1); then
+        bad "build with relative dep-info" "$out"
+        break
+    fi
+    mine=$(cat target/debug/app.d)
+    if ! has "$mine" "target/debug/app: crates/app/src/main.rs"; then
+        bad "build.dep-info-basedir makes the paths relative (round $((depinfo_rounds + 1)))" "$mine"
+        break
+    fi
+    if ! out=$("$R" build 2>&1); then
+        bad "build with default dep-info" "$out"
+        break
+    fi
+    mine=$(cat target/debug/app.d)
+    if [ "$mine" != "$theirs" ]; then
+        bad "default dep-info restores the absolute paths (round $((depinfo_rounds + 1)))" "$mine"
+        break
+    fi
+    depinfo_rounds=$((depinfo_rounds + 1))
+done
+[ "$depinfo_rounds" -ne 20 ] || ok "build.dep-info-basedir switches dep-info paths (20 rounds)"
 
 echo "== garbage collection keeps everything still needed"
 cd "$A"
