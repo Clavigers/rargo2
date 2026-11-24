@@ -96,7 +96,9 @@ printf 'fn main() {\n    println!("second");\n}\n' >src/main.rs
 git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
 out=$("$R" @$host 2>&1); grep -q '^\[workspace.metadata.rargo\]' Cargo.toml; check $? "a workspace gets workspace metadata" "$out" "$(cat Cargo.toml)"
 ! grep -q "rargo auth" <<<"$out"; check $? "and is not sent to rargo auth again" "$out"
-out=$("$R" run -q 2>&1); [ "$out" = "second" ]; check $? "rargo run works there" "$out"
+out=$("$R" run -q 2>&1); [ "$out" = "second" ]; check $? "rargo run works there" "$out" \
+    "$(ls -la target target/debug 2>&1 | head -n 20)" "$(grep -c " $PWD/target " /proc/self/mountinfo) mounts at target/" \
+    "$("$R" --rargo-daemon-status 2>&1 | tail -n 6)" "$(tail -n 15 "$RARGO_CACHE_DIR/daemon.log" 2>&1)"
 cargo metadata --format-version 1 --no-deps >/dev/null 2>"$T/cargo.err"; check $? "stock cargo reads the manifest as before" "$(cat "$T/cargo.err")"
 
 echo "== an administrator, while the server runs"
