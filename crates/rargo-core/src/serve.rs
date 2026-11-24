@@ -515,6 +515,7 @@ pub fn status_text(d: &Daemon) -> String {
          cold tier           {}\n\
          cache               {} hits, {} misses, {} traces stored\n\
          actions run         {} ({:.1}s cpu, {:.1}s wall)\n\
+         actions by kind     {}\n\
          in-flight dedup     {} joined, {} of those ran anyway\n\
          reruns              {} changed-input, {} environment\n\
          scheduler           {} running, {} waiting, peak {}, {} granted, {} tokens\n\
@@ -550,6 +551,11 @@ pub fn status_text(d: &Daemon) -> String {
         s.runs.load(Ordering::Relaxed),
         s.run_cpu_us.load(Ordering::Relaxed) as f64 / 1e6,
         s.run_wall_us.load(Ordering::Relaxed) as f64 / 1e6,
+        crate::trace::ActionKind::ALL
+            .iter()
+            .map(|k| format!("{} {}", k.name(), s.runs_by_kind[*k as usize].load(Ordering::Relaxed)))
+            .collect::<Vec<_>>()
+            .join(", "),
         s.joined.load(Ordering::Relaxed),
         s.joined_then_ran.load(Ordering::Relaxed),
         s.tainted.load(Ordering::Relaxed),
