@@ -193,20 +193,24 @@ out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(same binary
 out=$(R clean 2>&1); rc=$?
 [ $rc = 0 ] && [ ! -e target ]; check $? "clean removes target/" "$out"
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "and the next build fills it again" "$out"
-[ "$(pgrep -fc "^unmount-guard: $proj/target")" = 1 ]; check $? "one process watches the mount, and not under the daemon's name" "$(pgrep -af "unmount-guard")"
 # A daemon that is killed outright cannot unmount. What it left watching
 # does, at once and with no rargo command run: target/ is never a dead
 # mount, and stock cargo works in the worktree.
 unmounted() { for _ in $(seq 1 50); do grep -q " $1 [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo || return 0; sleep 0.1; done; return 1; }
+# (The daemon of the TCP part above is still running, with a cache of its
+# own; it is not this one, and its mount here was replaced long ago.)
+mine() { pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"; }
+guard=$(pgrep -P "$(mine)" -f "^unmount-guard: $proj/target")
+[ -n "$guard" ]; check $? "a process of the daemon's watches the mount, and not under the daemon's name" "$(pgrep -af unmount-guard)"
 pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"
 unmounted "$proj/target"; check $? "after the daemon is killed (SIGKILL) target/ is unmounted, with no rargo command run" "$(grep "$proj" /proc/self/mountinfo)"
 out=$(ls target 2>&1); check $? "and is a plain directory that can be listed" "$out"
-[ "$(daemons)" = 0 ]; check $? "(no daemon is running: $(daemons))"
+[ -z "$(mine)" ]; check $? "(its daemon is not running)" "$(mine)"
 out=$(cargo build --offline 2>&1); check $? "stock cargo builds in the worktree after the daemon was killed" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and its binary runs" "$out"
 out=$(cargo test --offline -q 2>&1); check $? "stock cargo test works there too" "$out"
-! mounted && [ "$(daemons)" = 0 ]; check $? "all of it without rargo: still no daemon and no mount"
-! pgrep -f "^unmount-guard: $E/" >/dev/null; check $? "nothing is left watching" "$(pgrep -af "^unmount-guard: $E/")"
+! mounted && [ -z "$(mine)" ]; check $? "all of it without rargo: still no daemon and no mount"
+! kill -0 "$guard" 2>/dev/null; check $? "and what watched the mount is gone"
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "the next rargo command starts a daemon and builds" "$out"
 mounted; check $? "which mounts target/ again"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and shows the binary" "$out"
