@@ -6,7 +6,8 @@
 # the other services on the box keep headroom (see CLAUDE.md).
 # Override the limits with RARGO_CPU_QUOTA and RARGO_MEMORY_MAX, the address
 # with RARGO_SERVER (default 127.0.0.1:7459). RARGO_HIDE names directories
-# the server must not see.
+# the server must not see; RARGO_SERVER_RUSTUP_HOME gives it toolchains of
+# its own.
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 state=${RARGO_STATE:-$work/state}
@@ -20,6 +21,9 @@ start)
         echo "rargod already running"; exit 0
     fi
     . "$work/env.sh"
+    # RARGO_SERVER_RUSTUP_HOME: toolchains of the server's own, instead of
+    # the shared ones.
+    export RUSTUP_HOME="${RARGO_SERVER_RUSTUP_HOME:-$RUSTUP_HOME}"
     : >"$state/rargod.log"
     # RARGO_HIDE: directories (space separated) the server must not be able
     # to see, e.g. the client worktrees of a test on the same machine. The
