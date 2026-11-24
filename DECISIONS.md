@@ -2378,3 +2378,42 @@ shadow-rs, git-version, built, git-testament) add `describe --tags` and
 - A tag made, moved or removed makes another stand-in without a new
   commit: HEAD carries a seal of `packed-refs` and `refs/tags`, read
   without starting git on every command.
+
+## D79. A scan looks only where something may have changed (issue 10)
+
+- Every inotify event names its directory. A scan lists only the
+  directories that had events or have no watch, every directory above
+  them, and the root. Every other directory is taken from the previous
+  scan as it was, without a system call.
+  - "No watch" includes a watch the kernel dropped: a directory that was
+    removed, and perhaps made again, has one no longer.
+  - A dropped event queue, a directory that moved (its watches now stand
+    for other paths), or a change of what is synced (`exclude`,
+    `include`, `gitignored`, what git ignores) means a whole scan.
+- The rescan edits the previous scan's maps in place, and moves them
+  rather than copying when no command still holds that scan. A listed
+  directory is compared with its previous tree: what went is removed,
+  what came is added. Contents carry reference counts, so the one path
+  kept for a content is replaced by another copy when it goes.
+- Measured with one change (median of five):
+
+  | Worktree | Files | Directories | Whole scan | Rescan | Rescan, scan shared |
+  |---|---|---|---|---|---|
+  | rustc | 243,970 | 21,412 | 329 ms | 12 ms (18 listed) | 99 ms |
+  | Ruff | 11,338 | 908 | 11.2 ms | 0.86 ms | 2.2 ms |
+  | Zed | 3,698 | 830 | 4.5 ms | 0.91 ms | 1.5 ms |
+
+  "Scan shared" is the copy made when another command still holds the
+  previous scan.
+- Watches go only to directories that are synced: `target/`, excluded
+  paths, cache directories, and (with `gitignored = false`) what git
+  ignores are neither scanned nor watched. A directory that leaves the
+  sync loses its watch.
+- At the per-user limit (`ENOSPC`), the daemon watches as many
+  directories as it can. It says once, with the command's output, how
+  many are left without a watch and which `fs.inotify.max_user_watches`
+  value would cover them. Those directories are listed by every scan,
+  and adding their watches is tried again each time. The limit
+  reported is the user namespace's own (`/proc/sys/user/
+  max_inotify_watches`). The e2e test lowers it in a namespace of its
+  own, so the machine's setting is never touched.

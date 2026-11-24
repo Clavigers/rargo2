@@ -750,6 +750,47 @@ out=$("$R" run -q 2>&1)
 git -C "$G" checkout -q Cargo.toml
 
 # --- reports cargo writes into target/, and clients that go away ------------
+echo "== a directory removed and made again is watched again"
+M=$T/m
+mkdir -p "$M/src" "$M/data"
+printf '[package]\nname = "remade"\nversion = "0.1.0"\nedition = "2021"\n' >"$M/Cargo.toml"
+printf 'fn main() {\n    println!("{}", include_str!("../data/v.txt").trim());\n}\n' >"$M/src/main.rs"
+echo one >"$M/data/v.txt"
+cd "$M"
+out=$("$R" run -q 2>&1); [ "$out" = one ] && ok "built ($out)" || bad "built" "$out"
+"$R" run -q >/dev/null 2>&1   # the directories watched since the first scan are looked at once more
+rm -rf "$M/data" && mkdir "$M/data" && echo two >"$M/data/v.txt"
+out=$("$R" run -q 2>&1); [ "$out" = two ] && ok "the new directory's file is seen ($out)" || bad "the new directory's file is seen" "$out"
+"$R" run -q >/dev/null 2>&1
+echo three >"$M/data/v.txt"
+out=$("$R" run -q 2>&1); [ "$out" = three ] && ok "and so is a later change in it ($out)" || bad "and so is a later change in it" "$out"
+
+echo "== more directories than the daemon may watch"
+# A daemon of its own, in a user namespace whose limit is 40 watches (the
+# limit is per user namespace; the machine's own is not touched).
+W=$T/w
+WC=$T/w-cache
+mkdir -p "$W/src"
+printf '[package]\nname = "manydirs"\nversion = "0.1.0"\nedition = "2021"\n' >"$W/Cargo.toml"
+printf 'fn main() {\n    println!("{} {}", include_str!("../d/1/x.txt").trim(), include_str!("../d/77/x.txt").trim());\n}\n' >"$W/src/main.rs"
+for i in $(seq 1 80); do mkdir -p "$W/d/$i" && echo "a$i" >"$W/d/$i/x.txt"; done
+limited() { (cd "$W" && RARGO_CACHE_DIR=$WC RARGO_OUTPUT=copy RARGO_SYNC_STATS=1 unshare -Ur sh -c 'echo 40 >/proc/sys/user/max_inotify_watches && exec "$0" "$@"' "$R" "$@"); }
+out=$(limited run -q 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "a1 a77" && ok "it builds" || bad "it builds" "$out"
+has "$out" "directories of $W are not watched: the kernel allows 40 inotify watches per user" && has "$out" "sysctl fs.inotify.max_user_watches=" && ok "it says the directories are not watched, and the setting to raise" || bad "it says the directories are not watched, and the setting to raise" "$out"
+out=$(limited run -q 2>&1)
+! has "$out" "are not watched" && ok "it says so once" || bad "it says so once" "$out"
+echo b1 >"$W/d/1/x.txt"; echo b77 >"$W/d/77/x.txt"
+out=$(limited run -q 2>&1)
+has "$out" "b1 b77" && ok "changes are seen, in watched and unwatched directories alike" || bad "changes are seen, in watched and unwatched directories alike" "$out"
+looked=$(sed -n 's/.*looking at \([0-9]*\) of \([0-9]*\) directories.*/\1 \2/p' <<<"$out" | tail -1)
+set -- $looked
+[ -n "${1:-}" ] && [ "$1" -lt "$2" ] && [ "$1" -gt 1 ] && ok "a scan looks only at what has no watch or changed ($1 of $2 directories)" || bad "a scan looks only at what has no watch or changed" "$out"
+st=$(RARGO_CACHE_DIR=$WC "$R" --rargo-daemon-status 2>&1)
+has "$st" "1 known, 0 watched completely" && ok "the daemon's status says the worktree is not watched completely" || bad "the daemon's status says the worktree is not watched completely" "$st"
+RARGO_CACHE_DIR=$WC "$R" --rargo-daemon-stop >/dev/null 2>&1
+cd "$A"
+
 echo "== future-incompatibility report, --timings, interrupted clients"
 H=$T/h
 mkdir -p "$H/old/src" "$H/app/src"
