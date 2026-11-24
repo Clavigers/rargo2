@@ -721,7 +721,12 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     };
     let policy = loaded.policy;
     for notice in &loaded.notices {
-        c.out.warn(notice);
+        c.out.warn_once(notice);
+    }
+    if c.env.get("RARGO_QUIET_DEPRECATIONS").is_none() {
+        for d in &loaded.deprecations {
+            c.out.note_once(d);
+        }
     }
     let generation = d.memo.advance();
     let mut masks = vec![vjoin(WORKTREE_AT, b"target")];

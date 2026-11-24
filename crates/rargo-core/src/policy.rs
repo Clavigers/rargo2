@@ -121,7 +121,14 @@ struct InManifest {
 pub struct Loaded {
     pub policy: Policy,
     pub notices: Vec<String>,
+    /// Said once per command unless the client asks for quiet about it:
+    /// the older file is still what the policy comes from.
+    pub deprecations: Vec<String>,
 }
+
+/// The release in which `.rargo.toml` and `~/.config/rargo/config.toml`
+/// stop being read.
+pub const OLD_FILES_UNTIL: &str = "0.5.0";
 
 fn matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_suffix('*') {
@@ -141,7 +148,12 @@ impl Policy {
         let mut out = Loaded { policy: match file {
             Some(text) => Policy::parse(text)?,
             None => Policy::default(),
-        }, notices: Vec::new() };
+        }, notices: Vec::new(), deprecations: Vec::new() };
+        if file.is_some() {
+            out.deprecations.push(format!(
+                "{POLICY_FILE} is still read, until rargo {OLD_FILES_UNTIL}: its tables belong in {MANIFEST} under [workspace.metadata.rargo] (`rargo --rargo-migrate` moves them)"
+            ));
+        }
         let Some(manifest) = manifest else { return Ok(out) };
         // A manifest cargo itself would reject is cargo's to report.
         let Ok(table) = manifest.parse::<toml::Table>() else { return Ok(out) };
@@ -256,6 +268,8 @@ mod tests {
         assert_eq!(l.policy.env.pass, ["DATABASE_URL"]);
         assert_eq!(l.policy.sync.exclude, ["node_modules"]);
         assert_eq!(l.notices.len(), 1);
+        assert_eq!(l.deprecations.len(), 1, "the file is still read, and that is said");
+        assert!(Policy::load(Some(manifest), None).unwrap().deprecations.is_empty());
         assert!(l.notices[0].contains("[env] is ignored") && l.notices[0].contains("[workspace.metadata.rargo]"), "{}", l.notices[0]);
         // A manifest that only names the server changes nothing.
         let only_host = "[package]\nname = \"a\"\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n";
