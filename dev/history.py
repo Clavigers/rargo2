@@ -89,6 +89,7 @@ def main():
     ap.add_argument("--cores", type=int, default=6)
     ap.add_argument("--lane", type=int, default=0)
     ap.add_argument("--netns", default=None)
+    ap.add_argument("--cargo", default=None, help="fetch: the cargo binary to fetch with")
     ap.add_argument("--rargo", default=os.path.join(WORK, "bin-hist", "rargo"))
     a = ap.parse_args()
     if a.variant == "stats":
@@ -104,9 +105,14 @@ def main():
                 prev = c
                 continue
             checkout(wt, c)
-            p = subprocess.run(["cargo", f"+{tc}", "fetch", "--locked"], cwd=wt, capture_output=True, text=True)
+            # With the toolchain's own cargo, or with the one given (the
+            # server's planner keeps its registry cache under another
+            # directory name than older cargos do).
+            cargo = [a.cargo] if a.cargo else ["cargo", f"+{tc}"]
+            env = dict(os.environ, RUSTUP_TOOLCHAIN=tc)
+            p = subprocess.run([*cargo, "fetch", "--locked"], cwd=wt, env=env, capture_output=True, text=True)
             if p.returncode != 0:
-                p = subprocess.run(["cargo", f"+{tc}", "fetch"], cwd=wt, capture_output=True, text=True)
+                p = subprocess.run([*cargo, "fetch"], cwd=wt, env=env, capture_output=True, text=True)
             if p.returncode != 0:
                 print(i, c[:9], "fetch failed:", p.stderr[-200:], flush=True)
             prev = c
