@@ -403,7 +403,7 @@ fn auth_command(args: &[OsString]) -> ! {
                     "rargo auth [HOST]            get this machine a token for the project's server (or HOST), confirmed in a browser\n\
                      rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
                      rargo auth status            which server this project builds on, and as whom\n\
-                     rargo auth remove [HOST]     forget the token for the project's server (or HOST)"
+                     rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here"
                 );
                 std::process::exit(0)
             }
@@ -429,14 +429,26 @@ fn auth_command(args: &[OsString]) -> ! {
             }
             std::process::exit(0)
         }
-        "remove" => match project::forget(&host) {
-            Ok(true) => {
-                println!("forgot the token for {host} (to make it stop working everywhere: rargod token revoke, on the server)");
-                std::process::exit(0)
+        "remove" => {
+            if project::credential(&host).is_none() {
+                die(&format!("there is no token for {host} on this machine"));
             }
-            Ok(false) => die(&format!("there is no token for {host} on this machine")),
-            Err(e) => die(&e),
-        },
+            // Ended on the server first, so that a copy of it kept
+            // anywhere stops working too; forgotten here either way.
+            let revoked = project::revoke_on_server(&host);
+            if let Err(e) = project::forget(&host) {
+                die(&e);
+            }
+            match revoked {
+                Ok(true) => println!("revoked the token for {host} on the server and forgot it here"),
+                Ok(false) => println!("forgot the token for {host} (the server did not know it as a token that still works)"),
+                Err(e) => {
+                    println!("forgot the token for {host} on this machine");
+                    eprintln!("warning: the server could not be told to revoke it ({e}); it keeps working for whoever has a copy until an administrator runs `rargod token revoke`");
+                }
+            }
+            std::process::exit(0)
+        }
         _ => {}
     }
     if let Some(token) = token {

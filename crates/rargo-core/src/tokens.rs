@@ -339,6 +339,22 @@ impl TokenStore {
         self.file().github.clone()
     }
 
+    /// A token revokes itself: whoever holds its text may end it. Returns
+    /// whether it was a token that still worked.
+    pub fn revoke_self(&self, text: &str) -> Result<bool> {
+        let Some((id, secret)) = text.trim().split_once('.') else { return Ok(false) };
+        let key = hex(&secure::psk_from_secret(secret.as_bytes()));
+        self.change(|f| {
+            match f.tokens.iter_mut().find(|t| t.id == id && t.key == key && !t.revoked) {
+                Some(t) => {
+                    t.revoked = true;
+                    Ok(true)
+                }
+                None => Ok(false),
+            }
+        })
+    }
+
     /// Makes an invitation. Returns its code, which is not kept.
     pub fn invite(&self, user: Option<&str>, admin: bool, days: Option<u32>, uses: u32, token_days: Option<u32>) -> Result<String> {
         if let Some(u) = user {
@@ -423,7 +439,15 @@ mod tests {
         let (t2, _) = store.create("bob", false, Some(0), "test").unwrap();
         assert!(store.lookup(&t2.id).is_none(), "expired");
         assert!(store.create("no spaces", false, None, "").is_err());
-        assert_eq!(store.list().len(), 2);
+        // A token may end itself, given its whole text and nothing less.
+        let (t3, secret3) = store.create("carol", false, None, "test").unwrap();
+        assert!(!store.revoke_self(&format!("{}.not-the-secret-of-it", t3.id)).unwrap());
+        assert!(!store.revoke_self(&t3.id).unwrap());
+        assert!(store.lookup(&t3.id).is_some());
+        assert!(store.revoke_self(&token_text(&t3, &secret3)).unwrap());
+        assert!(store.lookup(&t3.id).is_none());
+        assert!(!store.revoke_self(&token_text(&t3, &secret3)).unwrap(), "once");
+        assert_eq!(store.list().len(), 3);
     }
 
     #[test]

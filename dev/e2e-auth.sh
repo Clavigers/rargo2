@@ -126,6 +126,24 @@ grep -q "no longer valid" "$T/srv.log"; check $? "the server closed the open ses
 out=$("$R" auth remove 2>&1); check $? "rargo auth remove forgets the token" "$out"
 ! grep -q "^\[\"$host\"\]" "$cred"; check $? "it is gone from the credentials file"
 
+echo "== rargo auth remove ends the token on the server too"
+export HOME=$T/home3 XDG_CONFIG_HOME=$T/home3/.config RARGO_CACHE_DIR=$T/cache3
+mkdir -p "$HOME"
+cd "$T/proj" || exit 2
+tok3=$("$D" token create --state "$T/state" --user dave 2>/dev/null)
+out=$("$R" auth --token "$tok3" 2>&1); check $? "rargo auth --token stores a token an administrator made" "$out"
+echo "// dave" >>src/main.rs
+out=$("$R" build 2>&1); check $? "and builds with it" "$out"
+out=$("$R" auth remove 2>&1); rc=$?
+[ $rc = 0 ] && grep -q "revoked the token for $host on the server" <<<"$out"; check $? "rargo auth remove says it revoked the token on the server" "$out"
+sleep 3
+echo "// dave again" >>src/main.rs
+out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "does not know this user or key" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
+out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok3%%.*}.wrong-secret-wrong-secret\"}" "http://$host/auth/revoke"); grep -q '"revoked":false' <<<"$out"; check $? "a token cannot be revoked by its id alone" "$out"
+out=$("$R" auth remove 2>&1); [ $? != 0 ]; check $? "a second rargo auth remove has nothing to remove" "$out"
+for c in "$T/cache3" "$T/cache3b"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+
 echo "== signing in with GitHub (a stand-in for it), with an allow list"
 printf 'the-app-secret\n' >"$T/app-secret"
 out=$("$D" token github --state "$T/state" --client-id the-app-id --client-secret-file "$T/app-secret" --url "http://$host" 2>&1); check $? "rargod token github sets the application up, without a restart" "$out"
