@@ -2417,3 +2417,42 @@ shadow-rs, git-version, built, git-testament) add `describe --tags` and
   reported is the user namespace's own (`/proc/sys/user/
   max_inotify_watches`). The e2e test lowers it in a namespace of its
   own, so the machine's setting is never touched.
+
+## D80. What the server holds outlives the client daemon (issue 9)
+
+- The belief about which trees and contents the server holds was held by
+  the link. It now belongs to the daemon and is kept in the cache:
+  - one record per server address and user (`held/<hash>`);
+  - eight bytes of each digest, which is enough for a hint;
+  - capped at four million entries, after which it starts over.
+  - The chunk index (which chunk of which cached content, where) is kept
+    beside it (`chunks`).
+  - Both are written every five seconds when they changed, and when the
+    daemon stops, goes idle or runs one command without a daemon. Both
+    are read when a daemon starts.
+- No validation step is added, because none is needed for correctness:
+  - A request names its root. The server finds what it lacks under it and
+    asks for it before building, as it does when its store evicted
+    something a running daemon believed it held. A stale record (an
+    eviction, a gc, another server at the address) costs the round trips
+    of that question, never a wrong build.
+  - Each chunk taken from the cache is checked against its hash, as
+    before.
+  - The e2e check makes the server's gc drop a content the record still
+    lists, brings the content back, and gets a correct build.
+- A daemon started while a stopped one is still exiting waits up to
+  three seconds for the lock. It used to give up at once, and the command
+  then ran without a daemon.
+- Measured with `dev/bench-restart.sh` (rust-analyzer; the daemon stopped
+  before each command; median of 7):
+
+  | Link | First command, no edit (before → after) | First command after a one-line edit (before → after) |
+  |---|---|---|
+  | LAN (2 ms RTT) | 0.100 → 0.094 s | 1.227 → 1.222 s |
+  | 100 ms RTT | 0.291 → 0.297 s | 1.763 → 1.432 s |
+
+  - With no edit, the server already answered the root alone in one round
+    trip, so nothing changes.
+  - After an edit, the new daemon used to offer every manifest of the
+    worktree and wait for the server to say which it lacked. It now
+    offers the edited file and the manifests on its path, unasked.
