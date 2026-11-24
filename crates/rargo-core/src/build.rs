@@ -958,7 +958,7 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
     env.insert("CARGO_HOME".into(), c.home.dir.to_string_lossy().into_owned());
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
-    let out = tokio::task::spawn_blocking(move || -> Result<Option<std::process::Output>> {
+    let out = tokio::task::spawn_blocking(move || -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
         snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         let run = |program: &Path, args: &[String]| {
@@ -974,20 +974,25 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
         let _ = run(Path::new("rustc"), &["-V".to_string()]);
         // A component the command needs (clippy for `cargo clippy`), which
         // the toolchain was installed without: rustup said which.
-        for (component, toolchain) in &components {
-            let add = ["component", "add", component, "--toolchain", toolchain].map(String::from);
-            let _ = run(Path::new("rustup"), &add);
+        if let Err(said) = add_components(&components, &run) {
+            return Ok(Err(said));
         }
         if offline {
-            return Ok(None);
+            return Ok(Ok(None));
         }
-        Ok(Some(run(&planner, &fetch_args)?))
+        Ok(Ok(Some(run(&planner, &fetch_args)?)))
     })
     .await?;
     let out = match out {
-        Ok(Some(o)) => o,
+        Ok(Ok(Some(o))) => o,
+        // rustup could not add a component: its own words.
+        Ok(Err(said)) => {
+            let _ = std::fs::remove_dir_all(&scratch);
+            c.out.raw_err(&said);
+            return Ok(None);
+        }
         // Only components were added: the same snapshot is planned again.
-        Ok(None) => {
+        Ok(Ok(None)) => {
             let _ = std::fs::remove_dir_all(&scratch);
             return Ok(Some(p.snapshot.clone()));
         }
@@ -1033,6 +1038,57 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
     }
     c.deliver(Vec::new(), writes);
     Ok(Some(snapshot))
+}
+
+/// Adds each component to its toolchain with `run` (rustup, as the
+/// client). `Err` is what rustup said when it could not, such as for a
+/// component that does not exist for that toolchain.
+fn add_components(
+    components: &[(String, String)],
+    run: &dyn Fn(&Path, &[String]) -> std::io::Result<std::process::Output>,
+) -> std::result::Result<(), Vec<u8>> {
+    for (component, toolchain) in components {
+        let add = ["component", "add", component, "--toolchain", toolchain].map(String::from);
+        match run(Path::new("rustup"), &add) {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => return Err(o.stderr),
+            Err(e) => return Err(format!("error: running rustup: {e}\n").into_bytes()),
+        }
+    }
+    Ok(())
+}
+
+/// Adds the components a build step found missing (a build script that
+/// runs rustfmt, say) to the server's toolchains, one request at a time.
+/// `false` when rustup could not; the client has been shown why.
+async fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, String)>) -> Result<bool> {
+    let _one_at_a_time = d.fetching.lock().await;
+    let mut env: HashMap<String, String> = d.cfg.server_env.clone();
+    for (k, v) in base_env(&d.cfg.server_env, &c.env.to_map()) {
+        env.insert(k, v);
+    }
+    let (uid, gid) = (c.uid, c.gid);
+    let added = tokio::task::spawn_blocking(move || {
+        use std::os::unix::process::CommandExt;
+        let run = |program: &Path, args: &[String]| {
+            let mut cmd = std::process::Command::new(program);
+            cmd.args(args).current_dir("/").env_clear().envs(&env);
+            cmd.stdin(std::process::Stdio::null());
+            if uid != unsafe { libc::geteuid() } {
+                cmd.uid(uid).gid(gid);
+            }
+            cmd.output()
+        };
+        add_components(&components, &run)
+    })
+    .await?;
+    Ok(match added {
+        Ok(()) => true,
+        Err(said) => {
+            c.out.raw_err(&said);
+            false
+        }
+    })
 }
 
 /// The components rustup says are missing, each with its toolchain:
@@ -1788,6 +1844,9 @@ impl Run {
             _ => None,
         };
         self.times.lock()[i].start = Some(std::time::Instant::now());
+        // A step that failed because its toolchain lacks a component (a
+        // build script running rustfmt) runs again once rustup added it.
+        let mut components_added = false;
         let outcome = loop {
             if let Some(o) = from_full.take() {
                 break o;
@@ -1839,6 +1898,17 @@ impl Run {
                 if let Some(bad) = seed.take() {
                     self.d.incr.discard(&crate_key, bad.id);
                     continue;
+                }
+            }
+            if !r.success() && !components_added {
+                let missing = missing_components(&self.d.store().read(&r.stderr).unwrap_or_default());
+                if !missing.is_empty() {
+                    components_added = true;
+                    if add_components_for(&self.d, &self.c, missing).await? {
+                        // What the failed run saw of the toolchain is gone.
+                        self.base.renew();
+                        continue;
+                    }
                 }
             }
             break outcome;
@@ -3035,5 +3105,32 @@ mod tests {
         // Nothing else is taken for a component, nor anything not a name.
         assert!(missing_components(b"error: could not download file\n").is_empty());
         assert!(missing_components(b"is not installed for the toolchain 'x;rm'\nrustup component add a\n").is_empty());
+    }
+
+    #[test]
+    fn a_component_rustup_cannot_add_comes_back_in_rustups_words() {
+        use std::os::unix::process::ExitStatusExt;
+        let asked = std::sync::Mutex::new(Vec::new());
+        let run = |program: &Path, args: &[String]| {
+            asked.lock().unwrap().push(format!("{} {}", program.display(), args.join(" ")));
+            let ok = args[2] != "nope";
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
+                stdout: Vec::new(),
+                stderr: if ok { Vec::new() } else { b"error: toolchain 'T' does not contain component 'nope'\n".to_vec() },
+            })
+        };
+        let pair = |c: &str| (c.to_string(), "T".to_string());
+        assert_eq!(add_components(&[pair("rustfmt"), pair("clippy")], &run), Ok(()));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["rustup component add rustfmt --toolchain T", "rustup component add clippy --toolchain T"]
+        );
+        assert_eq!(
+            add_components(&[pair("nope"), pair("clippy")], &run),
+            Err(b"error: toolchain 'T' does not contain component 'nope'\n".to_vec()),
+            "rustup's message, and nothing more is tried"
+        );
+        assert_eq!(asked.lock().unwrap().len(), 3);
     }
 }

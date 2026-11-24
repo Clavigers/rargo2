@@ -82,7 +82,7 @@ pub struct BaseView {
     mounts: Vec<Mount>,
     memo: Arc<HostMemo>,
     /// Host lookups remembered at or after this generation are trusted.
-    min_gen: u64,
+    min_gen: AtomicU64,
 }
 
 const DIR_OWNER: Owner = Owner { uid: 0, gid: 0, mode: 0o755 };
@@ -93,7 +93,13 @@ impl BaseView {
         // Longest prefix first.
         mounts.sort_by(|a, b| b.at.len().cmp(&a.at.len()));
         assert!(mounts.iter().any(|m| m.at == b"/"), "a root mount is required");
-        BaseView { mounts, memo, min_gen }
+        BaseView { mounts, memo, min_gen: AtomicU64::new(min_gen) }
+    }
+
+    /// Forgets the host lookups made so far: after this, every host path is
+    /// looked at again (the server changed a toolchain mid-request).
+    pub fn renew(&self) {
+        self.min_gen.store(self.memo.advance(), Ordering::SeqCst);
     }
 
     /// The mount containing directory `dir`, and `dir` relative to it.
@@ -119,7 +125,7 @@ impl BaseView {
         key.push(b'/');
         key.extend_from_slice(name);
         if let Some(e) = self.memo.looked.get(&key) {
-            if e.0 >= self.min_gen {
+            if e.0 >= self.min_gen.load(Ordering::Relaxed) {
                 return e.1.clone();
             }
         }
@@ -134,7 +140,7 @@ impl BaseView {
             key.extend_from_slice(rel_dir);
         }
         if let Some(e) = self.memo.listed.get(&key) {
-            if e.0 >= self.min_gen {
+            if e.0 >= self.min_gen.load(Ordering::Relaxed) {
                 return Ok(e.1.clone());
             }
         }

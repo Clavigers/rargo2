@@ -1,6 +1,7 @@
 #!/bin/bash
 # End to end: a command that needs a toolchain component the server lacks
-# (clippy for `rargo clippy`) gets it installed there on first use.
+# (clippy for `rargo clippy`, rustfmt for a build script that runs it) gets
+# it installed there on first use.
 #
 #   dev/e2e-components.sh
 #
@@ -117,6 +118,57 @@ for w in c d; do
     out=$(cat "$E/$w.out")
     [ "$(cat "$E/$w.rc")" = 0 ] && linted "$out"; check $? "worktree $w: rargo clippy reports clippy's lint" "$out"
 done
+
+echo "== a build script that runs rustfmt"
+# The script fails when rustfmt does not run, as it would on any machine
+# without it.
+has_rustfmt() { [ -x "$RH/toolchains/$1-$host_triple/bin/rustfmt" ]; }
+script_project() { # dir build.rs
+    mkdir -p "$1/src"
+    (
+        cd "$1" || exit 1
+        git init -q .
+        printf '[package]\nname = "fmtme"\nversion = "0.1.0"\nedition = "2021"\n' >Cargo.toml
+        printf '%s' "$2" >build.rs
+        printf 'fn main() {\n    println!("{}", env!("FMT_SAID"));\n}\n' >src/main.rs
+        git add -A
+        git -c user.name=t -c user.email=t@t.invalid commit -qm one
+    )
+}
+script_project "$T/f" '
+use std::process::Command;
+fn main() {
+    let o = Command::new("rustfmt").arg("--version").output().expect("running rustfmt");
+    if !o.status.success() {
+        panic!("rustfmt failed: {}", String::from_utf8_lossy(&o.stderr));
+    }
+    let said = String::from_utf8_lossy(&o.stdout);
+    println!("cargo:rustc-env=FMT_SAID={}", said.split_whitespace().next().unwrap_or(""));
+}
+'
+cd "$T/f" || exit 2
+rh rustup component remove rustfmt --toolchain $DEFAULT_TC >/dev/null 2>&1
+! has_rustfmt $DEFAULT_TC; check $? "rustfmt is not installed for $DEFAULT_TC on the server"
+out=$("$R" run -q 2>&1); rc=$?
+[ $rc = 0 ] && [ "$out" = rustfmt ]; check $? "rargo run builds and runs it" "$out"
+! grep -q "is not installed" <<<"$out"; check $? "and the client sees no error about it" "$out"
+has_rustfmt $DEFAULT_TC; check $? "rustfmt is now installed for $DEFAULT_TC on the server" "$(ls "$RH/toolchains/$DEFAULT_TC-$host_triple/bin")"
+echo "// two" >>src/main.rs
+out=$("$R" run -q 2>&1); [ $? = 0 ] && [ "$out" = rustfmt ]; check $? "the second build needs nothing installed" "$out"
+
+echo "== a component that does not exist for the toolchain"
+# rustup names it as missing; adding it fails, and rustup says why.
+script_project "$T/g" '
+fn main() {
+    eprintln!("error: '"'"'nothing'"'"' is not installed for the toolchain '"'"'1.87.0-x86_64-unknown-linux-gnu'"'"'.");
+    eprintln!("help: run `rustup component add no-such-component` to install it");
+    std::process::exit(1);
+}
+'
+cd "$T/g" || exit 2
+out=$("$R" build 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "does not contain component 'no-such-component'" <<<"$out"; check $? "the build fails with rustup's own message" "$out"
+grep -q "failed to run custom build command for \`fmtme" <<<"$out"; check $? "and cargo's report of the failed build script" "$out"
 
 cd /
 echo "$((checks - fails)) passed, $fails failed"
