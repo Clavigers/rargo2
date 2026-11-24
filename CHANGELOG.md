@@ -10,6 +10,12 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- A build whose outputs arrive while an earlier delivery's fetch is still
+  running no longer gets their parts mixed up: one fetch is in flight at a
+  time, and what it brings is checked against what it asked for before
+  the next one starts. A large binary outside the mounted `target/`
+  (a nested workspace built from the repository root) could come out
+  corrupt. (#95)
 - `rargo nextest` (and `cargo nextest` through the cargo link) runs
   nextest on the server. The client needs no nextest. The test binaries
   come from rargo's build and share its cache with `rargo test`, and
