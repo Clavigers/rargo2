@@ -86,6 +86,9 @@ export RARGO_E2E_AUTH=${RARGO_E2E_AUTH:-$L/work/e2e-auth}
 export E2E_AUTH_PORT=${E2E_AUTH_PORT:-$(free_pair)}
 export RARGO_E2E_LINK=${RARGO_E2E_LINK:-$L/work/e2e-link}
 export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
+# The toolchains e2e-components installs components into: kept between
+# runs of this gate.
+export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
 mkdir -p "$L/work"
 step e2e dev/e2e.sh
 step e2e-copy env RARGO_OUTPUT=copy dev/e2e.sh
