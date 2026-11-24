@@ -6,6 +6,15 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.7
+
+Protocol 7 (unchanged).
+
+- A worktree that was synced for a request is pinned in the server's
+  store for as long as the request holds it: a store at its budget
+  evicts other content, never the sources of a build that is running.
+  (#40)
+
 ## 0.3.6
 
 Protocol 7 (unchanged).
