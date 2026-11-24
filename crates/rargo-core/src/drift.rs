@@ -101,8 +101,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     // that environment too (the devShell's tools and variables), as its
     // users would: `nix develop -c cargo build`. Unsandboxed, so the store
     // paths are simply the host's.
-    let loaded = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
-    let policy = loaded.policy;
+    let policy = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
     let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
     let mut cargo = "cargo".to_string();
     if has_flake && policy.flake.enabled != Some(false) {

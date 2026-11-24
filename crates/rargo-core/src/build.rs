@@ -720,16 +720,7 @@ struct Prepared {
 
 async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
     let dir = c.policy_dir()?;
-    let loaded = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
-    let policy = loaded.policy;
-    for notice in &loaded.notices {
-        c.out.warn_once(notice);
-    }
-    if c.env.get("RARGO_QUIET_DEPRECATIONS").is_none() {
-        for d in &loaded.deprecations {
-            c.out.note_once(d);
-        }
-    }
+    let policy = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
     let generation = d.memo.advance();
     let mut masks = vec![vjoin(WORKTREE_AT, b"target")];
     if let Some(extra) = d.masks.get(&c.worktree) {
@@ -747,7 +738,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
             tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &files, uid, gid))
                 .await?
                 .context(
-                    "evaluating the repository's flake (if it reads files of the repository, name them in `flake.files` in .rargo.toml; \
+                    "evaluating the repository's flake (if it reads files of the repository, name them in `files` under [workspace.metadata.rargo.flake] in Cargo.toml; \
                      `flake.enabled = false` builds without it)",
                 )?,
         )

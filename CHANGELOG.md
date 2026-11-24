@@ -6,6 +6,16 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.4.0
+
+Protocol 7 (unchanged).
+
+- A project's server and policy are in its `Cargo.toml`
+  (`[workspace.metadata.rargo]`) and nowhere else; a machine's token is in
+  `~/.config/rargo/credentials.toml` or `RARGO_TOKEN`. `.rargo.toml` and
+  `~/.config/rargo/config.toml` are not read, and there is no
+  `rargo --rargo-migrate`. (#55)
+
 ## 0.3.7
 
 Protocol 7 (unchanged).
