@@ -51,6 +51,9 @@
 //! git = "history"
 //! ```
 //!
+//! Beside the tables, `nextest = "0.9.100"` directly under
+//! `[workspace.metadata.rargo]` names the nextest `rargo nextest` runs.
+//!
 //! The manifest is read from the snapshot, so editing it takes effect on
 //! the next command and the policy flows into action keys through the
 //! environment and network settings it produces.
@@ -71,6 +74,8 @@ pub struct Policy {
     /// that the file means the same thing at both ends.
     #[serde(default)]
     pub sync: SyncPolicy,
+    /// The version of nextest `rargo nextest` runs.
+    pub nextest: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -145,6 +150,7 @@ struct InManifest {
     flake: FlakePolicy,
     #[serde(default)]
     sync: SyncPolicy,
+    nextest: Option<String>,
 }
 
 fn matches(pattern: &str, name: &str) -> bool {
@@ -175,7 +181,7 @@ impl Policy {
             .find_map(|kind| Some((*kind, table.get(*kind)?.get("metadata")?.get("rargo")?.clone())));
         let Some((kind, value)) = found else { return Ok(Policy::default()) };
         let m: InManifest = value.try_into().map_err(|e: toml::de::Error| format!("{MANIFEST}: [{kind}.metadata.rargo]: {}", e.message()))?;
-        Ok(Policy { env: m.env, network: m.network, flake: m.flake, sync: m.sync })
+        Ok(Policy { env: m.env, network: m.network, flake: m.flake, sync: m.sync, nextest: m.nextest })
     }
 
     /// Client variables the policy passes to every action.

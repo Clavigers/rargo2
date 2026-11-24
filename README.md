@@ -153,7 +153,12 @@ A project that needs another library adds it to `packages` in its
 [nextest](https://nexte.st) on the server; the client needs no nextest.
 The test binaries are rargo's build, shared with `rargo test`, and
 nextest's output, exit code and JUnit files come back as from any build.
-The server installs the newest nextest the first time it is asked.
+Every test is cached on its own: a test whose binary and inputs did not
+change is replayed, and a failure is never cached, so retries run.
+The version is the one the repository names (`nextest = "0.9.100"` under
+`[workspace.metadata.rargo]`, or `nextest-version` in
+`.config/nextest.toml`), else the client's own nextest's, else the newest;
+the server installs each version the first time it is asked.
 
 ## Other commands
 

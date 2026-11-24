@@ -1154,8 +1154,6 @@ struct Built {
     /// The environment the build's tests would run in.
     env: BTreeMap<String, String>,
     cargo_override: Option<String>,
-    /// The workspace's own packages.
-    local_packages: Vec<String>,
 }
 
 async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
@@ -1312,17 +1310,12 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         need: if as_build { Some(pd.needs()) } else { None },
     });
     if let Some(keep) = keep {
-        let mut local: Vec<String> =
-            plan.units.iter().filter(|u| u.is_local).map(|u| u.pkg_name.clone()).collect();
-        local.sort();
-        local.dedup();
         *keep.lock() = Some(Built {
             layer: run.layer.clone(),
             units: n,
             target_dirs: vec![plan.target_dir.clone(), plan.build_dir.clone()],
             env: run.base_env.clone(),
             cargo_override: run.cargo_override.clone(),
-            local_packages: local,
         });
     }
 
