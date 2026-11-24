@@ -126,7 +126,10 @@ impl Trees {
         for _ in 0..SYNC_ATTEMPTS {
             let generation = self.store.generation();
             if self.complete.get(&root).is_some_and(|g| *g == generation) {
-                return Ok(Arc::new(Snapshot::new(self.clone(), root)));
+                // Known complete; held from here on, if it still is.
+                if let Some(s) = self.hold(root) {
+                    return Ok(s);
+                }
             }
             // Walk level by level: fetch the manifests this level lacks,
             // then descend into every directory not known to be complete.
@@ -183,10 +186,9 @@ impl Trees {
             // ours? (What the walk found present was marked as just used,
             // so an eviction by age takes other things first.)
             if self.store.generation() != generation {
-                let (trees, blobs) = self.lacking(root);
-                if trees.is_empty() && blobs.is_empty() {
+                if let Some(s) = self.hold(root) {
                     self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
-                    return Ok(Arc::new(Snapshot::new(self.clone(), root)));
+                    return Ok(s);
                 }
                 continue;
             }
@@ -196,10 +198,59 @@ impl Trees {
             if self.complete.len() > 2_000_000 {
                 self.complete.retain(|_, g| *g == generation);
             }
-            self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::new(Snapshot::new(self.clone(), root)));
+            // Held before it is handed out: evicted in this very moment,
+            // and the next round fetches it again.
+            if let Some(s) = self.hold(root) {
+                self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
+                return Ok(s);
+            }
         }
         bail!("content of the worktree was evicted from the store {SYNC_ATTEMPTS} times while it was being synced (is the store's budget smaller than the worktree?)")
+    }
+
+    /// The tree rooted at `root` as a snapshot whose content the store may
+    /// not evict while the snapshot exists; none if the store does not hold
+    /// all of it at this moment. Checking and pinning are one step with
+    /// respect to eviction ([`Store::pin_all`]).
+    fn hold(self: &Arc<Self>, root: Hash) -> Option<Arc<Snapshot>> {
+        let mut all: Vec<Hash> = Vec::new();
+        let mut seen: HashSet<Hash> = HashSet::new();
+        let mut todo = vec![root];
+        seen.insert(root);
+        while let Some(d) = todo.pop() {
+            let tree = self.get(&d)?;
+            // A manifest is kept decoded in memory; its bytes in the store
+            // may have been collected since (nothing reads them while the
+            // decoded form is at hand). Held content includes them.
+            if !self.store.has(&d) {
+                match self.store.put_bytes(&tree.encode()) {
+                    Ok(stored) if stored == d => {}
+                    _ => return None,
+                }
+            }
+            all.push(d);
+            for (_, node) in &tree.entries {
+                match node {
+                    Node::File { hash, .. } => {
+                        let h = Hash(*hash);
+                        if seen.insert(h) {
+                            all.push(h);
+                        }
+                    }
+                    Node::Dir(sub) => {
+                        let sub = Hash(*sub);
+                        if seen.insert(sub) {
+                            todo.push(sub);
+                        }
+                    }
+                    Node::Symlink(_) => {}
+                }
+            }
+        }
+        if !self.store.pin_all(&all) {
+            return None;
+        }
+        Some(Arc::new(Snapshot { trees: self.clone(), id: root, dirs: DashMap::new(), pinned: all }))
     }
 
     /// What of the tree rooted at `root` the store does not hold: directory
@@ -356,11 +407,24 @@ pub struct Snapshot {
     /// The root tree's digest: identifies the snapshot's content.
     pub id: Hash,
     dirs: DashMap<Vec<u8>, Option<Arc<Tree>>>,
+    /// Every manifest and file content of the tree, pinned in the store
+    /// for as long as this snapshot exists (a synced worktree: the request
+    /// that holds it builds from it, however long that takes and whatever
+    /// the store evicts meanwhile). Empty for a tree built on the server.
+    pinned: Vec<Hash>,
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if !self.pinned.is_empty() {
+            self.trees.store.unpin_all(&self.pinned);
+        }
+    }
 }
 
 impl Snapshot {
     pub fn new(trees: Arc<Trees>, root: Hash) -> Snapshot {
-        Snapshot { trees, id: root, dirs: DashMap::new() }
+        Snapshot { trees, id: root, dirs: DashMap::new(), pinned: Vec::new() }
     }
 
     /// `rel_dir` is `/` for the worktree root or `/a/b`.
@@ -676,6 +740,64 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         let churned = churn.join().unwrap();
         assert!(churned >= 12 && trees.store.generation() > before + 12, "the store did change throughout ({churned} rounds)");
+    }
+
+    /// The store's own eviction, to a budget far below what it holds, run
+    /// without pause while other content keeps arriving, as rargod runs it:
+    /// what was used in the last moments is left alone (two seconds here,
+    /// ten minutes there), everything older goes. A worktree that was
+    /// synced stays whole for as long as its snapshot is held, well past
+    /// that grace, and is evictable again once it is dropped.
+    #[tokio::test]
+    async fn a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held() {
+        let (_d, trees, fake) = setup();
+        let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let evictor = {
+            let (store, stop) = (trees.store.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let (mut n, mut freed) = (0u64, 0u64);
+                while !stop.load(Ordering::Relaxed) {
+                    // A build producing content ...
+                    for _ in 0..8 {
+                        store.put_bytes(format!("output {n} {}", "x".repeat(4000)).as_bytes()).unwrap();
+                        n += 1;
+                    }
+                    // ... and a store that may keep next to nothing.
+                    freed += store.evict(1000, 2, &|_| false, &|_| {});
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                (n, freed)
+            })
+        };
+        let mut last = None;
+        for round in 0..3 {
+            let files: Vec<(&str, Node)> =
+                names.iter().map(|n| (n.as_str(), fake.file(format!("{n} in round {round}").as_bytes()))).collect();
+            let v = fake.dir(vec![("src", fake.dir(files)), ("top", fake.file(format!("top {round}").as_bytes()))]);
+            let s = trees.sync(root_of(&v), &fake).await.unwrap_or_else(|e| panic!("sync {round} failed: {e:#}"));
+            // The request runs for longer than anything stays in the store
+            // by having been used recently; eviction goes on beside it.
+            tokio::time::sleep(std::time::Duration::from_millis(3300)).await;
+            for n in &names {
+                let path = format!("src/{n}");
+                assert_eq!(
+                    s.read(path.as_bytes()).unwrap_or_else(|| panic!("round {round}: {path} was evicted while its snapshot was held")),
+                    format!("{n} in round {round}").as_bytes()
+                );
+            }
+            assert_eq!(trees.lacking(s.id), (Vec::new(), Vec::new()));
+            last = Some((s.id, Hash::of(format!("f000 in round {round}").as_bytes())));
+            // The request ends here: its worktree is ordinary content again.
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (made, freed) = evictor.join().unwrap();
+        assert!(made >= 3 * 8 && freed > 100_000, "eviction ran throughout ({made} outputs made, {freed} bytes freed)");
+        // Nothing is held any more: the last worktree goes like the rest.
+        let (root, a_file) = last.unwrap();
+        trees.store.evict_to(0, &|_| false);
+        assert!(!trees.store.has(&a_file) && !trees.store.has(&root));
+        assert!(!trees.store.is_pinned(&a_file));
     }
 
     #[tokio::test]
