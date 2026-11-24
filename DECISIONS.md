@@ -1737,3 +1737,41 @@ namespaces. `bench/hist-freeze.py` would also stop a second rig's server
 (it matches the state directory by prefix), so the suites are not run
 during a pause.
 
+## D66. A client is asked for its environment once per request, not once per action
+
+Zed built from a fresh worktree on a second machine took 8.1 s at
+100 ms of round-trip time when everything was in the server's cache
+and the same build from the first machine took 0.38 s. With phases
+recorded on both sides (`RARGO_SYNC_STATS=1` on a command prints the
+daemon's; `RARGO_PHASES=1` in rargod's environment logs the server's):
+7.25 s of 7.94 s were between "planned" and "units answered" on the
+server, and on a 1 ms link the same phase took 0.05 s. So it was round
+trips, and they were these: the engine, before it forms an action's
+key, makes sure it knows the client's values of the variables that
+action declared in earlier runs (`ClientEnv::ensure`), and asks the
+client when it does not. A daemon that has never been asked sends
+none, so it was asked at every action with a variable the server had
+not yet heard of from it, and actions wait for their dependencies, so
+the questions followed one another.
+
+Now the trace cache keeps the set of every variable any action has
+declared (read once from its records, extended as actions declare
+more), and a request asks its client for all of them in one question,
+at the start, while the worktree is prepared and the build planned.
+What the engine asks later is only what an action declares for the
+first time in this very build.
+
+Measured: Zed's second machine 7.94 s to 0.86 s; rust-analyzer's 1.46 s
+to 0.66 s. All three suites pass (113, 67, 28).
+
+Considered: sending every such variable from the client unasked. The
+client does not know the names (they come from build scripts that ran
+on the server), and sending its whole environment would make every
+variable of a developer's shell visible to the server, which the
+allow-list exists to prevent. One question for names the server can
+justify keeps that.
+
+A cost: a client is asked for variables of builds it will never run
+(another repository's). They are names and short values, once per
+daemon.
+

@@ -188,6 +188,8 @@ pub struct TraceCache {
     db: Arc<Db>,
     mem: DashMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>,
     next_id: AtomicU64,
+    /// Every declared variable name, once it has been asked for.
+    env_names: parking_lot::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub stats: CacheStats,
 }
 
@@ -205,7 +207,7 @@ impl TraceCache {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
             .unwrap_or(1);
-        TraceCache { db, mem: DashMap::new(), next_id: AtomicU64::new(seed), stats: CacheStats::default() }
+        TraceCache { db, mem: DashMap::new(), env_names: parking_lot::Mutex::new(None), next_id: AtomicU64::new(seed), stats: CacheStats::default() }
     }
 
     fn load(&self, weak: &Hash) -> Arc<Vec<(u64, Arc<Trace>)>> {
@@ -303,8 +305,25 @@ impl TraceCache {
             let mut k = b"env:".to_vec();
             k.extend_from_slice(&weak.0);
             self.db.put(Table::Meta, &k, &bincode::serialize(&cur).unwrap());
+            if let Some(names) = &mut *self.env_names.lock() {
+                names.extend(added.iter().cloned());
+            }
         }
         added
+    }
+
+    /// Every variable any action has declared an interest in. A client is
+    /// asked for all of them at once when its request arrives, instead of
+    /// for a few at each action that is looked up (a round trip each,
+    /// one after another along the dependency chain, for a client that
+    /// has not been asked before).
+    pub fn every_env_name(&self) -> Vec<String> {
+        let mut names = self.env_names.lock();
+        names
+            .get_or_insert_with(|| self.all_needs_env().into_iter().flat_map(|(_, v)| v).collect())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Every recorded trace with its weak key.

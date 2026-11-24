@@ -814,8 +814,15 @@ impl Daemon {
         }
         let stats = var(&req.vars, "RARGO_SYNC_STATS").is_some();
         let mut changes = 0;
+        let taken_up = Instant::now();
+        let phase = |what: &str| {
+            if stats {
+                let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
+            }
+        };
         loop {
             let mux = self.mux().await?;
+            phase("link to the server ready");
             let started = Instant::now();
             let snap = {
                 let mut st = wt.state.lock().await;
@@ -836,8 +843,9 @@ impl Daemon {
                 }
                 // Sent before the request and in order with it, so the
                 // server has the change when it looks at the request.
+                phase("worktree read");
                 match self.offer(&mux, &wt, &snap).await {
-                    Ok(true) => {}
+                    Ok(true) => phase("worktree offered and what the server lacked sent"),
                     Ok(false) => {
                         changes += 1;
                         if changes >= 5 {
@@ -875,8 +883,12 @@ impl Daemon {
                 ..base.clone()
             };
             let said = AtomicBool::new(false);
+            phase("request sent");
             match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &said).await {
-                Ok(Outcome::Final(reply)) => return Ok(reply),
+                Ok(Outcome::Final(reply)) => {
+                    phase("answer complete");
+                    return Ok(reply);
+                }
                 Ok(Outcome::Changed) => {
                     wt.dirty.store(true, Ordering::SeqCst);
                     changes += 1;

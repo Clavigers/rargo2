@@ -227,6 +227,13 @@ received. One run each, at the final build (`fd599de`).
 | (the first worktree, which waits for the build: copy) | 41.7 s | 0.00 s | 98 MiB |
 | (the first worktree: virtual) | 40.6 s | 1.80 s | 93 MiB |
 
+Since then the build on a machine with an empty cache has gone from
+1.43 s to 0.66 to 0.69 s (two fresh machines, measured with a 6-core
+server beside the history benchmark, `bench/fresh-phases.sh`): the
+server asked that machine for environment variables nine times in a
+row and now asks once (D66, and the Zed figures under One remote
+client). The table above was not run again.
+
 A worktree that runs its binary has it after 3.1 s either way: the
 binary has to cross the link, at the end of the build or when it is
 first run. The virtual directory moves that cost from the build to the
@@ -399,15 +406,48 @@ time:
 | `check` after a one-file edit | 19.2 s |
 | `build -p zed` after that (the 1.7 GB binary is listed, not sent) | 144.8 s |
 | the same build, nothing changed | 0.38 s |
-| the same build from a fresh worktree on a second machine (binary listed, not fetched) | 8.1 s |
+| the same build from a fresh worktree on a second machine (binary listed, not fetched) | 0.86 s (was 8.1 s, see below) |
 | shown in the worktree's `target/` afterwards | 1,703 MiB |
 
 Against the copying client over the 20 ms, 100 Mbit link in the table
 above (113.0, 0.36, 19.5, 167.8, 0.41 and 28.2 s): the build no longer
-waits for the binary, and neither does the second machine. Its 8.1 s
-were not broken down; a second machine's first command includes
-starting its daemon, the key agreement, offering 827 manifests and
-receiving the small files of the delivery.
+waits for the binary, and neither does the second machine.
+
+**The second machine's 8.1 s, broken down and mostly removed (D66).**
+The series was run again with the phases of that command recorded on
+both sides (`RARGO_SYNC_STATS=1` on the command, `RARGO_PHASES=1` on
+the server), while the history benchmark was paused:
+
+| second machine, 100 ms round trip | before | after |
+|---|---|---|
+| daemon started, link to the server ready (one round trip) | 0.10 s | 0.10 s |
+| worktree read (3,698 files, 70.8 MiB hashed) | 0.05 s | 0.04 s |
+| worktree offered, the server's answer awaited | 0.32 s | 0.32 s |
+| request sent to answer complete | 7.45 s | 0.39 s |
+| of that on the server: planning | 0.08 s | 0.10 s |
+| of that on the server: every unit answered from the cache | 7.25 s | 0.16 s |
+| whole command | 7.94 s | 0.86 s |
+
+The 7.25 s were not work. When the server looks up an action it needs
+the client's values of the environment variables that action's earlier
+runs declared (`CC`, `CFLAGS` and the like, through build scripts'
+`rerun-if-env-changed`); a client it had not asked before was asked at
+each action, a round trip each, one after another down the dependency
+chain: about 70 round trips for Zed, 9 for rust-analyzer (0.93 s of a
+1.46 s command there; 0.05 s on a 1 ms link, which is why it did not
+show on the LAN). The server now asks for all variables any action has
+ever declared in one question, while it plans. A client that has
+answered sends them with every later request, as before.
+
+What is left of the 0.86 s: three round trips that follow one another
+(the key agreement, the offer and its answer, the request and its
+answer), the server's 0.27 s, and 0.2 s in the offer that I did not
+break down (it takes 0.32 s where one round trip is 0.10 s). Sending
+the request without waiting for the offer's answer would save a round
+trip and was not tried.
+
+The other rows of the series in that run: 114.2 s, 0.36 s, 19.2 s,
+145.4 s and 0.38 s.
 
 The first sync was one push: 263 manifests offered, the server answered
 with the 2,333 files it lacked, none asked for afterwards.
@@ -497,12 +537,12 @@ does not cross the link; its figures are the ones above.
 
 | 20 agents, 100 ms round trip | wall time | server CPU | client CPU: commands + daemon | on the client's disk | bytes down / up the link | failed steps |
 |---|---|---|---|---|---|---|
-| rust-analyzer, results copied (before) | 133.3 s | 1,707 s | 0.4 s + not recorded | 11.83 GB | 1,959 MiB / 96 MiB | 0 |
+| rust-analyzer, results copied (before) | 133.3 s | 1,707 s | 0.4 s + 38.9 s (from a second run: 132.2 s) | 11.83 GB | 1,959 MiB / 96 MiB | 0 |
 | rust-analyzer, virtual output directory | 114.9 s | 1,636 s | 0.4 s + 3.1 s | 0.01 GB | 2.3 MiB / 6.7 MiB | 0 |
 | Ruff, virtual output directory | 147.3 s | 2,657 s | 0.5 s + 11.8 s | 0.03 GB | 4.0 MiB / 22.6 MiB | 0 |
 | Bevy, virtual output directory | 87.2 s | 1,090 s | 0.5 s + 6.4 s | 0.01 GB | 7.1 MiB / 65.6 MiB | 0 |
 | Zed, virtual output directory | 603.3 s | 12,350 s | 1.1 s + 7.7 s | 0.01 GB | 9.3 MiB / 32.7 MiB | 0 |
-| rust-analyzer on the LAN link, virtual output directory | 112.7 s | 1,653 s | 0.4 s + not recorded | 0.01 GB | 2.2 MiB / 6.7 MiB | 0 |
+| rust-analyzer on the LAN link, virtual output directory | 112.7 s | 1,653 s | 0.4 s + 3.0 s (from a second run: 119.6 s) | 0.01 GB | 2.2 MiB / 6.7 MiB | 0 |
 
 Against stock cargo (which does not cross the link): 380.8 s, 797.5 s,
 385.6 s and 4,244 s of wall time (Zed's in two groups of ten), 100.1,
@@ -526,8 +566,15 @@ and left 11.8, 2.7, 2.1 and 35.7 GB on the client.
 - **Client CPU.** The commands are the `rargo` processes; the daemon is
   a separate process, read from `/proc` before it is stopped (scanning,
   hashing edits, serving the output directories for twenty agents): 3 to
-  12 s over a whole swarm. It was not recorded for two rows (the lookup
-  for the daemon's process was wrong in those runs).
+  12 s over a whole swarm with the virtual directory, and 38.9 s when
+  results are copied (the daemon then receives and writes 1.9 GiB into
+  twenty `target/` directories). For two rows it was not recorded in the
+  run the row is from (the lookup for the daemon's process was wrong);
+  those two swarms were run again at `bb2192b` during a pause of the
+  history benchmark, and the daemon figure is from that second run
+  (132.2 s and 2,044 MiB down with results copied; 119.6 s on the LAN
+  link, against 112.7 s in the first run, a difference I did not look
+  into).
 - Runs one build earlier (`32f6c5e`) of Ruff and Bevy at 100 ms failed
   (2 and 20 failed steps): twenty worktrees starting at once each
   uploaded the repository, the server took longer than 45 s to take it

@@ -35,6 +35,8 @@ stock=${stock:-cargo}
 secs() { local t0=$(date +%s.%N); "$@" >"$C/last.log" 2>&1; local rc=$?; printf '%.2f %s' "$(echo "$(date +%s.%N) - $t0" | bc)" "$rc"; }
 wt() { # name
     git -C "$base" worktree remove --force "$C/$1" >/dev/null 2>&1
+    # (What a daemon's output directory leaves behind: an empty target/.)
+    grep -q " $C/$1/target " /proc/self/mountinfo || rm -rf "$C/$1"
     git -C "$base" worktree prune
     git -C "$base" worktree add -q --detach "$C/$1" HEAD
 }
@@ -80,10 +82,14 @@ while [ $# -ge 3 ]; do
     cd "$C/two" || exit 2
     printf '\n#[allow(dead_code)]\npub fn rargo_remote_bench() -> u32 { 7 }\n' >>"$edit"
     export RARGO_CACHE_DIR=$C/cache-2
-    read c6 r6 < <(secs R "${main[@]}")
+    # With the phases of the command, on the client (the command's
+    # stderr) and on the server (its log, if it runs with RARGO_PHASES).
+    read c6 r6 < <(RARGO_SYNC_STATS=1 secs R "${main[@]}")
+    { grep '^rargo: ' "$C/last.log"; grep "rargod: phase" "$work/${RIG_STATE:-nstest}/srv.log" | tail -5; } >"$work/bench/logs/remote-$repo-second-$label.phases" 2>/dev/null
     printf '{"repo":"%s","config":"rargo, %s (%s ms each way, %s)","cold_check_s":%s,"noop_check_s":%s,"edit_check_s":%s,"build_s":%s,"noop_build_s":%s,"second_machine_build_s":%s,"rc":[%s,%s,%s,%s,%s,%s],"target_mib":%s,"first_sync":"%s","sync":"%s"}\n' \
         "$repo" "$label" "$delay" "$rate" "$c1" "$c2" "$c3" "$c4" "$c5" "$c6" "$r1" "$r2" "$r3" "$r4" "$r5" "$r6" "$mib" "$sync1" "$(field sync)" | tee -a "$out"
     cd /
+    for n in 1 2; do RARGO_CACHE_DIR=$C/cache-$n R --rargo-daemon-stop >/dev/null 2>&1; done
     "$here/netns.sh" down >/dev/null 2>&1
 done
 git -C "$base" worktree remove --force "$C/one" >/dev/null 2>&1

@@ -1020,6 +1020,15 @@ fn needs_network(stderr: &[u8]) -> bool {
         .any(|m| s.contains(m))
 }
 
+/// `RARGO_PHASES` in rargod's environment: one line per phase of every
+/// request on its stderr, with the time since the request was taken up.
+fn phase(started: Instant, c: &Client, what: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("RARGO_PHASES").is_some()) {
+        eprintln!("rargod: phase {:>8.3} s  {what}  ({} {})", started.elapsed().as_secs_f64(), c.worktree, c.args.join(" "));
+    }
+}
+
 async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     let started = Instant::now();
     let mut args: Vec<String> = c.args.clone();
@@ -1030,7 +1039,16 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         no_cache_tests = true;
     }
 
+    // The client's values of every variable any action has declared: one
+    // question, asked while the build is planned, where there used to be
+    // one per action looked up. A client that has answered before sends
+    // them with its request and is asked nothing.
+    let env_known = {
+        let (env, names) = (c.env.clone(), d.engine.traces.every_env_name());
+        tokio::spawn(async move { env.ensure(&names).await })
+    };
     let mut p = prepare(d, c, c.snapshot.clone()).await?;
+    phase(started, c, "worktree prepared");
     if c.session.is_some() && !c.worktree.is_empty() {
         d.trees.remember(&c.worktree, &c.snapshot);
         let mut last = d.last_clients.lock();
@@ -1088,6 +1106,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     };
     let pd = planned.data;
     let plan = &pd.plan;
+    env_known.await.map_err(|e| anyhow!("asking the client for its environment: {e}"))??;
+    phase(started, c, "planned");
 
     // A target directory elsewhere in the worktree must be masked too; the
     // next request for this worktree will know.
@@ -1293,6 +1313,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
             }
         }
     }
+    phase(started, c, "units answered");
     let incompat = run.future_incompat_summary().await?;
     let finished = || {
         c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
@@ -1315,9 +1336,12 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     // Place what was asked for into the real target directory.
     run.materialize_roots();
     run.write_depinfo();
+    phase(started, c, "results listed for the client");
     finished();
 
-    run.steps().await
+    let done = run.steps().await;
+    phase(started, c, "done");
+    done
 }
 
 struct UnitObserver {
