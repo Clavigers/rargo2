@@ -1175,7 +1175,8 @@ impl Daemon {
         let mut placer = tokio::task::block_in_place(|| {
             Placer::new(&self.cache, placed_path.as_deref().map(Placed::load).unwrap_or_default())
         });
-        let mut fetching: Option<u64> = None;
+        let mut fetching: Option<(u64, Vec<Digest>)> = None;
+        let mut delivery_ready = false;
         let mut last: Option<LocalReply> = None;
         let mut token: Option<u64> = None;
         // What the server said on stderr, kept while the worktree leaves out
@@ -1183,7 +1184,7 @@ impl Daemon {
         let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
         let mut heard: Vec<u8> = Vec::new();
         loop {
-            if let (Some(_), None) = (&last, fetching) {
+            if let (Some(_), None) = (&last, &fetching) {
                 break;
             }
             let msg = tokio::select! {
@@ -1282,20 +1283,13 @@ impl Daemon {
                 ServerMsg::BlobPart { hash, part, last } => {
                     tokio::task::block_in_place(|| -> std::io::Result<()> { placer.part(hash, &part.unpack()?, last) })?
                 }
-                ServerMsg::Delivered { .. } => {
-                    // What the server did not send along, it thought was
-                    // here: fetch the rest.
-                    let wanting = placer.wanting();
-                    if !wanting.is_empty() {
-                        fetching = Some(mux.fetch(wanting, &tx));
-                    }
-                }
+                ServerMsg::Delivered { .. } => delivery_ready = true,
                 ServerMsg::Fetched { id } => {
-                    if fetching == Some(id) {
-                        fetching = None;
-                        if !placer.settled() {
+                    if let Some((sent, hashes)) = &fetching && *sent == id {
+                        if hashes.iter().any(|hash| placer.awaiting(hash)) {
                             return Err(std::io::Error::other("the server did not send every file it announced"));
                         }
+                        fetching = None;
                     }
                 }
                 ServerMsg::DeliveryToken(t) => token = Some(t),
@@ -1324,6 +1318,17 @@ impl Daemon {
                 | ServerMsg::Pong(_)
                 | ServerMsg::Recipe { .. }
                 | ServerMsg::Chunks { .. } => {}
+            }
+            // A second delivery can finish while its predecessor's fetch
+            // is still in flight. Let that fetch finish before requesting
+            // more digests so multipart replies for a hash cannot mix.
+            if delivery_ready && fetching.is_none() {
+                delivery_ready = false;
+                let hashes = placer.wanting();
+                if !hashes.is_empty() {
+                    let id = mux.fetch(hashes.clone(), &tx);
+                    fetching = Some((id, hashes));
+                }
             }
         }
         if let Some((fs, _)) = shown {
