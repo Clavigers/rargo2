@@ -13,6 +13,13 @@ Protocol 7 (unchanged).
 - A command that needs a toolchain component the server lacks (clippy for
   `rargo clippy`) gets it installed on the server on first use, also with
   `--locked`, `--frozen` or `--offline`. (#69)
+- An administrator manages tokens from any machine authenticated to the
+  server: `rargo auth invite|create|tokens|revoke|allow|disallow`, with
+  the options of `rargod token`. Anyone may list and revoke their own
+  tokens. (#24)
+- A token that is not an administrator's, refused an administrator's
+  command, is told how one is made (`rargod token create --admin`, `token
+  invite --admin`, `token allow --admin`). (#56)
 
 ## 0.6.0
 
