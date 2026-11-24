@@ -10,7 +10,6 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
-<<<<<<< HEAD
 - Fixed: a client daemon that was killed (SIGKILL, a crash, the
   out-of-memory killer) left `target/` as a dead mount, and everything
   that touched it (an editor, rust-analyzer, stock cargo, `ls`) got
@@ -18,7 +17,6 @@ Protocol 7 (unchanged).
   The directory is now unmounted the moment its daemon is gone, with no
   rargo command run, and is an ordinary directory stock cargo builds in.
   (#6)
-=======
 - The older configuration files say that they are old: a build that takes
   its server or key from `~/.config/rargo/config.toml`, or its policy from
   `.rargo.toml`, notes it once per command and names what replaces it.
@@ -27,7 +25,6 @@ Protocol 7 (unchanged).
 - `rargo --rargo-migrate` moves them: the old server becomes the project's
   `host`, the old key a credential for it, and the tables of `.rargo.toml`
   go into `Cargo.toml` with their comments; `.rargo.toml` is removed. (#21)
->>>>>>> 517cd64 (Old configuration files: a notice, and rargo --rargo-migrate; 0.3.5)
 
 ## 0.3.4
 
