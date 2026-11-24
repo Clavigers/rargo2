@@ -8,7 +8,11 @@
 # also checks that the server can download crates and install toolchains.
 set -u
 R=$(command -v "${1:-rargo}") || { echo "no rargo binary: $1" >&2; exit 2; }
-: "${RARGO_SERVER:?}" "${RARGO_TOKEN:?}"
+: "${RARGO_SERVER:?}"
+# Keep the caller's stored credentials available when no token is supplied.
+if [ -z "${RARGO_TOKEN:-}" ]; then
+    export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+fi
 T=$(mktemp -d "${TMPDIR:-/tmp}/rargo-check.XXXXXX")
 export HOME=$T/home RARGO_CACHE_DIR=$T/cache
 mkdir -p "$T/home" "$T/proj/src"
