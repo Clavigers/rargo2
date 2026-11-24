@@ -56,6 +56,18 @@ Facts that affect the design:
   are in `$RARGO_WORK/bench/history2y.jsonl` (`dev/history.py stats`);
   they are enough for now. The Downworld services on this machine were
   stopped by the owner too and stay stopped.
+- **rargo is built with rargo (the owner's rule).** `Cargo.toml` names
+  the server (`rargo.rs`, the service on this machine) and this machine
+  is signed in to it. Build, check, lint and test with `rargo` wherever
+  you would type `cargo`: `rargo build`, `rargo check`, `rargo clippy`,
+  `rargo test --lib --bins`. Never `cargo build` or `cargo test` for this
+  repository: a build outside the server is cores taken from it and a
+  cache nobody else gets. The tests that mount are compiled by the server
+  and run here: `dev/mount-tests.sh`. The exceptions build the server
+  itself and stay on stock cargo: `deploy/update-service.sh` and the
+  release workflow. `/usr/local/bin/rargo` is the client, replaced by
+  `deploy/update-service.sh`. A problem met while building rargo with
+  rargo is a bug to file, not a reason to go back to cargo.
 - **Two agents work here, each in a checkout of its own** (`/root/rargo`
   and `/root/rargo-codex`); neither touches the other's. An issue is
   locked before it is worked on: the label `wip-claude` or `wip-codex`.
