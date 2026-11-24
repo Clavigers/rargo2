@@ -124,8 +124,8 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
 /// Serves one client daemon for as long as its link lasts: every command
 /// is a stream; stream 0 carries what the daemon does on its own.
 pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
-    // What the client presented is a name of the key file or a token's id;
-    // the name shown and recorded is the person's.
+    // What the client presented is a token's id; the name shown and
+    // recorded is its holder's.
     let user = keys.name_of(&presented);
     let mut checked = std::time::Instant::now();
     let has = Arc::new(ClientHas::default());
@@ -298,7 +298,7 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
     }
     let command = req.args.first().map(|s| s.as_str()).unwrap_or("");
     if matches!(command, "__gc" | "__compact" | "__export" | "__import") && !admin {
-        return fail(&sess, format!("user `{user}` may not administer this server (mark the user `admin` in the key file)"));
+        return fail(&sess, format!("user `{user}` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)"));
     }
     match command {
         "__status" => return say(&sess, status_text(&d)),

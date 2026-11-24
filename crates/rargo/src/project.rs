@@ -193,7 +193,7 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
 
 /// Tells the host's server to revoke the token this machine holds for it.
 /// `Ok(true)`: revoked there; `Ok(false)`: the server did not know it as a
-/// token that works (already revoked, expired, or a user of a key file).
+/// token that works (already revoked, or expired).
 pub fn revoke_on_server(host: &str) -> Result<bool, String> {
     let Some(c) = credential(host) else { return Ok(false) };
     let url = format!("{}/auth/revoke", base_url(host));

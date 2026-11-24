@@ -71,7 +71,7 @@ out=$(RARGO_TOKEN="${RARGO_TOKEN%%.*}.wrong-secret-0123456789" "$R" --rargo-stat
 out=$(RARGO_TOKEN=t-nobody000000.some-secret-0123456789 "$R" --rargo-status 2>&1); rc=$?
 [ $rc -ne 0 ] && ok "a token the server does not know is refused" || bad "a token the server does not know is refused" "$out"
 out=$(RARGO_TOKEN=$guest_token "$R" --rargo-gc 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" "may not administer" && ok "a user who is not an administrator cannot collect garbage" || bad "a user who is not an administrator cannot collect garbage" "$out"
+[ $rc -ne 0 ] && has "$out" "may not administer" && has "$out" "rargod token create --admin" && ok "a user who is not an administrator cannot collect garbage, and is told how an administrator is made" || bad "a user who is not an administrator cannot collect garbage, and is told how an administrator is made" "$out"
 expect "the right token is accepted" "$R" --rargo-status
 
 # --- a small workspace -----------------------------------------------------
