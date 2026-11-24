@@ -6,6 +6,18 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.3
+
+Protocol 7 (unchanged).
+
+- What the server holds, and where the cache holds chunks, outlive the
+  client daemon: the first command of a new daemon (after a reboot, an
+  idle timeout, or `--rargo-daemon-stop`) offers only what changed. The
+  server still asks for anything it lacks, so a record that is out of
+  date costs a round trip, never a wrong build. (#9)
+- A command right after `--rargo-daemon-stop` starts a new daemon; it
+  waits for the old one to let go instead of running without one.
+
 ## 0.6.2
 
 Protocol 7 (unchanged).

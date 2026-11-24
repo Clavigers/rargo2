@@ -15,6 +15,7 @@
 
 mod daemon;
 mod git;
+mod known;
 mod mux;
 mod outfs;
 mod place;

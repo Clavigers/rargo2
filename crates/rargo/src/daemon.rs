@@ -149,8 +149,14 @@ pub struct Daemon {
     big_sync: tokio::sync::Mutex<()>,
     /// One fetch per content at a time.
     fetching: Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
-    /// Chunks the cache holds: in which content, where.
-    chunks: Mutex<HashMap<Digest, (Digest, u64, u32)>>,
+    /// Chunks the cache holds: in which content, where. Kept in the cache
+    /// across daemons (see `known`).
+    chunks: Mutex<crate::known::Chunks>,
+    chunks_changed: AtomicBool,
+    /// Trees and file contents the server is believed to hold: what was
+    /// sent to it or what it said it has, by this daemon or earlier ones.
+    /// Only ever a hint: the server asks for whatever it turns out to lack.
+    held: crate::known::Held,
     handle: tokio::runtime::Handle,
 }
 
@@ -197,6 +203,8 @@ impl Daemon {
     /// `watch`: follow worktrees with inotify (a daemon does; a command
     /// that runs without one has nothing to gain from it).
     pub fn new(cfg: Config, cache: PathBuf, watch: bool) -> Arc<Daemon> {
+        let chunks = crate::known::load_chunks(&cache);
+        let held = crate::known::Held::load(&cache, &cfg.server, &cfg.user);
         let watcher = if watch {
             match Watcher::new() {
                 Ok(w) => Some(Arc::new(w)),
@@ -223,7 +231,9 @@ impl Daemon {
             counters: Counters::default(),
             big_sync: tokio::sync::Mutex::new(()),
             fetching: Mutex::new(HashMap::new()),
-            chunks: Mutex::new(HashMap::new()),
+            chunks: Mutex::new(chunks),
+            chunks_changed: AtomicBool::new(false),
+            held,
             handle: tokio::runtime::Handle::current(),
         });
         if let Some(w) = d.watcher.clone() {
@@ -516,10 +526,9 @@ impl Daemon {
     /// longer has the content the scan saw.
     async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>, probe: Probe) -> std::io::Result<Offered> {
         let delta = || -> (Vec<Digest>, Vec<(Digest, u64)>) {
-            let sent = mux.sent.lock().unwrap();
             (
-                snap.scan.trees.keys().filter(|d| !sent.contains(*d)).copied().collect(),
-                snap.scan.files.iter().filter(|(d, _)| !sent.contains(*d)).map(|(d, (_, size))| (*d, *size)).collect(),
+                self.held.lacking(snap.scan.trees.keys().map(|d| (d, ()))).into_iter().map(|(d, ())| d).collect(),
+                self.held.lacking(snap.scan.files.iter().map(|(d, (_, size))| (d, *size))),
             )
         };
         let (mut trees, mut blobs) = delta();
@@ -642,19 +651,27 @@ impl Daemon {
                 return Ok(Offered::Changed);
             }
         }
-        Self::has_now(mux, snap);
+        self.has_now(snap);
         Ok(Offered::Sent)
     }
 
     /// Notes that the server holds everything of `snap`.
-    fn has_now(mux: &Mux, snap: &Snap) {
-        let mut sent = mux.sent.lock().unwrap();
-        // The belief is only a hint; kept from growing without bound.
-        if sent.len() > 4_000_000 {
-            sent.clear();
+    fn has_now(&self, snap: &Snap) {
+        self.held.add(snap.scan.trees.keys().chain(snap.scan.files.keys()));
+    }
+
+    /// Writes down what outlives this daemon: what the server holds and
+    /// where the cache holds chunks.
+    pub fn save_known(&self) {
+        if let Err(e) = self.held.save() {
+            eprintln!("rargo daemon: cannot keep what the server holds: {e}");
         }
-        sent.extend(snap.scan.trees.keys().copied());
-        sent.extend(snap.scan.files.keys().copied());
+        if self.chunks_changed.swap(false, Ordering::SeqCst) {
+            let chunks = self.chunks.lock().unwrap().clone();
+            if let Err(e) = crate::known::save_chunks(&self.cache, &chunks) {
+                eprintln!("rargo daemon: cannot keep the chunk index: {e}");
+            }
+        }
     }
 
     /// The worktree's virtual output directory, mounted if it can be and
@@ -868,12 +885,13 @@ impl Daemon {
                 let _ = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
                 std::fs::rename(&tmp, &slot)?;
                 let mut index = self.chunks.lock().unwrap();
-                if index.len() > 4_000_000 {
+                if index.len() > crate::known::MOST_CHUNKS {
                     index.clear();
                 }
                 for (i, (chunk, len)) in recipe.iter().enumerate() {
                     index.insert(*chunk, (hash, offsets[i], *len));
                 }
+                self.chunks_changed.store(true, Ordering::SeqCst);
                 return Ok(slot);
             }
         }
@@ -1175,7 +1193,7 @@ impl Daemon {
                     let (trees, blobs) = lacking.map_err(|_| lost())?;
                     if trees.is_empty() && blobs.is_empty() {
                         if let Some(s) = snap {
-                            Self::has_now(mux, s);
+                            self.has_now(s);
                         }
                         self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
                         continue;
@@ -1356,6 +1374,7 @@ impl Daemon {
              commands            {}\nworktrees           {worktrees} known, {watched} watched completely\n\
              scans               {} of whole worktrees, {} of {} directories that had changed or have no watch, {} spared (nothing had changed)\n\
              pushed              {} changes, {} bytes; {} trees the server had already (asked by root)\n\
+             held                {} trees and contents the server is believed to hold (kept across daemons)\n\
              outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on open, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
             c.links.load(Ordering::Relaxed),
@@ -1367,6 +1386,7 @@ impl Daemon {
             c.offers.load(Ordering::Relaxed),
             c.offered_bytes.load(Ordering::Relaxed),
             c.probes_known.load(Ordering::Relaxed),
+            self.held.len(),
             outs.0,
             outs.1,
             outs.2,
@@ -1607,6 +1627,7 @@ async fn serve_command(d: Arc<Daemon>, stream: tokio::net::UnixStream, socket: P
     }
     if req.kind == "stop" {
         d.unmount_all();
+        d.save_known();
         let _ = std::fs::remove_file(&socket);
         let done = rargo_proto::encode(&LocalReply::Exit(0));
         let _ = wr.write_all(&(done.len() as u32).to_le_bytes()).await;
@@ -1658,10 +1679,16 @@ pub fn serve(socket: &Path) -> ! {
         };
         {
             use std::os::fd::AsRawFd;
+            // A daemon that was told to stop lets go of the lock as it
+            // exits, after it answered: it is waited for. One that holds
+            // it longer is running (or starting) and serves the socket.
+            let started = Instant::now();
             // SAFETY: valid descriptor.
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                // Another daemon is starting or running.
-                std::process::exit(0);
+            while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                if started.elapsed() > Duration::from_secs(3) {
+                    std::process::exit(0);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
         let _ = std::fs::remove_file(&socket);
@@ -1682,11 +1709,13 @@ pub fn serve(socket: &Path) -> ! {
                 // plain directories first.
                 _ = term.recv() => {
                     d.unmount_all();
+                    d.save_known();
                     let _ = std::fs::remove_file(&socket);
                     break;
                 }
                 _ = int.recv() => {
                     d.unmount_all();
+                    d.save_known();
                     let _ = std::fs::remove_file(&socket);
                     break;
                 }
@@ -1702,6 +1731,7 @@ pub fn serve(socket: &Path) -> ! {
                     let showing = d.worktrees.lock().unwrap().values().any(|w| w.out.lock().unwrap().is_some());
                     let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
                     // Someone removed the socket: nobody can reach us.
+                    d.save_known();
                     if quiet || !socket.exists() {
                         d.unmount_all();
                         if quiet {
@@ -1743,7 +1773,8 @@ pub fn inline(cfg: Config, cache: PathBuf, req: LocalRequest, mut each: impl FnM
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
         rt.block_on(async move {
             let d = Daemon::new(cfg, cache, false);
-            d.command(req, tx).await;
+            d.clone().command(req, tx).await;
+            d.save_known();
         });
     });
     while let Some(reply) = rx.blocking_recv() {
