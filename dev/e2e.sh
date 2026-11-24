@@ -593,6 +593,32 @@ cp "$T/Cargo.toml.before-policy" Cargo.toml
 rm -rf big-data
 expect "without the policy the workspace builds again" "$R" build
 
+echo "== what git ignores, left out (sync.gitignored = false) and taken back (sync.include)"
+# The fixture's util crate reads local-note.txt, which git ignores (the
+# first build shows it is synced by default), and git ignores /junk.
+echo "ignored by git" >crates/util/local-note.txt
+# Counted before the edit, the ignored files changed after it (see above).
+files=$(asked_files)
+printf '\n[workspace.metadata.rargo.sync]\ngitignored = false\n' >>Cargo.toml
+sleep 0.3
+echo "changed, and still ignored" >crates/util/local-note.txt
+head -c 1500000 /dev/urandom >junk/blob2
+out=$("$R" build 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "local-note.txt" && ok "with gitignored = false a file git ignores is not on the server: the build that reads it fails" || bad "with gitignored = false a file git ignores is not on the server: the build that reads it fails" "$out"
+has "$out" 'note: `crates/util/local-note.txt` is not on the build server: git ignores it' && has "$out" "gitignored = false" && has "$out" '`include`' && ok "and the failure says why, naming the option and include" || bad "and the failure says why, naming the option and include" "$out"
+[ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest was uploaded: neither the ignored file nor the ignored directory" || bad "only the manifest was uploaded: neither the ignored file nor the ignored directory" "files $files -> $(asked_files)"
+files=$(asked_files)
+printf 'include = ["local-note.txt"]\n' >>Cargo.toml
+out=$("$R" build 2>&1); rc=$?
+ran=$(./target/debug/app 2>&1)
+[ $rc -eq 0 ] && has "$ran" "note: changed, and still ignored" && ok "a file include names is sent although git ignores it" || bad "a file include names is sent although git ignores it" "$out
+$ran"
+[ $(( $(asked_files) - files )) -eq 2 ] && ok "and only it and the manifest were uploaded, not the ignored directory" || bad "and only it and the manifest were uploaded, not the ignored directory" "files $files -> $(asked_files)"
+cp "$T/Cargo.toml.before-policy" Cargo.toml
+echo "ignored by git" >crates/util/local-note.txt
+rm -f junk/blob2
+out=$("$R" build 2>&1) && has "$(./target/debug/app 2>&1)" "note: ignored by git" && ok "without the option, what git ignores is synced again" || bad "without the option, what git ignores is synced again" "$out"
+
 echo "== workspace policy inside a Git worktree"
 nested=$T/nested-policy
 git init -q "$nested"
