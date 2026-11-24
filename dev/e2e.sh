@@ -697,6 +697,20 @@ expect "the workspace member uses its enclosing manifest's environment and exclu
 expect "the same daemon selects the outer workspace policy" policy_test "$nested"
 expect "an explicit nested manifest selects the inner workspace policy" policy_test "$nested" --manifest-path rust/member/Cargo.toml
 
+cat >"$nested/rust/member/src/main.rs" <<'EOF'
+static PAYLOAD: [u8; 2 * 1024 * 1024] = [42; 2 * 1024 * 1024];
+
+fn main() {
+    let payload = std::hint::black_box(&PAYLOAD);
+    println!("nested artifact: {}", payload[0]);
+}
+EOF
+out=$(cd "$nested" && "$R" build --manifest-path rust/member/Cargo.toml --bin inner 2>&1); rc=$?
+nested_bin=$nested/rust/target/debug/inner
+[ "$rc" -eq 0 ] && [ "$(stat -c %s "$nested_bin")" -gt 1048576 ] && [ "$("$nested_bin")" = "nested artifact: 42" ] \
+    && ok "the explicit nested manifest delivers a runnable multipart artifact" \
+    || bad "the explicit nested manifest delivers a runnable multipart artifact" "$out"
+
 out=$(cd "$nested/rust/member" && "$R" --rargo-drift-check 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "stock cargo builds" && has "$out" "rargo builds" && ok "the drift check builds the nested package on both sides" || bad "the drift check builds the nested package on both sides" "$out"
 
