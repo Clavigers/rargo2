@@ -104,8 +104,8 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     // What cargo would hand the `cargo-nextest` program: everything after
     // the subcommand's name.
     let at = subcommand_pos(&args).context("no subcommand")?;
-    let nextest = installed(d).await?;
     let mut p = prepare(d, c, c.snapshot.clone()).await?;
+    let nextest = installed(d, c, wanted(c, &p)?).await?;
     let mut argv = vec![NEXTEST_AT.to_vec(), b"nextest".to_vec()];
     for a in &args[at + 1..] {
         argv.push(bytes(&canonical_arg(&p.tr, a)));
@@ -415,24 +415,128 @@ async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(A
 // nextest on the server.
 
 const RELEASES: &str = "https://github.com/nextest-rs/nextest/releases";
+/// The client's own nextest version, which the client sends with a
+/// `nextest` command.
+pub const CLIENT_VERSION_VAR: &str = "RARGO_NEXTEST_VERSION";
 
-/// nextest as the server has it: the newest release it has installed, or,
-/// on first use, the newest there is. It is the statically linked build,
-/// which runs in any root (a Nix shell's too), from nextest's releases on
-/// GitHub, checked against the release's SHA-256 sum.
-async fn installed(d: &Daemon) -> Result<PathBuf> {
+/// The nextest a command asks for, and who asks.
+#[derive(Debug, PartialEq)]
+struct Wanted {
+    version: String,
+    by: String,
+}
+
+/// The version the repository names, else the client's own, else none
+/// (the newest). The repository names it with `nextest = "..."` under
+/// `[workspace.metadata.rargo]`, or with nextest's own `nextest-version`
+/// in `.config/nextest.toml` (the recommended version where it names
+/// one, else the required one).
+fn wanted(c: &Client, p: &Prepared) -> Result<Option<Wanted>> {
+    let check = |version: &str, by: String| -> Result<Option<Wanted>> {
+        if version_of(version).is_none() {
+            bail!("{by} names nextest `{version}`; rargo installs nextest by its exact version (such as `0.9.100`)");
+        }
+        Ok(Some(Wanted { version: version.to_string(), by }))
+    };
+    if let Some(v) = &p.policy.nextest {
+        return check(v, "the `nextest` key of rargo's metadata in Cargo.toml".into());
+    }
+    let dir = c.policy_dir()?;
+    let read = |path: &Path| {
+        use std::os::unix::ffi::OsStrExt;
+        p.snapshot.read(path.as_os_str().as_bytes()).map(|b| String::from_utf8_lossy(&b).into_owned())
+    };
+    let root = rargo_proto::workspace::manifest_for(&dir, read)
+        .and_then(|(manifest, _)| manifest.parent().map(Path::to_path_buf))
+        .unwrap_or(dir);
+    let config = root.join(".config/nextest.toml");
+    if let Some(v) = read(&config).as_deref().and_then(config_version) {
+        return check(&v, format!("`nextest-version` in {}", config.display()));
+    }
+    match c.env.get(CLIENT_VERSION_VAR) {
+        Some(v) => check(&v, "the client's own nextest".into()),
+        None => Ok(None),
+    }
+}
+
+/// `nextest-version` in nextest's configuration: `"0.9.100"`, or
+/// `{ required = "0.9.90", recommended = "0.9.100" }`.
+fn config_version(text: &str) -> Option<String> {
+    let table = text.parse::<toml::Table>().ok()?;
+    match table.get("nextest-version")? {
+        toml::Value::String(v) => Some(v.clone()),
+        toml::Value::Table(t) => t.get("recommended").or_else(|| t.get("required"))?.as_str().map(String::from),
+        _ => None,
+    }
+}
+
+/// The program of the nextest a command asks for, installed on first use
+/// beside the others: `STATE/nextest/VERSION/cargo-nextest`, the
+/// statically linked build (it runs in any root, a Nix shell's too) from
+/// nextest's releases on GitHub, checked against the release's SHA-256
+/// sum. Without a version asked for, the newest release.
+async fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<PathBuf> {
     static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let dir = d.cfg.state_dir.join("nextest");
-    if let Some(p) = newest(&dir) {
-        return Ok(p);
+    let wanted = match wanted {
+        Some(w) => w,
+        None => {
+            let dir2 = dir.clone();
+            let newest = tokio::task::spawn_blocking(move || newest_release(&dir2)).await?;
+            match newest {
+                Ok(version) => Wanted { version, by: "nobody (the newest release)".into() },
+                // Without word of the newest, the newest at hand.
+                Err(e) => return newest_installed(&dir).ok_or(e).context("nextest is not installed on this server"),
+            }
+        }
+    };
+    let program = dir.join(&wanted.version).join("cargo-nextest");
+    if program.is_file() {
+        return Ok(program);
     }
     let _one_at_a_time = INSTALLING.lock().await;
-    if let Some(p) = newest(&dir) {
-        return Ok(p);
+    if program.is_file() {
+        return Ok(program);
     }
-    tokio::task::spawn_blocking(move || install_latest(&dir))
+    c.out.status("Installing", &format!("nextest {} on the server", wanted.version));
+    let (dir2, version) = (dir.clone(), wanted.version.clone());
+    tokio::task::spawn_blocking(move || install(&dir2, &version))
         .await?
-        .context("nextest is not installed on this server, and installing it failed")
+        .with_context(|| format!("nextest {}, which {} asks for, cannot be installed on this server", wanted.version, wanted.by))
+}
+
+/// The newest nextest release, asked of GitHub at most once a day.
+fn newest_release(dir: &Path) -> Result<String> {
+    let note = dir.join("newest-release");
+    let fresh = std::fs::metadata(&note)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(24 * 3600)));
+    if fresh
+        && let Some(v) = std::fs::read_to_string(&note).ok().map(|s| s.trim().to_string()).filter(|v| version_of(v).is_some())
+    {
+        return Ok(v);
+    }
+    // The newest release's page answers with a redirect to its tag.
+    let url = format!("{RELEASES}/latest");
+    let r = match agent(false).get(&url).call() {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => bail!("asking {url} for the newest nextest release: {e}"),
+    };
+    let tag = r
+        .header("location")
+        .and_then(|l| l.rsplit('/').next())
+        .map(str::to_string)
+        .with_context(|| format!("{url} did not name the newest release (HTTP {})", r.status()))?;
+    let version = tag
+        .strip_prefix("cargo-nextest-")
+        .filter(|v| version_of(v).is_some())
+        .with_context(|| format!("{url} names `{tag}`, which is not a nextest release"))?
+        .to_string();
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".newest-release.{}", std::process::id()));
+    std::fs::write(&tmp, &version)?;
+    std::fs::rename(&tmp, &note)?;
+    Ok(version)
 }
 
 fn version_of(name: &str) -> Option<Vec<u64>> {
@@ -441,7 +545,7 @@ fn version_of(name: &str) -> Option<Vec<u64>> {
 }
 
 /// `DIR/VERSION/cargo-nextest` of the highest version.
-fn newest(dir: &Path) -> Option<PathBuf> {
+fn newest_installed(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
@@ -460,25 +564,6 @@ fn agent(follow: bool) -> ureq::Agent {
         .timeout(std::time::Duration::from_secs(120))
         .user_agent(concat!("rargod/", env!("CARGO_PKG_VERSION")))
         .build()
-}
-
-fn install_latest(dir: &Path) -> Result<PathBuf> {
-    // The newest release's page answers with a redirect to its tag.
-    let url = format!("{RELEASES}/latest");
-    let r = match agent(false).get(&url).call() {
-        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => bail!("asking {url} for the newest release: {e}"),
-    };
-    let tag = r
-        .header("location")
-        .and_then(|l| l.rsplit('/').next())
-        .map(str::to_string)
-        .with_context(|| format!("{url} did not name the newest release (HTTP {})", r.status()))?;
-    let version = tag
-        .strip_prefix("cargo-nextest-")
-        .filter(|v| version_of(v).is_some())
-        .with_context(|| format!("{url} names `{tag}`, which is not a nextest release"))?;
-    install(dir, version)
 }
 
 fn install(dir: &Path, version: &str) -> Result<PathBuf> {
@@ -562,15 +647,27 @@ mod tests {
     }
 
     #[test]
+    fn nextest_s_own_version_setting_is_read() {
+        assert_eq!(config_version("nextest-version = \"0.9.100\"\n").as_deref(), Some("0.9.100"));
+        assert_eq!(
+            config_version("nextest-version = { required = \"0.9.90\", recommended = \"0.9.100\" }\n").as_deref(),
+            Some("0.9.100")
+        );
+        assert_eq!(config_version("[profile.ci]\nnextest-version = { required = \"0.9.90\" }\n"), None);
+        assert_eq!(config_version("nextest-version = { required = \"0.9.90\" }\n").as_deref(), Some("0.9.90"));
+        assert_eq!(config_version("[profile.default]\nretries = 2\n"), None);
+    }
+
+    #[test]
     fn the_newest_installed_version_is_used() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(newest(tmp.path()), None);
+        assert_eq!(newest_installed(tmp.path()), None);
         for v in ["0.9.9", "0.9.152", "0.9.100", "1.0", ".0.9.200.123"] {
             std::fs::create_dir_all(tmp.path().join(v)).unwrap();
             std::fs::write(tmp.path().join(v).join("cargo-nextest"), b"").unwrap();
         }
         // A version without the program is not installed.
         std::fs::create_dir_all(tmp.path().join("0.10.0")).unwrap();
-        assert_eq!(newest(tmp.path()), Some(tmp.path().join("0.9.152/cargo-nextest")));
+        assert_eq!(newest_installed(tmp.path()), Some(tmp.path().join("0.9.152/cargo-nextest")));
     }
 }

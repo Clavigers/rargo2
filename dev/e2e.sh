@@ -359,6 +359,41 @@ out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
 $out"
 "$R" nextest run >/dev/null 2>&1
 
+echo "== nextest: the version a project names"
+nx_project() { # directory, manifest lines, [.config/nextest.toml]
+    mkdir -p "$1/src" && git init -q "$1"
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n%s' "$(basename "$1")" "$2" >"$1/Cargo.toml"
+    echo '#[test] fn t() {}' >"$1/src/lib.rs"
+    if [ -n "${3:-}" ]; then mkdir -p "$1/.config" && printf '%s' "$3" >"$1/.config/nextest.toml"; fi
+}
+nx_project "$T/nx-a" "" 'nextest-version = "0.9.100"
+'
+nx_project "$T/nx-b" '[package.metadata.rargo]
+nextest = "0.9.120"
+'
+out=$(cd "$T/nx-a" && "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "Installing nextest 0.9.100 on the server" && has "$out" "cargo-nextest 0.9.100 (" && ok "nextest-version in .config/nextest.toml: the server installs and runs nextest 0.9.100" || bad "nextest-version in .config/nextest.toml: the server installs and runs nextest 0.9.100" "$out"
+out=$(cd "$T/nx-b" && "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "cargo-nextest 0.9.120 (" && ok "nextest under [package.metadata.rargo]: the same server runs nextest 0.9.120 for this project" || bad "nextest under [package.metadata.rargo]: the same server runs nextest 0.9.120 for this project" "$out"
+out=$(cd "$T/nx-a" && "$R" nextest run 2>&1); rc=$?
+[ $rc -eq 0 ] && ! has "$out" "Installing" && grep -qE "1 test run: 1 passed" <<<"$out" && ok "the first project's tests run on its 0.9.100, already installed beside the others ($(ls "$RARGO_STATE/nextest" | grep -v newest | tr '\n' ' '))" || bad "the first project's tests run on its 0.9.100, already installed" "$out"
+mkdir -p "$T/fake-nextest"
+printf '#!/bin/sh\necho "cargo-nextest 0.9.120 (client 2026-01-01)"\n' >"$T/fake-nextest/cargo-nextest"
+chmod +x "$T/fake-nextest/cargo-nextest"
+nx_project "$T/nx-c" ""
+out=$(cd "$T/nx-c" && PATH="$T/fake-nextest:$PATH" "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "cargo-nextest 0.9.120 (" && ! has "$out" "client 2026" && ok "a project that names no version runs the client's own nextest version, on the server" || bad "a project that names no version runs the client's own nextest version, on the server" "$out"
+newest=$(cat "$RARGO_STATE/nextest/newest-release" 2>/dev/null)
+out=$(cd "$T/nx-c" && "$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && [ -n "$newest" ] && has "$out" "cargo-nextest $newest (" && ok "with no version named and none on the client, the newest release ($newest)" || bad "with no version named and none on the client, the newest release" "newest=$newest
+$out"
+nx_project "$T/nx-d" '[package.metadata.rargo]
+nextest = "9.9.9"
+'
+out=$(cd "$T/nx-d" && "$R" nextest run 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "nextest 9.9.9, which the \`nextest\` key of rargo's metadata in Cargo.toml asks for, cannot be installed on this server" && has "$out" "cargo-nextest-9.9.9/cargo-nextest-9.9.9-x86_64-unknown-linux-musl" && ok "a version the server cannot get: the error names it and what was tried" || bad "a version the server cannot get: the error names it and what was tried" "rc=$rc
+$out"
+
 echo "== errors"
 cd "$A"
 cp crates/app/src/main.rs "$T/main.rs.bak"

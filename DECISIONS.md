@@ -2535,3 +2535,47 @@ nextest actions stay on the server and are never offered to workers.
 
 **Counters.** `--rargo-status` lists actions run by kind (planning,
 rustc, rustdoc, build scripts, tests, doctests, nextest, other).
+
+## D82. The nextest a command runs (issue 32)
+
+**Which version.** The first of these that applies:
+1. `nextest = "X.Y.Z"` under `[workspace.metadata.rargo]` (or
+   `[package.metadata.rargo]`), rargo's own key;
+2. nextest's own `nextest-version` in the workspace's
+   `.config/nextest.toml`:
+   - a plain string is the version;
+   - in the table form, the recommended version where it names one, else
+     the required one;
+3. the client's own nextest:
+   - the client runs `cargo-nextest nextest --version` when one is on its
+     PATH and sends the version as `RARGO_NEXTEST_VERSION` (a user may
+     set that variable too);
+4. the newest release.
+
+**Why rargo's key comes first.** It is the one that exists only for
+rargo.
+
+**Why `nextest-version` is taken as exact.** nextest reads it as a
+minimum. Installing the named version itself meets the minimum, and it
+gives the same nextest on every machine and in every run. That is what
+pinning in a repository is for.
+
+**How it is installed.** Every version is installed on first use, without
+a restart, into `STATE/nextest/VERSION/cargo-nextest`:
+- the static musl build from nextest's GitHub release, checked against the
+  release's `.sha256`;
+- the client sees a status line, `Installing nextest X on the server`;
+- installs happen one at a time, and versions stay side by side.
+
+**The newest release** is asked of GitHub (`releases/latest` redirects to
+its tag) at most once a day. The answer is kept in
+`STATE/nextest/newest-release`. When GitHub cannot be asked, the newest
+installed version is used.
+
+**When the version cannot be had**, the command fails, naming:
+- the version;
+- what asked for it;
+- the URL that failed.
+
+A version that is not of the form X.Y.Z is refused before anything is
+tried.

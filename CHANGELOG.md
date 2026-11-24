@@ -14,8 +14,12 @@ Protocol 7 (unchanged).
   nextest on the server. The client needs no nextest. The test binaries
   come from rargo's build and share its cache with `rargo test`, and
   nextest's output, exit code and the files it writes (a JUnit report)
-  come back. The server installs the newest nextest on first use. The
-  client passes `NEXTEST_*` variables. (#30)
+  come back. The client passes `NEXTEST_*` variables. (#30)
+- The nextest that runs is the version the repository names (`nextest =
+  "X.Y.Z"` under `[workspace.metadata.rargo]`, or `nextest-version` in
+  `.config/nextest.toml`), else the client's own nextest's, else the
+  newest release. The server installs each version on first use, checked
+  against the release's checksum, and keeps them side by side. (#32)
 - After stock cargo built a test binary and rargo then put its own at the
   same path (`rargo test --no-run`, `rargo nextest`), stock `cargo test`
   ran rargo's executable and failed. rargo now removes stock cargo's
