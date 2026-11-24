@@ -6,7 +6,7 @@
 # The server and the client run on this machine but share nothing except a
 # TCP port: the server runs in a mount namespace in which the client's
 # directory (worktrees, cache, cargo home) is an empty file system, has its
-# own cargo home, and requires a key.
+# own cargo home, and requires a token.
 #
 # Uses private directories under $RARGO_WORK. Set RARGO_E2E_ROOT to an
 # existing directory on a reflink filesystem to put the store and the client

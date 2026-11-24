@@ -78,8 +78,9 @@ Facts that affect the design:
   share the machine: the limits above are for both together, and each
   uses rigs, state and build directories of its own for the suites (the
   second agent: `RIG=codex RIG_STATE=rig-codex`,
-  `RARGO_E2E_LINK=$RARGO_WORK/e2e-link-codex`, its own `CARGO_TARGET_DIR`
-  and gate directory), never the other's.
+  `RARGO_E2E_LINK=$RARGO_WORK/e2e-link-codex`,
+  `RARGO_COMPONENTS_RUSTUP=$RARGO_WORK/rustup-components-codex`, its own
+  `CARGO_TARGET_DIR` and gate directory), never the other's.
 - Work that closes an issue happens on a branch and lands through a pull
   request whose description says `Closes #N`, what changed, how it was
   tested and what was measured. Nobody reviews it: it merges (squash) when

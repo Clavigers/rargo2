@@ -30,6 +30,7 @@ step e2e dev/e2e.sh
 step e2e-copy env RARGO_OUTPUT=copy dev/e2e.sh
 step e2e-flake dev/e2e-flake.sh
 step e2e-auth dev/e2e-auth.sh
+step e2e-components dev/e2e-components.sh
 step e2e-link env RIG=rargo2 RIG_STATE=rig2 dev/e2e-link.sh
 step e2e-worker env RIG=rargo2 RIG_STATE=rig2 dev/e2e-worker.sh
 git log --oneline -1

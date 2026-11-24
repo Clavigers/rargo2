@@ -6,6 +6,14 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.1
+
+Protocol 7 (unchanged).
+
+- A command that needs a toolchain component the server lacks (clippy for
+  `rargo clippy`) gets it installed on the server on first use, also with
+  `--locked`, `--frozen` or `--offline`. (#69)
+
 ## 0.6.0
 
 Protocol 7 (unchanged).
