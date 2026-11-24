@@ -6,6 +6,16 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.4
+
+Protocol 7 (unchanged).
+
+- A project's policy (`env`, `network`, `flake`, `sync`) is read from its
+  `Cargo.toml`, under `[workspace.metadata.rargo]` (`[package.metadata.rargo]`
+  for a package outside a workspace), so a repository needs no rargo file
+  of its own. `.rargo.toml` is still read; where both have a table the
+  manifest's wins and the build says the file's is ignored. (#20)
+
 ## 0.3.3
 
 Protocol 7 (unchanged).

@@ -164,18 +164,24 @@ pub struct Policy {
 }
 
 pub fn load_policy(root: &Path) -> Policy {
-    let none = Policy { pass: Vec::new(), exclude: Vec::new(), git: true };
-    let Ok(text) = std::fs::read_to_string(root.join(".rargo.toml")) else { return none };
-    // A malformed file is the server's to report, with the build.
-    let Ok(t) = text.parse::<toml::Table>() else { return none };
-    let list = |section: &str, key: &str| -> Vec<String> {
-        t.get(section)
-            .and_then(|s| s.get(key))
-            .and_then(|v| v.as_array())
+    // A malformed file or table is the server's to report, with the build.
+    let table = |name: &str| std::fs::read_to_string(root.join(name)).ok().and_then(|t| t.parse::<toml::Table>().ok());
+    let file = table(".rargo.toml").unwrap_or_default();
+    // The manifest at the top of the repository holds the policy under
+    // `[workspace.metadata.rargo]` (or `[package.metadata.rargo]`); a table
+    // it has wins over the same table of the older `.rargo.toml`.
+    let manifest: toml::Table = table("Cargo.toml")
+        .and_then(|t| ["workspace", "package"].iter().find_map(|kind| t.get(*kind)?.get("metadata")?.get("rargo")?.as_table().cloned()))
+        .unwrap_or_default();
+    let section = |name: &str| manifest.get(name).or_else(|| file.get(name)).cloned();
+    let list = |name: &str, key: &str| -> Vec<String> {
+        section(name)
+            .and_then(|s| s.get(key).cloned())
+            .and_then(|v| v.as_array().cloned())
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default()
     };
-    let git = t.get("sync").and_then(|s| s.get("git")).and_then(|v| v.as_bool()).unwrap_or(true);
+    let git = section("sync").and_then(|s| s.get("git").cloned()).and_then(|v| v.as_bool()).unwrap_or(true);
     Policy { pass: list("env", "pass"), exclude: list("sync", "exclude"), git }
 }
 

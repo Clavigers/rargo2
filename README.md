@@ -92,26 +92,36 @@ and shared between worktrees through the cache.
 The client keeps its index, the daemon's socket and log, and fetched
 contents in `~/.cache/rargo` (`RARGO_CACHE_DIR`).
 
-## Per-repository policy: `.rargo.toml`
+## Per-repository policy: in `Cargo.toml`
 
-Optional; cargo ignores it.
+Optional. It lives in the manifest at the top of the repository, under
+`[workspace.metadata.rargo]` (`[package.metadata.rargo]` for a package
+outside a workspace), beside the `host` that `rargo @host` writes. Cargo
+ignores `metadata` tables.
 
 ```toml
-[env]
+[workspace.metadata.rargo]
+host = "build.example"
+
+[workspace.metadata.rargo.env]
 pass = ["DATABASE_URL", "PROTOC*"]     # given to every action, part of every key
 
-[network]
+[workspace.metadata.rargo.network]
 tests = false                          # host networking for all test runs
 test-packages = ["integration-tests"]  # ... or for these packages' tests
 build-scripts = ["some-sys"]           # build scripts that may use the network
 
-[flake]
+[workspace.metadata.rargo.flake]
 enabled = true                         # build in the repo's flake devShell (default when flake.nix exists)
 
-[sync]
+[workspace.metadata.rargo.sync]
 exclude = ["node_modules"]             # never sent to the server
 git = true                             # show build scripts a history-free .git for HEAD
 ```
+
+The older place, a `.rargo.toml` at the top of the repository with the
+same tables unprefixed, is still read. A table the manifest has wins over
+the same table of the file, and the build says so.
 
 ## Other commands
 
