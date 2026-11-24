@@ -2307,3 +2307,27 @@ two cannot drift apart. Someone who is not an administrator may list
 and revoke their own tokens and nothing else; the list shows no secret
 and no invitation code. `rargod token github` stays on the server's
 machine: it reads the application's secret from a file there.
+
+## D77. What git ignores is synced unless the project says otherwise (issue 62)
+
+`[workspace.metadata.rargo.sync] gitignored = false` leaves out everything
+git ignores: it is not scanned, not watched and not sent. `include` names
+what is sent all the same, with `exclude`'s patterns; a file inside an
+ignored directory is named by its path, and only the way to it is entered.
+The default stays `true`: a build may read an ignored file (a generated
+source, a local `.env`, a file `include_str!` embeds), and a build that
+quietly lacks an input is a worse surprise than an upload of things it
+never reads. A project with large ignored trees says so in one line.
+
+Git itself says what it ignores (`git ls-files --others --ignored
+--exclude-standard --directory`, once per scan with the option), so
+nested `.gitignore` files, `.git/info/exclude` and the user's global
+excludes all count, exactly as `git status` counts them; rargo does not
+reimplement gitignore matching. Outside a git repository, or where git
+cannot answer, nothing is left out.
+
+A failed command whose error output names a path that was left out this
+way ends with a note naming the path, the option and `include`. The
+daemon keeps the command's error output (up to 1 MiB) only while the
+option is set, and matches the paths in it against what git ignores, so
+an error about another file is not blamed on the option.

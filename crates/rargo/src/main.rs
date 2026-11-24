@@ -143,6 +143,10 @@ pub struct Policy {
     pub exclude: Vec<String>,
     /// `[sync] git = false`: the sandbox gets no `.git` at all.
     pub git: bool,
+    /// `[sync] gitignored = false`: what git ignores is not synced, except
+    /// what `include` names.
+    pub gitignored: bool,
+    pub include: Vec<String>,
 }
 
 pub fn load_policy(root: &Path, start: &Path) -> Policy {
@@ -160,8 +164,14 @@ pub fn load_policy(root: &Path, start: &Path) -> Policy {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
             .unwrap_or_default()
     };
-    let git = policy.get("sync").and_then(|s| s.get("git")).and_then(|v| v.as_bool()).unwrap_or(true);
-    Policy { pass: list("env", "pass"), exclude: list("sync", "exclude"), git }
+    let flag = |key: &str| policy.get("sync").and_then(|s| s.get(key)).and_then(|v| v.as_bool()).unwrap_or(true);
+    Policy {
+        pass: list("env", "pass"),
+        exclude: list("sync", "exclude"),
+        git: flag("git"),
+        gitignored: flag("gitignored"),
+        include: list("sync", "include"),
+    }
 }
 
 pub fn pattern_matches(pattern: &str, name: &str) -> bool {

@@ -7,16 +7,18 @@
 //!
 //! What is left out: `.git` (anywhere), cargo target directories (any
 //! directory holding a `CACHEDIR.TAG`, and `target` at the root), anything
-//! the repository's policy file excludes, and things that are neither file,
+//! the project's policy excludes, and things that are neither file,
 //! directory nor symlink. Everything else is synced, whether git ignores it
-//! or not: an ignored `Cargo.lock` or generated source is as much an input
-//! to the build as a tracked file.
+//! or not (an ignored `Cargo.lock` or generated source is as much an input
+//! to the build as a tracked file), unless the policy says
+//! `gitignored = false`: then what git ignores is left out too, except what
+//! the policy's `include` names ([`Ignored`]).
 
 use rargo_proto::Digest;
 use rargo_proto::tree::{Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -86,6 +88,7 @@ struct Ctx<'a> {
     root: &'a Path,
     old: &'a Index,
     exclude: &'a [String],
+    ignored: Option<&'a Ignored>,
     trees: Mutex<HashMap<Digest, Vec<u8>>>,
     files: Mutex<HashMap<Digest, (PathBuf, u64)>>,
     dirs: Mutex<Vec<PathBuf>>,
@@ -134,6 +137,105 @@ fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
     })
 }
 
+/// What git ignores in a worktree, as git itself says (`.gitignore` files,
+/// `info/exclude`, the user's excludes file; a tracked file is never
+/// ignored), less what the policy's `include` takes back. An ignored
+/// directory is one entry and is not looked into, unless a path in
+/// `include` lies inside it: then only the way to that path is.
+#[derive(Debug, Default)]
+pub struct Ignored {
+    /// Paths from the root; a directory's without its trailing slash.
+    paths: HashSet<Vec<u8>>,
+    include: Vec<String>,
+    /// The directories that lead to a path `include` names.
+    on_way: HashSet<Vec<u8>>,
+}
+
+/// What the scan does with one entry.
+#[derive(Debug, PartialEq)]
+enum Take {
+    Skip,
+    Keep,
+    /// Kept, but only the way to an included path inside it is.
+    OnlyTheWay,
+}
+
+impl Ignored {
+    /// Asks git; `None` where git cannot say (no repository, no git).
+    pub fn from_git(root: &Path, include: &[String]) -> Option<Ignored> {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["--no-optional-locks", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        Some(Ignored::new(out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()), include))
+    }
+
+    fn new<'p>(listed: impl Iterator<Item = &'p [u8]>, include: &[String]) -> Ignored {
+        let mut me = Ignored { include: include.to_vec(), ..Ignored::default() };
+        for p in listed {
+            me.paths.insert(p.strip_suffix(b"/").unwrap_or(p).to_vec());
+        }
+        for p in include.iter().filter(|p| p.trim_end_matches('/').contains('/')) {
+            let mut way = p.trim_matches('/').as_bytes();
+            while let Some(i) = way.iter().rposition(|&b| b == b'/') {
+                way = &way[..i];
+                me.on_way.insert(way.to_vec());
+            }
+        }
+        me
+    }
+
+    /// As if git had listed `listed` (directories with a trailing slash).
+    #[cfg(test)]
+    pub fn for_test(listed: &[&str], include: &[String]) -> Ignored {
+        Ignored::new(listed.iter().map(|p| p.as_bytes()), include)
+    }
+
+    fn included(&self, rel: &[u8], name: &[u8]) -> bool {
+        excluded(&self.include, rel, name)
+    }
+
+    fn take(&self, rel: &[u8], name: &[u8], inside: bool) -> Take {
+        if !inside && !self.paths.contains(rel) {
+            return Take::Keep;
+        }
+        if self.included(rel, name) {
+            Take::Keep
+        } else if self.on_way.contains(rel) {
+            Take::OnlyTheWay
+        } else {
+            Take::Skip
+        }
+    }
+
+    /// Whether the scan left `rel` (a path from the root) out because git
+    /// ignores it.
+    pub fn left_out(&self, rel: &[u8]) -> bool {
+        let mut inside = false;
+        let mut at = 0;
+        loop {
+            let end = rel[at..].iter().position(|&b| b == b'/').map(|i| at + i).unwrap_or(rel.len());
+            let (here, name) = (&rel[..end], &rel[at..end]);
+            match self.take(here, name, inside) {
+                Take::Skip => return true,
+                Take::Keep => inside = false,
+                Take::OnlyTheWay => inside = true,
+            }
+            if end == rel.len() {
+                return false;
+            }
+            at = end + 1;
+        }
+    }
+}
+
 fn is_cache_dir(dir: &Path) -> bool {
     let mut head = [0u8; 43];
     match std::fs::File::open(dir.join("CACHEDIR.TAG")).and_then(|mut f| f.read_exact(&mut head)) {
@@ -143,8 +245,10 @@ fn is_cache_dir(dir: &Path) -> bool {
 }
 
 impl Ctx<'_> {
-    /// Scans one directory; returns its tree's digest.
-    fn dir(&self, rel: &[u8]) -> io::Result<Digest> {
+    /// Scans one directory; returns its tree's digest. `inside`: the
+    /// directory is one git ignores, entered only on the way to a path the
+    /// policy includes.
+    fn dir(&self, rel: &[u8], inside: bool) -> io::Result<Digest> {
         let abs = if rel.is_empty() { self.root.to_path_buf() } else { self.root.join(OsStr::from_bytes(rel)) };
         let mut names: Vec<Vec<u8>> = Vec::new();
         self.dirs.lock().unwrap().push(abs.clone());
@@ -156,6 +260,10 @@ impl Ctx<'_> {
             .map(|name| -> io::Result<Option<(Vec<u8>, Node, Option<Entry>)>> {
                 let child_rel = join(rel, &name);
                 if name == b".git" || excluded(self.exclude, &child_rel, &name) || (rel.is_empty() && name == b"target") {
+                    return Ok(None);
+                }
+                let take = self.ignored.map(|i| i.take(&child_rel, &name, inside)).unwrap_or(Take::Keep);
+                if take == Take::Skip {
                     return Ok(None);
                 }
                 let child_abs = abs.join(OsStr::from_bytes(&name));
@@ -170,7 +278,7 @@ impl Ctx<'_> {
                     if is_cache_dir(&child_abs) {
                         return Ok(None);
                     }
-                    return match self.dir(&child_rel) {
+                    return match self.dir(&child_rel, take == Take::OnlyTheWay) {
                         Ok(d) => Ok(Some((name, Node::Dir(d), None))),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                         Err(e) => Err(e),
@@ -182,7 +290,7 @@ impl Ctx<'_> {
                         Err(_) => Ok(None),
                     };
                 }
-                if !ft.is_file() {
+                if !ft.is_file() || take == Take::OnlyTheWay {
                     return Ok(None);
                 }
                 self.file_count.fetch_add(1, Ordering::Relaxed);
@@ -233,13 +341,14 @@ impl Ctx<'_> {
     }
 }
 
-/// Scans the worktree at `root`. `git`, when given, is a directory shown
-/// as the worktree's `.git` (see `git::thin`).
-pub fn scan(root: &Path, old: &Index, exclude: &[String], git: Option<&Path>) -> io::Result<Scan> {
-    let mut scan = scan_dir(root, old, exclude)?;
+/// Scans the worktree at `root`, leaving out what `ignored` says git
+/// ignores. `git`, when given, is a directory shown as the worktree's
+/// `.git` (see `git::thin`).
+pub fn scan(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>, git: Option<&Path>) -> io::Result<Scan> {
+    let mut scan = scan_dir(root, old, exclude, ignored)?;
     if let Some(git) = git {
         // Small and immutable: scanned from scratch, grafted into the root.
-        let sub = scan_dir(git, &Index::default(), &[])?;
+        let sub = scan_dir(git, &Index::default(), &[], None)?;
         let mut top = Tree::decode(&scan.trees[&scan.root])?;
         let put = |top: &mut Tree, name: &[u8], node: Node| {
             match top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)) {
@@ -280,11 +389,12 @@ pub fn scan(root: &Path, old: &Index, exclude: &[String], git: Option<&Path>) ->
     Ok(scan)
 }
 
-fn scan_dir(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
+fn scan_dir(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
     let ctx = Ctx {
         root,
         old,
         exclude,
+        ignored,
         trees: Mutex::new(HashMap::new()),
         files: Mutex::new(HashMap::new()),
         dirs: Mutex::new(Vec::new()),
@@ -294,7 +404,7 @@ fn scan_dir(root: &Path, old: &Index, exclude: &[String]) -> io::Result<Scan> {
         file_count: AtomicU64::new(0),
         reused: AtomicU64::new(0),
     };
-    let root_digest = ctx.dir(b"")?;
+    let root_digest = ctx.dir(b"", false)?;
     let files = ctx.index.into_inner().unwrap();
     let hashed_files = ctx.hashed_files.into_inner();
     // Unchanged when nothing was hashed and no path came or went.
@@ -327,6 +437,75 @@ mod tests {
     }
 
     #[test]
+    fn what_git_ignores_is_left_out_on_request_but_what_include_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = tmp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(r)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        write(r, ".gitignore", "node_modules/\n*.log\ndata/\n.env\n");
+        write(r, "src/lib.rs", "pub fn a() {}");
+        write(r, "node_modules/a/b.js", "x");
+        write(r, "x.log", "x");
+        write(r, "src/y.log", "x");
+        write(r, "kept.log", "tracked although it matches");
+        write(r, "data/big.bin", "x");
+        write(r, "data/schema.sql", "create table t;");
+        write(r, "data/sub/z", "x");
+        write(r, ".env", "A=1");
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["add", "-f", "kept.log"]);
+        git(&["commit", "-q", "-m", "one"]);
+        let names = |s: &Scan, d: &Digest| tree(s, d).entries.iter().map(|(n, _)| String::from_utf8(n.clone()).unwrap()).collect::<Vec<_>>();
+        let dir = |s: &Scan, d: &Digest, name: &str| match tree(s, d).get(name.as_bytes()) {
+            Some(Node::Dir(x)) => *x,
+            other => panic!("{name}: {other:?}"),
+        };
+
+        // Without the option nothing changes: everything is synced.
+        let all = scan(r, &Index::default(), &[], None, None).unwrap();
+        assert!(names(&all, &all.root).contains(&"node_modules".to_string()));
+
+        let include = ["data/schema.sql".to_string(), ".env".to_string()];
+        let ignored = Ignored::from_git(r, &include).unwrap();
+        let s = scan(r, &Index::default(), &[], Some(&ignored), None).unwrap();
+        assert_eq!(names(&s, &s.root), [".env", ".gitignore", "data", "kept.log", "src"]);
+        assert_eq!(names(&s, &dir(&s, &s.root, "src")), ["lib.rs"]);
+        assert_eq!(names(&s, &dir(&s, &s.root, "data")), ["schema.sql"], "only the way to the included file");
+        assert!(!s.dirs.iter().any(|d| d.ends_with("node_modules") || d.ends_with("data/sub")), "not looked into, so not watched");
+        for (path, out) in [
+            ("node_modules/a/b.js", true),
+            ("x.log", true),
+            ("src/y.log", true),
+            ("data/big.bin", true),
+            ("data/sub/z", true),
+            ("data/schema.sql", false),
+            (".env", false),
+            ("kept.log", false),
+            ("src/lib.rs", false),
+        ] {
+            assert_eq!(ignored.left_out(path.as_bytes()), out, "{path}");
+        }
+        assert!(!ignored.left_out(b"data"), "data/ is not left out whole");
+
+        // Without `include`, an ignored directory is one entry, left out.
+        let ignored = Ignored::from_git(r, &[]).unwrap();
+        let s = scan(r, &Index::default(), &[], Some(&ignored), None).unwrap();
+        assert_eq!(names(&s, &s.root), [".gitignore", "kept.log", "src"]);
+        // Outside a repository git cannot say.
+        let elsewhere = tempfile::tempdir().unwrap();
+        assert!(Ignored::from_git(elsewhere.path(), &[]).is_none());
+    }
+
+    #[test]
     fn a_linked_worktree_keeps_its_git_file() {
         let tmp = tempfile::tempdir().unwrap();
         let (main, linked, stand_in) = (tmp.path().join("main"), tmp.path().join("linked"), tmp.path().join("cache/git/abc"));
@@ -337,12 +516,12 @@ mod tests {
         std::fs::create_dir_all(main.join(".git")).unwrap();
         std::fs::write(linked.join(".git"), "gitdir: /elsewhere/.git/worktrees/linked\n").unwrap();
         // A checkout with a git directory is shown with a directory.
-        let s = scan(&main, &Index::default(), &[], Some(&stand_in)).unwrap();
+        let s = scan(&main, &Index::default(), &[], None, Some(&stand_in)).unwrap();
         let top = tree(&s, &s.root);
         assert!(matches!(top.get(b".git"), Some(Node::Dir(_))));
         assert!(top.get(rargo_proto::GIT_SIDE.as_bytes()).is_none());
         // A linked worktree with a file that names the directory beside it.
-        let s = scan(&linked, &Index::default(), &[], Some(&stand_in)).unwrap();
+        let s = scan(&linked, &Index::default(), &[], None, Some(&stand_in)).unwrap();
         let top = tree(&s, &s.root);
         let Some(Node::File { hash, .. }) = top.get(b".git") else { panic!("`.git` is not a file") };
         let (path, _) = &s.files[hash];
@@ -371,7 +550,7 @@ mod tests {
         std::os::unix::fs::symlink("src", r.join("link")).unwrap();
         std::fs::create_dir(r.join("empty")).unwrap();
         let exclude = vec!["node_modules".to_string(), "vendor/skip".to_string(), "/cache".to_string()];
-        let s = scan(r, &Index::default(), &exclude, None).unwrap();
+        let s = scan(r, &Index::default(), &exclude, None, None).unwrap();
         let top = tree(&s, &s.root);
         let names: Vec<&str> = top.entries.iter().map(|(n, _)| std::str::from_utf8(n).unwrap()).collect();
         assert_eq!(names, ["Cargo.toml", "docs", "empty", "link", "src", "sub", "vendor"]);
@@ -389,7 +568,7 @@ mod tests {
         assert_eq!(s.files[&lib], (r.join("src/lib.rs"), 13));
         // A directory grafted in as `.git`.
         write(tmp.path(), "thin/HEAD", "ref: refs/heads/main\n");
-        let g = scan(r, &Index::default(), &exclude, Some(&tmp.path().join("thin"))).unwrap();
+        let g = scan(r, &Index::default(), &exclude, None, Some(&tmp.path().join("thin"))).unwrap();
         assert_ne!(g.root, s.root);
         let top = tree(&g, &g.root);
         let Some(Node::Dir(git)) = top.get(b".git") else { panic!() };
@@ -405,26 +584,26 @@ mod tests {
         let r = tmp.path();
         write(r, "a.rs", "one");
         write(r, "d/b.rs", "two");
-        let s1 = scan(r, &Index::default(), &[], None).unwrap();
+        let s1 = scan(r, &Index::default(), &[], None, None).unwrap();
         // Hashed just after being written: not trusted yet.
-        let s2 = scan(r, &s1.index, &[], None).unwrap();
+        let s2 = scan(r, &s1.index, &[], None, None).unwrap();
         assert_eq!(s2.hashed_files, 2);
         assert_eq!(s2.root, s1.root);
         std::thread::sleep(std::time::Duration::from_millis(120));
-        let s3 = scan(r, &s2.index, &[], None).unwrap();
+        let s3 = scan(r, &s2.index, &[], None, None).unwrap();
         assert_eq!(s3.hashed_files, 2, "hashed within the racy window of the write");
-        let s4 = scan(r, &s3.index, &[], None).unwrap();
+        let s4 = scan(r, &s3.index, &[], None, None).unwrap();
         assert_eq!(s4.hashed_files, 0);
         assert!(!s4.index_changed);
         assert_eq!(s4.root, s1.root);
         // An edit changes the root and is the only thing read.
         write(r, "d/b.rs", "two!");
-        let s5 = scan(r, &s4.index, &[], None).unwrap();
+        let s5 = scan(r, &s4.index, &[], None, None).unwrap();
         assert_eq!(s5.hashed_files, 1);
         assert_ne!(s5.root, s1.root);
         // Same size, same content hash path: a removed file leaves the index.
         std::fs::remove_file(r.join("a.rs")).unwrap();
-        let s6 = scan(r, &s5.index, &[], None).unwrap();
+        let s6 = scan(r, &s5.index, &[], None, None).unwrap();
         assert!(s6.index_changed);
         assert_eq!(s6.index.files.len(), 1);
     }
@@ -433,7 +612,7 @@ mod tests {
     fn index_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "wt/a", "x");
-        let s = scan(&tmp.path().join("wt"), &Index::default(), &[], None).unwrap();
+        let s = scan(&tmp.path().join("wt"), &Index::default(), &[], None, None).unwrap();
         let p = tmp.path().join("cache/index");
         s.index.save(&p).unwrap();
         assert_eq!(Index::load(&p).files, s.index.files);

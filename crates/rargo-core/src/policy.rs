@@ -34,6 +34,12 @@
 //! # directories. A name matches at any depth; a path with a slash is taken
 //! # from the worktree root.
 //! exclude = ["node_modules", "data/fixtures-large"]
+//! # Whether what git ignores is synced. Default: true (a generated file or
+//! # a local `.env` may be an input). With false, it is not scanned, watched
+//! # or sent, except what `include` names (same patterns as `exclude`; a
+//! # file inside an ignored directory is named by its path).
+//! gitignored = false
+//! include = ["data/schema.sql"]
 //! # Show build scripts a `.git` that answers questions about HEAD (commit,
 //! # branch, dirty or not) without history or file contents. Default: true.
 //! git = true
@@ -66,6 +72,11 @@ pub struct Policy {
 pub struct SyncPolicy {
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Whether what git ignores is synced (default: yes).
+    pub gitignored: Option<bool>,
+    /// What is synced although git ignores it, with `gitignored = false`.
+    #[serde(default)]
+    pub include: Vec<String>,
     /// Whether the sandbox gets a thin `.git` describing HEAD.
     pub git: Option<bool>,
 }
@@ -213,6 +224,10 @@ mod tests {
         // A workspace table comes before a package table of the same file.
         let both = "[workspace.metadata.rargo.sync]\nexclude = [\"a\"]\n[package]\nname = \"p\"\n[package.metadata.rargo.sync]\nexclude = [\"b\"]\n";
         assert_eq!(Policy::load(Some(both)).unwrap().sync.exclude, ["a"]);
+        // What git ignores, left out but for one path.
+        let ignored = "[workspace.metadata.rargo.sync]\ngitignored = false\ninclude = [\"data/schema.sql\"]\n";
+        let sync = Policy::load(Some(ignored)).unwrap().sync;
+        assert_eq!((sync.gitignored, sync.include), (Some(false), vec!["data/schema.sql".to_string()]));
         // No manifest, or one without the table.
         assert_eq!(Policy::load(None).unwrap(), Policy::default());
         assert_eq!(Policy::load(Some("[package]\nname = \"a\"\n")).unwrap(), Policy::default());
