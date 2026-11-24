@@ -22,7 +22,10 @@ for _ in $(seq 1 30); do
 done
 if gh pr checks "$url" --watch --fail-fast --interval 20 >/dev/null; then
     gh pr merge "$url" --squash --delete-branch
-    git checkout -q main && git pull -q --ff-only origin main
+    # In the main checkout: back on main. In a second worktree (main is
+    # checked out elsewhere): at what was merged.
+    git fetch -q origin
+    if git checkout -q main 2>/dev/null; then git pull -q --ff-only origin main; else git checkout -q --detach origin/main; fi
     echo "merged: $url"
 else
     gh pr checks "$url" || true
