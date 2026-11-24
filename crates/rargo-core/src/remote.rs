@@ -2252,9 +2252,10 @@ impl RemoteRunner for Pool {
         req: &'a Request,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RunResult>> + Send + 'a>> {
         Box::pin(async move {
-            // Planning needs the host; host networking has no meaning
-            // elsewhere; a flake root would need the closure on the worker.
-            if spec.kind == ActionKind::Plan || spec.net != NetMode::Loopback || spec.root_id != Hash::ZERO {
+            // Planning needs the host, and so does nextest (it is installed
+            // on the server); host networking has no meaning elsewhere; a
+            // flake root would need the closure on the worker.
+            if matches!(spec.kind, ActionKind::Plan | ActionKind::Nextest) || spec.net != NetMode::Loopback || spec.root_id != Hash::ZERO {
                 return None;
             }
             // A crate that is compiled incrementally (a workspace member)

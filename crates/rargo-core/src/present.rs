@@ -164,16 +164,32 @@ pub struct Output {
     pub quiet: bool,
     pub verbose: bool,
     pub tr: Translator,
+    /// Where standard output goes instead of the client, when it is kept.
+    kept: Option<std::sync::Arc<parking_lot::Mutex<Vec<u8>>>>,
 }
 
 impl Output {
     pub fn new(tx: UnboundedSender<ServerMsg>, color_err: bool, color_out: bool) -> Output {
-        Output { tx, color_err, color_out, quiet: false, verbose: false, tr: Translator::default() }
+        Output { tx, color_err, color_out, quiet: false, verbose: false, tr: Translator::default(), kept: None }
     }
 
     /// The same client with different presentation settings.
     pub fn derive(&self, quiet: bool, verbose: bool, tr: Translator) -> Output {
-        Output { tx: self.tx.clone(), color_err: self.color_err, color_out: self.color_out, quiet, verbose, tr }
+        Output {
+            tx: self.tx.clone(),
+            color_err: self.color_err,
+            color_out: self.color_out,
+            quiet,
+            verbose,
+            tr,
+            kept: self.kept.clone(),
+        }
+    }
+
+    /// The same client, with standard output kept in `into` instead of
+    /// shown; standard error is shown as usual.
+    pub fn keeping_stdout(&self, into: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Output {
+        Output { kept: Some(into), ..self.derive(self.quiet, self.verbose, self.tr.clone()) }
     }
 
     pub fn send(&self, m: ServerMsg) {
@@ -188,6 +204,10 @@ impl Output {
     }
 
     pub fn raw_out(&self, b: &[u8]) {
+        if let Some(k) = &self.kept {
+            k.lock().extend_from_slice(b);
+            return;
+        }
         if !b.is_empty() {
             self.send(ServerMsg::Stdout(b.to_vec()));
         }

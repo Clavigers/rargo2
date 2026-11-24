@@ -34,7 +34,8 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 /// Subcommands the server handles.
-const ROUTED: &[&str] = &["build", "b", "check", "c", "clippy", "test", "t", "run", "r", "doc", "d", "bench", "rustc", "rustdoc"];
+const ROUTED: &[&str] =
+    &["build", "b", "check", "c", "clippy", "test", "t", "run", "r", "doc", "d", "bench", "rustc", "rustdoc", "nextest"];
 
 /// Writes a file by renaming a complete temporary file into place.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -669,8 +670,11 @@ fn main() {
             }
             _ => passthrough(&raw),
         }
-        // Asking for help or version is cargo's business.
-        if args.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V") {
+        // Asking for help or version is cargo's business, except for
+        // nextest, which is the server's.
+        if subcommand(&args) != Some("nextest")
+            && args.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V")
+        {
             passthrough(&raw);
         }
     }
