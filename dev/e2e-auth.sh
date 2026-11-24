@@ -6,13 +6,20 @@
 #
 #   dev/e2e-auth.sh
 #
+# Runs on the build machine and on a CI runner: RARGO_BIN (rargod, rargo),
+# PLANNER (the cargo fork's binary) and RARGO_WORK (scratch directory) say
+# where things are.
+#
 # The browser's part (opening the page, entering the invitation) is played
 # with curl. Needs root (rargod) and a free loopback port.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 B=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
-. "$work/env.sh"
+[ -f "$work/env.sh" ] && . "$work/env.sh"
+planner=${PLANNER:-$work/cargo/target/release/cargo}
+[ -x "$planner" ] || { echo "no planner at $planner (set PLANNER)" >&2; exit 2; }
+mkdir -p "$work"
 unset RARGO_SERVER RARGO_USER RARGO_KEY RARGO_TOKEN RARGO_KEY_FILE RARGO_STATE RARGO_HIDE
 T=$work/e2e-auth
 port=${E2E_AUTH_PORT:-7466}
@@ -30,14 +37,14 @@ R=$B/rargo
 D="$B/rargod"
 
 echo "== an administrator, before the server runs"
-out=$("$B/rargod" --state "$T/state" --planner "$work/cargo/target/release/cargo" --listen 0.0.0.0:$port --jobs 2 2>&1)
+out=$("$B/rargod" --state "$T/state" --planner "$planner" --listen 0.0.0.0:$port --jobs 2 2>&1)
 grep -q "nobody could connect" <<<"$out"; check $? "a public server without keys or tokens refuses to start" "$out"
 invite=$("$D" token invite --state "$T/state" --user ann --uses 2 2>/dev/null)
 [[ "$invite" =~ ^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$ ]]; check $? "rargod token invite prints a code" "$invite"
 ! grep -q "${invite//-/}" "$T/state/tokens.json"; check $? "the code is not in the token file"
 [ "$(stat -c %a "$T/state/tokens.json")" = 600 ]; check $? "the token file is readable by its owner only"
 
-"$D" --state "$T/state" --planner "$work/cargo/target/release/cargo" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
+"$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
 srv=$!
 for _ in $(seq 1 100); do grep -q "serving clients" "$T/srv.log" && break; sleep 0.1; done
 grep -q "keys or tokens required" "$T/srv.log"; check $? "the server runs with tokens only" "$(cat "$T/srv.log")"
