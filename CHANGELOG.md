@@ -10,6 +10,12 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- A command after a change looks only at the directories that changed
+  (and those without a watch), not at the whole worktree: 12 ms instead
+  of 329 ms on a rustc checkout of 244,000 files. With more directories
+  than the kernel lets one user watch, the daemon watches as many as it
+  can and says once which `fs.inotify.max_user_watches` value would cover
+  the rest. A directory removed and made again is watched again. (#10)
 - A build step that needs a toolchain component the server lacks (a build
   script that runs `rustfmt`) gets it installed there and runs again; the
   client sees the build succeed. A component that does not exist for the

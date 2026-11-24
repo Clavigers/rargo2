@@ -43,7 +43,12 @@ const SETTLE: Duration = Duration::from_millis(20);
 pub struct Counters {
     pub commands: AtomicU64,
     pub scans: AtomicU64,
-    /// Commands that needed no scan: the watcher vouched for the worktree.
+    /// Scans that looked only at some directories, and how many they
+    /// looked at.
+    pub rescans: AtomicU64,
+    pub rescanned_dirs: AtomicU64,
+    /// Commands that needed no scan: every directory is watched and none
+    /// had an event.
     pub scans_spared: AtomicU64,
     pub offers: AtomicU64,
     /// Large trees the server said it had when shown the root alone.
@@ -82,7 +87,24 @@ struct WtState {
     /// The index to start from before the first scan.
     loaded: Option<scan::Index>,
     last: Option<Arc<Snap>>,
-    watched: HashSet<PathBuf>,
+    /// The directories of the last scan that have a watch, and its
+    /// descriptor.
+    watched: HashMap<PathBuf, i32>,
+    /// Those that have none (the watch limit, or an error).
+    unwatched: HashSet<PathBuf>,
+    /// The watch limit was reported for this worktree.
+    told_limit: bool,
+    /// For the user, with the next command's output.
+    note: Option<String>,
+}
+
+impl Worktree {
+    /// Something changed, where is not known: the next scan is of
+    /// everything.
+    fn rescan_all(&self) {
+        self.everything.store(true, Ordering::SeqCst);
+        self.dirty.store(true, Ordering::SeqCst);
+    }
 }
 
 struct Worktree {
@@ -93,8 +115,12 @@ struct Worktree {
     state: tokio::sync::Mutex<WtState>,
     /// Something changed since the last scan (or may have).
     dirty: AtomicBool,
-    /// Every directory is watched: no event means no change.
-    vouched: AtomicBool,
+    /// Where: the directories with events since the last scan.
+    events: Mutex<HashSet<PathBuf>>,
+    /// Somewhere unknown: the next scan is of the whole worktree.
+    everything: AtomicBool,
+    /// How many directories of the last scan have no watch.
+    unwatched: AtomicUsize,
     changed: tokio::sync::Notify,
     /// One command at a time places files (as cargo locks its build
     /// directory).
@@ -208,10 +234,16 @@ impl Daemon {
                     let all: Vec<Arc<Worktree>> = d2.worktrees.lock().unwrap().values().cloned().collect();
                     for ev in events {
                         for wt in &all {
-                            if matches!(ev, Event::Overflow) || matches!(ev, Event::Changed(id) if id == wt.id) {
-                                wt.dirty.store(true, Ordering::SeqCst);
-                                wt.changed.notify_one();
+                            match &ev {
+                                Event::Changed(id, dir) if *id == wt.id => {
+                                    wt.events.lock().unwrap().insert(dir.clone());
+                                }
+                                Event::Moved(id) if *id == wt.id => wt.everything.store(true, Ordering::SeqCst),
+                                Event::Overflow => wt.everything.store(true, Ordering::SeqCst),
+                                _ => continue,
                             }
+                            wt.dirty.store(true, Ordering::SeqCst);
+                            wt.changed.notify_one();
                         }
                     }
                 }
@@ -265,12 +297,17 @@ impl Daemon {
                 policy_dir: PathBuf::new(),
                 loaded: Some(scan::Index::load(&wt_cache.join("index"))),
                 last: None,
-                watched: HashSet::new(),
+                watched: HashMap::new(),
+                unwatched: HashSet::new(),
+                told_limit: false,
+                note: None,
             }),
             wt_id,
             wt_cache,
             dirty: AtomicBool::new(true),
-            vouched: AtomicBool::new(false),
+            events: Mutex::new(HashSet::new()),
+            everything: AtomicBool::new(true),
+            unwatched: AtomicUsize::new(0),
             changed: tokio::sync::Notify::new(),
             running: tokio::sync::Mutex::new(()),
             last_used: Mutex::new(Instant::now()),
@@ -301,27 +338,37 @@ impl Daemon {
         wt
     }
 
-    /// The worktree as it is now: the last scan if the watcher vouches for
-    /// it, a new scan otherwise. The flag says whether a scan was needed.
+    /// The worktree as it is now: the last scan if every directory is
+    /// watched and none had an event, a new scan otherwise: of the
+    /// directories that had events or have no watch, or of everything when
+    /// where is not known. The flag says whether a scan was needed.
     async fn fresh(&self, wt: &Arc<Worktree>, st: &mut WtState) -> std::io::Result<(Arc<Snap>, bool)> {
         // HEAD is not under the watched directories; reading it is cheap.
         let head = git::head(&wt.root);
+        let watching = self.watcher.is_some();
         if let Some(last) = &st.last {
             let same_head = match (&last.head, &head) {
                 (None, None) => true,
                 (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text && a.tags == b.tags,
                 _ => false,
             };
-            if same_head && wt.vouched.load(Ordering::SeqCst) && !wt.dirty.load(Ordering::SeqCst) {
+            if same_head && watching && st.unwatched.is_empty() && !wt.dirty.load(Ordering::SeqCst) {
                 self.counters.scans_spared.fetch_add(1, Ordering::Relaxed);
                 return Ok((last.clone(), false));
             }
         }
         // Cleared before looking: a change during the scan marks it again.
         wt.dirty.store(false, Ordering::SeqCst);
-        self.counters.scans.fetch_add(1, Ordering::Relaxed);
+        let everything = wt.everything.swap(false, Ordering::SeqCst) || !watching;
+        let mut changed: HashSet<PathBuf> = std::mem::take(&mut *wt.events.lock().unwrap());
+        changed.extend(st.unwatched.iter().cloned());
+        if let Some(w) = &self.watcher {
+            // A directory removed (and perhaps made again) lost its watch.
+            changed.extend(st.watched.iter().filter(|(d, wd)| !w.watches(**wd, d)).map(|(d, _)| d.clone()));
+        }
         let (root, cache, wt_cache) = (wt.root.clone(), self.cache.clone(), wt.wt_cache.clone());
-        let (previous, loaded) = (st.last.clone(), st.loaded.take());
+        // Taken, so that a rescan can edit it rather than copy it.
+        let (previous, loaded) = (st.last.take(), st.loaded.take());
         let policy_dir = st.policy_dir.clone();
         let snap = tokio::task::spawn_blocking(move || -> std::io::Result<Snap> {
             let mut policy = crate::load_policy(&root, &policy_dir);
@@ -329,15 +376,29 @@ impl Daemon {
             if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
-            let empty = scan::Index::default();
-            let old = match (&previous, &loaded) {
-                (Some(p), _) => &p.scan.index,
-                (None, Some(l)) => l,
-                (None, None) => &empty,
-            };
             let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
-            let mut scan = scan::scan(&root, old, &policy.exclude, left_out.as_ref())
-                .map_err(|e| std::io::Error::new(e.kind(), format!("scanning {}: {e}", root.display())))?;
+            // Only directories that may have changed are looked at, unless
+            // what is synced at all changed since.
+            let reusable = previous.as_ref().is_some_and(|p| {
+                !everything
+                    && p.policy.exclude == policy.exclude
+                    && p.policy.gitignored == policy.gitignored
+                    && p.policy.include == policy.include
+                    && p.left_out == left_out
+            });
+            let whole = |old: &scan::Index| scan::scan(&root, old, &policy.exclude, left_out.as_ref());
+            let scanned = match previous {
+                Some(p) if reusable => {
+                    let prev = Arc::try_unwrap(p).map(|s| s.scan).unwrap_or_else(|shared| shared.scan.clone());
+                    // Should the scan before not add up, the whole worktree
+                    // is scanned, against the index on disk.
+                    scan::rescan(&root, prev, &changed, &policy.exclude, left_out.as_ref())
+                        .or_else(|_| whole(&scan::Index::load(&wt_cache.join("index"))))
+                }
+                Some(p) => whole(&p.scan.index),
+                None => whole(&loaded.unwrap_or_default()),
+            };
+            let mut scan = scanned.map_err(|e| std::io::Error::new(e.kind(), format!("scanning {}: {e}", root.display())))?;
             if scan.index_changed {
                 let _ = scan.index.save(&wt_cache.join("index"));
             }
@@ -372,42 +433,82 @@ impl Daemon {
         })
         .await
         .map_err(std::io::Error::other)??;
-        // Watch what the scan found. A directory that was not watched
-        // while it was scanned may have changed in between: look again
-        // next time.
+        if snap.scan.listed_dirs < snap.scan.dirs.len() as u64 {
+            self.counters.rescans.fetch_add(1, Ordering::Relaxed);
+            self.counters.rescanned_dirs.fetch_add(snap.scan.listed_dirs, Ordering::Relaxed);
+        } else {
+            self.counters.scans.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(w) = &self.watcher {
-            let now: HashSet<PathBuf> = snap.scan.dirs.iter().cloned().collect();
-            let mut ok = true;
-            let mut added = false;
-            for dir in &snap.scan.dirs {
-                if st.watched.contains(dir) {
-                    continue;
-                }
-                match w.add(dir, wt.id) {
-                    Ok(_) => {
-                        st.watched.insert(dir.clone());
-                        added = true;
-                    }
-                    // Removed since the scan: the parent's event says so.
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => added = true,
-                    Err(e) => {
-                        if wt.vouched.swap(false, Ordering::SeqCst) || st.last.is_none() {
-                            eprintln!("rargo daemon: cannot watch {} ({e}); it will be scanned for every command", dir.display());
-                        }
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            st.watched.retain(|d| now.contains(d));
-            wt.vouched.store(ok, Ordering::SeqCst);
-            if added {
-                wt.dirty.store(true, Ordering::SeqCst);
-            }
+            self.watch(w, wt, st, &snap);
         }
         let snap = Arc::new(snap);
         st.last = Some(snap.clone());
         Ok((snap, true))
+    }
+
+    /// Watches the directories of `snap` that have no watch, and stops
+    /// watching those it no longer has. A directory watched only now may
+    /// have changed while it was scanned: the next scan looks at it again.
+    /// What cannot be watched is looked at by every scan; the watch limit
+    /// is said once, with the setting that raises it.
+    fn watch(&self, w: &Watcher, wt: &Worktree, st: &mut WtState, snap: &Snap) {
+        let now: HashSet<&PathBuf> = snap.scan.dirs.iter().collect();
+        let mut unwatched = HashSet::new();
+        let mut added = Vec::new();
+        let mut over_limit = 0usize;
+        let mut failed = None;
+        for dir in &snap.scan.dirs {
+            if st.watched.get(dir).is_some_and(|wd| w.watches(*wd, dir)) {
+                continue;
+            }
+            st.watched.remove(dir);
+            match w.add(dir, wt.id) {
+                Ok(wd) => {
+                    st.watched.insert(dir.clone(), wd);
+                    added.push(dir.clone());
+                }
+                // Removed since the scan: its parent had an event.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => added.push(dir.clone()),
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::ENOSPC) {
+                        over_limit += 1;
+                    } else if failed.is_none() && !st.unwatched.contains(dir) {
+                        failed = Some(format!("rargo: cannot watch {} ({e}); it is looked at again for every command\n", dir.display()));
+                    }
+                    unwatched.insert(dir.clone());
+                }
+            }
+        }
+        st.watched.retain(|d, wd| {
+            let keep = now.contains(d);
+            if !keep {
+                w.remove(*wd, d);
+            }
+            keep
+        });
+        if !added.is_empty() {
+            wt.events.lock().unwrap().extend(added);
+            wt.dirty.store(true, Ordering::SeqCst);
+        }
+        let mut note = failed.unwrap_or_default();
+        if over_limit > 0 && !st.told_limit {
+            let limit = Watcher::limit().unwrap_or(0);
+            // Room for these and as many again, in round numbers.
+            let enough = (limit + 2 * over_limit as u64).div_ceil(65536) * 65536;
+            note.push_str(&format!(
+                "rargo: {over_limit} of the {} directories of {} are not watched: the kernel allows {limit} inotify watches per user, and they are in use. \
+                 Those directories are looked at again for every command. To watch them all: sysctl fs.inotify.max_user_watches={enough}\n",
+                snap.scan.dirs.len(),
+                wt.root.display()
+            ));
+        }
+        st.told_limit = over_limit > 0;
+        wt.unwatched.store(unwatched.len(), Ordering::SeqCst);
+        st.unwatched = unwatched;
+        if !note.is_empty() {
+            st.note = Some(note);
+        }
     }
 
     /// Brings the server up to `snap` without being asked: everything of
@@ -486,7 +587,7 @@ impl Daemon {
             .await
             .map_err(std::io::Error::other)?;
             let Some(packed) = packed else {
-                wt.dirty.store(true, Ordering::SeqCst);
+                wt.rescan_all();
                 return Ok(Offered::Changed);
             };
             self.counters.offered_bytes.fetch_add(tree_bytes + blob_bytes, Ordering::Relaxed);
@@ -537,7 +638,7 @@ impl Daemon {
             let bytes: u64 = missing.iter().filter_map(|h| snap.scan.files.get(h)).map(|(_, s)| *s).sum();
             self.counters.offered_bytes.fetch_add(bytes, Ordering::Relaxed);
             if !upload(mux, CONTROL, snap, missing).await? {
-                wt.dirty.store(true, Ordering::SeqCst);
+                wt.rescan_all();
                 return Ok(Offered::Changed);
             }
         }
@@ -936,17 +1037,22 @@ impl Daemon {
                 let mut st = wt.state.lock().await;
                 if st.policy_dir != policy_dir {
                     st.policy_dir.clone_from(&policy_dir);
-                    wt.dirty.store(true, Ordering::SeqCst);
+                    wt.rescan_all();
                 }
                 let (snap, scanned) = self.fresh(&wt, &mut st).await?;
+                if let Some(note) = st.note.take() {
+                    let _ = out.send(LocalReply::Stderr(note.into_bytes()));
+                }
                 if stats {
                     let text = if scanned {
                         format!(
-                            "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB)\n",
+                            "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB), looking at {} of {} directories\n",
                             snap.scan.file_count,
                             started.elapsed().as_secs_f64() * 1e3,
                             snap.scan.hashed_files,
-                            snap.scan.hashed_bytes as f64 / 1048576.0
+                            snap.scan.hashed_bytes as f64 / 1048576.0,
+                            snap.scan.listed_dirs,
+                            snap.scan.dirs.len()
                         )
                     } else {
                         format!("rargo: no scan needed, {} files watched and unchanged\n", snap.scan.file_count)
@@ -1010,7 +1116,7 @@ impl Daemon {
                     probe = how;
                 }
                 Ok(Outcome::Changed) => {
-                    wt.dirty.store(true, Ordering::SeqCst);
+                    wt.rescan_all();
                     changes += 1;
                     if changes >= 5 {
                         return Ok(Self::fail(out, "the worktree kept changing while it was being synced".into()));
@@ -1230,7 +1336,7 @@ impl Daemon {
         };
         let (worktrees, watched) = {
             let all = self.worktrees.lock().unwrap();
-            (all.len(), all.values().filter(|w| w.vouched.load(Ordering::SeqCst)).count())
+            (all.len(), all.values().filter(|w| w.unwatched.load(Ordering::SeqCst) == 0).count())
         };
         let outs = {
             let all = self.worktrees.lock().unwrap();
@@ -1248,13 +1354,15 @@ impl Daemon {
         let text = format!(
             "server              {}\nlink                {kind}; {} made; {bytes_out} bytes sent, {bytes_in} bytes received on the current one\n\
              commands            {}\nworktrees           {worktrees} known, {watched} watched completely\n\
-             scans               {} done, {} spared (nothing had changed)\n\
+             scans               {} of whole worktrees, {} of {} directories that had changed or have no watch, {} spared (nothing had changed)\n\
              pushed              {} changes, {} bytes; {} trees the server had already (asked by root)\n\
              outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on open, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
             c.links.load(Ordering::Relaxed),
             c.commands.load(Ordering::Relaxed),
             c.scans.load(Ordering::Relaxed),
+            c.rescans.load(Ordering::Relaxed),
+            c.rescanned_dirs.load(Ordering::Relaxed),
             c.scans_spared.load(Ordering::Relaxed),
             c.offers.load(Ordering::Relaxed),
             c.offered_bytes.load(Ordering::Relaxed),
