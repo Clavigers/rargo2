@@ -17,14 +17,11 @@ Linux, root (it mounts a FUSE filesystem and creates namespaces).
 forks/setup.sh                      # clones cargo at the pinned commit, applies the patches, builds the planner
 cargo build --release               # rargod and rargo
 
-cat >/etc/rargo.keys <<EOF          # one user per line: name, secret (16+ characters), optionally `admin`
-ann  $(head -c 24 /dev/urandom | base64)  admin
-bob  $(head -c 24 /dev/urandom | base64)
-EOF
+rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation for the first user
 
 rargod --state /var/lib/rargo \
        --planner /path/to/cargo-fork/target/release/cargo \
-       --listen 0.0.0.0:7459 --keys /etc/rargo.keys
+       --listen 0.0.0.0:7459
 ```
 
 rargod uses the rustup and `PATH` it is started with; toolchains a repo
@@ -36,8 +33,9 @@ asks for are installed on first use, crates are downloaded into
 `rargod --state DIR --worker SERVER:PORT --worker-key FILE`; the link is
 authenticated and encrypted with that key).
 
-Without `--keys`, rargod listens on `127.0.0.1` only and accepts anyone on
-the machine.
+Who may connect is a matter of tokens (`rargod token invite|create|list|
+revoke`, in effect while the server runs). A server that has issued none
+listens on `127.0.0.1` only and accepts anyone on the machine.
 
 ## The client
 
@@ -57,8 +55,8 @@ project builds on and as whom; `rargo auth remove` forgets the token. On
 the server, `rargod token invite|create|list|revoke --state DIR` manage
 who may connect, without a restart.
 
-`RARGO_SERVER`, `RARGO_TOKEN`, `RARGO_USER`, `RARGO_KEY` and `RARGO_KEY_FILE`
-override all of it. To make agents that type `cargo` use rargo, put a link named `cargo`
+`RARGO_SERVER` and `RARGO_TOKEN` override the project's server and the
+stored token. To make agents that type `cargo` use rargo, put a link named `cargo`
 to the `rargo` binary ahead of the real cargo on `PATH`; everything that is
 not a build is passed to the real cargo, and `RARGO_FALLBACK=cargo` passes
 builds too when the server cannot be reached.

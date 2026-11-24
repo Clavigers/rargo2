@@ -20,8 +20,8 @@ B=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
 planner=${PLANNER:-$work/cargo/target/release/cargo}
 [ -x "$planner" ] || { echo "no planner at $planner (set PLANNER)" >&2; exit 2; }
 mkdir -p "$work"
-unset RARGO_SERVER RARGO_USER RARGO_KEY RARGO_TOKEN RARGO_KEY_FILE RARGO_STATE RARGO_HIDE
-T=$work/e2e-auth
+unset RARGO_SERVER RARGO_TOKEN RARGO_STATE RARGO_HIDE
+T=${RARGO_E2E_AUTH:-$work/e2e-auth}
 port=${E2E_AUTH_PORT:-7466}
 host=127.0.0.1:$port
 pass=0; fail=0
@@ -39,7 +39,7 @@ D="$B/rargod"
 
 echo "== an administrator, before the server runs"
 out=$("$B/rargod" --state "$T/state" --planner "$planner" --listen 0.0.0.0:$port --jobs 2 2>&1)
-grep -q "nobody could connect" <<<"$out"; check $? "a public server without keys or tokens refuses to start" "$out"
+grep -q "nobody could connect" <<<"$out"; check $? "a public server without tokens refuses to start" "$out"
 invite=$("$D" token invite --state "$T/state" --user ann --uses 2 2>/dev/null)
 [[ "$invite" =~ ^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$ ]]; check $? "rargod token invite prints a code" "$invite"
 ! grep -q "${invite//-/}" "$T/state/tokens.json"; check $? "the code is not in the token file"
@@ -54,7 +54,7 @@ export RARGO_GITHUB_URL=http://127.0.0.1:$ghport RARGO_GITHUB_API=http://127.0.0
 "$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
 srv=$!
 for _ in $(seq 1 100); do grep -q "serving clients" "$T/srv.log" && break; sleep 0.1; done
-grep -q "keys or tokens required" "$T/srv.log"; check $? "the server runs with tokens only" "$(cat "$T/srv.log")"
+grep -q "tokens required" "$T/srv.log"; check $? "the server runs with tokens" "$(cat "$T/srv.log")"
 
 echo "== what the server says over HTTP on its port"
 out=$(curl -fsS "http://$host/.well-known/rargo.json")

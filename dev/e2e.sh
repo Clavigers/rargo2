@@ -29,9 +29,12 @@ port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); pr
 export RARGO_SERVER=127.0.0.1:$port
 export RARGO_HIDE=$T
 export RARGO_CACHE_DIR=$T/.rargo-cache
-export RARGO_USER=e2e
-export RARGO_KEY=e2e-client-secret-0123456789
-printf 'e2e %s admin\nguest guest-secret-0123456789abcdef\n' "$RARGO_KEY" >"$RARGO_STATE/keys"
+# Two users of the server: an administrator, whose token the suite uses,
+# and one who is not.
+mkdir -p "$RARGO_STATE"
+RARGO_TOKEN=$("$bin/rargod" token create --state "$RARGO_STATE" --user e2e --admin 2>/dev/null)
+export RARGO_TOKEN
+guest_token=$("$bin/rargod" token create --state "$RARGO_STATE" --user guest 2>/dev/null)
 # The server gets a cargo home of its own.
 export RARGO_SERVER_CARGO_HOME=$RARGO_STATE/cargo-home
 # The stock Cargo checks intentionally exercise the fixture's own target/.
@@ -54,7 +57,7 @@ asked_files() { "$R" --rargo-status | sed -n 's/^sync .* manifests and \([0-9]*\
 asked_trees() { "$R" --rargo-status | sed -n 's/^sync .*states, \([0-9]*\) manifests.*/\1/p'; }
 
 trap '"$repo/dev/rargod.sh" stop >/dev/null 2>&1' EXIT
-"$repo/dev/rargod.sh" start --store "$E/store" --keys "$RARGO_STATE/keys" >/dev/null || {
+"$repo/dev/rargod.sh" start --store "$E/store" >/dev/null || {
     cat "$RARGO_STATE/rargod.log"
     exit 1
 }
@@ -63,13 +66,13 @@ echo "== client and server are apart"
 pid=$(pgrep -f "rargod --state $RARGO_STATE " | head -1)
 echo marker >"$T/marker"
 [ -n "$pid" ] && [ -d "/proc/$pid/root$T" ] && [ -z "$(ls -A "/proc/$pid/root$T" 2>/dev/null)" ] && ok "the server sees an empty directory where the client's files are" || bad "the server sees an empty directory where the client's files are" "$(ls -A "/proc/$pid/root$T" 2>&1)"
-out=$(RARGO_KEY=wrong-secret-0123456789 "$R" --rargo-status 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" "key" && ok "a wrong key is refused" || bad "a wrong key is refused" "$out"
-out=$(RARGO_USER=nobody "$R" --rargo-status 2>&1); rc=$?
-[ $rc -ne 0 ] && ok "an unknown user is refused" || bad "an unknown user is refused" "$out"
-out=$(RARGO_USER=guest RARGO_KEY=guest-secret-0123456789abcdef "$R" --rargo-gc 2>&1); rc=$?
+out=$(RARGO_TOKEN="${RARGO_TOKEN%%.*}.wrong-secret-0123456789" "$R" --rargo-status 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" "rargo auth" && ok "a token with a wrong secret is refused" || bad "a token with a wrong secret is refused" "$out"
+out=$(RARGO_TOKEN=t-nobody000000.some-secret-0123456789 "$R" --rargo-status 2>&1); rc=$?
+[ $rc -ne 0 ] && ok "a token the server does not know is refused" || bad "a token the server does not know is refused" "$out"
+out=$(RARGO_TOKEN=$guest_token "$R" --rargo-gc 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" "may not administer" && ok "a user who is not an administrator cannot collect garbage" || bad "a user who is not an administrator cannot collect garbage" "$out"
-expect "the right key is accepted" "$R" --rargo-status
+expect "the right token is accepted" "$R" --rargo-status
 
 # --- a small workspace -----------------------------------------------------
 A=$T/a

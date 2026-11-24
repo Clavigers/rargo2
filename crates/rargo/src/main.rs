@@ -58,8 +58,8 @@ fn home_dir() -> PathBuf {
 /// The server: `RARGO_SERVER`, else the host the project names in its
 /// `Cargo.toml` (`rargo @host`), else a server on this machine. A bare
 /// name is asked where its server is.
-/// Who we are: `RARGO_TOKEN`, else `RARGO_USER` with `RARGO_KEY` or
-/// `RARGO_KEY_FILE`, else the token `rargo auth` stored for that host.
+/// Who we are: `RARGO_TOKEN`, else the token `rargo auth` stored for that
+/// host. A server on this machine that issues no tokens asks for none.
 pub struct Config {
     /// The host as it is written (`rargo.rs`, `build.example:7459`).
     pub host: String,
@@ -74,28 +74,29 @@ pub fn load_config() -> Result<Config, String> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     // A daemon is told all of it by the command that starts it: it has no
     // project around it to look into.
+    let local_name = || env("USER").or_else(|| env("LOGNAME")).unwrap_or_else(|| "user".into());
+    let from_token = |token: &str| -> Result<(String, Option<String>), String> {
+        let (id, secret) = project::split_token(token).ok_or("RARGO_TOKEN is not a token (an id, a dot and a secret)")?;
+        Ok((id.to_string(), Some(secret.to_string())))
+    };
     if env("RARGO_DAEMON_CONFIG").is_some() {
         let server = env("RARGO_SERVER").ok_or("the daemon was started without a server")?;
-        let secret = env("RARGO_KEY");
+        let (user, secret) = match env("RARGO_TOKEN") {
+            Some(t) => from_token(&t)?,
+            None => (local_name(), None),
+        };
         let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
-        return Ok(Config { host: server.clone(), server, user: env("RARGO_USER").unwrap_or_default(), secret, psk });
+        return Ok(Config { host: server.clone(), server, user, secret, psk });
     }
     let cwd = std::env::current_dir().ok();
     let host = env("RARGO_SERVER").or_else(|| cwd.as_deref().and_then(project::project_host)).unwrap_or_else(|| "127.0.0.1:7459".into());
     let server = project::resolve(&host)?;
-    let local_name = || env("USER").or_else(|| env("LOGNAME")).unwrap_or_else(|| "user".into());
     let (user, secret) = if let Some(token) = env("RARGO_TOKEN") {
-        let (id, secret) = project::split_token(&token).ok_or("RARGO_TOKEN is not a token (an id, a dot and a secret)")?;
-        (id.to_string(), Some(secret.to_string()))
-    } else if let Some(key) = env("RARGO_KEY") {
-        (env("RARGO_USER").unwrap_or_else(local_name), Some(key))
-    } else if let Some(f) = env("RARGO_KEY_FILE") {
-        let key = std::fs::read_to_string(&f).map(|s| s.trim().to_string()).map_err(|e| format!("cannot read the key file {f}: {e}"))?;
-        (env("RARGO_USER").unwrap_or_else(local_name), Some(key))
+        from_token(&token)?
     } else if let Some(c) = project::credential(&host) {
         (c.user, Some(c.key))
     } else {
-        (env("RARGO_USER").unwrap_or_else(local_name), None)
+        (local_name(), None)
     };
     let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
     Ok(Config { host, server, user, secret, psk })
@@ -282,12 +283,11 @@ fn start_daemon(socket: &Path, cache: &Path, cfg: &Config) -> std::io::Result<()
     let log = std::fs::OpenOptions::new().create(true).append(true).open(cache.join("daemon.log"))?;
     let mut cmd = std::process::Command::new(exe);
     // The daemon gets what this command worked out (it runs in no project).
-    cmd.env("RARGO_DAEMON_CONFIG", "1").env("RARGO_SERVER", &cfg.server).env("RARGO_USER", &cfg.user);
+    cmd.env("RARGO_DAEMON_CONFIG", "1").env("RARGO_SERVER", &cfg.server);
     match &cfg.secret {
-        Some(s) => cmd.env("RARGO_KEY", s),
-        None => cmd.env_remove("RARGO_KEY"),
+        Some(s) => cmd.env("RARGO_TOKEN", format!("{}.{s}", cfg.user)),
+        None => cmd.env_remove("RARGO_TOKEN"),
     };
-    cmd.env_remove("RARGO_TOKEN").env_remove("RARGO_KEY_FILE");
     cmd.arg("--rargo-daemon")
         .arg(socket)
         .stdin(std::process::Stdio::null())
@@ -354,7 +354,7 @@ fn at_host(host: &str) -> ! {
         Ok(path) => {
             eprintln!("{} now names `{host}` as this project's rargo server.", path.display());
             if host.contains(':') || project::resolve(host).is_ok() {
-                if project::credential(host).is_none() && std::env::var_os("RARGO_KEY").is_none() && std::env::var_os("RARGO_TOKEN").is_none() {
+                if project::credential(host).is_none() && std::env::var_os("RARGO_TOKEN").is_none() {
                     eprintln!("Next: `rargo auth`, then `rargo build`.");
                 }
             } else {

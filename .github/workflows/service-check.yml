@@ -28,6 +28,5 @@ jobs:
       - name: Build, run and test through the server
         env:
           RARGO_SERVER: ${{ secrets.RARGO_CHECK_SERVER }}
-          RARGO_USER: ${{ secrets.RARGO_CHECK_USER }}
-          RARGO_KEY: ${{ secrets.RARGO_CHECK_KEY }}
+          RARGO_TOKEN: ${{ secrets.RARGO_CHECK_TOKEN }}
         run: deploy/check-service.sh "$HOME/rargo"

@@ -2258,3 +2258,24 @@ nothing needs to: an empty output directory holds nothing worth serving.
 `cargo clean -p NAME` and `--release` leave other entries and never
 reach this.
 
+## D74. Tokens are the one way to say who may connect (issue 56)
+
+A server admits the holders of tokens. A token is made by an
+administrator (`rargod token create`), by an invitation being redeemed
+or by a GitHub account on the allow list signing in (`rargo auth`); it
+may expire and can be revoked while the server runs. A client presents
+`RARGO_TOKEN` or the token stored for the project's host. A server with
+no `tokens.json` in its state directory admits anyone on its machine and
+therefore starts only on the loopback interface.
+
+The rigs and suites make their users with `rargod token create` before
+the server starts (`dev/netns.sh` keeps the rig's token file beside the
+server's state, so a server started on an emptied state directory admits
+the same token), and `deploy/check-service.sh` takes `RARGO_TOKEN`.
+
+`RARGO_TOKEN` is on the list of variables that never leave the client:
+a build's environment on the server does not contain it.
+
+The secret shared by a server and its workers (`--worker-key`) is a
+different matter and is unchanged.
+
