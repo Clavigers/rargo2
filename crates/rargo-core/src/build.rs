@@ -1042,9 +1042,10 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     }
 
     // The client's values of every variable any action has declared: one
-    // question, asked while the build is planned, where there used to be
-    // one per action looked up. A client that has answered before sends
-    // them with its request and is asked nothing.
+    // question, asked while the build is planned (a question per action
+    // looked up is a round trip per action, one after another down the
+    // dependency chain). A client that has answered before sends them
+    // with its request and is asked nothing.
     let env_known = {
         let (env, names) = (c.env.clone(), d.engine.traces.every_env_name());
         tokio::spawn(async move { env.ensure(&names).await })

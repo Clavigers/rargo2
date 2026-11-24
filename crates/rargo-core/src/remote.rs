@@ -544,11 +544,10 @@ impl WorkerState {
 
     async fn on_push(self: &Arc<Self>, blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, part: u32, of: u32) {
         // The messages of one push overtake each other: the blob is put
-        // together when all of them are here, whichever came last. (It
-        // used to be put together when the one sent last arrived, with
-        // whatever recipe the first to arrive had carried: an empty one if
-        // that was not the first sent, and the content then failed its
-        // check. The server went on believing the worker held it.)
+        // together when all of them are here, whichever came last. (The
+        // recipe travels in the message numbered 0, which need not be the
+        // first to arrive; putting the blob together on the last-numbered
+        // message would use whatever recipe had come by then.)
         let complete = {
             let mut partial = self.partial.lock();
             let inc = partial.entry(blob).or_insert_with(|| Incoming { recipe: None, chunks: HashMap::new(), parts: 0 });
