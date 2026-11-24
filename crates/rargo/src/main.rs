@@ -176,14 +176,12 @@ pub struct Policy {
     pub git: bool,
 }
 
-pub fn load_policy(root: &Path) -> Policy {
+pub fn load_policy(root: &Path, start: &Path) -> Policy {
     // A malformed file or table is the server's to report, with the build.
-    let table = |name: &str| std::fs::read_to_string(root.join(name)).ok().and_then(|t| t.parse::<toml::Table>().ok());
-    let file = table(".rargo.toml").unwrap_or_default();
-    // The manifest at the top of the repository holds the policy under
-    // `[workspace.metadata.rargo]` (or `[package.metadata.rargo]`); a table
-    // it has wins over the same table of the older `.rargo.toml`.
-    let manifest: toml::Table = table("Cargo.toml")
+    let read = |path: &Path| std::fs::read_to_string(root.join(path)).ok();
+    let file = read(Path::new(".rargo.toml")).and_then(|text| text.parse::<toml::Table>().ok()).unwrap_or_default();
+    let manifest = rargo_proto::workspace::manifest_for(start, read)
+        .and_then(|(path, _)| read(&path)?.parse::<toml::Table>().ok())
         .and_then(|t| ["workspace", "package"].iter().find_map(|kind| t.get(*kind)?.get("metadata")?.get("rargo")?.as_table().cloned()))
         .unwrap_or_default();
     let section = |name: &str| manifest.get(name).or_else(|| file.get(name)).cloned();

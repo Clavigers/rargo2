@@ -411,10 +411,14 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, sess:
         })
     };
     if command == "__drift" {
+        let Some(dir) = rargo_proto::workspace::command_dir(req.root.as_ref(), req.cwd.as_ref(), &req.args) else {
+            return fail(&sess, "the current directory must be inside the synced worktree".into());
+        };
         let who = crate::drift::LastClient {
             env: Arc::new(env),
             home,
             root: req.root.clone(),
+            dir,
             at: std::time::Instant::now(),
             checked: None,
         };

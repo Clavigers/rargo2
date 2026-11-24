@@ -127,6 +127,11 @@ pub struct Client {
 }
 
 impl Client {
+    fn policy_dir(&self) -> Result<PathBuf> {
+        rargo_proto::workspace::command_dir(Path::new(&self.root), Path::new(&self.cwd), &self.args)
+            .context("the manifest must be inside the synced worktree")
+    }
+
     /// Queues files to place and writes to apply on the client. They go
     /// out together when the request ends ([`Client::flush`]): one round
     /// trip, however many steps produced something.
@@ -714,11 +719,8 @@ struct Prepared {
 }
 
 async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
-    // The repository's policy file, as of this snapshot.
-    let loaded = {
-        let text = |name: &str| snapshot.read(name.as_bytes()).map(|b| String::from_utf8_lossy(&b).into_owned());
-        crate::policy::Policy::load(text(crate::policy::MANIFEST).as_deref(), text(crate::policy::POLICY_FILE).as_deref()).map_err(|e| anyhow!(e))?
-    };
+    let dir = c.policy_dir()?;
+    let loaded = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
     let policy = loaded.policy;
     for notice in &loaded.notices {
         c.out.warn_once(notice);
@@ -1061,13 +1063,15 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
     if c.session.is_some() && !c.worktree.is_empty() {
         d.trees.remember(&c.worktree, &c.snapshot);
         let mut last = d.last_clients.lock();
-        let checked = last.get(&c.worktree).and_then(|l| l.checked);
+        let dir = c.policy_dir()?;
+        let checked = last.get(&c.worktree).filter(|l| l.dir == dir).and_then(|l| l.checked);
         last.insert(
             c.worktree.clone(),
             crate::drift::LastClient {
                 env: Arc::new(c.env.to_map()),
                 home: c.home.clone(),
                 root: c.root.clone(),
+                dir,
                 at: Instant::now(),
                 checked,
             },

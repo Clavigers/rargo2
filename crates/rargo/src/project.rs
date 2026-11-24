@@ -44,25 +44,6 @@ pub fn project_host(cwd: &Path) -> Option<String> {
     package
 }
 
-/// The manifest `rargo @host` writes to: the workspace root above `cwd`
-/// (the outermost manifest with a `[workspace]` table that is not below
-/// another), else the nearest package's manifest.
-fn manifest_for(cwd: &Path) -> Option<(PathBuf, &'static str)> {
-    let mut nearest: Option<PathBuf> = None;
-    for dir in cwd.ancestors() {
-        let path = dir.join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Ok(table) = text.parse::<toml::Table>() else { continue };
-        if table.contains_key("workspace") {
-            return Some((path, "workspace"));
-        }
-        if nearest.is_none() && table.contains_key("package") {
-            nearest = Some(path);
-        }
-    }
-    nearest.map(|p| (p, "package"))
-}
-
 /// A host as a person may type it: a name or an address, an optional port.
 pub fn valid_host(host: &str) -> bool {
     let (name, port) = match host.rsplit_once(':') {
@@ -81,7 +62,7 @@ pub fn set_host(cwd: &Path, host: &str) -> Result<PathBuf, String> {
     if !valid_host(host) {
         return Err(format!("`{host}` is not a host: write a name (rargo.rs) or a name and a port (build.example:7459)"));
     }
-    let Some((path, kind)) = manifest_for(cwd) else {
+    let Some((path, kind)) = rargo_proto::workspace::manifest_for(cwd, |p| std::fs::read_to_string(p).ok()) else {
         return Err("no Cargo.toml here or above: `rargo @host` is run inside a cargo project".into());
     };
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;

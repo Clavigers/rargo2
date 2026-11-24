@@ -94,7 +94,9 @@ contents in `~/.cache/rargo` (`RARGO_CACHE_DIR`).
 
 ## Per-repository policy: in `Cargo.toml`
 
-Optional. It lives in the manifest at the top of the repository, under
+Optional. The nearest enclosing Cargo workspace supplies the policy, even when
+the Git root has its own manifest. A standalone package supplies its own policy.
+Place the tables under
 `[workspace.metadata.rargo]` (`[package.metadata.rargo]` for a package
 outside a workspace), beside the `host` that `rargo @host` writes. Cargo
 ignores `metadata` tables.
