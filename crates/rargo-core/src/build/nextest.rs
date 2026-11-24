@@ -275,7 +275,7 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         let mut set = tokio::task::JoinSet::new();
         for q in questions {
             let (d, c, p_policy, view) = (d.clone(), c.clone(), p.policy.clone(), tests_view.clone());
-            let (root_id, no_cache) = (p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO), no_cache);
+            let (root_id, no_cache) = (p.flake.id, no_cache);
             set.spawn(async move {
                 let ran = run_test(&d, &c, &p_policy, view, root_id, no_cache, &q).await;
                 (q, ran)
