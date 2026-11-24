@@ -223,7 +223,8 @@ out=$("$R" build 2>&1); rc=$?
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 after=$(runs)
 # Its branch is another one: what stands in for .git differs in HEAD.
-[ $(( $(asked_files) - files )) -eq 1 ] && ok "the second worktree uploaded one file: the HEAD naming its branch" || bad "the second worktree uploaded one file: the HEAD naming its branch" "before=$files after=$(asked_files)"
+# ...and it is a linked worktree: its `.git` is a file, and is shown as one.
+[ $(( $(asked_files) - files )) -eq 2 ] && ok "the second worktree uploaded two files: the HEAD naming its branch and its .git file" || bad "the second worktree uploaded two files: the HEAD naming its branch and its .git file" "before=$files after=$(asked_files)"
 [ $(( $(asked_trees) - trees )) -le 4 ] && ok "and $(( $(asked_trees) - trees )) directory manifests (the root and those on the way to its branch)" || bad "the second worktree uploaded only the manifests on the way to its branch" "before=$trees after=$(asked_trees)"
 [ $rc -eq 0 ] && [ "$before" = "$after" ] && ok "second worktree built with zero actions in ${ms}ms" || bad "second worktree built with zero actions" "rc=$rc before=$before after=$after
 $out"

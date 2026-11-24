@@ -22,6 +22,11 @@ pub mod tree;
 
 pub const PROTO_VERSION: u32 = 7;
 
+/// Where the stand-in for a linked worktree's git directory is shown: the
+/// worktree's `.git` is a file there, as on the client, and names this
+/// directory beside it.
+pub const GIT_SIDE: &str = ".rargo-git";
+
 /// The stream of a link that belongs to no command.
 pub const CONTROL: u32 = 0;
 /// Frames of this stream are keepalives: outside every order, answered at

@@ -131,6 +131,10 @@ fn build(root: &Path, head: &Head, dir: &Path) -> Option<()> {
     if !pack.wait().ok()?.success() {
         return None;
     }
+    // Where the stand-in is shown beside a `.git` file (a linked worktree),
+    // it is not part of what git sees in the worktree.
+    std::fs::create_dir_all(dir.join("info")).ok()?;
+    std::fs::write(dir.join("info/exclude"), format!("/{}\n", rargo_proto::GIT_SIDE)).ok()?;
     // An index that says "exactly this commit is checked out".
     let read = git(root).env("GIT_INDEX_FILE", dir.join("index")).args(["read-tree", &head.commit]).status().ok()?;
     read.success().then_some(())
@@ -140,7 +144,7 @@ fn build(root: &Path, head: &Head, dir: &Path) -> Option<()> {
 /// kept in the client's cache. `None` when the worktree is not a git
 /// checkout, has no commit yet, or git is not installed.
 pub fn thin(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
-    let key = blake3::hash(format!("v2\n{}\n{}", head.text, head.commit).as_bytes()).to_hex()[..32].to_string();
+    let key = blake3::hash(format!("v3\n{}\n{}", head.text, head.commit).as_bytes()).to_hex()[..32].to_string();
     let all = cache.join("git");
     let dir = all.join(&key);
     if dir.join("HEAD").is_file() {

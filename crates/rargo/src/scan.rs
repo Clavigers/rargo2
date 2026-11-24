@@ -241,8 +241,31 @@ pub fn scan(root: &Path, old: &Index, exclude: &[String], git: Option<&Path>) ->
         // Small and immutable: scanned from scratch, grafted into the root.
         let sub = scan_dir(git, &Index::default(), &[])?;
         let mut top = Tree::decode(&scan.trees[&scan.root])?;
-        let at = top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(b".git")).unwrap_or_else(|i| i);
-        top.entries.insert(at, (b".git".to_vec(), Node::Dir(sub.root)));
+        let put = |top: &mut Tree, name: &[u8], node: Node| {
+            match top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)) {
+                Ok(i) => top.entries[i].1 = node,
+                Err(i) => top.entries.insert(i, (name.to_vec(), node)),
+            }
+        };
+        if root.join(".git").is_file() {
+            // A linked worktree: `.git` is a file that names the git
+            // directory, and it is shown as one. Build scripts tell the two
+            // apart (rust-analyzer's asks cargo to rerun it when
+            // `.git/HEAD` changes, and finds no such file in a linked
+            // worktree); showing a directory made every commit rerun the
+            // script and recompile the crate where stock cargo does not.
+            let text = format!("gitdir: {}\n", rargo_proto::GIT_SIDE);
+            let gitfile = git.parent().unwrap_or(git).join("gitfile-v1");
+            if std::fs::read(&gitfile).ok().as_deref() != Some(text.as_bytes()) {
+                crate::write_atomic(&gitfile, text.as_bytes())?;
+            }
+            let hash = *blake3::hash(text.as_bytes()).as_bytes();
+            scan.files.entry(hash).or_insert((gitfile, text.len() as u64));
+            put(&mut top, b".git", Node::File { hash, size: text.len() as u64, exec: false });
+            put(&mut top, rargo_proto::GIT_SIDE.as_bytes(), Node::Dir(sub.root));
+        } else {
+            put(&mut top, b".git", Node::Dir(sub.root));
+        }
         let encoded = top.encode();
         // The root without `.git` is not part of the tree any more (no
         // directory below the root can equal it).
@@ -301,6 +324,31 @@ mod tests {
 
     fn tree<'a>(s: &'a Scan, d: &Digest) -> Tree {
         Tree::decode(&s.trees[d]).unwrap()
+    }
+
+    #[test]
+    fn a_linked_worktree_keeps_its_git_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (main, linked, stand_in) = (tmp.path().join("main"), tmp.path().join("linked"), tmp.path().join("cache/git/abc"));
+        for r in [&main, &linked] {
+            write(r, "src/lib.rs", "pub fn a() {}");
+        }
+        write(&stand_in, "HEAD", "ref: refs/heads/main\n");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: /elsewhere/.git/worktrees/linked\n").unwrap();
+        // A checkout with a git directory is shown with a directory.
+        let s = scan(&main, &Index::default(), &[], Some(&stand_in)).unwrap();
+        let top = tree(&s, &s.root);
+        assert!(matches!(top.get(b".git"), Some(Node::Dir(_))));
+        assert!(top.get(rargo_proto::GIT_SIDE.as_bytes()).is_none());
+        // A linked worktree with a file that names the directory beside it.
+        let s = scan(&linked, &Index::default(), &[], Some(&stand_in)).unwrap();
+        let top = tree(&s, &s.root);
+        let Some(Node::File { hash, .. }) = top.get(b".git") else { panic!("`.git` is not a file") };
+        let (path, _) = &s.files[hash];
+        assert_eq!(std::fs::read_to_string(path).unwrap(), format!("gitdir: {}\n", rargo_proto::GIT_SIDE));
+        let Some(Node::Dir(side)) = top.get(rargo_proto::GIT_SIDE.as_bytes()) else { panic!("no stand-in beside it") };
+        assert!(tree(&s, side).get(b"HEAD").is_some());
     }
 
     #[test]

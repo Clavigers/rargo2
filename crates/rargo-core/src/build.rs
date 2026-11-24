@@ -2847,6 +2847,7 @@ fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manife
             && !target_dirs.iter().any(|t| vpath_starts_with(p, t.as_bytes()))
             && !vpath_starts_with(p, &vjoin(WORKTREE_AT, b"target"))
             && !vpath_starts_with(p, &vjoin(WORKTREE_AT, b".git"))
+            && !vpath_starts_with(p, &vjoin(WORKTREE_AT, rargo_proto::GIT_SIDE.as_bytes()))
     };
     let writes: Vec<Write> = m
         .entries
