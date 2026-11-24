@@ -127,6 +127,13 @@ else. CI installs the released client, signs in with a token and runs
 `rargo build` and `rargo test`; the tests that mount file systems are
 compiled by the server and run on the runner (`dev/mount-tests.sh`).
 
+The repository's `flake.nix` and `flake.lock` select the native build
+environment and provide the Rust standard library and C linker for
+`x86_64-unknown-linux-musl`. Use `rargo build` or `rargo test` to build
+on the server in that environment. Run `nix develop --command true` on
+a machine that runs the native binaries or mount tests, so their loader
+and libraries are available under `/nix/store`.
+
 ## The build environment is the project's flake
 
 A build sees what the dev shell of the project's `flake.nix` has: the
