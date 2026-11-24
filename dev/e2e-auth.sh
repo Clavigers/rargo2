@@ -29,7 +29,7 @@ ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/        /'; }
 check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else bad "$name" "$@"; fi; }
 
-umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
+umount -l "$T/proj/target" "$T/proj2/target" "$T/proj4/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
 pkill -KILL -f "fake-github.py $((${E2E_AUTH_PORT:-7466} + 1)) " 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
@@ -143,6 +143,36 @@ out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok3%%.*}.wrong-secret-wrong-secret\"}" "http://$host/auth/revoke"); grep -q '"revoked":false' <<<"$out"; check $? "a token cannot be revoked by its id alone" "$out"
 out=$("$R" auth remove 2>&1); [ $? != 0 ]; check $? "a second rargo auth remove has nothing to remove" "$out"
 for c in "$T/cache3" "$T/cache3b"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+
+echo "== the older configuration files: a notice, and rargo --rargo-migrate"
+export HOME=$T/home4 XDG_CONFIG_HOME=$T/home4/.config RARGO_CACHE_DIR=$T/cache4
+mkdir -p "$XDG_CONFIG_HOME/rargo" "$T/proj4/src" "$T/proj4/tests"
+tok4=$("$D" token create --state "$T/state" --user legacy 2>/dev/null)
+printf 'server = "%s"\nuser = "%s"\nkey = "%s"\n' "$host" "${tok4%%.*}" "${tok4#*.}" >"$XDG_CONFIG_HOME/rargo/config.toml"
+cd "$T/proj4" || exit 2
+git init -q .
+printf '# an old project\n[package]\nname = "old"\nversion = "0.1.0"\nedition = "2021"\n' >Cargo.toml
+printf 'pub fn one() -> u32 { 1 }\n' >src/lib.rs
+printf '#[test]\nfn probe() {\n    println!("probe={:?}", std::env::var("LEGACY_PROBE").ok());\n}\n' >tests/probe.rs
+printf '# what tests may see\n[env]\npass = ["LEGACY_PROBE"]\n' >.rargo.toml
+git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
+out=$(LEGACY_PROBE=seen "$R" test --test probe -- --nocapture 2>&1); rc=$?
+[ $rc = 0 ] && grep -q 'probe=Some("seen")' <<<"$out"; check $? "a project with the old files still builds and its policy file still counts" "$out"
+[ "$(grep -c "config.toml, which is read until rargo" <<<"$out")" = 1 ] && grep -q "the server and the key come from" <<<"$out"; check $? "the build says once that server and key come from the old file, and what replaces it" "$out"
+[ "$(grep -c "\.rargo\.toml is still read, until rargo" <<<"$out")" = 1 ]; check $? "and once that .rargo.toml is still read" "$out"
+out=$(LEGACY_PROBE=seen RARGO_QUIET_DEPRECATIONS=1 "$R" test --test probe -- --nocapture 2>&1)
+! grep -q "is read until rargo\|is still read" <<<"$out"; check $? "RARGO_QUIET_DEPRECATIONS=1 silences both" "$out"
+out=$("$R" --rargo-migrate 2>&1); rc=$?
+[ $rc = 0 ] && grep -q "host = \"$host\"" <<<"$out" && grep -q "the key of" <<<"$out" && grep -q "removed .*\.rargo\.toml" <<<"$out"; check $? "rargo --rargo-migrate says what it moved" "$out"
+grep -q '^# an old project' Cargo.toml && grep -q '^\[package.metadata.rargo\]' Cargo.toml && grep -q "^host = \"$host\"" Cargo.toml && grep -q '^\[package.metadata.rargo.env\]' Cargo.toml && grep -q '^# what tests may see' Cargo.toml; check $? "the manifest has the host and the policy table, comments kept" "$(cat Cargo.toml)"
+[ ! -e .rargo.toml ]; check $? ".rargo.toml is gone"
+[ "$(stat -c %a "$XDG_CONFIG_HOME/rargo/credentials.toml")" = 600 ] && grep -q "^\[\"$host\"\]" "$XDG_CONFIG_HOME/rargo/credentials.toml"; check $? "the old key is a credential for that server"
+rm "$XDG_CONFIG_HOME/rargo/config.toml"
+out=$(LEGACY_PROBE=again "$R" test --test probe -- --nocapture 2>&1); rc=$?
+[ $rc = 0 ] && grep -q 'probe=Some("again")' <<<"$out"; check $? "with neither old file left, the project builds and its policy counts" "$out"
+! grep -q "is read until rargo\|is still read" <<<"$out"; check $? "and nothing is said about old files any more" "$out"
+out=$("$R" --rargo-migrate 2>&1); grep -q "nothing to move" <<<"$out"; check $? "a second rargo --rargo-migrate has nothing to move" "$out"
+RARGO_CACHE_DIR=$T/cache4 "$R" --rargo-daemon-stop >/dev/null 2>&1
 
 echo "== signing in with GitHub (a stand-in for it), with an allow list"
 printf 'the-app-secret\n' >"$T/app-secret"

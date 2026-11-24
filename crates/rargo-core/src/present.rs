@@ -164,16 +164,33 @@ pub struct Output {
     pub quiet: bool,
     pub verbose: bool,
     pub tr: Translator,
+    /// What was said with `note_once` or `warn_once` during this command.
+    said: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Output {
     pub fn new(tx: UnboundedSender<ServerMsg>, color_err: bool, color_out: bool) -> Output {
-        Output { tx, color_err, color_out, quiet: false, verbose: false, tr: Translator::default() }
+        Output { tx, color_err, color_out, quiet: false, verbose: false, tr: Translator::default(), said: Default::default() }
+    }
+
+    /// A warning that is shown once per command, however often its
+    /// reason is met (a build is prepared again after a fetch).
+    pub fn warn_once(&self, msg: &str) {
+        if self.said.lock().insert(msg.to_string()) {
+            self.warn(msg);
+        }
+    }
+
+    /// Likewise for a note; shown even with `--quiet` off only.
+    pub fn note_once(&self, msg: &str) {
+        if self.said.lock().insert(msg.to_string()) {
+            self.note(msg);
+        }
     }
 
     /// The same client with different presentation settings.
     pub fn derive(&self, quiet: bool, verbose: bool, tr: Translator) -> Output {
-        Output { tx: self.tx.clone(), color_err: self.color_err, color_out: self.color_out, quiet, verbose, tr }
+        Output { tx: self.tx.clone(), color_err: self.color_err, color_out: self.color_out, quiet, verbose, tr, said: self.said.clone() }
     }
 
     pub fn send(&self, m: ServerMsg) {

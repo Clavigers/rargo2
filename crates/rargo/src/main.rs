@@ -69,6 +69,9 @@ pub struct Config {
     pub user: String,
     pub secret: Option<String>,
     pub psk: [u8; 32],
+    /// What of this came from the older configuration file (said once per
+    /// command; `RARGO_QUIET_DEPRECATIONS` silences it).
+    pub old: Vec<&'static str>,
 }
 
 pub fn load_config() -> Result<Config, String> {
@@ -79,7 +82,7 @@ pub fn load_config() -> Result<Config, String> {
         let server = env("RARGO_SERVER").ok_or("the daemon was started without a server")?;
         let secret = env("RARGO_KEY");
         let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
-        return Ok(Config { host: server.clone(), server, user: env("RARGO_USER").unwrap_or_default(), secret, psk });
+        return Ok(Config { host: server.clone(), server, user: env("RARGO_USER").unwrap_or_default(), secret, psk, old: Vec::new() });
     }
     let path = project::config_dir().join("config.toml");
     let file: toml::Table = match std::fs::read_to_string(&path) {
@@ -88,9 +91,16 @@ pub fn load_config() -> Result<Config, String> {
     };
     let old = |key: &str| file.get(key).and_then(|v| v.as_str()).map(String::from);
     let cwd = std::env::current_dir().ok();
+    let mut from_old: Vec<&'static str> = Vec::new();
     let host = env("RARGO_SERVER")
         .or_else(|| cwd.as_deref().and_then(project::project_host))
-        .or_else(|| old("server"))
+        .or_else(|| {
+            let s = old("server");
+            if s.is_some() {
+                from_old.push("server");
+            }
+            s
+        })
         .unwrap_or_else(|| "127.0.0.1:7459".into());
     let server = project::resolve(&host)?;
     let local_name = || env("USER").or_else(|| env("LOGNAME")).unwrap_or_else(|| "user".into());
@@ -111,10 +121,13 @@ pub fn load_config() -> Result<Config, String> {
             (None, Some(f)) => Some(key_file(f)?),
             (None, None) => None,
         };
+        if secret.is_some() {
+            from_old.push("key");
+        }
         (user, secret)
     };
     let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
-    Ok(Config { host, server, user, secret, psk })
+    Ok(Config { host, server, user, secret, psk, old: from_old })
 }
 
 /// Whether a server at this address accepts anyone on its machine (one
@@ -364,6 +377,9 @@ pub fn mount_ns() -> String {
     std::fs::read_link("/proc/self/ns/mnt").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// The release in which the older configuration files stop being read.
+const OLD_FILES_UNTIL: &str = "0.5.0";
+
 /// Commands about the local daemon need no server.
 fn kind_needs_server(daemon_cmd: Option<&str>) -> bool {
     daemon_cmd.is_none()
@@ -533,7 +549,7 @@ fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsStrin
             if !no_daemon && std::env::var_os("RARGO_QUIET_DAEMON").is_none() {
                 eprintln!("warning: rargo runs without its daemon ({e}); every command connects to the server anew");
             }
-            let cfg2 = Config { host: cfg.host.clone(), server: cfg.server.clone(), user: cfg.user.clone(), secret: cfg.secret.clone(), psk: cfg.psk };
+            let cfg2 = Config { host: cfg.host.clone(), server: cfg.server.clone(), user: cfg.user.clone(), secret: cfg.secret.clone(), psk: cfg.psk, old: Vec::new() };
             daemon::inline(cfg2, cache, req, |reply| relay(reply, &cfg, raw));
             die("the command ended without a result");
         }
@@ -575,6 +591,22 @@ fn main() {
     // machine a token for it. Neither is a name cargo uses.
     if let Some(host) = raw.first().and_then(|a| a.to_str()).and_then(|a| a.strip_prefix('@')) {
         at_host(host);
+    }
+    if raw.first().is_some_and(|a| a == "--rargo-migrate") {
+        let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cannot determine the current directory: {e}")));
+        match project::migrate(&cwd) {
+            Ok(done) if done.is_empty() => {
+                println!("nothing to move: this project has no .rargo.toml and names its server itself");
+                std::process::exit(0)
+            }
+            Ok(done) => {
+                for line in done {
+                    println!("{line}");
+                }
+                std::process::exit(0)
+            }
+            Err(e) => die(&e),
+        }
     }
     if raw.first().is_some_and(|a| a == "auth") {
         auth_command(&raw[1..]);
@@ -652,6 +684,18 @@ fn main() {
         }
     }
     let cfg = load_config().unwrap_or_else(|e| die(&e));
+    // The older configuration file still works, and says that it is old.
+    if !cfg.old.is_empty() && daemon_cmd.is_none() && std::env::var_os("RARGO_QUIET_DEPRECATIONS").is_none() {
+        let what = match cfg.old.as_slice() {
+            ["server"] => "the server comes",
+            ["key"] => "the key comes",
+            _ => "the server and the key come",
+        };
+        eprintln!(
+            "note: {what} from {}, which is read until rargo {OLD_FILES_UNTIL}: `rargo @host` and `rargo auth` replace it (`rargo --rargo-migrate` does it for this project)",
+            project::config_dir().join("config.toml").display()
+        );
+    }
     if cfg.secret.is_none() && !is_loopback(&cfg.server) && kind_needs_server(daemon_cmd) {
         die(&format!("this machine is not authenticated to {}: run `rargo auth`", cfg.host));
     }
@@ -914,7 +958,7 @@ mod tests {
 
     #[test]
     fn socket_name_follows_the_configuration() {
-        let cfg = |server: &str| Config { host: server.into(), server: server.into(), user: "u".into(), secret: None, psk: [7; 32] };
+        let cfg = |server: &str| Config { host: server.into(), server: server.into(), user: "u".into(), secret: None, psk: [7; 32], old: Vec::new() };
         let cache = Path::new("/c");
         let a = daemon_socket(&cfg("a:1"), cache);
         assert_eq!(a, daemon_socket(&cfg("a:1"), cache));
