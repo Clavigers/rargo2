@@ -115,7 +115,7 @@ enabled = true                         # build in the repo's flake devShell (def
 exclude = ["node_modules"]             # never sent to the server
 gitignored = false                     # nor anything git ignores (default: synced)
 include = ["config/local.toml"]        # ... but this, although git ignores it
-git = true                             # show build scripts a history-free .git for HEAD
+git = "history"                        # build scripts see every commit (default: where they ask)
 ```
 
 ## rargo builds rargo

@@ -342,51 +342,94 @@ impl Ctx<'_> {
 }
 
 /// Scans the worktree at `root`, leaving out what `ignored` says git
-/// ignores. `git`, when given, is a directory shown as the worktree's
-/// `.git` (see `git::thin`).
-pub fn scan(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>, git: Option<&Path>) -> io::Result<Scan> {
-    let mut scan = scan_dir(root, old, exclude, ignored)?;
-    if let Some(git) = git {
-        // Small and immutable: scanned from scratch, grafted into the root.
-        let sub = scan_dir(git, &Index::default(), &[], None)?;
-        let mut top = Tree::decode(&scan.trees[&scan.root])?;
-        let put = |top: &mut Tree, name: &[u8], node: Node| {
-            match top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)) {
-                Ok(i) => top.entries[i].1 = node,
-                Err(i) => top.entries.insert(i, (name.to_vec(), node)),
-            }
-        };
-        if root.join(".git").is_file() {
-            // A linked worktree: `.git` is a file that names the git
-            // directory, and it is shown as one. Build scripts tell the two
-            // apart (rust-analyzer's asks cargo to rerun it when
-            // `.git/HEAD` changes, and finds no such file in a linked
-            // worktree); showing a directory made every commit rerun the
-            // script and recompile the crate where stock cargo does not.
-            let text = format!("gitdir: {}\n", rargo_proto::GIT_SIDE);
-            let gitfile = git.parent().unwrap_or(git).join("gitfile-v1");
-            if std::fs::read(&gitfile).ok().as_deref() != Some(text.as_bytes()) {
-                crate::write_atomic(&gitfile, text.as_bytes())?;
-            }
-            let hash = *blake3::hash(text.as_bytes()).as_bytes();
-            scan.files.entry(hash).or_insert((gitfile, text.len() as u64));
-            put(&mut top, b".git", Node::File { hash, size: text.len() as u64, exec: false });
-            put(&mut top, rargo_proto::GIT_SIDE.as_bytes(), Node::Dir(sub.root));
-        } else {
-            put(&mut top, b".git", Node::Dir(sub.root));
+/// ignores.
+pub fn scan(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
+    scan_dir(root, old, exclude, ignored)
+}
+
+/// Scans a directory the client keeps itself (the history of
+/// [`crate::git::history`]): everything in it, against its own index.
+pub fn scan_store(dir: &Path, old: &Index) -> io::Result<Scan> {
+    scan_dir(dir, old, &[], None)
+}
+
+/// Shows `git` (see `git::thin`) as the worktree's `.git`, with what
+/// `history` holds (a [`scan_store`] of `git::history`'s packs) in its
+/// `objects` directory beside its own.
+pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>) -> io::Result<()> {
+    // Small and immutable: scanned from scratch, grafted into the root.
+    let mut sub = scan_dir(git, &Index::default(), &[], None)?;
+    let put = |top: &mut Tree, name: &[u8], node: Node| {
+        match top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)) {
+            Ok(i) => top.entries[i].1 = node,
+            Err(i) => top.entries.insert(i, (name.to_vec(), node)),
         }
+    };
+    if let Some(h) = history {
+        let mut top = Tree::decode(&sub.trees[&sub.root])?;
+        let objects = top.entries.iter().find(|(n, _)| n == b"objects").map(|(_, node)| node.clone());
+        let Some(Node::Dir(objects)) = objects else { return Err(io::Error::other("the git stand-in has no objects directory")) };
+        sub.trees.extend(h.trees);
+        let digest = merge(&mut sub.trees, objects, h.root)?;
+        put(&mut top, b"objects", Node::Dir(digest));
         let encoded = top.encode();
-        // The root without `.git` is not part of the tree any more (no
-        // directory below the root can equal it).
-        scan.trees.remove(&scan.root);
-        scan.root = rargo_proto::tree::digest(&encoded);
-        scan.trees.insert(scan.root, encoded);
-        scan.trees.extend(sub.trees);
-        for (h, at) in sub.files {
-            scan.files.entry(h).or_insert(at);
+        sub.root = rargo_proto::tree::digest(&encoded);
+        sub.trees.insert(sub.root, encoded);
+        for (hash, at) in h.files {
+            sub.files.entry(hash).or_insert(at);
         }
     }
-    Ok(scan)
+    let mut top = Tree::decode(&scan.trees[&scan.root])?;
+    if root.join(".git").is_file() {
+        // A linked worktree: `.git` is a file that names the git
+        // directory, and it is shown as one. Build scripts tell the two
+        // apart (rust-analyzer's asks cargo to rerun it when
+        // `.git/HEAD` changes, and finds no such file in a linked
+        // worktree); showing a directory made every commit rerun the
+        // script and recompile the crate where stock cargo does not.
+        let text = format!("gitdir: {}\n", rargo_proto::GIT_SIDE);
+        let gitfile = git.parent().unwrap_or(git).join("gitfile-v1");
+        if std::fs::read(&gitfile).ok().as_deref() != Some(text.as_bytes()) {
+            crate::write_atomic(&gitfile, text.as_bytes())?;
+        }
+        let hash = *blake3::hash(text.as_bytes()).as_bytes();
+        scan.files.entry(hash).or_insert((gitfile, text.len() as u64));
+        put(&mut top, b".git", Node::File { hash, size: text.len() as u64, exec: false });
+        put(&mut top, rargo_proto::GIT_SIDE.as_bytes(), Node::Dir(sub.root));
+    } else {
+        put(&mut top, b".git", Node::Dir(sub.root));
+    }
+    let encoded = top.encode();
+    // The root without `.git` is not part of the tree any more (no
+    // directory below the root can equal it).
+    scan.trees.remove(&scan.root);
+    scan.root = rargo_proto::tree::digest(&encoded);
+    scan.trees.insert(scan.root, encoded);
+    scan.trees.extend(sub.trees);
+    for (h, at) in sub.files {
+        scan.files.entry(h).or_insert(at);
+    }
+    Ok(())
+}
+
+/// The directory with the entries of both `a` and `b`, directories of the
+/// same name merged, `b`'s entry taken where one of them is a file.
+fn merge(trees: &mut HashMap<Digest, Vec<u8>>, a: Digest, b: Digest) -> io::Result<Digest> {
+    let mut out = Tree::decode(&trees[&a])?;
+    for (name, node) in Tree::decode(&trees[&b])?.entries {
+        let node = match (out.get(&name).cloned(), node) {
+            (Some(Node::Dir(x)), Node::Dir(y)) => Node::Dir(merge(trees, x, y)?),
+            (_, n) => n,
+        };
+        match out.entries.binary_search_by(|(n, _)| n.as_slice().cmp(&name)) {
+            Ok(i) => out.entries[i].1 = node,
+            Err(i) => out.entries.insert(i, (name, node)),
+        }
+    }
+    let encoded = out.encode();
+    let digest = rargo_proto::tree::digest(&encoded);
+    trees.insert(digest, encoded);
+    Ok(digest)
 }
 
 fn scan_dir(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
@@ -471,12 +514,12 @@ mod tests {
         };
 
         // Without the option nothing changes: everything is synced.
-        let all = scan(r, &Index::default(), &[], None, None).unwrap();
+        let all = scan(r, &Index::default(), &[], None).unwrap();
         assert!(names(&all, &all.root).contains(&"node_modules".to_string()));
 
         let include = ["data/schema.sql".to_string(), ".env".to_string()];
         let ignored = Ignored::from_git(r, &include).unwrap();
-        let s = scan(r, &Index::default(), &[], Some(&ignored), None).unwrap();
+        let s = scan(r, &Index::default(), &[], Some(&ignored)).unwrap();
         assert_eq!(names(&s, &s.root), [".env", ".gitignore", "data", "kept.log", "src"]);
         assert_eq!(names(&s, &dir(&s, &s.root, "src")), ["lib.rs"]);
         assert_eq!(names(&s, &dir(&s, &s.root, "data")), ["schema.sql"], "only the way to the included file");
@@ -498,7 +541,7 @@ mod tests {
 
         // Without `include`, an ignored directory is one entry, left out.
         let ignored = Ignored::from_git(r, &[]).unwrap();
-        let s = scan(r, &Index::default(), &[], Some(&ignored), None).unwrap();
+        let s = scan(r, &Index::default(), &[], Some(&ignored)).unwrap();
         assert_eq!(names(&s, &s.root), [".gitignore", "kept.log", "src"]);
         // Outside a repository git cannot say.
         let elsewhere = tempfile::tempdir().unwrap();
@@ -516,12 +559,28 @@ mod tests {
         std::fs::create_dir_all(main.join(".git")).unwrap();
         std::fs::write(linked.join(".git"), "gitdir: /elsewhere/.git/worktrees/linked\n").unwrap();
         // A checkout with a git directory is shown with a directory.
-        let s = scan(&main, &Index::default(), &[], None, Some(&stand_in)).unwrap();
+        let mut s = scan(&main, &Index::default(), &[], None).unwrap();
+        graft_git(&mut s, &main, &stand_in, None).unwrap();
         let top = tree(&s, &s.root);
         assert!(matches!(top.get(b".git"), Some(Node::Dir(_))));
         assert!(top.get(rargo_proto::GIT_SIDE.as_bytes()).is_none());
+        // History's packs, beside the stand-in's own.
+        let store = tmp.path().join("cache/git-history/r/heads/c");
+        write(&stand_in, "objects/pack/pack-1.pack", "pack");
+        write(&store, "pack/pack-2.pack", "history");
+        let h = scan_store(&store, &Index::default()).unwrap();
+        let mut s = scan(&main, &Index::default(), &[], None).unwrap();
+        graft_git(&mut s, &main, &stand_in, Some(h)).unwrap();
+        let Some(Node::Dir(git)) = tree(&s, &s.root).get(b".git").cloned() else { panic!("no .git") };
+        let Some(Node::Dir(objects)) = tree(&s, &git).get(b"objects").cloned() else { panic!("no objects") };
+        let Some(Node::Dir(pack)) = tree(&s, &objects).get(b"pack").cloned() else { panic!("no pack directory") };
+        let packs = tree(&s, &pack);
+        assert!(packs.get(b"pack-1.pack").is_some() && packs.get(b"pack-2.pack").is_some(), "both packs side by side");
+        let Some(Node::File { hash, .. }) = packs.get(b"pack-2.pack").cloned() else { panic!() };
+        assert_eq!(s.files[&hash].0, store.join("pack/pack-2.pack"), "sent from the store");
         // A linked worktree with a file that names the directory beside it.
-        let s = scan(&linked, &Index::default(), &[], None, Some(&stand_in)).unwrap();
+        let mut s = scan(&linked, &Index::default(), &[], None).unwrap();
+        graft_git(&mut s, &linked, &stand_in, None).unwrap();
         let top = tree(&s, &s.root);
         let Some(Node::File { hash, .. }) = top.get(b".git") else { panic!("`.git` is not a file") };
         let (path, _) = &s.files[hash];
@@ -550,7 +609,7 @@ mod tests {
         std::os::unix::fs::symlink("src", r.join("link")).unwrap();
         std::fs::create_dir(r.join("empty")).unwrap();
         let exclude = vec!["node_modules".to_string(), "vendor/skip".to_string(), "/cache".to_string()];
-        let s = scan(r, &Index::default(), &exclude, None, None).unwrap();
+        let s = scan(r, &Index::default(), &exclude, None).unwrap();
         let top = tree(&s, &s.root);
         let names: Vec<&str> = top.entries.iter().map(|(n, _)| std::str::from_utf8(n).unwrap()).collect();
         assert_eq!(names, ["Cargo.toml", "docs", "empty", "link", "src", "sub", "vendor"]);
@@ -568,7 +627,8 @@ mod tests {
         assert_eq!(s.files[&lib], (r.join("src/lib.rs"), 13));
         // A directory grafted in as `.git`.
         write(tmp.path(), "thin/HEAD", "ref: refs/heads/main\n");
-        let g = scan(r, &Index::default(), &exclude, None, Some(&tmp.path().join("thin"))).unwrap();
+        let mut g = scan(r, &Index::default(), &exclude, None).unwrap();
+        graft_git(&mut g, r, &tmp.path().join("thin"), None).unwrap();
         assert_ne!(g.root, s.root);
         let top = tree(&g, &g.root);
         let Some(Node::Dir(git)) = top.get(b".git") else { panic!() };
@@ -584,26 +644,26 @@ mod tests {
         let r = tmp.path();
         write(r, "a.rs", "one");
         write(r, "d/b.rs", "two");
-        let s1 = scan(r, &Index::default(), &[], None, None).unwrap();
+        let s1 = scan(r, &Index::default(), &[], None).unwrap();
         // Hashed just after being written: not trusted yet.
-        let s2 = scan(r, &s1.index, &[], None, None).unwrap();
+        let s2 = scan(r, &s1.index, &[], None).unwrap();
         assert_eq!(s2.hashed_files, 2);
         assert_eq!(s2.root, s1.root);
         std::thread::sleep(std::time::Duration::from_millis(120));
-        let s3 = scan(r, &s2.index, &[], None, None).unwrap();
+        let s3 = scan(r, &s2.index, &[], None).unwrap();
         assert_eq!(s3.hashed_files, 2, "hashed within the racy window of the write");
-        let s4 = scan(r, &s3.index, &[], None, None).unwrap();
+        let s4 = scan(r, &s3.index, &[], None).unwrap();
         assert_eq!(s4.hashed_files, 0);
         assert!(!s4.index_changed);
         assert_eq!(s4.root, s1.root);
         // An edit changes the root and is the only thing read.
         write(r, "d/b.rs", "two!");
-        let s5 = scan(r, &s4.index, &[], None, None).unwrap();
+        let s5 = scan(r, &s4.index, &[], None).unwrap();
         assert_eq!(s5.hashed_files, 1);
         assert_ne!(s5.root, s1.root);
         // Same size, same content hash path: a removed file leaves the index.
         std::fs::remove_file(r.join("a.rs")).unwrap();
-        let s6 = scan(r, &s5.index, &[], None, None).unwrap();
+        let s6 = scan(r, &s5.index, &[], None).unwrap();
         assert!(s6.index_changed);
         assert_eq!(s6.index.files.len(), 1);
     }
@@ -612,7 +672,7 @@ mod tests {
     fn index_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "wt/a", "x");
-        let s = scan(&tmp.path().join("wt"), &Index::default(), &[], None, None).unwrap();
+        let s = scan(&tmp.path().join("wt"), &Index::default(), &[], None).unwrap();
         let p = tmp.path().join("cache/index");
         s.index.save(&p).unwrap();
         assert_eq!(Index::load(&p).files, s.index.files);
