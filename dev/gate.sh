@@ -62,6 +62,34 @@ mkdir -p "$B"
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
 export RIG=${RIG:-rargo2} RIG_STATE=${RIG_STATE:-rig2}
+# Each suite's files are under this gate's directory, and the suites that
+# listen on fixed ports get free ones: two gates with different gate
+# directories (one per agent) share nothing. What the environment already
+# names stays.
+free_pair() { # a port P such that P and P + 1 are free on loopback
+    python3 -I -c '
+import socket
+for _ in range(200):
+    a = socket.socket(); a.bind(("127.0.0.1", 0)); p = a.getsockname()[1]
+    b = socket.socket()
+    try:
+        b.bind(("127.0.0.1", p + 1))
+    except OSError:
+        continue
+    print(p)
+    break
+'
+}
+export RARGO_E2E_FLAKE=${RARGO_E2E_FLAKE:-$L/work/e2e-flake}
+export RARGO_E2E_FLAKE_PORT=${RARGO_E2E_FLAKE_PORT:-$(free_pair)}
+export RARGO_E2E_AUTH=${RARGO_E2E_AUTH:-$L/work/e2e-auth}
+export E2E_AUTH_PORT=${E2E_AUTH_PORT:-$(free_pair)}
+export RARGO_E2E_LINK=${RARGO_E2E_LINK:-$L/work/e2e-link}
+export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
+# The toolchains e2e-components installs components into: kept between
+# runs of this gate.
+export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
+mkdir -p "$L/work"
 step e2e dev/e2e.sh
 step e2e-copy env RARGO_OUTPUT=copy dev/e2e.sh
 step e2e-flake dev/e2e-flake.sh
