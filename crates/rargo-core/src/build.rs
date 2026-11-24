@@ -25,6 +25,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::watch;
 
+mod nextest;
+
 /// Where the planner writes its plan inside the sandbox.
 const PLAN_PATH: &str = "/.rargo-plan";
 
@@ -662,9 +664,24 @@ pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
     // An inconsistency between an early-announced artifact and the final
     // one invalidates work that started on the early one; everything is
     // cached, so starting over is cheap.
+    // `nextest` runs nextest on the server against a build of rargo's own.
+    if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {
+        let result = match nextest::run(&d, &c).await {
+            Ok(code) => code,
+            Err(e) => {
+                c.out.error(&format!("{e:#}"));
+                101
+            }
+        };
+        if let Err(e) = c.flush().await {
+            c.out.error(&format!("delivering results: {e:#}"));
+            return Ok(101);
+        }
+        return Ok(result);
+    }
     let mut result = Ok(101);
     for attempt in 0..3 {
-        match run_request(&d, &c).await {
+        match run_request(&d, &c, None).await {
             Ok(Finish::Code(code)) => result = Ok(code),
             Ok(Finish::Exec(e)) => result = Err(e),
             Ok(Finish::Retry) if attempt < 2 => {
@@ -708,6 +725,9 @@ impl Observer for PlanObserver {
 
 struct Prepared {
     snapshot: Arc<Snapshot>,
+    /// What the views are made of, and the host generation they see.
+    parts: ViewParts,
+    generation: u64,
     policy: crate::policy::Policy,
     /// The view the planner runs against (always the host root).
     plan_base: Arc<BaseView>,
@@ -748,6 +768,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
         masks,
         hidden: vec![d.cfg.state_dir.as_os_str().as_encoded_bytes().to_vec()],
         planner: d.cfg.planner.clone(),
+        tools: Vec::new(),
         restricted,
     };
     let base = parts.build(d.memo.clone(), generation, false);
@@ -776,7 +797,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
-    Ok(Prepared { snapshot, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
+    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
 }
 
 struct Planned {
@@ -1124,7 +1145,20 @@ fn phase(started: Instant, c: &Client, what: &str) {
     }
 }
 
-async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
+/// What a build leaves for nextest to run against (see `nextest`).
+struct Built {
+    layer: Arc<OutputsLayer>,
+    units: usize,
+    /// The target and build directories, canonical.
+    target_dirs: Vec<String>,
+    /// The environment the build's tests would run in.
+    env: BTreeMap<String, String>,
+    cargo_override: Option<String>,
+    /// The workspace's own packages.
+    local_packages: Vec<String>,
+}
+
+async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
     let started = Instant::now();
     let mut args: Vec<String> = c.args.clone();
     // rargo's own flag; cargo never sees it.
@@ -1277,6 +1311,20 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<Finish> {
         unit_keys: (0..n).map(|_| OnceLock::new()).collect(),
         need: if as_build { Some(pd.needs()) } else { None },
     });
+    if let Some(keep) = keep {
+        let mut local: Vec<String> =
+            plan.units.iter().filter(|u| u.is_local).map(|u| u.pkg_name.clone()).collect();
+        local.sort();
+        local.dedup();
+        *keep.lock() = Some(Built {
+            layer: run.layer.clone(),
+            units: n,
+            target_dirs: vec![plan.target_dir.clone(), plan.build_dir.clone()],
+            env: run.base_env.clone(),
+            cargo_override: run.cargo_override.clone(),
+            local_packages: local,
+        });
+    }
 
     // If this build is dropped (its client went away), so are its units:
     // those waiting never start, those running are killed.
@@ -2773,6 +2821,7 @@ impl Run {
         let plan = self.plan();
         let tr = &self.c.out.tr;
         let mut files: Vec<Delivery> = Vec::new();
+        let mut writes = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let mut push = |files: &mut Vec<Delivery>, path: String, hash: &Hash, exec: bool, size: u64, own: bool| {
             if seen.insert(path.clone()) {
@@ -2801,10 +2850,16 @@ impl Run {
                 // An executable at its own path, where rustc writes it in
                 // place. Wanted when the user asked for executables (test
                 // binaries have no other name), not when rargo ran them
-                // here. A file of its own: stock cargo's next compile
-                // writes over it.
+                // here. A file of its own, which replaces one stock cargo
+                // built there: stock cargo's fingerprint of that unit goes
+                // with it, so that its next build compiles the unit again
+                // rather than run rargo's executable (which names the
+                // sandbox's paths).
                 if u.executable.as_deref() == Some(o.path.as_str()) && !run_here.contains(&ri) {
                     push(&mut files, tr.path(&o.path), hash, *exec, *size, true);
+                    if let Some(fp) = stock_fingerprint(&o.path, &u.pkg_name) {
+                        writes.push(Write::Remove { path: tr.path(&fp) });
+                    }
                 }
             }
         }
@@ -2827,7 +2882,6 @@ impl Run {
             return;
         }
         // What cargo leaves at the top of a target directory it creates.
-        let mut writes = Vec::new();
         let mut tagged: HashSet<String> = HashSet::new();
         for dir in [&plan.target_dir, &plan.build_dir] {
             let dir = tr.path(dir);
@@ -2990,6 +3044,22 @@ impl Run {
     }
 }
 
+/// Where stock cargo keeps the fingerprint of the unit that writes the
+/// executable `exe`: `build/PKG/HASH/fingerprint` beside
+/// `build/PKG/HASH/out/EXE`, or `.fingerprint/PKG-HASH` beside
+/// `deps/EXE-HASH` in cargo's older layout.
+fn stock_fingerprint(exe: &str, pkg: &str) -> Option<String> {
+    let (dir, file) = exe.rsplit_once('/')?;
+    if let Some(unit) = dir.strip_suffix("/out") {
+        let mut up = unit.rsplit('/');
+        let (_hash, _pkg, build) = (up.next()?, up.next()?, up.next()?);
+        return (build == "build").then(|| format!("{unit}/fingerprint"));
+    }
+    let profile = dir.strip_suffix("/deps")?;
+    let (_, hash) = file.rsplit_once('-')?;
+    Some(format!("{profile}/.fingerprint/{pkg}-{hash}"))
+}
+
 /// Sends the worktree part of an action's outputs to the client's worktree.
 fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manifest) {
     let inside = |p: &[u8]| {
@@ -3067,6 +3137,21 @@ fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stock_fingerprint_of_an_executable_s_unit() {
+        assert_eq!(
+            stock_fingerprint("/w/target/debug/build/app/02ffaad58935a0bc/out/it-02ffaad58935a0bc", "app").as_deref(),
+            Some("/w/target/debug/build/app/02ffaad58935a0bc/fingerprint")
+        );
+        assert_eq!(
+            stock_fingerprint("/w/target/debug/deps/it-02ffaad58935a0bc", "my-app").as_deref(),
+            Some("/w/target/debug/.fingerprint/my-app-02ffaad58935a0bc")
+        );
+        // A build script's OUT_DIR is no unit directory of an executable.
+        assert_eq!(stock_fingerprint("/w/target/debug/out/x", "app"), None);
+        assert_eq!(stock_fingerprint("/w/target/debug/app", "app"), None);
+    }
 
     #[test]
     fn rustups_word_for_a_missing_component_names_it_and_its_toolchain() {

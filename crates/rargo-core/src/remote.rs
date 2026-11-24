@@ -2252,10 +2252,12 @@ impl RemoteRunner for Pool {
         req: &'a Request,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RunResult>> + Send + 'a>> {
         Box::pin(async move {
-            // Planning needs the host and host networking stays local.
-            // Workers get the same filesystem view, including the selected
-            // Nix closure, through RemoteView.
-            if spec.kind == ActionKind::Plan || spec.net != NetMode::Loopback {
+            // Planning and nextest (installed on the server) run locally.
+            // Host networking stays local too. Workers get the selected Nix
+            // closure through RemoteView.
+            if matches!(spec.kind, ActionKind::Plan | ActionKind::Nextest)
+                || spec.net != NetMode::Loopback
+            {
                 return None;
             }
             // A crate that is compiled incrementally (a workspace member)

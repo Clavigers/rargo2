@@ -10,6 +10,18 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
+- `rargo nextest` (and `cargo nextest` through the cargo link) runs
+  nextest on the server. The client needs no nextest. The test binaries
+  come from rargo's build and share its cache with `rargo test`, and
+  nextest's output, exit code and the files it writes (a JUnit report)
+  come back. The server installs the newest nextest on first use. The
+  client passes `NEXTEST_*` variables. (#30)
+- After stock cargo built a test binary and rargo then put its own at the
+  same path (`rargo test --no-run`, `rargo nextest`), stock `cargo test`
+  ran rargo's executable and failed. rargo now removes stock cargo's
+  fingerprint of that unit, so stock cargo compiles it again.
+- `--rargo-status` counts the actions run by kind.
+
 - What the server holds, and where the cache holds chunks, outlive the
   client daemon: the first command of a new daemon (after a reboot, an
   idle timeout, or `--rargo-daemon-stop`) offers only what changed. The

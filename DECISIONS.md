@@ -2456,3 +2456,82 @@ shadow-rs, git-version, built, git-testament) add `describe --tags` and
   - After an edit, the new daemon used to offer every manifest of the
     worktree and wait for the server to say which it lacked. It now
     offers the edited file and the manifests on its path, unasked.
+
+## D81. `rargo nextest`: nextest on the server, asking a stand-in cargo (issue 30)
+
+D69 chose real nextest running on the server against rargo's build. D69
+named nextest's reuse-build mode (`--binaries-metadata`,
+`--cargo-metadata`) as the way to hand nextest that build. It is not used:
+
+- The binaries file is nextest's own format: build-script out directories,
+  linked paths, the host's library directory and the target layout. rargo
+  would have to write it.
+- The mode refuses cargo's options on the command line (`-p`, `--release`,
+  features). So rargo would have to know which of nextest's options are
+  cargo's, and how nextest renames them (`--cargo-profile`,
+  `--build-jobs`).
+
+**Instead, nextest asks cargo, and rargo answers.** nextest gets what it
+needs from cargo in two requests: `cargo metadata ...` and `cargo test
+--no-run --message-format=json-render-diagnostics ...`. In the sandbox,
+nextest's `CARGO` is a stand-in, a short `sh` script that rargod puts into
+the view together with its answers.
+
+- **A request with no answer yet is a question.** The stand-in writes the
+  request's arguments to a file and exits, so nextest stops. rargod answers
+  it, then runs nextest again:
+  - **the metadata**: from the cargo fork, as planning runs it (host root,
+    offline). A refusal that needs the network gets the usual fetch and is
+    asked again;
+  - **the build**: from rargo's own pipeline, with exactly the arguments
+    nextest gave. Its status and diagnostics go to the client as they
+    happen. Its JSON messages, with paths translated back to the
+    sandbox's, become the answer, together with the exit code.
+- **The run with both answers is the one the user sees.** Its output
+  streams to the client, and its exit code is the command's. nextest
+  decides everything from there: `-E` filters, retries, partitions,
+  profiles, JUnit files, a failed build reported as nextest reports it.
+- **Other cargo calls are passed through.** The stand-in replays an answer
+  only for the arguments it answers. Anything else goes to the real cargo
+  (the fork, or the Nix shell's cargo): a test that runs cargo itself
+  works as under `rargo test`.
+- **Commands that never build** (`--version`, `show-config`, a mistake on
+  the command line) stop without a question, and what nextest printed is
+  the answer.
+
+**Cost.** Each question is one extra nextest start in the sandbox. The two
+runs that stop at a question are cached (they are a function of their
+inputs). The command's compiles are the same actions as `rargo test`'s and
+are hits after it: the e2e check counts rustc runs.
+
+**Where the run's files go.**
+- In the worktree: as a test's writes do.
+- In the target directory (a JUnit report): as artifacts do.
+
+The final run is cached when it passes, as tests are, and `--no-cache`
+runs it again. Caching per test, and the runner, are issue 31.
+
+**nextest on the server.** On first use the server installs the newest
+release from nextest's GitHub releases into `STATE/nextest/VERSION/`:
+- it uses the statically linked (musl) build, which runs in any root,
+  a Nix shell's included;
+- the archive is checked against the release's SHA-256 file;
+- the newest installed version is the one used.
+Choosing the version (the repository's pin, the client's) is issue 32.
+nextest actions stay on the server and are never offered to workers.
+
+**Found on the way: stock cargo after rargo's test executables.**
+- The failure: stock cargo built a test binary, then `rargo test --no-run`
+  (or `rargo nextest`) put rargo's executable at the same path. Stock
+  cargo's fingerprint still said fresh, so its next `cargo test` ran
+  rargo's executable, which names `/w` paths, and failed.
+- The cause: the two layouts agree because the fork plans with the
+  layout of current cargo.
+- The fix: when rargo delivers an executable at its own path, it also
+  removes stock cargo's fingerprint of that unit:
+  - `build/PKG/HASH/fingerprint` in the current layout;
+  - `.fingerprint/PKG-HASH` in the older one.
+  Stock cargo then compiles that unit again.
+
+**Counters.** `--rargo-status` lists actions run by kind (planning,
+rustc, rustdoc, build scripts, tests, doctests, nextest, other).

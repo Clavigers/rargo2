@@ -316,6 +316,49 @@ out=$("$R" test 2>&1); rc=$?
 before=$(runs); "$R" test --no-cache >/dev/null 2>&1; after=$(runs)
 [ $((after - before)) -ge 3 ] && ok "--no-cache really runs the tests ($((after - before)) actions)" || bad "--no-cache really runs the tests" "delta=$((after - before))"
 
+echo "== nextest on the server"
+cd "$A"
+# Runs of one kind of action so far (`actions by kind` in the status).
+kind_runs() { "$R" --rargo-status | sed -n "s/^actions by kind.* $1 \([0-9]*\).*/\1/p"; }
+command -v cargo-nextest >/dev/null 2>&1 && bad "the client has no nextest" "$(command -v cargo-nextest)" || ok "the client has no nextest"
+"$R" test >/dev/null 2>&1
+rustc_before=$(kind_runs rustc); scripts_before=$(kind_runs "build scripts")
+out=$("$R" nextest run 2>&1); rc=$?
+rustc_after=$(kind_runs rustc); scripts_after=$(kind_runs "build scripts")
+[ $rc -eq 0 ] && has "$out" "Starting 5 tests across 4 binaries" && grep -qE "Summary \[ *[0-9.]+s\] 5 tests run: 5 passed" <<<"$out" && ok "rargo nextest run: nextest's summary, exit 0" || bad "rargo nextest run: nextest's summary, exit 0" "rc=$rc
+$out"
+[ -n "$rustc_after" ] && [ "$rustc_before" = "$rustc_after" ] && [ "$scripts_before" = "$scripts_after" ] && ok "after rargo test, every compile of rargo nextest was a cache hit (rustc runs: $rustc_before before, $rustc_after after)" || bad "after rargo test, every compile of rargo nextest was a cache hit" "rustc $rustc_before -> $rustc_after, build scripts $scripts_before -> $scripts_after"
+echo changed >crates/app/tests/fixture.txt
+out=$("$R" nextest run 2>&1); rc=$?
+[ $rc -eq 100 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && grep -qE "5 tests run: 4 passed, 1 failed" <<<"$out" && ok "a failing test: nextest's failure output and summary, exit 100" || bad "a failing test: nextest's failure output and summary, exit 100" "rc=$rc
+$out"
+echo fixture >crates/app/tests/fixture.txt
+mkdir -p "$T/shim" && ln -sf "$R" "$T/shim/cargo"
+out=$(PATH="$T/shim:$PATH" cargo nextest run -E 'test(reads_a_fixture)' 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -qE "1 test run: 1 passed, 4 skipped" <<<"$out" && ok "cargo nextest through the shim, with a filter expression" || bad "cargo nextest through the shim, with a filter expression" "rc=$rc
+$out"
+out=$("$R" nextest --version 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "cargo-nextest 0." && ok "rargo nextest --version is the server's nextest ($(head -1 <<<"$out"))" || bad "rargo nextest --version is the server's nextest" "$out"
+mkdir -p .config
+printf '[profile.ci.junit]\npath = "junit.xml"\n' >.config/nextest.toml
+out=$("$R" nextest run --profile ci 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -q '<testcase name="reads_a_fixture"' target/nextest/ci/junit.xml 2>/dev/null && ok "the JUnit file a nextest profile asks for comes back" || bad "the JUnit file a nextest profile asks for comes back" "rc=$rc
+$out
+$(ls -la target/nextest/ci 2>&1)"
+rm -rf .config
+# Stock nextest (the server's copy, on the client's PATH) with stock cargo.
+mkdir -p "$T/nextest-bin" && ln -sf "$(ls "$RARGO_STATE"/nextest/*/cargo-nextest | head -1)" "$T/nextest-bin/cargo-nextest"
+out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -qE "5 tests run: 5 passed" <<<"$out" && ok "stock cargo nextest in the same worktree" || bad "stock cargo nextest in the same worktree" "rc=$rc
+$out"
+expect "and rargo nextest still works afterwards" "$R" nextest run
+# rargo's test executables replaced stock's: stock's next build compiles
+# them again rather than run rargo's.
+out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
+[ $rc -eq 0 ] && grep -qE "5 tests run: 5 passed" <<<"$out" && ok "and stock cargo nextest again after it" || bad "and stock cargo nextest again after it" "rc=$rc
+$out"
+"$R" nextest run >/dev/null 2>&1
+
 echo "== errors"
 cd "$A"
 cp crates/app/src/main.rs "$T/main.rs.bak"
