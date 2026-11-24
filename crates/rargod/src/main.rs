@@ -283,6 +283,7 @@ fn main() -> Result<()> {
     let keys = Arc::new(keys);
     let listen = opts.listen;
     let public = opts.public.clone();
+    let http_state = state.clone();
     let result = rt.block_on(async move {
         let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
         // Client daemons connect over the UDP transport on the same port;
@@ -307,7 +308,7 @@ fn main() -> Result<()> {
             listener.local_addr()?,
             if keys.is_open() { "no key file: loopback only, anyone on this machine" } else { "keys or tokens required" }
         );
-        let http = Arc::new(rargo_core::http::Http::new(keys.clone(), public, listen.port()));
+        let http = Arc::new(rargo_core::http::Http::new(keys.clone(), public, listen.port()).with_state(http_state));
         serve(daemon, listener, keys, http).await
     });
     session.unmount();
@@ -320,10 +321,14 @@ fn token_command(args: &[String]) -> Result<()> {
     let usage = "usage: rargod token invite --state DIR [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
                  rargod token create --state DIR --user NAME [--admin] [--days N]\n       \
                  rargod token list --state DIR\n       \
-                 rargod token revoke --state DIR ID-OR-USER";
+                 rargod token revoke --state DIR ID-OR-USER\n       \
+                 rargod token allow --state DIR GITHUB-LOGIN [--admin]      (may sign in with GitHub through `rargo auth`)\n       \
+                 rargod token disallow --state DIR GITHUB-LOGIN             (and revokes the tokens it signed in for)\n       \
+                 rargod token github --state DIR --client-id ID --client-secret-file FILE --url https://NAME";
     let Some(what) = args.first().map(String::as_str) else { bail!("{usage}") };
     let mut state: Option<PathBuf> = None;
     let (mut user, mut admin, mut days, mut uses, mut token_days) = (None::<String>, false, None::<u32>, 1u32, None::<u32>);
+    let (mut client_id, mut secret_file, mut url) = (None::<String>, None::<PathBuf>, None::<String>);
     let mut rest: Vec<&str> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -339,6 +344,9 @@ fn token_command(args: &[String]) -> Result<()> {
             "--days" => days = Some(val()?.parse().context("--days takes a number")?),
             "--uses" => uses = val()?.parse().context("--uses takes a number")?,
             "--token-days" => token_days = Some(val()?.parse().context("--token-days takes a number")?),
+            "--client-id" => client_id = Some(val()?.clone()),
+            "--client-secret-file" => secret_file = Some(val()?.into()),
+            "--url" => url = Some(val()?.trim_end_matches('/').to_string()),
             other if other.starts_with("--") => bail!("unknown option `{other}`\n{usage}"),
             other => rest.push(other),
         }
@@ -375,6 +383,10 @@ fn token_command(args: &[String]) -> Result<()> {
                 let state = if t.revoked { "revoked".to_string() } else { when(t.expires) };
                 println!("{:<16} {:<20} {:<6} {:<12} {}", t.id, t.user, if t.admin { "yes" } else { "" }, state, t.note);
             }
+            let allowed = store.allow_list();
+            if !allowed.is_empty() {
+                println!("\nGitHub accounts that may sign in: {}", allowed.iter().map(|a| format!("{}{}", a.login, if a.admin { " (administrator)" } else { "" })).collect::<Vec<_>>().join(", "));
+            }
             let open: Vec<_> = store.invites().into_iter().filter(|i| i.uses_left > 0 && i.expires.is_none_or(|e| e > rargo_core::tokens::now())).collect();
             if !open.is_empty() {
                 println!("\ninvitations not used up: {}", open.len());
@@ -382,6 +394,31 @@ fn token_command(args: &[String]) -> Result<()> {
                     println!("  for {}{}: {} use(s) left, expires {}", i.user.as_deref().unwrap_or("anyone"), if i.admin { " (administrator)" } else { "" }, i.uses_left, when(i.expires));
                 }
             }
+        }
+        "allow" => {
+            let Some(login) = rest.first() else { bail!("{usage}") };
+            store.allow(login, admin)?;
+            println!("{login} may sign in with GitHub{}", if admin { " (administrator)" } else { "" });
+            if rargo_core::tokens::Github::load(&state).is_none() {
+                eprintln!("note: this server has no GitHub application yet (rargod token github ...); until then `rargo auth` asks for an invitation");
+            }
+        }
+        "disallow" => {
+            let Some(login) = rest.first() else { bail!("{usage}") };
+            let (was, n) = store.disallow(login)?;
+            if !was && n == 0 {
+                bail!("`{login}` is not on the allow list");
+            }
+            println!("{login} may no longer sign in; revoked {n} token(s) it had signed in for");
+        }
+        "github" => {
+            let (Some(client_id), Some(file), Some(url)) = (client_id, secret_file, url) else { bail!("{usage}") };
+            let client_secret = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?.trim().to_string();
+            if client_id.is_empty() || client_secret.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+                bail!("a client id, a secret and an address starting with https:// are needed");
+            }
+            rargo_core::tokens::Github { client_id, client_secret, url: url.clone() }.save(&state)?;
+            println!("`rargo auth` now signs people in with GitHub. The application's callback address must be {url}/auth/github/callback");
         }
         "revoke" => {
             let Some(id) = rest.first() else { bail!("{usage}") };

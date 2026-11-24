@@ -6,6 +6,21 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.2
+
+Protocol 7 (unchanged).
+
+- `rargo auth` signs in with GitHub where the server has a GitHub
+  application: the page sends the browser to GitHub and back, and an
+  account on the server's allow list gets the token. On the server:
+  `rargod token allow LOGIN [--admin]`, `rargod token disallow LOGIN`
+  (which also revokes the tokens the account signed in for) and
+  `rargod token github` to set the application up, all without a
+  restart. A server without an application keeps asking for an
+  invitation. (#13)
+- The server installer invites its first user instead of writing a key
+  file; both installers resolve "latest" to a version first. (#2)
+
 ## 0.3.1
 
 Protocol 7 (unchanged).

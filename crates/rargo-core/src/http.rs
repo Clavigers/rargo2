@@ -16,6 +16,11 @@
 //!      token made for that person.
 //! The code only names the request; it grants nothing without the
 //! invitation, and the token goes only to whoever holds the device secret.
+//!
+//! Where the server has a GitHub OAuth application (`rargod token github`),
+//! step 2 is signing in with GitHub instead: the page sends the browser to
+//! GitHub and back, the server asks GitHub who that was, and an account on
+//! the server's allow list (`rargod token allow LOGIN`) gets the token.
 
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
@@ -37,6 +42,8 @@ struct Pending {
     /// The token's text and the user's name, once approved.
     granted: Option<(String, String)>,
     denied: bool,
+    /// What the browser carries to GitHub and back, naming this request.
+    state: Option<String>,
 }
 
 pub struct Http {
@@ -45,6 +52,8 @@ pub struct Http {
     /// name the request was sent to, with the port the server listens on.
     public: Option<String>,
     port: u16,
+    /// The server's state directory (the GitHub application's settings).
+    state: Option<std::path::PathBuf>,
     /// By device secret.
     pending: parking_lot::Mutex<HashMap<String, Pending>>,
 }
@@ -120,7 +129,17 @@ fn page(title: &str, body: &str) -> String {
 
 impl Http {
     pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
-        Http { keys, public, port, pending: parking_lot::Mutex::new(HashMap::new()) }
+        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(HashMap::new()) }
+    }
+
+    /// With the state directory, where a GitHub application may be set up.
+    pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
+        self.state = Some(state);
+        self
+    }
+
+    fn github(&self) -> Option<tokens::Github> {
+        tokens::Github::load(self.state.as_deref()?)
     }
 
     fn server_for(&self, host: &str) -> String {
@@ -142,7 +161,8 @@ impl Http {
             }
             Err(_) => return Ok(()),
         };
-        let (status, kind, body) = self.answer(&req);
+        // (Signing in asks GitHub two questions over HTTPS, which blocks.)
+        let (status, kind, body) = tokio::task::block_in_place(|| self.answer(&req));
         respond(&mut stream, status, kind, body.as_bytes()).await
     }
 
@@ -154,6 +174,7 @@ impl Http {
                 "protocol": crate::proto::PROTO_VERSION,
                 "version": env!("CARGO_PKG_VERSION"),
                 "auth": self.keys.tokens().is_some(),
+                "github": self.github().is_some(),
             })),
             ("POST", "/auth/start") => match self.start() {
                 Ok((device, code)) => json(serde_json::json!({
@@ -174,6 +195,29 @@ impl Http {
                 json(self.poll(device.as_deref().unwrap_or("")))
             }
             ("GET", "/auth") => (200, "text/html; charset=utf-8", self.auth_page(req.query.get("code").map(String::as_str).unwrap_or(""), None)),
+            ("GET", "/auth/github") => match self.to_github(req.query.get("code").map(String::as_str).unwrap_or("")) {
+                Ok(location) => (302, "location", location),
+                Err(e) => (403, "text/html; charset=utf-8", self.auth_page(req.query.get("code").map(String::as_str).unwrap_or(""), Some(&format!("{e:#}")))),
+            },
+            ("GET", "/auth/github/callback") => {
+                let q = |k: &str| req.query.get(k).map(String::as_str).unwrap_or("");
+                match self.from_github(q("state"), q("code")) {
+                    Ok((code, user)) => (
+                        200,
+                        "text/html; charset=utf-8",
+                        page(
+                            "Authenticated",
+                            &format!(
+                                "<p>The terminal showing <code class=\"code\">{}</code> now holds a token for the GitHub account <b>{}</b>.</p>\
+                                 <p>You can close this page and go back to it: <code>rargo build</code> will work.</p>",
+                                escape(&shown(&code)),
+                                escape(&user)
+                            ),
+                        ),
+                    ),
+                    Err(e) => (403, "text/html; charset=utf-8", page("rargo auth", &format!("<p class=\"err\">{}</p><p>Run <code>rargo auth</code> again to start over.</p>", escape(&format!("{e:#}"))))),
+                }
+            }
             ("POST", "/auth/approve") => {
                 let f = form(&String::from_utf8_lossy(&req.body));
                 let get = |k: &str| f.get(k).map(String::as_str).unwrap_or("").trim().to_string();
@@ -204,6 +248,21 @@ impl Http {
             return page("rargo auth", "<p>This server does not issue tokens.</p>");
         }
         let err = error.map(|e| format!("<p class=\"err\">{}</p>", escape(e))).unwrap_or_default();
+        if self.github().is_some() {
+            return page(
+                "rargo auth",
+                &format!(
+                    "<p>A terminal is asking for a token to build on this server. Go on only if the code below is the one \
+                     <code>rargo auth</code> is showing you.</p>\
+                     {err}\
+                     <form method=\"get\" action=\"/auth/github\">\
+                     <label>Code shown in the terminal<input name=\"code\" value=\"{}\" autocomplete=\"off\" required></label>\
+                     <button type=\"submit\">Sign in with GitHub and give that terminal a token</button></form>\
+                     <p>The server learns your GitHub user name and nothing else, and gives a token only to accounts its administrator has allowed.</p>",
+                    escape(&shown(code))
+                ),
+            );
+        }
         page(
             "rargo auth",
             &format!(
@@ -236,7 +295,7 @@ impl Http {
                 break c;
             }
         };
-        pending.insert(device.clone(), Pending { code: code.clone(), made: Instant::now(), tries: 0, granted: None, denied: false });
+        pending.insert(device.clone(), Pending { code: code.clone(), made: Instant::now(), tries: 0, granted: None, denied: false, state: None });
         Ok((device, code))
     }
 
@@ -276,6 +335,93 @@ impl Http {
         Ok(token.user)
     }
 
+    /// Where the browser is sent to sign in: GitHub, with something that
+    /// names this request for the way back.
+    fn to_github(&self, code: &str) -> Result<String> {
+        let gh = self.github().context("this server does not sign people in with GitHub")?;
+        let code = normal_code(code);
+        let state = tokens::random_text(32, b"abcdefghijklmnopqrstuvwxyz0123456789")?;
+        let mut pending = self.pending.lock();
+        let Some(p) = pending.values_mut().find(|p| p.code == code && p.made.elapsed() < PENDING_FOR) else {
+            bail!("no terminal is waiting with this code (it is good for ten minutes): run `rargo auth` again");
+        };
+        if p.granted.is_some() {
+            bail!("this code has been confirmed already");
+        }
+        p.state = Some(state.clone());
+        Ok(format!(
+            "{}/login/oauth/authorize?client_id={}&redirect_uri={}%2Fauth%2Fgithub%2Fcallback&state={state}&allow_signup=false",
+            github_url(),
+            gh.client_id,
+            gh.url.replace(':', "%3A").replace('/', "%2F"),
+        ))
+    }
+
+    /// The browser is back from GitHub: who was it, and may they?
+    /// Returns the flow's code and the account's login.
+    fn from_github(&self, state: &str, gh_code: &str) -> Result<(String, String)> {
+        let gh = self.github().context("this server does not sign people in with GitHub")?;
+        let store = self.keys.tokens().context("this server does not issue tokens")?;
+        if state.is_empty() || gh_code.is_empty() {
+            bail!("GitHub sent the browser back without a sign-in (it was cancelled there)");
+        }
+        let code = {
+            let pending = self.pending.lock();
+            let Some(p) = pending.values().find(|p| p.state.as_deref() == Some(state) && p.made.elapsed() < PENDING_FOR) else {
+                bail!("this sign-in belongs to no terminal that is still waiting");
+            };
+            p.code.clone()
+        };
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+        let answer: serde_json::Value = agent
+            .post(&format!("{}/login/oauth/access_token", github_url()))
+            .set("Accept", "application/json")
+            .send_form(&[
+                ("client_id", gh.client_id.as_str()),
+                ("client_secret", gh.client_secret.as_str()),
+                ("code", gh_code),
+                ("redirect_uri", &format!("{}/auth/github/callback", gh.url)),
+            ])
+            .map_err(|e| anyhow::anyhow!("asking GitHub: {e}"))
+            .and_then(|r| r.into_string().context("reading GitHub's answer"))
+            .and_then(|t| serde_json::from_str(&t).context("GitHub's answer"))?;
+        let Some(access) = answer.get("access_token").and_then(|t| t.as_str()) else {
+            bail!("GitHub did not confirm the sign-in ({})", answer.get("error_description").and_then(|e| e.as_str()).unwrap_or("no reason given"));
+        };
+        let who: serde_json::Value = agent
+            .get(&format!("{}/user", github_api()))
+            .set("Authorization", &format!("Bearer {access}"))
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", "rargod")
+            .call()
+            .map_err(|e| anyhow::anyhow!("asking GitHub who signed in: {e}"))
+            .and_then(|r| r.into_string().context("reading GitHub's answer"))
+            .and_then(|t| serde_json::from_str(&t).context("GitHub's answer"))?;
+        let login = who.get("login").and_then(|l| l.as_str()).context("GitHub did not say who signed in")?.to_string();
+        if !tokens::valid_login(&login) {
+            bail!("GitHub named an account this server cannot use");
+        }
+        let Some(allowed) = store.allowed(&login) else {
+            bail!(
+                "the GitHub account {login} is not on this server's allow list. Its administrator adds it with: rargod token allow {login}"
+            );
+        };
+        let (token, secret) = store.create(&allowed.login, allowed.admin, None, "github")?;
+        let mut pending = self.pending.lock();
+        match pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
+            Some(p) if p.granted.is_none() => {
+                p.granted = Some((tokens::token_text(&token, &secret), token.user.clone()));
+                p.state = None;
+            }
+            _ => {
+                let _ = store.revoke(&token.id);
+                bail!("the terminal stopped waiting: run `rargo auth` again");
+            }
+        }
+        eprintln!("rargod: a token for the GitHub account {} was issued through `rargo auth`", token.user);
+        Ok((code, token.user))
+    }
+
     fn poll(&self, device: &str) -> serde_json::Value {
         let mut pending = self.pending.lock();
         let Some(p) = pending.get(device) else {
@@ -295,6 +441,15 @@ impl Http {
         }
         serde_json::json!({ "status": "pending" })
     }
+}
+
+/// GitHub's addresses; other ones stand in for it in tests.
+fn github_url() -> String {
+    std::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
+}
+
+fn github_api() -> String {
+    std::env::var("RARGO_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').to_string()
 }
 
 async fn read_request(stream: &mut TcpStream) -> Result<Request> {
@@ -350,6 +505,15 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
 }
 
 async fn respond(stream: &mut TcpStream, status: u16, kind: &str, body: &[u8]) -> Result<()> {
+    if status == 302 {
+        let head = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            String::from_utf8_lossy(body)
+        );
+        stream.write_all(head.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
