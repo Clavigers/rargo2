@@ -10,9 +10,10 @@ release notes say when a release changes it.
 
 Protocol 7 (unchanged).
 
-- A command for another server in a worktree (`RARGO_SERVER=...`) no
-  longer leaves its `target/` showing stale results afterwards: the
-  daemon notices its mount was replaced and mounts again. (#76)
+- After a command for another server in a worktree (`RARGO_SERVER=...`),
+  `target/` shows this server's builds: a daemon notices that another
+  one replaced its mount, also when the kernel gave the new mount the
+  same device number and mount id, and mounts again. (#76)
 
 ## 0.6.1
 
