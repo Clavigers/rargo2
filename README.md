@@ -121,6 +121,25 @@ exclude = ["node_modules"]             # never sent to the server
 git = true                             # show build scripts a history-free .git for HEAD
 ```
 
+## The build environment is the project's flake
+
+A build sees what the dev shell of the project's `flake.nix` has: the
+compiler, the linker, `pkg-config`, the system libraries. Nothing is
+installed on a server for a project, and the same commit builds the same
+way on every server.
+
+A project without a flake starts from the default one, the build
+essentials (Rust, a C and C++ compiler, `make`, `cmake`, `pkg-config`,
+openssl, zlib, sqlite):
+
+```sh
+cp install/flake/flake.nix install/flake/flake.lock YOUR-PROJECT/
+cd YOUR-PROJECT && git add flake.nix flake.lock
+```
+
+A project that needs another library adds it to `packages` in its
+`flake.nix`. `nix develop` gives the same environment on your machine.
+
 The older place, a `.rargo.toml` at the top of the repository with the
 same tables unprefixed, is still read. A table the manifest has wins over
 the same table of the file, and the build says so.

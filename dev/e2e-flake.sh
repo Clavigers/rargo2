@@ -16,13 +16,14 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 bin=${RARGO_BIN:-$repo/target/release}
 export RARGO_BIN=$bin
 R=$bin/rargo
-T=$work/e2e-flake
+T=${RARGO_E2E_FLAKE:-$work/e2e-flake}
 fails=0; checks=0
 ok() { checks=$((checks + 1)); echo "  ok   $1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/       | /' | head -30; }
 has() { grep -qF -- "$2" <<<"$1"; }
 
-port() { case $1 in a) echo 7471 ;; b) echo 7472 ;; esac; }
+base=${RARGO_E2E_FLAKE_PORT:-7471}
+port() { case $1 in a) echo $base ;; b) echo $((base + 1)) ;; esac; }
 daemon() { # name action
     RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
         RARGO_HIDE="$T/a $T/b $T/home-a $T/home-b" "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
@@ -114,6 +115,38 @@ out=$(on a "$R" build 2>&1); rc=$?
 rm "$P/.rargo.toml"
 on a "$R" build >/dev/null 2>&1
 [ "$(sha256sum target/debug/flaky | cut -d' ' -f1)" = "$a_hash" ] && ok "removing the switch brings back the identical flake build" || bad "removing the switch brings back the identical flake build"
+
+echo "== the default flake (install/flake): the build essentials"
+# A project that copies rargo's default flake finds a C compiler, cmake,
+# make, pkg-config and the common libraries, none of them the host's.
+D=$T/a/essentials
+mkdir -p "$D/src"
+cp "$repo/install/flake/flake.nix" "$repo/install/flake/flake.lock" "$D/"
+printf '[package]\nname = "essentials"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$D/Cargo.toml"
+cat >"$D/build.rs" <<'RS'
+use std::process::Command;
+fn say(cmd: &str, args: &[&str]) -> String {
+    let out = Command::new(cmd).args(args).output().unwrap_or_else(|e| panic!("{cmd}: {e}"));
+    assert!(out.status.success(), "{cmd} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").to_string()
+}
+fn main() {
+    let libs = ["openssl", "zlib", "sqlite3"].map(|l| format!("{l} {}", say("pkg-config", &["--modversion", l])));
+    let where_ssl = say("pkg-config", &["--variable=libdir", "openssl"]);
+    println!("cargo:rustc-env=ESSENTIALS={}; {}; {}; {}; {}", say("cc", &["--version"]), say("cmake", &["--version"]), say("make", &["--version"]), libs.join(", "), where_ssl);
+}
+RS
+echo 'fn main() { println!("{}", env!("ESSENTIALS")); }' >"$D/src/main.rs"
+printf '/target\n' >"$D/.gitignore"
+git -C "$D" init -q -b main; git -C "$D" add -A; git -C "$D" -c user.name=t -c user.email=t@t commit -q -m init
+cd "$D"
+out=$(on a "$R" build 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "a project with the default flake builds" || bad "a project with the default flake builds" "$out"
+out=$(./target/debug/essentials 2>&1)
+has "$out" "gcc (GCC)" && has "$out" "cmake version" && has "$out" "GNU Make" && ok "its build script finds cc, cmake and make" || bad "its build script finds cc, cmake and make" "$out"
+has "$out" "openssl 3" && has "$out" "zlib 1" && has "$out" "sqlite3 3" && ok "pkg-config finds openssl, zlib and sqlite" || bad "pkg-config finds openssl, zlib and sqlite" "$out"
+[[ "$out" == *"; /nix/store/"* ]] && ok "from the flake, not the host (${out##*; })" || bad "from the flake, not the host" "$out"
+cd "$P"
 
 echo "== export from A"
 out=$(on a "$R" --rargo-export "$T/export" 2>&1)
