@@ -7,16 +7,18 @@
 #   dev/e2e-worker.sh
 #
 # A server with one core and a worker with four, then with one, in network
-# namespaces (dev/netns.sh). Needs root.
+# namespaces (dev/netns.sh). Needs root. Its workspace and client cache are
+# in RARGO_E2E_WORKER (default $RARGO_WORK/e2e-worker), which it empties.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
-proj=$work/e2e-worker/ws
-export RARGO_HIDE=$work/e2e-worker
+E=${RARGO_E2E_WORKER:-$work/e2e-worker}
+proj=$E/ws
+export RARGO_HIDE=$E
 # Off unless asked for (D65); the suite checks it.
 export RARGO_STATE_AHEAD=1
-export RARGO_CACHE_DIR=$work/e2e-worker/client-cache
+export RARGO_CACHE_DIR=$E/client-cache
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail -15 | sed 's/^/        /'; }
@@ -59,7 +61,7 @@ app() { # leaf names...
 }
 
 "$here/netns.sh" down >/dev/null 2>&1
-rm -rf "$work/e2e-worker"; mkdir -p "$proj"
+rm -rf "$E"; mkdir -p "$proj"
 first="la lb lc ld"
 warm="lk ll lm ln"
 second="le lf lg lh li lj"
@@ -196,7 +198,7 @@ grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" | { read n; [ "$n" = 0 ]
 cd /
 "$here/netns.sh" down >/dev/null 2>&1
 umount -l "$work/${RIG_STATE:-nstest}/srv/mnt" "$work/${RIG_STATE:-nstest}/w1/mnt" 2>/dev/null
-rm -rf "$work/e2e-worker"
+rm -rf "$E"
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
