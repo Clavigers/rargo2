@@ -228,11 +228,20 @@ received. One run each, at the final build (`fd599de`).
 | (the first worktree: virtual) | 40.6 s | 1.80 s | 93 MiB |
 
 Since then the build on a machine with an empty cache has gone from
-1.43 s to 0.66 to 0.69 s (two fresh machines, measured with a 6-core
-server beside the history benchmark, `bench/fresh-phases.sh`): the
-server asked that machine for environment variables nine times in a
-row and now asks once (D66, and the Zed figures under One remote
-client). The table above was not run again.
+1.43 s to 0.52 to 0.56 s (two fresh machines, measured with a 6-core
+server beside the history benchmark, `bench/fresh-phases.sh`), in two
+steps (D66):
+
+| a machine with an empty cache, everything cached on the server | whole command | of it: the offer | of it: request to answer |
+|---|---|---|---|
+| before | 1.46 to 1.64 s | 0.24 to 0.32 s | 1.05 s |
+| the server asks for environment variables once, not nine times in a row | 0.66 to 0.69 s | 0.24 s | 0.26 s |
+| a tree the server may have is offered by its root first | 0.52 to 0.56 s | 0.10 s | 0.25 s |
+
+What is left is three round trips one after the other (key agreement,
+offer, request) and one beside the planning (the environment question,
+asked of a machine once in its life), plus about 0.1 s of work on the
+two sides. The table above was not run again.
 
 A worktree that runs its binary has it after 3.1 s either way: the
 binary has to cross the link, at the end of the build or when it is
@@ -441,10 +450,14 @@ answered sends them with every later request, as before.
 
 What is left of the 0.86 s: three round trips that follow one another
 (the key agreement, the offer and its answer, the request and its
-answer), the server's 0.27 s, and 0.2 s in the offer that I did not
-break down (it takes 0.32 s where one round trip is 0.10 s). Sending
-the request without waiting for the offer's answer would save a round
-trip and was not tried.
+answer), the server's 0.27 s, and 0.2 s more in the offer: the
+manifests of a whole repository do not fit into the first flight of a
+link that has just been made, and took two more round trips to get
+through. Since this run the daemon offers such a tree by its root
+first, and a server that has it says so in one round trip (D66); on
+rust-analyzer that took the offer from 0.24 s to 0.10 s. Zed was not
+run again with it. Sending the request without waiting for the offer's
+answer would save one more round trip and was not tried.
 
 The other rows of the series in that run: 114.2 s, 0.36 s, 19.2 s,
 145.4 s and 0.38 s.

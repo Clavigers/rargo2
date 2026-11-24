@@ -1775,3 +1775,19 @@ A cost: a client is asked for variables of builds it will never run
 (another repository's). They are names and short values, once per
 daemon.
 
+**The offer, root first (same round of measurements).** With the
+question gone, the offer stood out: 0.24 to 0.32 s where a round trip
+is 0.10 s. A daemon that has not told this server about a tree sends
+all its manifests and asks what is lacking; for a repository that is a
+few hundred kilobytes, more than a link that has just been made lets
+out in its first flight (64 datagrams), so it took two more round
+trips. When the manifests are more than 32 KiB the daemon now sends
+the root's hash alone first. A server that has the whole tree (the
+usual case for a fresh worktree in a swarm: someone has built that
+commit) answers with the files it lacks, usually none, and no manifest
+is sent. A server that lacks any manifest is then sent them all, as
+before, which costs that case one round trip more than it did; it is
+the case that goes on to upload files. Measured on rust-analyzer: the
+offer 0.24 s to 0.10 s, the command 0.66 s to 0.52 s. The daemon's
+status counts the trees answered this way.
+

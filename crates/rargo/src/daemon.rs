@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
+/// Manifests larger than this in all are offered by their root first.
+const PROBE_FROM: u64 = 32 << 10;
+
 /// A change smaller than this is pushed whole, without asking the server
 /// what it lacks: an edit. Anything bigger (a worktree seen for the first
 /// time, a branch switch) sends the manifests and asks, because another
@@ -43,6 +46,8 @@ pub struct Counters {
     /// Commands that needed no scan: the watcher vouched for the worktree.
     pub scans_spared: AtomicU64,
     pub offers: AtomicU64,
+    /// Large trees the server said it had when shown the root alone.
+    pub probes_known: AtomicU64,
     pub offered_bytes: AtomicU64,
     pub links: AtomicU64,
     /// Contents fetched because something opened them: whole, by chunk,
@@ -438,7 +443,25 @@ impl Daemon {
             // the manifests go, and the server says what it lacks.
             let mut encoded = encoded;
             let mut tree_bytes = tree_bytes;
+            // First the root alone: a server that has this tree (another
+            // worktree's commit, a branch another agent built) says so in
+            // one small round trip, where the manifests of a repository
+            // take several to get through a link that is just starting.
+            // One that lacks any manifest is sent them all, as before.
+            let mut known = if tree_bytes > PROBE_FROM {
+                let answer = mux.expect_missing(id);
+                let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: Vec::new(), blobs: Vec::new(), ask: true }));
+                mux.post_bulk(CONTROL, &msg, 0).await?;
+                let (lacking_trees, lacking_blobs) = answer.await.map_err(|_| lost())?;
+                lacking_trees.is_empty().then_some(lacking_blobs)
+            } else {
+                None
+            };
             let missing = loop {
+                if let Some(blobs) = known.take() {
+                    self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
+                    break blobs;
+                }
                 let answer = mux.expect_missing(id);
                 self.counters.offered_bytes.fetch_add(tree_bytes, Ordering::Relaxed);
                 let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: Vec::new(), ask: true }));
@@ -1092,7 +1115,7 @@ impl Daemon {
             "server              {}\nlink                {kind}; {} made; {bytes_out} bytes sent, {bytes_in} bytes received on the current one\n\
              commands            {}\nworktrees           {worktrees} known, {watched} watched completely\n\
              scans               {} done, {} spared (nothing had changed)\n\
-             pushed              {} changes, {} bytes\n\
+             pushed              {} changes, {} bytes; {} trees the server had already (asked by root)\n\
              outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on open, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
             c.links.load(Ordering::Relaxed),
@@ -1101,6 +1124,7 @@ impl Daemon {
             c.scans_spared.load(Ordering::Relaxed),
             c.offers.load(Ordering::Relaxed),
             c.offered_bytes.load(Ordering::Relaxed),
+            c.probes_known.load(Ordering::Relaxed),
             outs.0,
             outs.1,
             outs.2,
