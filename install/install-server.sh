@@ -11,14 +11,16 @@
 #   /var/lib/rargo/state/            store and cache
 #   /var/lib/rargo/{rustup,cargo-home}/   toolchains and crates (beside the
 #                                    state, which builds cannot see)
-#   /etc/rargo/keys                  one user per line: name, secret, [admin]
+#   /var/lib/rargo/state/tokens.json who may connect (rargod token ...)
 #   /etc/systemd/system/rargod.service
 # Settings, all optional, from the environment:
 #   RARGO_LISTEN (0.0.0.0:7459)  RARGO_JOBS (all cores)  RARGO_MEM_GB
-#   RARGO_ADMIN (admin: name of the first user, made if no key file exists)
+#   RARGO_ADMIN (admin: name of the first user, invited if nobody is yet)
+#   RARGO_PUBLIC  HOST:PORT clients are told to connect to, if not the
+#                 name they asked
 #   RARGO_NO_SERVICE=1  install the files and print the command, start nothing
-# Running it again with a newer version upgrades in place; state and keys
-# are kept. The server must be reachable on its port over UDP and TCP.
+# Running it again with a newer version upgrades in place; the state, the
+# tokens and a key file of an older install (/etc/rargo/keys) are kept. The server must be reachable on its port over UDP and TCP.
 set -eu
 version=${1:-latest}
 base=${RARGO_DL:-https://rargo.rs/dl}
@@ -33,6 +35,11 @@ for tool in curl tar sha256sum git cc; do
 done
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# "latest" is turned into its number first, so that every file comes from
+# an address that never changes what it holds.
+if [ "$version" = latest ]; then
+    version=$(curl -fsSL "$base/VERSION") || { echo "cannot read $base/VERSION" >&2; exit 1; }
+fi
 asset=rargo-server-x86_64-unknown-linux-gnu.tar.gz
 echo "downloading $base/$version/$asset"
 curl -fsSL -o "$tmp/$asset" "$base/$version/$asset"
@@ -53,15 +60,19 @@ if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     echo "installing rustup into $home"
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable >/dev/null
 fi
+# Who may connect: tokens, made through invitations (`rargo auth`). A key
+# file from an older install keeps working beside them.
 keys=$P/etc/rargo/keys
-made=""
-if [ ! -s "$keys" ]; then
-    made=$(head -c 24 /dev/urandom | base64 | tr -d '/+=')
-    (umask 077; printf '%s %s admin\n' "$admin" "$made" >"$keys")
+keyopt=""
+[ -s "$keys" ] && keyopt="--keys $keys"
+invite=""
+if [ ! -s "$keys" ] && [ ! -s "$state/tokens.json" ]; then
+    invite=$("$lib/current/rargod" token invite --state "$state" --user "$admin" --admin --uses 5 --days 30 2>/dev/null)
 fi
 jobs=${RARGO_JOBS:+--jobs $RARGO_JOBS}
 mem=${RARGO_MEM_GB:+--mem-gb $RARGO_MEM_GB}
-run="$lib/current/rargod --state $state --planner $lib/current/planner-cargo --listen $listen --keys $keys --cargo-home $CARGO_HOME $jobs $mem"
+public=${RARGO_PUBLIC:+--public $RARGO_PUBLIC}
+run="$lib/current/rargod --state $state --planner $lib/current/planner-cargo --listen $listen $public $keyopt --cargo-home $CARGO_HOME $jobs $mem"
 if [ "${RARGO_NO_SERVICE:-}" = 1 ]; then
     echo "installed rargod $real; not started. To run it:"
     echo "  RUSTUP_HOME=$RUSTUP_HOME CARGO_HOME=$CARGO_HOME PATH=$CARGO_HOME/bin:\$PATH $run"
@@ -94,13 +105,18 @@ UNIT
     systemctl is-active --quiet rargod.service || { echo "rargod did not start: journalctl -u rargod" >&2; exit 1; }
     echo "rargod $real is running on $listen (UDP and TCP; open both in your firewall)"
 fi
-if [ -n "$made" ]; then
+port=${listen##*:}
+if [ -n "$invite" ]; then
     echo
-    echo "A first user was made. On the machine you build from, put this into ~/.config/rargo/config.toml:"
+    echo "An invitation for the first user ($admin, administrator; 5 uses, 30 days):"
     echo
-    echo "  server = \"THIS-MACHINE:${listen##*:}\""
-    echo "  user = \"$admin\""
-    echo "  key = \"$made\""
+    echo "    $invite"
     echo
-    echo "More users: one line each in $keys (name, secret of 16+ characters, optionally admin), then restart rargod."
+    echo "On the machine you build from, in a cargo project:"
+    echo
+    echo "    rargo @THIS-MACHINE:$port"
+    echo "    rargo auth          # opens a page; enter the invitation there"
+    echo "    rargo build"
+    echo
 fi
+echo "More people: $lib/current/rargod token invite --state $state --user NAME   (token list, token revoke: likewise; no restart)"

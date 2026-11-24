@@ -165,6 +165,51 @@ Not met, or weak:
 | `cargo` shim | done, e2e (routing, passthrough, fallback without a server) |
 | rustc fork (phase 5), `check` as a build | done, re-measured; not worth using |
 
+## Installing and releasing (issues 1, 2, 4; `FACTORY.md` has the process)
+
+What exists and how each part was checked (2026-11-24):
+
+| | how it was checked |
+|---|---|
+| `cargo install rargo` (crates.io: `rargo`, `rargo-net`, `rargo-proto`, `fusewire`; 0.2.1 and 0.3.0 published by the release workflow) | in a clean `rust:1-slim` container: install, `rargo @rargo.rs`, `rargo auth`, `rargo build`, run, test: 36 s in all (`dev/new-user.sh`) |
+| `curl -fsSL https://rargo.rs/install.sh \| sh` (static client for Linux x86_64, checksum verified) | in a clean `ubuntu:24.04` container |
+| `curl -fsSL https://rargo.rs/install-server.sh \| sudo sh` (rargod, sandbox helper, planner; rustup; an invitation for the first user; a systemd unit) | in a clean privileged `ubuntu:24.04` container with `RARGO_NO_SERVICE=1`: installed, started by the printed command, and the printed path (`rargo @host`, `rargo auth` with the printed invitation, `rargo build`) run against it. **Not run:** the branch that writes and starts the systemd unit (the container has no systemd; the unit is the shape of the one that runs on this machine) |
+| GitHub releases with the client, the server archive, both installers, checksums, the changelog section as notes | v0.2.1 and v0.3.0 made by `.github/workflows/release.yml` from a tag |
+| the rargod service on this machine, `build.rargo.rs:7459` | from a GitHub runner over UDP and TCP (`service check` workflow), and by the container runs above through `rargo.rs` |
+| CI on every push and pull request | build with warnings as errors, unit and engine tests, static client, packaged crates, and the new user's path against a server of the commit (`dev/e2e-auth.sh`, 36 checks) |
+| the end-to-end suites that need the planner and network rigs | on this machine before a release (`dev/gate.sh`): 113 + 113 + 14 + 36 + 67 + 28 checks |
+
+Found by trying it as a stranger and fixed: the site served the server
+archive with a gzip content encoding, so it arrived unpacked and failed
+its checksum (downloads are now served as bytes, and the installers turn
+"latest" into a version number first so every file has an address that
+never changes what it holds); `rargo run` could not start a program in a
+worktree under `/tmp` whose `target/` was mounted (0.3.1).
+
+**crates.io: what the owner has to do once, to stop needing a token.**
+Releases publish with the repository secret `CARGO_REGISTRY_TOKEN` when
+it is set, and with crates.io trusted publishing when it is not. All
+four crates exist now, so trusted publishing can be set up:
+
+1. On crates.io, signed in as the owner of the crates, for each of
+   `rargo`, `rargo-net`, `rargo-proto` and `fusewire`: the crate's page,
+   *Settings*, *Trusted Publishing*, *Add*.
+2. Publisher: GitHub. Repository owner: `sadosystems`. Repository name:
+   `rargo2`. Workflow filename: `release.yml`. Environment: leave empty.
+3. When all four are added: delete the secret `CARGO_REGISTRY_TOKEN` in
+   the repository's settings (Secrets and variables, Actions) and revoke
+   the token on crates.io (Account Settings, API Tokens). The next
+   release then publishes without it.
+
+Until step 3 nothing is blocked: the token publishes.
+
+**Not possible on this plan:** a rule on `main` that requires a pull
+request and passing checks (GitHub offers branch rules for private
+repositories only on a paid plan; the API answers "Upgrade to GitHub Pro
+or make this repository public"). The rule is kept by `CLAUDE.md` and by
+`dev/pr-land.sh`, which merges a pull request only after its checks
+passed.
+
 ## Measurements
 
 ### One command (`dev/bench-latency.sh`)
