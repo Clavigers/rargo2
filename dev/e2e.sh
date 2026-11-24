@@ -556,6 +556,27 @@ echo 'bogus = 1' >.rargo.toml
 out=$("$R" build 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file (the older place) is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
 rm -f .rargo.toml crates/app/tests/policy.rs
+# Build scripts: the one the manifest names may use the network, another may not.
+for c in netprobe netprobe2; do
+    mkdir -p crates/$c/src
+    printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' $c >crates/$c/Cargo.toml
+    echo "" >crates/$c/src/lib.rs
+    cat >crates/$c/build.rs <<EOF
+fn main() {
+    let net = std::net::TcpStream::connect(("127.0.0.1", $port)).is_ok();
+    println!("cargo:warning=build script net={net}");
+}
+EOF
+done
+out=$("$R" build -p netprobe -p netprobe2 2>&1)
+has "$out" "netprobe@0.1.0: build script net=false" && has "$out" "netprobe2@0.1.0: build script net=false" && ok "by default no build script reaches the host's network" || bad "by default no build script reaches the host's network" "$out"
+printf '\n[workspace.metadata.rargo.network]\nbuild-scripts = ["netprobe"]\n' >>Cargo.toml
+out=$("$R" build -p netprobe -p netprobe2 2>&1)
+has "$out" "netprobe@0.1.0: build script net=true" && has "$out" "netprobe2@0.1.0: build script net=false" && ok "the build script the manifest names under network.build-scripts reaches it, the other does not" || bad "the build script the manifest names under network.build-scripts reaches it, the other does not" "$out"
+cp "$T/Cargo.toml.before-policy" Cargo.toml
+out=$("$R" build -p netprobe 2>&1)
+has "$out" "netprobe@0.1.0: build script net=false" && ok "and loses it again when the manifest no longer names it" || bad "and loses it again when the manifest no longer names it" "$out"
+rm -rf crates/netprobe crates/netprobe2
 kill $listener 2>/dev/null
 # What the policy excludes is never uploaded.
 # (Counted before the edit, and the directory made after it is excluded:
