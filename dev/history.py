@@ -178,6 +178,18 @@ def stats(out):
             continue
         key = d["variant"] if d["variant"] != "d" else "d-" + d["agent"]
         rows.setdefault(key, {})[d["i"]] = d
+    # Builds that were in progress while the benchmark was stopped for a
+    # while (their times include the pause) are left out.
+    tainted = {}
+    path = os.path.join(os.path.dirname(out), "history-tainted.json")
+    if os.path.exists(path):
+        tainted = {k: set(v) for k, v in json.load(open(path)).items()}
+    for k in list(rows):
+        skip = tainted.get(k[0], set())
+        left = sum(1 for i in rows[k] if i in skip)
+        rows[k] = {i: d for i, d in rows[k].items() if i not in skip}
+        if left:
+            print(k, "left out (in progress during a pause):", left)
     ok = lambda k: {i: d["wall_s"] for i, d in rows.get(k, {}).items() if d["rc"] == 0}
     for k in sorted(rows):
         failed = sum(1 for d in rows[k].values() if d["rc"] != 0)

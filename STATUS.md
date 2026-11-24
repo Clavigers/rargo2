@@ -268,38 +268,71 @@ For comparison, the base commit's first check, build and test took
 24.1 / 39.5 / 3.2 s under rargo (LAN) and 22.6 / 37.5 / 3.0 s with
 stock cargo.
 
-### History (`dev/replay.py`)
+### History (`dev/history.py`)
 
-One worktree is moved through the last 30 first-parent commits of
-rust-analyzer, oldest first, with `build -p rust-analyzer` at each.
-The statistics are over the 29 commits after the first. What (a) to (d)
-are is my reading of the brief (D61). 100 ms of round-trip time on the
-client link for (b) to (d); server and stock cargo with 24 cores; final
-build (`fd599de`); one run each, no failed build.
+The first-parent history of rust-analyzer over two years (2,672
+commits, 2024-11-24 to 2026-11-22), `build -p rust-analyzer` at each
+commit, four ways (D62; an earlier version of this section had my own
+reading of (a) to (d) over 30 commits, which was not what the brief
+defines):
 
-| | first commit | median | 90th percentile | maximum | total of the 29 |
-|---|---|---|---|---|---|
-| (a) stock cargo, one worktree and `target/` | 38.3 s | 7.2 s | 13.6 s | 22.8 s | 212.5 s |
-| (b) rargo, a server that has built nothing | 41.3 s | 12.1 s | 17.3 s | 23.1 s | 351.0 s |
-| (c) rargo again, from a second machine's fresh worktree, the server of (b) | 1.4 s | 0.15 s | 0.19 s | 0.21 s | 4.6 s |
-| (d) rargo with the rustc fork, a server that has built nothing | 58.8 s | 21.2 s | 28.5 s | 35.1 s | 628.0 s |
+- (a) stock cargo, one worktree with a persistent target directory,
+  every commit;
+- (b) stock cargo, an empty target directory at every commit;
+- (c) stock cargo, one worktree with a persistent target directory,
+  every 10th commit only;
+- (d) rargo, 100 ms of round-trip time on the client link, two agents
+  interleaved in commit order: one builds every commit that is not a
+  10th, the other only the 10th ones.
 
-- **(b) against (a): walking history alone, rargo is slower than stock
-  cargo**, 12.1 s against 7.2 s per commit at the median, 351 s against
-  213 s in all. The 100 ms link is not the reason (on the LAN link the
-  same run took 351.3 s). Both rebuild the same crates with the same
-  compiler; where rargo's extra five seconds per commit go was not
-  broken down. What differs and is suspect: every commit's 456 MiB
-  binary and its debug information are hashed and stored on the server,
-  and each crate's incremental state is stored and laid out again
-  rather than left in place. It is the single-agent, single-worktree
-  case, which is the one rargo was not built for, but it is a real cost
-  and it is not explained.
-- **(c): what anyone gets who comes after.** The second machine walks
-  the same 30 commits in 6 s altogether: every build is one round trip
-  and nothing is fetched (the binaries are listed, not run).
-- **(d): the rustc fork still loses** (628 s against 351 s), as in
-  Phase 5.
+Every build has 4 cores (stock cargo's `-j4` under a 4-core cap, a
+rargo server with 4 cores), six builds side by side, because (b) is
+2,672 cold builds and everything shares a cap of 24 cores. These
+figures compare with each other, not with the 24-core tables. Each
+commit is built with the toolchain of its time (1.82 to 1.98, nine of
+them): older commits do not compile with today's.
+
+The run takes about a day and was still going when this was written
+(2026-11-24, 04:00: 200 of 2,672 commits in (a), 290 in (b), 48 in
+(d); (c) starts when (a) ends; no build had failed for a reason of its
+own). The distributions are added here when it ends.
+
+**Why one agent alone is slower under rargo than under stock cargo.**
+Measured per action on single steps of this history (24 cores, LAN;
+D62). It is not hashing or storing the binary or the incremental
+states:
+
+| one commit that changes one file of `hir-ty` | stock cargo | rargo |
+|---|---|---|
+| `hir-ty` to `ide` (ten units) | the same to 0.1 s each | the same |
+| `rust-analyzer` (lib) | 1.6 s | 6.3 s (10.6 CPU-s) |
+| `rust-analyzer` (bin), the link | 0.9 s | 1.1 s |
+| before the first unit starts / after the last ends | 0.1 s / 0 | 0.3 s / 0.3 s |
+| whole step | 7.1 s | 12.5 s |
+| the same with `[sync] git = false` | | 7.9 s |
+
+- 4.6 of the 5.4 s are the `rust-analyzer` library being compiled
+  again because its build script ran again and passed it a new commit
+  hash. The script asks cargo to rerun it when `.git/HEAD` changes; in
+  a linked worktree there is no such file (`.git` is a file), so it
+  asks for nothing and stock cargo never reruns it: on a commit that
+  changes no Rust file stock cargo takes 0.14 s, and its binary
+  reports the commit it was first built at. rargo saw the script read
+  HEAD through git, HEAD changed, the script runs (0.02 s), and what
+  embeds its answer is rebuilt: 7.7 s on such a commit. rargo's binary
+  says the right commit; that is what the time buys. A repository that
+  does not want it sets `[sync] git = false` in `.rargo.toml`.
+- 0.8 s are rargo's own: 0.2 s before the first action (request,
+  plan), 0.2 s on the link step, 0.3 s after it (the 456 MiB binary is
+  hashed and stored and the delivery listed), the round trip. Not
+  reduced.
+- Found on the way and changed: a linked worktree is shown to the build
+  as one (`.git` a file, the stand-in beside it), as on the client; and
+  a compile starts from the incremental state made nearest to HEAD,
+  which for an agent that has just arrived at a commit is another
+  agent's state from one commit back, not its own from ten back. The
+  second matters for (d)'s 10th-commit agent and was found by watching
+  the first builds of this run.
 
 ### One remote client (`dev/bench-remote.sh`)
 
