@@ -199,6 +199,39 @@ fn var<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
     vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
 }
 
+/// The link to the server could not be made: the only failure reported as
+/// a server that cannot be reached (an error of the same kind from anything
+/// else, a local file that is missing say, is reported as itself).
+#[derive(Debug)]
+struct NoLink(std::io::Error);
+
+impl std::fmt::Display for NoLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for NoLink {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// `e`, from making the link, marked as the server being out of reach if it
+/// says so (a server that answers and refuses is not).
+fn no_link(e: std::io::Error) -> std::io::Error {
+    use std::io::ErrorKind::*;
+    if matches!(e.kind(), ConnectionRefused | TimedOut | NotFound | HostUnreachable | NetworkUnreachable) {
+        std::io::Error::new(e.kind(), NoLink(e))
+    } else {
+        e
+    }
+}
+
+fn is_no_link(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<NoLink>())
+}
+
 impl Daemon {
     /// `watch`: follow worktrees with inotify (a daemon does; a command
     /// that runs without one has nothing to gain from it).
@@ -271,10 +304,11 @@ impl Daemon {
             }
         }
         let addr = tokio::net::lookup_host(&self.cfg.server)
-            .await?
+            .await
+            .map_err(no_link)?
             .next()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the server's name has no address"))?;
-        let link = Link::connect(addr, &self.cfg.user, &self.cfg.psk, &self.transport).await?;
+            .ok_or_else(|| no_link(std::io::Error::new(std::io::ErrorKind::NotFound, "the server's name has no address")))?;
+        let link = Link::connect(addr, &self.cfg.user, &self.cfg.psk, &self.transport).await.map_err(no_link)?;
         self.counters.links.fetch_add(1, Ordering::Relaxed);
         let m = Mux::new(link);
         *g = Some(m.clone());
@@ -937,8 +971,7 @@ impl Daemon {
         let reply = match self.run(&req, &out).await {
             Ok(reply) => reply,
             Err(e) => {
-                use std::io::ErrorKind::*;
-                if matches!(e.kind(), ConnectionRefused | TimedOut | NotFound | HostUnreachable | NetworkUnreachable) {
+                if is_no_link(&e) {
                     LocalReply::Unreachable(e.to_string())
                 } else {
                     // A server that does not know us: no token, or one that
@@ -1871,5 +1904,26 @@ mod left_out_tests {
         let note = left_out_note(&ignored, Path::new(root), b"cannot open /home/ann/proj/junk/blob and local-note.txt\n").unwrap();
         assert!(note.starts_with("note: `junk/blob` is not"), "a file inside an ignored directory: {note}");
         assert!(left_out_note(&ignored, Path::new(root), b"error[E0308]: mismatched types\n  --> src/main.rs:3:5\n").is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_link_that_cannot_be_made_is_an_unreachable_server() {
+        use std::io::{Error, ErrorKind};
+        let refused = no_link(Error::new(ErrorKind::ConnectionRefused, "connection refused"));
+        assert!(is_no_link(&refused));
+        assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
+        assert_eq!(refused.to_string(), "connection refused");
+        // A missing local file is reported as itself.
+        assert!(!is_no_link(&Error::from_raw_os_error(libc::ENOENT)));
+        // A server that answers and turns the token down is not out of reach.
+        assert!(!is_no_link(&no_link(Error::new(ErrorKind::PermissionDenied, rargo_proto::REFUSED))));
+        // Through `?` the mark stays.
+        let passed = (|| -> std::io::Result<()> { Err(no_link(Error::new(ErrorKind::TimedOut, "timed out")))? })();
+        assert!(is_no_link(&passed.unwrap_err()));
     }
 }

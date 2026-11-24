@@ -329,7 +329,9 @@ rustc_after=$(kind_runs rustc); scripts_after=$(kind_runs "build scripts")
 $out"
 [ -n "$rustc_after" ] && [ "$rustc_before" = "$rustc_after" ] && [ "$scripts_before" = "$scripts_after" ] && ok "after rargo test, every compile of rargo nextest was a cache hit (rustc runs: $rustc_before before, $rustc_after after)" || bad "after rargo test, every compile of rargo nextest was a cache hit" "rustc $rustc_before -> $rustc_after, build scripts $scripts_before -> $scripts_after"
 echo changed >crates/app/tests/fixture.txt
-out=$("$R" nextest run 2>&1); rc=$?
+# Every test runs: with nextest's fail-fast, how many of the others finish
+# before it stops depends on timing.
+out=$("$R" nextest run --no-fail-fast 2>&1); rc=$?
 [ $rc -eq 100 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && grep -qE "5 tests run: 4 passed, 1 failed" <<<"$out" && ok "a failing test: nextest's failure output and summary, exit 100" || bad "a failing test: nextest's failure output and summary, exit 100" "rc=$rc
 $out"
 echo fixture >crates/app/tests/fixture.txt
@@ -548,6 +550,20 @@ delta=$((after - before))
 # One build is 5 new actions: plan, build script compile and run, util, app2.
 # The proc macro is byte-identical to the first workspace's and is a hit.
 [ "$delta" -ge 5 ] && [ "$delta" -le 6 ] && ok "8 identical cold builds ran $delta actions in total (one build's worth)" || bad "8 identical cold builds ran about one build's worth of actions" "delta=$delta"
+
+echo "== the first commands of many linked worktrees at once, in a new daemon"
+# Linked worktrees of one repository share files in the client's cache
+# (the \`.git\` file they are shown); a new daemon writes them as each
+# worktree's first command scans it.
+for i in $(seq 8 23); do git -C "$C" worktree add -q --detach "$T/c$i" HEAD; done
+FC=$T/.rargo-cache-first
+pids=""
+for i in $(seq 8 23); do (cd "$T/c$i" && RARGO_CACHE_DIR=$FC "$R" check >"$T/c$i/.check.log" 2>&1) & pids="$pids $!"; done
+failed=0
+for p in $pids; do wait "$p" || failed=$((failed + 1)); done
+[ $failed -eq 0 ] && ! grep -q "cannot reach" "$T"/c*/.check.log && ok "16 first commands at once in a new daemon all succeed" || bad "16 first commands at once in a new daemon all succeed" "$failed failed
+$(grep -h -B2 -A2 error "$T"/c*/.check.log | head -20)"
+RARGO_CACHE_DIR=$FC "$R" --rargo-daemon-stop >/dev/null 2>&1
 
 echo "== stock cargo still works (no drift)"
 cd "$A"

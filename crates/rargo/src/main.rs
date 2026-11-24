@@ -43,7 +43,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!("{}{}-{name}", tmp::BESIDE, std::process::id()));
+    let tmp = path.with_file_name(format!("{}{}-{}-{name}", tmp::BESIDE, std::process::id(), tmp::seq()));
     let _watched = tmp::watch(&tmp);
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path).inspect_err(|_| {
@@ -959,6 +959,28 @@ fn exec(mut e: ExecRequest) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writes_of_one_path_at_once_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared");
+        let threads: Vec<_> = (0..16)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..200 {
+                        crate::write_atomic(&path, format!("{t} {i}").as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with(" 199"));
+        // No temporary is left beside it.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
     use super::*;
 
     #[test]
