@@ -329,7 +329,9 @@ rustc_after=$(kind_runs rustc); scripts_after=$(kind_runs "build scripts")
 $out"
 [ -n "$rustc_after" ] && [ "$rustc_before" = "$rustc_after" ] && [ "$scripts_before" = "$scripts_after" ] && ok "after rargo test, every compile of rargo nextest was a cache hit (rustc runs: $rustc_before before, $rustc_after after)" || bad "after rargo test, every compile of rargo nextest was a cache hit" "rustc $rustc_before -> $rustc_after, build scripts $scripts_before -> $scripts_after"
 echo changed >crates/app/tests/fixture.txt
-out=$("$R" nextest run 2>&1); rc=$?
+# Every test runs: with nextest's fail-fast, how many of the others finish
+# before it stops depends on timing.
+out=$("$R" nextest run --no-fail-fast 2>&1); rc=$?
 [ $rc -eq 100 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && grep -qE "5 tests run: 4 passed, 1 failed" <<<"$out" && ok "a failing test: nextest's failure output and summary, exit 100" || bad "a failing test: nextest's failure output and summary, exit 100" "rc=$rc
 $out"
 echo fixture >crates/app/tests/fixture.txt
