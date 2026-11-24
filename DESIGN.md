@@ -419,8 +419,9 @@ cargo.
   reboot, or when the daemon is stopped, `target/` shows only what was
   written locally until the next rargo command mounts it again (the
   listing is kept; contents are still in the cache or on the server). A
-  daemon that is killed outright leaves a dead mount until the next
-  command replaces it. Stock `cargo clean` cannot remove a mount point;
+  daemon that is killed outright cannot unmount; a small process it
+  left watching does, at once (D70), so the directory is never a dead
+  mount. Stock `cargo clean` cannot remove a mount point;
   through the shim it can, because the daemon lets go first.
 - **A daemon on every client machine** is one more thing that can be
   stale or stuck. It is keyed by server, user, key and program version,

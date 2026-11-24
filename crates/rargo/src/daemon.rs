@@ -601,7 +601,15 @@ impl Daemon {
         )?;
         // SAFETY: no arguments, cannot fail.
         let root = unsafe { libc::geteuid() } == 0;
-        let opts = fusewire::MountOptions { fsname: "rargo".into(), allow_other: root, default_permissions: true, passthrough: true };
+        // auto_unmount: a daemon that is killed must not leave `target/` as
+        // a dead mount for editors, stock cargo and the next `ls` to trip on.
+        let opts = fusewire::MountOptions {
+            fsname: "rargo".into(),
+            allow_other: root,
+            default_permissions: true,
+            passthrough: true,
+            auto_unmount: true,
+        };
         let session = Arc::new(fusewire::Session::mount(&dir, &opts)?);
         fs.attach(session.clone());
         // Enough threads that a parallel build's name operations (a

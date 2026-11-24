@@ -6,6 +6,18 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.3.5
+
+Protocol 7 (unchanged).
+
+- Fixed: a client daemon that was killed (SIGKILL, a crash, the
+  out-of-memory killer) left `target/` as a dead mount, and everything
+  that touched it (an editor, rust-analyzer, stock cargo, `ls`) got
+  "Transport endpoint is not connected" until the next rargo command.
+  The directory is now unmounted the moment its daemon is gone, with no
+  rargo command run, and is an ordinary directory stock cargo builds in.
+  (#6)
+
 ## 0.3.4
 
 Protocol 7 (unchanged).

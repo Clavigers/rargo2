@@ -2020,3 +2020,55 @@ caching; the pinned version; output checked against stock on a failing
 and a flaky test; the swarm variant measured; the notice for other
 subcommands.
 
+
+## D70. A killed daemon's `target/` is unmounted by a process that outlives it (issue 6)
+
+A FUSE mount outlives the process that serves it: a daemon killed with
+SIGKILL (or crashed, or taken by the out-of-memory killer) left
+`target/` answering "Transport endpoint is not connected" to everything
+until the next rargo command replaced the mount. Nothing inside the
+daemon can run at that moment, so something outside it has to.
+
+- `fusewire::MountOptions::auto_unmount`: at mount, the session forks a
+  guard. The guard holds nothing of the daemon's but the read end of a
+  pipe (every other descriptor is closed, the FUSE connection included,
+  so it keeps nothing alive), is in a session of its own and ignores
+  the signals a terminal or a service manager sends to a group, and
+  blocks in `read`. A byte means the daemon unmounted itself: the guard
+  exits. End of file means the daemon is gone: the guard lazily unmounts
+  the directory (`umount2`, or `fusermount3 -u -z` for a mount this user
+  made through it) and exits. It costs one sleeping process per mounted
+  worktree.
+- The guard is a fork, and a fork has its parent's name and command
+  line: the first end-to-end run killed the daemon with `pkill -KILL -f`
+  and killed the guard with it. It renames itself and overwrites its
+  argument strings, and shows as `unmount-guard: DIRECTORY`, which
+  neither `pkill rargo` nor `pkill -f 'rargo --rargo-daemon'` matches.
+  Mounting returns only when the guard has said it is set up.
+- It unmounts only its own mount: the kernel's mount id (statx, Linux
+  5.8; asked without a question to the file system, which cannot answer)
+  is recorded at mount and compared before unmounting, in the guard and
+  in `Session::unmount`. Before 5.8 the comparison is skipped.
+- `Session::unmount` stands the guard down and waits for it before it
+  unmounts, so no guard of an old mount is alive when the same directory
+  is mounted again.
+- **Not `fusermount3 -o auto_unmount`.** It was tried first. The helper
+  (3.14) unmounts only if opening the directory fails with ENOTCONN at
+  the moment it looks; after a kill it exited without unmounting in
+  every trial here.
+- **What is left is a plain directory**, as after a stopped daemon:
+  what was written locally is there, what the server delivered is not
+  (it is in the cache and on the server, and listed again by the next
+  rargo command). Stock cargo builds in it and builds again what it does
+  not find. Copying delivered files into the worktree at that moment is
+  not possible for a killed daemon and was not added for a stopped one.
+- Not covered: the guard itself being killed too (`kill -9` of both, a
+  machine going down). After a reboot there is no mount to clean up.
+
+Tested: `crates/fusewire/tests/auto_unmount.rs` (a process killed while
+mounted, with and without the option; the guard gone after an ordinary
+unmount; a second mount of the same directory untouched by the first
+session), as root in CI and through `fusermount3` as a user;
+`dev/e2e-link.sh` kills the daemon with SIGKILL and runs stock
+`cargo build` and `cargo test` in the worktree, and kills an
+unprivileged user's daemon.
