@@ -121,6 +121,15 @@ exclude = ["node_modules"]             # never sent to the server
 git = true                             # show build scripts a history-free .git for HEAD
 ```
 
+## rargo builds rargo
+
+This repository's `Cargo.toml` names `rargo.rs` as its server, so `rargo
+build` here, on a laptop, for an agent or in CI, is one build on one
+cache: what was built for a commit anywhere is a cache hit everywhere
+else. CI installs the released client, signs in with a token and runs
+`rargo build` and `rargo test`; the tests that mount file systems are
+compiled by the server and run on the runner (`dev/mount-tests.sh`).
+
 ## The build environment is the project's flake
 
 A build sees what the dev shell of the project's `flake.nix` has: the

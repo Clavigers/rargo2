@@ -20,8 +20,10 @@ step() { # name, command...
     if "$@" >"$L/$name.log" 2>&1; then echo "ok    $name: $(grep -E 'passed|test result' "$L/$name.log" | tail -n 1 | sed 's/^ *//')"
     else echo "FAIL  $name (see $L/$name.log)"; fail=1; fi
 }
-step build cap cargo build --release --locked
-step unit cap cargo test --release --locked --workspace
+# rargo builds rargo: on the server Cargo.toml names, not on this machine.
+step build rargo build --release --locked
+step unit rargo test --release --locked --workspace --lib --bins
+step mount-tests dev/mount-tests.sh --release
 B=$work/gate/bin; rm -rf "$B"; mkdir -p "$B"; cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
 step e2e dev/e2e.sh

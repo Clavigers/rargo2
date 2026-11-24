@@ -62,5 +62,7 @@ if [ "$(readlink "$S/current" 2>/dev/null)" != "$rel" ]; then
     systemctl restart rargod.service
     sleep 1
 fi
+# The client the agents and the gate build rargo with is the service's.
+install -m 755 "$rel/rargo" /usr/local/bin/rargo
 systemctl is-active rargod.service
 echo "running: $rel"
