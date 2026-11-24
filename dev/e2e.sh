@@ -508,8 +508,9 @@ out=$(PATH="$T/shim:$PATH" RARGO_SERVER=127.0.0.1:1 RARGO_FALLBACK=cargo CARGO_T
 out=$(RARGO_SERVER=127.0.0.1:1 "$R" build 2>&1); rc=$?
 [ $rc -eq 101 ] && has "$out" "cannot reach the rargo server" && ok "without a server and without the fallback, the error says so" || bad "without a server and without the fallback, the error says so" "$out"
 
-echo "== policy file (.rargo.toml)"
+echo "== policy in Cargo.toml ([workspace.metadata.rargo])"
 cd "$A"
+cp Cargo.toml "$T/Cargo.toml.before-policy"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 python3 -c "
 import socket, sys
@@ -529,29 +530,42 @@ fn probe() {
 EOF
 out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
 has "$out" "env=None" && has "$out" "net=false" && ok "by default a test sees neither an undeclared variable nor the host's network" || bad "by default a test sees neither an undeclared variable nor the host's network" "$out"
-cat >.rargo.toml <<'EOF'
-[env]
+cat >>Cargo.toml <<'EOF'
+
+[workspace.metadata.rargo.env]
 pass = ["POLICY_PROBE"]
-[network]
+[workspace.metadata.rargo.network]
 test-packages = ["app"]
 EOF
+[ ! -e .rargo.toml ] && ok "the worktree has no .rargo.toml" || bad "the worktree has no .rargo.toml"
 out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
-has "$out" 'env=Some("seen")' && has "$out" "net=true" && ok "the policy file passes the variable and gives the package's tests the network" || bad "the policy file passes the variable and gives the package's tests the network" "$out"
+has "$out" 'env=Some("seen")' && has "$out" "net=true" && ok "the manifest's policy passes the variable and gives the package's tests the network" || bad "the manifest's policy passes the variable and gives the package's tests the network" "$out"
+out=$(cargo metadata --format-version 1 --no-deps --offline 2>&1 >/dev/null); [ -z "$out" ] && ok "stock cargo reads that manifest without a word" || bad "stock cargo reads that manifest without a word" "$out"
+# The older file beside it: a table the manifest has wins, and the build says so.
+printf '[env]\npass = ["SOMETHING_ELSE"]\n' >.rargo.toml
+out=$(POLICY_PROBE=seen "$R" test -p app --test policy -- --nocapture 2>&1)
+has "$out" 'env=Some("seen")' && has "$out" ".rargo.toml: [env] is ignored" && ok "with both, the manifest's table wins and the build says the file's is ignored" || bad "with both, the manifest's table wins and the build says the file's is ignored" "$out"
+rm -f .rargo.toml
 out=$(POLICY_PROBE=other "$R" test -p app --test policy -- --nocapture 2>&1)
 has "$out" 'env=Some("other")' && ok "a passed variable is part of the key (new value, new run)" || bad "a passed variable is part of the key" "$out"
-echo 'bogus = 1' >>.rargo.toml
+echo 'bogus = 1' >>Cargo.toml
 out=$("$R" build 2>&1); rc=$?
-[ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
+[ $rc -ne 0 ] && has "$out" "Cargo.toml: [workspace.metadata.rargo]" && ok "an unknown key in the manifest's policy is an error that names the table" || bad "an unknown key in the manifest's policy is an error that names the table" "$out"
+cp "$T/Cargo.toml.before-policy" Cargo.toml
+echo 'bogus = 1' >.rargo.toml
+out=$("$R" build 2>&1); rc=$?
+[ $rc -ne 0 ] && has "$out" ".rargo.toml" && ok "a malformed policy file (the older place) is an error that names the file" || bad "a malformed policy file is an error that names the file" "$out"
 rm -f .rargo.toml crates/app/tests/policy.rs
 kill $listener 2>/dev/null
 # What the policy excludes is never uploaded.
 mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
-printf '[sync]\nexclude = ["big-data"]\n' >.rargo.toml
+printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
 files=$(asked_files)
-expect "a build with an excluded directory" "$R" build
-[ $(( $(asked_files) - files )) -eq 1 ] && ok "only the policy file itself was uploaded, not the excluded directory" || bad "only the policy file itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
-rm -rf .rargo.toml big-data
-expect "without the policy file the workspace builds again" "$R" build
+expect "a build with a directory the manifest excludes" "$R" build
+[ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest itself was uploaded, not the excluded directory" || bad "only the manifest itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
+cp "$T/Cargo.toml.before-policy" Cargo.toml
+rm -rf big-data
+expect "without the policy the workspace builds again" "$R" build
 
 echo "== build scripts that ask git about HEAD"
 G=$T/g

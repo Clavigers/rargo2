@@ -1,10 +1,16 @@
 //! Per-repository policy: the escape hatch for inputs that cannot be traced.
 //!
 //! Environment variables and the network are handled by rule, not by
-//! observation (DESIGN, "Sandbox and tracing"). The rules live in
-//! `.rargo.toml` at the worktree root, deliberately outside the cargo files:
-//! cargo ignores the file, so a repository that has one still builds with
-//! plain cargo.
+//! observation (DESIGN, "Sandbox and tracing"). The rules live in the
+//! `Cargo.toml` at the top of the repository, under
+//! `[workspace.metadata.rargo]` (`[package.metadata.rargo]` where there is no
+//! workspace table): cargo ignores `metadata`, so the repository builds with
+//! plain cargo as before, and it needs no file of rargo's own. The tables
+//! are the ones below, each prefixed with `workspace.metadata.rargo.`.
+//!
+//! The older place, `.rargo.toml` at the worktree root with the same tables
+//! unprefixed, is still read. A table the manifest has wins over the same
+//! table in the file, and the build says so.
 //!
 //! ```toml
 //! [env]
@@ -95,6 +101,27 @@ pub struct FlakePolicy {
 }
 
 pub const POLICY_FILE: &str = ".rargo.toml";
+pub const MANIFEST: &str = "Cargo.toml";
+
+/// What `[workspace.metadata.rargo]` may hold: the policy's tables and the
+/// server's name (which the client reads; D67).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct InManifest {
+    #[allow(dead_code)]
+    host: Option<String>,
+    env: Option<EnvPolicy>,
+    network: Option<NetPolicy>,
+    flake: Option<FlakePolicy>,
+    sync: Option<SyncPolicy>,
+}
+
+/// A repository's policy and what should be said about how it was found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Loaded {
+    pub policy: Policy,
+    pub notices: Vec<String>,
+}
 
 fn matches(pattern: &str, name: &str) -> bool {
     match pattern.strip_suffix('*') {
@@ -106,6 +133,51 @@ fn matches(pattern: &str, name: &str) -> bool {
 impl Policy {
     pub fn parse(text: &str) -> Result<Policy, String> {
         toml::from_str(text).map_err(|e| format!("{POLICY_FILE}: {}", e.message()))
+    }
+
+    /// The policy of a repository: from the manifest at its top and, for
+    /// tables the manifest does not have, from the older policy file.
+    pub fn load(manifest: Option<&str>, file: Option<&str>) -> Result<Loaded, String> {
+        let mut out = Loaded { policy: match file {
+            Some(text) => Policy::parse(text)?,
+            None => Policy::default(),
+        }, notices: Vec::new() };
+        let Some(manifest) = manifest else { return Ok(out) };
+        // A manifest cargo itself would reject is cargo's to report.
+        let Ok(table) = manifest.parse::<toml::Table>() else { return Ok(out) };
+        let found = ["workspace", "package"]
+            .iter()
+            .find_map(|kind| Some((*kind, table.get(*kind)?.get("metadata")?.get("rargo")?.clone())));
+        let Some((kind, value)) = found else { return Ok(out) };
+        let m: InManifest = value.try_into().map_err(|e: toml::de::Error| format!("{MANIFEST}: [{kind}.metadata.rargo]: {}", e.message()))?;
+        let in_file = file.and_then(|t| t.parse::<toml::Table>().ok()).unwrap_or_default();
+        let mut shadowed: Vec<&str> = Vec::new();
+        let mut take = |name: &'static str, has: bool| {
+            if has && in_file.contains_key(name) {
+                shadowed.push(name);
+            }
+            has
+        };
+        if take("env", m.env.is_some()) {
+            out.policy.env = m.env.unwrap_or_default();
+        }
+        if take("network", m.network.is_some()) {
+            out.policy.network = m.network.unwrap_or_default();
+        }
+        if take("flake", m.flake.is_some()) {
+            out.policy.flake = m.flake.unwrap_or_default();
+        }
+        if take("sync", m.sync.is_some()) {
+            out.policy.sync = m.sync.unwrap_or_default();
+        }
+        if !shadowed.is_empty() {
+            out.notices.push(format!(
+                "{POLICY_FILE}: {} ignored: {MANIFEST} has {} under [{kind}.metadata.rargo]",
+                shadowed.iter().map(|t| format!("[{t}]")).collect::<Vec<_>>().join(", ") + if shadowed.len() == 1 { " is" } else { " are" },
+                if shadowed.len() == 1 { "that table" } else { "those tables" },
+            ));
+        }
+        Ok(out)
     }
 
     /// Client variables the policy passes to every action.
@@ -158,6 +230,47 @@ mod tests {
         assert!(p.test_network("it") && !p.test_network("other"));
         assert!(p.build_script_network("fetcher-sys") && !p.build_script_network("util"));
         assert_eq!(p.flake.enabled, None);
+    }
+
+    #[test]
+    fn the_manifest_holds_the_policy_and_wins_over_the_file_table_by_table() {
+        let manifest = r#"
+            [workspace]
+            members = ["crates/*"]
+            [workspace.metadata.rargo]
+            host = "rargo.rs"
+            [workspace.metadata.rargo.env]
+            pass = ["DATABASE_URL"]
+            [workspace.metadata.rargo.network]
+            build-scripts = ["fetcher-sys"]
+        "#;
+        // The manifest alone.
+        let l = Policy::load(Some(manifest), None).unwrap();
+        assert_eq!(l.policy.env.pass, ["DATABASE_URL"]);
+        assert!(l.policy.build_script_network("fetcher-sys"));
+        assert!(l.notices.is_empty());
+        // With a file: its [env] is ignored and said to be; its [sync], which
+        // the manifest does not have, still counts.
+        let file = "[env]\npass = [\"OLD\"]\n[sync]\nexclude = [\"node_modules\"]\n";
+        let l = Policy::load(Some(manifest), Some(file)).unwrap();
+        assert_eq!(l.policy.env.pass, ["DATABASE_URL"]);
+        assert_eq!(l.policy.sync.exclude, ["node_modules"]);
+        assert_eq!(l.notices.len(), 1);
+        assert!(l.notices[0].contains("[env] is ignored") && l.notices[0].contains("[workspace.metadata.rargo]"), "{}", l.notices[0]);
+        // A manifest that only names the server changes nothing.
+        let only_host = "[package]\nname = \"a\"\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n";
+        let l = Policy::load(Some(only_host), Some(file)).unwrap();
+        assert_eq!(l.policy.env.pass, ["OLD"]);
+        assert!(l.notices.is_empty());
+        // A package outside a workspace; other tools' metadata is not ours.
+        let package = "[package]\nname = \"a\"\n[package.metadata.docs.rs]\nall-features = true\n[package.metadata.rargo.sync]\ngit = false\n";
+        assert_eq!(Policy::load(Some(package), None).unwrap().policy.sync.git, Some(false));
+        // Unknown keys are errors there too, and name the place.
+        let bad = "[workspace.metadata.rargo.env]\npas = []\n";
+        let e = Policy::load(Some(bad), None).unwrap_err();
+        assert!(e.contains("Cargo.toml") && e.contains("workspace.metadata.rargo"), "{e}");
+        // No manifest, no file.
+        assert_eq!(Policy::load(None, None).unwrap(), Loaded::default());
     }
 
     #[test]

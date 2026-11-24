@@ -715,10 +715,14 @@ struct Prepared {
 
 async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
     // The repository's policy file, as of this snapshot.
-    let policy = match snapshot.read(crate::policy::POLICY_FILE.as_bytes()) {
-        Some(text) => crate::policy::Policy::parse(&String::from_utf8_lossy(&text)).map_err(|e| anyhow!(e))?,
-        None => Default::default(),
+    let loaded = {
+        let text = |name: &str| snapshot.read(name.as_bytes()).map(|b| String::from_utf8_lossy(&b).into_owned());
+        crate::policy::Policy::load(text(crate::policy::MANIFEST).as_deref(), text(crate::policy::POLICY_FILE).as_deref()).map_err(|e| anyhow!(e))?
     };
+    let policy = loaded.policy;
+    for notice in &loaded.notices {
+        c.out.warn(notice);
+    }
     let generation = d.memo.advance();
     let mut masks = vec![vjoin(WORKTREE_AT, b"target")];
     if let Some(extra) = d.masks.get(&c.worktree) {
