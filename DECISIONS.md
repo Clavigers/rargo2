@@ -2072,3 +2072,109 @@ session), as root in CI and through `fusermount3` as a user;
 `dev/e2e-link.sh` kills the daemon with SIGKILL and runs stock
 `cargo build` and `cargo test` in the worktree, and kills an
 unprivileged user's daemon.
+
+## D70. CI, the gate, releases (initiative 4)
+
+The process is told in `FACTORY.md`; this is the design behind it and the
+reasons.
+
+**Two places run tests, because one cannot run them all.** GitHub's
+runners give root and FUSE but no time to build the planner (the cargo
+fork, ten minutes and more) on every push, and the suites that shape
+links (`e2e-link`, `e2e-worker`) want network namespaces with `netem`
+and several daemons with core caps. So:
+
+- *CI* (`.github/workflows/ci.yml`), on every push and pull request,
+  runs what a runner can run in minutes: the workspace built with
+  warnings as errors, unit and engine tests as root, the static client,
+  the published crates built from their packaged form, the installers
+  parsed, and one end-to-end suite, `dev/e2e-auth.sh`, against a server
+  of the commit. That suite needs no rig, and takes the planner from
+  the latest release's server archive instead of building it. It was
+  chosen because it is the path a new user takes.
+- *The gate* (`dev/gate.sh`), on the build machine, runs everything:
+  the above plus `e2e.sh` in both output modes, `e2e-flake.sh`,
+  `e2e-link.sh` and `e2e-worker.sh`, the last two in a second network
+  rig so that a benchmark holding the first is not disturbed.
+
+**What blocks a merge and what blocks a release.** A pull request is
+merged only when CI passed on it; a release is tagged only after the
+gate passed on the commit. Today both are kept by scripts and by rule,
+not by GitHub: the repository is private on a plan without branch
+rules (the API says so; recorded in `STATUS.md`), so `gh pr merge
+--auto` would merge at once. `dev/pr-land.sh` therefore watches the
+checks itself and merges only if all passed, and `CLAUDE.md` forbids
+other ways. The weakness is plain: nothing stops a push to `main` or a
+tag on an untested commit. Two issues close it as far as the plan
+allows: #26 makes the gate report its result on the commit as checks,
+so a pull request shows them beside CI's and `pr-land` can require
+them; #27 makes the release workflow refuse a tag whose commit has no
+green gate, and turns the release into one command.
+
+**How a release is made and what it publishes.** A tag `vX.Y.Z` on a
+commit whose `Cargo.toml` and `CHANGELOG.md` are at that version starts
+`.github/workflows/release.yml`: it checks that tag, manifest and
+changelog agree; builds the static client (musl) and the server
+archive (rargod, its sandbox helper, the planner built from
+`forks/cargo`'s base and patches, cached by their hash); publishes a
+GitHub release whose notes are the changelog section (which names the
+issues) and whose files are the client, the archive, both installers
+and checksums; then publishes the client's crates to crates.io, with
+the repository's token while it exists and by trusted publishing
+after. Versions before 1.0: the second number may break something,
+the third does not; the notes always say the protocol number.
+
+**The machine's part.** rargo.rs and the service here are not reachable
+from a runner, so `deploy/release-local.sh` runs on the build machine
+after the workflow: it puts the release's files where the site serves
+them (so the installers and `/dl/latest` never name a version that is
+not released) and rebuilds the service from a clean checkout of the
+tag. That it is a separate, hand-started step is the gap #27 closes.
+
+**Why squash merges and one issue per pull request.** The merge closes
+the issue and links the two; the squashed commit on `main` names the
+pull request, where what was tested is written. Commits that only
+record results skip this so that benchmarks do not wait on CI.
+
+## D71. Documentation on rargo.rs (initiative 3)
+
+**What was there.** The site is the owner's: a hand-written Book as its
+front page (pandoc with the-proportional-web; Fern and JetBrains Mono;
+`<cmd>` chips for commands, `<aside>` notes, figures for examples), a
+navigation of Book, Reference, Protocol and Bibliography of which only
+the first and last existed, and a note of the owner's that fixes the
+shape: the Book is read straight through and hands the reader to the
+Reference, how-tos live in the Reference as a FAQ, the Protocol is for
+people who implement the other side.
+
+**Decisions.**
+- The Book stays the owner's. Its prose is not rewritten; its `TODO`
+  chapters are not filled in by the agent. The one kind of change made
+  to it is a fact a reader needs to get through Getting Started, set
+  as an aside in the site's own manner.
+- What the initiative asks for (installing the client, installing a
+  server, how rargo works, configuration, troubleshooting) is the
+  Reference, built with the Book's template and style sheets so it
+  looks like the rest. Troubleshooting is its FAQ.
+- The Protocol page is separate work (#29).
+- The site also serves what the documented path needs: the installers
+  and released files (`/install.sh`, `/install-server.sh`, `/dl/`), and
+  the paths the client asks of the name (`/.well-known/rargo.json`,
+  `/auth*`), passed to the build server.
+- Released files come from the release process, never from `main`. The
+  Reference's text should too: today it lives in the site's repository
+  and is edited by hand, so nothing ties it to a release; #28 moves its
+  source into the rargo repository and has the release build it.
+- **Who can follow the path today.** The front page sends a reader to
+  the public farm, and the farm does not admit strangers: it gives a
+  token to GitHub accounts its owner has allowed, once sign-in with
+  GitHub is switched on (#23, which waits on the owner registering the
+  application), and until then to holders of an invitation. A reader
+  with neither can still finish the path on a server of their own, which
+  is one command. The site has to say this where the reader meets it
+  (#43), so that nobody gets stuck at `rargo auth` wondering what an
+  invitation is.
+
+The site is deployed by a push to its own repository on the build
+machine; it is not GitHub Pages.
+
