@@ -1540,13 +1540,90 @@ no `allow_other` (the mount is the user's alone) and no passthrough
 as `nobody`; that part uses a directory in `/tmp`, because an
 unprivileged user cannot reach anything under `/root`.
 
-**The history benchmark.** The brief asks for it as (a) to (d) with
-median, 90th percentile, maximum and total, without saying what (a) to
-(d) are; nothing in KICKOFF or DESIGN does. I took them to be, on the
-last 30 first-parent commits of rust-analyzer with `build -p
-rust-analyzer` at each: (a) stock cargo in one worktree; (b) rargo
-against a server that has built nothing; (c) rargo again from a second
-machine's fresh worktree against the server of (b); (d) rargo with the
-rustc fork against a server that has built nothing. The statistics are
-over the 29 commits after the first.
+**The history benchmark** as first written here was wrong: I took (a) to
+(d) for something of my own making over 30 commits. The brief defines
+them; see D62.
 
+## D62. The history benchmark as the brief defines it; where single-agent rargo loses to stock cargo
+
+**The benchmark.** First-parent history of rust-analyzer over two years
+(2,672 commits, 2024-11-24 to 2026-11-22), `build -p rust-analyzer` at
+each commit, 100 ms of round-trip time on rargo's client link:
+
+- (a) stock cargo, one worktree with a persistent target directory,
+  every commit;
+- (b) stock cargo, an empty target directory at every commit;
+- (c) stock cargo, one worktree with a persistent target directory,
+  only every 10th commit (the commits between are holes for it);
+- (d) rargo, two agents (two worktrees of one client machine)
+  interleaved in commit order: one builds every commit that is not a
+  10th, the other only the 10th ones. The second agent's builds against
+  (c) are the comparison that matters: both arrive at a commit nine
+  commits after the last one they built; rargo's agent finds what the
+  other agent built one commit earlier.
+
+Each as median, 90th percentile, maximum and total (`dev/history.py`).
+What had to be decided to run it:
+
+- **A toolchain per commit.** Commits older than a few months do not
+  compile with today's compiler (a lint that became an error). Each
+  commit is built with the toolchain its workspace names as its minimum
+  (`rust-version`: 1.82 to 1.98, nine toolchains), by stock cargo
+  through rustup's `+toolchain` and by rargo through
+  `RUSTUP_TOOLCHAIN`. For 72 commits whose dependencies already needed
+  the next toolchain's cargo, the next one is used. Two commits are
+  broken in the repository itself and fail for both.
+- **Four cores per build, six builds at a time.** (b) alone is 2,672
+  cold builds. Everything shares the machine's cap of 24 cores, so each
+  build (stock cargo's `-j`, and rargo's server) gets 4 cores and six
+  run side by side; cold builds are handed to whichever lane is free.
+  The other tables in STATUS are at 24 cores; these are not comparable
+  with them in absolute terms, only among themselves.
+- **Crates fetched beforehand**, by each toolchain's cargo and by the
+  server's planner (they keep the registry cache under different
+  directory names), so that neither side downloads while timed and the
+  rig's server, which has no route out, can build.
+- A full clone was needed (`bench/ra-hist`); the benchmark's shallow
+  clone could not be deepened.
+
+**Where one agent alone loses to stock cargo.** Measured per action on
+single history steps (24 cores, LAN): hashing and storing the binary
+and the incremental states is not it. On a commit that changes one file
+of `hir-ty`, every unit up to `ide` takes the same time under both to a
+tenth of a second; then the `rust-analyzer` library takes 6.3 s under
+rargo and 1.6 s under stock cargo, and the link 1.1 s against 0.9 s. On
+a commit that changes no Rust file, stock cargo does nothing (0.14 s)
+and rargo runs three actions (7.7 s): the crate's build script, the
+library, the link.
+
+The reason is the build script. It asks git for the commit and passes
+it to the compiler, and tells cargo to rerun it when `.git/HEAD`
+changes. In a linked worktree `.git` is a file, the script finds no
+`.git/HEAD`, tells cargo nothing, and stock cargo never runs it again:
+its binary goes on reporting the commit it was first built at. rargo
+does not go by what a script declares; it saw the script read HEAD
+through git, HEAD changed, so the script runs, the commit it passes on
+is new, and the library that embeds it is compiled again. Of the 5.4 s
+between the two on the one-file commit, 4.6 s are that recompilation;
+with `[sync] git = false` (no repository in the sandbox, the script
+finds no commit) the step takes 7.9 s against stock cargo's 7.1 s. The
+remaining 0.8 s are rargo's own: 0.2 s before the first action starts,
+0.2 s on the link step, 0.3 s after it (the 456 MiB binary is hashed
+and stored, the delivery listed), and the round trip. Those were not
+reduced.
+
+What was changed: a linked worktree is now shown to the build as one.
+`.git` is a file there, as on the client, naming a stand-in directory
+beside it (`.rargo-git`, excluded from what git sees). Before, the
+stand-in was a directory at `.git` whatever the client had, so the
+script behaved as in a main checkout: it found `.git/HEAD`, and said so
+to cargo. That was a difference from the client for no reason. It does
+not change the timing: rargo reruns the script because of what it
+read, not because of what it declared.
+
+What was not changed: rargo still reruns the script and rebuilds the
+library at every commit. That is the cost of the binary saying which
+commit it is, which stock cargo in a linked worktree gets wrong. A
+repository that prefers cargo's behaviour can set `[sync] git = false`.
+Rejected: honouring `rerun-if-changed` over what was observed (it would
+make rargo's cache as stale as cargo's in exactly this case).

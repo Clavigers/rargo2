@@ -46,7 +46,8 @@ def worktree(name, commit):
     wt = os.path.join(ROOT, name)
     if not os.path.isdir(wt):
         os.makedirs(ROOT, exist_ok=True)
-        git("worktree", "prune")
+        # (No `git worktree prune` here: several walks start at once, and
+        # one's prune took away the worktree another was just adding.)
         git("worktree", "add", "--detach", wt, commit)
     return wt
 
