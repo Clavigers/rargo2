@@ -26,6 +26,18 @@ An issue labelled `initiative` is a larger feature: a short design in
 request; the initiative is closed when its tests or measurements are in
 `STATUS.md`.
 
+## What done means
+
+Every closed issue is checked by an independent reviewer: a separate run
+with no memory of the work, which reads the issue, reads the pull request
+and tries the thing for real. An issue that holds up is labelled
+`verified`; one that does not is reopened with a comment starting
+"Independent review: not done" that lists what is missing. Reopened issues
+come before everything else, and are not closed again until what the
+review lists is fixed. The agent does not set the labels `verified` or
+`needs-owner`. Closing an issue therefore claims that a strict stranger
+would agree it is done as the issue states it.
+
 ## From issue to main
 
 1. A branch. The change, with its tests.
