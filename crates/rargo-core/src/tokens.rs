@@ -59,12 +59,61 @@ pub struct Invite {
     pub created: u64,
 }
 
+/// A GitHub account that may get a token by signing in (`rargo auth`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Allowed {
+    pub login: String,
+    #[serde(default)]
+    pub admin: bool,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct File {
     #[serde(default)]
     tokens: Vec<Token>,
     #[serde(default)]
     invites: Vec<Invite>,
+    /// The allow list of GitHub accounts.
+    #[serde(default)]
+    github: Vec<Allowed>,
+}
+
+/// The GitHub OAuth application a server signs people in with, and the
+/// address its pages are reached at (`github.json` in the state directory,
+/// written by `rargod token github`, read whenever it is needed).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Github {
+    pub client_id: String,
+    pub client_secret: String,
+    /// `https://rargo.rs`: where GitHub sends the browser back to.
+    pub url: String,
+}
+
+impl Github {
+    pub fn path(state: &Path) -> PathBuf {
+        state.join("github.json")
+    }
+
+    pub fn load(state: &Path) -> Option<Github> {
+        let g: Github = serde_json::from_slice(&std::fs::read(Self::path(state)).ok()?).ok()?;
+        (!g.client_id.is_empty() && !g.client_secret.is_empty()).then_some(g)
+    }
+
+    pub fn save(&self, state: &Path) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = Self::path(state);
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let mut w = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        w.write_all(&serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+/// A GitHub login: letters, digits and single hyphens, at most 39.
+pub fn valid_login(login: &str) -> bool {
+    !login.is_empty() && login.len() <= 39 && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !login.starts_with('-')
 }
 
 pub struct TokenStore {
@@ -252,6 +301,44 @@ impl TokenStore {
         })
     }
 
+    /// Puts a GitHub account on the allow list (or changes its standing).
+    pub fn allow(&self, login: &str, admin: bool) -> Result<()> {
+        if !valid_login(login) {
+            bail!("`{login}` is not a GitHub login");
+        }
+        self.change(|f| {
+            f.github.retain(|a| !a.login.eq_ignore_ascii_case(login));
+            f.github.push(Allowed { login: login.to_string(), admin });
+            Ok(())
+        })
+    }
+
+    /// Takes a GitHub account off the allow list and revokes the tokens it
+    /// got by signing in. Returns whether it was on the list and how many
+    /// tokens were revoked.
+    pub fn disallow(&self, login: &str) -> Result<(bool, usize)> {
+        self.change(|f| {
+            let before = f.github.len();
+            f.github.retain(|a| !a.login.eq_ignore_ascii_case(login));
+            let mut n = 0;
+            for t in f.tokens.iter_mut().filter(|t| !t.revoked && t.note == "github" && t.user.eq_ignore_ascii_case(login)) {
+                t.revoked = true;
+                n += 1;
+            }
+            Ok((f.github.len() != before, n))
+        })
+    }
+
+    /// Whether a GitHub account may sign in, and as what (GitHub logins
+    /// do not distinguish case).
+    pub fn allowed(&self, login: &str) -> Option<Allowed> {
+        self.file().github.iter().find(|a| a.login.eq_ignore_ascii_case(login)).cloned()
+    }
+
+    pub fn allow_list(&self) -> Vec<Allowed> {
+        self.file().github.clone()
+    }
+
     /// Makes an invitation. Returns its code, which is not kept.
     pub fn invite(&self, user: Option<&str>, admin: bool, days: Option<u32>, uses: u32, token_days: Option<u32>) -> Result<String> {
         if let Some(u) = user {
@@ -337,6 +424,30 @@ mod tests {
         assert!(store.lookup(&t2.id).is_none(), "expired");
         assert!(store.create("no spaces", false, None, "").is_err());
         assert_eq!(store.list().len(), 2);
+    }
+
+    #[test]
+    fn the_allow_list_admits_github_accounts_and_taking_one_off_revokes_its_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TokenStore::new(dir.path().join("tokens.json"));
+        assert!(store.allowed("ann").is_none());
+        store.allow("Ann", false).unwrap();
+        store.allow("ann", true).unwrap();
+        assert_eq!(store.allow_list().len(), 1, "one entry per account, whatever the case");
+        assert!(store.allowed("ANN").unwrap().admin);
+        assert!(store.allow("not a login", false).is_err());
+        let (signed_in, _) = store.create("ann", true, None, "github").unwrap();
+        let (invited, _) = store.create("ann", false, None, "invitation").unwrap();
+        assert_eq!(store.disallow("Ann").unwrap(), (true, 1));
+        assert!(store.lookup(&signed_in.id).is_none(), "the token it signed in for is revoked");
+        assert!(store.lookup(&invited.id).is_some(), "a token from an invitation is another matter");
+        assert_eq!(store.disallow("ann").unwrap(), (false, 0));
+        // The application's settings: kept beside the tokens, private.
+        assert!(Github::load(dir.path()).is_none());
+        Github { client_id: "id".into(), client_secret: "s".into(), url: "https://x".into() }.save(dir.path()).unwrap();
+        assert_eq!(Github::load(dir.path()).unwrap().url, "https://x");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(Github::path(dir.path())).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

@@ -31,6 +31,7 @@ check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else 
 
 umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
+pkill -KILL -f "fake-github.py $((${E2E_AUTH_PORT:-7466} + 1)) " 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
 export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config RARGO_CACHE_DIR=$T/cache RARGO_NO_BROWSER=1
 R=$B/rargo
@@ -44,6 +45,12 @@ invite=$("$D" token invite --state "$T/state" --user ann --uses 2 2>/dev/null)
 ! grep -q "${invite//-/}" "$T/state/tokens.json"; check $? "the code is not in the token file"
 [ "$(stat -c %a "$T/state/tokens.json")" = 600 ]; check $? "the token file is readable by its owner only"
 
+# What stands in for GitHub in the sign-in checks further down.
+ghport=$((port + 1))
+echo mallory >"$T/github-who"
+python3 "$here/fake-github.py" $ghport "$T/github-who" &
+gh=$!
+export RARGO_GITHUB_URL=http://127.0.0.1:$ghport RARGO_GITHUB_API=http://127.0.0.1:$ghport
 "$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
 srv=$!
 for _ in $(seq 1 100); do grep -q "serving clients" "$T/srv.log" && break; sleep 0.1; done
@@ -119,7 +126,42 @@ grep -q "no longer valid" "$T/srv.log"; check $? "the server closed the open ses
 out=$("$R" auth remove 2>&1); check $? "rargo auth remove forgets the token" "$out"
 ! grep -q "^\[\"$host\"\]" "$cred"; check $? "it is gone from the credentials file"
 
-for c in "$T/cache" "$T/cache-bob"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+echo "== signing in with GitHub (a stand-in for it), with an allow list"
+printf 'the-app-secret\n' >"$T/app-secret"
+out=$("$D" token github --state "$T/state" --client-id the-app-id --client-secret-file "$T/app-secret" --url "http://$host" 2>&1); check $? "rargod token github sets the application up, without a restart" "$out"
+[ "$(stat -c %a "$T/state/github.json")" = 600 ]; check $? "its secret is readable by the owner only"
+out=$("$D" token allow --state "$T/state" Carol 2>&1); check $? "rargod token allow puts an account on the allow list" "$out"
+out=$(curl -fsS "http://$host/.well-known/rargo.json"); grep -q '"github":true' <<<"$out"; check $? "the server says that it signs in with GitHub" "$out"
+export HOME=$T/home2 XDG_CONFIG_HOME=$T/home2/.config RARGO_CACHE_DIR=$T/cache2
+mkdir -p "$HOME"
+cd "$T/proj" || exit 2
+"$R" auth >"$T/auth2.out" 2>&1 &
+auth=$!
+for _ in $(seq 1 50); do grep -q -E '^ +[A-Z0-9]{4}-[A-Z0-9]{4}$' "$T/auth2.out" 2>/dev/null && break; sleep 0.1; done
+code=$(grep -E '^ +[A-Z0-9]{4}-[A-Z0-9]{4}$' "$T/auth2.out" | tr -d ' ')
+out=$(curl -fsS "http://$host/auth?code=$code"); grep -q 'action="/auth/github"' <<<"$out" && ! grep -q 'name="invite"' <<<"$out"; check $? "the page offers GitHub and asks for no invitation" "$out"
+out=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "http://$host/auth/github?code=$code")
+grep -q "^302 http://127.0.0.1:$ghport/login/oauth/authorize?client_id=the-app-id&redirect_uri=http%3A%2F%2F127.0.0.1%3A$port%2Fauth%2Fgithub%2Fcallback&state=" <<<"$out"; check $? "it sends the browser to GitHub with the application's id and the way back" "$out"
+out=$(curl -sL -w '\n%{http_code}' "http://$host/auth/github?code=$code")
+[ "$(tail -n 1 <<<"$out")" = 403 ] && grep -q "mallory is not on this server.s allow list" <<<"$out"; check $? "an account that is not allowed gets nothing and is told why" "$out"
+kill -0 $auth 2>/dev/null; check $? "and the terminal keeps waiting"
+out=$(curl -s -w '\n%{http_code}' "http://$host/auth/github/callback?state=made-up&code=ghcode-carol")
+[ "$(tail -n 1 <<<"$out")" = 403 ]; check $? "a callback that belongs to no waiting terminal is refused" "$out"
+echo carol >"$T/github-who"
+out=$(curl -sL -w '\n%{http_code}' "http://$host/auth/github?code=$code")
+[ "$(tail -n 1 <<<"$out")" = 200 ] && grep -q "GitHub account <b>Carol</b>" <<<"$out"; check $? "an allowed account is signed in (as the allow list spells it)" "$out"
+wait $auth; rc=$?
+[ $rc = 0 ] && grep -q "Authenticated to $host as Carol" "$T/auth2.out"; check $? "rargo auth ends authenticated as that account" "$(cat "$T/auth2.out")"
+echo "// carol" >>src/main.rs
+out=$("$R" build 2>&1); check $? "rargo build works with the token" "$out"
+out=$("$D" token list --state "$T/state" 2>&1); grep -q "Carol.*github" <<<"$out" && grep -q "may sign in: Carol" <<<"$out"; check $? "rargod token list shows the token and the allow list" "$out"
+out=$("$D" token disallow --state "$T/state" carol 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargod token disallow revokes what the account signed in for" "$out"
+sleep 4
+echo "// again" >>src/main.rs
+out=$("$R" build 2>&1); [ $? != 0 ]; check $? "and its builds stop" "$out"
+
+for c in "$T/cache" "$T/cache-bob" "$T/cache2"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+kill $gh 2>/dev/null
 cd /
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
 [ "$(grep -c panicked "$T/srv.log")" = 0 ]; check $? "the server did not panic" "$(grep panicked "$T/srv.log")"

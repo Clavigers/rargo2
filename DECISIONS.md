@@ -1915,3 +1915,49 @@ needs no second `rargo auth`; create, list, revoke while the server
 runs; a revoked token's open session is closed) and unit tests of the
 token store, the flow and the manifest edit.
 
+## D68. `rargo auth` signs in with GitHub; the server keeps an allow list (issue 13, the owner's decision)
+
+The browser step of `rargo auth` (D67) identifies a person by their
+GitHub account. The page shows the terminal's code and one button; the
+button sends the browser to GitHub's authorization page with the
+server's OAuth application and a random value that names the waiting
+request; GitHub sends the browser back to `/auth/github/callback`; the
+server exchanges what came back for an access token, asks GitHub who it
+belongs to (`GET /user`: the login, nothing else is used and no scope is
+asked for), and drops that access token. If the login is on the
+server's allow list, a rargo token is made for that name with the
+standing the list gives it and handed to the terminal that holds the
+device secret.
+
+- **The allow list** is in `tokens.json` beside the tokens:
+  `rargod token allow LOGIN [--admin]`, `rargod token disallow LOGIN`
+  (which also revokes the tokens that account signed in for, so its
+  open sessions end within seconds), shown by `rargod token list`.
+  Logins are compared without regard to case, as GitHub does.
+- **The application** (client id, client secret, the address the pages
+  are reached at) is in `github.json` in the state directory, mode 600,
+  written by `rargod token github --client-id ID --client-secret-file
+  FILE --url https://NAME` and read when needed: setting it up needs no
+  restart. A server without it asks for an invitation as before, so
+  private servers need no GitHub.
+- **Why an OAuth application and not something that needs none.** Only
+  GitHub can say who is at the browser, and it says so only to a
+  registered application. Registering one is a form on github.com that
+  belongs to the owner of the name (the callback address is theirs);
+  it cannot be done through the API or by a collaborator.
+- rargod now carries an HTTPS client (`ureq`, as the client does) for
+  the two questions it asks GitHub.
+- The exchange is bound to the request by the random `state` value,
+  which is known only to the server and the browser it redirected; a
+  callback with a value that belongs to no waiting request is refused.
+
+Tested in `dev/e2e-auth.sh` against a stand-in for GitHub's three
+addresses (`dev/fake-github.py`; `RARGO_GITHUB_URL` and
+`RARGO_GITHUB_API` point rargod at it): the redirect carries the
+application's id and the way back; an account that is not allowed gets
+nothing and is told what its administrator has to run, and the terminal
+keeps waiting; a made-up callback is refused; an allowed account is
+signed in and its build works; taking it off the list stops its builds.
+**Not tested against github.com itself**: that needs the application,
+which is the owner's to register.
+
