@@ -656,6 +656,10 @@ mod tests {
                     store.put_bytes(junk.as_bytes()).unwrap();
                     store.remove(&Hash::of(junk.as_bytes()));
                     n += 1;
+                    // Often enough that every walk of the tree overlaps a
+                    // change, without taking a core from the tests that
+                    // run beside this one.
+                    std::thread::sleep(std::time::Duration::from_micros(200));
                 }
                 n
             })
