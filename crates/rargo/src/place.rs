@@ -112,11 +112,6 @@ pub fn cache_slot(cache_dir: &Path, hash: &Digest) -> PathBuf {
 
 /// Temporary names are unique in the process: a daemon places for several
 /// commands at once.
-fn next_seq() -> u64 {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 impl Drop for Placer {
     /// A command that was interrupted leaves no half-received files.
     fn drop(&mut self) {
@@ -157,7 +152,7 @@ impl Placer {
             }
         }
         let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let tmp = dest.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), next_seq()));
+        let tmp = dest.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), crate::tmp::seq()));
         let watched = crate::tmp::watch(&tmp);
         (tmp, watched)
     }
@@ -274,7 +269,7 @@ impl Placer {
 
     fn scratch(&mut self) -> io::Result<PathBuf> {
         std::fs::create_dir_all(&self.cache)?;
-        Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), next_seq())))
+        Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), crate::tmp::seq())))
     }
 
     pub fn blob(&mut self, hash: Digest, bytes: &[u8]) -> io::Result<()> {
