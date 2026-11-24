@@ -11,10 +11,9 @@ release notes say when a release changes it.
 Protocol 7 (unchanged).
 
 - A project's server and policy are in its `Cargo.toml`
-  (`[workspace.metadata.rargo]`) and nowhere else; a machine's token is in
-  `~/.config/rargo/credentials.toml` or `RARGO_TOKEN`. `.rargo.toml` and
-  `~/.config/rargo/config.toml` are not read, and there is no
-  `rargo --rargo-migrate`. (#55)
+  (`[workspace.metadata.rargo]`); a machine's token is in
+  `~/.config/rargo/credentials.toml` or `RARGO_TOKEN`. Those are the only
+  places rargo reads them from. (#55)
 
 ## 0.3.7
 
@@ -45,14 +44,6 @@ Protocol 7 (unchanged).
   The directory is now unmounted the moment its daemon is gone, with no
   rargo command run, and is an ordinary directory stock cargo builds in.
   (#6)
-- The older configuration files say that they are old: a build that takes
-  its server or key from `~/.config/rargo/config.toml`, or its policy from
-  `.rargo.toml`, notes it once per command and names what replaces it.
-  `RARGO_QUIET_DEPRECATIONS=1` silences that. Both files are read until
-  **0.5.0**. (#21)
-- `rargo --rargo-migrate` moves them: the old server becomes the project's
-  `host`, the old key a credential for it, and the tables of `.rargo.toml`
-  go into `Cargo.toml` with their comments; `.rargo.toml` is removed. (#21)
 
 ## 0.3.4
 
