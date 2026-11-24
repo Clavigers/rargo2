@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod secure;
 pub mod tree;
+pub mod workspace;
 
 pub const PROTO_VERSION: u32 = 7;
 

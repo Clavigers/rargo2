@@ -591,6 +591,67 @@ cp "$T/Cargo.toml.before-policy" Cargo.toml
 rm -rf big-data
 expect "without the policy the workspace builds again" "$R" build
 
+echo "== workspace policy inside a Git worktree"
+nested=$T/nested-policy
+git init -q "$nested"
+mkdir -p "$nested/rust/member/src" "$nested/src"
+cat >"$nested/Cargo.toml" <<'EOF'
+[package]
+name = "outer"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+exclude = ["rust"]
+[workspace.metadata.rargo.env]
+pass = ["OUTER_PROBE"]
+[workspace.metadata.rargo.sync]
+exclude = ["inner-only"]
+EOF
+cat >"$nested/rust/Cargo.toml" <<'EOF'
+[workspace]
+members = ["member"]
+resolver = "2"
+[workspace.metadata.rargo.env]
+pass = ["INNER_PROBE"]
+[workspace.metadata.rargo.sync]
+exclude = ["outer-only"]
+EOF
+cat >"$nested/rust/member/Cargo.toml" <<'EOF'
+[package]
+name = "inner"
+version = "0.1.0"
+edition = "2021"
+EOF
+echo outer >"$nested/outer-only"
+echo inner >"$nested/inner-only"
+cat >"$nested/src/lib.rs" <<'EOF'
+pub const MARKER: &str = include_str!("../outer-only");
+
+#[test]
+fn outer_policy() {
+    assert_eq!(std::env::var("OUTER_PROBE").as_deref(), Ok("outer"));
+    assert!(std::env::var_os("INNER_PROBE").is_none());
+    assert_eq!(MARKER.trim(), "outer");
+    assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("inner-only").exists());
+}
+EOF
+cat >"$nested/rust/member/src/lib.rs" <<'EOF'
+#[test]
+fn inner_policy() {
+    assert_eq!(std::env::var("INNER_PROBE").as_deref(), Ok("inner"));
+    assert!(std::env::var_os("OUTER_PROBE").is_none());
+    assert_eq!(include_str!("../../../inner-only").trim(), "inner");
+    assert!(!std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../outer-only").exists());
+}
+EOF
+policy_test() ( cd "$1" && shift && INNER_PROBE=inner OUTER_PROBE=outer "$R" test --lib "$@" )
+expect "the workspace member uses its enclosing manifest's environment and exclusions" policy_test "$nested/rust/member"
+expect "the same daemon selects the outer workspace policy" policy_test "$nested"
+expect "an explicit nested manifest selects the inner workspace policy" policy_test "$nested" --manifest-path rust/member/Cargo.toml
+
+out=$(cd "$nested/rust/member" && "$R" --rargo-drift-check 2>&1); rc=$?
+[ $rc -eq 0 ] && has "$out" "stock cargo builds" && has "$out" "rargo builds" && ok "the drift check builds the nested package on both sides" || bad "the drift check builds the nested package on both sides" "$out"
+
 echo "== build scripts that ask git about HEAD"
 G=$T/g
 mkdir -p "$G/src"

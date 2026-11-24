@@ -2,7 +2,7 @@
 //!
 //! Environment variables and the network are handled by rule, not by
 //! observation (DESIGN, "Sandbox and tracing"). The rules live in the
-//! `Cargo.toml` at the top of the repository, under
+//! active workspace or package manifest, under
 //! `[workspace.metadata.rargo]` (`[package.metadata.rargo]` where there is no
 //! workspace table): cargo ignores `metadata`, so the repository builds with
 //! plain cargo as before, and it needs no file of rargo's own. The tables
@@ -137,13 +137,19 @@ fn matches(pattern: &str, name: &str) -> bool {
     }
 }
 
+pub fn snapshot_policy(snapshot: &crate::snapshot::Snapshot, dir: &std::path::Path) -> Result<Loaded, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let read = |path: &std::path::Path| snapshot.read(path.as_os_str().as_bytes()).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let manifest = rargo_proto::workspace::manifest_for(dir, read).and_then(|(path, _)| read(&path));
+    Policy::load(manifest.as_deref(), read(std::path::Path::new(POLICY_FILE)).as_deref())
+}
+
 impl Policy {
     pub fn parse(text: &str) -> Result<Policy, String> {
         toml::from_str(text).map_err(|e| format!("{POLICY_FILE}: {}", e.message()))
     }
 
-    /// The policy of a repository: from the manifest at its top and, for
-    /// tables the manifest does not have, from the older policy file.
+    /// Parse policy tables from the selected Cargo manifest and the worktree policy file.
     pub fn load(manifest: Option<&str>, file: Option<&str>) -> Result<Loaded, String> {
         let mut out = Loaded { policy: match file {
             Some(text) => Policy::parse(text)?,
