@@ -438,6 +438,49 @@ $(norm <<<"$out")
 --- stock
 $(norm <<<"$stock")"
 
+echo "== nextest: rargo's against stock's, in the same worktree"
+cd "$A"
+# What may differ: timings, run IDs, thread IDs, and the lines of the
+# build (cargo's and rargo's) and rargo's own.
+nnorm() {
+    sed -E -e 's/\[ *[0-9.]+s\]/[time]/g' -e 's/run ID [0-9a-f-]+/run ID X/' -e "s/(thread '[^']*') \([0-9]+\)/\1 (N)/g" \
+        -e 's/finished in [0-9.]+s/finished in Ns/' |
+        grep -vE '^ *(Compiling|Finished|Replayed|Installing|Blocking|Locking|Downloaded|Running|Executable) |^warning: util@'
+}
+jnorm() { sed -E -e 's/ (uuid|timestamp|time)="[^"]*"//g' -e "s/(thread &apos;[^&]*&apos;) \([0-9]+\)/\1 (N)/g" -e 's/finished in [0-9.]+s/finished in Ns/g' "$1"; }
+against_stock() { # description, arguments for `nextest run`...
+    local d=$1; shift
+    stock=$(PATH="$T/nextest-newest:$PATH" cargo nextest run --offline "$@" 2>&1); src=$?
+    out=$("$R" nextest run "$@" 2>&1); rc=$?
+    if [ $rc -eq $src ] && [ "$(nnorm <<<"$out")" = "$(nnorm <<<"$stock")" ]; then
+        ok "$d: output and exit code ($rc) as stock nextest's"
+    else
+        bad "$d: output and exit code as stock nextest's" "rargo $rc, stock $src
+$(diff <(nnorm <<<"$stock") <(nnorm <<<"$out"))"
+    fi
+}
+echo changed >crates/app/tests/fixture.txt
+against_stock "a failing test" --test-threads 1
+against_stock "a failing test with --no-fail-fast" --test-threads 1 --no-fail-fast
+echo fixture >crates/app/tests/fixture.txt
+against_stock "a filter expression" --test-threads 1 -E 'test(=reads_a_fixture) | test(answers)'
+against_stock "a partition" --test-threads 1 --partition count:2/2
+cd "$T/nx-flaky"
+against_stock "a flaky test with retries" --test-threads 1 --retries 2
+cd "$A"
+# The JUnit file a profile asks for, with a failure in it.
+mkdir -p .config
+printf '[profile.ci.junit]\npath = "junit.xml"\nstore-success-output = true\n' >.config/nextest.toml
+echo changed >crates/app/tests/fixture.txt
+PATH="$T/nextest-newest:$PATH" cargo nextest run --offline --profile ci --no-fail-fast --test-threads 1 >/dev/null 2>&1; src=$?
+cp target/nextest/ci/junit.xml "$T/junit-stock.xml" 2>/dev/null
+rm -f target/nextest/ci/junit.xml
+"$R" nextest run --profile ci --no-fail-fast --test-threads 1 >/dev/null 2>&1; rc=$?
+[ $rc -eq $src ] && [ -s "$T/junit-stock.xml" ] && grep -q '<failure' target/nextest/ci/junit.xml && [ "$(jnorm target/nextest/ci/junit.xml)" = "$(jnorm "$T/junit-stock.xml")" ] && ok "the JUnit file of a run with a failure is stock nextest's (timestamps aside)" || bad "the JUnit file of a run with a failure is stock nextest's" "rargo $rc, stock $src
+$(diff <(jnorm "$T/junit-stock.xml") <(jnorm target/nextest/ci/junit.xml) 2>&1 | head -30)"
+echo fixture >crates/app/tests/fixture.txt
+rm -rf .config
+
 echo "== errors"
 cd "$A"
 cp crates/app/src/main.rs "$T/main.rs.bak"
