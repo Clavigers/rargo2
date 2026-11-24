@@ -1097,6 +1097,12 @@ impl Daemon {
             c.fetched_bytes.load(Ordering::Relaxed),
             c.reused_bytes.load(Ordering::Relaxed),
         );
+        let mut text = text;
+        for w in self.worktrees.lock().unwrap().values() {
+            if let Some(m) = &*w.out.lock().unwrap() {
+                text.push_str(&format!("operations          {}: {}\n", m.dir.display(), m.fs.op_report()));
+            }
+        }
         let _ = out.send(LocalReply::Stdout(text.into_bytes()));
         LocalReply::Exit(0)
     }

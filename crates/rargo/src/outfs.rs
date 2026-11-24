@@ -31,6 +31,37 @@ use std::time::Duration;
 
 const TTL: Duration = Duration::from_secs(3600);
 const ROOT: u64 = 1;
+/// The operations whose number and time are counted.
+const OPS: [&str; 20] = ["lookup", "forget", "getattr", "setattr", "readlink", "symlink", "mknod", "mkdir", "unlink", "rmdir", "rename", "link", "open", "create", "read", "write", "release", "fsync", "readdir", "statfs"];
+
+/// A change to a directory's names.
+enum Patch {
+    Add(Vec<u8>, u32),
+    Del(Vec<u8>),
+}
+
+/// What is kept of a directory that has been listed: its names by cookie,
+/// kept up to date by every operation that adds or removes one, so that a
+/// listing is a walk through this map and never a look at the disk again.
+/// `deps` in a build of Zed holds tens of thousands of files, is listed
+/// by every compiler, and changes between any two of those listings.
+#[derive(Default)]
+struct DirState {
+    live: Option<BTreeMap<u64, (Vec<u8>, u32)>>,
+    /// While the names are being read from the disk: the changes made
+    /// meanwhile, applied when the reading is done.
+    building: Option<Vec<Patch>>,
+}
+
+/// Adds the time since it was made to an operation's total when dropped.
+struct Timed<'a>(&'a OutFs, usize, std::time::Instant);
+
+impl Drop for Timed<'_> {
+    fn drop(&mut self) {
+        self.0.op_count[self.1].fetch_add(1, Ordering::Relaxed);
+        self.0.op_nanos[self.1].fetch_add(self.2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
 /// How long a listing whose reading has begun may be continued from.
 const LISTING_KEPT: Duration = Duration::from_secs(30);
 
@@ -91,12 +122,16 @@ pub struct OutFs {
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
+    /// Directories that have been listed, by node.
+    dirs: Mutex<HashMap<u64, DirState>>,
     /// Listings being read, by directory node (see `readdir`).
     listings: Mutex<HashMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
     /// Directories already cleared of dead clients' temporaries.
     swept: Mutex<std::collections::HashSet<Vec<u8>>>,
     uid: u32,
     gid: u32,
+    op_count: [AtomicU64; OPS.len()],
+    op_nanos: [AtomicU64; OPS.len()],
     pub opened_virtual: AtomicU64,
     pub made_real: AtomicU64,
 }
@@ -161,13 +196,33 @@ impl OutFs {
             session: OnceLock::new(),
             table: table.to_path_buf(),
             dirty: AtomicBool::new(false),
+            dirs: Mutex::new(HashMap::new()),
             listings: Mutex::new(HashMap::new()),
             swept: Mutex::new(Default::default()),
             uid,
             gid,
+            op_count: std::array::from_fn(|_| AtomicU64::new(0)),
+            op_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
             opened_virtual: AtomicU64::new(0),
             made_real: AtomicU64::new(0),
         }))
+    }
+
+    fn timed(&self, op: &str) -> Timed<'_> {
+        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), std::time::Instant::now())
+    }
+
+    /// How many of each operation were served and how long they took in
+    /// the daemon, most expensive first.
+    pub fn op_report(&self) -> String {
+        let mut rows: Vec<(u64, u64, &str)> = OPS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (self.op_nanos[i].load(Ordering::Relaxed), self.op_count[i].load(Ordering::Relaxed), *name))
+            .filter(|r| r.1 > 0)
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.iter().map(|(ns, n, name)| format!("{name} {n} ({:.2} s)", *ns as f64 / 1e9)).collect::<Vec<_>>().join(", ")
     }
 
     pub fn attach(&self, session: Arc<Session>) {
@@ -399,6 +454,33 @@ impl OutFs {
         }
     }
 
+    /// Tells a listed directory that a name was added or removed.
+    fn patch(&self, dir: u64, p: Patch) {
+        let mut dirs = self.dirs.lock().unwrap();
+        let Some(d) = dirs.get_mut(&dir) else { return };
+        if let Some(log) = &mut d.building {
+            log.push(p);
+            return;
+        }
+        if let Some(live) = &mut d.live {
+            match p {
+                Patch::Add(name, t) => {
+                    live.insert(name_cookie(&name), (name, t));
+                }
+                Patch::Del(name) => {
+                    live.remove(&name_cookie(&name));
+                }
+            }
+        }
+    }
+
+    /// Forgets what is kept of a directory's names (something changed
+    /// them in a way that is not followed name by name).
+    fn unlist(&self, dir: u64) {
+        self.dirs.lock().unwrap().remove(&dir);
+        self.listings.lock().unwrap().remove(&dir);
+    }
+
     /// The names in the directory `rel`, real ones and delivered ones that
     /// are not also real, in the order of their cookies.
     fn listing(&self, rel: &[u8]) -> Vec<(u64, Vec<u8>, u32)> {
@@ -489,6 +571,7 @@ impl OutFs {
                 }
             }
         }
+        self.unlist(parent);
         self.inval(parent, name);
     }
 
@@ -597,6 +680,7 @@ impl OutFs {
 
 impl Filesystem for OutFs {
     fn lookup(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<Entry> {
+        let _t = self.timed("lookup");
         let rel = join(&self.path(parent)?, name);
         match self.kind(&rel) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
@@ -609,6 +693,8 @@ impl Filesystem for OutFs {
     }
 
     fn forget(&self, nodeid: u64, nlookup: u64) {
+        let _t = self.timed("forget");
+        let mut gone: Vec<u64> = Vec::new();
         let mut st = self.state.lock().unwrap();
         let mut id = nodeid;
         let mut drop_by = nlookup;
@@ -622,6 +708,7 @@ impl Filesystem for OutFs {
             }
             let (parent, name) = (n.parent, n.name.clone());
             st.nodes.remove(&id);
+            gone.push(id);
             if st.children.get(&(parent, name.clone())) == Some(&id) {
                 st.children.remove(&(parent, name));
             }
@@ -631,15 +718,24 @@ impl Filesystem for OutFs {
             id = parent;
             drop_by = 0;
         }
+        drop(st);
+        if !gone.is_empty() {
+            let mut dirs = self.dirs.lock().unwrap();
+            for id in gone {
+                dirs.remove(&id);
+            }
+        }
     }
 
     fn getattr(&self, _ctx: &Ctx, nodeid: u64, _fh: Option<u64>) -> Res<(fuse_attr, Duration)> {
+        let _t = self.timed("getattr");
         let rel = self.path(nodeid)?;
         let kind = self.kind(&rel).ok_or(Errno(libc::ENOENT))?;
         Ok((self.attr(nodeid, &kind), TTL))
     }
 
     fn setattr(&self, ctx: &Ctx, nodeid: u64, set: &SetAttr) -> Res<(fuse_attr, Duration)> {
+        let _t = self.timed("setattr");
         let rel = self.path(nodeid)?;
         let kind = self.kind(&rel).ok_or(Errno(libc::ENOENT))?;
         match kind {
@@ -688,11 +784,13 @@ impl Filesystem for OutFs {
     }
 
     fn readlink(&self, _ctx: &Ctx, nodeid: u64) -> Res<Vec<u8>> {
+        let _t = self.timed("readlink");
         let rel = self.path(nodeid)?;
         std::fs::read_link(self.real(&rel)).map(|t| t.as_os_str().as_bytes().to_vec()).map_err(errno)
     }
 
     fn symlink(&self, _ctx: &Ctx, parent: u64, name: &[u8], target: &[u8]) -> Res<Entry> {
+        let _t = self.timed("symlink");
         let rel = join(&self.path(parent)?, name);
         if self.virt.read().unwrap().contains_key(&rel) {
             return Err(Errno(libc::EEXIST));
@@ -700,10 +798,12 @@ impl Filesystem for OutFs {
         self.make_parents(&rel)?;
         std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), self.real(&rel)).map_err(errno)?;
         let kind = self.kind(&rel).ok_or(Errno(libc::EIO))?;
+        self.patch(parent, Patch::Add(name.to_vec(), libc::DT_LNK as u32));
         Ok(self.entry(parent, name, &kind))
     }
 
     fn mknod(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32, _rdev: u32) -> Res<Entry> {
+        let _t = self.timed("mknod");
         if mode & libc::S_IFMT != libc::S_IFREG {
             return Err(Errno(libc::EPERM));
         }
@@ -714,10 +814,12 @@ impl Filesystem for OutFs {
         self.make_parents(&rel)?;
         std::fs::OpenOptions::new().write(true).create_new(true).mode(mode & 0o7777).open(self.real(&rel)).map_err(errno)?;
         let kind = self.kind(&rel).ok_or(Errno(libc::EIO))?;
+        self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         Ok(self.entry(parent, name, &kind))
     }
 
     fn mkdir(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32) -> Res<Entry> {
+        let _t = self.timed("mkdir");
         let rel = join(&self.path(parent)?, name);
         if self.touches_virtual(&rel) {
             return Err(Errno(libc::EEXIST));
@@ -732,10 +834,12 @@ impl Filesystem for OutFs {
             r => r.map_err(errno)?,
         }
         let md = std::fs::symlink_metadata(self.real(&rel)).map_err(errno)?;
+        self.patch(parent, Patch::Add(name.to_vec(), libc::DT_DIR as u32));
         Ok(self.entry(parent, name, &Kind::Real(md)))
     }
 
     fn unlink(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
+        let _t = self.timed("unlink");
         let rel = join(&self.path(parent)?, name);
         let real = std::fs::remove_file(self.real(&rel));
         let listed = self.virt.read().unwrap().contains_key(&rel);
@@ -748,11 +852,13 @@ impl Filesystem for OutFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && virt => {}
             Err(e) => return Err(errno(e)),
         }
+        self.patch(parent, Patch::Del(name.to_vec()));
         self.detach(parent, name);
         Ok(())
     }
 
     fn rmdir(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
+        let _t = self.timed("rmdir");
         let rel = join(&self.path(parent)?, name);
         if self.has_virtual_below(&rel) {
             return Err(Errno(libc::ENOTEMPTY));
@@ -764,11 +870,13 @@ impl Filesystem for OutFs {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(errno(e)),
         }
+        self.patch(parent, Patch::Del(name.to_vec()));
         self.detach(parent, name);
         Ok(())
     }
 
     fn rename(&self, _ctx: &Ctx, parent: u64, name: &[u8], newparent: u64, newname: &[u8], flags: u32) -> Res<()> {
+        let _t = self.timed("rename");
         const NOREPLACE: u32 = 1;
         if flags & !NOREPLACE != 0 {
             return Err(Errno(libc::EINVAL));
@@ -843,6 +951,20 @@ impl Filesystem for OutFs {
             }
             self.dirty.store(true, Ordering::SeqCst);
         }
+        if plain {
+            // A real name left one directory and arrived in another (or
+            // the same) as what it was.
+            let t = match std::fs::symlink_metadata(self.real(&to)) {
+                Ok(md) if md.is_dir() => libc::DT_DIR,
+                Ok(md) if md.file_type().is_symlink() => libc::DT_LNK,
+                _ => libc::DT_REG,
+            };
+            self.patch(parent, Patch::Del(name.to_vec()));
+            self.patch(newparent, Patch::Add(newname.to_vec(), t as u32));
+        } else {
+            self.unlist(parent);
+            self.unlist(newparent);
+        }
         // The node moves with the name; what was at the new name is gone.
         let mut st = self.state.lock().unwrap();
         st.children.remove(&(newparent, newname.to_vec()));
@@ -865,6 +987,7 @@ impl Filesystem for OutFs {
     }
 
     fn link(&self, _ctx: &Ctx, nodeid: u64, newparent: u64, newname: &[u8]) -> Res<Entry> {
+        let _t = self.timed("link");
         let (from, to) = {
             let st = self.state.lock().unwrap();
             (Self::path_of(&st, nodeid)?, join(&Self::path_of(&st, newparent)?, newname))
@@ -880,6 +1003,8 @@ impl Filesystem for OutFs {
                 r => r.map_err(errno)?,
             }
             let md = std::fs::symlink_metadata(self.real(&to)).map_err(errno)?;
+            let t = if md.file_type().is_symlink() { libc::DT_LNK } else { libc::DT_REG };
+            self.patch(newparent, Patch::Add(newname.to_vec(), t as u32));
             return Ok(self.entry(newparent, newname, &Kind::Real(md)));
         }
         if self.kind(&to).is_some() {
@@ -898,10 +1023,12 @@ impl Filesystem for OutFs {
             Kind::VDir => return Err(Errno(libc::EPERM)),
         }
         let kind = self.kind(&to).ok_or(Errno(libc::EIO))?;
+        self.patch(newparent, Patch::Add(newname.to_vec(), libc::DT_REG as u32));
         Ok(self.entry(newparent, newname, &kind))
     }
 
     fn open(&self, _ctx: &Ctx, nodeid: u64, flags: u32) -> Res<Opened> {
+        let _t = self.timed("open");
         let rel = self.path(nodeid)?;
         let acc = flags as i32 & libc::O_ACCMODE;
         let keep = flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW);
@@ -935,6 +1062,7 @@ impl Filesystem for OutFs {
     }
 
     fn create(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32, flags: u32) -> Res<(Entry, Opened)> {
+        let _t = self.timed("create");
         let rel = join(&self.path(parent)?, name);
         let had_virtual = {
             let virt = self.virt.read().unwrap();
@@ -961,11 +1089,13 @@ impl Filesystem for OutFs {
         }
         // What was just opened is what the name is: no second look.
         let md = file.metadata().map_err(errno)?;
+        self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         let entry = self.entry(parent, name, &Kind::Real(md));
         Ok((entry, self.open_handle(entry.nodeid, file, true)))
     }
 
     fn read(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
+        let _t = self.timed("read");
         let file = self.handles.lock().unwrap().get(&fh).map(|h| h.file.try_clone()).ok_or(Errno(libc::EBADF))?.map_err(errno)?;
         out.resize(size as usize, 0);
         let mut done = 0;
@@ -982,12 +1112,14 @@ impl Filesystem for OutFs {
     }
 
     fn write(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Res<u32> {
+        let _t = self.timed("write");
         let file = self.handles.lock().unwrap().get(&fh).map(|h| h.file.try_clone()).ok_or(Errno(libc::EBADF))?.map_err(errno)?;
         file.write_all_at(data, offset).map_err(errno)?;
         Ok(data.len() as u32)
     }
 
     fn release(&self, _nodeid: u64, fh: u64, _flags: u32) {
+        let _t = self.timed("release");
         let Some(h) = self.handles.lock().unwrap().remove(&fh) else { return };
         let mut st = self.state.lock().unwrap();
         if let Some(n) = st.nodes.get_mut(&h.node) {
@@ -1006,11 +1138,13 @@ impl Filesystem for OutFs {
     }
 
     fn fsync(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, datasync: bool) -> Res<()> {
+        let _t = self.timed("fsync");
         let file = self.handles.lock().unwrap().get(&fh).map(|h| h.file.try_clone()).ok_or(Errno(libc::EBADF))?.map_err(errno)?;
         if datasync { file.sync_data() } else { file.sync_all() }.map_err(errno)
     }
 
     fn readdir(&self, _ctx: &Ctx, nodeid: u64, _fh: u64, offset: u64, sink: &mut DirSink) -> Res<()> {
+        let _t = self.timed("readdir");
         // The kernel reads a directory about a hundred names at a time. A
         // listing is put together once, when its reading starts, and the
         // calls that continue it use that: putting it together for every
@@ -1018,11 +1152,54 @@ impl Filesystem for OutFs {
         // thousand files (Zed's `deps`, with unpacked debug information)
         // five hundred times as expensive as it is, and every compiler
         // looks through that directory.
+        // (Names are listed in the order of a hash of themselves, and a
+        // call continues after the hash it was given: see below.)
+        {
+            let dirs = self.dirs.lock().unwrap();
+            if let Some(live) = dirs.get(&nodeid).and_then(|d| d.live.as_ref()) {
+                for (cookie, (name, t)) in live.range(offset + 1..) {
+                    if !sink.push(u64::MAX - 1, *cookie, *t, name) {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+        }
         let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| at.elapsed() < LISTING_KEPT).map(|(_, l)| l.clone()) };
         let listing = match cached {
             Some(l) => l,
             None => {
+                // Read from the disk once; changes made while that goes
+                // on are noted and applied afterwards, so that what is
+                // kept is complete whatever the build is doing meanwhile.
+                let mine = {
+                    let mut dirs = self.dirs.lock().unwrap();
+                    let d = dirs.entry(nodeid).or_default();
+                    if d.building.is_none() {
+                        d.building = Some(Vec::new());
+                        true
+                    } else {
+                        false
+                    }
+                };
                 let l = Arc::new(self.listing(&self.path(nodeid)?));
+                if mine {
+                    let mut dirs = self.dirs.lock().unwrap();
+                    if let Some(d) = dirs.get_mut(&nodeid) {
+                        let mut live: BTreeMap<u64, (Vec<u8>, u32)> = l.iter().map(|(c, n, t)| (*c, (n.clone(), *t))).collect();
+                        for p in d.building.take().unwrap_or_default() {
+                            match p {
+                                Patch::Add(name, t) => {
+                                    live.insert(name_cookie(&name), (name, t));
+                                }
+                                Patch::Del(name) => {
+                                    live.remove(&name_cookie(&name));
+                                }
+                            }
+                        }
+                        d.live = Some(live);
+                    }
+                }
                 let mut all = self.listings.lock().unwrap();
                 if all.len() > 256 {
                     all.retain(|_, (at, _)| at.elapsed() < LISTING_KEPT);
@@ -1046,6 +1223,7 @@ impl Filesystem for OutFs {
     }
 
     fn statfs(&self, _ctx: &Ctx, _nodeid: u64) -> Res<fuse_kstatfs> {
+        let _t = self.timed("statfs");
         let c = std::ffi::CString::new(self.under.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
         // SAFETY: valid path and a zeroed statvfs to fill.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };

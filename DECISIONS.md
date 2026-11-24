@@ -1661,3 +1661,39 @@ benchmark (D62) was stopped with SIGSTOP; the builds that were in
 progress in those windows are left out of its statistics
 (`history-tainted.json`).
 
+## D64. The output file system keeps a listed directory's names
+
+Profile of stock cargo's cold build of Zed through the mount after D63
+(`bench/zed-prof.sh`; the daemon now counts and times its operations,
+shown by `rargo --rargo-daemon-status`): 174.4 s against 168.8 s in a
+plain directory; 1.3 million operations, 42.7 s of daemon CPU; and
+listings still first, 45,652 `readdir` calls costing 13.1 s. D63 built
+a listing once per reading, but `deps` is read by every compiler and
+changes between any two readings, so every reading still read tens of
+thousands of names from the disk, hashed and sorted them, and did so
+holding the directory against the 98,000 creates the compilers were
+making in it.
+
+A directory that has been listed now keeps its names (by cookie, in a
+map). Every operation that adds or removes a name (create, mknod,
+mkdir, symlink, link, unlink, rmdir, rename) updates the map of the
+directory it happens in; a delivery or a removal by the daemon, and a
+rename that involves delivered names, drop the map, and it is read
+again at the next listing. While a directory's names are being read
+from the disk the changes made meanwhile are noted and applied when
+the reading is done, so the map is complete however busy the directory
+is. A listing is then a walk through the map from the cookie it is
+continued at.
+
+Measured: 170.9 s (plain 168.8 s); `readdir` 2.1 s, daemon CPU 31.4 s.
+The 2 s that are left are the round trips of everything else and were
+not pursued. Checked by the listing stress (150 listings against
+churn, none short; names added by create, mkdir, link, symlink and
+rename listed, removed and renamed-away ones not; the listing equal to
+the real directory's) and `dev/e2e.sh`.
+
+The risk taken: an operation that changes a directory's names and
+tells the map nothing would leave a listing wrong until the directory
+is forgotten. All that the file system offers are covered; the real
+directory is reached by nothing but this file system and the daemon.
+
