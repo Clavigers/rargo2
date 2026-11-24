@@ -44,8 +44,12 @@ start)
     echo "rargod did not start:"; tail -20 "$state/rargod.log"; exit 1
     ;;
 stop)
-    # Client daemons started by tests with these binaries.
-    pkill -TERM -f "${RARGO_BIN:-$repo/target/release}/rargo --rargo-daemon" 2>/dev/null || true
+    # Match this test's cache as well as its binary. Parallel suites
+    # can use the same binaries with separate caches and servers.
+    bin=$(realpath -m "${RARGO_BIN:-$repo/target/release}/rargo")
+    cache=${RARGO_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME%/}/.cache}/rargo}
+    pattern=$(printf '%s' "$bin --rargo-daemon $cache/run/" | sed 's/[][(){}.^$*+?|\\]/\\&/g')
+    pkill -TERM -f -- "^$pattern" 2>/dev/null || true
     pkill -TERM -f "rargod --state $state " 2>/dev/null || true
     for i in $(seq 1 50); do
         pgrep -f "rargod --state $state " >/dev/null 2>&1 || { echo "rargod stopped"; exit 0; }

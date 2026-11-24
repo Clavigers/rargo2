@@ -25,7 +25,7 @@ has() { grep -qF -- "$2" <<<"$1"; }
 base=${RARGO_E2E_FLAKE_PORT:-7471}
 port() { case $1 in a) echo $base ;; b) echo $((base + 1)) ;; esac; }
 daemon() { # name action
-    RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
+    RARGO_CACHE_DIR=$T/home-$1/.cache/rargo RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
         RARGO_HIDE="$T/a $T/b $T/home-a $T/home-b" "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
 }
 on() { # machine, command...
