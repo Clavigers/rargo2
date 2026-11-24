@@ -52,6 +52,7 @@ if [ ! -x "$rel/rargod" ]; then
     *) echo "the planner's last commit is not the last patch" >&2; exit 1 ;;
     esac
     cp "$planner/target/release/cargo" "$rel.tmp/planner-cargo"
+    cp -R "$S/src/nix/default" "$rel.tmp/default-flake"
     mv "$rel.tmp" "$rel"
 fi
 "$rel/rargod" --version
