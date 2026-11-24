@@ -157,7 +157,11 @@ fn unmounting_stands_the_guard_down() {
     assert!(first.auto_unmount_active());
     // One guard while mounted, and not under this program's name: whoever
     // kills this program by name or command line must not kill it too.
-    assert_eq!(guards_of_this_process(), [format!("unmount-guard: {}", tmp.path().display())]);
+    // (It has the room this program's own command line took, so the
+    // directory may be cut short.)
+    let (guards, title) = (guards_of_this_process(), format!("unmount-guard: {}", tmp.path().display()));
+    assert_eq!(guards.len(), 1, "{guards:?}");
+    assert!(!guards[0].is_empty() && title.starts_with(&guards[0]), "{guards:?} is not the start of {title:?}");
     first.unmount();
     assert!(!first.auto_unmount_active());
     assert!(wait_unmounted(tmp.path(), Duration::from_secs(5)));

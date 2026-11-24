@@ -110,11 +110,15 @@ echo 'fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }' >cr
 echo '' >crates/slow/src/lib.rs
 nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" build -p slow >/dev/null 2>&1 &
 cl=$!
-for i in $(seq 1 100); do
+# (It sleeps for a minute. On a busy machine it has taken more than ten
+# seconds to get to it: the server was restarted just before.)
+t0=$(date +%s.%N)
+for i in $(seq 1 450); do
     pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null && break
     sleep 0.1
 done
-pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null; check $? "a slow build script is running on the server"
+took=$(echo "$(date +%s.%N) - $t0" | bc | cut -c1-5)
+pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null; check $? "a slow build script is running on the server (${took}s after the command)"
 pkill -INT -P $cl 2>/dev/null; kill -INT $cl 2>/dev/null; wait $cl 2>/dev/null
 for i in $(seq 1 50); do
     pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null || break
