@@ -13,7 +13,7 @@ work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
 . "$work/env.sh"
-E=$work/e2e-link
+E=${RARGO_E2E_LINK:-$work/e2e-link}
 proj=$E/ws
 export RARGO_HIDE=$E
 export RARGO_CACHE_DIR=$E/cache
