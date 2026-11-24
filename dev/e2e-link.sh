@@ -21,7 +21,7 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail -15 | sed 's/^/        /'; }
 check() { if [ "$1" = 0 ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
-R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 dstat() { R --rargo-daemon-status 2>&1; }
 # A figure from the server's sync line: the number before PATTERN.
 sync_n() { R --rargo-status | grep '^sync' | grep -oE "[0-9]+ $1" | head -1 | cut -d' ' -f1; }
@@ -37,7 +37,7 @@ printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n[dependenc
 echo 'fn main() { println!("value {}", util::value()); }' >crates/app/src/main.rs
 git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one
 "$here/netns.sh" up 4 4 0 >/dev/null 2>&1
-. "$work/nstest/client.env"
+. "$work/${RIG_STATE:-nstest}/client.env"
 
 echo "== one daemon, one link"
 out=$(R run -q 2>&1); [ "$out" = "value 1" ]; check $? "the first command starts a daemon and builds through it" "$out"
@@ -83,8 +83,8 @@ git checkout -q master 2>/dev/null || git checkout -q main 2>/dev/null
 out=$(R run -q 2>&1); [ "$out" = "value 53" ]; check $? "and the checkout back" "$out"
 
 echo "== the client's address changes"
-ip -n rargo-cl addr del 10.77.0.200/24 dev eth0
-ip -n rargo-cl addr add 10.77.0.201/24 dev eth0
+ip -n ${RIG:-rargo}-cl addr del 10.77.0.200/24 dev eth0
+ip -n ${RIG:-rargo}-cl addr add 10.77.0.201/24 dev eth0
 sed -i 's/{ 50 }/{ 60 }/' crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 63" ]; check $? "a build from the new address works" "$out"
 st=$(dstat)
@@ -108,7 +108,7 @@ mkdir -p crates/slow/src
 printf '[package]\nname = "slow"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >crates/slow/Cargo.toml
 echo 'fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }' >crates/slow/build.rs
 echo '' >crates/slow/src/lib.rs
-nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" build -p slow >/dev/null 2>&1 &
+nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" build -p slow >/dev/null 2>&1 &
 cl=$!
 for i in $(seq 1 100); do
     pgrep -f 'build/slow/[0-9a-f]*/out/build_script_build' >/dev/null && break
@@ -130,8 +130,8 @@ out=$(RARGO_NO_DAEMON=1 R run -q 2>&1); [ "$out" = "value 83" ]; check $? "RARGO
 
 echo "== UDP does not get through"
 # Drop every UDP datagram the client sends (in its own namespace).
-ip netns exec rargo-cl tc qdisc replace dev eth0 root handle 1: prio
-ip netns exec rargo-cl tc filter add dev eth0 parent 1: protocol ip u32 match ip protocol 17 0xff action drop
+ip netns exec ${RIG:-rargo}-cl tc qdisc replace dev eth0 root handle 1: prio
+ip netns exec ${RIG:-rargo}-cl tc filter add dev eth0 parent 1: protocol ip u32 match ip protocol 17 0xff action drop
 export RARGO_CACHE_DIR=$E/cache-tcp
 start=$(date +%s.%N)
 out=$(R run -q 2>&1); rc=$?
@@ -146,7 +146,7 @@ took=$(echo "$(date +%s.%N) - $start" | bc)
 [ "$out" = "value 93" ]; check $? "and keeps to it for the commands that follow (${took}s after an edit)" "$out"
 out=$(RARGO_TRANSPORT=udp RARGO_NO_DAEMON=1 RARGO_CACHE_DIR=$E/cache-udp R build 2>&1); rc=$?
 [ $rc = 101 ] && grep -q "cannot reach the rargo server" <<<"$out"; check $? "RARGO_TRANSPORT=udp does not fall back" "$out"
-ip netns exec rargo-cl tc qdisc del dev eth0 root 2>/dev/null
+ip netns exec ${RIG:-rargo}-cl tc qdisc del dev eth0 root 2>/dev/null
 
 echo "== the output directory is virtual"
 export RARGO_CACHE_DIR=$E/cache
@@ -209,7 +209,7 @@ cp "$RARGO_BIN/rargo" "$U/bin/"
 cp -r "$proj/Cargo.toml" "$proj/crates" "$U/"
 [ -f "$proj/Cargo.lock" ] && cp "$proj/Cargo.lock" "$U/"
 chown -R nobody:nogroup "$U"; chmod 755 "$U"
-asuser() { (cd "$U" && nsenter --net=/run/netns/rargo-cl setpriv --reuid=nobody --regid=nogroup --clear-groups \
+asuser() { (cd "$U" && nsenter --net=/run/netns/${RIG:-rargo}-cl setpriv --reuid=nobody --regid=nogroup --clear-groups \
     env HOME="$U/home" RARGO_CACHE_DIR="$U/cache" "$@"); }
 out=$(asuser "$U/bin/rargo" build 2>&1); check $? "an unprivileged user builds" "$out"
 grep -q " $U/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo; check $? "and has the virtual output directory (mounted through fusermount3)" "$(grep "$U" /proc/self/mountinfo; tail -3 "$U/cache/daemon.log")"
@@ -227,11 +227,11 @@ sleep 0.5
 ! mounted && [ -d target ]; check $? "and leaves target/ a plain directory"
 out=$(cargo build --offline 2>&1); check $? "in which stock cargo builds" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "the same program" "$out"
-grep -c "panicked" "$work/nstest/srv.log" "$E"/cache*/daemon.log 2>/dev/null | grep -v ':0$' | { ! grep -q .; }; check $? "nothing panicked"
+grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" "$E"/cache*/daemon.log 2>/dev/null | grep -v ':0$' | { ! grep -q .; }; check $? "nothing panicked"
 
 cd /
 "$here/netns.sh" down >/dev/null 2>&1
-umount -l "$work/nstest/srv/mnt" 2>/dev/null
+umount -l "$work/${RIG_STATE:-nstest}/srv/mnt" 2>/dev/null
 rm -rf "$E"
 echo
 echo "$pass passed, $fail failed"

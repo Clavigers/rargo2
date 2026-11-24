@@ -1697,3 +1697,43 @@ tells the map nothing would leave a listing wrong until the directory
 is forgotten. All that the file system offers are covered; the real
 directory is reached by nothing but this file system and the daemon.
 
+## D65. States go to workers ahead of need; contents travel behind questions; a second rig
+
+Three changes made while the history benchmark held the machine's
+cores, so each is tested and none is measured yet. The measurements
+(`dev/bench-worker.sh`, `dev/bench-worker-swarm.sh`) follow the
+benchmark, and a change that does not pay is taken out again.
+
+**States ahead of need.** D56 gives a compile that starts from an
+incremental state only to a worker that holds that state. A state made
+on the server was held by no worker, so the crate's later compiles
+stayed on the server: 871 of 1,476 compiles in the worker swarm. Now a
+state saved on the server is queued for the workers (the newest of each
+crate and worktree, newest first, at most 512 waiting), and a
+background task sends each worker what it lacks of it, by chunk, when
+that worker's link is reckoned free, up to 256 MiB per state. The
+reverse direction (D56's bringing states home) is unchanged.
+`RARGO_STATE_AHEAD=0` turns it off. Risk: bytes and link time spent on
+states nobody compiles from again.
+
+**Contents behind questions.** One queue per direction carried
+everything in order, so a worker's question waited behind every pushed
+megabyte queued before it, and so did the server's answer. There are
+now two queues: `Push` and the replies that carry chunks in one, all
+else in the other, which is emptied first. This replaces the idea of a
+second connection: the transport delivers messages independently, so
+one connection has no head-of-line blocking of its own beyond what is
+already in its send buffer (8 MiB). Consequence handled: an action can
+arrive before contents another action's push claimed earlier, so the
+server remembers until when each pushed blob is in flight (the link's
+reckoned free time plus 2 s) and names those in the action's `incoming`
+list too; the worker waits for what is announced instead of asking.
+
+**A second rig.** `dev/netns.sh` and the scripts that use it take `RIG`
+(namespace prefix, default `rargo`) and `RIG_STATE` (directory, default
+`nstest`), so that the suites can run beside a benchmark that holds the
+first rig. The addresses are the same in both; they are in separate
+namespaces. `bench/hist-freeze.py` would also stop a second rig's server
+(it matches the state directory by prefix), so the suites are not run
+during a pause.
+

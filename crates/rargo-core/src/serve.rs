@@ -524,7 +524,7 @@ pub fn status_text(d: &Daemon) -> String {
                 let ps = &p.stats;
                 format!(
                     "{} connected; {} actions dispatched ({} of them also started here on an idle core: {} finished here first, {} were stopped because the worker was ahead), {} kept local (core free), {} kept local (a local core came free first), {} kept local (transfer too costly), {} kept local (no worker has the incremental state), {} worker failures; overhead per remote action {}; \
-                     incremental compiles on workers: {} without state, {} with the state the worker held; state left on workers {:.1} MiB in {} files, of which {:.1} MiB in {} files came home in the background and {} files were fetched for a compile here; \
+                     incremental compiles on workers: {} without state, {} with the state the worker held; state left on workers {:.1} MiB in {} files, of which {:.1} MiB in {} files came home in the background and {} files were fetched for a compile here; {} states made here sent to workers ahead of need ({:.1} MiB); \
                      sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
                      {} answers sent ahead, {} lookups and {} opens asked",
                     p.worker_count(),
@@ -545,6 +545,8 @@ pub fn status_text(d: &Daemon) -> String {
                     ps.state_homed_bytes.load(Ordering::Relaxed) as f64 / 1048576.0,
                     ps.state_homed_blobs.load(Ordering::Relaxed),
                     ps.state_needed_blobs.load(Ordering::Relaxed),
+                    ps.states_sent_ahead.load(Ordering::Relaxed),
+                    ps.state_ahead_bytes.load(Ordering::Relaxed) as f64 / 1048576.0,
                     pushed as f64 / 1048576.0,
                     skipped as f64 / 1048576.0,
                     fetched as f64 / 1048576.0,

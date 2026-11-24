@@ -19,7 +19,7 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail -15 | sed 's/^/        /'; }
 check() { if [ "$1" = 0 ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
-R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 # A figure from the workers part of the status text: the number before PATTERN.
 stat() { R --rargo-status | tr '\n' ' ' | grep -oE "[0-9.]+ $1" | head -1 | cut -d' ' -f1; }
 
@@ -65,7 +65,7 @@ for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
 "$here/netns.sh" up 1 4 1 1 0 1gbit >/dev/null 2>&1
-. "$work/nstest/client.env"
+. "$work/${RIG_STATE:-nstest}/client.env"
 cd "$proj" || exit 2
 
 # The first build teaches the server what a compile reads; the second has
@@ -123,13 +123,20 @@ none2=$(R --rargo-status | grep '^incremental' | grep -oE '[0-9]+ none' | cut -d
 # but time may be lost.
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 2 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "the workspace builds after a third edit" "$out"
-pkill -KILL -f "rargod --state $work/nstest/w1" 2>/dev/null
+ahead=0
+for _ in $(seq 1 40); do
+    ahead=$(stat 'states made here sent to workers ahead')
+    [ "${ahead:-0}" -ge 1 ] && break
+    sleep 0.25
+done
+[ "${ahead:-0}" -ge 1 ]; check $? "states made on the server were sent to the worker ahead of need ($ahead)" "$(R --rargo-status)"
+pkill -KILL -f "rargod --state $work/${RIG_STATE:-nstest}/w1" 2>/dev/null
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 3 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "the workspace builds after the worker was killed" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 22" ]; check $? "its program shows the last edit (total 22)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
-grep -c "panicked" "$work/nstest/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
+grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 
 
 # The same with a worker of one core and states that stay on it (the
@@ -143,7 +150,7 @@ for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
 RARGO_STATE_HOME_AFTER_MS=3600000 "$here/netns.sh" up 1 1 1 1 0 1gbit >/dev/null 2>&1
-. "$work/nstest/client.env"
+. "$work/${RIG_STATE:-nstest}/client.env"
 cd "$proj" || exit 2
 out=$(R build 2>&1); check $? "one-core worker: a workspace builds" "$out"
 for l in $warm; do leaf $l 0; done
@@ -175,18 +182,18 @@ for n in 20 30 40; do
     out=$(R build 2>&1) || break
 done
 [ "${needed:-0}" -ge 1 ]; check $? "a compile on the server fetched the state it started from ($needed files)" "$(R --rargo-status)"
-pkill -KILL -f "rargod --state $work/nstest/w1" 2>/dev/null
+pkill -KILL -f "rargod --state $work/${RIG_STATE:-nstest}/w1" 2>/dev/null
 sleep 3
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 7 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "it builds after the worker died with states on it" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 46" ]; check $? "its program shows the last edit (total 46)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
-grep -c "panicked" "$work/nstest/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
+grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 
 cd /
 "$here/netns.sh" down >/dev/null 2>&1
-umount -l "$work/nstest/srv/mnt" "$work/nstest/w1/mnt" 2>/dev/null
+umount -l "$work/${RIG_STATE:-nstest}/srv/mnt" "$work/${RIG_STATE:-nstest}/w1/mnt" 2>/dev/null
 rm -rf "$work/e2e-worker"
 echo
 echo "$pass passed, $fail failed"

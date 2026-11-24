@@ -96,13 +96,17 @@ earlier figure is quoted beside it, the text says so.
   report file (D49); temporaries of interrupted clients (D50); Zed builds,
   through its flake (D45), and its drift check (D51).
 
-Tests at the final commit: `cargo test` 14 (client) + 9 (protocol) +
-4 (transport) + 53 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
-113 checks, run with the virtual output directory and again with
-`RARGO_OUTPUT=copy`; `dev/e2e-flake.sh` 14 checks (two servers, a
-registry dependency fetched by the servers); `dev/e2e-link.sh` 67 checks
-(daemon, link, pushes, output directory); `dev/e2e-worker.sh` 27 checks
-(incremental state on workers). All pass.
+Tests at the current commit: `cargo test` 15 (client) + 9 (protocol) +
+4 (transport) + 56 unit and 6 engine (server) + 1 (plan); `dev/e2e.sh`
+(113 checks, virtual output directory) at `f507fb5`, whose client is
+unchanged since; `dev/e2e-link.sh` (67 checks) and `dev/e2e-worker.sh`
+(27 checks at `f507fb5`, 28 with the check added for D65) at `f507fb5`
+and again at the current commit. Both of those ran in a second rig
+(`RIG=rargo2`, see `dev/netns.sh`) beside the history benchmark, which
+holds the first. Not run again since `fd599de`: `dev/e2e-flake.sh` (14)
+and `dev/e2e.sh` with `RARGO_OUTPUT=copy`. An earlier version of this
+paragraph said all suites passed at the final commit when the link and
+worker suites had last run eleven commits before it.
 
 Not met, or weak:
 
@@ -1160,13 +1164,29 @@ server stay there; the transfer guard counts what is queued on the link;
 a worker without the toolchain is sent it once instead of being given
 work it cannot start.
 
-Ideas not tried, in the order I would try them: send incremental
-states to idle workers ahead of need, so that a crate whose state is
-only on the server can also go to a worker (in the swarm about 500
-compiles stayed on the server for that reason); let workers fetch
-registry crates themselves instead of through the server; a second
-transport connection for bulk data so that questions do not queue
-behind pushes.
+Done since, in code and tests, **not yet measured** (the worker
+benchmarks need 24 cores and the history benchmark has them; D65):
+
+- **Incremental states made on the server are sent to workers ahead of
+  need**, newest first, when a worker's link has nothing else to carry,
+  by chunk, up to 256 MiB per state. A crate whose state was only on the
+  server had to stay there (in the swarm about 500 compiles; in
+  `dev/e2e-worker.sh` 12 compiles "kept local (no worker has the
+  incremental state)", 3 to 6 with this). `RARGO_STATE_AHEAD=0` turns it
+  off. What it may cost and is not known: the bytes (in the suite's
+  three-line crates 19 states were 220 MiB, about 11 MiB each, which I
+  did not look into), and the link being busy with a state when an
+  action wants it.
+- **File contents go behind everything else on the worker link** in
+  both directions: a question, an answer to one, an action or its
+  result is sent before contents that were queued earlier. It is what
+  the "second connection for bulk data" was for, without a second
+  connection: the transport already delivers messages independently.
+  An action is told which contents are still on their way, since it can
+  now arrive before them.
+
+Not tried: letting workers fetch registry crates themselves instead of
+through the server.
 
 Known weaknesses besides the above: flake-rooted and host-network actions
 are never sent to workers; a worker is trusted like the server (it sees

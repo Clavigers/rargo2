@@ -171,6 +171,11 @@ pub trait RemoteRunner: Send + Sync {
     /// Whether a connected worker holds this blob.
     fn holds(&self, blob: &Hash) -> bool;
 
+    /// A crate's incremental state was just made here: workers may be
+    /// sent it ahead of need, so that the crate's next compile can run on
+    /// one of them. `whose` names the crate and the worktree.
+    fn offer_state(&self, _whose: (Hash, String), _blobs: Arc<Vec<(Hash, u64)>>) {}
+
     /// Fetches blobs that are held by workers into the store.
     fn bring_home<'a>(
         &'a self,

@@ -1955,6 +1955,21 @@ impl Run {
             let state = crate::incr::apply_changes(dir, seed.as_ref().map(|s| &*s.manifest), &outcome.side);
             if !state.entries.is_empty() {
                 self.d.incr.save(&crate_key, &wt, self.c.commits.first().copied(), &state);
+                // Workers get it in the background (what a worker made
+                // itself it already holds, and nothing is sent).
+                if let Some(remote) = self.d.engine.remote.get() {
+                    let mut blobs: Vec<(Hash, u64)> = state
+                        .entries
+                        .iter()
+                        .filter_map(|(_, e)| match e {
+                            MEntry::File { hash, size, .. } => Some((*hash, *size)),
+                            _ => None,
+                        })
+                        .collect();
+                    blobs.sort();
+                    blobs.dedup();
+                    remote.offer_state((crate_key, wt.clone()), Arc::new(blobs));
+                }
             }
         }
         let r = outcome.result.clone();

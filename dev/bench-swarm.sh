@@ -21,8 +21,8 @@ renv=""
 if [ "${SWARM_SKIP_RARGO:-}" != 1 ]; then
     # rargo: fresh server and store, so nothing is warm.
     RARGO_HIDE="$work/swarm" "$repo/dev/netns.sh" up "$jobs" 0 0 >/dev/null
-    . "$work/nstest/client.env"
-    env $renv python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" --netns rargo-cl \
+    . "$work/${RIG_STATE:-nstest}/client.env"
+    env $renv python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" --netns ${RIG:-rargo}-cl \
         --label "remote client ${CLIENT_DELAY_MS:-1}ms ${CLIENT_RATE:-1gbit}"
     "$repo/dev/netns.sh" down
 fi

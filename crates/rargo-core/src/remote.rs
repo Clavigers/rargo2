@@ -154,7 +154,19 @@ pub struct Peer {
     pub conn: Arc<Conn>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Resp>>>,
     next: AtomicU64,
+    /// Questions, answers, actions and their results.
     out: mpsc::UnboundedSender<Vec<u8>>,
+    /// File contents. Sent when nothing waits in `out`, so that a question
+    /// is not held up by the megabytes queued before it.
+    bulk: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+/// Whether a message carries file contents (and goes behind the others).
+/// The transport delivers messages independently and nothing relies on
+/// contents arriving before the message that needs them: an action waits
+/// for what it was told is coming.
+fn is_bulk(m: &Msg) -> bool {
+    matches!(m, Msg::Push { .. } | Msg::Resp { body: Resp::Chunks(_) | Resp::Blob(_), .. })
 }
 
 impl Peer {
@@ -162,11 +174,18 @@ impl Peer {
     /// returned receiver.
     pub fn new(conn: Arc<Conn>) -> (Arc<Peer>, mpsc::UnboundedReceiver<Msg>) {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        let peer = Arc::new(Peer { conn: conn.clone(), pending: Mutex::new(HashMap::new()), next: AtomicU64::new(1), out: out_tx });
+        let peer = Arc::new(Peer { conn: conn.clone(), pending: Mutex::new(HashMap::new()), next: AtomicU64::new(1), out: out_tx, bulk: bulk_tx });
         let c = conn.clone();
         tokio::spawn(async move {
-            while let Some(m) = out_rx.recv().await {
+            loop {
+                let m = tokio::select! {
+                    biased;
+                    m = out_rx.recv() => m,
+                    m = bulk_rx.recv() => m,
+                };
+                let Some(m) = m else { break };
                 let m = if m.len() >= COMPRESS_FROM { tokio::task::block_in_place(|| frame(m)) } else { frame(m) };
                 if c.send(&m).await.is_err() {
                     break;
@@ -198,7 +217,7 @@ impl Peer {
     /// Sends a message without waiting.
     pub fn post(&self, m: &Msg) {
         if let Ok(b) = bincode::serialize(m) {
-            let _ = self.out.send(b);
+            let _ = if is_bulk(m) { self.bulk.send(b) } else { self.out.send(b) };
         }
     }
 
@@ -1125,6 +1144,57 @@ fn state_home_after() -> Duration {
     }))
 }
 
+/// `RARGO_STATE_AHEAD=0` in rargod's environment: incremental states made
+/// on the server are not sent to workers ahead of need.
+fn state_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RARGO_STATE_AHEAD").ok().as_deref() != Some("0"))
+}
+
+/// A state larger than this in what a worker lacks of it is not sent ahead.
+const AHEAD_MAX: u64 = 256 << 20;
+
+/// States made on the server that workers have not been sent yet: the
+/// newest of each crate and worktree, newest first, a bounded number.
+#[derive(Default)]
+pub struct AheadQueue {
+    waiting: std::collections::VecDeque<((Hash, String), Arc<Vec<(Hash, u64)>>)>,
+}
+
+impl AheadQueue {
+    const KEPT: usize = 512;
+
+    /// A newer state of a crate replaces the one still waiting.
+    pub fn offer(&mut self, whose: (Hash, String), blobs: Arc<Vec<(Hash, u64)>>) {
+        self.waiting.retain(|(w, _)| *w != whose);
+        self.waiting.push_back((whose, blobs));
+        if self.waiting.len() > Self::KEPT {
+            self.waiting.pop_front();
+        }
+    }
+
+    /// The newest state waiting.
+    pub fn next(&mut self) -> Option<Arc<Vec<(Hash, u64)>>> {
+        self.waiting.pop_back().map(|(_, b)| b)
+    }
+
+    pub fn len(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.waiting.is_empty()
+    }
+}
+
+/// How long after the link is reckoned to have carried a blob an action is
+/// still told that it is coming.
+const IN_FLIGHT_SLACK: Duration = Duration::from_secs(2);
+
+fn still_in_flight(fl: &HashMap<Hash, std::time::Instant>, h: &Hash, now: std::time::Instant) -> bool {
+    fl.get(h).is_some_and(|at| *at > now)
+}
+
 /// How much of an incremental state a worker may lack and still be given
 /// the compile: that much is sent along; a state it does not have is not
 /// (D31).
@@ -1154,6 +1224,10 @@ pub struct Worker {
     overhead_samples: AtomicU64,
     /// When what has been queued for the worker will have crossed the link.
     link_free_at: Mutex<std::time::Instant>,
+    /// Contents on their way to the worker and when the link will have
+    /// carried them: an action that needs one is told it is coming (it is
+    /// sent ahead of contents and may arrive first).
+    in_flight: Mutex<HashMap<Hash, std::time::Instant>>,
     /// The files every compile reads (the toolchain) are on their way.
     warmed: std::sync::atomic::AtomicBool,
 }
@@ -1217,6 +1291,10 @@ pub struct PoolStats {
     pub state_homed_bytes: AtomicU64,
     /// Fetched because a compile here needed them.
     pub state_needed_blobs: AtomicU64,
+    /// States made here and sent to workers ahead of need, and their size
+    /// in what the workers lacked.
+    pub states_sent_ahead: AtomicU64,
+    pub state_ahead_bytes: AtomicU64,
     /// Dispatched, then run here because a local core fell idle first.
     pub hedged: AtomicU64,
     /// Hedges where the local copy finished first.
@@ -1247,6 +1325,9 @@ pub struct Pool {
     /// the order they were made.
     home_queue: Mutex<std::collections::VecDeque<(Arc<Worker>, Hash, u64, std::time::Instant)>>,
     home_wake: tokio::sync::Notify,
+    /// States made here, to be sent to workers when the link is idle.
+    ahead: Mutex<AheadQueue>,
+    ahead_wake: tokio::sync::Notify,
     /// Files of incremental states that compiles left on workers: which
     /// worker, and the action that made them (for diagnosis).
     left_on: DashMap<Hash, (u64, String)>,
@@ -1303,9 +1384,12 @@ impl Pool {
             freed: tokio::sync::Notify::new(),
             home_queue: Mutex::new(std::collections::VecDeque::new()),
             home_wake: tokio::sync::Notify::new(),
+            ahead: Mutex::new(AheadQueue::default()),
+            ahead_wake: tokio::sync::Notify::new(),
             left_on: DashMap::new(),
         });
         tokio::spawn(pool.clone().bring_states_home(engine.clone()));
+        tokio::spawn(pool.clone().send_states_ahead(engine.clone()));
         let p = pool.clone();
         tokio::spawn(async move {
             while let Some(conn) = endpoint.accept().await {
@@ -1369,6 +1453,7 @@ impl Pool {
                         overhead_us: AtomicU64::new(0),
                         overhead_samples: AtomicU64::new(0),
                         link_free_at: Mutex::new(std::time::Instant::now()),
+                        in_flight: Mutex::new(HashMap::new()),
                         warmed: std::sync::atomic::AtomicBool::new(false),
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
@@ -1585,6 +1670,49 @@ impl Pool {
         ws.iter().find(|w| w.alive.load(Ordering::Relaxed) && w.has_blobs.lock().contains(blob)).cloned()
     }
 
+    /// Sends workers the incremental states compiles made here, newest
+    /// first, while their links have nothing else to carry. A compile
+    /// that starts from a state is only given to a worker that holds it
+    /// (D56), so a crate whose state is only here stays here; this is
+    /// what lets its next compile go to a worker. Only what a worker
+    /// lacks is sent, by chunk.
+    async fn send_states_ahead(self: Arc<Self>, engine: Arc<Engine>) {
+        loop {
+            let next = self.ahead.lock().next();
+            let Some(blobs) = next else {
+                self.ahead_wake.notified().await;
+                continue;
+            };
+            let workers: Vec<Arc<Worker>> = self.workers.lock().iter().filter(|w| w.alive.load(Ordering::Relaxed)).cloned().collect();
+            for w in workers {
+                let missing: Vec<(Hash, u64)> = {
+                    let has = w.has_blobs.lock();
+                    blobs.iter().filter(|(h, _)| !has.contains(h) && engine.store.has(h)).copied().collect()
+                };
+                let bytes: u64 = missing.iter().map(|(_, s)| *s).sum();
+                if missing.is_empty() || bytes > AHEAD_MAX {
+                    continue;
+                }
+                // Behind whatever actions are waiting for on this link.
+                for _ in 0..60 {
+                    let busy = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
+                    if busy.is_zero() {
+                        break;
+                    }
+                    tokio::time::sleep(busy.min(Duration::from_millis(500))).await;
+                }
+                if !w.alive.load(Ordering::Relaxed) {
+                    continue;
+                }
+                // (Counted: what was sent, which is less than the files'
+                // sizes where the worker held some of their chunks.)
+                let sent: u64 = tokio::task::block_in_place(|| missing.iter().map(|(h, _)| self.push_blob(&w, *h)).sum());
+                self.stats.states_sent_ahead.fetch_add(1, Ordering::Relaxed);
+                self.stats.state_ahead_bytes.fetch_add(sent, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Fetches the files of incremental states that compiles left on
     /// workers, oldest first, one at a time and only on a core nothing else
     /// wants: putting a file together and checking it costs the CPU time
@@ -1617,16 +1745,16 @@ impl Pool {
 
     /// Sends a blob the worker is expected to need, leaving out the chunks
     /// it is known to hold.
-    fn push_blob(&self, w: &Worker, h: Hash) {
+    fn push_blob(&self, w: &Worker, h: Hash) -> u64 {
         // Another action's push may have sent it since this one was planned.
         // (Claimed before sending: pushes planned together run together.)
         if !w.has_blobs.lock().insert(h) {
-            return;
+            return 0;
         }
         let Some(recipe) = self.blobs.recipe(&h) else {
             w.has_blobs.lock().remove(&h);
             eprintln!("rargod: content {h} was to be sent ahead to worker {:x} but cannot be read here", w.id);
-            return;
+            return 0;
         };
         let missing: Vec<u32> = {
             let has = w.has_chunks.lock();
@@ -1641,6 +1769,12 @@ impl Pool {
             let secs = need as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64;
             let mut free_at = w.link_free_at.lock();
             *free_at = (*free_at).max(std::time::Instant::now()) + Duration::from_secs_f64(secs);
+            let mut fl = w.in_flight.lock();
+            let now = std::time::Instant::now();
+            if fl.len() > 4096 {
+                fl.retain(|_, at| *at > now);
+            }
+            fl.insert(h, *free_at + IN_FLIGHT_SLACK);
         }
         // Cut into messages of about a megabyte, counted first: the
         // worker has to know when it has them all.
@@ -1672,6 +1806,7 @@ impl Pool {
             });
         }
         w.has_chunks.lock().extend(recipe.iter().map(|c| c.hash));
+        need
     }
 }
 
@@ -1841,7 +1976,9 @@ impl Pool {
             prefill = p;
             listings = l;
             let has = w.has_blobs.lock();
-            incoming = files.into_iter().filter(|h| !has.contains(h)).collect();
+            let fl = w.in_flight.lock();
+            let now = std::time::Instant::now();
+            incoming = files.into_iter().filter(|h| !has.contains(h) || still_in_flight(&fl, h, now)).collect();
             incoming.sort();
             incoming.dedup();
         }
@@ -2071,6 +2208,14 @@ impl Pool {
 impl RemoteRunner for Pool {
     fn holds(&self, blob: &Hash) -> bool {
         self.holder(blob).is_some()
+    }
+
+    fn offer_state(&self, whose: (Hash, String), blobs: Arc<Vec<(Hash, u64)>>) {
+        if !state_ahead() || self.worker_count() == 0 {
+            return;
+        }
+        self.ahead.lock().offer(whose, blobs);
+        self.ahead_wake.notify_one();
     }
 
     fn bring_home<'a>(
@@ -2325,6 +2470,56 @@ impl RemoteRunner for Pool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn contents_go_behind_questions_and_actions() {
+        use super::{is_bulk, Msg, Req, Resp};
+        use crate::hash::Hash;
+        let h = Hash([1; 32]);
+        assert!(is_bulk(&Msg::Push { blob: h, recipe: Vec::new(), chunks: Vec::new(), part: 0, of: 1 }));
+        assert!(is_bulk(&Msg::Resp { rid: 1, body: Resp::Chunks(Vec::new()) }));
+        assert!(is_bulk(&Msg::Resp { rid: 1, body: Resp::Blob(None) }));
+        assert!(!is_bulk(&Msg::Resp { rid: 1, body: Resp::Opened(Ok(h)) }));
+        assert!(!is_bulk(&Msg::Resp { rid: 1, body: Resp::Recipe(None) }));
+        assert!(!is_bulk(&Msg::Req { rid: 1, body: Req::Chunks { blob: h, idx: vec![0] } }));
+        assert!(!is_bulk(&Msg::Cancel { action: 1 }));
+        assert!(!is_bulk(&Msg::Stdout { action: 1, data: Vec::new() }));
+    }
+
+    #[test]
+    fn a_blob_is_in_flight_until_the_link_has_carried_it() {
+        use crate::hash::Hash;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut fl = std::collections::HashMap::new();
+        fl.insert(Hash([1; 32]), now + Duration::from_secs(1));
+        fl.insert(Hash([2; 32]), now);
+        assert!(super::still_in_flight(&fl, &Hash([1; 32]), now));
+        assert!(!super::still_in_flight(&fl, &Hash([2; 32]), now));
+        assert!(!super::still_in_flight(&fl, &Hash([3; 32]), now));
+    }
+
+    #[test]
+    fn states_wait_newest_first_one_per_crate_and_worktree() {
+        use crate::hash::Hash;
+        use std::sync::Arc;
+        let state = |n: u8| Arc::new(vec![(Hash([n; 32]), n as u64)]);
+        let who = |c: u8, wt: &str| (Hash([c; 32]), wt.to_string());
+        let mut q = super::AheadQueue::default();
+        q.offer(who(1, "/a"), state(1));
+        q.offer(who(2, "/a"), state(2));
+        q.offer(who(1, "/b"), state(3));
+        // The same crate in the same worktree again: only its newest waits.
+        q.offer(who(1, "/a"), state(4));
+        assert_eq!(q.len(), 3);
+        let order: Vec<u64> = std::iter::from_fn(|| q.next()).map(|b| b[0].1).collect();
+        assert_eq!(order, [4, 3, 2]);
+        // Bounded: the oldest give way.
+        for n in 0..(super::AheadQueue::KEPT + 10) {
+            q.offer((Hash([9; 32]), format!("/wt{n}")), state(7));
+        }
+        assert_eq!(q.len(), super::AheadQueue::KEPT);
+    }
+
     #[test]
     fn crate_roots_are_found_and_made_absolute() {
         let argv = |a: &[&str]| -> Vec<Vec<u8>> { a.iter().map(|s| s.as_bytes().to_vec()).collect() };

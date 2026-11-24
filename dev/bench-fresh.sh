@@ -23,14 +23,14 @@ out=$work/bench/fresh.jsonl
 base=$work/bench/ra
 C=$work/fresh-client
 export RARGO_HIDE=$C
-R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
-rx() { ip netns exec rargo-cl cat /sys/class/net/eth0/statistics/rx_bytes; }
+R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
+rx() { ip netns exec ${RIG:-rargo}-cl cat /sys/class/net/eth0/statistics/rx_bytes; }
 t() { local t0=$(date +%s.%N); "$@" >>"$C/last.log" 2>&1 || echo "FAILED: $*" >&2; echo "$(date +%s.%N) - $t0" | bc; }
 "$here/netns.sh" down >/dev/null 2>&1
 rm -rf "$C"; mkdir -p "$C"
 git -C "$base" worktree prune
 CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1
-. "$work/nstest/client.env"
+. "$work/${RIG_STATE:-nstest}/client.env"
 fresh() { # worktree name, cache directory -> "build_s run_s bytes"
     git -C "$base" worktree add -q --detach "$C/$1" HEAD
     cd "$C/$1" || exit 2

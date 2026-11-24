@@ -24,7 +24,11 @@ set -eu
 qlimit=${NETEM_LIMIT:-100000}
 work=${RARGO_WORK:-/root/rargo-work}
 B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
-T=$work/nstest
+# RIG names the rig (its namespaces are $RIG-srv, $RIG-cl, $RIG-wN) and
+# RIG_STATE its directory under $RARGO_WORK, so that a second rig can run
+# beside one that is in use.
+RIG=${RIG:-rargo}
+T=$work/${RIG_STATE:-nstest}
 down() {
     # Client daemons started with these binaries (they live in the
     # client's namespace).
@@ -33,7 +37,7 @@ down() {
     pkill -TERM -f "rigproxy.py [a-z]* $T/proxy.sock" 2>/dev/null || true
     sleep 0.5
     pkill -KILL -f "rargod --state $T" 2>/dev/null || true
-    for ns in $(ip netns list 2>/dev/null | awk '/^rargo-/ {print $1}'); do
+    for ns in $(ip netns list 2>/dev/null | awk -v p="^$RIG-" '$1 ~ p {print $1}'); do
         ip netns del "$ns" 2>/dev/null || true
     done
 }
@@ -45,12 +49,12 @@ start_server() {
     if [ "${RIG_PROXY:-}" = 1 ] && ! pgrep -f "rigproxy.py outside $T/proxy.sock" >/dev/null 2>&1; then
         here=$(cd "$(dirname "$0")" && pwd)
         nohup python3 "$here/rigproxy.py" outside "$T/proxy.sock" >/dev/null 2>&1 &
-        nohup ip netns exec rargo-srv python3 "$here/rigproxy.py" inside "$T/proxy.sock" 3128 >/dev/null 2>&1 &
+        nohup ip netns exec $RIG-srv python3 "$here/rigproxy.py" inside "$T/proxy.sock" 3128 >/dev/null 2>&1 &
     fi
     hide=""
     for d in ${RARGO_HIDE:-}; do mkdir -p "$d"; hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
     nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G -p Delegate=yes \
-        ip netns exec rargo-srv unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
+        ip netns exec $RIG-srv unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
         "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
         --listen 10.77.0.1:7459 --keys "$T/keys" --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
@@ -64,7 +68,7 @@ start_workers() {
     while [ "$i" -le "$n" ]; do
         mkdir -p "$T/w$i"
         nohup systemd-run --scope -q -p CPUQuota=$((wj * 100))% -p MemoryMax=30G -p Delegate=yes \
-            ip netns exec "rargo-w$i" "$B/rargod" --state "$T/w$i" --worker 10.77.0.1:7711 --worker-key "$T/link.key" --jobs "$wj" \
+            ip netns exec "$RIG-w$i" "$B/rargod" --state "$T/w$i" --worker 10.77.0.1:7711 --worker-key "$T/link.key" --jobs "$wj" \
             >"$T/w$i.log" 2>&1 &
         i=$((i + 1))
     done
@@ -75,38 +79,38 @@ up)
     down
     rm -rf "$T"; mkdir -p "$T/srv"
     . "$work/env.sh"
-    ip netns add rargo-srv
-    ip -n rargo-srv link set lo up
+    ip netns add $RIG-srv
+    ip -n $RIG-srv link set lo up
     # One bridge in the server's namespace; every worker hangs off it.
-    ip -n rargo-srv link add br0 type bridge
-    ip -n rargo-srv addr add 10.77.0.1/24 dev br0
-    ip -n rargo-srv link set br0 up
+    ip -n $RIG-srv link add br0 type bridge
+    ip -n $RIG-srv addr add 10.77.0.1/24 dev br0
+    ip -n $RIG-srv link set br0 up
     i=1
     while [ "$i" -le "$n" ]; do
-        ns=rargo-w$i
+        ns=$RIG-w$i
         ip netns add "$ns"
         ip -n "$ns" link set lo up
-        ip link add "vs$i" netns rargo-srv type veth peer name eth0 netns "$ns"
-        ip -n rargo-srv link set "vs$i" master br0
-        ip -n rargo-srv link set "vs$i" up
+        ip link add "vs$i" netns $RIG-srv type veth peer name eth0 netns "$ns"
+        ip -n $RIG-srv link set "vs$i" master br0
+        ip -n $RIG-srv link set "vs$i" up
         ip -n "$ns" addr add "10.77.0.$((i + 1))/24" dev eth0
         ip -n "$ns" link set eth0 up
         # Shape both directions of the link.
-        ip netns exec rargo-srv tc qdisc add dev "vs$i" root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
+        ip netns exec $RIG-srv tc qdisc add dev "vs$i" root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
         ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
         i=$((i + 1))
     done
     # The client machine.
-    ip netns add rargo-cl
-    ip -n rargo-cl link set lo up
-    ip link add vcl netns rargo-srv type veth peer name eth0 netns rargo-cl
-    ip -n rargo-srv link set vcl master br0
-    ip -n rargo-srv link set vcl up
-    ip -n rargo-cl addr add 10.77.0.200/24 dev eth0
-    ip -n rargo-cl link set eth0 up
+    ip netns add $RIG-cl
+    ip -n $RIG-cl link set lo up
+    ip link add vcl netns $RIG-srv type veth peer name eth0 netns $RIG-cl
+    ip -n $RIG-srv link set vcl master br0
+    ip -n $RIG-srv link set vcl up
+    ip -n $RIG-cl addr add 10.77.0.200/24 dev eth0
+    ip -n $RIG-cl link set eth0 up
     cdelay=${CLIENT_DELAY_MS:-1}; closs=${CLIENT_LOSS_PCT:-0}; crate=${CLIENT_RATE:-1gbit}
-    ip netns exec rargo-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
-    ip netns exec rargo-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
+    ip netns exec $RIG-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
+    ip netns exec $RIG-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
     head -c 32 /dev/urandom >"$T/link.key"
     secret=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
     echo "bench $secret admin" >"$T/keys"
@@ -116,8 +120,8 @@ up)
     start_workers
     sleep 2
     cat "$T/srv.log"
-    [ "$n" -ge 1 ] && ip netns exec rargo-w1 ping -c 3 -q 10.77.0.1 | tail -2
-    ip netns exec rargo-cl ping -c 3 -q 10.77.0.1 | tail -1
+    [ "$n" -ge 1 ] && ip netns exec $RIG-w1 ping -c 3 -q 10.77.0.1 | tail -2
+    ip netns exec $RIG-cl ping -c 3 -q 10.77.0.1 | tail -1
     true
     ;;
 reset-server)

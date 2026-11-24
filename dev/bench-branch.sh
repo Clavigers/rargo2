@@ -29,7 +29,7 @@ edits=(crates/parser/src/lib.rs crates/syntax/src/lib.rs crates/ide-db/src/lib.r
 tests=(test -p stdx -p parser -p syntax)
 if [ "$mode" = rargo ]; then
     export RARGO_HIDE=$C RARGO_CACHE_DIR=$C/cache
-    run() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
+    run() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
     label="rargo, $((2 * delay)) ms round trip"
 else
     run() { systemd-run --scope -q -p CPUQuota=2400% -p MemoryMax=90G cargo "$@" -j 24; }
@@ -45,7 +45,7 @@ all() { # prints "check build test" seconds for the current directory
 rm -rf "$C"; mkdir -p "$C"
 git -C "$base" worktree prune
 git -C "$base" branch -D rargo-bench-b >/dev/null 2>&1
-[ "$mode" = rargo ] && { CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1; . "$work/nstest/client.env"; }
+[ "$mode" = rargo ] && { CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1; . "$work/${RIG_STATE:-nstest}/client.env"; }
 G() { git -c user.name=bench -c user.email=bench@example.invalid "$@"; }
 
 # The worktree that will be switched: built on the base commit.

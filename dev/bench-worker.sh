@@ -23,7 +23,7 @@ repo=${1:-ra}; shift || true
 args=("$@"); [ ${#args[@]} -eq 0 ] && args=(build)
 out=$work/bench/worker.jsonl
 # The client runs in its own namespace, one shaped link from the server.
-R() { nsenter --net=/run/netns/rargo-cl "$RARGO_BIN/rargo" "$@"; }
+R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 export RARGO_HIDE=$work/bench/worker-wt
 export RARGO_CACHE_DIR=$work/bench/worker-client-cache
 base=$work/bench/$repo
@@ -41,7 +41,7 @@ fresh_wt() {
     git -C "$base" worktree add -q --detach "$wt" HEAD
 }
 measure() { # label
-    . "$work/nstest/client.env"
+    . "$work/${RIG_STATE:-nstest}/client.env"
     rm -rf "$RARGO_CACHE_DIR"
     fresh_wt
     cd "$wt" || exit 2
