@@ -1,0 +1,33 @@
+# Checks a deployed rargo server from outside its machine: the released
+# client builds, runs and tests a small workspace through it, over UDP and
+# over TCP (deploy/check-service.sh). The server and a key that may only
+# build are repository secrets.
+name: service check
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release whose client is used (a tag)
+        default: v0.2.0
+permissions:
+  contents: read
+jobs:
+  from-outside:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: The released client
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release download "$VERSION" --pattern 'rargo-x86_64-unknown-linux-musl' --pattern SHA256SUMS
+          sha256sum -c SHA256SUMS
+          install -m 755 rargo-x86_64-unknown-linux-musl "$HOME/rargo"
+      - name: Build, run and test through the server
+        env:
+          RARGO_SERVER: ${{ secrets.RARGO_CHECK_SERVER }}
+          RARGO_USER: ${{ secrets.RARGO_CHECK_USER }}
+          RARGO_KEY: ${{ secrets.RARGO_CHECK_KEY }}
+        run: deploy/check-service.sh "$HOME/rargo"
