@@ -6,6 +6,15 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.4.1
+
+Protocol 7 (unchanged).
+
+- Stock `cargo clean` works in a worktree whose `target/` the daemon
+  serves: when the directory's last entry is removed the daemon gives the
+  directory back, and cargo removes it. Stock cargo and rargo both build
+  there afterwards. (#7)
+
 ## 0.4.0
 
 Protocol 7 (unchanged).

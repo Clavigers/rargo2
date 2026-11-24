@@ -81,8 +81,8 @@ in `target/` for the command, and files the build wrote into the worktree.
 `CAP_SYS_ADMIN`): what the server built is listed there at once and
 fetched when something opens it; what you or stock cargo write there
 goes to the real directory underneath. Stopping the daemon leaves that
-plain directory. Use `rargo clean` (or `cargo clean` through the shim),
-not a stock `cargo clean`, while it is mounted. Where it cannot be
+plain directory. `cargo clean`, stock or through rargo, removes it as it
+removes any `target/`. Where it cannot be
 mounted, or with `RARGO_OUTPUT=copy`, results are copied into `target/`
 and shared between worktrees through the cache.
 
