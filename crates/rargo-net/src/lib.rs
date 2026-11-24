@@ -416,9 +416,9 @@ impl Conn {
         let accepted = keys(name).and_then(|psk| rargo_proto::secure::link_accept(&user_handshake_key(&psk), &first[1 + n..]).ok());
         let Some((m2, cipher)) = accepted else {
             let mut refusal = vec![1u8];
-            refusal.extend_from_slice(b"the server does not know this user or key");
+            refusal.extend_from_slice(rargo_proto::REFUSED.as_bytes());
             let _ = self.send_raw(&refusal).await;
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("refused `{name}`: unknown user or wrong key")));
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("refused token `{name}`: unknown, revoked, expired or a wrong secret")));
         };
         let _ = self.user.set(name.to_string());
         let _ = self.tag.set(cipher.binding());

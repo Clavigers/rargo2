@@ -135,10 +135,10 @@ pub fn resolve(host: &str) -> Result<String, String> {
 
 #[derive(Clone)]
 pub struct Credential {
-    /// What is presented as the user: a token's id.
-    pub user: String,
-    pub key: String,
-    /// Who the server says this is.
+    /// The token's id, presented as who is connecting.
+    pub id: String,
+    pub secret: String,
+    /// Whose token it is, as the server said.
     pub name: String,
 }
 
@@ -154,7 +154,7 @@ pub fn credential(host: &str) -> Option<Credential> {
     let all = credentials();
     let c = all.get(host)?.as_table()?;
     let get = |k: &str| c.get(k).and_then(|v| v.as_str()).map(String::from);
-    Some(Credential { user: get("user")?, key: get("key")?, name: get("name").unwrap_or_default() })
+    Some(Credential { id: get("id")?, secret: get("secret")?, name: get("name").unwrap_or_default() })
 }
 
 fn save_credentials(all: &toml::Table) -> Result<(), String> {
@@ -184,8 +184,8 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
     let (id, secret) = split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
     let mut all = credentials();
     let mut c = toml::Table::new();
-    c.insert("user".into(), id.into());
-    c.insert("key".into(), secret.into());
+    c.insert("id".into(), id.into());
+    c.insert("secret".into(), secret.into());
     c.insert("name".into(), name.into());
     all.insert(host.to_string(), toml::Value::Table(c));
     save_credentials(&all)
@@ -197,7 +197,7 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
 pub fn revoke_on_server(host: &str) -> Result<bool, String> {
     let Some(c) = credential(host) else { return Ok(false) };
     let url = format!("{}/auth/revoke", base_url(host));
-    let body = serde_json::json!({ "token": format!("{}.{}", c.user, c.key) });
+    let body = serde_json::json!({ "token": format!("{}.{}", c.id, c.secret) });
     let text = agent()
         .post(&url)
         .set("Content-Type", "application/json")
@@ -207,6 +207,23 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
     Ok(v.get("revoked").and_then(|r| r.as_bool()).unwrap_or(false))
+}
+
+/// Whose token this is, as the host's server says; `None` for a token it
+/// does not admit.
+pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
+    split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
+    let url = format!("{}/auth/whoami", base_url(host));
+    let body = serde_json::json!({ "token": token.trim() });
+    let text = agent()
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+        .map_err(|e| format!("{url}: {e}"))?
+        .into_string()
+        .map_err(|e| format!("{url}: {e}"))?;
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
+    Ok(v.get("user").and_then(|u| u.as_str()).map(String::from))
 }
 
 pub fn forget(host: &str) -> Result<bool, String> {

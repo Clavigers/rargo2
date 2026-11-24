@@ -797,7 +797,7 @@ impl Daemon {
                 } else {
                     // A server that does not know us: no token, or one that
                     // was revoked or has expired.
-                    let hint = if e.to_string().contains("does not know this user or key") {
+                    let hint = if e.to_string().contains(rargo_proto::REFUSED) {
                         "       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n"
                     } else {
                         ""

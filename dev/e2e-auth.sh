@@ -89,7 +89,9 @@ out=$(curl -s -w '\n%{http_code}' --data-urlencode "code=$code" --data-urlencode
 wait $auth; rc=$?
 [ $rc = 0 ] && grep -q "Authenticated to $host as ann" "$T/auth.out"; check $? "rargo auth ends authenticated" "$(cat "$T/auth.out")"
 cred=$XDG_CONFIG_HOME/rargo/credentials.toml
-[ "$(stat -c %a "$cred")" = 600 ] && grep -q "^\[\"$host\"\]" "$cred"; check $? "the token is stored for that host, readable by its owner only" "$(ls -la "$cred"; sed 's/^key = .*/key = (hidden)/' "$cred")"
+[ "$(stat -c %a "$cred")" = 600 ] && grep -q "^\[\"$host\"\]" "$cred"; check $? "the token is stored for that host, readable by its owner only" "$(ls -la "$cred"; sed 's/^secret = .*/secret = (hidden)/' "$cred")"
+grep -q '^id = "t-' "$cred" && grep -q '^secret = "' "$cred" && grep -q '^name = "ann"' "$cred" && ! grep -q '^\(user\|key\) = ' "$cred"
+check $? "it is stored as the token's id, secret and holder" "$(sed 's/^secret = .*/secret = (hidden)/' "$cred")"
 out=$("$R" auth status 2>&1); grep -q "authenticated as ann" <<<"$out"; check $? "rargo auth status names the user" "$out"
 out=$("$R" build 2>&1); check $? "rargo build works" "$out"
 out=$(./target/debug/hello 2>&1); [ "$out" = "built by the path" ]; check $? "and its binary runs" "$out"
@@ -121,17 +123,20 @@ sleep 4
 echo "// changed" >>src/main.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc != 0 ]; check $? "a build with the revoked token fails, the session it had open included" "$out"
-grep -q -i "does not know this user or key\|rargo auth" <<<"$out"; check $? "and says why" "$out"
+grep -q "does not know this token, or it was revoked or has expired" <<<"$out" && grep -q "run \`rargo auth\`" <<<"$out"; check $? "and says why, and what to do" "$out"
 grep -q "no longer valid" "$T/srv.log"; check $? "the server closed the open session" "$(tail -n 5 "$T/srv.log")"
 out=$("$R" auth remove 2>&1); check $? "rargo auth remove forgets the token" "$out"
 ! grep -q "^\[\"$host\"\]" "$cred"; check $? "it is gone from the credentials file"
 
 echo "== rargo auth remove ends the token on the server too"
 export HOME=$T/home3 XDG_CONFIG_HOME=$T/home3/.config RARGO_CACHE_DIR=$T/cache3
+cred=$XDG_CONFIG_HOME/rargo/credentials.toml
 mkdir -p "$HOME"
 cd "$T/proj" || exit 2
 tok3=$("$D" token create --state "$T/state" --user dave 2>/dev/null)
 out=$("$R" auth --token "$tok3" 2>&1); check $? "rargo auth --token stores a token an administrator made" "$out"
+grep -q "it is dave's" <<<"$out"; check $? "and says whose it is" "$out"
+out=$("$R" auth status 2>&1); grep -q "authenticated as dave (token ${tok3%%.*})" <<<"$out"; check $? "rargo auth status names its holder, as the server said" "$out"
 echo "// dave" >>src/main.rs
 out=$("$R" build 2>&1); check $? "and builds with it" "$out"
 out=$("$R" auth remove 2>&1); rc=$?
@@ -139,10 +144,17 @@ out=$("$R" auth remove 2>&1); rc=$?
 sleep 3
 echo "// dave again" >>src/main.rs
 out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
-[ $rc != 0 ] && grep -q "does not know this user or key" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
+[ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
+out=$(RARGO_TRANSPORT=tcp RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3c "$R" build 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "over TCP too, in the same words" "$out"
+out=$("$R" auth --token "$tok3" 2>&1); rc=$?
+[ $rc != 0 ] && grep -q "does not know this token" <<<"$out" && ! grep -q "^\[\"$host\"\]" "$cred"; check $? "rargo auth --token refuses a revoked token and keeps nothing" "$out" "$(sed 's/^secret = .*/secret = (hidden)/' "$cred" 2>&1)"
+out=$("$R" auth --token "${tok3%%.*}.wrong-secret-wrong-secret" 2>&1); [ $? != 0 ] && grep -q "does not know this token" <<<"$out"; check $? "and one with the wrong secret" "$out"
+out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"$tok\"}" "http://$host/auth/whoami"); grep -q '"user":"bob"' <<<"$out"; check $? "/auth/whoami names the holder of a token that works" "$out"
+out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok%%.*}\"}" "http://$host/auth/whoami"); grep -q '"user":null' <<<"$out"; check $? "and nobody for a token's id alone" "$out"
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok3%%.*}.wrong-secret-wrong-secret\"}" "http://$host/auth/revoke"); grep -q '"revoked":false' <<<"$out"; check $? "a token cannot be revoked by its id alone" "$out"
 out=$("$R" auth remove 2>&1); [ $? != 0 ]; check $? "a second rargo auth remove has nothing to remove" "$out"
-for c in "$T/cache3" "$T/cache3b"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+for c in "$T/cache3" "$T/cache3b" "$T/cache3c"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
 
 echo "== signing in with GitHub (a stand-in for it), with an allow list"
 printf 'the-app-secret\n' >"$T/app-secret"
