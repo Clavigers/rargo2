@@ -672,14 +672,14 @@ printf '[workspace]\nresolver = "2"\nmembers = ["old", "app", "slowcancel"]\n' >
 client=$!
 script=""
 for _ in $(seq 1 300); do
-    script=$(pgrep -f 'build/slowcancel/[0-9a-f]*/out/build_script_build' | head -1)
+    script=$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$' | head -1)
     [ -n "$script" ] && break
     sleep 0.1
 done
 kill "$client" 2>/dev/null; wait "$client" 2>/dev/null
 gone=no
 for _ in $(seq 1 50); do
-    if [ -z "$(pgrep -f 'build/slowcancel/[0-9a-f]*/out/build_script_build')" ]; then gone=yes; break; fi
+    if [ -z "$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$')" ]; then gone=yes; break; fi
     sleep 0.1
 done
 [ -n "$script" ] && [ $gone = yes ] && ok "an action still running when its client goes away is stopped" \
