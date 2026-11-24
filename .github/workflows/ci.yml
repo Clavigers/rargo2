@@ -38,3 +38,34 @@ jobs:
       - name: The crates that are published
         run: cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh
+  new-user-path:
+    # The path a new user takes (rargo @host, rargo auth, rargo build) and
+    # the token commands, against a server of this commit started on the
+    # runner (dev/e2e-auth.sh). The planner is the one of the latest
+    # release: building the cargo fork takes longer than everything else.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: path-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --locked --release -p rargo -p rargod -p rargo-core
+      - name: The planner of the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --pattern 'rargo-server-x86_64-unknown-linux-gnu.tar.gz' --pattern SHA256SUMS
+          grep ' rargo-server-x86_64-unknown-linux-gnu.tar.gz$' SHA256SUMS | sha256sum -c -
+          tar -xzf rargo-server-x86_64-unknown-linux-gnu.tar.gz
+      - name: rargo @host, rargo auth, rargo build, tokens
+        run: |
+          sudo -E env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            RARGO_WORK=/tmp/rargo-work RARGO_BIN=$PWD/target/release PLANNER=$PWD/rargo-server/planner-cargo \
+            dev/e2e-auth.sh
+

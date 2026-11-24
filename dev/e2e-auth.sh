@@ -6,13 +6,20 @@
 #
 #   dev/e2e-auth.sh
 #
+# Runs on the build machine and on a CI runner: RARGO_BIN (rargod, rargo),
+# PLANNER (the cargo fork's binary) and RARGO_WORK (scratch directory) say
+# where things are.
+#
 # The browser's part (opening the page, entering the invitation) is played
 # with curl. Needs root (rargod) and a free loopback port.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 B=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
-. "$work/env.sh"
+[ -f "$work/env.sh" ] && . "$work/env.sh"
+planner=${PLANNER:-$work/cargo/target/release/cargo}
+[ -x "$planner" ] || { echo "no planner at $planner (set PLANNER)" >&2; exit 2; }
+mkdir -p "$work"
 unset RARGO_SERVER RARGO_USER RARGO_KEY RARGO_TOKEN RARGO_KEY_FILE RARGO_STATE RARGO_HIDE
 T=$work/e2e-auth
 port=${E2E_AUTH_PORT:-7466}
@@ -30,14 +37,14 @@ R=$B/rargo
 D="$B/rargod"
 
 echo "== an administrator, before the server runs"
-out=$("$B/rargod" --state "$T/state" --planner "$work/cargo/target/release/cargo" --listen 0.0.0.0:$port --jobs 2 2>&1)
+out=$("$B/rargod" --state "$T/state" --planner "$planner" --listen 0.0.0.0:$port --jobs 2 2>&1)
 grep -q "nobody could connect" <<<"$out"; check $? "a public server without keys or tokens refuses to start" "$out"
 invite=$("$D" token invite --state "$T/state" --user ann --uses 2 2>/dev/null)
 [[ "$invite" =~ ^[A-Z0-9]{4}(-[A-Z0-9]{4}){3}$ ]]; check $? "rargod token invite prints a code" "$invite"
 ! grep -q "${invite//-/}" "$T/state/tokens.json"; check $? "the code is not in the token file"
 [ "$(stat -c %a "$T/state/tokens.json")" = 600 ]; check $? "the token file is readable by its owner only"
 
-"$D" --state "$T/state" --planner "$work/cargo/target/release/cargo" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
+"$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
 srv=$!
 for _ in $(seq 1 100); do grep -q "serving clients" "$T/srv.log" && break; sleep 0.1; done
 grep -q "keys or tokens required" "$T/srv.log"; check $? "the server runs with tokens only" "$(cat "$T/srv.log")"
@@ -89,7 +96,9 @@ printf 'fn main() {\n    println!("second");\n}\n' >src/main.rs
 git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
 out=$("$R" @$host 2>&1); grep -q '^\[workspace.metadata.rargo\]' Cargo.toml; check $? "a workspace gets workspace metadata" "$out" "$(cat Cargo.toml)"
 ! grep -q "rargo auth" <<<"$out"; check $? "and is not sent to rargo auth again" "$out"
-out=$("$R" run -q 2>&1); [ "$out" = "second" ]; check $? "rargo run works there" "$out"
+out=$("$R" run -q 2>&1); [ "$out" = "second" ]; check $? "rargo run works there" "$out" \
+    "$(ls -la target target/debug 2>&1 | head -n 20)" "$(grep -c " $PWD/target " /proc/self/mountinfo) mounts at target/" \
+    "$("$R" --rargo-daemon-status 2>&1 | tail -n 6)" "$(tail -n 15 "$RARGO_CACHE_DIR/daemon.log" 2>&1)"
 cargo metadata --format-version 1 --no-deps >/dev/null 2>"$T/cargo.err"; check $? "stock cargo reads the manifest as before" "$(cat "$T/cargo.err")"
 
 echo "== an administrator, while the server runs"

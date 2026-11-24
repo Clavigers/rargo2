@@ -762,11 +762,18 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
         std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
     }
     mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
-    // The new root is a tmpfs mounted over /tmp (any existing directory
-    // would do); the real /tmp is reached through a descriptor.
+    // The new root is a tmpfs mounted over an existing top-level directory;
+    // what that directory held is reached through a descriptor. It must not
+    // be one a worktree lies under: what is mounted below the covered
+    // directory (a worktree's output directory, served by the daemon)
+    // would not come along.
     let entries: Vec<std::fs::DirEntry> = std::fs::read_dir("/")?.filter_map(|e| e.ok()).collect();
-    let tmp_fd = std::fs::File::open("/tmp")?;
-    let new_root = Path::new("/tmp");
+    let covered = ["/tmp", "/mnt", "/media", "/srv", "/opt", "/home", "/var"]
+        .into_iter()
+        .find(|d| Path::new(d).is_dir() && !binds.iter().any(|(real, _)| Path::new(real).starts_with(d)))
+        .ok_or_else(|| std::io::Error::other("no directory to build the namespace on"))?;
+    let tmp_fd = std::fs::File::open(covered)?;
+    let new_root = Path::new(covered);
     mount(Some(Path::new("tmpfs")), new_root, Some("tmpfs"), 0, Some("mode=755"))?;
     use std::os::fd::AsRawFd;
     for e in entries {
@@ -783,7 +790,7 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
             }
         } else if ft.is_dir() {
             std::fs::create_dir(&dst)?;
-            let from = if name == "tmp" { PathBuf::from(format!("/proc/self/fd/{}", tmp_fd.as_raw_fd())) } else { src };
+            let from = if src == new_root { PathBuf::from(format!("/proc/self/fd/{}", tmp_fd.as_raw_fd())) } else { src };
             mount(Some(&from), &dst, None, libc::MS_BIND | libc::MS_REC, None)?;
         } else if ft.is_file() {
             std::fs::File::create(&dst)?;
@@ -793,8 +800,9 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
     for (real, at) in binds {
         let dst = new_root.join(at.trim_start_matches('/'));
         std::fs::create_dir_all(&dst)?;
-        // Paths below the old /tmp are only reachable through the descriptor.
-        let real_p = match Path::new(real).strip_prefix("/tmp") {
+        // Paths below the covered directory are only reachable through the
+        // descriptor (none is a worktree, by the choice above).
+        let real_p = match Path::new(real).strip_prefix(covered) {
             Ok(rest) => PathBuf::from(format!("/proc/self/fd/{}", tmp_fd.as_raw_fd())).join(rest),
             Err(_) => PathBuf::from(real),
         };
