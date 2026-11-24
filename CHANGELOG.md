@@ -6,6 +6,19 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.0
+
+Protocol 7 (unchanged).
+
+- `~/.config/rargo/credentials.toml` holds a token as `id`, `secret` and
+  `name`.
+- `rargo auth --token T` asks the server whose token it is before keeping
+  it: it stores the holder's name, which `rargo auth status` shows, and
+  refuses a token the server does not admit. (#68)
+- A server refuses a client it does not admit with "the server does not
+  know this token, or it was revoked or has expired", over UDP and TCP.
+  (#68)
+
 ## 0.5.0
 
 Protocol 7 (unchanged).

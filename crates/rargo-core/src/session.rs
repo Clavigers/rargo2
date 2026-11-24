@@ -557,7 +557,7 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
     stream.read_exact(&mut len).await?;
     let mut msg1 = vec![0u8; u16::from_le_bytes(len) as usize];
     stream.read_exact(&mut msg1).await?;
-    let refuse = "the server does not know this user or key\n";
+    let refuse = format!("{}\n", crate::proto::REFUSED);
     let accepted = keys.lookup(&user).and_then(|(psk, admin)| secure::server_accept(&psk, &msg1).ok().map(|r| (r, admin)));
     let Some(((msg2, early, sealer, opener), admin)) = accepted else {
         let mut reply = vec![1u8];

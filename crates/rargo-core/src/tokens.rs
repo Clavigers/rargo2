@@ -355,6 +355,18 @@ impl TokenStore {
         })
     }
 
+    /// Whose token this is, given its whole text, if it works now.
+    pub fn holder(&self, text: &str) -> Option<String> {
+        let (id, secret) = text.trim().split_once('.')?;
+        let key = hex(&secure::psk_from_secret(secret.as_bytes()));
+        let file = self.file();
+        let t = file.tokens.iter().find(|t| t.id == id && t.key == key)?;
+        if t.revoked || t.expires.is_some_and(|e| e <= now()) {
+            return None;
+        }
+        Some(t.user.clone())
+    }
+
     /// Makes an invitation. Returns its code, which is not kept.
     pub fn invite(&self, user: Option<&str>, admin: bool, days: Option<u32>, uses: u32, token_days: Option<u32>) -> Result<String> {
         if let Some(u) = user {
@@ -444,8 +456,13 @@ mod tests {
         assert!(!store.revoke_self(&format!("{}.not-the-secret-of-it", t3.id)).unwrap());
         assert!(!store.revoke_self(&t3.id).unwrap());
         assert!(store.lookup(&t3.id).is_some());
+        // Its whole text also says whose it is, while it works.
+        assert_eq!(store.holder(&token_text(&t3, &secret3)).as_deref(), Some("carol"));
+        assert_eq!(store.holder(&format!("{}.not-the-secret-of-it", t3.id)), None);
+        assert_eq!(store.holder(&t3.id), None);
         assert!(store.revoke_self(&token_text(&t3, &secret3)).unwrap());
         assert!(store.lookup(&t3.id).is_none());
+        assert_eq!(store.holder(&token_text(&t3, &secret3)), None, "revoked");
         assert!(!store.revoke_self(&token_text(&t3, &secret3)).unwrap(), "once");
         assert_eq!(store.list().len(), 3);
     }

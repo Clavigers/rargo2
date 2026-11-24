@@ -207,6 +207,16 @@ impl Http {
                 }
                 json(serde_json::json!({ "revoked": done }))
             }
+            // Whose token this is (`rargo auth --token`): its own text again,
+            // and nothing for a token that does not work.
+            ("POST", "/auth/whoami") => {
+                let token = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|v| v.get("token")?.as_str().map(String::from));
+                let user = match (self.keys.tokens(), token) {
+                    (Some(store), Some(t)) => store.holder(&t),
+                    _ => None,
+                };
+                json(serde_json::json!({ "user": user }))
+            }
             ("GET", "/auth") => (200, "text/html; charset=utf-8", self.auth_page(req.query.get("code").map(String::as_str).unwrap_or(""), None)),
             ("GET", "/auth/github") => match self.to_github(req.query.get("code").map(String::as_str).unwrap_or("")) {
                 Ok(location) => (302, "location", location),

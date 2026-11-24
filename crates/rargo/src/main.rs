@@ -94,7 +94,7 @@ pub fn load_config() -> Result<Config, String> {
     let (user, secret) = if let Some(token) = env("RARGO_TOKEN") {
         from_token(&token)?
     } else if let Some(c) = project::credential(&host) {
-        (c.user, Some(c.key))
+        (c.id, Some(c.secret))
     } else {
         (local_name(), None)
     };
@@ -408,7 +408,8 @@ fn auth_command(args: &[OsString]) -> ! {
         "status" => {
             let server = project::resolve(&host).unwrap_or_else(|e| format!("unknown ({e})"));
             match project::credential(&host) {
-                Some(c) => println!("{host} (server {server}): authenticated as {} (token {})", if c.name.is_empty() { "?" } else { &c.name }, c.user),
+                Some(c) if c.name.is_empty() => println!("{host} (server {server}): authenticated (token {})", c.id),
+                Some(c) => println!("{host} (server {server}): authenticated as {} (token {})", c.name, c.id),
                 None => println!("{host} (server {server}): not authenticated; run `rargo auth`"),
             }
             std::process::exit(0)
@@ -436,12 +437,17 @@ fn auth_command(args: &[OsString]) -> ! {
         _ => {}
     }
     if let Some(token) = token {
-        match project::store_token(&host, &token, "") {
-            Ok(()) => {
-                println!("stored the token for {host}");
+        // Asked of the server first: a token it does not admit is not kept.
+        let stored = project::holder(&host, &token).and_then(|name| match name {
+            Some(name) => project::store_token(&host, &token, &name).map(|()| name),
+            None => Err(format!("{host}: {}", rargo_proto::REFUSED)),
+        });
+        match stored {
+            Ok(name) => {
+                println!("stored the token for {host}: it is {name}'s");
                 std::process::exit(0)
             }
-            Err(e) => die(&e),
+            Err(e) => die(&format!("rargo auth: {e}")),
         }
     }
     match project::auth(&host) {

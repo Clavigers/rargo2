@@ -23,6 +23,10 @@ pub mod workspace;
 
 pub const PROTO_VERSION: u32 = 7;
 
+/// What a server says to a client whose token it does not admit, on either
+/// transport; the client recognises it by this text.
+pub const REFUSED: &str = "the server does not know this token, or it was revoked or has expired";
+
 /// Where the stand-in for a linked worktree's git directory is shown: the
 /// worktree's `.git` is a file there, as on the client, and names this
 /// directory beside it.
