@@ -384,7 +384,7 @@ impl Session {
         if opts.auto_unmount {
             // Without a guard the mount still works; `auto_unmount_active`
             // says which it is.
-            guard = spawn_guard(&tgt, mount_id, &opts.fsname, helper).ok();
+            guard = spawn_guard(&tgt, mount_id, helper).ok();
         }
         let mut sess = Session {
             dev,
@@ -633,17 +633,29 @@ fn mount_id(path: &std::ffi::CStr) -> Option<u64> {
 /// process has other threads; after fork only the calling one exists and
 /// no lock or allocator can be trusted). It is in a session of its own, so
 /// what is sent to this process's group, a terminal's interrupt or a
-/// service manager's stop, does not reach it first.
+/// service manager's stop, does not reach it first. And it is not to be
+/// found under this program's name: a fork has its parent's name and
+/// command line, and whoever kills a stuck server by either (`pkill -9`,
+/// `pkill -9 -f`) would kill the guard with it and be left with the dead
+/// mount. It shows as `unmount-guard: DIRECTORY`.
 ///
 /// A mount made by `fusermount3` (`helper`) is one this user may not
 /// unmount: the guard then runs `fusermount3 -u -z`, as `unmount` does.
-fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, fsname: &str, helper: bool) -> io::Result<Guard> {
+fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io::Result<Guard> {
+    let name = c"unmount-guard";
+    let mut title = b"unmount-guard: ".to_vec();
+    title.extend_from_slice(tgt.to_bytes());
+    // Where the kernel reads this process's command line from: fields 48
+    // and 49 of /proc/self/stat, counted from after the name in brackets.
+    let args: Option<(usize, usize)> = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
+        let rest = &s[s.rfind(')')? + 1..];
+        let mut f = rest.split_ascii_whitespace().skip(45);
+        let (start, end) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
+        (start != 0 && end > start).then_some((start, end))
+    });
     let argv_owned = [c"fusermount3", c"-u", c"-z", c"-q", c"--", tgt];
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
-    let mut name: Vec<u8> = format!("{fsname}-unmount").into_bytes();
-    name.truncate(15);
-    let name = CString::new(name).map_err(io::Error::other)?;
     let mut p = [0 as libc::c_int; 2];
     // SAFETY: a valid two-element array.
     if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
@@ -667,6 +679,12 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, fsname: &str, helper
         unsafe {
             libc::setsid();
             libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+            if let Some((start, end)) = args {
+                // This copy of the argument strings is the child's own.
+                let (area, len) = (start as *mut u8, end - start);
+                std::ptr::write_bytes(area, 0, len);
+                std::ptr::copy_nonoverlapping(title.as_ptr(), area, title.len().min(len - 1));
+            }
             for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGPIPE] {
                 libc::signal(sig, libc::SIG_IGN);
             }

@@ -2038,7 +2038,12 @@ daemon can run at that moment, so something outside it has to.
   exits. End of file means the daemon is gone: the guard lazily unmounts
   the directory (`umount2`, or `fusermount3 -u -z` for a mount this user
   made through it) and exits. It costs one sleeping process per mounted
-  worktree, named `rargo-unmount`.
+  worktree.
+- The guard is a fork, and a fork has its parent's name and command
+  line: the first end-to-end run killed the daemon with `pkill -KILL -f`
+  and killed the guard with it. It renames itself and overwrites its
+  argument strings, and shows as `unmount-guard: DIRECTORY`, which
+  neither `pkill rargo` nor `pkill -f 'rargo --rargo-daemon'` matches.
 - It unmounts only its own mount: the kernel's mount id (statx, Linux
   5.8; asked without a question to the file system, which cannot answer)
   is recorded at mount and compared before unmounting, in the guard and

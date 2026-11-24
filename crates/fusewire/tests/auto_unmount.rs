@@ -128,7 +128,7 @@ fn a_killed_process_leaves_no_mount_behind() {
     assert_eq!(std::fs::read_dir(guarded.path()).unwrap().count(), 2);
 }
 
-/// Children of this process that are guards (named after the file system).
+/// Children of this process that are guards, with their command lines.
 fn guards_of_this_process() -> Vec<String> {
     let me = std::process::id().to_string();
     let mut found = Vec::new();
@@ -139,8 +139,9 @@ fn guards_of_this_process() -> Vec<String> {
         let comm = &stat[open + 1..close];
         let mut rest = stat[close + 1..].split_whitespace();
         let (state, ppid) = (rest.next(), rest.next());
-        if ppid == Some(me.as_str()) && state != Some("Z") && comm == "fwtest-unmount" {
-            found.push(comm.to_string());
+        if ppid == Some(me.as_str()) && state != Some("Z") && comm == "unmount-guard" {
+            let cmdline = std::fs::read(e.path().join("cmdline")).unwrap_or_default();
+            found.push(String::from_utf8_lossy(&cmdline).trim_end_matches('\0').to_string());
         }
     }
     found
@@ -154,7 +155,9 @@ fn unmounting_stands_the_guard_down() {
     let tmp = tempfile::tempdir().unwrap();
     let first = Session::mount(tmp.path(), &opts(true)).unwrap();
     assert!(first.auto_unmount_active());
-    assert_eq!(guards_of_this_process().len(), 1, "one guard while mounted");
+    // One guard while mounted, and not under this program's name: whoever
+    // kills this program by name or command line must not kill it too.
+    assert_eq!(guards_of_this_process(), [format!("unmount-guard: {}", tmp.path().display())]);
     first.unmount();
     assert!(!first.auto_unmount_active());
     assert!(wait_unmounted(tmp.path(), Duration::from_secs(5)));
