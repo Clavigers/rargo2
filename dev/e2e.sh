@@ -559,8 +559,9 @@ rm -f .rargo.toml crates/app/tests/policy.rs
 kill $listener 2>/dev/null
 # What the policy excludes is never uploaded.
 mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
-printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
+# (Counted before the edit: the daemon may push it as soon as it is made.)
 files=$(asked_files)
+printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
 expect "a build with a directory the manifest excludes" "$R" build
 [ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest itself was uploaded, not the excluded directory" || bad "only the manifest itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
 cp "$T/Cargo.toml.before-policy" Cargo.toml
