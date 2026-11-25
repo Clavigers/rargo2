@@ -180,7 +180,7 @@ out=$(adm revoke "$id" 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rar
 echo "// changed" >>src/main.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc != 0 ]; check $? "a build with the revoked token fails, the session it had open included" "$out"
-grep -q "does not know this token, or it was revoked or has expired" <<<"$out" && grep -q "run \`rargo auth\`" <<<"$out"; check $? "and says why, and what to do" "$out"
+grep -q "no longer accepts this machine's token: it was revoked or has expired" <<<"$out" && grep -q "Run \`rargo auth\`" <<<"$out"; check $? "and says why, and what to do" "$out"
 grep -q "no longer valid" "$T/srv.log"; check $? "the server closed the open session" "$(tail -n 5 "$T/srv.log")"
 out=$("$R" auth remove 2>&1); check $? "rargo auth remove forgets the token" "$out"
 ! grep -q "^\[\"$host\"\]" "$cred"; check $? "it is gone from the credentials file"
@@ -201,9 +201,9 @@ out=$("$R" auth remove 2>&1); rc=$?
 [ $rc = 0 ] && grep -q "revoked the token for $host on the server" <<<"$out"; check $? "rargo auth remove says it revoked the token on the server" "$out"
 echo "// dave again" >>src/main.rs
 out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
-[ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
+[ $rc != 0 ] && grep -q "no longer accepts this machine's token: it was revoked or has expired" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
 out=$(RARGO_TRANSPORT=tcp RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3c "$R" build 2>&1); rc=$?
-[ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "over TCP too, in the same words" "$out"
+[ $rc != 0 ] && grep -q "no longer accepts this machine's token: it was revoked or has expired" <<<"$out"; check $? "over TCP too, in the same words" "$out"
 out=$("$R" auth --token "$tok3" 2>&1); rc=$?
 [ $rc != 0 ] && grep -q "does not know this token" <<<"$out" && ! grep -q "^\[\"$host\"\]" "$cred"; check $? "rargo auth --token refuses a revoked token and keeps nothing" "$out" "$(sed 's/^secret = .*/secret = (hidden)/' "$cred" 2>&1)"
 out=$("$R" auth --token "${tok3%%.*}.wrong-secret-wrong-secret" 2>&1); [ $? != 0 ] && grep -q "does not know this token" <<<"$out"; check $? "and one with the wrong secret" "$out"

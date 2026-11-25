@@ -78,7 +78,7 @@ impl Trees {
     }
 
     pub fn put(&self, encoded: &[u8]) -> Result<Hash> {
-        let tree = Tree::decode(encoded)?;
+        let tree = Tree::decode(encoded).context("the client sent a malformed directory manifest")?;
         let digest = self.store.put_bytes(encoded)?;
         self.decoded.insert(digest, Arc::new(tree));
         Ok(digest)
@@ -109,7 +109,7 @@ impl Trees {
                 let this = self.clone();
                 let stored: Result<HashSet<Hash>> =
                     tokio::task::spawn_blocking(move || got.iter().map(|enc| this.put(enc)).collect()).await?;
-                let stored = stored.context("the client sent a malformed directory manifest")?;
+                let stored = stored?;
                 if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
                     bail!("the client did not send directory manifest {d}");
                 }

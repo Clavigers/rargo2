@@ -437,6 +437,37 @@ impl std::error::Error for NoLink {
     }
 }
 
+fn refused_text(server: &str, had_token: bool) -> String {
+    if had_token {
+        format!(
+            "error: the rargo server at {server} no longer accepts this machine's token: it was revoked or has expired. \
+             Run `rargo auth` to get a new one\n"
+        )
+    } else {
+        format!("error: this machine is not authenticated to the rargo server at {server}: run `rargo auth`\n")
+    }
+}
+
+const LOW_SPACE: u64 = 64 << 20;
+
+fn low_space_text(cache: &Path, free: u64) -> Option<String> {
+    (free < LOW_SPACE).then(|| {
+        format!(
+            "warning: the disk that holds rargo's cache ({}) has {} MiB free. Built files are read through that cache, \
+             so running them fails once it is full. Free space on that disk; the cache itself may be deleted after \
+             `rargo --rargo-daemon-stop`\n",
+            cache.display(),
+            free >> 20
+        )
+    })
+}
+
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+}
+
 fn no_link(e: std::io::Error) -> std::io::Error {
     use std::io::ErrorKind::*;
     if matches!(e.kind(), ConnectionRefused | TimedOut | NotFound | HostUnreachable | NetworkUnreachable) {
@@ -1222,14 +1253,12 @@ impl Daemon {
                 if is_no_link(&e) {
                     LocalReply::Unreachable(e.to_string())
                 } else {
-                    let hint = if e.to_string().contains(rargo_proto::REFUSED) {
-                        "       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n"
+                    let text = if e.to_string().contains(rargo_proto::REFUSED) {
+                        refused_text(&self.cfg.server, self.cfg.secret.is_some())
                     } else {
-                        ""
+                        format!("error: talking to the rargo server at {}: {}\n", self.cfg.server, crate::plain_cause(&e.to_string()))
                     };
-                    let _ = out.send(LocalReply::Stderr(
-                        format!("error: talking to the rargo server at {}: {e}\n{hint}", self.cfg.server).into_bytes(),
-                    ));
+                    let _ = out.send(LocalReply::Stderr(text.into_bytes()));
                     LocalReply::Exit(101)
                 }
             }
@@ -1245,6 +1274,11 @@ impl Daemon {
     async fn run(self: &Arc<Self>, req: &LocalRequest, out: &UnboundedSender<LocalReply>) -> std::io::Result<LocalReply> {
         if req.kind == "status" {
             return Ok(self.status(out).await);
+        }
+        if req.kind != "admin"
+            && let Some(text) = free_bytes(&self.cache).and_then(|free| low_space_text(&self.cache, free))
+        {
+            let _ = out.send(LocalReply::Stderr(text.into_bytes()));
         }
         let cwd = PathBuf::from(&req.cwd);
         let home = PathBuf::from(var(&req.vars, "HOME").unwrap_or("/"));
@@ -2549,6 +2583,30 @@ mod left_out_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_token_says_whether_there_was_one_and_names_rargo_auth() {
+        let none = refused_text("build.example:7459", false);
+        let revoked = refused_text("build.example:7459", true);
+        assert_eq!(none, "error: this machine is not authenticated to the rargo server at build.example:7459: run `rargo auth`\n");
+        assert!(revoked.starts_with("error: the rargo server at build.example:7459 no longer accepts this machine's token: it was revoked or has expired. Run `rargo auth`"), "{revoked}");
+        for text in [none, revoked] {
+            assert!(!text.contains(rargo_proto::REFUSED), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_nearly_full_cache_disk_is_warned_of_with_what_to_do() {
+        let cache = Path::new("/home/ann/.cache/rargo");
+        for (free, warned) in [(0, true), (1 << 20, true), (LOW_SPACE - 1, true), (LOW_SPACE, false), (1 << 40, false)] {
+            let text = low_space_text(cache, free);
+            assert_eq!(text.is_some(), warned, "{free}");
+            if let Some(text) = text {
+                assert!(text.contains("/home/ann/.cache/rargo") && text.contains(&format!("{} MiB free", free >> 20)), "{text}");
+                assert!(text.contains("Free space on that disk") && text.contains("`rargo --rargo-daemon-stop`"), "{text}");
+            }
+        }
+    }
 
     #[test]
     fn only_a_link_that_cannot_be_made_is_an_unreachable_server() {
