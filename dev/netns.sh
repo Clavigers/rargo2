@@ -64,17 +64,14 @@ live_server() {
     done
     return 1
 }
-# Follow pid when one is given, so a dead server ends the wait, and give up
-# after 30s either way. The server itself is left running.
+# Follow the server, so a dead server ends the wait, and give up after 30s
+# either way. The server itself is left running. No server pid is a failure.
 wait_for_line() {
     file=$1
     pat=$2
     pid=${3:-}
-    if [ -n "$pid" ]; then
-        timeout 30 tail -n +1 -f --pid="$pid" "$file"
-    else
-        timeout 30 tail -n +1 -f "$file"
-    fi | awk -v pat="$pat" 'index($0, pat) { found = 1; exit } END { exit found ? 0 : 1 }'
+    [ -n "$pid" ] || return 1
+    timeout 30 tail -n +1 -f --pid="$pid" "$file" | awk -v pat="$pat" 'index($0, pat) { found = 1; exit } END { exit found ? 0 : 1 }'
 }
 show_worker_logs() {
     i=1
@@ -93,6 +90,11 @@ show_worker_logs() {
 wait_up() {
     if [ "${n:-0}" -ge 1 ]; then
         sp=$(live_server || true)
+        if [ -z "$sp" ]; then
+            echo "no worker joined" >&2
+            show_worker_logs
+            return 1
+        fi
         if ! wait_for_line "$T/srv.log" "joined" "$sp"; then
             echo "no worker joined" >&2
             show_worker_logs
@@ -116,7 +118,8 @@ start_server() {
         "$B/rargod" --state "$T/srv" --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
         --listen 10.77.0.1:7459 --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
-    if ! wait_for_line "$T/srv.log" "serving clients"; then
+    srvpid=$!
+    if ! wait_for_line "$T/srv.log" "serving clients" "$srvpid"; then
         echo "rargod did not start" >&2
         tail -n 20 "$T/srv.log" >&2 || true
         return 1
