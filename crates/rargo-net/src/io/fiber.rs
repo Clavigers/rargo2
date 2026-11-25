@@ -87,6 +87,29 @@ pub(super) fn poke_arc() -> Arc<Poke> {
     Arc::clone(&unsafe { &*sched_ptr() }.poke)
 }
 
+struct Outside {
+    current: u64,
+    yielder: *const Yielder<Resume, Pause>,
+}
+
+impl Outside {
+    fn enter() -> Outside {
+        Outside { current: CURRENT.with(|c| c.replace(0)), yielder: YIELDER.with(|c| c.replace(std::ptr::null())) }
+    }
+}
+
+impl Drop for Outside {
+    fn drop(&mut self) {
+        CURRENT.with(|c| c.set(self.current));
+        YIELDER.with(|c| c.set(self.yielder));
+    }
+}
+
+fn drop_outside(fiber: Fiber) {
+    let _outside = Outside::enter();
+    drop(fiber);
+}
+
 pub(super) fn current_id() -> u64 {
     let id = CURRENT.with(|c| c.get());
     assert!(id != 0, "this runs on a fiber");
@@ -343,6 +366,8 @@ pub(super) fn resume_one(sched: *mut Sched, id: u64) {
         s.fibers.get_mut(&id).expect("a ready fiber exists").co.take().expect("a fiber has its stack")
     };
     let resumed = catch_unwind(AssertUnwindSafe(|| co.resume(input)));
+    CURRENT.with(|c| c.set(0));
+    YIELDER.with(|c| c.set(std::ptr::null()));
     match resumed {
         Ok(CoroutineResult::Yield(pause)) => {
             let s = unsafe { &mut *sched };
@@ -432,7 +457,7 @@ pub(super) fn cancel_request(id: u64) -> bool {
         fiber
     };
     let task = fiber.task.clone();
-    drop(fiber);
+    drop_outside(fiber);
     if let Some(task) = task {
         task.fail_abort();
         if let Some(waiter) = task.take_waiter() {
@@ -464,7 +489,7 @@ pub(super) fn reap(sched: *mut Sched, id: u64) {
     let task = fiber.task.clone();
     let parent = fiber.parent;
     let race = fiber.race;
-    drop(fiber);
+    drop_outside(fiber);
     if let Some(task) = task {
         task.fail_abort();
         if let Some(waiter) = task.take_waiter() {
