@@ -3064,9 +3064,19 @@ nightly ships: `forks/cargo/BASE` is the cargo commit of nightly
 `CFG_RELEASE_CHANNEL=nightly`, so unstable features are gated as that
 nightly's cargo gates them, whatever the toolchain of the build.
 
+The same nightly is the toolchain of a project without a toolchain file:
+the bundled shell names `nightly-2026-11-22`, the rustup nightly whose
+cargo is `f93c676e3`, so what the planner plans is what that toolchain's
+cargo plans, down to the unit hashes in output paths. e2e takes its stock
+cargo from the same line of `nix/default/flake.nix`: its checks compare
+rargo with stock cargo byte for byte, and they hold only when the two are
+the same cargo (against stable 1.100, three differ: a lint's span and a
+build script's output directory, twice).
+
 Following a newer nightly is the same step again: rebase the patch series
-onto the cargo commit `cargo +nightly -vV` names, export it with
-`git format-patch`, write that commit to `BASE`, and rebuild.
+onto the cargo commit `cargo +nightly-DATE -vV` names, export it with
+`git format-patch`, write that commit to `BASE`, put `nightly-DATE` in
+the bundled shell, and rebuild.
 
 Measured on the rebase to `f93c676e3`: patch 1 met three conflicts
 (build-script and rustdoc runs now return process stats), and the series

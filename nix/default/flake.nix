@@ -23,7 +23,9 @@
       toolchainText = if toolchainFile == null then "" else builtins.readFile toolchainFile;
       legacyChannel = builtins.match "([^\r\n]+)\r?\n?" toolchainText;
       toolchain =
-        if toolchainFile == null then { channel = "stable"; }
+        # Without a toolchain file: the nightly whose cargo the planner is
+        # (forks/cargo/BASE), so what is planned is what that cargo plans.
+        if toolchainFile == null then { channel = "nightly-2026-11-22"; }
         else if legacyChannel != null then { channel = builtins.head legacyChannel; }
         else (builtins.fromTOML toolchainText).toolchain;
       rust = pkgs.rust-bin.fromRustupToolchain (toolchain // {
