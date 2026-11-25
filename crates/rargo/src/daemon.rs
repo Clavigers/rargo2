@@ -1599,26 +1599,108 @@ fn join_rel(rel: &[u8]) -> Vec<u8> {
     p
 }
 
-async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
-    let mut small: Vec<(Digest, PathBuf, u64)> = Vec::new();
-    let mut large: Vec<(Digest, PathBuf)> = Vec::new();
-    for h in want {
-        let Some((path, size)) = snap.scan.files.get(&h).cloned() else { return Ok(false) };
-        if size as usize > rargo_proto::PART_SIZE { large.push((h, path)) } else { small.push((h, path, size)) }
-    }
-    assert!(small.iter().all(|(_, _, size)| *size as usize <= rargo_proto::PART_SIZE));
-    let wanted = small.len();
-    let mut batches: Vec<Vec<(Digest, PathBuf)>> = vec![Vec::new()];
-    let mut bytes = 0usize;
-    for (h, p, size) in small {
-        if bytes >= rargo_proto::BATCH_SIZE {
-            batches.push(Vec::new());
-            bytes = 0;
+const UPLOAD_OVERHEAD: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UploadFile {
+    hash: Digest,
+    path: PathBuf,
+    size: u64,
+}
+
+struct UploadPlan {
+    batches: Vec<Vec<UploadFile>>,
+    multipart: Vec<UploadFile>,
+    part_size: usize,
+}
+
+impl UploadPlan {
+    fn new(want: Vec<Digest>, files: &HashMap<Digest, (PathBuf, u64)>, budget: usize) -> Option<Self> {
+        let part_size = rargo_proto::PART_SIZE.min(budget.checked_sub(UPLOAD_OVERHEAD)?);
+        if part_size == 0 {
+            return None;
         }
-        bytes += size as usize + 64;
-        batches.last_mut().unwrap().push((h, p));
+        let mut plan = Self { batches: Vec::new(), multipart: Vec::new(), part_size };
+        let mut batch = Vec::new();
+        let mut used = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        for hash in want {
+            if !seen.insert(hash) {
+                continue;
+            }
+            let (path, size) = files.get(&hash)?;
+            let file = UploadFile { hash, path: path.clone(), size: *size };
+            if *size > part_size as u64 {
+                plan.multipart.push(file);
+                continue;
+            }
+            let cost = *size as usize + UPLOAD_OVERHEAD;
+            if cost > budget - used {
+                plan.batches.push(std::mem::take(&mut batch));
+                used = 0;
+            }
+            used += cost;
+            batch.push(file);
+        }
+        if !batch.is_empty() {
+            plan.batches.push(batch);
+        }
+        Some(plan)
     }
-    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), wanted, "every small file is in one batch");
+
+    #[cfg(test)]
+    fn invariants(&self, budget: usize) -> bool {
+        let mut seen = std::collections::BTreeSet::new();
+        self.batches.iter().all(|batch| {
+            !batch.is_empty() && batch.iter().map(|file| file.size as usize + UPLOAD_OVERHEAD).sum::<usize>() <= budget
+                && batch.iter().all(|file| file.size <= self.part_size as u64 && seen.insert(file.hash))
+        }) && self.multipart.iter().all(|file| file.size > self.part_size as u64 && seen.insert(file.hash))
+    }
+}
+
+struct Multipart {
+    hash: Digest,
+    size: u64,
+    part_size: usize,
+    bytes: u64,
+    hasher: blake3::Hasher,
+    held: Option<Vec<u8>>,
+}
+
+impl Multipart {
+    fn frame(&self, data: Vec<u8>, last: bool) -> (ClientMsg, usize) {
+        let part = rargo_proto::Part::pack(data);
+        let bytes = part.data.len();
+        (ClientMsg::BlobPart { hash: self.hash, part, last }, bytes)
+    }
+
+    fn read(&mut self, data: Vec<u8>) -> Result<Option<(ClientMsg, usize)>, ()> {
+        if data.len() > self.part_size || data.len() as u64 > self.size - self.bytes {
+            return Err(());
+        }
+        self.bytes += data.len() as u64;
+        self.hasher.update(&data);
+        let previous = self.held.replace(data);
+        Ok(previous.map(|part| self.frame(part, false)))
+    }
+
+    fn finish(mut self) -> Option<(ClientMsg, usize)> {
+        if self.bytes != self.size || *self.hasher.finalize().as_bytes() != self.hash {
+            return None;
+        }
+        let last = self.held.take()?;
+        Some(self.frame(last, true))
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.bytes <= self.size && self.held.as_ref().is_none_or(|buf| buf.len() <= self.part_size)
+    }
+}
+
+async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
+    let Some(plan) = UploadPlan::new(want, &snap.scan.files, rargo_proto::BATCH_SIZE) else { return Ok(false) };
+    let UploadPlan { batches, multipart, part_size } = plan;
     for window in batches.chunks(8) {
         let window = window.to_vec();
         let packed: Vec<Option<Vec<Blob>>> = tokio::task::spawn_blocking(move || {
@@ -1627,9 +1709,10 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
                 .map(|batch| {
                     batch
                         .par_iter()
-                        .map(|(h, p)| {
-                            let bytes = std::fs::read(p).ok()?;
-                            (*blake3::hash(&bytes).as_bytes() == *h).then(|| Blob::pack(*h, &bytes))
+                        .map(|file| {
+                            let bytes = std::fs::read(&file.path).ok()?;
+                            (bytes.len() as u64 == file.size && *blake3::hash(&bytes).as_bytes() == file.hash)
+                                .then(|| Blob::pack(file.hash, &bytes))
                         })
                         .collect::<Option<Vec<Blob>>>()
                 })
@@ -1639,19 +1722,16 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
         .map_err(std::io::Error::other)?;
         for blobs in packed {
             let Some(blobs) = blobs else { return Ok(false) };
-            if !blobs.is_empty() {
-                let n = blobs.iter().map(|b| b.data.len()).sum();
-                mux.post_bulk(stream, &ClientMsg::Blobs(blobs), n).await?;
-            }
+            let n = blobs.iter().map(|b| b.data.len()).sum();
+            mux.post_bulk(stream, &ClientMsg::Blobs(blobs), n).await?;
         }
     }
-    for (h, path) in large {
+    for UploadFile { hash, path, size } in multipart {
         let Ok(mut f) = std::fs::File::open(&path) else { return Ok(false) };
-        let mut hasher = blake3::Hasher::new();
-        let mut held: Option<Vec<u8>> = None;
+        let mut content = Multipart { hash, size, part_size, bytes: 0, hasher: blake3::Hasher::new(), held: None };
         loop {
             let (buf, file) = tokio::task::spawn_blocking(move || -> std::io::Result<(Vec<u8>, std::fs::File)> {
-                let mut buf = vec![0u8; rargo_proto::PART_SIZE];
+                let mut buf = vec![0u8; part_size];
                 let mut n = 0;
                 while n < buf.len() {
                     let got = f.read(&mut buf[n..])?;
@@ -1661,32 +1741,83 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
                     n += got;
                 }
                 buf.truncate(n);
-                assert!(buf.len() <= rargo_proto::PART_SIZE);
                 Ok((buf, f))
             })
             .await
             .map_err(std::io::Error::other)??;
             f = file;
-            hasher.update(&buf);
             if buf.is_empty() {
                 break;
             }
-            if let Some(prev) = held.replace(buf) {
-                let part = rargo_proto::Part::pack(prev);
-                let n = part.data.len();
-                mux.post_bulk(stream, &ClientMsg::BlobPart { hash: h, part, last: false }, n).await?;
+            match content.read(buf) {
+                Ok(Some((frame, bytes))) => mux.post_bulk(stream, &frame, bytes).await?,
+                Ok(None) => {}
+                Err(()) => return Ok(false),
             }
         }
-        if *hasher.finalize().as_bytes() != h {
-            return Ok(false);
-        }
-        let part = rargo_proto::Part::pack(held.unwrap_or_default());
-        let n = part.data.len();
-        mux.post_bulk(stream, &ClientMsg::BlobPart { hash: h, part, last: true }, n).await?;
+        let Some((frame, bytes)) = content.finish() else { return Ok(false) };
+        mux.post_bulk(stream, &frame, bytes).await?;
     }
     Ok(true)
 }
 
+
+#[cfg(test)]
+mod upload_tests {
+    use super::*;
+
+    #[test]
+    fn upload_plans_keep_first_occurrence_order_within_both_frame_types() {
+        for budget in [128usize, 232, 4096] {
+            let mut want = Vec::new();
+            let mut files = HashMap::new();
+            let mut small = Vec::new();
+            let mut large = Vec::new();
+            for i in 0..96u8 {
+                let hash = [i; 32];
+                let size = u64::from(i) * 21;
+                files.insert(hash, (PathBuf::from(i.to_string()), size));
+                want.extend([hash, hash]);
+                if size <= (budget - UPLOAD_OVERHEAD) as u64 { small.push(hash) } else { large.push(hash) }
+                let plan = UploadPlan::new(want.clone(), &files, budget).unwrap();
+                assert!(plan.invariants(budget));
+                assert_eq!(plan.batches.iter().flatten().map(|entry| entry.hash).collect::<Vec<_>>(), small);
+                assert_eq!(plan.multipart.iter().map(|entry| entry.hash).collect::<Vec<_>>(), large);
+            }
+            assert!(UploadPlan::new(vec![[255; 32]], &files, budget).is_none());
+        }
+        assert_eq!(join_rel(b"debug"), b"debug/.");
+    }
+
+    #[test]
+    fn only_verified_multipart_content_gets_a_terminal_frame() {
+        let input = b"one two three";
+        let hash = *blake3::hash(input).as_bytes();
+        let fresh = || Multipart { hash, size: input.len() as u64, part_size: 4, bytes: 0, hasher: blake3::Hasher::new(), held: None };
+        let mut content = fresh();
+        let mut transferred = Vec::new();
+        for chunk in input.chunks(4) {
+            if let Some((ClientMsg::BlobPart { hash: got, part, last: false }, bytes)) = content.read(chunk.to_vec()).ok().unwrap() {
+                assert_eq!(got, hash);
+                assert!(bytes <= 4);
+                transferred.extend(part.unpack().unwrap());
+            }
+            assert!(content.invariants());
+        }
+        let (ClientMsg::BlobPart { hash: got, part, last: true }, bytes) = content.finish().unwrap() else { panic!("expected final part") };
+        assert_eq!(got, hash);
+        assert!(bytes <= 4);
+        transferred.extend(part.unpack().unwrap());
+        assert_eq!(transferred, input);
+
+        let mut corrupt = fresh();
+        for chunk in b"one TWO three".chunks(4) {
+            let _ = corrupt.read(chunk.to_vec()).unwrap();
+            assert!(corrupt.invariants());
+        }
+        assert!(corrupt.finish().is_none());
+    }
+}
 
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
