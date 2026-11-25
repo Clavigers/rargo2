@@ -2,6 +2,7 @@ pub mod ar;
 pub mod build;
 pub mod buildview;
 pub mod chunk;
+pub mod conn_state;
 pub mod db;
 pub mod drift;
 pub mod engine;

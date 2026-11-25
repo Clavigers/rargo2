@@ -1,40 +1,29 @@
 use crate::build::{self, Client, Daemon};
+use crate::conn_state::{Command, ConnectionState, Route, StatusFigures, WorkerFigures};
 use crate::engine::{ClientEnv, EnvAsker};
 use crate::hash::Hash;
-use crate::present::Output;
 use crate::net::link::Link;
-use crate::proto::{CONTROL, ClientMsg, Frame, PROTO_VERSION, Reorder, RunRequest, ServerMsg};
-use crate::sched::Priority;
+use crate::present::Output;
+use crate::proto::{CONTROL, ClientMsg, Frame, Reorder, RunRequest, ServerMsg};
 use crate::session::{self, ClientHas, Keys, Session};
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::net::TcpStream;
 
-fn wants_color(req: &RunRequest, env: &HashMap<String, String>, tty: bool) -> bool {
-    let mut choice: Option<&str> = None;
-    let mut it = req.args.iter().take_while(|a| *a != "--");
-    while let Some(a) = it.next() {
-        if a == "--color" {
-            choice = it.next().map(|s| s.as_str());
-        } else if let Some(v) = a.strip_prefix("--color=") {
-            choice = Some(v);
-        }
-    }
-    let choice = choice.or(env.get("CARGO_TERM_COLOR").map(|s| s.as_str()));
-    match choice {
-        Some("always") => true,
-        Some("never") => false,
-        _ => tty && !env.contains_key("NO_COLOR") && env.get("TERM").map(|t| t != "dumb").unwrap_or(false),
-    }
-}
-
-pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>, http: Arc<crate::http::Http>) -> Result<()> {
+pub async fn connection(
+    d: Arc<Daemon>,
+    mut stream: TcpStream,
+    keys: Arc<Keys>,
+    http: Arc<crate::http::Http>,
+) -> Result<()> {
     let _ = stream.set_nodelay(true);
     let mut first = [0u8; 4];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.peek(&mut first)).await.context("nothing was sent")??;
+    let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.peek(&mut first))
+        .await
+        .context("nothing was sent")??;
     if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
         return http.serve(stream).await;
     }
@@ -46,7 +35,12 @@ pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>, 
     Ok(())
 }
 
-pub async fn udp_connection(d: Arc<Daemon>, conn: Arc<crate::net::Conn>, endpoint: Arc<crate::net::Endpoint>, keys: Arc<Keys>) {
+pub async fn udp_connection(
+    d: Arc<Daemon>,
+    conn: Arc<crate::net::Conn>,
+    endpoint: Arc<crate::net::Endpoint>,
+    keys: Arc<Keys>,
+) {
     let Some(user) = conn.user().map(String::from) else {
         endpoint.forget(conn.id);
         return;
@@ -60,7 +54,12 @@ struct Stream {
     abort: tokio::task::AbortHandle,
 }
 
-async fn pump(link: Arc<Link>, stream: u32, mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
+async fn pump(
+    link: Arc<Link>,
+    stream: u32,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
+    sess: Arc<Session>,
+) {
     assert_ne!(stream, crate::proto::KEEPALIVE, "keepalives are not a session's stream");
     let mut seq = 0u64;
     while let Some(m) = rx.recv().await {
@@ -107,7 +106,11 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
         return None;
     }
     let (trees, blobs) = d.trees.lacking(Hash(o.root));
-    Some(ServerMsg::Missing { id: o.id, trees: trees.iter().map(|h| h.0).collect(), blobs: blobs.iter().map(|h| h.0).collect() })
+    Some(ServerMsg::Missing {
+        id: o.id,
+        trees: trees.iter().map(|h| h.0).collect(),
+        blobs: blobs.iter().map(|h| h.0).collect(),
+    })
 }
 
 pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
@@ -117,15 +120,135 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
     let (control, control_rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
     tokio::spawn(pump(link.clone(), CONTROL, control_rx, control.clone()));
     let streams: Arc<parking_lot::Mutex<HashMap<u32, Stream>>> = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let conn = Arc::new(parking_lot::Mutex::new(ConnectionState::new()));
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
+    let mut todo: VecDeque<Route> = VecDeque::new();
     d.stats.links.fetch_add(1, Ordering::Relaxed);
     'link: loop {
-        if checked.elapsed() > std::time::Duration::from_secs(2) {
-            if !keys.still_valid(&presented) {
-                eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
-                break;
+        while let Some(route) = todo.pop_front() {
+            match route {
+                Route::Close => break 'link,
+                Route::Reply(m) => control.send(m),
+                Route::Offer(o) => {
+                    if let Some(reply) = tokio::task::block_in_place(|| offer(&d, *o)) {
+                        control.send(reply);
+                    }
+                }
+                Route::Control(m) => {
+                    if let Err(e) = control.incoming(m) {
+                        eprintln!("rargod: {user}: {e:#}");
+                        todo.extend(conn.lock().control_failed());
+                    }
+                }
+                Route::Fetch { stream, id, hashes } => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    tokio::spawn(async move {
+                        let _ = sess.fetch(id, hashes).await;
+                    });
+                }
+                Route::Recipe { stream, id, hash } => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let blobs = d.client_blobs.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let chunks: Vec<_> = blobs
+                            .recipe(&Hash(hash))
+                            .map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect())
+                            .unwrap_or_default();
+                        let (outline, lazy) = match blobs.outline(&Hash(hash)) {
+                            Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
+                            _ => (Vec::new(), Vec::new()),
+                        };
+                        sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
+                        sess.send(ServerMsg::Fetched { id });
+                    });
+                }
+                Route::Chunks { stream, id, hash, idx } => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let blobs = d.client_blobs.clone();
+                    tokio::task::spawn_blocking(move || {
+                        for group in idx.chunks(16) {
+                            let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
+                            let chunks: Vec<(u32, crate::proto::Part)> =
+                                group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect();
+                            sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
+                            sess.send(ServerMsg::Chunks { hash, chunks });
+                        }
+                        sess.send(ServerMsg::Fetched { id });
+                    });
+                }
+                Route::Refuse { stream } => {
+                    eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    sess.send(ServerMsg::Stderr(
+                        format!(
+                            "error: {}\n       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n",
+                            crate::proto::REFUSED
+                        )
+                        .into_bytes(),
+                    ));
+                    sess.send(ServerMsg::Exit(101));
+                    let _ = pumping.await;
+                    sess.close();
+                }
+                Route::Run { stream, req } => {
+                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                    let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, keys.clone(), sess.clone()));
+                    streams.lock().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
+                    let (streams2, conn2) = (streams.clone(), conn.clone());
+                    tokio::spawn(async move {
+                        let msg = match work.await {
+                            Ok(m) => m,
+                            Err(e) if e.is_cancelled() => ServerMsg::Exit(130),
+                            Err(e) => {
+                                sess.send(ServerMsg::Stderr(
+                                    format!("error: rargod internal error: {e}\n").into_bytes(),
+                                ));
+                                ServerMsg::Exit(101)
+                            }
+                        };
+                        sess.send(msg);
+                        let _ = pumping.await;
+                        sess.close();
+                        let mut s = streams2.lock();
+                        if s.get(&stream).is_some_and(|st| Arc::ptr_eq(&st.sess, &sess)) {
+                            s.remove(&stream);
+                            conn2.lock().finished(stream);
+                        }
+                    });
+                }
+                Route::Stream { stream, msg } => {
+                    let sess = streams.lock().get(&stream).map(|st| st.sess.clone());
+                    if let Some(sess) = sess
+                        && let Err(e) = sess.incoming(msg)
+                    {
+                        eprintln!("rargod: {e:#}");
+                        sess.send(ServerMsg::Stderr(format!("error: {e:#}\n").into_bytes()));
+                        todo.extend(conn.lock().stream_failed(stream));
+                    }
+                }
+                Route::Cancel { stream } => {
+                    let gone = streams.lock().remove(&stream);
+                    if let Some(st) = gone {
+                        st.sess.close();
+                        st.abort.abort();
+                    }
+                }
+                Route::Report { stream, text } => eprintln!("rargod: {user}: stream {stream}: {text}"),
             }
+        }
+        if checked.elapsed() > std::time::Duration::from_secs(2) {
+            let valid = keys.still_valid(&presented);
+            if !valid {
+                eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
+            }
+            todo.extend(conn.lock().key_checked(valid));
             checked = std::time::Instant::now();
+            continue;
         }
         let raw = tokio::select! {
             m = link.recv() => m,
@@ -137,7 +260,8 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
         let Ok(frame) = crate::proto::decode::<Frame<ClientMsg>>(&raw) else { break };
         if frame.stream == crate::proto::KEEPALIVE {
             if let ClientMsg::Ping(n) = frame.msg {
-                let pong = crate::proto::encode(&Frame { stream: crate::proto::KEEPALIVE, seq: 0, msg: ServerMsg::Pong(n) });
+                let pong =
+                    crate::proto::encode(&Frame { stream: crate::proto::KEEPALIVE, seq: 0, msg: ServerMsg::Pong(n) });
                 let link = link.clone();
                 tokio::spawn(async move {
                     let _ = link.send(&pong).await;
@@ -153,120 +277,19 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                 },
                 m => m,
             };
-            match (stream, msg) {
-                (CONTROL, ClientMsg::Ping(n)) => control.send(ServerMsg::Pong(n)),
-                (CONTROL, ClientMsg::Offer(o)) => {
-                    if let Some(reply) = tokio::task::block_in_place(|| offer(&d, *o)) {
-                        control.send(reply);
-                    }
-                }
-                (stream, ClientMsg::Fetch { id, hashes }) if stream != CONTROL => {
-                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    tokio::spawn(async move {
-                        let _ = sess.fetch(id, hashes).await;
-                    });
-                }
-                (CONTROL, m) => {
-                    if let Err(e) = control.incoming(m) {
-                        eprintln!("rargod: {user}: {e:#}");
-                        break 'link;
-                    }
-                }
-                (stream, ClientMsg::Recipe { id, hash }) if stream != CONTROL => {
-                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    let blobs = d.client_blobs.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let chunks: Vec<_> = blobs.recipe(&Hash(hash)).map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect()).unwrap_or_default();
-                        let (outline, lazy) = match blobs.outline(&Hash(hash)) {
-                            Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
-                            _ => (Vec::new(), Vec::new()),
-                        };
-                        sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
-                        sess.send(ServerMsg::Fetched { id });
-                    });
-                }
-                (stream, ClientMsg::Chunks { id, hash, idx }) if stream != CONTROL => {
-                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    let blobs = d.client_blobs.clone();
-                    tokio::task::spawn_blocking(move || {
-                        for group in idx.chunks(16) {
-                            let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
-                            let chunks: Vec<(u32, crate::proto::Part)> =
-                                group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect();
-                            sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
-                            sess.send(ServerMsg::Chunks { hash, chunks });
-                        }
-                        sess.send(ServerMsg::Fetched { id });
-                    });
-                }
-                (stream, ClientMsg::Run(req)) => {
-                    if !keys.still_valid(&presented) {
-                        eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
-                        let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                        let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                        sess.send(ServerMsg::Stderr(
-                            format!(
-                                "error: {}\n       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n",
-                                crate::proto::REFUSED
-                            )
-                            .into_bytes(),
-                        ));
-                        sess.send(ServerMsg::Exit(101));
-                        let _ = pumping.await;
-                        sess.close();
-                        break 'link;
-                    }
-                    let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, keys.clone(), sess.clone()));
-                    streams.lock().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
-                    let streams2 = streams.clone();
-                    tokio::spawn(async move {
-                        let msg = match work.await {
-                            Ok(m) => m,
-                            Err(e) if e.is_cancelled() => ServerMsg::Exit(130),
-                            Err(e) => {
-                                sess.send(ServerMsg::Stderr(format!("error: rargod internal error: {e}\n").into_bytes()));
-                                ServerMsg::Exit(101)
-                            }
-                        };
-                        sess.send(msg);
-                        let _ = pumping.await;
-                        sess.close();
-                        streams2.lock().remove(&stream);
-                    });
-                }
-                (stream, ClientMsg::Cancel) => {
-                    let gone = streams.lock().remove(&stream);
-                    if let Some(st) = gone {
-                        st.sess.close();
-                        st.abort.abort();
-                    }
-                }
-                (stream, m) => {
-                    let sess = streams.lock().get(&stream).map(|st| st.sess.clone());
-                    if let Some(sess) = sess {
-                        if let Err(e) = sess.incoming(m) {
-                            eprintln!("rargod: {e:#}");
-                            sess.send(ServerMsg::Stderr(format!("error: {e:#}\n").into_bytes()));
-                            let gone = streams.lock().remove(&stream);
-                            if let Some(st) = gone {
-                                st.sess.close();
-                                st.abort.abort();
-                            }
-                        }
-                    }
-                }
-            }
+            let valid = !matches!(msg, ClientMsg::Run(_)) || keys.still_valid(&presented);
+            todo.extend(conn.lock().message(stream, msg, valid));
         }
     }
-    let all: Vec<Stream> = streams.lock().drain().map(|(_, st)| st).collect();
-    for st in all {
-        st.sess.close();
-        st.abort.abort();
+    let rest = conn.lock().close();
+    for route in rest {
+        if let Route::Cancel { stream } = route {
+            let gone = streams.lock().remove(&stream);
+            if let Some(st) = gone {
+                st.sess.close();
+                st.abort.abort();
+            }
+        }
     }
     control.close();
     link.close();
@@ -289,26 +312,25 @@ fn say(sess: &Session, text: String) -> ServerMsg {
     ServerMsg::Exit(0)
 }
 
-async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys: Arc<Keys>, sess: Arc<Session>) -> ServerMsg {
-    if req.version != PROTO_VERSION {
-        return fail(
-            &sess,
-            format!("rargo client (protocol {}) does not match rargod (protocol {PROTO_VERSION})", req.version),
-        );
-    }
-    let command = req.args.first().map(|s| s.as_str()).unwrap_or("");
-    if matches!(command, "__gc" | "__compact" | "__export" | "__import") && !admin {
-        return fail(&sess, format!("user `{user}` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)"));
-    }
-    match command {
-        "__status" => return say(&sess, status_text(&d)),
-        "__settle" => {
+async fn serve(
+    d: Arc<Daemon>,
+    req: RunRequest,
+    user: String,
+    admin: bool,
+    keys: Arc<Keys>,
+    sess: Arc<Session>,
+) -> ServerMsg {
+    let command = crate::conn_state::command(req.version, &req.args, admin, &user);
+    match &command {
+        Command::Fail(text) => return fail(&sess, text.clone()),
+        Command::Status => return say(&sess, status_text(&d)),
+        Command::Settle => {
             if let Some(pool) = d.pool.get() {
                 pool.settle().await;
             }
             return say(&sess, status_text(&d));
         }
-        "__token" => {
+        Command::Token => {
             let Some(store) = keys.tokens().cloned() else {
                 return fail(&sess, "this server has issued no tokens: it admits anyone on its machine, and its tokens are made there (`rargod token`)".into());
             };
@@ -331,11 +353,11 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
                 Err(e) => fail(&sess, format!("{e}")),
             };
         }
-        "__incr" => {
+        Command::Incr => {
             let d2 = d.clone();
             return say(&sess, tokio::task::spawn_blocking(move || d2.incr.analyze()).await.unwrap_or_default());
         }
-        "__gc" => {
+        Command::Gc => {
             let (running, waiting, _, _) = d.engine.sched.snapshot();
             let age = if running + waiting == 0 { 0 } else { 600 };
             let d2 = d.clone();
@@ -350,7 +372,7 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
                 ),
             );
         }
-        "__compact" => {
+        Command::Compact => {
             let d2 = d.clone();
             let (n, freed) = tokio::task::spawn_blocking(move || {
                 let fs = d2.engine.fs.clone();
@@ -371,9 +393,9 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
                 ),
             );
         }
-        "__export" | "__import" => {
-            let Some(dir) = req.args.get(1).cloned() else { return fail(&sess, "a directory is required".into()) };
-            let export = command == "__export";
+        Command::Export(dir) | Command::Import(dir) => {
+            let export = matches!(command, Command::Export(_));
+            let dir = dir.clone();
             let d2 = d.clone();
             let reply = tokio::task::spawn_blocking(move || {
                 let dir = PathBuf::from(dir);
@@ -389,13 +411,16 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
                 Err(e) => fail(&sess, format!("{e}")),
             };
         }
-        _ => {}
+        Command::Drift | Command::Build => {}
     }
 
     let worktree = req.worktree.clone();
     let before: Option<Arc<std::collections::HashSet<crate::proto::Digest>>> = {
         let known = d.deliveries.lock();
-        known.get(&worktree).filter(|(token, _)| req.delivered != 0 && *token == req.delivered).map(|(_, set)| set.clone())
+        known
+            .get(&worktree)
+            .filter(|(token, _)| req.delivered != 0 && *token == req.delivered)
+            .map(|(_, set)| set.clone())
     };
     if let Some(set) = &before {
         sess.knows(set.iter().copied());
@@ -415,14 +440,12 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
         Err(e) => return fail(&sess, format!("setting up the cargo configuration: {e:#}")),
     };
     let env: HashMap<String, String> = req.env.iter().cloned().collect();
-    let prio = match env.get("RARGO_PRIORITY").map(|s| s.as_str()) {
-        Some("human") => Priority::Human,
-        Some("agent") => Priority::Agent,
-        Some("background") => Priority::Background,
-        _ if req.stderr_tty => Priority::Human,
-        _ => Priority::Agent,
-    };
-    let out = Output::new(sess.sender(), wants_color(&req, &env, req.stderr_tty), wants_color(&req, &env, req.stdout_tty));
+    let prio = crate::conn_state::priority(&env, req.stderr_tty);
+    let out = Output::new(
+        sess.sender(),
+        crate::conn_state::wants_color(&req.args, &env, req.stderr_tty),
+        crate::conn_state::wants_color(&req.args, &env, req.stdout_tty),
+    );
     let asker: EnvAsker = {
         let s = sess.clone();
         Arc::new(move |names| {
@@ -430,7 +453,7 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
             Box::pin(async move { s.want_env(names).await })
         })
     };
-    if command == "__drift" {
+    if command == Command::Drift {
         let Some(dir) = rargo_proto::workspace::command_dir(req.root.as_ref(), req.cwd.as_ref(), &req.args) else {
             return fail(&sess, "the current directory must be inside the synced worktree".into());
         };
@@ -491,123 +514,100 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
 }
 
 pub fn status_text(d: &Daemon) -> String {
+    crate::conn_state::status_text(&status_figures(d))
+}
+
+fn status_figures(d: &Daemon) -> StatusFigures {
     let e = &d.engine;
     let (running, waiting, peak, granted) = e.sched.snapshot();
     let t = &e.traces.stats;
     let s = &e.stats;
     let f = e.fs.stats();
     let y = &d.trees.stats;
-    format!(
-        "requests            {}\n\
-         sync                {} worktree states, {} manifests and {} files received from clients ({} changes pushed unasked, {} files asked for, {} awaited from another client's upload), {:.1} MiB received, {:.1} MiB of results sent; {} client daemons have connected\n\
-         store               {} blobs, {:.1} MiB\n\
-         cold tier           {}\n\
-         cache               {} hits, {} misses, {} traces stored\n\
-         actions run         {} ({:.1}s cpu, {:.1}s wall)\n\
-         actions by kind     {}\n\
-         in-flight dedup     {} joined, {} of those ran anyway\n\
-         reruns              {} changed-input, {} environment\n\
-         scheduler           {} running, {} waiting, peak {}, {} granted, {} tokens\n\
-         fuse                {} lookups, {} opens, {} userspace reads, {} userspace writes\n\
-         plans decoded       {}\n\
-         incremental         {} states saved; seeds: {} same worktree, {} ancestor, {} other, {} none; {} dropped after a crash\n\
-         verify              {} cached units re-run cleanly, {} differed\n\
-         drift               {}\n\
-         workers             {}\n",
-        d.stats.requests.load(Ordering::Relaxed),
-        y.snapshots.load(Ordering::Relaxed),
-        y.trees_received.load(Ordering::Relaxed),
-        d.stats.files_in.load(Ordering::Relaxed),
-        y.offers.load(Ordering::Relaxed),
-        y.blobs_requested.load(Ordering::Relaxed),
-        y.shared_uploads.load(Ordering::Relaxed),
-        d.stats.bytes_in.load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
-        d.stats.bytes_out.load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
-        d.stats.links.load(Ordering::Relaxed),
-        e.store.blob_count(),
-        e.store.total_bytes() as f64 / (1 << 20) as f64,
-        {
-            let (n, logical, disk) = e.store.cold_stats();
-            format!(
-                "{n} blobs of {:.1} MiB kept as {:.1} MiB of chunks",
-                logical as f64 / (1 << 20) as f64,
-                disk as f64 / (1 << 20) as f64
-            )
-        },
-        t.hits.load(Ordering::Relaxed),
-        t.misses.load(Ordering::Relaxed),
-        t.stored.load(Ordering::Relaxed),
-        s.runs.load(Ordering::Relaxed),
-        s.run_cpu_us.load(Ordering::Relaxed) as f64 / 1e6,
-        s.run_wall_us.load(Ordering::Relaxed) as f64 / 1e6,
-        crate::trace::ActionKind::ALL
+    let (cold_blobs, cold_logical, cold_disk) = e.store.cold_stats();
+    let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    StatusFigures {
+        requests: n(&d.stats.requests),
+        snapshots: n(&y.snapshots),
+        trees_received: n(&y.trees_received),
+        files_in: n(&d.stats.files_in),
+        offers: n(&y.offers),
+        blobs_requested: n(&y.blobs_requested),
+        shared_uploads: n(&y.shared_uploads),
+        bytes_in: n(&d.stats.bytes_in),
+        bytes_out: n(&d.stats.bytes_out),
+        links: n(&d.stats.links),
+        blob_count: e.store.blob_count() as u64,
+        store_bytes: e.store.total_bytes(),
+        cold_blobs: cold_blobs as u64,
+        cold_logical,
+        cold_disk,
+        hits: n(&t.hits),
+        misses: n(&t.misses),
+        traces_stored: n(&t.stored),
+        runs: n(&s.runs),
+        run_cpu_us: n(&s.run_cpu_us),
+        run_wall_us: n(&s.run_wall_us),
+        runs_by_kind: crate::trace::ActionKind::ALL
             .iter()
-            .map(|k| format!("{} {}", k.name(), s.runs_by_kind[*k as usize].load(Ordering::Relaxed)))
-            .collect::<Vec<_>>()
-            .join(", "),
-        s.joined.load(Ordering::Relaxed),
-        s.joined_then_ran.load(Ordering::Relaxed),
-        s.tainted.load(Ordering::Relaxed),
-        s.env_reruns.load(Ordering::Relaxed),
-        running,
-        waiting,
-        peak,
+            .map(|k| (k.name(), n(&s.runs_by_kind[*k as usize])))
+            .collect(),
+        joined: n(&s.joined),
+        joined_then_ran: n(&s.joined_then_ran),
+        tainted: n(&s.tainted),
+        env_reruns: n(&s.env_reruns),
+        running: running as u64,
+        waiting: waiting as u64,
+        peak: peak as u64,
         granted,
-        e.sched.tokens(),
-        f.lookups.load(Ordering::Relaxed),
-        f.opens.load(Ordering::Relaxed),
-        f.reads.load(Ordering::Relaxed),
-        f.writes.load(Ordering::Relaxed),
-        d.stats.plans_decoded.load(Ordering::Relaxed),
-        d.incr.stats.saved.load(Ordering::Relaxed),
-        d.incr.stats.seeded_same_worktree.load(Ordering::Relaxed),
-        d.incr.stats.seeded_ancestor.load(Ordering::Relaxed),
-        d.incr.stats.seeded_other.load(Ordering::Relaxed),
-        d.incr.stats.unseeded.load(Ordering::Relaxed),
-        d.incr.stats.discarded_after_crash.load(Ordering::Relaxed),
-        d.stats.verify_units.load(Ordering::Relaxed),
-        d.stats.verify_mismatches.load(Ordering::Relaxed),
-        d.drift_report.lock().clone().unwrap_or_else(|| "not checked yet".into()).trim_end(),
-        match d.pool.get() {
-            None => "not accepting workers".to_string(),
-            Some(p) => {
-                let (pushed, skipped, fetched, reused) = p.transfer_totals();
-                let ps = &p.stats;
-                format!(
-                    "{} connected; {} actions dispatched ({} of them also started here on an idle core: {} finished here first, {} were stopped because the worker was ahead), {} kept local (core free), {} kept local (a local core came free first), {} kept local (transfer too costly), {} kept local (no worker has the incremental state), {} worker failures; overhead per remote action {}; \
-                     incremental compiles on workers: {} without state, {} with the state the worker held; state left on workers {:.1} MiB in {} files, of which {:.1} MiB in {} files came home in the background and {} files were fetched for a compile here; {} states made here sent to workers ahead of need ({:.1} MiB); \
-                     sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
-                     {} answers sent ahead, {} lookups and {} opens asked, {} nix store lookups",
-                    p.worker_count(),
-                    ps.dispatched.load(Ordering::Relaxed),
-                    ps.hedged.load(Ordering::Relaxed),
-                    ps.hedge_won.load(Ordering::Relaxed),
-                    ps.hedge_stopped.load(Ordering::Relaxed),
-                    ps.kept_local_no_wait.load(Ordering::Relaxed),
-                    ps.kept_local_first.load(Ordering::Relaxed),
-                    ps.kept_local_transfer.load(Ordering::Relaxed),
-                    ps.kept_local_incremental.load(Ordering::Relaxed),
-                    ps.worker_failures.load(Ordering::Relaxed),
-                    p.overhead_text(),
-                    ps.unseeded_remote.load(Ordering::Relaxed),
-                    ps.seeded_in_place.load(Ordering::Relaxed),
-                    ps.state_left_bytes.load(Ordering::Relaxed) as f64 / 1048576.0,
-                    ps.state_left_blobs.load(Ordering::Relaxed),
-                    ps.state_homed_bytes.load(Ordering::Relaxed) as f64 / 1048576.0,
-                    ps.state_homed_blobs.load(Ordering::Relaxed),
-                    ps.state_needed_blobs.load(Ordering::Relaxed),
-                    ps.states_sent_ahead.load(Ordering::Relaxed),
-                    ps.state_ahead_bytes.load(Ordering::Relaxed) as f64 / 1048576.0,
-                    pushed as f64 / 1048576.0,
-                    skipped as f64 / 1048576.0,
-                    fetched as f64 / 1048576.0,
-                    reused as f64 / 1048576.0,
-                    ps.prefilled_entries.load(Ordering::Relaxed),
-                    ps.lookups_served.load(Ordering::Relaxed),
-                    ps.opens_served.load(Ordering::Relaxed),
-                    ps.nix_lookups.load(Ordering::Relaxed),
-                )
+        tokens: e.sched.tokens() as u64,
+        lookups: n(&f.lookups),
+        opens: n(&f.opens),
+        reads: n(&f.reads),
+        writes: n(&f.writes),
+        plans_decoded: n(&d.stats.plans_decoded),
+        incr_saved: n(&d.incr.stats.saved),
+        seeded_same_worktree: n(&d.incr.stats.seeded_same_worktree),
+        seeded_ancestor: n(&d.incr.stats.seeded_ancestor),
+        seeded_other: n(&d.incr.stats.seeded_other),
+        unseeded: n(&d.incr.stats.unseeded),
+        discarded_after_crash: n(&d.incr.stats.discarded_after_crash),
+        verify_units: n(&d.stats.verify_units),
+        verify_mismatches: n(&d.stats.verify_mismatches),
+        drift: d.drift_report.lock().clone(),
+        workers: d.pool.get().map(|p| {
+            let (pushed, skipped, fetched, reused) = p.transfer_totals();
+            let ps = &p.stats;
+            WorkerFigures {
+                count: p.worker_count() as u64,
+                dispatched: n(&ps.dispatched),
+                hedged: n(&ps.hedged),
+                hedge_won: n(&ps.hedge_won),
+                hedge_stopped: n(&ps.hedge_stopped),
+                kept_local_no_wait: n(&ps.kept_local_no_wait),
+                kept_local_first: n(&ps.kept_local_first),
+                kept_local_transfer: n(&ps.kept_local_transfer),
+                kept_local_incremental: n(&ps.kept_local_incremental),
+                worker_failures: n(&ps.worker_failures),
+                overhead: p.overhead_text(),
+                unseeded_remote: n(&ps.unseeded_remote),
+                seeded_in_place: n(&ps.seeded_in_place),
+                state_left_bytes: n(&ps.state_left_bytes),
+                state_left_blobs: n(&ps.state_left_blobs),
+                state_homed_bytes: n(&ps.state_homed_bytes),
+                state_homed_blobs: n(&ps.state_homed_blobs),
+                state_needed_blobs: n(&ps.state_needed_blobs),
+                states_sent_ahead: n(&ps.states_sent_ahead),
+                state_ahead_bytes: n(&ps.state_ahead_bytes),
+                pushed,
+                skipped,
+                fetched,
+                reused,
+                prefilled: n(&ps.prefilled_entries),
+                lookups_served: n(&ps.lookups_served),
+                opens_served: n(&ps.opens_served),
+                nix_lookups: n(&ps.nix_lookups),
             }
-        },
-    )
+        }),
+    }
 }
