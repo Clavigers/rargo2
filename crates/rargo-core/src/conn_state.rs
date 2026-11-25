@@ -161,11 +161,18 @@ pub enum Command {
     Build,
 }
 
+pub fn protocol_mismatch(client: u32) -> String {
+    let server = env!("CARGO_PKG_VERSION");
+    let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {server}");
+    let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching client") };
+    format!(
+        "this rargo (protocol {client}) is {age} than the build server (rargod {server}, protocol {PROTO_VERSION}); {verb} with: {install}"
+    )
+}
+
 pub fn command(version: u32, args: &[String], admin: bool, user: &str) -> Command {
     if version != PROTO_VERSION {
-        return Command::Fail(format!(
-            "rargo client (protocol {version}) does not match rargod (protocol {PROTO_VERSION})"
-        ));
+        return Command::Fail(protocol_mismatch(version));
     }
     let name = args.first().map(|s| s.as_str()).unwrap_or("");
     if matches!(name, "__gc" | "__compact" | "__export" | "__import") && !admin {
@@ -568,6 +575,11 @@ mod tests {
             );
         }
         assert_eq!(command(PROTO_VERSION, &a(&["__gc"]), true, "ann"), Command::Gc);
+        let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {}", env!("CARGO_PKG_VERSION"));
+        let Command::Fail(old) = command(PROTO_VERSION - 1, &a(&["build"]), false, "bob") else { panic!("an old client") };
+        assert!(old.contains("is older than the build server") && old.ends_with(&format!("update it with: {install}")), "{old}");
+        let Command::Fail(new) = command(PROTO_VERSION + 1, &a(&["build"]), false, "bob") else { panic!("a new client") };
+        assert!(new.contains("is newer than the build server") && new.ends_with(&install), "{new}");
         assert_eq!(command(PROTO_VERSION, &a(&["__export", "/d"]), true, "ann"), Command::Export("/d".into()));
         assert_eq!(
             command(PROTO_VERSION, &a(&["__import"]), true, "ann"),
@@ -576,7 +588,7 @@ mod tests {
         assert_eq!(command(PROTO_VERSION, &a(&["__status"]), false, "bob"), Command::Status);
         assert_eq!(command(PROTO_VERSION, &a(&["build"]), false, "bob"), Command::Build);
         assert!(
-            matches!(command(PROTO_VERSION - 1, &a(&["build"]), true, "ann"), Command::Fail(t) if t.contains("does not match"))
+            matches!(command(PROTO_VERSION - 1, &a(&["build"]), true, "ann"), Command::Fail(t) if t.contains("is older than the build server"))
         );
     }
 
