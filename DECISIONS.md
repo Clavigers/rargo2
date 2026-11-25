@@ -2679,3 +2679,10 @@ machine (`RARGO_CPU_QUOTA` 800%, `RARGO_MEMORY_MAX` 20G, unless the
 environment names another). A rig's caps stay what `dev/netns.sh` sets
 from the cores that rig is given. The service beside the gate keeps the
 headroom `CLAUDE.md` asks for.
+
+Before the gate copies its binaries over the ones already in its
+directory, every process still running those copies is gone. That
+includes a daemon's unmount-guard, which exits once the daemon does.
+`e2e-auth` stops every daemon under its own directory: a stop aimed at
+the socket for the credentials held right now leaves the others running,
+and a daemon that is showing a directory does not exit on its own.

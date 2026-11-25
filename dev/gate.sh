@@ -66,6 +66,43 @@ if [ "$passed" -ne 3 ]; then
 fi
 B=$L/bin
 mkdir -p "$B"
+# The copy replaces these files, which it can do only when nothing still
+# has them mapped. A suite's daemon exits on SIGTERM. The process that
+# unmounts its mount ignores that signal and exits once the daemon is gone.
+release_binaries() {
+    local sig skip pid exe comm i
+    for sig in TERM KILL; do
+        for pid in /proc/[0-9]*; do
+            [ -d "$pid" ] || continue
+            pid=${pid#/proc/}
+            exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+            case "$exe" in
+                "$B/rargo"|"$B/rargo (deleted)"|"$B/rargod"|"$B/rargod (deleted)"|"$B/rargo-sandbox"|"$B/rargo-sandbox (deleted)") ;;
+                *) continue ;;
+            esac
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+            # Leave the guard until its daemon is gone, so the mount goes too.
+            [ "$sig" = TERM ] && [ "$comm" = unmount-guard ] && continue
+            kill "-$sig" "$pid" 2>/dev/null || true
+        done
+        for i in $(seq 1 30); do
+            skip=0
+            for pid in /proc/[0-9]*; do
+                [ -d "$pid" ] || continue
+                pid=${pid#/proc/}
+                exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+                case "$exe" in
+                    "$B/rargo"|"$B/rargo (deleted)"|"$B/rargod"|"$B/rargod (deleted)"|"$B/rargo-sandbox"|"$B/rargo-sandbox (deleted)") skip=1; break ;;
+                esac
+            done
+            [ "$skip" = 0 ] && return 0
+            sleep 0.1
+        done
+    done
+    echo "gate: a process is still running a binary in $B" >&2
+    return 1
+}
+release_binaries
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
 # The suites that follow run at the same time. Each rargod they start

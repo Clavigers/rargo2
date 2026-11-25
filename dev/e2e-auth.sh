@@ -41,13 +41,44 @@ wait_session_closed() {
     done
 }
 
+# `--rargo-daemon-stop` reaches the daemon whose socket matches the
+# credentials this command holds. A suite starts several, under different
+# credentials, and each stays while it is showing a directory. Signal every
+# daemon under `root` by the path it was started with. The process that
+# unmounts its mount ignores the signal and exits once the daemon is gone.
+reap_clients() {
+    local root=$1 i dpat gpat
+    dpat=$(printf '%s' "$R --rargo-daemon $root/" | sed 's/[][(){}.^$*+?|\\]/\\&/g')
+    gpat=$(printf '%s' "unmount-guard: $root/" | sed 's/[][(){}.^$*+?|\\]/\\&/g')
+    pkill -TERM -f -- "$dpat" 2>/dev/null || true
+    for i in $(seq 1 30); do
+        pgrep -f -- "$dpat" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    pkill -KILL -f -- "$dpat" 2>/dev/null || true
+    for i in $(seq 1 30); do
+        pgrep -f -- "$dpat" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    for i in $(seq 1 30); do
+        pgrep -f -- "^$gpat" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    pkill -KILL -f -- "^$gpat" 2>/dev/null || true
+    if pgrep -f -- "$dpat" >/dev/null 2>&1 || pgrep -f -- "^$gpat" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
+
+R=$B/rargo
+D="$B/rargod"
+reap_clients "$T" || { echo "daemons under $T are still running" >&2; exit 2; }
 umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
 pkill -KILL -f "fake-github.py [0-9]+ $T/github-who" 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
 export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config RARGO_CACHE_DIR=$T/cache RARGO_NO_BROWSER=1
-R=$B/rargo
-D="$B/rargod"
 
 echo "== an administrator, before the server runs"
 out=$("$B/rargod" --state "$T/state" --planner "$planner" --listen 0.0.0.0:$port --jobs 2 2>&1)
@@ -185,7 +216,7 @@ out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"$tok\"}" "h
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok%%.*}\"}" "http://$host/auth/whoami"); grep -q '"user":null' <<<"$out"; check $? "and nobody for a token's id alone" "$out"
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok3%%.*}.wrong-secret-wrong-secret\"}" "http://$host/auth/revoke"); grep -q '"revoked":false' <<<"$out"; check $? "a token cannot be revoked by its id alone" "$out"
 out=$("$R" auth remove 2>&1); [ $? != 0 ]; check $? "a second rargo auth remove has nothing to remove" "$out"
-for c in "$T/cache3" "$T/cache3b" "$T/cache3c"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+for c in "$T/cache3" "$T/cache3b" "$T/cache3c"; do reap_clients "$c" || true; done
 
 echo "== signing in with GitHub (a stand-in for it), with an allow list"
 printf 'the-app-secret\n' >"$T/app-secret"
@@ -222,7 +253,7 @@ wait_session_closed "$closed"
 echo "// again" >>src/main.rs
 out=$("$R" build 2>&1); [ $? != 0 ]; check $? "and its builds stop" "$out"
 
-for c in "$T/cache" "$T/cache-bob" "$T/cache2" "$T/cache-admin"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+reap_clients "$T"; check $? "the suite's daemons are gone" "$(ps -eo args | grep -F "$T/" | grep -E 'rargo --rargo-daemon|unmount-guard' | grep -v grep || true)"
 kill $gh 2>/dev/null
 cd /
 kill $srv 2>/dev/null; wait $srv 2>/dev/null
