@@ -351,15 +351,31 @@ directory that results are copied into.
 - What the server built appears there as soon as the server has it: a
   name, a size, an executable bit and a content hash, sent while the
   build is still running. Nothing is copied into the worktree.
-- Content is fetched when something first reads the file, into the
-  client's cache, which all worktrees of the machine share. Opening alone
-  fetches nothing: stock cargo opens each output it is about to replace,
-  and reads none of them. Large contents are
-  fetched by chunk (content-defined chunks, the same as between server and
-  workers), so the next version of a binary costs the chunks that
-  changed. Small files (dependency information, fingerprints, generated
-  sources) are sent along with their names, because fetching each when read
-  would cost a round trip apiece.
+- Content is fetched as it is read, into the client's cache, which all
+  worktrees of the machine share. Opening alone fetches nothing: stock
+  cargo opens each output it is about to replace, and reads none of them.
+  Large contents (1 MiB and more) are fetched by chunk (content-defined
+  chunks, the same as between server and workers), so the next version
+  of a binary costs the chunks that changed, and only the chunks that are
+  read: a read waits for the chunks under it, and the first read in a
+  region asks for the rest of the region behind them. The server names
+  the regions with the recipe: each run of debug sections (`.debug_*`,
+  `.zdebug_*`) is one, everything else is one. So running a debug binary
+  fetches its code and data at once and its debug information only when
+  a backtrace or a debugger reads it.
+- Nothing that has not been proven against the content hash reaches a
+  reader. The hash is plain BLAKE3, a Merkle tree; with the recipe the
+  server sends the content's outline, the chaining values of its 64 KiB
+  groups, which the client checks against the hash at once. A group is
+  served once all of it is here and it gives its chaining value; a wrong
+  chunk or a wrong recipe is an I/O error for the reader, never bytes.
+  Once every group is proven the file is the content, and it takes its
+  place in the cache; from then on the kernel reads it itself, through
+  the cached file (passthrough).
+- Small files (dependency information, fingerprints, generated sources)
+  are sent along with their names, because fetching each when read would
+  cost a round trip apiece; contents under 1 MiB are fetched whole on
+  their first read.
 - Underneath the mount is the real `target/` directory. Everything that
   is written locally lands there: what stock cargo builds, what a test
   writes. A name is real if the real directory has it, otherwise virtual

@@ -119,9 +119,12 @@ it expects the client to need, and `Delivered` ends that batch. Ask
 for any remaining digest with `Fetch` and wait for its `Fetched`
 marker. Echo a `DeliveryToken` in the next request for the worktree
 after placing its complete delivery. For lazy outputs, the listing
-can arrive during the build. The client fetches content on open and
-can use a `Recipe` and indexed `Chunks` to reuse chunks it already
-holds. `Blob.packed` and `Part.packed` select Zstandard compression
+can arrive during the build. The client fetches content as it is read.
+For content of 1 MiB or more it asks for the `Recipe`, which also carries
+the content's outline (the BLAKE3 chaining values of its 64 KiB groups,
+which give the content hash) and the byte ranges of its debug sections,
+then indexed `Chunks`, reusing chunks it already holds. It serves a group
+to a reader only once the group's bytes give its chaining value. `Blob.packed` and `Part.packed` select Zstandard compression
 for that content.
 
 # Browser authentication

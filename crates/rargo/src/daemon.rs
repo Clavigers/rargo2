@@ -10,7 +10,8 @@
 //! about the build is decided here.
 
 use crate::mux::Mux;
-use crate::outfs::{OutFs, VFile};
+use crate::outfs::{OutFs, Reader, VFile};
+use crate::partial::Partial;
 use crate::place::{Placed, Placer};
 use crate::watch::{Event, Watcher};
 use crate::{Config, Policy, git, report, scan};
@@ -29,6 +30,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 /// Manifests larger than this in all are offered by their root first.
 const PROBE_FROM: u64 = 32 << 10;
+/// Contents read by range that are kept for more reading at most.
+const MOST_PARTIALS: usize = 64;
 
 /// A change smaller than this is pushed whole, without asking the server
 /// what it lacks: an edit. Anything bigger (a worktree seen for the first
@@ -149,6 +152,10 @@ pub struct Daemon {
     big_sync: tokio::sync::Mutex<()>,
     /// One fetch per content at a time.
     fetching: Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
+    /// Contents in `target/` being read by range, by when they were first
+    /// read (see `partial`). Each is shared by every reader of it, and is
+    /// let go once it is whole in the cache.
+    partials: Mutex<HashMap<Digest, (u64, Arc<Partial>)>>,
     /// Chunks the cache holds: in which content, where. Kept in the cache
     /// across daemons (see `known`).
     chunks: Mutex<crate::known::Chunks>,
@@ -264,6 +271,7 @@ impl Daemon {
             counters: Counters::default(),
             big_sync: tokio::sync::Mutex::new(()),
             fetching: Mutex::new(HashMap::new()),
+            partials: Mutex::new(HashMap::new()),
             chunks: Mutex::new(chunks),
             chunks_changed: AtomicBool::new(false),
             held,
@@ -776,17 +784,8 @@ impl Daemon {
         if !tag.exists() {
             std::fs::write(&tag, rargo_proto::CACHEDIR_TAG)?;
         }
-        let weak = Arc::downgrade(self);
-        let handle = self.handle.clone();
-        let fs = OutFs::new(
-            &dir,
-            &wt.wt_cache.join("virtual"),
-            Box::new(move |hash, size| {
-                let d = weak.upgrade().ok_or_else(|| std::io::Error::other("the daemon is stopping"))?;
-                let (hash, handle) = (*hash, handle.clone());
-                handle.block_on(async move { d.fetch_content(hash, size).await })
-            }),
-        )?;
+        let source = Box::new(Contents { d: Arc::downgrade(self), handle: self.handle.clone() });
+        let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
         // SAFETY: no arguments, cannot fail.
         let root = unsafe { libc::geteuid() } == 0;
         // auto_unmount: a daemon that is killed must not leave `target/` as
@@ -835,6 +834,116 @@ impl Daemon {
             let _ = std::fs::remove_file(wt.wt_cache.join("virtual"));
             let _ = std::fs::remove_file(wt.wt_cache.join("delivered"));
         }
+    }
+
+    /// A reader of a content that fetches it by range as it is read: the
+    /// one already reading it, or a new one made from the server's recipe
+    /// and outline. None if the server cannot outline it (then it is
+    /// fetched whole).
+    async fn partial(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<Option<Arc<Partial>>> {
+        if let Some((_, p)) = self.partials.lock().unwrap().get(&hash) {
+            return Ok(Some(p.clone()));
+        }
+        let turn = self.fetching.lock().unwrap().entry(hash).or_default().clone();
+        let _turn = turn.lock().await;
+        if let Some((_, p)) = self.partials.lock().unwrap().get(&hash) {
+            return Ok(Some(p.clone()));
+        }
+        let mux = self.mux().await?;
+        let (tx, mut rx) = unbounded_channel();
+        let id = mux.ask(&tx, |id| ClientMsg::Recipe { id, hash });
+        let mut answer = None;
+        loop {
+            match next_msg(&mux, &mut rx).await? {
+                ServerMsg::Recipe { chunks, outline, lazy, .. } => answer = Some((chunks, outline, lazy)),
+                ServerMsg::Fetched { id: got } if got == id => break,
+                _ => {}
+            }
+        }
+        let Some((chunks, outline, lazy)) = answer.filter(|(c, o, _)| !c.is_empty() && !o.is_empty()) else { return Ok(None) };
+        let fetcher = Arc::new(ChunkFetcher { d: Arc::downgrade(self), handle: self.handle.clone() });
+        let slot = crate::place::cache_slot(&self.cache, &hash);
+        let p = tokio::task::block_in_place(|| Partial::new(hash, size, chunks, outline, &lazy, &slot, fetcher))?;
+        self.counters.fetched_contents.fetch_add(1, Ordering::Relaxed);
+        let mut partials = self.partials.lock().unwrap();
+        // Readers given up on (their files closed before they were read
+        // through) are let go, oldest first.
+        while partials.len() >= MOST_PARTIALS {
+            let Some(oldest) = partials.iter().min_by_key(|(_, (n, _))| *n).map(|(h, _)| *h) else { break };
+            partials.remove(&oldest);
+        }
+        let n = self.counters.fetched_contents.load(Ordering::Relaxed);
+        partials.insert(hash, (n, p.clone()));
+        Ok(Some(p))
+    }
+
+    /// Hands `p` the chunks of `idx` that contents in the cache hold; says
+    /// which are left.
+    fn reuse_chunks(&self, p: &Partial, idx: Vec<u32>) -> Vec<u32> {
+        use std::os::unix::fs::FileExt;
+        let mut need = Vec::new();
+        for i in idx {
+            let (chunk, len) = p.recipe()[i as usize];
+            let held = self.chunks.lock().unwrap().get(&chunk).copied();
+            let local = held.and_then(|(blob, off, l)| {
+                let slot = crate::place::cache_slot(&self.cache, &blob);
+                let path = crate::place::cached(&self.cache, &blob, std::fs::metadata(&slot).ok()?.len())?;
+                let mut buf = vec![0u8; l as usize];
+                std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
+                (l == len).then_some(buf)
+            });
+            match local {
+                Some(buf) => {
+                    self.counters.reused_bytes.fetch_add(buf.len() as u64, Ordering::Relaxed);
+                    p.deliver(i, &buf);
+                }
+                None => need.push(i),
+            }
+        }
+        need
+    }
+
+    /// Asks the server for chunks of `p` and hands them over as they
+    /// arrive; says which did not.
+    async fn fetch_chunks(self: &Arc<Self>, p: &Arc<Partial>, idx: Vec<u32>) -> Vec<u32> {
+        let Ok(mux) = self.mux().await else { return idx };
+        let mut left: HashSet<u32> = idx.iter().copied().collect();
+        let (tx, mut rx) = unbounded_channel();
+        let hash = *p.hash();
+        let id = mux.ask(&tx, |id| ClientMsg::Chunks { id, hash, idx });
+        loop {
+            match next_msg(&mux, &mut rx).await {
+                Ok(ServerMsg::Chunks { chunks, .. }) => tokio::task::block_in_place(|| {
+                    for (i, part) in chunks {
+                        let Ok(data) = part.unpack() else { continue };
+                        self.counters.fetched_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        p.deliver(i, &data);
+                        left.remove(&i);
+                    }
+                }),
+                Ok(ServerMsg::Fetched { id: got }) if got == id => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let mut left: Vec<u32> = left.into_iter().collect();
+        left.sort_unstable();
+        left
+    }
+
+    /// A content read by range is whole in the cache now: its chunks are
+    /// known there, and the reader is let go.
+    fn read_through(&self, p: &Partial) {
+        let mut index = self.chunks.lock().unwrap();
+        if index.len() > crate::known::MOST_CHUNKS {
+            index.clear();
+        }
+        for (i, (chunk, len)) in p.recipe().iter().enumerate() {
+            index.insert(*chunk, (*p.hash(), p.offset(i as u32), *len));
+        }
+        drop(index);
+        self.chunks_changed.store(true, Ordering::SeqCst);
+        self.partials.lock().unwrap().remove(p.hash());
     }
 
     /// Makes sure a content is in the cache, fetching it from the server
@@ -1456,6 +1565,78 @@ impl Daemon {
 
 /// The next message on a channel the link feeds, or an error once the
 /// link is dead.
+/// The contents of delivered files in `target/`, for the mount.
+struct Contents {
+    d: std::sync::Weak<Daemon>,
+    handle: tokio::runtime::Handle,
+}
+
+impl Contents {
+    fn daemon(&self) -> std::io::Result<Arc<Daemon>> {
+        self.d.upgrade().ok_or_else(|| std::io::Error::other("the daemon is stopping"))
+    }
+}
+
+impl crate::outfs::Source for Contents {
+    fn cached(&self, hash: &Digest, size: u64) -> Option<PathBuf> {
+        crate::place::cached(&self.d.upgrade()?.cache, hash, size)
+    }
+
+    fn whole(&self, hash: &Digest, size: u64) -> std::io::Result<PathBuf> {
+        let d = self.daemon()?;
+        let reading = d.partials.lock().unwrap().get(hash).map(|(_, p)| p.clone());
+        match reading {
+            Some(p) => p.whole(),
+            None => self.handle.block_on(d.fetch_content(*hash, size)),
+        }
+    }
+
+    /// Small contents are fetched whole (one round trip either way); a
+    /// larger one by range, unless the server cannot outline it.
+    fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<Reader> {
+        let d = self.daemon()?;
+        if let Some(path) = crate::place::cached(&d.cache, hash, size) {
+            return Ok(Reader::Whole(std::fs::File::open(path)?));
+        }
+        if size >= rargo_proto::CHUNKED_FROM {
+            if let Some(p) = self.handle.block_on(d.partial(*hash, size))? {
+                return Ok(Reader::Ranged(p));
+            }
+        }
+        let path = self.handle.block_on(d.fetch_content(*hash, size))?;
+        Ok(Reader::Whole(std::fs::File::open(path)?))
+    }
+}
+
+/// Fetches the chunks a [`Partial`] asks for: from contents the cache
+/// holds where it can, from the server otherwise.
+struct ChunkFetcher {
+    d: std::sync::Weak<Daemon>,
+    handle: tokio::runtime::Handle,
+}
+
+impl crate::partial::Chunks for ChunkFetcher {
+    fn request(&self, p: &Arc<Partial>, idx: Vec<u32>) {
+        let Some(d) = self.d.upgrade() else {
+            p.failed(&idx);
+            return;
+        };
+        let p = p.clone();
+        self.handle.spawn(async move {
+            let need = tokio::task::block_in_place(|| d.reuse_chunks(&p, idx));
+            if !need.is_empty() {
+                let left = d.fetch_chunks(&p, need).await;
+                if !left.is_empty() {
+                    p.failed(&left);
+                }
+            }
+            if p.is_done() {
+                d.read_through(&p);
+            }
+        });
+    }
+}
+
 async fn next_msg(mux: &Arc<Mux>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMsg>) -> std::io::Result<ServerMsg> {
     loop {
         tokio::select! {

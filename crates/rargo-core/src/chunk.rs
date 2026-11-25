@@ -123,6 +123,57 @@ fn elf_boundaries(data: &[u8]) -> Option<Vec<usize>> {
     Some(b)
 }
 
+/// The parts of a 64-bit little-endian ELF file that only a debugger or a
+/// backtrace reads: its `.debug_*` and `.zdebug_*` sections, as `(start,
+/// end)` byte ranges, ascending, adjacent ones joined. Empty for anything
+/// else.
+pub fn debug_ranges(data: &[u8]) -> Vec<(u64, u64)> {
+    debug_sections(data).unwrap_or_default()
+}
+
+fn debug_sections(data: &[u8]) -> Option<Vec<(u64, u64)>> {
+    if data.len() < 64 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
+        return None;
+    }
+    let u64_at = |o: usize| data.get(o..o + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let u32_at = |o: usize| data.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u16_at = |o: usize| data.get(o..o + 2).map(|b| u16::from_le_bytes(b.try_into().unwrap()) as usize);
+    let shoff = u64_at(0x28)? as usize;
+    let shentsize = u16_at(0x3a)?;
+    let shnum = u16_at(0x3c)?;
+    let shstrndx = u16_at(0x3e)?;
+    if shentsize < 64 || shoff == 0 || shstrndx >= shnum {
+        return None;
+    }
+    let sh = |i: usize| shoff.checked_add(i.checked_mul(shentsize)?);
+    let names = u64_at(sh(shstrndx)? + 0x18)? as usize;
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for i in 0..shnum {
+        let h = sh(i)?;
+        let name = names.checked_add(u32_at(h)? as usize)?;
+        let name = data.get(name..)?;
+        let debug = name.starts_with(b".debug_") || name.starts_with(b".zdebug_");
+        // SHT_NOBITS occupies no file space.
+        if !debug || u32_at(h + 4)? == 8 {
+            continue;
+        }
+        let (off, size) = (u64_at(h + 0x18)?, u64_at(h + 0x20)?);
+        let end = off.checked_add(size)?;
+        if size > 0 && end <= data.len() as u64 {
+            out.push((off, end));
+        }
+    }
+    out.sort_unstable();
+    let mut joined: Vec<(u64, u64)> = Vec::with_capacity(out.len());
+    for (s, e) in out {
+        match joined.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => joined.push((s, e)),
+        }
+    }
+    Some(joined)
+}
+
 /// Structural boundaries of `data` (offsets, ascending, exclusive of 0 and
 /// the end).
 fn structural(data: &[u8]) -> Vec<usize> {
@@ -268,6 +319,75 @@ mod tests {
 
     fn total(r: &Recipe) -> usize {
         r.iter().map(|c| c.len as usize).sum()
+    }
+
+    /// A 64-bit little-endian ELF file with these sections (name, type,
+    /// bytes) after its header, then its section names, then the section
+    /// headers.
+    fn elf(sections: &[(&str, u32, usize)]) -> (Vec<u8>, Vec<(u64, u64)>) {
+        let mut data = vec![0u8; 64];
+        data[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        let mut placed = Vec::new();
+        for (i, (_, typ, len)) in sections.iter().enumerate() {
+            let off = data.len() as u64;
+            if *typ != 8 {
+                data.extend(noise(*len, i as u64 + 1));
+            }
+            placed.push((off, *len as u64));
+        }
+        let names_at = data.len() as u64;
+        let mut names = vec![0u8];
+        let mut name_offs = Vec::new();
+        for (n, _, _) in sections.iter().copied().chain([(".shstrtab", 3, 0)]) {
+            name_offs.push(names.len() as u32);
+            names.extend(n.as_bytes());
+            names.push(0);
+        }
+        data.extend(&names);
+        let shoff = data.len() as u64;
+        let mut headers = vec![0u8; 64]; // the null section
+        let all: Vec<(u32, u32, u64, u64)> = sections
+            .iter()
+            .enumerate()
+            .map(|(i, (_, typ, _))| (name_offs[i], *typ, placed[i].0, placed[i].1))
+            .chain([(name_offs[sections.len()], 3, names_at, names.len() as u64)])
+            .collect();
+        for (name, typ, off, size) in &all {
+            let mut h = vec![0u8; 64];
+            h[0..4].copy_from_slice(&name.to_le_bytes());
+            h[4..8].copy_from_slice(&typ.to_le_bytes());
+            h[0x18..0x20].copy_from_slice(&off.to_le_bytes());
+            h[0x20..0x28].copy_from_slice(&size.to_le_bytes());
+            headers.extend(h);
+        }
+        data.extend(headers);
+        data[0x28..0x30].copy_from_slice(&shoff.to_le_bytes());
+        data[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
+        data[0x3c..0x3e].copy_from_slice(&(all.len() as u16 + 1).to_le_bytes());
+        data[0x3e..0x40].copy_from_slice(&(all.len() as u16).to_le_bytes());
+        let placed = placed.into_iter().map(|(o, l)| (o, o + l)).collect();
+        (data, placed)
+    }
+
+    #[test]
+    fn debug_sections_are_found_and_joined() {
+        let (data, at) = elf(&[
+            (".text", 1, 5000),
+            (".debug_info", 1, 7000),
+            (".debug_line", 1, 3000),
+            (".data", 1, 100),
+            (".zdebug_str", 1, 900),
+            (".bss", 8, 4096),
+            (".debug_empty", 1, 0),
+            (".debugger_not", 1, 50),
+        ]);
+        // Adjacent debug sections are one range; a named look-alike, an
+        // empty one and the rest are not debug sections.
+        assert_eq!(debug_ranges(&data), vec![(at[1].0, at[2].1), at[4]]);
+        assert!(debug_ranges(b"not an ELF file at all, just some text").is_empty());
+        let mut broken = data.clone();
+        broken.truncate(data.len() - 64);
+        assert!(debug_ranges(&broken).is_empty(), "a section header past the end");
     }
 
     #[test]

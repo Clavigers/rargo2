@@ -2791,3 +2791,81 @@ mount goes with it. A check that a killed daemon's mount is gone waits
 on that daemon's guard. Another daemon can still be running with a
 guard whose title names the same directory, and that guard stays until
 its own daemon exits. `e2e-auth` stops every daemon under its own directory.
+
+## D87. A delivered file is fetched as it is read, each part proven against the content hash (issue 115)
+
+A virtual file in `target/` is fetched as it is read. Bytes that arrive are
+served to a reader only once they are proven against the content hash.
+The design follows Bonanza's `FileReadAt`, which fetches only the chunks
+under a read, and the `bao` way of proving a slice against a BLAKE3 root.
+
+**Proof.**
+- Content hashes are plain BLAKE3, which is a Merkle tree over 1 KiB
+  chunks.
+- The server sends a content's outline with its recipe: the chaining
+  values of its 64 KiB groups (`rargo_proto::outline`). Groups sit at
+  multiples of 64 KiB, so each group is a subtree of BLAKE3's tree, and
+  the tree above them has BLAKE3's own shape.
+- The outline gives the root hash by `blake3::hazmat`'s merges. The
+  client checks that root against the content hash before it reads
+  anything, which proves every group's value at once.
+- After that, a group's bytes are proven by its value alone.
+- The recipe (chunk hashes and lengths) is not trusted. Each chunk is
+  checked against its recipe hash, which catches wrong bytes early, and
+  the group check catches a wrong recipe.
+- A failed proof is an I/O error for the reader, never bytes. The unit
+  tests in `partial.rs` cover a server that sends wrong bytes, a recipe
+  that is wrong but self-consistent, and an outline that does not give
+  the hash.
+
+**Why 64 KiB groups, and the whole outline at once.**
+- An outline is 32 bytes per 64 KiB, 0.05% of the content: 233 KB for a
+  477 MB debug rust-analyzer.
+- Sending it whole with the recipe costs no extra round trip. Every
+  later proof is local, with no per-range proof nodes (bao's encoding)
+  to fetch or store.
+- 64 KiB is the average chunk size, so a read waits for about two
+  chunks.
+
+**What a read fetches.**
+- The server's recipe names the byte ranges of a 64-bit ELF file's debug
+  sections (`.debug_*`, `.zdebug_*`; adjacent ones joined).
+- A content's regions are each of those ranges, plus everything else as
+  one region. A chunk not wholly inside a debug range belongs to the
+  everything-else region.
+- A read asks for the chunks under it. Its first read in a region also
+  asks for the rest of that region, in a second request behind the
+  first. So a sequential read does not cost a round trip per chunk.
+- Running a debug binary fetches its code and data in one go, and its
+  debug information when a backtrace reads it. A file without debug
+  sections (an rlib) is one region: its first read asks for all of it,
+  and that read is served as soon as its own chunks arrive.
+- Contents under 1 MiB (`CHUNKED_FROM`) are fetched whole on their first
+  read: one round trip either way.
+- Chunks the cache already holds in other contents are taken from there.
+
+**Where the bytes are kept.**
+- They gather in a sparse file next to the content's place in the
+  cache.
+- When every group is proven, the file is the content: it is renamed
+  into its place, and its chunks go into the cache's chunk index.
+- The daemon keeps up to 64 contents that are partly read, so a binary
+  that is run again does not fetch again what it has. The oldest is let
+  go first, and its file is removed once no handle reads it.
+
+**Passthrough for cached contents.**
+- A delivered file whose content the cache holds whole is opened on the
+  cached file for passthrough, so the kernel reads it itself.
+- The node's opens for passthrough share one backing file. While it is
+  a cached content, the node refuses an open for writing (which would
+  write into the cache) with `ETXTBSY`, which is what the kernel answers
+  conflicting opens with. The other way round, a real file's backing is
+  never handed to a delivered file's reader.
+
+**Protocol 8.** `ServerMsg::Recipe` carries the outline and the debug
+ranges. The server computes an outline on the first request for it, with
+the pages of the content hashed in parallel, and keeps it in memory with
+the recipe.
+
+**Copy mode** (`RARGO_OUTPUT=copy`) places whole files, each
+checked against its hash once whole.
