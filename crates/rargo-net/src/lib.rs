@@ -190,6 +190,9 @@ pub struct Conn {
     send: Mutex<SendState>,
     recv: Mutex<RecvState>,
     wake_sender: Notify,
+    /// Signalled when nothing is queued and nothing is waiting for an
+    /// acknowledgement.
+    pub send_settled: Notify,
     space: Notify,
     inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
     inbound_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
@@ -230,6 +233,7 @@ impl Conn {
             }),
             recv: Mutex::new(RecvState { partial: HashMap::new(), done_below: 1, done: HashSet::new() }),
             wake_sender: Notify::new(),
+            send_settled: Notify::new(),
             space: Notify::new(),
             inbound_tx: tx,
             inbound_rx: tokio::sync::Mutex::new(rx),
@@ -274,6 +278,12 @@ impl Conn {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Nothing is waiting to be sent and nothing sent is still unacknowledged.
+    pub fn send_idle(&self) -> bool {
+        let s = self.send.lock();
+        s.queue.is_empty() && s.inflight.is_empty()
     }
 
     /// The sender's state in a line, for diagnosis.
@@ -636,8 +646,12 @@ impl Conn {
             }
             s.cwnd = s.cwnd.min(MAX_CWND);
         }
+        let idle = s.queue.is_empty() && s.inflight.is_empty();
         drop(s);
         self.wake_sender.notify_one();
+        if idle {
+            self.send_settled.notify_waiters();
+        }
     }
 
     /// Handles a data fragment; returns whether to acknowledge it.

@@ -273,6 +273,33 @@ fn daemon_socket(cfg: &Config, cache: &Path) -> PathBuf {
     dir.join(name)
 }
 
+/// Stops every daemon of `cache`. A daemon unmounts and exits before the
+/// reply ends, so reading the reply to its end returns when that daemon
+/// is gone. A socket that nobody is listening on is skipped.
+fn stop_daemons(cfg: &Config, cache: &Path, req: &LocalRequest) {
+    use std::os::unix::net::UnixStream;
+    let mut sockets = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(cache.join("run")) {
+        for ent in rd.flatten() {
+            let path = ent.path();
+            if path.extension().is_some_and(|ext| ext == "sock") {
+                sockets.push(path);
+            }
+        }
+    }
+    let primary = daemon_socket(cfg, cache);
+    if !sockets.iter().any(|path| path == &primary) {
+        sockets.push(primary);
+    }
+    let bytes = rargo_proto::encode(req);
+    for socket in sockets {
+        let Ok(mut stream) = UnixStream::connect(&socket) else { continue };
+        let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes));
+        let mut rest = Vec::new();
+        let _ = stream.read_to_end(&mut rest);
+    }
+}
+
 /// Makes the directory the socket lives in: ours alone.
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
@@ -629,6 +656,7 @@ fn main() {
     let admin = match args.first().map(|s| s.as_str()) {
         Some("auth") if token_command => Some("__token"),
         Some("--rargo-status") => Some("__status"),
+        Some("--rargo-settle") => Some("__settle"),
         Some("--rargo-gc") => Some("__gc"),
         Some("--rargo-incr-stats") => Some("__incr"),
         Some("--rargo-compact") => Some("__compact"),
@@ -641,6 +669,7 @@ fn main() {
     let daemon_cmd = match args.first().map(|s| s.as_str()) {
         Some("--rargo-daemon-status") => Some("status"),
         Some("--rargo-daemon-stop") => Some("stop"),
+        Some("--rargo-daemon-sync") => Some("sync"),
         _ => None,
     };
     if daemon_cmd.is_some() {
@@ -714,13 +743,10 @@ fn main() {
     };
     let cache = cache_dir();
     if kind == "stop" {
-        // Only a daemon that is running can be stopped.
-        let socket = daemon_socket(&cfg, &cache);
-        let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket) else { std::process::exit(0) };
-        let bytes = rargo_proto::encode(&req);
-        let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes));
-        let mut rest = Vec::new();
-        let _ = stream.read_to_end(&mut rest);
+        // Every daemon of this cache, not only the one whose socket matches
+        // the credentials held right now. Each unmounts and exits before
+        // its reply ends, so this returns when they are gone.
+        stop_daemons(&cfg, &cache, &req);
         std::process::exit(0);
     }
     through_daemon(cfg, cache, req, &raw)

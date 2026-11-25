@@ -70,37 +70,43 @@ mkdir -p "$B"
 # has them mapped. A suite's daemon exits on SIGTERM. The process that
 # unmounts its mount ignores that signal and exits once the daemon is gone.
 release_binaries() {
-    local sig skip pid exe comm i
-    for sig in TERM KILL; do
-        for pid in /proc/[0-9]*; do
-            [ -d "$pid" ] || continue
-            pid=${pid#/proc/}
-            exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
-            case "$exe" in
-                "$B/rargo"|"$B/rargo (deleted)"|"$B/rargod"|"$B/rargod (deleted)"|"$B/rargo-sandbox"|"$B/rargo-sandbox (deleted)") ;;
-                *) continue ;;
+    local pid comm
+    # Processes whose executable is one of the binaries about to be replaced.
+    bin_pids() {
+        local p e out=""
+        for p in /proc/[0-9]*; do
+            [ -d "$p" ] || continue
+            p=${p#/proc/}
+            e=$(readlink "/proc/$p/exe" 2>/dev/null || true)
+            case "$e" in
+                "$B/rargo"|"$B/rargo (deleted)"|"$B/rargod"|"$B/rargod (deleted)"|"$B/rargo-sandbox"|"$B/rargo-sandbox (deleted)")
+                    out="$out $p" ;;
             esac
-            comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
-            # Leave the guard until its daemon is gone, so the mount goes too.
-            [ "$sig" = TERM ] && [ "$comm" = unmount-guard ] && continue
-            kill "-$sig" "$pid" 2>/dev/null || true
         done
-        for i in $(seq 1 30); do
-            skip=0
-            for pid in /proc/[0-9]*; do
-                [ -d "$pid" ] || continue
-                pid=${pid#/proc/}
-                exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
-                case "$exe" in
-                    "$B/rargo"|"$B/rargo (deleted)"|"$B/rargod"|"$B/rargod (deleted)"|"$B/rargo-sandbox"|"$B/rargo-sandbox (deleted)") skip=1; break ;;
-                esac
-            done
-            [ "$skip" = 0 ] && return 0
-            sleep 0.1
-        done
+        printf '%s\n' "$out"
+    }
+    # A daemon exits on SIGTERM. The guard ignores that signal and exits
+    # once the daemon is gone, which is what takes the mount with it.
+    for pid in $(bin_pids); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+        [ "$comm" = unmount-guard ] && continue
+        kill -TERM "$pid" 2>/dev/null || true
     done
-    echo "gate: a process is still running a binary in $B" >&2
-    return 1
+    for pid in $(bin_pids); do
+        comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
+        [ "$comm" = unmount-guard ] && continue
+        tail --pid="$pid" -f /dev/null
+    done
+    for pid in $(bin_pids); do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+    for pid in $(bin_pids); do
+        tail --pid="$pid" -f /dev/null
+    done
+    if [ -n "$(bin_pids | tr -d '[:space:]')" ]; then
+        echo "gate: a process is still running a binary in $B" >&2
+        return 1
+    fi
 }
 release_binaries
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"

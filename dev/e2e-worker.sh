@@ -20,6 +20,10 @@ proj=$E/ws
 export RARGO_HIDE=$E
 # Off unless asked for (D65); the suite checks it.
 export RARGO_STATE_AHEAD=1
+# An idle local core does not also run a compile the worker was given.
+# These crates are small, so that race would finish here and the state
+# the checks look for would never be left on the worker.
+export RARGO_HEDGE=0
 export RARGO_CACHE_DIR=$E/client-cache
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
@@ -30,38 +34,51 @@ R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 stat() { R --rargo-status | tr '\n' ' ' | grep -oE "[0-9.]+ $1" | head -1 | cut -d' ' -f1; }
 # Bytes in the worker's store, 0 when it has none yet.
 store_bytes() { du -sb "$rig/w1/store" 2>/dev/null | awk '{print $1; found=1} END{if (!found) print 0}'; }
-# The toolchain has crossed the link when the worker's store has taken
-# the files (it has grown) and has stopped growing. `base` is the size
-# before the build that sends them.
-wait_toolchain() {
-    local base=$1 size prev=0 stable=0 i gain=0
-    for i in $(seq 1 200); do
-        size=$(store_bytes)
-        gain=$((size - base))
-        if [ "$gain" -gt 20000000 ] && [ "$size" = "$prev" ]; then
-            stable=$((stable + 1))
-            if [ "$stable" -ge 10 ]; then
-                echo "        toolchain is on the worker (+$((gain / 1048576)) MiB, no longer growing)"
-                return 0
-            fi
-        else
-            stable=0
-        fi
-        prev=$size
-        sleep 0.1
+# Returns when pushes are acknowledged, states sent ahead have been sent,
+# and incremental state that is due has come home.
+settle() { R --rargo-settle >/dev/null; }
+# A rargod whose command names this state directory (not the scope that started it).
+rargod_pids() { # state-dir
+    local pid comm
+    for pid in $(pgrep -f "rargod --state $1 " || true); do
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+        [ "$comm" = rargod ] && echo "$pid"
     done
-    echo "        toolchain wait ended at +$((gain / 1048576)) MiB"
 }
-# The server has noticed the worker process is gone.
-wait_worker_gone() {
-    local before now i
+# The worker is stopped. It tells the server it is leaving, and this
+# returns when the server has dropped it.
+stop_worker() {
+    local before srv pid
     before=$(grep -c "is gone" "$rig/srv.log" 2>/dev/null || true)
-    pkill -KILL -f "rargod --state $rig/w1 " 2>/dev/null || true
-    for i in $(seq 1 50); do
-        now=$(grep -c "is gone" "$rig/srv.log" 2>/dev/null || true)
-        [ "${now:-0}" -gt "${before:-0}" ] && return 0
-        sleep 0.1
+    srv=$(rargod_pids "$rig/srv" | head -1)
+    for pid in $(rargod_pids "$rig/w1"); do
+        kill -TERM "$pid" 2>/dev/null || true
+        tail --pid="$pid" -f /dev/null
     done
+    tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk -v need="$((${before:-0} + 1))" '
+        /is gone/ { c++; if (c >= need) { found = 1; exit } }
+        END { exit found ? 0 : 1 }
+    '
+}
+wait_worker_gone() { stop_worker; }
+# The worker keeps its store and advertises it, and is given no core, so
+# the next compile runs on the server and fetches the state.
+worker_holds_only() {
+    local joined srv wpid
+    stop_worker
+    joined=$(grep -c "joined" "$rig/srv.log" 2>/dev/null || true)
+    srv=$(rargod_pids "$rig/srv" | head -1)
+    nohup systemd-run --scope -q -p CPUQuota=100% -p MemoryMax=30G -p Delegate=yes \
+        ip netns exec "${RIG}-w1" "$RARGO_BIN/rargod" --state "$rig/w1" --worker 10.77.0.1:7711 \
+        --worker-key "$rig/link.key" --jobs 0 >>"$rig/w1.log" 2>&1 &
+    wpid=$!
+    tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk -v need="$((${joined:-0} + 1))" '
+        /joined/ { c++; if (c >= need) { found = 1; exit } }
+        END { exit found ? 0 : 1 }
+    '
+    # The scope lives as long as the worker. Record it so a later signal
+    # still names a process if the worker's own pid is the scope.
+    echo "$wpid" >"$rig/w1.scope"
 }
 
 # The two scenarios share nothing, so they run at the same time, each
@@ -97,7 +114,7 @@ if [ -z "${E2E_WORKER_PHASE:-}" ]; then
     exit
 fi
 
-# A library crate that takes a compiler a second or two.
+# A library crate.
 leaf() { # name value
     mkdir -p "$proj/$1/src"
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$1" >"$proj/$1/Cargo.toml"
@@ -105,9 +122,6 @@ leaf() { # name value
         echo "pub fn value() -> u64 { $2 }"
         echo '// This is set by the selected Nix shell on every compiler action.'
         echo 'const _: &str = env!("NIX_CC");'
-        for i in $(seq 1 1500); do
-            echo "pub fn f$i(v: &[u64]) -> String { let mut s = String::new(); for (i, x) in v.iter().enumerate() { s.push_str(&format!(\"{}:{}:{} \", i, x, $i)); } s }"
-        done
     } >"$proj/$1/src/lib.rs"
 }
 app() { # leaf names...
@@ -154,7 +168,10 @@ app $first $warm
 before=$(store_bytes)
 out=$(R build 2>&1); check $? "the workspace builds after four crates were added" "$out"
 # The toolchain has to have crossed the link before the worker is of use.
-wait_toolchain "$before"
+settle
+gain=$(( $(store_bytes) - before ))
+# A toolchain is several megabytes; the incremental state of these crates is not.
+[ "$gain" -gt 8388608 ]; check $? "the toolchain is on the worker (+$((gain / 1048576)) MiB)" "$(R --rargo-status)"
 
 # Six new crates at once, one server core: first compiles go to the worker.
 for l in $second; do leaf $l 10; done
@@ -167,11 +184,8 @@ left=$(stat 'files, of which')
 [ "${left:-0}" -ge 1 ]; check $? "their incremental state was left on the worker ($left files)" "$(R --rargo-status)"
 
 # With the server idle the state comes home by itself.
-for i in $(seq 1 150); do
-    homed=$(stat 'files came home')
-    [ "${homed:-0}" -ge "${left:-1}" ] && break
-    sleep 0.2
-done
+settle
+homed=$(stat 'files came home')
 [ "${homed:-0}" -ge "${left:-1}" ]; check $? "the state came home in the background ($homed of $left files)" "$(R --rargo-status)"
 
 # Edit every new crate: each compile starts from a state. Those that go to
@@ -196,12 +210,8 @@ none2=$(R --rargo-status | grep '^incremental' | grep -oE '[0-9]+ none' | cut -d
 # but time may be lost.
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 2 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "the workspace builds after a third edit" "$out"
-ahead=0
-for _ in $(seq 1 40); do
-    ahead=$(stat 'states made here sent to workers ahead')
-    [ "${ahead:-0}" -ge 1 ] && break
-    sleep 0.25
-done
+settle
+ahead=$(stat 'states made here sent to workers ahead')
 [ "${ahead:-0}" -ge 1 ]; check $? "states made on the server were sent to the worker ahead of need ($ahead)" "$(R --rargo-status)"
 wait_worker_gone
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 3 }/' "$proj/$l/src/lib.rs"; done
@@ -239,26 +249,28 @@ app $first $warm
 before=$(store_bytes)
 out=$(R build 2>&1); check $? "one-core worker: it builds after four crates were added" "$out"
 # The toolchain has to have crossed the link before the worker is of use.
-wait_toolchain "$before"
+settle
+gain=$(( $(store_bytes) - before ))
+[ "$gain" -gt 8388608 ]; check $? "one-core worker: the toolchain is on the worker (+$((gain / 1048576)) MiB)" "$(R --rargo-status)"
 for l in $second; do leaf $l 10; done
 app $first $warm $second
 out=$(R build 2>&1); check $? "one-core worker: it builds after six crates were added" "$out"
 left=$(stat 'files, of which')
+settle
 homed=$(stat 'files came home')
 [ "${left:-0}" -ge 2 ] && [ "${homed:-1}" = 0 ]; check $? "states stay on the worker while the background fetch is put off ($left files left, $homed home)" "$(R --rargo-status)"
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 100 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "one-core worker: it builds after an edit to six crates" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 604" ]; check $? "its program shows the edit (total 604)" "$out"
 none=$(R --rargo-status | grep '^incremental' | grep -oE '[0-9]+ none' | cut -d' ' -f1)
-# Make sure some newest states are on the worker only, then lose it.
+# Make sure some newest states are on the worker only. Restart it with
+# no core, so the one compile that follows runs here and fetches them.
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 5 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "one-core worker: it builds after a second edit" "$out"
-for n in 20 30 40; do
-    needed=$(stat 'files were fetched for a compile here')
-    [ "${needed:-0}" -ge 1 ] && break
-    for l in $second; do sed -i "1s/.*/pub fn value() -> u64 { $n }/" "$proj/$l/src/lib.rs"; done
-    out=$(R build 2>&1) || break
-done
+worker_holds_only
+for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 6 }/' "$proj/$l/src/lib.rs"; done
+out=$(R build 2>&1); check $? "one-core worker: it builds while the worker has no core" "$out"
+needed=$(stat 'files were fetched for a compile here')
 [ "${needed:-0}" -ge 1 ]; check $? "a compile on the server fetched the state it started from ($needed files)" "$(R --rargo-status)"
 wait_worker_gone
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 7 }/' "$proj/$l/src/lib.rs"; done

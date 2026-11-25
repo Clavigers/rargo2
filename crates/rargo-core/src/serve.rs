@@ -135,9 +135,10 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
     d.stats.links.fetch_add(1, Ordering::Relaxed);
     'link: loop {
-        // A token that was revoked or has expired ends its sessions: looked
-        // at whenever something arrives (a daemon sends something every
-        // few seconds), at most every other second.
+        // A revoked or expired token is refused on the next command. A
+        // session that only sits idle is closed when the next message
+        // shows the token no longer works, and that look happens at most
+        // every other second.
         if checked.elapsed() > std::time::Duration::from_secs(2) {
             if !keys.still_valid(&presented) {
                 eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
@@ -223,6 +224,22 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                     });
                 }
                 (stream, ClientMsg::Run(req)) => {
+                    if !keys.still_valid(&presented) {
+                        eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
+                        let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
+                        let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                        sess.send(ServerMsg::Stderr(
+                            format!(
+                                "error: {}\n       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n",
+                                crate::proto::REFUSED
+                            )
+                            .into_bytes(),
+                        ));
+                        sess.send(ServerMsg::Exit(101));
+                        let _ = pumping.await;
+                        sess.close();
+                        break 'link;
+                    }
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
                     let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
                     let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, keys.clone(), sess.clone()));
@@ -310,6 +327,12 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
     }
     match command {
         "__status" => return say(&sess, status_text(&d)),
+        "__settle" => {
+            if let Some(pool) = d.pool.get() {
+                pool.settle().await;
+            }
+            return say(&sess, status_text(&d));
+        }
         // `rargo auth invite|create|tokens|revoke|allow|disallow`.
         "__token" => {
             let Some(store) = keys.tokens().cloned() else {

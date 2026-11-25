@@ -786,13 +786,9 @@ kill $listener 2>/dev/null
 # the daemon may push a change as soon as it is made.)
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
-# The manifest has reached the server, so the directory made next is
-# already excluded and is not uploaded with the edit.
-for _ in $(seq 1 40); do
-    now=$(asked_files)
-    [ -n "$now" ] && [ "$now" -gt "$files" ] && break
-    sleep 0.05
-done
+# The manifest is on the server, so the directory made next is already
+# excluded and is not uploaded with the edit.
+"$R" --rargo-daemon-sync
 mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
 expect "a build with a directory the manifest excludes" "$R" build
 [ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest itself was uploaded, not the excluded directory" || bad "only the manifest itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
@@ -807,13 +803,9 @@ echo "ignored by git" >crates/util/local-note.txt
 # Counted before the edit, the ignored files changed after it (see above).
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\ngitignored = false\n' >>Cargo.toml
-# The manifest has reached the server before the ignored files change,
-# so neither the file nor the directory is uploaded with the edit.
-for _ in $(seq 1 40); do
-    now=$(asked_files)
-    [ -n "$now" ] && [ "$now" -gt "$files" ] && break
-    sleep 0.05
-done
+# The manifest is on the server before the ignored files change, so
+# neither the file nor the directory is uploaded with the edit.
+"$R" --rargo-daemon-sync
 echo "changed, and still ignored" >crates/util/local-note.txt
 head -c 1500000 /dev/urandom >junk/blob2
 out=$("$R" build 2>&1); rc=$?
@@ -1094,24 +1086,25 @@ rm -f "$H/target/debug/.rargo-tmp-$$-7-app"
 # A client that goes away takes its running actions with it.
 mkdir -p "$H/slowcancel/src"
 printf '[package]\nname = "slowcancel"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$H/slowcancel/Cargo.toml"
-printf 'fn main() { std::thread::sleep(std::time::Duration::from_secs(600)); }\n' >"$H/slowcancel/build.rs"
+cat >"$H/slowcancel/build.rs" <<'EOF'
+fn main() {
+    println!("cargo:warning=script-started");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::thread::park();
+}
+EOF
 : >"$H/slowcancel/src/lib.rs"
 printf '[workspace]\nresolver = "2"\nmembers = ["old", "app", "slowcancel"]\n' >"$H/Cargo.toml"
 "$R" build -p slowcancel >"$T/cancel.log" 2>&1 &
 client=$!
-script=""
-for _ in $(seq 1 300); do
-    script=$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$' | head -1)
-    [ -n "$script" ] && break
-    sleep 0.1
-done
+tail -n +1 -f --pid="$client" "$T/cancel.log" | awk '/script-started/ { found=1; exit } END { exit found ? 0 : 1 }' || true
+script=$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$' | head -1)
 kill "$client" 2>/dev/null; wait "$client" 2>/dev/null
-gone=no
-for _ in $(seq 1 50); do
-    if [ -z "$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$')" ]; then gone=yes; break; fi
-    sleep 0.1
-done
-[ -n "$script" ] && [ $gone = yes ] && ok "an action still running when its client goes away is stopped" \
+if [ -n "$script" ]; then
+    tail --pid="$script" -f /dev/null
+fi
+[ -n "$script" ] && [ -z "$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$')" ] \
+    && ok "an action still running when its client goes away is stopped" \
     || bad "an action still running when its client goes away is stopped" "script pid: ${script:-never started}; $(cat "$T/cancel.log")"
 left=$(find "$H/target" -name '.rargo-tmp-*' | head -3)
 [ -z "$left" ] && ok "an interrupted client leaves no temporaries in target/" || bad "an interrupted client leaves no temporaries in target/" "$left"

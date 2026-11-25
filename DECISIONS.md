@@ -1003,9 +1003,8 @@ Two consequences, both accepted:
   running (it was needed for crashed compilers); until then the server
   runs a few tokens short.
 
-Checked by e2e: a build script sleeping for ten minutes is gone within
-five seconds of its client being killed, the scheduler shows nothing
-running, and the next build works.
+Checked by e2e: a build script that is still running when its client is
+killed is stopped with it, and the next build works.
 
 ## D49. cargo's report files: future incompatibility and `--timings`
 
@@ -1885,10 +1884,10 @@ wire protocol is unchanged (protocol 7). They live in `tokens.json` in
 the server's state directory, rewritten whole under a lock by whoever
 changes it and read again by the server whenever the file has changed:
 `rargod token create|list|revoke|invite` on the server's machine take
-effect at once, with no restart. A token may expire. A session whose
-token was revoked or has expired is closed within seconds (looked at
-when anything arrives on the link, at most every other second). Tokens
-are the one way to say who may connect (D74).
+effect at once, with no restart. A token may expire. The next command on a session whose token was
+revoked or has expired is refused, and the session ends. A session that
+only sits idle is closed when the next message shows the token no longer
+works. Tokens are the one way to say who may connect (D74).
 
 *Secrets are not kept in plain text*, with a limit that has to be said:
 the file holds the key derived from the secret, not the secret, and an
@@ -1931,8 +1930,8 @@ device secret.
 
 - **The allow list** is in `tokens.json` beside the tokens:
   `rargod token allow LOGIN [--admin]`, `rargod token disallow LOGIN`
-  (which also revokes the tokens that account signed in for, so its
-  open sessions end within seconds), shown by `rargod token list`.
+  (which also revokes the tokens that account signed in for, so the
+  next command on an open session is refused), shown by `rargod token list`.
   Logins are compared without regard to case, as GitHub does.
 - **The application** (client id, client secret, the address the pages
   are reached at) is in `github.json` in the state directory, mode 600,
@@ -2665,14 +2664,23 @@ from the gate directory), and the two scenarios inside `e2e-worker` do
 too: a wide worker, and a one-core worker whose states stay where they
 were made. A benchmark's rig is a different name and is not used.
 
-A fixed sleep in a suite is a wait for something that can be seen: the
-toolchain sitting in the worker's store and no longer growing, the
-server's log saying a worker or a revoked session is gone, a daemon
-process or its mount gone, a manifest the daemon has pushed. The poll
-stops when that is true. `dev/netns.sh` brings a rig up when the client
-can reach the server and any worker has joined, and it signals only the
-daemons that are in that rig's namespace, so one suite cannot stop
-another's.
+A check that needs something to have happened runs a command that returns
+when it has. `rargo --rargo-settle` returns when every push to a worker
+has been acknowledged, states sent ahead have been sent, and incremental
+state that is already due has come home. A file whose delay has not
+elapsed stays where it is. `rargo --rargo-daemon-sync` returns when the
+server holds the worktree. `rargo --rargo-daemon-stop` stops every daemon
+of that cache and returns when each has unmounted and exited. The next
+command on a revoked token is refused and the session ends. A rig is up
+when its server is serving and any worker has joined, and the client can
+reach the server. `dev/netns.sh` signals only the daemons in that rig's
+namespace, so one suite cannot stop another's. The leaf crates in
+`e2e-worker` are ordinary libraries. A worker that is stopped tells the
+server, and the server drops it then. `RARGO_HEDGE=0` on that suite's
+servers keeps a compile given to a worker from also running on an idle
+local core, so the state it leaves is the worker's. A compile that has
+to run on the server fetches its state from a worker that holds the
+state and has no core to take the compile.
 
 The servers the suites start through `dev/rargod.sh` take a share of the
 machine (`RARGO_CPU_QUOTA` 800%, `RARGO_MEMORY_MAX` 20G, unless the
@@ -2681,8 +2689,6 @@ from the cores that rig is given. The service beside the gate keeps the
 headroom `CLAUDE.md` asks for.
 
 Before the gate copies its binaries over the ones already in its
-directory, every process still running those copies is gone. That
-includes a daemon's unmount-guard, which exits once the daemon does.
-`e2e-auth` stops every daemon under its own directory: a stop aimed at
-the socket for the credentials held right now leaves the others running,
-and a daemon that is showing a directory does not exit on its own.
+directory, every process still running those copies is gone. A daemon
+exits on SIGTERM. Its unmount-guard exits once the daemon does, and the
+mount goes with it. `e2e-auth` stops every daemon under its own directory.

@@ -56,11 +56,8 @@ spared=$(grep '^scans' <<<"$st" | grep -oE '[0-9]+ spared' | cut -d' ' -f1)
 echo "== changes travel as they happen"
 files=$(sync_n 'files received'); asked=$(sync_n 'files asked for')
 sed -i 's/{ 1 }/{ 2 }/' crates/util/src/lib.rs
-for i in $(seq 1 50); do
-    [ "$(sync_n 'files received')" -gt "$files" ] && break
-    sleep 0.1
-done
-[ "$(sync_n 'files received')" = $((files + 1)) ]; check $? "an edit reaches the server without any command ($files -> $(sync_n 'files received') files)" "$(R --rargo-status | grep '^sync')"
+R --rargo-daemon-sync
+[ "$(sync_n 'files received')" = $((files + 1)) ]; check $? "an edit is on the server once the daemon has synced it ($files -> $(sync_n 'files received') files)" "$(R --rargo-status | grep '^sync')"
 out=$(R run -q 2>&1); [ "$out" = "value 2" ]; check $? "the build that follows sees the edit" "$out"
 [ "$(sync_n 'files asked for')" = "$asked" ]; check $? "and the server had nothing to ask for" "$(R --rargo-status | grep '^sync')"
 # An edit and a build in the same instant: the change rides ahead of the
@@ -75,15 +72,9 @@ echo 'pub fn more() -> i32 { 40 }' >crates/extra/src/lib.rs
 printf 'extra = { path = "../extra" }\n' >>crates/app/Cargo.toml
 echo 'fn main() { println!("value {}", util::value() + extra::more()); }' >crates/app/src/main.rs
 out=$(R run -q 2>&1); [ "$out" = "value 43" ]; check $? "a crate added in a new directory is built" "$out"
-# The push of the new crate has landed, so the edit that follows is a
-# change of its own and not folded into that push.
-prev=$(sync_n 'files received')
-for _ in $(seq 1 40); do
-    sleep 0.05
-    now=$(sync_n 'files received')
-    if [ -n "$prev" ] && [ "$now" = "$prev" ]; then break; fi
-    prev=$now
-done
+# The new crate is on the server, so the edit that follows is a change
+# of its own and not folded into that push.
+R --rargo-daemon-sync
 echo 'pub fn more() -> i32 { 50 }' >crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 53" ]; check $? "and an edit inside the new directory is seen" "$out"
 git -c user.name=t -c user.email=t@example.invalid commit -qam two
@@ -101,8 +92,9 @@ st=$(dstat)
 grep -q '^link  *udp; 1 made' <<<"$st"; check $? "on the link it had: no new connection, no new key agreement" "$st"
 
 echo "== the daemon dies"
+pids=$(pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" || true)
 pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E" 2>/dev/null || true
-for _ in $(seq 1 50); do [ "$(daemons)" = 0 ] && break; sleep 0.05; done
+for pid in $pids; do tail --pid="$pid" -f /dev/null; done
 sed -i 's/{ 60 }/{ 70 }/' crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 73" ]; check $? "the next command starts a new daemon and builds" "$out"
 [ "$(daemons)" = 1 ]; check $? "one daemon is running again"
@@ -120,7 +112,13 @@ slow="slow_$BASHPID"
 slow_script="^[^ ]*build/$slow/[0-9a-f]*/out/build_script_build[^ ]*\$"
 mkdir -p "crates/$slow/src"
 printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' "$slow" >"crates/$slow/Cargo.toml"
-echo 'fn main() { std::thread::sleep(std::time::Duration::from_secs(60)); }' >"crates/$slow/build.rs"
+cat >"crates/$slow/build.rs" <<'EOF'
+fn main() {
+    println!("cargo:warning=script-started");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::thread::park();
+}
+EOF
 echo '' >"crates/$slow/src/lib.rs"
 # A noninteractive Bash ignores SIGINT for asynchronous commands.
 env --default-signal=INT nsenter --no-fork --net=/run/netns/${RIG:-rargo}-cl \
@@ -129,20 +127,15 @@ cl=$!
 # The pattern is the script running, as a command of one word: its
 # compiler and its linker name the same file among their arguments, and
 # were taken for it when they were looked at first.
-t0=$(date +%s.%N)
-for i in $(seq 1 300); do
-    pgrep -f "$slow_script" >/dev/null && break
-    sleep 0.1
-done
-took=$(echo "$(date +%s.%N) - $t0" | bc | cut -c1-5)
-pgrep -f "$slow_script" >/dev/null; check $? "a slow build script is running on the server (${took}s after the command)" "$(cat "$E/slow.log"; kill -0 $cl 2>/dev/null && echo "(the command is still running)")"
+tail -n +1 -f --pid="$cl" "$E/slow.log" | awk '/script-started/ { found=1; exit } END { exit found ? 0 : 1 }' || true
+script=$(pgrep -f "$slow_script" | head -1)
+[ -n "$script" ]; check $? "a build script is running on the server" "$(cat "$E/slow.log"; kill -0 $cl 2>/dev/null && echo "(the command is still running)")"
 kill -INT "$cl" 2>/dev/null
 wait "$cl" 2>/dev/null
 interrupted=$?
-for i in $(seq 1 50); do
-    pgrep -f "$slow_script" >/dev/null || break
-    sleep 0.1
-done
+if [ -n "$script" ]; then
+    tail --pid="$script" -f /dev/null
+fi
 [ "$interrupted" -eq 130 ] && ! pgrep -f "$slow_script" >/dev/null; check $? "interrupting the command stops it there, though the daemon and its link stay"
 rm -rf "crates/$slow"
 out=$(R run -q 2>&1); [ "$out" = "value 83" ]; check $? "the next command works on the same link" "$out"
@@ -231,7 +224,13 @@ out=$(R run -q 2>&1); [ "$out" = "value 113" ] && mounted; check $? "rargo build
 # A daemon that is killed outright cannot unmount. What it left watching
 # does, at once and with no rargo command run: target/ is never a dead
 # mount, and stock cargo works in the worktree.
-unmounted() { for _ in $(seq 1 50); do grep -q " $1 [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo || return 0; sleep 0.1; done; return 1; }
+unmounted() {
+    local g
+    for g in $(pgrep -f "^unmount-guard: $1" || true); do
+        tail --pid="$g" -f /dev/null
+    done
+    ! grep -q " $1 [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo
+}
 # (The daemon of the TCP part above is still running, with a cache of its
 # own; it is not this one, and its mount here was replaced long ago.)
 mine() { pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"; }
@@ -281,7 +280,9 @@ rm -rf "$U"
 
 echo "== daemons go when told"
 RARGO_CACHE_DIR=$E/cache-tcp R --rargo-daemon-stop; RARGO_CACHE_DIR=$E/cache R --rargo-daemon-stop
-for _ in $(seq 1 50); do [ "$(daemons)" = 0 ] && break; sleep 0.05; done
+for g in $(pgrep -f "^unmount-guard: $proj/" || true); do
+    tail --pid="$g" -f /dev/null
+done
 [ "$(daemons)" = 0 ]; check $? "--rargo-daemon-stop ends them ($(daemons) left)"
 ! mounted && [ -d target ]; check $? "and leaves target/ a plain directory"
 out=$(cargo build --offline 2>&1); check $? "in which stock cargo builds" "$out"

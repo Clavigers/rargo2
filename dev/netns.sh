@@ -43,41 +43,59 @@ signal_client_daemons() { # TERM or KILL
         fi
     done
 }
-# rargod of this rig has exited (its state directory is $T/...).
-servers_gone() { ! pgrep -f "rargod --state $T/" >/dev/null 2>&1; }
-wait_servers_gone() {
-    i=0
-    while [ "$i" -lt 50 ]; do
-        servers_gone && return 0
-        sleep 0.1
-        i=$((i + 1))
+# Pids of client daemons in this rig's client namespace, one per line.
+client_daemon_pids() {
+    ns=/run/netns/$RIG-cl
+    [ -e "$ns" ] || return 0
+    ino=$(stat -c %i "$ns")
+    for pid in $(pgrep -f "$B/rargo --rargo-daemon" 2>/dev/null || true); do
+        if [ "$(stat -c %i "/proc/$pid/ns/net" 2>/dev/null || echo none)" = "$ino" ]; then
+            printf '%s\n' "$pid"
+        fi
     done
 }
+# Block on each pid. A pid that has already exited returns at once.
+wait_pids() {
+    for pid in "$@"; do
+        [ -n "$pid" ] || continue
+        tail --pid="$pid" -f /dev/null
+    done
+}
+# rargod of this rig has exited (its state directory is $T/...).
+wait_servers_gone() {
+    pids=$(pgrep -f "rargod --state $T/" || true)
+    # shellcheck disable=SC2086
+    wait_pids $pids
+}
 down() {
+    cpids=$(client_daemon_pids | tr '\n' ' ')
     signal_client_daemons TERM
+    spids=$(pgrep -f "rargod --state $T/" || true)
+    ppids=$(pgrep -f "rigproxy.py [a-z]* $T/proxy.sock" || true)
     pkill -TERM -f "rargod --state $T/" 2>/dev/null || true
     pkill -TERM -f "rigproxy.py [a-z]* $T/proxy.sock" 2>/dev/null || true
-    wait_servers_gone
+    # shellcheck disable=SC2086
+    wait_pids $cpids $spids $ppids
+    spids=$(pgrep -f "rargod --state $T/" || true)
     pkill -KILL -f "rargod --state $T/" 2>/dev/null || true
     signal_client_daemons KILL
+    cpids=$(client_daemon_pids | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    wait_pids $spids $cpids
     for nsname in $(ip netns list 2>/dev/null | awk -v p="^$RIG-" '$1 ~ p {print $1}'); do
         ip netns del "$nsname" 2>/dev/null || true
     done
 }
-# The rig answers when the client can reach the server and, if this rig
-# has workers, the server has accepted one.
+# The rig is up when the server is serving, any worker has joined, and
+# the client can reach the server.
 wait_up() {
-    i=0
-    while [ "$i" -lt 50 ]; do
-        ready=1
-        if [ "${n:-0}" -ge 1 ]; then
-            grep -q "joined" "$T/srv.log" 2>/dev/null || ready=0
+    if [ "${n:-0}" -ge 1 ]; then
+        if ! tail -n +1 -f --pid="$srvpid" "$T/srv.log" | awk '/joined/ { found=1; exit } END { exit found ? 0 : 1 }'; then
+            echo "no worker joined" >&2
+            return 1
         fi
-        ip netns exec "$RIG-cl" ping -c 1 -W 1 -q 10.77.0.1 >/dev/null 2>&1 || ready=0
-        [ "$ready" = 1 ] && return 0
-        sleep 0.1
-        i=$((i + 1))
-    done
+    fi
+    ip netns exec "$RIG-cl" ping -c 1 -W 2 -q 10.77.0.1 >/dev/null 2>&1
 }
 start_server() {
     mkdir -p "$T/srv"
@@ -97,10 +115,11 @@ start_server() {
         "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
         --listen 10.77.0.1:7459 --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
-    for i in $(seq 1 100); do
-        grep -q "serving clients" "$T/srv.log" 2>/dev/null && break
-        sleep 0.1
-    done
+    srvpid=$!
+    if ! tail -n +1 -f --pid="$srvpid" "$T/srv.log" | awk '/serving clients/ { found=1; exit } END { exit found ? 0 : 1 }'; then
+        echo "rargod did not start" >&2
+        return 1
+    fi
 }
 start_workers() {
     i=1
