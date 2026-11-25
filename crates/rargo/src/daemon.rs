@@ -101,13 +101,7 @@ pub struct Daemon {
     handle: tokio::runtime::Handle,
 }
 
-enum Outcome {
-    Final(LocalReply),
-    Changed,
-    NotThere(Probe),
-}
-
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Probe {
     Wait,
     Bet,
@@ -130,19 +124,67 @@ enum CommandEffect {
     Part(Digest, rargo_proto::Part, bool),
     VerifyFetch,
     Report(Box<rargo_proto::FutureReport>),
-    ExplainExit(i32),
+    ExplainExit,
+    Abandon,
     None,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandPhase {
+enum CommandKind {
+    Admin,
     Sync,
-    Running,
+    Run,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandPhase {
+    Link,
+    Scan,
+    Offer,
+    Request,
     Finished,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Link,
+    Scan,
+    Offer(Probe),
+    Request,
+    Rescan,
+    Exit(i32),
+    Fail(&'static str),
+    Error(&'static str),
+    GiveUp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sent {
+    All,
+    Bet,
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum After {
+    NotThere(Probe),
+    Changed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BetAnswer {
+    Known,
+    Lacking,
+}
+
+const KEPT_CHANGING: &str = "the worktree kept changing while it was being synced";
+const UNEXPECTED: &str = "unexpected answer from the server";
+
 struct CommandState {
+    kind: CommandKind,
     phase: CommandPhase,
+    bet: bool,
+    after: Option<After>,
     retry_used: bool,
     changes: u8,
     probe: Probe,
@@ -156,15 +198,125 @@ struct CommandState {
 }
 
 impl CommandState {
-    fn new(probe: Probe) -> Self {
+    fn new(kind: CommandKind, probe: Probe) -> Self {
         Self {
-            phase: CommandPhase::Sync, retry_used: false, changes: 0, probe, visible: false, capture_errors: false,
-            heard: Vec::new(), fetching: None, delivery_ready: false, last: None, token: None,
+            kind, phase: CommandPhase::Link, bet: false, after: None, retry_used: false, changes: 0, probe, visible: false,
+            capture_errors: false, heard: Vec::new(), fetching: None, delivery_ready: false, last: None, token: None,
         }
     }
 
+    fn begin(&self) -> Step {
+        assert_eq!(self.phase, CommandPhase::Link);
+        Step::Link
+    }
+
+    fn linked(&mut self) -> Step {
+        assert_eq!(self.phase, CommandPhase::Link, "a link is made when one is asked for");
+        if self.kind == CommandKind::Admin {
+            self.phase = CommandPhase::Request;
+            return Step::Request;
+        }
+        self.phase = CommandPhase::Scan;
+        Step::Scan
+    }
+
+    fn scanned(&mut self) -> Step {
+        assert_eq!(self.phase, CommandPhase::Scan, "a scan is made when one is asked for");
+        self.phase = CommandPhase::Offer;
+        Step::Offer(self.probe)
+    }
+
+    fn offered(&mut self, sent: Sent) -> Step {
+        assert_eq!(self.phase, CommandPhase::Offer, "an offer is made when one is asked for");
+        match sent {
+            Sent::Changed => self.change(),
+            Sent::All | Sent::Bet if self.kind == CommandKind::Sync => {
+                self.phase = CommandPhase::Finished;
+                Step::Exit(0)
+            }
+            Sent::All | Sent::Bet => {
+                self.bet = sent == Sent::Bet;
+                self.phase = CommandPhase::Request;
+                Step::Request
+            }
+        }
+    }
+
+    fn change(&mut self) -> Step {
+        self.changes += 1;
+        self.visible = false;
+        if self.changes < 5 {
+            self.phase = CommandPhase::Link;
+            Step::Link
+        } else {
+            self.phase = CommandPhase::Finished;
+            Step::Fail(KEPT_CHANGING)
+        }
+    }
+
+    fn link_lost(&mut self) -> Step {
+        self.bet = false;
+        self.after = None;
+        self.fetching = None;
+        self.delivery_ready = false;
+        if self.visible || self.retry_used || self.phase == CommandPhase::Finished {
+            self.phase = CommandPhase::Finished;
+            return Step::GiveUp;
+        }
+        self.retry_used = true;
+        self.phase = CommandPhase::Link;
+        Step::Link
+    }
+
+    fn again(&mut self) -> Step {
+        assert_eq!(self.phase, CommandPhase::Request, "a request ends before it is made again");
+        self.bet = false;
+        self.fetching = None;
+        self.delivery_ready = false;
+        let after = self.after.take();
+        if self.kind == CommandKind::Admin {
+            self.phase = CommandPhase::Finished;
+            return Step::Error(UNEXPECTED);
+        }
+        match after.expect("a request that ends without an answer says why") {
+            After::NotThere(probe) => {
+                self.probe = probe;
+                self.visible = false;
+                self.phase = CommandPhase::Link;
+                Step::Link
+            }
+            After::Changed => match self.change() {
+                Step::Link => Step::Rescan,
+                other => other,
+            },
+        }
+    }
+
+    fn rescanned(&mut self) -> Step {
+        assert_eq!(self.phase, CommandPhase::Link);
+        Step::Link
+    }
+
+    fn bet_answered(&mut self, trees_lacking: bool, blobs_lacking: bool) -> BetAnswer {
+        assert!(self.bet, "a bet is answered once");
+        self.bet = false;
+        if !trees_lacking && !blobs_lacking {
+            return BetAnswer::Known;
+        }
+        self.after = Some(After::NotThere(if trees_lacking { Probe::Whole } else { Probe::Wait }));
+        BetAnswer::Lacking
+    }
+
+    fn uploaded(&mut self, ok: bool) -> CommandEffect {
+        if ok {
+            return CommandEffect::None;
+        }
+        self.after = Some(After::Changed);
+        CommandEffect::Abandon
+    }
+
     fn start(&mut self, capture_errors: bool) {
-        self.phase = CommandPhase::Running;
+        assert_eq!(self.phase, CommandPhase::Request);
         self.visible = false;
         self.capture_errors = capture_errors;
         self.heard.clear();
@@ -174,29 +326,12 @@ impl CommandState {
         self.token = None;
     }
 
-    fn retry(&mut self, disconnected: bool) -> bool {
-        if !disconnected || self.visible || self.retry_used {
-            return false;
-        }
-        self.retry_used = true;
-        self.phase = CommandPhase::Sync;
-        true
-    }
-
-    fn changed(&mut self) -> bool {
-        self.changes += 1;
-        self.phase = CommandPhase::Sync;
-        self.visible = false;
-        self.changes < 5
-    }
-
-    fn not_there(&mut self, probe: Probe) {
-        self.probe = probe;
-        self.phase = CommandPhase::Sync;
-        self.visible = false;
-    }
-
     fn server(&mut self, msg: ServerMsg) -> CommandEffect {
+        if self.bet && matches!(msg, ServerMsg::WantTrees(_) | ServerMsg::WantBlobs(_)) {
+            self.bet = false;
+            self.after = Some(After::NotThere(Probe::Whole));
+            return CommandEffect::Abandon;
+        }
         match msg {
             ServerMsg::Stdout(bytes) => {
                 self.visible = true;
@@ -230,7 +365,7 @@ impl CommandState {
             ServerMsg::Report(report) => CommandEffect::Report(report),
             ServerMsg::Exit(code) => {
                 self.last = Some(LocalReply::Exit(code));
-                CommandEffect::ExplainExit(code)
+                if code != 0 && self.capture_errors { CommandEffect::ExplainExit } else { CommandEffect::None }
             }
             ServerMsg::Exec(exec) => {
                 self.last = Some(LocalReply::Exec(exec));
@@ -261,15 +396,21 @@ impl CommandState {
             return None;
         }
         let reply = self.last.take()?;
+        self.bet = false;
         self.phase = CommandPhase::Finished;
         Some(reply)
     }
 
     #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.changes <= 5 && self.heard.len() <= HEARD_MAX
-            && (self.phase != CommandPhase::Finished || (self.last.is_none() && self.fetching.is_none()))
-            && self.fetching.as_ref().is_none_or(|(_, hashes)| !hashes.is_empty())
+    fn invariants(&self) {
+        assert!(self.changes <= 5 && self.heard.len() <= HEARD_MAX);
+        assert!(self.fetching.as_ref().is_none_or(|(_, hashes)| !hashes.is_empty()), "a fetch asks for something");
+        assert!(!self.bet || self.phase == CommandPhase::Request, "a bet is pending only while a request runs");
+        assert!(self.after.is_none() || self.phase == CommandPhase::Request, "why a request ended is kept until it is asked");
+        assert!(self.kind != CommandKind::Admin || !matches!(self.phase, CommandPhase::Scan | CommandPhase::Offer));
+        if self.phase == CommandPhase::Finished {
+            assert!(self.fetching.is_none() && !self.bet, "a finished command waits for nothing");
+        }
     }
 }
 
@@ -1139,18 +1280,36 @@ impl Daemon {
             (env, asked)
         };
         let probe = if req.kind == "sync" || var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
-        let mut command = CommandState::new(probe);
-        if req.kind == "admin" {
+        let kind = match req.kind.as_str() {
+            "admin" => CommandKind::Admin,
+            "sync" => CommandKind::Sync,
+            _ => CommandKind::Run,
+        };
+        let mut command = CommandState::new(kind, probe);
+        if kind == CommandKind::Admin {
+            let mut step = command.begin();
+            let mut link = None;
             loop {
-                let mux = self.mux().await?;
-                let (env, env_checked) = env_for(&Policy::default());
-                let run = RunRequest { env, env_checked, ..base.clone() };
-                match self.converse(&mux, run, None, None, None, req, out, &mut command, None).await {
-                    Ok(Outcome::Final(reply)) => return Ok(reply),
-                    Ok(Outcome::Changed | Outcome::NotThere(_)) => return Err(std::io::Error::other("unexpected answer from the server")),
-                    Err(_) if command.retry(mux.is_dead()) => {},
-                    Err(e) => return Err(e),
-                }
+                step = match step {
+                    Step::Link => {
+                        link = Some(self.mux().await?);
+                        command.linked()
+                    }
+                    Step::Request => {
+                        let mux = link.clone().expect("a link before a request");
+                        let (env, env_checked) = env_for(&Policy::default());
+                        let run = RunRequest { env, env_checked, ..base.clone() };
+                        match self.converse(&mux, run, None, None, None, req, out, &mut command, None).await {
+                            Ok(Some(reply)) => return Ok(reply),
+                            Ok(None) => command.again(),
+                            Err(_) if mux.is_dead() => command.link_lost(),
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    Step::Error(text) => return Err(std::io::Error::other(text)),
+                    Step::GiveUp => return Err(lost()),
+                    other => unreachable!("an admin command does not {other:?}"),
+                };
             }
         }
         let Some(root) = crate::find_root(&cwd) else {
@@ -1179,98 +1338,120 @@ impl Daemon {
                 let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
             }
         };
+        let mut step = command.begin();
+        let mut link: Option<Arc<Mux>> = None;
+        let mut snap: Option<Arc<Snap>> = None;
+        let mut bet = None;
+        let mut failure = None;
+        let mut started = Instant::now();
         loop {
-            let mux = self.mux().await?;
-            phase("link to the server ready");
-            let started = Instant::now();
-            let mut bet = None;
-            let snap = {
-                let mut st = wt.state.lock().await;
-                if st.policy_dir != policy_dir {
-                    st.policy_dir.clone_from(&policy_dir);
-                    self.knowledge.lock().unwrap().changed(wt.id, true);
+            step = match step {
+                Step::Link => {
+                    link = Some(self.mux().await?);
+                    phase("link to the server ready");
+                    started = Instant::now();
+                    command.linked()
                 }
-                let (snap, scanned) = self.fresh(&wt, &mut st).await?;
-                if let Some(note) = st.note.take() {
-                    let _ = out.send(LocalReply::Stderr(note.into_bytes()));
-                }
-                if stats {
-                    let text = if scanned {
-                        format!(
-                            "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB), looking at {} of {} directories\n",
-                            snap.scan.file_count,
-                            started.elapsed().as_secs_f64() * 1e3,
-                            snap.scan.hashed_files,
-                            snap.scan.hashed_bytes as f64 / 1048576.0,
-                            snap.scan.listed_dirs,
-                            snap.scan.dirs.len()
-                        )
-                    } else {
-                        format!("rargo: no scan needed, {} files watched and unchanged\n", snap.scan.file_count)
-                    };
-                    let _ = out.send(LocalReply::Stderr(text.into_bytes()));
-                }
-                phase("worktree read");
-                match self.offer(&mux, &wt, &snap, command.probe).await {
-                    Ok(Offered::Sent) => phase("worktree offered and what the server lacked sent"),
-                    Ok(Offered::Bet(answer)) => {
-                        phase("worktree offered by its root, answer not awaited");
-                        bet = Some(answer);
+                Step::Scan => {
+                    let mut st = wt.state.lock().await;
+                    if st.policy_dir != policy_dir {
+                        st.policy_dir.clone_from(&policy_dir);
+                        self.knowledge.lock().unwrap().changed(wt.id, true);
                     }
-                    Ok(Offered::Changed) => {
-                        if !command.changed() {
-                            return Ok(Self::fail(out, "the worktree kept changing while it was being synced".into()));
+                    let (fresh, scanned) = self.fresh(&wt, &mut st).await?;
+                    if let Some(note) = st.note.take() {
+                        let _ = out.send(LocalReply::Stderr(note.into_bytes()));
+                    }
+                    if stats {
+                        let text = if scanned {
+                            format!(
+                                "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB), looking at {} of {} directories\n",
+                                fresh.scan.file_count,
+                                started.elapsed().as_secs_f64() * 1e3,
+                                fresh.scan.hashed_files,
+                                fresh.scan.hashed_bytes as f64 / 1048576.0,
+                                fresh.scan.listed_dirs,
+                                fresh.scan.dirs.len()
+                            )
+                        } else {
+                            format!("rargo: no scan needed, {} files watched and unchanged\n", fresh.scan.file_count)
+                        };
+                        let _ = out.send(LocalReply::Stderr(text.into_bytes()));
+                    }
+                    phase("worktree read");
+                    snap = Some(fresh);
+                    command.scanned()
+                }
+                Step::Offer(probe) => {
+                    let (mux, fresh) = (link.clone().expect("a link before an offer"), snap.clone().expect("a scan before an offer"));
+                    match self.offer(&mux, &wt, &fresh, probe).await {
+                        Ok(Offered::Sent) => {
+                            phase("worktree offered and what the server lacked sent");
+                            command.offered(Sent::All)
                         }
-                        continue;
+                        Ok(Offered::Bet(answer)) => {
+                            phase("worktree offered by its root, answer not awaited");
+                            bet = Some(answer);
+                            command.offered(Sent::Bet)
+                        }
+                        Ok(Offered::Changed) => command.offered(Sent::Changed),
+                        Err(e) if mux.is_dead() => {
+                            failure = Some(e);
+                            command.link_lost()
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(_) if command.retry(mux.is_dead()) => continue,
-                    Err(e) => return Err(e),
                 }
-                snap
-            };
-            if req.kind == "sync" {
-                return Ok(LocalReply::Exit(0));
-            }
-            let (env, env_checked) = env_for(&snap.policy);
-            let commits = match &snap.head {
-                Some(h) => {
-                    let (root, h, wt_cache) = (root.clone(), h.clone(), wt.wt_cache.clone());
-                    tokio::task::spawn_blocking(move || crate::recent_commits(&root, &h, &wt_cache)).await.unwrap_or_default()
+                Step::Request => {
+                    let (mux, fresh) = (link.clone().expect("a link before a request"), snap.clone().expect("a scan before a request"));
+                    let (env, env_checked) = env_for(&fresh.policy);
+                    let commits = match &fresh.head {
+                        Some(h) => {
+                            let (root, h, wt_cache) = (root.clone(), h.clone(), wt.wt_cache.clone());
+                            tokio::task::spawn_blocking(move || crate::recent_commits(&root, &h, &wt_cache)).await.unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                    let delivered =
+                        std::fs::read_to_string(wt.wt_cache.join("delivered")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+                    let run = RunRequest {
+                        root: root.to_string_lossy().into_owned(),
+                        env,
+                        env_checked,
+                        worktree: wt.wt_id.clone(),
+                        commits,
+                        tree: fresh.scan.root,
+                        home_files: home_files.clone(),
+                        delivered,
+                        lazy: shown.is_some(),
+                        ..base.clone()
+                    };
+                    phase("request sent");
+                    match self.converse(&mux, run, Some(&fresh), Some(&wt), shown.as_ref(), req, out, &mut command, bet.take()).await {
+                        Ok(Some(reply)) => {
+                            phase("answer complete");
+                            return Ok(reply);
+                        }
+                        Ok(None) => {
+                            phase("the server lacked the tree, or the worktree changed: offering it again");
+                            command.again()
+                        }
+                        Err(e) if mux.is_dead() => {
+                            failure = Some(e);
+                            command.link_lost()
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
-                None => Vec::new(),
-            };
-            let delivered = std::fs::read_to_string(wt.wt_cache.join("delivered")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
-            let run = RunRequest {
-                root: root.to_string_lossy().into_owned(),
-                env,
-                env_checked,
-                worktree: wt.wt_id.clone(),
-                commits,
-                tree: snap.scan.root,
-                home_files: home_files.clone(),
-                delivered,
-                lazy: shown.is_some(),
-                ..base.clone()
-            };
-            phase("request sent");
-            match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &mut command, bet).await {
-                Ok(Outcome::Final(reply)) => {
-                    phase("answer complete");
-                    return Ok(reply);
-                }
-                Ok(Outcome::NotThere(how)) => {
-                    phase("the server lacked the tree: offering it");
-                    command.not_there(how);
-                }
-                Ok(Outcome::Changed) => {
+                Step::Rescan => {
                     self.knowledge.lock().unwrap().changed(wt.id, true);
-                    if !command.changed() {
-                        return Ok(Self::fail(out, "the worktree kept changing while it was being synced".into()));
-                    }
+                    command.rescanned()
                 }
-                Err(_) if command.retry(mux.is_dead()) => {},
-                Err(e) => return Err(e),
-            }
+                Step::Exit(code) => return Ok(LocalReply::Exit(code)),
+                Step::Fail(text) => return Ok(Self::fail(out, text.into())),
+                Step::Error(text) => return Err(std::io::Error::other(text)),
+                Step::GiveUp => return Err(failure.take().unwrap_or_else(lost)),
+            };
         }
     }
 
@@ -1286,7 +1467,7 @@ impl Daemon {
         out: &UnboundedSender<LocalReply>,
         command: &mut CommandState,
         mut bet: Option<tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
-    ) -> std::io::Result<Outcome> {
+    ) -> std::io::Result<Option<LocalReply>> {
         let (stream, tx, mut rx) = mux.open();
         struct Withdraw<'a>(&'a Mux, u32);
         impl Drop for Withdraw<'_> {
@@ -1310,26 +1491,30 @@ impl Daemon {
                 lacking = async { bet.as_mut().unwrap().await }, if bet.is_some() => {
                     bet = None;
                     let (trees, blobs) = lacking.map_err(|_| lost())?;
-                    if trees.is_empty() && blobs.is_empty() {
-                        if let Some(s) = snap {
-                            self.has_now(wt, s);
+                    match command.bet_answered(!trees.is_empty(), !blobs.is_empty()) {
+                        BetAnswer::Known => {
+                            if let Some(s) = snap {
+                                self.has_now(wt, s);
+                            }
+                            self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
-                        self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
-                        continue;
+                        BetAnswer::Lacking => {
+                            self.knowledge.lock().unwrap().missing(trees.iter().chain(&blobs));
+                            mux.post(stream, &ClientMsg::Changed);
+                            return Ok(None);
+                        }
                     }
-                    self.knowledge.lock().unwrap().missing(trees.iter().chain(&blobs));
-                    mux.post(stream, &ClientMsg::Changed);
-                    return Ok(Outcome::NotThere(if trees.is_empty() { Probe::Wait } else { Probe::Whole }));
                 }
                 m = rx.recv() => m,
                 _ = mux.until_dead() => None,
             };
             let Some(msg) = msg else { return Err(lost()) };
-            if bet.is_some() && matches!(msg, ServerMsg::WantTrees(_) | ServerMsg::WantBlobs(_)) {
-                mux.post(stream, &ClientMsg::Changed);
-                return Ok(Outcome::NotThere(Probe::Whole));
-            }
             match command.server(msg) {
+                CommandEffect::Abandon => {
+                    mux.post(stream, &ClientMsg::Changed);
+                    return Ok(None);
+                }
                 CommandEffect::Relay(reply) => { let _ = out.send(reply); }
                 CommandEffect::Trees(want) => {
                     self.knowledge.lock().unwrap().missing(want.iter());
@@ -1342,9 +1527,9 @@ impl Daemon {
                         Some(s) => upload(mux, stream, s, want).await?,
                         None => false,
                     };
-                    if !ok {
+                    if matches!(command.uploaded(ok), CommandEffect::Abandon) {
                         mux.post(stream, &ClientMsg::Changed);
-                        return Ok(Outcome::Changed);
+                        return Ok(None);
                     }
                 }
                 CommandEffect::Environment(names) => {
@@ -1399,11 +1584,11 @@ impl Daemon {
                     };
                     mux.post(stream, &ClientMsg::ReportId(id));
                 }
-                CommandEffect::ExplainExit(code) => {
-                    if let (true, Some((ignored, wt))) = (code != 0, left_out) {
-                        if let Some(note) = left_out_note(ignored, &wt.root, &command.heard) {
-                            let _ = out.send(LocalReply::Stderr(note.into_bytes()));
-                        }
+                CommandEffect::ExplainExit => {
+                    if let Some((ignored, wt)) = left_out
+                        && let Some(note) = left_out_note(ignored, &wt.root, &command.heard)
+                    {
+                        let _ = out.send(LocalReply::Stderr(note.into_bytes()));
                     }
                 }
                 CommandEffect::None => {}
@@ -1433,7 +1618,7 @@ impl Daemon {
                 let _ = crate::write_atomic(&wt.wt_cache.join("delivered"), format!("{t}\n").as_bytes());
             }
         });
-        Ok(Outcome::Final(final_reply))
+        Ok(Some(final_reply))
     }
 
     async fn status(&self, out: &UnboundedSender<LocalReply>) -> LocalReply {
@@ -2088,55 +2273,260 @@ fn paths_in<'t>(text: &'t str, root: &'t str) -> impl Iterator<Item = String> + 
 
 #[cfg(test)]
 mod left_out_tests {
-    #[test]
-    fn command_retries_a_silent_failure_once_and_preserves_visible_output() {
-        let mut command = CommandState::new(Probe::Bet);
-        command.start(true);
-        assert!(command.invariants());
-        assert!(command.retry(true));
-        assert!(command.invariants());
-        command.start(true);
-        assert!(command.invariants());
-        assert!(!command.retry(true));
-        assert!(command.invariants());
+    struct Rng(u64);
 
-        let mut command = CommandState::new(Probe::Wait);
-        command.start(true);
-        assert!(command.invariants());
-        let msgs = [
-            ServerMsg::Stdout(b"first".to_vec()),
-            ServerMsg::Stderr(b"second".to_vec()),
-            ServerMsg::Stdout(b"third".to_vec()),
-        ];
-        let mut relayed = Vec::new();
-        for msg in msgs {
-            if let CommandEffect::Relay(reply) = command.server(msg) {
-                relayed.push(reply);
-            }
-            assert!(command.invariants());
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
         }
-        assert!(matches!(relayed.as_slice(), [LocalReply::Stdout(a), LocalReply::Stderr(b), LocalReply::Stdout(c)]
-            if a == b"first" && b == b"second" && c == b"third"));
-        assert!(!command.retry(true));
-        assert!(command.invariants());
-        command.server(ServerMsg::Delivered { id: 1 });
-        assert!(command.invariants());
-        assert!(command.ready_to_fetch());
-        assert!(command.invariants());
-        command.request_fetch(2, vec![[1; 32]]);
-        assert!(command.invariants());
-        assert!(matches!(command.server(ServerMsg::Exit(42)), CommandEffect::ExplainExit(42)));
-        assert!(command.invariants());
-        assert!(command.finish().is_none());
-        assert!(command.invariants());
-        assert!(matches!(command.server(ServerMsg::Fetched { id: 2 }), CommandEffect::VerifyFetch));
-        assert!(command.invariants());
-        assert!(command.verified_fetch(false).is_err());
-        assert!(command.invariants());
-        command.verified_fetch(true).unwrap();
-        assert!(command.invariants());
-        assert!(matches!(command.finish(), Some(LocalReply::Exit(42))));
-        assert!(command.invariants());
+    }
+
+    enum Ended {
+        Reply,
+        Again,
+        Lost,
+    }
+
+    struct Model {
+        sent: Vec<(bool, Vec<u8>)>,
+        relayed: Vec<(bool, Vec<u8>)>,
+        retried: bool,
+        changes: u8,
+        explained: usize,
+    }
+
+    fn converse(c: &mut CommandState, rng: &mut Rng, m: &mut Model, capture: bool, seed: u64) -> Ended {
+        c.start(capture);
+        c.invariants();
+        let mut fetch = None;
+        for i in 0..rng.below(6) {
+            if c.bet && rng.below(3) == 0 {
+                let (trees, blobs) = (rng.below(3) == 0, rng.below(3) == 0);
+                let answer = c.bet_answered(trees, blobs);
+                c.invariants();
+                assert_eq!(answer == BetAnswer::Known, !trees && !blobs, "seed {seed}");
+                if answer == BetAnswer::Lacking {
+                    return Ended::Again;
+                }
+            }
+            match rng.below(9) {
+                0 => return Ended::Lost,
+                1 => {
+                    let was_bet = c.bet;
+                    let effect = c.server(ServerMsg::WantBlobs(vec![[i as u8; 32]]));
+                    c.invariants();
+                    if was_bet {
+                        assert!(matches!(effect, CommandEffect::Abandon), "seed {seed}: a request for files during a bet ends it");
+                        return Ended::Again;
+                    }
+                    assert!(matches!(effect, CommandEffect::Upload(_)));
+                    let ok = rng.below(4) != 0;
+                    let effect = c.uploaded(ok);
+                    c.invariants();
+                    assert_eq!(matches!(effect, CommandEffect::Abandon), !ok, "seed {seed}: only a failed upload ends the request");
+                    if !ok {
+                        return Ended::Again;
+                    }
+                }
+                2 => {
+                    c.server(ServerMsg::Delivered { id: 1 });
+                    c.invariants();
+                    if c.ready_to_fetch() {
+                        c.request_fetch(7 + i, vec![[9; 32]]);
+                        fetch = Some(7 + i);
+                    }
+                    c.invariants();
+                }
+                _ => {
+                    let out = rng.below(2) == 0;
+                    let bytes = format!("{seed}-{i}").into_bytes();
+                    let msg = if out { ServerMsg::Stdout(bytes.clone()) } else { ServerMsg::Stderr(bytes.clone()) };
+                    m.sent.push((out, bytes));
+                    match c.server(msg) {
+                        CommandEffect::Relay(LocalReply::Stdout(b)) => m.relayed.push((true, b)),
+                        CommandEffect::Relay(LocalReply::Stderr(b)) => m.relayed.push((false, b)),
+                        CommandEffect::Abandon => return Ended::Again,
+                        _ => panic!("seed {seed}: output is relayed"),
+                    }
+                    c.invariants();
+                }
+            }
+        }
+        let code = rng.below(3) as i32;
+        let effect = c.server(ServerMsg::Exit(code));
+        c.invariants();
+        if matches!(effect, CommandEffect::ExplainExit) {
+            assert!(code != 0 && capture, "seed {seed}: only a failure of a worktree with left-out files is explained");
+            m.explained += 1;
+        }
+        if let Some(id) = fetch {
+            assert!(c.finish().is_none(), "seed {seed}: the exit waits for the files it was promised");
+            if rng.below(5) == 0 {
+                return Ended::Lost;
+            }
+            assert!(matches!(c.server(ServerMsg::Fetched { id }), CommandEffect::VerifyFetch));
+            c.verified_fetch(true).unwrap();
+            c.invariants();
+        }
+        let reply = c.finish().expect("an exit ends the command");
+        c.invariants();
+        assert!(matches!(reply, LocalReply::Exit(x) if x == code), "seed {seed}: the exit code is the build's");
+        Ended::Reply
+    }
+
+    #[test]
+    fn generated_commands_relay_in_order_exit_with_the_builds_code_and_retry_a_lost_link_once() {
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let kind = [CommandKind::Run, CommandKind::Run, CommandKind::Sync, CommandKind::Admin][rng.below(4) as usize];
+            let probe = if rng.below(2) == 0 { Probe::Bet } else { Probe::Wait };
+            let mut c = CommandState::new(kind, probe);
+            c.invariants();
+            let mut m = Model { sent: Vec::new(), relayed: Vec::new(), retried: false, changes: 0, explained: 0 };
+            let capture = rng.below(2) == 0;
+            let mut step = c.begin();
+            let mut probes = vec![probe];
+            let mut ended = false;
+            for _ in 0..200 {
+                let lost = |c: &mut CommandState, m: &mut Model, visible: bool| {
+                    let next = c.link_lost();
+                    c.invariants();
+                    if visible || m.retried {
+                        assert_eq!(next, Step::GiveUp, "seed {seed}: a lost link fails clearly after output or a retry");
+                    } else {
+                        assert_eq!(next, Step::Link, "seed {seed}: a lost link is retried once");
+                        m.retried = true;
+                    }
+                    next
+                };
+                step = match step {
+                    Step::Link => c.linked(),
+                    Step::Scan => {
+                        assert_ne!(kind, CommandKind::Admin, "seed {seed}");
+                        c.scanned()
+                    }
+                    Step::Offer(p) => {
+                        assert_eq!(Some(&p), probes.last(), "seed {seed}: the offer is made as the command last asked");
+                        match rng.below(6) {
+                            0 => lost(&mut c, &mut m, false),
+                            1 => {
+                                m.changes += 1;
+                                let next = c.offered(Sent::Changed);
+                                if m.changes >= 5 {
+                                    assert_eq!(next, Step::Fail(KEPT_CHANGING), "seed {seed}");
+                                } else {
+                                    assert_eq!(next, Step::Link, "seed {seed}");
+                                }
+                                next
+                            }
+                            2 if p == Probe::Bet => c.offered(Sent::Bet),
+                            _ => c.offered(Sent::All),
+                        }
+                    }
+                    Step::Request => {
+                        let before = m.relayed.len();
+                        match converse(&mut c, &mut rng, &mut m, capture, seed) {
+                            Ended::Reply => {
+                                ended = true;
+                                break;
+                            }
+                            Ended::Lost => {
+                                let visible = m.relayed.len() > before;
+                                lost(&mut c, &mut m, visible)
+                            }
+                            Ended::Again => {
+                                let why = c.after;
+                                let next = c.again();
+                                c.invariants();
+                                match (kind, why) {
+                                    (CommandKind::Admin, _) => assert_eq!(next, Step::Error(UNEXPECTED), "seed {seed}"),
+                                    (_, Some(After::NotThere(p))) => {
+                                        assert_eq!(next, Step::Link, "seed {seed}");
+                                        probes.push(p);
+                                    }
+                                    (_, Some(After::Changed)) => {
+                                        m.changes += 1;
+                                        let want = if m.changes >= 5 { Step::Fail(KEPT_CHANGING) } else { Step::Rescan };
+                                        assert_eq!(next, want, "seed {seed}");
+                                    }
+                                    (_, None) => panic!("seed {seed}: a request ends without an answer only for a reason"),
+                                }
+                                next
+                            }
+                        }
+                    }
+                    Step::Rescan => c.rescanned(),
+                    Step::Exit(code) => {
+                        assert_eq!((kind, code), (CommandKind::Sync, 0), "seed {seed}: only a sync ends after its offer");
+                        ended = true;
+                        break;
+                    }
+                    Step::Fail(_) | Step::Error(_) | Step::GiveUp => {
+                        ended = true;
+                        break;
+                    }
+                };
+                c.invariants();
+            }
+            assert!(ended, "seed {seed}: every command ends");
+            assert_eq!(m.relayed, m.sent, "seed {seed}: output is relayed in order");
+            assert!(m.explained <= 1, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn paths_in_failure_text_are_found_relative_to_the_root() {
+        let root = "/home/ann/proj";
+        let rows: &[(&str, &[&str])] = &[
+            ("at /home/ann/proj/src/main.rs:12:5", &["src/main.rs"]),
+            ("open data/big.bin: not found.", &["data/big.bin"]),
+            ("error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`", &["crates/util/local-note.txt"]),
+            ("couldn't read `/elsewhere/data/big.bin`", &[]),
+            ("see /home/ann/proj/../x and /home/ann/proj/a/../../y", &[]),
+            ("wrote out.txt... then a/b.rs.", &["out.txt", "a/b.rs"]),
+            ("./src/lib.rs and src/./mod.rs", &["src/lib.rs", "src/mod.rs"]),
+            ("a/b.rs a/b.rs /home/ann/proj/a/b.rs", &["a/b.rs", "a/b.rs", "a/b.rs"]),
+            ("one/a.rs two/b.rs three/c.rs four/d.rs", &["one/a.rs", "two/b.rs", "three/c.rs", "four/d.rs"]),
+            ("error[E0308]: mismatched types", &[]),
+            ("plain words without paths", &[]),
+            ("/home/ann/proj/ and /home/ann/proj/.", &[]),
+        ];
+        for (text, want) in rows {
+            assert_eq!(paths_in(text, root).collect::<Vec<_>>(), *want, "{text}");
+            assert_eq!(paths_in(text, "/home/ann/proj/").collect::<Vec<_>>(), *want, "a root with a trailing slash: {text}");
+        }
+    }
+
+    #[test]
+    fn a_failure_naming_left_out_files_gets_one_note_for_at_most_three() {
+        let root = Path::new("/home/ann/proj");
+        let ignored = scan::Ignored::for_test(&["junk/", "crates/util/local-note.txt", "a.bin", "b.bin", "c.bin", "d.bin"], &[]);
+        let one = |p: &str| format!("note: `{p}` is not on the build server: git ignores it");
+        let rows: &[(&str, Option<String>)] = &[
+            ("error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`\n", Some(one("crates/util/local-note.txt"))),
+            ("cannot open /home/ann/proj/junk/blob\n", Some(one("junk/blob"))),
+            ("a.bin a.bin /home/ann/proj/a.bin\n", Some(one("a.bin"))),
+            ("a.bin b.bin\n", Some("note: `a.bin`, `b.bin` are not on the build server: git ignores them".into())),
+            ("a.bin b.bin c.bin d.bin\n", Some("note: `a.bin`, `b.bin`, `c.bin` are not".into())),
+            ("src/main.rs and /elsewhere/a.bin and ../a.bin\n", None),
+            ("error[E0308]: mismatched types\n  --> src/main.rs:3:5\n", None),
+            ("", None),
+        ];
+        for (heard, want) in rows {
+            let got = left_out_note(&ignored, root, heard.as_bytes());
+            match (want, &got) {
+                (None, None) => {}
+                (Some(start), Some(note)) => {
+                    assert!(note.starts_with(start.as_str()), "{heard:?}: {note}");
+                    assert!(note.contains("gitignored = false") && note.contains("`include`"), "{note}");
+                    assert!(!note.contains("d.bin"), "at most three are named: {note}");
+                }
+                _ => panic!("{heard:?}: {got:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2153,28 +2543,6 @@ mod left_out_tests {
 
     use super::*;
 
-    #[test]
-    fn a_failure_that_names_a_path_git_ignores_is_explained() {
-        let root = "/home/ann/proj";
-        let found = |text: &str| paths_in(text, root).collect::<Vec<_>>();
-        assert_eq!(found("error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`: No such file"), ["crates/util/local-note.txt"]);
-        assert_eq!(found("open data/big.bin: not found."), ["data/big.bin"]);
-        assert_eq!(found("at /home/ann/proj/src/main.rs:12:5"), ["src/main.rs"]);
-        assert!(found("couldn't read `/elsewhere/data/big.bin` or /home/ann/proj/../x").is_empty());
-
-        let ignored = scan::Ignored::for_test(&["junk/", "crates/util/local-note.txt"], &[]);
-        let failed = b"error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`: No such file or directory\n";
-        let note = left_out_note(&ignored, Path::new(root), failed).unwrap();
-        assert!(
-            note.starts_with("note: `crates/util/local-note.txt` is not on the build server: git ignores it")
-                && note.contains("gitignored = false")
-                && note.contains("`include`"),
-            "{note}"
-        );
-        let note = left_out_note(&ignored, Path::new(root), b"cannot open /home/ann/proj/junk/blob and local-note.txt\n").unwrap();
-        assert!(note.starts_with("note: `junk/blob` is not"), "a file inside an ignored directory: {note}");
-        assert!(left_out_note(&ignored, Path::new(root), b"error[E0308]: mismatched types\n  --> src/main.rs:3:5\n").is_none());
-    }
 }
 
 #[cfg(test)]
