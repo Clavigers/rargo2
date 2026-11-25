@@ -8,6 +8,7 @@ mod place;
 mod project;
 mod report;
 mod scan;
+mod status;
 mod tmp;
 mod watch;
 
@@ -527,6 +528,18 @@ fn main() {
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     if std::env::var_os("RARGO_BYPASS").is_some() {
         passthrough(&raw);
+    }
+    let cargo_link = std::env::args_os().next().is_some_and(|arg| Path::new(&arg).file_name().is_some_and(|name| name == "cargo"));
+    if !cargo_link && raw.first().is_some_and(|a| a == "status") {
+        match raw.get(1).and_then(|arg| arg.to_str()) {
+            Some("--help" | "-h") if raw.len() == 2 => println!("Usage: rargo status\n\nShow your server, account, daemon, mount and versions."),
+            None if raw.len() == 1 => status::run(),
+            _ => die("usage: rargo status"),
+        }
+        return;
+    }
+    if !cargo_link && raw.len() == 1 && raw.first().is_some_and(|a| a == "--help" || a == "-h") {
+        println!("rargo status    Show your server, account, daemon, mount and versions.\n");
     }
     if raw.first().is_some_and(|a| a == "--rargo-version") {
         println!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION);

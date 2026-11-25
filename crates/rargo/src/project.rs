@@ -71,6 +71,15 @@ pub fn base_url(host: &str) -> String {
     if host.contains(':') { format!("http://{host}") } else { format!("https://{host}") }
 }
 
+pub fn server_status(host: &str) -> Result<serde_json::Value, String> {
+    let url = format!("{}/.well-known/rargo.json", base_url(host));
+    let response = agent().get(&url).call().map_err(|err| err.to_string())?;
+    let body = response.into_string().map_err(|err| err.to_string())?;
+    let status: serde_json::Value = serde_json::from_str(&body).map_err(|err| err.to_string())?;
+    status.get("server").and_then(|s| s.as_str()).ok_or("not a rargo server")?;
+    Ok(status)
+}
+
 pub fn resolve(host: &str) -> Result<String, String> {
     if host.contains(':') {
         return Ok(host.to_string());
