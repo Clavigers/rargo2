@@ -648,15 +648,15 @@ fn main() {
     if cfg.secret.is_none() && !is_loopback(&cfg.server) && matches!(kind, "admin" | "drift" | "build") {
         die(&format!("this machine is not authenticated to {}: run `rargo auth`", cfg.host));
     }
-    if kind == "build" {
-        for name in ignored_compiler_wrappers(&vars) {
-            eprintln!("warning: {name} is ignored for remote builds; rargo runs the server's compiler directly");
-        }
-    }
     let cwd = match std::env::current_dir().and_then(|d| d.canonicalize()) {
         Ok(d) => d,
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
     };
+    if kind == "build" {
+        for source in ignored_compiler_wrappers(&args, &vars, &cwd) {
+            eprintln!("warning: {source} is ignored for remote builds; rargo runs the server's compiler directly");
+        }
+    }
     let req = LocalRequest {
         args,
         kind: kind.to_string(),
@@ -764,9 +764,58 @@ fn prepare_route(raw: &[OsString], mut vars: Vec<(String, String)>, token_comman
     Route::Remote { args, vars, kind }
 }
 
-fn ignored_compiler_wrappers(vars: &[(String, String)]) -> impl Iterator<Item = &'static str> + '_ {
-    ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"].into_iter()
-        .filter(|name| vars.iter().any(|(key, value)| key == name && !value.is_empty()))
+fn wrapper_config_keys(table: &toml::Table) -> impl Iterator<Item = &'static str> + '_ {
+    ["rustc-wrapper", "rustc-workspace-wrapper"].into_iter().filter(|name| {
+        table.get("build").and_then(|build| build.get(name)).and_then(toml::Value::as_str).is_some_and(|wrapper| !wrapper.is_empty())
+    })
+}
+
+fn cargo_config_args(args: &[String]) -> impl Iterator<Item = &str> {
+    let mut args = args.iter().map(String::as_str).take_while(|arg| *arg != "--");
+    std::iter::from_fn(move || {
+        for arg in args.by_ref() {
+            if let Some(config) = arg.strip_prefix("--config=") {
+                return Some(config);
+            }
+            if arg == "--config" {
+                return args.next();
+            }
+        }
+        None
+    })
+}
+
+fn ignored_compiler_wrappers(args: &[String], vars: &[(String, String)], cwd: &Path) -> Vec<String> {
+    let var = |name: &str| vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str()).filter(|value| !value.is_empty());
+    let mut sources: Vec<_> = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"]
+        .into_iter().filter(|name| var(name).is_some()).map(str::to_owned).collect();
+    let mut read = std::collections::BTreeSet::new();
+    let mut files = Vec::new();
+
+    for config in cargo_config_args(args) {
+        match config.parse::<toml::Table>() {
+            Ok(table) => sources.extend(wrapper_config_keys(&table).map(|key| format!("--config build.{key}"))),
+            Err(_) => files.push(cwd.join(config)),
+        }
+    }
+    let cargo_home = var("CARGO_HOME").map(|path| cwd.join(path))
+        .unwrap_or_else(|| Path::new(var("HOME").unwrap_or("/")).join(".cargo"));
+    // Only worktree files and the selected Cargo home are sent for the remote build.
+    let root = find_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let project_configs = cwd.ancestors().take_while(|path| path.starts_with(&root)).map(|path| path.join(".cargo"));
+    for dir in project_configs.chain(std::iter::once(cargo_home)) {
+        let legacy = dir.join("config");
+        files.push(if legacy.is_file() { legacy } else { dir.join("config.toml") });
+    }
+    for file in files {
+        if !read.insert(file.clone()) || !file.metadata().is_ok_and(|md| md.is_file() && md.len() <= 1 << 20) {
+            continue;
+        }
+        if let Some(table) = std::fs::read_to_string(&file).ok().and_then(|text| text.parse::<toml::Table>().ok()) {
+            sources.extend(wrapper_config_keys(&table).map(|key| format!("build.{key} in {}", file.display())));
+        }
+    }
+    sources
 }
 
 fn subcommand(args: &[String]) -> Option<&str> {

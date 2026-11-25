@@ -666,6 +666,22 @@ out=$(RUSTC_WRAPPER="$T/unused-wrapper" RUSTC_WORKSPACE_WRAPPER="$T/unused-works
 [ "$rc" -eq 0 ] && grep -Fq 'RUSTC_WRAPPER is ignored for remote builds' <<<"$out" \
     && grep -Fq 'RUSTC_WORKSPACE_WRAPPER is ignored for remote builds' <<<"$out" \
     && ok "remote builds say when compiler wrappers are ignored" || bad "remote builds say when compiler wrappers are ignored" "$out"
+out=$(CARGO_BUILD_RUSTC_WRAPPER="$T/unused-wrapper" CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER="$T/unused-workspace-wrapper" "$R" check 2>&1); rc=$?
+[ "$rc" -eq 0 ] && has "$out" 'CARGO_BUILD_RUSTC_WRAPPER is ignored for remote builds' \
+    && has "$out" 'CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER is ignored for remote builds' \
+    && ok "remote builds say when Cargo wrapper environment settings are ignored" || bad "remote builds say when Cargo wrapper environment settings are ignored" "$out"
+out=$("$R" check --config 'build.rustc-wrapper="/unused-wrapper"' --config='build.rustc-workspace-wrapper="/unused-wrapper"' 2>&1); rc=$?
+[ "$rc" -eq 0 ] && has "$out" '--config build.rustc-wrapper is ignored for remote builds' \
+    && has "$out" '--config build.rustc-workspace-wrapper is ignored for remote builds' \
+    && ok "remote builds say when --config compiler wrappers are ignored" || bad "remote builds say when --config compiler wrappers are ignored" "$out"
+mkdir -p "$A/.cargo" "$T/wrapper-cargo-home"
+printf '[build]\nrustc-wrapper = "/unused-wrapper"\n' > "$A/.cargo/config.toml"
+printf '[build]\nrustc-workspace-wrapper = "/unused-wrapper"\n' > "$T/wrapper-cargo-home/config.toml"
+out=$(CARGO_HOME="$T/wrapper-cargo-home" "$R" check 2>&1); rc=$?
+rm -f "$A/.cargo/config.toml"
+[ "$rc" -eq 0 ] && has "$out" "build.rustc-wrapper in $A/.cargo/config.toml is ignored for remote builds" \
+    && has "$out" "build.rustc-workspace-wrapper in $T/wrapper-cargo-home/config.toml is ignored for remote builds" \
+    && ok "remote builds say when project and user config wrappers are ignored" || bad "remote builds say when project and user config wrappers are ignored" "$out"
 out=$("$R" build -Zunstable-options --unit-graph 2>&1); rc=$?
 [ "$rc" -eq 2 ] && grep -Fq 'rargo does not support --unit-graph for remote builds' <<<"$out" \
     && ok "remote builds explicitly reject unit graphs" || bad "remote builds explicitly reject unit graphs" "$out"
