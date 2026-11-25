@@ -1,9 +1,10 @@
 use crate::hash::Hash;
+use crate::io::{self, Notify, UnboundedReceiver, UnboundedSender, oneshot};
 use crate::session_state::{
     Accepted, Answer, ClientSet, Effect, Handshake, Next, Outgoing, Progress, Question, SessionState, Shake, Shook,
     bulk_size,
 };
-use crate::snapshot::{Uploader, futures::BoxFuture};
+use crate::snapshot::Uploader;
 use crate::store::Store;
 use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
@@ -14,9 +15,6 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::{Notify, oneshot};
 
 pub struct Keys {
     open: bool,
@@ -86,7 +84,7 @@ pub struct Session {
     trees_reply: Mutex<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
     env_reply: Mutex<Option<oneshot::Sender<Vec<(String, Option<String>)>>>>,
     report_reply: Mutex<Option<oneshot::Sender<u32>>>,
-    asking: tokio::sync::Mutex<()>,
+    asking: io::Mutex<()>,
     arrivals: Notify,
     window: Notify,
     parts: Mutex<BTreeMap<Digest, (PathBuf, std::fs::File)>>,
@@ -103,7 +101,7 @@ impl Session {
         has: Arc<ClientHas>,
         totals: Arc<crate::build::DaemonStats>,
     ) -> (Arc<Session>, UnboundedReceiver<ServerMsg>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = io::unbounded_channel();
         let s = Arc::new(Session {
             tx,
             has,
@@ -112,7 +110,7 @@ impl Session {
             trees_reply: Mutex::new(None),
             env_reply: Mutex::new(None),
             report_reply: Mutex::new(None),
-            asking: tokio::sync::Mutex::new(()),
+            asking: io::Mutex::new(()),
             arrivals: Notify::new(),
             window: Notify::new(),
             parts: Mutex::new(BTreeMap::new()),
@@ -179,18 +177,15 @@ impl Session {
         }
     }
 
-    async fn send_bulk(&self, m: ServerMsg) -> Result<()> {
+    fn send_bulk(&self, m: ServerMsg) -> Result<()> {
         let bytes = bulk_size(&m);
         loop {
-            let freed = self.window.notified();
-            tokio::pin!(freed);
-            freed.as_mut().enable();
             match self.state.lock().take_bulk(bytes) {
                 Err(_) => return Err(self.gone()),
                 Ok(true) => break,
                 Ok(false) => {}
             }
-            freed.await;
+            self.window.notified();
         }
         self.totals.bytes_out.fetch_add(crate::session_state::bulk_cost(bytes) as u64, Ordering::Relaxed);
         self.tx.send(m).map_err(|_| self.gone())
@@ -215,12 +210,9 @@ impl Session {
     pub fn incoming(&self, msg: ClientMsg) -> Result<()> {
         let step = self.state.lock().client(msg);
         self.totals.bytes_in.fetch_add(step.bytes_in, Ordering::Relaxed);
-        tokio::task::block_in_place(|| -> Result<()> {
-            for e in step.effects {
-                self.carry_out(e)?;
-            }
-            Ok(())
-        })?;
+        for e in step.effects {
+            self.carry_out(e)?;
+        }
         match step.refused {
             Some(why) => bail!("{why}"),
             None => Ok(()),
@@ -283,8 +275,8 @@ impl Session {
         Ok(())
     }
 
-    async fn ask<T>(&self, q: Question, slot: &Mutex<Option<oneshot::Sender<T>>>) -> Result<T> {
-        let _g = self.asking.lock().await;
+    fn ask<T: Send>(&self, q: Question, slot: &Mutex<Option<oneshot::Sender<T>>>) -> Result<T> {
+        let _g = self.asking.lock();
         let (tx, rx) = oneshot::channel();
         *slot.lock() = Some(tx);
         let asked = self.state.lock().ask(q);
@@ -295,21 +287,21 @@ impl Session {
                 return Err(self.gone());
             }
         }
-        rx.await.map_err(|_| self.gone())
+        rx.recv().ok_or_else(|| self.gone())
     }
 
-    pub async fn want_env(&self, names: Vec<String>) -> Result<Vec<(String, Option<String>)>> {
-        self.ask(Question::Env(names), &self.env_reply).await
+    pub fn want_env(&self, names: Vec<String>) -> Result<Vec<(String, Option<String>)>> {
+        self.ask(Question::Env(names), &self.env_reply)
     }
 
-    pub async fn report(&self, report: rargo_proto::FutureReport) -> Result<u32> {
-        self.ask(Question::Report(Box::new(report)), &self.report_reply).await
+    pub fn report(&self, report: rargo_proto::FutureReport) -> Result<u32> {
+        self.ask(Question::Report(Box::new(report)), &self.report_reply)
     }
 
-    pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) -> Result<()> {
+    pub fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) -> Result<()> {
         let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes, targets);
         match out {
-            Some(out) => self.send_out(out).await,
+            Some(out) => self.send_out(out),
             None => Ok(()),
         }
     }
@@ -318,32 +310,30 @@ impl Session {
         self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    pub async fn fetch(&self, id: u64, hashes: Vec<Digest>) -> Result<()> {
+    pub fn fetch(&self, id: u64, hashes: Vec<Digest>) -> Result<()> {
         let found: Vec<(Digest, Option<u64>)> = hashes.into_iter().map(|h| (h, self.store.size_of(&Hash(h)))).collect();
         let out = self.state.lock().fetch(&mut self.has.set.lock(), id, found);
-        self.send_out(out).await
+        self.send_out(out)
     }
 
-    async fn send_out(&self, mut out: Outgoing) -> Result<()> {
+    fn send_out(&self, mut out: Outgoing) -> Result<()> {
         let mut open: Option<OpenBlob> = None;
         let failed = loop {
             match out.step() {
                 Next::Read { hash, at, len, whole } => {
                     let store = self.store.clone();
                     let file = open.take().filter(|(h, _)| *h == hash);
-                    let (o, read) = tokio::task::spawn_blocking(move || {
+                    let (next, read) = io::cpu(move || {
                         let read = read_blob(&store, hash, at, len, whole, file);
-                        let file = match read {
+                        match read {
                             Ok((bytes, file)) => {
                                 out.read(Some(bytes));
-                                Ok(file)
+                                (out, Ok(file))
                             }
-                            Err(e) => Err(e),
-                        };
-                        (out, file)
-                    })
-                    .await?;
-                    out = o;
+                            Err(e) => (out, Err(e)),
+                        }
+                    });
+                    out = next;
                     match read {
                         Ok(file) => open = file,
                         Err(e) => break Err(anyhow::Error::from(e)),
@@ -354,7 +344,7 @@ impl Session {
                     self.send(m);
                 }
                 Next::Bulk(m) => {
-                    if let Err(e) = self.send_bulk(m).await {
+                    if let Err(e) = self.send_bulk(m) {
                         break Err(e);
                     }
                 }
@@ -404,31 +394,26 @@ fn read_blob(
 }
 
 impl Uploader for Session {
-    fn trees<'a>(&'a self, want: Vec<Hash>) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
-        Box::pin(async move { self.ask(Question::Trees(want.iter().map(|h| h.0).collect()), &self.trees_reply).await })
+    fn trees(&self, want: Vec<Hash>) -> Result<Vec<Vec<u8>>> {
+        self.ask(Question::Trees(want.iter().map(|h| h.0).collect()), &self.trees_reply)
     }
 
-    fn blobs<'a>(&'a self, want: Vec<Hash>) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move {
-            let _g = self.asking.lock().await;
-            let digests: Vec<Digest> = want.iter().map(|h| h.0).collect();
-            let ask = self.state.lock().want(&digests, &|d| self.store.has(&Hash(*d)));
-            let wanting = Wanting(self);
-            self.send(ask);
-            loop {
-                let arrived = self.arrivals.notified();
-                tokio::pin!(arrived);
-                arrived.as_mut().enable();
-                match self.state.lock().progress(&|d| self.store.has(&Hash(*d))) {
-                    Progress::Done => break,
-                    Progress::Gone => return Err(self.gone()),
-                    Progress::Wait => {}
-                }
-                arrived.await;
+    fn blobs(&self, want: Vec<Hash>) -> Result<()> {
+        let _g = self.asking.lock();
+        let digests: Vec<Digest> = want.iter().map(|h| h.0).collect();
+        let ask = self.state.lock().want(&digests, &|d| self.store.has(&Hash(*d)));
+        let wanting = Wanting(self);
+        self.send(ask);
+        loop {
+            match self.state.lock().progress(&|d| self.store.has(&Hash(*d))) {
+                Progress::Done => break,
+                Progress::Gone => return Err(self.gone()),
+                Progress::Wait => {}
             }
-            drop(wanting);
-            Ok(())
-        })
+            self.arrivals.notified();
+        }
+        drop(wanting);
+        Ok(())
     }
 }
 
@@ -440,17 +425,14 @@ impl Drop for Wanting<'_> {
     }
 }
 
-pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
-    stream: &mut S,
-    keys: &Keys,
-) -> Result<(String, bool, Sealer, Opener)> {
+pub fn accept(stream: &mut io::TcpStream, keys: &Keys) -> Result<(String, bool, Sealer, Opener)> {
     let (mut hs, mut next) = Handshake::new(secure::MAGIC);
     let mut keys_for = None;
     loop {
         next = match next {
             Shake::Read(n) => {
                 let mut bytes = vec![0; n];
-                stream.read_exact(&mut bytes).await?;
+                stream.read_exact(&mut bytes)?;
                 hs.received(&bytes)
             }
             Shake::Check { user, msg1 } => {
@@ -463,7 +445,7 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
                 }))
             }
             Shake::Reply { write, end } => {
-                let wrote = if write.is_empty() { Ok(()) } else { stream.write_all(&write).await };
+                let wrote = if write.is_empty() { Ok(()) } else { stream.write_all(&write) };
                 return match end {
                     Shook::Accepted { user, admin } => {
                         wrote?;

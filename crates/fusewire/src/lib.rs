@@ -5,7 +5,6 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -234,7 +233,7 @@ pub trait Filesystem: Send + Sync + 'static {
     fn release_in(&self, ctx: &Ctx, nodeid: u64, fh: u64, flags: u32) {
         self.release(nodeid, fh, flags)
     }
-    fn fsync(&self, ctx: &Ctx, nodeid: u64, fh: u64, datasync: bool) -> Res<()> {
+    fn fsync(&self, ctx: &Ctx, nodeid: u64, fh: u64, data_sync: bool) -> Res<()> {
         Ok(())
     }
     fn readdir(
@@ -326,7 +325,7 @@ impl Default for MountOptions {
 }
 
 const MAX_WRITE: u32 = 1 << 20;
-const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
+pub const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
 const _: () = assert!(MAX_WRITE % 4096 == 0);
 const _: () = assert!(MAX_WRITE / 4096 <= u16::MAX as u32);
 const _: () = assert!(BUF_SIZE % 8 == 0);
@@ -487,33 +486,8 @@ impl Session {
         &self.mountpoint
     }
 
-    pub fn spawn_workers<F: Filesystem>(
-        self: &Arc<Self>,
-        fs: Arc<F>,
-        threads: usize,
-    ) -> io::Result<Vec<std::thread::JoinHandle<()>>> {
-        let mut handles = Vec::new();
-        for i in 0..threads.max(1) {
-            let fd = self.clone_dev()?;
-            let fs = fs.clone();
-            let sess = self.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("fuse-{i}"))
-                .spawn(move || worker(sess, fd, fs))?;
-            handles.push(h);
-        }
-        assert_eq!(handles.len(), threads.max(1));
-        Ok(handles)
-    }
-
-    fn clone_dev(&self) -> io::Result<OwnedFd> {
-        let fd = open_dev()?;
-        let master: u32 = self.dev.as_raw_fd() as u32;
-        let r = unsafe { libc::ioctl(fd.as_raw_fd(), FUSE_DEV_IOC_CLONE as libc::Ioctl, &master as *const u32) };
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(fd)
+    pub fn device_fd(&self) -> RawFd {
+        self.dev.as_raw_fd()
     }
 
     pub fn carry(&self, effect: &Effect) -> io::Result<i32> {
@@ -844,46 +818,71 @@ fn open_out(o: &Opened) -> fuse_open_out {
     fuse_open_out { fh: o.fh, open_flags: o.flags, backing_id: o.backing_id }
 }
 
-fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
-    let fd = dev.as_raw_fd();
-    let mut storage = vec![0u64; BUF_SIZE / 8];
-    let mut handler = RequestHandler::new(sess.caps.max_write);
-    loop {
-        let n = unsafe { libc::read(fd, storage.as_mut_ptr() as *mut libc::c_void, BUF_SIZE) };
-        if n == 0 {
-            sess.connected.store(false, Ordering::SeqCst);
-            break;
-        }
-        if n < 0 {
-            match io::Error::last_os_error().raw_os_error() {
-                Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::ENOENT) => continue,
-                _ => {
-                    sess.connected.store(false, Ordering::SeqCst);
+impl Session {
+    pub fn serve<F, R, W>(&self, fs: &F, mut read: R, mut write: W)
+    where
+        F: Filesystem,
+        R: FnMut(&mut [u8]) -> io::Result<usize>,
+        W: FnMut(&[u8]) -> io::Result<()>,
+    {
+        let mut storage = vec![0u64; BUF_SIZE / 8];
+        let mut handler = self.handler();
+        loop {
+            let buf = unsafe {
+                std::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, BUF_SIZE)
+            };
+            let n = match read(buf) {
+                Ok(0) => {
+                    self.ended();
                     break;
                 }
+                Ok(n) => n,
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EINTR | libc::EAGAIN | libc::ENOENT)) => continue,
+                Err(_) => {
+                    self.ended();
+                    break;
+                }
+            };
+            assert!(n <= BUF_SIZE);
+            let request = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
+            if !self.respond(&mut handler, fs, request, &mut write) {
+                return;
             }
         }
-        let n = n as usize;
-        assert!(n <= BUF_SIZE);
-        let buf = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
-        let mut handled = handler.handle(&*fs, buf);
+    }
+
+    pub fn handler(&self) -> RequestHandler {
+        RequestHandler::new(self.caps.max_write)
+    }
+
+    pub fn ended(&self) {
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    pub fn respond<F, W>(&self, handler: &mut RequestHandler, fs: &F, request: &[u8], mut write: W) -> bool
+    where
+        F: Filesystem,
+        W: FnMut(&[u8]) -> io::Result<()>,
+    {
+        let mut handled = handler.handle(fs, request);
         loop {
             let mut registered = None;
             for effect in std::mem::take(&mut handled.effects) {
-                let done = sess.carry(&effect);
+                let done = self.carry(&effect);
                 if let Effect::Register { token, .. } = effect {
                     registered = Some((token, done.map_err(Errno::from)));
                 }
             }
-            if !handled.bytes.is_empty() {
-                unsafe { libc::write(fd, handled.bytes.as_ptr().cast(), handled.bytes.len()) };
+            if !handled.bytes.is_empty() && write(handled.bytes).is_err() {
+                self.ended();
+                return false;
             }
             if handled.destroyed {
-                sess.connected.store(false, Ordering::SeqCst);
-                return;
+                self.ended();
+                return false;
             }
-            let Some((token, id)) = registered else { break };
-            handled = handler.registered(&*fs, token, id);
+            let Some((token, id)) = registered else { return true };
+            handled = handler.registered(fs, token, id);
         }
     }
 }
@@ -892,7 +891,7 @@ pub struct RequestHandler {
     scratch: Vec<u8>,
     reply: Vec<u8>,
     max_write: u32,
-    awaiting: Option<Awaiting>,
+    pending: Option<Awaiting>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -912,11 +911,11 @@ pub struct Handled<'a> {
 
 impl RequestHandler {
     pub fn new(max_write: u32) -> Self {
-        Self { scratch: Vec::new(), reply: Vec::new(), max_write, awaiting: None }
+        Self { scratch: Vec::new(), reply: Vec::new(), max_write, pending: None }
     }
 
     pub fn handle<F: Filesystem>(&mut self, fs: &F, request: &[u8]) -> Handled<'_> {
-        assert!(self.awaiting.is_none(), "a registration is carried out before the next request");
+        assert!(self.pending.is_none(), "a registration is carried out before the next request");
         self.reply.clear();
         let Some(hdr) = read_struct::<fuse_in_header>(request) else {
             return Handled { bytes: &self.reply, effects: Vec::new(), destroyed: false };
@@ -938,13 +937,13 @@ impl RequestHandler {
             encode_reply(&mut self.reply, hdr.unique, 0, &[]);
         } else {
             let body = &request[std::mem::size_of::<fuse_in_header>()..];
-            let mut call = Call { reply: &mut self.reply, out: &mut self.scratch, max_write: self.max_write, awaiting: None };
+            let mut call = Call { reply: &mut self.reply, out: &mut self.scratch, max_write: self.max_write, pending: None };
             dispatch(fs, &ctx, &mut call, &hdr, body);
-            self.awaiting = call.awaiting;
+            self.pending = call.pending;
         }
         let mut effects = effects.take();
         let registrations = effects.iter().filter(|e| matches!(e, Effect::Register { .. })).count();
-        match self.awaiting {
+        match self.pending {
             Some(a) => {
                 assert_eq!(registrations, 1, "an open awaits exactly one registration");
                 assert!(effects.iter().any(|e| matches!(e, Effect::Register { token, .. } if *token == a.token)));
@@ -955,7 +954,7 @@ impl RequestHandler {
     }
 
     pub fn registered<F: Filesystem>(&mut self, fs: &F, token: u64, id: Res<i32>) -> Handled<'_> {
-        let a = self.awaiting.take().expect("a registration answers an open that awaits it");
+        let a = self.pending.take().expect("a registration answers an open that awaits it");
         assert_eq!(a.token, token, "the registration is the one the open asked for");
         self.reply.clear();
         let effects = Effects::default();
@@ -973,12 +972,12 @@ impl RequestHandler {
         Handled { bytes: &self.reply, effects, destroyed: false }
     }
 
-    pub fn awaiting(&self) -> bool {
-        self.awaiting.is_some()
+    pub fn pending(&self) -> bool {
+        self.pending.is_some()
     }
 
     pub fn invariants(&self) {
-        if self.awaiting.is_some() {
+        if self.pending.is_some() {
             assert!(self.reply.is_empty(), "an open that awaits its registration has not been answered");
         }
         if !self.reply.is_empty() {
@@ -993,7 +992,7 @@ struct Call<'a> {
     reply: &'a mut Vec<u8>,
     out: &'a mut Vec<u8>,
     max_write: u32,
-    awaiting: Option<Awaiting>,
+    pending: Option<Awaiting>,
 }
 
 impl Call<'_> {
@@ -1004,7 +1003,7 @@ impl Call<'_> {
         });
         match asked {
             Some(token) => {
-                self.awaiting =
+                self.pending =
                     Some(Awaiting { unique: hdr.unique, token, ctx: (ctx.uid, ctx.gid, ctx.pid), entry });
             }
             None => match entry {
@@ -1524,7 +1523,7 @@ mod request_tests {
         let handled = h.registered(fs, token, id);
         let out = (handled.bytes.to_vec(), handled.effects);
         h.invariants();
-        assert!(!h.awaiting());
+        assert!(!h.pending());
         out
     }
 
@@ -1600,7 +1599,7 @@ mod request_tests {
         let mut waiting = RequestHandler::new(MAX_WRITE);
         let open = frame(FUSE_OPEN, 52, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
         let (bytes, effects) = checked(&mut waiting, &fs, &open);
-        assert!(bytes.is_empty() && waiting.awaiting(), "the open waits for its registration");
+        assert!(bytes.is_empty() && waiting.pending(), "the open waits for its registration");
         assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 70 }]);
         let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_INTERRUPT, 53, 0, &52u64.to_ne_bytes()));
         assert!(bytes.is_empty() && effects.is_empty(), "an interrupt of a request in flight on another worker");
@@ -1619,7 +1618,7 @@ mod request_tests {
         h.invariants();
         let open = |u| frame(FUSE_OPEN, u, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
         let (bytes, effects) = checked(&mut h, &fs, &open(10));
-        assert!(bytes.is_empty() && h.awaiting());
+        assert!(bytes.is_empty() && h.pending());
         assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 70 }]);
         let (bytes, effects) = after_registration(&mut h, &fs, 70, Ok(5));
         assert_eq!((bytes, effects), (opened_reply(10, 70, FOPEN_PASSTHROUGH, 5), Vec::new()));
@@ -1643,7 +1642,7 @@ mod request_tests {
 
         let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_OPEN, 14, 9, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 })));
         assert_eq!(bytes, answer(14, -libc::EACCES, &[]));
-        assert!(effects.is_empty() && !h.awaiting(), "a failed open's registration is dropped");
+        assert!(effects.is_empty() && !h.pending(), "a failed open's registration is dropped");
 
         let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_UNLINK, 15, 1, b"file\0"));
         assert_eq!(bytes, answer(15, 0, &[]));
@@ -1767,7 +1766,7 @@ mod request_tests {
                         assert!(bytes.is_empty() && effects.is_empty(), "seed {seed} step {step}");
                     }
                 }
-                assert!(!h.awaiting(), "seed {seed} step {step}");
+                assert!(!h.pending(), "seed {seed} step {step}");
             }
             assert_eq!(*fs.forgotten.lock().unwrap(), model.forgotten, "seed {seed}");
             assert_eq!(*fs.released.lock().unwrap(), model.released, "seed {seed}");
@@ -1845,7 +1844,7 @@ mod request_tests {
                 if hdr.is_none_or(|hdr| hdr.unique == 0) {
                     assert!(bytes.is_empty() && effects.is_empty(), "seed {seed} step {step}: nothing to answer");
                 }
-                if h.awaiting() {
+                if h.pending() {
                     let [Effect::Register { token, .. }] = effects.as_slice() else { panic!("seed {seed}: {effects:?}") };
                     after_registration(&mut h, &fs, *token, Ok(1 + step));
                 }

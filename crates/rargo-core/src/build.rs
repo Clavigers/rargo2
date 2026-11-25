@@ -2,6 +2,7 @@ use crate::buildview::*;
 use crate::engine::*;
 use crate::expand::{self, EnvRule, Scripts};
 use crate::hash::Hash;
+use crate::io::watch;
 use crate::parse::Parser;
 use crate::present::*;
 use crate::proto::{Delivery, ExecRequest, Write};
@@ -21,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-use tokio::sync::watch;
 
 mod nextest;
 mod pure;
@@ -71,7 +71,7 @@ pub struct Daemon {
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
-    fetching: tokio::sync::Mutex<()>,
+    fetching: crate::io::Mutex<()>,
     scratch_seq: AtomicU64,
     pub stats: Arc<DaemonStats>,
 }
@@ -117,10 +117,10 @@ impl Client {
         q.2.extend(self.targets.iter().cloned());
     }
 
-    pub async fn flush(&self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         let (files, writes, targets) = std::mem::take(&mut *self.outbox.lock());
         match &self.session {
-            Some(s) => s.deliver(files, writes, targets.into_iter().collect()).await,
+            Some(s) => s.deliver(files, writes, targets.into_iter().collect()),
             None => Ok(()),
         }
     }
@@ -243,7 +243,7 @@ impl Daemon {
         let trees = Trees::new(engine.store.clone());
         Daemon {
             trees,
-            fetching: tokio::sync::Mutex::new(()),
+            fetching: crate::io::Mutex::new(()),
             scratch_seq: AtomicU64::new(0),
             incr,
             pool: OnceLock::new(),
@@ -377,19 +377,19 @@ impl Daemon {
     }
 }
 
-pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
+pub fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
     let _hold = crate::nixmanifest::hold_build();
     d.stats.requests.fetch_add(1, Ordering::Relaxed);
     let c = Arc::new(c);
     if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {
-        let result = match nextest::run(&d, &c).await {
+        let result = match nextest::run(&d, &c) {
             Ok(code) => code,
             Err(e) => {
                 c.out.error(&format!("{e:#}"));
                 101
             }
         };
-        if let Err(e) = c.flush().await {
+        if let Err(e) = c.flush() {
             c.out.error(&format!("delivering results: {e:#}"));
             return Ok(101);
         }
@@ -397,7 +397,7 @@ pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
     }
     let mut result = Ok(101);
     for attempt in 0..3 {
-        match run_request(&d, &c, None).await {
+        match run_request(&d, &c, None) {
             Ok(Finish::Code(code)) => result = Ok(code),
             Ok(Finish::Exec(e)) => result = Err(e),
             Ok(Finish::Retry) if attempt < 2 => {
@@ -409,7 +409,7 @@ pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
         }
         break;
     }
-    if let Err(e) = c.flush().await {
+    if let Err(e) = c.flush() {
         c.out.error(&format!("delivering results: {e:#}"));
         return Ok(101);
     }
@@ -447,7 +447,7 @@ struct Prepared {
     env: BTreeMap<String, String>,
 }
 
-async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
+fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
     let dir = c.policy_dir()?;
     let policy = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
     let generation = d.memo.advance();
@@ -460,8 +460,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
         }
     }
     let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
-    let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
-        .await?
+    let flake = crate::io::cpu(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
         .context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")?;
     let mut links = Vec::new();
     for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
@@ -525,11 +524,11 @@ enum PlanOutcome {
     Failed { stderr: Vec<u8>, stdout: Vec<u8>, code: i32 },
 }
 
-async fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -> Result<PlanOutcome> {
-    plan_with(d, c, p, args, &[]).await
+fn plan(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String]) -> Result<PlanOutcome> {
+    plan_with(d, c, p, args, &[])
 }
 
-async fn plan_with(
+fn plan_with(
     d: &Arc<Daemon>,
     c: &Arc<Client>,
     p: &Prepared,
@@ -580,8 +579,7 @@ async fn plan_with(
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(PlanObserver { client: c.clone() }),
-        })
-        .await?;
+        })?;
     let r = &outcome.result;
     let stderr = d.store().read(&r.stderr)?;
     if !r.success() {
@@ -612,7 +610,7 @@ async fn plan_with(
     Ok(PlanOutcome::Ok(Planned { data, stderr }))
 }
 
-async fn fetch(
+fn fetch(
     d: &Arc<Daemon>,
     c: &Arc<Client>,
     p: &Prepared,
@@ -648,7 +646,7 @@ async fn fetch(
             _ => {}
         }
     }
-    let _one_at_a_time = d.fetching.lock().await;
+    let _one_at_a_time = d.fetching.lock();
     let planner = d.cfg.planner.clone();
     let cwd = PathBuf::from(format!("{scratch_s}{}", &p.sandbox_cwd[2..]));
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
@@ -658,7 +656,7 @@ async fn fetch(
     env.insert("CARGO_HOME".into(), c.home.dir.to_string_lossy().into_owned());
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
-    let out = tokio::task::spawn_blocking(move || -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
+    let out = crate::io::cpu(move || -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
         snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         let run = |program: &Path, args: &[String]| {
@@ -678,8 +676,7 @@ async fn fetch(
             return Ok(Ok(None));
         }
         Ok(Ok(Some(run(&planner, &fetch_args)?)))
-    })
-    .await?;
+    });
     let out = match out {
         Ok(Ok(Some(o))) => o,
         Ok(Err(said)) => {
@@ -751,14 +748,14 @@ fn add_components(
     Ok(())
 }
 
-async fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, String)>) -> Result<bool> {
-    let _one_at_a_time = d.fetching.lock().await;
+fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, String)>) -> Result<bool> {
+    let _one_at_a_time = d.fetching.lock();
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
     for (k, v) in base_env(&d.cfg.server_env, &c.env.to_map()) {
         env.insert(k, v);
     }
     let (uid, gid) = (c.uid, c.gid);
-    let added = tokio::task::spawn_blocking(move || {
+    let added = crate::io::cpu(move || {
         use std::os::unix::process::CommandExt;
         let run = |program: &Path, args: &[String]| {
             let mut cmd = std::process::Command::new(program);
@@ -770,8 +767,7 @@ async fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String
             cmd.output()
         };
         add_components(&components, &run)
-    })
-    .await?;
+    });
     Ok(match added {
         Ok(()) => true,
         Err(said) => {
@@ -828,7 +824,7 @@ struct Built {
     cargo_override: Option<String>,
 }
 
-async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
+fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
     let started = Instant::now();
     let mut args: Vec<String> = c.args.clone();
     let mut no_cache_tests = false;
@@ -837,9 +833,9 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         no_cache_tests = true;
     }
 
-    let env_known = {
+    let mut env_known = {
         let (env, names) = (c.env.clone(), d.engine.traces.every_env_name());
-        tokio::spawn(async move { env.ensure(&names).await })
+        crate::io::spawn(move || env.ensure(&names))
     };
     let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
     let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").as_deref() == Some("1"));
@@ -858,7 +854,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         let next = match effect {
             Effect::Prepare => {
                 let first = prepared.is_none();
-                prepared = Some(prepare(d, c, snapshot.clone()).await?);
+                prepared = Some(prepare(d, c, snapshot.clone())?);
                 if first {
                     phase(started, c, "worktree prepared");
                     remember_client(d, c)?;
@@ -871,7 +867,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
                 if let (Some(i), true) = (check_at, as_build) {
                     plan_args[i] = "build".into();
                 }
-                match plan(d, c, p, &plan_args).await? {
+                match plan(d, c, p, &plan_args)? {
                     PlanOutcome::Ok(pl) => {
                         let plan = &pl.data.plan;
                         let fx = req.lock().planned(plan.rustc_fork, plan.units.len(), plan.keep_going);
@@ -891,7 +887,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
             }
             Effect::Fetch { components, offline } => {
                 let p = prepared.as_ref().expect("a fetch follows a prepared worktree");
-                let got = fetch(d, c, p, &args, components, offline).await?;
+                let got = fetch(d, c, p, &args, components, offline)?;
                 let ok = got.is_some();
                 if let Some(s) = got {
                     snapshot = s;
@@ -919,7 +915,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
     let as_build = req.lock().as_build();
     let pd = planned.data;
     let plan = &pd.plan;
-    env_known.await.map_err(|e| anyhow!("asking the client for its environment: {e}"))??;
+    env_known.join().map_err(|e| anyhow!("asking the client for its environment: {e}"))??;
     phase(started, c, "planned");
 
     for dir in [&plan.target_dir, &plan.build_dir] {
@@ -999,7 +995,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         });
     }
 
-    struct Units(Vec<tokio::task::JoinHandle<()>>);
+    struct Units(Vec<crate::io::JoinHandle<()>>);
     impl Drop for Units {
         fn drop(&mut self) {
             for t in &self.0 {
@@ -1010,8 +1006,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
     let mut tasks = Units(Vec::with_capacity(n));
     for i in 0..n {
         let r = run.clone();
-        tasks.0.push(tokio::spawn(async move {
-            let st = match r.exec_unit(i).await {
+        tasks.0.push(crate::io::spawn(move || {
+            let st = match r.exec_unit(i) {
                 Ok(st) => st,
                 Err(e) => {
                     r.c.out.error(&format!("{}: {e:#}", r.pd.plan.units[i].desc));
@@ -1029,7 +1025,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         }));
     }
     for t in tasks.0.iter_mut() {
-        t.await.context("a unit task panicked")?;
+        t.join().map_err(|e| anyhow!("a unit task panicked: {e}"))?;
     }
     let (ok, after) = req.lock().units_ended();
     if after == [Effect::End(End::Retry)] {
@@ -1112,7 +1108,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
             let map: BTreeMap<usize, (&str, &str)> =
                 unused.iter().map(|(i, l)| (*i, (plan.units[*i].desc.as_str(), l.as_str()))).collect();
             let json = serde_json::to_string(&map)?;
-            if let PlanOutcome::Ok(lint) = plan_with(d, c, &p, &plan_args, &rp::split_env(rp::UNUSED_ENV, &json)).await? {
+            if let PlanOutcome::Ok(lint) = plan_with(d, c, &p, &plan_args, &rp::split_env(rp::UNUSED_ENV, &json))? {
                 let before = String::from_utf8_lossy(&planned.stderr).into_owned();
                 let after = String::from_utf8_lossy(&lint.stderr).into_owned();
                 let new = match after.strip_prefix(before.as_str()) {
@@ -1127,7 +1123,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         }
     }
     phase(started, c, "units answered");
-    let incompat = run.future_incompat_summary().await?;
+    let incompat = run.future_incompat_summary()?;
     let finished = || {
         c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
         for (kind, text) in &incompat {
@@ -1151,7 +1147,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
     phase(started, c, "results listed for the client");
     finished();
 
-    let done = run.steps().await;
+    let done = run.steps();
     phase(started, c, "done");
     if let Ok(Finish::Code(code)) = &done {
         req.lock().delivered(*code);
@@ -1297,7 +1293,7 @@ impl Run {
         self.need.as_ref().is_some_and(|n| n[i] == LEVEL_META) && u.kind == rp::UnitKind::Compile && u.cmd.is_some()
     }
 
-    async fn wait_dep(&self, dep: &rp::Dep) -> bool {
+    fn wait_dep(&self, dep: &rp::Dep) -> bool {
         let j = dep.unit as usize;
         let meta_ok = dep.only_rmeta && (self.plan().units[j].rmeta_early || self.meta_only(j));
         let mut rx = self.states[j].subscribe();
@@ -1308,7 +1304,7 @@ impl Run {
                 Go::Skip => return false,
                 Go::Wait => {}
             }
-            if rx.changed().await.is_err() {
+            if rx.changed().is_err() {
                 return false;
             }
         }
@@ -1362,7 +1358,7 @@ impl Run {
         self.c.commits.iter().position(|c| c == commit)
     }
 
-    async fn exec_unit(self: &Arc<Self>, i: usize) -> Result<UState> {
+    fn exec_unit(self: &Arc<Self>, i: usize) -> Result<UState> {
         let plan = self.plan();
         let u = &plan.units[i];
         if self.need.as_ref().is_some_and(|n| n[i] == LEVEL_NONE) {
@@ -1373,14 +1369,14 @@ impl Run {
             let levels = self.pd.meta_levels(i);
             for (j, lv) in levels.iter().enumerate() {
                 if *lv != LEVEL_NONE
-                    && !self.wait_dep(&rp::Dep { unit: j as u32, only_rmeta: *lv == LEVEL_META }).await
+                    && !self.wait_dep(&rp::Dep { unit: j as u32, only_rmeta: *lv == LEVEL_META })
                 {
                     return Ok(UState::Skipped);
                 }
             }
         } else {
             for dep in &u.deps {
-                if !self.wait_dep(dep).await {
+                if !self.wait_dep(dep) {
                     return Ok(UState::Skipped);
                 }
             }
@@ -1391,8 +1387,12 @@ impl Run {
             let before = &self.pd.facts.doc_order[..pos];
             if let Some(&prev) = before.iter().rev().find(|&&j| self.pd.facts.doc_dir[j] == self.pd.facts.doc_dir[i]) {
                 let mut rx = self.states[prev].subscribe();
-                while matches!(*rx.borrow_and_update(), UState::Pending | UState::Meta) {
-                    if rx.changed().await.is_err() {
+                loop {
+                    rx.borrow_and_update();
+                    if !matches!(self.req.lock().dep(prev, false), Go::Wait) {
+                        break;
+                    }
+                    if rx.changed().is_err() {
                         break;
                     }
                 }
@@ -1401,7 +1401,7 @@ impl Run {
         if u.needs_objects && !meta_only {
             let levels = self.pd.levels(i);
             for (j, lv) in levels.iter().enumerate() {
-                if *lv == LEVEL_FULL && !self.wait_dep(&rp::Dep { unit: j as u32, only_rmeta: false }).await {
+                if *lv == LEVEL_FULL && !self.wait_dep(&rp::Dep { unit: j as u32, only_rmeta: false }) {
                     return Ok(UState::Skipped);
                 }
             }
@@ -1563,8 +1563,7 @@ impl Run {
                         shown: display_cmd(&cmd.program, &args),
                         pending: Mutex::new(Vec::new()),
                     }),
-                })
-                .await;
+                });
             let outcome = match outcome {
                 Err(e) if e.downcast_ref::<crate::engine::SeedLost>().is_some() && seed.is_some() => {
                     if let Some(lost) = seed.take() {
@@ -1587,7 +1586,7 @@ impl Run {
                 let stderr = self.d.store().read(&r.stderr).unwrap_or_default();
                 let on_failure = self.req.lock().unit_failed(i, &stderr);
                 if let OnFailure::Install(missing) = on_failure {
-                    let added = add_components_for(&self.d, &self.c, missing).await?;
+                    let added = add_components_for(&self.d, &self.c, missing)?;
                     if self.req.lock().components_installed(i, added) {
                         self.base.renew();
                         continue;
@@ -1621,8 +1620,7 @@ impl Run {
                     cacheable: Arc::new(|_| false),
                     declared_env: Arc::new(|_, _| Vec::new()),
                     observer: Arc::new(NullObserver),
-                })
-                .await?;
+                })?;
             self.verified.fetch_add(1, Ordering::Relaxed);
             let (a, b) = (&outcome.result.outputs.entries, &clean.result.outputs.entries);
             if !clean.result.success() {
@@ -1795,7 +1793,7 @@ impl Run {
             }
         }
         if u.kind == rp::UnitKind::RunScript {
-            if !self.finish_script(i, &r).await? {
+            if !self.finish_script(i, &r)? {
                 return Ok(UState::Failed);
             }
         }
@@ -1830,13 +1828,13 @@ impl Run {
         Ok(UState::Done)
     }
 
-    async fn finish_script(self: &Arc<Self>, i: usize, r: &ActionResult) -> Result<bool> {
+    fn finish_script(self: &Arc<Self>, i: usize, r: &ActionResult) -> Result<bool> {
         let u = &self.plan().units[i];
         let Some(s) = u.script.clone() else { return Ok(true) };
         let stdout = self.d.store().read(&r.stdout)?;
         let d = self.d.clone();
         let s2 = s.clone();
-        let parsed = tokio::task::spawn_blocking(move || d.parser.parse(&s2, &stdout)).await?;
+        let parsed = crate::io::cpu(move || d.parser.parse(&s2, &stdout));
         let o = match &*parsed {
             Ok(o) => o.clone(),
             Err(msg) => {
@@ -1936,7 +1934,7 @@ impl Run {
         self.c.out.status("Timing", &format!("report saved to {dated}"));
     }
 
-    async fn future_incompat_summary(&self) -> Result<Vec<(char, String)>> {
+    fn future_incompat_summary(&self) -> Result<Vec<(char, String)>> {
         let plan = self.plan();
         let reports = std::mem::take(&mut self.ui.lock().future_incompat);
         if reports.is_empty() {
@@ -2010,8 +2008,7 @@ impl Run {
                 path: tr.path(&format!("{}/.future-incompat-report.json", plan.build_dir)),
                 per_package: per_package.into_iter().collect(),
                 suggestion,
-            })
-            .await?;
+            })?;
         if plan.future_incompat_report {
             for s in &suggestions {
                 out.push(('h', s.replace(rargo_proto::REPORT_ID, &id.to_string())));
@@ -2460,7 +2457,7 @@ impl Run {
         self.c.deliver(files, writes);
     }
 
-    async fn steps(self: &Arc<Self>) -> Result<Finish> {
+    fn steps(self: &Arc<Self>) -> Result<Finish> {
         let plan = self.plan();
         let out = &self.c.out;
         let mut failed: Vec<String> = Vec::new();
@@ -2552,8 +2549,7 @@ impl Run {
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
-                        })
-                        .await?;
+                        })?;
                     let r = &outcome.result;
                     if r.success() {
                         self.apply_worktree_writes(&r.outputs);

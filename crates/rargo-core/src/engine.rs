@@ -6,14 +6,14 @@ use crate::sched::{Priority, Scheduler};
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
+use crate::io;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::AsyncReadExt;
 
 pub trait Observer: Send + Sync {
     fn miss(&self) {}
@@ -45,14 +45,7 @@ impl Live for LiveCtl<'_> {
     }
 }
 
-pub type EnvAsker = Arc<
-    dyn Fn(
-            Vec<String>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<(String, Option<String>)>>> + Send>>
-        + Send
-        + Sync,
->;
+pub type EnvAsker = Arc<dyn Fn(Vec<String>) -> Result<Vec<(String, Option<String>)>> + Send + Sync>;
 
 pub struct ClientEnv {
     vars: parking_lot::RwLock<HashMap<String, String>>,
@@ -81,7 +74,7 @@ impl ClientEnv {
         self.vars.read().clone()
     }
 
-    pub async fn ensure(&self, names: &[String]) -> Result<()> {
+    pub fn ensure(&self, names: &[String]) -> Result<()> {
         let Some(asker) = &self.asker else { return Ok(()) };
         let unknown: Vec<String> = {
             let (vars, checked) = (self.vars.read(), self.checked.read());
@@ -94,7 +87,7 @@ impl ClientEnv {
         if unknown.is_empty() {
             return Ok(());
         }
-        let answers = asker(unknown.clone()).await?;
+        let answers = asker(unknown.clone())?;
         let (mut vars, mut checked) = (self.vars.write(), self.checked.write());
         for (name, value) in answers {
             if let Some(v) = value {
@@ -136,25 +129,15 @@ pub trait RemoteRunner: Send + Sync {
 
     fn offer_state(&self, _whose: (Hash, String), _blobs: Arc<Vec<(Hash, u64)>>) {}
 
-    fn bring_home<'a>(
-        &'a self,
-        blobs: &'a [Hash],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+    fn bring_home(&self, blobs: &[Hash]) -> Result<()>;
 
-    fn try_run<'a>(
-        &'a self,
-        engine: &'a Engine,
-        spec: &'a ActionSpec,
-        key: &'a Hash,
-        req: &'a Request,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Option<Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>>,
-                > + Send
-                + 'a,
-        >,
-    >;
+    fn try_run(
+        &self,
+        engine: &Engine,
+        spec: &ActionSpec,
+        key: &Hash,
+        req: &Request,
+    ) -> Option<Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>>;
 }
 
 pub struct Outcome {
@@ -186,7 +169,7 @@ pub struct Engine {
     pub traces: TraceCache,
     pub sched: Arc<Scheduler>,
     actions: Mutex<ActionTable>,
-    flight_ended: tokio::sync::Notify,
+    flight_ended: io::watch::Sender<()>,
     seq: AtomicU64,
     avg_wall_us: AtomicU64,
     profiles: dashmap::DashMap<Vec<u8>, Arc<Trace>>,
@@ -220,7 +203,7 @@ impl Drop for Requester<'_> {
     fn drop(&mut self) {
         let woke = self.engine.actions.lock().cancel(self.id);
         if !woke.is_empty() {
-            self.engine.flight_ended.notify_waiters();
+            let _ = self.engine.flight_signal().send_replace(());
         }
     }
 }
@@ -253,7 +236,9 @@ impl Drop for Teardown {
             }
             if let Some(r) = running {
                 zygote.kill(r.id);
-                let _ = r.done.blocking_recv();
+                if let Some(rx) = r.done {
+                    let _ = io::call(|| rx.recv());
+                }
             }
             if held > 0 {
                 sched.restore(held);
@@ -301,13 +286,52 @@ fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
-fn async_reader(fd: OwnedFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
-    use std::os::fd::AsRawFd;
-    unsafe {
-        let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+fn read_pipe(fd: &OwnedFd) -> std::io::Result<Vec<u8>> {
+    io::read_at(fd.as_raw_fd(), 0, 64 * 1024)
+}
+
+#[derive(Clone, Copy)]
+struct ObsPtr(*const dyn Observer);
+
+unsafe impl Send for ObsPtr {}
+
+fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
+    let mut all = Vec::new();
+    loop {
+        let buf = match read_pipe(&fd) {
+            Ok(buf) if !buf.is_empty() => buf,
+            _ => break,
+        };
+        unsafe { (&*obs.0).stdout(&buf) };
+        all.extend_from_slice(&buf);
     }
-    tokio::net::unix::pipe::Receiver::from_owned_fd(fd)
+    all
+}
+
+fn read_stderr(fd: OwnedFd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut at = 0usize;
+    loop {
+        let buf = match read_pipe(&fd) {
+            Ok(buf) if !buf.is_empty() => buf,
+            _ => break,
+        };
+        all.extend_from_slice(&buf);
+        while let Some(i) = all[at..].iter().position(|&c| c == b'\n') {
+            let line = &all[at..at + i];
+            if !line.is_empty() {
+                let live = LiveCtl { action: &action, store: &store };
+                unsafe { (&*obs.0).stderr_line(line, Some(&live)) };
+            }
+            at += i + 1;
+            assert!(at <= all.len());
+        }
+    }
+    if at < all.len() {
+        let live = LiveCtl { action: &action, store: &store };
+        unsafe { (&*obs.0).stderr_line(&all[at..], Some(&live)) };
+    }
+    all
 }
 
 impl Engine {
@@ -330,7 +354,7 @@ impl Engine {
             traces,
             sched,
             actions: Mutex::new(ActionTable::new()),
-            flight_ended: tokio::sync::Notify::new(),
+            flight_ended: io::watch::channel(()).0,
             seq: AtomicU64::new(1),
             avg_wall_us: AtomicU64::new(0),
             profiles: dashmap::DashMap::new(),
@@ -458,12 +482,16 @@ impl Engine {
         if eff.env.len() == spec.env.len() { base_key } else { eff.weak_key() }
     }
 
-    pub async fn obtain(&self, req: Request) -> Result<Outcome> {
+    fn flight_signal(&self) -> &io::watch::Sender<()> {
+        &self.flight_ended
+    }
+
+    pub fn obtain(&self, req: Request) -> Result<Outcome> {
         let id = self.actions.lock().begin();
         let _requester = Requester { engine: self, id };
         let mut announced = false;
         loop {
-            req.client_env.ensure(&self.traces.needs_env(&req.spec.weak_key())).await?;
+            req.client_env.ensure(&self.traces.needs_env(&req.spec.weak_key()))?;
             let (spec, base_key) = self.effective_spec(&req.spec, &req.client_env);
             let key = if spec.env.len() == req.spec.env.len() { base_key } else { spec.weak_key() };
 
@@ -485,16 +513,15 @@ impl Engine {
                 }
                 Start::Join => {
                     self.stats.joined.fetch_add(1, Ordering::Relaxed);
+                    let mut ended = self.flight_signal().subscribe();
                     loop {
-                        let ended = self.flight_ended.notified();
-                        tokio::pin!(ended);
-                        ended.as_mut().enable();
+                        ended.borrow_and_update();
                         match self.actions.lock().woken(id) {
                             Woken::Waiting => {}
                             Woken::Retry => break,
                             Woken::Fail(why) => bail!("{why}"),
                         }
-                        ended.await;
+                        let _ = ended.changed();
                     }
                     continue;
                 }
@@ -506,7 +533,7 @@ impl Engine {
             }
 
             let (result, obs, side) = loop {
-                let (result, obs, tainted, side) = match self.run(&spec, &req).await {
+                let (result, obs, tainted, side) = match self.run(&spec, &req) {
                     Ok(v) => v,
                     Err(e) => {
                         let why = if let Some(t) = e.downcast_ref::<ActionTimedOut>() {
@@ -517,7 +544,7 @@ impl Engine {
                             Failure::Error
                         };
                         self.actions.lock().failed(id, why);
-                        self.flight_ended.notify_waiters();
+                        let _ = self.flight_signal().send_replace(());
                         return Err(e);
                     }
                 };
@@ -550,12 +577,12 @@ impl Engine {
                 }
             }
             self.actions.lock().settled(id);
-            self.flight_ended.notify_waiters();
+            let _ = self.flight_signal().send_replace(());
 
             let declared = (req.declared_env)(&result, &self.store);
             if !declared.is_empty() {
                 let added = self.traces.add_needs_env(&base_key, &declared);
-                req.client_env.ensure(&added).await?;
+                req.client_env.ensure(&added)?;
                 let relevant =
                     added.iter().any(|v| !spec.env.contains_key(v.as_bytes()) && req.client_env.contains_key(v));
                 if relevant {
@@ -575,23 +602,23 @@ impl Engine {
         }
     }
 
-    async fn run(
+    fn run(
         &self,
         spec: &ActionSpec,
         req: &Request,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         let key = spec.weak_key();
         if let Some(remote) = self.remote.get() {
-            if let Some(r) = remote.try_run(self, spec, &key, req).await {
+            if let Some(r) = remote.try_run(self, spec, &key, req) {
                 return r;
             }
         }
-        self.seed_home(req).await?;
-        let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind)).await;
+        self.seed_home(req)?;
+        let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind));
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
         self.stats.runs_by_kind[spec.kind as usize].fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+        let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer);
         drop(permit);
         self.note_action_wall(started.elapsed());
         static LOG_ACTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -609,13 +636,13 @@ impl Engine {
         req.seed_blobs.iter().filter(|(h, _)| !self.store.has(h)).copied().collect()
     }
 
-    pub async fn seed_home(&self, req: &Request) -> Result<()> {
+    pub fn seed_home(&self, req: &Request) -> Result<()> {
         let away: Vec<Hash> = self.seed_away(req).into_iter().map(|(h, _)| h).collect();
         if away.is_empty() {
             return Ok(());
         }
         let fetched = match self.remote.get() {
-            Some(remote) => remote.bring_home(&away).await,
+            Some(remote) => remote.bring_home(&away),
             None => Err(anyhow::anyhow!("no worker is connected")),
         };
         fetched.map_err(|e| {
@@ -634,11 +661,24 @@ impl Engine {
         self.avg_wall_us.store(new, Ordering::Relaxed);
     }
 
+    pub(crate) fn run_local(
+        &self,
+        spec: &ActionSpec,
+        req: &Request,
+        observer: &dyn Observer,
+    ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
+        self.stats.runs.fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
+        let r = self.execute(spec, req.view.clone(), req.uid, req.gid, observer);
+        self.note_action_wall(started.elapsed());
+        r
+    }
+
     pub fn avg_action_wall(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.avg_wall_us.load(Ordering::Relaxed).max(200_000))
     }
 
-    pub async fn execute(
+    pub fn execute(
         &self,
         spec: &ActionSpec,
         view: Arc<dyn View>,
@@ -666,13 +706,13 @@ impl Engine {
             group: None,
             armed: true,
         };
-        let run = self.run_in(spec, uid, gid, observer, &action, &mut teardown).await;
+        let run = self.run_in(spec, uid, gid, observer, &action, &mut teardown);
         teardown.armed = false;
         drop(teardown);
         let fin = {
             let fs = self.fs.clone();
             let a = action.clone();
-            tokio::task::spawn_blocking(move || fs.finish_action(&a)).await?
+            io::cpu(move || fs.finish_action(&a))
         };
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
@@ -685,7 +725,7 @@ impl Engine {
         let store = self.store.clone();
         let content = self.content.clone();
         let upper = fin.upper;
-        let (entries, out_hash, err_hash) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
             use rayon::prelude::*;
             let mut scratch: Vec<(PathBuf, bool)> = upper
                 .iter()
@@ -731,8 +771,7 @@ impl Engine {
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
-        })
-        .await??;
+        })?;
         let _ = std::fs::remove_dir_all(&scratch);
 
         let mut entries = entries;
@@ -755,7 +794,7 @@ impl Engine {
         Ok((result, fin.obs, fin.tainted, side))
     }
 
-    async fn run_in(
+    fn run_in(
         &self,
         spec: &ActionSpec,
         uid: u32,
@@ -787,66 +826,61 @@ impl Engine {
         let group = group_slot.as_ref();
         assert!(slot.is_none(), "one process per action");
         let running = slot.insert(self.zygote.spawn(plan, None, out_w, err_w, &self.sched.jobserver_fds())?);
-        let mut out_rd = async_reader(out_r)?;
-        let mut err_rd = async_reader(err_r)?;
-        let live = LiveCtl { action, store: &self.store };
-
-        let read_out = async {
-            let mut all = Vec::new();
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match out_rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        observer.stdout(&buf[..n]);
-                        all.extend_from_slice(&buf[..n]);
-                    }
-                }
-            }
-            all
-        };
-        let read_err = async {
-            let mut all: Vec<u8> = Vec::new();
-            let mut done = 0usize;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                match err_rd.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        all.extend_from_slice(&buf[..n]);
-                        while let Some(i) = all[done..].iter().position(|&c| c == b'\n') {
-                            let line = &all[done..done + i];
-                            if !line.is_empty() {
-                                observer.stderr_line(line, Some(&live));
-                            }
-                            done += i + 1;
-                            assert!(done <= all.len());
-                        }
-                    }
-                }
-            }
-            if done < all.len() {
-                observer.stderr_line(&all[done..], Some(&live));
-            }
-            all
-        };
-        let peak_kb = std::sync::atomic::AtomicU64::new(0);
-        let watch = async {
-            let Some(g) = group else { return std::future::pending::<()>().await };
-            let mut every = tokio::time::interval(std::time::Duration::from_millis(100));
-            loop {
-                every.tick().await;
-                peak_kb.fetch_max(g.anon_kb(), Ordering::Relaxed);
-            }
-        };
         let id = running.id;
-        let (stdout, stderr, info) = tokio::select! {
-            r = async { tokio::join!(read_out, read_err, &mut running.done) } => r,
-            _ = watch => unreachable!("the memory watch never finishes"),
-            _ = tokio::time::sleep(self.action_timeout) => {
+        let exit = running.done.take().expect("the exit is waited once");
+        let obs = ObsPtr(unsafe {
+            std::mem::transmute::<*const (dyn Observer + '_), *const (dyn Observer + 'static)>(observer)
+        });
+        let peak_kb = Arc::new(AtomicU64::new(0));
+        let mut watch = None;
+        if let Some(g) = group {
+            let dir = g.dir.clone();
+            let peak = Arc::clone(&peak_kb);
+            watch = Some(io::spawn(move || {
+                let group = crate::cgroup::ActionGroup::open(dir);
+                let mut every = io::interval(std::time::Duration::from_millis(100));
+                loop {
+                    every.tick();
+                    let kb = io::cpu(|| group.anon_kb());
+                    peak.fetch_max(kb, Ordering::Relaxed);
+                }
+            }));
+        }
+        let action_r = Arc::clone(action);
+        let store_r = Arc::clone(&self.store);
+        let timeout = self.action_timeout;
+        enum ActionWait {
+            Finished(Vec<u8>, Vec<u8>, Option<crate::sandbox::ExitInfo>),
+            TimedOut,
+        }
+        let mut out_h = io::spawn(move || read_stdout(out_r, obs));
+        let mut err_h = io::spawn(move || read_stderr(err_r, obs, action_r, store_r));
+        let mut done_h = io::spawn(move || exit.recv());
+        let arms: Vec<Box<dyn FnOnce() -> ActionWait + '_>> = vec![
+            Box::new(|| {
+                let stdout = out_h.join().unwrap_or_default();
+                let stderr = err_h.join().unwrap_or_default();
+                let info = done_h.join().ok().flatten();
+                ActionWait::Finished(stdout, stderr, info)
+            }),
+            Box::new(move || {
+                io::sleep(timeout);
+                ActionWait::TimedOut
+            }),
+        ];
+        let waited = io::race_biased(arms);
+        if let Some(w) = watch.as_ref() {
+            w.abort();
+        }
+        let (stdout, stderr, info) = match waited {
+            ActionWait::TimedOut => {
                 self.zygote.kill(id);
+                out_h.abort();
+                err_h.abort();
+                done_h.abort();
                 return Err(ActionTimedOut { label: spec.label.clone(), secs: self.action_timeout.as_secs() }.into());
             }
+            ActionWait::Finished(stdout, stderr, info) => (stdout, stderr, info),
         };
         let mut info = info.context("the sandbox helper process died")?;
         if let Some(g) = group {

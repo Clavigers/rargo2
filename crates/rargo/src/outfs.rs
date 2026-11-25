@@ -1338,10 +1338,10 @@ impl Filesystem for OutFs {
         }
     }
 
-    fn fsync(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, datasync: bool) -> Res<()> {
+    fn fsync(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, data_sync: bool) -> Res<()> {
         let _t = self.timed("fsync");
         let Some(file) = self.handle_file(fh)? else { return Ok(()) };
-        if datasync { file.sync_data() } else { file.sync_all() }.map_err(errno)
+        if data_sync { file.sync_data() } else { file.sync_all() }.map_err(errno)
     }
 
     fn readdir(&self, _ctx: &Ctx, nodeid: u64, _fh: u64, offset: u64, sink: &mut DirSink) -> Res<()> {

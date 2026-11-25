@@ -9,11 +9,11 @@ use crate::session::{self, ClientHas, Keys, Session};
 use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use crate::io::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::net::TcpStream;
 
-pub async fn connection(
+pub fn connection(
     d: Arc<Daemon>,
     mut stream: TcpStream,
     keys: Arc<Keys>,
@@ -21,24 +21,18 @@ pub async fn connection(
 ) -> Result<()> {
     let _ = stream.set_nodelay(true);
     let mut first = [0u8; 4];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.peek(&mut first))
-        .await
-        .context("nothing was sent")??;
+    let n = crate::io::timeout(std::time::Duration::from_secs(20), || stream.peek(&mut first)).context("nothing was sent")??;
     if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
-        let stream = stream.into_std()?;
-        return tokio::task::spawn_blocking(move || http.serve(stream)).await?;
+        return http.serve(stream);
     }
     let (user, admin, sealer, opener) =
-        tokio::time::timeout(std::time::Duration::from_secs(20), session::accept(&mut stream, &keys))
-            .await
+        crate::io::timeout(std::time::Duration::from_secs(20), || session::accept(&mut stream, &keys))
             .context("handshake timed out")??;
-    let stream = stream.into_std().context("the accepted stream blocks")?;
-    stream.set_nonblocking(false).context("the accepted stream blocks")?;
-    link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin, keys).await;
+    link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin, keys);
     Ok(())
 }
 
-pub async fn udp_connection(
+pub fn udp_connection(
     d: Arc<Daemon>,
     conn: Arc<crate::net::Conn>,
     endpoint: Arc<crate::net::Endpoint>,
@@ -49,23 +43,23 @@ pub async fn udp_connection(
         return;
     };
     let admin = keys.admin(&user);
-    link(d, Arc::new(Link::Udp(conn, endpoint)), user, admin, keys).await;
+    link(d, Arc::new(Link::Udp(conn, endpoint)), user, admin, keys);
 }
 
 struct Stream {
     sess: Arc<Session>,
-    abort: tokio::task::AbortHandle,
+    abort: crate::io::AbortHandle<ServerMsg>,
 }
 
-async fn pump(
-    link: Arc<Link>,
-    stream: u32,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>,
-    sess: Arc<Session>,
-) {
+enum RecvWait {
+    Frame(Option<Vec<u8>>),
+    Idle,
+}
+
+fn pump(link: Arc<Link>, stream: u32, mut rx: crate::io::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
     assert_ne!(stream, crate::proto::KEEPALIVE, "keepalives are not a session's stream");
     let mut seq = 0u64;
-    while let Some(m) = rx.recv().await {
+    while let Some(m) = rx.recv() {
         let last = matches!(m, ServerMsg::Exit(_) | ServerMsg::Exec(_) | ServerMsg::Fetched { .. });
         let bulk = session::bulk_of(&m);
         let msg = match (bulk, crate::proto::pack(&crate::proto::encode(&m))) {
@@ -74,7 +68,7 @@ async fn pump(
         };
         let frame = crate::proto::encode(&Frame { stream, seq, msg });
         seq += 1;
-        if link.send(&frame).await.is_err() {
+        if link.send(&frame).is_err() {
             break;
         }
         if bulk > 0 {
@@ -116,12 +110,15 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     })
 }
 
-pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
+pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
     let user = keys.name_of(&presented);
     let mut checked = std::time::Instant::now();
     let has = Arc::new(ClientHas::default());
     let (control, control_rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-    tokio::spawn(pump(link.clone(), CONTROL, control_rx, control.clone()));
+    {
+        let (pump_link, pump_control) = (link.clone(), control.clone());
+        crate::io::spawn(move || pump(pump_link, CONTROL, control_rx, pump_control));
+    }
     let streams: Arc<parking_lot::Mutex<HashMap<u32, Stream>>> = Arc::new(parking_lot::Mutex::new(HashMap::new()));
     let conn = Arc::new(parking_lot::Mutex::new(ConnectionState::new()));
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
@@ -133,7 +130,7 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                 Route::Close => break 'link,
                 Route::Reply(m) => control.send(m),
                 Route::Offer(o) => {
-                    if let Some(reply) = tokio::task::block_in_place(|| offer(&d, *o)) {
+                    if let Some(reply) = crate::io::cpu(|| offer(&d, *o)) {
                         control.send(reply);
                     }
                 }
@@ -145,74 +142,82 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                 }
                 Route::Fetch { stream, id, hashes } => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    tokio::spawn(async move {
-                        let _ = sess.fetch(id, hashes).await;
+                    let (pump_link, pump_sess) = (link.clone(), sess.clone());
+                    crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
+                    crate::io::spawn(move || {
+                        let _ = sess.fetch(id, hashes);
                     });
                 }
                 Route::Recipe { stream, id, hash } => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let (pump_link, pump_sess) = (link.clone(), sess.clone());
+                    crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
                     let blobs = d.client_blobs.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let chunks: Vec<_> = blobs
-                            .recipe(&Hash(hash))
-                            .map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect())
-                            .unwrap_or_default();
-                        let (outline, lazy) = match blobs.outline(&Hash(hash)) {
-                            Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
-                            _ => (Vec::new(), Vec::new()),
-                        };
-                        sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
-                        sess.send(ServerMsg::Fetched { id });
+                    crate::io::spawn(move || {
+                        crate::io::cpu(move || {
+                            let chunks: Vec<_> = blobs
+                                .recipe(&Hash(hash))
+                                .map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect())
+                                .unwrap_or_default();
+                            let (outline, lazy) = match blobs.outline(&Hash(hash)) {
+                                Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
+                                _ => (Vec::new(), Vec::new()),
+                            };
+                            sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
+                            sess.send(ServerMsg::Fetched { id });
+                        });
                     });
                 }
                 Route::Chunks { stream, id, hash, idx } => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let (pump_link, pump_sess) = (link.clone(), sess.clone());
+                    crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
                     let blobs = d.client_blobs.clone();
-                    tokio::task::spawn_blocking(move || {
-                        for group in idx.chunks(16) {
-                            let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
-                            let chunks: Vec<(u32, crate::proto::Part)> =
-                                group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect();
-                            sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
-                            sess.send(ServerMsg::Chunks { hash, chunks });
-                        }
-                        sess.send(ServerMsg::Fetched { id });
+                    crate::io::spawn(move || {
+                        crate::io::cpu(move || {
+                            for group in idx.chunks(16) {
+                                let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
+                                let chunks: Vec<(u32, crate::proto::Part)> =
+                                    group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect();
+                                sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
+                                sess.send(ServerMsg::Chunks { hash, chunks });
+                            }
+                            sess.send(ServerMsg::Fetched { id });
+                        });
                     });
                 }
                 Route::Refuse { stream } => {
                     eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
+                    let (pump_link, pump_sess) = (link.clone(), sess.clone());
+                    let mut pumping = crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
                     sess.send(ServerMsg::Stderr(TOKEN_ENDED.as_bytes().to_vec()));
                     sess.send(ServerMsg::Exit(101));
-                    let _ = pumping.await;
+                    let _ = pumping.join();
                     sess.close();
                 }
                 Route::Run { stream, req } => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
-                    let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    let work = tokio::spawn(serve(d.clone(), *req, user.clone(), admin, keys.clone(), sess.clone()));
+                    let (pump_link, pump_sess) = (link.clone(), sess.clone());
+                    let mut pumping = crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
+                    let (serve_d, serve_user, serve_keys, serve_sess) = (d.clone(), user.clone(), keys.clone(), sess.clone());
+                    let mut work = crate::io::spawn(move || serve(serve_d, *req, serve_user, admin, serve_keys, serve_sess));
                     streams.lock().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
-                    let (streams2, conn2) = (streams.clone(), conn.clone());
-                    tokio::spawn(async move {
-                        let msg = match work.await {
+                    let (streams2, conn2, sess2) = (streams.clone(), conn.clone(), sess.clone());
+                    crate::io::spawn(move || {
+                        let msg = match work.join() {
                             Ok(m) => m,
                             Err(e) if e.is_cancelled() => ServerMsg::Exit(130),
                             Err(e) => {
-                                sess.send(ServerMsg::Stderr(
-                                    format!("error: rargod internal error: {e}\n").into_bytes(),
-                                ));
+                                sess2.send(ServerMsg::Stderr(format!("error: rargod internal error: {e}\n").into_bytes()));
                                 ServerMsg::Exit(101)
                             }
                         };
-                        sess.send(msg);
-                        let _ = pumping.await;
-                        sess.close();
+                        sess2.send(msg);
+                        let _ = pumping.join();
+                        sess2.close();
                         let mut s = streams2.lock();
-                        if s.get(&stream).is_some_and(|st| Arc::ptr_eq(&st.sess, &sess)) {
+                        if s.get(&stream).is_some_and(|st| Arc::ptr_eq(&st.sess, &sess2)) {
                             s.remove(&stream);
                             conn2.lock().finished(stream);
                         }
@@ -247,10 +252,21 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
             checked = std::time::Instant::now();
             continue;
         }
-        let raw = tokio::select! {
-            m = link.recv() => m,
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                if link.idle() > std::time::Duration::from_secs(180) { None } else { continue }
+        let waited = crate::io::race_biased(vec![
+            Box::new(|| RecvWait::Frame(link.recv())),
+            Box::new(|| {
+                crate::io::sleep(std::time::Duration::from_secs(30));
+                RecvWait::Idle
+            }),
+        ]);
+        let raw = match waited {
+            RecvWait::Frame(m) => m,
+            RecvWait::Idle => {
+                if link.idle() > std::time::Duration::from_secs(180) {
+                    None
+                } else {
+                    continue;
+                }
             }
         };
         let Some(raw) = raw else { break };
@@ -259,9 +275,9 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
             if let ClientMsg::Ping(n) = frame.msg {
                 let pong =
                     crate::proto::encode(&Frame { stream: crate::proto::KEEPALIVE, seq: 0, msg: ServerMsg::Pong(n) });
-                let link = link.clone();
-                tokio::spawn(async move {
-                    let _ = link.send(&pong).await;
+                let pong_link = link.clone();
+                crate::io::spawn(move || {
+                    let _ = pong_link.send(&pong);
                 });
             }
             continue;
@@ -324,7 +340,7 @@ fn say(sess: &Session, text: String) -> ServerMsg {
     ServerMsg::Exit(0)
 }
 
-async fn serve(
+fn serve(
     d: Arc<Daemon>,
     req: RunRequest,
     user: String,
@@ -338,7 +354,7 @@ async fn serve(
         Command::Status => return say(&sess, status_text(&d)),
         Command::Settle => {
             if let Some(pool) = d.pool.get() {
-                pool.settle().await;
+                pool.settle();
             }
             return say(&sess, status_text(&d));
         }
@@ -349,31 +365,29 @@ async fn serve(
             assert!(!req.args.is_empty(), "a command was named");
             let args = req.args[1..].to_vec();
             let (asker_user, from) = (user.clone(), format!("rargo auth, by {user}"));
-            let said = tokio::task::spawn_blocking(move || {
+            let said = crate::io::cpu(move || {
                 let asker = crate::tokens::Asker { user: &asker_user, admin, from: &from };
                 crate::tokens::command(&store, &args, &asker, TOKEN_USAGE)
-            })
-            .await;
+            });
             return match said {
-                Ok(Ok((out, err))) => {
+                Ok((out, err)) => {
                     if !err.is_empty() {
                         sess.send(ServerMsg::Stderr(err.into_bytes()));
                     }
                     say(&sess, out)
                 }
-                Ok(Err(e)) => fail(&sess, failure("", &e)),
-                Err(e) => fail(&sess, format!("{e}")),
+                Err(e) => fail(&sess, failure("", &e)),
             };
         }
         Command::Incr => {
             let d2 = d.clone();
-            return say(&sess, tokio::task::spawn_blocking(move || d2.incr.analyze(&d2.engine.store)).await.unwrap_or_default());
+            return say(&sess, crate::io::cpu(move || d2.incr.analyze(&d2.engine.store)));
         }
         Command::Gc => {
             let (running, waiting, _, _) = d.engine.sched.snapshot();
             let age = if running + waiting == 0 { 0 } else { 600 };
             let d2 = d.clone();
-            let (n, bytes) = tokio::task::spawn_blocking(move || d2.collect_garbage(age)).await.unwrap_or((0, 0));
+            let (n, bytes) = crate::io::cpu(move || d2.collect_garbage(age));
             d.engine.store.db().flush();
             return say(
                 &sess,
@@ -386,12 +400,10 @@ async fn serve(
         }
         Command::Compact => {
             let d2 = d.clone();
-            let (n, freed) = tokio::task::spawn_blocking(move || {
+            let (n, freed) = crate::io::cpu(move || {
                 let fs = d2.engine.fs.clone();
                 d2.engine.store.freeze_idle(0, &|h| fs.forget_backing(h))
-            })
-            .await
-            .unwrap_or((0, 0));
+            });
             d.engine.store.db().flush();
             let (cn, logical, disk) = d.engine.store.cold_stats();
             let mib = |b: u64| b as f64 / (1 << 20) as f64;
@@ -409,18 +421,16 @@ async fn serve(
             let export = matches!(command, Command::Export(_));
             let dir = dir.clone();
             let d2 = d.clone();
-            let reply = tokio::task::spawn_blocking(move || {
+            let reply = crate::io::cpu(move || {
                 let dir = PathBuf::from(dir);
                 if export { d2.export_cache(&dir) } else { d2.import_cache(&dir) }
-            })
-            .await;
+            });
             return match reply {
-                Ok(Ok((traces, blobs))) => say(
+                Ok((traces, blobs)) => say(
                     &sess,
                     format!("{} {traces} traces and {blobs} blobs\n", if export { "exported" } else { "imported" }),
                 ),
-                Ok(Err(e)) => fail(&sess, format!("{e:#}")),
-                Err(e) => fail(&sess, format!("{e}")),
+                Err(e) => fail(&sess, format!("{e:#}")),
             };
         }
         Command::Drift | Command::Build => {}
@@ -440,7 +450,7 @@ async fn serve(
     if req.lazy {
         sess.set_lazy();
     }
-    let snapshot = match d.trees.sync(Hash(req.tree), &*sess).await {
+    let snapshot = match d.trees.sync(Hash(req.tree), &*sess) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("rargod: {}: syncing {}: {e:#}", req.who, req.root);
@@ -460,10 +470,7 @@ async fn serve(
     );
     let asker: EnvAsker = {
         let s = sess.clone();
-        Arc::new(move |names| {
-            let s = s.clone();
-            Box::pin(async move { s.want_env(names).await })
-        })
+        Arc::new(move |names| s.want_env(names))
     };
     if command == Command::Drift {
         let Some(dir) = rargo_proto::workspace::command_dir(req.root.as_ref(), req.cwd.as_ref(), &req.args) else {
@@ -477,7 +484,7 @@ async fn serve(
             at: std::time::Instant::now(),
             checked: None,
         };
-        return match crate::drift::check(&d, &snapshot, &who, std::time::Instant::now).await {
+        return match crate::drift::check(&d, &snapshot, &who, std::time::Instant::now) {
             Ok(r) => {
                 let text = r.render();
                 *d.drift_report.lock() = Some(format!("{}: {text}", req.root));
@@ -505,7 +512,7 @@ async fn serve(
         outbox: Default::default(),
         targets: Vec::new(),
     };
-    let outcome = build::handle(d.clone(), client).await;
+    let outcome = build::handle(d.clone(), client);
     let mut delivered = sess.delivered();
     if !delivered.is_empty() && !worktree.is_empty() {
         if let Some(set) = &before {

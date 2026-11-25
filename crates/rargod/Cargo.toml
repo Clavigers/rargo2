@@ -12,7 +12,6 @@ homepage.workspace = true
 rargo-core = { path = "../rargo-core" }
 fusewire = { path = "../fusewire" }
 anyhow.workspace = true
-tokio.workspace = true
 libc.workspace = true
 bincode.workspace = true
 serde.workspace = true

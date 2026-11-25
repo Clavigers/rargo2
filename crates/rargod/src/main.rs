@@ -7,9 +7,9 @@ use rargo_core::sched::Scheduler;
 use rargo_core::session::Keys;
 use rargo_core::store::Store;
 use rargo_core::view::Content;
+use rargo_core::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::net::TcpListener;
 
 struct Opts {
     state: PathBuf,
@@ -153,8 +153,7 @@ fn main() -> Result<()> {
         .context("mounting the sandbox filesystem (is rargod running as root?)")?,
     );
     fs.attach(session.clone());
-    let fuse_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    session.spawn_workers(fs.clone(), fuse_threads)?;
+    let fuse_fs = fs.clone();
 
     let sched = Scheduler::new(opts.jobs, opts.mem_kb)?;
     let mut engine = Engine::new(store.clone(), content, fs, mnt, zygote, sched);
@@ -167,15 +166,17 @@ fn main() -> Result<()> {
     engine.action_timeout = std::time::Duration::from_secs(opts.action_timeout_secs);
     let engine = Arc::new(engine);
     if let Some(server) = opts.worker_of {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let key = link_key(&opts, server)?;
-        let result = rt.block_on(rargo_core::remote::worker_main(engine, server, opts.jobs as u32, key));
-        session.unmount();
-        return result;
+        let jobs = opts.jobs as u32;
+        let (engine, session, fuse_fs) = (engine.clone(), session.clone(), fuse_fs.clone());
+        io::drive(4, move || {
+            rargo_core::io::FuseDrive::spawn(&session, &fuse_fs).detach();
+            let result = rargo_core::remote::worker_main(engine, server, jobs, key);
+            stop(&session, result);
+        });
+        unreachable!("the worker leaves through stop");
     }
     let cargo_home = opts.cargo_home.clone().unwrap_or_else(|| state.join("cargo-home"));
-    std::fs::create_dir_all(&cargo_home)?;
-    let cargo_home = cargo_home.canonicalize()?;
     let (uid, gid) = (opts.uid.unwrap_or(unsafe { libc::geteuid() }), opts.gid.unwrap_or(unsafe { libc::getegid() }));
     for dir in ["registry", "git"] {
         let p = cargo_home.join(dir);
@@ -184,6 +185,7 @@ fn main() -> Result<()> {
             rargo_core::snapshot::chown(&p, uid, gid);
         }
     }
+    let cargo_home = cargo_home.canonicalize()?;
     let server_env = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
@@ -236,50 +238,72 @@ fn main() -> Result<()> {
         })?;
     }
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-    if let Some(addr) = opts.workers_listen {
-        let key = link_key(&opts, addr)?;
-        let pool = rt.block_on(rargo_core::remote::Pool::listen(&daemon.engine, addr, key))?;
-        let _ = daemon.engine.remote.set(pool.clone());
-        let _ = daemon.pool.set(pool);
-        eprintln!("rargod: accepting workers on {addr}");
-    }
-    if opts.drift_minutes > 0 {
-        let d = daemon.clone();
-        let every = std::time::Duration::from_secs(opts.drift_minutes * 60);
-        rt.spawn(rargo_core::drift::background(d, every, std::time::Instant::now));
-    }
-    let keys = Arc::new(keys);
+    let worker_link = match opts.workers_listen {
+        Some(addr) => Some((addr, link_key(&opts, addr)?)),
+        None => None,
+    };
+    let drift_minutes = opts.drift_minutes;
     let listen = opts.listen;
     let public = opts.public.clone();
     let http_state = state.clone();
-    let result = rt.block_on(async move {
-        let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
+    let keys = Arc::new(keys);
+    io::drive(4, move || {
+        rargo_core::io::FuseDrive::spawn(&session, &fuse_fs).detach();
+        if let Some((addr, key)) = worker_link {
+            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key) {
+                Ok(pool) => {
+                    let _ = daemon.engine.remote.set(pool.clone());
+                    let _ = daemon.pool.set(pool);
+                    eprintln!("rargod: accepting workers on {addr}");
+                }
+                Err(err) => stop(&session, Err(err)),
+            }
+        }
+        if drift_minutes > 0 {
+            let d = daemon.clone();
+            let every = std::time::Duration::from_secs(drift_minutes * 60);
+            io::spawn(move || {
+                rargo_core::drift::background(d, every, std::time::Instant::now);
+            });
+        }
+        let listener = match io::TcpListener::bind(listen) {
+            Ok(listener) => listener,
+            Err(err) => stop(&session, Err(err).context(format!("listening on {listen}"))),
+        };
         let users: rargo_core::net::UserKeys = {
             let keys = keys.clone();
             Arc::new(move |user| keys.psk(user))
         };
-        let endpoint = rargo_core::net::Endpoint::bind_auth(listener.local_addr()?, true, rargo_core::net::Auth::Users(users))
-            .await
-            .with_context(|| format!("binding UDP {listen}"))?;
+        let local = match listener.local_addr() {
+            Ok(addr) => addr,
+            Err(err) => stop(&session, Err(err).context(format!("binding UDP {listen}"))),
+        };
+        let endpoint = match rargo_core::net::Endpoint::bind_auth(local, true, rargo_core::net::Auth::Users(users)) {
+            Ok(endpoint) => endpoint,
+            Err(err) => stop(&session, Err(err).context(format!("binding UDP {listen}"))),
+        };
         {
             let (d, k, ep) = (daemon.clone(), keys.clone(), endpoint.clone());
-            tokio::spawn(async move {
-                while let Some(conn) = ep.accept().await {
-                    tokio::spawn(rargo_core::serve::udp_connection(d.clone(), conn, ep.clone(), k.clone()));
+            io::spawn(move || {
+                while let Some(conn) = ep.accept() {
+                    let (d, k, ep) = (d.clone(), k.clone(), ep.clone());
+                    io::spawn(move || rargo_core::serve::udp_connection(d, conn, ep, k));
                 }
             });
         }
-        eprintln!(
-            "rargod: serving clients on {} ({})",
-            listener.local_addr()?,
-            if keys.is_open() { "no tokens: loopback only, anyone on this machine" } else { "tokens required" }
-        );
+        match listener.local_addr() {
+            Ok(addr) => eprintln!(
+                "rargod: serving clients on {} ({})",
+                addr,
+                if keys.is_open() { "no tokens: loopback only, anyone on this machine" } else { "tokens required" }
+            ),
+            Err(err) => stop(&session, Err(err).context(format!("listening on {listen}"))),
+        }
         let http = Arc::new(rargo_core::http::Http::new(keys.clone(), public, listen.port()).with_state(http_state));
-        serve(daemon, listener, keys, http).await
+        let result = serve(&daemon, &listener, &keys, &http);
+        stop(&session, result);
     });
-    session.unmount();
-    result
+    unreachable!("the server leaves through stop")
 }
 
 fn token_command(args: &[String]) -> Result<()> {
@@ -328,34 +352,69 @@ fn token_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>, http: Arc<rargo_core::http::Http>) -> Result<()> {
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+fn stop(session: &fusewire::Session, result: Result<()>) -> ! {
+    session.unmount();
+    let code = match result {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            1
+        }
+    };
+    std::process::exit(code)
+}
+
+fn serve(daemon: &Arc<Daemon>, listener: &io::TcpListener, keys: &Arc<Keys>, http: &Arc<rargo_core::http::Http>) -> Result<()> {
+    let mut term = io::signal(io::SignalKind::terminate())?;
+    let mut int = io::signal(io::SignalKind::interrupt())?;
+    enum Wait<C> {
+        Term,
+        Int,
+        Conn(C),
+    }
     loop {
-        tokio::select! {
-            _ = term.recv() => break,
-            _ = int.recv() => break,
-            conn = listener.accept() => {
-                let (stream, peer) = match conn {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("rargod: accept failed: {e}");
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        continue;
-                    }
-                };
+        match io::race_biased(vec![
+            Box::new(|| {
+                let _ = term.recv();
+                Wait::Term
+            }),
+            Box::new(|| {
+                let _ = int.recv();
+                Wait::Int
+            }),
+            Box::new(|| Wait::Conn(listener.accept())),
+        ]) {
+            Wait::Term | Wait::Int => break,
+            Wait::Conn(Ok((stream, peer))) => {
                 let (d, k, h) = (daemon.clone(), keys.clone(), http.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = rargo_core::serve::connection(d, stream, k, h).await {
+                io::spawn(move || {
+                    if let Err(e) = accept_client(d, stream, k, h) {
                         eprintln!("rargod: connection from {peer}: {e:#}");
                     }
                 });
+            }
+            Wait::Conn(Err(e)) => {
+                eprintln!("rargod: accept failed: {e}");
+                io::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
     eprintln!("rargod: shutting down");
     daemon.engine.store.db().flush();
     Ok(())
+}
+
+fn accept_client(d: Arc<Daemon>, stream: io::TcpStream, keys: Arc<Keys>, http: Arc<rargo_core::http::Http>) -> Result<()> {
+    let _ = stream.set_nodelay(true);
+    let mut first = [0u8; 4];
+    let n = match io::timeout(std::time::Duration::from_secs(20), || stream.peek(&mut first)) {
+        Ok(n) => n?,
+        Err(_) => bail!("nothing was sent"),
+    };
+    if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
+        return http.serve(stream);
+    }
+    rargo_core::serve::connection(d, stream, keys, http)
 }
 
 fn link_key(opts: &Opts, addr: std::net::SocketAddr) -> Result<rargo_core::net::LinkKey> {

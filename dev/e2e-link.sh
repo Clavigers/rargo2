@@ -301,7 +301,7 @@ guard=$(pgrep -P "$(mine)" -f "^unmount-guard: $proj/target")
 daemon=$(mine)
 kill -KILL $guard; timeout 10 tail --pid="$guard" -f /dev/null
 kill -KILL $daemon; timeout 10 tail --pid="$daemon" -f /dev/null
-out=$(ls target 2>&1)
+for _ in $(seq 50); do out=$(ls target 2>&1); grep -q 'not connected' <<<"$out" && break; sleep 0.1; done
 mounted && grep -q 'not connected' <<<"$out"; check $? "target/ is left a dead mount (\"Transport endpoint is not connected\")" "$out
 $(grep "$proj" /proc/self/mountinfo)"
 sed -i 's/{ 110 }/{ 120 }/' crates/extra/src/lib.rs

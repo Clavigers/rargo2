@@ -12,4 +12,6 @@ rargo-proto = { path = "../rargo-proto", version = "0.7.6" }
 libc.workspace = true
 blake3.workspace = true
 parking_lot.workspace = true
-tokio.workspace = true
+io-uring.workspace = true
+fusewire = { path = "../fusewire", version = "0.7.6" }
+corosensei.workspace = true

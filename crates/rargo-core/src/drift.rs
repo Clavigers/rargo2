@@ -60,14 +60,14 @@ impl Report {
     }
 }
 
-pub async fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, time: fn() -> Instant) -> Result<Report> {
+pub fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, time: fn() -> Instant) -> Result<Report> {
     let scratch = d.scratch("drift")?;
-    let result = check_in(d, snapshot, who, &scratch, time).await;
+    let result = check_in(d, snapshot, who, &scratch, time);
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 
-async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path, time: fn() -> Instant) -> Result<Report> {
+fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path, time: fn() -> Instant) -> Result<Report> {
     let (uid, gid) = (d.cfg.uid, d.cfg.gid);
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
     for (k, v) in who.env.iter() {
@@ -77,8 +77,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     }
     let policy = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
     let (dd, snap, dir, files) = (d.clone(), snapshot.clone(), who.dir.clone(), policy.flake.files.clone());
-    let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
-        .await?
+    let flake = crate::io::cpu(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
         .context("evaluating the build flake for the drift check")?;
     for k in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         env.remove(k);
@@ -93,7 +92,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
     let started = time();
     let stock_cwd = scratch.join(&who.dir);
-    let stock = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
+    let stock = crate::io::cpu(move || -> Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
         snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         let stock_cwd = stock_cwd.canonicalize()?;
@@ -113,11 +112,10 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
             c.uid(uid).gid(gid);
         }
         c.output().context("running stock cargo")
-    })
-    .await??;
+    })?;
     let stock_ran = (started, time());
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = crate::io::unbounded_channel();
     let mut env: HashMap<String, String> = (*who.env).clone();
     env.insert("RARGO_VERIFY".into(), "1".into());
     env.remove("CARGO_TARGET_DIR");
@@ -142,10 +140,10 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     };
     let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
     let started = time();
-    let code = handle(d.clone(), client).await.unwrap_or(0);
+    let code = handle(d.clone(), client).unwrap_or(0);
     let rargo_ran = (started, time());
     let mut text = String::new();
-    while let Ok(m) = rx.try_recv() {
+    while let Some(m) = rx.recv() {
         if let ServerMsg::Stderr(b) = m {
             text.push_str(&String::from_utf8_lossy(&b));
         }
@@ -198,9 +196,9 @@ fn compare<T: Since>(snapshot: String, stock: Ran<T>, rargo: Ran<T>, verified_un
     }
 }
 
-pub async fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> Instant) {
+pub fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> Instant) {
     loop {
-        tokio::time::sleep(interval).await;
+        crate::io::sleep(interval);
         for (worktree, snapshot) in d.trees.recent() {
             let (running, waiting, _, _) = d.engine.sched.snapshot();
             if running + waiting > 0 {
@@ -210,7 +208,7 @@ pub async fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn(
             if who.checked == Some(snapshot.id) {
                 continue;
             }
-            let text = match check(&d, &snapshot, &who, time).await {
+            let text = match check(&d, &snapshot, &who, time) {
                 Ok(r) => format!("{}: {}", who.root, r.render()),
                 Err(e) => format!("{}: drift check could not run: {e:#}\n", who.root),
             };

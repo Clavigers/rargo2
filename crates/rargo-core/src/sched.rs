@@ -3,9 +3,9 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
+use crate::io::oneshot;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
@@ -104,7 +104,7 @@ impl Scheduler {
         self.inner.lock().state.spare() + self.in_pipe()
     }
 
-    pub async fn acquire(self: &Arc<Self>, prio: Priority, mem_kb: u64) -> Permit {
+    pub fn acquire(self: &Arc<Self>, prio: Priority, mem_kb: u64) -> Permit {
         let rx = {
             let mut i = self.inner.lock();
             self.prune(&mut i);
@@ -117,9 +117,14 @@ impl Scheduler {
             self.wake_broker.notify_one();
             rx
         };
-        match rx.await {
-            Ok(p) => p,
-            Err(_) => std::future::pending().await,
+        match rx.recv() {
+            Some(permit) => permit,
+            None => {
+                let hang = crate::io::Notify::new();
+                loop {
+                    hang.notified();
+                }
+            }
         }
     }
 
@@ -244,27 +249,23 @@ fn broker(weak: std::sync::Weak<Scheduler>) {
 mod tests {
     use super::*;
 
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
-    }
-
     #[test]
     fn tokens_are_shared_with_jobserver_clients() {
-        let s = Scheduler::new(2, u64::MAX).unwrap();
-        rt().block_on(async {
+        crate::io::drive(1, || {
+            let s = Scheduler::new(2, u64::MAX).unwrap();
             assert_eq!(s.free_tokens(), 2);
             let [r, w] = s.jobserver_fds();
             let mut b = 0u8;
             assert_eq!(unsafe { libc::read(r, &mut b as *mut u8 as *mut _, 1) }, 1);
             assert_eq!(s.free_tokens(), 1);
-            let _a = s.acquire(Priority::Agent, 0).await;
+            let _a = s.acquire(Priority::Agent, 0);
             assert_eq!(s.free_tokens(), 0);
             let s2 = s.clone();
-            let second = tokio::spawn(async move { s2.acquire(Priority::Agent, 0).await });
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let mut second = crate::io::spawn(move || s2.acquire(Priority::Agent, 0));
+            crate::io::sleep(std::time::Duration::from_millis(50));
             assert!(!second.is_finished());
             write_token(w);
-            tokio::time::timeout(std::time::Duration::from_secs(5), second).await.unwrap().unwrap();
+            crate::io::timeout(std::time::Duration::from_secs(5), || second.join()).unwrap().unwrap();
         });
     }
 }

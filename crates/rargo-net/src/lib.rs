@@ -5,13 +5,13 @@ mod handshake;
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::io;
+pub mod io;
+use std::io as sio;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tokio::sync::{Notify, mpsc};
+use crate::io::{Mutex as FiberMutex, Notify, UdpSocket, UnboundedReceiver, UnboundedSender};
 
 const FRAG: usize = 1200;
 const T_DATA: u8 = 1;
@@ -29,10 +29,10 @@ const _: () = assert!(MIN_RTO.as_nanos() < MAX_RTO.as_nanos());
 const _: () = assert!(DATA_HDR == 25);
 const _: () = assert!(SEND_BUFFER >= FRAG);
 
-pub(crate) async fn connect_within(wait: Duration, endpoint: &Arc<Endpoint>, server: SocketAddr) -> io::Result<Arc<Conn>> {
-    match tokio::time::timeout(wait, endpoint.connect(server)).await {
+pub(crate) fn connect_within(wait: Duration, endpoint: &Arc<Endpoint>, server: SocketAddr) -> sio::Result<Arc<Conn>> {
+    match io::timeout(wait, || endpoint.connect(server)) {
         Ok(r) => r,
-        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "no answer over UDP")),
+        Err(_) => Err(sio::Error::new(sio::ErrorKind::TimedOut, "no answer over UDP")),
     }
 }
 
@@ -107,8 +107,8 @@ pub struct Conn {
     wake_sender: Notify,
     pub send_settled: Notify,
     space: Notify,
-    inbound_tx: mpsc::UnboundedSender<Vec<u8>>,
-    inbound_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    inbound_tx: UnboundedSender<Vec<u8>>,
+    inbound_rx: FiberMutex<UnboundedReceiver<Vec<u8>>>,
     pub stats: NetStats,
     closed: std::sync::atomic::AtomicBool,
     last_heard: Mutex<Instant>,
@@ -118,7 +118,7 @@ pub struct Conn {
 
 impl Conn {
     fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey, per_conn: bool) -> Arc<Conn> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = io::unbounded_channel();
         let c = Arc::new(Conn {
             id,
             key,
@@ -134,7 +134,7 @@ impl Conn {
             send_settled: Notify::new(),
             space: Notify::new(),
             inbound_tx: tx,
-            inbound_rx: tokio::sync::Mutex::new(rx),
+            inbound_rx: FiberMutex::new(rx),
             stats: NetStats::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
             last_heard: Mutex::new(Instant::now()),
@@ -142,7 +142,7 @@ impl Conn {
             handshake_in: Mutex::new(Vec::new()),
         });
         let c2 = c.clone();
-        tokio::spawn(async move { c2.sender_loop().await });
+        io::spawn(move || c2.sender_loop());
         c
     }
 
@@ -199,21 +199,21 @@ impl Conn {
         self.state.lock().rtt()
     }
 
-    pub async fn send(&self, msg: &[u8]) -> io::Result<()> {
+    pub fn send(&self, msg: &[u8]) -> sio::Result<()> {
         if !self.encrypted() {
-            return self.send_raw(msg).await;
+            return self.send_raw(msg);
         }
         let Some(cipher) = self.cipher.get() else {
-            return Err(io::Error::other("link: no keys agreed yet"));
+            return Err(sio::Error::other("link: no keys agreed yet"));
         };
-        let sealed = if msg.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.seal(msg)) } else { cipher.seal(msg) }?;
-        self.send_raw(&sealed).await
+        let sealed = if msg.len() >= 256 << 10 { io::cpu(|| cipher.seal(msg)) } else { cipher.seal(msg) }?;
+        self.send_raw(&sealed)
     }
 
-    async fn send_raw(&self, msg: &[u8]) -> io::Result<()> {
+    fn send_raw(&self, msg: &[u8]) -> sio::Result<()> {
         loop {
             if self.is_closed() {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+                return Err(sio::Error::new(sio::ErrorKind::BrokenPipe, "connection closed"));
             }
             match self.state.lock().send(msg) {
                 conn::Admit::Queued => {
@@ -221,16 +221,16 @@ impl Conn {
                     self.wake_sender.notify_one();
                     return Ok(());
                 }
-                conn::Admit::Closed => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")),
+                conn::Admit::Closed => return Err(sio::Error::new(sio::ErrorKind::BrokenPipe, "connection closed")),
                 conn::Admit::Full => {}
             }
-            self.space.notified().await;
+            self.space.notified();
         }
     }
 
-    pub async fn recv(&self) -> Option<Vec<u8>> {
+    pub fn recv(&self) -> Option<Vec<u8>> {
         loop {
-            let raw = self.recv_raw().await?;
+            let raw = self.recv_raw()?;
             if self.handshake_in.lock().iter().any(|m| m == &raw) {
                 continue;
             }
@@ -238,7 +238,7 @@ impl Conn {
                 return Some(raw);
             }
             let cipher = self.cipher.get()?;
-            let opened = if raw.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.open(&raw)) } else { cipher.open(&raw) };
+            let opened = if raw.len() >= 256 << 10 { io::cpu(|| cipher.open(&raw)) } else { cipher.open(&raw) };
             return match opened {
                 Ok(m) => Some(m),
                 Err(_) => {
@@ -249,8 +249,8 @@ impl Conn {
         }
     }
 
-    async fn recv_raw(&self) -> Option<Vec<u8>> {
-        self.inbound_rx.lock().await.recv().await
+    fn recv_raw(&self) -> Option<Vec<u8>> {
+        self.inbound_rx.lock().recv()
     }
 
     fn note_handshake(&self, msg: &[u8]) {
@@ -273,26 +273,26 @@ impl Conn {
         let _ = self.cipher.set(agreed.cipher);
     }
 
-    async fn apply(&self, hs: &mut handshake::Handshake, result: io::Result<handshake::Action>) -> io::Result<handshake::Action> {
+    fn apply(&self, hs: &mut handshake::Handshake, result: sio::Result<handshake::Action>) -> sio::Result<handshake::Action> {
         match result {
             Ok(action) => Ok(action),
             Err(e) => {
                 if let Some(pkt) = hs.take_notify() {
-                    let _ = self.send_raw(&pkt).await;
+                    let _ = self.send_raw(&pkt);
                 }
                 Err(e)
             }
         }
     }
 
-    async fn drive(&self, hs: &mut handshake::Handshake, keys: Option<&UserKeys>) -> io::Result<handshake::Agreed> {
+    fn drive(&self, hs: &mut handshake::Handshake, keys: Option<&UserKeys>) -> sio::Result<handshake::Agreed> {
         let deadline = Instant::now() + HANDSHAKE_WAIT;
         let mut action = hs.start()?;
         loop {
             hs.invariants();
             match action {
                 handshake::Action::Send(pkt) => {
-                    self.send_raw(&pkt).await?;
+                    self.send_raw(&pkt)?;
                     action = hs.sent()?;
                 }
                 handshake::Action::Wait => {
@@ -301,16 +301,16 @@ impl Conn {
                         return Err(hs.timeout_error());
                     }
                     let slice = (left / hs.resend_share()).max(Duration::from_millis(1)).min(left);
-                    match tokio::time::timeout(slice, self.recv_raw()).await {
+                    match io::timeout(slice, || self.recv_raw()) {
                         Ok(Some(pkt)) => {
                             self.note_handshake(&pkt);
                             let result = hs.recv(&pkt);
-                            action = self.apply(hs, result).await?;
+                            action = self.apply(hs, result)?;
                         }
-                        Ok(None) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")),
+                        Ok(None) => return Err(sio::Error::new(sio::ErrorKind::BrokenPipe, "connection closed")),
                         Err(_) => {
                             if let Some(pkt) = hs.lost() {
-                                self.send_raw(&pkt).await?;
+                                self.send_raw(&pkt)?;
                                 action = handshake::Action::Wait;
                             } else {
                                 return Err(hs.timeout_error());
@@ -319,9 +319,9 @@ impl Conn {
                     }
                 }
                 handshake::Action::NeedKey(name) => {
-                    let found = keys.ok_or_else(|| io::Error::other("no user directory"))?.as_ref()(&name);
+                    let found = keys.ok_or_else(|| sio::Error::other("no user directory"))?.as_ref()(&name);
                     let result = hs.provide_key(found);
-                    action = self.apply(hs, result).await?;
+                    action = self.apply(hs, result)?;
                 }
                 handshake::Action::Done(agreed) => {
                     hs.invariants();
@@ -331,27 +331,27 @@ impl Conn {
         }
     }
 
-    async fn agree_as_initiator(&self, key: &[u8; 32]) -> io::Result<()> {
+    fn agree_as_initiator(&self, key: &[u8; 32]) -> sio::Result<()> {
         let mut hs = handshake::Handshake::shared_initiator(*key, Self::ephemeral());
-        self.install(self.drive(&mut hs, None).await?);
+        self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
 
-    async fn agree_as_responder(&self, key: &[u8; 32]) -> io::Result<()> {
+    fn agree_as_responder(&self, key: &[u8; 32]) -> sio::Result<()> {
         let mut hs = handshake::Handshake::shared_responder(*key, Self::ephemeral());
-        self.install(self.drive(&mut hs, None).await?);
+        self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
 
-    async fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> io::Result<()> {
+    fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> sio::Result<()> {
         let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral());
-        self.install(self.drive(&mut hs, None).await?);
+        self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
 
-    async fn agree_with_user(&self, keys: &UserKeys) -> io::Result<()> {
+    fn agree_with_user(&self, keys: &UserKeys) -> sio::Result<()> {
         let mut hs = handshake::Handshake::user_responder(Self::ephemeral());
-        self.install(self.drive(&mut hs, Some(keys)).await?);
+        self.install(self.drive(&mut hs, Some(keys))?);
         Ok(())
     }
 
@@ -394,7 +394,7 @@ impl Conn {
         }
     }
 
-    async fn emit(&self, packets: Vec<conn::Packet>) {
+    fn emit(&self, packets: Vec<conn::Packet>) {
         for p in packets {
             self.stats.sent_packets.fetch_add(1, Ordering::Relaxed);
             self.stats.sent_bytes.fetch_add(p.bytes.len() as u64, Ordering::Relaxed);
@@ -407,7 +407,7 @@ impl Conn {
             if p.msg != AGREEMENT {
                 self.tag_datagram(&mut pkt);
             }
-            let _ = self.sock.send_to(&pkt, peer).await;
+            let _ = self.sock.send_to(&pkt, peer);
         }
     }
 
@@ -418,7 +418,7 @@ impl Conn {
         }
     }
 
-    async fn sender_loop(self: Arc<Self>) {
+    fn sender_loop(self: Arc<Self>) {
         loop {
             if self.is_closed() {
                 return;
@@ -434,16 +434,16 @@ impl Conn {
             self.stats.retransmits.fetch_add(out.retransmits, Ordering::Relaxed);
             let again = out.again;
             let deadline = out.deadline;
-            self.emit(out.datagrams).await;
+            self.emit(out.datagrams);
             if again {
                 continue;
             }
             match deadline {
                 Some(d) => {
                     let wait = d.saturating_sub(self.now()).max(Duration::from_millis(1));
-                    let _ = tokio::time::timeout(wait, self.wake_sender.notified()).await;
+                    let _ = io::timeout(wait, || self.wake_sender.notified());
                 }
-                None => self.wake_sender.notified().await,
+                None => self.wake_sender.notified(),
             }
         }
     }
@@ -470,42 +470,33 @@ pub struct Endpoint {
     conns: Mutex<HashMap<u64, Arc<Conn>>>,
     state: Mutex<endpoint::EndpointState>,
     t0: Instant,
-    accept_tx: mpsc::UnboundedSender<Arc<Conn>>,
-    accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<Conn>>>,
+    accept_tx: UnboundedSender<Arc<Conn>>,
+    accept_rx: FiberMutex<UnboundedReceiver<Arc<Conn>>>,
     key: LinkKey,
     auth: Auth,
 }
 
 impl Endpoint {
-    pub async fn bind(addr: SocketAddr, accepting: bool) -> io::Result<Arc<Endpoint>> {
-        Endpoint::bind_keyed(addr, accepting, None).await
+    pub fn bind(addr: SocketAddr, accepting: bool) -> sio::Result<Arc<Endpoint>> {
+        Endpoint::bind_keyed(addr, accepting, None)
     }
 
-    pub async fn bind_keyed(addr: SocketAddr, accepting: bool, key: LinkKey) -> io::Result<Arc<Endpoint>> {
+    pub fn bind_keyed(addr: SocketAddr, accepting: bool, key: LinkKey) -> sio::Result<Arc<Endpoint>> {
         let auth = match key {
             Some(k) => Auth::Shared(k),
             None => Auth::None,
         };
-        Endpoint::bind_auth(addr, accepting, auth).await
+        Endpoint::bind_auth(addr, accepting, auth)
     }
 
-    pub async fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> io::Result<Arc<Endpoint>> {
+    pub fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> sio::Result<Arc<Endpoint>> {
         let key: LinkKey = match &auth {
             Auth::Shared(k) => Some(k.clone()),
             _ => None,
         };
-        let sock = Arc::new(UdpSocket::bind(addr).await?);
-        {
-            use std::os::fd::AsRawFd;
-            let fd = sock.as_raw_fd();
-            let size: libc::c_int = 16 << 20;
-            for opt in [libc::SO_RCVBUFFORCE, libc::SO_SNDBUFFORCE, libc::SO_RCVBUF, libc::SO_SNDBUF] {
-                unsafe {
-                    libc::setsockopt(fd, libc::SOL_SOCKET, opt, &size as *const _ as *const libc::c_void, 4);
-                }
-            }
-        }
-        let (tx, rx) = mpsc::unbounded_channel();
+        let sock = Arc::new(UdpSocket::bind(addr)?);
+        sock.set_buffers(16 << 20);
+        let (tx, rx) = io::unbounded_channel();
         let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. });
         let ep = Arc::new(Endpoint {
             sock,
@@ -513,20 +504,20 @@ impl Endpoint {
             state: Mutex::new(endpoint::EndpointState::new(accepting, per_conn, key.clone())),
             t0: Instant::now(),
             accept_tx: tx,
-            accept_rx: tokio::sync::Mutex::new(rx),
+            accept_rx: FiberMutex::new(rx),
             key,
             auth,
         });
         let ep2 = ep.clone();
-        tokio::spawn(async move { ep2.recv_loop().await });
+        io::spawn(move || ep2.recv_loop());
         Ok(ep)
     }
 
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> sio::Result<SocketAddr> {
         self.sock.local_addr()
     }
 
-    pub async fn connect(&self, peer: SocketAddr) -> io::Result<Arc<Conn>> {
+    pub fn connect(&self, peer: SocketAddr) -> sio::Result<Arc<Conn>> {
         let id = {
             let mut b = [0u8; 8];
             unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
@@ -538,9 +529,9 @@ impl Endpoint {
         assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
         let agreed = match &self.auth {
             Auth::None => Ok(()),
-            Auth::Shared(key) => c.agree_as_initiator(key).await,
-            Auth::User { name, psk } => c.agree_as_user(name, psk).await,
-            Auth::Users(_) => Err(io::Error::other("an accepting endpoint does not connect")),
+            Auth::Shared(key) => c.agree_as_initiator(key),
+            Auth::User { name, psk } => c.agree_as_user(name, psk),
+            Auth::Users(_) => Err(sio::Error::other("an accepting endpoint does not connect")),
         };
         if let Err(e) = agreed {
             self.forget(id);
@@ -549,8 +540,8 @@ impl Endpoint {
         Ok(c)
     }
 
-    pub async fn accept(&self) -> Option<Arc<Conn>> {
-        self.accept_rx.lock().await.recv().await
+    pub fn accept(&self) -> Option<Arc<Conn>> {
+        self.accept_rx.lock().recv()
     }
 
     fn per_conn(&self) -> bool {
@@ -581,13 +572,13 @@ impl Endpoint {
         match (self.key.clone(), &self.auth) {
             (_, Auth::Users(keys)) => {
                 let (c, tx, keys) = (c.clone(), self.accept_tx.clone(), keys.clone());
-                tokio::spawn(async move {
-                    match c.agree_with_user(&keys).await {
+                io::spawn(move || {
+                    match c.agree_with_user(&keys) {
                         Ok(()) => {
                             let _ = tx.send(c);
                         }
                         Err(_) => {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            io::sleep(Duration::from_secs(2));
                             c.close();
                         }
                     }
@@ -598,8 +589,8 @@ impl Endpoint {
             }
             (Some(key), _) => {
                 let (c, tx) = (c.clone(), self.accept_tx.clone());
-                tokio::spawn(async move {
-                    match c.agree_as_responder(&key).await {
+                io::spawn(move || {
+                    match c.agree_as_responder(&key) {
                         Ok(()) => {
                             let _ = tx.send(c);
                         }
@@ -646,10 +637,10 @@ impl Endpoint {
         }
     }
 
-    async fn recv_loop(self: Arc<Self>) {
+    fn recv_loop(self: Arc<Self>) {
         let mut buf = vec![0u8; 65536];
         loop {
-            let Ok((n, from)) = self.sock.recv_from(&mut buf).await else { return };
+            let Ok((n, from)) = self.sock.recv_from(&mut buf) else { return };
             self.ingest(from, &buf[..n]);
             while let Ok((n, from)) = self.sock.try_recv_from(&mut buf) {
                 self.ingest(from, &buf[..n]);
@@ -659,7 +650,7 @@ impl Endpoint {
             }
             let outbound = self.state.lock().take_datagrams();
             for (to, pkt) in outbound {
-                let _ = self.sock.send_to(&pkt, to).await;
+                let _ = self.sock.send_to(&pkt, to);
             }
         }
     }
