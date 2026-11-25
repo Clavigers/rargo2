@@ -152,18 +152,8 @@ enum Take {
 
 impl Ignored {
     pub fn from_git(root: &Path, include: &[String]) -> Option<Ignored> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["--no-optional-locks", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"])
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())?;
-        Some(Ignored::new(crate::git::ignored_paths(&out.stdout), include))
+        let listed = crate::git::ignored(root)?;
+        Some(Ignored::new(listed.iter().map(|p| p.as_slice()), include))
     }
 
     fn new<'p>(listed: impl Iterator<Item = &'p [u8]>, include: &[String]) -> Ignored {

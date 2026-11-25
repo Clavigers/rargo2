@@ -795,8 +795,11 @@ version = "0.7.5"
 dependencies = [
  "bincode",
  "blake3",
+ "crc32fast",
+ "flate2",
  "fusewire",
  "libc",
+ "memmap2",
  "rargo-net",
  "rargo-proto",
  "rayon",

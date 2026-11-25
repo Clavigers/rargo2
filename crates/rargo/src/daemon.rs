@@ -682,7 +682,7 @@ impl Daemon {
                     git::Mode::History => Some(true),
                     git::Mode::Detect => Some(git::asks_for_history(&root, scan.index.files.keys().map(|k| k.as_slice()))),
                 };
-                let objects = if history == Some(true) { git::history(&root, h, &cache) } else { None };
+                let objects = if history == Some(true) { git::history(h, &cache) } else { None };
                 let thin = history.and_then(|_| git::thin(&root, h, &cache, objects.is_some()));
                 if let Some(thin) = thin {
                     let stored = match &objects {
