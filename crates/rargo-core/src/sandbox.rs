@@ -385,22 +385,19 @@ fn spawn_init(
     extras: Vec<OwnedFd>,
 ) -> io::Result<(i32, OwnedFd)> {
     let (status_r, status_w) = pipe()?;
-    let mut flags = libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS;
-    if req.net == NetMode::Loopback {
-        flags |= libc::CLONE_NEWNET;
-    }
+    let plan = SetupPlan::new(req)?;
     let pid = unsafe {
-        libc::syscall(libc::SYS_clone, (flags | libc::SIGCHLD) as libc::c_ulong, 0usize, 0usize, 0usize, 0usize)
+        libc::syscall(libc::SYS_clone, (plan.namespaces | libc::SIGCHLD) as libc::c_ulong, 0usize, 0usize, 0usize, 0usize)
     } as i32;
     if pid < 0 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
         drop(status_r);
-        if let Some(cg) = &req.cgroup {
-            let _ = std::fs::write(cg.join("cgroup.procs"), "0");
+        if let Some(file) = &plan.join_cgroup {
+            let _ = std::fs::write(file, "0");
         }
-        let code = init_main(req, stdin, stdout, stderr, extras, status_w);
+        let code = init_main(req, &plan, stdin, stdout, stderr, extras, status_w);
         unsafe { libc::_exit(code) };
     }
     Ok((pid, status_r))
@@ -427,54 +424,116 @@ fn mount(src: Option<&Path>, tgt: &Path, fstype: Option<&str>, flags: libc::c_ul
     Ok(())
 }
 
-fn inside(root: &Path, p: &[u8]) -> PathBuf {
-    let rel = p.strip_prefix(b"/").unwrap_or(p);
-    if rel.is_empty() { root.to_path_buf() } else { root.join(OsStr::from_bytes(rel)) }
+struct MountOp {
+    src: Option<PathBuf>,
+    target: PathBuf,
+    fstype: Option<&'static str>,
+    flags: libc::c_ulong,
+    data: Option<&'static str>,
 }
 
-fn setup_mounts(req: &SpawnReq) -> io::Result<()> {
-    let root = &req.root;
-    mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
-    mount(Some(root), root, None, libc::MS_BIND | libc::MS_REC, None)?;
-    mount(Some(Path::new("tmpfs")), &root.join("tmp"), Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("mode=1777"))?;
-    mount(Some(Path::new("proc")), &root.join("proc"), Some("proc"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)?;
-    mount(Some(Path::new("/sys")), &root.join("sys"), None, libc::MS_BIND | libc::MS_REC, None)?;
-    let dev = root.join("dev");
-    mount(Some(Path::new("tmpfs")), &dev, Some("tmpfs"), libc::MS_NOSUID, Some("mode=755"))?;
-    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
-        let tgt = dev.join(name);
-        std::fs::File::create(&tgt)?;
-        mount(Some(&Path::new("/dev").join(name)), &tgt, None, libc::MS_BIND, None)?;
-    }
-    std::os::unix::fs::symlink("/proc/self/fd", dev.join("fd"))?;
-    std::os::unix::fs::symlink("/proc/self/fd/0", dev.join("stdin"))?;
-    std::os::unix::fs::symlink("/proc/self/fd/1", dev.join("stdout"))?;
-    std::os::unix::fs::symlink("/proc/self/fd/2", dev.join("stderr"))?;
-    std::fs::create_dir(dev.join("shm"))?;
-    mount(Some(Path::new("tmpfs")), &dev.join("shm"), Some("tmpfs"), libc::MS_NOSUID | libc::MS_NODEV, Some("mode=1777"))?;
-    std::fs::create_dir(dev.join("pts"))?;
-    if mount(Some(Path::new("devpts")), &dev.join("pts"), Some("devpts"), libc::MS_NOSUID | libc::MS_NOEXEC, Some("newinstance,ptmxmode=0666,mode=620")).is_ok() {
-        std::os::unix::fs::symlink("pts/ptmx", dev.join("ptmx"))?;
-    }
-    for b in &req.binds {
-        let tgt = inside(root, &b.inside);
-        mount(Some(&b.host), &tgt, None, libc::MS_BIND | libc::MS_REC, None)?;
-        if b.read_only {
-            mount(None, &tgt, None, libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC, None)?;
+enum SetupOp {
+    Mount(MountOp),
+    CreateFile(PathBuf),
+    CreateDir(PathBuf),
+    Symlink(&'static str, PathBuf),
+    Devpts(MountOp, PathBuf),
+    Pivot(PathBuf),
+}
+
+struct SetupPlan {
+    namespaces: i32,
+    loopback: bool,
+    join_cgroup: Option<PathBuf>,
+    mounts: Vec<SetupOp>,
+}
+
+impl SetupPlan {
+    fn new(req: &SpawnReq) -> io::Result<Self> {
+        let loopback = req.net == NetMode::Loopback;
+        let namespaces = libc::CLONE_NEWNS | libc::CLONE_NEWPID | libc::CLONE_NEWIPC | libc::CLONE_NEWUTS
+            | if loopback { libc::CLONE_NEWNET } else { 0 };
+        let root = &req.root;
+        let op = |src: Option<&Path>, target, fstype, flags, data| {
+            MountOp { src: src.map(Path::to_path_buf), target, fstype, flags, data }
+        };
+        let dev = root.join("dev");
+        let tmpfs = |target, flags, mode| SetupOp::Mount(op(Some(Path::new("tmpfs")), target, Some("tmpfs"), flags, Some(mode)));
+        let mut mounts = vec![
+            SetupOp::Mount(op(None, "/".into(), None, libc::MS_REC | libc::MS_PRIVATE, None)),
+            SetupOp::Mount(op(Some(root), root.clone(), None, libc::MS_BIND | libc::MS_REC, None)),
+            tmpfs(root.join("tmp"), libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"),
+            SetupOp::Mount(op(Some(Path::new("proc")), root.join("proc"), Some("proc"), libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC, None)),
+            SetupOp::Mount(op(Some(Path::new("/sys")), root.join("sys"), None, libc::MS_BIND | libc::MS_REC, None)),
+            tmpfs(dev.clone(), libc::MS_NOSUID, "mode=755"),
+        ];
+        for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+            let target = dev.join(name);
+            mounts.push(SetupOp::CreateFile(target.clone()));
+            mounts.push(SetupOp::Mount(op(Some(&Path::new("/dev").join(name)), target, None, libc::MS_BIND, None)));
         }
+        for (target, name) in [("/proc/self/fd", "fd"), ("/proc/self/fd/0", "stdin"), ("/proc/self/fd/1", "stdout"), ("/proc/self/fd/2", "stderr")] {
+            mounts.push(SetupOp::Symlink(target, dev.join(name)));
+        }
+        mounts.push(SetupOp::CreateDir(dev.join("shm")));
+        mounts.push(tmpfs(dev.join("shm"), libc::MS_NOSUID | libc::MS_NODEV, "mode=1777"));
+        mounts.push(SetupOp::CreateDir(dev.join("pts")));
+        mounts.push(SetupOp::Devpts(op(Some(Path::new("devpts")), dev.join("pts"), Some("devpts"),
+            libc::MS_NOSUID | libc::MS_NOEXEC, Some("newinstance,ptmxmode=0666,mode=620")), dev.join("ptmx")));
+        for bind in &req.binds {
+            let rel = Path::new(OsStr::from_bytes(&bind.inside));
+            let rel = rel.strip_prefix("/").unwrap_or(rel);
+            if !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "sandbox bind destination must stay within the root"));
+            }
+            let target = if rel.as_os_str().is_empty() { root.clone() } else { root.join(rel) };
+            mounts.push(SetupOp::Mount(op(Some(&bind.host), target.clone(), None, libc::MS_BIND | libc::MS_REC, None)));
+            if bind.read_only {
+                mounts.push(SetupOp::Mount(op(None, target, None, libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC, None)));
+            }
+        }
+        mounts.push(SetupOp::Pivot(root.clone()));
+        let join_cgroup = req.cgroup.as_ref().map(|group| crate::cgroup::membership_file(group));
+        Ok(Self { namespaces, loopback, join_cgroup, mounts })
     }
+
+    #[cfg(test)]
+    fn invariants(&self, root: &Path) -> bool {
+        self.mounts.iter().enumerate().all(|(i, op)| match op {
+            SetupOp::Mount(op) if i == 0 => op.target == Path::new("/") && op.flags == (libc::MS_REC | libc::MS_PRIVATE),
+            SetupOp::Mount(op) | SetupOp::Devpts(op, _) => op.target.starts_with(root),
+            SetupOp::CreateFile(target) | SetupOp::CreateDir(target) | SetupOp::Symlink(_, target) => target.starts_with(root),
+            SetupOp::Pivot(at) => at == root && i + 1 == self.mounts.len(),
+        })
+    }
+
+    fn execute(&self) -> io::Result<()> {
+        for op in &self.mounts {
+            match op {
+                SetupOp::Mount(op) => mount(op.src.as_deref(), &op.target, op.fstype, op.flags, op.data)?,
+                SetupOp::CreateFile(path) => { std::fs::File::create(path)?; }
+                SetupOp::CreateDir(path) => std::fs::create_dir(path)?,
+                SetupOp::Symlink(target, path) => std::os::unix::fs::symlink(target, path)?,
+                SetupOp::Devpts(op, link) => {
+                    if mount(op.src.as_deref(), &op.target, op.fstype, op.flags, op.data).is_ok() {
+                        std::os::unix::fs::symlink("pts/ptmx", link)?;
+                    }
+                }
+                SetupOp::Pivot(root) => pivot(root)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn pivot(root: &Path) -> io::Result<()> {
     let root_c = path_cstr(root);
     unsafe {
-        if libc::chdir(root_c.as_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::umount2(c".".as_ptr(), libc::MNT_DETACH) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if libc::chdir(c"/".as_ptr()) != 0 {
+        if libc::chdir(root_c.as_ptr()) != 0
+            || libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) != 0
+            || libc::umount2(c".".as_ptr(), libc::MNT_DETACH) != 0
+            || libc::chdir(c"/".as_ptr()) != 0
+        {
             return Err(io::Error::last_os_error());
         }
     }
@@ -510,6 +569,7 @@ fn write_all_fd(fd: RawFd, mut b: &[u8]) {
 
 fn init_main(
     req: &SpawnReq,
+    plan: &SetupPlan,
     stdin: Option<OwnedFd>,
     stdout: OwnedFd,
     stderr: OwnedFd,
@@ -527,10 +587,10 @@ fn init_main(
         let name = b"rargo";
         libc::sethostname(name.as_ptr() as *const _, name.len());
     }
-    if req.net == NetMode::Loopback {
+    if plan.loopback {
         loopback_up();
     }
-    if let Err(e) = setup_mounts(req) {
+    if let Err(e) = plan.execute() {
         write_all_fd(stderr.as_raw_fd(), format!("rargo: sandbox setup failed: {e}\n").as_bytes());
         report(126 << 8, true);
         return 126;
@@ -580,6 +640,49 @@ fn init_main(
     }
 }
 
+struct ExecPlan {
+    argv: Vec<CString>,
+    env: Vec<CString>,
+    candidates: Vec<Vec<u8>>,
+}
+
+impl ExecPlan {
+    fn new(req: &SpawnReq) -> io::Result<Self> {
+        let Some(prog) = req.argv.first() else { return Err(io::Error::from_raw_os_error(libc::EINVAL)) };
+        let argv: Vec<CString> = req.argv.iter().map(|a| cstr(a)).collect();
+        let env: Vec<CString> = req
+            .env
+            .iter()
+            .map(|(k, v)| {
+                let mut kv = k.clone();
+                kv.push(b'=');
+                kv.extend_from_slice(v);
+                cstr(&kv)
+            })
+            .collect();
+        let candidates: Vec<Vec<u8>> = if prog.contains(&b'/') {
+            vec![prog.clone()]
+        } else {
+            let path = req
+                .env
+                .iter()
+                .find(|(k, _)| k == b"PATH")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| b"/usr/local/bin:/usr/bin:/bin".to_vec());
+            path.split(|&c| c == b':')
+                .filter(|d| !d.is_empty())
+                .map(|d| {
+                    let mut p = d.to_vec();
+                    p.push(b'/');
+                    p.extend_from_slice(prog);
+                    p
+                })
+                .collect()
+        };
+        Ok(Self { argv, env, candidates })
+    }
+}
+
 fn exec_child(
     req: &SpawnReq,
     stdin: Option<OwnedFd>,
@@ -625,44 +728,16 @@ fn exec_child(
             return io::Error::last_os_error();
         }
     }
-    let Some(prog) = req.argv.first() else { return io::Error::from_raw_os_error(libc::EINVAL) };
-    let argv: Vec<CString> = req.argv.iter().map(|a| cstr(a)).collect();
-    let mut argv_p: Vec<*const libc::c_char> = argv.iter().map(|c| c.as_ptr()).collect();
-    argv_p.push(std::ptr::null());
-    let env: Vec<CString> = req
-        .env
-        .iter()
-        .map(|(k, v)| {
-            let mut kv = k.clone();
-            kv.push(b'=');
-            kv.extend_from_slice(v);
-            cstr(&kv)
-        })
-        .collect();
-    let mut env_p: Vec<*const libc::c_char> = env.iter().map(|c| c.as_ptr()).collect();
-    env_p.push(std::ptr::null());
-
-    let candidates: Vec<Vec<u8>> = if prog.contains(&b'/') {
-        vec![prog.clone()]
-    } else {
-        let path = req
-            .env
-            .iter()
-            .find(|(k, _)| k == b"PATH")
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| b"/usr/local/bin:/usr/bin:/bin".to_vec());
-        path.split(|&c| c == b':')
-            .filter(|d| !d.is_empty())
-            .map(|d| {
-                let mut p = d.to_vec();
-                p.push(b'/');
-                p.extend_from_slice(prog);
-                p
-            })
-            .collect()
+    let exec = match ExecPlan::new(req) {
+        Ok(exec) => exec,
+        Err(error) => return error,
     };
+    let mut argv_p: Vec<*const libc::c_char> = exec.argv.iter().map(|arg| arg.as_ptr()).collect();
+    argv_p.push(std::ptr::null());
+    let mut env_p: Vec<*const libc::c_char> = exec.env.iter().map(|var| var.as_ptr()).collect();
+    env_p.push(std::ptr::null());
     let mut last = io::Error::from_raw_os_error(libc::ENOENT);
-    for c in candidates {
+    for c in exec.candidates {
         let c = cstr(&c);
         unsafe { libc::execve(c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
         let e = io::Error::last_os_error();
@@ -672,4 +747,43 @@ fn exec_child(
         last = e;
     }
     last
+}
+
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn generated_setup_plans_keep_mounts_inside_the_action() {
+        for net in [NetMode::Host, NetMode::Loopback] {
+            for flake in [false, true] {
+                for worker in [false, true] {
+                    let root = PathBuf::from("/fixture/sandbox");
+                    let binds = if flake { vec![Bind { host: "/nix/store".into(), inside: b"/nix/store".to_vec(), read_only: true }] } else { vec![] };
+                    let req = SpawnReq { root: root.clone(), argv: vec![b"rustc".to_vec()], env: vec![], cwd: b"/work".to_vec(), uid: 700, gid: 701,
+                        net, binds, cgroup: (!worker).then(|| "/fixture/cgroup/action-5".into()) };
+                    let plan = SetupPlan::new(&req).unwrap();
+                    assert!(plan.invariants(&root));
+                    assert_eq!(plan.namespaces & libc::CLONE_NEWNET != 0, net == NetMode::Loopback);
+                    assert_eq!(plan.join_cgroup, (!worker).then(|| "/fixture/cgroup/action-5/cgroup.procs".into()));
+                    let mounted: Vec<_> = plan.mounts.iter().filter_map(|op| match op {
+                        SetupOp::Mount(op) | SetupOp::Devpts(op, _) => Some(op.target.as_path()),
+                        _ => None,
+                    }).collect();
+                    let mut expected = vec!["/", "/fixture/sandbox", "/fixture/sandbox/tmp", "/fixture/sandbox/proc", "/fixture/sandbox/sys",
+                        "/fixture/sandbox/dev", "/fixture/sandbox/dev/null", "/fixture/sandbox/dev/zero", "/fixture/sandbox/dev/full",
+                        "/fixture/sandbox/dev/random", "/fixture/sandbox/dev/urandom", "/fixture/sandbox/dev/tty", "/fixture/sandbox/dev/shm",
+                        "/fixture/sandbox/dev/pts"];
+                    if flake {
+                        expected.extend(["/fixture/sandbox/nix/store"; 2]);
+                    }
+                    assert_eq!(mounted, expected.into_iter().map(Path::new).collect::<Vec<_>>());
+                    let exec = ExecPlan::new(&req).unwrap();
+                    assert_eq!(exec.argv[0].as_bytes(), b"rustc");
+                    assert_eq!(exec.candidates, [b"/usr/local/bin/rustc".to_vec(), b"/usr/bin/rustc".to_vec(), b"/bin/rustc".to_vec()]);
+                }
+            }
+        }
+    }
 }

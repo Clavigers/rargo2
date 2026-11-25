@@ -21,7 +21,8 @@ impl View for HostView {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--internal-zygote") {
-        rargo_core::sandbox::zygote_main(args[2].parse()?);
+        let fd = args.get(2).ok_or_else(|| anyhow::anyhow!("--internal-zygote requires a descriptor"))?.parse()?;
+        rargo_core::sandbox::zygote_main(fd);
     }
     let mut state = PathBuf::from("/root/rargo-work/sandbox-tool");
     let mut passthrough = true;
@@ -31,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         match args[i].as_str() {
             "--state" => {
                 i += 1;
-                state = PathBuf::from(&args[i]);
+                state = PathBuf::from(args.get(i).ok_or_else(|| anyhow::anyhow!("--state requires a directory"))?);
             }
             "--no-passthrough" => passthrough = false,
             "--quiet" => quiet = true,

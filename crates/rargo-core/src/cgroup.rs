@@ -5,22 +5,31 @@ pub fn setup() -> Option<PathBuf> {
         return None;
     }
     let me = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let rel = me.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
-    if rel == "/" || rel.is_empty() {
-        return None;
-    }
-    let dir = PathBuf::from(format!("/sys/fs/cgroup{rel}"));
+    let dir = delegated_root(&me)?;
     if !delegated(&dir) {
         return None;
     }
     let leaf = dir.join("daemon");
     std::fs::create_dir_all(&leaf).ok()?;
-    let procs = std::fs::read_to_string(dir.join("cgroup.procs")).ok()?;
+    let procs = std::fs::read_to_string(membership_file(&dir)).ok()?;
     for pid in procs.split_whitespace() {
-        std::fs::write(leaf.join("cgroup.procs"), pid).ok()?;
+        std::fs::write(membership_file(&leaf), pid).ok()?;
     }
     std::fs::write(dir.join("cgroup.subtree_control"), "+memory").ok()?;
     Some(dir)
+}
+
+fn delegated_root(membership: &str) -> Option<PathBuf> {
+    let rel = membership.lines().find_map(|line| line.strip_prefix("0::"))?.trim();
+    let relative = Path::new(rel).strip_prefix("/").ok()?;
+    if relative.as_os_str().is_empty() || !relative.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+        return None;
+    }
+    Some(Path::new("/sys/fs/cgroup").join(relative))
+}
+
+pub(crate) fn membership_file(group: &Path) -> PathBuf {
+    group.join("cgroup.procs")
 }
 
 fn delegated(dir: &Path) -> bool {
