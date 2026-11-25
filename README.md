@@ -48,3 +48,7 @@ pass = ["DATABASE_URL"]                # given to every action
 ```
 
 `rargo --help` lists the other commands.
+
+## Docs
+
+Read the docs at [rargo.rs](https://rargo.rs).
