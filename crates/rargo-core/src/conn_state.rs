@@ -585,10 +585,15 @@ mod tests {
         let Command::Fail(old) = command(PROTO_VERSION - 1, &a(&["build"]), false, "bob") else { panic!("an old client") };
         let server = format!("which runs rargo {}", env!("CARGO_PKG_VERSION"));
         assert!(old.starts_with("this rargo is older than the build server, ") && old.contains(&server), "{old}");
-        assert!(old.contains(&format!("update it with: {install}; then name the server once more with `rargo @HOST`")), "{old}");
-        assert!(old.ends_with("not in Cargo.toml") && !old.contains("protocol"), "{old}");
+        assert!(old.ends_with(&format!("update it with: {install}")) && !old.contains("protocol"), "{old}");
+        let Command::Fail(oldest) = command(SERVER_IN_CARGO_TOML_UNTIL, &a(&["build"]), false, "bob") else { panic!("a client from before the server left Cargo.toml") };
+        assert!(oldest.contains(&format!("update it with: {install}; then name the server once more with `rargo @HOST`")), "{oldest}");
+        assert!(oldest.ends_with("not in Cargo.toml") && !oldest.contains("protocol"), "{oldest}");
         for client in [1, 6, SERVER_IN_CARGO_TOML_UNTIL] {
             assert!(protocol_mismatch(client).contains("`rargo @HOST`"), "a client that kept its server in Cargo.toml: {client}");
+        }
+        for client in SERVER_IN_CARGO_TOML_UNTIL + 1..PROTO_VERSION {
+            assert!(!protocol_mismatch(client).contains("`rargo @HOST`"), "a client that keeps its server in its own configuration: {client}");
         }
         let Command::Fail(new) = command(PROTO_VERSION + 1, &a(&["build"]), false, "bob") else { panic!("a new client") };
         assert!(new.starts_with("this rargo is newer than the build server, ") && new.ends_with(&install), "{new}");

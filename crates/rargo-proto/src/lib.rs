@@ -5,7 +5,7 @@ pub mod secure;
 pub mod tree;
 pub mod workspace;
 
-pub const PROTO_VERSION: u32 = 8;
+pub const PROTO_VERSION: u32 = 9;
 
 pub const REFUSED: &str = "the server does not know this token, or it was revoked or has expired";
 
@@ -153,7 +153,7 @@ pub enum ServerMsg {
     WantTrees(Vec<Digest>),
     WantBlobs(Vec<Digest>),
     WantEnv(Vec<String>),
-    Deliver { id: u64, files: Vec<Delivery>, writes: Vec<Write> },
+    Deliver { id: u64, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String> },
     Blobs(Vec<Blob>),
     BlobPart { hash: Digest, part: Part, last: bool },
     Delivered { id: u64 },

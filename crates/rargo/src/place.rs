@@ -133,6 +133,35 @@ pub(crate) fn within(root: &Path, path: &Path) -> bool {
         })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Bound {
+    root: PathBuf,
+    targets: Vec<PathBuf>,
+}
+
+impl Bound {
+    pub(crate) fn new(root: &Path, targets: &[String]) -> Bound {
+        let mut targets: Vec<PathBuf> = targets.iter().map(PathBuf::from).filter(|t| within(Path::new("/"), t)).collect();
+        targets.sort();
+        targets.dedup();
+        Bound { root: root.into(), targets }
+    }
+
+    pub(crate) fn holds(&self, path: &Path) -> bool {
+        within(&self.root, path) || self.targets.iter().any(|t| t == path || within(t, path))
+    }
+}
+
+impl std::fmt::Display for Bound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the worktree `{}`", self.root.display())?;
+        for t in &self.targets {
+            write!(f, " or the target directory `{}`", t.display())?;
+        }
+        Ok(())
+    }
+}
+
 fn write_path(w: &Write) -> &str {
     match w {
         Write::Dir { path } | Write::Remove { path } | Write::Symlink { path, .. } | Write::File { path, .. } | Write::Text { path, .. } => {
@@ -182,7 +211,7 @@ enum Choice {
 }
 
 pub(crate) struct Placement {
-    root: PathBuf,
+    bound: Bound,
     blobs: PathBuf,
     writes: Vec<Write>,
     targets: BTreeMap<PathBuf, Target>,
@@ -198,7 +227,7 @@ pub(crate) struct Plan {
 }
 
 impl Placement {
-    pub(crate) fn new(root: &Path, blobs: &Path, placed: &Placed, files: Vec<Delivery>, writes: Vec<Write>) -> Result<Self, PathBuf> {
+    pub(crate) fn new(bound: &Bound, blobs: &Path, placed: &Placed, files: Vec<Delivery>, writes: Vec<Write>) -> Result<Self, PathBuf> {
         let mut targets = BTreeMap::new();
         let mut rest = Vec::new();
         let mut add = |path: String, hash: Digest, size: u64, exec: bool, own: bool| {
@@ -206,7 +235,7 @@ impl Placement {
             targets.insert(path.clone(), Target { path, hash, size, exec, own, clear: false });
         };
         for w in writes {
-            if !within(root, Path::new(write_path(&w))) {
+            if !bound.holds(Path::new(write_path(&w))) {
                 return Err(write_path(&w).into());
             }
             match w {
@@ -215,7 +244,7 @@ impl Placement {
             }
         }
         for f in files {
-            if !within(root, Path::new(&f.path)) {
+            if !bound.holds(Path::new(&f.path)) {
                 return Err(f.path.into());
             }
             add(f.path, f.hash, f.size, f.exec, f.own);
@@ -224,7 +253,7 @@ impl Placement {
             .keys()
             .filter_map(|p| Some((p.clone(), *placed.files.get(p.to_str()?)?)))
             .collect();
-        Ok(Placement { root: root.into(), blobs: blobs.into(), writes: rest, targets, records, seen: BTreeMap::new() })
+        Ok(Placement { bound: bound.clone(), blobs: blobs.into(), writes: rest, targets, records, seen: BTreeMap::new() })
     }
 
     pub(crate) fn saw(&mut self, look: Look, sight: Sight) {
@@ -364,7 +393,7 @@ impl Placement {
                 }
                 Choice::Install(from, matching) => {
                     reused += 1;
-                    if let Some(dir) = t.path.parent().filter(|d| within(&self.root, d) && dirs.insert(d.to_path_buf())) {
+                    if let Some(dir) = t.path.parent().filter(|d| self.bound.holds(d) && dirs.insert(d.to_path_buf())) {
                         ops.push(Op::Dir(dir.into()));
                     }
                     if clear {
@@ -381,13 +410,13 @@ impl Placement {
 
     #[cfg(test)]
     fn invariants(&self) -> bool {
-        let ours = |p: &Path| p == self.root || within(&self.root, p) || within(&self.blobs, p);
+        let ours = |p: &Path| p == self.bound.root || self.bound.holds(p) || within(&self.blobs, p);
         let named = |pid: u32| {
             self.seen.values().any(|s| matches!(s, Sight::List(names) if names.iter().any(|n| crate::tmp::owner(n, crate::tmp::BESIDE) == Some(pid))))
         };
         let wants = self.wants();
-        self.targets.iter().all(|(p, t)| *p == t.path && within(&self.root, p) && !t.clear)
-            && self.writes.iter().all(|w| within(&self.root, Path::new(write_path(w))) && !matches!(w, Write::File { .. }))
+        self.targets.iter().all(|(p, t)| *p == t.path && self.bound.holds(p) && !t.clear)
+            && self.writes.iter().all(|w| self.bound.holds(Path::new(write_path(w))) && !matches!(w, Write::File { .. }))
             && self.records.keys().all(|p| self.targets.contains_key(p))
             && self.seen.iter().all(|(look, sight)| {
                 look.answered_by(sight)
@@ -708,14 +737,10 @@ impl Placer {
         self.arrived(hash, &part.tmp)
     }
 
-    pub fn deliver(&mut self, root: &Path, files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
-        let mut placement = Placement::new(root, &self.cache, &self.placed, files, writes).map_err(|path| {
-            io::Error::other(format!(
-                "the server asked to place `{}`, which is not inside the worktree `{}`",
-                path.display(),
-                root.display()
-            ))
-        })?;
+    pub fn deliver(&mut self, root: &Path, targets: &[String], files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
+        let bound = Bound::new(root, targets);
+        let mut placement = Placement::new(&bound, &self.cache, &self.placed, files, writes)
+            .map_err(|path| io::Error::other(format!("the server asked to place `{}`, which is not inside {bound}", path.display())))?;
         loop {
             let wants = placement.wants();
             if wants.is_empty() {
@@ -952,8 +977,8 @@ mod tests {
             Ok(())
         }
 
-        fn deliver(&mut self, waiting: &mut Waiting, root: &Path, blobs: &Path, files: Vec<Delivery>, writes: Vec<Write>) -> (Vec<Op>, Vec<Digest>) {
-            let mut placement = Placement::new(root, blobs, &self.placed, files, writes).unwrap();
+        fn deliver(&mut self, waiting: &mut Waiting, bound: &Bound, blobs: &Path, files: Vec<Delivery>, writes: Vec<Write>) -> (Vec<Op>, Vec<Digest>) {
+            let mut placement = Placement::new(bound, blobs, &self.placed, files, writes).unwrap();
             assert!(placement.invariants());
             loop {
                 let wants = placement.wants();
@@ -968,8 +993,8 @@ mod tests {
             }
             let plan = placement.plan();
             for op in &plan.ops {
-                let root_dir = matches!(op, Op::Dir(p) if p == root);
-                assert!(root_dir || within(root, op.path()) || within(blobs, op.path()), "{op:?} stays in the worktree or the cache");
+                let root_dir = matches!(op, Op::Dir(p) if *p == bound.root);
+                assert!(root_dir || bound.holds(op.path()) || within(blobs, op.path()), "{op:?} stays in the worktree, the target directories or the cache");
                 if let Op::Install { ways, .. } = op {
                     assert!(ways.iter().all(|w| within(blobs, &w.from)), "a placement copies only from the cache: {ways:?}");
                 }
@@ -988,7 +1013,7 @@ mod tests {
             let ino = self.inode(content.to_vec(), 0o644);
             self.tree.insert(tmp.clone(), Entry::File(ino));
             for op in waiting.arrived(blobs, hash, &tmp) {
-                assert!(within(blobs, op.path()) || op.path().starts_with("/w"), "{op:?}");
+                assert!(within(blobs, op.path()) || op.path().starts_with("/w") || op.path().starts_with("/o/tgt"), "{op:?}");
                 self.run(&op).unwrap_or_else(|()| panic!("{op:?} failed"));
                 assert!(waiting.invariants());
             }
@@ -1002,8 +1027,9 @@ mod tests {
 
     #[test]
     fn generated_placements_leave_the_delivered_tree_keep_what_is_unchanged_and_touch_nothing_else() {
-        let root = Path::new("/w");
         let blobs = Path::new("/home/u/.cache/rargo/blobs");
+        let inside = Bound::new(Path::new("/w"), &["/w/target".into()]);
+        let outside = Bound::new(Path::new("/w"), &["/o/tgt".into(), "/o/tgt/build".into()]);
         let pool = [
             "/w/target/debug/app",
             "/w/target/debug/deps/libx.rlib",
@@ -1011,11 +1037,15 @@ mod tests {
             "/w/target/release/tool",
             "/w/target/doc/x/index.html",
             "/w/target/debug/examples/ex",
+            "/o/tgt/debug/app",
+            "/o/tgt/build/debug/deps/liby.rlib",
         ];
         let contents: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 1 + (i as usize % 2)]).collect();
         let (dead_tmp, live_tmp) = ("/w/target/debug/.rargo-tmp-777-1-app", "/w/target/debug/.rargo-tmp-888-2-app");
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let elsewhere = rng.chance(2);
+            let bound = if elsewhere { &outside } else { &inside };
             let mut w = World::new(rng.chance(2));
             w.dead.insert(777);
             w.file("/etc/passwd", b"root", 0o644);
@@ -1037,7 +1067,7 @@ mod tests {
             let mut files = Vec::new();
             let mut kept = BTreeSet::new();
             for path in pool {
-                if rng.chance(3) {
+                if rng.chance(3) || !bound.holds(Path::new(path)) {
                     continue;
                 }
                 let content = &contents[rng.below(contents.len() as u64) as usize];
@@ -1093,6 +1123,10 @@ mod tests {
             if rng.chance(3) {
                 writes.push(Write::Dir { path: "/w/gen/deep".into() });
             }
+            if elsewhere && rng.chance(2) {
+                writes.push(Write::Dir { path: "/o/tgt".into() });
+                writes.push(Write::Text { path: "/o/tgt/CACHEDIR.TAG".into(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) });
+            }
             if rng.chance(3) {
                 writes.push(Write::Symlink { path: "/w/gen/link".into(), target: b"deep".to_vec() });
             }
@@ -1108,7 +1142,7 @@ mod tests {
 
             let before = w.clone();
             let mut waiting = Waiting::default();
-            let (_, need) = w.deliver(&mut waiting, root, blobs, files.clone(), writes.clone());
+            let (_, need) = w.deliver(&mut waiting, bound, blobs, files.clone(), writes.clone());
             assert_eq!(need.iter().collect::<BTreeSet<_>>().len(), need.len(), "each content is fetched once");
             for hash in &need {
                 let content = contents.iter().find(|c| blake3::hash(c).as_bytes() == hash).unwrap();
@@ -1187,7 +1221,7 @@ mod tests {
 
             let settled = w.clone();
             let mut waiting = Waiting::default();
-            let (ops, need) = w.deliver(&mut waiting, root, blobs, files.clone(), Vec::new());
+            let (ops, need) = w.deliver(&mut waiting, bound, blobs, files.clone(), Vec::new());
             assert!(need.is_empty(), "seed {seed}: a second delivery of the same files fetches nothing");
             assert!(ops.iter().all(|op| matches!(op, Op::Record(..))), "seed {seed}: and changes nothing: {ops:?}");
             assert_eq!((w.tree, w.inodes), (settled.tree, settled.inodes), "seed {seed}: every mtime is kept");
@@ -1195,24 +1229,38 @@ mod tests {
     }
 
     #[test]
-    fn only_paths_inside_the_worktree_are_placed() {
+    fn only_paths_inside_the_worktree_or_the_commands_target_directories_are_placed() {
         let root = Path::new("/w");
-        for (path, inside) in [
-            ("/w/target/debug/app", true),
-            ("/w/Cargo.lock", true),
-            ("/w", false),
-            ("/etc/passwd", false),
-            ("/w/../etc/passwd", false),
-            ("/w/target/../../etc/passwd", false),
-            ("/wx/target/app", false),
-            ("target/debug/app", false),
-            ("", false),
+        let named = ["/w/target".to_string(), "/srv/out".into(), "/srv/out".into(), "/".into(), "rel/out".into(), "/x/../etc".into(), "".into()];
+        let bound = Bound::new(root, &named);
+        assert_eq!(bound.targets, [PathBuf::from("/srv/out"), PathBuf::from("/w/target")], "only plain absolute directories bound a delivery");
+        assert_eq!(bound.to_string(), "the worktree `/w` or the target directory `/srv/out` or the target directory `/w/target`");
+        for (path, worktree, with_targets) in [
+            ("/w/target/debug/app", true, true),
+            ("/w/Cargo.lock", true, true),
+            ("/w", false, false),
+            ("/srv/out", false, true),
+            ("/srv/out/CACHEDIR.TAG", false, true),
+            ("/srv/out/debug/app", false, true),
+            ("/srv/out/../../etc/passwd", false, false),
+            ("/srv/outer/app", false, false),
+            ("/srv", false, false),
+            ("/etc/passwd", false, false),
+            ("/x/../etc/passwd", false, false),
+            ("/w/../etc/passwd", false, false),
+            ("/w/target/../../etc/passwd", false, false),
+            ("/wx/target/app", false, false),
+            ("target/debug/app", false, false),
+            ("", false, false),
         ] {
-            assert_eq!(within(root, Path::new(path)), inside, "{path}");
-            let file = Placement::new(root, Path::new("/c"), &Placed::default(), vec![delivery(path, b"x", false, true)], vec![]);
-            assert_eq!(file.is_ok(), inside, "{path}");
-            let write = Placement::new(root, Path::new("/c"), &Placed::default(), vec![], vec![Write::Remove { path: path.into() }]);
-            assert_eq!(write.err(), (!inside).then(|| PathBuf::from(path)), "{path}");
+            assert_eq!(within(root, Path::new(path)), worktree, "{path}");
+            for (b, inside) in [(Bound::new(root, &[]), worktree), (bound.clone(), with_targets)] {
+                assert_eq!(b.holds(Path::new(path)), inside, "{path} in {b}");
+                let file = Placement::new(&b, Path::new("/c"), &Placed::default(), vec![delivery(path, b"x", false, true)], vec![]);
+                assert_eq!(file.is_ok(), inside, "{path} in {b}");
+                let write = Placement::new(&b, Path::new("/c"), &Placed::default(), vec![], vec![Write::Remove { path: path.into() }]);
+                assert_eq!(write.err(), (!inside).then(|| PathBuf::from(path)), "{path} in {b}");
+            }
         }
         assert!(!within(Path::new("w"), Path::new("w/a")), "the root is absolute");
     }
@@ -1257,7 +1305,7 @@ mod tests {
         let h = *blake3::hash(&content).as_bytes();
         let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
         let d = delivery(dest.to_str().unwrap(), &content, false, true);
-        assert_eq!(p.deliver(tmp.path(), vec![d], vec![]).unwrap(), vec![h]);
+        assert_eq!(p.deliver(tmp.path(), &[], vec![d], vec![]).unwrap(), vec![h]);
         let (x, y) = content.split_at(700_000);
         p.part(h, x, false).unwrap();
         p.part(h, y, true).unwrap();
@@ -1275,6 +1323,7 @@ mod tests {
         let need = p
             .deliver(
                 tmp.path(),
+                &[],
                 vec![],
                 vec![
                     Write::Dir { path: s("gen/deep") },
@@ -1292,8 +1341,39 @@ mod tests {
         assert_eq!(std::fs::read(tmp.path().join("src/generated.rs")).unwrap(), src);
         let md = std::fs::metadata(tmp.path().join("src/generated.rs")).unwrap();
         assert!(md.mode() & 0o200 != 0 && md.nlink() == 1, "a source file is an ordinary writable file");
-        p.deliver(tmp.path(), vec![], vec![Write::Remove { path: s("gen") }, Write::Text { path: s("target/debug/app.d"), text: None }]).unwrap();
+        p.deliver(tmp.path(), &[], vec![], vec![Write::Remove { path: s("gen") }, Write::Text { path: s("target/debug/app.d"), text: None }]).unwrap();
         assert!(!tmp.path().join("gen").exists() && !tmp.path().join("target/debug/app.d").exists());
-        assert!(p.deliver(tmp.path(), vec![], vec![Write::Remove { path: "/etc".into() }]).is_err());
+        assert!(p.deliver(tmp.path(), &[], vec![], vec![Write::Remove { path: "/etc".into() }]).is_err());
+    }
+
+    #[test]
+    fn a_target_directory_outside_the_worktree_is_placed_when_the_server_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, outside) = (tmp.path().join("proj"), tmp.path().join("outside"));
+        std::fs::create_dir_all(&root).unwrap();
+        let named = [outside.to_string_lossy().into_owned(), root.join("target").to_string_lossy().into_owned()];
+        let content = b"\x7fELF hi";
+        let h = *blake3::hash(content).as_bytes();
+        let app = outside.join("debug/p");
+        let tag = Write::Text { path: outside.join("CACHEDIR.TAG").to_string_lossy().into_owned(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) };
+        let files = vec![delivery(app.to_str().unwrap(), content, true, false)];
+        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
+        let refused = p.deliver(&root, &named[1..], files.clone(), vec![tag.clone()]).unwrap_err().to_string();
+        assert_eq!(
+            refused,
+            format!(
+                "the server asked to place `{}`, which is not inside the worktree `{}` or the target directory `{}`",
+                outside.join("CACHEDIR.TAG").display(),
+                root.display(),
+                root.join("target").display()
+            )
+        );
+        assert!(!outside.exists(), "nothing is placed when the delivery is refused");
+        assert_eq!(p.deliver(&root, &named, files, vec![Write::Dir { path: named[0].clone() }, tag]).unwrap(), vec![h]);
+        p.blob(h, content).unwrap();
+        assert_eq!(std::fs::read(&app).unwrap(), content);
+        assert!(outside.join("CACHEDIR.TAG").is_file());
+        let passwd = vec![delivery("/etc/passwd", b"x", false, true)];
+        assert!(p.deliver(&root, &named, passwd, vec![]).is_err(), "and nothing else outside is");
     }
 }

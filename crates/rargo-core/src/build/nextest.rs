@@ -664,6 +664,7 @@ async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(A
         commits: c.commits.clone(),
         home: c.home.clone(),
         outbox: c.outbox.clone(),
+        targets: c.targets.clone(),
     });
     let keep = Mutex::new(None);
     let mut code = 101;

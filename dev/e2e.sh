@@ -539,6 +539,15 @@ out=$(cargo build --offline 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "stock cargo builds into the same target/ that rargo linked into" || bad "stock cargo builds into the same target/" "$out"
 expect "and rargo still works afterwards" "$R" build
 
+echo "== a target directory outside the worktree"
+cd "$A"
+out=$(CARGO_TARGET_DIR="$T/outside-target" "$R" build 2>&1); rc=$?
+ran=$("$T/outside-target/debug/app" 2>&1)
+[ $rc -eq 0 ] && [ -f "$T/outside-target/CACHEDIR.TAG" ] && [ "$ran" = "$(./target/debug/app 2>&1)" ] && ok "CARGO_TARGET_DIR outside the worktree gets the built program" || bad "CARGO_TARGET_DIR outside the worktree gets the built program" "rc=$rc
+$out
+$ran"
+rm -rf "$T/outside-target"
+
 echo "== cargo's unused_dependencies lint"
 cd "$A"
 cp crates/app/Cargo.toml "$T/app-Cargo.toml"

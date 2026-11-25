@@ -96,7 +96,8 @@ pub struct Client {
     pub worktree: String,
     pub commits: Arc<Vec<[u8; 20]>>,
     pub home: Arc<Home>,
-    pub outbox: Arc<Mutex<(Vec<Delivery>, Vec<Write>)>>,
+    pub outbox: Arc<Mutex<(Vec<Delivery>, Vec<Write>, std::collections::BTreeSet<String>)>>,
+    pub targets: Vec<String>,
 }
 
 impl Client {
@@ -107,18 +108,19 @@ impl Client {
 
     pub fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) {
         if let Some(s) = self.session.as_ref().filter(|s| s.is_lazy()) {
-            s.deliver_lazy(files, writes);
+            s.deliver_lazy(files, writes, self.targets.clone());
             return;
         }
         let mut q = self.outbox.lock();
         q.0.extend(files);
         q.1.extend(writes);
+        q.2.extend(self.targets.iter().cloned());
     }
 
     pub async fn flush(&self) -> Result<()> {
-        let (files, writes) = std::mem::take(&mut *self.outbox.lock());
+        let (files, writes, targets) = std::mem::take(&mut *self.outbox.lock());
         match &self.session {
-            Some(s) => s.deliver(files, writes).await,
+            Some(s) => s.deliver(files, writes, targets.into_iter().collect()).await,
             None => Ok(()),
         }
     }
@@ -951,6 +953,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         commits: c.commits.clone(),
         home: c.home.clone(),
         outbox: c.outbox.clone(),
+        targets: [&plan.target_dir, &plan.build_dir].into_iter().map(|d| p.tr.path(d)).collect(),
     });
     c2.out.err_text(&String::from_utf8_lossy(&planned.stderr));
 
