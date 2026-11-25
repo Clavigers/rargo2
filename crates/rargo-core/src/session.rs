@@ -133,8 +133,8 @@ impl Session {
         self.state.lock().is_lazy()
     }
 
-    pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>) {
-        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes);
+    pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) {
+        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes, targets);
         let Some(mut out) = out else { return };
         loop {
             match out.step() {
@@ -306,8 +306,8 @@ impl Session {
         self.ask(Question::Report(Box::new(report)), &self.report_reply).await
     }
 
-    pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) -> Result<()> {
-        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes);
+    pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) -> Result<()> {
+        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes, targets);
         match out {
             Some(out) => self.send_out(out).await,
             None => Ok(()),

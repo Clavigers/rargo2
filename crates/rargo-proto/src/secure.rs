@@ -2,7 +2,7 @@ use snow::{HandshakeState, StatelessTransportState};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-pub const MAGIC: &[u8; 8] = b"rargo\x08\r\n";
+pub const MAGIC: &[u8; 8] = b"rargo\x09\r\n";
 const PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const RECORD: usize = 65000;
 pub const EARLY_MAX: usize = 60000;

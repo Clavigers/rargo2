@@ -119,7 +119,7 @@ enum CommandEffect {
     Trees(Vec<Digest>),
     Upload(Vec<Digest>),
     Environment(Vec<String>),
-    Deliver(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>),
+    Deliver(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>, Vec<String>),
     Blobs(Vec<Blob>),
     Part(Digest, rargo_proto::Part, bool),
     VerifyFetch,
@@ -347,9 +347,9 @@ impl CommandState {
             ServerMsg::WantTrees(want) => CommandEffect::Trees(want),
             ServerMsg::WantBlobs(want) => CommandEffect::Upload(want),
             ServerMsg::WantEnv(names) => CommandEffect::Environment(names),
-            ServerMsg::Deliver { files, writes, .. } => {
+            ServerMsg::Deliver { files, writes, targets, .. } => {
                 self.visible = true;
-                CommandEffect::Deliver(files, writes)
+                CommandEffect::Deliver(files, writes, targets)
             }
             ServerMsg::Blobs(blobs) => CommandEffect::Blobs(blobs),
             ServerMsg::BlobPart { hash, part, last } => CommandEffect::Part(hash, part, last),
@@ -1583,14 +1583,14 @@ impl Daemon {
                         let _ = crate::write_atomic(&self.cache.join("env-names"), (asked.join("\n") + "\n").as_bytes());
                     }
                 }
-                CommandEffect::Deliver(files, writes) => {
+                CommandEffect::Deliver(files, writes, targets) => {
                     tokio::task::block_in_place(|| -> std::io::Result<()> {
                         let (files, writes) = match shown {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
                             None => (files, writes),
                         };
                         let root = wt.map(|w| w.root.as_path()).ok_or_else(|| std::io::Error::other("the server sent files for a command that has no worktree"))?;
-                        placer.deliver(root, files, writes)?;
+                        placer.deliver(root, &targets, files, writes)?;
                         Ok(())
                     })?;
                 }

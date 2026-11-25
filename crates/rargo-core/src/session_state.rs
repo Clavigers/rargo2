@@ -400,7 +400,7 @@ impl SessionState {
         self.parts.remove(hash);
     }
 
-    pub fn deliver(&mut self, has: &mut ClientSet, files: Vec<Delivery>, writes: Vec<Write>) -> Option<Outgoing> {
+    pub fn deliver(&mut self, has: &mut ClientSet, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) -> Option<Outgoing> {
         if files.is_empty() && writes.is_empty() {
             return None;
         }
@@ -408,7 +408,7 @@ impl SessionState {
         let id = self.next_id;
         self.next_id += 1;
         self.delivered.extend(sizes.keys().copied());
-        let deliver = ServerMsg::Deliver { id, files, writes };
+        let deliver = ServerMsg::Deliver { id, files, writes, targets };
         if self.lazy {
             let small = has.push_small(&sizes, self.sizes.lazy_small);
             let mut out = Outgoing::new(self.sizes, small, true, ServerMsg::Delivered { id }, false);
@@ -824,7 +824,7 @@ mod tests {
         let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
         s.knows(&mut has, []);
-        let mut out = s.deliver(&mut has, vec![delivery(&small), delivery(&big)], vec![]).unwrap();
+        let mut out = s.deliver(&mut has, vec![delivery(&small), delivery(&big)], vec![], vec![]).unwrap();
         let mut seen = Vec::new();
         loop {
             match out.step() {
@@ -844,7 +844,7 @@ mod tests {
             "the big blob goes in parts as it is read; the small ones wait for a batch"
         );
         assert!(
-            s.deliver(&mut has, vec![delivery(&small)], vec![]).is_some_and(|mut o| {
+            s.deliver(&mut has, vec![delivery(&small)], vec![], vec![]).is_some_and(|mut o| {
                 let first = o.step();
                 matches!(first, Next::Send(ServerMsg::Deliver { .. }))
                     && matches!(o.step(), Next::Send(ServerMsg::Delivered { .. }))
@@ -869,13 +869,13 @@ mod tests {
         let (small, mid) = (content(5), content(2));
         let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
-        let mut out = s.deliver(&mut has, vec![delivery(&small)], vec![]).unwrap();
+        let mut out = s.deliver(&mut has, vec![delivery(&small)], vec![], vec![]).unwrap();
         assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
         assert!(matches!(out.step(), Next::Send(ServerMsg::Delivered { .. })));
         let mut lazy = SessionState::with_sizes(SMALL);
         lazy.set_lazy();
         let mut has = ClientSet::default();
-        let mut out = lazy.deliver(&mut has, vec![delivery(&small), delivery(&mid)], vec![]).unwrap();
+        let mut out = lazy.deliver(&mut has, vec![delivery(&small), delivery(&mid)], vec![], vec![]).unwrap();
         assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
         assert!(matches!(out.step(), Next::Read { hash, .. } if hash == digest(&small)));
         out.read(None);
@@ -1119,7 +1119,7 @@ mod tests {
                             .collect();
                         let twice = rng.below(3) == 0;
                         for _ in 0..1 + twice as usize {
-                            if let Some(out) = w.s.deliver(&mut w.has, files.clone(), vec![]) {
+                            if let Some(out) = w.s.deliver(&mut w.has, files.clone(), vec![], vec![]) {
                                 w.sends.push(Sending { out, fetched: BTreeSet::new() });
                                 if w.s.is_lazy() {
                                     let i = w.sends.len() - 1;

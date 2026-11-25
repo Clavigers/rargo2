@@ -138,6 +138,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         commits: Arc::new(Vec::new()),
         home: who.home.clone(),
         outbox: Default::default(),
+        targets: Vec::new(),
     };
     let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
     let started = time();

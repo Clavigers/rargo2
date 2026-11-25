@@ -503,6 +503,7 @@ async fn serve(
         commits: Arc::new(req.commits),
         home,
         outbox: Default::default(),
+        targets: Vec::new(),
     };
     let outcome = build::handle(d.clone(), client).await;
     let mut delivered = sess.delivered();
