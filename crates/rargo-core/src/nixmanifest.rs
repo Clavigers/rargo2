@@ -147,12 +147,26 @@ fn walk_dir(path: &Path, parallel: bool) -> io::Result<Walked> {
             .collect()
     };
 
+    manifest(
+        path,
+        hashed.into_iter().collect::<io::Result<Vec<_>>>()?,
+        links,
+        children.into_iter().collect::<io::Result<Vec<_>>>()?,
+    )
+}
+
+fn manifest(
+    path: &Path,
+    hashed: Vec<(Vec<u8>, Node, u64)>,
+    links: Vec<(Vec<u8>, Vec<u8>)>,
+    mut children: Vec<(Vec<u8>, Walked)>,
+) -> io::Result<Walked> {
+    children.sort_by(|a, b| a.0.cmp(&b.0));
     let mut entries: Vec<(Vec<u8>, Node)> = Vec::new();
     let mut files_n = 0u64;
     let mut bytes = 0u64;
     let mut trees = Vec::new();
-    for item in hashed {
-        let (name, node, size) = item?;
+    for (name, node, size) in hashed {
         files_n += 1;
         bytes += size;
         entries.push((name, node));
@@ -160,8 +174,7 @@ fn walk_dir(path: &Path, parallel: bool) -> io::Result<Walked> {
     for (name, target) in links {
         entries.push((name, Node::Symlink(target)));
     }
-    for item in children {
-        let (name, walked) = item?;
+    for (name, walked) in children {
         entries.push((name, Node::Dir(walked.root.0)));
         files_n += walked.files;
         bytes += walked.bytes;
@@ -817,6 +830,28 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+
+    #[test]
+    fn generated_store_listings_have_a_stable_manifest() {
+        for count in 0..32 {
+            let build = |reverse| {
+                let directories: Vec<_> = (0..count).map(|i| {
+                    let child = manifest(Path::new("child"),
+                        vec![(b"bin".to_vec(), Node::File { hash: [i as u8; 32], size: 7, exec: true }, 7)], vec![], vec![]).unwrap();
+                    (format!("dir-{i}").into_bytes(), child)
+                }).collect();
+                let mut directories = directories;
+                if reverse { directories.reverse(); }
+                manifest(Path::new("store-path"), vec![], vec![(b"link".to_vec(), b"dir-0/bin".to_vec())], directories).unwrap()
+            };
+            let a = build(false);
+            let b = build(true);
+            assert_eq!(a.root, b.root);
+            assert_eq!(a.trees, b.trees);
+            assert_eq!((a.files, a.bytes), (count, count * 7));
+            assert_eq!(a.trees.last().unwrap().0, a.root);
+        }
+    }
 
     fn tree(store: &Path) {
         fs::create_dir_all(store.join("aaa/bin")).unwrap();
