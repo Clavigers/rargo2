@@ -105,7 +105,7 @@ fn run_nix(root: &Path, mut c: Command, uid: u32, gid: u32) -> std::result::Resu
     if uid != unsafe { libc::geteuid() } {
         c.uid(uid).gid(gid);
     }
-    let out = c.output().map_err(|e| format!("running nix: {e}"))?;
+    let out = crate::io::output(&mut c).map_err(|e| format!("running nix: {e}"))?;
     if !out.status.success() {
         return Err(format!("nix failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -377,11 +377,15 @@ fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
 
 pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
     static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    NIX_READY.get_or_init(|| match nix().arg("--version").output() {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
-        Err(e) => Err(e.to_string()),
-    }).as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
+    if NIX_READY.get().is_none() {
+        let ready = match crate::io::output(nix().arg("--version")) {
+            Ok(out) if out.status.success() => Ok(()),
+            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = NIX_READY.set(ready);
+    }
+    NIX_READY.get().expect("set above").as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
 
     let src = source(snap, dir, extra);
     let store = &d.engine.store;
@@ -391,20 +395,20 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     let hosts = d.pool.get().map(|p| p.host_sources().clone());
     let tables: Arc<dyn crate::db::Tables> = store.db().clone();
     let disk: Arc<dyn crate::nixmanifest::StoreFs> = Arc::new(crate::nixmanifest::Disk);
-    let cached = store.db().get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok());
+    let cached = crate::io::cpu(|| store.db().get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
     let mut resolution = Resolution::new(src.key, cached, host_ca_bundle().is_some());
     let mut scratch: Option<std::path::PathBuf> = None;
     let done = loop {
         match resolution.need() {
             Need::Exists(names) => {
-                let present = names.into_iter().filter(|n| nix_store.join(n).exists()).collect();
+                let present = crate::io::cpu(|| names.into_iter().filter(|n| nix_store.join(n).exists()).collect());
                 resolution.exists(&present);
             }
             Need::Evaluate => {
-                let at = d.scratch("flake")?;
+                let at = crate::io::cpu(|| d.scratch("flake"))?;
                 scratch = Some(at.clone());
                 let out = (|| -> Result<Vec<u8>> {
-                    let dir = match &src.root {
+                    let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
                         Some(root) => {
                             snap.materialize(&at, uid, gid, &|rel, node| workspace_entry(root.as_os_str().as_bytes(), rel, node, extra))?;
                             at.join(root)
@@ -418,7 +422,7 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
                             }
                             at.clone()
                         }
-                    };
+                    }) })?;
                     let mut c = nix();
                     c.args(["print-dev-env", "--json", "--no-write-lock-file", ".#default"]);
                     run_nix(&dir, c, uid, gid).map_err(anyhow::Error::msg)
@@ -435,7 +439,7 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
                 resolution.closed(run_nix(&at, c, uid, gid));
             }
             Need::Manifest(closure) => {
-                let prepared = crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), &d.nix_attached);
+                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), &d.nix_attached));
                 let prepared = match prepared {
                     Ok(p) => p,
                     Err(e) => break Err(e),
@@ -448,11 +452,14 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
         }
     };
     if let Some(at) = scratch {
-        let _ = std::fs::remove_dir_all(at);
+        crate::io::cpu(move || {
+            let _ = std::fs::remove_dir_all(at);
+        });
     }
     let (env, save) = done?;
     if save {
-        store.db().put(Table::Meta, &k, &bincode::serialize(&env)?);
+        let value = bincode::serialize(&env)?;
+        crate::io::cpu(|| store.db().put(Table::Meta, &k, &value));
     }
     Ok(Arc::new(env))
 }

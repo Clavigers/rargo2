@@ -33,6 +33,8 @@ pub(super) enum Kind {
     Close,
     Timeout,
     WaitPid,
+    SendFds,
+    RecvFds,
     Readable,
 }
 
@@ -48,6 +50,7 @@ pub(super) struct Slot {
     pub(super) path2: Option<CString>,
     pub(super) iov: Option<Box<libc::iovec>>,
     pub(super) msg: Option<Box<libc::msghdr>>,
+    pub(super) cbuf: Option<Vec<u8>>,
 }
 
 pub struct Loop {
@@ -199,7 +202,7 @@ impl Drop for Loop {
 
 impl Slot {
     pub(super) fn empty(kind: Kind) -> Self {
-        Self { kind, buf: None, stat: None, addr: None, addrlen: None, ts: None, info: None, path: None, path2: None, iov: None, msg: None }
+        Self { kind, buf: None, stat: None, addr: None, addrlen: None, ts: None, info: None, path: None, path2: None, iov: None, msg: None, cbuf: None }
     }
     pub(super) fn buf(kind: Kind, buf: Vec<u8>) -> Self {
         Self { buf: Some(buf), ..Self::empty(kind) }

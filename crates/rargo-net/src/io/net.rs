@@ -442,3 +442,19 @@ pub fn lookup_host(host: &str) -> io::Result<Vec<SocketAddr>> {
         .map_err(|err| io::Error::other(err))
 }
 
+pub fn send_fds(fd: i32, buf: &[u8], fds: &[i32]) -> io::Result<usize> {
+    match op_event(Op::SendFds { fd, buf: buf.to_vec(), fds: fds.to_vec() })? {
+        Event::Send { n } => Ok(n),
+        _ => Err(io::Error::other("sendmsg")),
+    }
+}
+
+pub fn recv_fds(fd: i32, len: usize) -> io::Result<(Vec<u8>, Vec<i32>)> {
+    match op_event(Op::RecvFds { fd, len })? {
+        Event::RecvFds { n, mut buf, fds } => {
+            buf.truncate(n);
+            Ok((buf, fds))
+        }
+        _ => Err(io::Error::other("recvmsg")),
+    }
+}

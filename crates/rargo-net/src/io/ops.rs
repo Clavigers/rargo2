@@ -29,7 +29,9 @@ pub enum Op {
     Fsync { fd: i32 },
     Close { fd: i32 },
     Timeout { ms: u64 },
-    WaitPid { pid: i32 },
+    WaitPid { pid: i32, reap: bool },
+    SendFds { fd: i32, buf: Vec<u8>, fds: Vec<i32> },
+    RecvFds { fd: i32, len: usize },
     Readable { fd: i32 },
     Cpu(Box<dyn FnOnce() + Send>),
 }
@@ -55,6 +57,7 @@ pub enum Event {
     Closed,
     Timeout,
     Exited { status: i32 },
+    RecvFds { n: usize, buf: Vec<u8>, fds: Vec<i32> },
     Readable,
     Cpu,
     Failed(io::Error),
@@ -62,8 +65,16 @@ pub enum Event {
 
 impl Event {
     pub(super) fn release(self) {
-        if let Event::Accept { fd, .. } | Event::Socket { fd } | Event::Open { fd } = self {
-            unsafe { libc::close(fd) };
+        match self {
+            Event::Accept { fd, .. } | Event::Socket { fd } | Event::Open { fd } => {
+                unsafe { libc::close(fd) };
+            }
+            Event::RecvFds { fds, .. } => {
+                for fd in fds {
+                    unsafe { libc::close(fd) };
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -168,9 +179,12 @@ pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) ->
             inflight.insert(token, Slot { kind: Kind::Timeout, ts: Some(ts), ..Slot::empty(Kind::Timeout) });
             entry
         }
-        Op::WaitPid { pid } => {
+        Op::SendFds { fd, buf, fds } => fds_send(token, fd, buf, &fds, inflight),
+        Op::RecvFds { fd, len } => fds_recv(token, fd, len, inflight),
+        Op::WaitPid { pid, reap } => {
             let info = Box::new(unsafe { std::mem::zeroed::<libc::siginfo_t>() });
-            let entry = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, libc::WEXITED)
+            let options = if reap { libc::WEXITED } else { libc::WEXITED | libc::WNOWAIT };
+            let entry = opcode::WaitId::new(libc::P_PID, pid as libc::id_t, options)
                 .infop(&*info)
                 .build()
                 .user_data(token);
@@ -306,9 +320,84 @@ pub(super) fn datagram_send(token: u64, fd: i32, buf: Vec<u8>, addr: SocketAddr,
     Ok(entry)
 }
 
+const CONTROL: usize = 256;
+const MOST_FDS: usize = 32;
+
+fn fds_send(token: u64, fd: i32, buf: Vec<u8>, fds: &[i32], inflight: &mut BTreeMap<u64, Slot>) -> io_uring::squeue::Entry {
+    assert!(fds.len() <= MOST_FDS, "descriptors per message fit the control buffer");
+    let iov = Box::new(libc::iovec { iov_base: buf.as_ptr().cast_mut().cast(), iov_len: buf.len() });
+    let mut cbuf = vec![0u8; CONTROL];
+    let mut msg = Box::new(unsafe { std::mem::zeroed::<libc::msghdr>() });
+    msg.msg_iov = (&*iov as *const libc::iovec).cast_mut();
+    msg.msg_iovlen = 1;
+    if !fds.is_empty() {
+        let bytes = std::mem::size_of_val(fds) as u32;
+        msg.msg_control = cbuf.as_mut_ptr().cast();
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(bytes) } as _;
+        unsafe {
+            let c = libc::CMSG_FIRSTHDR(&*msg);
+            (*c).cmsg_level = libc::SOL_SOCKET;
+            (*c).cmsg_type = libc::SCM_RIGHTS;
+            (*c).cmsg_len = libc::CMSG_LEN(bytes) as _;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast::<i32>(), fds.len());
+        }
+    }
+    let entry = opcode::SendMsg::new(types::Fd(fd), &*msg).flags(libc::MSG_NOSIGNAL as u32).build().user_data(token);
+    inflight.insert(token, Slot { buf: Some(buf), iov: Some(iov), msg: Some(msg), cbuf: Some(cbuf), ..Slot::empty(Kind::SendFds) });
+    entry
+}
+
+fn fds_recv(token: u64, fd: i32, len: usize, inflight: &mut BTreeMap<u64, Slot>) -> io_uring::squeue::Entry {
+    let mut buf = vec![0u8; len];
+    let mut cbuf = vec![0u8; CONTROL];
+    let iov = Box::new(libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() });
+    let mut msg = Box::new(unsafe { std::mem::zeroed::<libc::msghdr>() });
+    msg.msg_iov = (&*iov as *const libc::iovec).cast_mut();
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr().cast();
+    msg.msg_controllen = cbuf.len() as _;
+    let entry = opcode::RecvMsg::new(types::Fd(fd), (&*msg as *const libc::msghdr).cast_mut())
+        .flags(libc::MSG_CMSG_CLOEXEC as u32)
+        .build()
+        .user_data(token);
+    inflight.insert(token, Slot { buf: Some(buf), iov: Some(iov), msg: Some(msg), cbuf: Some(cbuf), ..Slot::empty(Kind::RecvFds) });
+    entry
+}
+
+fn received_fds(msg: &libc::msghdr) -> Vec<i32> {
+    let mut fds = Vec::new();
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<i32>();
+                let data = libc::CMSG_DATA(c).cast::<i32>();
+                for i in 0..n {
+                    fds.push(std::ptr::read_unaligned(data.add(i)));
+                }
+            }
+            c = libc::CMSG_NXTHDR(msg, c);
+        }
+    }
+    fds
+}
+
+fn wait_status(info: &libc::siginfo_t) -> i32 {
+    let status = unsafe { info.si_status() };
+    match info.si_code {
+        libc::CLD_EXITED => (status & 0xff) << 8,
+        libc::CLD_DUMPED => (status & 0x7f) | 0x80,
+        _ => status & 0x7f,
+    }
+}
+
 pub(super) fn event_of(slot: Slot, res: i32) -> Event {
-    let Slot { kind, buf, stat, addr, info, path, path2, addrlen, ts, iov, msg } = slot;
-    drop((path, path2, addrlen, ts, iov, msg));
+    let Slot { kind, buf, stat, addr, info, path, path2, addrlen, ts, iov, msg, cbuf } = slot;
+    let fds = match (&kind, &msg) {
+        (Kind::RecvFds, Some(msg)) if res >= 0 => received_fds(msg),
+        _ => Vec::new(),
+    };
+    drop((path, path2, addrlen, ts, iov, msg, cbuf));
     if res < 0 {
         if matches!(kind, Kind::Timeout) && res == -libc::ETIME {
             return Event::Timeout;
@@ -335,10 +424,9 @@ pub(super) fn event_of(slot: Slot, res: i32) -> Event {
         Kind::Fsync => Event::Synced,
         Kind::Close => Event::Closed,
         Kind::Timeout => Event::Timeout,
-        Kind::WaitPid => {
-            let status = info.map(|info| unsafe { info.si_status() }).unwrap_or(res);
-            Event::Exited { status }
-        }
+        Kind::WaitPid => Event::Exited { status: info.map(|info| wait_status(&info)).unwrap_or(res) },
+        Kind::SendFds => Event::Send { n: res as usize },
+        Kind::RecvFds => Event::RecvFds { n: res as usize, buf: buf.unwrap_or_default(), fds },
         Kind::Readable => Event::Readable,
     }
 }

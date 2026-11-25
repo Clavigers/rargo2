@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsStr};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
@@ -87,10 +87,12 @@ enum FromZygote {
 }
 
 pub struct Zygote {
-    sock: Mutex<UnixStream>,
+    sock: OwnedFd,
+    sending: crate::io::Mutex<()>,
     pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
     next: AtomicU64,
-    child: Mutex<Option<std::process::Child>>,
+    pid: i32,
+    reading: std::sync::Once,
 }
 
 pub struct Running {
@@ -98,89 +100,41 @@ pub struct Running {
     pub done: Option<crate::io::oneshot::Receiver<ExitInfo>>,
 }
 
-fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
-    assert!(payload.len() <= u32::MAX as usize);
-    assert!(fds.len() <= 16, "descriptors per message fit the control buffer");
-    let len = (payload.len() as u32).to_le_bytes();
-    let mut iov = libc::iovec { iov_base: len.as_ptr() as *mut _, iov_len: 4 };
-    let mut cbuf = [0u8; 128];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    if !fds.is_empty() {
-        let space = unsafe { libc::CMSG_SPACE((fds.len() * 4) as u32) } as usize;
-        assert!(space <= cbuf.len());
-        msg.msg_control = cbuf.as_mut_ptr() as *mut _;
-        msg.msg_controllen = space;
-        unsafe {
-            let cmsg = libc::CMSG_FIRSTHDR(&msg);
-            (*cmsg).cmsg_level = libc::SOL_SOCKET;
-            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN((fds.len() * 4) as u32) as usize;
-            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(cmsg) as *mut RawFd, fds.len());
+fn send_frame(sock: RawFd, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    let len = u32::try_from(payload.len()).map_err(|_| io::Error::other("a zygote message fits in 4 GiB"))?;
+    let mut frame = len.to_le_bytes().to_vec();
+    frame.extend_from_slice(payload);
+    let mut sent = crate::io::send_fds(sock, &frame, fds)?;
+    while sent < frame.len() {
+        let n = crate::io::write_at(sock, 0, &frame[sent..])?;
+        if n == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
         }
+        sent += n;
     }
-    loop {
-        let r = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e);
-        }
-        if r != 4 {
-            return Err(io::Error::other("short header write"));
-        }
-        break;
-    }
-    let mut s = sock;
-    s.write_all(payload)
+    Ok(())
 }
 
-fn recv_msg(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
-    let mut len = [0u8; 4];
-    let mut got = 0;
+fn recv_frame(sock: RawFd) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+    let mut head = Vec::with_capacity(4);
     let mut fds = Vec::new();
-    while got < 4 {
-        let mut iov = libc::iovec { iov_base: len[got..].as_mut_ptr() as *mut _, iov_len: 4 - got };
-        let mut cbuf = [0u8; 128];
-        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_iov = &mut iov;
-        msg.msg_iovlen = 1;
-        msg.msg_control = cbuf.as_mut_ptr() as *mut _;
-        msg.msg_controllen = cbuf.len();
-        let r = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e);
-        }
-        if r == 0 {
+    while head.len() < 4 {
+        let (got, passed) = crate::io::recv_fds(sock, 4 - head.len())?;
+        fds.extend(passed.into_iter().map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }));
+        if got.is_empty() {
             return Ok(None);
         }
-        got += r as usize;
-        assert!(got <= 4);
-        unsafe {
-            let mut c = libc::CMSG_FIRSTHDR(&msg);
-            while !c.is_null() {
-                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                    let n = ((*c).cmsg_len - libc::CMSG_LEN(0) as usize) / 4;
-                    let data = libc::CMSG_DATA(c) as *const RawFd;
-                    for i in 0..n {
-                        fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
-                    }
-                }
-                c = libc::CMSG_NXTHDR(&msg, c);
-            }
-        }
+        head.extend_from_slice(&got);
     }
-    let n = u32::from_le_bytes(len) as usize;
-    let mut payload = vec![0u8; n];
-    let mut s = sock;
-    s.read_exact(&mut payload)?;
+    let n = u32::from_le_bytes(head[..4].try_into().expect("four bytes")) as usize;
+    let mut payload = Vec::with_capacity(n);
+    while payload.len() < n {
+        let got = crate::io::read_at(sock, 0, n - payload.len())?;
+        if got.is_empty() {
+            return Ok(None);
+        }
+        payload.extend_from_slice(&got);
+    }
     Ok(Some((payload, fds)))
 }
 
@@ -196,24 +150,37 @@ impl Zygote {
             .spawn()
             .with_context(|| format!("starting zygote {}", exe.display()))?;
         drop(theirs);
+        let pid = child.id() as i32;
+        drop(child);
+        let sock = OwnedFd::from(ours);
         let pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
-        let reader = ours.try_clone()?;
-        let p2 = pending.clone();
-        std::thread::Builder::new().name("zygote-reader".into()).spawn(move || {
-            while let Ok(Some((payload, _))) = recv_msg(&reader) {
+        Ok(Arc::new(Zygote {
+            sock,
+            sending: crate::io::Mutex::new(()),
+            pending,
+            next: AtomicU64::new(1),
+            pid,
+            reading: std::sync::Once::new(),
+        }))
+    }
+
+    fn read_exits(&self) {
+        let fd = self.sock.as_raw_fd();
+        let waiting = self.pending.clone();
+        drop(crate::io::spawn(move || {
+            while let Ok(Some((payload, _))) = recv_frame(fd) {
                 let Ok(FromZygote::Exited { id, info }) = bincode::deserialize(&payload) else { continue };
-                if let Some(tx) = p2.lock().remove(&id) {
+                if let Some(tx) = waiting.lock().remove(&id) {
                     let _ = tx.send(info);
                 }
             }
-            p2.lock().clear();
-        })?;
-        Ok(Arc::new(Zygote {
-            sock: Mutex::new(ours),
-            pending,
-            next: AtomicU64::new(1),
-            child: Mutex::new(Some(child)),
-        }))
+            waiting.lock().clear();
+        }));
+    }
+
+    fn send(&self, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
+        let _one_frame_at_a_time = self.sending.lock();
+        send_frame(self.sock.as_raw_fd(), payload, fds)
     }
 
     pub fn spawn(
@@ -224,6 +191,7 @@ impl Zygote {
         stderr: OwnedFd,
         extra: &[RawFd],
     ) -> Result<Running> {
+        self.reading.call_once(|| self.read_exits());
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = crate::io::oneshot::channel();
         assert!(self.pending.lock().insert(id, tx).is_none(), "spawn ids are unique");
@@ -239,8 +207,7 @@ impl Zygote {
         }
         fds.extend_from_slice(extra);
         assert_eq!(fds.len(), 2 + stdin.is_some() as usize + extra.len());
-        let r = send_msg(&self.sock.lock(), &msg, &fds);
-        if let Err(e) = r {
+        if let Err(e) = self.send(&msg, &fds) {
             self.pending.lock().remove(&id);
             bail!("zygote is not reachable: {e}");
         }
@@ -249,130 +216,103 @@ impl Zygote {
 
     pub fn kill(&self, id: u64) {
         if let Ok(msg) = bincode::serialize(&ToZygote::Kill { id }) {
-            let _ = send_msg(&self.sock.lock(), &msg, &[]);
+            let _ = self.send(&msg, &[]);
         }
     }
 }
 
 impl Drop for Zygote {
     fn drop(&mut self) {
-        let _ = self.sock.lock().shutdown(std::net::Shutdown::Both);
-        if let Some(mut c) = self.child.lock().take() {
-            let _ = c.wait();
+        unsafe { libc::shutdown(self.sock.as_raw_fd(), libc::SHUT_RDWR) };
+        if crate::io::on_fiber() {
+            let _ = crate::io::wait_exit(self.pid);
         }
     }
 }
 
-
-struct Child {
-    id: u64,
-    status_pipe: OwnedFd,
-    started: std::time::Instant,
-}
-
 pub fn zygote_main(fd: RawFd) -> ! {
-    let sock = unsafe { UnixStream::from_raw_fd(fd) };
     unsafe {
         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
         libc::prctl(libc::PR_SET_NAME, c"rargo-zygote".as_ptr());
     }
-    let sigfd = unsafe {
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigaddset(&mut mask, libc::SIGCHLD);
-        libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut());
-        libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK)
-    };
-    let mut children: HashMap<i32, Child> = HashMap::new();
-    let mut by_id: HashMap<u64, i32> = HashMap::new();
+    crate::io::run(1, move || zygote_serve(fd));
+    std::process::exit(0)
+}
+
+fn zygote_serve(sock: RawFd) {
+    let sending = Arc::new(crate::io::Mutex::new(()));
+    let children: std::rc::Rc<std::cell::RefCell<BTreeMap<u64, i32>>> = Default::default();
     loop {
-        let mut fds = [
-            libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: sigfd, events: libc::POLLIN, revents: 0 },
-        ];
-        let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if r < 0 {
-            continue;
-        }
-        if fds[1].revents != 0 {
-            let mut buf = [0u8; 1024];
-            while unsafe { libc::read(sigfd, buf.as_mut_ptr() as *mut _, buf.len()) } > 0 {}
-            reap(&sock, &mut children, &mut by_id);
-        }
-        if fds[0].revents != 0 {
-            match recv_msg(&sock) {
-                Ok(Some((payload, fds))) => match bincode::deserialize::<ToZygote>(&payload) {
-                    Ok(ToZygote::Spawn { id, plan, has_stdin, extra }) => {
-                        let mut it = fds.into_iter();
-                        let (Some(out), Some(err)) = (it.next(), it.next()) else { continue };
-                        let stdin = if has_stdin { it.next() } else { None };
-                        let extras: Vec<OwnedFd> = it.take(extra).collect();
-                        match spawn_init(&plan, stdin, out, err, extras) {
-                            Ok((pid, status_pipe)) => {
-                                assert!(children.insert(pid, Child { id, status_pipe, started: std::time::Instant::now() }).is_none());
-                                assert!(by_id.insert(id, pid).is_none(), "spawn ids are unique");
-                                assert_eq!(children.len(), by_id.len());
-                            }
-                            Err(_) => {
-                                let info = ExitInfo { status: 127 << 8, setup_failed: true, ..Default::default() };
-                                let _ = send_msg(&sock, &bincode::serialize(&FromZygote::Exited { id, info }).unwrap(), &[]);
-                            }
-                        }
+        let Ok(Some((payload, fds))) = recv_frame(sock) else { break };
+        match bincode::deserialize::<ToZygote>(&payload) {
+            Ok(ToZygote::Spawn { id, plan, has_stdin, extra }) => {
+                let mut it = fds.into_iter();
+                let (Some(out), Some(err)) = (it.next(), it.next()) else { continue };
+                let stdin = if has_stdin { it.next() } else { None };
+                let extras: Vec<OwnedFd> = it.take(extra).collect();
+                let started = std::time::Instant::now();
+                match spawn_init(&plan, stdin, out, err, extras) {
+                    Ok((pid, status_pipe)) => {
+                        assert!(children.borrow_mut().insert(id, pid).is_none(), "spawn ids are unique");
+                        let (children, sending) = (children.clone(), sending.clone());
+                        drop(crate::io::spawn(move || {
+                            let info = child_exit(pid, status_pipe, started);
+                            assert_eq!(children.borrow_mut().remove(&id), Some(pid));
+                            let msg = bincode::serialize(&FromZygote::Exited { id, info }).expect("an exit serializes");
+                            let _one_frame_at_a_time = sending.lock();
+                            let _ = send_frame(sock, &msg, &[]);
+                        }));
                     }
-                    Ok(ToZygote::Kill { id }) => {
-                        if let Some(pid) = by_id.get(&id) {
-                            unsafe { libc::kill(*pid, libc::SIGKILL) };
-                        }
+                    Err(_) => {
+                        let info = ExitInfo { status: 127 << 8, setup_failed: true, ..Default::default() };
+                        let msg = bincode::serialize(&FromZygote::Exited { id, info }).expect("an exit serializes");
+                        let _one_frame_at_a_time = sending.lock();
+                        let _ = send_frame(sock, &msg, &[]);
                     }
-                    Err(_) => {}
-                },
-                Ok(None) | Err(_) => {
-                    for pid in children.keys() {
-                        unsafe { libc::kill(*pid, libc::SIGKILL) };
-                    }
-                    std::process::exit(0);
                 }
             }
+            Ok(ToZygote::Kill { id }) => {
+                if let Some(pid) = children.borrow().get(&id) {
+                    unsafe { libc::kill(*pid, libc::SIGKILL) };
+                }
+            }
+            Err(_) => {}
         }
+    }
+    for pid in children.borrow().values() {
+        unsafe { libc::kill(*pid, libc::SIGKILL) };
     }
 }
 
-fn reap(sock: &UnixStream, children: &mut HashMap<i32, Child>, by_id: &mut HashMap<u64, i32>) {
-    loop {
-        let mut status = 0i32;
-        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        let pid = unsafe { libc::wait4(-1, &mut status, libc::WNOHANG, &mut ru) };
-        if pid <= 0 {
-            return;
+fn child_exit(pid: i32, status_pipe: OwnedFd, started: std::time::Instant) -> ExitInfo {
+    let _ = crate::io::wait_exited(pid);
+    let mut status = 0i32;
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    let reaped = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
+    assert_eq!(reaped, pid, "a child the ring saw exit is reaped at once");
+    let mut info = ExitInfo {
+        status,
+        setup_failed: false,
+        user_us: ru.ru_utime.tv_sec as u64 * 1_000_000 + ru.ru_utime.tv_usec as u64,
+        sys_us: ru.ru_stime.tv_sec as u64 * 1_000_000 + ru.ru_stime.tv_usec as u64,
+        max_rss_kb: ru.ru_maxrss as u64,
+        wall_us: started.elapsed().as_micros() as u64,
+    };
+    let mut report = Vec::with_capacity(5);
+    while report.len() < 5 {
+        match crate::io::read_at(status_pipe.as_raw_fd(), 0, 5 - report.len()) {
+            Ok(got) if !got.is_empty() => report.extend_from_slice(&got),
+            _ => break,
         }
-        let Some(child) = children.remove(&pid) else { continue };
-        assert_eq!(by_id.remove(&child.id), Some(pid));
-        assert_eq!(children.len(), by_id.len());
-        let mut buf = [0u8; 5];
-        let mut f = std::fs::File::from(child.status_pipe);
-        let mut info = ExitInfo {
-            status,
-            setup_failed: false,
-            user_us: ru.ru_utime.tv_sec as u64 * 1_000_000 + ru.ru_utime.tv_usec as u64,
-            sys_us: ru.ru_stime.tv_sec as u64 * 1_000_000 + ru.ru_stime.tv_usec as u64,
-            max_rss_kb: ru.ru_maxrss as u64,
-            wall_us: child.started.elapsed().as_micros() as u64,
-        };
-        match f.read_exact(&mut buf) {
-            Ok(()) => {
-                info.status = i32::from_le_bytes(buf[..4].try_into().unwrap());
-                info.setup_failed = buf[4] != 0;
-            }
-            Err(_) => {
-                if !libc::WIFSIGNALED(status) {
-                    info.setup_failed = true;
-                }
-            }
-        }
-        let msg = bincode::serialize(&FromZygote::Exited { id: child.id, info }).unwrap();
-        let _ = send_msg(sock, &msg, &[]);
     }
+    if report.len() == 5 {
+        info.status = i32::from_le_bytes(report[..4].try_into().expect("four bytes"));
+        info.setup_failed = report[4] != 0;
+    } else if !libc::WIFSIGNALED(status) {
+        info.setup_failed = true;
+    }
+    info
 }
 
 fn cstr(b: &[u8]) -> CString {

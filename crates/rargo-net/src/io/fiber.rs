@@ -64,6 +64,10 @@ pub(super) struct Sched {
     pub(super) waiting: BTreeMap<u64, u64>,
 }
 
+pub fn on_fiber() -> bool {
+    CURRENT.with(|c| c.get()) != 0
+}
+
 pub(super) fn on_loop() -> bool {
     LOOP_THREAD.with(|c| c.get().is_some())
 }
