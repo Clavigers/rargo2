@@ -218,13 +218,75 @@ impl ActionTable {
 mod tests {
     use super::*;
 
+    struct Checked(ActionTable);
+
+    impl std::ops::Deref for Checked {
+        type Target = ActionTable;
+        fn deref(&self) -> &ActionTable {
+            &self.0
+        }
+    }
+
+    impl Checked {
+        fn new() -> Checked {
+            let t = ActionTable::new();
+            t.invariants();
+            Checked(t)
+        }
+
+        fn check<R>(&mut self, r: R) -> R {
+            self.0.invariants();
+            r
+        }
+
+        fn begin(&mut self) -> ReqId {
+            let r = self.0.begin();
+            self.check(r)
+        }
+
+        fn start(&mut self, id: ReqId, slot: Slot, hit: bool, no_cache: bool) -> Start {
+            let r = self.0.start(id, slot, hit, no_cache);
+            self.check(r)
+        }
+
+        fn woken(&mut self, id: ReqId) -> Woken {
+            let r = self.0.woken(id);
+            self.check(r)
+        }
+
+        fn ran(&mut self, id: ReqId, tainted: bool, cacheable: bool) -> Ran {
+            let r = self.0.ran(id, tainted, cacheable);
+            self.check(r)
+        }
+
+        fn settled(&mut self, id: ReqId) -> Vec<ReqId> {
+            let r = self.0.settled(id);
+            self.check(r)
+        }
+
+        fn failed(&mut self, id: ReqId, why: Failure) -> Vec<ReqId> {
+            let r = self.0.failed(id, why);
+            self.check(r)
+        }
+
+        fn done(&mut self, id: ReqId) {
+            self.0.done(id);
+            self.0.invariants();
+        }
+
+        fn cancel(&mut self, id: ReqId) -> Vec<ReqId> {
+            let r = self.0.cancel(id);
+            self.check(r)
+        }
+    }
+
     fn slot(i: u8) -> Slot {
         (Hash([i; 32]), Hash::ZERO)
     }
 
     #[test]
     fn identical_concurrent_requests_run_once() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let (a, b, c) = (t.begin(), t.begin(), t.begin());
         assert_eq!(t.start(a, slot(1), false, false), Start::Run { after_wait: false });
         assert_eq!(t.start(b, slot(1), false, false), Start::Join);
@@ -243,7 +305,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_reported_and_never_recorded() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let a = t.begin();
         t.start(a, slot(1), false, false);
         assert_eq!(t.ran(a, false, false), Ran::Keep, "a result that is not cacheable (a failure) is not recorded");
@@ -261,7 +323,7 @@ mod tests {
 
     #[test]
     fn a_timed_out_run_fails_its_joiners_with_it() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let (a, b) = (t.begin(), t.begin());
         t.start(a, slot(1), false, false);
         t.start(b, slot(1), false, false);
@@ -272,7 +334,7 @@ mod tests {
 
     #[test]
     fn a_cancelled_requester_does_not_cancel_the_others() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let (a, b, c) = (t.begin(), t.begin(), t.begin());
         t.start(a, slot(1), false, false);
         t.start(b, slot(1), false, false);
@@ -289,24 +351,36 @@ mod tests {
 
     #[test]
     fn a_lost_seed_ends_the_flight_and_the_request_is_retried() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let (a, j) = (t.begin(), t.begin());
-        t.start(a, slot(1), false, false);
-        t.start(j, slot(1), false, false);
-        assert_eq!(t.failed(a, Failure::SeedLost), vec![j]);
+        assert_eq!(t.start(a, slot(1), false, false), Start::Run { after_wait: false });
+        assert_eq!(t.start(j, slot(1), false, false), Start::Join);
+        assert_eq!(t.failed(a, Failure::SeedLost), vec![j], "a lost seed ends the flight and wakes its joiners");
+        assert!(!t.is_running(&slot(1)), "nothing is left running for the action");
         let again = t.begin();
         assert_eq!(
-            t.start(again, slot(3), false, false),
+            t.start(again, slot(1), false, false),
             Start::Run { after_wait: false },
-            "the retry with another seed runs"
+            "build.rs asks again with another seed: the same action runs, it neither joins nor hits"
         );
         assert_eq!(t.woken(j), Woken::Retry);
-        t.invariants();
+        assert_eq!(
+            t.start(j, slot(1), false, false),
+            Start::Run { after_wait: true },
+            "a joiner whose wait ended without a result runs for itself and does not wait on that action again"
+        );
+        assert_eq!(t.ran(again, false, true), Ran::Record);
+        assert_eq!(t.settled(again), Vec::<ReqId>::new(), "the flight is the joiner's now");
+        t.done(again);
+        assert_eq!(t.ran(j, false, true), Ran::Record);
+        assert_eq!(t.settled(j), Vec::<ReqId>::new());
+        t.done(j);
+        assert!(!t.is_running(&slot(1)));
     }
 
     #[test]
     fn a_tainted_run_is_repeated_and_then_kept_unrecorded() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let a = t.begin();
         t.start(a, slot(1), false, false);
         assert_eq!(t.ran(a, true, true), Ran::Again);
@@ -321,7 +395,7 @@ mod tests {
 
     #[test]
     fn no_cache_runs_beside_a_flight_and_takes_it_over() {
-        let mut t = ActionTable::new();
+        let mut t = Checked::new();
         let (a, b, j) = (t.begin(), t.begin(), t.begin());
         t.start(a, slot(1), false, false);
         t.start(j, slot(1), false, false);
@@ -348,7 +422,7 @@ mod tests {
     fn generated_requests_each_end_and_a_slot_runs_once_at_a_time() {
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut t = ActionTable::new();
+            let mut t = Checked::new();
             let mut cache: BTreeSet<Slot> = BTreeSet::new();
             let mut live: Vec<(ReqId, Slot)> = Vec::new();
             let mut ended = 0;
