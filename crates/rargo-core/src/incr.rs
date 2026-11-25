@@ -54,10 +54,6 @@ fn key(crate_key: &Hash, id: u64) -> Vec<u8> {
     k
 }
 
-fn now() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeedKind {
     SameWorktree,
@@ -66,11 +62,7 @@ pub enum SeedKind {
 }
 
 impl IncrStore {
-    pub fn new(store: Arc<Store>) -> IncrStore {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(1);
+    pub fn new(store: Arc<Store>, seed: u64) -> IncrStore {
         IncrStore {
             db: store.db().clone(),
             store,
@@ -173,7 +165,7 @@ impl IncrStore {
         None
     }
 
-    pub fn save(&self, crate_key: &Hash, worktree: &str, commit: Option<[u8; 20]>, manifest: &Manifest) {
+    pub fn save(&self, crate_key: &Hash, worktree: &str, commit: Option<[u8; 20]>, manifest: &Manifest, created: u64) {
         let Ok(raw) = bincode::serialize(manifest) else { return };
         let Ok(h) = self.store.put_bytes(&raw) else { return };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
@@ -182,7 +174,7 @@ impl IncrStore {
             manifest: h,
             worktree: worktree.to_string(),
             commit,
-            created: now(),
+            created,
             bytes: manifest.total_size(),
         };
         self.db.put(Table::Incr, &key(crate_key, id), &bincode::serialize(&meta).unwrap());
@@ -386,13 +378,13 @@ mod tests {
     #[test]
     fn seed_preference_order() {
         let (_d, s) = store();
-        let incr = IncrStore::new(s.clone());
+        let incr = IncrStore::new(s.clone(), 1);
         let k = Hash::of(b"crate");
         let main = [1u8; 20];
         let side = [2u8; 20];
         assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-        incr.save(&k, "/wt/main", Some(main), &manifest(&s, &[("/i/x", "main state")]));
-        incr.save(&k, "/wt/side", Some(side), &manifest(&s, &[("/i/x", "side state")]));
+        incr.save(&k, "/wt/main", Some(main), &manifest(&s, &[("/i/x", "main state")]), 100);
+        incr.save(&k, "/wt/side", Some(side), &manifest(&s, &[("/i/x", "side state")]), 100);
         let content = |m: &Manifest| match &m.entries[0].1 {
             MEntry::File { hash, .. } => String::from_utf8(s.read(hash).unwrap()).unwrap(),
             _ => unreachable!(),
@@ -402,11 +394,11 @@ mod tests {
         assert_eq!(s1.blobs.len(), 1);
         let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
         assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
-        incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]));
+        incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]), 100);
         let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
         let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
         assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
-        incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]));
+        incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]), 100);
         let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
         let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
         assert_eq!((content(&s5.manifest).as_str(), s5.kind), ("one commit back", SeedKind::Ancestor));
@@ -419,10 +411,10 @@ mod tests {
     #[test]
     fn evicted_state_is_skipped() {
         let (_d, s) = store();
-        let incr = IncrStore::new(s.clone());
+        let incr = IncrStore::new(s.clone(), 1);
         let k = Hash::of(b"crate");
         let m = manifest(&s, &[("/i/x", "will be evicted")]);
-        incr.save(&k, "/wt/a", None, &m);
+        incr.save(&k, "/wt/a", None, &m, 100);
         if let MEntry::File { hash, .. } = &m.entries[0].1 {
             s.remove(hash);
         }
@@ -433,7 +425,7 @@ mod tests {
     #[test]
     fn state_with_files_on_a_worker_is_usable_while_the_worker_holds_them() {
         let (_d, s) = store();
-        let incr = IncrStore::new(s.clone());
+        let incr = IncrStore::new(s.clone(), 1);
         let k = Hash::of(b"crate");
         let away = Hash::of(b"made on a worker, not fetched yet");
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -441,7 +433,7 @@ mod tests {
         incr.set_held(Box::new(move |h| *h == away && c2.load(Ordering::Relaxed)));
         let mut m = manifest(&s, &[("/i/here", "at home")]);
         m.entries.push((b"/i/there".to_vec(), MEntry::File { hash: away, exec: false, size: 33 }));
-        incr.save(&k, "/wt/a", None, &m);
+        incr.save(&k, "/wt/a", None, &m, 100);
         let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
         assert!(seed.blobs.contains(&(away, 33)));
         assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
@@ -474,11 +466,11 @@ mod tests {
     #[test]
     fn pruning_keeps_latest_per_worktree() {
         let (_d, s) = store();
-        let incr = IncrStore::new(s.clone());
+        let incr = IncrStore::new(s.clone(), 1);
         let k = Hash::of(b"crate");
         for round in 0..6 {
             for wt in ["/wt/a", "/wt/b"] {
-                incr.save(&k, wt, None, &manifest(&s, &[("/i/x", &format!("{wt} {round}"))]));
+                incr.save(&k, wt, None, &manifest(&s, &[("/i/x", &format!("{wt} {round}"))]), 100);
             }
         }
         assert_eq!(incr.state_count(&k), 2 + KEEP_EXTRA);

@@ -229,7 +229,8 @@ fn bytes(s: &str) -> Vec<u8> {
 impl Daemon {
     pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
-        let incr = crate::incr::IncrStore::new(engine.store.clone());
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let incr = crate::incr::IncrStore::new(engine.store.clone(), seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
@@ -1690,7 +1691,7 @@ impl Run {
         {
             let state = crate::incr::apply_changes(dir, seed.as_ref().map(|s| &*s.manifest), &outcome.side);
             if !state.entries.is_empty() {
-                self.d.incr.save(&crate_key, &wt, self.c.commits.first().copied(), &state);
+                self.d.incr.save(&crate_key, &wt, self.c.commits.first().copied(), &state, crate::tokens::now());
                 if let Some(remote) = self.d.engine.remote.get() {
                     let mut blobs: Vec<(Hash, u64)> = state
                         .entries
@@ -1840,7 +1841,7 @@ impl Run {
             .map(|(index, (u, time))| crate::timings::Row {
                 runs: u.cmd.is_some() && u.kind != rp::UnitKind::Noop,
                 name: format!("{} {}", u.pkg_name, u.desc),
-                time,
+                time: time.relative_to(started),
                 index,
                 deps: u.deps.iter().map(|d| (d.unit as usize, d.only_rmeta)).collect(),
                 needs_objects: u.needs_objects,
@@ -1851,7 +1852,6 @@ impl Run {
         let html = crate::timings::render(
             &format!("cargo {}", self.c.args.join(" ")),
             &stamp,
-            started,
             started.elapsed(),
             self.d.engine.sched.tokens(),
             &rows,

@@ -206,11 +206,7 @@ fn trace_key(weak: &Hash, id: u64) -> Vec<u8> {
 }
 
 impl TraceCache {
-    pub fn new(db: Arc<Db>) -> TraceCache {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(1);
+    pub fn new(db: Arc<Db>, seed: u64) -> TraceCache {
         TraceCache { db, mem: DashMap::new(), env_names: parking_lot::Mutex::new(None), next_id: AtomicU64::new(seed), stats: CacheStats::default() }
     }
 
