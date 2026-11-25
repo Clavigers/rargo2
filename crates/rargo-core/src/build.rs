@@ -731,7 +731,7 @@ struct Prepared {
     policy: crate::policy::Policy,
     /// The view the planner runs against (always the host root).
     plan_base: Arc<BaseView>,
-    flake: Option<Arc<crate::flake::FlakeEnv>>,
+    flake: Arc<crate::flake::FlakeEnv>,
     base: Arc<BaseView>,
     tr: Translator,
     sandbox_cwd: String,
@@ -750,33 +750,17 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
             }
         }
     }
-    // A flake, when present and not switched off, defines the environment.
-    let has_flake = matches!(snapshot.node(b"flake.nix"), Some(rargo_proto::tree::Node::File { .. }));
-    let flake = if has_flake && policy.flake.enabled != Some(false) {
-        let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
-        Some(
-            tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &files, uid, gid))
-                .await?
-                .context(
-                    "evaluating the repository's flake (if it reads files of the repository, name them in `files` under [workspace.metadata.rargo.flake] in Cargo.toml; \
-                     `flake.enabled = false` builds without it)",
-                )?,
-        )
-    } else {
-        None
-    };
-    let restricted = match &flake {
-        Some(f) => {
-            let mut links = Vec::new();
-            for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
-                if let Some(target) = f.which(tool).or_else(|| if tool == "sh" { f.which("bash") } else { None }) {
-                    links.push((bytes(at), bytes(&target)));
-                }
-            }
-            Some(Restricted { store_names: f.closure_set(), etc: f.etc(d.store(), c.uid, c.gid)?, links })
+    let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
+    let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
+        .await?
+        .context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")?;
+    let mut links = Vec::new();
+    for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
+        if let Some(target) = flake.which(tool).or_else(|| if tool == "sh" { flake.which("bash") } else { None }) {
+            links.push((bytes(at), bytes(&target)));
         }
-        None => None,
-    };
+    }
+    let restricted = Some(Restricted { store_names: flake.closure_set(), etc: flake.etc(d.store(), c.uid, c.gid)?, links });
     let parts = ViewParts {
         snapshot: snapshot.clone(),
         cargo_home: d.cfg.cargo_home.clone(),
@@ -788,7 +772,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
         restricted,
     };
     let base = parts.build(d.memo.clone(), generation, false);
-    let plan_base = if flake.is_some() { Arc::new(parts.build(d.memo.clone(), generation, true)) } else { Arc::new(parts.build(d.memo.clone(), generation, false)) };
+    let plan_base = Arc::new(parts.build(d.memo.clone(), generation, true));
     let tr = Translator::new(vec![
         (String::from_utf8_lossy(WORKTREE_AT).into_owned(), c.root.clone()),
         (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), c.cargo_home.clone()),
@@ -799,21 +783,17 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     }
     let client_env = c.env.to_map();
     let mut env = base_env(&d.cfg.server_env, &client_env);
-    if let Some(f) = &flake {
-        // The flake's variables replace the server's: PATH, compilers and
-        // their flags all come from the devShell. HOME is a scratch place.
-        for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
-            env.remove(k);
-        }
-        env.retain(|k, _| !k.starts_with("NIX_"));
-        for (k, v) in &f.env {
-            env.insert(k.clone(), v.clone());
-        }
-        env.insert("HOME".into(), "/tmp".into());
-        env.insert("CARGO_HOME".into(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned());
-        env.insert("RUSTC_WRAPPER".into(), String::new());
-        env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
+    // PATH, compilers and their flags come from the dev shell. HOME is a
+    // scratch place and Cargo's registry is supplied separately.
+    for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
+        env.remove(k);
     }
+    env.retain(|k, _| !k.starts_with("NIX_"));
+    env.extend(flake.env.clone());
+    env.insert("HOME".into(), "/tmp".into());
+    env.insert("CARGO_HOME".into(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned());
+    env.insert("RUSTC_WRAPPER".into(), String::new());
+    env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
@@ -870,7 +850,7 @@ async fn plan_with(
         cwd: bytes(&p.sandbox_cwd),
         net: NetMode::Loopback,
         mkdirs: vec![],
-        root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
+        root_id: p.flake.id,
         discard: vec![],
         label: "cargo (planning)".into(),
     };
@@ -1319,8 +1299,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         base_env: env,
         no_cache_tests,
         explain: c.env.contains_key("RARGO_EXPLAIN"),
-        root_id: p.flake.as_ref().map(|f| f.id).unwrap_or(Hash::ZERO),
-        cargo_override: p.flake.as_ref().and_then(|f| f.which("cargo")),
+        root_id: p.flake.id,
+        cargo_override: p.flake.which("cargo"),
         policy: p.policy.clone(),
         verify: c.env.contains_key("RARGO_VERIFY"),
         verified: AtomicU64::new(0),

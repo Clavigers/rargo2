@@ -57,6 +57,8 @@ jobs:
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9 # v32
       - name: Realise the flake closure for binaries from the build server
         run: nix develop --command true
+      - name: Realise the bundled shell's closure
+        run: nix develop ./nix/default --command true
       - name: Rust toolchain for the no-flake auth fixture
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: rargo, signed in to the server this repository names

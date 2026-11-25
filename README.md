@@ -141,12 +141,13 @@ compiler, the linker, `pkg-config`, the system libraries. Nothing is
 installed on a server for a project, and the same commit builds the same
 way on every server.
 
-A project without a flake starts from the default one, the build
-essentials (Rust, a C and C++ compiler, `make`, `cmake`, `pkg-config`,
-openssl, zlib, sqlite):
+A project without a flake uses rargo's bundled build shell, with Rust, a
+C and C++ compiler, `make`, `cmake`, `pkg-config`, OpenSSL, zlib and SQLite.
+Its `rust-toolchain.toml` or `rust-toolchain` selects the Rust toolchain.
+A workspace can supply a flake with its own shell:
 
 ```sh
-cp install/flake/flake.nix install/flake/flake.lock YOUR-PROJECT/
+cp nix/default/flake.nix nix/default/flake.lock YOUR-PROJECT/
 cd YOUR-PROJECT && git add flake.nix flake.lock
 ```
 
