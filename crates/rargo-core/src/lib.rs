@@ -5,6 +5,7 @@ pub mod buildview;
 pub mod chunk;
 pub mod conn_state;
 pub mod db;
+pub mod db_writer;
 pub mod drift;
 pub mod engine;
 pub mod expand;

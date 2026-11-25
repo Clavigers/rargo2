@@ -1,12 +1,12 @@
+use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
 use anyhow::{Context, Result};
 use parking_lot::{Condvar, Mutex};
 use redb::{Database, TableDefinition};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Table {
     Blobs,
     Traces,
@@ -17,15 +17,8 @@ pub enum Table {
     Cold,
 }
 
-const ALL: [Table; 7] = [
-    Table::Blobs,
-    Table::Traces,
-    Table::HostSigs,
-    Table::Meta,
-    Table::Incr,
-    Table::Chunks,
-    Table::Cold,
-];
+const ALL: [Table; 7] =
+    [Table::Blobs, Table::Traces, Table::HostSigs, Table::Meta, Table::Incr, Table::Chunks, Table::Cold];
 
 impl Table {
     fn def(self) -> TableDefinition<'static, &'static [u8], &'static [u8]> {
@@ -41,13 +34,19 @@ impl Table {
     }
 }
 
-type Pending = HashMap<(Table, Vec<u8>), Option<Arc<[u8]>>>;
-
 struct Shared {
     db: Database,
-    pending: Mutex<Pending>,
+    writer: Mutex<DbWriter>,
+    flushing: Mutex<()>,
     wake: Condvar,
     stop: Mutex<bool>,
+    born: Instant,
+}
+
+impl Shared {
+    fn now_ms(&self) -> u64 {
+        self.born.elapsed().as_millis() as u64
+    }
 }
 
 pub struct Db {
@@ -67,20 +66,20 @@ impl Db {
         }
         let shared = Arc::new(Shared {
             db,
-            pending: Mutex::new(HashMap::new()),
+            writer: Mutex::new(DbWriter::new()),
+            flushing: Mutex::new(()),
             wake: Condvar::new(),
             stop: Mutex::new(false),
+            born: Instant::now(),
         });
         let s2 = shared.clone();
-        let writer = std::thread::Builder::new()
-            .name("db-writer".into())
-            .spawn(move || writer_loop(s2))?;
+        let writer = std::thread::Builder::new().name("db-writer".into()).spawn(move || writer_loop(s2))?;
         Ok(Db { shared, writer: Mutex::new(Some(writer)) })
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
-        if let Some(v) = self.shared.pending.lock().get(&(table, key.to_vec())) {
-            return v.clone();
+        if let Some(v) = self.shared.writer.lock().get(table, key) {
+            return v;
         }
         let tx = self.shared.db.begin_read().ok()?;
         let t = tx.open_table(table.def()).ok()?;
@@ -89,12 +88,14 @@ impl Db {
     }
 
     pub fn put(&self, table: Table, key: &[u8], val: &[u8]) {
-        self.shared.pending.lock().insert((table, key.to_vec()), Some(Arc::from(val)));
+        let now = self.shared.now_ms();
+        self.shared.writer.lock().put(table, key, val, now);
         self.shared.wake.notify_one();
     }
 
     pub fn delete(&self, table: Table, key: &[u8]) {
-        self.shared.pending.lock().insert((table, key.to_vec()), None);
+        let now = self.shared.now_ms();
+        self.shared.writer.lock().delete(table, key, now);
         self.shared.wake.notify_one();
     }
 
@@ -113,10 +114,8 @@ impl Db {
                 }
             }
         }
-        for ((t, k), v) in self.shared.pending.lock().iter() {
-            if *t == table && k.starts_with(prefix) {
-                out.insert(k.clone(), v.clone());
-            }
+        for (k, v) in self.shared.writer.lock().pending_with_prefix(table, prefix) {
+            out.insert(k, v);
         }
         out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
     }
@@ -143,50 +142,41 @@ impl Drop for Db {
     }
 }
 
-fn flush_once(shared: &Shared) {
-    let batch: Vec<((Table, Vec<u8>), Option<Arc<[u8]>>)> = {
-        let p = shared.pending.lock();
-        p.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
-    if batch.is_empty() {
-        return;
-    }
-    let commit = || -> Result<()> {
-        let tx = shared.db.begin_write()?;
-        for t in ALL {
-            let mut table = tx.open_table(t.def())?;
-            for ((bt, k), v) in &batch {
-                if *bt != t {
-                    continue;
+fn commit(db: &Database, batch: &Batch) -> Result<()> {
+    let tx = db.begin_write()?;
+    for t in ALL {
+        let mut table = tx.open_table(t.def())?;
+        for (bt, k, v) in &batch.writes {
+            if *bt != t {
+                continue;
+            }
+            match v {
+                Some(v) => {
+                    table.insert(k.as_slice(), &v[..])?;
                 }
-                match v {
-                    Some(v) => {
-                        table.insert(k.as_slice(), &v[..])?;
-                    }
-                    None => {
-                        table.remove(k.as_slice())?;
-                    }
+                None => {
+                    table.remove(k.as_slice())?;
                 }
             }
         }
-        tx.commit()?;
-        Ok(())
-    };
-    if let Err(e) = commit() {
-        eprintln!("rargod: db commit failed: {e:#}");
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn flush_once(shared: &Shared) {
+    let _one = shared.flushing.lock();
+    let batch = shared.writer.lock().take();
+    if batch.is_empty() {
         return;
     }
-    let mut p = shared.pending.lock();
-    for (k, v) in batch {
-        if let Some(cur) = p.get(&k) {
-            let same = match (cur, &v) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                (None, None) => true,
-                _ => false,
-            };
-            if same {
-                p.remove(&k);
-            }
+    let done = commit(&shared.db, &batch);
+    let now = shared.now_ms();
+    match done {
+        Ok(()) => shared.writer.lock().flushed(&batch, now),
+        Err(e) => {
+            eprintln!("rargod: db commit failed: {e:#}");
+            shared.writer.lock().failed(now);
         }
     }
 }
@@ -194,18 +184,29 @@ fn flush_once(shared: &Shared) {
 fn writer_loop(shared: Arc<Shared>) {
     loop {
         {
-            let mut p = shared.pending.lock();
-            if p.is_empty() {
-                if *shared.stop.lock() {
-                    return;
+            let mut w = shared.writer.lock();
+            let now = shared.now_ms();
+            match w.due(now) {
+                Due::Now => {}
+                Due::Idle => {
+                    if *shared.stop.lock() {
+                        return;
+                    }
+                    shared.wake.wait_for(&mut w, Duration::from_millis(IDLE_MS));
+                    continue;
                 }
-                shared.wake.wait_for(&mut p, Duration::from_millis(500));
+                Due::At(t) => {
+                    if *shared.stop.lock() {
+                        return;
+                    }
+                    shared.wake.wait_for(&mut w, Duration::from_millis(t.saturating_sub(now).max(1)));
+                    continue;
+                }
             }
         }
         if *shared.stop.lock() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(100));
         flush_once(&shared);
     }
 }
