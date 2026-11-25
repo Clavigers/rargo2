@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
+      RARGO_SERVER: rargo.rs
       RUSTFLAGS: -D warnings
       RARGO_OUTPUT: copy
     steps:
@@ -29,7 +30,6 @@ jobs:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
           curl -fsSL https://rargo.rs/install.sh | sh
-          rargo @rargo.rs
           rargo auth --token "$RARGO_TOKEN"
       - name: Build (on the server, on the cache every other build of this commit uses)
         run: rargo build --locked --workspace
@@ -45,6 +45,8 @@ jobs:
   new-user-path:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    env:
+      RARGO_SERVER: rargo.rs
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
@@ -59,7 +61,6 @@ jobs:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
           curl -fsSL https://rargo.rs/install.sh | sh
-          rargo @rargo.rs
           rargo auth --token "$RARGO_TOKEN"
       - run: RARGO_OUTPUT=copy rargo build --locked --release -p rargo -p rargod -p rargo-core
       - name: The planner of the latest release
