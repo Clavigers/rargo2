@@ -81,6 +81,12 @@ pub struct Store {
     cold_lock: std::sync::RwLock<()>,
     /// Bumped whenever a blob stops being whole or stops existing.
     generation: AtomicU64,
+    /// Moves of blobs between `meta` and `cold` begun, and ended. A blob
+    /// that goes cold or comes back is in one map, then both, then the
+    /// other, and a look at both maps that a move overlaps can see it in
+    /// neither: see [`Store::steady`].
+    moves_begun: AtomicU64,
+    moves_ended: AtomicU64,
     /// Content that requests in progress hold: never evicted or swept. A
     /// count per blob, one for each holder ([`Store::pin_all`]).
     pins: DashMap<Hash, u32>,
@@ -196,6 +202,8 @@ impl Store {
             cold,
             cold_disk: AtomicU64::new(cold_disk),
             cold_lock: std::sync::RwLock::new(()),
+            moves_begun: AtomicU64::new(0),
+            moves_ended: AtomicU64::new(0),
         })
     }
 
@@ -255,11 +263,34 @@ impl Store {
     }
 
     pub fn has(&self, h: &Hash) -> bool {
-        self.meta.contains_key(h) || self.cold.contains_key(h)
+        self.steady(|| self.meta.contains_key(h) || self.cold.contains_key(h))
     }
 
     pub fn size_of(&self, h: &Hash) -> Option<u64> {
-        self.meta.get(h).map(|m| m.size).or_else(|| self.cold.get(h).map(|m| m.size))
+        self.steady(|| self.meta.get(h).map(|m| m.size).or_else(|| self.cold.get(h).map(|m| m.size)))
+    }
+
+    /// `look` at both maps as at one moment: again if a move between them
+    /// was under way when it began or began while it looked.
+    fn steady<R>(&self, look: impl Fn() -> R) -> R {
+        loop {
+            let begun = self.moves_begun.load(Ordering::SeqCst);
+            if self.moves_ended.load(Ordering::SeqCst) == begun {
+                let r = look();
+                if self.moves_begun.load(Ordering::SeqCst) == begun {
+                    return r;
+                }
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Runs `step`, which moves blobs between the two maps, as a move.
+    fn moving<R>(&self, step: impl FnOnce() -> R) -> R {
+        self.moves_begun.fetch_add(1, Ordering::SeqCst);
+        let r = step();
+        self.moves_ended.fetch_add(1, Ordering::SeqCst);
+        r
     }
 
     fn chunk_path(&self, c: &Hash) -> PathBuf {
@@ -363,9 +394,12 @@ impl Store {
         before(h);
         let cm = ColdMeta { size: meta.size, last_used: meta.last_used, added, recipe };
         self.db.put(Table::Cold, &h.0, &bincode::serialize(&cm).unwrap());
-        self.cold.insert(*h, cm);
         // Still in the store, as chunks: the generation stays.
-        if let Some((_, m)) = self.meta.remove(h) {
+        let whole = self.moving(|| {
+            self.cold.insert(*h, cm);
+            self.meta.remove(h)
+        });
+        if let Some((_, m)) = whole {
             let before = self.total.fetch_sub(m.size, Ordering::Relaxed);
             assert!(before >= m.size, "total bytes do not go negative");
         }
@@ -484,17 +518,17 @@ impl Store {
 
     fn record(&self, h: Hash, size: u64, mtime_ns: i64) {
         let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
-        match self.meta.insert(h, m) {
+        self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
+        // A blob that is whole again is not cold any more: a move, and
+        // nothing left the store, so the generation stays.
+        let (old, was_cold) = self.moving(|| (self.meta.insert(h, m), self.cold.remove(&h).is_some()));
+        match old {
             None => {
                 self.total.fetch_add(size, Ordering::Relaxed);
             }
             Some(old) => assert_eq!(old.size, size, "one hash, one size"),
         }
-        self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
-        // A blob that is whole again is not cold any more. It is whole
-        // before its cold entry goes, so `has` never misses it, and nothing
-        // left the store, so the generation stays.
-        if self.cold.remove(&h).is_some() {
+        if was_cold {
             self.db.delete(Table::Cold, &h.0);
         }
     }
@@ -1085,6 +1119,56 @@ mod tests {
         }
         done.store(true, Ordering::Relaxed);
         assert_eq!(watcher.join().unwrap(), 0, "a blob being thawed was reported missing");
+    }
+
+    /// Blobs going cold and coming back on several threads at once, while
+    /// others look: none is ever reported missing or without a size.
+    #[test]
+    fn blobs_moving_on_many_threads_are_never_missing() {
+        let (_d, s) = store();
+        let s = Arc::new(s);
+        let blobs: Vec<(Hash, Vec<u8>)> = (0..4u8)
+            .map(|i| {
+                let data = vec![i; 1 << 20];
+                (s.put_bytes(&data).unwrap(), data)
+            })
+            .collect();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lookers: Vec<_> = (0..3)
+            .map(|_| {
+                let (s, done, hs) = (s.clone(), done.clone(), blobs.iter().map(|b| b.0).collect::<Vec<_>>());
+                std::thread::spawn(move || {
+                    let mut missed = 0;
+                    while !done.load(Ordering::Relaxed) {
+                        for h in &hs {
+                            if !s.has(h) || s.size_of(h) != Some(1 << 20) {
+                                missed += 1;
+                            }
+                        }
+                    }
+                    missed
+                })
+            })
+            .collect();
+        let movers: Vec<_> = blobs
+            .into_iter()
+            .map(|(h, data)| {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+                        assert_eq!(s.read(&h).unwrap(), data);
+                    }
+                })
+            })
+            .collect();
+        for m in movers {
+            m.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        for l in lookers {
+            assert_eq!(l.join().unwrap(), 0, "a moving blob was reported missing");
+        }
     }
 
     #[test]

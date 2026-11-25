@@ -2794,6 +2794,240 @@ on that daemon's guard. Another daemon can still be running with a
 guard whose title names the same directory, and that guard stays until
 its own daemon exits. `e2e-auth` stops every daemon under its own directory.
 
+## D87. A delivered file is fetched as it is read, each part proven against the content hash (issue 115)
+
+A virtual file in `target/` is fetched as it is read. Bytes that arrive are
+served to a reader only once they are proven against the content hash.
+The design follows Bonanza's `FileReadAt`, which fetches only the chunks
+under a read, and the `bao` way of proving a slice against a BLAKE3 root.
+
+**Proof.**
+- Content hashes are plain BLAKE3, which is a Merkle tree over 1 KiB
+  chunks.
+- The server sends a content's outline with its recipe: the chaining
+  values of its 64 KiB groups (`rargo_proto::outline`). Groups sit at
+  multiples of 64 KiB, so each group is a subtree of BLAKE3's tree, and
+  the tree above them has BLAKE3's own shape.
+- The outline gives the root hash by `blake3::hazmat`'s merges. The
+  client checks that root against the content hash before it reads
+  anything, which proves every group's value at once.
+- After that, a group's bytes are proven by its value alone.
+- The recipe (chunk hashes and lengths) is not trusted. Each chunk is
+  checked against its recipe hash, which catches wrong bytes early, and
+  the group check catches a wrong recipe.
+- A failed proof is an I/O error for the reader, never bytes. The unit
+  tests in `partial.rs` cover a server that sends wrong bytes, a recipe
+  that is wrong but self-consistent, and an outline that does not give
+  the hash.
+
+**Why 64 KiB groups, and the whole outline at once.**
+- An outline is 32 bytes per 64 KiB, 0.05% of the content: 233 KB for a
+  477 MB debug rust-analyzer.
+- Sending it whole with the recipe costs no extra round trip. Every
+  later proof is local, with no per-range proof nodes (bao's encoding)
+  to fetch or store.
+- 64 KiB is the average chunk size, so a read waits for about two
+  chunks.
+
+**What a read fetches.**
+- The server's recipe names the byte ranges of a 64-bit ELF file's debug
+  sections (`.debug_*`, `.zdebug_*`; adjacent ones joined).
+- A content's regions are each of those ranges, plus everything else as
+  one region. A chunk not wholly inside a debug range belongs to the
+  everything-else region.
+- A read asks for the chunks under it. Its first read in a region also
+  asks for the rest of that region, in a second request behind the
+  first. So a sequential read does not cost a round trip per chunk.
+- Running a debug binary fetches its code and data in one go, and its
+  debug information when a backtrace reads it. A file without debug
+  sections (an rlib) is one region: its first read asks for all of it,
+  and that read is served as soon as its own chunks arrive.
+- Contents under 1 MiB (`CHUNKED_FROM`) are fetched whole on their first
+  read: one round trip either way.
+- Chunks the cache already holds in other contents are taken from there.
+
+**Where the bytes are kept.**
+- They gather in a sparse file next to the content's place in the
+  cache.
+- When every group is proven, the file is the content: it is renamed
+  into its place, and its chunks go into the cache's chunk index.
+- The daemon keeps up to 64 contents that are partly read, so a binary
+  that is run again does not fetch again what it has. The oldest is let
+  go first, and its file is removed once no handle reads it.
+
+**Passthrough for cached contents.**
+- A delivered file whose content the cache holds whole is opened on the
+  cached file for passthrough, so the kernel reads it itself.
+- The node's opens for passthrough share one backing file. While it is
+  a cached content, the node refuses an open for writing (which would
+  write into the cache) with `ETXTBSY`, which is what the kernel answers
+  conflicting opens with. The other way round, a real file's backing is
+  never handed to a delivered file's reader.
+
+**Protocol 8.** `ServerMsg::Recipe` carries the outline and the debug
+ranges. The server computes an outline on the first request for it, with
+the pages of the content hashed in parallel, and keeps it in memory with
+the recipe.
+
+**Copy mode** (`RARGO_OUTPUT=copy`) places whole files, each
+checked against its hash once whole.
+
+## D88. A kept test pass is keyed by the functions it executed (initiative 134)
+
+A `Test` action (D83: one test process, under `rargo test` or `rargo
+nextest`) is cached under its command line and what it read, and the test
+binary is one of those reads. Any edit that relinks the binary to
+different bytes reruns every test in it. This design keeps a pass for as
+long as the code of every function the test executed is unchanged. The
+binary's bytes stop being a read of the test. blaze does the same for
+`blaze test` with its own code generator (`docs/cargo.md`, "Which tests
+run"; `docs/v2/plan/design/test-selection.md`). rargo keeps rustc, so
+the slots and the identities come from a patch in rargo's rustc fork, as
+in D84.
+
+**Recording: a slot per function, written by the function itself.**
+- With `-Z rargo-fn-slots`, every function instance that codegen emits
+  begins with a one-byte store to a slot of its own: `mov byte [slot], 1`
+  (relaxed, unconditional).
+- The slots of a crate are one array in a section of its own
+  (`.rargo_slots`), so a linked binary holds every crate's arrays in one
+  contiguous range.
+- The store is part of the function's body before LLVM optimises. So a
+  function that is inlined still marks its own slot wherever its code
+  runs, and a function that is never called marks nothing.
+- A constructor (`.init_array`) of the fork's small runtime maps the
+  file named by `RARGO_FN_SLOTS` over the slot range, `MAP_SHARED`. What
+  the process marks is in the file as it happens, also when the process
+  aborts or is killed. It costs no exit handler and no copy.
+- Threads mark the same slots. A child made by `fork` shares the
+  mapping, and a child that re-executes the same binary maps the same
+  file, so both add to the test's record. This is right: what they run
+  is the test. A different program the test starts is an executable it
+  read, an ordinary file observation, as today.
+- A test that never returns is stopped by its timeout and fails. A
+  failure is never cached, so its record is not used.
+- **Cost:** one store per call. The recording issue measures it on
+  rust-analyzer's tests, and slots are on only if it is under 3%.
+- Code without slots: the standard library (prebuilt), C and assembly
+  objects from build scripts, `global_asm!`. It is not tracked by
+  function. It is the binary's *rest* (below).
+
+**Identity: what "the code of a function" hashes to.** The fork computes
+an identity for every function instance with a slot. It writes a table
+(`.rargo_fn_ids`: slot index, symbol name, 32-byte identity), which the
+linker gathers like the slots. A function's identity is a hash of:
+- its optimised MIR body, with spans removed, and its generic arguments
+  (each monomorphised instance has its own slot and identity);
+- the symbol name of every function it calls, takes the address of, or
+  puts in a vtable, but not their bodies: a callee that runs marks its
+  own slot, and is checked by its own identity;
+- the evaluated contents of every `static` and `const` allocation it
+  refers to, recursively through the allocations those point to (a
+  changed initializer changes every function that reads it);
+- the `#[track_caller]` and panic `Location`s it names, as file, column
+  and line *relative to the function's own first line*. So a function
+  that only moved (an edit above it) keeps its identity, while
+  `line!()` and `column!()` are constants in the body and count in full.
+  A replayed pass shows its output as recorded, with the old lines in a
+  panic message that it caught.
+
+What an identity does not include: debug information, the function's
+address, the order of items in the crate, and codegen-unit partitioning.
+So an unrelated edit, moving code, and relinking leave it as it is.
+
+A function whose identity the fork cannot compute is marked so in the
+table, and a test that executed one falls back to the binary's bytes as
+a read. This is always sound. The cases are inline `asm!` with symbol
+operands, naked functions, and items the hash does not know.
+
+**The binary's rest.** What a binary holds besides functions with slots
+is hashed as one *rest*. It is computed by rargod from the link action's
+trace, not by parsing the binary:
+- the content hashes of every link input that is not an rlib built with
+  slots (native libraries, objects, the standard library's rlibs);
+- the linker's arguments.
+
+A test whose rest changed reruns.
+
+**The key.**
+- The weak key of a `Test` action is unchanged: kind, command line,
+  environment, policy.
+- In its trace, the observation of the test binary (`Obs::File` at the
+  binary's path) becomes `Obs::Code { executed, rest }`:
+  - `executed` names a blob listing the `(symbol, identity)` pairs whose
+    slots the run marked, sorted;
+  - `rest` is the binary's rest.
+- When the binary in the requesting worktree's view is checked against
+  it, rargod reads that binary's identity table (kept per binary hash)
+  and its rest. The observation holds when the rest is equal and every
+  recorded symbol has the recorded identity there.
+- A symbol that is gone does not hold.
+- A function that is new, or changed but not executed, does not matter.
+- All other observations (files, listings, lookups, environment) hold as
+  they do today.
+- Several traces under one weak key are kept, as for every action, so
+  undoing an edit finds the old pass again.
+
+**The test list.** libtest's `main` refers to the array of all the
+binary's test descriptors, so adding a test anywhere would change
+`main`'s identity, and rerun everything. The array of
+`#[rustc_test_marker]` items is not hashed into `main`'s identity. The
+descriptor of the test the process runs (name, ignore, should_panic,
+its function) counts in the identity of that test's own function. The
+listing action (`--list`) keeps the binary's bytes as its read: a new
+test is listed at once.
+
+**Where it applies.**
+- Every `Test` action: `rargo test` (each test binary run) and
+  `rargo nextest` (each test process, D83).
+- `--no-cache` still runs every test.
+- Doctests keep the binary read, since each is a binary of its own.
+- Benchmarks are not cached.
+- A test binary built without slots (a toolchain other than rargo's
+  fork, or slots off for its profile) keeps the binary read.
+
+**Which builds have slots.** Every rargo build with the fork whose
+profile has `debug-assertions` on (the `dev` and `test` profiles by
+default). Then the dependencies of `rargo build` and `rargo test` stay
+shared. Release builds have none, so they are untouched. Slots change the
+emitted code, which is why they are a profile property, not a test-only
+flag.
+
+**Soundness, and how it is checked.**
+- A kept pass is wrong when something the test's behaviour depends on
+  changed and neither the identities nor the rest nor the other reads
+  saw it. The candidates are:
+  - code without slots that the rest misses;
+  - data reached only through raw pointers or `extern` statics;
+  - build-script outputs that become `include_bytes!` data (a const,
+    counted) or `cfg`s (they change code, so identities);
+  - process-wide state that one test sets for another;
+  - the relative-line rule for `Location`s.
+- The check is a replay: for a series of commits, run every test twice,
+  once selected (with the cache) and once with `--no-cache`. Compare
+  every test's outcome, and count any difference as unsoundness to fix
+  before slots are on.
+- It runs on rargo's own history and on rust-analyzer's.
+- The two-year history replay (`dev/history.py`) is stopped by the owner
+  and is not used for this unless the owner asks.
+- In service, the drift check (D42) also reruns a sample of kept passes
+  for real, and reports a pass that fails.
+
+**Measurement.** On the rust-analyzer swarm (`dev/bench-swarm.sh`): tests
+rerun per edit and server CPU seconds, before and after.
+
+**Already built:**
+- `Test` and nextest test processes as cached, traced actions (D83);
+- the trace cache with several traces per weak key;
+- rargo's rustc fork with its patch series and `dev/fork-check.sh` (D84);
+- the drift check (D42).
+
+**Not built:**
+- the slots;
+- the identities;
+- the `Code` observation;
+- the replay check.
+
 ## D89. A Nix store path is a content-addressed tree (issue 116)
 
 A closure is the list of (store path name, root identity). That identity

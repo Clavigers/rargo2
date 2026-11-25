@@ -203,8 +203,12 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                     tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
                     let blobs = d.client_blobs.clone();
                     tokio::task::spawn_blocking(move || {
-                        let chunks = blobs.recipe(&Hash(hash)).map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect()).unwrap_or_default();
-                        sess.send(ServerMsg::Recipe { hash, chunks });
+                        let chunks: Vec<_> = blobs.recipe(&Hash(hash)).map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect()).unwrap_or_default();
+                        let (outline, lazy) = match blobs.outline(&Hash(hash)) {
+                            Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
+                            _ => (Vec::new(), Vec::new()),
+                        };
+                        sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
                         sess.send(ServerMsg::Fetched { id });
                     });
                 }

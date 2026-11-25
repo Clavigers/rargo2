@@ -768,6 +768,53 @@ and left 11.8, 2.7, 2.1 and 35.7 GB on the client.
   rest of the 1.5 to 2 s in the swarm, where twenty agents share the
   server, is not measured.
 
+### Running a debug binary fetched as it is read (`dev/bench-run.sh`, issue 115, 2026-11-25)
+
+**Setup.**
+- rust-analyzer at `37721d141`: its debug `rust-analyzer` binary is
+  476,998,528 bytes.
+- A server with 24 cores builds it for a first worktree.
+- Then a fresh worktree of the same commit, on a machine that has never
+  fetched it (an empty client cache), runs `rargo build -p rust-analyzer`
+  (nothing to build), then, measured,
+  `rargo run -p rust-analyzer -- --version`.
+- Bytes are what the client's network interface received during the run.
+  The client link is LAN, or 50 ms each way (100 ms round trip).
+- **ranged** is this design (protocol 8): reading fetches the chunks under
+  each read, and the first read of the code region asks for the rest of it
+  behind them. **whole** is 0.6.5, which fetches the whole content (by
+  chunk, compressed) at its first read.
+- Three rounds; each figure is the median, and the rounds differed by at
+  most 0.02 s.
+
+| | LAN | 100 ms round trip |
+|---|---|---|
+| **ranged**: wall time of the run | 1.13 s | 1.99 s |
+| **ranged**: bytes received during it | 28.1 MB | 27.9 MB |
+| **whole**: wall time of the run | 1.69 s | 2.67 s |
+| **whole**: bytes received during it | 97.1 MB | 97.1 MB |
+
+**What the numbers say.**
+- A run receives 5.9% of the binary's size. It is 0.56 s faster than
+  fetching the binary whole on LAN, and 0.68 s faster at 100 ms.
+- The rest of the code region is still arriving when `--version` exits:
+  18–21 MB more, received during the next run. So a binary that is run
+  once costs about 48 MB in all (half of what a whole fetch receives).
+  The debug information, the remaining 429 MB of the file, is not
+  fetched.
+- The same command again takes 0.14–0.16 s on LAN and 0.19–0.21 s at
+  100 ms, against 0.05 s and 0.15 s for a whole binary in the cache. The
+  partly fetched file is still read through the daemon until every part
+  of it is here, and the kernel reads a whole one itself (passthrough).
+- `dev/e2e-link.sh`, "a binary is read by range", covers the rest:
+  - A run of a small debug binary fetched 620,916 of its 4,548,168 bytes.
+  - A panic with `RUST_BACKTRACE=1` printed files and lines, after
+    fetching the debug sections.
+  - Read through to the end, the file is byte for byte the server's
+    stored content.
+  - With the server's store wiped, the file reads the same and runs from
+    the cache, fetching nothing.
+
 ### Chunking rule: RepMaxCDC against the mask rule (issue 117, 2026-11-25)
 
 The question: is RepMaxCDC (`github.com/buildbarn/go-cdc`, as Bonanza uses
@@ -1657,6 +1704,13 @@ cache that shares artifacts between them.
 On `08bf0d3`, three gates in a row on this machine each pass every suite.
 They take 127s, 104s and 103s. The scripts the gate and CI run do not wait
 on time.
+
+The gate also fails when it is slower than the budget in `dev/gate-budget`
+(150s total; the file also holds each suite's last recorded time, so the
+failure message says which suite grew). This ratchet is the one check in
+the gate that depends on how long something took, by the owner's choice.
+`dev/gate-budget.sh` refuses a higher total than `origin/main` has unless
+a commit since says `Gate-budget-raise: <why>`. Not yet run in a full gate.
 
 ## Nix store trees (issue 116)
 

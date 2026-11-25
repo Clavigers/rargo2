@@ -343,6 +343,14 @@ pub struct Blobs {
     pub fetched_bytes: AtomicU64,
     pub reused_bytes: AtomicU64,
     pub fetched_blobs: AtomicU64,
+    outlines: dashmap::DashMap<Hash, Arc<Outline>>,
+}
+
+/// What proves a blob's parts and says which of them are read only on
+/// demand (see [`crate::proto::ServerMsg::Recipe`]).
+pub struct Outline {
+    pub cvs: Vec<crate::proto::outline::Cv>,
+    pub lazy: Vec<(u64, u64)>,
 }
 
 const BATCH_BYTES: usize = 1 << 20;
@@ -357,7 +365,46 @@ impl Blobs {
             fetched_bytes: AtomicU64::new(0),
             reused_bytes: AtomicU64::new(0),
             fetched_blobs: AtomicU64::new(0),
+            outlines: dashmap::DashMap::new(),
         }
+    }
+
+    /// The outline of a blob we can serve.
+    pub fn outline(&self, h: &Hash) -> Option<Arc<Outline>> {
+        if let Some(o) = self.outlines.get(h) {
+            return Some(o.clone());
+        }
+        let f = self.source.open(h).ok()?;
+        let len = f.metadata().ok()?.len() as usize;
+        if len == 0 {
+            return Some(Arc::new(Outline { cvs: Vec::new(), lazy: Vec::new() }));
+        }
+        use std::os::fd::AsRawFd;
+        // SAFETY: a read-only private mapping of an immutable blob, unmapped
+        // after its last use below.
+        let o = unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
+            if p == libc::MAP_FAILED {
+                return None;
+            }
+            let data = std::slice::from_raw_parts(p as *const u8, len);
+            let cvs = if len as u64 <= crate::proto::outline::GROUP {
+                Vec::new()
+            } else {
+                use rayon::prelude::*;
+                data.par_chunks(crate::proto::outline::GROUP as usize)
+                    .enumerate()
+                    .map(|(i, g)| crate::proto::outline::group_cv(i, g))
+                    .collect()
+            };
+            let o = Outline { cvs, lazy: chunk::debug_ranges(data) };
+            libc::munmap(p, len);
+            o
+        };
+        assert!(o.cvs.is_empty() || o.cvs.len() == crate::proto::outline::groups(len as u64));
+        let o = Arc::new(o);
+        self.outlines.insert(*h, o.clone());
+        Some(o)
     }
 
     /// The recipe of a blob we can serve.

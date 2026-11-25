@@ -17,11 +17,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod outline;
 pub mod secure;
 pub mod tree;
 pub mod workspace;
 
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
 
 /// What a server says to a client whose token it does not admit, on either
 /// transport; the client recognises it by this text.
@@ -264,8 +265,12 @@ pub enum ServerMsg {
     /// Everything asked for in fetch `id` has been sent.
     Fetched { id: u64 },
     /// How a content is cut into chunks: `(hash, length)` in order. Empty
-    /// if the server does not have the content.
-    Recipe { hash: Digest, chunks: Vec<(Digest, u32)> },
+    /// if the server does not have the content. With it, the content's
+    /// [`outline`] (empty for a content of one group), which proves each
+    /// part as it arrives, and the byte ranges that only a debugger or a
+    /// backtrace reads (debug sections), which a reader fetches only when
+    /// it reads them.
+    Recipe { hash: Digest, chunks: Vec<(Digest, u32)>, outline: Vec<outline::Cv>, lazy: Vec<(u64, u64)> },
     /// Chunks of a content, by their place in its recipe.
     Chunks { hash: Digest, chunks: Vec<(u32, Part)> },
     Pong(u64),

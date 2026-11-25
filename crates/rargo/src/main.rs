@@ -18,6 +18,7 @@ mod git;
 mod known;
 mod mux;
 mod outfs;
+mod partial;
 mod place;
 mod project;
 mod report;
