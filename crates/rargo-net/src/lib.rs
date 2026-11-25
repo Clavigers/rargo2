@@ -1,7 +1,8 @@
 pub mod link;
+mod endpoint;
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -639,9 +640,10 @@ impl Conn {
 pub struct Endpoint {
     sock: Arc<UdpSocket>,
     conns: Mutex<HashMap<u64, Arc<Conn>>>,
+    state: Mutex<endpoint::EndpointState>,
+    t0: Instant,
     accept_tx: mpsc::UnboundedSender<Arc<Conn>>,
     accept_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<Arc<Conn>>>,
-    accepting: bool,
     key: LinkKey,
     auth: Auth,
 }
@@ -676,12 +678,14 @@ impl Endpoint {
             }
         }
         let (tx, rx) = mpsc::unbounded_channel();
+        let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. });
         let ep = Arc::new(Endpoint {
             sock,
             conns: Mutex::new(HashMap::new()),
+            state: Mutex::new(endpoint::EndpointState::new(accepting, per_conn, key.clone())),
+            t0: Instant::now(),
             accept_tx: tx,
             accept_rx: tokio::sync::Mutex::new(rx),
-            accepting,
             key,
             auth,
         });
@@ -701,6 +705,8 @@ impl Endpoint {
             u64::from_le_bytes(b) | 1
         };
         let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn());
+        let now = self.t0.elapsed().as_millis() as u64;
+        assert!(self.state.lock().connect(id, peer, now), "connection ids are unique");
         assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
         let agreed = match &self.auth {
             Auth::None => Ok(()),
@@ -723,144 +729,110 @@ impl Endpoint {
         matches!(self.auth, Auth::Users(_) | Auth::User { .. })
     }
 
-    fn admit<'a>(&self, pkt: &'a [u8]) -> Option<(&'a [u8], bool)> {
-        if !self.per_conn() {
-            return open(&self.key, pkt).map(|p| (p, true));
-        }
-        if pkt.len() >= 9 + TAG {
-            let id = u64::from_le_bytes(pkt[1..9].try_into().unwrap());
-            let tag_key = self.conns.lock().get(&id).and_then(|c| c.tag.get().copied());
-            if let Some(k) = tag_key {
-                let (body, tag) = pkt.split_at(pkt.len() - TAG);
-                let want = blake3::keyed_hash(&k, body);
-                let diff = want.as_bytes()[..TAG].iter().zip(tag).fold(0u8, |d, (a, b)| d | (a ^ b));
-                if diff == 0 {
-                    return Some((body, true));
-                }
-            }
-        }
-        Some((pkt, false))
-    }
-
     pub fn forget(&self, id: u64) {
+        self.state.lock().forget(id);
         if let Some(c) = self.conns.lock().remove(&id) {
             c.close();
         }
     }
 
-    async fn recv_loop(self: Arc<Self>) {
-        let mut buf = vec![0u8; 65536];
-        let mut acks: BTreeMap<u64, (SocketAddr, Vec<u8>)> = BTreeMap::new();
-        loop {
-            let Ok((n, from)) = self.sock.recv_from(&mut buf).await else { return };
-            if let Some((pkt, proven)) = self.admit(&buf[..n]) {
-                self.handle(pkt, from, proven, &mut acks);
-            }
-            while let Ok((n, from)) = self.sock.try_recv_from(&mut buf) {
-                if let Some((pkt, proven)) = self.admit(&buf[..n]) {
-                    self.handle(pkt, from, proven, &mut acks);
-                }
-                if acks.values().any(|(_, a)| a.len() > 1100) {
-                    break;
-                }
-            }
-            for (id, (to, mut pkt)) in std::mem::take(&mut acks) {
-                seal(&self.key, &mut pkt);
-                if self.per_conn() {
-                    let conn = self.conns.lock().get(&id).cloned();
-                    if let Some(c) = conn {
-                        c.tag_datagram(&mut pkt);
+    fn sync_tag(&self, bytes: &[u8]) {
+        if bytes.len() < 9 {
+            return;
+        }
+        let id = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
+        let tag = self.conns.lock().get(&id).and_then(|c| c.tag.get().copied());
+        if let Some(tag) = tag {
+            self.state.lock().set_tag(id, tag);
+        }
+    }
+
+    fn open_conn(&self, id: u64, from: SocketAddr) {
+        let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn());
+        assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
+        match (self.key.clone(), &self.auth) {
+            (_, Auth::Users(keys)) => {
+                let (c, tx, keys) = (c.clone(), self.accept_tx.clone(), keys.clone());
+                tokio::spawn(async move {
+                    match c.agree_with_user(&keys).await {
+                        Ok(()) => {
+                            let _ = tx.send(c);
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            c.close();
+                        }
                     }
-                }
-                let _ = self.sock.send_to(&pkt, to).await;
+                });
+            }
+            (None, _) => {
+                let _ = self.accept_tx.send(c.clone());
+            }
+            (Some(key), _) => {
+                let (c, tx) = (c.clone(), self.accept_tx.clone());
+                tokio::spawn(async move {
+                    match c.agree_as_responder(&key).await {
+                        Ok(()) => {
+                            let _ = tx.send(c);
+                        }
+                        Err(_) => c.close(),
+                    }
+                });
             }
         }
     }
 
-    fn handle(&self, pkt: &[u8], from: SocketAddr, proven: bool, acks: &mut BTreeMap<u64, (SocketAddr, Vec<u8>)>) {
-        if pkt.len() < 9 {
-            return;
-        }
-        let id = u64::from_le_bytes(pkt[1..9].try_into().unwrap());
-        let first_msg = (pkt.len() >= 17).then(|| u64::from_le_bytes(pkt[9..17].try_into().unwrap()));
-        if !proven && pkt[0] == T_DATA && first_msg != Some(AGREEMENT) {
-            return;
-        }
-        let conn = {
-            let mut conns = self.conns.lock();
-            match conns.get(&id) {
-                Some(c) => c.clone(),
-                None if self.accepting && pkt[0] == T_DATA => {
-                    let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn());
-                    assert!(conns.insert(id, c.clone()).is_none());
-                    match (self.key.clone(), &self.auth) {
-                        (_, Auth::Users(keys)) => {
-                            let (c, tx, keys) = (c.clone(), self.accept_tx.clone(), keys.clone());
-                            tokio::spawn(async move {
-                                match c.agree_with_user(&keys).await {
-                                    Ok(()) => {
-                                        let _ = tx.send(c);
-                                    }
-                                    Err(_) => {
-                                        tokio::time::sleep(Duration::from_secs(2)).await;
-                                        c.close();
-                                    }
-                                }
-                            });
-                        }
-                        (None, _) => {
-                            let _ = self.accept_tx.send(c.clone());
-                        }
-                        (Some(key), _) => {
-                            let (c, tx) = (c.clone(), self.accept_tx.clone());
-                            tokio::spawn(async move {
-                                match c.agree_as_responder(&key).await {
-                                    Ok(()) => {
-                                        let _ = tx.send(c);
-                                    }
-                                    Err(_) => c.close(),
-                                }
-                            });
+    fn ingest(&self, from: SocketAddr, bytes: &[u8]) {
+        self.sync_tag(bytes);
+        let now = self.t0.elapsed().as_millis() as u64;
+        let routed = self.state.lock().recv(from, bytes, now);
+        for ev in routed.events {
+            match ev {
+                endpoint::RouteEvent::Open { id, from } => self.open_conn(id, from),
+                endpoint::RouteEvent::Peer { id, from } => {
+                    if let Some(c) = self.conns.lock().get(&id) {
+                        *c.last_heard.lock() = Instant::now();
+                        *c.peer.lock() = from;
+                    }
+                }
+                endpoint::RouteEvent::Data { id, msg, frag, nfrags, payload } => {
+                    let conn = self.conns.lock().get(&id).cloned();
+                    if let Some(c) = conn {
+                        if c.on_data(msg, frag, nfrags, &payload) {
+                            self.state.lock().ack(id, msg, frag, from);
                         }
                     }
-                    c
                 }
-                None => return,
-            }
-        };
-        if proven {
-            *conn.last_heard.lock() = Instant::now();
-            *conn.peer.lock() = from;
-        }
-        conn.stats.recv_packets.fetch_add(1, Ordering::Relaxed);
-        conn.stats.recv_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-        match pkt[0] {
-            T_DATA if pkt.len() >= DATA_HDR => {
-                let msg = u64::from_le_bytes(pkt[9..17].try_into().unwrap());
-                let frag = u32::from_le_bytes(pkt[17..21].try_into().unwrap());
-                let nfrags = u32::from_le_bytes(pkt[21..25].try_into().unwrap());
-                if conn.on_data(msg, frag, nfrags, &pkt[DATA_HDR..]) {
-                    let (_, a) = acks.entry(id).or_insert_with(|| {
-                        let mut v = vec![T_ACK];
-                        v.extend_from_slice(&id.to_le_bytes());
-                        (from, v)
-                    });
-                    a.extend_from_slice(&msg.to_le_bytes());
-                    a.extend_from_slice(&frag.to_le_bytes());
-                }
-            }
-            T_ACK => {
-                let mut rest = &pkt[9..];
-                while rest.len() >= 12 {
-                    let msg = u64::from_le_bytes(rest[..8].try_into().unwrap());
-                    let frag = u32::from_le_bytes(rest[8..12].try_into().unwrap());
-                    if proven || msg == AGREEMENT {
-                        conn.on_ack(msg, frag);
+                endpoint::RouteEvent::Ack { id, msg, frag } => {
+                    if let Some(c) = self.conns.lock().get(&id) {
+                        c.on_ack(msg, frag);
                     }
-                    rest = &rest[12..];
                 }
             }
-            _ => {}
+        }
+        if let Some(id) = routed.id {
+            if let Some(c) = self.conns.lock().get(&id) {
+                c.stats.recv_packets.fetch_add(1, Ordering::Relaxed);
+                c.stats.recv_bytes.fetch_add(routed.len as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    async fn recv_loop(self: Arc<Self>) {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let Ok((n, from)) = self.sock.recv_from(&mut buf).await else { return };
+            self.ingest(from, &buf[..n]);
+            while let Ok((n, from)) = self.sock.try_recv_from(&mut buf) {
+                self.ingest(from, &buf[..n]);
+                if self.state.lock().ack_full() {
+                    break;
+                }
+            }
+            let outbound = self.state.lock().take_datagrams();
+            for (to, pkt) in outbound {
+                let _ = self.sock.send_to(&pkt, to).await;
+            }
         }
     }
 }
