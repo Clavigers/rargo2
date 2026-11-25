@@ -56,6 +56,13 @@ pub struct Mount {
     pub traced: bool,
 }
 
+enum LookupPlan<'a> {
+    Known(Looked),
+    MountedHost(&'a Path),
+    Host(&'a HostRegion, &'a [u8]),
+    Nix(&'a [u8]),
+}
+
 pub struct BaseView {
     mounts: Vec<Mount>,
     memo: Arc<HostMemo>,
@@ -143,52 +150,56 @@ impl BaseView {
         }
     }
 
-    fn lookup_unchecked(&self, dir: &[u8], name: &[u8]) -> Looked {
-        let path = vjoin(dir, name);
-        if let Some(m) = self.mount_at(&path) {
-            return match &m.region {
-                Region::Link(target) => Looked::Symlink(target.clone()),
-                Region::Empty | Region::Snap(_) | Region::NixStore { .. } | Region::Synth(_) => {
-                    Looked::Dir(DIR_OWNER)
-                }
-                Region::Host(h) => {
-                    let real = &h.real;
-                    match (real.parent(), real.file_name()) {
-                        (Some(p), Some(n)) => {
-                            HostRegion::new(p).lookup(b"/", n.as_encoded_bytes())
-                        }
-                        _ => Looked::Dir(DIR_OWNER),
-                    }
-                }
+    fn plan_lookup<'a>(&'a self, dir: &'a [u8], name: &[u8], path: &[u8]) -> LookupPlan<'a> {
+        if let Some(mount) = self.mount_at(path) {
+            return match &mount.region {
+                Region::Link(target) => LookupPlan::Known(Looked::Symlink(target.clone())),
+                Region::Host(host) => LookupPlan::MountedHost(&host.real),
+                _ => LookupPlan::Known(Looked::Dir(DIR_OWNER)),
             };
         }
-        let (m, rel) = self.mount_of(dir);
-        let looked = match &m.region {
-            Region::Empty | Region::Link(_) => Looked::Absent,
-            Region::Snap(s) => s.lookup(rel, name),
-            Region::Host(h) => self.host_lookup(h, rel, name),
-            Region::NixStore { names } => {
-                if rel == b"/" && !names.contains(name) {
-                    Looked::Absent
-                } else {
-                    self.host_lookup(&nix_store_region(), rel, name)
-                }
-            }
-            Region::Synth(entries) => match (rel, entries.get(name)) {
+        let (mount, rel) = self.mount_of(dir);
+        match &mount.region {
+            Region::Empty | Region::Link(_) => LookupPlan::Known(Looked::Absent),
+            Region::Snap(snapshot) => LookupPlan::Known(snapshot.lookup(rel, name)),
+            Region::Host(host) => LookupPlan::Host(host, rel),
+            Region::NixStore { names } if rel == b"/" && !names.contains(name) => LookupPlan::Known(Looked::Absent),
+            Region::NixStore { .. } => LookupPlan::Nix(rel),
+            Region::Synth(entries) => LookupPlan::Known(match (rel, entries.get(name)) {
                 (b"/", Some(SynthEnt::File { hash, size })) => Looked::File(FileInfo {
                     size: *size,
                     owner: Owner { uid: 0, gid: 0, mode: 0o644 },
                     src: FileSrc::Blob(*hash),
                     sem: None,
                 }),
-                (b"/", Some(SynthEnt::Symlink(t))) => Looked::Symlink(t.clone()),
+                (b"/", Some(SynthEnt::Symlink(target))) => Looked::Symlink(target.clone()),
                 _ => Looked::Absent,
-            },
-        };
-        if matches!(looked, Looked::Absent) && self.mounts.iter().any(|o| is_strictly_under(&o.at, &path)) {
-            return Looked::Dir(DIR_OWNER);
+            }),
         }
-        looked
+    }
+
+    fn infer_mount_parent(&self, path: &[u8], observed: Looked) -> Looked {
+        if matches!(observed, Looked::Absent) && self.mounts.iter().any(|mount| is_strictly_under(&mount.at, path)) {
+            Looked::Dir(DIR_OWNER)
+        } else {
+            observed
+        }
+    }
+
+    fn lookup_unchecked(&self, dir: &[u8], name: &[u8]) -> Looked {
+        let path = vjoin(dir, name);
+        let observed = match self.plan_lookup(dir, name, &path) {
+            LookupPlan::Known(observed) => observed,
+            LookupPlan::MountedHost(real) => {
+                return match (real.parent(), real.file_name()) {
+                    (Some(parent), Some(name)) => HostRegion::new(parent).lookup(b"/", name.as_encoded_bytes()),
+                    _ => Looked::Dir(DIR_OWNER),
+                };
+            }
+            LookupPlan::Host(host, rel) => self.host_lookup(host, rel, name),
+            LookupPlan::Nix(rel) => self.host_lookup(&nix_store_region(), rel, name),
+        };
+        self.infer_mount_parent(&path, observed)
     }
 }
 
@@ -437,27 +448,16 @@ impl View for BuildView {
         if let Some(seed) = &self.seed {
             layered.extend(seed.names(dir, &SEED_LEVELS));
         }
-        let mut map: HashMap<Vec<u8>, DType> = match self.base_has_dir(dir) {
-            true => self.base.list(dir)?.into_iter().collect(),
-            false => HashMap::new(),
-        };
-        for (name, e) in layered {
-            match e {
-                LayerEnt::Entry(MEntry::Whiteout) => {
-                    map.remove(&name);
-                }
-                LayerEnt::Entry(MEntry::File { .. }) => {
-                    map.insert(name, DType::File);
-                }
-                LayerEnt::Entry(MEntry::Symlink(_)) => {
-                    map.insert(name, DType::Symlink);
-                }
-                LayerEnt::Entry(MEntry::Dir) | LayerEnt::Implied => {
-                    map.insert(name, DType::Dir);
-                }
-            }
-        }
-        Ok(map.into_iter().collect())
+        let base = if self.base_has_dir(dir) { self.base.list(dir)? } else { Listing::new() };
+        Ok(crate::view::merge_listings(base, layered.into_iter().map(|(name, entry)| {
+            let dtype = match entry {
+                LayerEnt::Entry(MEntry::Whiteout) => None,
+                LayerEnt::Entry(MEntry::File { .. }) => Some(DType::File),
+                LayerEnt::Entry(MEntry::Symlink(_)) => Some(DType::Symlink),
+                LayerEnt::Entry(MEntry::Dir) | LayerEnt::Implied => Some(DType::Dir),
+            };
+            (name, dtype)
+        })))
     }
 
     fn traced(&self, dir: &[u8]) -> bool {
