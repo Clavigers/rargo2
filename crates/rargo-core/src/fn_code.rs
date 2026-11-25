@@ -330,13 +330,21 @@ pub fn mark(spec: &mut crate::trace::ActionSpec) {
     spec.discard.push(MARKS_DIR.to_vec());
 }
 
+pub fn drift_line(label: &str, functions: &[String], failure: &str) -> String {
+    let shown = functions.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let more = if functions.len() > 8 { format!(" and {} more", functions.len() - 8) } else { String::new() };
+    format!(
+        "{label}: kept as a pass by the {} function(s) it executed ({shown}{more}), but a real run fails ({failure})",
+        functions.len()
+    )
+}
+
 pub fn sample(key: &Hash, created: u64, one_in: u64) -> bool {
     let mut h = KeyHasher::new("fn-code-drift-sample");
     h.field(&key.0).u64(created);
     one_in > 0 && u64::from_le_bytes(h.finish().0[..8].try_into().expect("eight bytes")) % one_in == 0
 }
 
-#[cfg(test)]
 pub mod fixture {
     pub struct Function {
         pub symbol: &'static str,
@@ -347,7 +355,35 @@ pub mod fixture {
         Some([n; 32])
     }
 
+    const MARKS_WRITER: [u8; 116] = [
+        0x48, 0x8b, 0x1c, 0x24, 0x48, 0x8d, 0x5c, 0xdc, 0x10, 0x48, 0x8b, 0x3b, 0x48, 0x85, 0xff, 0x74, 0x3d, 0x48, 0x83,
+        0xc3, 0x08, 0x48, 0x8d, 0x35, 0x40, 0x00, 0x00, 0x00, 0xb9, 0x0f, 0x00, 0x00, 0x00, 0xf3, 0xa6, 0x75, 0xe4, 0xb8,
+        0x02, 0x00, 0x00, 0x00, 0xbe, 0x41, 0x02, 0x00, 0x00, 0xba, 0xa4, 0x01, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x89, 0xc7,
+        0xb8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8d, 0x35, 0x2f, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x15, 0x1f, 0x00, 0x00, 0x00,
+        0x0f, 0x05, 0xb8, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0xb6, 0x3d, 0x19, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x52, 0x41, 0x52,
+        0x47, 0x4f, 0x5f, 0x46, 0x4e, 0x5f, 0x53, 0x4c, 0x4f, 0x54, 0x53, 0x3d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    const MARKS_LEN_AT: usize = 107;
+    const EXIT_AT: usize = 115;
+    const BASE: u64 = 0x40_0000;
+    const TEXT_AT: usize = 120;
+
+    pub struct Run<'a> {
+        pub ran: &'a [&'a str],
+        pub exit: u8,
+        pub pad: &'a [u8],
+    }
+
     pub fn elf(functions: &[Function], with_sections: bool) -> Vec<u8> {
+        build(functions, with_sections, None)
+    }
+
+    pub fn program(functions: &[Function], with_sections: bool, run: &Run<'_>) -> Vec<u8> {
+        build(functions, with_sections, Some(run))
+    }
+
+    fn build(functions: &[Function], with_sections: bool, run: Option<&Run<'_>>) -> Vec<u8> {
         let page = 4096;
         let slots = functions.len().next_multiple_of(page).max(page);
         let mut names = Vec::new();
@@ -364,7 +400,18 @@ pub mod fixture {
             ids.extend_from_slice(&f.identity.unwrap_or([0; 32]));
             ids.push(f.identity.is_none() as u8);
         }
-        let text = b"\x55\x48\x89\xe5\xc3".repeat(8);
+        let text = match run {
+            Some(run) => {
+                let m = marks(functions, run.ran);
+                let mut t = MARKS_WRITER.to_vec();
+                t[MARKS_LEN_AT..MARKS_LEN_AT + 8].copy_from_slice(&(m.len() as u64).to_le_bytes());
+                t[EXIT_AT] = run.exit;
+                t.extend_from_slice(&m);
+                t.extend_from_slice(run.pad);
+                t
+            }
+            None => b"\x55\x48\x89\xe5\xc3".repeat(8),
+        };
         let mut sections: Vec<(&[u8], u32, Vec<u8>, u64)> = vec![(b".text", 1, text, 0)];
         if with_sections {
             sections.push((super::SLOTS, 8, Vec::new(), slots as u64));
@@ -380,7 +427,7 @@ pub mod fixture {
         }
         let strtab_name = shstrtab.len() as u32;
         shstrtab.extend_from_slice(b".shstrtab\0");
-        let mut out = vec![0u8; 64];
+        let mut out = vec![0u8; if run.is_some() { TEXT_AT } else { 64 }];
         let mut placed = Vec::new();
         for (_, kind, body, size) in &sections {
             let at = out.len() as u64;
@@ -393,29 +440,49 @@ pub mod fixture {
             out.push(0);
         }
         let shoff = out.len() as u64;
-        let header = |name: u32, kind: u32, offset: u64, size: u64| {
+        let header = |name: u32, kind: u32, flags: u64, offset: u64, size: u64| {
             let mut h = vec![0u8; 64];
             h[0..4].copy_from_slice(&name.to_le_bytes());
             h[4..8].copy_from_slice(&kind.to_le_bytes());
+            h[8..16].copy_from_slice(&flags.to_le_bytes());
             h[0x18..0x20].copy_from_slice(&offset.to_le_bytes());
             h[0x20..0x28].copy_from_slice(&size.to_le_bytes());
             h
         };
         out.extend_from_slice(&[0u8; 64]);
         for (i, (_, kind, ..)) in sections.iter().enumerate() {
-            out.extend_from_slice(&header(name_at[i], *kind, placed[i].0, placed[i].1));
+            let flags = if i == 0 && run.is_some() { 6 } else { 0 };
+            out.extend_from_slice(&header(name_at[i], *kind, flags, placed[i].0, placed[i].1));
         }
-        out.extend_from_slice(&header(strtab_name, 3, strtab_at, shstrtab.len() as u64));
+        out.extend_from_slice(&header(strtab_name, 3, 0, strtab_at, shstrtab.len() as u64));
         let count = sections.len() as u16 + 2;
+        let set = |out: &mut Vec<u8>, at: usize, v: u64, n: usize| out[at..at + n].copy_from_slice(&v.to_le_bytes()[..n]);
         out[0..6].copy_from_slice(b"\x7fELF\x02\x01");
         out[6] = 1;
-        out[0x10..0x12].copy_from_slice(&3u16.to_le_bytes());
-        out[0x12..0x14].copy_from_slice(&62u16.to_le_bytes());
-        out[0x28..0x30].copy_from_slice(&shoff.to_le_bytes());
-        out[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
-        out[0x3a..0x3c].copy_from_slice(&64u16.to_le_bytes());
-        out[0x3c..0x3e].copy_from_slice(&count.to_le_bytes());
-        out[0x3e..0x40].copy_from_slice(&(count - 1).to_le_bytes());
+        set(&mut out, 0x12, 62, 2);
+        set(&mut out, 0x14, 1, 4);
+        set(&mut out, 0x28, shoff, 8);
+        set(&mut out, 0x34, 64, 2);
+        set(&mut out, 0x3a, 64, 2);
+        set(&mut out, 0x3c, count as u64, 2);
+        set(&mut out, 0x3e, count as u64 - 1, 2);
+        if run.is_some() {
+            let len = out.len() as u64;
+            set(&mut out, 0x10, 2, 2);
+            set(&mut out, 0x18, BASE + TEXT_AT as u64, 8);
+            set(&mut out, 0x20, 64, 8);
+            set(&mut out, 0x36, 56, 2);
+            set(&mut out, 0x38, 1, 2);
+            set(&mut out, 64, 1, 4);
+            set(&mut out, 68, 5, 4);
+            set(&mut out, 80, BASE, 8);
+            set(&mut out, 88, BASE, 8);
+            set(&mut out, 96, len, 8);
+            set(&mut out, 104, len, 8);
+            set(&mut out, 112, 0x1000, 8);
+        } else {
+            set(&mut out, 0x10, 3, 2);
+        }
         out
     }
 

@@ -2537,46 +2537,30 @@ impl Run {
     }
 
     fn verify_kept_test(&self, spec: ActionSpec, view: Arc<dyn View>, out: &Output) {
-        let engine = &self.d.engine;
-        let key = engine.effective_key(&spec, &self.c.env);
-        let Some(kept) = engine.traces.lookup(&key, &*view, &engine.content) else { return };
-        if !kept.by_code() || !crate::fn_code::sample(&key, kept.created, DRIFT_SAMPLE) {
-            return;
-        }
         let label = spec.label.clone();
-        let real = engine.obtain(Request {
+        let req = Request {
             spec,
             view,
             client_env: self.c.env.clone(),
             uid: self.c.uid,
             gid: self.c.gid,
             prio: self.c.prio,
-            no_cache: true,
+            no_cache: false,
             seed_blobs: Default::default(),
-            cacheable: Arc::new(|_| false),
+            cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(NullObserver),
-        });
-        self.verified.fetch_add(1, Ordering::Relaxed);
-        let failed = match &real {
-            Ok(o) if o.result.success() => return,
-            Ok(o) => describe_status(o.result.status),
-            Err(e) => format!("{e:#}"),
         };
-        let mut ran: Vec<String> = Vec::new();
-        for (_, o) in &kept.obs {
-            if let crate::view::Obs::Code { executed, .. } = o {
-                if let Some(pairs) = engine.store.read(executed).ok().as_deref().and_then(crate::fn_code::decode) {
-                    ran.extend(pairs.iter().map(|(s, _)| String::from_utf8_lossy(s).into_owned()));
-                }
+        match self.d.engine.recheck_kept(req, DRIFT_SAMPLE) {
+            crate::engine::Kept::NotKept | crate::engine::Kept::NotSampled => {}
+            crate::engine::Kept::Holds => {
+                self.verified.fetch_add(1, Ordering::Relaxed);
+            }
+            crate::engine::Kept::Fails { functions, failure } => {
+                self.verified.fetch_add(1, Ordering::Relaxed);
+                out.warn(&format!("verify: {}", crate::fn_code::drift_line(&label, &functions, &failure)));
             }
         }
-        let shown = ran.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
-        let more = if ran.len() > 8 { format!(" and {} more", ran.len() - 8) } else { String::new() };
-        out.warn(&format!(
-            "verify: {label}: kept as a pass by the {} function(s) it executed ({shown}{more}), but a real run fails ({failed})",
-            ran.len()
-        ));
     }
 
     fn steps(self: &Arc<Self>) -> Result<Finish> {
