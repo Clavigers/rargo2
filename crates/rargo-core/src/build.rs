@@ -445,6 +445,7 @@ struct Prepared {
     tr: Translator,
     sandbox_cwd: String,
     env: BTreeMap<String, String>,
+    channel: Option<&'static str>,
 }
 
 fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
@@ -511,7 +512,65 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
-    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
+    let channel = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd)?.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
+    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, channel })
+}
+
+const CHANNEL_VAR: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
+
+fn cargo_channel(rustc_vv: &str, bootstrap: Option<&str>) -> &'static str {
+    if bootstrap == Some("1") {
+        return "dev";
+    }
+    let release = rustc_vv.lines().find_map(|l| l.strip_prefix("release:")).unwrap_or_default().trim();
+    match release.split_once('-').map(|(_, tag)| tag) {
+        Some(tag) if tag.starts_with("nightly") => "nightly",
+        Some(tag) if tag.starts_with("beta") => "beta",
+        Some(tag) if tag.starts_with("dev") => "dev",
+        _ => "stable",
+    }
+}
+
+fn rustc_vv(
+    d: &Arc<Daemon>,
+    c: &Arc<Client>,
+    view: &Arc<dyn View>,
+    flake: &crate::flake::FlakeEnv,
+    env: &BTreeMap<String, String>,
+    cwd: &str,
+) -> Result<Option<String>> {
+    let program = env.get("RUSTC").filter(|r| !r.is_empty()).cloned().unwrap_or_else(|| "rustc".into());
+    let spec = ActionSpec {
+        kind: ActionKind::Other,
+        argv: vec![bytes(&program), bytes("-vV")],
+        env: env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect(),
+        cwd: bytes(cwd),
+        net: NetMode::Loopback,
+        mkdirs: vec![],
+        root_id: flake.id,
+        discard: vec![],
+        label: "rustc -vV (the channel cargo plans on)".into(),
+    };
+    let outcome = d
+        .engine
+        .obtain(Request {
+            spec,
+            view: view.clone(),
+            client_env: c.env.clone(),
+            uid: c.uid,
+            gid: c.gid,
+            prio: c.prio,
+            no_cache: false,
+            seed_blobs: Default::default(),
+            cacheable: Arc::new(|r| r.success()),
+            declared_env: Arc::new(|_, _| Vec::new()),
+            observer: Arc::new(NullObserver),
+        })?;
+    let r = &outcome.result;
+    if !r.success() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&d.store().read(&r.stdout)?).into_owned()))
 }
 
 struct Planned {
@@ -541,6 +600,9 @@ fn plan_with(
         env.insert(bytes(k), bytes(v));
     }
     env.insert(bytes(rp::PLAN_ENV), bytes(PLAN_PATH));
+    if let Some(channel) = p.channel {
+        env.insert(bytes(CHANNEL_VAR), bytes(channel));
+    }
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
     env.insert(bytes("CARGO_CACHE_RUSTC_INFO"), bytes("0"));
     let mut argv = vec![PLANNER_AT.to_vec()];
@@ -2710,6 +2772,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn cargo_plans_on_the_channel_of_the_flake_s_rustc() {
+        let vv = |release: &str| format!("rustc {release} (0123456789 2026-11-22)\nbinary: rustc\nhost: x86_64-unknown-linux-gnu\nrelease: {release}\nLLVM version: 21.1.2\n");
+        assert_eq!(cargo_channel(&vv("1.100.0"), None), "stable");
+        assert_eq!(cargo_channel(&vv("1.101.0-beta.3"), None), "beta");
+        assert_eq!(cargo_channel(&vv("1.102.0-nightly"), None), "nightly");
+        assert_eq!(cargo_channel(&vv("1.102.0-dev"), None), "dev");
+        assert_eq!(cargo_channel(&vv("1.100.0"), Some("1")), "dev", "RUSTC_BOOTSTRAP=1 allows nightly features as it does for stock cargo");
+        assert_eq!(cargo_channel(&vv("1.100.0"), Some("serde")), "stable", "only RUSTC_BOOTSTRAP=1 does");
+    }
 
     #[test]
     fn the_stock_fingerprint_of_an_executable_s_unit() {
