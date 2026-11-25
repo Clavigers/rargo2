@@ -146,18 +146,6 @@ impl ObsCore {
         assert!(self.invariants());
     }
 
-    #[cfg(test)]
-    fn mark_read_path(&mut self, path: &[u8]) {
-        for (got, rec) in &mut self.items {
-            if got.as_ref() == path {
-                if let Rec::File(file) = rec {
-                    file.read = true;
-                }
-            }
-        }
-        assert!(self.invariants());
-    }
-
     fn pending_hashes(&self) -> Vec<usize> {
         self.items
             .iter()
@@ -263,6 +251,58 @@ pub struct ActionFs {
     st: Mutex<State>,
 }
 
+fn initial_nodes(view: &dyn View, mountpoints: &[Vec<u8>]) -> Vec<Kind> {
+    let mut nodes = Vec::with_capacity(256);
+    nodes.push(Kind::Mount);
+    let root_path: VPath = Arc::from(&b"/"[..]);
+    let mut root = Dir {
+        parent: 0,
+        traced: view.traced(&root_path),
+        lower: Some(root_path),
+        entries: HashMap::new(),
+        dirty: false,
+        owner: Owner { uid: 0, gid: 0, mode: 0o755 },
+        lower_listed: false,
+        listing: None,
+        mtime: (LOWER_MTIME as i64, 0),
+    };
+    nodes.push(Kind::Mount);
+    for m in mountpoints {
+        let id = nodes.len() as u32;
+        nodes.push(Kind::Mount);
+        assert!(!m.is_empty());
+        assert!(!m.contains(&b'/'), "a mountpoint is one name in the action root");
+        assert!(root.entries.insert(m.clone().into_boxed_slice(), Slot::Upper(id, true)).is_none(), "duplicate mountpoint");
+    }
+    nodes[ROOT_LOCAL as usize] = Kind::Dir(Box::new(root));
+    nodes
+}
+
+impl ActionFs {
+    fn assemble(seq: u64, view: Arc<dyn View>, uid: u32, gid: u32, scratch: PathBuf, mountpoints: &[Vec<u8>], size_blind: bool) -> ActionFs {
+        let nodes = initial_nodes(&*view, mountpoints);
+        ActionFs {
+            seq,
+            view,
+            uid,
+            gid,
+            scratch,
+            st: Mutex::new(State {
+                nodes,
+                trace: ObsCore::new(size_blind),
+                next_upper: 0,
+                backing_ids: Vec::new(),
+                finished: false,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn in_memory(view: Arc<dyn View>, size_blind: bool) -> ActionFs {
+        Self::assemble(1, view, 0, 0, PathBuf::new(), &[], size_blind)
+    }
+}
+
 pub struct ActionFsConfig {
     pub view: Arc<dyn View>,
     pub uid: u32,
@@ -344,47 +384,7 @@ impl SandboxFs {
 
     pub fn create_action(&self, cfg: ActionFsConfig) -> Arc<ActionFs> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let mut nodes = Vec::with_capacity(256);
-        nodes.push(Kind::Mount);
-        let root_path: VPath = Arc::from(&b"/"[..]);
-        let mut root = Dir {
-            parent: 0,
-            traced: cfg.view.traced(&root_path),
-            lower: Some(root_path),
-            entries: HashMap::new(),
-            dirty: false,
-            owner: Owner { uid: 0, gid: 0, mode: 0o755 },
-            lower_listed: false,
-            listing: None,
-            mtime: (LOWER_MTIME as i64, 0),
-        };
-        let mut mounts = Vec::new();
-        for m in &cfg.mountpoints {
-            mounts.push(m.clone());
-        }
-        nodes.push(Kind::Mount);
-        for m in mounts {
-            let id = nodes.len() as u32;
-            nodes.push(Kind::Mount);
-            assert!(!m.is_empty());
-            assert!(!m.contains(&b'/'), "a mountpoint is one name in the action root");
-            assert!(root.entries.insert(m.into_boxed_slice(), Slot::Upper(id, true)).is_none(), "duplicate mountpoint");
-        }
-        nodes[ROOT_LOCAL as usize] = Kind::Dir(Box::new(root));
-        let a = Arc::new(ActionFs {
-            seq,
-            view: cfg.view,
-            uid: cfg.uid,
-            gid: cfg.gid,
-            scratch: cfg.scratch,
-            st: Mutex::new(State {
-                nodes,
-                trace: ObsCore::new(cfg.size_blind),
-                next_upper: 0,
-                backing_ids: Vec::new(),
-                finished: false,
-            }),
-        });
+        let a = Arc::new(ActionFs::assemble(seq, cfg.view, cfg.uid, cfg.gid, cfg.scratch, &cfg.mountpoints, cfg.size_blind));
         assert!(self.actions.insert(seq, a.clone()).is_none(), "action sequence numbers are unique");
         a
     }
@@ -988,17 +988,46 @@ impl ActionFs {
             crate::store::clone_or_copy(&src, &file)?;
             read_src = Some(actual);
         }
-        let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!("checked to be a file above") };
         {
+            let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!("checked to be a file above") };
             assert!(matches!(f.src, Src::Lower(_)));
-            if f.read_src.is_none() {
-                f.read_src = read_src;
-            }
             f.src = Src::Upper { path, file, backing: None };
             f.file = None;
         }
-        mark_file_read(st, n);
+        if let Some(src) = read_src {
+            accept_read(st, n, src);
+        } else {
+            mark_file_read(st, n);
+        }
         self.mark_dirty(st, parent);
+        Ok(())
+    }
+
+    fn conceal(&self, st: &mut State, parent: u32, name: &[u8]) -> Res<()> {
+        let Some(n) = self.resolve(st, parent, name, true)? else { return Err(Errno::ENOENT) };
+        if matches!(st.nodes[n as usize], Kind::Dir(_) | Kind::Mount) {
+            return Err(Errno::EISDIR);
+        }
+        let covers = self.covers_lower(st, parent, name);
+        {
+            let d = self.dir_mut(st, parent)?;
+            if covers {
+                d.entries.insert(name.into(), Slot::Whiteout);
+            } else {
+                d.entries.remove(name);
+            }
+        }
+        if let Kind::File(f) = &mut st.nodes[n as usize] {
+            assert!(f.links > 0, "unlinking a file with no links");
+            f.links = f.links.saturating_sub(1);
+            if f.links == 0 && f.opens == 0 {
+                if let Src::Upper { path, .. } = &f.src {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        self.mark_dirty(st, parent);
+        assert!(st.invariants());
         Ok(())
     }
 
@@ -1033,6 +1062,22 @@ fn file_hash_src(st: &State, index: usize) -> Option<FileSrc> {
         }
     }
     None
+}
+
+fn accept_read(st: &mut State, node: u32, actual: FileSrc) {
+    if let Kind::File(file) = &mut st.nodes[node as usize] {
+        if file.read_src.is_none() {
+            file.read_src = Some(actual);
+        }
+    }
+    mark_file_read(st, node);
+}
+
+fn note_read(st: &mut State, node: u32) {
+    if st.nodes.get(node as usize).is_some() {
+        mark_file_read(st, node);
+    }
+    assert!(st.invariants());
 }
 
 fn mark_file_read(st: &mut State, node: u32) {
@@ -1256,28 +1301,7 @@ impl Filesystem for SandboxFs {
     fn unlink(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
         let (a, p) = self.action(parent)?;
         let mut st = a.st.lock();
-        let Some(n) = a.resolve(&mut st, p, name, true)? else { return Err(Errno::ENOENT) };
-        if matches!(st.nodes[n as usize], Kind::Dir(_) | Kind::Mount) {
-            return Err(Errno::EISDIR);
-        }
-        let covers = a.covers_lower(&st, p, name);
-        let d = a.dir_mut(&mut st, p)?;
-        if covers {
-            d.entries.insert(name.into(), Slot::Whiteout);
-        } else {
-            d.entries.remove(name);
-        }
-        if let Kind::File(f) = &mut st.nodes[n as usize] {
-            assert!(f.links > 0, "unlinking a file with no links");
-            f.links = f.links.saturating_sub(1);
-            if f.links == 0 && f.opens == 0 {
-                if let Src::Upper { path, .. } = &f.src {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        }
-        a.mark_dirty(&mut st, p);
-        Ok(())
+        a.conceal(&mut st, p, name)
     }
 
     fn rmdir(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
@@ -1407,7 +1431,7 @@ impl Filesystem for SandboxFs {
                 Cached(i32),
                 Opened { file: std::fs::File, key: BackingKey },
             }
-            let next = {
+            let (next, actual) = {
                 let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!() };
                 let Src::Lower(info) = &mut f.src else { unreachable!() };
                 if self.passthrough() {
@@ -1418,32 +1442,26 @@ impl Filesystem for SandboxFs {
                     };
                     if let Some(e) = key.and_then(|k| self.backing.get(&k)) {
                         e.1.store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
-                        if f.read_src.is_none() {
-                            f.read_src = Some(info.src.clone());
-                        }
+                        let src = info.src.clone();
                         f.opens += 1;
                         f.lower_pt_opens += 1;
-                        Next::Cached(e.0)
+                        (Next::Cached(e.0), src)
                     } else {
                         let (file, key, actual) = self.content.open(&info.src)?;
-                        if f.read_src.is_none() {
-                            f.read_src = Some(actual.clone());
-                        }
+                        let recorded = actual.clone();
                         info.src = actual;
                         f.opens += 1;
-                        Next::Opened { file, key }
+                        (Next::Opened { file, key }, recorded)
                     }
                 } else {
                     let (file, key, actual) = self.content.open(&info.src)?;
-                    if f.read_src.is_none() {
-                        f.read_src = Some(actual.clone());
-                    }
+                    let recorded = actual.clone();
                     info.src = actual;
                     f.opens += 1;
-                    Next::Opened { file, key }
+                    (Next::Opened { file, key }, recorded)
                 }
             };
-            mark_file_read(&mut st, n);
+            accept_read(&mut st, n, actual);
             match next {
                 Next::Cached(id) => return Ok(Opened { fh: 1, flags: FOPEN_PASSTHROUGH, backing_id: id }),
                 Next::Opened { file, key } => {
@@ -1516,14 +1534,7 @@ impl Filesystem for SandboxFs {
         out.truncate(done);
         {
             let mut st = a.st.lock();
-            if let Some(Kind::File(file)) = st.nodes.get(n as usize) {
-                if file.read_src.is_some() {
-                    if let Some(index) = file.obs {
-                        st.trace.mark_read(index);
-                    }
-                }
-            }
-            assert!(st.invariants());
+            note_read(&mut st, n);
         }
         Ok(())
     }
@@ -1593,23 +1604,17 @@ impl Filesystem for SandboxFs {
 }
 
 #[cfg(test)]
-fn read_window(bytes: &[u8], offset: u64, size: usize) -> &[u8] {
-    let start = usize::try_from(offset).unwrap_or(usize::MAX);
-    if start >= bytes.len() {
-        return &[];
-    }
-    let end = start.saturating_add(size).min(bytes.len());
-    &bytes[start..end]
-}
-
-#[cfg(test)]
 mod model_tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
 
     enum Access {
-        Lookup { dir: Vec<u8>, name: Vec<u8>, traced: bool },
+        Lookup { dir: Vec<u8>, name: Vec<u8> },
         ReadDir(Vec<u8>),
-        Read { path: Vec<u8>, offset: u64, size: usize },
+        Open { path: Vec<u8> },
+        Read { path: Vec<u8> },
+        Unlink { dir: Vec<u8>, name: Vec<u8> },
+        Mkdir { dir: Vec<u8>, name: Vec<u8> },
     }
 
     struct Lcg(u64);
@@ -1623,6 +1628,7 @@ mod model_tests {
 
     struct Built {
         view: MemView,
+        untraced: Vec<Vec<u8>>,
         blind: bool,
         accesses: Vec<Access>,
         dir: Vec<u8>,
@@ -1633,7 +1639,30 @@ mod model_tests {
         link: Vec<u8>,
         other: Vec<u8>,
         hidden: Vec<u8>,
+        hidden_dir: Vec<u8>,
+        cover_name: Vec<u8>,
+        made_name: Vec<u8>,
         sem: crate::hash::Hash,
+    }
+
+    struct Partial {
+        inner: MemView,
+        untraced: Vec<Vec<u8>>,
+    }
+
+    impl View for Partial {
+        fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+            self.inner.lookup(dir, name)
+        }
+        fn list(&self, dir: &[u8]) -> std::io::Result<Listing> {
+            self.inner.list(dir)
+        }
+        fn traced(&self, dir: &[u8]) -> bool {
+            !self.untraced.iter().any(|path| path.as_slice() == dir)
+        }
+        fn read_bytes(&self, path: &[u8]) -> Option<&[u8]> {
+            self.inner.read_bytes(path)
+        }
     }
 
     fn fresh_name(rng: &mut Lcg, view: &MemView, parent: &[u8]) -> Vec<u8> {
@@ -1704,8 +1733,13 @@ mod model_tests {
         view.symlink(&link, format!("away-{seed}").as_bytes());
         let other = place(&mut rng, &mut view, &dir);
         view.other(&other);
-        let hidden = place(&mut rng, &mut view, &dir);
+        let hidden_dir = place(&mut rng, &mut view, b"/");
+        view.dir(&hidden_dir);
+        let hidden = place(&mut rng, &mut view, &hidden_dir);
         view.file(&hidden, b"hidden-bytes", false, None);
+        let cover_name = fresh_name(&mut rng, &view, &dir);
+        view.file(&vjoin(&dir, &cover_name), b"cover-bytes", false, None);
+        let made_name = fresh_name(&mut rng, &view, &dir);
 
         let mut accesses = Vec::new();
         for path in &made {
@@ -1713,19 +1747,14 @@ mod model_tests {
                 continue;
             }
             let (parent, name) = vsplit(path).unwrap();
-            accesses.push(Access::Lookup {
-                dir: parent.to_vec(),
-                name: name.to_vec(),
-                traced: rng.next() % 11 != 0,
-            });
+            accesses.push(Access::Lookup { dir: parent.to_vec(), name: name.to_vec() });
         }
         for _ in 0..(2 + rng.next() % 3) {
             let parent = dirs[(rng.next() as usize) % dirs.len()].clone();
             accesses.push(Access::Lookup {
                 dir: parent,
                 name: format!("miss{}", rng.next() % 1_000_000).into_bytes(),
-                traced: true,
-            });
+                });
         }
         for directory in &dirs {
             if rng.next() % 2 == 0 {
@@ -1733,12 +1762,10 @@ mod model_tests {
             }
         }
         for path in &files {
-            if rng.next() % 2 == 0 {
-                accesses.push(Access::Read {
-                    path: path.clone(),
-                    offset: rng.next() % 5,
-                    size: 1 + (rng.next() % 8) as usize,
-                });
+            match rng.next() % 3 {
+                0 => accesses.push(Access::Open { path: path.clone() }),
+                1 => accesses.push(Access::Read { path: path.clone() }),
+                _ => {}
             }
         }
         for i in (1..accesses.len()).rev() {
@@ -1747,7 +1774,7 @@ mod model_tests {
         }
         let lookup = |path: &[u8]| {
             let (parent, name) = vsplit(path).unwrap();
-            Access::Lookup { dir: parent.to_vec(), name: name.to_vec(), traced: true }
+            Access::Lookup { dir: parent.to_vec(), name: name.to_vec() }
         };
         accesses.push(lookup(&dir));
         accesses.push(lookup(&child));
@@ -1757,23 +1784,24 @@ mod model_tests {
         accesses.push(lookup(&idle_sem));
         accesses.push(lookup(&link));
         accesses.push(lookup(&other));
-        accesses.push(Access::Lookup {
-            dir: dir.clone(),
-            name: format!("gone-{seed}").into_bytes(),
-            traced: true,
-        });
-        accesses.push(Access::Lookup {
-            dir: vsplit(&hidden).unwrap().0.to_vec(),
-            name: vsplit(&hidden).unwrap().1.to_vec(),
-            traced: false,
-        });
-        accesses.push(Access::Read { path: hidden.clone(), offset: 0, size: 4 });
+        accesses.push(Access::Lookup { dir: dir.clone(), name: format!("gone-{seed}").into_bytes() });
+        accesses.push(lookup(&hidden_dir));
+        accesses.push(lookup(&hidden));
+        accesses.push(Access::ReadDir(hidden_dir.clone()));
+        accesses.push(Access::Open { path: hidden.clone() });
+        accesses.push(Access::Read { path: hidden.clone() });
+        accesses.push(Access::Open { path: plain.clone() });
+        accesses.push(Access::Read { path: plain.clone() });
+        accesses.push(Access::Open { path: semantic.clone() });
+        accesses.push(Access::Read { path: idle_sem.clone() });
+        accesses.push(lookup(&vjoin(&dir, &cover_name)));
+        accesses.push(Access::Unlink { dir: dir.clone(), name: cover_name.clone() });
+        accesses.push(Access::Mkdir { dir: dir.clone(), name: made_name.clone() });
         accesses.push(Access::ReadDir(dir.clone()));
         accesses.push(Access::ReadDir(b"/".to_vec()));
-        accesses.push(Access::Read { path: plain.clone(), offset: rng.next() % 3, size: 2 + (rng.next() % 6) as usize });
-        accesses.push(Access::Read { path: semantic.clone(), offset: 0, size: 64 });
         Built {
             view,
+            untraced: vec![hidden_dir.clone()],
             blind: seed % 2 == 0,
             accesses,
             dir,
@@ -1784,6 +1812,9 @@ mod model_tests {
             link,
             other,
             hidden,
+            hidden_dir,
+            cover_name,
+            made_name,
             sem,
         }
     }
@@ -1793,47 +1824,140 @@ mod model_tests {
         File { size: u64, exec: bool, sem: Option<crate::hash::Hash>, read: bool },
     }
 
-    fn spec(view: &MemView, blind: bool, accesses: &[Access]) -> Vec<(VPath, Obs)> {
-        let mut items: Vec<(Vec<u8>, Expect)> = Vec::new();
-        for access in accesses {
-            match access {
-                Access::Lookup { dir, name, traced } => {
-                    if !traced {
-                        continue;
-                    }
-                    let path = vjoin(dir, name);
-                    let looked = view.lookup(dir, name);
-                    let item = match &looked {
-                        Looked::Absent => Expect::Settled(Obs::Absent),
-                        Looked::Dir(_) => Expect::Settled(Obs::Dir),
-                        Looked::Other => Expect::Settled(Obs::Other),
-                        Looked::Symlink(target) => Expect::Settled(Obs::Symlink(target.clone())),
-                        Looked::File(info) => Expect::File {
-                            size: info.size,
-                            exec: info.exec(),
-                            sem: info.sem,
-                            read: false,
-                        },
-                    };
-                    items.push((path, item));
-                }
-                Access::ReadDir(dir) => {
-                    if let Ok(list) = view.list(dir) {
-                        items.push((dir.clone(), Expect::Settled(Obs::Listing(listing_hash(&list)))));
-                    }
-                }
-                Access::Read { path, .. } => {
-                    for (got, item) in &mut items {
-                        if got == path {
-                            if let Expect::File { read, .. } = item {
-                                *read = true;
-                            }
-                        }
-                    }
+    struct Seen {
+        traced: BTreeMap<Vec<u8>, bool>,
+        resolved: BTreeSet<(Vec<u8>, Vec<u8>)>,
+        listed: BTreeSet<Vec<u8>>,
+        opened: BTreeSet<Vec<u8>>,
+        overlay: BTreeMap<Vec<u8>, Vec<(Vec<u8>, Option<DType>)>>,
+    }
+
+    fn note_lookup(view: &dyn View, seen: &mut Seen, items: &mut Vec<(Vec<u8>, Expect)>, dir: &[u8], name: &[u8]) {
+        if !seen.resolved.insert((dir.to_vec(), name.to_vec())) {
+            return;
+        }
+        let parent_traced = seen.traced[dir];
+        let looked = view.lookup(dir, name);
+        let path = vjoin(dir, name);
+        if parent_traced {
+            let item = match &looked {
+                Looked::Absent => Expect::Settled(Obs::Absent),
+                Looked::Dir(_) => Expect::Settled(Obs::Dir),
+                Looked::Other => Expect::Settled(Obs::Other),
+                Looked::Symlink(target) => Expect::Settled(Obs::Symlink(target.clone())),
+                Looked::File(info) => Expect::File {
+                    size: info.size,
+                    exec: info.exec(),
+                    sem: info.sem,
+                    read: false,
+                },
+            };
+            items.push((path.clone(), item));
+        }
+        if matches!(looked, Looked::Dir(_)) {
+            let child_traced = view.traced(&path);
+            seen.traced.insert(path, child_traced);
+        }
+    }
+
+    fn ensure(view: &dyn View, seen: &mut Seen, items: &mut Vec<(Vec<u8>, Expect)>, path: &[u8]) -> bool {
+        if path == b"/" || seen.traced.contains_key(path) {
+            return true;
+        }
+        let Some((parent, name)) = vsplit(path) else { return false };
+        if !ensure(view, seen, items, parent) {
+            return false;
+        }
+        note_lookup(view, seen, items, parent, name);
+        seen.traced.contains_key(path)
+    }
+
+    fn mark_opened(items: &mut [(Vec<u8>, Expect)], path: &[u8]) {
+        for (got, item) in items {
+            if got == path {
+                if let Expect::File { read, .. } = item {
+                    *read = true;
                 }
             }
         }
-        items
+    }
+
+    fn independent_merge(base: Listing, overlay: &[(Vec<u8>, Option<DType>)]) -> Vec<(Vec<u8>, DType)> {
+        let mut names: BTreeMap<Vec<u8>, DType> = base.into_iter().collect();
+        for (name, kind) in overlay {
+            match kind {
+                Some(kind) => {
+                    names.insert(name.clone(), *kind);
+                }
+                None => {
+                    names.remove(name);
+                }
+            }
+        }
+        names.into_iter().collect()
+    }
+
+    struct Oracle {
+        obs: Vec<(VPath, Obs)>,
+        listings: Vec<Vec<(Vec<u8>, DType)>>,
+    }
+
+    fn oracle(view: &dyn View, blind: bool, accesses: &[Access]) -> Oracle {
+        let mut seen = Seen {
+            traced: BTreeMap::new(),
+            resolved: BTreeSet::new(),
+            listed: BTreeSet::new(),
+            opened: BTreeSet::new(),
+            overlay: BTreeMap::new(),
+        };
+        seen.traced.insert(b"/".to_vec(), view.traced(b"/"));
+        let mut items = Vec::new();
+        let mut listings = Vec::new();
+        for access in accesses {
+            match access {
+                Access::Lookup { dir, name } => {
+                    assert!(ensure(view, &mut seen, &mut items, dir), "lookup parent {}", show(dir));
+                    note_lookup(view, &mut seen, &mut items, dir, name);
+                }
+                Access::ReadDir(dir) => {
+                    assert!(ensure(view, &mut seen, &mut items, dir), "readdir {}", show(dir));
+                    let first = seen.listed.insert(dir.clone());
+                    if first && seen.traced[dir.as_slice()] {
+                        let list = view.list(dir).expect("a directory lists");
+                        items.push((dir.clone(), Expect::Settled(Obs::Listing(listing_hash(&list)))));
+                    }
+                    let list = view.list(dir).expect("a directory lists");
+                    let overlay = seen.overlay.get(dir).map(Vec::as_slice).unwrap_or(&[]);
+                    listings.push(independent_merge(list, overlay));
+                }
+                Access::Open { path } => {
+                    let (parent, name) = vsplit(path).unwrap();
+                    assert!(ensure(view, &mut seen, &mut items, parent));
+                    note_lookup(view, &mut seen, &mut items, parent, name);
+                    seen.opened.insert(path.clone());
+                    mark_opened(&mut items, path);
+                }
+                Access::Read { path } => {
+                    let (parent, name) = vsplit(path).unwrap();
+                    assert!(ensure(view, &mut seen, &mut items, parent));
+                    note_lookup(view, &mut seen, &mut items, parent, name);
+                    if seen.opened.contains(path) {
+                        mark_opened(&mut items, path);
+                    }
+                }
+                Access::Unlink { dir, name } => {
+                    assert!(ensure(view, &mut seen, &mut items, dir));
+                    note_lookup(view, &mut seen, &mut items, dir, name);
+                    seen.overlay.entry(dir.clone()).or_default().push((name.clone(), None));
+                }
+                Access::Mkdir { dir, name } => {
+                    assert!(ensure(view, &mut seen, &mut items, dir));
+                    note_lookup(view, &mut seen, &mut items, dir, name);
+                    seen.overlay.entry(dir.clone()).or_default().push((name.clone(), Some(DType::Dir)));
+                }
+            }
+        }
+        let obs = items
             .into_iter()
             .map(|(path, item)| {
                 let obs = match item {
@@ -1855,46 +1979,95 @@ mod model_tests {
                 };
                 (path.into(), obs)
             })
-            .collect()
+            .collect();
+        Oracle { obs, listings }
     }
 
-    fn play(view: &MemView, blind: bool, accesses: &[Access]) -> (Vec<(VPath, Obs)>, bool) {
-        let mut core = ObsCore::new(blind);
-        assert!(core.invariants());
+    fn resolve_file(fs: &ActionFs, st: &mut State, ids: &mut BTreeMap<Vec<u8>, u32>, path: &[u8]) -> u32 {
+        let (parent, name) = vsplit(path).expect("a path has a parent");
+        let parent_id = ensure_dir(fs, st, ids, parent).unwrap_or_else(|| panic!("parent {}", show(parent)));
+        let id = fs.resolve(st, parent_id, name, true).expect("resolve").unwrap_or_else(|| panic!("present {}", show(path)));
+        assert!(st.invariants());
+        if matches!(st.nodes[id as usize], Kind::Dir(_)) {
+            ids.insert(path.to_vec(), id);
+        }
+        id
+    }
+
+    fn ensure_dir(fs: &ActionFs, st: &mut State, ids: &mut BTreeMap<Vec<u8>, u32>, path: &[u8]) -> Option<u32> {
+        if path == b"/" {
+            return Some(ROOT_LOCAL);
+        }
+        if let Some(&id) = ids.get(path) {
+            return Some(id);
+        }
+        let id = resolve_file(fs, st, ids, path);
+        match &st.nodes[id as usize] {
+            Kind::Dir(_) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn drive(view: Arc<dyn View>, blind: bool, accesses: &[Access]) -> (Vec<(VPath, Obs)>, bool, Vec<Vec<(Vec<u8>, DType)>>) {
+        let fs = ActionFs::in_memory(view.clone(), blind);
+        let mut st = fs.st.lock();
+        assert!(st.invariants());
+        let mut ids = BTreeMap::new();
+        let mut listings = Vec::new();
         for access in accesses {
             match access {
-                Access::Lookup { dir, name, traced } => {
-                    let looked = view.lookup(dir, name);
-                    core.observe_lookup(vjoin(dir, name).into(), *traced, &looked);
-                    assert!(core.invariants());
+                Access::Lookup { dir, name } => {
+                    let parent = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("lookup parent {}", show(dir)));
+                    let id = fs.resolve(&mut st, parent, name, true).expect("resolve");
+                    assert!(st.invariants());
+                    if let Some(id) = id {
+                        if matches!(st.nodes[id as usize], Kind::Dir(_)) {
+                            ids.insert(vjoin(dir, name), id);
+                        }
+                    }
                 }
                 Access::ReadDir(dir) => {
-                    if let Ok(list) = view.list(dir) {
-                        core.observe_list(dir.as_slice().into(), &list);
-                        assert!(core.invariants());
-                    }
+                    let id = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("readdir {}", show(dir)));
+                    let list = fs.merged_listing(&mut st, id).expect("list");
+                    assert!(st.invariants());
+                    listings.push(list.iter().map(|(name, kind)| (name.to_vec(), *kind)).collect());
                 }
-                Access::Read { path, offset, size } => {
-                    let bytes = view.read_bytes(path);
-                    if let Some(bytes) = bytes {
-                        let window = read_window(bytes, *offset, *size);
-                        assert_eq!(window, read_window(bytes, *offset, *size));
-                        assert!(window.len() <= *size);
-                    }
-                    core.mark_read_path(path);
-                    assert!(core.invariants());
+                Access::Open { path } => {
+                    let id = resolve_file(&fs, &mut st, &mut ids, path);
+                    let (parent, name) = vsplit(path).unwrap();
+                    let Looked::File(info) = view.lookup(parent, name) else { panic!("open expects a file {}", show(path)) };
+                    accept_read(&mut st, id, info.src);
+                    assert!(st.invariants());
+                }
+                Access::Read { path } => {
+                    let id = resolve_file(&fs, &mut st, &mut ids, path);
+                    assert!(st.read_source(id).is_err(), "an in-memory file has no content handle");
+                    note_read(&mut st, id);
+                    assert!(st.invariants());
+                }
+                Access::Unlink { dir, name } => {
+                    let parent = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("unlink parent {}", show(dir)));
+                    fs.conceal(&mut st, parent, name).expect("unlink");
+                    assert!(st.invariants());
+                }
+                Access::Mkdir { dir, name } => {
+                    let parent = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("mkdir parent {}", show(dir)));
+                    assert!(fs.resolve(&mut st, parent, name, true).expect("resolve").is_none(), "mkdir names a new entry");
+                    assert!(st.invariants());
+                    fs.do_mkdir(&mut st, parent, name, 0o755).expect("mkdir");
+                    assert!(st.invariants());
                 }
             }
         }
-        while let Some(&index) = core.pending_hashes().first() {
-            let path = core.path_of(index).to_vec();
+        while let Some(&index) = st.trace.pending_hashes().first() {
+            let path = st.trace.path_of(index).to_vec();
             let bytes = view.read_bytes(&path).expect("a read file has bytes");
-            core.supply_hash(index, crate::hash::Hash::of(bytes));
-            assert!(core.invariants());
+            st.trace.supply_hash(index, crate::hash::Hash::of(bytes));
+            assert!(st.invariants());
         }
-        let outcome = core.outcome();
-        assert!(core.invariants());
-        outcome
+        let (obs, tainted) = st.trace.outcome();
+        assert!(st.invariants());
+        (obs, tainted, listings)
     }
 
     fn holds(view: &dyn View, items: &[(VPath, Obs)]) -> bool {
@@ -1920,9 +2093,12 @@ mod model_tests {
             } else {
                 saw_meta = true;
             }
-            let (obs, tainted) = play(&built.view, built.blind, &built.accesses);
-            assert!(!tainted);
-            assert_eq!(obs, spec(&built.view, built.blind, &built.accesses));
+            let partial: Arc<dyn View> = Arc::new(Partial { inner: built.view.clone(), untraced: built.untraced.clone() });
+            let expected = oracle(partial.as_ref(), built.blind, &built.accesses);
+            let (obs, tainted, listings) = drive(partial, built.blind, &built.accesses);
+            assert!(!tainted, "seed {seed}");
+            assert_eq!(obs, expected.obs, "seed {seed}");
+            assert_eq!(listings, expected.listings, "seed {seed}");
             assert!(obs.iter().all(|(path, _)| path_ok(path)));
             let plain_hash = crate::hash::Hash::of(built.view.read_bytes(&built.plain).unwrap());
             match last(&obs, &built.plain) {
@@ -1941,7 +2117,7 @@ mod model_tests {
             match last(&obs, &built.idle_sem) {
                 Obs::Meta { .. } if !built.blind => {}
                 Obs::IsFile { .. } if built.blind => {}
-                other => panic!("a semantic id is recorded only after the file is read: {other:?}"),
+                other => panic!("a read without an open does not record the content: {other:?}"),
             }
             assert!(matches!(last(&obs, &built.link), Obs::Symlink(_)));
             assert!(matches!(last(&obs, &built.other), Obs::Other));
@@ -1949,6 +2125,33 @@ mod model_tests {
             assert!(obs.iter().any(|(_, obs)| matches!(obs, Obs::Listing(_))));
             assert!(obs.iter().any(|(_, obs)| matches!(obs, Obs::Dir)));
             assert!(obs.iter().all(|(path, _)| path.as_ref() != built.hidden.as_slice()));
+            assert!(obs.iter().any(|(path, obs)| path.as_ref() == built.hidden_dir.as_slice() && matches!(obs, Obs::Dir)));
+            assert!(obs.iter().all(|(path, obs)| !(path.as_ref() == built.hidden_dir.as_slice() && matches!(obs, Obs::Listing(_)))));
+
+            let readdirs: Vec<&Vec<u8>> = built
+                .accesses
+                .iter()
+                .filter_map(|access| match access {
+                    Access::ReadDir(dir) => Some(dir),
+                    _ => None,
+                })
+                .collect();
+            let final_dir = listings
+                .iter()
+                .zip(readdirs)
+                .filter(|(_, dir)| dir.as_slice() == built.dir.as_slice())
+                .map(|(list, _)| list)
+                .last()
+                .expect("the anchor directory is listed");
+            assert!(final_dir.iter().all(|(name, _)| name != &built.cover_name));
+            assert!(final_dir.iter().any(|(name, kind)| name == &built.made_name && *kind == DType::Dir));
+            let lower = built.view.list(&built.dir).unwrap();
+            match obs.iter().rev().find(|(path, obs)| path.as_ref() == built.dir.as_slice() && matches!(obs, Obs::Listing(_))) {
+                Some((_, Obs::Listing(hash))) => assert_eq!(*hash, listing_hash(&lower)),
+                _ => panic!("a traced directory records the lower listing"),
+            }
+            let merged: Listing = final_dir.iter().map(|(name, kind)| (name.clone(), *kind)).collect();
+            assert_ne!(listing_hash(&merged), listing_hash(&lower));
 
             assert!(holds(&built.view, &obs));
             let compact = compact_obs(obs.clone());
@@ -1987,18 +2190,24 @@ mod model_tests {
 
     #[test]
     fn a_failed_content_hash_taints_the_trace() {
-        let mut view = MemView::new();
-        view.file(b"/f", b"abc", false, None);
-        let mut core = ObsCore::new(false);
-        assert!(core.invariants());
-        core.observe_lookup(b"/f"[..].into(), true, &view.lookup(b"/", b"f"));
-        assert!(core.invariants());
-        core.mark_read_path(b"/f");
-        assert!(core.invariants());
-        let index = core.pending_hashes()[0];
-        core.fail_hash(index);
-        assert!(core.invariants());
-        let (obs, tainted) = core.outcome();
+        let mut mem = MemView::new();
+        mem.file(b"/f", b"abc", false, None);
+        let view: Arc<dyn View> = Arc::new(mem);
+        let fs = ActionFs::in_memory(view.clone(), false);
+        let mut st = fs.st.lock();
+        assert!(st.invariants());
+        let id = fs.resolve(&mut st, ROOT_LOCAL, b"f", true).expect("resolve").expect("file");
+        assert!(st.invariants());
+        let Looked::File(info) = view.lookup(b"/", b"f") else { panic!("file") };
+        accept_read(&mut st, id, info.src);
+        assert!(st.invariants());
+        assert!(st.read_source(id).is_err());
+        note_read(&mut st, id);
+        assert!(st.invariants());
+        let index = st.trace.pending_hashes()[0];
+        st.trace.fail_hash(index);
+        assert!(st.invariants());
+        let (obs, tainted) = st.trace.outcome();
         assert!(tainted);
         assert!(matches!(obs.as_slice(), [(path, Obs::File { hash, exec: false })] if path.as_ref() == b"/f" && *hash == crate::hash::Hash::ZERO));
     }
