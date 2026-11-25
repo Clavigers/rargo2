@@ -936,7 +936,7 @@ impl Daemon {
         if !want {
             if let Some(m) = g.take() {
                 m.fs.save();
-                m.session.unmount();
+                io::blocking(|| m.session.unmount());
             }
             return None;
         }
@@ -946,7 +946,7 @@ impl Daemon {
             }
             if let Some(m) = g.take() {
                 m.fs.save();
-                m.session.unmount();
+                io::blocking(|| m.session.unmount());
             }
         }
         if wt.out_failed.load(Ordering::SeqCst) && var(&req.vars, "RARGO_OUTPUT") != Some("fuse") {
@@ -988,7 +988,7 @@ impl Daemon {
             passthrough: true,
             auto_unmount: true,
         };
-        let session = Arc::new(fusewire::Session::mount(&dir, &opts)?);
+        let session = Arc::new(io::blocking(|| fusewire::Session::mount(&dir, &opts))?);
         fs.attach(session.clone());
         rargo_net::io::FuseDrive::spawn(&session, &fs).detach();
         let dev = dev_at(&mountinfo(), &dir).ok_or_else(|| std::io::Error::other("the mount does not show in /proc/self/mountinfo"))?;
@@ -1000,7 +1000,7 @@ impl Daemon {
         for wt in all {
             if let Some(m) = wt.out.lock().unwrap().take() {
                 m.fs.save();
-                m.session.unmount();
+                io::blocking(|| m.session.unmount());
             }
         }
     }
@@ -1010,7 +1010,7 @@ impl Daemon {
         let wt = self.worktrees.lock().unwrap().get(&root).cloned();
         if let Some(wt) = wt {
             if let Some(m) = wt.out.lock().unwrap().take() {
-                m.session.unmount();
+                io::blocking(|| m.session.unmount());
             }
             let _ = rargo_net::io::file::remove_file(wt.wt_cache.join("virtual"));
             let _ = rargo_net::io::file::remove_file(wt.wt_cache.join("delivered"));

@@ -528,7 +528,7 @@ impl OutFs {
         let _ = rargo_net::io::file::remove_file(self.table.with_file_name("delivered"));
         self.dirty.store(false, Ordering::SeqCst);
         if let Some(session) = self.session.get() {
-            session.unmount();
+            rargo_net::io::blocking(|| session.unmount());
         }
     }
 

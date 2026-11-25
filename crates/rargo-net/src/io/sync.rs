@@ -134,6 +134,10 @@ impl<T> Mutex<T> {
         }
     }
 
+    pub fn get_mut(&mut self) -> &mut T {
+        self.value.get_mut()
+    }
+
     pub fn lock(&self) -> MutexGuard<'_, T> {
         use std::sync::atomic::Ordering::{Acquire, AcqRel};
         struct Leave<'a, T> {

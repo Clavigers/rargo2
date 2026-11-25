@@ -61,7 +61,7 @@ pub struct Daemon {
     pub engine: Arc<Engine>,
     pub memo: Arc<HostMemo>,
     pub trees: Arc<Trees>,
-    pub parser: Parser,
+    pub parser: Arc<Parser>,
     pub incr: crate::incr::IncrStore,
     pub pool: OnceLock<Arc<crate::remote::Pool>>,
     pub(crate) nix_attached: Arc<Mutex<HashSet<String>>>,

@@ -1,27 +1,35 @@
 use crate::hash::Hash;
+use crate::io;
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use rargo_plan::{PARSE_ENV, ParseReq, ParseResp, Script};
-use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 struct Proc {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    pid: i32,
+    stdin: OwnedFd,
+    stdout: OwnedFd,
+}
+
+impl Proc {
+    fn end(self) {
+        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        drop((self.stdin, self.stdout));
+        let _ = io::wait_exit(self.pid);
+    }
 }
 
 pub struct Parser {
     exe: PathBuf,
-    proc: Mutex<Option<Proc>>,
+    proc: io::Mutex<Option<Proc>>,
     memo: DashMap<Hash, Arc<ParseResp>>,
 }
 
 impl Parser {
-    pub fn new(exe: PathBuf) -> Parser {
-        Parser { exe, proc: Mutex::new(None), memo: DashMap::new() }
+    pub fn new(exe: PathBuf) -> Arc<Parser> {
+        Arc::new(Parser { exe, proc: io::Mutex::new(None), memo: DashMap::new() })
     }
 
     fn start(&self) -> std::io::Result<Proc> {
@@ -32,28 +40,56 @@ impl Parser {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        Ok(Proc { child, stdin, stdout })
+        let stdin = OwnedFd::from(child.stdin.take().expect("stdin is piped"));
+        let stdout = OwnedFd::from(child.stdout.take().expect("stdout is piped"));
+        Ok(Proc { pid: child.id() as i32, stdin, stdout })
     }
 
-    fn call(p: &mut Proc, req: &[u8]) -> std::io::Result<Vec<u8>> {
-        p.stdin.write_all(&(req.len() as u32).to_le_bytes())?;
-        p.stdin.write_all(req)?;
-        p.stdin.flush()?;
-        let mut len = [0u8; 4];
-        p.stdout.read_exact(&mut len)?;
-        let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
-        p.stdout.read_exact(&mut buf)?;
-        Ok(buf)
+    fn write_all(fd: &OwnedFd, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            let n = io::write_at(fd.as_raw_fd(), 0, bytes)?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            bytes = &bytes[n..];
+        }
+        Ok(())
     }
 
-    pub fn parse(&self, script: &Script, stdout: &[u8]) -> Arc<ParseResp> {
+    fn read_exact(fd: &OwnedFd, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let got = io::read_at(fd.as_raw_fd(), 0, len - out.len())?;
+            if got.is_empty() {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            out.extend_from_slice(&got);
+        }
+        Ok(out)
+    }
+
+    fn call(p: &Proc, req: &[u8]) -> std::io::Result<Vec<u8>> {
+        let mut framed = (req.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(req);
+        Self::write_all(&p.stdin, &framed)?;
+        let len = Self::read_exact(&p.stdout, 4)?;
+        Self::read_exact(&p.stdout, u32::from_le_bytes(len.try_into().expect("four bytes")) as usize)
+    }
+
+    pub fn parse(self: &Arc<Self>, script: &Script, stdout: &[u8]) -> Arc<ParseResp> {
         let req = rargo_plan::encode(&ParseReq { script: script.clone(), stdout: stdout.to_vec() });
         let key = Hash::of(&req);
         if let Some(r) = self.memo.get(&key) {
             return r.clone();
         }
+        if !io::on_fiber() {
+            let this = Arc::clone(self);
+            return io::call(move || this.ask(key, &req));
+        }
+        self.ask(key, &req)
+    }
+
+    fn ask(&self, key: Hash, req: &[u8]) -> Arc<ParseResp> {
         let mut guard = self.proc.lock();
         let mut last_err = String::new();
         for _ in 0..2 {
@@ -66,7 +102,7 @@ impl Parser {
                     }
                 }
             }
-            match Self::call(guard.as_mut().unwrap(), &req) {
+            match Self::call(guard.as_ref().expect("the parser was started"), req) {
                 Ok(bytes) => match rargo_plan::decode::<ParseResp>(&bytes) {
                     Ok(resp) => {
                         let resp = Arc::new(resp);
@@ -77,9 +113,8 @@ impl Parser {
                 },
                 Err(e) => last_err = format!("build-script parser failed: {e}"),
             }
-            if let Some(mut p) = guard.take() {
-                let _ = p.child.kill();
-                let _ = p.child.wait();
+            if let Some(p) = guard.take() {
+                p.end();
             }
         }
         Arc::new(Err(last_err))
@@ -88,9 +123,11 @@ impl Parser {
 
 impl Drop for Parser {
     fn drop(&mut self) {
-        if let Some(mut p) = self.proc.lock().take() {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+        let Some(p) = self.proc.get_mut().take() else { return };
+        if io::on_fiber() {
+            p.end();
+        } else {
+            unsafe { libc::kill(p.pid, libc::SIGKILL) };
         }
     }
 }

@@ -235,6 +235,9 @@ pub fn cpu<R: Send>(body: impl FnOnce() -> R + Send) -> R {
 }
 
 pub fn blocking<R: Send>(body: impl FnOnce() -> R + Send) -> R {
+    if CURRENT.with(|c| c.get()) == 0 {
+        return body();
+    }
     on_pool(true, body)
 }
 
