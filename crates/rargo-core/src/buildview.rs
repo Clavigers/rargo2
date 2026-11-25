@@ -12,7 +12,7 @@ use crate::view::*;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -587,6 +587,17 @@ pub const CARGO_HOME_AT: &[u8] = b"/c";
 /// process's `CARGO` variable, so it has to be the same everywhere.
 pub const PLANNER_AT: &[u8] = b"/rargo/cargo";
 
+/// The server's cargo home at [`CARGO_HOME_AT`], without its `bin`: the
+/// programs there are the server's rustup proxies, and cargo looks for a
+/// subcommand (`cargo-clippy`) in `$CARGO_HOME/bin` before `PATH`. The
+/// Rust tools of a build are its flake's, on its `PATH`.
+fn cargo_home_mounts(cargo_home: &Path) -> [Mount; 2] {
+    [
+        Mount { at: CARGO_HOME_AT.to_vec(), region: Region::Host(HostRegion::new(cargo_home)), traced: true },
+        Mount { at: vjoin(CARGO_HOME_AT, b"bin"), region: Region::Empty, traced: true },
+    ]
+}
+
 impl ViewParts {
     /// Builds the mount table. With `host_root`, the host is the root even
     /// if a restricted root is configured (the planner needs host libraries).
@@ -609,15 +620,13 @@ impl ViewParts {
         }
         let this = self.clone();
         let this = &this;
-        mounts.extend([
-            Mount { at: WORKTREE_AT.to_vec(), region: Region::Snap(this.snapshot.clone()), traced: true },
-            Mount {
-                at: CARGO_HOME_AT.to_vec(),
-                region: Region::Host(HostRegion::new(this.cargo_home.clone())),
-                traced: true,
-            },
-            Mount { at: PLANNER_AT.to_vec(), region: Region::Host(HostRegion::new(this.planner.clone())), traced: true },
-        ]);
+        mounts.push(Mount { at: WORKTREE_AT.to_vec(), region: Region::Snap(this.snapshot.clone()), traced: true });
+        mounts.extend(cargo_home_mounts(&this.cargo_home));
+        mounts.push(Mount {
+            at: PLANNER_AT.to_vec(),
+            region: Region::Host(HostRegion::new(this.planner.clone())),
+            traced: true,
+        });
         for (at, real) in this.home_files.iter().chain(&this.tools) {
             mounts.push(Mount { at: at.clone(), region: Region::Host(HostRegion::new(real.clone())), traced: true });
         }
@@ -782,6 +791,24 @@ mod host_listing_tests {
 #[cfg(test)]
 mod mount_tests {
     use super::*;
+
+    /// The cargo home's registry is in the view; its rustup proxies are not.
+    #[test]
+    fn cargo_home_without_its_programs() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("registry/index")).unwrap();
+        std::fs::create_dir(home.path().join("bin")).unwrap();
+        std::fs::write(home.path().join("bin/cargo-clippy"), "rustup").unwrap();
+        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        let mut mounts = vec![Mount { at: b"/".to_vec(), region: Region::Empty, traced: true }];
+        mounts.extend(cargo_home_mounts(home.path()));
+        let v = BaseView::new(mounts, Arc::new(HostMemo::default()), 0);
+        assert!(matches!(v.stat(b"/c/registry/index"), Looked::Dir(_)));
+        assert!(matches!(v.stat(b"/c/config.toml"), Looked::File(_)));
+        assert!(matches!(v.stat(b"/c/bin"), Looked::Dir(_)));
+        assert!(v.list(b"/c/bin").unwrap().is_empty());
+        assert!(matches!(v.stat(b"/c/bin/cargo-clippy"), Looked::Absent));
+    }
 
     #[test]
     fn file_mounted_below_a_directory_that_does_not_exist() {

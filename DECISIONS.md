@@ -2720,3 +2720,28 @@ above, that is one session in thousands.
 - Not checked, and not true without the patch either: that the rlib after
   many sessions equals a fresh incremental build of the same source. With
   either compiler, the rlib and rmeta differ after four sessions.
+## D85. The server's cargo home is in the sandbox without its `bin` (issue 119)
+
+The sandbox shows the server's cargo home at `/c`: registry, git checkouts
+and the client's configuration files. Its `bin` holds the server's rustup
+proxies (`cargo-clippy`, `clippy-driver`, `rustfmt`, ...). Cargo looks for
+a subcommand in `$CARGO_HOME/bin` before `PATH`, so `cargo clippy` ran the
+server's rustup proxy rather than the flake's clippy. The proxy, with no
+`RUSTUP_HOME` and `HOME=/tmp`, has no toolchain, and every `rargo clippy`
+failed:
+
+```
+error: rustup could not choose a version of cargo-clippy to run, because one wasn't specified explicitly, and no default is configured.
+```
+
+Every build runs in a flake: the project's own, or the bundled one with
+clippy and rustfmt added. So a build's Rust tools always come from the
+flake's `PATH`, and nothing in the sandbox needs `/c/bin`. It is shown as
+an empty directory.
+
+**How it is checked.** The e2e and e2e-flake servers' cargo homes get a
+`bin/cargo-clippy` that fails if it runs, as a stand-in for the real
+server's proxy. Both suites run `rargo clippy` whatever the client has
+installed: e2e on a project without a flake, e2e-flake on a flake project
+that has `pkgs.clippy`. Without this change e2e-flake fails its new check
+("the server cargo home bin's cargo-clippy ran"); with it, all 22 pass.
