@@ -56,6 +56,8 @@ pub struct NetPolicy {
     pub test_packages: Vec<String>,
     #[serde(default, rename = "build-scripts")]
     pub build_scripts: Vec<String>,
+    #[serde(default, rename = "git-build-scripts-offline")]
+    pub git_build_scripts_offline: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -97,6 +99,11 @@ pub fn snapshot_policy(snapshot: &crate::snapshot::Snapshot, dir: &std::path::Pa
     Policy::load(manifest.as_deref())
 }
 
+pub fn from_git(manifest: &str) -> bool {
+    let home = String::from_utf8_lossy(crate::buildview::CARGO_HOME_AT);
+    manifest.strip_prefix(home.as_ref()).is_some_and(|rest| rest.starts_with("/git/checkouts/"))
+}
+
 impl Policy {
     pub fn load(manifest: Option<&str>) -> Result<Policy, String> {
         let Some(manifest) = manifest else { return Ok(Policy::default()) };
@@ -123,8 +130,8 @@ impl Policy {
         self.network.tests || self.network.test_packages.iter().any(|p| p == package)
     }
 
-    pub fn build_script_network(&self, package: &str) -> bool {
-        self.network.build_scripts.iter().any(|p| p == package)
+    pub fn build_script_network(&self, package: &str, manifest: &str) -> bool {
+        self.network.build_scripts.iter().any(|p| p == package) || (from_git(manifest) && !self.network.git_build_scripts_offline)
     }
 }
 
@@ -160,7 +167,21 @@ mod tests {
         let passed: Vec<String> = p.passed_env(&client).into_iter().map(|(k, _)| k).collect();
         assert_eq!(passed, ["DATABASE_URL", "PROTOC", "PROTOC_INCLUDE"]);
         assert!(p.test_network("it") && !p.test_network("other"));
-        assert!(p.build_script_network("fetcher-sys") && !p.build_script_network("util"));
+        assert!(p.build_script_network("fetcher-sys", "/w/crates/fetcher-sys/Cargo.toml"));
+        assert!(!p.build_script_network("util", "/w/crates/util/Cargo.toml"));
+    }
+
+    #[test]
+    fn build_scripts_of_git_dependencies_have_network_unless_the_workspace_says_otherwise() {
+        let git = "/c/git/checkouts/livekit-rust-sdks-6a2c/147fbca/webrtc-sys/Cargo.toml";
+        let registry = "/c/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.104/Cargo.toml";
+        let p = Policy::default();
+        assert!(p.build_script_network("webrtc-sys", git));
+        assert!(!p.build_script_network("openssl-sys", registry), "a registry crate builds offline, as on docs.rs");
+        assert!(!p.build_script_network("app", "/w/Cargo.toml"));
+        assert!(!p.build_script_network("x", "/w/c/git/checkouts/x/Cargo.toml"), "a workspace that happens to have such a directory");
+        let offline = Policy::load(Some("[workspace.metadata.rargo.network]\ngit-build-scripts-offline = true\n")).unwrap();
+        assert!(!offline.build_script_network("webrtc-sys", git));
     }
 
     #[test]

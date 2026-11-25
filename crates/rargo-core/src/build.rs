@@ -1553,7 +1553,7 @@ impl Run {
             argv,
             env: self.action_env(&cmd),
             cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
-            net: if u.kind == rp::UnitKind::RunScript && self.policy.build_script_network(&u.pkg_name) {
+            net: if u.kind == rp::UnitKind::RunScript && self.policy.build_script_network(&u.pkg_name, &u.manifest_path) {
                 NetMode::Host
             } else {
                 NetMode::Loopback
@@ -2329,7 +2329,7 @@ impl Run {
                 self.c.out.error(&format!(
                     "failed to run custom build command for `{pkg_descr}`\n\nCaused by:\n  process didn't exit successfully: {shown} ({status})\n  --- stdout\n{stdout}  --- stderr\n{stderr}"
                 ));
-                if let Some(hint) = network_hint(&u.pkg_name, self.policy.build_script_network(&u.pkg_name), &stderr, &stdout) {
+                if let Some(hint) = network_hint(&u.pkg_name, self.policy.build_script_network(&u.pkg_name, &u.manifest_path), &stderr, &stdout) {
                     self.c.out.note(&hint);
                 }
                 if let Some(hint) = library_hint(&u.pkg_name, &stderr, &stdout) {
