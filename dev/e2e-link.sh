@@ -255,6 +255,32 @@ out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "the next rargo command
 mounted; check $? "which mounts target/ again"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and shows the binary" "$out"
 
+echo "== a binary is read by range"
+# A machine whose cache holds none of it.
+export RARGO_CACHE_DIR=$E/cache-ranged
+echo 'fn main() { if std::env::args().any(|a| a == "panic") { panic!("asked to panic") } println!("value {}", util::value() + extra::more()); }' >crates/app/src/main.rs
+out=$(R build 2>&1); check $? "a build for a machine that has fetched nothing" "$out"
+size=$(stat -c %s target/debug/app)
+before=$(shown 'bytes fetched')
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "the binary runs" "$out"
+ran=$(($(shown 'bytes fetched') - before))
+[ "$ran" -lt "$size" ]; check $? "having fetched less than all of it ($ran of $size bytes)" "$(dstat)"
+out=$(RUST_BACKTRACE=1 ./target/debug/app panic 2>&1)
+grep -q 'asked to panic' <<<"$out" && grep -q 'app/src/main.rs:1' <<<"$out"; check $? "a panic prints a backtrace with files and lines, from debug sections it had not fetched" "$out"
+traced=$(($(shown 'bytes fetched') - before))
+[ "$traced" -gt "$ran" ]; check $? "(which it fetched for that: $traced bytes in all)" "$(dstat)"
+# Read through to the end, it is the content the server holds.
+stored=$(find "$RARGO_STATE/store" -type f -size "${size}c" -exec sha256sum {} + | cut -d' ' -f1 | sort -u)
+read_through=$(sha256sum <target/debug/app | cut -d' ' -f1)
+[ -n "$stored" ] && [ "$read_through" = "$stored" ]; check $? "read through to the end, the file is byte for byte the server's content" "stored: $stored, read: $read_through"
+find "$E/cache-ranged/blobs" -type f -size "${size}c" | grep -q .; check $? "and is in the client's cache whole"
+"$here/netns.sh" reset-server >/dev/null 2>&1
+fetched=$(shown 'bytes fetched')
+[ "$(sha256sum <target/debug/app | cut -d' ' -f1)" = "$read_through" ]; check $? "with the server's store gone, it reads the same"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and runs" "$out"
+[ "$(shown 'bytes fetched')" = "$fetched" ]; check $? "from the client's cache, fetching nothing" "$(dstat)"
+export RARGO_CACHE_DIR=$E/cache
+
 echo "== a user who may not mount"
 # An unprivileged user gets the virtual directory through fusermount3.
 # The user has to be able to reach the files, which nothing under /root
@@ -286,7 +312,7 @@ unmounted "$U/target"
 rm -rf "$U"
 
 echo "== daemons go when told"
-RARGO_CACHE_DIR=$E/cache-tcp R --rargo-daemon-stop; RARGO_CACHE_DIR=$E/cache R --rargo-daemon-stop
+for c in cache-tcp cache-ranged cache; do RARGO_CACHE_DIR=$E/$c R --rargo-daemon-stop; done
 for g in $(pgrep -f "^unmount-guard: $proj/" || true); do
     tail --pid="$g" -f /dev/null
 done

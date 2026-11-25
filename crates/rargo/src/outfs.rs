@@ -17,6 +17,7 @@
 
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
+use crate::partial::Partial;
 use rargo_proto::Digest;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -82,10 +83,11 @@ struct Node {
     /// Handles open on it, by how they do their I/O: the kernel does not
     /// let one file be open both ways.
     cached: u32,
-    /// The kernel's handle on the real file behind this node while it is
-    /// open for passthrough, and how many opens share it: the kernel
-    /// refuses a second, different one.
-    backing: Option<(i32, u32)>,
+    /// The kernel's handle on the file behind this node while it is open
+    /// for passthrough, how many opens share it (the kernel refuses a
+    /// second, different one), and whether it is a cached content rather
+    /// than the real file.
+    backing: Option<(i32, u32, bool)>,
 }
 
 /// The nodes the kernel knows. Held only to translate between node
@@ -109,16 +111,45 @@ struct Handle {
 /// What a handle reads and writes.
 enum Content {
     Open(File),
-    /// A delivered file opened for reading: its content is fetched when
-    /// it is first read, not when it is opened. Stock cargo opens every
-    /// output it is about to replace (to see whether it is the file it
-    /// links there), and a fetch on open would bring each over the link
-    /// only for it to be overwritten.
+    /// A delivered file opened for reading whose content is not in the
+    /// client's cache: nothing is fetched until it is read. Stock cargo
+    /// opens every output it is about to replace (to see whether it is the
+    /// file it links there), and a fetch on open would bring each over the
+    /// link only for it to be overwritten.
     Unfetched { hash: Digest, size: u64, rel: Vec<u8> },
+    /// A delivered file being read: what is read is fetched as it is read
+    /// (see [`crate::partial`]).
+    Ranged(Arc<Partial>),
 }
 
-/// Makes sure a content is in the client's cache and says where.
-pub type Fetcher = Box<dyn Fn(&Digest, u64) -> std::io::Result<PathBuf> + Send + Sync>;
+/// How the kernel does a handle's I/O.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum How {
+    /// Through the daemon.
+    Daemon,
+    /// Itself, on the real file.
+    Real,
+    /// Itself, on a content in the client's cache (reading only).
+    Content,
+}
+
+/// What a delivered file reads, once it is read.
+pub enum Reader {
+    /// The content, whole in the client's cache.
+    Whole(File),
+    /// The content, fetched by range as it is read.
+    Ranged(Arc<Partial>),
+}
+
+/// Where the contents of delivered files come from.
+pub trait Source: Send + Sync {
+    /// The content in the client's cache, if it is there whole.
+    fn cached(&self, hash: &Digest, size: u64) -> Option<PathBuf>;
+    /// The content, whole in the client's cache, fetched if need be.
+    fn whole(&self, hash: &Digest, size: u64) -> std::io::Result<PathBuf>;
+    /// A reader of the content, which fetches no more than it must.
+    fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<Reader>;
+}
 
 pub struct OutFs {
     /// The real directory under the mount, reached through a descriptor
@@ -129,7 +160,7 @@ pub struct OutFs {
     virt: std::sync::RwLock<Table>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_fh: AtomicU64,
-    fetch: Fetcher,
+    source: Box<dyn Source>,
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
@@ -189,7 +220,7 @@ enum Kind {
 impl OutFs {
     /// `dir` is the directory to mount over; `table` is where the list of
     /// delivered names is kept between runs of the daemon.
-    pub fn new(dir: &Path, table: &Path, fetch: Fetcher) -> std::io::Result<Arc<OutFs>> {
+    pub fn new(dir: &Path, table: &Path, source: Box<dyn Source>) -> std::io::Result<Arc<OutFs>> {
         let fd = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_PATH).open(dir)?;
         let under = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
         let virt: Table = std::fs::read(table)
@@ -208,7 +239,7 @@ impl OutFs {
             virt: std::sync::RwLock::new(virt),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
-            fetch,
+            source,
             session: OnceLock::new(),
             table: table.to_path_buf(),
             dirty: AtomicBool::new(false),
@@ -425,7 +456,7 @@ impl OutFs {
         let dst = self.real(rel);
         let mode = if v.exec { 0o755 } else { 0o644 };
         if with_content && v.size > 0 {
-            let src = (self.fetch)(&v.hash, v.size).map_err(errno)?;
+            let src = self.source.whole(&v.hash, v.size).map_err(errno)?;
             let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", std::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
             std::fs::copy(&src, &tmp).map_err(errno)?;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
@@ -442,27 +473,33 @@ impl OutFs {
         Ok(())
     }
 
-    /// Registers an open file. With `real`, the file is a real one that
-    /// the kernel may read and write itself (passthrough), through this
-    /// very descriptor: no second open.
-    fn open_handle(&self, node: u64, file: Content, real: bool) -> Opened {
+    /// Registers an open file. Unless `how` is [`How::Daemon`], the
+    /// kernel may read (and for a real file write) it itself
+    /// (passthrough), through this very descriptor: no second open.
+    ///
+    /// A node's opens for passthrough share one file, so a real file is
+    /// not opened while the node reads a cached content that way (its
+    /// writes would go to the cache), nor the other way round: that open
+    /// fails as the kernel's own conflicting opens do, text file busy.
+    fn open_handle(&self, node: u64, file: Content, how: How) -> Res<Opened> {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         let mut backing_id = None;
-        if let (Some(n), true, Some(s), Content::Open(file)) = (st.nodes.get_mut(&node), real, self.session.get(), &file) {
-            if n.cached == 0 && s.caps().passthrough {
-                match &mut n.backing {
-                    Some((id, refs)) => {
-                        *refs += 1;
-                        backing_id = Some(*id);
-                    }
-                    None => {
-                        if let Ok(id) = s.backing_open(file.as_raw_fd()) {
-                            n.backing = Some((id, 1));
-                            backing_id = Some(id);
-                        }
+        let content = how == How::Content;
+        if let (Some(n), true, Some(s), Content::Open(file)) = (st.nodes.get_mut(&node), how != How::Daemon, self.session.get(), &file) {
+            match &mut n.backing {
+                Some((_, _, c)) if *c != content => return Err(Errno(libc::ETXTBSY)),
+                Some((id, refs, _)) if n.cached == 0 => {
+                    *refs += 1;
+                    backing_id = Some(*id);
+                }
+                None if n.cached == 0 && s.caps().passthrough => {
+                    if let Ok(id) = s.backing_open(file.as_raw_fd()) {
+                        n.backing = Some((id, 1, content));
+                        backing_id = Some(id);
                     }
                 }
+                _ => {}
             }
         }
         if backing_id.is_none() {
@@ -472,32 +509,43 @@ impl OutFs {
         }
         drop(st);
         self.handles.lock().unwrap().insert(fh, Handle { file, node, through: backing_id.is_some() });
-        match backing_id {
+        Ok(match backing_id {
             Some(id) => Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: id },
             None => Opened { fh, flags: FOPEN_KEEP_CACHE, backing_id: 0 },
-        }
+        })
     }
 
     /// Opens a real file for as much as the caller may later want: all
     /// opens of a file share the first one's descriptor in the kernel, so
     /// it is opened for reading and writing where that is allowed.
-    /// The file behind a handle, fetched into the cache first if nothing
-    /// has been read through the handle yet. The fetch runs without the
-    /// table of handles locked, so other handles go on meanwhile.
-    fn handle_file(&self, fh: u64) -> Res<File> {
+    /// The file behind a handle that writes: only a real file's.
+    fn handle_file(&self, fh: u64) -> Res<Option<File>> {
+        match &self.handles.lock().unwrap().get(&fh).ok_or(Errno(libc::EBADF))?.file {
+            Content::Open(file) => Ok(Some(file.try_clone().map_err(errno)?)),
+            Content::Unfetched { .. } | Content::Ranged(_) => Ok(None),
+        }
+    }
+
+    /// What a handle reads: on its first read of a delivered file, the
+    /// content's reader. It is made without the table of handles locked,
+    /// so other handles go on meanwhile.
+    fn handle_reader(&self, fh: u64) -> Res<Reader> {
         let (hash, size, rel) = match &self.handles.lock().unwrap().get(&fh).ok_or(Errno(libc::EBADF))?.file {
-            Content::Open(file) => return file.try_clone().map_err(errno),
+            Content::Open(file) => return Ok(Reader::Whole(file.try_clone().map_err(errno)?)),
+            Content::Ranged(p) => return Ok(Reader::Ranged(p.clone())),
             Content::Unfetched { hash, size, rel } => (*hash, *size, rel.clone()),
         };
-        let path = (self.fetch)(&hash, size).map_err(|e| {
+        let reader = self.source.reader(&hash, size).map_err(|e| {
             eprintln!("rargo daemon: target/{}: its content could not be fetched: {e}", String::from_utf8_lossy(&rel));
             errno(e)
         })?;
-        let file = File::open(path).map_err(errno)?;
         if let Some(h) = self.handles.lock().unwrap().get_mut(&fh) {
-            h.file = Content::Open(file.try_clone().map_err(errno)?);
+            h.file = match &reader {
+                Reader::Whole(file) => Content::Open(file.try_clone().map_err(errno)?),
+                Reader::Ranged(p) => Content::Ranged(p.clone()),
+            };
         }
-        Ok(file)
+        Ok(reader)
     }
 
     fn open_wide(path: &Path, acc: i32, extra: i32, create: Option<u32>) -> std::io::Result<File> {
@@ -1100,25 +1148,31 @@ impl Filesystem for OutFs {
         // real directory is simply tried first: one system call for the
         // usual case.
         match Self::open_wide(&self.real(&rel), acc, keep, None) {
-            Ok(file) => return Ok(self.open_handle(nodeid, Content::Open(file), true)),
+            Ok(file) => return self.open_handle(nodeid, Content::Open(file), How::Real),
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(errno(e)),
             Err(_) => {}
         }
         let Some(v) = self.virt.read().unwrap().get(&rel).cloned() else { return Err(Errno(libc::ENOENT)) };
         let writing = acc != libc::O_RDONLY || keep & libc::O_TRUNC != 0;
         if !writing {
-            // Reading: from the client's cache, once something is read.
             self.opened_virtual.fetch_add(1, Ordering::Relaxed);
-            let content = if v.size == 0 {
-                Content::Open(File::open("/dev/null").map_err(errno)?)
-            } else {
-                Content::Unfetched { hash: v.hash, size: v.size, rel }
-            };
-            return Ok(self.open_handle(nodeid, content, false));
+            if v.size == 0 {
+                return self.open_handle(nodeid, Content::Open(File::open("/dev/null").map_err(errno)?), How::Daemon);
+            }
+            // A content the cache holds whole is read by the kernel itself,
+            // through the cached file; any other is fetched as it is read.
+            if let Some(file) = self.source.cached(&v.hash, v.size).and_then(|p| File::open(p).ok()) {
+                return self.open_handle(nodeid, Content::Open(file), How::Content);
+            }
+            return self.open_handle(nodeid, Content::Unfetched { hash: v.hash, size: v.size, rel }, How::Daemon);
+        }
+        if self.state.lock().unwrap().nodes.get(&nodeid).is_some_and(|n| n.backing.is_some()) {
+            // Read by the kernel from the cache: see `open_handle`.
+            return Err(Errno(libc::ETXTBSY));
         }
         self.make_real(&rel, &v, keep & libc::O_TRUNC == 0)?;
         let file = Self::open_wide(&self.real(&rel), acc, keep, None).map_err(errno)?;
-        Ok(self.open_handle(nodeid, Content::Open(file), true))
+        self.open_handle(nodeid, Content::Open(file), How::Real)
     }
 
     fn create(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32, flags: u32) -> Res<(Entry, Opened)> {
@@ -1151,12 +1205,21 @@ impl Filesystem for OutFs {
         let md = file.metadata().map_err(errno)?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         let entry = self.entry(parent, name, &Kind::Real(md));
-        Ok((entry, self.open_handle(entry.nodeid, Content::Open(file), true)))
+        Ok((entry, self.open_handle(entry.nodeid, Content::Open(file), How::Real)?))
     }
 
     fn read(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
         let _t = self.timed("read");
-        let file = self.handle_file(fh)?;
+        let file = match self.handle_reader(fh)? {
+            Reader::Whole(file) => file,
+            Reader::Ranged(p) => {
+                *out = p.read_at(offset, size as usize).map_err(|e| {
+                    eprintln!("rargo daemon: content {}: {e}", crate::partial::hex(p.hash()));
+                    Errno(libc::EIO)
+                })?;
+                return Ok(());
+            }
+        };
         out.resize(size as usize, 0);
         let mut done = 0;
         while done < out.len() {
@@ -1173,7 +1236,7 @@ impl Filesystem for OutFs {
 
     fn write(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Res<u32> {
         let _t = self.timed("write");
-        let file = self.handle_file(fh)?;
+        let file = self.handle_file(fh)?.ok_or(Errno(libc::EBADF))?;
         file.write_all_at(data, offset).map_err(errno)?;
         Ok(data.len() as u32)
     }
@@ -1185,7 +1248,7 @@ impl Filesystem for OutFs {
         if let Some(n) = st.nodes.get_mut(&h.node) {
             if !h.through {
                 n.cached = n.cached.saturating_sub(1);
-            } else if let Some((id, refs)) = &mut n.backing {
+            } else if let Some((id, refs, _)) = &mut n.backing {
                 *refs -= 1;
                 if *refs == 0 {
                     if let Some(s) = self.session.get() {
@@ -1199,7 +1262,8 @@ impl Filesystem for OutFs {
 
     fn fsync(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, datasync: bool) -> Res<()> {
         let _t = self.timed("fsync");
-        let file = self.handle_file(fh)?;
+        // A delivered file read through a handle has nothing to sync.
+        let Some(file) = self.handle_file(fh)? else { return Ok(()) };
         if datasync { file.sync_data() } else { file.sync_all() }.map_err(errno)
     }
 
@@ -1319,6 +1383,25 @@ mod tests {
         assert_eq!(cookies.len(), names.len(), "no two of these names share a place");
     }
 
+    /// Serves one content, counting its fetches; nothing is cached.
+    struct Counting {
+        fetches: Arc<AtomicU64>,
+        content: PathBuf,
+    }
+
+    impl Source for Counting {
+        fn cached(&self, _: &Digest, _: u64) -> Option<PathBuf> {
+            None
+        }
+        fn whole(&self, _: &Digest, _: u64) -> std::io::Result<PathBuf> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.content.clone())
+        }
+        fn reader(&self, h: &Digest, size: u64) -> std::io::Result<Reader> {
+            Ok(Reader::Whole(File::open(self.whole(h, size)?)?))
+        }
+    }
+
     /// Stock cargo opens each output it is about to replace and reads none
     /// of them: opening a delivered file fetches nothing, reading it does.
     #[test]
@@ -1329,12 +1412,8 @@ mod tests {
         let content = dir.path().join("content");
         std::fs::write(&content, b"built on the server").unwrap();
         let fetches = Arc::new(AtomicU64::new(0));
-        let (f, c) = (fetches.clone(), content.clone());
-        let fs = OutFs::new(&real, &dir.path().join("table"), Box::new(move |_, _| {
-            f.fetch_add(1, Ordering::SeqCst);
-            Ok(c.clone())
-        }))
-        .unwrap();
+        let source = Counting { fetches: fetches.clone(), content: content.clone() };
+        let fs = OutFs::new(&real, &dir.path().join("table"), Box::new(source)).unwrap();
         fs.deliver(b"app", VFile { hash: [7; 32], size: 19, exec: true, mtime_ns: 1 });
         let ctx = Ctx { uid: 0, gid: 0, pid: 0 };
         let node = fs.lookup(&ctx, ROOT, b"app").unwrap().nodeid;
