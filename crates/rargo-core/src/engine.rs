@@ -401,6 +401,8 @@ impl Engine {
                 spec.env.insert(v.into_bytes(), val.into_bytes());
             }
         }
+        assert!(spec.env.len() >= base.env.len());
+        assert!(base.env.keys().all(|k| spec.env.get(k) == base.env.get(k)), "declared variables never override the spec");
         (spec, base_key)
     }
 
@@ -571,6 +573,7 @@ impl Engine {
             let mut attempt = 0;
             let (result, obs, side) = loop {
                 attempt += 1;
+                assert!(attempt <= 3);
                 let (result, obs, tainted, side) = self.run(&spec, &req).await?;
                 if !tainted {
                     break (result, Some(obs), side);
@@ -810,9 +813,12 @@ impl Engine {
 
         let mut entries = entries;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "each output path appears once");
+        let total = entries.len();
         // Paths under a discard prefix are not part of the result.
         let (side, entries): (Vec<_>, Vec<_>) =
             entries.into_iter().partition(|(p, _)| spec.discard.iter().any(|d| vpath_starts_with(p, d)));
+        assert_eq!(side.len() + entries.len(), total);
         let stats = Stats { wall_us: info.wall_us, cpu_us: info.user_us + info.sys_us, max_rss_kb: info.max_rss_kb };
         self.stats.run_cpu_us.fetch_add(stats.cpu_us, Ordering::Relaxed);
         self.stats.run_wall_us.fetch_add(stats.wall_us, Ordering::Relaxed);
@@ -872,6 +878,7 @@ impl Engine {
         // The process is kept where the caller can reach it: if this future
         // is dropped (the client went away, another copy of the action won),
         // the process is killed instead of running on unobserved.
+        assert!(slot.is_none(), "one process per action");
         let running = slot.insert(self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?);
         let mut out_rd = async_reader(out_r)?;
         let mut err_rd = async_reader(err_r)?;
@@ -906,6 +913,7 @@ impl Engine {
                                 observer.stderr_line(line, Some(&live));
                             }
                             done += i + 1;
+                            assert!(done <= all.len());
                         }
                     }
                 }

@@ -70,6 +70,7 @@ pub struct Trees {
 /// How often a sync starts over because content of its own tree was
 /// evicted while it ran.
 const SYNC_ATTEMPTS: usize = 8;
+const _: () = assert!(SYNC_ATTEMPTS >= 1);
 
 impl Trees {
     pub fn new(store: Arc<Store>) -> Arc<Trees> {
@@ -179,6 +180,8 @@ impl Trees {
                 }
                 level = next;
             }
+            assert_eq!(visited.first(), Some(&root), "the walk starts at the root");
+            assert!(visited.len() <= seen.len());
             if !missing_blobs.is_empty() {
                 self.upload(missing_blobs.into_iter().collect(), from).await?;
             }
@@ -247,6 +250,8 @@ impl Trees {
                 }
             }
         }
+        assert_eq!(all.first(), Some(&root));
+        debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
         if !self.store.pin_all(&all) {
             return None;
         }
@@ -324,6 +329,7 @@ impl Trees {
             // The claims go when the upload ends, and also when this future
             // is dropped in the middle of it (the request was cancelled):
             // otherwise whoever waits on them would wait forever.
+            assert!(theirs.iter().all(|(h, _)| !mine.contains(h)), "a hash is claimed by one sync");
             let claims = Claims { trees: self, mine: &mine };
             let result = if mine.is_empty() {
                 Ok(())
@@ -372,9 +378,8 @@ impl Drop for Claims<'_> {
     fn drop(&mut self) {
         let mut up = self.trees.uploading.lock();
         for h in self.mine {
-            if let Some(n) = up.remove(h) {
-                n.notify_waiters();
-            }
+            let n = up.remove(h).expect("a claim stays until its owner gives it up");
+            n.notify_waiters();
         }
     }
 }

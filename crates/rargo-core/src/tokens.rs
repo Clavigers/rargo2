@@ -135,10 +135,14 @@ fn random(n: usize) -> Result<Vec<u8>> {
 /// Letters and digits that are not mistaken for one another when read off
 /// a screen.
 const CLEAR: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const _: () = assert!(CLEAR.len() == 32);
 
 pub fn random_text(n: usize, alphabet: &[u8]) -> Result<String> {
     // (256 is a multiple of 32, and of 62 it is not: bytes that would bias
     // the choice are drawn again.)
+    assert!(!alphabet.is_empty());
+    assert!(alphabet.len() <= 256);
+    assert!(alphabet.is_ascii(), "one byte per character");
     let limit = 256 - 256 % alphabet.len();
     let mut out = String::new();
     while out.len() < n {
@@ -148,11 +152,14 @@ pub fn random_text(n: usize, alphabet: &[u8]) -> Result<String> {
             }
         }
     }
+    assert_eq!(out.len(), n);
     Ok(out)
 }
 
 fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
+    let s: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    assert_eq!(s.len(), 2 * b.len());
+    s
 }
 
 fn unhex32(s: &str) -> Option<[u8; 32]> {
@@ -272,6 +279,9 @@ impl TokenStore {
             revoked: false,
             note: note.to_string(),
         };
+        assert_eq!(secret.len(), 40);
+        assert_eq!(token.id.len(), 14);
+        assert!(unhex32(&token.key).is_some(), "the stored key reads back");
         let t = token.clone();
         self.change(move |f| {
             f.tokens.push(t);
@@ -388,7 +398,9 @@ impl TokenStore {
             }
         }
         let raw = random_text(16, CLEAR)?;
+        assert_eq!(raw.len(), 16);
         let code = format!("{}-{}-{}-{}", &raw[0..4], &raw[4..8], &raw[8..12], &raw[12..16]);
+        assert_eq!(normal_code(&code), raw, "the dashes do not change the code");
         let invite = Invite {
             code: code_hash(&code),
             user: user.map(String::from),
@@ -398,6 +410,7 @@ impl TokenStore {
             token_days,
             created: now(),
         };
+        assert!(invite.uses_left > 0);
         self.change(move |f| {
             f.invites.retain(|i| i.uses_left > 0 && i.expires.is_none_or(|e| e > now()));
             f.invites.push(invite);

@@ -22,6 +22,8 @@ const MOST: usize = 4_000_000;
 const HELD_MAGIC: &[u8] = b"rargo-held-1\n";
 const CHUNKS_MAGIC: &[u8] = b"rargo-chunks-1\n";
 
+const _: () = assert!(MOST <= u32::MAX as usize);
+
 /// The first eight bytes of a digest: enough to tell contents apart in a
 /// hint (one that collides is offered again, or asked for by the server).
 fn short(d: &Digest) -> u64 {
@@ -48,6 +50,7 @@ impl Held {
                 rest.is_empty().then(|| whole.iter().map(|c| u64::from_le_bytes(*c)).collect())
             })
             .unwrap_or_default();
+        assert!(path.starts_with(cache));
         Held { path, set: Mutex::new(set), changed: AtomicBool::new(false) }
     }
 
@@ -64,6 +67,7 @@ impl Held {
         if set.len() > MOST {
             set.clear();
         }
+        assert!(set.len() <= MOST);
         if set.len() != before {
             self.changed.store(true, Ordering::SeqCst);
         }
@@ -85,6 +89,7 @@ impl Held {
             for v in set.iter() {
                 b.extend_from_slice(&v.to_le_bytes());
             }
+            assert_eq!(b.len(), HELD_MAGIC.len() + 8 * set.len());
             b
         };
         if let Some(dir) = self.path.parent() {
@@ -117,6 +122,7 @@ pub fn load_chunks(cache: &Path) -> Chunks {
                         let blob: Digest = r[32..64].try_into().unwrap();
                         let off = u64::from_le_bytes(r[64..72].try_into().unwrap());
                         let len = u32::from_le_bytes(r[72..76].try_into().unwrap());
+                        const _: () = assert!(ONE == 76);
                         (chunk, (blob, off, len))
                     })
                     .collect()
@@ -134,6 +140,7 @@ pub fn save_chunks(cache: &Path, chunks: &Chunks) -> io::Result<()> {
         b.extend_from_slice(&off.to_le_bytes());
         b.extend_from_slice(&len.to_le_bytes());
     }
+    assert_eq!(b.len(), CHUNKS_MAGIC.len() + 76 * chunks.len());
     crate::write_atomic(&chunks_path(cache), &b)
 }
 

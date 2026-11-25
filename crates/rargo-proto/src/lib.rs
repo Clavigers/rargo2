@@ -37,6 +37,7 @@ pub const CONTROL: u32 = 0;
 /// Frames of this stream are keepalives: outside every order, answered at
 /// once, so that neither end mistakes a busy link for a dead one.
 pub const KEEPALIVE: u32 = u32::MAX;
+const _: () = assert!(CONTROL != KEEPALIVE);
 
 /// One message on a link, with the stream it belongs to and its place in
 /// the sender's order (the UDP transport delivers messages in arrival
@@ -75,9 +76,15 @@ impl<M> Reorder<M> {
         }
         let held = self.held.entry(lane).or_default();
         held.insert(f.seq, (f.stream, f.msg));
+        let before = *next;
         while let Some(m) = held.remove(next) {
             out.push(m);
             *next += 1;
+        }
+        assert_eq!(*next - before, out.len() as u64);
+        assert!(!held.contains_key(next));
+        if let Some((&first, _)) = held.first_key_value() {
+            assert!(first > *next, "held frames lie beyond a gap");
         }
         if held.is_empty() {
             self.held.remove(&lane);
@@ -337,6 +344,7 @@ impl Part {
         if let Ok(z) = zstd::bulk::compress(&bytes, 1) {
             // Worth it only when it saves a tenth or more.
             if z.len() + bytes.len() / 10 < bytes.len() {
+                assert!(z.len() < bytes.len());
                 return Part { data: z, packed: true };
             }
         }
@@ -358,7 +366,11 @@ pub fn pack(encoded: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let z = zstd::bulk::compress(encoded, 3).ok()?;
-    (z.len() + encoded.len() / 8 < encoded.len()).then_some(z)
+    let packed = (z.len() + encoded.len() / 8 < encoded.len()).then_some(z);
+    if let Some(z) = &packed {
+        assert!(z.len() < encoded.len());
+    }
+    packed
 }
 
 /// Undoes [`pack`].
@@ -377,12 +389,16 @@ pub const CHUNKED_FROM: u64 = 1 << 20;
 pub const PART_SIZE: usize = 1 << 20;
 /// Small blobs are batched up to about this many bytes per message.
 pub const BATCH_SIZE: usize = 4 << 20;
+const _: () = assert!(LAZY_SMALL < CHUNKED_FROM);
+const _: () = assert!(PART_SIZE <= BATCH_SIZE);
+const _: () = assert!(CHUNKED_FROM as usize >= PART_SIZE);
 
 impl Blob {
     pub fn pack(hash: Digest, bytes: &[u8]) -> Blob {
         if bytes.len() >= 256 {
             if let Ok(z) = zstd::bulk::compress(bytes, 1) {
                 if z.len() + 16 < bytes.len() {
+                    assert!(z.len() < bytes.len());
                     return Blob { hash, data: z, packed: true };
                 }
             }
@@ -432,6 +448,11 @@ pub fn decode<T: for<'a> Deserialize<'a>>(b: &[u8]) -> std::io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cachedir_tag_carries_its_signature() {
+        assert!(CACHEDIR_TAG.as_bytes().starts_with(CACHEDIR_SIGNATURE));
+    }
 
     #[test]
     fn allow_list() {

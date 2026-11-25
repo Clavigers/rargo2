@@ -87,6 +87,9 @@ impl Keys {
 
 /// Bytes of bulk data that may sit in the outgoing queue.
 const WINDOW: usize = 32 << 20;
+// Permits are acquired as `u32`.
+const _: () = assert!(WINDOW <= u32::MAX as usize);
+const _: () = assert!(WINDOW > 0);
 
 fn bulk_size(m: &ServerMsg) -> usize {
     match m {
@@ -200,6 +203,7 @@ impl Session {
             return;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id > 0, "delivery ids start at 1");
         let mut sizes: HashMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
         for w in &writes {
             if let Write::File { hash, size, .. } = w {
@@ -210,6 +214,7 @@ impl Session {
             let mut has = self.has.set.lock();
             sizes.iter().filter(|(h, size)| **size <= rargo_proto::LAZY_SMALL && has.insert(**h)).map(|(h, _)| *h).collect()
         };
+        assert!(small.len() <= sizes.len());
         self.delivered.lock().extend(sizes.keys().copied());
         self.send(ServerMsg::Deliver { id, files, writes });
         let mut batch: Vec<Blob> = Vec::new();
@@ -266,6 +271,8 @@ impl Session {
     /// Sends bulk data, waiting while too much is queued.
     async fn send_bulk(&self, m: ServerMsg) -> Result<()> {
         let n = bulk_size(&m).clamp(1, WINDOW) as u32;
+        assert!(n >= 1);
+        assert!(n as usize <= WINDOW);
         let permit = self.window.acquire_many(n).await.map_err(|_| self.gone())?;
         permit.forget();
         self.totals.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
@@ -291,6 +298,7 @@ impl Session {
             bail!("the client sent content that does not match its hash");
         }
         self.store.put_bytes(bytes)?;
+        assert!(self.store.has(&Hash(claimed)), "a stored blob is in the store");
         self.totals.files_in.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -363,6 +371,7 @@ impl Session {
                         bail!("the client sent content that does not match its hash");
                     }
                     self.store.install_hashed(&part.path, Hash(hash), part.size)?;
+                    assert!(self.store.has(&Hash(hash)), "an installed blob is in the store");
                     self.totals.files_in.fetch_add(1, Ordering::Relaxed);
                     Ok(true)
                 })?;
@@ -408,6 +417,7 @@ impl Session {
             return Ok(());
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        assert!(id > 0, "delivery ids start at 1");
         let mut sizes: HashMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
         for w in &writes {
             if let Write::File { hash, size, .. } = w {
@@ -425,6 +435,7 @@ impl Session {
             }
             push
         };
+        assert!(push.len() <= sizes.len());
         self.delivered.lock().extend(sizes.keys().copied());
         self.send(ServerMsg::Deliver { id, files, writes });
         if self.closed.load(Ordering::SeqCst) {
@@ -465,6 +476,7 @@ impl Session {
                     batch_bytes = 0;
                     self.send_bulk(ServerMsg::Blobs(std::mem::take(&mut batch))).await?;
                 }
+                assert!(batch_bytes < rargo_proto::BATCH_SIZE);
                 continue;
             }
             let store = self.store.clone();

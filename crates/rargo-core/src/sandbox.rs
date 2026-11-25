@@ -106,6 +106,8 @@ pub struct Running {
 }
 
 fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
+    assert!(payload.len() <= u32::MAX as usize);
+    assert!(fds.len() <= 16, "descriptors per message fit the control buffer");
     let len = (payload.len() as u32).to_le_bytes();
     // The fds travel with the 4-byte length header.
     let mut iov = libc::iovec { iov_base: len.as_ptr() as *mut _, iov_len: 4 };
@@ -173,6 +175,7 @@ fn recv_msg(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
             return Ok(None);
         }
         got += r as usize;
+        assert!(got <= 4);
         // SAFETY: walking the control messages the kernel filled in.
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
@@ -244,7 +247,7 @@ impl Zygote {
     ) -> Result<Running> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending.lock().insert(id, tx);
+        assert!(self.pending.lock().insert(id, tx).is_none(), "spawn ids are unique");
         let msg = bincode::serialize(&ToZygote::Spawn {
             id,
             req,
@@ -256,6 +259,7 @@ impl Zygote {
             fds.push(s.as_raw_fd());
         }
         fds.extend_from_slice(extra);
+        assert_eq!(fds.len(), 2 + stdin.is_some() as usize + extra.len());
         let r = send_msg(&self.sock.lock(), &msg, &fds);
         if let Err(e) = r {
             self.pending.lock().remove(&id);
@@ -338,8 +342,9 @@ pub fn zygote_main(fd: RawFd) -> ! {
                         let extras: Vec<OwnedFd> = it.take(extra).collect();
                         match spawn_init(&req, stdin, out, err, extras) {
                             Ok((pid, status_pipe)) => {
-                                children.insert(pid, Child { id, status_pipe, started: std::time::Instant::now() });
-                                by_id.insert(id, pid);
+                                assert!(children.insert(pid, Child { id, status_pipe, started: std::time::Instant::now() }).is_none());
+                                assert!(by_id.insert(id, pid).is_none(), "spawn ids are unique");
+                                assert_eq!(children.len(), by_id.len());
                             }
                             Err(_) => {
                                 let info = ExitInfo { status: 127 << 8, setup_failed: true, ..Default::default() };
@@ -379,7 +384,8 @@ fn reap(sock: &UnixStream, children: &mut HashMap<i32, Child>, by_id: &mut HashM
             return;
         }
         let Some(child) = children.remove(&pid) else { continue };
-        by_id.remove(&child.id);
+        assert_eq!(by_id.remove(&child.id), Some(pid));
+        assert_eq!(children.len(), by_id.len());
         // Init reports the command's own wait status through the pipe.
         let mut buf = [0u8; 5];
         let mut f = std::fs::File::from(child.status_pipe);

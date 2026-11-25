@@ -128,12 +128,14 @@ pub enum Msg {
 }
 
 fn dtype_to_u8(t: DType) -> u8 {
-    match t {
+    let b = match t {
         DType::Dir => 0,
         DType::File => 1,
         DType::Symlink => 2,
         DType::Other => 3,
-    }
+    };
+    assert_eq!(std::mem::discriminant(&dtype_from_u8(b)), std::mem::discriminant(&t), "the encoding round-trips");
+    b
 }
 
 fn dtype_from_u8(b: u8) -> DType {
@@ -223,8 +225,9 @@ impl Peer {
 
     fn start(&self, body: Req) -> oneshot::Receiver<Resp> {
         let rid = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(rid > 0, "request ids start at 1");
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(rid, tx);
+        assert!(self.pending.lock().insert(rid, tx).is_none(), "request ids are not reused");
         self.post(&Msg::Req { rid, body });
         rx
     }
@@ -293,6 +296,9 @@ fn inline_indices(recipe: &Recipe, has: &dyn Fn(&Hash) -> bool) -> Vec<u32> {
         bytes += c.len as usize;
         out.push(i as u32);
     }
+    assert!(out.windows(2).all(|w| w[0] < w[1]), "indices ascend");
+    assert!(out.len() <= recipe.len());
+    assert!(out.len() <= 1 || bytes <= BATCH_BYTES);
     out
 }
 
@@ -341,6 +347,7 @@ impl Blobs {
             offsets.push(off);
             off += c.len as u64;
         }
+        assert_eq!(offsets.len(), recipe.len());
         idx.iter()
             .map(|&i| {
                 let c = recipe.get(i as usize).ok_or_else(|| anyhow!("chunk index out of range"))?;
@@ -391,6 +398,8 @@ impl Blobs {
             }
             off += c.len as u64;
         }
+        assert_eq!(off, recipe.iter().map(|c| c.len as u64).sum::<u64>());
+        let missing_count = missing.len();
         // Ask for what is still missing, a megabyte at a time, several
         // requests in flight.
         let mut batches: Vec<Vec<(u32, u64, u32)>> = Vec::new();
@@ -407,6 +416,8 @@ impl Blobs {
         if !cur.is_empty() {
             batches.push(cur);
         }
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), missing_count);
+        assert!(batches.iter().all(|b| !b.is_empty()));
         for group in batches.chunks(8) {
             let calls: Vec<_> = group
                 .iter()
@@ -435,6 +446,7 @@ impl Blobs {
             bail!("blob {h} arrived with the wrong content");
         }
         self.store.install_hashed(&tmp, got, size)?;
+        assert!(self.store.has(h));
         self.index.add_blob(*h, Arc::new(recipe.clone()));
         self.fetched_blobs.fetch_add(1, Ordering::Relaxed);
         Ok(())
@@ -1097,6 +1109,7 @@ fn frame(b: Vec<u8>) -> Vec<u8> {
                 out.push(1);
                 out.extend_from_slice(&(b.len() as u64).to_le_bytes());
                 out.extend_from_slice(&z);
+                assert_eq!(out.len(), z.len() + 9);
                 return out;
             }
         }
@@ -1104,6 +1117,7 @@ fn frame(b: Vec<u8>) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len() + 1);
     out.push(0);
     out.extend_from_slice(&b);
+    assert_eq!(out.len(), b.len() + 1);
     out
 }
 
@@ -1172,6 +1186,8 @@ impl AheadQueue {
         if self.waiting.len() > Self::KEPT {
             self.waiting.pop_front();
         }
+        assert!(self.waiting.len() <= Self::KEPT);
+        debug_assert_eq!(self.waiting.iter().filter(|(w, _)| *w == self.waiting.back().unwrap().0).count(), 1, "one state per crate");
     }
 
     /// The newest state waiting.

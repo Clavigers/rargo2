@@ -962,7 +962,8 @@ impl Daemon {
         struct Active<'a>(&'a Daemon);
         impl Drop for Active<'_> {
             fn drop(&mut self) {
-                self.0.active.fetch_sub(1, Ordering::SeqCst);
+                let was = self.0.active.fetch_sub(1, Ordering::SeqCst);
+                assert!(was > 0, "every command that ends was counted when it began");
                 *self.0.last_active.lock().unwrap() = Instant::now();
             }
         }
@@ -1542,6 +1543,7 @@ fn show(
 /// The path of a directory inside the mount, as `real_for_write` wants it
 /// (it makes the parents of what it is given).
 fn join_rel(rel: &[u8]) -> Vec<u8> {
+    assert!(!rel.ends_with(b"/"));
     let mut p = rel.to_vec();
     p.extend_from_slice(b"/.");
     p
@@ -1557,6 +1559,8 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
         if size as usize > rargo_proto::PART_SIZE { large.push((h, path)) } else { small.push((h, path, size)) }
     }
     // Small files travel in batches, read and compressed in parallel.
+    assert!(small.iter().all(|(_, _, size)| *size as usize <= rargo_proto::PART_SIZE));
+    let wanted = small.len();
     let mut batches: Vec<Vec<(Digest, PathBuf)>> = vec![Vec::new()];
     let mut bytes = 0usize;
     for (h, p, size) in small {
@@ -1567,6 +1571,7 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
         bytes += size as usize + 64;
         batches.last_mut().unwrap().push((h, p));
     }
+    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), wanted, "every small file is in one batch");
     for window in batches.chunks(8) {
         let window = window.to_vec();
         let packed: Vec<Option<Vec<Blob>>> = tokio::task::spawn_blocking(move || {
@@ -1611,6 +1616,7 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
                     n += got;
                 }
                 buf.truncate(n);
+                assert!(buf.len() <= rargo_proto::PART_SIZE);
                 Ok((buf, f))
             })
             .await
