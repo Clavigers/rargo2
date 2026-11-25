@@ -40,8 +40,8 @@ if [ -z "$remote_tag" ]; then
     # The suites run their own servers: a token or server meant for the
     # service check below would reach their clients.
     env -u RARGO_TOKEN -u RARGO_SERVER dev/gate.sh
-    step='waiting for the successful gate status'
-    dev/release-gate.sh "$commit" --wait
+    step='checking the gate status'
+    dev/release-gate.sh "$commit"
     step='creating and pushing the tag'
     if git show-ref --verify --quiet "refs/tags/$tag"; then
         [ "$(git rev-parse "$tag^{commit}")" = "$commit" ] || die "$tag points at a different commit"
