@@ -159,6 +159,11 @@ fn main() -> Result<()> {
     let sched = Scheduler::new(opts.jobs, opts.mem_kb)?;
     let mut engine = Engine::new(store.clone(), content, fs, mnt, zygote, sched);
     engine.cgroup_root = cgroup_root.clone();
+    engine.place = if opts.worker_of.is_some() {
+        rargo_core::sandbox::Place::Worker
+    } else {
+        rargo_core::sandbox::Place::Server
+    };
     engine.action_timeout = std::time::Duration::from_secs(opts.action_timeout_secs);
     let engine = Arc::new(engine);
     if let Some(server) = opts.worker_of {
