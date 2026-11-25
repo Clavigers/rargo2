@@ -1,7 +1,7 @@
 use crate::scan::hash_file;
 use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write as _};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -30,6 +30,136 @@ struct Dest {
     own: bool,
 }
 
+enum WriteOp {
+    Dir(PathBuf),
+    Remove(PathBuf),
+    Symlink(PathBuf, Vec<u8>),
+    RemoveText(PathBuf),
+    Text(PathBuf, String),
+}
+
+struct PlacementPlan {
+    writes: Vec<WriteOp>,
+    files: Vec<(Dest, Digest, u64)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PlaceFile {
+    Keep,
+    Install { source: PathBuf, matching_mode: bool },
+    Fetch,
+}
+
+#[derive(Clone, Copy)]
+struct Existing {
+    size: u64,
+    exec: bool,
+    writable: bool,
+    links: u64,
+    hash: Option<Digest>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Materialize {
+    Reflink,
+    Link,
+    Copy,
+}
+
+impl Materialize {
+    fn try_install(self, src: &Path, tmp: &Path) -> io::Result<bool> {
+        match self {
+            Self::Reflink => Ok(reflink(src, tmp)),
+            Self::Link => Ok(std::fs::hard_link(src, tmp).is_ok()),
+            Self::Copy => std::fs::copy(src, tmp).map(|_| true),
+        }
+    }
+}
+
+impl Dest {
+    fn materialize(&self, matching_cache_mode: bool) -> &'static [Materialize] {
+        use Materialize::*;
+        if !self.own && matching_cache_mode { &[Reflink, Link, Copy] } else { &[Reflink, Copy] }
+    }
+
+    fn fits(&self, info: Existing, size: u64) -> bool {
+        info.size == size && info.exec == self.exec && (!self.own || (info.links == 1 && info.writable))
+    }
+
+    fn plan(&self, hash: &Digest, size: u64, existing: Option<Existing>, cache: Option<(PathBuf, bool)>) -> PlaceFile {
+        if existing.is_some_and(|info| self.fits(info, size) && info.hash.as_ref() == Some(hash)) {
+            PlaceFile::Keep
+        } else if let Some((source, matching_mode)) = cache {
+            PlaceFile::Install { source, matching_mode }
+        } else {
+            PlaceFile::Fetch
+        }
+    }
+}
+
+impl PlacementPlan {
+    fn new(files: Vec<Delivery>, writes: Vec<Write>) -> Self {
+        let mut plan = Self { writes: Vec::new(), files: Vec::new() };
+        for write in writes {
+            let op = match write {
+                Write::Dir { path } => WriteOp::Dir(path.into()),
+                Write::Remove { path } => WriteOp::Remove(path.into()),
+                Write::Symlink { path, target } => WriteOp::Symlink(path.into(), target),
+                Write::Text { path, text: None } => WriteOp::RemoveText(path.into()),
+                Write::Text { path, text: Some(text) } => WriteOp::Text(path.into(), text),
+                Write::File { path, hash, size, exec } => {
+                    plan.files.push((Dest { path: path.into(), exec, own: true }, hash, size));
+                    continue;
+                }
+            };
+            plan.writes.push(op);
+        }
+        plan.files.extend(files.into_iter().map(|f| (Dest { path: f.path.into(), exec: f.exec, own: f.own }, f.hash, f.size)));
+        plan
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.writes.iter().all(|op| {
+            let path = match op {
+                WriteOp::Dir(path) | WriteOp::Remove(path) | WriteOp::Symlink(path, _) | WriteOp::RemoveText(path)
+                | WriteOp::Text(path, _) => path,
+            };
+            !path.as_os_str().is_empty()
+        }) && self.files.iter().all(|(dest, _, _)| !dest.path.as_os_str().is_empty())
+    }
+}
+
+impl WriteOp {
+    fn execute(self) -> io::Result<()> {
+        match self {
+            Self::Dir(path) => std::fs::create_dir_all(path)?,
+            Self::Remove(path) => {
+                if let Ok(md) = std::fs::symlink_metadata(&path) {
+                    let _ = if md.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+                }
+            }
+            Self::Symlink(path, target) => {
+                use std::os::unix::ffi::OsStrExt;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let _ = std::fs::remove_file(&path);
+                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), path)?;
+            }
+            Self::RemoveText(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+            Self::Text(path, text) => {
+                if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+                    crate::write_atomic(&path, text.as_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Part {
     tmp: PathBuf,
     file: std::fs::File,
@@ -40,7 +170,7 @@ pub struct Placer {
     cache: PathBuf,
     pub placed: Placed,
     pub changed: bool,
-    pending: HashMap<Digest, Vec<Dest>>,
+    pending: BTreeMap<Digest, Vec<Dest>>,
     parts: HashMap<Digest, Part>,
     swept: std::collections::HashSet<PathBuf>,
     pub fetched_bytes: u64,
@@ -110,7 +240,7 @@ impl Placer {
             cache: cache_dir.join("blobs"),
             placed,
             changed: false,
-            pending: HashMap::new(),
+            pending: BTreeMap::new(),
             parts: HashMap::new(),
             fetched_bytes: 0,
             reused_files: 0,
@@ -137,20 +267,27 @@ impl Placer {
         (tmp, watched)
     }
 
-    fn already(&self, d: &Dest, hash: &Digest, size: u64) -> bool {
-        let Ok(md) = std::fs::symlink_metadata(&d.path) else { return false };
-        if !md.is_file() || md.len() != size || (md.mode() & 0o111 != 0) != d.exec {
-            return false;
+    fn observe(&self, d: &Dest, size: u64) -> Option<Existing> {
+        let md = std::fs::symlink_metadata(&d.path).ok()?;
+        if !md.is_file() {
+            return None;
         }
-        if d.own && (md.nlink() > 1 || md.mode() & 0o200 == 0) {
-            return false;
+        let mut info = Existing { size: md.len(), exec: md.mode() & 0o111 != 0, writable: md.mode() & 0o200 != 0, links: md.nlink(), hash: None };
+        if d.fits(info, size) {
+            info.hash = match self.placed.files.get(d.path.to_string_lossy().as_ref()) {
+                Some((s, m, ino, hash)) if *s == size && *m == mtime_ns(&md) && *ino == md.ino() => Some(*hash),
+                _ => hash_file(&d.path, size).ok(),
+            };
         }
-        if let Some((s, m, ino, h)) = self.placed.files.get(d.path.to_string_lossy().as_ref()) {
-            if *s == size && *m == mtime_ns(&md) && *ino == md.ino() {
-                return h == hash;
-            }
-        }
-        hash_file(&d.path, size).map(|h| h == *hash).unwrap_or(false)
+        Some(info)
+    }
+
+    fn find_cached(&self, d: &Dest, hash: &Digest, size: u64) -> Option<(PathBuf, bool)> {
+        [d.exec, !d.exec].into_iter().find_map(|exec| {
+            let path = self.cache_path(hash, exec);
+            let fits = std::fs::metadata(&path).is_ok_and(|m| m.len() == size);
+            (fits && hash_file(&path, size).is_ok_and(|h| h == *hash)).then_some((path, exec == d.exec))
+        })
     }
 
     fn note(&mut self, path: &Path, hash: &Digest) {
@@ -169,14 +306,15 @@ impl Placer {
         }
         let (tmp, _watched) = self.tmp_beside(&d.path);
         let done = (|| -> io::Result<()> {
-            if reflink(src, &tmp) {
-                std::fs::set_permissions(&tmp, mode(d.exec, true))?;
-            } else if !d.own && src_is_cache && std::fs::hard_link(src, &tmp).is_ok() {
-            } else {
-                std::fs::copy(src, &tmp)?;
-                std::fs::set_permissions(&tmp, mode(d.exec, true))?;
+            for &op in d.materialize(src_is_cache) {
+                if op.try_install(src, &tmp)? {
+                    if op != Materialize::Link {
+                        std::fs::set_permissions(&tmp, mode(d.exec, true))?;
+                    }
+                    return std::fs::rename(&tmp, &d.path);
+                }
             }
-            std::fs::rename(&tmp, &d.path)
+            unreachable!("the placement plan ends in copy")
         })();
         if done.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -278,65 +416,34 @@ impl Placer {
     }
 
     pub fn deliver(&mut self, files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
-        let mut wanted: Vec<(Dest, Digest, u64)> = Vec::new();
-        for w in writes {
-            match w {
-                Write::Dir { path } => std::fs::create_dir_all(&path)?,
-                Write::Remove { path } => {
-                    if let Ok(md) = std::fs::symlink_metadata(&path) {
-                        let _ = if md.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
-                    }
-                }
-                Write::Symlink { path, target } => {
-                    use std::os::unix::ffi::OsStrExt;
-                    if let Some(parent) = Path::new(&path).parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let _ = std::fs::remove_file(&path);
-                    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &path)?;
-                }
-                Write::Text { path, text: None } => {
-                    let _ = std::fs::remove_file(&path);
-                }
-                Write::Text { path, text: Some(text) } => {
-                    if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-                        crate::write_atomic(Path::new(&path), text.as_bytes())?;
-                    }
-                }
-                Write::File { path, hash, size, exec } => {
-                    wanted.push((Dest { path: PathBuf::from(path), exec, own: true }, hash, size))
-                }
-            }
-        }
-        for f in files {
-            wanted.push((Dest { path: PathBuf::from(f.path), exec: f.exec, own: f.own }, f.hash, f.size));
+        let plan = PlacementPlan::new(files, writes);
+        for write in plan.writes {
+            write.execute()?;
         }
         let mut need = Vec::new();
-        for (d, hash, size) in wanted {
-            if self.already(&d, &hash, size) {
-                self.reused_files += 1;
-                self.note(&d.path.clone(), &hash);
-                continue;
+        for (d, hash, size) in plan.files {
+            let existing = self.observe(&d, size);
+            let mut op = d.plan(&hash, size, existing, None);
+            if op == PlaceFile::Fetch {
+                op = d.plan(&hash, size, existing, self.find_cached(&d, &hash, size));
             }
-            let mut from_cache = None;
-            for exec in [d.exec, !d.exec] {
-                let cp = self.cache_path(&hash, exec);
-                let fits = std::fs::metadata(&cp).map(|m| m.len() == size).unwrap_or(false);
-                if fits && hash_file(&cp, size).map(|h| h == hash).unwrap_or(false) {
-                    from_cache = Some((cp, exec == d.exec));
-                    break;
+            match op {
+                PlaceFile::Keep => {
+                    self.reused_files += 1;
+                    self.note(&d.path, &hash);
+                }
+                PlaceFile::Install { source, matching_mode } => {
+                    self.reused_files += 1;
+                    self.install(&source, &d, &hash, matching_mode)?;
+                }
+                PlaceFile::Fetch => {
+                    let pending = self.pending.entry(hash).or_insert_with(|| {
+                        need.push(hash);
+                        Vec::new()
+                    });
+                    pending.push(d);
                 }
             }
-            if let Some((cp, same_mode)) = from_cache {
-                self.reused_files += 1;
-                self.install(&cp, &d, &hash, same_mode)?;
-                continue;
-            }
-            if !self.pending.contains_key(&hash) {
-                debug_assert!(!need.contains(&hash));
-                need.push(hash);
-            }
-            self.pending.entry(hash).or_default().push(d);
         }
         debug_assert!(need.iter().all(|h| self.pending.contains_key(h)));
         Ok(need)
@@ -395,33 +502,59 @@ mod tests {
     }
 
     #[test]
-    fn places_shares_and_skips() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cache = tmp.path().join("cache");
-        let (a, b, c) = (tmp.path().join("wt1/target/debug/app"), tmp.path().join("wt2/target/debug/app"), tmp.path().join("wt1/target/debug/deps/app-1234"));
-        let content = b"an executable";
-        let h = *blake3::hash(content).as_bytes();
-        let mut p = Placer::new(&cache, Placed::default());
-        let need = p.deliver(vec![d(&a, content, true, false), d(&c, content, true, true)], vec![]).unwrap();
-        assert_eq!(need, vec![h]);
-        assert!(!p.settled());
-        p.blob(h, content).unwrap();
-        assert!(p.settled());
-        assert_eq!(std::fs::read(&a).unwrap(), content);
-        assert_eq!(std::fs::read(&c).unwrap(), content);
-        let (ma, mc) = (std::fs::metadata(&a).unwrap(), std::fs::metadata(&c).unwrap());
-        assert!(ma.mode() & 0o111 != 0 && mc.mode() & 0o111 != 0);
-        assert_eq!(mc.nlink(), 1);
-        assert!(mc.mode() & 0o200 != 0);
-        assert_ne!(ma.ino(), mc.ino());
-        let before = mtime_ns(&ma);
-        assert!(p.deliver(vec![d(&a, content, true, false), d(&c, content, true, true)], vec![]).unwrap().is_empty());
-        assert_eq!(mtime_ns(&std::fs::metadata(&a).unwrap()), before);
-        let mut p2 = Placer::new(&cache, Placed::default());
-        assert!(p2.deliver(vec![d(&b, content, true, false)], vec![]).unwrap().is_empty());
-        assert_eq!(std::fs::read(&b).unwrap(), content);
-        let need = p2.deliver(vec![d(&tmp.path().join("x"), b"wanted", false, true)], vec![]).unwrap();
-        assert!(p2.blob(need[0], b"forged").is_err());
+    fn generated_target_placements_keep_unchanged_files_and_only_touch_manifest_paths() {
+        let root = Path::new("/workspace");
+        let target = root.join("target");
+        let unrelated = root.join("src/main.rs");
+        for seed in 0..64 {
+            let mut current = BTreeMap::from([(unrelated.clone(), ([73; 32], 999))]);
+            let mut expected = BTreeMap::new();
+            let mut files = Vec::new();
+            for i in 0..16 {
+                let path = target.join(format!("debug/file{i}"));
+                let same = (seed + i) % 3 == 0;
+                let manifest = d(&path, &[i as u8], i % 2 == 0, i % 4 == 0);
+                current.insert(path.clone(), (if same { manifest.hash } else { [0; 32] }, 500 + i));
+                expected.insert(path, (manifest.hash, if same { 500 + i } else { 1000 }));
+                files.push(manifest);
+            }
+            let plan = PlacementPlan::new(files, vec![]);
+            assert!(plan.invariants());
+            assert!(plan.writes.is_empty());
+            for (dest, hash, size) in &plan.files {
+                assert!(dest.path.starts_with(&target));
+                let (old_hash, old_mtime) = current[&dest.path];
+                let observed = Existing { size: *size, exec: dest.exec, writable: true, links: 1, hash: Some(old_hash) };
+                let cached = Some((PathBuf::from("/cache/input"), true));
+                let mtime = match dest.plan(hash, *size, Some(observed), cached) {
+                    PlaceFile::Keep => old_mtime,
+                    PlaceFile::Install { matching_mode, .. } => {
+                        assert_eq!(dest.materialize(matching_mode).contains(&Materialize::Link), !dest.own);
+                        1000
+                    }
+                    PlaceFile::Fetch => panic!("a cached file is always available"),
+                };
+                current.insert(dest.path.clone(), (*hash, mtime));
+                assert_eq!(current[&unrelated], ([73; 32], 999));
+                assert!(plan.invariants());
+            }
+            current.remove(&unrelated);
+            assert_eq!(current, expected);
+        }
+    }
+
+    #[test]
+    fn installed_file_must_have_the_requested_mode_and_ownership() {
+        let plan = PlacementPlan::new(vec![d(Path::new("target/debug/app"), b"app", true, true)], vec![]);
+        assert!(plan.invariants());
+        let (dest, hash, size) = &plan.files[0];
+        let info = Existing { size: *size, exec: true, writable: true, links: 2, hash: Some(*hash) };
+        assert_eq!(dest.plan(hash, *size, Some(info), None), PlaceFile::Fetch);
+        assert!(plan.invariants());
+        assert_eq!(dest.plan(hash, *size, Some(Existing { exec: false, links: 1, ..info }), None), PlaceFile::Fetch);
+        assert!(plan.invariants());
+        assert_eq!(dest.plan(hash, *size, Some(Existing { links: 1, ..info }), None), PlaceFile::Keep);
+        assert!(plan.invariants());
     }
 
     #[test]
