@@ -173,7 +173,7 @@ impl Ignored {
             .output()
             .ok()
             .filter(|o| o.status.success())?;
-        Some(Ignored::new(out.stdout.split(|&b| b == 0).filter(|p| !p.is_empty()), include))
+        Some(Ignored::new(crate::git::ignored_paths(&out.stdout), include))
     }
 
     fn new<'p>(listed: impl Iterator<Item = &'p [u8]>, include: &[String]) -> Ignored {
