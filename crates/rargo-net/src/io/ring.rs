@@ -29,6 +29,7 @@ pub(super) enum Kind {
     Open,
     Stat,
     Rename,
+    Path,
     Fsync,
     Close,
     Timeout,

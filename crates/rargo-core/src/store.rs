@@ -4,7 +4,7 @@ use crate::hash::Hash;
 use crate::store_index::{ColdRecord, HotMeta, StoreIndex, Touch};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -72,7 +72,7 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn mtime_ns(m: &fs::Metadata) -> i64 {
+fn mtime_ns(m: &std::fs::Metadata) -> i64 {
     m.mtime() * 1_000_000_000 + m.mtime_nsec()
 }
 
@@ -96,21 +96,21 @@ impl Store {
     pub fn open(root: &Path, db: Arc<Db>) -> Result<Store> {
         let blobs = root.join("blobs");
         let tmp = root.join("tmp");
-        fs::create_dir_all(&blobs)?;
-        let _ = fs::remove_dir_all(&tmp);
-        fs::create_dir_all(&tmp)?;
+        crate::io::file::create_dir_all(&blobs)?;
+        let _ = std::fs::remove_dir_all(&tmp);
+        crate::io::file::create_dir_all(&tmp)?;
         for i in 0..256 {
             let d = blobs.join(format!("{i:02x}"));
             if !d.exists() {
-                fs::create_dir(&d)?;
+                crate::io::file::create_dir(&d)?;
             }
         }
         let chunks = root.join("chunks");
-        fs::create_dir_all(&chunks)?;
+        crate::io::file::create_dir_all(&chunks)?;
         for i in 0..256 {
             let d = chunks.join(format!("{i:02x}"));
             if !d.exists() {
-                fs::create_dir(&d)?;
+                crate::io::file::create_dir(&d)?;
             }
         }
         let mut index = StoreIndex::new();
@@ -136,7 +136,7 @@ impl Store {
             Some(v) if v.len() == 8 => index.set_cold_disk(u64::from_le_bytes(v[..8].try_into().unwrap())),
             _ => {}
         }
-        let dev = fs::metadata(&blobs)?.dev();
+        let dev = crate::io::file::metadata(&blobs)?.dev();
         let reflink = {
             let a = tmp.join("reflink-probe-a");
             let b = tmp.join("reflink-probe-b");
@@ -145,8 +145,8 @@ impl Store {
             let fa = File::open(&a)?;
             let fb = File::create(&b)?;
             let ok = reflink(&fa, &fb);
-            let _ = fs::remove_file(&a);
-            let _ = fs::remove_file(&b);
+            let _ = crate::io::file::remove_file(&a);
+            let _ = crate::io::file::remove_file(&b);
             ok
         };
         Ok(Store {
@@ -206,7 +206,7 @@ impl Store {
 
     pub fn tmp_dir(&self, name: &str) -> io::Result<PathBuf> {
         let p = self.tmp.join(name);
-        fs::create_dir_all(&p)?;
+        crate::io::file::create_dir_all(&p)?;
         Ok(p)
     }
 
@@ -245,12 +245,12 @@ impl Store {
         assert!(body.len() <= data.len());
         let tmp = self.tmp_path();
         {
-            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             f.write_all(&[tag])?;
             f.write_all(body)?;
         }
-        let linked = fs::hard_link(&tmp, &dst);
-        let _ = fs::remove_file(&tmp);
+        let linked = crate::io::file::hard_link(&tmp, &dst);
+        let _ = crate::io::file::remove_file(&tmp);
         match linked {
             Ok(()) => Ok(body.len() as u64 + 1),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(0),
@@ -259,7 +259,7 @@ impl Store {
     }
 
     fn read_chunk(&self, c: &ChunkRef) -> io::Result<Vec<u8>> {
-        let raw = fs::read(self.chunk_path(&c.hash))?;
+        let raw = crate::io::file::read(self.chunk_path(&c.hash))?;
         let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("chunk {} is damaged", c.hash));
         let data = match raw.split_first() {
             Some((0, body)) => body.to_vec(),
@@ -299,7 +299,7 @@ impl Store {
         self.db.put(Table::Cold, &h.0, &bincode::serialize(&ColdMeta::from(record)).unwrap());
         self.db.delete(Table::Blobs, &h.0);
         for v in &variants {
-            let _ = fs::remove_file(v);
+            let _ = crate::io::file::remove_file(v);
         }
         self.set_cold_disk();
         Ok(Some((size * variants.len() as u64).saturating_sub(added)))
@@ -318,7 +318,7 @@ impl Store {
             return Ok(None);
         };
         for v in &variants {
-            if fs::metadata(v)?.nlink() != 1 {
+            if crate::io::file::metadata(v)?.nlink() != 1 {
                 return Ok(None);
             }
         }
@@ -371,7 +371,7 @@ impl Store {
         };
         let tmp = self.tmp_path();
         let built = (|| -> io::Result<()> {
-            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             let mut hasher = blake3::Hasher::new();
             let mut written = 0u64;
             for c in &recipe {
@@ -388,7 +388,7 @@ impl Store {
             Ok(())
         })();
         if let Err(e) = built {
-            let _ = fs::remove_file(&tmp);
+            let _ = crate::io::file::remove_file(&tmp);
             if self.index.lock().fail_thaw(h) {
                 self.db.delete(Table::Cold, &h.0);
             }
@@ -422,7 +422,7 @@ impl Store {
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
         for i in 0..256 {
             let prefix = format!("{i:02x}");
-            let Ok(rd) = fs::read_dir(self.chunks.join(&prefix)) else {
+            let Ok(rd) = std::fs::read_dir(self.chunks.join(&prefix)) else {
                 continue;
             };
             for ent in rd.flatten() {
@@ -432,7 +432,7 @@ impl Store {
                 match hash {
                     Some(c) if live.contains(&c) => kept += len,
                     _ => {
-                        if fs::remove_file(ent.path()).is_ok() {
+                        if crate::io::file::remove_file(ent.path()).is_ok() {
                             n += 1;
                             freed += len;
                         }
@@ -494,8 +494,8 @@ impl Store {
             let (actual, _) = Hash::of_file(&f)?;
             if actual != *h {
                 self.forget(h);
-                let _ = fs::remove_file(self.path_of(h, false));
-                let _ = fs::remove_file(self.path_of(h, true));
+                let _ = crate::io::file::remove_file(self.path_of(h, false));
+                let _ = crate::io::file::remove_file(self.path_of(h, true));
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("blob {h} was modified on disk and has been dropped"),
@@ -532,7 +532,7 @@ impl Store {
         }
         let tmp = self.tmp_path();
         {
-            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             f.write_all(bytes)?;
         }
         self.install(&tmp, h, false, bytes.len() as u64)?;
@@ -543,7 +543,7 @@ impl Store {
     pub fn put_file_move(&self, path: &Path, exec: bool) -> io::Result<(Hash, u64)> {
         let (h, size) = Hash::of_path(path)?;
         if self.has(&h) && self.existing(&h, exec).is_some() {
-            let _ = fs::remove_file(path);
+            let _ = crate::io::file::remove_file(path);
             self.touch(&h);
             return Ok((h, size));
         }
@@ -558,26 +558,26 @@ impl Store {
             return Ok((h, size));
         }
         let tmp = self.tmp_path();
-        fs::hard_link(path, &tmp)?;
+        crate::io::file::hard_link(path, &tmp)?;
         self.install(&tmp, h, exec, size)?;
         Ok((h, size))
     }
 
     pub fn put_file_copy(&self, src: &File, exec: bool) -> io::Result<(Hash, u64)> {
         let tmp = self.tmp_path();
-        let dst = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp)?;
+        let dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp)?;
         clone_or_copy(src, &dst)?;
         drop(dst);
         let r = self.put_file_move(&tmp, exec);
         if r.is_err() {
-            let _ = fs::remove_file(&tmp);
+            let _ = crate::io::file::remove_file(&tmp);
         }
         r
     }
 
     pub fn install_hashed(&self, tmp: &Path, h: Hash, size: u64) -> io::Result<()> {
         if self.has(&h) && self.existing(&h, false).is_some() {
-            let _ = fs::remove_file(tmp);
+            let _ = crate::io::file::remove_file(tmp);
             self.touch(&h);
             return Ok(());
         }
@@ -586,11 +586,11 @@ impl Store {
 
     fn install(&self, tmp: &Path, h: Hash, exec: bool, size: u64) -> io::Result<()> {
         let dst = self.path_of(&h, exec);
-        fs::set_permissions(tmp, fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
-        fs::rename(tmp, &dst)?;
-        let m = fs::metadata(&dst)?;
+        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
+        crate::io::file::rename(tmp, &dst)?;
+        let m = crate::io::file::metadata(&dst)?;
         assert_eq!(m.len(), size, "the installed file is the size the caller hashed");
-        self.record(h, size, mtime_ns(&m));
+        self.record(h, size, m.mtime_ns());
         assert!(self.index.lock().is_whole(&h));
         Ok(())
     }
@@ -604,11 +604,11 @@ impl Store {
         let src = File::open(&other)?;
         let tmp = self.tmp_path();
         let dst =
-            fs::OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
         clone_or_copy(&src, &dst)?;
         drop(dst);
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
-        fs::rename(&tmp, &want)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
+        crate::io::file::rename(&tmp, &want)?;
         Ok(want)
     }
 
@@ -620,23 +620,23 @@ impl Store {
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let src = self.open_blob(h)?;
-            let dst = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+            let dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
             Ok(if clone_or_copy(&src, &dst)? { Placed::Reflink } else { Placed::Copy })
         })();
         match placed {
             Ok(p) => {
-                fs::rename(&tmp, dest).with_context(|| format!("placing {}", dest.display()))?;
+                crate::io::file::rename(&tmp, dest).with_context(|| format!("placing {}", dest.display()))?;
                 Ok(p)
             }
             Err(e) => {
-                let _ = fs::remove_file(&tmp);
+                let _ = crate::io::file::remove_file(&tmp);
                 Err(e)
             }
         }
     }
 
     pub fn is_linked(&self, h: &Hash, exec: bool, dest: &Path) -> bool {
-        let (Ok(d), Ok(s)) = (fs::metadata(dest), fs::metadata(self.path_of(h, exec))) else {
+        let (Ok(d), Ok(s)) = (crate::io::file::metadata(dest), crate::io::file::metadata(self.path_of(h, exec))) else {
             return false;
         };
         d.dev() == s.dev() && d.ino() == s.ino()
@@ -651,39 +651,39 @@ impl Store {
             parent.join(format!(".rargo-tmp-{}-{}", std::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
-            let same_fs = fs::metadata(parent)?.dev() == self.dev;
+            let same_fs = crate::io::file::metadata(parent)?.dev() == self.dev;
             if same_fs && self.reflink {
                 let src = self.open_blob(h)?;
-                let dst = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+                let dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
                 if reflink(&src, &dst) {
                     return Ok(Placed::Reflink);
                 }
                 drop(dst);
-                fs::remove_file(&tmp)?;
+                crate::io::file::remove_file(&tmp)?;
             }
             if same_fs {
                 let src = self.variant(h, exec)?;
-                let m = fs::metadata(&src)?;
+                let m = crate::io::file::metadata(&src)?;
                 if m.len() != meta.size {
                     anyhow::bail!("blob {h} has the wrong size on disk");
                 }
-                if fs::hard_link(&src, &tmp).is_ok() {
+                if crate::io::file::hard_link(&src, &tmp).is_ok() {
                     return Ok(Placed::Hardlink);
                 }
             }
             let src = self.open_blob(h)?;
-            let mut dst = fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+            let mut dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
             let mut s = &src;
             io::copy(&mut s, &mut dst)?;
             Ok(Placed::Copy)
         })();
         match placed {
             Ok(p) => {
-                fs::rename(&tmp, dest).with_context(|| format!("placing {}", dest.display()))?;
+                crate::io::file::rename(&tmp, dest).with_context(|| format!("placing {}", dest.display()))?;
                 Ok(p)
             }
             Err(e) => {
-                let _ = fs::remove_file(&tmp);
+                let _ = crate::io::file::remove_file(&tmp);
                 Err(e)
             }
         }
@@ -727,8 +727,8 @@ impl Store {
             if e.cold {
                 self.db.delete(Table::Cold, &e.hash.0);
             } else {
-                let _ = fs::remove_file(self.path_of(&e.hash, false));
-                let _ = fs::remove_file(self.path_of(&e.hash, true));
+                let _ = crate::io::file::remove_file(self.path_of(&e.hash, false));
+                let _ = crate::io::file::remove_file(self.path_of(&e.hash, true));
             }
         }
     }
@@ -750,14 +750,15 @@ impl Store {
 
     pub fn remove(&self, h: &Hash) {
         self.forget(h);
-        let _ = fs::remove_file(self.path_of(h, false));
-        let _ = fs::remove_file(self.path_of(h, true));
+        let _ = crate::io::file::remove_file(self.path_of(h, false));
+        let _ = crate::io::file::remove_file(self.path_of(h, true));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn store() -> (tempfile::TempDir, Store) {
         let d = tempfile::tempdir().unwrap();
