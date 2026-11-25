@@ -6,7 +6,9 @@ import sys
 
 BUDGETS = "crates/rargo-purity/budgets.txt"
 ALLOW = "crates/rargo-purity/allow.txt"
-SCANNER = "crates/rargo-purity/src"
+SCANNER = "crates/rargo-purity/src/"
+PURITY = "crates/rargo-purity/"
+MEASURE = "cpu-across-runners"
 
 
 def rows(text):
@@ -17,7 +19,7 @@ def measure(text):
     for cols in rows(text):
         if cols[0] == "measure":
             return cols[1]
-    return "wall"
+    return None
 
 
 def parse_budgets(text):
@@ -73,6 +75,8 @@ def cpu_of(argv, cwd, env):
 
 
 def cpu(extra):
+    if measure(open(BUDGETS).read()) != MEASURE:
+        sys.exit(f"{BUDGETS} must measure {MEASURE}, which is what this script measures")
     suite, default, slow = parse_budgets(open(BUDGETS).read())
     root = os.getcwd()
     asroot = [] if os.geteuid() == 0 else ["sudo", "-E"]
@@ -128,7 +132,8 @@ def at(base, path):
 
 def ratchet(base):
     problems = []
-    scanner = subprocess.run(["git", "diff", "--quiet", base, "--", SCANNER]).returncode != 0
+    changed = subprocess.run(["git", "diff", "--name-only", base], capture_output=True, text=True, check=True).stdout.split()
+    scanner = any(f.startswith(SCANNER) for f in changed) and all(f.startswith(PURITY) for f in changed)
     old = at(base, ALLOW)
     if old is not None:
         before, now = parse_allow(old), parse_allow(open(ALLOW).read())
@@ -138,15 +143,20 @@ def ratchet(base):
                 grown.append(f"{ALLOW} gains an entry: {key[0]} {key[1]}")
             elif count > before[key]:
                 grown.append(f"{ALLOW} raises {key[0]} {key[1]} from {before[key]} to {count}")
-        if scanner:
+        if scanner and grown:
+            print(f"this change touches only {PURITY}, so the scanner's new findings are recorded, not added:")
             for g in grown:
-                print(f"recorded by the changed scanner, not added: {g}")
+                print(f"  {g}")
+        elif grown and any(f.startswith(SCANNER) for f in changed):
+            problems.append(f"a change to the scanner may record new entries only if it changes nothing outside {PURITY}")
+            problems.extend(grown)
         else:
             problems.extend(grown)
     old = at(base, BUDGETS)
+    if measure(open(BUDGETS).read()) != MEASURE:
+        problems.append(f"{BUDGETS} must measure {MEASURE}")
     if old is not None and measure(old) != measure(open(BUDGETS).read()):
-        print(f"{BUDGETS} measures {measure(open(BUDGETS).read())} time where {base} measured {measure(old)} time; its budgets are not compared")
-        old = None
+        problems.append(f"{BUDGETS} changes its measure from {measure(old)} to {measure(open(BUDGETS).read())}")
     if old is not None:
         (s0, d0, slow0), (s1, d1, slow1) = parse_budgets(old), parse_budgets(open(BUDGETS).read())
         if s1 > s0:
