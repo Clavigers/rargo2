@@ -382,6 +382,33 @@ mod tests {
     }
 
     #[test]
+    fn stored_credentials_and_the_host_line_are_read_and_written_as_text() {
+        let all: toml::Table = "[\"a.example\"]\nid = \"t1\"\nsecret = \"s1\"\nname = \"ann\"\n[\"b.example:7\"]\nid = \"t2\"\nsecret = \"s2\"\n[\"c.example\"]\nid = \"t3\"\n[\"d.example\"]\nid = 4\nsecret = \"s4\"\nflat = 1\n"
+            .parse()
+            .unwrap();
+        let got = |host: &str| credential_in(&all, host).map(|c| (c.id, c.secret, c.name));
+        assert_eq!(got("a.example"), Some(("t1".into(), "s1".into(), "ann".into())));
+        assert_eq!(got("b.example:7"), Some(("t2".into(), "s2".into(), String::new())), "the name is optional");
+        assert_eq!(got("c.example"), None, "a token without its secret is no credential");
+        assert_eq!(got("d.example"), None, "nor one whose id is not text");
+        assert_eq!(got("flat"), None);
+        assert_eq!(got("e.example"), None);
+
+        let path = Path::new("/c/config.toml");
+        for (before, after) in [
+            ("", "host = \"h.example\"\n"),
+            ("host = \"old\"\n", "host = \"h.example\"\n"),
+            ("# mine\nother = 1 # kept\n", "# mine\nother = 1 # kept\nhost = \"h.example\"\n"),
+            ("host = 7\n[t]\nx = 1\n", "host = \"h.example\"\n[t]\nx = 1\n"),
+        ] {
+            assert_eq!(set_host_text(path, "h.example", before).unwrap(), after, "{before:?}");
+        }
+        let bad = "host = \"";
+        let expected = format!("/c/config.toml: {}", bad.parse::<toml_edit::DocumentMut>().unwrap_err());
+        assert_eq!(set_host_text(path, "h.example", bad).unwrap_err(), expected);
+    }
+
+    #[test]
     fn hosts_and_tokens_are_told_from_what_they_are_not() {
         assert!(valid_host("rargo.rs") && valid_host("build.example:7459") && valid_host("10.0.0.1:7459"));
         assert!(!valid_host("") && !valid_host("a b") && !valid_host("http://x") && !valid_host(":7459"));
