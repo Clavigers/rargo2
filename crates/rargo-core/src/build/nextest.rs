@@ -1,3 +1,4 @@
+use super::nextest_run::{Asked, Effect as NextEffect, NextestRun, TestAsked, exit_code};
 use super::*;
 use std::io::Read;
 
@@ -105,109 +106,240 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     }
 
     let mut answers = Answers::default();
-    let mut fetched = false;
-    let build_args = loop {
-        let base = with_nextest(d, &p, &nextest);
-        let view: Arc<dyn View> = Arc::new(BuildView {
-            base,
-            layer: Arc::new(OutputsLayer::new()),
-            levels: Arc::new(Vec::new()),
-            untraced: Vec::new(),
-            seed: Some(answer_layer(d, &answers, &HashMap::new())?),
-            content: Some(d.engine.content.clone()),
-        });
-        let env = action_env(&p.env, None, c);
-        let r = d
-            .engine
-            .obtain(Request {
-                spec: spec(&p, argv.clone(), env, NetMode::Loopback),
-                view,
-                client_env: c.env.clone(),
-                uid: c.uid,
-                gid: c.gid,
-                prio: c.prio,
-                no_cache: false,
-                seed_blobs: Default::default(),
-                cacheable: Arc::new(|r| r.outputs.get(ASKED.as_bytes()).is_some()),
-                declared_env: Arc::new(|_, _| Vec::new()),
-                observer: Arc::new(NullObserver),
-            })
-            .await?
-            .result;
-        let question = match r.outputs.get(ASKED.as_bytes()) {
-            Some(MEntry::File { hash, .. }) => parse_question(&d.store().read(hash)?),
-            _ => None,
-        };
-        match question {
-            Some(Question::Metadata(m)) => {
-                let a = metadata(d, c, &p, m).await?;
-                if a.code != 0 && !fetched && needs_network(&a.err) {
-                    fetched = true;
-                    let (components, offline) = (missing_components(&a.err), offline_args(&a.args));
-                    if offline && components.is_empty() {
-                        return Ok(101);
-                    }
-                    let Some(snapshot) = fetch(d, c, &p, &a.args, components, offline).await? else {
-                        return Ok(101);
+    let (mut run, first) = NextestRun::new();
+    let mut todo: std::collections::VecDeque<NextEffect> = first.into();
+    let mut built: Option<Built> = None;
+    let mut rounds: Option<Rounds> = None;
+    let mut ran: HashMap<String, Ran> = HashMap::new();
+    let mut last: Option<Arc<ActionResult>> = None;
+    while let Some(effect) = todo.pop_front() {
+        let next = match effect {
+            NextEffect::RunNextest => match &rounds {
+                None => {
+                    let r = ask(d, c, &p, &nextest, &argv, &answers).await?;
+                    let question = match r.outputs.get(ASKED.as_bytes()) {
+                        Some(MEntry::File { hash, .. }) => parse_question(&d.store().read(hash)?),
+                        _ => None,
                     };
-                    p = prepare(d, c, snapshot).await?;
-                    continue;
+                    let asked = match question {
+                        Some(Question::Metadata(m)) => Asked::Metadata(m),
+                        Some(Question::Build(b)) => Asked::Build(b),
+                        None => Asked::Nothing,
+                    };
+                    let code = r.code();
+                    last = Some(r);
+                    run.asked(asked, code)
                 }
+                Some(rounds) => {
+                    let r = rounds.nextest(d, c, &p, &argv, &answers, &ran).await?;
+                    let asked: Vec<TestAsked> = rounds
+                        .asked
+                        .lock()
+                        .iter()
+                        .map(|q| TestAsked { key: q.key.clone(), listing: q.listing })
+                        .collect();
+                    last = Some(r);
+                    run.round_ended(asked)
+                }
+            },
+            NextEffect::Metadata(m) => {
+                let a = metadata(d, c, &p, m).await?;
+                let fx = run.metadata_answered(&a.args, a.code, &a.err);
                 answers.metadata = Some(a);
+                fx
             }
-            Some(Question::Build(b)) => break b,
-            None => {
+            NextEffect::Fetch { args, components, offline } => {
+                answers.metadata = None;
+                match fetch(d, c, &p, &args, components, offline).await? {
+                    Some(snapshot) => {
+                        p = prepare(d, c, snapshot).await?;
+                        run.fetched(true)
+                    }
+                    None => run.fetched(false),
+                }
+            }
+            NextEffect::Prepare => Vec::new(),
+            NextEffect::Build(build_args) => {
+                let host = answers.metadata.as_ref().and_then(|m| {
+                    m.args.iter().find_map(|a| a.strip_prefix("--filter-platform=").map(String::from))
+                });
+                let target = arg_value(&build_args, "--target").map(String::from);
+                let (answer, b) = build(d, c, build_args).await?;
+                answers.build = Some(answer);
+                built = b;
+                rounds = Some(Rounds::new(d, c, &p, &nextest, built.as_ref(), host.iter().chain(target.iter())));
+                run.built()
+            }
+            NextEffect::RunTests(keys) => {
+                let rounds = rounds.as_ref().expect("tests run in the rounds");
+                let asked = std::mem::take(&mut *rounds.asked.lock());
+                let mut set = tokio::task::JoinSet::new();
+                for key in keys {
+                    let q = asked.iter().find(|q| q.key == key).expect("the core runs what nextest asked").clone();
+                    let (d, c, p_policy, view) = (d.clone(), c.clone(), p.policy.clone(), rounds.tests_view.clone());
+                    let (root_id, no_cache) = (p.flake.id, no_cache);
+                    set.spawn(async move {
+                        let ran = run_test(&d, &c, &p_policy, view, root_id, no_cache, &q).await;
+                        (q, ran)
+                    });
+                }
+                let mut fx = Vec::new();
+                while let Some(done) = set.join_next().await {
+                    let (q, outcome) = done?;
+                    let (result, cached) = outcome?;
+                    deliver_writes(c, &p, built.as_ref(), &result.outputs);
+                    let store = d.store();
+                    ran.insert(
+                        q.key.clone(),
+                        Ran {
+                            q: q.key.clone(),
+                            out: store.read(&result.stdout)?,
+                            err: store.read(&result.stderr)?,
+                            status: match result.signal() {
+                                Some(sig) => format!("signal {sig}"),
+                                None => format!("exit {}", result.code().unwrap_or(101)),
+                            },
+                        },
+                    );
+                    fx.extend(run.test_ran(&q.key, cached));
+                }
+                fx
+            }
+            NextEffect::ShowNextest => {
+                let r = last.as_ref().expect("nextest ran");
                 let store = d.store();
                 c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
-                c.out.err_text(&String::from_utf8_lossy(&store.read(&r.stderr)?));
-                return Ok(r.code().unwrap_or(101));
+                if rounds.is_some() {
+                    c.out.err_text(&without_runner_note(&String::from_utf8_lossy(&store.read(&r.stderr)?)));
+                } else {
+                    c.out.err_text(&String::from_utf8_lossy(&store.read(&r.stderr)?));
+                }
+                Vec::new()
             }
-        }
-    };
+            NextEffect::Finish => {
+                let r = last.as_ref().expect("nextest ran");
+                if let Some(text) = run.summary() {
+                    c.out.status("Replayed", &text);
+                }
+                deliver_writes(c, &p, built.as_ref(), &r.outputs);
+                let (code, why) = exit_code(r.code(), &describe_status(r.status));
+                if let Some(why) = why {
+                    c.out.error(&why);
+                }
+                return Ok(code);
+            }
+            NextEffect::End(code) => return Ok(code),
+        };
+        run.invariants();
+        todo.extend(next);
+    }
+    unreachable!("a nextest run ends with an end or a finish, not in {:?}", run.phase())
+}
 
-    let host = answers.metadata.as_ref().and_then(|m| {
-        m.args.iter().find_map(|a| a.strip_prefix("--filter-platform=").map(String::from))
+async fn ask(
+    d: &Arc<Daemon>,
+    c: &Arc<Client>,
+    p: &Prepared,
+    nextest: &Path,
+    argv: &[Vec<u8>],
+    answers: &Answers,
+) -> Result<Arc<ActionResult>> {
+    let base = with_nextest(d, p, nextest);
+    let view: Arc<dyn View> = Arc::new(BuildView {
+        base,
+        layer: Arc::new(OutputsLayer::new()),
+        levels: Arc::new(Vec::new()),
+        untraced: Vec::new(),
+        seed: Some(answer_layer(d, answers, &HashMap::new())?),
+        content: Some(d.engine.content.clone()),
     });
-    let target = arg_value(&build_args, "--target").map(String::from);
-    let (answer, built) = build(d, c, build_args).await?;
-    answers.build = Some(answer);
+    let env = action_env(&p.env, None, c);
+    Ok(d
+        .engine
+        .obtain(Request {
+            spec: spec(p, argv.to_vec(), env, NetMode::Loopback),
+            view,
+            client_env: c.env.clone(),
+            uid: c.uid,
+            gid: c.gid,
+            prio: c.prio,
+            no_cache: false,
+            seed_blobs: Default::default(),
+            cacheable: Arc::new(|r| r.outputs.get(ASKED.as_bytes()).is_some()),
+            declared_env: Arc::new(|_, _| Vec::new()),
+            observer: Arc::new(NullObserver),
+        })
+        .await?
+        .result)
+}
 
-    let base = with_nextest(d, &p, &nextest);
-    let (layer, levels) = match &built {
-        Some(b) => (b.layer.clone(), Arc::new(vec![LEVEL_FULL; b.units])),
-        None => (Arc::new(OutputsLayer::new()), Arc::new(Vec::new())),
-    };
-    let mut env = match &built {
-        Some(b) => action_env(&b.env, b.cargo_override.as_deref(), c),
-        None => action_env(&p.env, None, c),
-    };
-    let runner = vjoin(AT, b"runner");
-    for triple in host.iter().chain(target.iter()) {
-        let var = format!("CARGO_TARGET_{}_RUNNER", triple.to_uppercase().replace(['-', '.'], "_"));
-        env.insert(bytes(&var), runner.clone());
-    }
-    if !c.env.contains_key("NEXTEST_TEST_THREADS") {
-        env.insert(bytes("NEXTEST_TEST_THREADS"), bytes(&d.engine.sched.tokens().to_string()));
-    }
-    let tests_view: Arc<dyn View> =
-        Arc::new(BuildView { base: p.base.clone(), layer: layer.clone(), levels: levels.clone(), untraced: Vec::new(), seed: None, content: Some(d.engine.content.clone()) });
-    let mut ran: HashMap<String, Ran> = HashMap::new();
-    let (mut replayed, mut run_now) = (0usize, 0usize);
-    let mut round = 0;
-    let r = loop {
-        round += 1;
-        let view: Arc<dyn View> = Arc::new(BuildView {
-            base: base.clone(),
+struct Rounds {
+    base: Arc<BaseView>,
+    layer: Arc<OutputsLayer>,
+    levels: Arc<Vec<u8>>,
+    env: BTreeMap<Vec<u8>, Vec<u8>>,
+    tests_view: Arc<dyn View>,
+    asked: Mutex<Vec<TestQuestion>>,
+}
+
+impl Rounds {
+    fn new<'a>(
+        d: &Arc<Daemon>,
+        c: &Arc<Client>,
+        p: &Prepared,
+        nextest: &Path,
+        built: Option<&Built>,
+        triples: impl Iterator<Item = &'a String>,
+    ) -> Rounds {
+        let base = with_nextest(d, p, nextest);
+        let (layer, levels) = match built {
+            Some(b) => (b.layer.clone(), Arc::new(vec![LEVEL_FULL; b.units])),
+            None => (Arc::new(OutputsLayer::new()), Arc::new(Vec::new())),
+        };
+        let mut env = match built {
+            Some(b) => action_env(&b.env, b.cargo_override.as_deref(), c),
+            None => action_env(&p.env, None, c),
+        };
+        let runner = vjoin(AT, b"runner");
+        for triple in triples {
+            let var = format!("CARGO_TARGET_{}_RUNNER", triple.to_uppercase().replace(['-', '.'], "_"));
+            env.insert(bytes(&var), runner.clone());
+        }
+        if !c.env.contains_key("NEXTEST_TEST_THREADS") {
+            env.insert(bytes("NEXTEST_TEST_THREADS"), bytes(&d.engine.sched.tokens().to_string()));
+        }
+        let tests_view: Arc<dyn View> = Arc::new(BuildView {
+            base: p.base.clone(),
             layer: layer.clone(),
             levels: levels.clone(),
             untraced: Vec::new(),
-            seed: Some(answer_layer(d, &answers, &ran)?),
+            seed: None,
+            content: Some(d.engine.content.clone()),
+        });
+        Rounds { base, layer, levels, env, tests_view, asked: Mutex::new(Vec::new()) }
+    }
+
+    async fn nextest(
+        &self,
+        d: &Arc<Daemon>,
+        c: &Arc<Client>,
+        p: &Prepared,
+        argv: &[Vec<u8>],
+        answers: &Answers,
+        ran: &HashMap<String, Ran>,
+    ) -> Result<Arc<ActionResult>> {
+        let view: Arc<dyn View> = Arc::new(BuildView {
+            base: self.base.clone(),
+            layer: self.layer.clone(),
+            levels: self.levels.clone(),
+            untraced: Vec::new(),
+            seed: Some(answer_layer(d, answers, ran)?),
             content: Some(d.engine.content.clone()),
         });
         let r = d
             .engine
             .obtain(Request {
-                spec: spec(&p, argv.clone(), env.clone(), NetMode::Loopback),
+                spec: spec(p, argv.to_vec(), self.env.clone(), NetMode::Loopback),
                 view,
                 client_env: c.env.clone(),
                 uid: c.uid,
@@ -217,83 +349,28 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                 seed_blobs: Default::default(),
                 cacheable: Arc::new(|r| r.success() || r.outputs.entries.iter().any(|(p, _)| is_test_question(p))),
                 declared_env: Arc::new(|_, _| Vec::new()),
-                observer: Arc::new(Explaining {
-                    c: c.clone(),
-                    label: "nextest".into(),
-                }),
+                observer: Arc::new(Explaining { c: c.clone(), label: "nextest".into() }),
             })
             .await?
             .result;
         let store = d.store();
-        let mut questions = Vec::new();
+        let mut asked = self.asked.lock();
+        asked.clear();
         for (path, e) in &r.outputs.entries {
             if let (true, MEntry::File { hash, .. }) = (is_test_question(path), e)
                 && let Some(q) = TestQuestion::parse(&store.read(hash)?)
-                && !ran.contains_key(&q.key)
-                && !questions.iter().any(|o: &TestQuestion| o.key == q.key)
+                && !asked.iter().any(|o: &TestQuestion| o.key == q.key)
             {
-                questions.push(q);
+                asked.push(q);
             }
         }
-        if questions.is_empty() || round == MOST_ROUNDS {
-            break r;
-        }
-        let mut set = tokio::task::JoinSet::new();
-        for q in questions {
-            let (d, c, p_policy, view) = (d.clone(), c.clone(), p.policy.clone(), tests_view.clone());
-            let (root_id, no_cache) = (p.flake.id, no_cache);
-            set.spawn(async move {
-                let ran = run_test(&d, &c, &p_policy, view, root_id, no_cache, &q).await;
-                (q, ran)
-            });
-        }
-        while let Some(done) = set.join_next().await {
-            let (q, outcome) = done?;
-            let (result, cached) = outcome?;
-            if !q.listing {
-                if cached { replayed += 1 } else { run_now += 1 }
-            }
-            deliver_writes(c, &p, built.as_ref(), &result.outputs);
-            let store = d.store();
-            ran.insert(q.key.clone(), Ran {
-                q: q.key.clone(),
-                out: store.read(&result.stdout)?,
-                err: store.read(&result.stderr)?,
-                status: match result.signal() {
-                    Some(sig) => format!("signal {sig}"),
-                    None => format!("exit {}", result.code().unwrap_or(101)),
-                },
-            });
-        }
-    };
-
-    let store = d.store();
-    c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
-    c.out.err_text(&without_runner_note(&String::from_utf8_lossy(&store.read(&r.stderr)?)));
-    if replayed + run_now > 0 {
-        c.out.status(
-            "Replayed",
-            &format!(
-                "{replayed} of {} test runs from rargo's cache ({run_now} run on the server; `--no-cache` runs every test)",
-                replayed + run_now
-            ),
-        );
-    }
-    deliver_writes(c, &p, built.as_ref(), &r.outputs);
-    match r.code() {
-        Some(code) => Ok(code),
-        None => {
-            c.out.error(&format!("nextest did not exit normally ({})", describe_status(r.status)));
-            Ok(101)
-        }
+        Ok(r)
     }
 }
 
 fn without_runner_note(err: &str) -> String {
     err.split_inclusive('\n').filter(|l| !l.contains("using target runner `/rargo/nextest/runner`")).collect()
 }
-
-const MOST_ROUNDS: usize = 16;
 
 const TEST_QUESTIONS: &[u8] = b"/.rargo-nextest-q";
 
