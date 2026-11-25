@@ -780,28 +780,6 @@ struct Prepared {
     env: BTreeMap<String, String>,
 }
 
-/// Makes cargo treat itself as a nightly cargo.
-const NIGHTLY_CHANNEL_ENV: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
-
-/// Whether the compiler at `rustc` (a store path, so its answer never
-/// changes) is a nightly or a locally built one, the channels on which
-/// cargo allows unstable features.
-fn nightly_rustc(rustc: &str) -> bool {
-    static SEEN: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
-    if let Some(&n) = SEEN.lock().get(rustc) {
-        return n;
-    }
-    let version = std::process::Command::new(rustc).arg("-V").env_clear().output().ok().filter(|o| o.status.success());
-    let n = version.is_some_and(|o| nightly_version(&String::from_utf8_lossy(&o.stdout)));
-    SEEN.lock().insert(rustc.to_owned(), n);
-    n
-}
-
-/// `rustc 1.102.0-nightly (bdf712ee8 2026-11-21)`, or `-dev`: nightly.
-fn nightly_version(v: &str) -> bool {
-    v.split_whitespace().nth(1).is_some_and(|ver| ver.ends_with("-nightly") || ver.ends_with("-dev"))
-}
-
 async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
     let dir = c.policy_dir()?;
     let policy = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
@@ -868,12 +846,6 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
-    }
-    // The planner is a cargo built on stable, and cargo allows nightly
-    // features (`cargo-features` in a manifest, `-Z` flags) by its own
-    // channel: it plans on the channel of the toolchain that builds.
-    if flake.which("rustc").is_some_and(|rustc| nightly_rustc(&rustc)) {
-        env.insert(NIGHTLY_CHANNEL_ENV.into(), "nightly".into());
     }
     Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
 }
@@ -3277,15 +3249,6 @@ mod tests {
         assert_eq!(script_warning_message("cargo:warning="), Some(""));
         assert_eq!(script_warning_message("cargo:rustc-cfg=has_generated"), None);
         assert_eq!(script_warning_message("not a directive"), None);
-    }
-
-    #[test]
-    fn a_nightly_or_local_compiler_is_on_the_nightly_channel() {
-        assert!(nightly_version("rustc 1.102.0-nightly (bdf712ee8 2026-11-21)\n"));
-        assert!(nightly_version("rustc 1.103.0-dev\n"));
-        assert!(!nightly_version("rustc 1.97.1 (8bab26f4f 2026-07-14)\n"));
-        assert!(!nightly_version("rustc 1.98.0-beta.3 (0123abcde 2026-11-20)\n"));
-        assert!(!nightly_version(""));
     }
 
     #[test]

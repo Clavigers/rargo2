@@ -44,6 +44,11 @@ printf '#!/bin/sh\necho "the server cargo home bin'"'"'s cargo-clippy ran" >&2\n
 chmod +x "$RARGO_SERVER_CARGO_HOME/bin/cargo-clippy"
 # The stock Cargo checks intentionally exercise the fixture's own target/.
 unset CARGO_TARGET_DIR
+# Stock cargo is the toolchain a project without a toolchain file builds
+# with: the nightly the bundled shell names, whose cargo the planner is.
+RUSTUP_TOOLCHAIN=$(sed -n 's/.*toolchainFile == null then { channel = "\(nightly-[0-9-]*\)"; }.*/\1/p' "$(dirname "$0")/../nix/default/flake.nix")
+[ -n "$RUSTUP_TOOLCHAIN" ] || { echo "e2e: no default toolchain in nix/default/flake.nix" >&2; exit 2; }
+export RUSTUP_TOOLCHAIN
 echo "e2e: state=$RARGO_STATE client=$T server=$RARGO_SERVER"
 fails=0
 checks=0

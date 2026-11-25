@@ -1,4 +1,4 @@
-From 197c5c808db663d02933e4a5531da52774e742b2 Mon Sep 17 00:00:00 2001
+From 488c0fec8d5aeff1072ad553f3d2f51c769b274e Mon Sep 17 00:00:00 2001
 From: rargo <rargo@localhost>
 Date: Mon, 23 Nov 2026 10:25:49 +0100
 Subject: [PATCH 8/8] rargo: plan carries --timings and the future-incompat
@@ -10,10 +10,10 @@ Subject: [PATCH 8/8] rargo: plan carries --timings and the future-incompat
  2 files changed, 13 insertions(+)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index 6fee881df..6f07a1be5 100644
+index 33163167f..c53de4866 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -70,6 +70,9 @@ struct Global {
+@@ -71,6 +71,9 @@ struct Global {
      deny_warnings: bool,
      rustc_fork: bool,
      dep_info_basedir: Option<String>,
@@ -23,7 +23,7 @@ index 6fee881df..6f07a1be5 100644
  }
  
  fn state() -> &'static Mutex<State> {
-@@ -157,6 +160,9 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+@@ -158,6 +161,9 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
          verbosity: verbosity(gctx.shell().verbosity()),
          extra_verbose: gctx.extra_verbose(),
          keep_going: bcx.build_config.keep_going,
@@ -33,7 +33,7 @@ index 6fee881df..6f07a1be5 100644
          deny_warnings: gctx.warning_handling()? == crate::context::WarningHandling::Deny,
          rustc_fork: bcx
              .target_data
-@@ -314,6 +320,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
+@@ -315,6 +321,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
          desc: super::descriptive_pkg_name(&unit.pkg.name(), &unit.target, &unit.mode),
          verb,
          is_local: unit.is_local(),
@@ -41,7 +41,7 @@ index 6fee881df..6f07a1be5 100644
          show_warnings: unit.show_warnings(gctx),
          fix_hint,
          pkg_spec: unit.pkg.package_id().to_spec().to_string(),
-@@ -685,6 +692,9 @@ pub fn finish() -> CargoResult<()> {
+@@ -690,6 +697,9 @@ pub fn finish() -> CargoResult<()> {
          verbosity: g.verbosity,
          extra_verbose: g.extra_verbose,
          keep_going: g.keep_going,
@@ -52,10 +52,10 @@ index 6fee881df..6f07a1be5 100644
          no_fail_fast,
          nocapture,
 diff --git a/src/compiler/timings/mod.rs b/src/compiler/timings/mod.rs
-index 3649e28a3..b23b83355 100644
+index 4befbc61a..8229b24b1 100644
 --- a/src/compiler/timings/mod.rs
 +++ b/src/compiler/timings/mod.rs
-@@ -262,7 +262,10 @@ impl<'gctx> Timings<'gctx> {
+@@ -281,7 +281,10 @@ impl<'gctx> Timings<'gctx> {
          build_runner: &BuildRunner<'_, '_>,
          error: &Option<anyhow::Error>,
      ) -> CargoResult<()> {
@@ -66,3 +66,6 @@ index 3649e28a3..b23b83355 100644
              && let Some(logs) = logger.get_logs()
          {
              let timings_path = build_runner
+-- 
+2.54.0
+

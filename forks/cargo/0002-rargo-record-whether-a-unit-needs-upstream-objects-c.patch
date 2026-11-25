@@ -1,4 +1,4 @@
-From a9ccf7cce3dfba0d332c69f7f252875b7b5f66ba Mon Sep 17 00:00:00 2001
+From c7fd570d6ebd927ce946cef33f1f081ec8af916e Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Sun, 22 Nov 2026 23:39:31 +0100
 Subject: [PATCH 2/8] rargo: record whether a unit needs upstream objects;
@@ -9,7 +9,7 @@ Subject: [PATCH 2/8] rargo: record whether a unit needs upstream objects;
  1 file changed, 6 insertions(+), 1 deletion(-)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index df685c379..f1c62befc 100644
+index ecfabd6d1..b1c8ced65 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
 @@ -294,6 +294,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
@@ -20,7 +20,7 @@ index df685c379..f1c62befc 100644
          pkg: unit.pkg.to_string(),
          pkg_id: format!("{:?}", unit.pkg.package_id()),
          pkg_name: unit.pkg.name().to_string(),
-@@ -408,7 +409,11 @@ pub fn fake_script_run(
+@@ -409,7 +410,11 @@ pub fn fake_script_run(
      );
      line("rustc-link-search", token::make(token::LIBPATH_EXTERNAL, meta));
      line("rustc-link-arg", token::link_arg("ALL", meta));
@@ -33,3 +33,6 @@ index df685c379..f1c62befc 100644
      if targets.iter().any(|t| t.is_bin()) {
          line("rustc-link-arg-bins", token::link_arg("BIN", meta));
          for t in targets.iter().filter(|t| t.is_bin()) {
+-- 
+2.54.0
+
