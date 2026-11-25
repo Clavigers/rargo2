@@ -24,6 +24,7 @@ pub mod session;
 pub mod snapshot;
 pub mod sandboxfs;
 pub mod sched;
+pub mod sched_state;
 pub mod store;
 pub mod timings;
 pub mod tokens;
