@@ -58,6 +58,7 @@ pub struct Loop {
     pub(super) next: u64,
     pub(super) inflight: BTreeMap<u64, Slot>,
     pub(super) pool: Pool,
+    pub(super) blocking: Pool,
 }
 
 impl Loop {
@@ -76,11 +77,18 @@ impl Loop {
             let done = Arc::clone(&done);
             joins.push(std::thread::Builder::new().name("rargo-cpu".into()).spawn(move || worker(jobs, done, efd)).expect("a worker thread starts"));
         }
+        let blocking = Pool {
+            jobs: Arc::new(Jobs { q: StdMutex::new(VecDeque::new()), cv: Condvar::new(), closed: AtomicBool::new(false) }),
+            done: Arc::clone(&done),
+            joins: Vec::new(),
+            efd,
+        };
         let mut this = Self {
             ring,
             next: 1,
             inflight: BTreeMap::new(),
             pool: Pool { jobs, done, joins, efd },
+            blocking,
         };
         this.arm_eventfd()?;
         this.ring.submit()?;
@@ -94,15 +102,28 @@ impl Loop {
     pub fn submit(&mut self, op: Op) -> io::Result<u64> {
         let token = self.next;
         self.next += 1;
-        if let Op::Cpu(run) = op {
-            if self.pool.jobs.closed.load(Ordering::Relaxed) {
-                return Err(io::Error::other("worker pool stopped"));
+        let (pool, run) = match op {
+            Op::Cpu(run) => (&mut self.pool, run),
+            Op::Blocking(run) => {
+                if self.blocking.joins.is_empty() {
+                    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(8, 32);
+                    for _ in 0..n {
+                        let (jobs, done, efd) = (Arc::clone(&self.blocking.jobs), Arc::clone(&self.blocking.done), self.blocking.efd);
+                        self.blocking.joins.push(std::thread::Builder::new().name("rargo-fs".into()).spawn(move || worker(jobs, done, efd))?);
+                    }
+                }
+                (&mut self.blocking, run)
             }
-            self.pool.jobs.q.lock().unwrap_or_else(|e| e.into_inner()).push_back(Job { token, run });
-            self.pool.jobs.cv.notify_one();
-            return Ok(token);
+            op => {
+                self.enqueue(token, op)?;
+                return Ok(token);
+            }
+        };
+        if pool.jobs.closed.load(Ordering::Relaxed) {
+            return Err(io::Error::other("worker pool stopped"));
         }
-        self.enqueue(token, op)?;
+        pool.jobs.q.lock().unwrap_or_else(|e| e.into_inner()).push_back(Job { token, run });
+        pool.jobs.cv.notify_one();
         Ok(token)
     }
 
@@ -189,10 +210,12 @@ impl Loop {
 
 impl Drop for Loop {
     fn drop(&mut self) {
-        self.pool.jobs.closed.store(true, Ordering::Relaxed);
-        self.pool.jobs.cv.notify_all();
-        for join in self.pool.joins.drain(..) {
-            let _ = join.join();
+        for pool in [&mut self.pool, &mut self.blocking] {
+            pool.jobs.closed.store(true, Ordering::Relaxed);
+            pool.jobs.cv.notify_all();
+            for join in pool.joins.drain(..) {
+                let _ = join.join();
+            }
         }
         if self.pool.efd >= 0 {
             unsafe { libc::close(self.pool.efd) };
