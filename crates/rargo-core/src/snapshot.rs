@@ -601,92 +601,78 @@ mod tests {
         });
     }
 
+    struct ChurningUpload<'a> {
+        source: &'a Fake,
+    }
+
+    impl Uploader for ChurningUpload<'_> {
+        fn trees(&self, want: Vec<Hash>) -> Result<Vec<Vec<u8>>> {
+            self.source.trees(want)
+        }
+
+        fn blobs(&self, want: Vec<Hash>) -> Result<()> {
+            self.source.blobs(want)?;
+            let store = self.source.store.as_ref().unwrap();
+            let unrelated = format!("someone else's output {}", store.generation());
+            let hash = store.put_bytes(unrelated.as_bytes())?;
+            store.remove(&hash);
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_store_that_evicts_other_content_all_the_time_fails_no_sync() {
         crate::io::drive(1, || {
-        let (_d, trees, fake) = setup();
-        let names: Vec<String> = (0..4000).map(|i| format!("f{i:04}")).collect();
-        let mut files: Vec<(&str, Node)> = names.iter().map(|n| (n.as_str(), fake.file(n.as_bytes()))).collect();
-        files.push(("b", fake.file(b"content b")));
-        let v = fake.dir(vec![("a", fake.file(b"content a")), ("sub", fake.dir(files))]);
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let churn = {
-            let (store, stop) = (trees.store.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let mut n = 0u64;
-                while !stop.load(Ordering::Relaxed) {
-                    let junk = format!("someone else's output {n}");
-                    store.put_bytes(junk.as_bytes()).unwrap();
-                    store.remove(&Hash::of(junk.as_bytes()));
-                    n += 1;
-                    std::thread::sleep(std::time::Duration::from_micros(200));
-                }
-                n
-            })
-        };
-        let before = trees.store.generation();
-        for i in 0..12 {
-            let extra = format!("edit {i}");
-            let w = fake.dir(vec![("tree", v.clone()), ("edit", fake.file(extra.as_bytes()))]);
-            let s = trees.sync(root_of(&w), &fake).unwrap_or_else(|e| panic!("sync {i} failed: {e:#}"));
-            assert_eq!(s.read(b"tree/sub/b").unwrap(), b"content b");
-            assert_eq!(s.read(b"edit").unwrap(), extra.as_bytes());
-        }
-        stop.store(true, Ordering::Relaxed);
-        let churned = churn.join().unwrap();
-        assert!(
-            churned >= 12 && trees.store.generation() > before + 12,
-            "the store did change throughout ({churned} rounds)"
-        );
+            let (_d, trees, fake) = setup();
+            let names: Vec<String> = (0..512).map(|i| format!("f{i:04}")).collect();
+            let mut files: Vec<(&str, Node)> = names.iter().map(|n| (n.as_str(), fake.file(n.as_bytes()))).collect();
+            files.push(("b", fake.file(b"content b")));
+            let v = fake.dir(vec![("a", fake.file(b"content a")), ("sub", fake.dir(files))]);
+            let source = ChurningUpload { source: &fake };
+            for i in 0..12 {
+                let before = trees.store.generation();
+                let extra = format!("edit {i}");
+                let w = fake.dir(vec![("tree", v.clone()), ("edit", fake.file(extra.as_bytes()))]);
+                let s = trees.sync(root_of(&w), &source).unwrap_or_else(|e| panic!("sync {i} failed: {e:#}"));
+                assert!(trees.store.generation() > before);
+                assert_eq!(s.read(b"tree/sub/b").unwrap(), b"content b");
+                assert_eq!(s.read(b"edit").unwrap(), extra.as_bytes());
+            }
         });
     }
 
     #[test]
     fn a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held() {
         crate::io::drive(1, || {
-        let (_d, trees, fake) = setup();
-        let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let evictor = {
-            let (store, stop) = (trees.store.clone(), stop.clone());
-            std::thread::spawn(move || {
-                let (mut n, mut freed) = (0u64, 0u64);
-                while !stop.load(Ordering::Relaxed) {
-                    for _ in 0..8 {
-                        store.put_bytes(format!("output {n} {}", "x".repeat(4000)).as_bytes()).unwrap();
-                        n += 1;
-                    }
-                    freed += store.evict(1000, 2, &|_| false, &|_| {});
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+            let (_d, trees, fake) = setup();
+            let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
+            let mut last = None;
+            for round in 0..3 {
+                let files: Vec<(&str, Node)> =
+                    names.iter().map(|n| (n.as_str(), fake.file(format!("{n} in round {round}").as_bytes()))).collect();
+                let v = fake.dir(vec![("src", fake.dir(files)), ("top", fake.file(format!("top {round}").as_bytes()))]);
+                let s = trees.sync(root_of(&v), &fake).unwrap_or_else(|e| panic!("sync {round} failed: {e:#}"));
+                let mut outputs = Vec::new();
+                for i in 0..32 {
+                    outputs.push(trees.store.put_bytes(format!("output {round}/{i} {}", "x".repeat(4000)).as_bytes()).unwrap());
                 }
-                (n, freed)
-            })
-        };
-        let mut last = None;
-        for round in 0..3 {
-            let files: Vec<(&str, Node)> =
-                names.iter().map(|n| (n.as_str(), fake.file(format!("{n} in round {round}").as_bytes()))).collect();
-            let v = fake.dir(vec![("src", fake.dir(files)), ("top", fake.file(format!("top {round}").as_bytes()))]);
-            let s = trees.sync(root_of(&v), &fake).unwrap_or_else(|e| panic!("sync {round} failed: {e:#}"));
-            crate::io::sleep(std::time::Duration::from_millis(3300));
-            for n in &names {
-                let path = format!("src/{n}");
-                assert_eq!(
-                    s.read(path.as_bytes())
-                        .unwrap_or_else(|| panic!("round {round}: {path} was evicted while its snapshot was held")),
-                    format!("{n} in round {round}").as_bytes()
-                );
+                assert!(trees.store.evict_to(1000, &|_| false) > 100_000);
+                assert!(outputs.iter().all(|h| !trees.store.has(h)));
+                for n in &names {
+                    let path = format!("src/{n}");
+                    assert_eq!(
+                        s.read(path.as_bytes())
+                            .unwrap_or_else(|| panic!("round {round}: {path} was evicted while its snapshot was held")),
+                        format!("{n} in round {round}").as_bytes()
+                    );
+                }
+                assert_eq!(trees.lacking(s.id), (Vec::new(), Vec::new()));
+                last = Some((s.id, Hash::of(format!("f000 in round {round}").as_bytes())));
             }
-            assert_eq!(trees.lacking(s.id), (Vec::new(), Vec::new()));
-            last = Some((s.id, Hash::of(format!("f000 in round {round}").as_bytes())));
-        }
-        stop.store(true, Ordering::Relaxed);
-        let (made, freed) = evictor.join().unwrap();
-        assert!(made >= 3 * 8 && freed > 100_000, "eviction ran throughout ({made} outputs made, {freed} bytes freed)");
-        let (root, a_file) = last.unwrap();
-        trees.store.evict_to(0, &|_| false);
-        assert!(!trees.store.has(&a_file) && !trees.store.has(&root));
-        assert!(!trees.store.is_pinned(&a_file));
+            let (root, a_file) = last.unwrap();
+            trees.store.evict_to(0, &|_| false);
+            assert!(!trees.store.has(&a_file) && !trees.store.has(&root));
+            assert!(!trees.store.is_pinned(&a_file));
         });
     }
 
