@@ -114,30 +114,7 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     };
     let mut c = nix();
     c.args(["print-dev-env", "--json", "--no-write-lock-file", shell]);
-    let json: serde_json::Value = serde_json::from_slice(&run(c)?).context("parsing `nix print-dev-env`")?;
-    let mut env = BTreeMap::new();
-    let mut roots = BTreeSet::new();
-    if let Some(vars) = json.get("variables").and_then(|v| v.as_object()) {
-        for (name, v) in vars {
-            if v.get("type").and_then(|t| t.as_str()) != Some("exported") {
-                continue;
-            }
-            let Some(value) = v.get("value").and_then(|x| x.as_str()) else { continue };
-            store_names(value, &mut roots);
-            if DROP.contains(&name.as_str()) || name.starts_with("__") || name.starts_with("BASH") {
-                continue;
-            }
-            env.insert(name.clone(), value.to_string());
-        }
-    }
-    if host_ca_bundle().is_some() {
-        for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"] {
-            env.entry(var.to_string()).or_insert_with(|| CA_AT.to_string());
-        }
-    }
-    if roots.is_empty() || !env.contains_key("PATH") {
-        bail!("the flake's devShell exports no tools (no store paths, or no PATH)");
-    }
+    let (env, roots) = parse_dev_env(&run(c)?, host_ca_bundle().is_some())?;
     let mut c = Command::new("nix-store");
     c.arg("-qR");
     let roots: BTreeSet<String> = roots
@@ -155,8 +132,42 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     for r in &roots {
         c.arg(format!("/nix/store/{r}"));
     }
+    Ok(flake_env(env, &run(c)?))
+}
+
+type DevEnv = (BTreeMap<String, String>, BTreeSet<String>);
+
+fn parse_dev_env(output: &[u8], ca_available: bool) -> Result<DevEnv> {
+    let json: serde_json::Value = serde_json::from_slice(output).context("parsing `nix print-dev-env`")?;
+    let mut env = BTreeMap::new();
+    let mut roots = BTreeSet::new();
+    if let Some(vars) = json.get("variables").and_then(|v| v.as_object()) {
+        for (name, v) in vars {
+            if v.get("type").and_then(|t| t.as_str()) != Some("exported") {
+                continue;
+            }
+            let Some(value) = v.get("value").and_then(|x| x.as_str()) else { continue };
+            store_names(value, &mut roots);
+            if DROP.contains(&name.as_str()) || name.starts_with("__") || name.starts_with("BASH") {
+                continue;
+            }
+            env.insert(name.clone(), value.to_string());
+        }
+    }
+    if ca_available {
+        for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"] {
+            env.entry(var.to_string()).or_insert_with(|| CA_AT.to_string());
+        }
+    }
+    if roots.is_empty() || !env.contains_key("PATH") {
+        bail!("the flake's devShell exports no tools (no store paths, or no PATH)");
+    }
+    Ok((env, roots))
+}
+
+fn flake_env(env: BTreeMap<String, String>, closure_output: &[u8]) -> FlakeEnv {
     let mut closure = BTreeSet::new();
-    store_names(&String::from_utf8_lossy(&run(c)?), &mut closure);
+    store_names(&String::from_utf8_lossy(closure_output), &mut closure);
     let closure: Vec<String> = closure.into_iter().collect();
     let mut h = KeyHasher::new("flake-env-v1");
     for c in &closure {
@@ -165,7 +176,7 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     for (k, v) in &env {
         h.field(k.as_bytes()).field(v.as_bytes());
     }
-    Ok(FlakeEnv { env, closure, roots: Vec::new(), id: h.finish() })
+    FlakeEnv { env, closure, roots: Vec::new(), id: h.finish() }
 }
 
 fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
@@ -337,6 +348,21 @@ mod tests {
         }
         assert!(may_hold(b"script", &extra) && may_hold(b"crates", &extra) && may_hold(b"crates/zed/src", &extra));
         assert!(!may_hold(b"crates/gpui", &extra) && !may_hold(b"docs", &extra));
+    }
+
+    #[test]
+    fn parses_dev_environment_and_the_real_bash_closure() {
+        let exported = br#"{"variables":{"PATH":{"type":"exported","value":"/nix/store/l9k32vj2aczxw62134j1x0dsh569jz2l-bash-5.2p37/bin"},"BASH_VERSION":{"type":"exported","value":"5.2.37"},"arr":{"type":"array","value":["ignored"]}}}"#;
+        let closure = b"/nix/store/16hvpw4b3r05girazh4rnwbw0jgjkb4l-xgcc-14.3.0-libgcc\n/nix/store/d5s1ab9ynjsh45js7d75ijxklzqm49r0-libunistring-1.3\n/nix/store/vi5fmmv0q0z9rjf3jfis7q2i9g05l8s2-libidn2-2.3.8\n/nix/store/i3ibgfskl99qd8rslafbpaa1dmxdzh1z-glibc-2.40-66\n/nix/store/l9k32vj2aczxw62134j1x0dsh569jz2l-bash-5.2p37\n";
+        let (env, roots) = parse_dev_env(exported, true).unwrap();
+        assert_eq!(roots.into_iter().collect::<Vec<_>>(), ["l9k32vj2aczxw62134j1x0dsh569jz2l-bash-5.2p37"]);
+        assert_eq!(env["SSL_CERT_FILE"], CA_AT);
+        assert!(!env.contains_key("BASH_VERSION") && !env.contains_key("arr"));
+        let resolved = flake_env(env.clone(), closure);
+        assert_eq!(resolved.closure.len(), 5);
+        let reversed = String::from_utf8_lossy(closure).lines().rev().collect::<Vec<_>>().join("\n");
+        assert_eq!(resolved.id, flake_env(env, reversed.as_bytes()).id);
+        assert!(parse_dev_env(b"{}", false).is_err());
     }
 
     #[test]
