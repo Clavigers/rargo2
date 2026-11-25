@@ -229,6 +229,94 @@ on b "$R" build >/dev/null 2>&1
 after=$(runs b)
 [ $((after - before)) -ge 4 ] && ok "without the import B ran $((after - before)) actions" || bad "without the import B has to run the build" "ran $((after - before))"
 
+echo "== a worker with an empty Nix store builds the flake"
+back=$PWD
+mkdir -p "$T/nw-proj/src" "$T/state-nw" "$T/worker-nw" "$T/home-nw"
+cp "$P/flake.nix" "$P/flake.lock" "$P/Cargo.toml" "$P/Cargo.lock" "$P/build.rs" "$T/nw-proj/"
+cp "$P/src/"* "$T/nw-proj/src/"
+nw_port=$((base + 2))
+wk_port=$((base + 3))
+nw_srv=
+nw_worker=
+trap 'kill ${nw_srv:-} ${nw_worker:-} 2>/dev/null; daemon a stop; daemon b stop' EXIT
+# The first compiles have no trace yet, so the server would keep them.
+# Eager dispatch sends them to the worker while the one local core is busy,
+# which is what shows that the worker can build without the host store.
+RARGO_HEDGE=0 RARGO_DISPATCH=eager systemd-run --scope -q -p CPUQuota=400% -p MemoryMax=20G -p Delegate=yes \
+    "$bin/rargod" --state "$T/state-nw" --listen "127.0.0.1:$nw_port" \
+    --workers-listen "127.0.0.1:$wk_port" \
+    --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
+    --cargo-home "$T/state-nw/cargo-home" --jobs 1 --drift-interval-min 0 \
+    >"$T/state-nw.log" 2>&1 &
+nw_srv=$!
+if tail -n +1 -f --pid="$nw_srv" "$T/state-nw.log" | awk '/serving clients/ { found=1; exit } END { exit found ? 0 : 1 }'; then
+    libs=$(ldd "$bin/rargod" | grep -o '/nix/store/[^ ]*' | sort -u | tr '\n' ' ')
+    RARGO_LD_LIBS="$libs" systemd-run --scope -q -p CPUQuota=800% -p MemoryMax=30G -p Delegate=yes \
+        unshare -m --propagation private bash -c '
+            set -euo pipefail
+            real=$(mktemp -d)
+            mount --bind /nix/store "$real"
+            # Resolve before the store is covered. A library can be a symlink
+            # to another store path; bind the file it names onto the path the
+            # loader opens.
+            pairs=
+            for p in $RARGO_LD_LIBS; do
+                target=$(readlink -f "$p")
+                case $target in
+                    /nix/store/*) ;;
+                    *) echo "library $p is not in the nix store ($target)" >&2; exit 1 ;;
+                esac
+                pairs="$pairs $p|$target"
+            done
+            mount -t tmpfs -o mode=755 tmpfs /nix/store
+            for pair in $pairs; do
+                p=${pair%%|*}
+                target=${pair#*|}
+                rel=${p#/nix/store/}
+                src=${target#/nix/store/}
+                mkdir -p "/nix/store/$(dirname "$rel")"
+                touch "/nix/store/$rel"
+                mount --bind "$real/$src" "/nix/store/$rel"
+            done
+            umount "$real" || umount -l "$real"
+            rmdir "$real" 2>/dev/null || true
+            if find /nix/store -path "*/bin/rustc" -o -path "*/bin/cc" -o -path "*/bin/nix" | grep -q .; then
+                echo "nix tools are still visible on the worker" >&2
+                exit 1
+            fi
+            exec "$1" --state "$2" --worker "$3" --jobs 4
+        ' bash "$bin/rargod" "$T/worker-nw" "127.0.0.1:$wk_port" >"$T/worker-nw.log" 2>&1 &
+    nw_worker=$!
+    joined=0
+    if tail -n +1 -f --pid="$nw_worker" "$T/state-nw.log" | awk '/joined/ { found=1; exit } END { exit found ? 0 : 1 }'; then
+        joined=1
+    fi
+    cd "$T/nw-proj"
+    out=$(RARGO_SERVER=127.0.0.1:$nw_port RARGO_CACHE_DIR=$T/home-nw/.cache/rargo HOME=$T/home-nw CARGO_HOME=$T/home-nw/.cargo "$R" build 2>&1); rc=$?
+    st=$(RARGO_SERVER=127.0.0.1:$nw_port RARGO_CACHE_DIR=$T/home-nw/.cache/rargo HOME=$T/home-nw "$R" --rargo-status 2>&1 || true)
+    nix=$(grep -oE '[0-9.]+ nix store lookups' <<<"$st" | head -1 | cut -d' ' -f1)
+    disp=$(grep -oE '[0-9.]+ actions dispatched' <<<"$st" | head -1 | cut -d' ' -f1)
+    if [ "$rc" -eq 0 ] && [ "$joined" = 1 ] && [ "${disp:-0}" -ge 1 ] && [ "${nix:-x}" = 0 ]; then
+        ok "a worker that cannot see /nix/store built the flake ($disp actions, $nix nix store lookups)"
+    else
+        bad "a worker that cannot see /nix/store built the flake" "$out
+joined=$joined dispatched=${disp:-} nix=${nix:-}
+$st
+$(tail -40 "$T/state-nw.log")
+$(tail -40 "$T/worker-nw.log")"
+    fi
+    grep "nix closure:" "$T/state-nw.log" | sed 's/^/        /' || true
+else
+    bad "a worker that cannot see /nix/store built the flake" "the server did not start
+$(tail -40 "$T/state-nw.log")"
+fi
+kill "$nw_srv" ${nw_worker:-} 2>/dev/null || true
+wait "$nw_srv" ${nw_worker:-} 2>/dev/null || true
+nw_srv=
+nw_worker=
+cd "$back"
+trap 'daemon a stop; daemon b stop' EXIT
+
 echo "== a server without Nix rejects a build"
 daemon b stop
 PATH="$T/no-tools" "$bin/rargod" --state "$T/no-nix" --listen "127.0.0.1:$(port b)" \

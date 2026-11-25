@@ -619,7 +619,7 @@ pub fn status_text(d: &Daemon) -> String {
                     "{} connected; {} actions dispatched ({} of them also started here on an idle core: {} finished here first, {} were stopped because the worker was ahead), {} kept local (core free), {} kept local (a local core came free first), {} kept local (transfer too costly), {} kept local (no worker has the incremental state), {} worker failures; overhead per remote action {}; \
                      incremental compiles on workers: {} without state, {} with the state the worker held; state left on workers {:.1} MiB in {} files, of which {:.1} MiB in {} files came home in the background and {} files were fetched for a compile here; {} states made here sent to workers ahead of need ({:.1} MiB); \
                      sent ahead {:.1} MiB, not sent because already there {:.1} MiB; outputs fetched {:.1} MiB, reused locally {:.1} MiB; \
-                     {} answers sent ahead, {} lookups and {} opens asked",
+                     {} answers sent ahead, {} lookups and {} opens asked, {} nix store lookups",
                     p.worker_count(),
                     ps.dispatched.load(Ordering::Relaxed),
                     ps.hedged.load(Ordering::Relaxed),
@@ -647,6 +647,7 @@ pub fn status_text(d: &Daemon) -> String {
                     ps.prefilled_entries.load(Ordering::Relaxed),
                     ps.lookups_served.load(Ordering::Relaxed),
                     ps.opens_served.load(Ordering::Relaxed),
+                    ps.nix_lookups.load(Ordering::Relaxed),
                 )
             }
         },

@@ -75,6 +75,8 @@ pub struct Daemon {
     pub incr: crate::incr::IncrStore,
     /// Workers, when the server accepts them.
     pub pool: OnceLock<Arc<crate::remote::Pool>>,
+    /// Store paths whose host files are already remembered for workers.
+    pub(crate) nix_attached: Mutex<HashSet<String>>,
     /// The most recent drift report, for `--rargo-status`.
     pub drift_report: Mutex<Option<String>>,
     /// Who last built in each worktree, for the background drift check.
@@ -553,6 +555,7 @@ impl Daemon {
             scratch_seq: AtomicU64::new(0),
             incr,
             pool: OnceLock::new(),
+            nix_attached: Mutex::new(HashSet::new()),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
             deliveries: Mutex::new(HashMap::new()),
@@ -821,7 +824,15 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
             links.push((bytes(at), bytes(&target)));
         }
     }
-    let restricted = Some(Restricted { store_names: flake.closure_set(), etc: flake.etc(d.store(), c.uid, c.gid)?, links });
+    let store_paths = Arc::new(
+        flake.closure.iter().zip(flake.roots.iter()).map(|(n, r)| (n.as_bytes().to_vec(), *r)).collect(),
+    );
+    let restricted = Some(Restricted {
+        store_names: flake.closure_set(),
+        store_paths,
+        etc: flake.etc(d.store(), c.uid, c.gid)?,
+        links,
+    });
     let parts = ViewParts {
         snapshot: snapshot.clone(),
         cargo_home: d.cfg.cargo_home.clone(),

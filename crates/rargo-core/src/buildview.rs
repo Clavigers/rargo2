@@ -83,6 +83,8 @@ pub struct BaseView {
     memo: Arc<HostMemo>,
     /// Host lookups remembered at or after this generation are trusted.
     min_gen: AtomicU64,
+    /// `(name, manifest identity)` of the closure, sorted by name.
+    nix: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
 }
 
 const DIR_OWNER: Owner = Owner { uid: 0, gid: 0, mode: 0o755 };
@@ -98,7 +100,12 @@ impl BaseView {
             assert!(m.at.starts_with(b"/"), "mount points are absolute");
             assert!(mounts[i + 1..].iter().all(|o| o.at != m.at), "two mounts at {}", crate::view::show(&m.at));
         }
-        BaseView { mounts, memo, min_gen: AtomicU64::new(min_gen) }
+        BaseView { mounts, memo, min_gen: AtomicU64::new(min_gen), nix: Arc::new(Vec::new()) }
+    }
+
+    pub fn with_nix(mut self, nix: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>) -> BaseView {
+        self.nix = nix;
+        self
     }
 
     /// Forgets the host lookups made so far: after this, every host path is
@@ -282,6 +289,10 @@ impl View for BaseView {
 
     fn traced(&self, dir: &[u8]) -> bool {
         self.mount_of(dir).0.traced
+    }
+
+    fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
+        &self.nix
     }
 
     fn stat(&self, path: &[u8]) -> Looked {
@@ -530,6 +541,10 @@ impl View for BuildView {
         self.layer.visible_paths(&self.levels)
     }
 
+    fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
+        self.base.nix_closure()
+    }
+
     fn stat(&self, path: &[u8]) -> Looked {
         let Some((dir, name)) = vsplit(path) else { return Looked::Dir(DIR_OWNER) };
         match self.layered(dir, name) {
@@ -587,6 +602,8 @@ pub struct ViewParts {
 #[derive(Clone)]
 pub struct Restricted {
     pub store_names: Arc<std::collections::HashSet<Vec<u8>>>,
+    /// Store path name and manifest identity, sorted by name.
+    pub store_paths: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
     pub etc: Arc<HashMap<Vec<u8>, SynthEnt>>,
     /// Absolute symlinks to provide (`/bin/sh`, `/usr/bin/env`).
     pub links: Vec<(Vec<u8>, Vec<u8>)>,
@@ -650,7 +667,11 @@ impl ViewParts {
                 mounts.push(Mount { at: m.clone(), region: Region::Empty, traced: true });
             }
         }
-        BaseView::new(mounts, memo, min_gen)
+        let nix = match (&self.restricted, host_root) {
+            (Some(r), false) => r.store_paths.clone(),
+            _ => Arc::new(Vec::new()),
+        };
+        BaseView::new(mounts, memo, min_gen).with_nix(nix)
     }
 }
 
