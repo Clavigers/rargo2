@@ -5,10 +5,10 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 name=$1
 agents=${2:-20}
 . "$work/env.sh"
+. "$repo/dev/bench-lib.sh"
 out=$work/bench/results.jsonl
 jobs=${RARGO_JOBS:-24}
-renv=""
-[ "$name" = zed ] && export GIT_LFS_SKIP_SMUDGE=1 RIG_PROXY=1 && renv="HTTPS_PROXY=http://127.0.0.1:3128"
+[ "$name" = zed ] && export GIT_LFS_SKIP_SMUDGE=1
 tests=${SWARM_TESTS:-test}
 nextest=$work/tools/nextest-musl/${NEXTEST_VERSION:-0.9.152}
 if [ "$tests" = nextest ] && [ ! -x "$nextest/cargo-nextest" ]; then
@@ -16,17 +16,17 @@ if [ "$tests" = nextest ] && [ ! -x "$nextest/cargo-nextest" ]; then
     exit 2
 fi
 if [ "${SWARM_SKIP_RARGO:-}" != 1 ]; then
-    RARGO_HIDE="$work/swarm" "$repo/dev/netns.sh" up "$jobs" 0 0 >/dev/null
-    . "$work/${RIG_STATE:-nstest}/client.env"
+    RARGO_HIDE="$work/swarm" bench_up "$jobs" 0 0 "${CLIENT_RTT_MS:-2}"
+    . "$T/client.env"
     if [ "$tests" = nextest ]; then
         v=$(basename "$nextest")
         mkdir -p "$RARGO_STATE/nextest/$v"
         cp "$nextest/cargo-nextest" "$RARGO_STATE/nextest/$v/"
         echo "$v" >"$RARGO_STATE/nextest/newest-release"
     fi
-    env $renv python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" --netns ${RIG:-rargo}-cl \
-        --tests "$tests" --label "remote client ${CLIENT_DELAY_MS:-1}ms ${CLIENT_RATE:-1gbit}"
-    "$repo/dev/netns.sh" down
+    python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" \
+        --tests "$tests" --label "remote client, ${CLIENT_RTT_MS:-2} ms round trip"
+    bench_down
 fi
 if [ "${SWARM_SKIP_STOCK:-}" != 1 ]; then
     [ "$tests" = nextest ] && export PATH="$nextest:$PATH"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, os, subprocess, sys, time, shutil, threading, json
+import argparse, json, os, re, shutil, subprocess, sys, threading, time
 
 WORK = os.environ.get("RARGO_WORK", "/root/rargo-work")
 RARGO = os.path.join(os.environ.get("RARGO_BIN") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release"), "rargo")
@@ -60,11 +60,11 @@ def du(path):
     real = subprocess.run(["du", "-sB1", path], capture_output=True, text=True).stdout.split()
     return (int(out[0]) if out else 0, int(real[0]) if real else 0)
 
-def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=(), tests="test"):
+def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", tests="test"):
     def run(args):
         if tests == "nextest" and args[0] == "test":
             args = ["nextest", "run"] + args[1:]
-        cmd = (list(prefix) + [RARGO] if mode == "rargo" else [cfg.get("cargo", "cargo")]) + args
+        cmd = ([RARGO] if mode == "rargo" else [cfg.get("cargo", "cargo")]) + args
         if mode == "stock":
             cmd.append("--offline")
         t = time.time()
@@ -119,7 +119,6 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--label", default=None, help="recorded with the result")
     ap.add_argument("--toolchain", default=None, help="RUSTUP_TOOLCHAIN for the agents")
-    ap.add_argument("--netns", default=None, help="network namespace the rargo clients run in")
     ap.add_argument("--batch", type=int, default=0,
                     help="run the agents in consecutive groups of this size (all worktrees and target directories are kept "
                          "until the end); for a stock swarm that does not fit in memory at once")
@@ -147,7 +146,6 @@ def main():
     if a.toolchain:
         env["RUSTUP_TOOLCHAIN"] = a.toolchain
     daemon_pid = None
-    prefix = ["nsenter", f"--net=/run/netns/{a.netns}"] if a.netns else []
     state = env.get("RARGO_STATE", os.path.join(WORK, "state"))
     client_cache = os.path.join(root, "client-cache")
     if a.mode == "rargo":
@@ -169,14 +167,14 @@ def main():
     results = {}
     logs = [open(os.path.join(root, f"agent{i:02d}.log"), "wb") for i in range(a.agents)]
     def link_bytes():
-        if not a.netns:
+        if a.mode != "rargo":
             return (0, 0)
-        read = lambda f: int(subprocess.run(["ip", "netns", "exec", a.netns, "cat", f"/sys/class/net/eth0/statistics/{f}"],
-                                            capture_output=True, text=True).stdout.strip() or 0)
-        return (read("rx_bytes"), read("tx_bytes"))
+        out = subprocess.run([RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
+        m = re.search(r"(\d+) bytes sent, (\d+) bytes received", out)
+        return (int(m.group(2)), int(m.group(1))) if m else (0, 0)
     link0 = link_bytes()
     t0 = time.time()
-    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, prefix, a.tests)) for i in range(a.agents)]
+    threads = [threading.Thread(target=agent, args=(i, wts[i], cfg, a.mode, env, logs[i], results, a.edit, a.tests)) for i in range(a.agents)]
     size = a.batch if a.batch > 0 else a.agents
     for first in range(0, a.agents, size):
         group = threads[first:first + size]
@@ -187,7 +185,7 @@ def main():
     daemon_status = ""
     daemon_cpu = 0.0
     if a.mode == "rargo":
-        daemon_status = subprocess.run(prefix + [RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
+        daemon_status = subprocess.run([RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
         tick = os.sysconf("SC_CLK_TCK")
         for pid in subprocess.run(["pgrep", "-f", "--", f"--rargo-daemon {client_cache}"], capture_output=True, text=True).stdout.split():
             try:
@@ -195,7 +193,7 @@ def main():
                 daemon_cpu += (int(fields[11]) + int(fields[12])) / tick
             except (OSError, IndexError, ValueError):
                 pass
-        subprocess.run(prefix + [RARGO, "--rargo-daemon-stop"], env=env, capture_output=True)
+        subprocess.run([RARGO, "--rargo-daemon-stop"], env=env, capture_output=True)
         time.sleep(1)
     cpu1 = cgroup_cpu_usec(daemon_pid) if a.mode == "rargo" else cgroup_cpu_usec(os.getpid())
 
@@ -217,9 +215,9 @@ def main():
     if a.mode == "rargo":
         store_dir = env.get("RARGO_STORE", os.path.join(state, "store"))
         store = du(store_dir)
-        status = subprocess.run(prefix + [RARGO, "--rargo-status"], env=env, capture_output=True, text=True).stdout
+        status = subprocess.run([RARGO, "--rargo-status"], env=env, capture_output=True, text=True).stdout
         sync_line = next((l for l in status.splitlines() if l.startswith("sync")), "")
-        subprocess.run(prefix + [RARGO, "--rargo-gc"], env=env, capture_output=True)
+        subprocess.run([RARGO, "--rargo-gc"], env=env, capture_output=True)
         store_after_gc = du(store_dir)
     per_step = {}
     for steps in results.values():
@@ -233,7 +231,7 @@ def main():
         store_bytes=store[1],
         store_after_gc_bytes=store_after_gc[1],
         disk_total_bytes=real + store[1],
-        netns=a.netns, sync=sync_line,
+        link_rtt_ms=int(env.get("RARGO_LINK_RTT_MS") or 0), sync=sync_line,
         link_down_bytes=link1[0] - link0[0], link_up_bytes=link1[1] - link0[1],
         output_mode=env.get("RARGO_OUTPUT", "fuse") if a.mode == "rargo" else None,
         client_daemon_cpu_s=round(daemon_cpu, 1),

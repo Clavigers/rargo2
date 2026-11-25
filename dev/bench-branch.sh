@@ -4,6 +4,7 @@ work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$here/../target/release}
 . "$work/env.sh"
+. "$here/bench-lib.sh"
 mode=${1:?rargo or stock}; delay=${2:-1}
 out=$work/bench/branch.jsonl
 base=$work/bench/ra
@@ -12,7 +13,7 @@ edits=(crates/parser/src/lib.rs crates/syntax/src/lib.rs crates/ide-db/src/lib.r
 tests=(test -p stdx -p parser -p syntax)
 if [ "$mode" = rargo ]; then
     export RARGO_HIDE=$C RARGO_CACHE_DIR=$C/cache
-    run() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
+    run() { "$RARGO_BIN/rargo" "$@"; }
     label="rargo, $((2 * delay)) ms round trip"
 else
     run() { systemd-run --scope -q -p CPUQuota=2400% -p MemoryMax=90G cargo "$@" -j 24; }
@@ -24,11 +25,11 @@ all() {
     c=$(t run check); b=$(t run build -p rust-analyzer); s=$(t run "${tests[@]}")
     echo "$c $b $s"
 }
-"$here/netns.sh" down >/dev/null 2>&1
+bench_down
 rm -rf "$C"; mkdir -p "$C"
 git -C "$base" worktree prune
 git -C "$base" branch -D rargo-bench-b >/dev/null 2>&1
-[ "$mode" = rargo ] && { CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1; . "$work/${RIG_STATE:-nstest}/client.env"; }
+[ "$mode" = rargo ] && { bench_up 24 0 0 $((2 * delay)) || exit 1; . "$T/client.env"; }
 G() { git -c user.name=bench -c user.email=bench@example.invalid "$@"; }
 
 git -C "$base" worktree add -q --detach "$C/c" HEAD
@@ -55,5 +56,5 @@ cd /
 [ "$mode" = rargo ] && run --rargo-daemon-stop
 for w in a b c; do git -C "$base" worktree remove --force "$C/$w" >/dev/null 2>&1; done
 git -C "$base" branch -D rargo-bench-b >/dev/null 2>&1
-"$here/netns.sh" down >/dev/null 2>&1
+bench_down
 rm -rf "$C"

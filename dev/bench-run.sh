@@ -8,17 +8,17 @@ label=${1:?label}; delay=${2:-0}
 export RARGO_OUTPUT=fuse
 out=$work/bench/run.jsonl
 base=$work/bench/ra
-export RIG=${RIG:-benchrun} RIG_STATE=${RIG_STATE:-benchrun}
+export BENCH_STATE=${BENCH_STATE:-benchrun} BENCH_PORT=${BENCH_PORT:-7569}
+. "$here/bench-lib.sh"
 C=$work/benchrun-client
 export RARGO_HIDE=$C
-R() { nsenter --net=/run/netns/$RIG-cl "$RARGO_BIN/rargo" "$@"; }
-rx() { ip netns exec $RIG-cl cat /sys/class/net/eth0/statistics/rx_bytes; }
+R() { "$RARGO_BIN/rargo" "$@"; }
 t() { local t0=$(date +%s.%N); "$@" >"$C/last.log" 2>&1 || { echo "FAILED: $*" >&2; tail -n 20 "$C/last.log" >&2; }; echo "$(date +%s.%N) - $t0" | bc; }
-"$here/netns.sh" down >/dev/null 2>&1
+bench_down
 rm -rf "$C"; mkdir -p "$C"
 git -C "$base" worktree prune
-CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1
-. "$work/$RIG_STATE/client.env"
+bench_up 24 0 0 $((2 * delay)) || exit 1
+. "$T/client.env"
 wt() { git -C "$base" worktree add -q --detach "$C/$1" HEAD; }
 wt a
 (cd "$C/a" && RARGO_CACHE_DIR=$C/cache-a t R build -p rust-analyzer) >/dev/null
@@ -37,5 +37,5 @@ printf '{"label":"%s","rtt_ms":%s,"binary_bytes":%s,"build_s":%.2f,"run_s":%.2f,
     "$label" $((2 * delay)) "$size" "$build_s" "$run_s" $((b1 - b0)) "$again_s" $((b2 - b1)) | tee -a "$out"
 for c in "$C/cache-a" "$C/cache-b"; do RARGO_CACHE_DIR=$c R --rargo-daemon-stop >/dev/null 2>&1; done
 for w in a b; do git -C "$base" worktree remove --force "$C/$w" >/dev/null 2>&1; done
-"$here/netns.sh" down >/dev/null 2>&1
+bench_down
 rm -rf "$C"

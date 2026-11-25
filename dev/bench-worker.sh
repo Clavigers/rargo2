@@ -3,10 +3,12 @@ set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$work/dev-target/release}
+. "$work/env.sh"
+. "$here/bench-lib.sh"
 repo=${1:-ra}; shift || true
 args=("$@"); [ ${#args[@]} -eq 0 ] && args=(build)
 out=$work/bench/worker.jsonl
-R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
+R() { "$RARGO_BIN/rargo" "$@"; }
 export RARGO_HIDE=$work/bench/worker-wt
 export RARGO_CACHE_DIR=$work/bench/worker-client-cache
 base=$work/bench/$repo
@@ -22,7 +24,7 @@ fresh_wt() {
     git -C "$base" worktree add -q --detach "$wt" HEAD
 }
 measure() {
-    . "$work/${RIG_STATE:-nstest}/client.env"
+    . "$T/client.env"
     rm -rf "$RARGO_CACHE_DIR"
     fresh_wt
     cd "$wt" || exit 2
@@ -39,12 +41,12 @@ measure() {
 }
 
 c=${CORES:-8}
-"$here/netns.sh" up $c $c 0 >/dev/null 2>&1;              measure "local-$c"
-"$here/netns.sh" up $c $c 1 1 0.1 1gbit >/dev/null 2>&1;   measure "$c+$c fresh worker"
-"$here/netns.sh" reset-server >/dev/null 2>&1;            measure "$c+$c warm worker"
-"$here/netns.sh" up $c $c 2 1 0.1 1gbit >/dev/null 2>&1;   measure "$c+$c+$c fresh workers" >/dev/null
-"$here/netns.sh" reset-server >/dev/null 2>&1;            measure "$c+$c+$c warm workers"
-"$here/netns.sh" up $((2 * c)) $c 0 >/dev/null 2>&1;      measure "local-$((2 * c))"
-"$here/netns.sh" up $((3 * c)) $c 0 >/dev/null 2>&1;      measure "local-$((3 * c))"
-"$here/netns.sh" down >/dev/null 2>&1
+bench_up $c $c 0 0;                        measure "local-$c"
+bench_up $c $c 1 0;                        measure "$c+$c fresh worker"
+bench_reset_server;                       measure "$c+$c warm worker"
+bench_up $c $c 2 0;                        measure "$c+$c+$c fresh workers" >/dev/null
+bench_reset_server;                       measure "$c+$c+$c warm workers"
+bench_up $((2 * c)) $c 0 0;                measure "local-$((2 * c))"
+bench_up $((3 * c)) $c 0 0;                measure "local-$((3 * c))"
+bench_down
 git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1
