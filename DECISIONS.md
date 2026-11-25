@@ -2892,6 +2892,8 @@ in D84.
 - The slots of a crate are one array in a section of its own
   (`.rargo_slots`), so a linked binary holds every crate's arrays in one
   contiguous range.
+  `.rargo_slot_names` holds the symbol of each slot, in slot order, each
+  ended by a NUL byte.
 - The store is part of the function's body before LLVM optimises. So a
   function that is inlined still marks its own slot wherever its code
   runs, and a function that is never called marks nothing.
@@ -2913,9 +2915,12 @@ in D84.
   function. It is the binary's *rest* (below).
 
 **Identity: what "the code of a function" hashes to.** The fork computes
-an identity for every function instance with a slot. It writes a table
-(`.rargo_fn_ids`: slot index, symbol name, 32-byte identity), which the
-linker gathers like the slots. A function's identity is a hash of:
+an identity for every function instance, with `-Z rargo-fn-ids`
+(independent of the slot flag). It writes a table (`.rargo_fn_ids`:
+symbol name, 32-byte identity, a flag byte that is 1 when there is no
+identity), which the linker gathers like the slots. rargod joins a mark
+to an identity by symbol name, so recording and identity need not be
+built together. A function's identity is a hash of:
 - its optimised MIR body, with spans removed, and its generic arguments
   (each monomorphised instance has its own slot and identity);
 - the symbol name of every function it calls, takes the address of, or
