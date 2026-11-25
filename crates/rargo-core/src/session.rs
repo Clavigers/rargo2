@@ -1,11 +1,13 @@
 use crate::hash::Hash;
-use crate::session_state::{Ask, ClientSet, Hello, Progress, SessionState};
+use crate::session_state::{
+    Answer, ClientSet, Effect, Hello, Next, Outgoing, Progress, Question, SessionState, bulk_size,
+};
 use crate::snapshot::{Uploader, futures::BoxFuture};
 use crate::store::Store;
 use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
 use rargo_proto::secure::{self, Opener, Sealer};
-use rargo_proto::{Blob, ClientMsg, Delivery, Digest, PART_SIZE, ServerMsg, Write};
+use rargo_proto::{ClientMsg, Delivery, Digest, ServerMsg, Write};
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -64,20 +66,6 @@ impl Keys {
     }
 }
 
-fn bulk_size(m: &ServerMsg) -> usize {
-    match m {
-        ServerMsg::Blobs(v) => v.iter().map(|b| b.data.len()).sum(),
-        ServerMsg::BlobPart { part, .. } => part.data.len(),
-        _ => 0,
-    }
-}
-
-struct Part {
-    path: PathBuf,
-    file: std::fs::File,
-    hasher: blake3::Hasher,
-}
-
 #[derive(Default)]
 pub struct ClientHas {
     set: Mutex<ClientSet>,
@@ -100,18 +88,8 @@ pub struct Session {
     asking: tokio::sync::Mutex<()>,
     arrivals: Notify,
     window: Notify,
-    parts: Mutex<BTreeMap<Digest, Part>>,
+    parts: Mutex<BTreeMap<Digest, (PathBuf, std::fs::File)>>,
     totals: Arc<crate::build::DaemonStats>,
-}
-
-fn sizes_of(files: &[Delivery], writes: &[Write]) -> BTreeMap<Digest, u64> {
-    let mut sizes: BTreeMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
-    for w in writes {
-        if let Write::File { hash, size, .. } = w {
-            sizes.insert(*hash, *size);
-        }
-    }
-    sizes
 }
 
 impl Session {
@@ -143,8 +121,7 @@ impl Session {
     }
 
     pub fn knows(&self, digests: impl IntoIterator<Item = Digest>) {
-        self.has.extend(digests);
-        self.state.lock().set_knows();
+        self.state.lock().knows(&mut self.has.set.lock(), digests);
     }
 
     pub fn set_lazy(&self) {
@@ -156,31 +133,19 @@ impl Session {
     }
 
     pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>) {
-        if files.is_empty() && writes.is_empty() {
-            return;
-        }
-        let sizes = sizes_of(&files, &writes);
-        let id = self.state.lock().delivery(&sizes);
-        let small = self.has.set.lock().push_small(&sizes);
-        self.send(ServerMsg::Deliver { id, files, writes });
-        let mut batch: Vec<Blob> = Vec::new();
-        let mut bytes = 0usize;
-        for h in small {
-            let Ok(content) = self.store.read(&Hash(h)) else { continue };
-            let b = Blob::pack(h, &content);
-            bytes += b.data.len();
-            batch.push(b);
-            if bytes >= 1 << 20 {
-                self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
-                self.send(ServerMsg::Blobs(std::mem::take(&mut batch)));
-                bytes = 0;
+        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes);
+        let Some(mut out) = out else { return };
+        loop {
+            match out.step() {
+                Next::Read { hash, .. } => out.read(self.store.read(&Hash(hash)).ok()),
+                Next::Send(m) => {
+                    self.count_out(bulk_size(&m));
+                    self.send(m);
+                }
+                Next::Done => return,
+                n => unreachable!("a lazy delivery neither waits for the window nor fails: {n:?}"),
             }
         }
-        if !batch.is_empty() {
-            self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
-            self.send(ServerMsg::Blobs(batch));
-        }
-        self.send(ServerMsg::Delivered { id });
     }
 
     pub fn delivered(&self) -> HashSet<Digest> {
@@ -239,151 +204,113 @@ impl Session {
         self.arrivals.notify_waiters();
         let mut files = self.parts.lock();
         for h in parts {
-            if let Some(p) = files.remove(&h) {
-                let _ = std::fs::remove_file(&p.path);
+            if let Some((path, _)) = files.remove(&h) {
+                let _ = std::fs::remove_file(&path);
             }
         }
         assert!(files.is_empty(), "every partial upload is one the session knows of");
     }
 
-    fn store_blob(&self, claimed: Digest, bytes: &[u8]) -> Result<()> {
-        self.totals.bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        if Hash::of(bytes).0 != claimed {
-            bail!("the client sent content that does not match its hash");
+    pub fn incoming(&self, msg: ClientMsg) -> Result<()> {
+        let step = self.state.lock().client(msg);
+        self.totals.bytes_in.fetch_add(step.bytes_in, Ordering::Relaxed);
+        tokio::task::block_in_place(|| -> Result<()> {
+            for e in step.effects {
+                self.carry_out(e)?;
+            }
+            Ok(())
+        })?;
+        match step.refused {
+            Some(why) => bail!("{why}"),
+            None => Ok(()),
         }
-        self.store.put_bytes(bytes)?;
-        assert!(self.store.has(&Hash(claimed)), "a stored blob is in the store");
-        self.totals.files_in.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
 
-    pub fn incoming(&self, msg: ClientMsg) -> Result<()> {
-        match msg {
-            ClientMsg::Run(_)
-            | ClientMsg::Packed(_)
-            | ClientMsg::Fetch { .. }
-            | ClientMsg::Recipe { .. }
-            | ClientMsg::Chunks { .. }
-            | ClientMsg::Offer(_)
-            | ClientMsg::Cancel
-            | ClientMsg::Ping(_) => bail!("unexpected message from the client"),
-            ClientMsg::Trees(t) => {
-                if self.state.lock().answer(Ask::Trees)
-                    && let Some(tx) = self.trees_reply.lock().take()
-                {
+    fn carry_out(&self, e: Effect) -> Result<()> {
+        match e {
+            Effect::Store { hash, bytes } => {
+                self.store.put_bytes(&bytes)?;
+                assert!(self.store.has(&Hash(hash)), "a stored blob is in the store");
+                self.totals.files_in.fetch_add(1, Ordering::Relaxed);
+            }
+            Effect::PartOpen(hash) => {
+                let path = self.store.tmp_path();
+                match std::fs::File::create(&path) {
+                    Ok(f) => {
+                        self.parts.lock().insert(hash, (path, f));
+                    }
+                    Err(e) => {
+                        self.state.lock().part_failed(&hash);
+                        return Err(e.into());
+                    }
+                }
+            }
+            Effect::PartWrite(hash, data) => {
+                let mut parts = self.parts.lock();
+                let (_, file) = parts.get_mut(&hash).expect("the core opened this upload");
+                file.write_all(&data)?;
+            }
+            Effect::PartInstall { hash, size } => {
+                let (path, file) = self.parts.lock().remove(&hash).expect("the core opened this upload");
+                drop(file);
+                self.store.install_hashed(&path, Hash(hash), size)?;
+                assert!(self.store.has(&Hash(hash)), "an installed blob is in the store");
+                self.totals.files_in.fetch_add(1, Ordering::Relaxed);
+            }
+            Effect::PartDrop(hash) => {
+                if let Some((path, _)) = self.parts.lock().remove(&hash) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            Effect::Answer(Answer::Trees(t)) => {
+                if let Some(tx) = self.trees_reply.lock().take() {
                     let _ = tx.send(t);
                 }
             }
-            ClientMsg::Env(e) => {
-                if self.state.lock().answer(Ask::Env)
-                    && let Some(tx) = self.env_reply.lock().take()
-                {
+            Effect::Answer(Answer::Env(e)) => {
+                if let Some(tx) = self.env_reply.lock().take() {
                     let _ = tx.send(e);
                 }
             }
-            ClientMsg::ReportId(id) => {
-                if self.state.lock().answer(Ask::Report)
-                    && let Some(tx) = self.report_reply.lock().take()
-                {
+            Effect::Answer(Answer::Report(id)) => {
+                if let Some(tx) = self.report_reply.lock().take() {
                     let _ = tx.send(id);
                 }
             }
-            ClientMsg::Changed => {
-                self.state.lock().changed();
-                self.arrivals.notify_waiters();
-            }
-            ClientMsg::Blobs(blobs) => {
-                tokio::task::block_in_place(|| -> Result<()> {
-                    for b in blobs {
-                        let hash = b.hash;
-                        self.store_blob(hash, &b.unpack()?)?;
-                    }
-                    Ok(())
-                })?;
-                self.arrivals.notify_waiters();
-            }
-            ClientMsg::BlobPart { hash, part, last } => {
-                let done = tokio::task::block_in_place(|| -> Result<bool> {
-                    self.totals.bytes_in.fetch_add(part.data.len() as u64, Ordering::Relaxed);
-                    let data = part.unpack()?;
-                    let step = self.state.lock().part(hash, data.len() as u64, last);
-                    let mut parts = self.parts.lock();
-                    if step.begin {
-                        let path = self.store.tmp_path();
-                        let file = match std::fs::File::create(&path) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                self.state.lock().part_failed(&hash);
-                                return Err(e.into());
-                            }
-                        };
-                        parts.insert(hash, Part { path, file, hasher: blake3::Hasher::new() });
-                    }
-                    let Some(p) = parts.get_mut(&hash) else { bail!("a part arrived for an upload that was closed") };
-                    p.file.write_all(&data)?;
-                    p.hasher.update(&data);
-                    let Some(size) = step.finish else { return Ok(false) };
-                    let p = parts.remove(&hash).expect("the finished part is held");
-                    drop(parts);
-                    drop(p.file);
-                    if *p.hasher.finalize().as_bytes() != hash {
-                        let _ = std::fs::remove_file(&p.path);
-                        bail!("the client sent content that does not match its hash");
-                    }
-                    self.store.install_hashed(&p.path, Hash(hash), size)?;
-                    assert!(self.store.has(&Hash(hash)), "an installed blob is in the store");
-                    self.totals.files_in.fetch_add(1, Ordering::Relaxed);
-                    Ok(true)
-                })?;
-                if done {
-                    self.arrivals.notify_waiters();
-                }
-            }
+            Effect::Wake => self.arrivals.notify_waiters(),
         }
         Ok(())
+    }
+
+    async fn ask<T>(&self, q: Question, slot: &Mutex<Option<oneshot::Sender<T>>>) -> Result<T> {
+        let _g = self.asking.lock().await;
+        let (tx, rx) = oneshot::channel();
+        *slot.lock() = Some(tx);
+        let asked = self.state.lock().ask(q);
+        match asked {
+            Ok(m) => self.send(m),
+            Err(_) => {
+                slot.lock().take();
+                return Err(self.gone());
+            }
+        }
+        rx.await.map_err(|_| self.gone())
     }
 
     pub async fn want_env(&self, names: Vec<String>) -> Result<Vec<(String, Option<String>)>> {
-        let _g = self.asking.lock().await;
-        let (tx, rx) = oneshot::channel();
-        *self.env_reply.lock() = Some(tx);
-        if self.state.lock().ask(Ask::Env).is_err() {
-            self.env_reply.lock().take();
-            return Err(self.gone());
-        }
-        self.send(ServerMsg::WantEnv(names));
-        rx.await.map_err(|_| self.gone())
+        self.ask(Question::Env(names), &self.env_reply).await
     }
 
     pub async fn report(&self, report: rargo_proto::FutureReport) -> Result<u32> {
-        let _g = self.asking.lock().await;
-        let (tx, rx) = oneshot::channel();
-        *self.report_reply.lock() = Some(tx);
-        if self.state.lock().ask(Ask::Report).is_err() {
-            self.report_reply.lock().take();
-            return Err(self.gone());
-        }
-        self.send(ServerMsg::Report(Box::new(report)));
-        rx.await.map_err(|_| self.gone())
+        self.ask(Question::Report(Box::new(report)), &self.report_reply).await
     }
 
     pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) -> Result<()> {
-        if files.is_empty() && writes.is_empty() {
-            return Ok(());
+        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes);
+        match out {
+            Some(out) => self.send_out(out).await,
+            None => Ok(()),
         }
-        let sizes = sizes_of(&files, &writes);
-        let (id, knows, closed) = {
-            let mut st = self.state.lock();
-            (st.delivery(&sizes), st.knows(), st.is_closed())
-        };
-        let push = self.has.set.lock().push(&sizes, knows);
-        self.send(ServerMsg::Deliver { id, files, writes });
-        if closed {
-            return Err(self.gone());
-        }
-        self.send_blobs(push).await?;
-        self.send(ServerMsg::Delivered { id });
-        Ok(())
     }
 
     pub fn count_out(&self, bytes: usize) {
@@ -391,85 +318,102 @@ impl Session {
     }
 
     pub async fn fetch(&self, id: u64, hashes: Vec<Digest>) -> Result<()> {
-        let wanted: Vec<(Digest, u64)> =
-            hashes.into_iter().filter_map(|h| self.store.size_of(&Hash(h)).map(|size| (h, size))).collect();
-        self.has.extend(wanted.iter().map(|(h, _)| *h));
-        let sent = self.send_blobs(wanted).await;
-        self.send(ServerMsg::Fetched { id });
-        sent
+        let found: Vec<(Digest, Option<u64>)> = hashes.into_iter().map(|h| (h, self.store.size_of(&Hash(h)))).collect();
+        let out = self.state.lock().fetch(&mut self.has.set.lock(), id, found);
+        self.send_out(out).await
     }
 
-    async fn send_blobs(&self, blobs: Vec<(Digest, u64)>) -> Result<()> {
-        let mut batch: Vec<Blob> = Vec::new();
-        let mut batch_bytes = 0usize;
-        for (h, size) in blobs {
-            let hash = Hash(h);
-            if size as usize <= PART_SIZE {
-                let store = self.store.clone();
-                let bytes = tokio::task::spawn_blocking(move || store.read(&hash)).await??;
-                let b = Blob::pack(h, &bytes);
-                batch_bytes += b.data.len();
-                batch.push(b);
-                if batch_bytes >= rargo_proto::BATCH_SIZE {
-                    batch_bytes = 0;
-                    self.send_bulk(ServerMsg::Blobs(std::mem::take(&mut batch))).await?;
-                }
-                assert!(batch_bytes < rargo_proto::BATCH_SIZE);
-                continue;
-            }
-            let store = self.store.clone();
-            let mut file =
-                tokio::fs::File::from_std(tokio::task::spawn_blocking(move || store.open_blob(&hash)).await??);
-            let mut sent = 0u64;
-            loop {
-                let mut data = vec![0u8; PART_SIZE];
-                let mut n = 0;
-                while n < data.len() {
-                    let got = file.read(&mut data[n..]).await?;
-                    if got == 0 {
-                        break;
+    async fn send_out(&self, mut out: Outgoing) -> Result<()> {
+        let mut open: Option<OpenBlob> = None;
+        let failed = loop {
+            match out.step() {
+                Next::Read { hash, at, len, whole } => {
+                    let store = self.store.clone();
+                    let file = open.take().filter(|(h, _)| *h == hash);
+                    let (o, read) = tokio::task::spawn_blocking(move || {
+                        let read = read_blob(&store, hash, at, len, whole, file);
+                        let file = match read {
+                            Ok((bytes, file)) => {
+                                out.read(Some(bytes));
+                                Ok(file)
+                            }
+                            Err(e) => Err(e),
+                        };
+                        (out, file)
+                    })
+                    .await?;
+                    out = o;
+                    match read {
+                        Ok(file) => open = file,
+                        Err(e) => break Err(anyhow::Error::from(e)),
                     }
-                    n += got;
                 }
-                data.truncate(n);
-                sent += n as u64;
-                let last = sent >= size || n == 0;
-                let part = tokio::task::spawn_blocking(move || rargo_proto::Part::pack(data)).await?;
-                self.send_bulk(ServerMsg::BlobPart { hash: h, part, last }).await?;
-                if last {
-                    break;
+                Next::Send(m) => {
+                    self.count_out(bulk_size(&m));
+                    self.send(m);
                 }
+                Next::Bulk(m) => {
+                    if let Err(e) = self.send_bulk(m).await {
+                        break Err(e);
+                    }
+                }
+                Next::Unreadable(h) => break Err(anyhow!("blob {} is not readable", Hash(h))),
+                Next::Gone => break Err(self.gone()),
+                Next::Done => break Ok(()),
             }
+        };
+        if failed.is_err()
+            && let Some(m) = out.abort()
+        {
+            self.send(m);
         }
-        if !batch.is_empty() {
-            self.send_bulk(ServerMsg::Blobs(batch)).await?;
-        }
-        Ok(())
+        failed
     }
+}
+
+type OpenBlob = (Digest, std::fs::File);
+
+fn read_blob(
+    store: &Store,
+    hash: Digest,
+    at: u64,
+    len: usize,
+    whole: bool,
+    file: Option<OpenBlob>,
+) -> std::io::Result<(Vec<u8>, Option<OpenBlob>)> {
+    use std::os::unix::fs::FileExt;
+    if whole {
+        return Ok((store.read(&Hash(hash))?, None));
+    }
+    let f = match file {
+        Some((_, f)) => f,
+        None => store.open_blob(&Hash(hash))?,
+    };
+    let mut data = vec![0u8; len];
+    let mut n = 0;
+    while n < len {
+        let got = f.read_at(&mut data[n..], at + n as u64)?;
+        if got == 0 {
+            break;
+        }
+        n += got;
+    }
+    data.truncate(n);
+    Ok((data, Some((hash, f))))
 }
 
 impl Uploader for Session {
     fn trees<'a>(&'a self, want: Vec<Hash>) -> BoxFuture<'a, Result<Vec<Vec<u8>>>> {
-        Box::pin(async move {
-            let _g = self.asking.lock().await;
-            let (tx, rx) = oneshot::channel();
-            *self.trees_reply.lock() = Some(tx);
-            if self.state.lock().ask(Ask::Trees).is_err() {
-                self.trees_reply.lock().take();
-                return Err(self.gone());
-            }
-            self.send(ServerMsg::WantTrees(want.iter().map(|h| h.0).collect()));
-            rx.await.map_err(|_| self.gone())
-        })
+        Box::pin(async move { self.ask(Question::Trees(want.iter().map(|h| h.0).collect()), &self.trees_reply).await })
     }
 
     fn blobs<'a>(&'a self, want: Vec<Hash>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let _g = self.asking.lock().await;
             let digests: Vec<Digest> = want.iter().map(|h| h.0).collect();
-            self.state.lock().want(&digests, &|d| self.store.has(&Hash(*d)));
+            let ask = self.state.lock().want(&digests, &|d| self.store.has(&Hash(*d)));
             let wanting = Wanting(self);
-            self.send(ServerMsg::WantBlobs(digests));
+            self.send(ask);
             loop {
                 let arrived = self.arrivals.notified();
                 tokio::pin!(arrived);

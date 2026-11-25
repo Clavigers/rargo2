@@ -1,11 +1,21 @@
-use rargo_proto::{Digest, LAZY_SMALL};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::hash::Hash;
+use rargo_proto::{BATCH_SIZE, Blob, ClientMsg, Delivery, Digest, LAZY_SMALL, PART_SIZE, Part, ServerMsg, Write};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub const WINDOW: usize = 32 << 20;
 const _: () = assert!(WINDOW <= u32::MAX as usize && WINDOW > 0);
+pub const LAZY_BATCH: usize = 1 << 20;
 
 pub fn bulk_cost(bytes: usize) -> usize {
     bytes.clamp(1, WINDOW)
+}
+
+pub fn bulk_size(m: &ServerMsg) -> usize {
+    match m {
+        ServerMsg::Blobs(v) => v.iter().map(|b| b.data.len()).sum(),
+        ServerMsg::BlobPart { part, .. } => part.data.len(),
+        _ => 0,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,11 +35,40 @@ pub enum Progress {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gone;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PartStep {
-    pub begin: bool,
-    pub finish: Option<u64>,
+pub enum Question {
+    Trees(Vec<Digest>),
+    Env(Vec<String>),
+    Report(Box<rargo_proto::FutureReport>),
 }
+
+#[derive(Debug, PartialEq)]
+pub enum Answer {
+    Trees(Vec<Vec<u8>>),
+    Env(Vec<(String, Option<String>)>),
+    Report(u32),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Effect {
+    Store { hash: Digest, bytes: Vec<u8> },
+    PartOpen(Digest),
+    PartWrite(Digest, Vec<u8>),
+    PartInstall { hash: Digest, size: u64 },
+    PartDrop(Digest),
+    Answer(Answer),
+    Wake,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct Step {
+    pub effects: Vec<Effect>,
+    pub refused: Option<&'static str>,
+    pub bytes_in: u64,
+}
+
+pub const UNEXPECTED: &str = "unexpected message from the client";
+pub const MISMATCH: &str = "the client sent content that does not match its hash";
+pub const UNREADABLE: &str = "the client sent content that does not unpack";
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientSet {
@@ -45,7 +84,7 @@ impl ClientSet {
         self.set.contains(d)
     }
 
-    pub fn push(&mut self, sizes: &BTreeMap<Digest, u64>, knows: bool) -> Vec<(Digest, u64)> {
+    fn push(&mut self, sizes: &BTreeMap<Digest, u64>, knows: bool) -> Vec<(Digest, u64)> {
         let mut push = Vec::new();
         for (h, size) in sizes {
             if self.set.insert(*h) && knows {
@@ -55,12 +94,132 @@ impl ClientSet {
         push
     }
 
-    pub fn push_small(&mut self, sizes: &BTreeMap<Digest, u64>) -> Vec<Digest> {
-        sizes.iter().filter(|(h, size)| **size <= LAZY_SMALL && self.set.insert(**h)).map(|(h, _)| *h).collect()
+    fn push_small(&mut self, sizes: &BTreeMap<Digest, u64>) -> Vec<(Digest, u64)> {
+        sizes.iter().filter(|(h, size)| **size <= LAZY_SMALL && self.set.insert(**h)).map(|(h, s)| (*h, *s)).collect()
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+pub enum Next {
+    Read { hash: Digest, at: u64, len: usize, whole: bool },
+    Send(ServerMsg),
+    Bulk(ServerMsg),
+    Unreadable(Digest),
+    Gone,
+    Done,
+}
+
+#[derive(Debug)]
+pub struct Outgoing {
+    todo: VecDeque<(Digest, u64)>,
+    lazy: bool,
+    batch: Vec<Blob>,
+    batch_bytes: usize,
+    part: Option<(Digest, u64, u64)>,
+    reading: Option<(Digest, bool)>,
+    ready: VecDeque<Next>,
+    end: Option<ServerMsg>,
+    end_always: bool,
+}
+
+impl Outgoing {
+    fn new(blobs: Vec<(Digest, u64)>, lazy: bool, end: ServerMsg, end_always: bool) -> Outgoing {
+        Outgoing {
+            todo: blobs.into(),
+            lazy,
+            batch: Vec::new(),
+            batch_bytes: 0,
+            part: None,
+            reading: None,
+            ready: VecDeque::new(),
+            end: Some(end),
+            end_always,
+        }
+    }
+
+    fn limit(&self) -> usize {
+        if self.lazy { LAZY_BATCH } else { BATCH_SIZE }
+    }
+
+    fn blobs(&mut self) -> Next {
+        let m = ServerMsg::Blobs(std::mem::take(&mut self.batch));
+        self.batch_bytes = 0;
+        if self.lazy { Next::Send(m) } else { Next::Bulk(m) }
+    }
+
+    pub fn step(&mut self) -> Next {
+        assert!(self.reading.is_none(), "a read is answered before the next step");
+        if let Some(n) = self.ready.pop_front() {
+            return n;
+        }
+        if let Some((hash, size, sent)) = self.part {
+            self.reading = Some((hash, false));
+            let len = PART_SIZE.min((size - sent) as usize).max(1);
+            return Next::Read { hash, at: sent, len, whole: false };
+        }
+        if let Some((hash, size)) = self.todo.pop_front() {
+            if self.lazy || size as usize <= PART_SIZE {
+                self.reading = Some((hash, true));
+                return Next::Read { hash, at: 0, len: size as usize, whole: true };
+            }
+            self.part = Some((hash, size, 0));
+            return self.step();
+        }
+        if !self.batch.is_empty() {
+            return self.blobs();
+        }
+        match self.end.take() {
+            Some(m) => Next::Send(m),
+            None => Next::Done,
+        }
+    }
+
+    pub fn read(&mut self, bytes: Option<Vec<u8>>) {
+        let (hash, whole) = self.reading.take().expect("a read answers the read asked for");
+        let Some(bytes) = bytes else {
+            if !(whole && self.lazy) {
+                self.ready.push_back(Next::Unreadable(hash));
+            }
+            return;
+        };
+        if whole {
+            let b = Blob::pack(hash, &bytes);
+            self.batch_bytes += b.data.len();
+            self.batch.push(b);
+            if self.batch_bytes >= self.limit() {
+                let n = self.blobs();
+                self.ready.push_back(n);
+            }
+            assert!(self.batch_bytes < self.limit());
+            return;
+        }
+        let (h, size, sent) = self.part.take().expect("a part is being read");
+        assert_eq!(h, hash);
+        let n = bytes.len() as u64;
+        let sent = sent + n;
+        let last = sent >= size || n == 0;
+        if !last {
+            self.part = Some((h, size, sent));
+        }
+        self.ready.push_back(Next::Bulk(ServerMsg::BlobPart { hash, part: Part::pack(bytes), last }));
+    }
+
+    pub fn abort(&mut self) -> Option<ServerMsg> {
+        self.todo.clear();
+        self.part = None;
+        self.reading = None;
+        self.ready.clear();
+        self.batch.clear();
+        let end = self.end.take();
+        if self.end_always { end } else { None }
+    }
+}
+
+struct Upload {
+    size: u64,
+    hasher: blake3::Hasher,
+}
+
 pub struct SessionState {
     knows: bool,
     lazy: bool,
@@ -69,7 +228,7 @@ pub struct SessionState {
     window_closed: bool,
     asking: Option<Ask>,
     wanted: BTreeSet<Digest>,
-    parts: BTreeMap<Digest, u64>,
+    parts: BTreeMap<Digest, Upload>,
     changed: bool,
     closed: bool,
     next_id: u64,
@@ -79,6 +238,16 @@ impl Default for SessionState {
     fn default() -> SessionState {
         SessionState::new()
     }
+}
+
+fn sizes_of(files: &[Delivery], writes: &[Write]) -> BTreeMap<Digest, u64> {
+    let mut sizes: BTreeMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
+    for w in writes {
+        if let Write::File { hash, size, .. } = w {
+            sizes.insert(*hash, *size);
+        }
+    }
+    sizes
 }
 
 impl SessionState {
@@ -98,12 +267,9 @@ impl SessionState {
         }
     }
 
-    pub fn set_knows(&mut self) {
+    pub fn knows(&mut self, has: &mut ClientSet, digests: impl IntoIterator<Item = Digest>) {
+        has.extend(digests);
         self.knows = true;
-    }
-
-    pub fn knows(&self) -> bool {
-        self.knows
     }
 
     pub fn set_lazy(&mut self) {
@@ -122,15 +288,125 @@ impl SessionState {
         self.changed
     }
 
-    pub fn delivery(&mut self, sizes: &BTreeMap<Digest, u64>) -> u64 {
+    pub fn delivered(&self) -> &BTreeSet<Digest> {
+        &self.delivered
+    }
+
+    pub fn client(&mut self, msg: ClientMsg) -> Step {
+        let mut step = Step::default();
+        if self.closed {
+            return step;
+        }
+        match msg {
+            ClientMsg::Run(_)
+            | ClientMsg::Packed(_)
+            | ClientMsg::Fetch { .. }
+            | ClientMsg::Recipe { .. }
+            | ClientMsg::Chunks { .. }
+            | ClientMsg::Offer(_)
+            | ClientMsg::Cancel
+            | ClientMsg::Ping(_) => step.refused = Some(UNEXPECTED),
+            ClientMsg::Trees(t) => {
+                if self.answer(Ask::Trees) {
+                    step.effects.push(Effect::Answer(Answer::Trees(t)));
+                }
+            }
+            ClientMsg::Env(e) => {
+                if self.answer(Ask::Env) {
+                    step.effects.push(Effect::Answer(Answer::Env(e)));
+                }
+            }
+            ClientMsg::ReportId(id) => {
+                if self.answer(Ask::Report) {
+                    step.effects.push(Effect::Answer(Answer::Report(id)));
+                }
+            }
+            ClientMsg::Changed => {
+                self.changed = true;
+                step.effects.push(Effect::Wake);
+            }
+            ClientMsg::Blobs(blobs) => {
+                for b in blobs {
+                    step.bytes_in += b.data.len() as u64;
+                    let hash = b.hash;
+                    let Ok(bytes) = b.unpack() else {
+                        step.refused = Some(UNREADABLE);
+                        break;
+                    };
+                    if Hash::of(&bytes).0 != hash {
+                        step.refused = Some(MISMATCH);
+                        break;
+                    }
+                    step.effects.push(Effect::Store { hash, bytes });
+                }
+                step.effects.push(Effect::Wake);
+            }
+            ClientMsg::BlobPart { hash, part, last } => {
+                step.bytes_in += part.data.len() as u64;
+                let Ok(data) = part.unpack() else {
+                    step.refused = Some(UNREADABLE);
+                    if self.parts.remove(&hash).is_some() {
+                        step.effects.push(Effect::PartDrop(hash));
+                    }
+                    return step;
+                };
+                let up = match self.parts.entry(hash) {
+                    std::collections::btree_map::Entry::Occupied(o) => o.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(v) => {
+                        step.effects.push(Effect::PartOpen(hash));
+                        v.insert(Upload { size: 0, hasher: blake3::Hasher::new() })
+                    }
+                };
+                up.size += data.len() as u64;
+                up.hasher.update(&data);
+                step.effects.push(Effect::PartWrite(hash, data));
+                if last {
+                    let up = self.parts.remove(&hash).expect("the upload is held");
+                    if *up.hasher.finalize().as_bytes() == hash {
+                        step.effects.push(Effect::PartInstall { hash, size: up.size });
+                        step.effects.push(Effect::Wake);
+                    } else {
+                        step.effects.push(Effect::PartDrop(hash));
+                        step.refused = Some(MISMATCH);
+                    }
+                }
+            }
+        }
+        step
+    }
+
+    pub fn part_failed(&mut self, hash: &Digest) {
+        self.parts.remove(hash);
+    }
+
+    pub fn deliver(&mut self, has: &mut ClientSet, files: Vec<Delivery>, writes: Vec<Write>) -> Option<Outgoing> {
+        if files.is_empty() && writes.is_empty() {
+            return None;
+        }
+        let sizes = sizes_of(&files, &writes);
         let id = self.next_id;
         self.next_id += 1;
         self.delivered.extend(sizes.keys().copied());
-        id
+        let deliver = ServerMsg::Deliver { id, files, writes };
+        if self.lazy {
+            let small = has.push_small(&sizes);
+            let mut out = Outgoing::new(small, true, ServerMsg::Delivered { id }, false);
+            out.ready.push_back(Next::Send(deliver));
+            return Some(out);
+        }
+        let push = has.push(&sizes, self.knows);
+        let mut out = Outgoing::new(push, false, ServerMsg::Delivered { id }, false);
+        out.ready.push_back(Next::Send(deliver));
+        if self.closed {
+            out.ready.push_back(Next::Gone);
+        }
+        Some(out)
     }
 
-    pub fn delivered(&self) -> &BTreeSet<Digest> {
-        &self.delivered
+    pub fn fetch(&mut self, has: &mut ClientSet, id: u64, found: Vec<(Digest, Option<u64>)>) -> Outgoing {
+        let wanted: Vec<(Digest, u64)> = found.into_iter().filter_map(|(h, size)| size.map(|s| (h, s))).collect();
+        has.extend(wanted.iter().map(|(h, _)| *h));
+        Outgoing::new(wanted, false, ServerMsg::Fetched { id }, true)
     }
 
     pub fn take_bulk(&mut self, bytes: usize) -> Result<bool, Gone> {
@@ -153,15 +429,20 @@ impl SessionState {
         self.window_closed = true;
     }
 
-    pub fn ask(&mut self, a: Ask) -> Result<(), Gone> {
+    pub fn ask(&mut self, q: Question) -> Result<ServerMsg, Gone> {
         if self.closed {
             return Err(Gone);
         }
+        let (a, m) = match q {
+            Question::Trees(t) => (Ask::Trees, ServerMsg::WantTrees(t)),
+            Question::Env(e) => (Ask::Env, ServerMsg::WantEnv(e)),
+            Question::Report(r) => (Ask::Report, ServerMsg::Report(r)),
+        };
         self.asking = Some(a);
-        Ok(())
+        Ok(m)
     }
 
-    pub fn answer(&mut self, a: Ask) -> bool {
+    fn answer(&mut self, a: Ask) -> bool {
         if self.asking == Some(a) {
             self.asking = None;
             return true;
@@ -169,8 +450,9 @@ impl SessionState {
         false
     }
 
-    pub fn want(&mut self, hashes: &[Digest], stored: &dyn Fn(&Digest) -> bool) {
+    pub fn want(&mut self, hashes: &[Digest], stored: &dyn Fn(&Digest) -> bool) -> ServerMsg {
         self.wanted = hashes.iter().filter(|h| !stored(h)).copied().collect();
+        ServerMsg::WantBlobs(hashes.to_vec())
     }
 
     pub fn progress(&mut self, stored: &dyn Fn(&Digest) -> bool) -> Progress {
@@ -187,22 +469,6 @@ impl SessionState {
 
     pub fn abandon_want(&mut self) {
         self.wanted.clear();
-    }
-
-    pub fn part(&mut self, hash: Digest, len: u64, last: bool) -> PartStep {
-        let begin = !self.parts.contains_key(&hash);
-        let total = self.parts.entry(hash).or_insert(0);
-        *total += len;
-        let finish = if last { self.parts.remove(&hash) } else { None };
-        PartStep { begin, finish }
-    }
-
-    pub fn part_failed(&mut self, hash: &Digest) {
-        self.parts.remove(hash);
-    }
-
-    pub fn changed(&mut self) {
-        self.changed = true;
     }
 
     pub fn close(&mut self) -> Vec<Digest> {
@@ -275,8 +541,22 @@ pub fn welcome(msg2: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn d(i: u8) -> Digest {
-        [i; 32]
+    fn content(i: u8) -> Vec<u8> {
+        let len = match i % 12 {
+            0 => 2 * PART_SIZE + 4321,
+            1 => PART_SIZE + 1,
+            2 => LAZY_SMALL as usize + 7,
+            _ => 1 + (i as usize * 997) % 9000,
+        };
+        (0..len).map(|k| (k as u32).wrapping_mul(2_654_435_761).wrapping_add(i as u32).to_le_bytes()[3]).collect()
+    }
+
+    fn digest(bytes: &[u8]) -> Digest {
+        Hash::of(bytes).0
+    }
+
+    fn delivery(bytes: &[u8]) -> Delivery {
+        Delivery { path: "f".into(), hash: digest(bytes), size: bytes.len() as u64, exec: false, own: false }
     }
 
     #[test]
@@ -319,26 +599,112 @@ mod tests {
     #[test]
     fn answers_go_only_to_the_question_asked() {
         let mut s = SessionState::new();
-        assert!(!s.answer(Ask::Trees), "nobody asked");
-        s.ask(Ask::Env).unwrap();
-        assert!(!s.answer(Ask::Trees));
-        assert!(s.answer(Ask::Env));
-        assert!(!s.answer(Ask::Env), "a duplicate answer is dropped");
+        assert_eq!(s.client(ClientMsg::Trees(vec![])).effects, vec![], "nobody asked");
+        assert!(matches!(s.ask(Question::Env(vec!["A".into()])), Ok(ServerMsg::WantEnv(v)) if v == ["A"]));
+        assert_eq!(s.client(ClientMsg::Trees(vec![])).effects, vec![]);
+        assert_eq!(s.client(ClientMsg::Env(vec![])).effects, vec![Effect::Answer(Answer::Env(vec![]))]);
+        assert_eq!(s.client(ClientMsg::Env(vec![])).effects, vec![], "a duplicate answer is dropped");
+        assert_eq!(s.client(ClientMsg::Ping(1)).refused, Some(UNEXPECTED));
         s.close();
-        assert_eq!(s.ask(Ask::Report), Err(Gone));
+        assert!(s.ask(Question::Trees(vec![])).is_err());
         s.invariants();
     }
 
     #[test]
-    fn a_blob_already_sent_or_fetched_is_not_pushed_again() {
+    fn a_blob_whose_content_is_not_its_hash_is_refused() {
+        let mut s = SessionState::new();
+        let good = content(5);
+        let mut bad = Blob::pack(digest(&good), &good);
+        bad.hash = digest(b"other");
+        let step = s.client(ClientMsg::Blobs(vec![Blob::pack(digest(&good), &good), bad]));
+        assert_eq!(step.refused, Some(MISMATCH));
+        assert!(matches!(&step.effects[0], Effect::Store { hash, .. } if *hash == digest(&good)));
+        let big = content(1);
+        let half = big.len() / 2;
+        s.client(ClientMsg::BlobPart { hash: digest(b"x"), part: Part::pack(big[..half].to_vec()), last: false });
+        let step =
+            s.client(ClientMsg::BlobPart { hash: digest(b"x"), part: Part::pack(big[half..].to_vec()), last: true });
+        assert_eq!(step.refused, Some(MISMATCH));
+        assert_eq!(step.effects.last(), Some(&Effect::PartDrop(digest(b"x"))));
+        assert!(s.parts.is_empty());
+    }
+
+    #[test]
+    fn a_delivery_sends_whole_blobs_in_batches_and_big_ones_in_parts() {
+        let (small, big) = (content(5), content(0));
+        let mut s = SessionState::new();
         let mut has = ClientSet::default();
-        let sizes: BTreeMap<Digest, u64> = [(d(1), 10), (d(2), LAZY_SMALL + 1)].into();
-        assert_eq!(has.push(&sizes, false), vec![], "a client that has not said what it has gets nothing pushed");
-        let mut fresh = ClientSet::default();
-        assert_eq!(fresh.push(&sizes, true), vec![(d(1), 10), (d(2), LAZY_SMALL + 1)]);
-        assert_eq!(fresh.push(&sizes, true), vec![]);
-        let mut lazy = ClientSet::default();
-        assert_eq!(lazy.push_small(&sizes), vec![d(1)], "only small blobs go ahead of a lazy delivery");
+        s.knows(&mut has, []);
+        let mut out = s.deliver(&mut has, vec![delivery(&small), delivery(&big)], vec![]).unwrap();
+        let mut seen = Vec::new();
+        loop {
+            match out.step() {
+                Next::Read { hash, at, len, .. } => {
+                    let all = if hash == digest(&small) { &small } else { &big };
+                    out.read(Some(all[at as usize..(at as usize + len).min(all.len())].to_vec()));
+                }
+                Next::Send(m) => seen.push(format!("send {}", name(&m))),
+                Next::Bulk(m) => seen.push(format!("bulk {}", name(&m))),
+                Next::Done => break,
+                n => panic!("{n:?}"),
+            }
+        }
+        assert_eq!(
+            seen,
+            ["send deliver", "bulk part", "bulk part", "bulk last part", "bulk blobs 1", "send delivered"],
+            "the big blob goes in parts as it is read; the small ones wait for a batch"
+        );
+        assert!(
+            s.deliver(&mut has, vec![delivery(&small)], vec![]).is_some_and(|mut o| {
+                let first = o.step();
+                matches!(first, Next::Send(ServerMsg::Deliver { .. }))
+                    && matches!(o.step(), Next::Send(ServerMsg::Delivered { .. }))
+            }),
+            "the same delivery again pushes nothing"
+        );
+    }
+
+    fn name(m: &ServerMsg) -> String {
+        match m {
+            ServerMsg::Deliver { .. } => "deliver".into(),
+            ServerMsg::Delivered { .. } => "delivered".into(),
+            ServerMsg::Fetched { .. } => "fetched".into(),
+            ServerMsg::Blobs(b) => format!("blobs {}", b.len()),
+            ServerMsg::BlobPart { last, .. } => if *last { "last part" } else { "part" }.into(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_client_that_has_not_said_what_it_has_gets_nothing_pushed_and_a_lazy_one_gets_small_blobs() {
+        let (small, mid) = (content(5), content(2));
+        let mut s = SessionState::new();
+        let mut has = ClientSet::default();
+        let mut out = s.deliver(&mut has, vec![delivery(&small)], vec![]).unwrap();
+        assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
+        assert!(matches!(out.step(), Next::Send(ServerMsg::Delivered { .. })));
+        let mut lazy = SessionState::new();
+        lazy.set_lazy();
+        let mut has = ClientSet::default();
+        let mut out = lazy.deliver(&mut has, vec![delivery(&small), delivery(&mid)], vec![]).unwrap();
+        assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
+        assert!(matches!(out.step(), Next::Read { hash, .. } if hash == digest(&small)));
+        out.read(None);
+        assert!(
+            matches!(out.step(), Next::Send(ServerMsg::Delivered { .. })),
+            "an unreadable small blob is left to a fetch"
+        );
+    }
+
+    #[test]
+    fn a_fetch_ends_with_fetched_even_when_it_fails() {
+        let mut s = SessionState::new();
+        let mut has = ClientSet::default();
+        let mut out = s.fetch(&mut has, 7, vec![(digest(b"a"), Some(1)), (digest(b"gone"), None)]);
+        assert!(matches!(out.step(), Next::Read { .. }));
+        out.read(None);
+        assert!(matches!(out.step(), Next::Unreadable(h) if h == digest(b"a")));
+        assert!(matches!(out.abort(), Some(ServerMsg::Fetched { id: 7 })), "and the client is told");
     }
 
     struct Rng(u64);
@@ -352,108 +718,354 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_client_messages_leave_no_claim_and_push_nothing_the_client_has() {
-        for seed in 1..=300u64 {
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut has = ClientSet::default();
-            let mut client: BTreeSet<Digest> = BTreeSet::new();
-            let mut store: BTreeSet<Digest> = BTreeSet::new();
-            let mut s = SessionState::new();
-            let mut waiting = false;
-            let mut in_flight = 0usize;
-            for _ in 0..300 {
-                match rng.below(11) {
-                    0 => {
-                        let set: Vec<Digest> = (0..rng.below(4)).map(|_| d(rng.below(24) as u8)).collect();
-                        client.extend(&set);
-                        has.extend(set);
-                        s.set_knows();
+    struct Sending {
+        out: Outgoing,
+        fetched: BTreeSet<Digest>,
+    }
+
+    struct World {
+        pool: Vec<Vec<u8>>,
+        store: BTreeMap<Digest, Vec<u8>>,
+        files: BTreeMap<Digest, Vec<u8>>,
+        client: BTreeSet<Digest>,
+        known: BTreeSet<Digest>,
+        fetching: BTreeSet<Digest>,
+        receiving: BTreeMap<Digest, Vec<u8>>,
+        uploading: Option<(usize, usize)>,
+        has: ClientSet,
+        s: SessionState,
+        sends: Vec<Sending>,
+        in_flight: usize,
+        waiting: bool,
+        asked: Option<Ask>,
+        seed: u64,
+    }
+
+    impl World {
+        fn apply(&mut self, step: Step) -> bool {
+            for e in step.effects {
+                match e {
+                    Effect::Store { hash, bytes } => {
+                        assert_eq!(digest(&bytes), hash);
+                        self.store.insert(hash, bytes);
                     }
-                    1 => {
-                        let sizes: BTreeMap<Digest, u64> = (0..1 + rng.below(4))
-                            .map(|_| (d(rng.below(24) as u8), rng.below(2 * LAZY_SMALL)))
-                            .collect();
-                        let before = client.clone();
-                        let pushed: Vec<Digest> = if rng.below(2) == 0 {
-                            has.push(&sizes, s.knows()).into_iter().map(|(h, _)| h).collect()
-                        } else {
-                            has.push_small(&sizes)
+                    Effect::PartOpen(h) => assert!(self.files.insert(h, Vec::new()).is_none(), "one file per upload"),
+                    Effect::PartWrite(h, d) => self.files.get_mut(&h).expect("written to an open upload").extend(d),
+                    Effect::PartInstall { hash, size } => {
+                        let bytes = self.files.remove(&hash).expect("installed from an open upload");
+                        assert_eq!((digest(&bytes), bytes.len() as u64), (hash, size));
+                        self.store.insert(hash, bytes);
+                    }
+                    Effect::PartDrop(h) => assert!(self.files.remove(&h).is_some()),
+                    Effect::Answer(a) => {
+                        let kind = match a {
+                            Answer::Trees(_) => Ask::Trees,
+                            Answer::Env(_) => Ask::Env,
+                            Answer::Report(_) => Ask::Report,
                         };
-                        for h in &pushed {
-                            assert!(!before.contains(h), "seed {seed}: pushed {h:?}, which the client has");
-                        }
-                        client.extend(pushed);
-                        let id = s.delivery(&sizes);
-                        assert!(id >= 1);
+                        assert_eq!(self.asked.take(), Some(kind), "seed {}: an answer nobody asked for", self.seed);
                     }
-                    2 if !s.is_closed() && !waiting => {
-                        let want: Vec<Digest> = (0..1 + rng.below(4)).map(|_| d(rng.below(24) as u8)).collect();
-                        s.want(&want, &|h| store.contains(h));
-                        waiting = true;
-                    }
-                    3 => {
-                        for _ in 0..1 + rng.below(3) {
-                            store.insert(d(rng.below(24) as u8));
-                        }
-                    }
-                    4 => {
-                        let h = d(rng.below(24) as u8);
-                        let last = rng.below(3) == 0;
-                        let step = s.part(h, rng.below(1 << 20), last);
-                        if step.finish.is_some() {
-                            store.insert(h);
-                        }
-                    }
-                    5 => s.changed(),
-                    6 => {
-                        if rng.below(2) == 0 {
-                            let _ = s.ask([Ask::Trees, Ask::Env, Ask::Report][rng.below(3) as usize]);
-                        } else {
-                            s.answer([Ask::Trees, Ask::Env, Ask::Report][rng.below(3) as usize]);
-                        }
-                    }
-                    7 => {
-                        let n = rng.below(WINDOW as u64 / 2) as usize;
-                        if s.take_bulk(n) == Ok(true) {
-                            in_flight += bulk_cost(n);
-                        }
-                    }
-                    8 if in_flight > 0 => {
-                        let n = in_flight.min(1 + rng.below(WINDOW as u64) as usize);
-                        s.sent_bulk(n);
-                        in_flight -= n;
-                    }
-                    9 if waiting && rng.below(4) == 0 => {
-                        s.abandon_want();
-                        waiting = false;
-                    }
-                    10 if rng.below(8) == 0 => {
-                        s.close();
-                        s.invariants();
-                        assert_eq!(s.progress(&|h| store.contains(h)), Progress::Done);
-                        s = SessionState::new();
-                        waiting = false;
-                        in_flight = 0;
-                    }
-                    _ => {}
+                    Effect::Wake => {}
                 }
-                if waiting {
-                    match s.progress(&|h| store.contains(h)) {
-                        Progress::Wait => {}
-                        Progress::Done | Progress::Gone => waiting = false,
-                    }
-                }
-                if !waiting {
-                    assert!(s.wanted.is_empty(), "seed {seed}: a finished ask left a claim behind");
-                }
-                if !s.is_closed() {
-                    assert_eq!(s.credit + in_flight, WINDOW, "seed {seed}: the window counts what is in flight");
-                }
-                s.invariants();
             }
-            s.close();
-            s.invariants();
+            step.refused.is_none()
+        }
+
+        fn receive(&mut self, m: ServerMsg, fetched: &BTreeSet<Digest>) {
+            let seed = self.seed;
+            match m {
+                ServerMsg::Blobs(blobs) => {
+                    for b in blobs {
+                        let h = b.hash;
+                        assert!(
+                            fetched.contains(&h) || !self.known.contains(&h),
+                            "seed {seed}: sent {h:?}, which the client has"
+                        );
+                        assert_eq!(digest(&b.unpack().unwrap()), h);
+                        self.client.insert(h);
+                        self.known.insert(h);
+                    }
+                }
+                ServerMsg::BlobPart { hash, part, last } => {
+                    let got = self.receiving.entry(hash).or_default();
+                    if got.is_empty() {
+                        assert!(
+                            fetched.contains(&hash) || !self.known.contains(&hash),
+                            "seed {seed}: began sending {hash:?}, which the client has"
+                        );
+                    }
+                    got.extend(part.unpack().unwrap());
+                    if last {
+                        let all = self.receiving.remove(&hash).unwrap();
+                        assert_eq!(digest(&all), hash, "seed {seed}: the parts make the blob");
+                        self.client.insert(hash);
+                        self.known.insert(hash);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn pump(&mut self, i: usize) {
+            let next = self.sends[i].out.step();
+            let fetched = self.sends[i].fetched.clone();
+            match next {
+                Next::Read { hash, at, len, .. } => {
+                    let bytes =
+                        self.store.get(&hash).map(|b| b[at as usize..(at as usize + len).min(b.len())].to_vec());
+                    self.sends[i].out.read(bytes);
+                }
+                Next::Send(m) => self.receive(m, &fetched),
+                Next::Bulk(m) => match self.s.take_bulk(bulk_size(&m)) {
+                    Ok(true) => {
+                        self.in_flight += bulk_cost(bulk_size(&m));
+                        self.receive(m, &fetched);
+                    }
+                    Ok(false) => self.sends[i].out.ready.push_front(Next::Bulk(m)),
+                    Err(Gone) => self.end(i, &fetched),
+                },
+                Next::Unreadable(_) | Next::Gone => self.end(i, &fetched),
+                Next::Done => {
+                    for h in &fetched {
+                        self.fetching.remove(h);
+                    }
+                    self.sends.remove(i);
+                }
+            }
+        }
+
+        fn end(&mut self, i: usize, fetched: &BTreeSet<Digest>) {
+            if let Some(m) = self.sends[i].out.abort() {
+                self.receive(m, fetched);
+            }
+            for h in fetched {
+                self.fetching.remove(h);
+            }
+            self.sends.remove(i);
+        }
+
+        fn start(&mut self, rng: &mut Rng) {
+            if rng.below(2) == 0 {
+                let told: Vec<Digest> = self.client.iter().copied().collect();
+                self.known.extend(&told);
+                self.s.knows(&mut self.has, told);
+            }
+            if rng.below(3) == 0 {
+                self.s.set_lazy();
+            }
+        }
+
+        fn drop_session(&mut self, reconnect: bool, rng: &mut Rng) {
+            for h in self.s.close() {
+                assert!(self.files.remove(&h).is_some(), "seed {}: an upload the shell did not hold", self.seed);
+            }
+            assert!(self.files.is_empty(), "seed {}: a dropped session left an upload behind", self.seed);
+            self.s.invariants();
+            assert_eq!(
+                self.s.progress(&|_| false),
+                Progress::Done,
+                "seed {}: a dropped session holds a claim",
+                self.seed
+            );
+            while !self.sends.is_empty() {
+                self.pump(0);
+            }
+            self.receiving.clear();
+            self.uploading = None;
+            self.waiting = false;
+            self.asked = None;
+            self.in_flight = 0;
+            self.s = SessionState::new();
+            if reconnect {
+                self.has = ClientSet::default();
+                self.known.clear();
+            }
+            self.start(rng);
+        }
+    }
+
+    #[test]
+    fn generated_client_messages_never_leave_a_claim_and_never_send_a_blob_the_client_has() {
+        let pool: Vec<Vec<u8>> = (0..24u8).map(content).collect();
+        for seed in 1..=200u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut w = World {
+                pool: pool.clone(),
+                store: BTreeMap::new(),
+                files: BTreeMap::new(),
+                client: BTreeSet::new(),
+                known: BTreeSet::new(),
+                fetching: BTreeSet::new(),
+                receiving: BTreeMap::new(),
+                uploading: None,
+                has: ClientSet::default(),
+                s: SessionState::new(),
+                sends: Vec::new(),
+                in_flight: 0,
+                waiting: false,
+                asked: None,
+                seed,
+            };
+            for _ in 0..40 {
+                let i = rng.below(24) as usize;
+                w.store.insert(digest(&w.pool[i]), w.pool[i].clone());
+            }
+            w.start(&mut rng);
+            for _ in 0..300 {
+                let pick = rng.below(24) as usize;
+                let h = digest(&w.pool[pick]);
+                let ok = match rng.below(16) {
+                    0 | 1 => {
+                        let files: Vec<Delivery> = (0..1 + rng.below(3))
+                            .map(|_| &w.pool[rng.below(24) as usize])
+                            .filter(|b| w.store.contains_key(&digest(b)))
+                            .map(|b| delivery(b))
+                            .collect();
+                        let twice = rng.below(3) == 0;
+                        for _ in 0..1 + twice as usize {
+                            if let Some(out) = w.s.deliver(&mut w.has, files.clone(), vec![]) {
+                                w.sends.push(Sending { out, fetched: BTreeSet::new() });
+                                if w.s.is_lazy() {
+                                    let i = w.sends.len() - 1;
+                                    while w.sends.len() > i {
+                                        w.pump(i);
+                                    }
+                                }
+                            }
+                        }
+                        true
+                    }
+                    2 if w.s.is_lazy() && !w.client.contains(&h) && !w.fetching.contains(&h) => {
+                        w.fetching.insert(h);
+                        let found = vec![(h, w.store.get(&h).map(|b| b.len() as u64))];
+                        let out = w.s.fetch(&mut w.has, rng.below(100), found);
+                        w.sends.push(Sending { out, fetched: [h].into() });
+                        true
+                    }
+                    3 | 4 if !w.sends.is_empty() => {
+                        for _ in 0..1 + rng.below(6) {
+                            if !w.sends.is_empty() {
+                                let i = rng.below(w.sends.len() as u64) as usize;
+                                w.pump(i);
+                            }
+                        }
+                        true
+                    }
+                    5 if w.in_flight > 0 => {
+                        let n = w.in_flight.min(1 + rng.below(WINDOW as u64) as usize);
+                        w.s.sent_bulk(n);
+                        w.in_flight -= n;
+                        true
+                    }
+                    6 => {
+                        let bytes = &w.pool[pick];
+                        let mut blobs = vec![Blob::pack(h, bytes)];
+                        if rng.below(3) == 0 {
+                            blobs.push(Blob::pack(h, bytes));
+                        }
+                        let step = w.s.client(ClientMsg::Blobs(blobs));
+                        w.apply(step)
+                    }
+                    7 | 8 => {
+                        let (i, at) = w.uploading.unwrap_or((pick, 0));
+                        let bytes = w.pool[i].clone();
+                        let end = (at + PART_SIZE / 2 + rng.below(PART_SIZE as u64) as usize).min(bytes.len());
+                        let last = end == bytes.len();
+                        w.uploading = if last { None } else { Some((i, end)) };
+                        let msg = ClientMsg::BlobPart {
+                            hash: digest(&bytes),
+                            part: Part::pack(bytes[at..end].to_vec()),
+                            last,
+                        };
+                        let step = w.s.client(msg);
+                        w.apply(step)
+                    }
+                    9 if w.uploading.is_some() && rng.below(3) == 0 => {
+                        w.uploading = None;
+                        let step = w.s.client(ClientMsg::Changed);
+                        w.apply(step)
+                    }
+                    10 if !w.waiting && !w.s.is_closed() => {
+                        let want: Vec<Digest> =
+                            (0..1 + rng.below(3)).map(|_| digest(&w.pool[rng.below(24) as usize])).collect();
+                        let store = &w.store;
+                        let asked = w.s.want(&want, &|d| store.contains_key(d));
+                        assert!(matches!(asked, ServerMsg::WantBlobs(v) if v == want));
+                        w.waiting = true;
+                        true
+                    }
+                    11 => {
+                        let q = match rng.below(3) {
+                            0 => Question::Trees(vec![h]),
+                            1 => Question::Env(vec!["A".into()]),
+                            _ => Question::Report(Box::new(rargo_proto::FutureReport {
+                                path: String::new(),
+                                per_package: vec![],
+                                suggestion: String::new(),
+                            })),
+                        };
+                        let kind = match q {
+                            Question::Trees(_) => Ask::Trees,
+                            Question::Env(_) => Ask::Env,
+                            Question::Report(_) => Ask::Report,
+                        };
+                        if w.s.ask(q).is_ok() {
+                            w.asked = Some(kind);
+                        }
+                        true
+                    }
+                    12 => {
+                        let msg = match rng.below(3) {
+                            0 => ClientMsg::Trees(vec![]),
+                            1 => ClientMsg::Env(vec![]),
+                            _ => ClientMsg::ReportId(3),
+                        };
+                        let step = w.s.client(msg);
+                        w.apply(step)
+                    }
+                    13 if rng.below(6) == 0 => {
+                        let msg = if rng.below(2) == 0 { ClientMsg::Ping(1) } else { ClientMsg::Cancel };
+                        let step = w.s.client(msg);
+                        assert_eq!(step.refused, Some(UNEXPECTED));
+                        false
+                    }
+                    14 if w.waiting && rng.below(4) == 0 => {
+                        w.s.abandon_want();
+                        w.waiting = false;
+                        true
+                    }
+                    15 if rng.below(10) == 0 => {
+                        let reconnect = rng.below(2) == 0;
+                        w.drop_session(reconnect, &mut rng);
+                        true
+                    }
+                    _ => true,
+                };
+                if !ok {
+                    let reconnect = rng.below(2) == 0;
+                    w.drop_session(reconnect, &mut rng);
+                }
+                if w.waiting {
+                    let store = &w.store;
+                    match w.s.progress(&|d| store.contains_key(d)) {
+                        Progress::Wait => {}
+                        Progress::Done | Progress::Gone => w.waiting = false,
+                    }
+                }
+                if !w.waiting {
+                    assert!(w.s.wanted.is_empty(), "seed {seed}: a finished ask left a claim behind");
+                }
+                assert_eq!(
+                    w.files.keys().collect::<Vec<_>>(),
+                    w.s.parts.keys().collect::<Vec<_>>(),
+                    "seed {seed}: the shell holds a file for exactly the uploads in progress"
+                );
+                if !w.s.is_closed() {
+                    assert!(w.s.credit + w.in_flight <= WINDOW, "seed {seed}: the window counts what is in flight");
+                }
+                w.s.invariants();
+            }
+            w.drop_session(false, &mut rng);
         }
     }
 }
