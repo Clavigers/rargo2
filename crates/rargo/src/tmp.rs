@@ -84,12 +84,12 @@ pub fn install_handlers() {
     }
 }
 
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
     r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn owner(name: &str, prefix: &str) -> Option<u32> {
+pub(crate) fn owner(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
     let (pid, _) = rest.split_once('-')?;
     assert!(!pid.contains('-'));

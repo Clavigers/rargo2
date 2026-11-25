@@ -1589,7 +1589,8 @@ impl Daemon {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
                             None => (files, writes),
                         };
-                        placer.deliver(files, writes)?;
+                        let root = wt.map(|w| w.root.as_path()).ok_or_else(|| std::io::Error::other("the server sent files for a command that has no worktree"))?;
+                        placer.deliver(root, files, writes)?;
                         Ok(())
                     })?;
                 }
