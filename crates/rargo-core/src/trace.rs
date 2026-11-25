@@ -1,4 +1,4 @@
-use crate::db::{Db, Table};
+use crate::db::{Table, Tables};
 use crate::hash::{Hash, KeyHasher};
 use crate::sandbox::NetMode;
 use crate::store::Store;
@@ -196,7 +196,7 @@ pub struct CacheStats {
 }
 
 pub struct TraceCache {
-    db: Arc<Db>,
+    db: Arc<dyn Tables>,
     mem: DashMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>,
     next_id: AtomicU64,
     env_names: parking_lot::Mutex<Option<std::collections::BTreeSet<String>>>,
@@ -210,7 +210,7 @@ fn trace_key(weak: &Hash, id: u64) -> Vec<u8> {
 }
 
 impl TraceCache {
-    pub fn new(db: Arc<Db>, seed: u64) -> TraceCache {
+    pub fn new(db: Arc<dyn Tables>, seed: u64) -> TraceCache {
         TraceCache { db, mem: DashMap::new(), env_names: parking_lot::Mutex::new(None), next_id: AtomicU64::new(seed), stats: CacheStats::default() }
     }
 
@@ -257,12 +257,12 @@ impl TraceCache {
     }
 
     pub fn insert(&self, weak: &Hash, trace: Trace) -> Arc<Trace> {
+        let mut list: Vec<(u64, Arc<Trace>)> = self.load(weak).as_ref().clone();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let raw = bincode::serialize(&trace).expect("trace serialises");
         let packed = zstd::encode_all(&raw[..], 3).expect("zstd");
         self.db.put(Table::Traces, &trace_key(weak, id), &packed);
         let trace = Arc::new(trace);
-        let mut list: Vec<(u64, Arc<Trace>)> = self.load(weak).as_ref().clone();
         list.insert(0, (id, trace.clone()));
         while list.len() > MAX_TRACES_PER_KEY {
             let (old, _) = list.pop().unwrap();
@@ -321,14 +321,14 @@ impl TraceCache {
 
     pub fn all(&self) -> Vec<(Hash, Trace)> {
         let mut out = Vec::new();
-        self.db.for_each(Table::Traces, |k, v| {
+        for (k, v) in self.db.scan_prefix(Table::Traces, &[]) {
             if k.len() != 40 {
-                return;
+                continue;
             }
-            let Ok(raw) = zstd::decode_all(v) else { return };
-            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { return };
+            let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
+            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
             out.push((Hash(k[..32].try_into().unwrap()), t));
-        });
+        }
         out
     }
 
@@ -344,9 +344,9 @@ impl TraceCache {
     }
 
     pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
-        self.db.for_each(Table::Traces, |_, v| {
-            let Ok(raw) = zstd::decode_all(v) else { return };
-            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { return };
+        for (_, v) in self.db.scan_prefix(Table::Traces, &[]) {
+            let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
+            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
             live.insert(t.result.stdout);
             live.insert(t.result.stderr);
             for (_, e) in &t.result.outputs.entries {
@@ -354,6 +354,115 @@ impl TraceCache {
                     live.insert(*hash);
                 }
             }
-        });
+        }
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        let next = self.next_id.load(Ordering::Relaxed);
+        let stored = |weak: &Hash| -> Vec<u64> {
+            let mut ids: Vec<u64> = self.db.scan_prefix(Table::Traces, &weak.0).into_iter().filter(|(k, _)| k.len() == 40).map(|(k, _)| u64::from_be_bytes(k[32..40].try_into().unwrap())).collect();
+            ids.sort_by(|a, b| b.cmp(a));
+            ids
+        };
+        let names: Option<std::collections::BTreeSet<String>> = self.env_names.lock().clone();
+        self.mem.iter().all(|e| {
+            let ids: Vec<u64> = e.value().iter().map(|(id, _)| *id).collect();
+            ids.len() <= MAX_TRACES_PER_KEY && ids.windows(2).all(|w| w[0] > w[1]) && ids.iter().all(|id| *id < next) && ids == stored(e.key())
+        }) && names.is_none_or(|n| n == self.all_needs_env().into_iter().flat_map(|(_, v)| v).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::MemTables;
+
+    fn trace(n: u8, created: u64) -> Trace {
+        let file = MEntry::File { hash: Hash([n; 32]), exec: false, size: n as u64 };
+        let result = ActionResult {
+            status: 0,
+            stdout: Hash([n.wrapping_add(1); 32]),
+            stderr: Hash([n.wrapping_add(2); 32]),
+            outputs: Arc::new(Manifest { entries: vec![(format!("/o/{n}").into_bytes(), file)] }),
+            stats: Stats { wall_us: 10, cpu_us: 5, max_rss_kb: 1 },
+        };
+        Trace { obs: Vec::new(), result, created }
+    }
+
+    fn ids(c: &TraceCache, weak: &Hash) -> Vec<u64> {
+        c.traces(weak).iter().map(|(id, _)| *id).collect()
+    }
+
+    #[test]
+    fn trace_ids_follow_the_given_seed_and_each_key_keeps_its_newest() {
+        let (a, b) = (Hash::of(b"action a"), Hash::of(b"action b"));
+        let run = |seed: u64| {
+            let db = Arc::new(MemTables::default());
+            let c = TraceCache::new(db.clone(), seed);
+            assert!(c.invariants());
+            for n in 0..30u8 {
+                c.insert(if n % 3 == 0 { &b } else { &a }, trace(n, 1000 + n as u64));
+                assert!(c.invariants(), "after insert {n}");
+            }
+            let keys: Vec<Vec<u8>> = db.scan_prefix(Table::Traces, &[]).into_iter().map(|(k, _)| k).collect();
+            (db, c, keys)
+        };
+        let (db, c, keys) = run(500);
+        assert_eq!(run(500).2, keys, "the same seed gives the same ids");
+        assert_ne!(run(7).2, keys);
+        let of_a: Vec<u64> = (500..530).filter(|i| (i - 500) % 3 != 0).rev().collect();
+        assert_eq!(ids(&c, &a), of_a, "20 traces of a, newest first");
+        let of_b: Vec<u64> = (500..530).filter(|i| (i - 500) % 3 == 0).rev().collect();
+        assert_eq!(ids(&c, &b), of_b);
+        for n in 0..30u8 {
+            c.insert(&a, trace(n, 2000));
+            assert!(c.invariants());
+        }
+        assert_eq!(ids(&c, &a), (530..560).rev().take(MAX_TRACES_PER_KEY).collect::<Vec<u64>>(), "only the newest 24 are kept");
+        assert_eq!(db.scan_prefix(Table::Traces, &a.0).len(), MAX_TRACES_PER_KEY, "and the rest are deleted");
+        assert_eq!(c.traces(&a)[0].1.created, 2000, "a trace keeps the time it was given");
+        c.remove(&a, 545);
+        assert!(c.invariants());
+        assert!(!ids(&c, &a).contains(&545));
+
+        let again = TraceCache::new(db.clone(), 900);
+        assert_eq!(ids(&again, &a), ids(&c, &a), "another cache reads the same traces back");
+        assert!(again.invariants());
+        let created: Vec<u64> = again.traces(&b).iter().map(|(_, t)| t.created).collect();
+        assert_eq!(created, (0..30u64).filter(|n| n % 3 == 0).rev().map(|n| 1000 + n).collect::<Vec<u64>>());
+        assert_eq!(again.all().len(), MAX_TRACES_PER_KEY - 1 + 10);
+        let mut live = std::collections::HashSet::new();
+        again.mark(&mut live);
+        let expected: std::collections::HashSet<Hash> = again
+            .all()
+            .iter()
+            .flat_map(|(_, t)| {
+                let files = t.result.outputs.entries.iter().filter_map(|(_, e)| if let MEntry::File { hash, .. } = e { Some(*hash) } else { None });
+                [t.result.stdout, t.result.stderr].into_iter().chain(files).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(live, expected, "every kept trace's outputs are live");
+        assert!(live.contains(&Hash([0; 32])), "including the oldest trace of b");
+    }
+
+    #[test]
+    fn the_environment_an_action_needs_is_merged_and_remembered() {
+        let db = Arc::new(MemTables::default());
+        let c = TraceCache::new(db.clone(), 1);
+        let (a, b) = (Hash::of(b"a"), Hash::of(b"b"));
+        assert!(c.needs_env(&a).is_empty() && c.every_env_name().is_empty());
+        assert!(c.invariants());
+        assert_eq!(c.add_needs_env(&a, &["PATH".into(), "HOME".into()]), ["PATH", "HOME"]);
+        assert!(c.invariants());
+        assert_eq!(c.add_needs_env(&a, &["HOME".into(), "CC".into()]), ["CC"]);
+        assert!(c.add_needs_env(&a, &["CC".into()]).is_empty());
+        assert_eq!(c.add_needs_env(&b, &["RUSTFLAGS".into()]), ["RUSTFLAGS"]);
+        assert!(c.invariants());
+        assert_eq!(c.needs_env(&a), ["CC", "HOME", "PATH"]);
+        assert_eq!(c.every_env_name(), ["CC", "HOME", "PATH", "RUSTFLAGS"]);
+        let again = TraceCache::new(db, 1);
+        assert_eq!(again.all_needs_env().len(), 2);
+        assert_eq!(again.every_env_name(), ["CC", "HOME", "PATH", "RUSTFLAGS"]);
     }
 }

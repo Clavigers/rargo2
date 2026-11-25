@@ -235,7 +235,7 @@ impl Daemon {
     pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
         let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
-        let incr = crate::incr::IncrStore::new(engine.store.clone(), seed);
+        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
