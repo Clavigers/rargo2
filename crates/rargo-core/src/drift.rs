@@ -77,7 +77,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     }
     let policy = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
     let (dd, snap, dir, files) = (d.clone(), snapshot.clone(), who.dir.clone(), policy.flake.files.clone());
-    let flake = crate::io::cpu(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
+    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid)
         .context("evaluating the build flake for the drift check")?;
     for k in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         env.remove(k);
@@ -92,11 +92,14 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
     let started = time();
     let stock_cwd = scratch.join(&who.dir);
-    let stock = crate::io::cpu(move || -> Result<std::process::Output> {
+    let stock = (|| -> Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
-        snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
-        let stock_cwd = stock_cwd.canonicalize()?;
-        anyhow::ensure!(stock_cwd.starts_with(scratch2.canonicalize()?), "drift check directory is outside the snapshot");
+        let stock_cwd = crate::io::cpu(|| -> Result<std::path::PathBuf> {
+            snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
+            let stock_cwd = stock_cwd.canonicalize()?;
+            anyhow::ensure!(stock_cwd.starts_with(scratch2.canonicalize()?), "drift check directory is outside the snapshot");
+            Ok(stock_cwd)
+        })?;
         let mut c = std::process::Command::new("nice");
         c.args(["-n", "19", cargo.as_str(), "build", "--offline", "-j", "4"])
             .current_dir(&stock_cwd)
@@ -111,8 +114,8 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
         if uid != unsafe { libc::geteuid() } {
             c.uid(uid).gid(gid);
         }
-        c.output().context("running stock cargo")
-    })?;
+        crate::io::output(&mut c).context("running stock cargo")
+    })()?;
     let stock_ran = (started, time());
 
     let (tx, mut rx) = crate::io::unbounded_channel();

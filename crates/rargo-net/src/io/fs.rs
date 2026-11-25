@@ -63,13 +63,6 @@ pub fn close_fd(fd: i32) -> io::Result<()> {
     }
 }
 
-pub fn wait_pid(pid: i32) -> io::Result<i32> {
-    match op_event(Op::WaitPid { pid })? {
-        Event::Exited { status } => Ok(status),
-        _ => Err(io::Error::other("wait")),
-    }
-}
-
 pub fn try_read(fd: i32, len: usize) -> io::Result<Option<Vec<u8>>> {
     let mut buf = vec![0u8; len];
     loop {

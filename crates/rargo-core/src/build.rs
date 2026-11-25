@@ -460,7 +460,7 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
         }
     }
     let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
-    let flake = crate::io::cpu(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
+    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid)
         .context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")?;
     let mut links = Vec::new();
     for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
@@ -656,9 +656,9 @@ fn fetch(
     env.insert("CARGO_HOME".into(), c.home.dir.to_string_lossy().into_owned());
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
-    let out = crate::io::cpu(move || -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
+    let out = (|| -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
-        snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
+        crate::io::cpu(|| snap.materialize(&scratch2, uid, gid, &|_, _| true))?;
         let run = |program: &Path, args: &[String]| {
             let mut cmd = std::process::Command::new(program);
             cmd.args(args).current_dir(&cwd).env_clear().envs(&env);
@@ -666,7 +666,7 @@ fn fetch(
             if uid != unsafe { libc::geteuid() } {
                 cmd.uid(uid).gid(gid);
             }
-            cmd.output()
+            crate::io::output(&mut cmd)
         };
         let _ = run(Path::new("rustc"), &["-V".to_string()]);
         if let Err(said) = add_components(&components, &run) {
@@ -676,7 +676,7 @@ fn fetch(
             return Ok(Ok(None));
         }
         Ok(Ok(Some(run(&planner, &fetch_args)?)))
-    });
+    })();
     let out = match out {
         Ok(Ok(Some(o))) => o,
         Ok(Err(said)) => {
@@ -755,7 +755,7 @@ fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, Stri
         env.insert(k, v);
     }
     let (uid, gid) = (c.uid, c.gid);
-    let added = crate::io::cpu(move || {
+    let added = {
         use std::os::unix::process::CommandExt;
         let run = |program: &Path, args: &[String]| {
             let mut cmd = std::process::Command::new(program);
@@ -764,10 +764,10 @@ fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, Stri
             if uid != unsafe { libc::geteuid() } {
                 cmd.uid(uid).gid(gid);
             }
-            cmd.output()
+            crate::io::output(&mut cmd)
         };
         add_components(&components, &run)
-    });
+    };
     Ok(match added {
         Ok(()) => true,
         Err(said) => {

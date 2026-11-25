@@ -228,28 +228,29 @@ impl Drop for Teardown {
         let (fs, action, scratch, group) =
             (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
         let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
-        let work = move || {
-            let mut held = 0;
-            if let (Some(_), Some(g)) = (&running, &group) {
-                g.freeze();
-                held = g.helper_tokens();
-            }
+        drop(io::spawn_off(move || {
+            let held = match (&running, &group) {
+                (Some(_), Some(g)) => io::cpu(|| {
+                    g.freeze();
+                    g.helper_tokens()
+                }),
+                _ => 0,
+            };
             if let Some(r) = running {
                 zygote.kill(r.id);
                 if let Some(rx) = r.done {
-                    let _ = io::call(|| rx.recv());
+                    let _ = rx.recv();
                 }
             }
             if held > 0 {
                 sched.restore(held);
             }
-            let _ = fs.finish_action(&action);
-            drop(group);
-            let _ = std::fs::remove_dir_all(&scratch);
-        };
-        if std::thread::Builder::new().name("cancelled-action".into()).spawn(work).is_err() {
-            eprintln!("rargod: could not start a thread to clean up a cancelled action");
-        }
+            io::cpu(move || {
+                let _ = fs.finish_action(&action);
+                drop(group);
+                let _ = std::fs::remove_dir_all(&scratch);
+            });
+        }));
     }
 }
 
