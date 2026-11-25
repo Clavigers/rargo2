@@ -177,3 +177,19 @@ fn a_race_whose_arms_wake_together_is_won_by_the_earlier_arm() {
         drop(sender);
     });
 }
+
+#[test]
+fn the_loop_ends_with_its_last_foreground_fiber_and_cancels_the_background() {
+    drive(1, || {
+        let wake = Arc::new(Notify::new());
+        let waiting = Arc::clone(&wake);
+        background(move || {
+            let _ = timeout(Duration::from_secs(3600), || waiting.notified());
+            unreachable!("a cancelled background fiber does not run on");
+        });
+        background(|| loop {
+            sleep(Duration::from_millis(1));
+        });
+        yield_now();
+    });
+}

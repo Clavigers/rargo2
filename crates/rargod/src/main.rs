@@ -204,39 +204,7 @@ fn main() -> Result<()> {
         opts.mem_kb >> 20,
     );
 
-    {
-        let d = daemon.clone();
-        let budget = opts.store_budget;
-        let cold_after = opts.cold_after_secs;
-        std::thread::Builder::new().name("evict".into()).spawn(move || {
-            let mut tick = 0u64;
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(20));
-                let store = &d.engine.store;
-                if tick % 6 == 5 {
-                    let (n, bytes) = d.collect_garbage(600);
-                    if n > 0 {
-                        eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
-                    }
-                }
-                if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
-                    let fs = d.engine.fs.clone();
-                    let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
-                    if n > 0 {
-                        eprintln!("rargod: {n} blobs went cold, {} MiB freed", freed >> 20);
-                    }
-                }
-                tick += 1;
-                if store.total_bytes() > budget {
-                    let fs = d.engine.fs.clone();
-                    let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
-                    if freed > 0 {
-                        eprintln!("rargod: evicted {} MiB (store now {} MiB)", freed >> 20, store.total_bytes() >> 20);
-                    }
-                }
-            }
-        })?;
-    }
+    let evicting = (daemon.clone(), opts.store_budget, opts.cold_after_secs);
 
     let worker_link = match opts.workers_listen {
         Some(addr) => Some((addr, link_key(&opts, addr)?)),
@@ -249,6 +217,7 @@ fn main() -> Result<()> {
     let keys = Arc::new(keys);
     io::drive(4, move || {
         rargo_core::io::FuseDrive::spawn(&session, &fuse_fs).detach();
+        io::background(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
             match rargo_core::remote::Pool::listen(&daemon.engine, addr, key) {
                 Ok(pool) => {
@@ -428,5 +397,37 @@ fn link_key(opts: &Opts, addr: std::net::SocketAddr) -> Result<rargo_core::net::
         }
         None if addr.ip().is_loopback() => Ok(None),
         None => anyhow::bail!("--worker-key FILE is required unless the worker link is on the loopback interface"),
+    }
+}
+
+fn evict_loop((d, budget, cold_after): (Arc<Daemon>, u64, u64)) {
+    let mut tick = 0u64;
+    loop {
+        io::sleep(std::time::Duration::from_secs(20));
+        let d = d.clone();
+        io::cpu(move || {
+            let store = &d.engine.store;
+            if tick % 6 == 5 {
+                let (n, bytes) = d.collect_garbage(600);
+                if n > 0 {
+                    eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
+                }
+            }
+            if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
+                let fs = d.engine.fs.clone();
+                let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
+                if n > 0 {
+                    eprintln!("rargod: {n} blobs went cold, {} MiB freed", freed >> 20);
+                }
+            }
+            if store.total_bytes() > budget {
+                let fs = d.engine.fs.clone();
+                let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
+                if freed > 0 {
+                    eprintln!("rargod: evicted {} MiB (store now {} MiB)", freed >> 20, store.total_bytes() >> 20);
+                }
+            }
+        });
+        tick += 1;
     }
 }

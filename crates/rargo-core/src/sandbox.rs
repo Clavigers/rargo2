@@ -167,7 +167,7 @@ impl Zygote {
     fn read_exits(&self) {
         let fd = self.sock.as_raw_fd();
         let waiting = self.pending.clone();
-        drop(crate::io::spawn(move || {
+        crate::io::background(move || {
             while let Ok(Some((payload, _))) = recv_frame(fd) {
                 let Ok(FromZygote::Exited { id, info }) = bincode::deserialize(&payload) else { continue };
                 if let Some(tx) = waiting.lock().remove(&id) {
@@ -175,7 +175,7 @@ impl Zygote {
                 }
             }
             waiting.lock().clear();
-        }));
+        });
     }
 
     fn send(&self, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
