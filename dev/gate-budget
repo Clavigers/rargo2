@@ -1,0 +1,13 @@
+# How long the gate may take, in seconds. dev/gate.sh fails when the whole
+# gate takes longer than `total`. The suite lines are the last recorded
+# time of each suite; they only make the failure message say which grew.
+# The total goes down, not up: dev/gate-budget.sh refuses a higher total
+# than origin/main has unless a commit says `Gate-budget-raise: <why>`.
+total 150
+e2e 41
+e2e-copy 43
+e2e-flake 15
+e2e-auth 107
+e2e-components 5
+e2e-link 87
+e2e-worker 25

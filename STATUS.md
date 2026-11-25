@@ -1657,3 +1657,10 @@ cache that shares artifacts between them.
 On `08bf0d3`, three gates in a row on this machine each pass every suite.
 They take 127s, 104s and 103s. The scripts the gate and CI run do not wait
 on time.
+
+The gate also fails when it is slower than the budget in `dev/gate-budget`
+(150s total; the file also holds each suite's last recorded time, so the
+failure message says which suite grew). This ratchet is the one check in
+the gate that depends on how long something took, by the owner's choice.
+`dev/gate-budget.sh` refuses a higher total than `origin/main` has unless
+a commit since says `Gate-budget-raise: <why>`. Not yet run in a full gate.
