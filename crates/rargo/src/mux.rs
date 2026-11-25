@@ -14,6 +14,16 @@ const DEAD_AFTER: Duration = Duration::from_secs(45);
 const _: () = assert!(WINDOW <= u32::MAX as usize, "a window's permits fit acquire_many");
 const _: () = assert!(DEAD_AFTER.as_secs() > 2 * PING_EVERY.as_secs());
 
+fn dead_limit(kind: &str) -> Duration {
+    let base = std::env::var("RARGO_LINK_DEAD_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n >= 1)
+        .map(Duration::from_secs)
+        .unwrap_or(DEAD_AFTER);
+    if kind == "udp" { base } else { base * 8 }
+}
+
 struct Out {
     seq: u64,
     tx: UnboundedSender<(Vec<u8>, usize)>,
@@ -116,22 +126,30 @@ impl Mux {
         });
         let m = mux.clone();
         tokio::spawn(async move {
+            let limit = dead_limit(m.link.kind());
+            // A live server answers a ping well inside the dead limit, so silence means it is gone.
+            let ping_every = PING_EVERY.min(limit / 3).max(Duration::from_millis(500));
+            let step = Duration::from_millis(200);
+            let mut since_ping = Duration::ZERO;
             let mut n = 0u64;
             loop {
-                tokio::time::sleep(PING_EVERY).await;
+                tokio::time::sleep(step).await;
                 if m.is_dead() {
                     break;
                 }
                 let frames = m.last_heard.lock().unwrap().elapsed();
                 let quiet = if m.link.kind() == "udp" { frames.min(m.link.idle()) } else { frames };
-                let limit = if m.link.kind() == "udp" { DEAD_AFTER } else { DEAD_AFTER * 8 };
                 if quiet > limit {
                     m.die();
                     break;
                 }
-                n += 1;
-                let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
-                let _ = m.out.lock().unwrap().urgent.send(ping);
+                since_ping += step;
+                if since_ping >= ping_every {
+                    since_ping = Duration::ZERO;
+                    n += 1;
+                    let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
+                    let _ = m.out.lock().unwrap().urgent.send(ping);
+                }
             }
         });
         mux
@@ -143,6 +161,19 @@ impl Mux {
 
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst) || self.link.is_closed()
+    }
+
+    /// Resolves when the link is closed. A missed wake is caught on the next check.
+    pub async fn until_dead(&self) {
+        loop {
+            if self.is_dead() {
+                return;
+            }
+            tokio::select! {
+                _ = self.gone.notified() => return,
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
     }
 
     pub fn die(&self) {
@@ -195,7 +226,7 @@ impl Mux {
             .window
             .acquire_many(n as u32)
             .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the connection to the server was lost"))?;
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the server went away"))?;
         permit.forget();
         self.queue(stream, msg, n);
         Ok(())

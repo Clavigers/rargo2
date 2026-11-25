@@ -129,7 +129,7 @@ enum Offered {
 }
 
 fn lost() -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the connection to the server was lost")
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the server went away")
 }
 
 fn var<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -1177,9 +1177,7 @@ impl Daemon {
                     return Ok(Outcome::NotThere(if trees.is_empty() { Probe::Wait } else { Probe::Whole }));
                 }
                 m = rx.recv() => m,
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if mux.is_dead() { None } else { continue }
-                }
+                _ = mux.until_dead() => None,
             };
             let Some(msg) = msg else { return Err(lost()) };
             if bet.is_some() && matches!(msg, ServerMsg::WantTrees(_) | ServerMsg::WantBlobs(_)) {
@@ -1446,11 +1444,7 @@ async fn next_msg(mux: &Arc<Mux>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<
     loop {
         tokio::select! {
             m = rx.recv() => return m.ok_or_else(lost),
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                if mux.is_dead() {
-                    return Err(lost());
-                }
-            }
+            _ = mux.until_dead() => return Err(lost()),
         }
     }
 }

@@ -90,6 +90,55 @@ out=$(R run -q 2>&1); [ "$out" = "value 83" ]; check $? "the daemon connects aga
 st=$(dstat)
 grep -q '^link  *udp; 2 made' <<<"$st"; check $? "over a second link" "$st"
 
+echo "== the server goes away during a build"
+pids=$(pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" || true)
+pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E" 2>/dev/null || true
+for pid in $pids; do timeout 10 tail --pid="$pid" -f /dev/null; done
+away="away_$BASHPID"
+mkdir -p "crates/$away/src"
+printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' "$away" >"crates/$away/Cargo.toml"
+cat >"crates/$away/build.rs" <<'EOF'
+fn main() {
+    println!("cargo:warning=script-started");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::thread::park();
+}
+EOF
+echo '' >"crates/$away/src/lib.rs"
+RARGO_LINK_DEAD_SECS=3 R build -p "$away" >"$E/away.log" 2>&1 &
+cl=$!
+timeout 40 tail -n +1 -f --pid="$cl" "$E/away.log" | awk '/script-started/ { found=1; exit } END { exit found ? 0 : 1 }' || true
+srv=
+for pid in $(pgrep -f "rargod --state $rig/srv " || true); do
+    comm=$(ps -p "$pid" -o comm= 2>/dev/null | tr -d ' ')
+    if [ "$comm" = rargod ]; then srv=$pid; break; fi
+done
+"$here/netns.sh" reset-server >/dev/null 2>&1 &
+rst=$!
+if [ -n "$srv" ]; then timeout 20 tail --pid="$srv" -f /dev/null; fi
+start=$(date +%s)
+timeout 8 tail --pid="$cl" -f /dev/null
+if kill -0 "$cl" 2>/dev/null; then
+    kill -KILL "$cl" 2>/dev/null || true
+    wait "$cl" 2>/dev/null || true
+    rc=1
+else
+    wait "$cl"
+    rc=$?
+fi
+elapsed=$(( $(date +%s) - start ))
+wait "$rst" 2>/dev/null || true
+if [ "$rc" -ne 0 ] && grep -q "the server went away" "$E/away.log" && [ "$elapsed" -le 8 ]; then
+    ok "a build whose server goes away fails and says so (${elapsed}s)"
+else
+    bad "a build whose server goes away fails and says so" "rc=$rc elapsed=${elapsed}s server=${srv:-none}
+$(cat "$E/away.log")"
+fi
+rm -rf "crates/$away"
+pids=$(pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" || true)
+pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E" 2>/dev/null || true
+for pid in $pids; do timeout 10 tail --pid="$pid" -f /dev/null; done
+
 echo "== a command that is interrupted"
 slow="slow_$BASHPID"
 slow_script="^[^ ]*build/$slow/[0-9a-f]*/out/build_script_build[^ ]*\$"
@@ -117,8 +166,9 @@ if [ -n "$script" ]; then
 fi
 [ "$interrupted" -eq 130 ] && ! pgrep -f "$slow_script" >/dev/null; check $? "interrupting the command stops it there, though the daemon and its link stay"
 rm -rf "crates/$slow"
+link=$(dstat | grep -oE 'udp; [0-9]+ made')
 out=$(R run -q 2>&1); [ "$out" = "value 83" ]; check $? "the next command works on the same link" "$out"
-grep -q '^link  *udp; 2 made' <<<"$(dstat)"; check $? "(no new connection)" "$(dstat)"
+grep -q "^link  *$link" <<<"$(dstat)"; check $? "(no new connection)" "$(dstat)"
 
 echo "== without a daemon"
 out=$(RARGO_NO_DAEMON=1 R run -q 2>&1); [ "$out" = "value 83" ]; check $? "RARGO_NO_DAEMON=1 runs the command in one process" "$out"
