@@ -451,67 +451,112 @@ mod tests {
             .collect()
     }
 
+    fn msg(c: &mut ConnectionState, stream: u32, m: ClientMsg, key_valid: bool) -> Vec<Route> {
+        let routes = c.message(stream, m, key_valid);
+        c.invariants();
+        routes
+    }
+
+    fn fin(c: &mut ConnectionState, stream: u32) {
+        c.finished(stream);
+        c.invariants();
+    }
+
+    fn key(c: &mut ConnectionState, valid: bool) -> Vec<Route> {
+        let routes = c.key_checked(valid);
+        c.invariants();
+        routes
+    }
+
+    fn close(c: &mut ConnectionState) -> Vec<Route> {
+        let routes = c.close();
+        c.invariants();
+        routes
+    }
+
+    fn failed(c: &mut ConnectionState, stream: u32) -> Vec<Route> {
+        let routes = c.stream_failed(stream);
+        c.invariants();
+        routes
+    }
+
+    fn control_failed(c: &mut ConnectionState) -> Vec<Route> {
+        let routes = c.control_failed();
+        c.invariants();
+        routes
+    }
+
+    #[test]
+    fn a_failed_stream_ends_only_itself_and_a_failed_control_stream_ends_the_connection() {
+        let mut c = ConnectionState::new();
+        msg(&mut c, 2, run(&["build"]), true);
+        msg(&mut c, 4, run(&["build"]), true);
+        assert_eq!(names(&failed(&mut c, 2)), ["cancel 2"]);
+        assert_eq!(names(&failed(&mut c, 2)), Vec::<String>::new(), "a stream ends once");
+        assert!(c.is_running(4) && !c.is_closed());
+        assert_eq!(names(&control_failed(&mut c)), ["cancel 4", "close"]);
+        assert!(control_failed(&mut c).is_empty());
+        assert!(failed(&mut c, 4).is_empty());
+    }
+
     #[test]
     fn streams_are_independent_and_a_cancel_reaches_only_its_stream() {
         let mut c = ConnectionState::new();
-        assert_eq!(names(&c.message(3, run(&["build"]), true)), ["run 3"]);
-        assert_eq!(names(&c.message(5, run(&["test"]), true)), ["run 5"]);
-        assert_eq!(names(&c.message(5, ClientMsg::Changed, true)), ["to 5"]);
-        assert_eq!(names(&c.message(3, ClientMsg::Cancel, true)), ["cancel 3"]);
-        assert_eq!(names(&c.message(3, ClientMsg::Cancel, true)), Vec::<String>::new(), "a stream ends once");
+        assert_eq!(names(&msg(&mut c, 3, run(&["build"]), true)), ["run 3"]);
+        assert_eq!(names(&msg(&mut c, 5, run(&["test"]), true)), ["run 5"]);
+        assert_eq!(names(&msg(&mut c, 5, ClientMsg::Changed, true)), ["to 5"]);
+        assert_eq!(names(&msg(&mut c, 3, ClientMsg::Cancel, true)), ["cancel 3"]);
+        assert_eq!(names(&msg(&mut c, 3, ClientMsg::Cancel, true)), Vec::<String>::new(), "a stream ends once");
         assert!(c.is_running(5) && !c.is_running(3));
-        assert_eq!(names(&c.message(5, ClientMsg::Env(Vec::new()), true)), ["to 5"]);
+        assert_eq!(names(&msg(&mut c, 5, ClientMsg::Env(Vec::new()), true)), ["to 5"]);
         assert_eq!(
-            names(&c.message(3, ClientMsg::Changed, true)),
+            names(&msg(&mut c, 3, ClientMsg::Changed, true)),
             ["report 3: unexpected a worktree change on stream 3"]
         );
-        c.finished(5);
+        fin(&mut c, 5);
         assert!(!c.is_running(5));
-        c.invariants();
     }
 
     #[test]
     fn a_closed_connection_cancels_all_of_its_streams() {
         let mut c = ConnectionState::new();
         for s in [2, 4, 6] {
-            c.message(s, run(&["build"]), true);
+            msg(&mut c, s, run(&["build"]), true);
         }
-        c.finished(4);
-        assert_eq!(names(&c.close()), ["cancel 2", "cancel 6", "close"]);
-        assert!(c.close().is_empty());
-        assert!(c.message(8, run(&["build"]), true).is_empty(), "a closed connection takes no request");
-        c.invariants();
+        fin(&mut c, 4);
+        assert_eq!(names(&close(&mut c)), ["cancel 2", "cancel 6", "close"]);
+        assert!(close(&mut c).is_empty());
+        assert!(msg(&mut c, 8, run(&["build"]), true).is_empty(), "a closed connection takes no request");
     }
 
     #[test]
     fn a_request_on_a_key_no_longer_valid_is_refused_and_ends_the_connection() {
         let mut c = ConnectionState::new();
-        c.message(2, run(&["build"]), true);
-        assert_eq!(names(&c.message(4, run(&["build"]), false)), ["refuse 4", "cancel 2", "close"]);
+        msg(&mut c, 2, run(&["build"]), true);
+        assert_eq!(names(&msg(&mut c, 4, run(&["build"]), false)), ["refuse 4", "cancel 2", "close"]);
         let mut d = ConnectionState::new();
-        d.message(2, run(&["build"]), true);
-        assert_eq!(names(&d.key_checked(true)), Vec::<String>::new());
-        assert_eq!(names(&d.key_checked(false)), ["cancel 2", "close"]);
+        msg(&mut d, 2, run(&["build"]), true);
+        assert_eq!(names(&key(&mut d, true)), Vec::<String>::new());
+        assert_eq!(names(&key(&mut d, false)), ["cancel 2", "close"]);
     }
 
     #[test]
     fn unknown_messages_are_reported_not_fatal() {
         let mut c = ConnectionState::new();
-        let r = c.message(CONTROL, run(&["build"]), true);
+        let r = msg(&mut c, CONTROL, run(&["build"]), true);
         assert_eq!(names(&r), ["report 0: unexpected a build request on the control stream"]);
         assert_eq!(
-            names(&c.message(CONTROL, ClientMsg::Cancel, true)),
+            names(&msg(&mut c, CONTROL, ClientMsg::Cancel, true)),
             ["report 0: unexpected a cancel on the control stream"]
         );
-        assert_eq!(names(&c.message(CONTROL, ClientMsg::Ping(7), true)), ["reply"]);
-        assert_eq!(names(&c.message(CONTROL, ClientMsg::Changed, true)), ["control"]);
-        c.message(3, run(&["build"]), true);
-        assert_eq!(names(&c.message(3, ClientMsg::Ping(1), true)), ["report 3: unexpected a ping on stream 3"]);
-        assert_eq!(names(&c.message(3, run(&["build"]), true)), ["report 3: unexpected a build request on stream 3"]);
+        assert_eq!(names(&msg(&mut c, CONTROL, ClientMsg::Ping(7), true)), ["reply"]);
+        assert_eq!(names(&msg(&mut c, CONTROL, ClientMsg::Changed, true)), ["control"]);
+        msg(&mut c, 3, run(&["build"]), true);
+        assert_eq!(names(&msg(&mut c, 3, ClientMsg::Ping(1), true)), ["report 3: unexpected a ping on stream 3"]);
+        assert_eq!(names(&msg(&mut c, 3, run(&["build"]), true)), ["report 3: unexpected a build request on stream 3"]);
         assert!(c.is_running(3) && !c.is_closed(), "the stream and the connection go on");
-        assert_eq!(names(&c.message(9, ClientMsg::Fetch { id: 1, hashes: vec![] }, true)), ["fetch 9"]);
+        assert_eq!(names(&msg(&mut c, 9, ClientMsg::Fetch { id: 1, hashes: vec![] }, true)), ["fetch 9"]);
         assert!(!c.is_running(9), "a fetch is not a request that runs");
-        c.invariants();
     }
 
     #[test]
