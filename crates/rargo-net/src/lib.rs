@@ -45,6 +45,11 @@ const MIN_CWND: f64 = 8.0;
 const MAX_CWND: f64 = 8192.0;
 /// Unsent bytes a connection buffers before `send` waits.
 const SEND_BUFFER: usize = 8 << 20;
+const _: () = assert!(MIN_CWND <= INIT_CWND);
+const _: () = assert!(INIT_CWND <= MAX_CWND);
+const _: () = assert!(MIN_RTO.as_nanos() < MAX_RTO.as_nanos());
+const _: () = assert!(DATA_HDR == 25);
+const _: () = assert!(SEND_BUFFER >= FRAG);
 
 #[derive(Default)]
 pub struct NetStats {
@@ -77,6 +82,8 @@ const LOSS_BETA: f64 = 0.7;
 const GROWTH: f64 = 8.0;
 /// Fragments that may leave together however slow the pace.
 const PACE_BURST: u32 = 16;
+const _: () = assert!(LOSS_BETA > 0.0 && LOSS_BETA < 1.0);
+const _: () = assert!(REORDER > 0);
 
 struct SendState {
     next_msg: u64,
@@ -152,11 +159,17 @@ fn handshake_key(key: &[u8; 32]) -> [u8; 32] {
 /// How long either side waits for the other's half of the key agreement.
 const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 const TAG: usize = 16;
+/// A data datagram with its shared-key tag and its connection tag fits an
+/// IPv4 UDP payload under a 1500-byte MTU.
+const _: () = assert!(DATA_HDR + FRAG + 2 * TAG <= 1500 - 20 - 8);
+const _: () = assert!(AGREEMENT >= 1, "message ids start at 1");
 
 fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
     if let Some(k) = key {
+        let before = pkt.len();
         let tag = blake3::keyed_hash(k, pkt);
         pkt.extend_from_slice(&tag.as_bytes()[..TAG]);
+        assert_eq!(pkt.len(), before + TAG);
     }
 }
 
@@ -318,13 +331,21 @@ impl Conn {
                 let mut s = self.send.lock();
                 if s.queued_bytes < SEND_BUFFER || s.queue.is_empty() {
                     let id = s.next_msg;
+                    assert!(id >= 1);
                     s.next_msg += 1;
                     let n = msg.len().div_ceil(FRAG).max(1) as u32;
+                    let queue_before = s.queue.len();
+                    let mut cut = 0usize;
                     for i in 0..n {
                         let a = i as usize * FRAG;
                         let b = (a + FRAG).min(msg.len());
+                        assert!(a <= b);
+                        assert!(b - a <= FRAG);
+                        cut += b - a;
                         s.queue.push_back((id, i, n, Arc::from(&msg[a..b])));
                     }
+                    assert_eq!(cut, msg.len(), "fragments cover the message exactly");
+                    assert_eq!(s.queue.len() - queue_before, n as usize);
                     s.queued_bytes += msg.len();
                     self.stats.messages_out.fetch_add(1, Ordering::Relaxed);
                     drop(s);
@@ -429,14 +450,17 @@ impl Conn {
     }
 
     fn rto(s: &SendState) -> Duration {
-        match s.srtt {
+        let rto = match s.srtt {
             // Headroom over the round trip even when it never varies (a
             // steady link has no variance to speak of, and acknowledgements
             // are sent in batches): otherwise ordinary acknowledgements
             // arrive "late" and every round trip looks like a loss.
             Some(srtt) => (srtt + (4 * s.rttvar).max(srtt / 2).max(Duration::from_millis(5))).clamp(MIN_RTO, MAX_RTO),
             None => Duration::from_millis(200),
-        }
+        };
+        assert!(rto >= MIN_RTO);
+        assert!(rto <= MAX_RTO);
+        rto
     }
 
     fn lossy(&self) -> bool {
@@ -454,6 +478,9 @@ impl Conn {
     }
 
     async fn transmit(&self, msg: u64, frag: u32, nfrags: u32, data: &[u8]) {
+        assert!(frag < nfrags);
+        assert!(data.len() <= FRAG);
+        assert!(msg >= 1);
         let mut pkt = Vec::with_capacity(DATA_HDR + data.len());
         pkt.push(T_DATA);
         pkt.extend_from_slice(&self.id.to_le_bytes());
@@ -461,6 +488,7 @@ impl Conn {
         pkt.extend_from_slice(&frag.to_le_bytes());
         pkt.extend_from_slice(&nfrags.to_le_bytes());
         pkt.extend_from_slice(data);
+        assert_eq!(pkt.len(), DATA_HDR + data.len());
         self.stats.sent_packets.fetch_add(1, Ordering::Relaxed);
         self.stats.sent_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
         if self.lossy() {
@@ -548,6 +576,7 @@ impl Conn {
                     s.ssthresh = (s.cwnd * beta).max(MIN_CWND);
                     s.cwnd = s.ssthresh;
                     s.last_cut = now;
+                    assert!(s.cwnd >= MIN_CWND);
                 }
                 let budget = budget.saturating_sub(resend.len() as u32);
                 let mut sent_new = 0u32;
@@ -560,11 +589,18 @@ impl Conn {
                     }
                     sent_new += 1;
                     let Some((m, f, n, data)) = s.queue.pop_front() else { break };
-                    s.queued_bytes = s.queued_bytes.saturating_sub(data.len());
+                    assert!(f < n);
+                    assert!(s.queued_bytes >= data.len(), "queued_bytes counts every queued fragment");
+                    s.queued_bytes -= data.len();
                     let seq = s.next_seq;
                     s.next_seq += 1;
-                    s.inflight.insert((m, f), Inflight { data: data.clone(), nfrags: n, sent_at: now, retries: 0, seq });
+                    let previous = s.inflight.insert((m, f), Inflight { data: data.clone(), nfrags: n, sent_at: now, retries: 0, seq });
+                    assert!(previous.is_none(), "a queued fragment is not in flight already");
                     batch.push((m, f, n, data));
+                }
+                assert!(s.next_seq > s.high_acked);
+                if s.queue.is_empty() {
+                    assert_eq!(s.queued_bytes, 0);
                 }
                 let sent = sent_new.min(batch.len() as u32) + resend.len() as u32;
                 s.next_send += interval * sent;
@@ -603,6 +639,7 @@ impl Conn {
     fn on_ack(&self, msg: u64, frag: u32) {
         let mut s = self.send.lock();
         if let Some(inf) = s.inflight.remove(&(msg, frag)) {
+            assert!(inf.seq < s.next_seq, "acknowledged seq was handed out");
             s.high_acked = s.high_acked.max(inf.seq);
             if inf.retries == 0 {
                 let sample = inf.sent_at.elapsed();
@@ -635,6 +672,8 @@ impl Conn {
                 s.cwnd += GROWTH.max(s.cwnd * 0.05) / s.cwnd;
             }
             s.cwnd = s.cwnd.min(MAX_CWND);
+            assert!(s.cwnd >= MIN_CWND);
+            assert!(s.cwnd <= MAX_CWND);
         }
         drop(s);
         self.wake_sender.notify_one();
@@ -657,13 +696,14 @@ impl Conn {
             p.frags[frag as usize] = Some(data.to_vec());
             p.have += 1;
         }
+        assert!(p.have as usize <= p.frags.len());
         if p.have as usize == p.frags.len() {
             let p = r.partial.remove(&msg).unwrap();
             let mut whole = Vec::with_capacity(p.frags.iter().map(|f| f.as_ref().map_or(0, |v| v.len())).sum());
             for f in p.frags {
                 whole.extend_from_slice(&f.unwrap());
             }
-            r.done.insert(msg);
+            assert!(r.done.insert(msg), "a message is delivered once");
             loop {
                 let low = r.done_below;
                 if !r.done.remove(&low) {
@@ -671,6 +711,9 @@ impl Conn {
                 }
                 r.done_below += 1;
             }
+            assert!(msg < r.done_below || r.done.contains(&msg));
+            assert!(!r.done.contains(&r.done_below));
+            debug_assert!(r.done.iter().all(|&m| m > r.done_below));
             self.stats.messages_in.fetch_add(1, Ordering::Relaxed);
             let _ = self.inbound_tx.send(whole);
         }
@@ -753,7 +796,7 @@ impl Endpoint {
             u64::from_le_bytes(b) | 1
         };
         let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn());
-        self.conns.lock().insert(id, c.clone());
+        assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
         let agreed = match &self.auth {
             Auth::None => Ok(()),
             Auth::Shared(key) => c.agree_as_initiator(key).await,
@@ -852,7 +895,7 @@ impl Endpoint {
                 Some(c) => c.clone(),
                 None if self.accepting && pkt[0] == T_DATA => {
                     let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn());
-                    conns.insert(id, c.clone());
+                    assert!(conns.insert(id, c.clone()).is_none());
                     match (self.key.clone(), &self.auth) {
                         (_, Auth::Users(keys)) => {
                             let (c, tx, keys) = (c.clone(), self.accept_tx.clone(), keys.clone());

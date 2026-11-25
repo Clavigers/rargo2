@@ -158,6 +158,9 @@ impl Client {
     }
 }
 
+const _: () = assert!(LEVEL_NONE < LEVEL_META);
+const _: () = assert!(LEVEL_META < LEVEL_FULL);
+
 /// A decoded plan with derived per-unit data.
 pub struct PlanData {
     pub plan: rp::Plan,
@@ -181,8 +184,8 @@ pub struct PlanData {
 impl PlanData {
     fn new(plan: rp::Plan) -> PlanData {
         let n = plan.units.len();
-        let linking = plan.units.iter().map(|u| u.needs_objects).collect();
-        let rmeta_out = plan
+        let linking: Vec<bool> = plan.units.iter().map(|u| u.needs_objects).collect();
+        let rmeta_out: Vec<Vec<Vec<u8>>> = plan
             .units
             .iter()
             .map(|u| u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect())
@@ -213,11 +216,13 @@ impl PlanData {
                     return;
                 }
                 seen[i] = true;
+                assert!(is_doc(i));
                 let mut deps: Vec<usize> = units[i].deps.iter().map(|d| d.unit as usize).filter(|&j| is_doc(j)).collect();
                 deps.sort_unstable();
                 for j in deps {
                     visit(j, units, is_doc, seen, out);
                 }
+                assert!(!out.contains(&i), "a documentation unit is ordered once");
                 out.push(i);
             }
             let is_doc = |j: usize| doc_dir[j].is_some();
@@ -227,10 +232,22 @@ impl PlanData {
                 }
             }
         }
+        assert_eq!(doc_order.len(), doc_dir.iter().filter(|d| d.is_some()).count());
         let mut doc_pos = vec![None; n];
         for (pos, &i) in doc_order.iter().enumerate() {
+            assert!(doc_pos[i].is_none());
             doc_pos[i] = Some(pos);
         }
+        for u in &plan.units {
+            for d in &u.deps {
+                assert!((d.unit as usize) < n, "a dependency names a unit of the plan");
+            }
+        }
+        for &r in &plan.roots {
+            assert!((r as usize) < n, "a root names a unit of the plan");
+        }
+        assert_eq!(linking.len(), n);
+        assert_eq!(rmeta_out.len(), n);
         PlanData {
             plan,
             linking,
@@ -272,6 +289,8 @@ impl PlanData {
                         stack.push(d.unit as usize);
                     }
                 }
+                assert_eq!(lv[i], LEVEL_NONE, "a unit does not depend on itself");
+                assert_eq!(lv.len(), units.len());
                 Arc::new(lv)
             })
             .clone()
@@ -300,10 +319,19 @@ impl PlanData {
                         }
                         // Only a compile can stop at metadata.
                         let lv = if units[k].kind == rp::UnitKind::Compile { lv } else { LEVEL_FULL };
+                        assert!(lv == LEVEL_META || lv == LEVEL_FULL);
                         if lv > need[k] {
                             need[k] = lv;
                             work.push(k);
                         }
+                    }
+                }
+                for &r in &self.plan.roots {
+                    assert_ne!(need[r as usize], LEVEL_NONE, "a root is needed");
+                }
+                for (k, &lv) in need.iter().enumerate() {
+                    if lv == LEVEL_META {
+                        assert_eq!(units[k].kind, rp::UnitKind::Compile, "only a compile stops at metadata");
                     }
                 }
                 Arc::new(need)
@@ -344,8 +372,14 @@ impl PlanData {
                         }
                     }
                 }
+                assert_eq!(lv[i], LEVEL_NONE, "a unit does not depend on itself");
+                if self.linking[i] {
+                    assert!(lv.iter().all(|&l| l != LEVEL_META), "a linking unit sees its dependencies whole");
+                }
                 if let Some(pos) = self.doc_pos[i] {
+                    assert_eq!(self.doc_order[pos], i);
                     for &j in &self.doc_order[..pos] {
+                        assert_ne!(j, i);
                         if self.doc_dir[j] == self.doc_dir[i] {
                             lv[j] = LEVEL_FULL;
                         }
@@ -444,6 +478,7 @@ fn subcommand_pos(args: &[String]) -> Option<usize> {
             return None;
         }
         if !a.starts_with('-') {
+            assert!(i < args.len());
             return Some(i);
         }
         // Global options that take a separate value.
@@ -1617,6 +1652,7 @@ fn rustc_env_deps(r: &ActionResult, store: &Store) -> Vec<String> {
         for line in String::from_utf8_lossy(&text).lines() {
             if let Some(rest) = line.strip_prefix("# env-dep:") {
                 let name = rest.split('=').next().unwrap_or(rest);
+                assert!(!name.contains('='));
                 if !name.is_empty() && !out.iter().any(|n| n == name) {
                     out.push(name.to_string());
                 }
@@ -1682,6 +1718,8 @@ impl Run {
         seed: Option<Arc<OutputsLayer>>,
     ) -> Arc<dyn View> {
         let mut levels = if self.meta_only(i) { self.pd.meta_levels(i) } else { self.pd.levels(i) };
+        assert_eq!(levels.len(), self.plan().units.len());
+        assert_eq!(levels[i], LEVEL_NONE, "a unit's own view excludes itself unless asked");
         if include_self {
             let mut lv = (*levels).clone();
             lv[i] = LEVEL_FULL;
@@ -3137,6 +3175,7 @@ fn parse_dep_info(text: &str) -> Vec<String> {
             out.push(cur);
         }
     }
+    assert!(out.iter().all(|p| !p.is_empty()), "a prerequisite is never empty");
     out
 }
 
@@ -3152,6 +3191,7 @@ fn normalize(p: &Path) -> PathBuf {
             c => out.push(c),
         }
     }
+    assert!(out.components().all(|c| !matches!(c, std::path::Component::CurDir | std::path::Component::ParentDir)));
     out
 }
 

@@ -184,6 +184,7 @@ impl Scheduler {
             let (tx, rx) = oneshot::channel();
             i.seq += 1;
             let seq = i.seq;
+            assert!(i.waiters.iter().all(|w| w.seq < seq), "sequence numbers ascend");
             i.waiters.push(Waiter { prio, seq, mem_kb, tx });
             self.dispatch(&mut i, false);
             self.wake_broker.notify_one();
@@ -215,6 +216,7 @@ impl Scheduler {
                 skipped.push(w);
                 continue;
             }
+            assert!(self.fits(i, w.mem_kb));
             i.spare_tokens -= 1;
             i.running += 1;
             i.mem_kb += w.mem_kb;
@@ -224,6 +226,8 @@ impl Scheduler {
             if let Err(p) = w.tx.send(permit) {
                 // The requester went away; undo without re-entering the lock.
                 std::mem::forget(p);
+                assert!(i.running > 0);
+                assert!(i.mem_kb >= w.mem_kb);
                 i.running -= 1;
                 i.mem_kb -= w.mem_kb;
                 i.spare_tokens += 1;
@@ -236,8 +240,13 @@ impl Scheduler {
 
     fn release(self: &Arc<Self>, mem_kb: u64) {
         let mut i = self.inner.lock();
+        assert!(i.running > 0, "release without a running action");
+        assert!(i.mem_kb >= mem_kb, "memory released that was never granted");
         i.running -= 1;
         i.mem_kb -= mem_kb;
+        if i.running == 0 {
+            assert_eq!(i.mem_kb, 0, "memory held with nothing running");
+        }
         // The token goes straight to the next waiter if there is one that
         // fits, otherwise back to the pipe for rustc's worker threads.
         i.spare_tokens += 1;
@@ -290,6 +299,7 @@ impl Scheduler {
             i.spare_tokens -= 1;
             write_token(self.pipe_w.as_raw_fd());
         }
+        assert!(i.spare_tokens <= 1);
     }
 
     /// With no action running nobody can be holding a token: the pipe and
@@ -298,6 +308,7 @@ impl Scheduler {
     /// was put back on its behalf was an estimate; settle the difference
     /// either way.
     fn reconcile(&self, i: &mut Inner) {
+        assert_eq!(i.running, 0);
         let have = self.in_pipe() + i.spare_tokens;
         for _ in have..self.tokens {
             write_token(self.pipe_w.as_raw_fd());

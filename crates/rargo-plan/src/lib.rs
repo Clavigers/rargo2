@@ -25,6 +25,8 @@ pub const UNUSED_ENV: &str = "__RARGO_UNUSED";
 /// `NAME_1`, `NAME_2`, ... and is put together again by [`joined_env`].
 pub fn split_env(name: &str, value: &str) -> Vec<(String, String)> {
     const PART: usize = 96 << 10;
+    const _: () = assert!(PART >= 4, "a part holds at least one UTF-8 character");
+    const _: () = assert!(PART < 128 << 10, "a part stays under the kernel's limit");
     let mut out = Vec::new();
     let mut rest = value;
     loop {
@@ -32,10 +34,14 @@ pub fn split_env(name: &str, value: &str) -> Vec<(String, String)> {
         while !rest.is_char_boundary(cut) {
             cut -= 1;
         }
+        assert!(cut > 0 || rest.is_empty(), "every part but an empty value's makes progress");
+        assert!(cut <= PART);
         let key = if out.is_empty() { name.to_string() } else { format!("{name}_{}", out.len()) };
         out.push((key, rest[..cut].to_string()));
         rest = &rest[cut..];
         if rest.is_empty() {
+            assert_eq!(out.iter().map(|(_, v)| v.len()).sum::<usize>(), value.len());
+            assert_eq!(out[0].0, name);
             return out;
         }
     }

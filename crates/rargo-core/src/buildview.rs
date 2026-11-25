@@ -93,6 +93,11 @@ impl BaseView {
         // Longest prefix first.
         mounts.sort_by(|a, b| b.at.len().cmp(&a.at.len()));
         assert!(mounts.iter().any(|m| m.at == b"/"), "a root mount is required");
+        assert!(mounts.windows(2).all(|w| w[0].at.len() >= w[1].at.len()));
+        for (i, m) in mounts.iter().enumerate() {
+            assert!(m.at.starts_with(b"/"), "mount points are absolute");
+            assert!(mounts[i + 1..].iter().all(|o| o.at != m.at), "two mounts at {}", crate::view::show(&m.at));
+        }
         BaseView { mounts, memo, min_gen: AtomicU64::new(min_gen) }
     }
 
@@ -107,7 +112,9 @@ impl BaseView {
         for m in &self.mounts {
             if vpath_starts_with(dir, &m.at) {
                 let rel = if m.at == b"/" { dir } else { &dir[m.at.len()..] };
-                return (m, if rel.is_empty() { b"/" } else { rel });
+                let rel: &[u8] = if rel.is_empty() { b"/" } else { rel };
+                assert!(rel.starts_with(b"/"));
+                return (m, rel);
             }
         }
         unreachable!("root mount always matches")
@@ -269,6 +276,7 @@ impl View for BaseView {
             };
             out.push((name.to_vec(), t));
         }
+        debug_assert!(out.iter().enumerate().all(|(i, (n, _))| out[i + 1..].iter().all(|(m, _)| m != n)), "listing names are unique");
         Ok(out)
     }
 
@@ -340,6 +348,7 @@ impl OutputsLayer {
                 if !list.iter().any(|(u, s, _)| *u == unit && *s == stage) {
                     list.push((unit, stage, LayerEnt::Entry(e.clone())));
                 }
+                assert_eq!(list.iter().filter(|(u, s, _)| *u == unit && *s == stage).count(), 1);
             }
             // Every ancestor directory exists by implication.
             let mut cur = parent;
@@ -350,6 +359,7 @@ impl OutputsLayer {
                     break;
                 }
                 list.push((unit, stage, LayerEnt::Implied));
+                assert!(pp.len() < cur.len());
                 cur = pp;
             }
         }
@@ -387,6 +397,7 @@ impl OutputsLayer {
                 best = Some((*u, ent));
             }
         }
+        assert!(best.is_some() || list.iter().all(|(u, s, _)| levels.get(*u as usize).copied().unwrap_or(LEVEL_NONE) < *s));
         best.map(|(_, e)| e.clone())
     }
 

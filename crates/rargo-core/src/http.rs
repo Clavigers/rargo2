@@ -34,6 +34,8 @@ use tokio::net::TcpStream;
 const PENDING_FOR: Duration = Duration::from_secs(600);
 const MAX_PENDING: usize = 1000;
 const MAX_TRIES: u32 = 5;
+const _: () = assert!(MAX_PENDING > 0);
+const _: () = assert!(MAX_TRIES > 0);
 
 struct Pending {
     code: String,
@@ -107,7 +109,13 @@ fn escape(s: &str) -> String {
 /// A code as it is shown: `ABCD-EFGH`.
 fn shown(code: &str) -> String {
     let c = normal_code(code);
-    if c.len() == 8 { format!("{}-{}", &c[..4], &c[4..]) } else { c }
+    if c.len() == 8 {
+        let s = format!("{}-{}", &c[..4], &c[4..]);
+        assert_eq!(s.len(), 9);
+        s
+    } else {
+        c
+    }
 }
 
 fn page(title: &str, body: &str) -> String {
@@ -318,7 +326,12 @@ impl Http {
                 break c;
             }
         };
-        pending.insert(device.clone(), Pending { code: code.clone(), made: Instant::now(), tries: 0, granted: None, denied: false, state: None });
+        assert_eq!(device.len(), 40);
+        assert_eq!(code.len(), 8);
+        assert_eq!(normal_code(&code), code, "a code is made in its normal form");
+        let fresh = Pending { code: code.clone(), made: Instant::now(), tries: 0, granted: None, denied: false, state: None };
+        assert!(pending.insert(device.clone(), fresh).is_none(), "device secrets are unique");
+        assert!(pending.len() <= MAX_PENDING);
         Ok((device, code))
     }
 
@@ -337,6 +350,7 @@ impl Http {
             if p.denied {
                 bail!("too many wrong invitations for this code: run `rargo auth` again");
             }
+            assert!(p.tries <= MAX_TRIES, "tries stop growing once the code is denied");
             p.tries += 1;
             if p.tries > MAX_TRIES {
                 p.denied = true;
@@ -346,7 +360,10 @@ impl Http {
         let (token, secret) = store.redeem(invite, name)?;
         let mut pending = self.pending.lock();
         match pending.values_mut().find(|p| p.code == code) {
-            Some(p) => p.granted = Some((tokens::token_text(&token, &secret), token.user.clone())),
+            Some(p) => {
+                assert!(p.granted.is_none(), "a code is granted once");
+                p.granted = Some((tokens::token_text(&token, &secret), token.user.clone()));
+            }
             None => {
                 // The request went away meanwhile: nobody can pick the
                 // token up, so it must not stay valid.
@@ -433,6 +450,7 @@ impl Http {
         let mut pending = self.pending.lock();
         match pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
             Some(p) if p.granted.is_none() => {
+                assert!(!p.denied);
                 p.granted = Some((tokens::token_text(&token, &secret), token.user.clone()));
                 p.state = None;
             }
@@ -459,7 +477,8 @@ impl Http {
             return serde_json::json!({ "status": "denied" });
         }
         if p.granted.is_some() {
-            let (token, user) = pending.remove(device).and_then(|p| p.granted).unwrap_or_default();
+            let (token, user) = pending.remove(device).and_then(|p| p.granted).expect("a granted request holds its token");
+            assert!(!token.is_empty());
             return serde_json::json!({ "status": "approved", "token": token, "user": user });
         }
         serde_json::json!({ "status": "pending" })
@@ -523,6 +542,8 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(length);
+    assert_eq!(body.len(), length);
+    assert!(head_end <= buf.len());
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     Ok(Request { method, path: path.to_string(), query: form(query), host, body, json })
 }

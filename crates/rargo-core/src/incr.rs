@@ -45,6 +45,7 @@ pub struct StateMeta {
 const KEEP_EXTRA: usize = 2;
 /// Worktrees whose latest state is kept, per crate.
 const KEEP_WORKTREES: usize = 32;
+const _: () = assert!(KEEP_WORKTREES > 0);
 
 #[derive(Default)]
 pub struct IncrStats {
@@ -79,6 +80,7 @@ pub struct Seed {
 fn key(crate_key: &Hash, id: u64) -> Vec<u8> {
     let mut k = crate_key.0.to_vec();
     k.extend_from_slice(&id.to_be_bytes());
+    assert_eq!(k.len(), 40, "list() reads the id at 32..40");
     k
 }
 
@@ -127,6 +129,7 @@ impl IncrStore {
             .collect();
         // Newest first.
         v.sort_by(|a, b| b.0.cmp(&a.0));
+        assert!(v.windows(2).all(|w| w[0].0 > w[1].0), "state ids are unique");
         v
     }
 
@@ -146,6 +149,7 @@ impl IncrStore {
         }
         blobs.sort();
         blobs.dedup();
+        assert!(blobs.windows(2).all(|w| w[0] < w[1]));
         for (hash, _) in &blobs {
             self.store.touch(hash);
         }
@@ -170,6 +174,8 @@ impl IncrStore {
             .collect();
         // Nearest first; among equals the newest (the list is newest first).
         near.sort_by_key(|(d, _)| *d);
+        assert!(own.iter().all(|(_, m)| m.worktree == worktree));
+        assert!(near.iter().all(|(_, (_, m))| m.worktree != worktree));
         // The worktree's own state leads unless someone else's was made
         // nearer to HEAD: at HEAD when its own is from further back, or at
         // an ancestor when its own is from somewhere that is none.
@@ -191,6 +197,7 @@ impl IncrStore {
             order.extend(own.iter().map(|s| (*s, SeedKind::SameWorktree)));
         }
         order.extend(all.iter().map(|s| (s, SeedKind::Other)));
+        assert_eq!(order.len(), own.len() + near.len() + all.len());
         for ((id, meta), kind) in order {
             match self.load(meta) {
                 Some((manifest, blobs)) => {
@@ -215,6 +222,7 @@ impl IncrStore {
         let Ok(raw) = bincode::serialize(manifest) else { return };
         let Ok(h) = self.store.put_bytes(&raw) else { return };
         let id = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(id < u64::MAX, "state id counter does not wrap");
         let meta = StateMeta {
             manifest: h,
             worktree: worktree.to_string(),
@@ -243,6 +251,8 @@ impl IncrStore {
             }
             self.db.delete(Table::Incr, &key(crate_key, *id));
         }
+        assert!(seen_worktrees.len() <= KEEP_WORKTREES);
+        assert!(extra <= KEEP_EXTRA);
     }
 
     /// Forgets a state rustc crashed on.

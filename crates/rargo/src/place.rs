@@ -107,6 +107,7 @@ pub fn cached(cache_dir: &Path, hash: &Digest, size: u64) -> Option<PathBuf> {
 /// Where a content fetched for the cache alone goes.
 pub fn cache_slot(cache_dir: &Path, hash: &Digest) -> PathBuf {
     let h = hex(hash);
+    assert_eq!(h.len(), 64);
     cache_dir.join("blobs").join(&h[..2]).join(&h[2..])
 }
 
@@ -139,6 +140,7 @@ impl Placer {
 
     fn cache_path(&self, hash: &Digest, exec: bool) -> PathBuf {
         let h = hex(hash);
+        assert_eq!(h.len(), 2 * hash.len());
         self.cache.join(&h[..2]).join(if exec { format!("{}.x", &h[2..]) } else { h[2..].to_string() })
     }
 
@@ -153,6 +155,8 @@ impl Placer {
         }
         let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let tmp = dest.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), crate::tmp::seq()));
+        assert_eq!(tmp.parent(), dest.parent());
+        assert_ne!(tmp, dest);
         let watched = crate::tmp::watch(&tmp);
         (tmp, watched)
     }
@@ -215,6 +219,7 @@ impl Placer {
     /// A finished download at `tmp` goes to everyone waiting for it; if
     /// nobody is (content for a virtual output directory), into the cache.
     fn arrived(&mut self, hash: Digest, tmp: &Path) -> io::Result<()> {
+        assert!(!self.parts.contains_key(&hash), "a finished download is no longer a part");
         let dests = self.pending.remove(&hash).unwrap_or_default();
         if dests.is_empty() {
             let cp = self.cache_path(&hash, false);
@@ -297,6 +302,7 @@ impl Placer {
             return Ok(());
         }
         let part = self.parts.remove(&hash).unwrap();
+        assert!(!self.parts.contains_key(&hash));
         drop(part.file);
         let size = std::fs::metadata(&part.tmp)?.len();
         if hash_file(&part.tmp, size)? != hash {
@@ -367,10 +373,12 @@ impl Placer {
                 continue;
             }
             if !self.pending.contains_key(&hash) {
+                debug_assert!(!need.contains(&hash));
                 need.push(hash);
             }
             self.pending.entry(hash).or_default().push(d);
         }
+        debug_assert!(need.iter().all(|h| self.pending.contains_key(h)));
         Ok(need)
     }
 

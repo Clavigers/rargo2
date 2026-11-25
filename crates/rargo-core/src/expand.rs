@@ -48,6 +48,7 @@ fn find_token(s: &str) -> Option<(std::ops::Range<usize>, Tok<'_>)> {
         if !m.bytes().all(|b| b.is_ascii_hexdigit()) || !rest[skip + META_LEN..].starts_with(token::SUFFIX) {
             return None;
         }
+        assert_eq!(m.len(), META_LEN);
         Some((m, pos + token::PREFIX.len() + skip + META_LEN + token::SUFFIX.len()))
     };
     const SIMPLE: [&str; 8] = ["CHECKCFG_", "CFG_", "ENV_", "LL_", "LPA_", "LPE_", "MD_", "DYNLP_"];
@@ -64,6 +65,8 @@ fn find_token(s: &str) -> Option<(std::ops::Range<usize>, Tok<'_>)> {
                 6 => Tok::Metadata(m),
                 _ => Tok::DynLibPaths(m),
             };
+            assert!(end <= s.len());
+            assert!(pos < end);
             return Some((pos..end, tok));
         }
     }
@@ -176,6 +179,7 @@ pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> R
                     bail!("internal error: unexpected link-arg token position in `{arg}`");
                 }
                 // Gather the run of `-C link-arg=TOKEN` pairs for this script.
+                assert!(range.start >= "link-arg=".len());
                 let mut sels = vec![first];
                 let mut j = i + 1;
                 while j + 1 < cmd.args.len() && cmd.args[j] == "-C" {
@@ -193,6 +197,9 @@ pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> R
                     .filter(|(t, _)| link_arg_matches(t, &sels))
                     .map(|(_, a)| format!("link-arg={a}"))
                     .collect();
+                assert!(j > i);
+                assert_eq!((j - i - 1) % 2, 0, "link args come in `-C` pairs");
+                assert_eq!(sels.len(), 1 + (j - i - 1) / 2);
                 flagged(values, &mut args)?;
                 i = j;
                 continue;
@@ -236,6 +243,7 @@ pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> R
         }
     }
 
+    assert!(env.len() >= cmd.env.iter().filter(|(k, _)| find_token(k).is_none()).count());
     let out = Cmd { program: cmd.program.clone(), args, env, cwd: cmd.cwd.clone() };
     // Anything left over is a token form this code does not know; failing
     // here is far better than passing a placeholder to a compiler.

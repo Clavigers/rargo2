@@ -25,13 +25,20 @@ pub const LOWER_MTIME: u64 = 946_684_800;
 const TTL: Duration = Duration::from_secs(365 * 86400);
 const LOCAL_BITS: u32 = 24;
 const LOCAL_MASK: u64 = (1 << LOCAL_BITS) - 1;
+const _: () = assert!(LOCAL_BITS < 32, "a local id fits in u32");
+const _: () = assert!(ROOT_LOCAL as u64 <= LOCAL_MASK);
 const ROOT_LOCAL: u32 = 1;
 const BACKING_CACHE_MAX: usize = 200_000;
 /// How long a backing id stays registered after it was last handed out.
 const RETIRE_GRACE: Duration = Duration::from_secs(60);
 
 fn nodeid(seq: u64, local: u32) -> u64 {
-    (seq << LOCAL_BITS) | local as u64
+    assert!(local as u64 <= LOCAL_MASK);
+    assert!(seq < 1 << (64 - LOCAL_BITS), "action sequence overflows a node id");
+    let id = (seq << LOCAL_BITS) | local as u64;
+    assert_eq!(id >> LOCAL_BITS, seq);
+    assert_ne!(id, FUSE_ROOT_ID, "an action node is never the mount root");
+    id
 }
 
 enum Slot {
@@ -237,7 +244,9 @@ impl SandboxFs {
         for m in mounts {
             let id = nodes.len() as u32;
             nodes.push(Kind::Mount);
-            root.entries.insert(m.into_boxed_slice(), Slot::Upper(id, true));
+            assert!(!m.is_empty());
+            assert!(!m.contains(&b'/'), "a mountpoint is one name in the action root");
+            assert!(root.entries.insert(m.into_boxed_slice(), Slot::Upper(id, true)).is_none(), "duplicate mountpoint");
         }
         nodes[ROOT_LOCAL as usize] = Kind::Dir(Box::new(root));
         let a = Arc::new(ActionFs {
@@ -255,7 +264,7 @@ impl SandboxFs {
                 finished: false,
             }),
         });
-        self.actions.insert(seq, a.clone());
+        assert!(self.actions.insert(seq, a.clone()).is_none(), "action sequence numbers are unique");
         a
     }
 
@@ -268,6 +277,7 @@ impl SandboxFs {
             let _ = s.notify_inval_entry(FUSE_ROOT_ID, Self::dir_name(a.seq).as_bytes());
         }
         let mut st = a.st.lock();
+        assert!(!st.finished, "action finished twice");
         st.finished = true;
         // Upper files were only ever opened by this action's processes, all
         // of which are gone, so no reply can still refer to these ids. They
@@ -322,7 +332,10 @@ impl SandboxFs {
             .collect();
         for (i, h, exec) in hashed {
             match h {
-                Ok(hash) => out[i].1 = Obs::File { hash, exec },
+                Ok(hash) => {
+                    assert!(matches!(out[i].1, Obs::File { hash: crate::hash::Hash::ZERO, .. }));
+                    out[i].1 = Obs::File { hash, exec }
+                }
                 Err(_) => tainted = true,
             }
         }
@@ -625,6 +638,8 @@ impl ActionFs {
             return Err(Errno(libc::ENOSPC));
         }
         st.nodes.push(k);
+        assert_eq!(st.nodes.len(), id + 1);
+        assert!(id as u32 > ROOT_LOCAL, "the root is created with the action");
         Ok(id as u32)
     }
 
@@ -703,9 +718,8 @@ impl ActionFs {
             Slot::Lower(n) => Some(*n),
             _ => None,
         };
-        if let Kind::Dir(d) = &mut st.nodes[parent as usize] {
-            d.entries.insert(name.into(), slot);
-        }
+        let Kind::Dir(d) = &mut st.nodes[parent as usize] else { unreachable!("checked to be a directory above") };
+        assert!(d.entries.insert(name.into(), slot).is_none(), "a name is resolved from the view once");
         Ok(found)
     }
 
@@ -737,6 +751,7 @@ impl ActionFs {
     }
 
     fn new_upper_file(&self, st: &mut State) -> Res<(PathBuf, Arc<File>)> {
+        assert!(!st.finished, "upper file created after the action finished");
         let n = st.next_upper;
         st.next_upper += 1;
         let path = self.scratch.join(n.to_string());
@@ -811,6 +826,7 @@ impl ActionFs {
         }
         let mut v: Vec<(Box<[u8]>, DType)> = names.into_iter().collect();
         v.sort();
+        assert!(v.windows(2).all(|w| w[0].0 < w[1].0), "listing names are unique");
         let v = Arc::new(v);
         let d = self.dir_mut(st, local)?;
         d.lower_listed = true;
@@ -902,7 +918,9 @@ impl ActionFs {
             crate::store::clone_or_copy(&src, &file)?;
             read_src = Some(actual);
         }
-        if let Kind::File(f) = &mut st.nodes[n as usize] {
+        let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!("checked to be a file above") };
+        {
+            assert!(matches!(f.src, Src::Lower(_)));
             if f.read_src.is_none() {
                 f.read_src = read_src;
             }
@@ -1116,6 +1134,7 @@ impl Filesystem for SandboxFs {
             d.entries.remove(name);
         }
         if let Kind::File(f) = &mut st.nodes[n as usize] {
+            assert!(f.links > 0, "unlinking a file with no links");
             f.links = f.links.saturating_sub(1);
             if f.links == 0 && f.opens == 0 {
                 if let Src::Upper { path, .. } = &f.src {
@@ -1375,6 +1394,8 @@ impl Filesystem for SandboxFs {
         let Ok((a, n)) = self.action(node) else { return };
         let mut st = a.st.lock();
         if let Some(Kind::File(f)) = st.nodes.get_mut(n as usize) {
+            assert!(f.opens > 0, "release without an open");
+            assert!(fh != 1 || f.lower_pt_opens > 0, "release of a passthrough open never counted");
             f.opens = f.opens.saturating_sub(1);
             if fh == 1 {
                 f.lower_pt_opens = f.lower_pt_opens.saturating_sub(1);

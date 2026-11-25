@@ -152,6 +152,8 @@ fn errno(e: std::io::Error) -> Errno {
 }
 
 fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    assert!(!name.is_empty());
+    assert!(!name.contains(&b'/'), "a name is one component");
     if dir.is_empty() {
         return name.to_vec();
     }
@@ -171,7 +173,10 @@ fn below(prefix: &[u8]) -> Vec<u8> {
 /// never zero.
 fn name_cookie(name: &[u8]) -> u64 {
     let h = blake3::hash(name);
-    (u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap()) >> 1).max(1)
+    let c = (u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap()) >> 1).max(1);
+    assert!(c >= 1);
+    assert!(c < 1 << 63);
+    c
 }
 
 enum Kind {
@@ -284,6 +289,8 @@ impl OutFs {
         let mut parts: Vec<&[u8]> = Vec::new();
         while id != ROOT {
             let n = st.nodes.get(&id).ok_or(Errno(libc::ESTALE))?;
+            assert!(!n.name.is_empty());
+            assert_ne!(n.parent, id);
             parts.push(&n.name);
             id = n.parent;
         }
@@ -372,17 +379,21 @@ impl OutFs {
     }
 
     fn node_for(st: &mut State, parent: u64, name: &[u8]) -> u64 {
+        assert!(!name.is_empty());
         if let Some(id) = st.children.get(&(parent, name.to_vec())) {
             let id = *id;
+            assert!(st.nodes.contains_key(&id), "a name leads only to a known node");
             if let Some(n) = st.nodes.get_mut(&id) {
+                assert_eq!(n.parent, parent);
                 n.nlookup += 1;
             }
             return id;
         }
         let id = st.next;
+        assert_ne!(id, ROOT);
         st.next += 1;
-        st.nodes.insert(id, Node { parent, name: name.to_vec(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        st.children.insert((parent, name.to_vec()), id);
+        assert!(st.nodes.insert(id, Node { parent, name: name.to_vec(), nlookup: 1, kids: 0, cached: 0, backing: None }).is_none());
+        assert!(st.children.insert((parent, name.to_vec()), id).is_none());
         if let Some(p) = st.nodes.get_mut(&parent) {
             p.kids += 1;
         }
@@ -763,7 +774,8 @@ impl Filesystem for OutFs {
                 st.children.remove(&(parent, name));
             }
             if let Some(p) = st.nodes.get_mut(&parent) {
-                p.kids = p.kids.saturating_sub(1);
+                assert!(p.kids > 0, "a parent counts the node that leaves it");
+                p.kids -= 1;
             }
             id = parent;
             drop_by = 0;
