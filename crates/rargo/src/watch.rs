@@ -224,6 +224,25 @@ mod tests {
     }
 
     #[test]
+    fn unregistering_a_directory_does_not_remove_another_worktree() {
+        let mut state = WatchState::default();
+        let mut changes = Changes::default();
+        for (descriptor, owner, dir) in [(1, 10, "first"), (2, 10, "first/src"), (3, 20, "second")] {
+            state.register(owner, dir.into(), WatchResult::Added(descriptor));
+            assert!(state.invariants(&changes));
+        }
+        assert!(!state.remove(2, Path::new("different")));
+        assert!(state.invariants(&changes));
+        assert_eq!(state.forget(10), [1, 2]);
+        assert!(state.invariants(&changes));
+        for descriptor in [1, 2, 3] {
+            state.apply(Event { descriptor, mask: libc::IN_CREATE }, &mut changes);
+            assert!(state.invariants(&changes));
+        }
+        assert_eq!(changes.dirty, BTreeMap::from([(20, BTreeSet::from(["second".into()]))]));
+    }
+
+    #[test]
     fn renames_cover_both_directories_and_invalidate_moved_directory_watches() {
         let mut state = WatchState::default();
         let mut changes = Changes::default();
