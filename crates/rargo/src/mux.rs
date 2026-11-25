@@ -1,7 +1,7 @@
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -30,15 +30,111 @@ struct Out {
     urgent: UnboundedSender<Vec<u8>>,
 }
 
+type Missing = (Vec<Digest>, Vec<Digest>);
+
+struct MuxState<S, M> {
+    streams: BTreeMap<u32, S>,
+    missing: BTreeMap<u64, M>,
+    order: Reorder<ServerMsg>,
+    next_stream: u32,
+    next_id: u64,
+    dead: bool,
+}
+
+enum Route<S, M> {
+    Stream(S, ServerMsg),
+    Missing(M, Missing),
+    Drop,
+}
+
+impl<S: Clone, M> MuxState<S, M> {
+    fn new() -> Self {
+        Self { streams: BTreeMap::new(), missing: BTreeMap::new(), order: Reorder::new(true), next_stream: 1, next_id: 1, dead: false }
+    }
+
+    fn open(&mut self, dest: S) -> (u32, Option<S>) {
+        let stream = self.next_stream;
+        assert_ne!(stream, CONTROL);
+        assert_ne!(stream, rargo_proto::KEEPALIVE);
+        self.next_stream += 1;
+        if self.dead {
+            return (stream, Some(dest));
+        }
+        assert!(self.streams.insert(stream, dest).is_none());
+        (stream, None)
+    }
+
+    fn close(&mut self, stream: u32) -> Option<S> {
+        self.order.end(stream);
+        self.streams.remove(&stream)
+    }
+
+    fn incoming(&mut self, frame: Frame<ServerMsg>) -> Vec<(u32, ServerMsg)> {
+        if self.dead || (frame.stream != CONTROL && !self.streams.contains_key(&frame.stream)) {
+            Vec::new()
+        } else {
+            self.order.push(frame)
+        }
+    }
+
+    fn route(&mut self, stream: u32, msg: ServerMsg) -> Route<S, M> {
+        if stream == CONTROL {
+            if let ServerMsg::Missing { id, trees, blobs } = msg
+                && let Some(dest) = self.missing.remove(&id)
+            {
+                return Route::Missing(dest, (trees, blobs));
+            }
+            return Route::Drop;
+        }
+        let dest = if matches!(msg, ServerMsg::Exit(_) | ServerMsg::Exec(_) | ServerMsg::Fetched { .. }) {
+            self.close(stream)
+        } else {
+            self.streams.get(&stream).cloned()
+        };
+        match dest {
+            Some(dest) => Route::Stream(dest, msg),
+            None => Route::Drop,
+        }
+    }
+
+    fn next_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn expect_missing(&mut self, id: u64, dest: M) -> Option<M> {
+        if self.dead {
+            return Some(dest);
+        }
+        assert!(self.missing.insert(id, dest).is_none(), "offer {id} awaited twice");
+        None
+    }
+
+    fn fail(&mut self) -> Option<(BTreeMap<u32, S>, BTreeMap<u64, M>)> {
+        if self.dead {
+            return None;
+        }
+        self.dead = true;
+        self.order = Reorder::new(true);
+        Some((std::mem::take(&mut self.streams), std::mem::take(&mut self.missing)))
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.streams.keys().all(|&id| id > CONTROL && id < self.next_stream && id != rargo_proto::KEEPALIVE)
+            && (!self.dead || (self.streams.is_empty() && self.missing.is_empty()))
+    }
+}
+
+type StreamSender = UnboundedSender<ServerMsg>;
+type WireState = MuxState<StreamSender, oneshot::Sender<Missing>>;
+
 pub struct Mux {
     link: Arc<Link>,
     out: Mutex<Out>,
     window: Arc<Semaphore>,
-    streams: Mutex<HashMap<u32, UnboundedSender<ServerMsg>>>,
-    next_stream: AtomicU32,
-    next_id: AtomicU64,
-    missing: Mutex<HashMap<u64, oneshot::Sender<(Vec<Digest>, Vec<Digest>)>>>,
-    dead: AtomicBool,
+    state: Mutex<WireState>,
     pub gone: tokio::sync::Notify,
     last_heard: Mutex<Instant>,
     pub bytes_out: AtomicU64,
@@ -54,11 +150,7 @@ impl Mux {
             link: link.clone(),
             out: Mutex::new(Out { seq: 0, tx, urgent }),
             window: Arc::new(Semaphore::new(WINDOW)),
-            streams: Mutex::new(HashMap::new()),
-            next_stream: AtomicU32::new(1),
-            next_id: AtomicU64::new(1),
-            missing: Mutex::new(HashMap::new()),
-            dead: AtomicBool::new(false),
+            state: Mutex::new(MuxState::new()),
             gone: tokio::sync::Notify::new(),
             last_heard: Mutex::new(Instant::now()),
             bytes_out: AtomicU64::new(0),
@@ -91,15 +183,12 @@ impl Mux {
         });
         let m = mux.clone();
         tokio::spawn(async move {
-            let mut order: Reorder<ServerMsg> = Reorder::new(true);
             while let Some(raw) = m.link.recv().await {
                 m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
                 *m.last_heard.lock().unwrap() = Instant::now();
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
-                if frame.stream == rargo_proto::KEEPALIVE {
-                    continue;
-                }
-                for (stream, msg) in order.push(frame) {
+                let ordered = m.state.lock().unwrap().incoming(frame);
+                for (stream, msg) in ordered {
                     let msg = match msg {
                         ServerMsg::Packed(z) => match rargo_proto::unpack(&z).and_then(|b| rargo_proto::decode(&b)) {
                             Ok(m) => m,
@@ -107,18 +196,11 @@ impl Mux {
                         },
                         m => m,
                     };
-                    if stream == CONTROL {
-                        m.control(msg);
-                        continue;
-                    }
-                    let last = matches!(msg, ServerMsg::Exit(_) | ServerMsg::Exec(_) | ServerMsg::Fetched { .. });
-                    let tx = m.streams.lock().unwrap().get(&stream).cloned();
-                    if let Some(tx) = tx {
-                        let _ = tx.send(msg);
-                    }
-                    if last {
-                        order.end(stream);
-                        m.streams.lock().unwrap().remove(&stream);
+                    let action = m.state.lock().unwrap().route(stream, msg);
+                    match action {
+                        Route::Stream(dest, msg) => { let _ = dest.send(msg); }
+                        Route::Missing(dest, missing) => { let _ = dest.send(missing); }
+                        Route::Drop => {}
                     }
                 }
             }
@@ -160,7 +242,7 @@ impl Mux {
     }
 
     pub fn is_dead(&self) -> bool {
-        self.dead.load(Ordering::SeqCst) || self.link.is_closed()
+        self.state.lock().unwrap().dead || self.link.is_closed()
     }
 
     /// Resolves when the link is closed. A missed wake is caught on the next check.
@@ -177,25 +259,12 @@ impl Mux {
     }
 
     pub fn die(&self) {
-        if self.dead.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let drained = self.state.lock().unwrap().fail();
+        let Some(endpoints) = drained else { return };
         self.link.close();
-        self.streams.lock().unwrap().clear();
-        self.missing.lock().unwrap().clear();
+        drop(endpoints);
         self.window.close();
         self.gone.notify_waiters();
-    }
-
-    fn control(&self, msg: ServerMsg) {
-        match msg {
-            ServerMsg::Missing { id, trees, blobs } => {
-                if let Some(tx) = self.missing.lock().unwrap().remove(&id) {
-                    let _ = tx.send((trees, blobs));
-                }
-            }
-            _ => {}
-        }
     }
 
     fn queue(&self, stream: u32, msg: &ClientMsg, bulk: usize) {
@@ -233,27 +302,27 @@ impl Mux {
     }
 
     pub fn open(&self) -> (u32, UnboundedSender<ServerMsg>, UnboundedReceiver<ServerMsg>) {
-        let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(id, CONTROL);
-        assert_ne!(id, rargo_proto::KEEPALIVE);
         let (tx, rx) = unbounded_channel();
-        assert!(self.streams.lock().unwrap().insert(id, tx.clone()).is_none());
+        let (id, rejected) = self.state.lock().unwrap().open(tx.clone());
+        drop(rejected);
         (id, tx, rx)
     }
 
     pub fn cancel(&self, stream: u32) {
-        if self.streams.lock().unwrap().remove(&stream).is_some() {
+        let closed = self.state.lock().unwrap().close(stream);
+        if closed.is_some() {
             self.post(stream, &ClientMsg::Cancel);
         }
     }
 
     pub fn next_id(&self) -> u64 {
-        self.next_id.fetch_add(1, Ordering::Relaxed)
+        self.state.lock().unwrap().next_id()
     }
 
-    pub fn expect_missing(&self, id: u64) -> oneshot::Receiver<(Vec<Digest>, Vec<Digest>)> {
+    pub fn expect_missing(&self, id: u64) -> oneshot::Receiver<Missing> {
         let (tx, rx) = oneshot::channel();
-        assert!(self.missing.lock().unwrap().insert(id, tx).is_none(), "offer {id} awaited twice");
+        let rejected = self.state.lock().unwrap().expect_missing(id, tx);
+        drop(rejected);
         rx
     }
 
@@ -262,12 +331,73 @@ impl Mux {
     }
 
     pub fn ask(&self, to: &UnboundedSender<ServerMsg>, question: impl FnOnce(u64) -> ClientMsg) -> u64 {
-        let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(stream, CONTROL);
-        assert_ne!(stream, rargo_proto::KEEPALIVE);
-        assert!(self.streams.lock().unwrap().insert(stream, to.clone()).is_none());
+        let (stream, rejected) = self.state.lock().unwrap().open(to.clone());
+        drop(rejected);
         let id = stream as u64;
         self.post(stream, &question(id));
         id
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reorder_and_terminal_frames_stay_with_their_own_stream() {
+        let mut state = MuxState::<_, ()>::new();
+        let (first, _) = state.open("first");
+        assert!(state.invariants());
+        let (second, _) = state.open("second");
+        assert!(state.invariants());
+
+        let stdout = |byte| ServerMsg::Stdout(vec![byte]);
+        assert!(state.incoming(Frame { stream: first, seq: 1, msg: ServerMsg::Exit(0) }).is_empty());
+        assert!(state.invariants());
+        let msgs = state.incoming(Frame { stream: second, seq: 0, msg: stdout(2) });
+        assert!(state.invariants());
+        let [(stream, msg)] = msgs.try_into().ok().unwrap();
+        assert!(matches!(state.route(stream, msg), Route::Stream("second", ServerMsg::Stdout(bytes)) if bytes == [2]));
+        assert!(state.invariants());
+
+        let msgs = state.incoming(Frame { stream: first, seq: 0, msg: stdout(1) });
+        assert!(state.invariants());
+        let [(stream, msg), (last_stream, last)] = msgs.try_into().ok().unwrap();
+        assert!(matches!(state.route(stream, msg), Route::Stream("first", ServerMsg::Stdout(bytes)) if bytes == [1]));
+        assert!(state.invariants());
+        assert!(matches!(state.route(last_stream, last), Route::Stream("first", ServerMsg::Exit(0))));
+        assert!(state.invariants());
+        assert!(state.incoming(Frame { stream: first, seq: 2, msg: stdout(9) }).is_empty());
+        assert!(state.invariants());
+        assert!(matches!(state.route(first, stdout(9)), Route::Drop));
+        assert!(state.invariants());
+    }
+
+    #[test]
+    fn failure_drains_every_open_registration_once() {
+        let mut state = MuxState::new();
+        let (closed, _) = state.open("cancelled");
+        assert!(state.invariants());
+        let (a, _) = state.open("first");
+        assert!(state.invariants());
+        let (b, _) = state.open("second");
+        assert!(state.invariants());
+        assert_eq!(state.close(closed), Some("cancelled"));
+        assert!(state.invariants());
+        let id = state.next_id();
+        assert!(state.invariants());
+        assert_eq!(state.expect_missing(id, "offer"), None);
+        assert!(state.invariants());
+        let (streams, offers) = state.fail().unwrap();
+        assert!(state.invariants());
+        assert_eq!(streams, BTreeMap::from([(a, "first"), (b, "second")]));
+        assert_eq!(offers, BTreeMap::from([(id, "offer")]));
+        assert!(state.fail().is_none());
+        assert!(state.invariants());
+        assert_eq!(state.open("late").1, Some("late"));
+        assert!(state.invariants());
+        assert_eq!(state.expect_missing(id, "late offer"), Some("late offer"));
+        assert!(state.invariants());
     }
 }
