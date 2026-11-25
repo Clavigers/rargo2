@@ -455,35 +455,46 @@ pub fn schedule(
     hosts: Option<&Arc<DashMap<Hash, FileSrc>>>,
     seen: &Arc<parking_lot::Mutex<HashSet<String>>>,
 ) -> Result<Prepared> {
+    let (prepared, pending) = plan(db.as_ref(), fs.as_ref(), store, names, hosts.map(|m| m.as_ref()), seen)?;
+    if !pending.is_empty() {
+        let job = Arc::new(Job {
+            db: Arc::clone(db),
+            fs: Arc::clone(fs),
+            store: store.to_path_buf(),
+            hosts: hosts.cloned(),
+            seen: Arc::clone(seen),
+            cost: parking_lot::Mutex::new(Cost::default()),
+            left: std::sync::atomic::AtomicUsize::new(pending.len()),
+        });
+        enqueue(pending.into_iter().map(|name| (Arc::clone(&job), name)));
+    }
+    Ok(prepared)
+}
+
+fn plan(
+    db: &dyn Tables,
+    fs: &dyn StoreFs,
+    store: &Path,
+    names: &[String],
+    hosts: Option<&DashMap<Hash, FileSrc>>,
+    seen: &parking_lot::Mutex<HashSet<String>>,
+) -> Result<(Prepared, Vec<String>)> {
     let mut cost = Cost::default();
     let mut roots = Vec::with_capacity(names.len());
     let mut pending = Vec::new();
-    let host_map = hosts.map(|m| m.as_ref());
     for name in names {
         let path = store.join(name);
-        if let Some(kind) = load(db.as_ref(), name.as_bytes()) {
+        if let Some(kind) = load(db, name.as_bytes()) {
             cost.reused_paths += 1;
             let mut guard = seen.lock();
-            let kind = adopt(
-                db.as_ref(), fs.as_ref(), name, &path, kind, true, host_map, &mut guard, &mut cost, false,
-            )?;
+            let kind = adopt(db, fs, name, &path, kind, true, hosts, &mut guard, &mut cost, false)?;
             roots.push(identity(&kind));
         } else {
             roots.push(Hash::ZERO);
             pending.push(name.clone());
         }
     }
-    if !pending.is_empty() {
-        enqueue(Job {
-            db: Arc::clone(db),
-            fs: Arc::clone(fs),
-            store: store.to_path_buf(),
-            names: pending,
-            hosts: hosts.cloned(),
-            seen: Arc::clone(seen),
-        });
-    }
-    Ok(Prepared { roots, cost })
+    Ok((Prepared { roots, cost }, pending))
 }
 
 fn adopt(
@@ -515,7 +526,7 @@ fn adopt(
             }
             cost.hashed_files += fresh.files;
             cost.hashed_bytes += fresh.bytes;
-            attach_kind(fs, &fresh.kind, path, hosts).with_context(|| format!("remembering {name}"))?;
+            attach_kind(fs, &fresh.kind, path, hosts).map_err(anyhow::Error::msg).with_context(|| format!("remembering {name}"))?;
             kind = fresh.kind;
         }
         seen.insert(name.to_string());
@@ -523,31 +534,102 @@ fn adopt(
     Ok(kind)
 }
 
+pub struct Queue<T> {
+    waiting: std::collections::VecDeque<(u64, T)>,
+    builds: usize,
+    one_core: bool,
+    pushed: u64,
+    handed: u64,
+}
+
+impl<T> Queue<T> {
+    pub fn new(one_core: bool) -> Queue<T> {
+        Queue { waiting: std::collections::VecDeque::new(), builds: 0, one_core, pushed: 0, handed: 0 }
+    }
+
+    pub fn push(&mut self, items: impl IntoIterator<Item = T>) {
+        for item in items {
+            self.waiting.push_back((self.pushed, item));
+            self.pushed += 1;
+        }
+    }
+
+    pub fn hold(&mut self) {
+        self.builds += 1;
+    }
+
+    pub fn release(&mut self) -> bool {
+        self.builds = self.builds.saturating_sub(1);
+        self.builds == 0
+    }
+
+    pub fn take(&mut self) -> Option<T> {
+        if self.one_core && self.builds > 0 {
+            return None;
+        }
+        let (_, item) = self.waiting.pop_front()?;
+        self.handed += 1;
+        Some(item)
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.handed + self.waiting.len() as u64 == self.pushed
+            && self.waiting.iter().zip(self.handed..).all(|((n, _), want)| *n == want)
+    }
+}
+
 struct Job {
     db: Arc<dyn Tables>,
     fs: Arc<dyn StoreFs>,
     store: PathBuf,
-    names: Vec<String>,
     hosts: Option<Arc<DashMap<Hash, FileSrc>>>,
     seen: Arc<parking_lot::Mutex<HashSet<String>>>,
+    cost: parking_lot::Mutex<Cost>,
+    left: std::sync::atomic::AtomicUsize,
 }
 
-fn enqueue(job: Job) {
-    static TX: OnceLock<std::sync::mpsc::Sender<Job>> = OnceLock::new();
-    let tx = TX.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel();
+type Hashing = (parking_lot::Mutex<Queue<(Arc<Job>, String)>>, parking_lot::Condvar);
+
+fn hashing() -> &'static Hashing {
+    static Q: OnceLock<Hashing> = OnceLock::new();
+    static WORKER: OnceLock<()> = OnceLock::new();
+    let q = Q.get_or_init(|| (parking_lot::Mutex::new(Queue::new(one_core())), parking_lot::Condvar::new()));
+    WORKER.get_or_init(|| {
         std::thread::Builder::new()
             .name("nix-hash".into())
-            .spawn(move || {
+            .spawn(|| {
                 idle_priority();
-                while let Ok(job) = rx.recv() {
-                    hash_job(job);
+                let (queue, cv) = hashing();
+                loop {
+                    let next = {
+                        let mut q = queue.lock();
+                        loop {
+                            match q.take() {
+                                Some(item) => break item,
+                                None => cv.wait(&mut q),
+                            }
+                        }
+                    };
+                    let (job, name) = next;
+                    {
+                        let mut cost = job.cost.lock();
+                        hash_one(&job, &name, &mut cost);
+                    }
+                    if job.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                        log_cost(&job.cost.lock());
+                    }
                 }
             })
             .expect("starting nix hash thread");
-        tx
     });
-    let _ = tx.send(job);
+    q
+}
+
+fn enqueue(items: impl IntoIterator<Item = (Arc<Job>, String)>) {
+    let (queue, cv) = hashing();
+    queue.lock().push(items);
+    cv.notify_all();
 }
 
 fn idle_priority() {
@@ -559,45 +641,25 @@ fn idle_priority() {
     }
 }
 
-struct Idle {
-    depth: parking_lot::Mutex<usize>,
-    cv: parking_lot::Condvar,
-}
-
-fn idle() -> &'static Idle {
-    static IDLE: OnceLock<Idle> = OnceLock::new();
-    IDLE.get_or_init(|| Idle {
-        depth: parking_lot::Mutex::new(0),
-        cv: parking_lot::Condvar::new(),
-    })
-}
-
 pub struct BuildHold {
     _private: (),
 }
 
 pub fn hold_build() -> BuildHold {
-    *idle().depth.lock() += 1;
+    hashing().0.lock().hold();
     BuildHold { _private: () }
 }
 
 impl Drop for BuildHold {
     fn drop(&mut self) {
-        let gate = idle();
-        let mut depth = gate.depth.lock();
-        *depth = depth.saturating_sub(1);
-        if *depth == 0 {
-            gate.cv.notify_all();
+        let (queue, cv) = hashing();
+        if queue.lock().release() {
+            cv.notify_all();
         }
     }
 }
 
 fn one_core() -> bool {
-    static ONE: OnceLock<bool> = OnceLock::new();
-    *ONE.get_or_init(quota_is_one_core)
-}
-
-fn quota_is_one_core() -> bool {
     let Ok(text) = fs::read_to_string("/proc/self/cgroup") else {
         return false;
     };
@@ -612,6 +674,10 @@ fn quota_is_one_core() -> bool {
             Err(_) => return false,
         },
     };
+    quota_is_one_core(&max)
+}
+
+fn quota_is_one_core(max: &str) -> bool {
     let mut parts = max.split_whitespace();
     let (Some(quota), Some(period)) = (parts.next(), parts.next()) else {
         return false;
@@ -625,145 +691,113 @@ fn quota_is_one_core() -> bool {
     )
 }
 
-#[cfg(test)]
-static FORCE_ONE_CORE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn defer_until_idle() -> bool {
-    #[cfg(test)]
-    if FORCE_ONE_CORE.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    one_core()
-}
-
-fn wait_until_the_build_is_done() {
-    if !defer_until_idle() {
+fn hash_one(job: &Job, name: &str, cost: &mut Cost) {
+    let path = job.store.join(name);
+    if let Some(kind) = load(job.db.as_ref(), name.as_bytes()) {
+        let mut seen = job.seen.lock();
+        if let Err(e) = adopt(job.db.as_ref(), job.fs.as_ref(), name, &path, kind, true, job.hosts.as_deref(), &mut seen, cost, false) {
+            eprintln!("rargod: nix path {name}: {e:#}");
+        }
         return;
     }
-    let gate = idle();
-    let mut depth = gate.depth.lock();
-    while *depth > 0 {
-        gate.cv.wait(&mut depth);
+    let t = Instant::now();
+    let fresh = match hash_path_mode(job.fs.as_ref(), &path, false) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("rargod: nix path {name}: {e}");
+            return;
+        }
+    };
+    cost.millis += t.elapsed().as_millis() as u64;
+    if let Some(hosts) = job.hosts.as_deref() {
+        let mut seen = job.seen.lock();
+        if !seen.contains(name) {
+            if let Err(e) = attach_kind(job.fs.as_ref(), &fresh.kind, &path, hosts) {
+                eprintln!("rargod: nix path {name} manifest does not match the files ({e})");
+                return;
+            }
+            seen.insert(name.to_string());
+        }
     }
+    if let Err(e) = save(job.db.as_ref(), name.as_bytes(), &fresh.kind) {
+        eprintln!("rargod: nix path {name}: {e:#}");
+        return;
+    }
+    cost.new_paths += 1;
+    cost.hashed_files += fresh.files;
+    cost.hashed_bytes += fresh.bytes;
 }
 
-fn hash_job(job: Job) {
-    let mut cost = Cost::default();
-    for name in job.names {
-        wait_until_the_build_is_done();
-        let path = job.store.join(&name);
-        if let Some(kind) = load(job.db.as_ref(), name.as_bytes()) {
-            let mut seen = job.seen.lock();
-            if let Err(e) = adopt(
-                job.db.as_ref(),
-                job.fs.as_ref(),
-                &name,
-                &path,
-                kind,
-                true,
-                job.hosts.as_deref(),
-                &mut seen,
-                &mut cost,
-                false,
-            ) {
-                eprintln!("rargod: nix path {name}: {e:#}");
-            }
-            continue;
-        }
-        let t = Instant::now();
-        let fresh = match hash_path_mode(job.fs.as_ref(), &path, false) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("rargod: nix path {name}: {e}");
-                continue;
-            }
-        };
-        cost.millis += t.elapsed().as_millis() as u64;
-        if let Some(hosts) = job.hosts.as_deref() {
-            let mut seen = job.seen.lock();
-            if !seen.contains(&name) {
-                if let Err(e) = attach_kind(job.fs.as_ref(), &fresh.kind, &path, hosts) {
-                    eprintln!("rargod: nix path {name} manifest does not match the files ({e})");
-                    continue;
-                }
-                seen.insert(name.clone());
-            }
-        }
-        if let Err(e) = save(job.db.as_ref(), name.as_bytes(), &fresh.kind) {
-            eprintln!("rargod: nix path {name}: {e:#}");
-            continue;
-        }
-        cost.new_paths += 1;
-        cost.hashed_files += fresh.files;
-        cost.hashed_bytes += fresh.bytes;
-    }
-    log_cost(&cost);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Expect {
+    Link,
+    File { hash: Hash, size: u64 },
 }
 
-fn attach_kind(fs: &dyn StoreFs, kind: &StoredKind, path: &Path, hosts: &DashMap<Hash, FileSrc>) -> io::Result<()> {
+pub fn expectations(kind: &StoredKind, path: &Path) -> Result<Vec<(PathBuf, Expect)>, String> {
     match kind {
         StoredKind::Dir { root, trees } => {
-            let installed = PathTrees::decode(*root, trees)?;
-            attach_tree(fs, &installed, *root, path, hosts)
+            let installed = PathTrees::decode(*root, trees).map_err(|e| e.to_string())?;
+            let mut out = Vec::new();
+            expect_tree(&installed, *root, path, &mut out)?;
+            Ok(out)
         }
-        StoredKind::File { hash, size, .. } => remember_file(fs, path, *hash, *size, hosts),
-        StoredKind::Link(_) => {
-            if matches!(fs.stat(path)?, Kind::Link(_)) {
-                Ok(())
-            } else {
-                Err(io::Error::other("not a symlink"))
-            }
-        }
+        StoredKind::File { hash, size, .. } => Ok(vec![(path.to_path_buf(), Expect::File { hash: *hash, size: *size })]),
+        StoredKind::Link(_) => Ok(vec![(path.to_path_buf(), Expect::Link)]),
     }
 }
 
-fn attach_tree(
-    fs: &dyn StoreFs,
-    trees: &PathTrees,
-    digest: Hash,
-    dir: &Path,
-    hosts: &DashMap<Hash, FileSrc>,
-) -> io::Result<()> {
-    let Some(tree) = trees.trees.get(&digest) else {
-        return Err(io::Error::other("missing directory tree"));
-    };
+fn expect_tree(trees: &PathTrees, digest: Hash, dir: &Path, out: &mut Vec<(PathBuf, Expect)>) -> Result<(), String> {
+    let tree = trees.trees.get(&digest).ok_or("missing directory tree")?;
     for (name, node) in &tree.entries {
         let path = dir.join(std::ffi::OsStr::from_bytes(name));
         match node {
-            Node::Dir(d) => attach_tree(fs, trees, Hash(*d), &path, hosts)?,
-            Node::File { hash, size, .. } => remember_file(fs, &path, Hash(*hash), *size, hosts)?,
-            Node::Symlink(_) => {
-                if !matches!(fs.stat(&path)?, Kind::Link(_)) {
-                    return Err(io::Error::other(format!(
-                        "{} is not a symlink",
-                        path.display()
-                    )));
-                }
-            }
+            Node::Dir(d) => expect_tree(trees, Hash(*d), &path, out)?,
+            Node::File { hash, size, .. } => out.push((path, Expect::File { hash: Hash(*hash), size: *size })),
+            Node::Symlink(_) => out.push((path, Expect::Link)),
         }
     }
     Ok(())
 }
 
-fn remember_file(
-    fs: &dyn StoreFs,
-    path: &Path,
-    hash: Hash,
-    size: u64,
-    hosts: &DashMap<Hash, FileSrc>,
-) -> io::Result<()> {
-    let (kind, sig) = fs.host(path)?;
-    if !matches!(kind, Kind::File { .. }) || sig.size != size {
-        return Err(io::Error::other(format!(
-            "{} is not the manifested file",
-            path.display()
-        )));
+#[derive(Debug, PartialEq)]
+pub enum Verdict {
+    Matches(Vec<(Hash, PathBuf, HostSig)>),
+    Stale(String),
+}
+
+pub fn judge(expected: Vec<(PathBuf, Expect)>, seen: Vec<io::Result<(Kind, HostSig)>>) -> Verdict {
+    if expected.len() != seen.len() {
+        return Verdict::Stale(format!("{} answers for {} paths", seen.len(), expected.len()));
     }
-    hosts.entry(hash).or_insert_with(|| FileSrc::Host {
-        path: Arc::from(path.to_path_buf()),
-        sig,
-    });
-    Ok(())
+    let mut files = Vec::new();
+    for ((path, want), got) in expected.into_iter().zip(seen) {
+        let (kind, sig) = match got {
+            Ok(k) => k,
+            Err(e) => return Verdict::Stale(e.to_string()),
+        };
+        match want {
+            Expect::Link if matches!(kind, Kind::Link(_)) => {}
+            Expect::Link => return Verdict::Stale(format!("{} is not a symlink", path.display())),
+            Expect::File { hash, size } if matches!(kind, Kind::File { .. }) && sig.size == size => files.push((hash, path, sig)),
+            Expect::File { .. } => return Verdict::Stale(format!("{} is not the manifested file", path.display())),
+        }
+    }
+    Verdict::Matches(files)
+}
+
+fn attach_kind(fs: &dyn StoreFs, kind: &StoredKind, path: &Path, hosts: &DashMap<Hash, FileSrc>) -> Result<(), String> {
+    let expected = expectations(kind, path)?;
+    let seen = expected.iter().map(|(p, _)| fs.host(p)).collect();
+    match judge(expected, seen) {
+        Verdict::Matches(files) => {
+            for (hash, path, sig) in files {
+                hosts.entry(hash).or_insert_with(|| FileSrc::Host { path: Arc::from(path), sig });
+            }
+            Ok(())
+        }
+        Verdict::Stale(why) => Err(why),
+    }
 }
 
 pub enum Place {
@@ -1235,18 +1269,24 @@ mod tests {
         fs
     }
 
-    fn shared(fs: FakeStore) -> (Arc<dyn Tables>, Arc<FakeStore>, Arc<dyn StoreFs>) {
-        let fs = Arc::new(fs);
-        let dynfs: Arc<dyn StoreFs> = fs.clone();
-        (Arc::new(MemTables::default()), fs, dynfs)
+    fn job(fs: FakeStore, hosts: Option<Arc<DashMap<Hash, FileSrc>>>) -> (Job, Arc<FakeStore>) {
+        let fake = Arc::new(fs);
+        let dynfs: Arc<dyn StoreFs> = fake.clone();
+        let job = Job {
+            db: Arc::new(MemTables::default()),
+            fs: dynfs,
+            store: PathBuf::from("/store"),
+            hosts,
+            seen: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            cost: parking_lot::Mutex::new(Cost::default()),
+            left: std::sync::atomic::AtomicUsize::new(0),
+        };
+        (job, fake)
     }
 
-    fn wait_for(db: &Arc<dyn Tables>, name: &[u8]) {
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while load(db.as_ref(), name).is_none() {
-            assert!(Instant::now() < deadline, "{} was not hashed", String::from_utf8_lossy(name));
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    fn plan_of(job: &Job, names: &[&str]) -> (Prepared, Vec<String>) {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        plan(job.db.as_ref(), job.fs.as_ref(), &job.store, &names, job.hosts.as_deref(), &job.seen).unwrap()
     }
 
     #[test]
@@ -1273,61 +1313,155 @@ mod tests {
     }
 
     #[test]
-    fn hashing_a_store_path_does_not_block_the_caller() {
-        let (db, _, fs) = shared(tree());
-        let store = Path::new("/store");
-        let seen = Arc::new(parking_lot::Mutex::new(HashSet::new()));
-        let first = schedule(&db, &fs, store, &["aaa".into(), "bbb".into()], None, &seen).unwrap();
+    fn scheduling_answers_from_saved_manifests_and_leaves_the_rest_to_the_hash_queue() {
+        let (job, fake) = job(tree(), None);
+        let (first, pending) = plan_of(&job, &["aaa", "bbb"]);
         assert_eq!(first.roots, vec![Hash::ZERO, Hash::ZERO]);
-        wait_for(&db, b"aaa");
-        wait_for(&db, b"bbb");
-        let second = schedule(&db, &fs, store, &["bbb".into(), "ccc".into()], None, &seen).unwrap();
-        assert_ne!(second.roots[0], Hash::ZERO);
-        assert_eq!(second.roots[0], identity(&load(db.as_ref(), b"bbb").unwrap()));
-        assert_eq!(second.cost.reused_paths, 1);
-        assert_eq!(second.roots[1], Hash::ZERO);
-        wait_for(&db, b"ccc");
-        let third = schedule(&db, &fs, store, &["aaa".into(), "bbb".into()], None, &seen).unwrap();
-        assert_eq!(third.cost.reused_paths, 2);
-        assert_eq!(third.cost.new_paths, 0);
-        assert!(third.roots.iter().all(|r| *r != Hash::ZERO));
-        assert_eq!(third.roots[1], second.roots[0]);
+        assert_eq!(pending, ["aaa", "bbb"]);
+        assert_eq!(fake.hashed.load(Ordering::Relaxed), 0, "planning hashes nothing");
+        let mut cost = Cost::default();
+        for name in &pending {
+            hash_one(&job, name, &mut cost);
+        }
+        assert_eq!((cost.new_paths, cost.hashed_files), (2, 3));
+        let (second, pending) = plan_of(&job, &["bbb", "ccc"]);
+        assert_eq!(second.roots[0], identity(&load(job.db.as_ref(), b"bbb").unwrap()));
+        assert_eq!(second.roots[0], model(&fake, Path::new("/store/bbb")).0);
+        assert_eq!((second.cost.reused_paths, second.roots[1]), (1, Hash::ZERO));
+        assert_eq!(pending, ["ccc"]);
+        hash_one(&job, "ccc", &mut cost);
+        hash_one(&job, "ccc", &mut cost);
+        assert_eq!(cost.new_paths, 3, "a path saved meanwhile is not hashed again");
+        let (third, pending) = plan_of(&job, &["aaa", "bbb"]);
+        assert!(pending.is_empty() && third.cost.reused_paths == 2 && third.roots.iter().all(|r| *r != Hash::ZERO));
+        let mut nothing = Cost::default();
+        hash_one(&job, "gone", &mut nothing);
+        assert!(load(job.db.as_ref(), b"gone").is_none() && nothing.new_paths == 0, "a path that cannot be hashed is skipped");
     }
 
     #[test]
     fn hashing_records_files_in_the_caller_map() {
-        let (db, _, fs) = shared(tree());
-        let seen = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let hosts = Arc::new(DashMap::new());
-        schedule(&db, &fs, Path::new("/store"), &["aaa".into()], Some(&hosts), &seen).unwrap();
-        wait_for(&db, b"aaa");
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while hosts.len() < 2 {
-            assert!(Instant::now() < deadline, "the server map received the file locations");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(hosts.contains_key(&Hash::of(b"tool-bytes")) && hosts.contains_key(&Hash::of(b"note")));
+        let (job, _) = job(tree(), Some(hosts.clone()));
+        let (_, pending) = plan_of(&job, &["aaa"]);
+        hash_one(&job, &pending[0], &mut Cost::default());
+        assert_eq!(hosts.len(), 2);
+        assert!(matches!(hosts.get(&Hash::of(b"tool-bytes")).map(|e| e.clone()), Some(FileSrc::Host { path, .. }) if path.as_ref() == Path::new("/store/aaa/bin/tool")));
+        assert!(hosts.contains_key(&Hash::of(b"note")));
+        assert!(job.seen.lock().contains("aaa"));
     }
 
     #[test]
     fn a_busy_one_core_server_hashes_after_the_build() {
-        struct Clear;
-        impl Drop for Clear {
-            fn drop(&mut self) {
-                FORCE_ONE_CORE.store(false, std::sync::atomic::Ordering::Relaxed);
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let one_core = rng.below(2) == 0;
+            let mut q = Queue::new(one_core);
+            let (mut builds, mut next_in, mut next_out) = (0usize, 0u32, 0u32);
+            for _ in 0..60 {
+                match rng.below(4) {
+                    0 => {
+                        let n = rng.below(3) as u32;
+                        q.push(next_in..next_in + n);
+                        next_in += n;
+                    }
+                    1 => {
+                        q.hold();
+                        builds += 1;
+                    }
+                    2 if builds > 0 => {
+                        builds -= 1;
+                        assert_eq!(q.release(), builds == 0, "seed {seed}: the last build to finish wakes the queue");
+                    }
+                    _ => match q.take() {
+                        Some(item) => {
+                            assert!(!(one_core && builds > 0), "seed {seed}: nothing is hashed while a build holds the only core");
+                            assert_eq!(item, next_out, "seed {seed}: paths are hashed in the order they were scheduled");
+                            next_out += 1;
+                        }
+                        None => assert!((one_core && builds > 0) || next_out == next_in, "seed {seed}: the queue is idle only when empty or held"),
+                    },
+                }
+                assert!(q.invariants(), "seed {seed}");
             }
         }
-        let _clear = Clear;
-        let (db, fake, fs) = shared(tree());
-        let seen = Arc::new(parking_lot::Mutex::new(HashSet::new()));
-        FORCE_ONE_CORE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let hold = hold_build();
-        let first = schedule(&db, &fs, Path::new("/store"), &["aaa".into()], None, &seen).unwrap();
-        assert_eq!(first.roots, vec![Hash::ZERO]);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(load(db.as_ref(), b"aaa").is_none() && fake.hashed.load(Ordering::Relaxed) == 0, "hashing waits while the build holds the only core");
-        drop(hold);
-        wait_for(&db, b"aaa");
+        assert!(quota_is_one_core("100000 100000\n") && quota_is_one_core("50000 100000"));
+        assert!(!quota_is_one_core("max 100000") && !quota_is_one_core("200000 100000") && !quota_is_one_core("1 0") && !quota_is_one_core(""));
+    }
+
+    #[test]
+    fn a_saved_manifest_matches_the_store_only_while_every_link_and_file_size_does() {
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x2545_f491_4f6c_dd1d) | 1);
+            let mut fs = FakeStore::default();
+            let root = "/store/0000000000000000000000000000000b-pkg";
+            fs.put(root, Ent::Dir);
+            let mut dirs = vec![PathBuf::from(root)];
+            for i in 0..1 + rng.below(25) {
+                let parent = dirs[rng.below(dirs.len() as u64) as usize].clone();
+                let path = parent.join(format!("e{i}"));
+                let e = match rng.below(6) {
+                    0..=2 => Ent::File(vec![i as u8; rng.below(4) as usize], rng.below(2) == 0),
+                    3 | 4 => {
+                        dirs.push(path.clone());
+                        Ent::Dir
+                    }
+                    _ => Ent::Link(b"x".to_vec()),
+                };
+                fs.ents.insert(path, e);
+            }
+            let kind = hash_path_mode(&fs, Path::new(root), false).unwrap().kind;
+            let expected = expectations(&kind, Path::new(root)).unwrap();
+            let files: Vec<_> = fs.ents.iter().filter(|(_, e)| matches!(e, Ent::File(..))).map(|(p, _)| p.clone()).collect();
+            let links = fs.ents.values().filter(|e| matches!(e, Ent::Link(_))).count();
+            assert_eq!(expected.len(), files.len() + links, "seed {seed}: every file and link is checked");
+            let answers = |fs: &FakeStore| expected.iter().map(|(p, _)| fs.host(p)).collect();
+            match judge(expected.clone(), answers(&fs)) {
+                Verdict::Matches(found) => {
+                    assert_eq!(found.len(), files.len(), "seed {seed}");
+                    for (hash, path, sig) in &found {
+                        let Some(Ent::File(data, _)) = fs.ents.get(path) else { panic!("seed {seed}: {path:?} is a file") };
+                        assert_eq!((*hash, sig.size), (Hash::of(data), data.len() as u64), "seed {seed}");
+                    }
+                }
+                other => panic!("seed {seed}: {other:?}"),
+            }
+            if expected.is_empty() {
+                continue;
+            }
+            let mut changed = fs;
+            let victim = expected[rng.below(expected.len() as u64) as usize].0.clone();
+            let why = match (changed.ents.get(&victim).cloned().unwrap(), rng.below(3)) {
+                (Ent::File(mut data, exec), 0) => {
+                    data.iter_mut().for_each(|b| *b ^= 0xff);
+                    changed.ents.insert(victim.clone(), Ent::File(data, exec));
+                    None
+                }
+                (Ent::File(mut data, exec), 1) => {
+                    data.push(7);
+                    changed.ents.insert(victim.clone(), Ent::File(data, exec));
+                    Some(format!("{} is not the manifested file", victim.display()))
+                }
+                (Ent::Link(_), 0) => {
+                    changed.ents.insert(victim.clone(), Ent::File(Vec::new(), false));
+                    Some(format!("{} is not a symlink", victim.display()))
+                }
+                _ => {
+                    changed.ents.remove(&victim);
+                    Some(format!("{} is missing", victim.display()))
+                }
+            };
+            match (judge(expected.clone(), answers(&changed)), why) {
+                (Verdict::Stale(got), Some(want)) => assert_eq!(got, want, "seed {seed}"),
+                (Verdict::Matches(_), None) => {}
+                (got, want) => panic!("seed {seed}: {got:?}, wanted {want:?}"),
+            }
+        }
+        let link = StoredKind::Link(b"x".to_vec());
+        assert_eq!(expectations(&link, Path::new("/s/l")).unwrap(), [(PathBuf::from("/s/l"), Expect::Link)]);
+        assert!(matches!(judge(vec![(PathBuf::from("/s/l"), Expect::Link)], Vec::new()), Verdict::Stale(_)), "every path needs an answer");
+        let broken = StoredKind::Dir { root: Hash::of(b"nothing"), trees: Vec::new() };
+        assert!(expectations(&broken, Path::new("/s/d")).is_err());
     }
 
     #[test]
