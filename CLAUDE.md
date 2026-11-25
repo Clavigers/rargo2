@@ -80,8 +80,9 @@ Facts that affect the design:
   own `CARGO_TARGET_DIR` and gate directory), never the other's.
   `dev/gate.sh` keeps everything its suites make under its gate directory
   (`RARGO_GATE_DIR`): each suite's directory, the temporary ones, the
-  mount tests' scratch area, the rig (network namespaces named after the
-  gate directory, the servers' state inside it), and it picks free ports.
+  mount tests' scratch area, each suite's rig (network namespaces named
+  after the gate directory and the suite, the servers' state inside it),
+  and it picks free ports. The suites run at the same time.
   So within a gate the gate directory is enough. A suite run by hand
   outside the gate is pointed elsewhere with `RIG` and `RIG_STATE` (the
   second agent: `RIG=codex RIG_STATE=rig-codex`), `RARGO_E2E_ROOT`,

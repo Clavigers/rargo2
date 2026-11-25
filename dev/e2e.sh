@@ -786,7 +786,13 @@ kill $listener 2>/dev/null
 # the daemon may push a change as soon as it is made.)
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
-sleep 0.3
+# The manifest has reached the server, so the directory made next is
+# already excluded and is not uploaded with the edit.
+for _ in $(seq 1 40); do
+    now=$(asked_files)
+    [ -n "$now" ] && [ "$now" -gt "$files" ] && break
+    sleep 0.05
+done
 mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
 expect "a build with a directory the manifest excludes" "$R" build
 [ $(( $(asked_files) - files )) -eq 1 ] && ok "only the manifest itself was uploaded, not the excluded directory" || bad "only the manifest itself was uploaded, not the excluded directory" "files $files -> $(asked_files)"
@@ -801,7 +807,13 @@ echo "ignored by git" >crates/util/local-note.txt
 # Counted before the edit, the ignored files changed after it (see above).
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\ngitignored = false\n' >>Cargo.toml
-sleep 0.3
+# The manifest has reached the server before the ignored files change,
+# so neither the file nor the directory is uploaded with the edit.
+for _ in $(seq 1 40); do
+    now=$(asked_files)
+    [ -n "$now" ] && [ "$now" -gt "$files" ] && break
+    sleep 0.05
+done
 echo "changed, and still ignored" >crates/util/local-note.txt
 head -c 1500000 /dev/urandom >junk/blob2
 out=$("$R" build 2>&1); rc=$?

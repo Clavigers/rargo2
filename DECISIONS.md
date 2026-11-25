@@ -2094,8 +2094,9 @@ and several daemons with core caps. So:
   chosen because it is the path a new user takes.
 - *The gate* (`dev/gate.sh`), on the build machine, runs everything:
   the above plus `e2e.sh` in both output modes, `e2e-flake.sh`,
-  `e2e-link.sh` and `e2e-worker.sh`, the last two in a second network
-  rig so that a benchmark holding the first is not disturbed.
+  `e2e-auth.sh`, `e2e-components.sh`, `e2e-link.sh` and `e2e-worker.sh`,
+  at the same time. Each suite that uses a network rig has one of its
+  own, so a benchmark holding another rig is not disturbed.
 
 **What blocks a merge and what blocks a release.** A pull request is
 merged only when CI passed on it; a release is tagged only after the
@@ -2652,3 +2653,29 @@ given to the action, because they would change its key every time:
   sees a replay.
 - **A runner the repository configures for the host target is replaced.**
   The variable outranks cargo configuration.
+
+## D84. The gate runs its suites at the same time (issue 112)
+
+The gate is the whole set of checks, and a pull request waits for all of
+it. The build, the unit tests and the mount tests go first, because the
+suites run the binaries they produce. After that the suites run together.
+Each already has its own directory and its own ports. `e2e-link` and
+`e2e-worker` each have a rig of their own (namespaces and state named
+from the gate directory), and the two scenarios inside `e2e-worker` do
+too: a wide worker, and a one-core worker whose states stay where they
+were made. A benchmark's rig is a different name and is not used.
+
+A fixed sleep in a suite is a wait for something that can be seen: the
+toolchain sitting in the worker's store and no longer growing, the
+server's log saying a worker or a revoked session is gone, a daemon
+process or its mount gone, a manifest the daemon has pushed. The poll
+stops when that is true. `dev/netns.sh` brings a rig up when the client
+can reach the server and any worker has joined, and it signals only the
+daemons that are in that rig's namespace, so one suite cannot stop
+another's.
+
+The servers the suites start through `dev/rargod.sh` take a share of the
+machine (`RARGO_CPU_QUOTA` 800%, `RARGO_MEMORY_MAX` 20G, unless the
+environment names another). A rig's caps stay what `dev/netns.sh` sets
+from the cores that rig is given. The service beside the gate keeps the
+headroom `CLAUDE.md` asks for.

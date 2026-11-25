@@ -68,8 +68,9 @@ tooling under `dev/`) go straight to `main`.
   and build from their packaged form, the installers parse.
 - **The gate** (`dev/gate.sh`), on the build machine: the above plus every
   end-to-end suite: `e2e.sh` in both output modes, `e2e-flake.sh`,
-  `e2e-auth.sh`, `e2e-link.sh` and `e2e-worker.sh` (the last two in a
-  second network rig, so that a running benchmark is not disturbed). They
+  `e2e-auth.sh`, `e2e-components.sh`, `e2e-link.sh` and `e2e-worker.sh`.
+  The suites run at the same time. Each that uses a network rig has one
+  of its own, so a benchmark holding another rig is not disturbed. They
   need root, FUSE, namespaces and the planner, which CI runners do not
   give. A release does not go out with a failing suite.
 - **The service check** (`.github/workflows/service-check.yml`): the

@@ -29,6 +29,17 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/        /'; }
 check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else bad "$name" "$@"; fi; }
+# A revoked token ends its open session when the server next looks, which
+# it does as the daemon's messages arrive. `before` is how many times the
+# log had already said so.
+wait_session_closed() {
+    local before=${1:-0} now i
+    for i in $(seq 1 80); do
+        now=$(grep -c "no longer valid" "$T/srv.log" 2>/dev/null || true)
+        [ "${now:-0}" -gt "$before" ] && return 0
+        sleep 0.1
+    done
+}
 
 umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
@@ -136,8 +147,9 @@ out=$("$R" auth tokens 2>&1); [ $? = 0 ] && grep -q "^$id " <<<"$out" && ! grep 
 out=$("$R" auth revoke bob 2>&1); [ $? != 0 ] && grep -q "only your own" <<<"$out"; check $? "and may not revoke bob's" "$out"
 out=$(RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" build 2>&1); check $? "which still works" "$out"
 RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" --rargo-daemon-stop >/dev/null 2>&1
+closed=$(grep -c "no longer valid" "$T/srv.log" 2>/dev/null || true)
 out=$(adm revoke "$id" 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargo auth revoke, by the administrator, ends ann's token" "$out"
-sleep 4
+wait_session_closed "$closed"
 echo "// changed" >>src/main.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc != 0 ]; check $? "a build with the revoked token fails, the session it had open included" "$out"
@@ -157,9 +169,10 @@ grep -q "held by dave" <<<"$out"; check $? "and says whose it is" "$out"
 out=$("$R" auth status 2>&1); grep -q "authenticated as dave (token ${tok3%%.*})" <<<"$out"; check $? "rargo auth status names its holder, as the server said" "$out"
 echo "// dave" >>src/main.rs
 out=$("$R" build 2>&1); check $? "and builds with it" "$out"
+closed=$(grep -c "no longer valid" "$T/srv.log" 2>/dev/null || true)
 out=$("$R" auth remove 2>&1); rc=$?
 [ $rc = 0 ] && grep -q "revoked the token for $host on the server" <<<"$out"; check $? "rargo auth remove says it revoked the token on the server" "$out"
-sleep 3
+wait_session_closed "$closed"
 echo "// dave again" >>src/main.rs
 out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
 [ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
@@ -203,8 +216,9 @@ wait $auth; rc=$?
 echo "// carol" >>src/main.rs
 out=$("$R" build 2>&1); check $? "rargo build works with the token" "$out"
 out=$(adm tokens 2>&1); grep -q "Carol.*github" <<<"$out" && grep -q "may sign in: Carol" <<<"$out"; check $? "rargo auth tokens shows the token and the allow list" "$out"
+closed=$(grep -c "no longer valid" "$T/srv.log" 2>/dev/null || true)
 out=$(adm disallow carol 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargo auth disallow revokes what the account signed in for" "$out"
-sleep 4
+wait_session_closed "$closed"
 echo "// again" >>src/main.rs
 out=$("$R" build 2>&1); [ $? != 0 ]; check $? "and its builds stop" "$out"
 

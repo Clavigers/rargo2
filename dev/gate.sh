@@ -1,6 +1,7 @@
 #!/bin/bash
 # Run the suites on the checked-out commit and publish their results.
 set -euo pipefail
+gate_started=$(date +%s)
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 cd "$here/.."
@@ -67,8 +68,15 @@ B=$L/bin
 mkdir -p "$B"
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
-# The rig (dev/netns.sh) too: its network namespaces are named after the
-# gate directory, and its servers' state is in it.
+# The suites that follow run at the same time. Each rargod they start
+# through dev/rargod.sh stays inside a share of the machine, so the
+# service beside them keeps the headroom CLAUDE.md asks for. A rig's own
+# caps are set in dev/netns.sh from the cores that rig is given.
+export RARGO_CPU_QUOTA=${RARGO_CPU_QUOTA:-800%}
+export RARGO_MEMORY_MAX=${RARGO_MEMORY_MAX:-20G}
+# One rig name for this gate. Suites that use a rig append their own
+# suffix, so each has namespaces and state of its own and a benchmark's
+# rig is left alone.
 export RIG=${RIG:-g$(printf '%s' "$L" | sha256sum | cut -c1-6)} RIG_STATE=${RIG_STATE:-$L/work/rig}
 # Each suite's directory is under this gate's directory, and the suites
 # that listen on fixed ports get free ones. What the environment already
@@ -97,18 +105,50 @@ export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
 # runs of this gate.
 export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
 mkdir -p "$L/work"
-step e2e dev/e2e.sh
-step e2e-copy env RARGO_OUTPUT=copy dev/e2e.sh
-step e2e-flake dev/e2e-flake.sh
-step e2e-auth dev/e2e-auth.sh
-step e2e-components dev/e2e-components.sh
-step e2e-link dev/e2e-link.sh
-step e2e-worker dev/e2e-worker.sh
+# Directories, rigs and ports are already per suite. They run together;
+# the gate's time is the slowest of them, plus the build above.
+declare -A suite_pid
+launch() {
+    local name=$1
+    shift
+    (
+        set +e
+        started=$(date +%s)
+        "$@" >"$L/$name.log" 2>&1
+        echo $? >"$L/$name.rc"
+        echo $(( $(date +%s) - started )) >"$L/$name.secs"
+    ) &
+    suite_pid[$name]=$!
+}
+launch e2e env RARGO_E2E_ROOT="$L/work/e2e" dev/e2e.sh
+launch e2e-copy env RARGO_OUTPUT=copy RARGO_E2E_ROOT="$L/work/e2e-copy" dev/e2e.sh
+launch e2e-flake dev/e2e-flake.sh
+launch e2e-auth dev/e2e-auth.sh
+launch e2e-components env RARGO_E2E_ROOT="$L/work/e2e-components" dev/e2e-components.sh
+launch e2e-link env RIG="${RIG}l" RIG_STATE="$L/work/rig-link" dev/e2e-link.sh
+launch e2e-worker env RIG="${RIG}w" RIG_STATE="$L/work/rig-worker" dev/e2e-worker.sh
+for suite in e2e e2e-copy e2e-flake e2e-auth e2e-components e2e-link e2e-worker; do
+    wait "${suite_pid[$suite]}" || true
+    rc=$(cat "$L/$suite.rc" 2>/dev/null || echo 1)
+    took=$(cat "$L/$suite.secs" 2>/dev/null || echo "?")
+    if [ "$rc" = 0 ]; then
+        passed=$((passed + 1))
+        description=$(summary "$L/$suite.log")
+        echo "ok    $suite (${took}s): ${description:-passed}"
+        report "$suite" success "${description:-passed}"
+    else
+        description=$(summary "$L/$suite.log")
+        echo "FAIL  $suite (${took}s, see $L/$suite.log)"
+        report "$suite" failure "${description:-failure}"
+    fi
+done
 if ! clean || [ "$(git rev-parse HEAD)" != "$commit" ]; then
     report all error "Checkout changed during the gate"
     exit 2
 fi
 result="$passed of ${#suites[@]} gate steps passed"
+elapsed=$(( $(date +%s) - gate_started ))
+echo "gate ${elapsed}s: $result"
 if [ "$passed" -eq "${#suites[@]}" ]; then
     report all success "$result"
 else

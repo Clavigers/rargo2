@@ -75,7 +75,15 @@ echo 'pub fn more() -> i32 { 40 }' >crates/extra/src/lib.rs
 printf 'extra = { path = "../extra" }\n' >>crates/app/Cargo.toml
 echo 'fn main() { println!("value {}", util::value() + extra::more()); }' >crates/app/src/main.rs
 out=$(R run -q 2>&1); [ "$out" = "value 43" ]; check $? "a crate added in a new directory is built" "$out"
-sleep 0.5
+# The push of the new crate has landed, so the edit that follows is a
+# change of its own and not folded into that push.
+prev=$(sync_n 'files received')
+for _ in $(seq 1 40); do
+    sleep 0.05
+    now=$(sync_n 'files received')
+    if [ -n "$prev" ] && [ "$now" = "$prev" ]; then break; fi
+    prev=$now
+done
 echo 'pub fn more() -> i32 { 50 }' >crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 53" ]; check $? "and an edit inside the new directory is seen" "$out"
 git -c user.name=t -c user.email=t@example.invalid commit -qam two
@@ -93,7 +101,8 @@ st=$(dstat)
 grep -q '^link  *udp; 1 made' <<<"$st"; check $? "on the link it had: no new connection, no new key agreement" "$st"
 
 echo "== the daemon dies"
-pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E"; sleep 0.3
+pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E" 2>/dev/null || true
+for _ in $(seq 1 50); do [ "$(daemons)" = 0 ] && break; sleep 0.05; done
 sed -i 's/{ 60 }/{ 70 }/' crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 73" ]; check $? "the next command starts a new daemon and builds" "$out"
 [ "$(daemons)" = 1 ]; check $? "one daemon is running again"
@@ -264,14 +273,15 @@ unmounted "$U/target"; check $? "a killed daemon of this user leaves no mount ei
 out=$(asuser cat target/note 2>&1); [ "$out" = x ]; check $? "and what the user wrote is in the plain directory" "$out"
 out=$(asuser "$U/bin/rargo" build 2>&1); check $? "the user's next build starts a daemon again" "$out"
 grep -q " $U/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo; check $? "which mounts target/ again" "$(tail -3 "$U/cache/daemon.log")"
-asuser "$U/bin/rargo" --rargo-daemon-stop; sleep 0.5
+asuser "$U/bin/rargo" --rargo-daemon-stop
+unmounted "$U/target"
 ! grep -q " $U/target " /proc/self/mountinfo; check $? "stopping the daemon unmounts it"
 [ -f "$U/target/note" ]; check $? "and what the user wrote is in the plain directory"
 rm -rf "$U"
 
 echo "== daemons go when told"
 RARGO_CACHE_DIR=$E/cache-tcp R --rargo-daemon-stop; RARGO_CACHE_DIR=$E/cache R --rargo-daemon-stop
-sleep 0.5
+for _ in $(seq 1 50); do [ "$(daemons)" = 0 ] && break; sleep 0.05; done
 [ "$(daemons)" = 0 ]; check $? "--rargo-daemon-stop ends them ($(daemons) left)"
 ! mounted && [ -d target ]; check $? "and leaves target/ a plain directory"
 out=$(cargo build --offline 2>&1); check $? "in which stock cargo builds" "$out"

@@ -28,6 +28,74 @@ check() { if [ "$1" = 0 ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
 R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 # A figure from the workers part of the status text: the number before PATTERN.
 stat() { R --rargo-status | tr '\n' ' ' | grep -oE "[0-9.]+ $1" | head -1 | cut -d' ' -f1; }
+# Bytes in the worker's store, 0 when it has none yet.
+store_bytes() { du -sb "$rig/w1/store" 2>/dev/null | awk '{print $1; found=1} END{if (!found) print 0}'; }
+# The toolchain has crossed the link when the worker's store has taken
+# the files (it has grown) and has stopped growing. `base` is the size
+# before the build that sends them.
+wait_toolchain() {
+    local base=$1 size prev=0 stable=0 i gain=0
+    for i in $(seq 1 200); do
+        size=$(store_bytes)
+        gain=$((size - base))
+        if [ "$gain" -gt 20000000 ] && [ "$size" = "$prev" ]; then
+            stable=$((stable + 1))
+            if [ "$stable" -ge 10 ]; then
+                echo "        toolchain is on the worker (+$((gain / 1048576)) MiB, no longer growing)"
+                return 0
+            fi
+        else
+            stable=0
+        fi
+        prev=$size
+        sleep 0.1
+    done
+    echo "        toolchain wait ended at +$((gain / 1048576)) MiB"
+}
+# The server has noticed the worker process is gone.
+wait_worker_gone() {
+    local before now i
+    before=$(grep -c "is gone" "$rig/srv.log" 2>/dev/null || true)
+    pkill -KILL -f "rargod --state $rig/w1 " 2>/dev/null || true
+    for i in $(seq 1 50); do
+        now=$(grep -c "is gone" "$rig/srv.log" 2>/dev/null || true)
+        [ "${now:-0}" -gt "${before:-0}" ] && return 0
+        sleep 0.1
+    done
+}
+
+# The two scenarios share nothing, so they run at the same time, each
+# in a rig of its own. A phase name in the environment runs just that one.
+if [ -z "${E2E_WORKER_PHASE:-}" ]; then
+    base=$E
+    rm -rf "$base"
+    mkdir -p "$base"
+    E2E_WORKER_PHASE=wide RIG="${RIG:-rargo}a" RIG_STATE="$rig-wide" RARGO_E2E_WORKER="$base/wide" \
+        "$0" >"$base/wide.log" 2>&1 &
+    wide=$!
+    E2E_WORKER_PHASE=one RIG="${RIG:-rargo}b" RIG_STATE="$rig-one" RARGO_E2E_WORKER="$base/one" \
+        "$0" >"$base/one.log" 2>&1 &
+    one=$!
+    wrc=0; orc=0
+    wait "$wide" || wrc=$?
+    wait "$one" || orc=$?
+    echo "== wide worker"
+    cat "$base/wide.log"
+    echo "== one-core worker"
+    cat "$base/one.log"
+    awk '
+        /^[0-9]+ passed, [0-9]+ failed$/ { p += $1; f += $3; n++ }
+        END {
+            if (n < 2) { print "0 passed, 1 failed"; exit 1 }
+            printf "%d passed, %d failed\n", p, f
+            exit (f == 0 ? 0 : 1)
+        }
+    ' "$base/wide.log" "$base/one.log"
+    rc=$?
+    rm -rf "$base"
+    [ "$wrc" = 0 ] && [ "$orc" = 0 ] && [ "$rc" = 0 ]
+    exit
+fi
 
 # A library crate that takes a compiler a second or two.
 leaf() { # name value
@@ -64,11 +132,12 @@ app() { # leaf names...
     } >"$proj/Cargo.toml"
 }
 
-"$here/netns.sh" down >/dev/null 2>&1
-rm -rf "$E"; mkdir -p "$proj"
 first="la lb lc ld"
 warm="lk ll lm ln"
 second="le lf lg lh li lj"
+if [ "$E2E_WORKER_PHASE" != one ]; then
+"$here/netns.sh" down >/dev/null 2>&1
+rm -rf "$E"; mkdir -p "$proj"
 for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
@@ -82,14 +151,10 @@ out=$(R build 2>&1); check $? "a workspace builds on a server with a worker" "$o
 out=$(R run -q 2>&1); [ "$out" = "total 4" ]; check $? "its program runs (total 4)" "$out"
 for l in $warm; do leaf $l 0; done
 app $first $warm
+before=$(store_bytes)
 out=$(R build 2>&1); check $? "the workspace builds after four crates were added" "$out"
 # The toolchain has to have crossed the link before the worker is of use.
-for i in $(seq 1 150); do
-    sent=$(stat 'MiB, not sent because')
-    [ "${sent%.*}" -ge 300 ] && break
-    sleep 0.2
-done
-sleep 6
+wait_toolchain "$before"
 
 # Six new crates at once, one server core: first compiles go to the worker.
 for l in $second; do leaf $l 10; done
@@ -138,14 +203,22 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 [ "${ahead:-0}" -ge 1 ]; check $? "states made on the server were sent to the worker ahead of need ($ahead)" "$(R --rargo-status)"
-pkill -KILL -f "rargod --state $rig/w1" 2>/dev/null
+wait_worker_gone
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 3 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "the workspace builds after the worker was killed" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 22" ]; check $? "its program shows the last edit (total 22)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
 grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
-
+cd /
+"$here/netns.sh" down >/dev/null 2>&1
+umount -l "$rig/srv/mnt" "$rig/w1/mnt" 2>/dev/null || true
+rm -rf "$E"
+echo
+echo "$pass passed, $fail failed"
+[ "$fail" = 0 ]
+exit
+fi
 
 # The same with a worker of one core and states that stay on it (the
 # background fetch is put off for the length of the test): compiles that
@@ -163,13 +236,10 @@ cd "$proj" || exit 2
 out=$(R build 2>&1); check $? "one-core worker: a workspace builds" "$out"
 for l in $warm; do leaf $l 0; done
 app $first $warm
+before=$(store_bytes)
 out=$(R build 2>&1); check $? "one-core worker: it builds after four crates were added" "$out"
-for i in $(seq 1 150); do
-    sent=$(stat 'MiB, not sent because')
-    [ "${sent%.*}" -ge 300 ] && break
-    sleep 0.2
-done
-sleep 6
+# The toolchain has to have crossed the link before the worker is of use.
+wait_toolchain "$before"
 for l in $second; do leaf $l 10; done
 app $first $warm $second
 out=$(R build 2>&1); check $? "one-core worker: it builds after six crates were added" "$out"
@@ -190,8 +260,7 @@ for n in 20 30 40; do
     out=$(R build 2>&1) || break
 done
 [ "${needed:-0}" -ge 1 ]; check $? "a compile on the server fetched the state it started from ($needed files)" "$(R --rargo-status)"
-pkill -KILL -f "rargod --state $rig/w1" 2>/dev/null
-sleep 3
+wait_worker_gone
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 7 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "it builds after the worker died with states on it" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 46" ]; check $? "its program shows the last edit (total 46)" "$out"
