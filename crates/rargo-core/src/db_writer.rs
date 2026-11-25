@@ -143,9 +143,52 @@ impl DbWriter {
 mod tests {
     use super::*;
 
+    struct Checked(DbWriter);
+
+    impl std::ops::Deref for Checked {
+        type Target = DbWriter;
+        fn deref(&self) -> &DbWriter {
+            &self.0
+        }
+    }
+
+    impl Checked {
+        fn new() -> Checked {
+            let w = DbWriter::new();
+            w.invariants();
+            Checked(w)
+        }
+
+        fn put(&mut self, table: Table, key: &[u8], value: &[u8], now_ms: u64) {
+            self.0.put(table, key, value, now_ms);
+            self.0.invariants();
+        }
+
+        fn delete(&mut self, table: Table, key: &[u8], now_ms: u64) {
+            self.0.delete(table, key, now_ms);
+            self.0.invariants();
+        }
+
+        fn take(&mut self) -> Batch {
+            let b = self.0.take();
+            self.0.invariants();
+            b
+        }
+
+        fn flushed(&mut self, batch: &Batch, now_ms: u64) {
+            self.0.flushed(batch, now_ms);
+            self.0.invariants();
+        }
+
+        fn failed(&mut self, now_ms: u64) {
+            self.0.failed(now_ms);
+            self.0.invariants();
+        }
+    }
+
     #[test]
     fn a_flush_is_due_a_delay_after_the_first_write_or_when_full() {
-        let mut w = DbWriter::new();
+        let mut w = Checked::new();
         assert_eq!(w.due(1000), Due::Idle);
         w.put(Table::Meta, b"a", b"1", 1000);
         assert_eq!(w.due(1000), Due::At(1000 + DELAY_MS));
@@ -164,7 +207,7 @@ mod tests {
 
     #[test]
     fn a_write_made_during_a_flush_stays_for_the_next() {
-        let mut w = DbWriter::new();
+        let mut w = Checked::new();
         w.put(Table::Meta, b"k", b"old", 0);
         w.put(Table::Meta, b"j", b"x", 0);
         let b = w.take();
@@ -179,7 +222,7 @@ mod tests {
 
     #[test]
     fn a_failed_flush_keeps_every_write_and_tries_again_later() {
-        let mut w = DbWriter::new();
+        let mut w = Checked::new();
         w.put(Table::Traces, b"t", b"v", 0);
         w.delete(Table::Traces, b"u", 0);
         let _ = w.take();
@@ -190,7 +233,7 @@ mod tests {
 
     #[test]
     fn pending_writes_are_found_by_prefix_and_deletes_show() {
-        let mut w = DbWriter::new();
+        let mut w = Checked::new();
         w.put(Table::Incr, b"ab1", b"1", 0);
         w.put(Table::Incr, b"ab2", b"2", 0);
         w.put(Table::Incr, b"ac", b"3", 0);
@@ -217,7 +260,7 @@ mod tests {
         let tables = [Table::Blobs, Table::Meta, Table::Cold];
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut w = DbWriter::new();
+            let mut w = Checked::new();
             let mut disk: BTreeMap<(Table, Vec<u8>), Vec<u8>> = BTreeMap::new();
             let mut last: BTreeMap<(Table, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
             let mut flushed_seqs = std::collections::BTreeSet::new();
