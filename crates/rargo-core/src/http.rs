@@ -553,7 +553,7 @@ fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
         bail!("malformed request target");
     }
     let mut host = String::new();
-    let mut length = 0usize;
+    let mut length = None;
     let mut json = false;
     for line in lines {
         let Some((k, v)) = line.split_once(':') else { bail!("malformed request header") };
@@ -561,11 +561,13 @@ fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
         match k.to_ascii_lowercase().as_str() {
             "host" => host = v.to_string(),
             "x-forwarded-host" => host = v.to_string(),
-            "content-length" => length = v.parse().context("Content-Length")?,
+            "content-length" if length.is_none() => length = Some(v.parse::<usize>().context("Content-Length")?),
+            "content-length" => bail!("multiple Content-Length headers"),
             "content-type" => json = v.starts_with("application/json"),
             _ => {}
         }
     }
+    let length = length.unwrap_or(0);
     if length > 64 << 10 {
         bail!("the request's body is too long");
     }
@@ -615,6 +617,18 @@ mod tests {
         assert!(matches!(get("/auth/github?code=AB%2DCD").endpoint(), Endpoint::Github("AB-CD")));
         assert!(matches!(get("/auth/github/callback?state=abc&code=x").endpoint(), Endpoint::Callback { state: "abc", code: "x" }));
         assert!(matches!(get("/missing").endpoint(), Endpoint::Missing));
+        let post = |path: &str, body: &str, kind: &str| {
+            parse_request(format!("POST {path} HTTP/1.1\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+                .unwrap().unwrap()
+        };
+        assert!(matches!(post("/auth/start", "", "text/plain").endpoint(), Endpoint::Start));
+        assert!(matches!(post("/auth/poll", "device=abc", "application/x-www-form-urlencoded").endpoint(), Endpoint::Poll(device) if device == "abc"));
+        assert!(matches!(post("/auth/approve", "code=abc&name=Ann+Lee", "application/x-www-form-urlencoded").endpoint(),
+            Endpoint::Approve { code, name, .. } if code == "abc" && name == "Ann Lee"));
+        for route in ["/auth/revoke", "/auth/whoami"] {
+            let request = post(route, r#"{"token":"fixture"}"#, "application/json");
+            assert!(matches!(request.endpoint(), Endpoint::Revoke(Some(token)) | Endpoint::Who(Some(token)) if token == "fixture"));
+        }
         assert!(auth_page("abc", None, false, false).contains("does not issue tokens"));
         assert!(auth_page("abc", Some("<error>"), true, false).contains("&lt;error&gt;"));
         assert!(auth_page("abc", None, true, true).contains("Sign in with GitHub"));
