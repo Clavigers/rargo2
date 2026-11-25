@@ -16,7 +16,7 @@ how its open ends were closed.
 
 - Everything is Rust, one cargo workspace in this repo (`crates/*`).
 - The cargo fork lives in `/root/rargo-work/cargo` (branch `rargo`, based on
-  the commit that shipped as cargo 1.100.0, `3acc79c0c`). This repo carries the
+  the cargo of nightly 2026-11-15, `f93c676e3`; see D90). This repo carries the
   fork as a patch series in `forks/cargo/` plus `forks/setup.sh`, and depends
   on the checkout by path. Reason: the brief says to clone forks under
   `/root/rargo-work`; the patch series keeps this repo self-contained.
@@ -3052,3 +3052,26 @@ which is absent. File bytes move by hash, by chunk, and only when
 something opens the file. Store paths are not traced on a worker. What
 an action may see is unchanged: only its closure's store paths exist in
 its `/nix/store`.
+## D90. The planner is the cargo of a nightly toolchain, on the nightly channel (issue 128)
+
+The planner reads every manifest and decides every unit, so the cargo it
+is decides what a project may write: a `cargo-features` entry, a `-Z`
+flag or a manifest key that its cargo does not know fails to plan, and a
+feature whose behaviour changed plans the way its cargo did it. rargo's
+projects build with the latest nightly, so the planner is the cargo that
+nightly ships: `forks/cargo/BASE` is the cargo commit of nightly
+2026-11-15 (`f93c676e3`, cargo 0.103), and `forks/build.sh` builds it with
+`CFG_RELEASE_CHANNEL=nightly`, so unstable features are gated as that
+nightly's cargo gates them, whatever the toolchain of the build.
+
+Following a newer nightly is the same step again: rebase the patch series
+onto the cargo commit `cargo +nightly -vV` names, export it with
+`git format-patch`, write that commit to `BASE`, and rebuild.
+
+Measured on the rebase to `f93c676e3`: patch 1 met three conflicts
+(build-script and rustdoc runs now return process stats), and the series
+needed two API follow-ups (the executor reports `ExecStats`; config paths
+resolve through `ConfigRelativePathResolveExt`); patches 2 to 8 applied
+cleanly. The rebuilt planner plans this repository (949 KB plan) and a
+nightly workspace with `cargo-features = ["codegen-backend"]` (11 MB plan),
+which the planner on stable refuses.

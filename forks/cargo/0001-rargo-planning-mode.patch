@@ -1,4 +1,4 @@
-From f50b420c7d92a9a5e8ea00a631bd07db840a7c1b Mon Sep 17 00:00:00 2001
+From 94f083f7d1f04642e32dec3c1f3ca257937fd03b Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Sun, 22 Nov 2026 23:14:45 +0100
 Subject: [PATCH 1/8] rargo: planning mode
@@ -12,23 +12,23 @@ With __RARGO_PARSE set, serve cargo's build-script output parser on stdio.
  Cargo.toml                            |   1 +
  src/bin/cargo/main.rs                 |  10 +
  src/compiler/build_runner/mod.rs      |  15 +-
- src/compiler/custom_build.rs          |  19 +-
+ src/compiler/custom_build.rs          |  22 +-
  src/compiler/job_queue/mod.rs         |  22 +-
- src/compiler/mod.rs                   |  62 ++-
- src/compiler/rargo.rs                 | 676 ++++++++++++++++++++++++++
+ src/compiler/mod.rs                   |  61 ++-
+ src/compiler/rargo.rs                 | 677 ++++++++++++++++++++++++++
  src/compiler/unit.rs                  |   7 +
  src/ops/cargo_compile/mod.rs          |   6 +-
  src/ops/cargo_run.rs                  |   3 +
  src/ops/cargo_test.rs                 |  38 +-
  src/workspace/global_cache_tracker.rs |   6 +
- 13 files changed, 852 insertions(+), 31 deletions(-)
+ 13 files changed, 855 insertions(+), 31 deletions(-)
  create mode 100644 src/compiler/rargo.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index a8337c041..fb3f26076 100644
+index 12fef1bb8..97e020451 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
-@@ -222,6 +222,15 @@ dependencies = [
+@@ -207,6 +207,15 @@ dependencies = [
   "url",
  ]
  
@@ -44,7 +44,7 @@ index a8337c041..fb3f26076 100644
  [[package]]
  name = "bit-set"
  version = "0.8.0"
-@@ -420,6 +429,7 @@ dependencies = [
+@@ -407,6 +416,7 @@ dependencies = [
   "pathdiff",
   "portable-atomic",
   "rand 0.10.1",
@@ -52,26 +52,26 @@ index a8337c041..fb3f26076 100644
   "regex",
   "rusqlite",
   "rustc-hash 2.1.2",
-@@ -3777,6 +3787,14 @@ dependencies = [
+@@ -3727,6 +3737,14 @@ dependencies = [
   "rand_core 0.6.4",
  ]
  
 +[[package]]
 +name = "rargo-plan"
-+version = "0.1.0"
++version = "0.6.4"
 +dependencies = [
 + "bincode",
 + "serde",
 +]
 +
  [[package]]
- name = "rayon"
- version = "1.12.0"
+ name = "redox_syscall"
+ version = "0.5.18"
 diff --git a/Cargo.toml b/Cargo.toml
-index 6d8001085..70dba523f 100644
+index 064270474..2a0a4e6e3 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -210,6 +210,7 @@ rustfix.workspace = true
+@@ -215,6 +215,7 @@ rustfix.workspace = true
  same-file.workspace = true
  semver.workspace = true
  serde = { workspace = true, features = ["derive"] }
@@ -80,7 +80,7 @@ index 6d8001085..70dba523f 100644
  serde_ignored.workspace = true
  serde_json = { workspace = true, features = ["raw_value"] }
 diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
-index 77dd77c82..38495273a 100644
+index 4aeef336b..7ba136386 100644
 --- a/src/bin/cargo/main.rs
 +++ b/src/bin/cargo/main.rs
 @@ -15,6 +15,11 @@ mod commands;
@@ -108,7 +108,7 @@ index 77dd77c82..38495273a 100644
  
  fn setup_logger() -> Option<tracing_chrome::FlushGuard> {
 diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
-index 4bf69f658..87cc79acc 100644
+index 09470a96b..e51fbd2c2 100644
 --- a/src/compiler/build_runner/mod.rs
 +++ b/src/compiler/build_runner/mod.rs
 @@ -181,6 +181,10 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -148,7 +148,7 @@ index 4bf69f658..87cc79acc 100644
                  self.compilation
                      .native_dirs
 diff --git a/src/compiler/custom_build.rs b/src/compiler/custom_build.rs
-index e23a2ecc7..67beb5893 100644
+index 946e607a3..b22813b03 100644
 --- a/src/compiler/custom_build.rs
 +++ b/src/compiler/custom_build.rs
 @@ -288,6 +288,9 @@ pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
@@ -161,38 +161,41 @@ index e23a2ecc7..67beb5893 100644
          fingerprint::prepare_target(build_runner, unit, false)
      } else {
          build_work(build_runner, unit)
-@@ -515,7 +518,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+@@ -516,7 +519,7 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
          script_out_dir.clone(),
      );
      let build_scripts = build_runner.build_scripts.get(unit).cloned();
 -    let json_messages = bcx.build_config.emit_json();
 +    let json_messages = bcx.build_config.emit_json() && !super::rargo::active();
      let extra_verbose = bcx.gctx.extra_verbose();
+     let capture_rusage = bcx.capture_rusage();
      let (prev_output, prev_script_out_dir) = prev_build_output(build_runner, unit);
-     let metadata_hash = build_runner.get_run_build_script_metadata(unit);
-@@ -600,7 +603,10 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+@@ -602,7 +605,13 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
          let prefix = format!("[{} {}] ", id.name(), id.version());
          let mut log_messages_in_case_of_panic = Vec::new();
          let span = tracing::debug_span!("build_script", process = cmd.to_string());
--        let output = span.in_scope(|| {
-+        let output = if super::rargo::active() {
-+            super::rargo::fake_script_run(&cmd, &metadata_hash.to_string(), &script_out_dir, &targets)
+-        let (stats, output) = span.in_scope(|| {
++        let (stats, output) = if super::rargo::active() {
++            (
++                cargo_util::ExecStats::default(),
++                super::rargo::fake_script_run(&cmd, &metadata_hash.to_string(), &script_out_dir, &targets),
++            )
 +        } else {
 +        span.in_scope(|| {
-             cmd.exec_with_streaming(
+             let (stats, result) = cmd.exec_with_streaming(
                  &mut |stdout| {
                      if let Some(error) = stdout.strip_prefix(CARGO_ERROR_SYNTAX) {
-@@ -646,7 +652,8 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
- 
+@@ -650,7 +659,8 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
                  build_error_context
-             })
+             });
+             (stats, result)
 -        });
 +        })
 +        };
  
-         // If the build failed
-         if let Err(error) = output {
-@@ -738,7 +745,11 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
+         if let Some(peak_memory) = stats.peak_rss {
+             state.peak_memory(peak_memory);
+@@ -746,7 +756,11 @@ fn build_work(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResul
          Ok(())
      });
  
@@ -206,10 +209,10 @@ index e23a2ecc7..67beb5893 100644
          job.before(dirty);
      } else {
 diff --git a/src/compiler/job_queue/mod.rs b/src/compiler/job_queue/mod.rs
-index a581e1135..a3aeda47c 100644
+index 5f14aa407..a7e0106c9 100644
 --- a/src/compiler/job_queue/mod.rs
 +++ b/src/compiler/job_queue/mod.rs
-@@ -619,11 +619,13 @@ impl<'gctx> DrainState<'gctx> {
+@@ -621,11 +621,13 @@ impl<'gctx> DrainState<'gctx> {
          let warning_handling = build_runner.bcx.gctx.warning_handling()?;
          match event {
              Message::Run(id, cmd) => {
@@ -228,7 +231,7 @@ index a581e1135..a3aeda47c 100644
                  self.timings
                      .unit_start(build_runner, id, self.active[&id].clone());
              }
-@@ -881,7 +883,7 @@ impl<'gctx> DrainState<'gctx> {
+@@ -886,7 +888,7 @@ impl<'gctx> DrainState<'gctx> {
          {
              self.handle_error(&mut build_runner.bcx.gctx.shell(), &mut errors, e);
          }
@@ -237,7 +240,7 @@ index a581e1135..a3aeda47c 100644
              let mut shell = build_runner.bcx.gctx.shell();
              let msg = machine_message::BuildFinished {
                  success: errors.count == 0,
-@@ -896,6 +898,11 @@ impl<'gctx> DrainState<'gctx> {
+@@ -901,6 +903,11 @@ impl<'gctx> DrainState<'gctx> {
              // Any errors up to this point have already been printed via the
              // `display_error` inside `handle_error`.
              (Err(anyhow::Error::new(AlreadyPrintedError::new(error))),)
@@ -249,7 +252,7 @@ index a581e1135..a3aeda47c 100644
          } else if self.queue.is_empty() && self.pending_queue.is_empty() {
              let profile_link = build_runner.bcx.gctx.shell().err_hyperlink(
                  "https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles",
-@@ -1227,6 +1234,9 @@ impl<'gctx> DrainState<'gctx> {
+@@ -1235,6 +1242,9 @@ impl<'gctx> DrainState<'gctx> {
          unit: &Unit,
          fresh: &Freshness,
      ) -> CargoResult<()> {
@@ -260,10 +263,10 @@ index a581e1135..a3aeda47c 100644
              && !unit.mode.is_doc()
              && !unit.mode.is_doc_scrape())
 diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
-index a2e6f3786..06aaf982d 100644
+index b6bf9ab51..c70c6d1bf 100644
 --- a/src/compiler/mod.rs
 +++ b/src/compiler/mod.rs
-@@ -72,6 +72,8 @@ use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippe
+@@ -73,6 +73,8 @@ use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippe
  use regex::Regex;
  use tracing::{debug, instrument, trace};
  
@@ -272,7 +275,7 @@ index a2e6f3786..06aaf982d 100644
  pub use self::build_config::UserIntent;
  pub use self::build_config::{BuildConfig, CompileMode, MessageFormat};
  pub use self::build_context::BuildContext;
-@@ -194,6 +196,11 @@ fn compile<'gctx>(
+@@ -201,6 +203,11 @@ fn compile<'gctx>(
      if !build_runner.compiled.insert(unit.clone()) {
          return Ok(());
      }
@@ -284,7 +287,7 @@ index a2e6f3786..06aaf982d 100644
  
      let lock = if build_runner.bcx.gctx.cli_unstable().fine_grain_locking {
          Some(build_runner.lock_manager.lock_shared(build_runner, unit)?)
-@@ -226,14 +233,18 @@ fn compile<'gctx>(
+@@ -233,14 +240,18 @@ fn compile<'gctx>(
          // we've got everything constructed.
          fingerprint::prepare_init(build_runner, unit)?;
  
@@ -305,7 +308,7 @@ index a2e6f3786..06aaf982d 100644
              job.before(if job.freshness().is_dirty() {
                  let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
                      rustdoc(build_runner, unit)?
-@@ -274,6 +285,9 @@ fn compile<'gctx>(
+@@ -281,6 +292,9 @@ fn compile<'gctx>(
  
              job
          };
@@ -315,7 +318,7 @@ index a2e6f3786..06aaf982d 100644
          jobs.enqueue(build_runner, unit, job)?;
      }
  
-@@ -685,7 +699,7 @@ fn link_targets(
+@@ -691,7 +705,7 @@ fn link_targets(
      let profile = unit.profile.clone();
      let unit_mode = unit.mode;
      let features = unit.features.iter().map(|s| s.to_string()).collect();
@@ -324,7 +327,7 @@ index a2e6f3786..06aaf982d 100644
      let executable = build_runner.get_executable(unit)?;
      let mut target = Target::clone(&unit.target);
      if let TargetSourcePath::Metabuild = target.src_path() {
-@@ -806,6 +820,12 @@ where
+@@ -812,6 +826,12 @@ where
      let mut search_path = vec![];
      for dir in paths {
          let dir = get_dynamic_search_path(dir);
@@ -337,55 +340,54 @@ index a2e6f3786..06aaf982d 100644
          if dir.starts_with(&root_output) {
              search_path.push(dir.to_path_buf());
          } else {
-@@ -1144,21 +1164,27 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
+@@ -1158,21 +1178,26 @@ fn rustdoc(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<W
          state.running(&rustdoc);
-         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
+         let timestamp = paths::set_invocation_time(&timestamp_file)?;
  
--        let result = rustdoc
--            .exec_with_streaming(
--                &mut |line| on_stdout_line(state, line, package_id, &target),
--                &mut |line| {
--                    on_stderr_line(
--                        state,
--                        line,
--                        package_id,
--                        &manifest,
--                        &target,
--                        &mut output_options,
--                    )
--                },
--                false,
--            )
-+        let result = if rargo::active() {
-+            rargo::record_cmd(&rustdoc).map(|()| None)
+-        let (stats, result) = rustdoc.exec_with_streaming(
+-            &mut |line| on_stdout_line(state, line, package_id, &target),
+-            &mut |line| {
+-                on_stderr_line(
+-                    state,
+-                    line,
+-                    package_id,
+-                    &manifest,
+-                    &target,
+-                    &mut output_options,
+-                )
+-            },
+-            false,
+-            capture_rusage,
+-        );
++        let (stats, result) = if rargo::active() {
++            (cargo_util::ExecStats::default(), rargo::record_cmd(&rustdoc).map(|()| None))
 +        } else {
-+            rustdoc
-+                .exec_with_streaming(
-+                    &mut |line| on_stdout_line(state, line, package_id, &target),
-+                    &mut |line| {
-+                        on_stderr_line(
-+                            state,
-+                            line,
-+                            package_id,
-+                            &manifest,
-+                            &target,
-+                            &mut output_options,
-+                        )
-+                    },
-+                    false,
-+                )
-+                .map(Some)
++            let (stats, result) = rustdoc.exec_with_streaming(
++                &mut |line| on_stdout_line(state, line, package_id, &target),
++                &mut |line| {
++                    on_stderr_line(
++                        state,
++                        line,
++                        package_id,
++                        &manifest,
++                        &target,
++                        &mut output_options,
++                    )
++                },
++                false,
++                capture_rusage,
++            );
++            (stats, result.map(Some))
 +        };
-+        let result = result
+         let result = result
              .map_err(verbose_if_simple_exit_code)
              .with_context(|| format!("could not document `{}`", name));
- 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
 new file mode 100644
-index 000000000..df685c379
+index 000000000..ecfabd6d1
 --- /dev/null
 +++ b/src/compiler/rargo.rs
-@@ -0,0 +1,676 @@
+@@ -0,0 +1,677 @@
 +//! rargo planning mode.
 +//!
 +//! With `__RARGO_PLAN=<file>` in the environment, cargo runs its normal
@@ -755,8 +757,9 @@ index 000000000..df685c379
 +        _mode: CompileMode,
 +        _on_stdout_line: &mut dyn FnMut(&str) -> CargoResult<()>,
 +        _on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
-+    ) -> CargoResult<()> {
-+        record_cmd(cmd)
++        _capture_rusage: bool,
++    ) -> (cargo_util::ExecStats, CargoResult<()>) {
++        (cargo_util::ExecStats::default(), record_cmd(cmd))
 +    }
 +
 +    fn force_rebuild(&self, _unit: &Unit) -> bool {
@@ -1063,10 +1066,10 @@ index 000000000..df685c379
 +    }
 +}
 diff --git a/src/compiler/unit.rs b/src/compiler/unit.rs
-index 7d242eb29..c3d0a0974 100644
+index c65f19e6f..48e1a4f06 100644
 --- a/src/compiler/unit.rs
 +++ b/src/compiler/unit.rs
-@@ -171,6 +171,13 @@ impl UnitInner {
+@@ -172,6 +172,13 @@ impl UnitInner {
      }
  }
  
@@ -1081,10 +1084,10 @@ index 7d242eb29..c3d0a0974 100644
  impl Hash for Unit {
      fn hash<H: Hasher>(&self, hasher: &mut H) {
 diff --git a/src/ops/cargo_compile/mod.rs b/src/ops/cargo_compile/mod.rs
-index bf55ba185..898e6fbc2 100644
+index 89f64c655..94404f888 100644
 --- a/src/ops/cargo_compile/mod.rs
 +++ b/src/ops/cargo_compile/mod.rs
-@@ -132,7 +132,11 @@ impl CompileOptions {
+@@ -133,7 +133,11 @@ impl CompileOptions {
  ///
  /// This uses the [`DefaultExecutor`]. To use a custom [`Executor`], see [`compile_with_exec`].
  pub fn compile<'a>(ws: &Workspace<'a>, options: &CompileOptions) -> CargoResult<Compilation<'a>> {
@@ -1112,7 +1115,7 @@ index ef00c24d1..113b11f81 100644
  
      process.exec_replace()
 diff --git a/src/ops/cargo_test.rs b/src/ops/cargo_test.rs
-index ec9f71619..1bef114a4 100644
+index bdaa2bc18..ab33074af 100644
 --- a/src/ops/cargo_test.rs
 +++ b/src/ops/cargo_test.rs
 @@ -65,6 +65,7 @@ impl UnitTestError {
@@ -1196,7 +1199,7 @@ index ec9f71619..1bef114a4 100644
              .concise(|shell| shell.status("Executable", &exe_display))?;
          gctx.shell()
 diff --git a/src/workspace/global_cache_tracker.rs b/src/workspace/global_cache_tracker.rs
-index 27adaa615..30dab64f6 100644
+index 48b606d6c..9787d3bf3 100644
 --- a/src/workspace/global_cache_tracker.rs
 +++ b/src/workspace/global_cache_tracker.rs
 @@ -1598,6 +1598,12 @@ impl DeferredGlobalLastUse {
@@ -1212,3 +1215,6 @@ index 27adaa615..30dab64f6 100644
          if let Err(e) = self.save_with_gctx(gctx) {
              // Because there is an assertion in auto-gc that checks if this is
              // empty, be sure to clear it so that assertion doesn't fail.
+-- 
+2.54.0
+

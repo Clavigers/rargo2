@@ -1254,7 +1254,7 @@ one filled earlier). A binary built in a flake sandbox needs the flake's
 store paths on the client to run there.
 
 ### Planner (cargo fork)
-`forks/cargo/*.patch` on cargo 1.100.0. Cargo's real pipeline runs with
+`forks/cargo/*.patch` on the cargo of nightly 2026-11-15 (`f93c676e3`). Cargo's real pipeline runs with
 process execution stubbed; build-script results appear in recorded commands
 as placeholder tokens that rargod expands.
 `--timings` writes rargo's own report where cargo puts its own, and the

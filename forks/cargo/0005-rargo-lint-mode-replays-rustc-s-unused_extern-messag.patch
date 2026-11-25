@@ -1,15 +1,15 @@
-From e321a737add3bcc3a192c1e164422dd0a7878a2f Mon Sep 17 00:00:00 2001
+From 7bfc8765d007a7ed4325f73aa514599a6fc90db4 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:01:11 +0100
 Subject: [PATCH 5/8] rargo: lint mode replays rustc's unused_extern messages
  for cargo's unused_dependencies lint
 
 ---
- src/compiler/rargo.rs | 25 +++++++++++++++++++++++--
- 1 file changed, 23 insertions(+), 2 deletions(-)
+ src/compiler/rargo.rs | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index fc50c9cfc..e917f4823 100644
+index d9f610695..48cc8bbed 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
 @@ -363,6 +363,23 @@ pub fn record_cmd(cmd: &ProcessBuilder) -> CargoResult<()> {
@@ -36,19 +36,26 @@ index fc50c9cfc..e917f4823 100644
  /// The `Executor` used in planning mode: records instead of running rustc.
  pub struct PlanExecutor;
  
-@@ -374,9 +391,13 @@ impl Executor for PlanExecutor {
+@@ -374,10 +391,17 @@ impl Executor for PlanExecutor {
          _target: &Target,
          _mode: CompileMode,
          _on_stdout_line: &mut dyn FnMut(&str) -> CargoResult<()>,
 -        _on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
 +        on_stderr_line: &mut dyn FnMut(&str) -> CargoResult<()>,
-     ) -> CargoResult<()> {
--        record_cmd(cmd)
-+        record_cmd(cmd)?;
-+        if let Some(line) = unused_externs_of(CURRENT.with(|c| c.get())) {
-+            on_stderr_line(&line)?;
-+        }
-+        Ok(())
+         _capture_rusage: bool,
+     ) -> (cargo_util::ExecStats, CargoResult<()>) {
+-        (cargo_util::ExecStats::default(), record_cmd(cmd))
++        let result = (|| {
++            record_cmd(cmd)?;
++            if let Some(line) = unused_externs_of(CURRENT.with(|c| c.get())) {
++                on_stderr_line(&line)?;
++            }
++            Ok(())
++        })();
++        (cargo_util::ExecStats::default(), result)
      }
  
      fn force_rebuild(&self, _unit: &Unit) -> bool {
+-- 
+2.54.0
+

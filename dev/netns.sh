@@ -112,7 +112,7 @@ start_server() {
     for d in ${RARGO_HIDE:-}; do mkdir -p "$d"; hide="$hide mount -t tmpfs tmpfs '$d' &&"; done
     nohup systemd-run --scope -q -p CPUQuota=$((sj * 100))% -p MemoryMax=60G -p Delegate=yes \
         ip netns exec $RIG-srv unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
-        "$B/rargod" --state "$T/srv" --planner "$work/cargo/target/release/cargo" \
+        "$B/rargod" --state "$T/srv" --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
         --listen 10.77.0.1:7459 --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
     srvpid=$!
