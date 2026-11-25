@@ -30,4 +30,5 @@ pub mod store_index;
 pub mod timings;
 pub mod tokens;
 pub mod trace;
+pub mod trees_state;
 pub mod view;
