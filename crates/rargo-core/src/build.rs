@@ -433,6 +433,10 @@ struct Run {
     /// Set when the request is a `check` planned as a build: how far each
     /// unit has to be taken (see `PlanData::needs`).
     need: Option<Arc<Vec<u8>>>,
+    /// `cargo:warning=` lines already shown. `finish_script` skips one
+    /// copy of each, so a warning appears as the script prints it and
+    /// again only when the script prints it again.
+    script_warnings: Mutex<Vec<String>>,
 }
 
 /// Position of the cargo subcommand in a command line.
@@ -1308,6 +1312,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         verify_unreproducible: Mutex::new(Vec::new()),
         unit_keys: (0..n).map(|_| OnceLock::new()).collect(),
         need: if as_build { Some(pd.needs()) } else { None },
+        script_warnings: Mutex::new(Vec::new()),
     });
     if let Some(keep) = keep {
         *keep.lock() = Some(Built {
@@ -1488,6 +1493,17 @@ struct UnitObserver {
     i: usize,
     /// The command as cargo would display it with `-v`.
     shown: String,
+    /// The tail of a build script's stdout that does not yet end in a newline.
+    pending: Mutex<Vec<u8>>,
+}
+
+/// The message of a `cargo:warning=` or `cargo::warning=` line, as cargo's
+/// parser records it: the line is trimmed, and so is the end of the value.
+fn script_warning_message(line: &str) -> Option<&str> {
+    let line = line.trim();
+    line.strip_prefix("cargo:warning=")
+        .or_else(|| line.strip_prefix("cargo::warning="))
+        .map(|msg| msg.trim_end())
 }
 
 impl Observer for UnitObserver {
@@ -1517,6 +1533,7 @@ impl Observer for UnitObserver {
                         }
                     }
                 }
+                self.note_script_warnings(data);
             }
             _ => self.run.c.out.out_text(&String::from_utf8_lossy(data)),
         }
@@ -1533,6 +1550,37 @@ impl Observer for UnitObserver {
                 }
             }
             _ => self.run.compiler_line(self.i, &String::from_utf8_lossy(line), live),
+        }
+    }
+}
+
+impl UnitObserver {
+    /// Shows each `cargo:warning=` line as the script prints it. The rest
+    /// of a build script's stdout stays with the script until it exits.
+    fn note_script_warnings(&self, data: &[u8]) {
+        let u = &self.run.pd.plan.units[self.i];
+        if !u.show_warnings {
+            return;
+        }
+        let ready = {
+            let mut pending = self.pending.lock();
+            pending.extend_from_slice(data);
+            let mut ready = Vec::new();
+            while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
+                ready.push(pending.drain(..=nl).collect::<Vec<u8>>());
+            }
+            ready
+        };
+        for mut line in ready {
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let Ok(line) = std::str::from_utf8(&line) else { continue };
+            let Some(msg) = script_warning_message(line) else { continue };
+            let text = format!("{}@{}: {}", u.pkg_name, u.pkg_version, msg);
+            self.run.script_warnings.lock().push(text.clone());
+            self.run.c.out.warn(&text);
         }
     }
 }
@@ -1860,7 +1908,12 @@ impl Run {
                 seed_blobs: Default::default(),
                 cacheable: cacheable.clone(),
                 declared_env: declared_env.clone(),
-                observer: Arc::new(UnitObserver { run: self.clone(), i, shown: display_cmd(&cmd.program, &args) }),
+                observer: Arc::new(UnitObserver {
+                    run: self.clone(),
+                    i,
+                    shown: display_cmd(&cmd.program, &args),
+                    pending: Mutex::new(Vec::new()),
+                }),
             }),
             _ => None,
         };
@@ -1895,6 +1948,7 @@ impl Run {
                         run: self.clone(),
                         i,
                         shown: display_cmd(&cmd.program, &args),
+                        pending: Mutex::new(Vec::new()),
                     }),
                 })
                 .await;
@@ -2231,7 +2285,13 @@ impl Run {
                 if *is_err {
                     self.c.out.error(&text);
                 } else {
-                    self.c.out.warn(&text);
+                    let mut seen = self.script_warnings.lock();
+                    if let Some(pos) = seen.iter().position(|s| s == &text) {
+                        seen.swap_remove(pos);
+                    } else {
+                        drop(seen);
+                        self.c.out.warn(&text);
+                    }
                 }
             }
         }
@@ -3130,6 +3190,15 @@ fn normalize(p: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_script_warning_is_the_trimmed_value() {
+        assert_eq!(script_warning_message("cargo:warning=script-started"), Some("script-started"));
+        assert_eq!(script_warning_message("  cargo::warning=hello  \r"), Some("hello"));
+        assert_eq!(script_warning_message("cargo:warning="), Some(""));
+        assert_eq!(script_warning_message("cargo:rustc-cfg=has_generated"), None);
+        assert_eq!(script_warning_message("not a directive"), None);
+    }
 
     #[test]
     fn the_stock_fingerprint_of_an_executable_s_unit() {

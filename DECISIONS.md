@@ -2680,7 +2680,9 @@ server, and the server drops it then. `RARGO_HEDGE=0` on that suite's
 servers keeps a compile given to a worker from also running on an idle
 local core, so the state it leaves is the worker's. A compile that has
 to run on the server fetches its state from a worker that holds the
-state and has no core to take the compile.
+state and has no core to take the compile. A build script's
+`cargo:warning=` lines are shown as the script prints them, and the
+same line is not shown again when the script's output is parsed.
 
 The servers the suites start through `dev/rargod.sh` take a share of the
 machine (`RARGO_CPU_QUOTA` 800%, `RARGO_MEMORY_MAX` 20G, unless the
