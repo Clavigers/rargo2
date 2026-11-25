@@ -444,7 +444,7 @@ fn refused_text(server: &str, had_token: bool) -> String {
              Run `rargo auth` to get a new one\n"
         )
     } else {
-        format!("error: the rargo server at {server} wants a token, and this machine has none. Run `rargo auth` to get one\n")
+        format!("error: this machine is not authenticated to the rargo server at {server}: run `rargo auth`\n")
     }
 }
 
@@ -2588,10 +2588,9 @@ mod tests {
     fn a_refused_token_says_whether_there_was_one_and_names_rargo_auth() {
         let none = refused_text("build.example:7459", false);
         let revoked = refused_text("build.example:7459", true);
-        assert!(none.contains("wants a token, and this machine has none"), "{none}");
-        assert!(revoked.contains("no longer accepts this machine's token: it was revoked or has expired"), "{revoked}");
+        assert_eq!(none, "error: this machine is not authenticated to the rargo server at build.example:7459: run `rargo auth`\n");
+        assert!(revoked.starts_with("error: the rargo server at build.example:7459 no longer accepts this machine's token: it was revoked or has expired. Run `rargo auth`"), "{revoked}");
         for text in [none, revoked] {
-            assert!(text.starts_with("error: the rargo server at build.example:7459 ") && text.contains("Run `rargo auth`"), "{text}");
             assert!(!text.contains(rargo_proto::REFUSED), "{text}");
         }
     }
