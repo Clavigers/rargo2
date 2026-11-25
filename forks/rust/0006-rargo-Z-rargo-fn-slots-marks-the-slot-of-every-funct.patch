@@ -1,22 +1,22 @@
-From 28227ba0b1caecbb73213deb8c6b53d4718416af Mon Sep 17 00:00:00 2001
+From d80b8320cbccf171ac8254b3e4326dc80432739e Mon Sep 17 00:00:00 2001
 From: rargo <noreply@rargo.invalid>
 Date: Wed, 25 Nov 2026 14:49:45 +0100
-Subject: [PATCH] rargo: -Z rargo-fn-slots marks the slot of every function
+Subject: [PATCH 6/7] rargo: -Z rargo-fn-slots marks the slot of every function
  instance that runs
 
 ---
- compiler/rustc_codegen_llvm/src/base.rs       |   2 +
- compiler/rustc_codegen_llvm/src/builder.rs    |  24 ++++
- compiler/rustc_codegen_llvm/src/consts.rs     |  48 ++++++++
- compiler/rustc_codegen_llvm/src/context.rs    |   4 +
- compiler/rustc_codegen_ssa/src/mir/mod.rs     |   7 +-
- .../rustc_codegen_ssa/src/traits/builder.rs   |   1 +
- compiler/rustc_mir_transform/src/inline.rs    |   3 +
- compiler/rustc_session/src/config.rs          |   2 +-
- compiler/rustc_session/src/options.rs         |   3 +
- library/std/src/sys/mod.rs                    |   2 +
- library/std/src/sys/rargo_slots.rs            | 104 ++++++++++++++++++
- 11 files changed, 198 insertions(+), 2 deletions(-)
+ compiler/rustc_codegen_llvm/src/base.rs       |  2 +
+ compiler/rustc_codegen_llvm/src/builder.rs    | 11 +++
+ compiler/rustc_codegen_llvm/src/consts.rs     | 40 ++++++++
+ compiler/rustc_codegen_llvm/src/context.rs    |  4 +
+ compiler/rustc_codegen_ssa/src/mir/mod.rs     |  7 +-
+ .../rustc_codegen_ssa/src/traits/builder.rs   |  1 +
+ compiler/rustc_mir_transform/src/inline.rs    |  3 +
+ compiler/rustc_session/src/config.rs          |  2 +-
+ compiler/rustc_session/src/options.rs         |  3 +
+ library/std/src/sys/mod.rs                    |  2 +
+ library/std/src/sys/rargo_slots.rs            | 98 +++++++++++++++++++
+ 11 files changed, 171 insertions(+), 2 deletions(-)
  create mode 100644 library/std/src/sys/rargo_slots.rs
 
 diff --git a/compiler/rustc_codegen_llvm/src/base.rs b/compiler/rustc_codegen_llvm/src/base.rs
@@ -33,10 +33,10 @@ index 6e7c31f77..571d8cda6 100644
              if !cx.used_statics.is_empty() {
                  cx.create_used_variable_impl(c"llvm.used", &cx.used_statics);
 diff --git a/compiler/rustc_codegen_llvm/src/builder.rs b/compiler/rustc_codegen_llvm/src/builder.rs
-index abc71f450..22103bdbb 100644
+index abc71f450..b76880ade 100644
 --- a/compiler/rustc_codegen_llvm/src/builder.rs
 +++ b/compiler/rustc_codegen_llvm/src/builder.rs
-@@ -700,6 +700,30 @@ fn load(&mut self, ty: &'ll Type, ptr: &'ll Value, align: Align) -> &'ll Value {
+@@ -700,6 +700,17 @@ fn load(&mut self, ty: &'ll Type, ptr: &'ll Value, align: Align) -> &'ll Value {
          }
      }
  
@@ -47,31 +47,18 @@ index abc71f450..22103bdbb 100644
 +            slots.push(name);
 +            slots.len() - 1
 +        };
-+        let isize_ty = self.cx.type_isize();
 +        let slot = self.inbounds_gep(self.cx.type_i8(), self.cx.rargo_slot_array(), &[self.cx.const_usize(index as u64)]);
-+        let delta = self.load(isize_ty, self.cx.rargo_slot_delta(), self.tcx.data_layout.pointer_align().abi);
-+        let at = self.ptrtoint(slot, isize_ty);
-+        let at = self.add(at, delta);
-+        let ptr = self.inttoptr(at, self.cx.type_ptr());
-+        let seen = self.volatile_load(self.cx.type_i8(), ptr, Align::ONE);
-+        let unmarked = self.icmp(IntPredicate::IntEQ, seen, self.cx.const_u8(0));
-+        let mark = self.append_sibling_block("rargo_mark");
-+        let marked = self.append_sibling_block("rargo_marked");
-+        self.cond_br_with_expect(unmarked, mark, marked, Some(false));
-+        self.switch_to_block(mark);
-+        self.store_with_flags(self.cx.const_u8(1), ptr, Align::ONE, MemFlags::VOLATILE);
-+        self.br(marked);
-+        self.switch_to_block(marked);
++        self.store_with_flags(self.cx.const_u8(1), slot, Align::ONE, MemFlags::VOLATILE);
 +    }
 +
      fn volatile_load(&mut self, ty: &'ll Type, ptr: &'ll Value, align: Align) -> &'ll Value {
          unsafe {
              let load = self.load(ty, ptr, align);
 diff --git a/compiler/rustc_codegen_llvm/src/consts.rs b/compiler/rustc_codegen_llvm/src/consts.rs
-index bbb1141a9..1a41e1f8b 100644
+index bbb1141a9..ac2da5126 100644
 --- a/compiler/rustc_codegen_llvm/src/consts.rs
 +++ b/compiler/rustc_codegen_llvm/src/consts.rs
-@@ -674,6 +674,54 @@ fn codegen_static_item(&mut self, def_id: DefId) {
+@@ -674,6 +674,46 @@ fn codegen_static_item(&mut self, def_id: DefId) {
          }
      }
  
@@ -84,25 +71,17 @@ index bbb1141a9..1a41e1f8b 100644
 +        array
 +    }
 +
-+    pub(crate) fn rargo_slot_delta(&self) -> &'ll Value {
-+        let delta = self.declare_global("__rargo_slot_delta", self.type_isize());
-+        if llvm::is_declaration(delta) {
-+            llvm::set_initializer(delta, self.const_usize(0));
-+            llvm::set_linkage(delta, llvm::Linkage::WeakAnyLinkage);
-+            llvm::set_visibility(delta, llvm::Visibility::Hidden);
-+        }
-+        delta
-+    }
-+
 +    pub(crate) fn rargo_finish_slots(&mut self) {
++        const RARGO_SLOT_PAGE: usize = 4096;
 +        let Some(pending) = self.rargo_slot_array.take() else { return };
-+        let names = self.rargo_slots.take();
++        let mut names = self.rargo_slots.take();
++        names.resize(names.len().next_multiple_of(RARGO_SLOT_PAGE), String::new());
 +        let slots_ty = self.type_array(self.type_i8(), names.len() as u64);
 +        let slots = self.define_global(&self.generate_local_symbol_name("rargo_slots"), slots_ty).unwrap();
 +        llvm::set_initializer(slots, self.const_null(slots_ty));
 +        llvm::set_linkage(slots, llvm::Linkage::InternalLinkage);
 +        llvm::set_section(slots, c".rargo_slots");
-+        set_global_alignment(self, slots, Align::ONE);
++        set_global_alignment(self, slots, Align::from_bytes(RARGO_SLOT_PAGE as u64).unwrap());
 +        let mut bytes = Vec::new();
 +        for name in &names {
 +            bytes.extend_from_slice(name.as_bytes());
@@ -241,15 +220,13 @@ index 58c8dc43e..a0c323d88 100644
  mod personality;
 diff --git a/library/std/src/sys/rargo_slots.rs b/library/std/src/sys/rargo_slots.rs
 new file mode 100644
-index 000000000..03ec8f666
+index 000000000..c5ee458e3
 --- /dev/null
 +++ b/library/std/src/sys/rargo_slots.rs
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,98 @@
 +use crate::os::unix::fs::FileExt;
-+use crate::sync::atomic::{AtomicIsize, Ordering};
 +
-+#[unsafe(no_mangle)]
-+static __rargo_slot_delta: AtomicIsize = AtomicIsize::new(0);
++static IN_THIS_IMAGE: u8 = 0;
 +
 +#[used]
 +#[unsafe(link_section = ".init_array.00098")]
@@ -266,7 +243,8 @@ index 000000000..03ec8f666
 +        return;
 +    }
 +    let Some((start, size)) = slot_range() else { return };
-+    if size == 0 {
++    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
++    if size == 0 || page <= 0 || start.addr() % page as usize != 0 || size % page as usize != 0 {
 +        return;
 +    }
 +    unsafe {
@@ -275,35 +253,30 @@ index 000000000..03ec8f666
 +            return;
 +        }
 +        let mut st: libc::stat64 = crate::mem::zeroed();
-+        let ready = libc::fstat64(fd, &mut st) == 0
-+            && (st.st_size >= size as i64 || libc::ftruncate64(fd, size as i64) == 0);
-+        let map = if ready {
-+            libc::mmap64(
-+                crate::ptr::null_mut(),
-+                size,
-+                libc::PROT_READ | libc::PROT_WRITE,
-+                libc::MAP_SHARED,
-+                fd,
-+                0,
-+            )
-+        } else {
-+            libc::MAP_FAILED
-+        };
-+        libc::close(fd);
-+        if map == libc::MAP_FAILED {
++        if libc::fstat64(fd, &mut st) != 0 || (st.st_size < size as i64 && libc::ftruncate64(fd, size as i64) != 0) {
++            libc::close(fd);
 +            return;
 +        }
-+        let map = map as *mut u8;
-+        for i in 0..size {
-+            if crate::ptr::read_volatile(start.add(i)) != 0 {
-+                crate::ptr::write_volatile(map.add(i), 1);
-+            }
++        let early: crate::vec::Vec<usize> = (0..size).filter(|&i| crate::ptr::read_volatile(start.add(i)) != 0).collect();
++        let map = libc::mmap64(
++            start as *mut libc::c_void,
++            size,
++            libc::PROT_READ | libc::PROT_WRITE,
++            libc::MAP_SHARED | libc::MAP_FIXED,
++            fd,
++            0,
++        );
++        libc::close(fd);
++        if map == libc::MAP_FAILED {
++            libc::abort();
 +        }
-+        __rargo_slot_delta.store(map.addr() as isize - start.addr() as isize, Ordering::SeqCst);
++        for i in early {
++            crate::ptr::write_volatile(start.add(i), 1);
++        }
 +    }
 +}
 +
-+fn slot_range() -> Option<(*const u8, usize)> {
++fn slot_range() -> Option<(*mut u8, usize)> {
 +    let exe = crate::fs::File::open("/proc/self/exe").ok()?;
 +    let read = |at: u64, len: usize| -> Option<crate::vec::Vec<u8>> {
 +        let mut buf = crate::vec![0u8; len];
@@ -330,11 +303,11 @@ index 000000000..03ec8f666
 +        (kind == 1 && offset <= phoff && phoff - offset < filesz).then(|| vaddr + (phoff - offset))
 +    })?;
 +    let bias = (unsafe { libc::getauxval(libc::AT_PHDR) } as u64).checked_sub(phdr_vaddr)?;
-+    let delta_at = (crate::ptr::addr_of!(__rargo_slot_delta).addr() as u64).checked_sub(bias)?;
++    let here = (crate::ptr::addr_of!(IN_THIS_IMAGE).addr() as u64).checked_sub(bias)?;
 +    (0..phnum).find(|&i| {
 +        let Some(h) = phdrs.get(i * phentsize..) else { return false };
 +        let (Some(kind), Some(vaddr), Some(memsz)) = (field(h, 0, 4), field(h, 16, 8), field(h, 40, 8)) else { return false };
-+        kind == 1 && vaddr <= delta_at && delta_at - vaddr < memsz
++        kind == 1 && vaddr <= here && here - vaddr < memsz
 +    })?;
 +    let shdrs = read(shoff, shentsize.checked_mul(shnum)?)?;
 +    let strtab = shdrs.get(shstrndx.checked_mul(shentsize)?..)?;
@@ -346,7 +319,7 @@ index 000000000..03ec8f666
 +            return None;
 +        }
 +        let (addr, size) = (field(h, 0x10, 8)?, field(h, 0x20, 8)?);
-+        Some((crate::ptr::with_exposed_provenance((bias + addr) as usize), usize::try_from(size).ok()?))
++        Some((crate::ptr::with_exposed_provenance_mut((bias + addr) as usize), usize::try_from(size).ok()?))
 +    })
 +}
 -- 

@@ -127,6 +127,10 @@ fn second_run() -> u32 { black_box(8) }
 fn never_called() -> u32 { black_box(9) }
 fn main() {
     black_box(never_called as fn() -> u32);
+    if std::env::args().nth(1).as_deref() == Some("maps") {
+        print!("{}", std::fs::read_to_string("/proc/self/maps").unwrap());
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("again") {
         black_box(second_run());
         return;
@@ -200,6 +204,31 @@ done
 [ "$(unmarked "$first" "12never_called")" = 1 ] && ok "unmarked: a function never called" || bad "unmarked: a function never called" "$(grep never_called <<<"$first")"
 [ "$(unmarked "$first" "10second_run")" = 1 ] && [ "$(marked "$second" "10second_run")" = 1 ] && [ "$(marked "$second" "8in_child")" = 1 ] && ok "a second run of the binary marks the same file" || bad "a second run of the binary marks the same file" "$(grep -E 'second_run|in_child' <<<"$second")"
 [ "$(grep -c '^+' <<<"$second")" -ge "$(grep -c '^+' <<<"$first")" ] && ok "marks are never cleared" || bad "marks are never cleared"
+cat >mapped.py <<'EOF'
+import sys
+d = open(sys.argv[1], 'rb').read()
+u = lambda at, n: int.from_bytes(d[at:at + n], 'little')
+shoff, shentsize, shnum, shstrndx = u(0x28, 8), u(0x3a, 2), u(0x3c, 2), u(0x3e, 2)
+names_at = u(shoff + shstrndx * shentsize + 0x18, 8)
+for i in range(shnum):
+    h = shoff + i * shentsize
+    n = names_at + u(h, 4)
+    if d[n:d.index(b'\0', n)] == b'.rargo_slots':
+        addr, size = u(h + 0x10, 8), u(h + 0x20, 8)
+exe, marks = None, None
+for line in sys.stdin:
+    cols = line.split()
+    lo, hi = (int(x, 16) for x in cols[0].split('-'))
+    if len(cols) > 5 and cols[5].endswith('/prog') and exe is None:
+        exe = lo
+    if len(cols) > 5 and cols[5].endswith('/marks.bin'):
+        marks = (lo, hi, 's' in cols[1])
+print('slots', hex(addr), size, 'mapped', marks and hex(marks[0] - exe), marks and marks[1] - marks[0], 'shared', marks and marks[2])
+EOF
+maps=$(RARGO_FN_SLOTS=$PWD/marks.bin ./prog maps | python3 -I mapped.py prog)
+grep -qE '^slots (0x[0-9a-f]+) ([0-9]+) mapped \1 \2 shared True$' <<<"$maps" && ok "the marks file is mapped shared over the binary's slot range itself" || bad "the marks file is mapped shared over the binary's slot range itself" "$maps"
+objdump -d --no-show-raw-insn prog | awk '/<_R[A-Za-z0-9_]*12before_abort>:$/{p=1;next} p&&/^$/{exit} p' > before_abort.s
+nm prog | grep -q rargo_slot_delta && bad "a mark is one unconditional store" "the binary still has __rargo_slot_delta" || { head -3 before_abort.s | grep -q 'movb *\$0x1,' && ! grep -q 'cmpb' before_abort.s && ok "a mark is one unconditional store: before_abort begins with movb \$0x1 and compares nothing" || bad "a mark is one unconditional store" "$(head -4 before_abort.s)"; }
 mir_calls() { rustc --edition=2021 -O "$@" --emit=mir prog.rs -o - 2>/dev/null | sed -n '/^fn main()/,/^}/p' | grep -c 'inlined('; }
 [ "$(mir_calls)" = 0 ] && [ "$(mir_calls -Zrargo-fn-slots)" = 1 ] && ok "the MIR inliner keeps a function its own slot: main calls inlined() only with the flag" || bad "the MIR inliner keeps a function its own slot" "without: $(mir_calls), with: $(mir_calls -Zrargo-fn-slots)"
 cat >plugin.rs <<'EOF'
