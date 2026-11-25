@@ -1,7 +1,7 @@
-From 018ac3370c22db7fe6d75d9294f9453793e69214 Mon Sep 17 00:00:00 2001
+From b4363b87b64295ad093920e4382bd13cf7e69fc3 Mon Sep 17 00:00:00 2001
 From: rargo <noreply@rargo.invalid>
 Date: Wed, 25 Nov 2026 15:26:20 +0100
-Subject: [PATCH] rargo: -Z rargo-fn-ids gives every function instance an
+Subject: [PATCH 7/7] rargo: -Z rargo-fn-ids gives every function instance an
  identity of its code
 
 ---
@@ -31,11 +31,11 @@ index 571d8cda6..a29ad9e3d 100644
              // Create the llvm.used variable.
              if !cx.used_statics.is_empty() {
 diff --git a/compiler/rustc_codegen_llvm/src/consts.rs b/compiler/rustc_codegen_llvm/src/consts.rs
-index 1a41e1f8b..fe75b9787 100644
+index ac2da5126..3ae00c6d0 100644
 --- a/compiler/rustc_codegen_llvm/src/consts.rs
 +++ b/compiler/rustc_codegen_llvm/src/consts.rs
-@@ -693,6 +693,21 @@ pub(crate) fn rargo_slot_delta(&self) -> &'ll Value {
-         delta
+@@ -683,6 +683,21 @@ pub(crate) fn rargo_slot_array(&self) -> &'ll Value {
+         array
      }
  
 +    pub(crate) fn rargo_finish_fn_ids(&mut self) {
@@ -54,8 +54,8 @@ index 1a41e1f8b..fe75b9787 100644
 +    }
 +
      pub(crate) fn rargo_finish_slots(&mut self) {
+         const RARGO_SLOT_PAGE: usize = 4096;
          let Some(pending) = self.rargo_slot_array.take() else { return };
-         let names = self.rargo_slots.take();
 diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
 index 795b43f23..321346053 100644
 --- a/compiler/rustc_codegen_llvm/src/context.rs
