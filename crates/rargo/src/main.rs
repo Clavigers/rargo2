@@ -648,6 +648,11 @@ fn main() {
     if cfg.secret.is_none() && !is_loopback(&cfg.server) && matches!(kind, "admin" | "drift" | "build") {
         die(&format!("this machine is not authenticated to {}: run `rargo auth`", cfg.host));
     }
+    if kind == "build" {
+        for name in ignored_compiler_wrappers(&vars) {
+            eprintln!("warning: {name} is ignored for remote builds; rargo runs the server's compiler directly");
+        }
+    }
     let cwd = match std::env::current_dir().and_then(|d| d.canonicalize()) {
         Ok(d) => d,
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
@@ -743,6 +748,9 @@ fn prepare_route(raw: &[OsString], mut vars: Vec<(String, String)>, token_comman
         {
             return Route::Local { release: false };
         }
+        if args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--unit-graph") {
+            return Route::Usage("error: rargo does not support --unit-graph for remote builds; use local Cargo to get a unit graph with local paths".into());
+        }
     }
     let kind = if let Some(daemon) = daemon_cmd {
         daemon
@@ -754,6 +762,11 @@ fn prepare_route(raw: &[OsString], mut vars: Vec<(String, String)>, token_comman
         "build"
     };
     Route::Remote { args, vars, kind }
+}
+
+fn ignored_compiler_wrappers(vars: &[(String, String)]) -> impl Iterator<Item = &'static str> + '_ {
+    ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"].into_iter()
+        .filter(|name| vars.iter().any(|(key, value)| key == name && !value.is_empty()))
 }
 
 fn subcommand(args: &[String]) -> Option<&str> {
