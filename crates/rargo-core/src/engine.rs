@@ -141,6 +141,14 @@ pub trait RemoteRunner: Send + Sync {
     ) -> Option<Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>>;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Kept {
+    NotKept,
+    NotSampled,
+    Holds,
+    Fails { functions: Vec<String>, failure: String },
+}
+
 pub struct Outcome {
     pub result: Arc<ActionResult>,
     pub cached: bool,
@@ -604,6 +612,38 @@ impl Engine {
             self.actions.lock().done(id);
             return Ok(Outcome { result, cached: false, side });
         }
+    }
+
+    pub fn explain_request(&self, req: &Request) -> String {
+        let key = self.effective_key(&req.spec, &req.client_env);
+        self.explain_miss(&key, &*req.view, req.no_cache)
+    }
+
+    pub fn recheck_kept(&self, mut req: Request, one_in: u64) -> Kept {
+        let key = self.effective_key(&req.spec, &req.client_env);
+        let Some(kept) = self.traces.lookup(&key, &*req.view, &self.content) else { return Kept::NotKept };
+        if !kept.by_code() || !fn_code::sample(&key, kept.created, one_in) {
+            return Kept::NotSampled;
+        }
+        req.no_cache = true;
+        req.cacheable = Arc::new(|_| false);
+        let failure = match self.obtain(req) {
+            Ok(o) if o.result.success() => return Kept::Holds,
+            Ok(o) => match o.result.code() {
+                Some(c) => format!("exit status: {c}"),
+                None => format!("wait status: {}", o.result.status),
+            },
+            Err(e) => format!("{e:#}"),
+        };
+        let mut functions = Vec::new();
+        for (_, o) in &kept.obs {
+            if let Obs::Code { executed, .. } = o {
+                if let Some(pairs) = self.store.read(executed).ok().as_deref().and_then(fn_code::decode) {
+                    functions.extend(pairs.iter().map(|(s, _)| String::from_utf8_lossy(s).into_owned()));
+                }
+            }
+        }
+        Kept::Fails { functions, failure }
     }
 
     fn select_code(&self, spec: &ActionSpec, result: &ActionResult, obs: &mut [(VPath, Obs)], side: &[(Vec<u8>, MEntry)]) {

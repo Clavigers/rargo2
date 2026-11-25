@@ -316,3 +316,239 @@ fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
         assert_eq!(fx.text(&ok.result.stdout), "fine\n");
     });
 }
+
+mod fn_code_selection {
+    use super::*;
+    use rargo_core::fn_code::{
+        self,
+        fixture::{self, Function, Run},
+    };
+
+    const TESTS: [(&str, &[&str]); 4] = [
+        ("a", &["_RNv3app5parse", "_RNv3app6shared", "_RNv5tests1a"]),
+        ("b", &["_RNv3app6render", "_RNv3app6shared", "_RNv5tests1b"]),
+        ("c", &["_RNv3app6shared", "_RNv5tests1c"]),
+        ("d", &["_RNv3app5parse", "_RNv5tests1d"]),
+    ];
+
+    #[derive(Clone, Copy)]
+    struct App {
+        parse: u8,
+        render: Option<u8>,
+        shared: u8,
+        unused: u8,
+        sections: bool,
+        exit: u8,
+        pad: u8,
+        native: u8,
+    }
+
+    const BASE: App = App { parse: 1, render: Some(2), shared: 3, unused: 4, sections: true, exit: 0, pad: 0, native: 0 };
+
+    fn functions(app: &App) -> Vec<Function> {
+        vec![
+            Function { symbol: "_RNv3app5parse", identity: fixture::id(app.parse) },
+            Function { symbol: "_RNv3app6render", identity: app.render.map(|n| [n; 32]) },
+            Function { symbol: "_RNv3app6shared", identity: fixture::id(app.shared) },
+            Function { symbol: "_RNv3app6unused", identity: fixture::id(app.unused) },
+            Function { symbol: "_RNv5tests1a", identity: fixture::id(50) },
+            Function { symbol: "_RNv5tests1b", identity: fixture::id(51) },
+            Function { symbol: "_RNv5tests1c", identity: fixture::id(52) },
+            Function { symbol: "_RNv5tests1d", identity: fixture::id(53) },
+        ]
+    }
+
+    fn put(fx: &Fx, unit: u32, layer: &OutputsLayer, path: &str, bytes: &[u8], exec: bool) {
+        let hash = fx.engine.store.put_bytes(bytes).unwrap();
+        layer.add(unit, LEVEL_FULL, &[(path.as_bytes().to_vec(), MEntry::File { hash, exec, size: bytes.len() as u64 })]);
+    }
+
+    fn layered(fx: &Fx, layer: &Arc<OutputsLayer>) -> Arc<dyn View> {
+        let g = fx.memo.advance();
+        let base = Arc::new(BaseView::new(
+            vec![
+                Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
+                Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(&fx.work)), traced: true },
+                Mount { at: test_tmp().into_os_string().into_vec(), region: Region::Empty, traced: true },
+            ],
+            fx.memo.clone(),
+            g,
+        ));
+        Arc::new(BuildView { base, layer: layer.clone(), levels: Arc::new(vec![LEVEL_FULL; 2]), untraced: vec![], seed: None, content: None })
+    }
+
+    fn req(view: &Arc<dyn View>, kind: ActionKind, argv: Vec<Vec<u8>>, mkdirs: Vec<Vec<u8>>, no_cache: bool) -> Request {
+        let mut env = BTreeMap::new();
+        env.insert(b"PATH".to_vec(), b"/usr/bin:/bin".to_vec());
+        Request {
+            spec: ActionSpec {
+                kind,
+                label: String::from_utf8_lossy(&argv.concat()).into_owned(),
+                argv,
+                env,
+                cwd: b"/w".to_vec(),
+                net: NetMode::Loopback,
+                mkdirs,
+                root_id: Hash::ZERO,
+                discard: vec![],
+            },
+            view: view.clone(),
+            client_env: Arc::new(ClientEnv::new(HashMap::new(), Vec::new(), None)),
+            uid: 0,
+            gid: 0,
+            prio: Priority::Agent,
+            no_cache,
+            seed_blobs: Default::default(),
+            cacheable: Arc::new(|r| r.success()),
+            declared_env: Arc::new(|_, _| Vec::new()),
+            observer: Arc::new(NullObserver),
+        }
+    }
+
+    fn link(fx: &Fx, app: &App, tests: &[&str]) -> (Arc<dyn View>, Vec<Hash>) {
+        let fns = functions(app);
+        let layer = Arc::new(OutputsLayer::new());
+        let unit = fixture::ar(&[("libapp.app.1-cgu.0.rcgu.o", fixture::elf(&fns, true))]);
+        put(fx, 0, &layer, "/w/in/libapp.rlib", &unit, false);
+        let native = fixture::program(&[], false, &Run { ran: &[], exit: 0, pad: &[app.native] });
+        put(fx, 0, &layer, "/w/in/libnative.a", &fixture::ar(&[("native.o", native)]), false);
+        for (name, ran) in TESTS.iter().filter(|(n, _)| tests.contains(n)) {
+            let bytes = fixture::program(&fns, app.sections, &Run { ran, exit: app.exit, pad: &[app.pad] });
+            put(fx, 0, &layer, &format!("/w/in/{name}"), &bytes, true);
+        }
+        let inputs = layered(fx, &layer);
+        let mut bins = Vec::new();
+        for name in tests {
+            let script = format!("cat /w/in/libapp.rlib /w/in/libnative.a > /w/out/{name}.read && cp /w/in/{name} /w/out/{name}");
+            let r = req(&inputs, ActionKind::Rustc, vec![b"/bin/sh".to_vec(), b"-c".to_vec(), script.into_bytes()], vec![b"/w/out".to_vec()], false);
+            let linked = fx.engine.obtain(r).unwrap();
+            assert!(linked.result.success(), "{}", fx.text(&linked.result.stderr));
+            layer.add_manifest(1, LEVEL_FULL, &linked.result.outputs);
+            let Some(MEntry::File { hash, exec: true, .. }) = linked.result.outputs.get(format!("/w/out/{name}").as_bytes()) else {
+                panic!("the link wrote no executable")
+            };
+            bins.push(*hash);
+        }
+        (layered(fx, &layer), bins)
+    }
+
+    fn test_req(view: &Arc<dyn View>, name: &str, nextest: bool, no_cache: bool) -> Request {
+        let mut argv = vec![format!("/w/out/{name}").into_bytes()];
+        if nextest {
+            argv.extend([b"--exact".to_vec(), name.as_bytes().to_vec(), b"--nocapture".to_vec()]);
+        }
+        let mut r = req(view, ActionKind::Test, argv, vec![], no_cache);
+        fn_code::mark(&mut r.spec);
+        r
+    }
+
+    struct Round {
+        ran: Vec<String>,
+        why: Vec<String>,
+    }
+
+    fn round(fx: &Fx, view: &Arc<dyn View>, tests: &[&str], nextest: bool, no_cache: bool) -> Round {
+        let mut out = Round { ran: Vec::new(), why: Vec::new() };
+        for name in tests {
+            let why = fx.engine.explain_request(&test_req(view, name, nextest, no_cache));
+            let o = fx.engine.obtain(test_req(view, name, nextest, no_cache)).unwrap();
+            assert!(o.result.success(), "test {name}: {}", fx.text(&o.result.stderr));
+            if !o.cached {
+                out.ran.push(name.to_string());
+                out.why.push(why);
+            }
+        }
+        out
+    }
+
+    fn table(nextest: bool) {
+        let fx = fixture();
+        io::drive(1, move || {
+            let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+            let abc = ["a", "b", "c"];
+            let run = |app: App, tests: &[&str], no_cache: bool| {
+                let (view, bins) = link(&fx, &app, tests);
+                (round(&fx, &view, tests, nextest, no_cache), bins)
+            };
+
+            let (first, bins) = run(BASE, &abc, false);
+            assert_eq!(first.ran, abc);
+            let (again, _) = run(BASE, &abc, false);
+            assert_eq!(again.ran, Vec::<String>::new());
+
+            let (native, _) = run(App { native: 1, ..BASE }, &abc, false);
+            assert_eq!(native.ran, abc, "a native object in the link inputs");
+            assert!(native.why.iter().all(|w| w.contains("rest changed")), "{:?}", native.why);
+            let base = App { native: 1, ..BASE };
+
+            let (parse, _) = run(App { parse: 9, ..base }, &abc, false);
+            assert_eq!(parse.ran, ["a"]);
+            assert!(parse.why[0].contains("/w/out/a: function changed: _RNv3app5parse"), "{}", parse.why[0]);
+
+            let (shared, _) = run(App { shared: 9, ..base }, &abc, false);
+            assert_eq!(shared.ran, abc);
+            assert!(shared.why[0].contains("/w/out/a: function changed: _RNv3app5parse"), "a's newest run had parse changed: {:?}", shared.why);
+            assert!(shared.why[1..].iter().all(|w| w.contains("function changed: _RNv3app6shared")), "{:?}", shared.why);
+
+            let (unused, relinked) = run(App { unused: 9, pad: 7, ..base }, &abc, false);
+            assert!(relinked.iter().zip(&bins).all(|(a, b)| a != b), "every binary has different bytes");
+            assert_eq!(unused.ran, Vec::<String>::new(), "a function no test executes, relinked");
+
+            let (undone, _) = run(base, &abc, false);
+            assert_eq!(undone.ran, Vec::<String>::new());
+
+            let (new, _) = run(base, &["a", "b", "c", "d"], false);
+            assert_eq!(new.ran, ["d"]);
+
+            let (all, _) = run(base, &abc, true);
+            assert_eq!(all.ran, abc, "--no-cache");
+            assert!(all.why.iter().all(|w| w == "caching was turned off for it"));
+
+            let flagged = App { render: None, native: 1, ..BASE };
+            let (kept, _) = run(flagged, &abc, false);
+            assert_eq!(kept.ran, ["b"], "b executed a function without identity");
+            let (fallback, _) = run(App { pad: 3, ..flagged }, &abc, false);
+            assert_eq!(fallback.ran, ["b"], "b keeps the binary read and reruns on any relink");
+            assert!(fallback.why[0].contains("/w/out/b was File"), "{}", fallback.why[0]);
+
+            let bare = App { sections: false, native: 1, ..BASE };
+            let (plain, _) = run(bare, &abc, false);
+            assert_eq!(plain.ran, abc);
+            let (plain_relinked, _) = run(App { pad: 5, ..bare }, &abc, false);
+            assert_eq!(plain_relinked.ran, abc, "a binary without sections reruns on its bytes");
+        });
+    }
+
+    #[test]
+    fn a_test_reruns_when_code_it_executed_or_the_binary_s_rest_changed() {
+        table(false);
+    }
+
+    #[test]
+    fn a_nextest_test_process_reruns_when_code_it_executed_or_the_binary_s_rest_changed() {
+        table(true);
+    }
+
+    #[test]
+    fn a_kept_pass_that_fails_for_real_with_no_identity_changed_is_reported_as_drift() {
+        let fx = fixture();
+        io::drive(1, move || {
+            let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+            let (view, _) = link(&fx, &BASE, &["c"]);
+            assert_eq!(round(&fx, &view, &["c"], false, false).ran, ["c"]);
+            assert_eq!(fx.engine.recheck_kept(test_req(&view, "c", false, false), 1), Kept::Holds);
+            assert_eq!(fx.engine.recheck_kept(test_req(&view, "a", false, false), 1), Kept::NotKept);
+
+            let (failing, _) = link(&fx, &App { exit: 1, ..BASE }, &["c"]);
+            assert!(fx.engine.obtain(test_req(&failing, "c", false, false)).unwrap().cached, "the pass is kept");
+            let Kept::Fails { functions, failure } = fx.engine.recheck_kept(test_req(&failing, "c", false, false), 1) else {
+                panic!("the real run fails")
+            };
+            assert_eq!(functions, ["_RNv3app6shared", "_RNv5tests1c"]);
+            assert_eq!(failure, "exit status: 1");
+            let line = fn_code::drift_line("test c", &functions, &failure);
+            assert_eq!(line, "test c: kept as a pass by the 2 function(s) it executed (_RNv3app6shared, _RNv5tests1c), but a real run fails (exit status: 1)");
+            assert!(fx.engine.obtain(test_req(&failing, "c", false, false)).unwrap().cached, "a recheck records nothing");
+        });
+    }
+}
