@@ -2321,6 +2321,9 @@ impl Run {
                 if let Some(hint) = network_hint(&u.pkg_name, self.policy.build_script_network(&u.pkg_name), &stderr, &stdout) {
                     self.c.out.note(&hint);
                 }
+                if let Some(hint) = library_hint(&u.pkg_name, &stderr, &stdout) {
+                    self.c.out.note(&hint);
+                }
             }
             _ => {
                 let errors = match cnt.errors {
@@ -2760,8 +2763,48 @@ fn network_hint(package: &str, allowed: bool, stderr: &str, stdout: &str) -> Opt
     })
 }
 
+fn missing_libraries(said: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in said.lines() {
+        let line = line.trim();
+        let name = line
+            .strip_prefix("Package ")
+            .and_then(|rest| rest.split_once(" was not found in the pkg-config search path"))
+            .map(|(name, _)| name)
+            .or_else(|| line.strip_prefix("No package '").and_then(|rest| rest.split_once("' found")).map(|(name, _)| name))
+            .or_else(|| line.split_once("The system library `").and_then(|(_, rest)| rest.split_once('`')).map(|(name, _)| name));
+        if let Some(name) = name.filter(|n| !n.is_empty() && !n.contains(char::is_whitespace)) {
+            if !found.iter().any(|f| f == name) {
+                found.push(name.to_string());
+            }
+        }
+    }
+    found
+}
+
+fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
+    let missing = missing_libraries(&format!("{stderr}\n{stdout}"));
+    (!missing.is_empty()).then(|| {
+        let names = missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
+        format!(
+            "the build script of `{package}` asked pkg-config for {names}, which the build's flake does not provide; rargo builds in the dev shell of the project's flake.nix, or in its default flake when there is none: add the library to that shell's buildInputs (see https://github.com/sadosystems/rargo2#toolchain-and-system-libraries)"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_build_script_that_failed_for_want_of_a_system_library_is_told_where_libraries_come_from() {
+        let udev = "  thread 'main' panicked at libudev-sys-0.1.4/build.rs:38:41:\n  pkg-config exited with status code 1\n  > PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs --cflags libudev\n\n  The system library `libudev` required by crate `libudev-sys` was not found.\n  Package libudev was not found in the pkg-config search path.\n  Perhaps you should add the directory containing `libudev.pc'\n";
+        assert_eq!(super::missing_libraries(udev), ["libudev"], "one library named three ways is one library");
+        let hint = super::library_hint("libudev-sys", udev, "").expect("a hint");
+        assert!(hint.contains("`libudev`") && hint.contains("flake.nix") && hint.contains("buildInputs"), "{hint}");
+        assert_eq!(super::missing_libraries("No package 'wayland-client' found\nNo package 'xkbcommon' found\n"), ["wayland-client", "xkbcommon"]);
+        assert_eq!(super::library_hint("cc-sys", "  error: linker `cc` not found\n", ""), None);
+        assert_eq!(super::library_hint("ring", "", "warning: Package was not found in the pkg-config search path\n"), None);
+    }
+
     #[test]
     fn a_build_script_that_failed_for_want_of_network_is_told_how_to_get_it() {
         let dns = "  Failed to send HTTP request to download WebRTC\n      3: failed to lookup address information: Temporary failure in name resolution\n";
