@@ -86,7 +86,7 @@ cd "$T/proj" || exit 2
 git init -q .
 printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' >Cargo.toml
 printf 'fn main() {\n    println!("built by the path");\n}\n' >src/main.rs
-printf '/target\n' >.gitignore
+printf '/target\n/Cargo.lock\n' >.gitignore
 git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
 manifest=$(sha256sum Cargo.toml)
 conf=$XDG_CONFIG_HOME/rargo/config.toml
@@ -189,6 +189,7 @@ echo "== rargo auth remove ends the token on the server too"
 export HOME=$T/home3 XDG_CONFIG_HOME=$T/home3/.config RARGO_CACHE_DIR=$T/cache3
 cred=$XDG_CONFIG_HOME/rargo/credentials.toml
 mkdir -p "$HOME"
+"$R" @$host >/dev/null 2>&1
 cd "$T/proj" || exit 2
 tok3=$(adm create --user dave 2>/dev/null)
 out=$("$R" auth --token "$tok3" 2>&1); check $? "rargo auth --token stores a token an administrator made" "$out"
@@ -220,6 +221,7 @@ out=$(adm allow Carol 2>&1); check $? "rargo auth allow puts an account on the a
 out=$(curl -fsS "http://$host/.well-known/rargo.json"); grep -q '"github":true' <<<"$out"; check $? "the server says that it signs in with GitHub" "$out"
 export HOME=$T/home2 XDG_CONFIG_HOME=$T/home2/.config RARGO_CACHE_DIR=$T/cache2
 mkdir -p "$HOME"
+"$R" @$host >/dev/null 2>&1
 cd "$T/proj" || exit 2
 "$R" auth >"$T/auth2.out" 2>&1 &
 auth=$!
