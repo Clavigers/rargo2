@@ -328,7 +328,7 @@ impl Daemon {
                 continue;
             }
             let Ok(mut src) = self.store().open_blob(h) else { continue };
-            let mut out = std::fs::File::create(&dest)?;
+            let mut out = crate::io::file::File::create(&dest)?;
             std::io::copy(&mut src, &mut out)?;
             written += 1;
         }
@@ -347,7 +347,7 @@ impl Daemon {
             if self.store().has(&want) {
                 continue;
             }
-            let (got, _) = self.store().put_file_copy(&std::fs::File::open(e.path())?, false)?;
+            let (got, _) = self.store().put_file_copy(&crate::io::file::File::open(e.path())?, false)?;
             if got != want {
                 self.store().remove(&got);
                 bail!("blob {} in the export does not have the content its name claims", want);

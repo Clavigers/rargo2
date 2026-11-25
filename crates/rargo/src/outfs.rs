@@ -4,10 +4,10 @@ use crate::partial::Partial;
 use rargo_proto::Digest;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
+use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -463,7 +463,7 @@ enum Kind<T = rargo_net::io::file::Stat> {
 
 impl OutFs {
     pub fn new(dir: &Path, table: &Path, source: Box<dyn Source>) -> std::io::Result<Arc<OutFs>> {
-        let fd = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_PATH).open(dir)?;
+        let fd = rargo_net::io::file::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_PATH).open(dir)?;
         let under = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
         let virt: Table = rargo_net::io::file::read(table)
             .ok()
@@ -727,9 +727,9 @@ impl OutFs {
     }
 
     fn open_wide(path: &Path, acc: i32, extra: i32, create: Option<u32>) -> std::io::Result<File> {
-        let mut wide = std::fs::OpenOptions::new();
+        let mut wide = rargo_net::io::file::OpenOptions::new();
         wide.read(true).write(true).custom_flags(extra);
-        let mut asked = std::fs::OpenOptions::new();
+        let mut asked = rargo_net::io::file::OpenOptions::new();
         asked.read(acc != libc::O_WRONLY).write(acc != libc::O_RDONLY || create.is_some()).custom_flags(extra);
         if let Some(mode) = create {
             wide.create(true).mode(mode);
@@ -1235,7 +1235,7 @@ impl Filesystem for OutFs {
             self.dirty.store(true, Ordering::SeqCst);
             self.detach(parent, name);
         }
-        let md = rargo_net::io::file::Stat::of(&file.metadata().map_err(errno)?);
+        let md = file.metadata().map_err(errno)?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         let entry = self.entry(parent, name, &Kind::Real(md));
         Ok((entry, self.open_handle(ctx, entry.nodeid, Content::Open(file), How::Real)?))

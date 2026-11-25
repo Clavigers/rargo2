@@ -87,7 +87,7 @@ pub struct Session {
     asking: io::Mutex<()>,
     arrivals: Notify,
     window: Notify,
-    parts: Mutex<BTreeMap<Digest, (PathBuf, std::fs::File)>>,
+    parts: Mutex<BTreeMap<Digest, (PathBuf, crate::io::file::File)>>,
     totals: Arc<crate::build::DaemonStats>,
 }
 
@@ -201,7 +201,7 @@ impl Session {
         let mut files = self.parts.lock();
         for h in parts {
             if let Some((path, _)) = files.remove(&h) {
-                let _ = std::fs::remove_file(&path);
+                let _ = crate::io::file::remove_file(&path);
             }
         }
         assert!(files.is_empty(), "every partial upload is one the session knows of");
@@ -228,7 +228,7 @@ impl Session {
             }
             Effect::PartOpen(hash) => {
                 let path = self.store.tmp_path();
-                match std::fs::File::create(&path) {
+                match crate::io::file::File::create(&path) {
                     Ok(f) => {
                         self.parts.lock().insert(hash, (path, f));
                     }
@@ -252,7 +252,7 @@ impl Session {
             }
             Effect::PartDrop(hash) => {
                 if let Some((path, _)) = self.parts.lock().remove(&hash) {
-                    let _ = std::fs::remove_file(&path);
+                    let _ = crate::io::file::remove_file(&path);
                 }
             }
             Effect::Answer(Answer::Trees(t)) => {
@@ -362,7 +362,7 @@ impl Session {
     }
 }
 
-type OpenBlob = (Digest, std::fs::File);
+type OpenBlob = (Digest, crate::io::file::File);
 
 fn read_blob(
     store: &Store,
@@ -372,7 +372,6 @@ fn read_blob(
     whole: bool,
     file: Option<OpenBlob>,
 ) -> std::io::Result<(Vec<u8>, Option<OpenBlob>)> {
-    use std::os::unix::fs::FileExt;
     if whole {
         return Ok((store.read(&Hash(hash))?, None));
     }

@@ -4,10 +4,10 @@ use crate::hash::Hash;
 use crate::store_index::{ColdRecord, HotMeta, StoreIndex, Touch};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use crate::io::file::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,23 +72,15 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn mtime_ns(m: &std::fs::Metadata) -> i64 {
-    m.mtime() * 1_000_000_000 + m.mtime_nsec()
-}
-
-pub fn reflink(src: &File, dst: &File) -> bool {
+pub fn reflink(src: &impl AsRawFd, dst: &impl AsRawFd) -> bool {
     unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) == 0 }
 }
 
-pub fn clone_or_copy(src: &File, dst: &File) -> io::Result<bool> {
+pub fn clone_or_copy(src: &impl AsRawFd, dst: &impl AsRawFd) -> io::Result<bool> {
     if reflink(src, dst) {
         return Ok(true);
     }
-    let mut s = src;
-    let mut d = dst;
-    use std::io::Seek;
-    s.seek(io::SeekFrom::Start(0))?;
-    io::copy(&mut s, &mut d)?;
+    crate::io::file::copy_fd(src.as_raw_fd(), dst.as_raw_fd())?;
     Ok(false)
 }
 
@@ -245,7 +237,7 @@ impl Store {
         assert!(body.len() <= data.len());
         let tmp = self.tmp_path();
         {
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             f.write_all(&[tag])?;
             f.write_all(body)?;
         }
@@ -324,7 +316,7 @@ impl Store {
         }
         let f = File::open(first)?;
         let m = f.metadata()?;
-        if m.len() != size || (variants.len() == 1 && mtime_ns(&m) != mtime) {
+        if m.len() != size || (variants.len() == 1 && m.mtime_ns() != mtime) {
             return Ok(None);
         }
         let recipe = crate::chunk::chunk_file(&f)?;
@@ -334,7 +326,6 @@ impl Store {
         let mut buf = Vec::new();
         for c in &recipe {
             if !self.chunk_path(&c.hash).exists() {
-                use std::os::unix::fs::FileExt;
                 buf.resize(c.len as usize, 0);
                 f.read_exact_at(&mut buf, off)?;
                 if Hash::of(&buf) != c.hash {
@@ -371,7 +362,7 @@ impl Store {
         };
         let tmp = self.tmp_path();
         let built = (|| -> io::Result<()> {
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             let mut hasher = blake3::Hasher::new();
             let mut written = 0u64;
             for c in &recipe {
@@ -490,7 +481,7 @@ impl Store {
             r => r?,
         };
         let m = f.metadata()?;
-        if m.len() != meta.size || mtime_ns(&m) != meta.mtime_ns {
+        if m.len() != meta.size || m.mtime_ns() != meta.mtime_ns {
             let (actual, _) = Hash::of_file(&f)?;
             if actual != *h {
                 self.forget(h);
@@ -501,7 +492,7 @@ impl Store {
                     format!("blob {h} was modified on disk and has been dropped"),
                 ));
             }
-            self.record(*h, m.len(), mtime_ns(&m));
+            self.record(*h, m.len(), m.mtime_ns());
         }
         self.touch(h);
         Ok(f)
@@ -532,7 +523,7 @@ impl Store {
         }
         let tmp = self.tmp_path();
         {
-            let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             f.write_all(bytes)?;
         }
         self.install(&tmp, h, false, bytes.len() as u64)?;
@@ -565,7 +556,7 @@ impl Store {
 
     pub fn put_file_copy(&self, src: &File, exec: bool) -> io::Result<(Hash, u64)> {
         let tmp = self.tmp_path();
-        let dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp)?;
+        let dst = OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp)?;
         clone_or_copy(src, &dst)?;
         drop(dst);
         let r = self.put_file_move(&tmp, exec);
@@ -604,7 +595,7 @@ impl Store {
         let src = File::open(&other)?;
         let tmp = self.tmp_path();
         let dst =
-            std::fs::OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
+            OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
         clone_or_copy(&src, &dst)?;
         drop(dst);
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
@@ -620,7 +611,7 @@ impl Store {
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let src = self.open_blob(h)?;
-            let dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+            let dst = OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
             Ok(if clone_or_copy(&src, &dst)? { Placed::Reflink } else { Placed::Copy })
         })();
         match placed {
@@ -654,7 +645,7 @@ impl Store {
             let same_fs = crate::io::file::metadata(parent)?.dev() == self.dev;
             if same_fs && self.reflink {
                 let src = self.open_blob(h)?;
-                let dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+                let dst = OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
                 if reflink(&src, &dst) {
                     return Ok(Placed::Reflink);
                 }
@@ -672,9 +663,8 @@ impl Store {
                 }
             }
             let src = self.open_blob(h)?;
-            let mut dst = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
-            let mut s = &src;
-            io::copy(&mut s, &mut dst)?;
+            let dst = OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
+            crate::io::file::copy_fd(src.as_raw_fd(), dst.as_raw_fd())?;
             Ok(Placed::Copy)
         })();
         match placed {

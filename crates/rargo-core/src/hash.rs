@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::fs::File;
-use std::io::{self, Read};
+use crate::io::file::File;
+use std::io;
 use std::path::Path;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
@@ -38,36 +38,26 @@ impl Hash {
         let len = file.metadata()?.len();
         let mut h = blake3::Hasher::new();
         if len >= 4 << 20 {
-            h.update_mmap_rayon_fd(file)?;
-        } else {
-            let mut buf = [0u8; 65536];
-            let mut f = file;
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
+            use std::os::fd::AsRawFd;
+            let size = len as usize;
+            unsafe {
+                let p = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
+                if p == libc::MAP_FAILED {
+                    return Err(io::Error::last_os_error());
                 }
-                h.update(&buf[..n]);
+                h.update_rayon(std::slice::from_raw_parts(p as *const u8, size));
+                libc::munmap(p, size);
             }
+        } else {
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact_at(&mut buf, 0)?;
+            h.update(&buf);
         }
         Ok((Hash(*h.finalize().as_bytes()), len))
     }
 
     pub fn of_path(path: &Path) -> io::Result<(Hash, u64)> {
         Hash::of_file(&File::open(path)?)
-    }
-}
-
-trait MmapFd {
-    fn update_mmap_rayon_fd(&mut self, file: &File) -> io::Result<()>;
-}
-
-impl MmapFd for blake3::Hasher {
-    fn update_mmap_rayon_fd(&mut self, file: &File) -> io::Result<()> {
-        use std::os::fd::AsRawFd;
-        let p = format!("/proc/self/fd/{}", file.as_raw_fd());
-        self.update_mmap_rayon(p)?;
-        Ok(())
     }
 }
 

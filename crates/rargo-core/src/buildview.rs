@@ -5,7 +5,6 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -467,7 +466,7 @@ fn list_key(region: &HostRegion, rel_dir: &[u8]) -> Vec<u8> {
 }
 
 pub fn read_host_lookup(path: &Path) -> Looked {
-    let Ok(m) = std::fs::symlink_metadata(path) else { return Looked::Absent };
+    let Ok(m) = crate::io::file::symlink_metadata(path) else { return Looked::Absent };
     let owner = Owner { uid: m.uid(), gid: m.gid(), mode: m.mode() & 0o777 };
     let ft = m.file_type();
     if ft.is_dir() {
