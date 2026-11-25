@@ -11,20 +11,19 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-pub fn user_host() -> Result<Option<(String, PathBuf)>, String> {
-    host_in(&config_path())
+pub fn read_config(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
 }
 
-fn host_in(path: &Path) -> Result<Option<(String, PathBuf)>, String> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
+pub fn parse_host(path: &Path, text: &str) -> Result<Option<String>, String> {
     let table: toml::Table = text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
     match table.get("host") {
         None => Ok(None),
-        Some(toml::Value::String(h)) => Ok(Some((h.clone(), path.to_path_buf()))),
+        Some(toml::Value::String(h)) => Ok(Some(h.clone())),
         Some(_) => Err(format!("{}: `host` is not a string", path.display())),
     }
 }
@@ -54,9 +53,7 @@ fn set_host_in(path: &Path, host: &str) -> Result<PathBuf, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
-    doc["host"] = toml_edit::value(host);
-    let new = doc.to_string();
+    let new = set_host_text(path, host, &text)?;
     if new == text {
         return Ok(path.to_path_buf());
     }
@@ -75,6 +72,12 @@ fn set_host_in(path: &Path, host: &str) -> Result<PathBuf, String> {
         format!("{}: {e}", path.display())
     })?;
     Ok(path.to_path_buf())
+}
+
+fn set_host_text(path: &Path, host: &str, text: &str) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
+    doc["host"] = toml_edit::value(host);
+    Ok(doc.to_string())
 }
 
 fn agent() -> ureq::Agent {
@@ -148,7 +151,10 @@ fn credentials() -> toml::Table {
 }
 
 pub fn credential(host: &str) -> Option<Credential> {
-    let all = credentials();
+    credential_in(&credentials(), host)
+}
+
+fn credential_in(all: &toml::Table, host: &str) -> Option<Credential> {
     let c = all.get(host)?.as_table()?;
     let get = |k: &str| c.get(k).and_then(|v| v.as_str()).map(String::from);
     Some(Credential { id: get("id")?, secret: get("secret")?, name: get("name").unwrap_or_default() })
@@ -306,6 +312,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new/rargo/config.toml");
+        let host_in = |path: &Path| -> Result<Option<(String, PathBuf)>, String> {
+            let Some(text) = read_config(path)? else { return Ok(None) };
+            Ok(parse_host(path, &text)?.map(|host| (host, path.to_path_buf())))
+        };
         assert_eq!(host_in(&path).unwrap(), None);
         assert_eq!(set_host_in(&path, "rargo.rs").unwrap(), path);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "host = \"rargo.rs\"\n");
