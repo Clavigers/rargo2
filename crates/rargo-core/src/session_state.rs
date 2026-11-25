@@ -535,7 +535,7 @@ fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
         let text = if buf[..5] == magic[..5] && buf[6..8] == magic[6..8] {
             crate::conn_state::protocol_mismatch(buf[5] as u32)
         } else {
-            "this is a rargo build server; the client speaks another protocol".to_string()
+            "this is a rargo build server, and what connected to it is not rargo".to_string()
         };
         return Hello::Foreign(refusal(&text));
     }
@@ -687,7 +687,7 @@ mod tests {
         assert_eq!(r[0], 1);
         let Hello::Foreign(r) = hello(b"rargo\x07\r\n\x03", magic) else { panic!("an older client is told so") };
         let text = String::from_utf8(r[3..].to_vec()).unwrap();
-        assert!(text.starts_with("this rargo (protocol 7) is older") && text.contains("install.sh | sh -s -- "), "{text}");
+        assert!(text.starts_with("this rargo is older than the build server") && text.contains("install.sh | sh -s -- "), "{text}");
         assert_eq!(welcome(b"xy"), vec![0, 2, 0, b'x', b'y']);
         assert_eq!(refusal("no"), vec![1, 3, 0, b'n', b'o', b'\n']);
         let mut bad = magic.to_vec();
