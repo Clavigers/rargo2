@@ -1,3 +1,4 @@
+pub mod action_table;
 pub mod ar;
 pub mod build;
 pub mod buildview;

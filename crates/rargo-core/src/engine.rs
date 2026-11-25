@@ -1,3 +1,4 @@
+use crate::action_table::{ActionTable, Failure, Ran, ReqId, Start, Woken};
 use crate::hash::{Hash, KeyHasher};
 use crate::sandbox::{EXTRA_FD_BASE, SpawnReq, Zygote};
 use crate::sandboxfs::{ActionFs, ActionFsConfig, SandboxFs, UpperKind};
@@ -45,7 +46,10 @@ impl Live for LiveCtl<'_> {
 }
 
 pub type EnvAsker = Arc<
-    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<(String, Option<String>)>>> + Send>>
+    dyn Fn(
+            Vec<String>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<(String, Option<String>)>>> + Send>>
         + Send
         + Sync,
 >;
@@ -181,7 +185,8 @@ pub struct Engine {
     pub zygote: Arc<Zygote>,
     pub traces: TraceCache,
     pub sched: Arc<Scheduler>,
-    inflight: Mutex<HashMap<(Hash, Hash), tokio::sync::watch::Receiver<Flight>>>,
+    actions: Mutex<ActionTable>,
+    flight_ended: tokio::sync::Notify,
     seq: AtomicU64,
     avg_wall_us: AtomicU64,
     profiles: dashmap::DashMap<Vec<u8>, Arc<Trace>>,
@@ -189,13 +194,6 @@ pub struct Engine {
     pub stats: EngineStats,
     pub cgroup_root: Option<PathBuf>,
     pub action_timeout: std::time::Duration,
-}
-
-#[derive(Clone)]
-enum Flight {
-    Running,
-    Done,
-    TimedOut(Arc<str>),
 }
 
 #[derive(Debug)]
@@ -212,17 +210,17 @@ impl std::fmt::Display for ActionTimedOut {
 
 impl std::error::Error for ActionTimedOut {}
 
-struct InflightGuard<'a> {
+struct Requester<'a> {
     engine: &'a Engine,
-    key: (Hash, Hash),
-    tx: tokio::sync::watch::Sender<Flight>,
-    end: Flight,
+    id: ReqId,
 }
 
-impl Drop for InflightGuard<'_> {
+impl Drop for Requester<'_> {
     fn drop(&mut self) {
-        self.engine.inflight.lock().remove(&self.key);
-        let _ = self.tx.send(self.end.clone());
+        let woke = self.engine.actions.lock().cancel(self.id);
+        if !woke.is_empty() {
+            self.engine.flight_ended.notify_waiters();
+        }
     }
 }
 
@@ -243,7 +241,8 @@ impl Drop for Teardown {
             return;
         }
         let running = self.running.take();
-        let (fs, action, scratch, group) = (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
+        let (fs, action, scratch, group) =
+            (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
         let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
         let work = move || {
             let mut held = 0;
@@ -328,7 +327,8 @@ impl Engine {
             zygote,
             traces,
             sched,
-            inflight: Mutex::new(HashMap::new()),
+            actions: Mutex::new(ActionTable::new()),
+            flight_ended: tokio::sync::Notify::new(),
             seq: AtomicU64::new(1),
             avg_wall_us: AtomicU64::new(0),
             profiles: dashmap::DashMap::new(),
@@ -355,7 +355,10 @@ impl Engine {
             }
         }
         assert!(spec.env.len() >= base.env.len());
-        assert!(base.env.keys().all(|k| spec.env.get(k) == base.env.get(k)), "declared variables never override the spec");
+        assert!(
+            base.env.keys().all(|k| spec.env.get(k) == base.env.get(k)),
+            "declared variables never override the spec"
+        );
         (spec, base_key)
     }
 
@@ -453,119 +456,111 @@ impl Engine {
     }
 
     pub async fn obtain(&self, req: Request) -> Result<Outcome> {
+        let id = self.actions.lock().begin();
+        let _requester = Requester { engine: self, id };
         let mut announced = false;
-        let mut waited: Option<(Hash, Hash)> = None;
         loop {
             req.client_env.ensure(&self.traces.needs_env(&req.spec.weak_key())).await?;
             let (spec, base_key) = self.effective_spec(&req.spec, &req.client_env);
             let key = if spec.env.len() == req.spec.env.len() { base_key } else { spec.weak_key() };
 
-            if !req.no_cache {
-                let view = req.view.clone();
-                let hit = self.traces.lookup(&key, &*view, &self.content);
-                if let Some(t) = hit {
-                    self.replay(&t.result, &*req.observer);
-                    return Ok(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() });
-                }
-            }
-            if !announced {
+            let hit = if req.no_cache { None } else { self.traces.lookup(&key, &*req.view, &self.content) };
+            if hit.is_none() && !announced {
                 req.observer.miss();
                 announced = true;
                 if req.observer.wants_explanation() {
                     req.observer.explain(&self.explain_miss(&key, &*req.view, req.no_cache));
                 }
             }
-
-            let pred = self.prediction(&key, &*req.view);
-            let slot = (key, pred);
-            let guard = {
-                let mut inflight = self.inflight.lock();
-                match inflight.get(&slot) {
-                    Some(rx) if !req.no_cache && waited != Some(slot) => Err(rx.clone()),
-                    _ => {
-                        let (tx, rx) = tokio::sync::watch::channel(Flight::Running);
-                        inflight.insert(slot, rx);
-                        Ok(InflightGuard { engine: self, key: slot, tx, end: Flight::Done })
-                    }
+            let pred = if hit.is_some() { Hash::ZERO } else { self.prediction(&key, &*req.view) };
+            let start = self.actions.lock().start(id, (key, pred), hit.is_some(), req.no_cache);
+            match start {
+                Start::Hit => {
+                    let t = hit.expect("a hit was found");
+                    self.replay(&t.result, &*req.observer);
+                    return Ok(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() });
                 }
-            };
-            let mut guard = match guard {
-                Err(mut rx) => {
+                Start::Join => {
                     self.stats.joined.fetch_add(1, Ordering::Relaxed);
-                    while matches!(*rx.borrow(), Flight::Running) {
-                        if rx.changed().await.is_err() {
-                            break;
+                    loop {
+                        let ended = self.flight_ended.notified();
+                        tokio::pin!(ended);
+                        ended.as_mut().enable();
+                        match self.actions.lock().woken(id) {
+                            Woken::Waiting => {}
+                            Woken::Retry => break,
+                            Woken::Fail(why) => bail!("{why}"),
                         }
+                        ended.await;
                     }
-                    let ended = rx.borrow().clone();
-                    if let Flight::TimedOut(why) = ended {
-                        bail!("{why}");
-                    }
-                    waited = Some(slot);
                     continue;
                 }
-                Ok(g) => g,
-            };
-            if waited.is_some() {
-                self.stats.joined_then_ran.fetch_add(1, Ordering::Relaxed);
+                Start::Run { after_wait } => {
+                    if after_wait {
+                        self.stats.joined_then_ran.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
 
-            let mut attempt = 0;
             let (result, obs, side) = loop {
-                attempt += 1;
-                assert!(attempt <= 3);
-                let ran = self.run(&spec, &req).await;
-                let (result, obs, tainted, side) = match ran {
+                let (result, obs, tainted, side) = match self.run(&spec, &req).await {
                     Ok(v) => v,
                     Err(e) => {
-                        if let Some(t) = e.downcast_ref::<ActionTimedOut>() {
-                            guard.end = Flight::TimedOut(Arc::from(t.to_string()));
-                        }
+                        let why = if let Some(t) = e.downcast_ref::<ActionTimedOut>() {
+                            Failure::TimedOut(Arc::from(t.to_string()))
+                        } else if e.downcast_ref::<SeedLost>().is_some() {
+                            Failure::SeedLost
+                        } else {
+                            Failure::Error
+                        };
+                        self.actions.lock().failed(id, why);
+                        self.flight_ended.notify_waiters();
                         return Err(e);
                     }
                 };
-                if !tainted {
-                    break (result, Some(obs), side);
+                if tainted {
+                    self.stats.tainted.fetch_add(1, Ordering::Relaxed);
                 }
-                self.stats.tainted.fetch_add(1, Ordering::Relaxed);
-                if attempt >= 3 {
-                    break (result, None, side);
+                let cacheable = !tainted && (req.cacheable)(&result);
+                let ran = self.actions.lock().ran(id, tainted, cacheable);
+                match ran {
+                    Ran::Again => continue,
+                    Ran::Record => break (result, Some(obs), side),
+                    Ran::Keep => break (result, None, side),
                 }
             };
             let result = Arc::new(result);
             if let Some(obs) = obs {
-                if (req.cacheable)(&result) {
-                    let stored = self.traces.insert(
-                        &key,
-                        Trace {
-                            obs,
-                            result: (*result).clone(),
-                            created: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0),
-                        },
-                    );
-                    if let Some(k) = profile_key(&spec) {
-                        self.profiles.insert(k, stored);
-                    }
+                let stored = self.traces.insert(
+                    &key,
+                    Trace {
+                        obs,
+                        result: (*result).clone(),
+                        created: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    },
+                );
+                if let Some(k) = profile_key(&spec) {
+                    self.profiles.insert(k, stored);
                 }
             }
-            drop(guard);
+            self.actions.lock().settled(id);
+            self.flight_ended.notify_waiters();
 
             let declared = (req.declared_env)(&result, &self.store);
             if !declared.is_empty() {
                 let added = self.traces.add_needs_env(&base_key, &declared);
                 req.client_env.ensure(&added).await?;
-                let relevant = added
-                    .iter()
-                    .any(|v| !spec.env.contains_key(v.as_bytes()) && req.client_env.contains_key(v));
+                let relevant =
+                    added.iter().any(|v| !spec.env.contains_key(v.as_bytes()) && req.client_env.contains_key(v));
                 if relevant {
                     self.stats.env_reruns.fetch_add(1, Ordering::Relaxed);
-                    waited = None;
                     continue;
                 }
             }
+            self.actions.lock().done(id);
             return Ok(Outcome { result, cached: false, side });
         }
     }
@@ -768,9 +763,7 @@ impl Engine {
     ) -> Result<(crate::sandbox::ExitInfo, Vec<u8>, Vec<u8>)> {
         let Teardown { running: slot, group: group_slot, .. } = teardown;
         for d in &spec.mkdirs {
-            action
-                .mkdir_p(d)
-                .map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
+            action.mkdir_p(d).map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
         }
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
@@ -873,11 +866,7 @@ impl Engine {
         *slot = None;
         *group_slot = None;
         if info.setup_failed {
-            bail!(
-                "could not start `{}`: {}",
-                spec.label,
-                String::from_utf8_lossy(&stderr).trim()
-            );
+            bail!("could not start `{}`: {}", spec.label, String::from_utf8_lossy(&stderr).trim());
         }
         Ok((info, stdout, stderr))
     }
