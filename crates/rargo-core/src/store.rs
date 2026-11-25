@@ -359,7 +359,11 @@ impl Store {
         let cm = ColdMeta { size: meta.size, last_used: meta.last_used, added, recipe };
         self.db.put(Table::Cold, &h.0, &bincode::serialize(&cm).unwrap());
         self.cold.insert(*h, cm);
-        self.forget_hot(h);
+        // Still in the store, as chunks: the generation stays.
+        if let Some((_, m)) = self.meta.remove(h) {
+            self.total.fetch_sub(m.size, Ordering::Relaxed);
+        }
+        self.db.delete(Table::Blobs, &h.0);
         for v in &variants {
             let _ = fs::remove_file(v);
         }
@@ -469,13 +473,17 @@ impl Store {
     }
 
     fn record(&self, h: Hash, size: u64, mtime_ns: i64) {
-        // A blob that is whole again is not cold any more.
-        self.drop_cold(&h);
         let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
         if self.meta.insert(h, m).is_none() {
             self.total.fetch_add(size, Ordering::Relaxed);
         }
         self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
+        // A blob that is whole again is not cold any more. It is whole
+        // before its cold entry goes, so `has` never misses it, and nothing
+        // left the store, so the generation stays.
+        if self.cold.remove(&h).is_some() {
+            self.db.delete(Table::Cold, &h.0);
+        }
     }
 
     /// Marks blobs as used now (for LRU eviction).
@@ -1022,6 +1030,36 @@ mod tests {
         s.evict_to(0, &|_| false);
         assert!(!s.has(&h));
         assert_eq!(s.cold_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn going_cold_and_back_keeps_a_blob_present_and_the_generation() {
+        let (_d, s) = store();
+        let s = Arc::new(s);
+        let data = vec![9u8; 1 << 20];
+        let h = s.put_bytes(&data).unwrap();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (s, done) = (s.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut missed = 0;
+                while !done.load(Ordering::Relaxed) {
+                    if !s.has(&h) {
+                        missed += 1;
+                    }
+                }
+                missed
+            })
+        };
+        for _ in 0..50 {
+            let g = s.generation();
+            assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+            assert_eq!(s.read(&h).unwrap(), data);
+            assert!(s.meta.contains_key(&h) && !s.cold.contains_key(&h), "reading a cold blob thaws it");
+            assert_eq!(s.generation(), g, "going cold and thawing remove nothing from the store");
+        }
+        done.store(true, Ordering::Relaxed);
+        assert_eq!(watcher.join().unwrap(), 0, "a blob being thawed was reported missing");
     }
 
     #[test]
