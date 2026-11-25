@@ -104,7 +104,8 @@ export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
 # The toolchains e2e-components installs components into: kept between
 # runs of this gate.
 export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
-mkdir -p "$L/work"
+# mktemp needs the parent of each suite's directory to exist already.
+mkdir -p "$L/work/e2e" "$L/work/e2e-copy" "$L/work/e2e-components"
 # Directories, rigs and ports are already per suite. They run together;
 # the gate's time is the slowest of them, plus the build above.
 declare -A suite_pid
