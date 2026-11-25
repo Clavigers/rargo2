@@ -104,24 +104,16 @@ export RARGO_BIN=$B RARGO_JOBS=$jobs
 export RARGO_CPU_QUOTA=${RARGO_CPU_QUOTA:-800%}
 export RARGO_MEMORY_MAX=${RARGO_MEMORY_MAX:-20G}
 export RIG=${RIG:-g$(printf '%s' "$L" | sha256sum | cut -c1-6)} RIG_STATE=${RIG_STATE:-$L/work/rig}
-free_pair() {
-    python3 -I -c '
-import socket
-for _ in range(200):
-    a = socket.socket(); a.bind(("127.0.0.1", 0)); p = a.getsockname()[1]
-    b = socket.socket()
-    try:
-        b.bind(("127.0.0.1", p + 1))
-    except OSError:
-        continue
-    print(p)
-    break
-'
+free_ports() {
+    local n
+    n=$(sed -n 's/^ports=\([0-9]\+\)$/\1/p' "dev/$1.sh")
+    [ -n "$n" ] || { echo "dev/$1.sh has no ports=N line" >&2; exit 2; }
+    python3 -I dev/free-ports.py "$n"
 }
 export RARGO_E2E_FLAKE=${RARGO_E2E_FLAKE:-$L/work/e2e-flake}
-export RARGO_E2E_FLAKE_PORT=${RARGO_E2E_FLAKE_PORT:-$(free_pair)}
+export RARGO_E2E_FLAKE_PORT=${RARGO_E2E_FLAKE_PORT:-$(free_ports e2e-flake)}
 export RARGO_E2E_AUTH=${RARGO_E2E_AUTH:-$L/work/e2e-auth}
-export E2E_AUTH_PORT=${E2E_AUTH_PORT:-$(free_pair)}
+export E2E_AUTH_PORT=${E2E_AUTH_PORT:-$(free_ports e2e-auth)}
 export RARGO_E2E_LINK=${RARGO_E2E_LINK:-$L/work/e2e-link}
 export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
 export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
