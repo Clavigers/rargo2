@@ -1,13 +1,11 @@
+use crate::io::{self as shell, JoinHandle, Mutex as FiberMutex, Notify, ReadHalf, TcpStream, WriteHalf};
 use crate::{Auth, Conn, Endpoint};
 use rargo_proto::secure::{self, Opener, Sealer};
 use std::collections::VecDeque;
-use std::future::poll_fn;
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::io;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::task::{Context, Poll, Waker};
-use std::thread::JoinHandle;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// A TCP record is a little-endian length and then that many bytes.
@@ -130,20 +128,19 @@ impl FrameDecoder {
 
 struct Inbox {
     msgs: VecDeque<Vec<u8>>,
-    waker: Option<Waker>,
     stop: bool,
     eof: bool,
 }
 
 struct Shared {
     mu: Mutex<Inbox>,
-    cv: Condvar,
+    space: Notify,
+    data: Notify,
 }
 
 pub struct TcpLink {
-    wr: Mutex<(TcpStream, Sealer)>,
+    wr: FiberMutex<Option<(WriteHalf, Sealer)>>,
     shared: Arc<Shared>,
-    stopper: TcpStream,
     closed: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -162,35 +159,29 @@ const UDP_WAIT: Duration = Duration::from_millis(2500);
 impl Link {
     pub fn tcp(stream: TcpStream, sealer: Sealer, opener: Opener) -> Link {
         let _ = stream.set_nodelay(true);
-        let _ = stream.set_nonblocking(false);
-        let rd = stream.try_clone().expect("a tcp stream clones for reading");
-        let stopper = stream.try_clone().expect("a tcp stream clones for closing");
+        let (rd, wr) = stream.into_split();
         let shared = Arc::new(Shared {
-            mu: Mutex::new(Inbox { msgs: VecDeque::new(), waker: None, stop: false, eof: false }),
-            cv: Condvar::new(),
+            mu: Mutex::new(Inbox { msgs: VecDeque::new(), stop: false, eof: false }),
+            space: Notify::new(),
+            data: Notify::new(),
         });
         let reading = Arc::clone(&shared);
-        // The socket read runs on its own thread. A caller waiting for a frame stays pending until one arrives.
-        let reader = std::thread::Builder::new()
-            .name("tcp-link".into())
-            .spawn(move || tcp_read(rd, opener, reading))
-            .expect("a tcp reader thread starts");
+        let reader = shell::spawn(move || tcp_read(rd, opener, reading));
         Link::Tcp(TcpLink {
-            wr: Mutex::new((stream, sealer)),
+            wr: FiberMutex::new(Some((wr, sealer))),
             shared,
-            stopper,
             closed: AtomicBool::new(false),
             reader: Mutex::new(Some(reader)),
         })
     }
 
-    pub async fn connect(server: SocketAddr, user: &str, psk: &[u8; 32], transport: &str) -> io::Result<Link> {
+    pub fn connect(server: SocketAddr, user: &str, psk: &[u8; 32], transport: &str) -> io::Result<Link> {
         let mut udp_error = None;
         if transport != "tcp" {
             let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
-            let endpoint = Endpoint::bind_auth(bind, false, Auth::User { name: user.to_string(), psk: *psk }).await?;
+            let endpoint = Endpoint::bind_auth(bind, false, Auth::User { name: user.to_string(), psk: *psk })?;
             let wait = if transport == "udp" { Duration::from_secs(20) } else { UDP_WAIT };
-            match crate::connect_within(wait, &endpoint, server).await {
+            match crate::connect_within(wait, &endpoint, server) {
                 Ok(conn) => return Ok(Link::Udp(conn, endpoint)),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
                 Err(e) => udp_error = Some(e),
@@ -227,32 +218,17 @@ impl Link {
         }
     }
 
-    pub async fn send(&self, msg: &[u8]) -> io::Result<()> {
+    pub fn send(&self, msg: &[u8]) -> io::Result<()> {
         match self {
-            Link::Udp(c, _) => c.send(msg).await,
-            Link::Tcp(t) => {
-                if t.closed.load(Ordering::SeqCst) {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
-                }
-                let mut g = t.wr.lock().unwrap_or_else(|e| e.into_inner());
-                let (wr, sealer) = &mut *g;
-                let records = sealer.seal_records(msg)?;
-                assert!(!records.is_empty(), "every message is at least one sealed record");
-                let mut buf = Vec::new();
-                for rec in &records {
-                    buf.extend(encode_frame(rec, FRAME_LIMIT).map_err(|e| io::Error::other(format!("frame: {e:?}")))?);
-                }
-                assert!(buf.len() > msg.len(), "every message is at least one sealed record");
-                wr.write_all(&buf)?;
-                wr.flush()
-            }
+            Link::Udp(c, _) => c.send(msg),
+            Link::Tcp(t) => t.send(msg),
         }
     }
 
-    pub async fn recv(&self) -> Option<Vec<u8>> {
+    pub fn recv(&self) -> Option<Vec<u8>> {
         match self {
-            Link::Udp(c, _) => c.recv().await,
-            Link::Tcp(t) => poll_fn(|cx| t.poll_recv(cx)).await,
+            Link::Udp(c, _) => c.recv(),
+            Link::Tcp(t) => t.recv(),
         }
     }
 
@@ -279,48 +255,54 @@ impl Link {
 }
 
 impl TcpLink {
-    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
-        let mut g = lock(&self.shared.mu);
-        if let Some(msg) = g.msgs.pop_front() {
-            let drained = g.msgs.is_empty();
-            g.waker = None;
-            drop(g);
-            if drained {
-                self.shared.cv.notify_one();
+    fn send(&self, msg: &[u8]) -> io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
+        let mut g = self.wr.lock();
+        let Some((wr, sealer)) = g.as_mut() else {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        };
+        let records = sealer.seal_records(msg)?;
+        assert!(!records.is_empty(), "every message is at least one sealed record");
+        let mut buf = Vec::new();
+        for rec in &records {
+            buf.extend(encode_frame(rec, FRAME_LIMIT).map_err(|e| io::Error::other(format!("frame: {e:?}")))?);
+        }
+        assert!(buf.len() > msg.len(), "every message is at least one sealed record");
+        wr.write_all(&buf)
+    }
+
+    fn recv(&self) -> Option<Vec<u8>> {
+        loop {
+            let mut g = lock(&self.shared.mu);
+            if let Some(msg) = g.msgs.pop_front() {
+                let drained = g.msgs.is_empty();
+                drop(g);
+                if drained {
+                    self.shared.space.notify_one();
+                }
+                return Some(msg);
             }
-            return Poll::Ready(Some(msg));
-        }
-        if g.eof {
-            return Poll::Ready(None);
-        }
-        g.waker = Some(cx.waker().clone());
-        if let Some(msg) = g.msgs.pop_front() {
-            let drained = g.msgs.is_empty();
-            g.waker = None;
-            drop(g);
-            if drained {
-                self.shared.cv.notify_one();
+            if g.eof {
+                return None;
             }
-            return Poll::Ready(Some(msg));
+            drop(g);
+            self.shared.data.notified();
         }
-        if g.eof {
-            return Poll::Ready(None);
-        }
-        Poll::Pending
     }
 
     fn halt(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        let waker = {
+        {
             let mut g = lock(&self.shared.mu);
             g.stop = true;
             g.eof = true;
-            g.waker.take()
-        };
-        self.shared.cv.notify_all();
-        let _ = self.stopper.shutdown(Shutdown::Both);
-        if let Some(waker) = waker {
-            waker.wake();
+        }
+        self.shared.space.notify_waiters();
+        self.shared.data.notify_waiters();
+        if let Some((mut wr, _)) = self.wr.lock().take() {
+            let _ = wr.halt();
         }
         assert!(self.closed.load(Ordering::SeqCst));
     }
@@ -329,41 +311,35 @@ impl TcpLink {
 impl Drop for TcpLink {
     fn drop(&mut self) {
         self.halt();
-        if let Some(reader) = lock(&self.reader).take() {
+        if let Some(mut reader) = lock(&self.reader).take() {
             let _ = reader.join();
         }
     }
 }
 
 fn deliver(shared: &Shared, msg: Vec<u8>) -> bool {
-    let waker = {
+    {
         let mut g = lock(&shared.mu);
         if g.stop {
             return false;
         }
         g.msgs.push_back(msg);
-        g.waker.take()
-    };
-    if let Some(waker) = waker {
-        waker.wake();
     }
+    shared.data.notify_one();
     true
 }
 
 fn mark_eof(shared: &Shared) {
-    let waker = {
+    {
         let mut g = lock(&shared.mu);
         g.eof = true;
         g.stop = true;
-        g.waker.take()
-    };
-    shared.cv.notify_all();
-    if let Some(waker) = waker {
-        waker.wake();
     }
+    shared.space.notify_waiters();
+    shared.data.notify_waiters();
 }
 
-fn tcp_read(mut stream: TcpStream, mut opener: Opener, shared: Arc<Shared>) {
+fn tcp_read(mut stream: ReadHalf, mut opener: Opener, shared: Arc<Shared>) {
     let mut dec = FrameDecoder::new(FRAME_LIMIT);
     let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut buf = vec![0u8; 256 << 10];
@@ -391,12 +367,18 @@ fn tcp_read(mut stream: TcpStream, mut opener: Opener, shared: Arc<Shared>) {
         // until that message is taken. A partial frame, or a record the opener has
         // not finished, is read at once.
         if !need_more && dec.missing() == 0 {
-            let mut g = lock(&shared.mu);
-            while !g.stop && !g.msgs.is_empty() {
-                g = shared.cv.wait(g).unwrap_or_else(|e| e.into_inner());
-            }
-            if g.stop {
-                return;
+            loop {
+                let waiting = {
+                    let g = lock(&shared.mu);
+                    if g.stop {
+                        return;
+                    }
+                    !g.msgs.is_empty()
+                };
+                if !waiting {
+                    break;
+                }
+                shared.space.notified();
             }
         }
         let n = match stream.read(&mut buf) {

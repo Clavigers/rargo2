@@ -20,7 +20,9 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+
+struct Stay<T>(*const T);
+unsafe impl<T> Send for Stay<T> {}
 
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,39 +128,54 @@ fn dtype_from_u8(b: u8) -> DType {
 
 pub struct Peer {
     pub conn: Arc<Conn>,
-    calls: Mutex<pool_state::Calls<oneshot::Sender<Resp>>>,
-    out: mpsc::UnboundedSender<Vec<u8>>,
-    bulk: mpsc::UnboundedSender<Vec<u8>>,
+    calls: Mutex<pool_state::Calls<crate::io::oneshot::Sender<Resp>>>,
+    out: crate::io::UnboundedSender<Vec<u8>>,
+    bulk: crate::io::UnboundedSender<Vec<u8>>,
 }
 
 fn is_bulk(m: &Msg) -> bool {
     matches!(m, Msg::Push { .. } | Msg::Resp { body: Resp::Chunks(_) | Resp::Blob(_), .. })
 }
 
+fn wait_reply(rx: crate::io::oneshot::Receiver<Resp>) -> Result<Resp> {
+    match crate::io::timeout(Duration::from_secs(120), move || rx.recv()) {
+        Ok(Some(Resp::Err(e))) => bail!("peer: {e}"),
+        Ok(Some(r)) => Ok(r),
+        Ok(None) => bail!("connection to peer lost"),
+        Err(_) => bail!("peer did not answer"),
+    }
+}
+
 impl Peer {
-    pub fn new(conn: Arc<Conn>) -> (Arc<Peer>, mpsc::UnboundedReceiver<Msg>) {
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (in_tx, in_rx) = mpsc::unbounded_channel();
+    pub fn new(conn: Arc<Conn>) -> (Arc<Peer>, crate::io::UnboundedReceiver<Msg>) {
+        let (out_tx, mut out_rx) = crate::io::unbounded_channel::<Vec<u8>>();
+        let (bulk_tx, mut bulk_rx) = crate::io::unbounded_channel::<Vec<u8>>();
+        let (in_tx, in_rx) = crate::io::unbounded_channel();
         let peer = Arc::new(Peer { conn: conn.clone(), calls: Mutex::new(pool_state::Calls::default()), out: out_tx, bulk: bulk_tx });
         let c = conn.clone();
-        tokio::spawn(async move {
+        crate::io::spawn(move || {
             loop {
-                let m = tokio::select! {
-                    biased;
-                    m = out_rx.recv() => m,
-                    m = bulk_rx.recv() => m,
+                enum Side {
+                    Out(Option<Vec<u8>>),
+                    Bulk(Option<Vec<u8>>),
+                }
+                let got = crate::io::race_biased(vec![
+                    Box::new(|| Side::Out(out_rx.recv())),
+                    Box::new(|| Side::Bulk(bulk_rx.recv())),
+                ]);
+                let m = match got {
+                    Side::Out(m) | Side::Bulk(m) => m,
                 };
                 let Some(m) = m else { break };
-                let m = if m.len() >= COMPRESS_FROM { tokio::task::block_in_place(|| frame(m)) } else { frame(m) };
-                if c.send(&m).await.is_err() {
+                let m = if m.len() >= COMPRESS_FROM { crate::io::cpu(|| frame(m)) } else { frame(m) };
+                if c.send(&m).is_err() {
                     break;
                 }
             }
         });
         let p = peer.clone();
-        tokio::spawn(async move {
-            while let Some(raw) = conn.recv().await {
+        crate::io::spawn(move || {
+            while let Some(raw) = conn.recv() {
                 let Some(raw) = unframe(&raw) else { continue };
                 let Ok(msg) = bincode::deserialize::<Msg>(&raw) else { continue };
                 match msg {
@@ -187,53 +204,41 @@ impl Peer {
         }
     }
 
-    pub async fn deliver(&self, m: &Msg) {
+    pub fn deliver(&self, m: &Msg) {
         let Ok(b) = bincode::serialize(m) else { return };
-        let framed = if b.len() >= COMPRESS_FROM { tokio::task::block_in_place(|| frame(b)) } else { frame(b) };
-        if self.conn.send(&framed).await.is_err() {
+        let framed = if b.len() >= COMPRESS_FROM { crate::io::cpu(|| frame(b)) } else { frame(b) };
+        if self.conn.send(&framed).is_err() {
             return;
         }
         loop {
-            let wake = self.conn.send_settled.notified();
-            tokio::pin!(wake);
-            wake.as_mut().enable();
             if self.conn.send_idle() {
                 return;
             }
-            wake.await;
+            self.conn.send_settled.notified();
         }
     }
 
-    fn start(&self, body: Req) -> oneshot::Receiver<Resp> {
-        let (tx, rx) = oneshot::channel();
+    fn start(&self, body: Req) -> crate::io::oneshot::Receiver<Resp> {
+        let (tx, rx) = crate::io::oneshot::channel();
         let rid = self.calls.lock().start(tx);
         self.post(&Msg::Req { rid, body });
         rx
     }
 
-    pub fn call(&self, body: Req) -> impl std::future::Future<Output = Result<Resp>> + Send + 'static {
-        let rx = self.start(body);
-        async move {
-            match tokio::time::timeout(Duration::from_secs(120), rx).await {
-                Ok(Ok(Resp::Err(e))) => bail!("peer: {e}"),
-                Ok(Ok(r)) => Ok(r),
-                Ok(Err(_)) => bail!("connection to peer lost"),
-                Err(_) => bail!("peer did not answer"),
-            }
-        }
+    pub fn call(&self, body: Req) -> Result<Resp> {
+        wait_reply(self.start(body))
     }
 
     pub fn call_blocking(&self, body: Req) -> Result<Resp> {
-        let rx = self.start(body);
-        let got = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| rx.blocking_recv())
-        } else {
-            rx.blocking_recv()
-        };
+        let stay = Stay(self);
+        let got = crate::io::call(move || {
+            let stay = stay;
+            unsafe { &*stay.0 }.start(body).recv()
+        });
         match got {
-            Ok(Resp::Err(e)) => bail!("peer: {e}"),
-            Ok(r) => Ok(r),
-            Err(_) => bail!("connection to peer lost"),
+            Some(Resp::Err(e)) => bail!("peer: {e}"),
+            Some(r) => Ok(r),
+            None => bail!("connection to peer lost"),
         }
     }
 }
@@ -355,7 +360,7 @@ impl Blobs {
         }
     }
 
-    pub async fn assemble(
+    pub fn assemble(
         &self,
         peer: &Peer,
         h: &Hash,
@@ -390,10 +395,10 @@ impl Blobs {
         for group in batches.chunks(8) {
             let calls: Vec<_> = group
                 .iter()
-                .map(|b| peer.call(Req::Chunks { blob: *h, idx: b.iter().map(|x| x.0).collect() }))
+                .map(|b| peer.start(Req::Chunks { blob: *h, idx: b.iter().map(|x| x.0).collect() }))
                 .collect();
             for (batch, call) in group.iter().zip(calls) {
-                let Resp::Chunks(chunks) = call.await? else { bail!("unexpected reply to a chunk request") };
+                let Resp::Chunks(chunks) = wait_reply(call)? else { bail!("unexpected reply to a chunk request") };
                 if chunks.len() != batch.len() {
                     bail!("peer sent the wrong number of chunks");
                 }
@@ -419,29 +424,29 @@ impl Blobs {
         Ok(())
     }
 
-    pub async fn fetch(&self, peer: &Peer, h: &Hash) -> Result<()> {
+    pub fn fetch(&self, peer: &Peer, h: &Hash) -> Result<()> {
         if self.store.has(h) {
             return Ok(());
         }
-        let Resp::Blob(Some((recipe, chunks))) = peer.call(Req::Blob { blob: *h }).await? else {
+        let Resp::Blob(Some((recipe, chunks))) = peer.call(Req::Blob { blob: *h })? else {
             bail!("peer does not have blob {h}");
         };
-        self.assemble(peer, h, &recipe, chunks.into_iter().collect()).await
+        self.assemble(peer, h, &recipe, chunks.into_iter().collect())
     }
 
-    pub async fn fetch_all(self: &Arc<Self>, peer: &Arc<Peer>, blobs: &[Hash]) -> Result<()> {
+    pub fn fetch_all(self: &Arc<Self>, peer: &Arc<Peer>, blobs: &[Hash]) -> Result<()> {
         for group in blobs.chunks(FETCH_TOGETHER) {
-            let tasks: Vec<_> = group
+            let mut tasks: Vec<_> = group
                 .iter()
                 .filter(|h| !self.store.has(h))
                 .map(|h| {
                     let (this, peer, h) = (self.clone(), peer.clone(), *h);
-                    tokio::spawn(async move { this.fetch(&peer, &h).await })
+                    crate::io::spawn(move || this.fetch(&peer, &h))
                 })
                 .collect();
             let mut first: Result<()> = Ok(());
-            for t in tasks {
-                let r = t.await.map_err(|e| anyhow!("fetch task: {e}")).and_then(|r| r);
+            for t in &mut tasks {
+                let r = t.join().map_err(|e| anyhow!("fetch task: {e}")).and_then(|r| r);
                 if first.is_ok() {
                     first = r;
                 }
@@ -492,19 +497,14 @@ pub struct WorkerState {
     peer: Mutex<Option<Arc<Peer>>>,
     blobs: Arc<Blobs>,
     engine: Arc<Engine>,
-    handle: tokio::runtime::Handle,
     core: Mutex<worker_state::Worker<Wire>>,
-    woken: parking_lot::Condvar,
-    tasks: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    woken: crate::io::watch::Sender<()>,
+    tasks: Mutex<HashMap<u64, crate::io::JoinHandle<()>>>,
     born: std::time::Instant,
     lookups_local: AtomicU64,
     lookups_remote: AtomicU64,
     starved: AtomicU64,
     nix: DashMap<Vec<u8>, Arc<crate::nixmanifest::Installed>>,
-}
-
-fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::try_current().is_ok() { tokio::task::block_in_place(f) } else { f() }
 }
 
 impl WorkerState {
@@ -517,90 +517,106 @@ impl WorkerState {
     }
 
     fn ensure_blob(self: &Arc<Self>, h: &Hash) -> io::Result<()> {
-        blocking(|| {
+        let this = Arc::clone(self);
+        let h = *h;
+        crate::io::call(move || this.pull_blob(h))
+    }
+
+    fn pull_blob(self: Arc<Self>, h: Hash) -> io::Result<()> {
+        let mut wake = self.woken.subscribe();
+        loop {
+            wake.borrow_and_update();
             let mut core = self.core.lock();
-            loop {
-                let has = self.blobs.store.has(h);
-                match core.need(*h, has) {
-                    worker_state::Need::Have => return Ok(()),
-                    worker_state::Need::Wait => {
-                        self.woken.wait_for(&mut core, Duration::from_secs(1));
-                    }
-                    worker_state::Need::Gone => {
+            let has = self.blobs.store.has(&h);
+            match core.need(h, has) {
+                worker_state::Need::Have => return Ok(()),
+                worker_state::Need::Wait => {
+                    drop(core);
+                    let _ = wake.changed();
+                }
+                worker_state::Need::Gone => {
+                    self.starved.fetch_add(1, Ordering::SeqCst);
+                    return Err(io::Error::other(format!("content {h} is not here and the server is gone")));
+                }
+                worker_state::Need::Fetch => {
+                    drop(core);
+                    let got = match self.peer() {
+                        Some(peer) => self.blobs.fetch(&peer, &h),
+                        None => Err(anyhow!("no link to the server")),
+                    };
+                    self.core.lock().fetched(h);
+                    let _ = self.woken.send_replace(());
+                    return got.map_err(|e| {
                         self.starved.fetch_add(1, Ordering::SeqCst);
-                        return Err(io::Error::other(format!("content {h} is not here and the server is gone")));
-                    }
-                    worker_state::Need::Fetch => {
-                        drop(core);
-                        let got = match self.peer() {
-                            Some(peer) => self.handle.block_on(self.blobs.fetch(&peer, h)),
-                            None => Err(anyhow!("no link to the server")),
-                        };
-                        self.core.lock().fetched(*h);
-                        self.woken.notify_all();
-                        return got.map_err(|e| {
-                            self.starved.fetch_add(1, Ordering::SeqCst);
-                            eprintln!("rargo worker: content {h} could not be had from the server: {e:#}");
-                            io::Error::other(format!("{e:#}"))
-                        });
-                    }
+                        eprintln!("rargo worker: content {h} could not be had from the server: {e:#}");
+                        io::Error::other(format!("{e:#}"))
+                    });
                 }
             }
-        })
+        }
     }
 
     fn ask(&self, token: u64, q: worker_state::Query) -> Option<worker_state::Reply> {
+        let stay = Stay(self);
+        crate::io::call(move || {
+            let stay = stay;
+            unsafe { &*stay.0 }.ask_here(token, q)
+        })
+    }
+
+    fn ask_here(&self, token: u64, q: worker_state::Query) -> Option<worker_state::Reply> {
         use worker_state::{Asked, Query, Reply};
-        blocking(|| {
+        let mut wake = self.woken.subscribe();
+        loop {
+            wake.borrow_and_update();
             let mut core = self.core.lock();
-            loop {
-                match core.query(token, q.clone()) {
-                    Asked::Known(r) => {
-                        self.lookups_local.fetch_add(1, Ordering::Relaxed);
-                        return Some(r);
-                    }
-                    Asked::Gone => return None,
-                    Asked::Wait => {
-                        self.woken.wait_for(&mut core, Duration::from_secs(1));
-                    }
-                    Asked::Ask { ticket, action } => {
-                        drop(core);
-                        self.lookups_remote.fetch_add(1, Ordering::Relaxed);
-                        let req = match &q {
-                            Query::Lookup { dir, name } => Req::Lookup { action, dir: dir.clone(), name: name.clone() },
-                            Query::List { dir } => Req::List { action, dir: dir.clone() },
-                            Query::Open { dir, name } => Req::Open { action, dir: dir.clone(), name: name.clone() },
-                        };
-                        let got = match self.peer() {
-                            Some(peer) => peer.call_blocking(req),
-                            None => Err(anyhow!("no link to the server")),
-                        };
-                        let reply = match got {
-                            Ok(Resp::Looked(w)) => Some(Reply::Looked(w)),
-                            Ok(Resp::Listing(l)) => Some(Reply::Listing(l)),
-                            Ok(Resp::Opened(o)) => Some(Reply::Opened(o)),
-                            other => {
-                                if let Query::Lookup { dir, name } = &q {
-                                    let why = match other {
-                                        Err(e) => format!("{e:#}"),
-                                        Ok(_) => "unexpected reply".to_string(),
-                                    };
-                                    eprintln!(
-                                        "rargo worker: action {action:x}: no answer about {}/{}: {why}",
-                                        String::from_utf8_lossy(dir),
-                                        String::from_utf8_lossy(name)
-                                    );
-                                }
-                                None
+            match core.query(token, q.clone()) {
+                Asked::Known(r) => {
+                    self.lookups_local.fetch_add(1, Ordering::Relaxed);
+                    return Some(r);
+                }
+                Asked::Gone => return None,
+                Asked::Wait => {
+                    drop(core);
+                    let _ = wake.changed();
+                }
+                Asked::Ask { ticket, action } => {
+                    drop(core);
+                    self.lookups_remote.fetch_add(1, Ordering::Relaxed);
+                    let req = match &q {
+                        Query::Lookup { dir, name } => Req::Lookup { action, dir: dir.clone(), name: name.clone() },
+                        Query::List { dir } => Req::List { action, dir: dir.clone() },
+                        Query::Open { dir, name } => Req::Open { action, dir: dir.clone(), name: name.clone() },
+                    };
+                    let got = match self.peer() {
+                        Some(peer) => peer.call_blocking(req),
+                        None => Err(anyhow!("no link to the server")),
+                    };
+                    let reply = match got {
+                        Ok(Resp::Looked(w)) => Some(Reply::Looked(w)),
+                        Ok(Resp::Listing(l)) => Some(Reply::Listing(l)),
+                        Ok(Resp::Opened(o)) => Some(Reply::Opened(o)),
+                        other => {
+                            if let Query::Lookup { dir, name } = &q {
+                                let why = match other {
+                                    Err(e) => format!("{e:#}"),
+                                    Ok(_) => "unexpected reply".to_string(),
+                                };
+                                eprintln!(
+                                    "rargo worker: action {action:x}: no answer about {}/{}: {why}",
+                                    String::from_utf8_lossy(dir),
+                                    String::from_utf8_lossy(name)
+                                );
                             }
-                        };
-                        self.core.lock().answered(ticket, reply.clone());
-                        self.woken.notify_all();
-                        return reply;
-                    }
+                            None
+                        }
+                    };
+                    self.core.lock().answered(ticket, reply.clone());
+                    let _ = self.woken.send_replace(());
+                    return reply;
                 }
             }
-        })
+        }
     }
 
     fn server_msg(self: &Arc<Self>, msg: Msg) {
@@ -650,7 +666,7 @@ impl WorkerState {
             fx.extend(core.tick(now));
             fx
         };
-        self.woken.notify_all();
+        let _ = self.woken.send_replace(());
         self.carry(fx);
     }
 
@@ -668,8 +684,8 @@ impl WorkerState {
                 WEffect::Serve { rid, serve } => {
                     let Some(peer) = self.peer() else { continue };
                     let blobs = self.blobs.clone();
-                    self.handle.spawn_blocking(move || {
-                        let resp = match serve {
+                    crate::io::spawn(move || {
+                        let resp = crate::io::cpu(move || match serve {
                             Req::Recipe { blob } => Resp::Recipe(blobs.recipe(&blob).map(|r| (*r).clone())),
                             Req::Blob { blob } => Resp::Blob(blobs.recipe(&blob).map(|r| {
                                 let idx = inline_indices(&r, &|_| false);
@@ -681,7 +697,7 @@ impl WorkerState {
                                 Err(e) => Resp::Err(format!("{e:#}")),
                             },
                             _ => unreachable!("the core serves only content requests"),
-                        };
+                        });
                         peer.post(&Msg::Resp { rid, body: resp });
                     });
                 }
@@ -693,7 +709,7 @@ impl WorkerState {
                 WEffect::Assemble { blob, parts } => {
                     let Some(peer) = self.peer() else { continue };
                     let state = self.clone();
-                    self.handle.spawn(async move {
+                    crate::io::spawn(move || {
                         let mut recipe = None;
                         let mut chunks = HashMap::new();
                         for (part, r, c) in parts {
@@ -703,11 +719,11 @@ impl WorkerState {
                             chunks.extend(c);
                         }
                         let recipe = recipe.unwrap_or_default();
-                        if let Err(e) = state.blobs.assemble(&peer, &blob, &recipe, chunks).await {
+                        if let Err(e) = state.blobs.assemble(&peer, &blob, &recipe, chunks) {
                             eprintln!("rargo worker: pushed blob {blob} could not be assembled: {e:#}");
                         }
                         let fx = state.core.lock().assembled(blob);
-                        state.woken.notify_all();
+                        let _ = state.woken.send_replace(());
                         state.carry(fx);
                     });
                 }
@@ -731,7 +747,7 @@ impl WorkerState {
         let Some(peer) = self.peer() else { return };
         let state = self.clone();
         let mut registry = self.tasks.lock();
-        let task = self.handle.spawn(async move {
+        let task = crate::io::spawn(move || {
             let RunWire { spec, uid, gid, untraced, closure } = run;
             let view = Arc::new(RemoteView { state: state.clone(), token, untraced, closure });
             let aspec = ActionSpec {
@@ -745,10 +761,10 @@ impl WorkerState {
                 discard: spec.discard,
                 label: spec.label,
             };
-            let permit = state.engine.sched.acquire(crate::sched::Priority::Agent, 0).await;
+            let permit = state.engine.sched.acquire(crate::sched::Priority::Agent, 0);
             let obs = WorkerObserver { peer: peer.clone(), action };
             let starved_before = state.starved.load(Ordering::SeqCst);
-            let r = state.engine.execute(&aspec, view, uid, gid, &obs).await;
+            let r = state.engine.execute(&aspec, view, uid, gid, &obs);
             drop(permit);
             let r = if state.starved.load(Ordering::SeqCst) != starved_before {
                 Err(anyhow!("an input's content could not be fetched from the server while the action ran"))
@@ -772,7 +788,7 @@ impl WorkerState {
                 peer.post(&Msg::Done { action, result });
             }
         });
-        registry.insert(token, task.abort_handle());
+        registry.insert(token, task);
     }
 }
 
@@ -896,43 +912,64 @@ enum LinkEnd {
     Stop,
 }
 
-async fn serve_link(
+enum LinkMsg {
+    Inbox(Option<Msg>),
+    Stop,
+    Tick,
+}
+
+fn serve_link(
     state: &Arc<WorkerState>,
     conn: &Arc<Conn>,
-    inbox: &mut mpsc::UnboundedReceiver<Msg>,
-    term: &mut tokio::signal::unix::Signal,
-    intr: &mut tokio::signal::unix::Signal,
+    inbox: &mut crate::io::UnboundedReceiver<Msg>,
+    term: &mut crate::io::Signal,
+    intr: &mut crate::io::Signal,
 ) -> LinkEnd {
     loop {
-        let msg = tokio::select! {
-            m = inbox.recv() => m,
-            _ = term.recv() => return LinkEnd::Stop,
-            _ = intr.recv() => return LinkEnd::Stop,
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+        let msg = crate::io::race_biased(vec![
+            Box::new(|| LinkMsg::Inbox(inbox.recv())),
+            Box::new(|| {
+                let _ = term.recv();
+                LinkMsg::Stop
+            }),
+            Box::new(|| {
+                let _ = intr.recv();
+                LinkMsg::Stop
+            }),
+            Box::new(|| {
+                crate::io::sleep(Duration::from_secs(5));
+                LinkMsg::Tick
+            }),
+        ]);
+        match msg {
+            LinkMsg::Stop => return LinkEnd::Stop,
+            LinkMsg::Tick => {
                 if conn.is_closed() {
-                    None
-                } else {
-                    state.tick();
-                    continue;
+                    return LinkEnd::Lost;
                 }
+                state.tick();
             }
-        };
-        let Some(msg) = msg else { return LinkEnd::Lost };
-        state.server_msg(msg);
+            LinkMsg::Inbox(Some(msg)) => state.server_msg(msg),
+            LinkMsg::Inbox(None) => return LinkEnd::Lost,
+        }
     }
 }
 
-pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: crate::net::LinkKey) -> Result<()> {
-    let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key).await?;
+enum Dial {
+    Ready(std::io::Result<Arc<Conn>>),
+    Stop,
+}
+
+pub fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: crate::net::LinkKey) -> Result<()> {
+    let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key)?;
     let blobs = Arc::new(Blobs::new(engine.store.clone(), None));
     let (core, first) = worker_state::Worker::new();
     let state = Arc::new(WorkerState {
         peer: Mutex::new(None),
         blobs,
         engine: engine.clone(),
-        handle: tokio::runtime::Handle::current(),
         core: Mutex::new(core),
-        woken: parking_lot::Condvar::new(),
+        woken: crate::io::watch::channel(()).0,
         tasks: Mutex::new(HashMap::new()),
         born: std::time::Instant::now(),
         lookups_local: AtomicU64::new(0),
@@ -942,8 +979,8 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
     });
     let s2 = state.clone();
     engine.content.set_fetcher(Arc::new(move |h| s2.ensure_blob(h)));
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
-    let mut intr = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("signal");
+    let mut term = crate::io::signal(crate::io::SignalKind::terminate()).expect("signal");
+    let mut intr = crate::io::signal(crate::io::SignalKind::interrupt()).expect("signal");
     let mut todo: std::collections::VecDeque<WEffect> = first.into();
     while let Some(effect) = todo.pop_front() {
         let after_ms = match effect {
@@ -953,14 +990,21 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                 continue;
             }
         };
-        let connected = tokio::select! {
-            c = async {
-                tokio::time::sleep(Duration::from_millis(after_ms)).await;
-                endpoint.connect(server).await
-            } => c,
-            _ = term.recv() => return Ok(()),
-            _ = intr.recv() => return Ok(()),
-        };
+        let connected = crate::io::race_biased(vec![
+            Box::new(|| {
+                crate::io::sleep(Duration::from_millis(after_ms));
+                Dial::Ready(endpoint.connect(server))
+            }),
+            Box::new(|| {
+                let _ = term.recv();
+                Dial::Stop
+            }),
+            Box::new(|| {
+                let _ = intr.recv();
+                Dial::Stop
+            }),
+        ]);
+        let Dial::Ready(connected) = connected else { return Ok(()) };
         let conn = match connected {
             Ok(c) => c,
             Err(e) => {
@@ -981,16 +1025,16 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
             peer.post(&Msg::Hello { cores, blobs: engine.store.all_hashes() });
         }
         eprintln!("rargo worker: connected to {server}, {cores} cores");
-        match serve_link(&state, &conn, &mut inbox, &mut term, &mut intr).await {
+        match serve_link(&state, &conn, &mut inbox, &mut term, &mut intr) {
             LinkEnd::Stop => {
-                let _ = tokio::time::timeout(BYE_WAIT, peer.deliver(&Msg::Bye)).await;
+                let _ = crate::io::timeout(BYE_WAIT, || peer.deliver(&Msg::Bye));
                 return Ok(());
             }
             LinkEnd::Lost => {
                 eprintln!("rargo worker: the connection to {server} was lost; connecting again");
                 *state.peer.lock() = None;
                 let fx = state.core.lock().link_lost();
-                state.woken.notify_all();
+                let _ = state.woken.send_replace(());
                 for e in fx {
                     match e {
                         WEffect::Connect { .. } => todo.push_back(e),
@@ -1004,19 +1048,22 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
 }
 
 
-#[derive(Default)]
 struct Voice {
     race: Mutex<pool_state::Race>,
-    changed: tokio::sync::Notify,
+    changed: crate::io::watch::Sender<()>,
 }
 
 impl Voice {
+    fn new() -> Voice {
+        Voice { race: Mutex::new(pool_state::Race::default()), changed: crate::io::watch::channel(()).0 }
+    }
+
     fn claim(&self, who: Who) -> bool {
         let mut race = self.race.lock();
         let first = race.owner().is_none();
         let ok = race.claim(who);
         if ok && first {
-            self.changed.notify_one();
+            let _ = self.changed.send_replace(());
         }
         ok
     }
@@ -1174,7 +1221,7 @@ enum Event {
 
 struct RemoteAction {
     view: Arc<dyn View>,
-    events: mpsc::UnboundedSender<Event>,
+    events: crate::io::UnboundedSender<Event>,
     served: Mutex<Vec<FileSrc>>,
     asked: AtomicU64,
 }
@@ -1369,14 +1416,14 @@ pub struct Pool {
     pub profile_exclude: Vec<Vec<u8>>,
     pub bandwidth: AtomicU64,
     pub stats: PoolStats,
-    freed: tokio::sync::Notify,
+    freed: crate::io::watch::Sender<()>,
     home_queue: Mutex<std::collections::VecDeque<(Arc<Worker>, Hash, u64, std::time::Instant)>>,
-    home_wake: tokio::sync::Notify,
+    home_wake: crate::io::watch::Sender<()>,
     ahead: Mutex<AheadQueue>,
-    ahead_wake: tokio::sync::Notify,
+    ahead_wake: crate::io::watch::Sender<()>,
     ahead_busy: AtomicBool,
     home_fetching: AtomicBool,
-    settle_wake: tokio::sync::Notify,
+    settle_wake: crate::io::watch::Sender<()>,
     left_on: DashMap<Hash, (u64, String)>,
 }
 
@@ -1397,8 +1444,8 @@ fn to_wire(l: &Looked, content: &Content) -> WLooked {
 }
 
 impl Pool {
-    pub async fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey) -> Result<Arc<Pool>> {
-        let endpoint = Endpoint::bind_keyed(addr, true, key).await.with_context(|| format!("binding {addr}"))?;
+    pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey) -> Result<Arc<Pool>> {
+        let endpoint = Endpoint::bind_keyed(addr, true, key).with_context(|| format!("binding {addr}"))?;
         let host_srcs: Arc<DashMap<Hash, FileSrc>> = Arc::new(DashMap::new());
         let blobs = Arc::new(Blobs::new(
             engine.store.clone(),
@@ -1425,23 +1472,27 @@ impl Pool {
             ],
             bandwidth: AtomicU64::new(100 << 20),
             stats: PoolStats::default(),
-            freed: tokio::sync::Notify::new(),
+            freed: crate::io::watch::channel(()).0,
             home_queue: Mutex::new(std::collections::VecDeque::new()),
-            home_wake: tokio::sync::Notify::new(),
+            home_wake: crate::io::watch::channel(()).0,
             ahead: Mutex::new(AheadQueue::default()),
-            ahead_wake: tokio::sync::Notify::new(),
+            ahead_wake: crate::io::watch::channel(()).0,
             ahead_busy: AtomicBool::new(false),
             home_fetching: AtomicBool::new(false),
-            settle_wake: tokio::sync::Notify::new(),
+            settle_wake: crate::io::watch::channel(()).0,
             left_on: DashMap::new(),
         });
-        tokio::spawn(pool.clone().bring_states_home(engine.clone()));
-        tokio::spawn(pool.clone().send_states_ahead(engine.clone()));
+        let home = pool.clone();
+        let engine_home = engine.clone();
+        crate::io::spawn(move || home.bring_states_home(engine_home));
+        let ahead = pool.clone();
+        let engine_ahead = engine.clone();
+        crate::io::spawn(move || ahead.send_states_ahead(engine_ahead));
         let p = pool.clone();
-        tokio::spawn(async move {
-            while let Some(conn) = endpoint.accept().await {
+        crate::io::spawn(move || {
+            while let Some(conn) = endpoint.accept() {
                 let p = p.clone();
-                tokio::spawn(async move { p.serve_worker(conn).await });
+                crate::io::spawn(move || p.serve_worker(conn));
             }
         });
         Ok(pool)
@@ -1471,16 +1522,30 @@ impl Pool {
         )
     }
 
-    async fn serve_worker(self: Arc<Self>, conn: Arc<Conn>) {
+    fn serve_worker(self: Arc<Self>, conn: Arc<Conn>) {
         let (peer, mut inbox) = Peer::new(conn.clone());
         let mut worker: Option<Arc<Worker>> = None;
         loop {
-            let msg = tokio::select! {
-                m = inbox.recv() => m,
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+            enum Incoming {
+                Msg(Option<Msg>),
+                Idle,
+            }
+            let msg = crate::io::race_biased(vec![
+                Box::new(|| Incoming::Msg(inbox.recv())),
+                Box::new(|| {
+                    crate::io::sleep(Duration::from_secs(2));
+                    Incoming::Idle
+                }),
+            ]);
+            let msg = match msg {
+                Incoming::Idle => {
                     let busy = worker.as_ref().is_some_and(|w| !w.actions.is_empty());
-                    if busy && conn.idle() > Duration::from_secs(30) { None } else { continue }
+                    if busy && conn.idle() > Duration::from_secs(30) {
+                        break;
+                    }
+                    continue;
                 }
+                Incoming::Msg(msg) => msg,
             };
             let Some(msg) = msg else { break };
             match msg {
@@ -1512,8 +1577,8 @@ impl Pool {
                     let Some(w) = worker.clone() else { continue };
                     let pool = self.clone();
                     let peer = peer.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let resp = pool.answer(&w, body);
+                    crate::io::spawn(move || {
+                        let resp = crate::io::cpu(move || pool.answer(&w, body));
                         peer.post(&Msg::Resp { rid, body: resp });
                     });
                 }
@@ -1524,7 +1589,7 @@ impl Pool {
                 Msg::Stored { blob } => {
                     if let Some(w) = &worker {
                         w.in_flight.lock().remove(&blob);
-                        self.settle_wake.notify_waiters();
+                        let _ = self.settle_wake.send_replace(());
                     }
                 }
                 Msg::Bye => break,
@@ -1535,7 +1600,7 @@ impl Pool {
             eprintln!("rargod: worker {:x} is gone", w.id);
             w.alive.store(false, Ordering::SeqCst);
             w.in_flight.lock().clear();
-            self.settle_wake.notify_waiters();
+            let _ = self.settle_wake.send_replace(());
             let fx = self.core.lock().left(w.id);
             for e in fx {
                 if let pool_state::Effect::Lost { action } = e
@@ -1551,7 +1616,9 @@ impl Pool {
     fn pool_effects(&self, fx: Vec<pool_state::Effect>) {
         for e in fx {
             match e {
-                pool_state::Effect::Wake => self.freed.notify_one(),
+                pool_state::Effect::Wake => {
+                    let _ = self.freed.send_replace(());
+                }
                 pool_state::Effect::Lost { .. } => unreachable!("a lost action is told where its worker leaves"),
                 pool_state::Effect::Cancel { worker, action } => {
                     if let Some(w) = self.workers.lock().iter().find(|w| w.id == worker) {
@@ -1693,19 +1760,18 @@ impl Pool {
     fn give_back(&self, w: &Worker) {
         let fx = self.core.lock().give_back(w.id);
         if !fx.is_empty() {
-            self.freed.notify_waiters();
+            let _ = self.freed.send_replace(());
         }
     }
 
-    async fn lease_wait(&self, among: Option<&[u64]>) -> Arc<Worker> {
+    fn lease_wait(&self, among: Option<&[u64]>) -> Arc<Worker> {
+        let mut wake = self.freed.subscribe();
         loop {
-            let freed = self.freed.notified();
-            tokio::pin!(freed);
-            freed.as_mut().enable();
+            wake.borrow_and_update();
             if let Some(w) = self.lease(among) {
                 return w;
             }
-            freed.await;
+            let _ = wake.changed();
         }
     }
 
@@ -1736,8 +1802,10 @@ impl Pool {
         ws.iter().find(|w| w.alive.load(Ordering::Relaxed) && w.has_blobs.lock().contains(blob)).cloned()
     }
 
-    async fn send_states_ahead(self: Arc<Self>, engine: Arc<Engine>) {
+    fn send_states_ahead(self: Arc<Self>, engine: Arc<Engine>) {
+        let mut wake = self.ahead_wake.subscribe();
         loop {
+            wake.borrow_and_update();
             let next = {
                 let mut q = self.ahead.lock();
                 let next = q.next();
@@ -1747,7 +1815,7 @@ impl Pool {
                 next
             };
             let Some(blobs) = next else {
-                self.ahead_wake.notified().await;
+                let _ = wake.changed();
                 continue;
             };
             let workers: Vec<Arc<Worker>> = self.workers.lock().iter().filter(|w| w.alive.load(Ordering::Relaxed)).cloned().collect();
@@ -1762,25 +1830,24 @@ impl Pool {
                     if busy.is_zero() {
                         break;
                     }
-                    tokio::time::sleep(busy.min(Duration::from_millis(500))).await;
+                    crate::io::sleep(busy.min(Duration::from_millis(500)));
                 }
                 if !w.alive.load(Ordering::Relaxed) {
                     continue;
                 }
-                let sent: u64 = tokio::task::block_in_place(|| missing.iter().map(|(h, _)| self.push_blob(&w, *h)).sum());
+                let sent: u64 = missing.iter().map(|(h, _)| self.push_blob(&w, *h)).sum();
                 self.stats.states_sent_ahead.fetch_add(1, Ordering::Relaxed);
                 self.stats.state_ahead_bytes.fetch_add(sent, Ordering::Relaxed);
             }
             self.ahead_busy.store(false, Ordering::SeqCst);
-            self.settle_wake.notify_waiters();
+            let _ = self.settle_wake.send_replace(());
         }
     }
 
-    async fn bring_states_home(self: Arc<Self>, engine: Arc<Engine>) {
+    fn bring_states_home(self: Arc<Self>, engine: Arc<Engine>) {
+        let mut wake = self.home_wake.subscribe();
         loop {
-            let wake = self.home_wake.notified();
-            tokio::pin!(wake);
-            wake.as_mut().enable();
+            wake.borrow_and_update();
             let due = {
                 let mut q = self.home_queue.lock();
                 match q.front() {
@@ -1795,17 +1862,21 @@ impl Pool {
                 }
             };
             match due {
-                Ok(None) => wake.await,
+                Ok(None) => {
+                    let _ = wake.changed();
+                }
                 Err(wait) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait) => {}
-                        _ = wake => {}
-                    }
+                    crate::io::race_biased(vec![
+                        Box::new(|| crate::io::sleep(wait)),
+                        Box::new(|| {
+                            let _ = wake.changed();
+                        }),
+                    ]);
                 }
                 Ok(Some((w, h, size, _))) => {
                     if !engine.store.has(&h) && w.alive.load(Ordering::Relaxed) {
-                        let permit = engine.sched.acquire(crate::sched::Priority::Idle, 0).await;
-                        match self.blobs.fetch(&w.peer, &h).await {
+                        let permit = engine.sched.acquire(crate::sched::Priority::Idle, 0);
+                        match self.blobs.fetch(&w.peer, &h) {
                             Ok(()) => {
                                 self.stats.state_homed_blobs.fetch_add(1, Ordering::Relaxed);
                                 self.stats.state_homed_bytes.fetch_add(size, Ordering::Relaxed);
@@ -1817,21 +1888,20 @@ impl Pool {
                         drop(permit);
                     }
                     self.home_fetching.store(false, Ordering::SeqCst);
-                    self.settle_wake.notify_waiters();
+                    let _ = self.settle_wake.send_replace(());
                 }
             }
         }
     }
 
-    pub async fn settle(&self) {
+    pub fn settle(&self) {
+        let mut wake = self.settle_wake.subscribe();
         loop {
-            let wake = self.settle_wake.notified();
-            tokio::pin!(wake);
-            wake.as_mut().enable();
+            wake.borrow_and_update();
             if self.transfers_idle() {
                 return;
             }
-            wake.await;
+            let _ = wake.changed();
         }
     }
 
@@ -1922,9 +1992,7 @@ impl Live for RemoteLive<'_> {
         let entry = self.early.lock().get(path).cloned()?;
         if let MEntry::File { hash, .. } = &entry {
             let (pool, worker, hash) = (self.pool, self.worker, *hash);
-            let ok = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(pool.blobs.fetch(&worker.peer, &hash)).is_ok()
-            });
+            let ok = pool.blobs.fetch(&worker.peer, &hash).is_ok();
             if !ok {
                 return None;
             }
@@ -1937,7 +2005,7 @@ type RunResult = Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, ME
 
 impl Pool {
     #[allow(clippy::type_complexity)]
-    async fn predict(
+    fn predict(
         &self,
         w: &Arc<Worker>,
         engine: &Engine,
@@ -1966,14 +2034,14 @@ impl Pool {
                     if let Some(program) = spec.argv.first() {
                         let view = view.clone();
                         let program = program.clone();
-                        let libs = tokio::task::spawn_blocking(move || sysroot_libs(&*view, &program)).await?;
+                        let libs = crate::io::cpu(move || sysroot_libs(&*view, &program));
                         obs.extend(libs.into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })));
                     }
                 }
                 if spec.kind == ActionKind::Rustc {
                     if let Some(root) = crate_root(&spec.argv, &spec.cwd) {
                         let view = view.clone();
-                        let (dirs, files) = tokio::task::spawn_blocking(move || source_tree(&*view, &root)).await?;
+                        let (dirs, files) = crate::io::cpu(move || source_tree(&*view, &root));
                         obs.extend(files.into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })));
                         obs.extend(dirs.iter().map(|d| (VPath::from(d.clone()), Obs::Listing(Hash::ZERO))));
                         closed = dirs;
@@ -1987,7 +2055,7 @@ impl Pool {
             let content = self.content.clone();
             let ra2 = ra.clone();
             let host_srcs = self.host_srcs.clone();
-            let (p, l, files) = tokio::task::spawn_blocking(move || {
+            let (p, l, files) = crate::io::cpu(move || {
                 let mut prefill = Vec::new();
                 let mut listings = Vec::new();
                 let mut files = Vec::new();
@@ -2034,8 +2102,7 @@ impl Pool {
                     }
                 }
                 (prefill, listings, files)
-            })
-            .await?;
+            });
             prefill = p;
             listings = l;
             let has = w.has_blobs.lock();
@@ -2047,7 +2114,7 @@ impl Pool {
         Ok((prefill, listings, incoming, closed))
     }
 
-    async fn run_on(
+    fn run_on(
         &self,
         w: &Arc<Worker>,
         engine: &Engine,
@@ -2057,7 +2124,7 @@ impl Pool {
         voice: &Voice,
     ) -> RunResult {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::io::unbounded_channel();
         let t0 = std::time::Instant::now();
         let view: Arc<dyn View> = req.view.clone();
         let ra = Arc::new(RemoteAction {
@@ -2081,16 +2148,16 @@ impl Pool {
             bail!("worker connection lost");
         }
 
-        let (mut prefill, mut listings, incoming, mut closed) = self.predict(w, engine, spec, key, &view, &ra).await?;
+        let (mut prefill, mut listings, incoming, mut closed) = self.predict(w, engine, spec, key, &view, &ra)?;
         if !req.seed_blobs.is_empty() {
             let (view, content, dirs) = (view.clone(), self.content.clone(), spec.discard.clone());
-            let (p, l) = tokio::task::spawn_blocking(move || side_tree(&*view, &content, &dirs)).await?;
+            let (p, l) = crate::io::cpu(move || side_tree(&*view, &content, &dirs));
             closed.extend(l.iter().map(|(d, _)| d.clone()));
             prefill.extend(p);
             listings.extend(l);
         }
         self.stats.prefilled_entries.fetch_add(prefill.len() as u64, Ordering::Relaxed);
-        tokio::task::block_in_place(|| {
+        {
             let mut held = w.store_paths.lock();
             let mut closure: Vec<(Vec<u8>, Hash)> = view.nix_closure().to_vec();
             closure.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2144,16 +2211,11 @@ impl Pool {
                 closure,
                 store_paths,
             });
-        });
+        }
         if !incoming.is_empty() {
-            let w2 = w.clone();
-            let blobs = incoming;
-            let this: &Pool = self;
-            tokio::task::block_in_place(|| {
-                for h in blobs {
-                    this.push_blob(&w2, h);
-                }
-            });
+            for h in incoming {
+                self.push_blob(w, h);
+            }
         }
 
         let early: Mutex<HashMap<Vec<u8>, MEntry>> = Mutex::new(HashMap::new());
@@ -2161,9 +2223,9 @@ impl Pool {
         let mut stderr: Vec<u8> = Vec::new();
         let t_sent = t0.elapsed();
         let done = loop {
-            let Some(ev) = rx.recv().await else { bail!("worker connection lost") };
+            let Some(ev) = rx.recv() else { bail!("worker connection lost") };
             if !matches!(ev, Event::Done(_)) && !voice.claim(Who::Remote) {
-                std::future::pending::<()>().await;
+                stop_here();
             }
             match ev {
                 Event::Stdout(d) => {
@@ -2178,8 +2240,7 @@ impl Pool {
                 }
                 Event::Line(line) => {
                     let live = RemoteLive { early: &early, pool: self, worker: w };
-                    let obs = req.observer.clone();
-                    tokio::task::block_in_place(|| obs.stderr_line(&line, Some(&live)));
+                    req.observer.stderr_line(&line, Some(&live));
                     stderr.extend_from_slice(&line);
                     stderr.push(b'\n');
                 }
@@ -2201,7 +2262,7 @@ impl Pool {
                 }
             }
         }
-        self.blobs.fetch_all(&w.peer, &wanted).await.context("fetching an output from the worker")?;
+        self.blobs.fetch_all(&w.peer, &wanted).context("fetching an output from the worker")?;
         {
             let mut has = w.has_blobs.lock();
             for (_, e) in done.entries.iter().chain(done.side.iter()) {
@@ -2229,8 +2290,8 @@ impl Pool {
                 self.stats.state_left_bytes.fetch_add(left.iter().map(|(_, s)| s).sum::<u64>(), Ordering::Relaxed);
                 let now = std::time::Instant::now();
                 self.home_queue.lock().extend(left.into_iter().map(|(h, s)| (w.clone(), h, s, now)));
-                self.home_wake.notify_one();
-                self.settle_wake.notify_waiters();
+                let _ = self.home_wake.send_replace(());
+                let _ = self.settle_wake.send_replace(());
             }
         }
         let mut tainted = done.tainted;
@@ -2282,6 +2343,12 @@ impl Pool {
     }
 }
 
+fn stop_here() -> ! {
+    loop {
+        crate::io::sleep(Duration::from_secs(3600));
+    }
+}
+
 impl RemoteRunner for Pool {
     fn holds(&self, blob: &Hash) -> bool {
         self.holder(blob).is_some()
@@ -2292,42 +2359,31 @@ impl RemoteRunner for Pool {
             return;
         }
         self.ahead.lock().offer(whose, blobs);
-        self.ahead_wake.notify_one();
-        self.settle_wake.notify_waiters();
+        let _ = self.ahead_wake.send_replace(());
+        let _ = self.settle_wake.send_replace(());
     }
 
-    fn bring_home<'a>(
-        &'a self,
-        blobs: &'a [Hash],
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut by_worker: Vec<(Arc<Worker>, Vec<Hash>)> = Vec::new();
-            for h in blobs {
-                if self.blobs.store.has(h) {
-                    continue;
-                }
-                let Some(w) = self.holder(h) else { bail!("no connected worker holds {h}") };
-                match by_worker.iter_mut().find(|(x, _)| x.id == w.id) {
-                    Some((_, v)) => v.push(*h),
-                    None => by_worker.push((w, vec![*h])),
-                }
+    fn bring_home(&self, blobs: &[Hash]) -> Result<()> {
+        let mut by_worker: Vec<(Arc<Worker>, Vec<Hash>)> = Vec::new();
+        for h in blobs {
+            if self.blobs.store.has(h) {
+                continue;
             }
-            for (w, hashes) in by_worker {
-                self.stats.state_needed_blobs.fetch_add(hashes.len() as u64, Ordering::Relaxed);
-                self.blobs.fetch_all(&w.peer, &hashes).await?;
+            let Some(w) = self.holder(h) else { bail!("no connected worker holds {h}") };
+            match by_worker.iter_mut().find(|(x, _)| x.id == w.id) {
+                Some((_, v)) => v.push(*h),
+                None => by_worker.push((w, vec![*h])),
             }
-            Ok(())
-        })
+        }
+        for (w, hashes) in by_worker {
+            self.stats.state_needed_blobs.fetch_add(hashes.len() as u64, Ordering::Relaxed);
+            self.blobs.fetch_all(&w.peer, &hashes)?;
+        }
+        Ok(())
     }
 
-    fn try_run<'a>(
-        &'a self,
-        engine: &'a Engine,
-        spec: &'a ActionSpec,
-        key: &'a Hash,
-        req: &'a Request,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RunResult>> + Send + 'a>> {
-        Box::pin(async move {
+    fn try_run(&self, engine: &Engine, spec: &ActionSpec, key: &Hash, req: &Request) -> Option<RunResult> {
+        {
             if matches!(spec.kind, ActionKind::Plan | ActionKind::Nextest)
                 || spec.net != NetMode::Loopback
             {
@@ -2374,19 +2430,23 @@ impl RemoteRunner for Pool {
                     }
                 }
             } else {
-                tokio::select! {
-                    biased;
-                    w = self.lease_wait(holders.as_deref()) => w,
-                    permit = engine.sched.acquire(req.prio, mem) => {
+                enum First {
+                    Leased(Arc<Worker>),
+                    Local(crate::sched::Permit),
+                }
+                let arms: Vec<Box<dyn FnOnce() -> First + '_>> = vec![
+                    Box::new(|| First::Leased(self.lease_wait(holders.as_deref()))),
+                    Box::new(|| First::Local(engine.sched.acquire(req.prio, mem))),
+                ];
+                match crate::io::race_biased(arms) {
+                    First::Leased(w) => w,
+                    First::Local(permit) => {
                         self.stats.kept_local_first.fetch_add(1, Ordering::Relaxed);
-                        if let Err(e) = engine.seed_home(req).await {
+                        if let Err(e) = engine.seed_home(req) {
                             return Some(Err(e));
                         }
-                        engine.stats.runs.fetch_add(1, Ordering::Relaxed);
-                        let started = std::time::Instant::now();
-                        let r = engine.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer).await;
+                        let r = engine.run_local(spec, req, &*req.observer);
                         drop(permit);
-                        engine.note_action_wall(started.elapsed());
                         return Some(r);
                     }
                 }
@@ -2426,19 +2486,17 @@ impl RemoteRunner for Pool {
             );
             if !send {
                 if self.core.lock().warm(w.id, known.is_some(), own.is_some()) {
-                    let (tx, _rx) = mpsc::unbounded_channel();
+                    let (tx, _rx) = crate::io::unbounded_channel();
                     let ra = Arc::new(RemoteAction {
                         view: req.view.clone(),
                         events: tx,
                         served: Mutex::new(Vec::new()),
                         asked: AtomicU64::new(0),
                     });
-                    if let Ok((_, _, incoming, _)) = self.predict(&w, engine, spec, key, &req.view, &ra).await {
-                        tokio::task::block_in_place(|| {
-                            for h in incoming {
-                                self.push_blob(&w, h);
-                            }
-                        });
+                    if let Ok((_, _, incoming, _)) = self.predict(&w, engine, spec, key, &req.view, &ra) {
+                        for h in incoming {
+                            self.push_blob(&w, h);
+                        }
                     }
                 }
                 self.give_back(&w);
@@ -2451,24 +2509,67 @@ impl RemoteRunner for Pool {
                 let which = if req.seed_blobs.is_empty() { &self.stats.unseeded_remote } else { &self.stats.seeded_in_place };
                 which.fetch_add(1, Ordering::Relaxed);
             }
-            let voice = Voice::default();
+            let voice = Voice::new();
             let gated = Gated { inner: &*req.observer, voice: &voice };
-            let mut remote = Some(Box::pin(self.run_on(&w, engine, spec, key, req, &voice)));
-            type Local<'f> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'f>>;
-            let mut local: Option<(Local<'_>, crate::sched::Permit, std::time::Instant)> = None;
+            enum Wake {
+                Remote(RunResult),
+                Local(RunResult),
+                Permit(crate::sched::Permit),
+                Voice,
+            }
+            let mut local: Option<(usize, crate::sched::Permit)> = None;
+            let (tx, mut rx) = crate::io::unbounded_channel::<Wake>();
+            let mut scope = Scope::default();
+            let mut remote = Some({
+                let (tx, w, voice) = (tx.clone(), &w, &voice);
+                scope.spawn(move || {
+                    let _ = tx.send(Wake::Remote(self.run_on(w, engine, spec, key, req, voice)));
+                })
+            });
+            {
+                let mut changed = voice.changed.subscribe();
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    while changed.changed().is_ok() && tx.send(Wake::Voice).is_ok() {}
+                });
+            }
+            let mut acquiring: Option<usize> = None;
             loop {
                 let settled = voice.race.lock().settle();
                 match settled {
                     Some(Settle::StopLocal) => {
                         self.stats.hedge_stopped.fetch_add(1, Ordering::Relaxed);
-                        local = None;
+                        if let Some((run, _)) = local.take() {
+                            scope.abort(run);
+                        }
                     }
-                    Some(Settle::DropRemote) => remote = None,
+                    Some(Settle::DropRemote) => {
+                        if let Some(run) = remote.take() {
+                            scope.abort(run);
+                        }
+                    }
                     None => {}
                 }
                 let may_hedge = voice.race.lock().may_hedge(away, hedge());
-                tokio::select! {
-                    r = async { remote.as_mut().expect("guarded").await }, if remote.is_some() => {
+                let wants_permit = local.is_none() && remote.is_some() && may_hedge;
+                match (wants_permit, acquiring) {
+                    (true, None) => {
+                        let tx = tx.clone();
+                        acquiring = Some(scope.spawn(move || {
+                            let _ = tx.send(Wake::Permit(engine.sched.acquire(crate::sched::Priority::Idle, mem)));
+                        }));
+                    }
+                    (false, Some(waiting)) => {
+                        scope.abort(waiting);
+                        acquiring = None;
+                    }
+                    _ => {}
+                }
+                match rx.recv().expect("the try_run holds a sender") {
+                    Wake::Remote(r) => {
+                        if remote.take().is_none() {
+                            continue;
+                        }
                         let outcome = voice.race.lock().remote_ended(r.is_ok());
                         match r {
                             Ok(r) => {
@@ -2481,34 +2582,65 @@ impl RemoteRunner for Pool {
                                 eprintln!("rargod: worker {:x} failed `{}`: {e:#}; running locally", w.id, spec.label);
                                 self.stats.worker_failures.fetch_add(1, Ordering::Relaxed);
                                 engine.stats.remote_failed.fetch_add(1, Ordering::Relaxed);
-                                remote = None;
                                 if outcome == Outcome::RunElsewhere {
                                     return None;
                                 }
                             }
                         }
-                    },
-                    r = async { (&mut local.as_mut().expect("guarded").0).await }, if local.is_some() => {
-                        let (_, permit, started) = local.take().expect("guarded");
+                    }
+                    Wake::Local(r) => {
+                        let Some((_, permit)) = local.take() else { continue };
                         drop(permit);
-                        engine.note_action_wall(started.elapsed());
                         voice.race.lock().local_ended();
                         self.stats.hedge_won.fetch_add(1, Ordering::Relaxed);
                         return Some(r);
                     }
-                    permit = engine.sched.acquire(crate::sched::Priority::Idle, mem),
-                        if local.is_none() && remote.is_some() && may_hedge =>
-                    {
+                    Wake::Permit(permit) => {
+                        acquiring = None;
+                        if local.is_some() || remote.is_none() {
+                            continue;
+                        }
                         voice.race.lock().hedged();
                         self.stats.hedged.fetch_add(1, Ordering::Relaxed);
-                        engine.stats.runs.fetch_add(1, Ordering::Relaxed);
-                        let run: Local<'_> = Box::pin(engine.execute(spec, req.view.clone(), req.uid, req.gid, &gated));
-                        local = Some((run, permit, std::time::Instant::now()));
+                        let (tx, gated) = (tx.clone(), &gated);
+                        let run = scope.spawn(move || {
+                            let _ = tx.send(Wake::Local(engine.run_local(spec, req, gated)));
+                        });
+                        local = Some((run, permit));
                     }
-                    _ = voice.changed.notified() => {}
+                    Wake::Voice => {}
                 }
             }
-        })
+        }
+    }
+}
+
+#[derive(Default)]
+struct Scope<'a> {
+    fibers: Vec<Option<crate::io::JoinHandle<()>>>,
+    borrows: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> Scope<'a> {
+    fn spawn(&mut self, body: impl FnOnce() + 'a) -> usize {
+        let body: Box<dyn FnOnce() + 'a> = Box::new(body);
+        let body: Box<dyn FnOnce() + 'static> = unsafe { std::mem::transmute(body) };
+        self.fibers.push(Some(crate::io::spawn(body)));
+        self.fibers.len() - 1
+    }
+
+    fn abort(&mut self, fiber: usize) {
+        if let Some(handle) = self.fibers[fiber].take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for Scope<'_> {
+    fn drop(&mut self) {
+        for fiber in 0..self.fibers.len() {
+            self.abort(fiber);
+        }
     }
 }
 

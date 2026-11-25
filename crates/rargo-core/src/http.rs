@@ -2,8 +2,7 @@ use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashMap};
-use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -741,29 +740,32 @@ fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
     Ok(Some(Request { method: method.into(), path: path.into(), query: form(query), host, body: body.to_vec(), json }))
 }
 
-fn next_item(stream: &mut TcpStream, deadline: Instant) -> ReadItem {
+fn next_item(stream: &mut rargo_net::io::TcpStream, deadline: Instant) -> ReadItem {
     let remain = deadline.saturating_duration_since(Instant::now());
     if remain.is_zero() {
         return ReadItem::Socket(ErrorKind::TimedOut, "timed out".into());
     }
-    if let Err(e) = stream.set_read_timeout(Some(remain)) {
-        return ReadItem::Socket(e.kind(), e.to_string());
-    }
     let mut chunk = [0u8; 2048];
-    match stream.read(&mut chunk) {
-        Ok(0) => ReadItem::Ended,
-        Ok(n) => ReadItem::Chunk(chunk[..n].to_vec()),
-        Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => ReadItem::Socket(e.kind(), e.to_string()),
-        Err(e) => ReadItem::Socket(e.kind(), e.to_string()),
+    match rargo_net::io::timeout(remain, || stream.read(&mut chunk)) {
+        Ok(Ok(0)) => ReadItem::Ended,
+        Ok(Ok(n)) => ReadItem::Chunk(chunk[..n].to_vec()),
+        Ok(Err(e)) => ReadItem::Socket(e.kind(), e.to_string()),
+        Err(_) => ReadItem::Socket(ErrorKind::TimedOut, "timed out".into()),
     }
 }
 
-fn write_outcome(stream: &mut TcpStream, outcome: &Outcome) -> Result<()> {
+fn write_all_within(stream: &mut rargo_net::io::TcpStream, bytes: &[u8]) -> Result<()> {
+    rargo_net::io::timeout(Duration::from_secs(20), || stream.write_all(bytes))
+        .map_err(|_| anyhow!("timed out"))?
+        .map_err(|e| anyhow!("{e}"))
+}
+
+fn write_outcome(stream: &mut rargo_net::io::TcpStream, outcome: &Outcome) -> Result<()> {
     match outcome {
         Outcome::Redirect(location) => {
             let head = format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
-            stream.write_all(head.as_bytes())?;
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+            write_all_within(stream, head.as_bytes())?;
+            let _ = stream.shutdown();
             Ok(())
         }
         Outcome::Body { status, kind, body } => {
@@ -775,9 +777,9 @@ fn write_outcome(stream: &mut TcpStream, outcome: &Outcome) -> Result<()> {
                 _ => "Service Unavailable",
             };
             let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
-            stream.write_all(head.as_bytes())?;
-            stream.write_all(body.as_bytes())?;
-            let _ = stream.shutdown(std::net::Shutdown::Write);
+            write_all_within(stream, head.as_bytes())?;
+            write_all_within(stream, body.as_bytes())?;
+            let _ = stream.shutdown();
             Ok(())
         }
     }
@@ -818,9 +820,7 @@ impl Http {
         server_for_host(&self.view_cfg(), host)
     }
 
-    pub fn serve(&self, mut stream: TcpStream) -> Result<()> {
-        stream.set_nonblocking(false)?;
-        stream.set_write_timeout(Some(Duration::from_secs(20)))?;
+    pub fn serve(&self, mut stream: rargo_net::io::TcpStream) -> Result<()> {
         let mut buf = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(20);
         let req = loop {

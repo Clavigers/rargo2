@@ -1,11 +1,10 @@
+use rargo_net::io::{self, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::sync::{Semaphore, oneshot};
 
 const WINDOW: usize = 32 << 20;
 const PING_EVERY: Duration = Duration::from_secs(10);
@@ -128,14 +127,24 @@ impl<S: Clone, M> MuxState<S, M> {
 }
 
 type StreamSender = UnboundedSender<ServerMsg>;
-type WireState = MuxState<StreamSender, oneshot::Sender<Missing>>;
+type WireState = MuxState<StreamSender, io::oneshot::Sender<Missing>>;
+
+enum Outgoing {
+    Urgent(Option<Vec<u8>>),
+    Bulk(Option<(Vec<u8>, usize)>),
+}
+
+enum DeadWait {
+    Gone,
+    Tick,
+}
 
 pub struct Mux {
     link: Arc<Link>,
     out: Mutex<Out>,
-    window: Arc<Semaphore>,
+    window: Arc<io::Semaphore>,
     state: Mutex<WireState>,
-    pub gone: tokio::sync::Notify,
+    pub gone: io::Notify,
     last_heard: Mutex<Instant>,
     pub bytes_out: AtomicU64,
     pub bytes_in: AtomicU64,
@@ -149,31 +158,29 @@ impl Mux {
         let mux = Arc::new(Mux {
             link: link.clone(),
             out: Mutex::new(Out { seq: 0, tx, urgent }),
-            window: Arc::new(Semaphore::new(WINDOW)),
+            window: Arc::new(io::Semaphore::new(WINDOW as u32)),
             state: Mutex::new(MuxState::new()),
-            gone: tokio::sync::Notify::new(),
+            gone: io::Notify::new(),
             last_heard: Mutex::new(Instant::now()),
             bytes_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
         });
         let m = mux.clone();
-        tokio::spawn(async move {
+        io::spawn(move || {
             loop {
-                let (frame, bulk) = tokio::select! {
-                    biased;
-                    u = urgent_rx.recv() => match u {
-                        Some(f) => (f, 0),
-                        None => break,
-                    },
-                    f = rx.recv() => match f {
-                        Some(f) => f,
-                        None => break,
-                    },
+                let got = io::race_biased(vec![
+                    Box::new(|| Outgoing::Urgent(urgent_rx.recv())),
+                    Box::new(|| Outgoing::Bulk(rx.recv())),
+                ]);
+                let (frame, bulk) = match got {
+                    Outgoing::Urgent(Some(frame)) => (frame, 0),
+                    Outgoing::Bulk(Some(frame)) => frame,
+                    Outgoing::Urgent(None) | Outgoing::Bulk(None) => break,
                 };
                 m.bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                let sent = m.link.send(&frame).await;
+                let sent = m.link.send(&frame);
                 if bulk > 0 {
-                    m.window.add_permits(bulk);
+                    m.window.add_permits(bulk as u32);
                 }
                 if sent.is_err() {
                     break;
@@ -182,8 +189,8 @@ impl Mux {
             m.die();
         });
         let m = mux.clone();
-        tokio::spawn(async move {
-            while let Some(raw) = m.link.recv().await {
+        io::spawn(move || {
+            while let Some(raw) = m.link.recv() {
                 m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
                 *m.last_heard.lock().unwrap() = Instant::now();
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
@@ -207,7 +214,7 @@ impl Mux {
             m.die();
         });
         let m = mux.clone();
-        tokio::spawn(async move {
+        io::spawn(move || {
             let limit = dead_limit(m.link.kind());
             // A live server answers a ping well inside the dead limit, so silence means it is gone.
             let ping_every = PING_EVERY.min(limit / 3).max(Duration::from_millis(500));
@@ -215,7 +222,7 @@ impl Mux {
             let mut since_ping = Duration::ZERO;
             let mut n = 0u64;
             loop {
-                tokio::time::sleep(step).await;
+                io::sleep(step);
                 if m.is_dead() {
                     break;
                 }
@@ -246,14 +253,17 @@ impl Mux {
     }
 
     /// Resolves when the link is closed. A missed wake is caught on the next check.
-    pub async fn until_dead(&self) {
+    pub fn until_dead(&self) {
         loop {
             if self.is_dead() {
                 return;
             }
-            tokio::select! {
-                _ = self.gone.notified() => return,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            match io::race_biased(vec![
+                Box::new(|| { self.gone.notified(); DeadWait::Gone }),
+                Box::new(|| { io::sleep(Duration::from_millis(200)); DeadWait::Tick }),
+            ]) {
+                DeadWait::Gone => return,
+                DeadWait::Tick => {}
             }
         }
     }
@@ -287,15 +297,11 @@ impl Mux {
         self.queue(stream, msg, 0);
     }
 
-    pub async fn post_bulk(&self, stream: u32, msg: &ClientMsg, bytes: usize) -> std::io::Result<()> {
+    pub fn post_bulk(&self, stream: u32, msg: &ClientMsg, bytes: usize) -> std::io::Result<()> {
         let n = bytes.clamp(1, WINDOW);
         assert!(n >= 1);
         assert!(n <= WINDOW);
-        let permit = self
-            .window
-            .acquire_many(n as u32)
-            .await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the server went away"))?;
+        let permit = self.window.acquire_many(n as u32)?;
         permit.forget();
         self.queue(stream, msg, n);
         Ok(())
@@ -319,8 +325,8 @@ impl Mux {
         self.state.lock().unwrap().next_id()
     }
 
-    pub fn expect_missing(&self, id: u64) -> oneshot::Receiver<Missing> {
-        let (tx, rx) = oneshot::channel();
+    pub fn expect_missing(&self, id: u64) -> io::oneshot::Receiver<Missing> {
+        let (tx, rx) = io::oneshot::channel();
         let rejected = self.state.lock().unwrap().expect_missing(id, tx);
         drop(rejected);
         rx

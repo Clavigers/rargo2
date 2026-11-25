@@ -761,7 +761,7 @@ impl Placer {
         self.waiting.wanting()
     }
 
-    pub fn awaiting(&self, hash: &Digest) -> bool {
+    pub fn pending(&self, hash: &Digest) -> bool {
         self.waiting.waits_for(hash) || self.parts.contains_key(hash)
     }
 

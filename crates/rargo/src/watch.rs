@@ -125,25 +125,24 @@ pub enum Registration {
 }
 
 pub struct Watcher {
-    fd: tokio::io::unix::AsyncFd<OwnedFd>,
+    fd: OwnedFd,
     state: Mutex<WatchState>,
 }
 
 impl Watcher {
     pub fn new() -> std::io::Result<Watcher> {
-        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }.map_err(std::io::Error::from)?;
         Ok(Watcher { fd, state: Mutex::new(WatchState::default()) })
     }
 
     pub fn add(&self, dir: &Path, owner: u64) -> std::io::Result<Registration> {
         let c = CString::new(dir.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
         let mut state = self.state.lock().unwrap();
-        let wd = unsafe { libc::inotify_add_watch(self.fd.get_ref().as_raw_fd(), c.as_ptr(), MASK) };
+        let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), c.as_ptr(), MASK) };
         let result = if wd >= 0 {
             WatchResult::Added(wd)
         } else {
@@ -163,7 +162,7 @@ impl Watcher {
     pub fn remove(&self, wd: i32, dir: &Path) {
         let mut state = self.state.lock().unwrap();
         if state.remove(wd, dir) {
-            unsafe { libc::inotify_rm_watch(self.fd.get_ref().as_raw_fd(), wd) };
+            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
         }
     }
 
@@ -176,37 +175,35 @@ impl Watcher {
     pub fn forget(&self, owner: u64) {
         let mut state = self.state.lock().unwrap();
         for wd in state.forget(owner) {
-            unsafe { libc::inotify_rm_watch(self.fd.get_ref().as_raw_fd(), wd) };
+            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
         }
     }
 
-    pub async fn next(&self) -> std::io::Result<Changes> {
-        let mut buf = vec![0u8; 64 << 10];
+    pub fn next(&self) -> std::io::Result<Changes> {
         loop {
-            let mut guard = self.fd.readable().await?;
-            let mut state = self.state.lock().unwrap();
-            let n = unsafe { libc::read(self.fd.get_ref().as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    guard.clear_ready();
-                    continue;
-                }
-                return Err(e);
-            }
-            let mut out = Changes::default();
-            let mut at = 0usize;
-            let n = n as usize;
-            const HEAD: usize = std::mem::size_of::<libc::inotify_event>();
-            while at + HEAD <= n {
-                let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at) as *const _) };
-                at += HEAD + ev.len as usize;
-                state.apply(Event { descriptor: ev.wd, mask: ev.mask }, &mut out);
-            }
+            let buf = rargo_net::io::read_ready(self.fd.as_raw_fd(), 64 << 10)?;
+            let out = self.parse(&buf);
             if !out.is_empty() {
                 return Ok(out);
             }
         }
+    }
+
+    pub fn queued(&self) -> std::io::Result<Option<Changes>> {
+        Ok(rargo_net::io::try_read(self.fd.as_raw_fd(), 64 << 10)?.map(|buf| self.parse(&buf)))
+    }
+
+    fn parse(&self, buf: &[u8]) -> Changes {
+        let mut state = self.state.lock().unwrap();
+        let mut out = Changes::default();
+        let mut at = 0usize;
+        const HEAD: usize = std::mem::size_of::<libc::inotify_event>();
+        while at + HEAD <= buf.len() {
+            let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(at) as *const _) };
+            at += HEAD + ev.len as usize;
+            state.apply(Event { descriptor: ev.wd, mask: ev.mask }, &mut out);
+        }
+        out
     }
 }
 

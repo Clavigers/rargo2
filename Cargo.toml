@@ -20,7 +20,8 @@ dashmap = "6"
 rayon = "1"
 zstd = "0.13"
 redb = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal", "process", "fs"] }
+io-uring = "0.7"
+corosensei = "0.3"
 tempfile = "3"
 
 [profile.dev]

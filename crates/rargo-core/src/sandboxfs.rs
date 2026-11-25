@@ -369,6 +369,9 @@ impl SandboxFs {
     pub fn attach(&self, session: Arc<Session>) {
         let _ = self.session.set(session);
     }
+}
+
+impl SandboxFs {
 
     pub fn stats(&self) -> &FsStats {
         &self.stats

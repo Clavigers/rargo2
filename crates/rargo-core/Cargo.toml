@@ -30,9 +30,7 @@ dashmap.workspace = true
 rayon.workspace = true
 zstd.workspace = true
 redb.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
 expect-test = "1.5"

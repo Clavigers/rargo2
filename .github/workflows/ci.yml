@@ -39,6 +39,14 @@ jobs:
         run: git fetch -q --depth=1 origin main && python3 -I dev/purity.py ratchet FETCH_HEAD
       - name: The shipped client
         run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
+      - name: io_uring runs on the runner, and a default Docker container refuses it with what to change
+        run: |
+          d=$(mktemp -d)
+          rc=0; HOME=$d RARGO_SERVER=127.0.0.1:1 RARGO_CACHE_DIR=$d/cache timeout 3 target/x86_64-unknown-linux-musl/release/rargo --rargo-daemon $d/probe.sock || rc=$?
+          test $rc = 124
+          rc=0; out=$(docker run --rm -e RARGO_SERVER=127.0.0.1:1 -e HOME=/tmp -v $PWD/target/x86_64-unknown-linux-musl/release:/b:ro ubuntu:24.04 /b/rargo --rargo-daemon /tmp/probe.sock 2>&1) || rc=$?
+          echo "$out"
+          test $rc = 1 && grep -q 'io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out" && grep -q 'seccomp=unconfined' <<<"$out"
       - name: The crates that are published
         run: nix develop --command cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh

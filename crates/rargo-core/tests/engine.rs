@@ -1,6 +1,7 @@
 use rargo_core::buildview::*;
 use rargo_core::engine::*;
 use rargo_core::hash::Hash;
+use rargo_core::io;
 use rargo_core::sandbox::{NetMode, Zygote};
 use rargo_core::sandboxfs::SandboxFs;
 use rargo_core::sched::{Priority, Scheduler};
@@ -18,6 +19,7 @@ struct Fx {
     work: std::path::PathBuf,
     engine: Arc<Engine>,
     memo: Arc<HostMemo>,
+    fs: Arc<SandboxFs>,
     session: Arc<fusewire::Session>,
 }
 
@@ -60,15 +62,14 @@ fn fixture_with(action_timeout: std::time::Duration) -> Fx {
             .unwrap(),
     );
     fs.attach(session.clone());
-    session.spawn_workers(fs.clone(), 4).unwrap();
     let zygote = Zygote::start(&sandbox_helper()).unwrap();
     let sched = Scheduler::new(8, u64::MAX).unwrap();
-    let mut engine = Engine::new(store, content, fs, mnt, zygote, sched);
+    let mut engine = Engine::new(store, content, fs.clone(), mnt, zygote, sched);
     engine.action_timeout = action_timeout;
     let engine = Arc::new(engine);
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
-    Fx { work, engine, memo: Arc::new(HostMemo::default()), session, _tmp: tmp }
+    Fx { work, engine, memo: Arc::new(HostMemo::default()), fs, session, _tmp: tmp }
 }
 
 impl Fx {
@@ -134,18 +135,15 @@ impl Fx {
     }
 }
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
-}
-
 #[test]
 fn replays_until_an_observed_input_changes() {
     let fx = fixture();
     std::fs::write(fx.work.join("in.txt"), "one\n").unwrap();
     std::fs::write(fx.work.join("other.txt"), "x\n").unwrap();
     let script = "cat in.txt > out.txt; echo printed; echo warned >&2; test -e missing.txt || true";
-    rt().block_on(async {
-        let a = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
+    io::drive(1, move || {
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let a = fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap();
         assert!(!a.cached && a.result.success());
         assert_eq!(fx.text(&a.result.stdout), "printed\n");
         assert_eq!(fx.text(&a.result.stderr), "warned\n");
@@ -155,27 +153,27 @@ fn replays_until_an_observed_input_changes() {
         assert!(!fx.work.join("out.txt").exists());
         assert_eq!(fx.runs(), 1);
 
-        let b = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
+        let b = fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap();
         assert!(b.cached);
         assert_eq!(fx.runs(), 1);
 
         std::fs::write(fx.work.join("other.txt"), "changed\n").unwrap();
-        assert!(fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap().cached);
+        assert!(fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap().cached);
 
         std::fs::write(fx.work.join("in.txt"), "two\n").unwrap();
-        let c = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
+        let c = fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap();
         assert!(!c.cached);
         let Some(MEntry::File { hash, .. }) = c.result.outputs.get(b"/w/out.txt") else { panic!() };
         assert_eq!(fx.text(hash), "two\n");
         assert_eq!(fx.runs(), 2);
 
         std::fs::write(fx.work.join("missing.txt"), "now here\n").unwrap();
-        assert!(!fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap().cached);
+        assert!(!fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap().cached);
         assert_eq!(fx.runs(), 3);
 
         std::fs::remove_file(fx.work.join("missing.txt")).unwrap();
         std::fs::write(fx.work.join("in.txt"), "one\n").unwrap();
-        let d = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
+        let d = fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap();
         assert!(d.cached);
         assert_eq!(fx.runs(), 3);
     });
@@ -189,15 +187,16 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
     std::fs::write(fx.work.join("in.txt"), "first\n").unwrap();
     std::fs::write(other.join("in.txt"), "second\n").unwrap();
     let script = "sleep 0.5; cat in.txt";
-    rt().block_on(async {
+    io::drive(1, move || {
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
         let e = fx.engine.clone();
         let r1 = fx.req(script, &[], &[], &[]);
-        let first = tokio::spawn(async move { e.obtain(r1).await.unwrap() });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let mut first = io::spawn(move || e.obtain(r1).unwrap());
+        io::sleep(std::time::Duration::from_millis(150));
         let mut r2 = fx.req(script, &[], &[], &[]);
         r2.view = fx.view_of(&other);
-        let second = fx.engine.obtain(r2).await.unwrap();
-        let first = first.await.unwrap();
+        let second = fx.engine.obtain(r2).unwrap();
+        let first = first.join().unwrap();
         assert_eq!(fx.text(&first.result.stdout), "first\n");
         assert_eq!(fx.text(&second.result.stdout), "second\n", "the waiter must not accept a result for other inputs");
         assert_eq!(fx.runs(), 2);
@@ -208,12 +207,12 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
         std::fs::write(other.join("in.txt"), "fourth\n").unwrap();
         let e = fx.engine.clone();
         let r1 = fx.req(script, &[], &[], &[]);
-        let a = tokio::spawn(async move { e.obtain(r1).await.unwrap() });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut a = io::spawn(move || e.obtain(r1).unwrap());
+        io::sleep(std::time::Duration::from_millis(100));
         let mut r2 = fx.req(script, &[], &[], &[]);
         r2.view = fx.view_of(&other);
-        let b = fx.engine.obtain(r2).await.unwrap();
-        let a = a.await.unwrap();
+        let b = fx.engine.obtain(r2).unwrap();
+        let a = a.join().unwrap();
         assert_eq!(fx.text(&a.result.stdout), "third\n");
         assert_eq!(fx.text(&b.result.stdout), "fourth\n");
         assert_eq!(fx.runs(), 4);
@@ -225,20 +224,21 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
 fn declared_environment_variables_become_part_of_the_key() {
     let fx = fixture();
     let script = "echo value=$FOO";
-    rt().block_on(async {
-        let a = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).await.unwrap();
+    io::drive(1, move || {
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let a = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).unwrap();
         assert_eq!(fx.text(&a.result.stdout), "value=bar\n");
         assert_eq!(fx.runs(), 2);
-        let b = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).await.unwrap();
+        let b = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).unwrap();
         assert!(b.cached);
         assert_eq!(fx.text(&b.result.stdout), "value=bar\n");
-        let c = fx.engine.obtain(fx.req(script, &[], &[("FOO", "baz")], &["FOO"])).await.unwrap();
+        let c = fx.engine.obtain(fx.req(script, &[], &[("FOO", "baz")], &["FOO"])).unwrap();
         assert!(!c.cached);
         assert_eq!(fx.text(&c.result.stdout), "value=baz\n");
-        let d = fx.engine.obtain(fx.req(script, &[], &[], &["FOO"])).await.unwrap();
+        let d = fx.engine.obtain(fx.req(script, &[], &[], &["FOO"])).unwrap();
         assert!(d.cached);
         assert_eq!(fx.text(&d.result.stdout), "value=\n");
-        let e = fx.engine.obtain(fx.req("echo other=$BAR", &[], &[("BAR", "x")], &[])).await.unwrap();
+        let e = fx.engine.obtain(fx.req("echo other=$BAR", &[], &[("BAR", "x")], &[])).unwrap();
         assert_eq!(fx.text(&e.result.stdout), "other=\n");
     });
 }
@@ -246,15 +246,16 @@ fn declared_environment_variables_become_part_of_the_key() {
 #[test]
 fn failures_are_not_cached_unless_allowed() {
     let fx = fixture();
-    rt().block_on(async {
-        let a = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).await.unwrap();
+    io::drive(1, move || {
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let a = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).unwrap();
         assert_eq!(a.result.code(), Some(3));
-        let b = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).await.unwrap();
+        let b = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).unwrap();
         assert!(!b.cached);
         assert_eq!(fx.runs(), 2);
         let mut r = fx.req("true", &[], &[], &[]);
         r.spec.argv = vec![b"/no/such/program".to_vec()];
-        let err = fx.engine.obtain(r).await.err().expect("must fail").to_string();
+        let err = fx.engine.obtain(r).err().expect("must fail").to_string();
         assert!(err.contains("could not start"), "{err}");
     });
 }
@@ -267,7 +268,8 @@ fn large_directories_list_completely_through_a_build_view() {
     for i in 0..400 {
         std::fs::write(big.join(format!("libsomething-with-a-long-name-{i:04}-5cc9b44b3cc93987.rmeta")), "x").unwrap();
     }
-    rt().block_on(async {
+    io::drive(1, move || {
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
         let mut r = fx.req("ls /w/big | wc -l; ls -la /w/big | grep -c rmeta; ls /w/big | sort | uniq -d | wc -l", &[], &[], &[]);
         let base = {
             let g = fx.memo.advance();
@@ -289,30 +291,28 @@ fn large_directories_list_completely_through_a_build_view() {
             seed: None,
             content: None,
         });
-        let o = fx.engine.obtain(r).await.unwrap();
+        let o = fx.engine.obtain(r).unwrap();
         assert_eq!(fx.text(&o.result.stdout), "400\n400\n0\n");
     });
 }
 
 #[test]
 fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
-    let fx = fixture_with(std::time::Duration::from_secs(600));
-    let paused = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
-    paused.block_on(async {
+    let fx = fixture_with(std::time::Duration::from_secs(1));
+    io::drive(1, move || {
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
         let mut tasks = Vec::new();
         for _ in 0..3 {
             let e = fx.engine.clone();
             let r = fx.req("sleep 100000", &[], &[], &[]);
-            tasks.push(tokio::spawn(async move { e.obtain(r).await }));
+            tasks.push(io::spawn(move || e.obtain(r)));
         }
-        for t in tasks {
-            let e = t.await.unwrap().err().expect("a hung action fails");
-            assert!(e.to_string().contains("ran longer than 600 s"), "{e:#}");
+        for t in &mut tasks {
+            let e = t.join().unwrap().err().expect("a hung action fails");
+            assert!(e.to_string().contains("ran longer than 1 s"), "{e:#}");
         }
         assert_eq!(fx.runs(), 1, "three identical requests, one run, and no rerun by the waiters");
-    });
-    rt().block_on(async {
-        let ok = fx.engine.obtain(fx.req("echo fine", &[], &[], &[])).await.unwrap();
+        let ok = fx.engine.obtain(fx.req("echo fine", &[], &[], &[])).unwrap();
         assert_eq!(fx.text(&ok.result.stdout), "fine\n");
     });
 }

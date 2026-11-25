@@ -13,10 +13,9 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use rargo_net::io::{self, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 const PROBE_FROM: u64 = 32 << 10;
 const MOST_PARTIALS: usize = 64;
@@ -68,10 +67,10 @@ struct Worktree {
     root: PathBuf,
     wt_id: String,
     wt_cache: PathBuf,
-    state: tokio::sync::Mutex<WtState>,
+    state: io::Mutex<WtState>,
     events: Mutex<HashSet<PathBuf>>,
-    changed: tokio::sync::Notify,
-    running: tokio::sync::Mutex<()>,
+    changed: io::Notify,
+    running: io::Mutex<()>,
     last_used: Mutex<Instant>,
     out: Mutex<Option<Mounted>>,
     out_failed: AtomicBool,
@@ -82,7 +81,7 @@ pub struct Daemon {
     cache: PathBuf,
     host: String,
     transport: String,
-    mux: tokio::sync::Mutex<Option<Arc<Mux>>>,
+    mux: io::Mutex<Option<Arc<Mux>>>,
     worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
     watcher: Option<Arc<Watcher>>,
     next_wt: AtomicU64,
@@ -90,15 +89,14 @@ pub struct Daemon {
     active: AtomicUsize,
     last_active: Mutex<Instant>,
     pub counters: Counters,
-    big_sync: tokio::sync::Mutex<()>,
-    fetching: Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
+    big_sync: io::Mutex<()>,
+    fetching: Mutex<HashMap<Digest, Arc<io::Mutex<()>>>>,
     partials: Mutex<HashMap<Digest, (u64, Arc<Partial>)>>,
     chunks: Mutex<crate::known::Chunks>,
     chunks_changed: AtomicBool,
     knowledge: Mutex<DaemonState>,
     held_file: crate::known::HeldFile,
     saving_held: Mutex<()>,
-    handle: tokio::runtime::Handle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,7 +109,7 @@ enum Probe {
 enum Offered {
     Sent,
     Changed,
-    Bet(tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>),
+    Bet(io::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>),
 }
 
 enum CommandEffect {
@@ -502,14 +500,14 @@ impl Daemon {
             cache,
             host: crate::hostname(),
             transport: std::env::var("RARGO_TRANSPORT").unwrap_or_default(),
-            mux: tokio::sync::Mutex::new(None),
+            mux: io::Mutex::new(None),
             worktrees: Mutex::new(HashMap::new()),
             watcher,
             next_wt: AtomicU64::new(1),
             active: AtomicUsize::new(0),
             last_active: Mutex::new(Instant::now()),
             counters: Counters::default(),
-            big_sync: tokio::sync::Mutex::new(()),
+            big_sync: io::Mutex::new(()),
             fetching: Mutex::new(HashMap::new()),
             partials: Mutex::new(HashMap::new()),
             chunks: Mutex::new(chunks),
@@ -517,51 +515,60 @@ impl Daemon {
             knowledge: Mutex::new(DaemonState::new(held)),
             held_file,
             saving_held: Mutex::new(()),
-            handle: tokio::runtime::Handle::current(),
         });
         if let Some(w) = d.watcher.clone() {
             let d2 = d.clone();
-            tokio::spawn(async move {
-                loop {
-                    let Ok(events) = w.next().await else { break };
-                    let all: Vec<Arc<Worktree>> = d2.worktrees.lock().unwrap().values().cloned().collect();
-                    for wt in all {
-                        let paths = events.dirty.get(&wt.id);
-                        let rescan = events.rescan_all || events.rescan.contains(&wt.id);
-                        if let Some(paths) = paths {
-                            wt.events.lock().unwrap().extend(paths.iter().cloned());
-                        }
-                        if paths.is_some() || rescan {
-                            d2.knowledge.lock().unwrap().changed(wt.id, rescan);
-                            wt.changed.notify_one();
-                        }
-                    }
+            io::spawn(move || {
+                while let Ok(events) = w.next() {
+                    d2.take_changes(&events);
                 }
             });
         }
         d
     }
 
-    async fn mux(&self) -> std::io::Result<Arc<Mux>> {
-        let mut g = self.mux.lock().await;
+    fn take_changes(&self, events: &crate::watch::Changes) {
+        let all: Vec<Arc<Worktree>> = self.worktrees.lock().unwrap().values().cloned().collect();
+        for wt in all {
+            let paths = events.dirty.get(&wt.id);
+            let rescan = events.rescan_all || events.rescan.contains(&wt.id);
+            if let Some(paths) = paths {
+                wt.events.lock().unwrap().extend(paths.iter().cloned());
+            }
+            if paths.is_some() || rescan {
+                self.knowledge.lock().unwrap().changed(wt.id, rescan);
+                wt.changed.notify_one();
+            }
+        }
+    }
+
+    fn take_queued_changes(&self) {
+        let Some(w) = &self.watcher else { return };
+        while let Ok(Some(events)) = w.queued() {
+            self.take_changes(&events);
+        }
+    }
+
+    fn mux(&self) -> std::io::Result<Arc<Mux>> {
+        let mut g = self.mux.lock();
         let alive = g.as_ref().is_some_and(|mux| !mux.is_dead());
         if self.knowledge.lock().unwrap().link(alive, Need::Must) == daemon_state::Link::Use {
             return Ok(g.as_ref().unwrap().clone());
         }
-        let addr = tokio::net::lookup_host(&self.cfg.server)
-            .await
+        let addr = io::lookup_host(&self.cfg.server)
             .map_err(no_link)?
+            .into_iter()
             .next()
             .ok_or_else(|| no_link(std::io::Error::new(std::io::ErrorKind::NotFound, "the server's name has no address")))?;
-        let link = Link::connect(addr, &self.cfg.user, &self.cfg.psk, &self.transport).await.map_err(no_link)?;
+        let link = Link::connect(addr, &self.cfg.user, &self.cfg.psk, &self.transport).map_err(no_link)?;
         let m = Mux::new(link);
         *g = Some(m.clone());
         self.knowledge.lock().unwrap().connected();
         Ok(m)
     }
 
-    async fn mux_if_up(&self) -> Option<Arc<Mux>> {
-        let link = self.mux.lock().await;
+    fn mux_if_up(&self) -> Option<Arc<Mux>> {
+        let link = self.mux.lock();
         let alive = link.as_ref().is_some_and(|mux| !mux.is_dead());
         match self.knowledge.lock().unwrap().link(alive, Need::IfUp) {
             daemon_state::Link::Use => link.clone(),
@@ -586,7 +593,7 @@ impl Daemon {
         let wt = Arc::new(Worktree {
             id: self.next_wt.fetch_add(1, Ordering::Relaxed),
             root: root.to_path_buf(),
-            state: tokio::sync::Mutex::new(WtState {
+            state: io::Mutex::new(WtState {
                 policy_dir: PathBuf::new(),
                 loaded: Some(scan::Index::load(&wt_cache.join("index"))),
                 last: None,
@@ -598,8 +605,8 @@ impl Daemon {
             wt_id,
             wt_cache,
             events: Mutex::new(HashSet::new()),
-            changed: tokio::sync::Notify::new(),
-            running: tokio::sync::Mutex::new(()),
+            changed: io::Notify::new(),
+            running: io::Mutex::new(()),
             last_used: Mutex::new(Instant::now()),
             out: Mutex::new(None),
             out_failed: AtomicBool::new(false),
@@ -608,19 +615,19 @@ impl Daemon {
         all.insert(root.to_path_buf(), wt.clone());
         if self.watcher.is_some() {
             let (d, w) = (self.clone(), Arc::downgrade(&wt));
-            tokio::spawn(async move {
+            io::spawn(move || {
                 loop {
                     let Some(wt) = w.upgrade() else { break };
-                    wt.changed.notified().await;
+                    wt.changed.notified();
                     if !d.worktrees.lock().unwrap().values().any(|x| x.id == wt.id) {
                         break;
                     }
-                    tokio::time::sleep(SETTLE).await;
-                    let Some(mux) = d.mux_if_up().await else { continue };
-                    let _running = wt.running.lock().await;
-                    let mut st = wt.state.lock().await;
-                    if let Ok((snap, _)) = d.fresh(&wt, &mut st).await {
-                        let _ = d.offer(&mux, &wt, &snap, Probe::Wait).await;
+                    io::sleep(SETTLE);
+                    let Some(mux) = d.mux_if_up() else { continue };
+                    let _running = wt.running.lock();
+                    let mut st = wt.state.lock();
+                    if let Ok((snap, _)) = d.fresh(&wt, &mut st) {
+                        let _ = d.offer(&mux, &wt, &snap, Probe::Wait);
                     }
                 }
             });
@@ -628,7 +635,8 @@ impl Daemon {
         wt
     }
 
-    async fn fresh(&self, wt: &Arc<Worktree>, st: &mut WtState) -> std::io::Result<(Arc<Snap>, bool)> {
+    fn fresh(&self, wt: &Arc<Worktree>, st: &mut WtState) -> std::io::Result<(Arc<Snap>, bool)> {
+        self.take_queued_changes();
         let head = git::head(&wt.root);
         let watching = self.watcher.is_some();
         let plan = self.knowledge.lock().unwrap().plan_scan(wt.id, head.as_ref(), watching);
@@ -648,7 +656,7 @@ impl Daemon {
         let (root, cache, wt_cache) = (wt.root.clone(), self.cache.clone(), wt.wt_cache.clone());
         let (previous, loaded) = (st.last.take(), st.loaded.take());
         let policy_dir = st.policy_dir.clone();
-        let snap = tokio::task::spawn_blocking(move || -> std::io::Result<Snap> {
+        let snap = io::cpu(move || -> std::io::Result<Snap> {
             let mut policy = crate::load_policy(&root, &policy_dir);
             if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
@@ -700,9 +708,7 @@ impl Daemon {
                 }
             }
             Ok(Snap { scan, policy, head, left_out })
-        })
-        .await
-        .map_err(std::io::Error::other)??;
+        })?;
         if snap.scan.listed_dirs < snap.scan.dirs.len() as u64 {
             self.counters.rescans.fetch_add(1, Ordering::Relaxed);
             self.counters.rescanned_dirs.fetch_add(snap.scan.listed_dirs, Ordering::Relaxed);
@@ -777,7 +783,7 @@ impl Daemon {
         }
     }
 
-    async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>, probe: Probe) -> std::io::Result<Offered> {
+    fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>, probe: Probe) -> std::io::Result<Offered> {
         let delta = || -> (Vec<Digest>, Vec<(Digest, u64)>) {
             self.knowledge.lock().unwrap().offer(
                 Some(wt.id),
@@ -791,7 +797,7 @@ impl Daemon {
             return Ok(Offered::Sent);
         }
         let _one_at_a_time = if blobs.iter().map(|(_, s)| *s).sum::<u64>() > PUSH_BLIND {
-            let turn = self.big_sync.lock().await;
+            let turn = self.big_sync.lock();
             (trees, blobs) = delta();
             if trees.is_empty() && blobs.is_empty() {
                 return Ok(Offered::Sent);
@@ -831,7 +837,7 @@ impl Daemon {
         if blob_bytes <= PUSH_BLIND && probe != Probe::Wait {
             let snap2 = snap.clone();
             let wanted: Vec<Digest> = blobs.iter().map(|(d, _)| *d).collect();
-            let packed = tokio::task::spawn_blocking(move || -> Option<Vec<Blob>> {
+            let packed = io::cpu(move || -> Option<Vec<Blob>> {
                 wanted
                     .iter()
                     .map(|h| {
@@ -840,27 +846,25 @@ impl Daemon {
                         (*blake3::hash(&bytes).as_bytes() == *h).then(|| Blob::pack(*h, &bytes))
                     })
                     .collect()
-            })
-            .await
-            .map_err(std::io::Error::other)?;
+            });
             let Some(packed) = packed else {
                 self.knowledge.lock().unwrap().changed(wt.id, true);
                 return Ok(Offered::Changed);
             };
             self.counters.offered_bytes.fetch_add(tree_bytes + blob_bytes, Ordering::Relaxed);
             let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: packed, ask: false }));
-            mux.post_bulk(CONTROL, &msg, (tree_bytes + blob_bytes) as usize).await?;
+            mux.post_bulk(CONTROL, &msg, (tree_bytes + blob_bytes) as usize)?;
         } else {
             let mut encoded = encoded;
             let mut tree_bytes = tree_bytes;
             let mut known = if tree_bytes > PROBE_FROM && probe != Probe::Whole {
                 let answer = mux.expect_missing(id);
                 let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: Vec::new(), blobs: Vec::new(), ask: true }));
-                mux.post_bulk(CONTROL, &msg, 0).await?;
+                mux.post_bulk(CONTROL, &msg, 0)?;
                 if probe == Probe::Bet {
                     return Ok(Offered::Bet(answer));
                 }
-                let (lacking_trees, lacking_blobs) = answer.await.map_err(|_| lost())?;
+                let (lacking_trees, lacking_blobs) = answer.recv().ok_or_else(lost)?;
                 if !lacking_trees.is_empty() || !lacking_blobs.is_empty() {
                     self.knowledge.lock().unwrap().missing(lacking_trees.iter().chain(&lacking_blobs));
                 }
@@ -876,8 +880,8 @@ impl Daemon {
                 let answer = mux.expect_missing(id);
                 self.counters.offered_bytes.fetch_add(tree_bytes, Ordering::Relaxed);
                 let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: Vec::new(), ask: true }));
-                mux.post_bulk(CONTROL, &msg, tree_bytes as usize).await?;
-                let (lacking_trees, lacking_blobs) = answer.await.map_err(|_| lost())?;
+                mux.post_bulk(CONTROL, &msg, tree_bytes as usize)?;
+                let (lacking_trees, lacking_blobs) = answer.recv().ok_or_else(lost)?;
                 if !lacking_trees.is_empty() || !lacking_blobs.is_empty() {
                     self.knowledge.lock().unwrap().missing(lacking_trees.iter().chain(&lacking_blobs));
                 }
@@ -892,7 +896,7 @@ impl Daemon {
             };
             let bytes: u64 = missing.iter().filter_map(|h| snap.scan.files.get(h)).map(|(_, s)| *s).sum();
             self.counters.offered_bytes.fetch_add(bytes, Ordering::Relaxed);
-            if !upload(mux, CONTROL, snap, missing).await? {
+            if !upload(mux, CONTROL, snap, missing)? {
                 self.knowledge.lock().unwrap().changed(wt.id, true);
                 return Ok(Offered::Changed);
             }
@@ -937,8 +941,7 @@ impl Daemon {
             return None;
         }
         if let Some(m) = &*g {
-            use std::os::unix::fs::MetadataExt;
-            if m.session.shown() && std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
+            if m.session.shown() && dev_at(&mountinfo(), &m.dir) == Some(m.dev) {
                 return Some((m.fs.clone(), m.dir.clone()));
             }
             if let Some(m) = g.take() {
@@ -975,7 +978,7 @@ impl Daemon {
         if !tag.exists() {
             std::fs::write(&tag, rargo_proto::CACHEDIR_TAG)?;
         }
-        let source = Box::new(Contents { d: Arc::downgrade(self), handle: self.handle.clone() });
+        let source = Box::new(Contents { d: Arc::downgrade(self) });
         let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
         let root = unsafe { libc::geteuid() } == 0;
         let opts = fusewire::MountOptions {
@@ -987,12 +990,8 @@ impl Daemon {
         };
         let session = Arc::new(fusewire::Session::mount(&dir, &opts)?);
         fs.attach(session.clone());
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(8, 32);
-        session.spawn_workers(fs.clone(), threads)?;
-        let dev = {
-            use std::os::unix::fs::MetadataExt;
-            std::fs::metadata(&dir)?.dev()
-        };
+        rargo_net::io::FuseDrive::spawn(&session, &fs).detach();
+        let dev = dev_at(&mountinfo(), &dir).ok_or_else(|| std::io::Error::other("the mount does not show in /proc/self/mountinfo"))?;
         Ok(Mounted { fs, session, dir, dev })
     }
 
@@ -1018,30 +1017,30 @@ impl Daemon {
         }
     }
 
-    async fn partial(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<Option<Arc<Partial>>> {
+    fn partial(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<Option<Arc<Partial>>> {
         if let Some((_, p)) = self.partials.lock().unwrap().get(&hash) {
             return Ok(Some(p.clone()));
         }
         let turn = self.fetching.lock().unwrap().entry(hash).or_default().clone();
-        let _turn = turn.lock().await;
+        let _turn = turn.lock();
         if let Some((_, p)) = self.partials.lock().unwrap().get(&hash) {
             return Ok(Some(p.clone()));
         }
-        let mux = self.mux().await?;
+        let mux = self.mux()?;
         let (tx, mut rx) = unbounded_channel();
         let id = mux.ask(&tx, |id| ClientMsg::Recipe { id, hash });
         let mut answer = None;
         loop {
-            match next_msg(&mux, &mut rx).await? {
+            match next_msg(&mux, &mut rx)? {
                 ServerMsg::Recipe { chunks, outline, lazy, .. } => answer = Some((chunks, outline, lazy)),
                 ServerMsg::Fetched { id: got } if got == id => break,
                 _ => {}
             }
         }
         let Some((chunks, outline, lazy)) = answer.filter(|(c, o, _)| !c.is_empty() && !o.is_empty()) else { return Ok(None) };
-        let fetcher = Arc::new(ChunkFetcher { d: Arc::downgrade(self), handle: self.handle.clone() });
+        let fetcher = Arc::new(ChunkFetcher { d: Arc::downgrade(self) });
         let slot = crate::place::cache_slot(&self.cache, &hash);
-        let p = tokio::task::block_in_place(|| Partial::new(hash, size, chunks, outline, &lazy, &slot, fetcher))?;
+        let p = io::cpu(|| Partial::new(hash, size, chunks, outline, &lazy, &slot, fetcher))?;
         self.counters.fetched_contents.fetch_add(1, Ordering::Relaxed);
         let mut partials = self.partials.lock().unwrap();
         while partials.len() >= MOST_PARTIALS {
@@ -1077,15 +1076,15 @@ impl Daemon {
         need
     }
 
-    async fn fetch_chunks(self: &Arc<Self>, p: &Arc<Partial>, idx: Vec<u32>) -> Vec<u32> {
-        let Ok(mux) = self.mux().await else { return idx };
+    fn fetch_chunks(self: &Arc<Self>, p: &Arc<Partial>, idx: Vec<u32>) -> Vec<u32> {
+        let Ok(mux) = self.mux() else { return idx };
         let mut left: HashSet<u32> = idx.iter().copied().collect();
         let (tx, mut rx) = unbounded_channel();
         let hash = *p.hash();
         let id = mux.ask(&tx, |id| ClientMsg::Chunks { id, hash, idx });
         loop {
-            match next_msg(&mux, &mut rx).await {
-                Ok(ServerMsg::Chunks { chunks, .. }) => tokio::task::block_in_place(|| {
+            match next_msg(&mux, &mut rx) {
+                Ok(ServerMsg::Chunks { chunks, .. }) => io::cpu(|| {
                     for (i, part) in chunks {
                         let Ok(data) = part.unpack() else { continue };
                         self.counters.fetched_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1116,23 +1115,23 @@ impl Daemon {
         self.partials.lock().unwrap().remove(p.hash());
     }
 
-    async fn fetch_content(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<PathBuf> {
+    fn fetch_content(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<PathBuf> {
         if let Some(p) = crate::place::cached(&self.cache, &hash, size) {
             return Ok(p);
         }
         let turn = self.fetching.lock().unwrap().entry(hash).or_default().clone();
-        let _turn = turn.lock().await;
+        let _turn = turn.lock();
         if let Some(p) = crate::place::cached(&self.cache, &hash, size) {
             return Ok(p);
         }
-        let mux = self.mux().await?;
+        let mux = self.mux()?;
         self.counters.fetched_contents.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = unbounded_channel();
         if size >= rargo_proto::CHUNKED_FROM {
             let id = mux.ask(&tx, |id| ClientMsg::Recipe { id, hash });
             let mut recipe: Vec<(Digest, u32)> = Vec::new();
             loop {
-                match next_msg(&mux, &mut rx).await? {
+                match next_msg(&mux, &mut rx)? {
                     ServerMsg::Recipe { chunks, .. } => recipe = chunks,
                     ServerMsg::Fetched { id: got } if got == id => break,
                     _ => {}
@@ -1152,7 +1151,7 @@ impl Daemon {
                     at += *len as u64;
                 }
                 let mut need: Vec<u32> = Vec::new();
-                tokio::task::block_in_place(|| {
+                io::cpu(|| {
                     use std::os::unix::fs::FileExt;
                     for (i, (chunk, len)) in recipe.iter().enumerate() {
                         let held = self.chunks.lock().unwrap().get(chunk).copied();
@@ -1174,8 +1173,8 @@ impl Daemon {
                 if !need.is_empty() {
                     let id = mux.ask(&tx, |id| ClientMsg::Chunks { id, hash, idx: need });
                     loop {
-                        match next_msg(&mux, &mut rx).await? {
-                            ServerMsg::Chunks { chunks, .. } => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                        match next_msg(&mux, &mut rx)? {
+                            ServerMsg::Chunks { chunks, .. } => io::cpu(|| -> std::io::Result<()> {
                                 use std::os::unix::fs::FileExt;
                                 for (i, part) in chunks {
                                     let data = part.unpack()?;
@@ -1191,7 +1190,7 @@ impl Daemon {
                     }
                 }
                 drop(file);
-                let whole = tokio::task::block_in_place(|| scan::hash_file(&tmp, size));
+                let whole = io::cpu(|| scan::hash_file(&tmp, size));
                 if whole.ok() != Some(hash) {
                     let _ = std::fs::remove_file(&tmp);
                     return Err(std::io::Error::other("the server sent content that does not match its hash"));
@@ -1212,8 +1211,8 @@ impl Daemon {
         let id = mux.fetch(vec![hash], &tx);
         let mut placer = Placer::new(&self.cache, Placed::default());
         loop {
-            match next_msg(&mux, &mut rx).await? {
-                ServerMsg::Blobs(blobs) => tokio::task::block_in_place(|| -> std::io::Result<()> {
+            match next_msg(&mux, &mut rx)? {
+                ServerMsg::Blobs(blobs) => io::cpu(|| -> std::io::Result<()> {
                     for b in blobs {
                         let h = b.hash;
                         let bytes = b.unpack()?;
@@ -1222,7 +1221,7 @@ impl Daemon {
                     }
                     Ok(())
                 })?,
-                ServerMsg::BlobPart { hash: h, part, last } => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                ServerMsg::BlobPart { hash: h, part, last } => io::cpu(|| -> std::io::Result<()> {
                     let bytes = part.unpack()?;
                     self.counters.fetched_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     placer.part(h, &bytes, last)
@@ -1235,19 +1234,29 @@ impl Daemon {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the server no longer has this content"))
     }
 
-    pub async fn command(self: Arc<Self>, req: LocalRequest, out: UnboundedSender<LocalReply>) {
+    fn touch(&self) {
+        *self.last_active.lock().unwrap() = Instant::now();
+    }
+
+    fn close_down(&self, socket: &Path) {
+        self.unmount_all();
+        self.save_known();
+        let _ = std::fs::remove_file(socket);
+    }
+
+    pub fn command(self: Arc<Self>, req: LocalRequest, out: UnboundedSender<LocalReply>) {
         self.active.fetch_add(1, Ordering::SeqCst);
         struct Active<'a>(&'a Daemon);
         impl Drop for Active<'_> {
             fn drop(&mut self) {
                 let was = self.0.active.fetch_sub(1, Ordering::SeqCst);
                 assert!(was > 0, "every command that ends was counted when it began");
-                *self.0.last_active.lock().unwrap() = Instant::now();
+                self.0.touch();
             }
         }
         let _active = Active(&self);
         self.counters.commands.fetch_add(1, Ordering::Relaxed);
-        let reply = match self.run(&req, &out).await {
+        let reply = match self.run(&req, &out) {
             Ok(reply) => reply,
             Err(e) => {
                 if is_no_link(&e) {
@@ -1271,9 +1280,9 @@ impl Daemon {
         LocalReply::Exit(101)
     }
 
-    async fn run(self: &Arc<Self>, req: &LocalRequest, out: &UnboundedSender<LocalReply>) -> std::io::Result<LocalReply> {
+    fn run(self: &Arc<Self>, req: &LocalRequest, out: &UnboundedSender<LocalReply>) -> std::io::Result<LocalReply> {
         if req.kind == "status" {
-            return Ok(self.status(out).await);
+            return Ok(self.status(out));
         }
         if req.kind != "admin"
             && let Some(text) = free_bytes(&self.cache).and_then(|free| low_space_text(&self.cache, free))
@@ -1326,14 +1335,14 @@ impl Daemon {
             loop {
                 step = match step {
                     Step::Link => {
-                        link = Some(self.mux().await?);
+                        link = Some(self.mux()?);
                         command.linked()
                     }
                     Step::Request => {
                         let mux = link.clone().expect("a link before a request");
                         let (env, env_checked) = env_for(&Policy::default());
                         let run = RunRequest { env, env_checked, ..base.clone() };
-                        match self.converse(&mux, run, None, None, None, req, out, &mut command, None).await {
+                        match self.converse(&mux, run, None, None, None, req, out, &mut command, None) {
                             Ok(Some(reply)) => return Ok(reply),
                             Ok(None) => command.again(),
                             Err(_) if mux.is_dead() => command.link_lost(),
@@ -1356,7 +1365,7 @@ impl Daemon {
             return Ok(Self::fail(out, "the manifest must be inside the synced worktree".into()));
         };
         let wt = self.worktree(&root);
-        let _running = wt.running.lock().await;
+        let _running = wt.running.lock();
         let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
@@ -1381,18 +1390,18 @@ impl Daemon {
         loop {
             step = match step {
                 Step::Link => {
-                    link = Some(self.mux().await?);
+                    link = Some(self.mux()?);
                     phase("link to the server ready");
                     started = Instant::now();
                     command.linked()
                 }
                 Step::Scan => {
-                    let mut st = wt.state.lock().await;
+                    let mut st = wt.state.lock();
                     if st.policy_dir != policy_dir {
                         st.policy_dir.clone_from(&policy_dir);
                         self.knowledge.lock().unwrap().changed(wt.id, true);
                     }
-                    let (fresh, scanned) = self.fresh(&wt, &mut st).await?;
+                    let (fresh, scanned) = self.fresh(&wt, &mut st)?;
                     if let Some(note) = st.note.take() {
                         let _ = out.send(LocalReply::Stderr(note.into_bytes()));
                     }
@@ -1418,7 +1427,7 @@ impl Daemon {
                 }
                 Step::Offer(probe) => {
                     let (mux, fresh) = (link.clone().expect("a link before an offer"), snap.clone().expect("a scan before an offer"));
-                    match self.offer(&mux, &wt, &fresh, probe).await {
+                    match self.offer(&mux, &wt, &fresh, probe) {
                         Ok(Offered::Sent) => {
                             phase("worktree offered and what the server lacked sent");
                             command.offered(Sent::All)
@@ -1442,7 +1451,7 @@ impl Daemon {
                     let commits = match &fresh.head {
                         Some(h) => {
                             let (root, h, wt_cache) = (root.clone(), h.clone(), wt.wt_cache.clone());
-                            tokio::task::spawn_blocking(move || crate::recent_commits(&root, &h, &wt_cache)).await.unwrap_or_default()
+                            io::cpu(move || crate::recent_commits(&root, &h, &wt_cache))
                         }
                         None => Vec::new(),
                     };
@@ -1461,7 +1470,7 @@ impl Daemon {
                         ..base.clone()
                     };
                     phase("request sent");
-                    match self.converse(&mux, run, Some(&fresh), Some(&wt), shown.as_ref(), req, out, &mut command, bet.take()).await {
+                    match self.converse(&mux, run, Some(&fresh), Some(&wt), shown.as_ref(), req, out, &mut command, bet.take()) {
                         Ok(Some(reply)) => {
                             phase("answer complete");
                             return Ok(reply);
@@ -1490,7 +1499,7 @@ impl Daemon {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn converse(
+    fn converse(
         &self,
         mux: &Arc<Mux>,
         run: RunRequest,
@@ -1500,7 +1509,7 @@ impl Daemon {
         req: &LocalRequest,
         out: &UnboundedSender<LocalReply>,
         command: &mut CommandState,
-        mut bet: Option<tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
+        bet: Option<io::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
     ) -> std::io::Result<Option<LocalReply>> {
         let (stream, tx, mut rx) = mux.open();
         struct Withdraw<'a>(&'a Mux, u32);
@@ -1512,19 +1521,46 @@ impl Daemon {
         let _withdraw = Withdraw(mux, stream);
         mux.post(stream, &ClientMsg::Run(Box::new(run)));
         let placed_path = wt.map(|w| w.wt_cache.join("placed"));
-        let mut placer = tokio::task::block_in_place(|| {
+        let mut placer = io::cpu(|| {
             Placer::new(&self.cache, placed_path.as_deref().map(Placed::load).unwrap_or_default())
         });
         let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
         command.start(left_out.is_some());
+        let mut bet_rx = None;
+        if let Some(oneshot_rx) = bet {
+            let (bet_tx, bet_notes) = unbounded_channel();
+            io::spawn(move || {
+                if let Some(missing) = oneshot_rx.recv() {
+                    let _ = bet_tx.send(missing);
+                }
+            });
+            bet_rx = Some(bet_notes);
+        }
+        enum Incoming {
+            Bet(Option<(Vec<Digest>, Vec<Digest>)>),
+            Msg(Option<ServerMsg>),
+            Dead,
+        }
         let final_reply = loop {
             if let Some(reply) = command.finish() {
                 break reply;
             }
-            let msg = tokio::select! {
-                lacking = async { bet.as_mut().unwrap().await }, if bet.is_some() => {
-                    bet = None;
-                    let (trees, blobs) = lacking.map_err(|_| lost())?;
+            let incoming = if let Some(notes) = bet_rx.as_mut() {
+                io::race_biased(vec![
+                    Box::new(|| Incoming::Bet(notes.recv())),
+                    Box::new(|| Incoming::Msg(rx.recv())),
+                    Box::new(|| { mux.until_dead(); Incoming::Dead }),
+                ])
+            } else {
+                io::race_biased(vec![
+                    Box::new(|| Incoming::Msg(rx.recv())),
+                    Box::new(|| { mux.until_dead(); Incoming::Dead }),
+                ])
+            };
+            let msg = match incoming {
+                Incoming::Bet(lacking) => {
+                    bet_rx = None;
+                    let (trees, blobs) = lacking.ok_or_else(lost)?;
                     match command.bet_answered(!trees.is_empty(), !blobs.is_empty()) {
                         BetAnswer::Known => {
                             if let Some(s) = snap {
@@ -1540,8 +1576,8 @@ impl Daemon {
                         }
                     }
                 }
-                m = rx.recv() => m,
-                _ = mux.until_dead() => None,
+                Incoming::Msg(msg) => msg,
+                Incoming::Dead => None,
             };
             let Some(msg) = msg else { return Err(lost()) };
             match command.server(msg) {
@@ -1558,7 +1594,7 @@ impl Daemon {
                 CommandEffect::Upload(want) => {
                     self.knowledge.lock().unwrap().missing(want.iter());
                     let ok = match snap {
-                        Some(s) => upload(mux, stream, s, want).await?,
+                        Some(s) => upload(mux, stream, s, want)?,
                         None => false,
                     };
                     if matches!(command.uploaded(ok), CommandEffect::Abandon) {
@@ -1584,7 +1620,7 @@ impl Daemon {
                     }
                 }
                 CommandEffect::Deliver(files, writes, targets) => {
-                    tokio::task::block_in_place(|| -> std::io::Result<()> {
+                    io::cpu(|| -> std::io::Result<()> {
                         let (files, writes) = match shown {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
                             None => (files, writes),
@@ -1594,7 +1630,7 @@ impl Daemon {
                         Ok(())
                     })?;
                 }
-                CommandEffect::Blobs(blobs) => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                CommandEffect::Blobs(blobs) => io::cpu(|| -> std::io::Result<()> {
                     for b in blobs {
                         let hash = b.hash;
                         placer.blob(hash, &b.unpack()?)?;
@@ -1602,14 +1638,14 @@ impl Daemon {
                     Ok(())
                 })?,
                 CommandEffect::Part(hash, part, last) => {
-                    tokio::task::block_in_place(|| -> std::io::Result<()> { placer.part(hash, &part.unpack()?, last) })?
+                    io::cpu(|| -> std::io::Result<()> { placer.part(hash, &part.unpack()?, last) })?
                 }
                 CommandEffect::VerifyFetch => {
-                    let complete = command.fetching.as_ref().is_some_and(|(_, hashes)| hashes.iter().all(|hash| !placer.awaiting(hash)));
+                    let complete = command.fetching.as_ref().is_some_and(|(_, hashes)| hashes.iter().all(|hash| !placer.pending(hash)));
                     command.verified_fetch(complete).map_err(std::io::Error::other)?;
                 }
                 CommandEffect::Report(r) => {
-                    let id = match tokio::task::block_in_place(|| report::save(&r)) {
+                    let id = match io::cpu(|| report::save(&r)) {
                         Ok(id) => id,
                         Err(e) => {
                             let text = format!("warning: failed to write on-disk future incompatible report {}: {e}\n", r.path);
@@ -1637,12 +1673,12 @@ impl Daemon {
             }
         };
         if let Some((fs, _)) = shown {
-            tokio::task::block_in_place(|| fs.save());
+            io::cpu(|| fs.save());
         }
         if !placer.settled() {
             return Err(std::io::Error::other("the server did not send every file it announced"));
         }
-        tokio::task::block_in_place(|| {
+        io::cpu(|| {
             if let Some(path) = &placed_path {
                 if placer.changed {
                     let _ = placer.placed.save(path);
@@ -1656,9 +1692,9 @@ impl Daemon {
         Ok(Some(final_reply))
     }
 
-    async fn status(&self, out: &UnboundedSender<LocalReply>) -> LocalReply {
+    fn status(&self, out: &UnboundedSender<LocalReply>) -> LocalReply {
         let c = &self.counters;
-        let (kind, bytes_out, bytes_in) = match self.mux_if_up().await {
+        let (kind, bytes_out, bytes_in) = match self.mux_if_up() {
             Some(m) => (m.kind(), m.bytes_out.load(Ordering::Relaxed), m.bytes_in.load(Ordering::Relaxed)),
             None => ("none", 0, 0),
         };
@@ -1722,7 +1758,6 @@ impl Daemon {
 
 struct Contents {
     d: std::sync::Weak<Daemon>,
-    handle: tokio::runtime::Handle,
 }
 
 impl Contents {
@@ -1741,7 +1776,10 @@ impl crate::outfs::Source for Contents {
         let reading = d.partials.lock().unwrap().get(hash).map(|(_, p)| p.clone());
         match reading {
             Some(p) => p.whole(),
-            None => self.handle.block_on(d.fetch_content(*hash, size)),
+            None => {
+                let hash = *hash;
+                io::call(move || d.fetch_content(hash, size))
+            }
         }
     }
 
@@ -1751,19 +1789,21 @@ impl crate::outfs::Source for Contents {
             return Ok((Reader::Whole(std::fs::File::open(path)?), *hash));
         }
         if size >= rargo_proto::CHUNKED_FROM {
-            if let Some(p) = self.handle.block_on(d.partial(*hash, size))? {
+            let d2 = d.clone();
+            let hash2 = *hash;
+            if let Some(p) = io::call(move || d2.partial(hash2, size))? {
                 let proven = *p.hash();
                 return Ok((Reader::Ranged(p), proven));
             }
         }
-        let path = self.handle.block_on(d.fetch_content(*hash, size))?;
-        Ok((Reader::Whole(std::fs::File::open(path)?), *hash))
+        let hash = *hash;
+        let path = io::call(move || d.fetch_content(hash, size))?;
+        Ok((Reader::Whole(std::fs::File::open(path)?), hash))
     }
 }
 
 struct ChunkFetcher {
     d: std::sync::Weak<Daemon>,
-    handle: tokio::runtime::Handle,
 }
 
 impl crate::partial::Chunks for ChunkFetcher {
@@ -1773,10 +1813,10 @@ impl crate::partial::Chunks for ChunkFetcher {
             return;
         };
         let p = p.clone();
-        self.handle.spawn(async move {
-            let need = tokio::task::block_in_place(|| d.reuse_chunks(&p, idx));
+        io::spawn_off(move || {
+            let need = io::cpu(|| d.reuse_chunks(&p, idx));
             if !need.is_empty() {
-                let left = d.fetch_chunks(&p, need).await;
+                let left = d.fetch_chunks(&p, need);
                 if !left.is_empty() {
                     p.failed(&left);
                 }
@@ -1788,19 +1828,40 @@ impl crate::partial::Chunks for ChunkFetcher {
     }
 }
 
-async fn next_msg(mux: &Arc<Mux>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<ServerMsg>) -> std::io::Result<ServerMsg> {
+enum LinkWait {
+    Msg(Option<ServerMsg>),
+    Dead,
+}
+
+fn next_msg(mux: &Arc<Mux>, rx: &mut UnboundedReceiver<ServerMsg>) -> std::io::Result<ServerMsg> {
     loop {
-        tokio::select! {
-            m = rx.recv() => return m.ok_or_else(lost),
-            _ = mux.until_dead() => return Err(lost()),
+        match io::race_biased(vec![
+            Box::new(|| LinkWait::Msg(rx.recv())),
+            Box::new(|| { mux.until_dead(); LinkWait::Dead }),
+        ]) {
+            LinkWait::Msg(Some(msg)) => return Ok(msg),
+            LinkWait::Msg(None) | LinkWait::Dead => return Err(lost()),
         }
     }
 }
 
+fn mountinfo() -> String {
+    std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+}
+
+fn mounts_at<'a>(info: &'a str, dir: &Path) -> impl Iterator<Item = &'a str> {
+    let here = dir.to_string_lossy().into_owned();
+    info.lines().filter(move |l| l.split(' ').nth(4) == Some(here.as_str()))
+}
+
+fn dev_at(info: &str, dir: &Path) -> Option<u64> {
+    let (major, minor) = mounts_at(info, dir).last()?.split(' ').nth(2)?.split_once(':')?;
+    Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
+}
+
 fn release_mounts(dir: &Path) {
-    let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else { return };
-    let here = dir.to_string_lossy();
-    let mounts = info.lines().filter(|l| l.split(' ').nth(4) == Some(here.as_ref())).count();
+    let info = mountinfo();
+    let mounts = mounts_at(&info, dir).count();
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
     for _ in 0..mounts {
         if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } != 0 {
@@ -1974,12 +2035,12 @@ impl Multipart {
     }
 }
 
-async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
+fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
     let Some(plan) = UploadPlan::new(want, &snap.scan.files, rargo_proto::BATCH_SIZE) else { return Ok(false) };
     let UploadPlan { batches, multipart, part_size } = plan;
     for window in batches.chunks(8) {
         let window = window.to_vec();
-        let packed: Vec<Option<Vec<Blob>>> = tokio::task::spawn_blocking(move || {
+        let packed: Vec<Option<Vec<Blob>>> = io::cpu(move || {
             window
                 .par_iter()
                 .map(|batch| {
@@ -1993,20 +2054,18 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
                         .collect::<Option<Vec<Blob>>>()
                 })
                 .collect()
-        })
-        .await
-        .map_err(std::io::Error::other)?;
+        });
         for blobs in packed {
             let Some(blobs) = blobs else { return Ok(false) };
             let n = blobs.iter().map(|b| b.data.len()).sum();
-            mux.post_bulk(stream, &ClientMsg::Blobs(blobs), n).await?;
+            mux.post_bulk(stream, &ClientMsg::Blobs(blobs), n)?;
         }
     }
     for UploadFile { hash, path, size } in multipart {
         let Ok(mut f) = std::fs::File::open(&path) else { return Ok(false) };
         let mut content = Multipart { hash, size, part_size, bytes: 0, hasher: blake3::Hasher::new(), held: None };
         loop {
-            let (buf, file) = tokio::task::spawn_blocking(move || -> std::io::Result<(Vec<u8>, std::fs::File)> {
+            let (buf, file) = io::cpu(move || -> std::io::Result<(Vec<u8>, std::fs::File)> {
                 let mut buf = vec![0u8; part_size];
                 let mut n = 0;
                 while n < buf.len() {
@@ -2018,21 +2077,19 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
                 }
                 buf.truncate(n);
                 Ok((buf, f))
-            })
-            .await
-            .map_err(std::io::Error::other)??;
+            })?;
             f = file;
             if buf.is_empty() {
                 break;
             }
             match content.read(buf) {
-                Ok(Some((frame, bytes))) => mux.post_bulk(stream, &frame, bytes).await?,
+                Ok(Some((frame, bytes))) => mux.post_bulk(stream, &frame, bytes)?,
                 Ok(None) => {}
                 Err(()) => return Ok(false),
             }
         }
         let Some((frame, bytes)) = content.finish() else { return Ok(false) };
-        mux.post_bulk(stream, &frame, bytes).await?;
+        mux.post_bulk(stream, &frame, bytes)?;
     }
     Ok(true)
 }
@@ -2095,57 +2152,64 @@ mod upload_tests {
     }
 }
 
-async fn read_frame<R: tokio::io::AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<Vec<u8>> {
+fn read_frame(rd: &mut io::ReadHalf) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
-    rd.read_exact(&mut len).await?;
+    rd.read_exact(&mut len)?;
     let n = u32::from_le_bytes(len) as usize;
     if n > 64 << 20 {
         return Err(std::io::Error::other("oversized request"));
     }
     let mut buf = vec![0u8; n];
-    rd.read_exact(&mut buf).await?;
+    rd.read_exact(&mut buf)?;
     Ok(buf)
 }
 
-async fn serve_command(d: Arc<Daemon>, stream: tokio::net::UnixStream, socket: PathBuf) {
+fn serve_command(d: Arc<Daemon>, stream: io::UnixStream, socket: PathBuf) {
     let (mut rd, mut wr) = stream.into_split();
-    let Ok(raw) = read_frame(&mut rd).await else { return };
+    let Ok(raw) = read_frame(&mut rd) else { return };
     let Ok(req) = rargo_proto::decode::<LocalRequest>(&raw) else { return };
     if req.kind == "release" {
         d.release(Path::new(&req.cwd));
         let done = rargo_proto::encode(&LocalReply::Exit(0));
-        let _ = wr.write_all(&(done.len() as u32).to_le_bytes()).await;
-        let _ = wr.write_all(&done).await;
+        let _ = wr.write_all(&(done.len() as u32).to_le_bytes());
+        let _ = wr.write_all(&done);
         return;
     }
     if req.kind == "stop" {
-        d.unmount_all();
-        d.save_known();
-        let _ = std::fs::remove_file(&socket);
+        d.close_down(&socket);
         let done = rargo_proto::encode(&LocalReply::Exit(0));
-        let _ = wr.write_all(&(done.len() as u32).to_le_bytes()).await;
-        let _ = wr.write_all(&done).await;
-        let _ = wr.shutdown().await;
+        let _ = wr.write_all(&(done.len() as u32).to_le_bytes());
+        let _ = wr.write_all(&done);
+        let _ = wr.shutdown();
         std::process::exit(0);
     }
     let (tx, mut rx) = unbounded_channel::<LocalReply>();
-    let work = tokio::spawn(d.command(req, tx));
+    let work = io::spawn(move || d.command(req, tx));
     let mut probe = [0u8; 1];
+    enum ClientWait {
+        Reply(Option<LocalReply>),
+        Gone,
+    }
     loop {
-        tokio::select! {
-            reply = rx.recv() => {
-                let Some(reply) = reply else { break };
+        match io::race_biased(vec![
+            Box::new(|| ClientWait::Reply(rx.recv())),
+            Box::new(|| {
+                let _ = rd.read(&mut probe);
+                ClientWait::Gone
+            }),
+        ]) {
+            ClientWait::Reply(Some(reply)) => {
                 let last = matches!(reply, LocalReply::Exit(_) | LocalReply::Exec(_) | LocalReply::Unreachable(_));
                 let bytes = rargo_proto::encode(&reply);
-                if wr.write_all(&(bytes.len() as u32).to_le_bytes()).await.is_err() || wr.write_all(&bytes).await.is_err() {
+                if wr.write_all(&(bytes.len() as u32).to_le_bytes()).is_err() || wr.write_all(&bytes).is_err() {
                     break;
                 }
                 if last {
-                    let _ = wr.shutdown().await;
+                    let _ = wr.shutdown();
                     return;
                 }
             }
-            _ = rd.read(&mut probe) => break,
+            ClientWait::Reply(None) | ClientWait::Gone => break,
         }
     }
     work.abort();
@@ -2157,9 +2221,8 @@ pub fn serve(socket: &Path) -> ! {
         Err(e) => crate::die(&e),
     };
     let cache = crate::cache_dir();
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("tokio runtime");
     let socket = socket.to_path_buf();
-    rt.block_on(async move {
+    io::drive(4, move || {
         let lock_path = socket.with_extension("lock");
         let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
             Ok(f) => f,
@@ -2172,11 +2235,11 @@ pub fn serve(socket: &Path) -> ! {
                 if started.elapsed() > Duration::from_secs(3) {
                     std::process::exit(0);
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                io::sleep(Duration::from_millis(20));
             }
         }
         let _ = std::fs::remove_file(&socket);
-        let listener = match tokio::net::UnixListener::bind(&socket) {
+        let listener = match io::UnixListener::bind(&socket) {
             Ok(l) => l,
             Err(e) => crate::die(&format!("{}: {e}", socket.display())),
         };
@@ -2185,37 +2248,50 @@ pub fn serve(socket: &Path) -> ! {
             std::env::var("RARGO_DAEMON_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800),
         );
         eprintln!("rargo daemon: {} serving {} on {}", std::process::id(), d.cfg.server, socket.display());
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
-        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("signal handler");
+        let mut term = io::signal(io::SignalKind::terminate()).expect("signal handler");
+        let mut int = io::signal(io::SignalKind::interrupt()).expect("signal handler");
+        enum Gate {
+            Term,
+            Int,
+            Conn(std::io::Result<(io::UnixStream, ())>),
+            Idle,
+        }
         loop {
-            tokio::select! {
-                _ = term.recv() => {
-                    d.unmount_all();
-                    d.save_known();
-                    let _ = std::fs::remove_file(&socket);
+            match io::race_biased(vec![
+                Box::new(|| {
+                    let _ = term.recv();
+                    Gate::Term
+                }),
+                Box::new(|| {
+                    let _ = int.recv();
+                    Gate::Int
+                }),
+                Box::new(|| Gate::Conn(listener.accept())),
+                Box::new(|| {
+                    io::sleep(Duration::from_secs(5));
+                    Gate::Idle
+                }),
+            ]) {
+                Gate::Term | Gate::Int => {
+                    d.close_down(&socket);
                     break;
                 }
-                _ = int.recv() => {
-                    d.unmount_all();
-                    d.save_known();
-                    let _ = std::fs::remove_file(&socket);
-                    break;
+                Gate::Conn(Ok((stream, ()))) => {
+                    d.touch();
+                    let (d, socket) = (d.clone(), socket.clone());
+                    io::spawn(move || serve_command(d, stream, socket));
                 }
-                conn = listener.accept() => {
-                    if let Ok((stream, _)) = conn {
-                        *d.last_active.lock().unwrap() = Instant::now();
-                        tokio::spawn(serve_command(d.clone(), stream, socket.clone()));
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                Gate::Conn(Err(_)) => {}
+                Gate::Idle => {
                     let showing = d.worktrees.lock().unwrap().values().any(|w| w.out.lock().unwrap().is_some());
                     let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
                     d.save_known();
-                    if quiet || !socket.exists() {
+                    if quiet {
+                        d.close_down(&socket);
+                        break;
+                    }
+                    if !socket.exists() {
                         d.unmount_all();
-                        if quiet {
-                            let _ = std::fs::remove_file(&socket);
-                        }
                         break;
                     }
                     let stale: Vec<Arc<Worktree>> = {
@@ -2238,24 +2314,23 @@ pub fn serve(socket: &Path) -> ! {
             }
         }
         drop(lock);
+        std::process::exit(0);
     });
-    std::process::exit(0)
+    unreachable!("the daemon leaves through exit")
 }
 
 pub fn inline(cfg: Config, cache: PathBuf, req: LocalRequest, mut each: impl FnMut(LocalReply)) {
-    let (tx, mut rx) = unbounded_channel::<LocalReply>();
-    let worker = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("tokio runtime");
-        rt.block_on(async move {
-            let d = Daemon::new(cfg, cache, false);
-            d.clone().command(req, tx).await;
-            d.save_known();
-        });
-    });
-    while let Some(reply) = rx.blocking_recv() {
-        each(reply);
-    }
-    let _ = worker.join();
+    io::run(2, move || {
+        let d = Daemon::new(cfg, cache, false);
+        let (reply_tx, mut reply_rx) = unbounded_channel();
+        let d2 = d.clone();
+        let mut command = io::spawn(move || d2.command(req, reply_tx));
+        while let Some(reply) = reply_rx.recv() {
+            each(reply);
+        }
+        let _ = command.join();
+        d.save_known();
+    })
 }
 
 const HEARD_MAX: usize = 1 << 20;
@@ -2584,6 +2659,18 @@ mod left_out_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_newest_mount_on_a_directory_gives_its_device() {
+        let info = "22 1 0:21 / /proc rw - proc proc rw\n\
+                    80 30 0:61 / /w/target rw - fuse.rargo rargo rw\n\
+                    81 80 0:62 / /w/target rw - fuse.rargo rargo rw\n\
+                    82 30 0:63 / /w/target2 rw - fuse.rargo rargo rw\n";
+        assert_eq!(super::dev_at(info, Path::new("/w/target")), Some(62));
+        assert_eq!(super::dev_at(info, Path::new("/w/target2")), Some(63));
+        assert_eq!(super::dev_at(info, Path::new("/w")), None);
+        assert_eq!(super::mounts_at(info, Path::new("/w/target")).count(), 2);
+    }
 
     #[test]
     fn a_refused_token_says_whether_there_was_one_and_names_rargo_auth() {

@@ -13,6 +13,7 @@ pub mod flake;
 pub mod hash;
 pub mod nixmanifest;
 pub mod http;
+pub use rargo_net::io;
 pub mod incr;
 pub mod cgroup;
 pub use rargo_net as net;

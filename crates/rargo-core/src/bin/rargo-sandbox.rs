@@ -56,6 +56,10 @@ fn main() -> anyhow::Result<()> {
         let fd = args.get(2).ok_or_else(|| anyhow::anyhow!("--internal-zygote requires a descriptor"))?.parse()?;
         rargo_core::sandbox::zygote_main(fd);
     }
+    rargo_net::io::run(1, move || sandbox(args))
+}
+
+fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
     let Options { state, passthrough, quiet, cmd } = options(&args)?;
     let zygote = Zygote::start(&std::env::current_exe()?)?;
     std::fs::create_dir_all(&state)?;
@@ -70,8 +74,7 @@ fn main() -> anyhow::Result<()> {
         &fusewire::MountOptions { fsname: "rargo".into(), passthrough, ..Default::default() },
     )?);
     fs.attach(session.clone());
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    session.spawn_workers(fs.clone(), threads)?;
+    let _fuse = rargo_core::io::FuseDrive::spawn(&session, &fs);
     eprintln!("[rargo-sandbox] passthrough: {}", session.caps().passthrough);
 
     let scratch = store.tmp_dir("tool-action")?;
@@ -107,7 +110,8 @@ fn main() -> anyhow::Result<()> {
     use std::os::fd::AsFd;
     let start = std::time::Instant::now();
     let running = zygote.spawn(plan, None, out, err, &[])?;
-    let info = running.done.blocking_recv()?;
+    let info = rargo_net::io::call(|| running.done.expect("the exit is waited once").recv())
+        .ok_or_else(|| anyhow::anyhow!("the sandbox helper process died"))?;
     let wall = start.elapsed();
     let fin = fs.finish_action(&action);
     eprintln!(

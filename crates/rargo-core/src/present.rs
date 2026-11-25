@@ -1,5 +1,5 @@
+use crate::io::UnboundedSender;
 use crate::proto::ServerMsg;
-use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone, Debug, Default)]
 pub struct Translator {

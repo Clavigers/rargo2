@@ -73,6 +73,16 @@ enum Question {
     Build(Vec<String>),
 }
 
+struct TestRuns(Vec<crate::io::JoinHandle<(TestQuestion, Result<(Arc<ActionResult>, bool)>)>>);
+
+impl Drop for TestRuns {
+    fn drop(&mut self) {
+        for handle in &self.0 {
+            handle.abort();
+        }
+    }
+}
+
 fn parse_question(raw: &[u8]) -> Option<Question> {
     let nl = raw.iter().position(|&b| b == b'\n')?;
     let args: Vec<String> = raw[nl + 1..]
@@ -90,7 +100,7 @@ fn parse_question(raw: &[u8]) -> Option<Question> {
     }
 }
 
-pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
+pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     let mut args = c.args.clone();
     let mut no_cache = false;
     if let Some(pos) = args.iter().take_while(|a| *a != "--").position(|a| a == "--no-cache") {
@@ -98,8 +108,8 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         no_cache = true;
     }
     let at = subcommand_pos(&args).context("no subcommand")?;
-    let mut p = prepare(d, c, c.snapshot.clone()).await?;
-    let nextest = installed(d, c, wanted(c, &p)?).await?;
+    let mut p = prepare(d, c, c.snapshot.clone())?;
+    let nextest = installed(d, c, wanted(c, &p)?)?;
     let mut argv = vec![NEXTEST_AT.to_vec(), b"nextest".to_vec()];
     for a in &args[at + 1..] {
         argv.push(bytes(&canonical_arg(&p.tr, a)));
@@ -116,7 +126,7 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         let next = match effect {
             NextEffect::RunNextest => match &rounds {
                 None => {
-                    let r = ask(d, c, &p, &nextest, &argv, &answers).await?;
+                    let r = ask(d, c, &p, &nextest, &argv, &answers)?;
                     let question = match r.outputs.get(ASKED.as_bytes()) {
                         Some(MEntry::File { hash, .. }) => parse_question(&d.store().read(hash)?),
                         _ => None,
@@ -131,7 +141,7 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                     run.asked(asked, code)
                 }
                 Some(rounds) => {
-                    let r = rounds.nextest(d, c, &p, &argv, &answers, &ran).await?;
+                    let r = rounds.nextest(d, c, &p, &argv, &answers, &ran)?;
                     let asked: Vec<TestAsked> = rounds
                         .asked
                         .lock()
@@ -143,16 +153,16 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                 }
             },
             NextEffect::Metadata(m) => {
-                let a = metadata(d, c, &p, m).await?;
+                let a = metadata(d, c, &p, m)?;
                 let fx = run.metadata_answered(&a.args, a.code, &a.err);
                 answers.metadata = Some(a);
                 fx
             }
             NextEffect::Fetch { args, components, offline } => {
                 answers.metadata = None;
-                match fetch(d, c, &p, &args, components, offline).await? {
+                match fetch(d, c, &p, &args, components, offline)? {
                     Some(snapshot) => {
-                        p = prepare(d, c, snapshot).await?;
+                        p = prepare(d, c, snapshot)?;
                         run.fetched(true)
                     }
                     None => run.fetched(false),
@@ -164,7 +174,7 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                     m.args.iter().find_map(|a| a.strip_prefix("--filter-platform=").map(String::from))
                 });
                 let target = arg_value(&build_args, "--target").map(String::from);
-                let (answer, b) = build(d, c, build_args).await?;
+                let (answer, b) = build(d, c, build_args)?;
                 answers.build = Some(answer);
                 built = b;
                 rounds = Some(Rounds::new(d, c, &p, &nextest, built.as_ref(), host.iter().chain(target.iter())));
@@ -173,19 +183,19 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             NextEffect::RunTests(keys) => {
                 let rounds = rounds.as_ref().expect("tests run in the rounds");
                 let asked = std::mem::take(&mut *rounds.asked.lock());
-                let mut set = tokio::task::JoinSet::new();
+                let mut runs = TestRuns(Vec::new());
                 for key in keys {
                     let q = asked.iter().find(|q| q.key == key).expect("the core runs what nextest asked").clone();
                     let (d, c, p_policy, view) = (d.clone(), c.clone(), p.policy.clone(), rounds.tests_view.clone());
                     let (root_id, no_cache) = (p.flake.id, no_cache);
-                    set.spawn(async move {
-                        let ran = run_test(&d, &c, &p_policy, view, root_id, no_cache, &q).await;
+                    runs.0.push(crate::io::spawn(move || {
+                        let ran = run_test(&d, &c, &p_policy, view, root_id, no_cache, &q);
                         (q, ran)
-                    });
+                    }));
                 }
                 let mut fx = Vec::new();
-                while let Some(done) = set.join_next().await {
-                    let (q, outcome) = done?;
+                for done in runs.0.iter_mut() {
+                    let (q, outcome) = done.join().map_err(|e| anyhow!("a test task panicked: {e}"))?;
                     let (result, cached) = outcome?;
                     deliver_writes(c, &p, built.as_ref(), &result.outputs);
                     let store = d.store();
@@ -236,7 +246,7 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     unreachable!("a nextest run ends with an end or a finish, not in {:?}", run.phase())
 }
 
-async fn ask(
+fn ask(
     d: &Arc<Daemon>,
     c: &Arc<Client>,
     p: &Prepared,
@@ -268,8 +278,7 @@ async fn ask(
             cacheable: Arc::new(|r| r.outputs.get(ASKED.as_bytes()).is_some()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(NullObserver),
-        })
-        .await?
+        })?
         .result)
 }
 
@@ -319,7 +328,7 @@ impl Rounds {
         Rounds { base, layer, levels, env, tests_view, asked: Mutex::new(Vec::new()) }
     }
 
-    async fn nextest(
+    fn nextest(
         &self,
         d: &Arc<Daemon>,
         c: &Arc<Client>,
@@ -350,8 +359,7 @@ impl Rounds {
                 cacheable: Arc::new(|r| r.success() || r.outputs.entries.iter().any(|(p, _)| is_test_question(p))),
                 declared_env: Arc::new(|_, _| Vec::new()),
                 observer: Arc::new(Explaining { c: c.clone(), label: "nextest".into() }),
-            })
-            .await?
+            })?
             .result;
         let store = d.store();
         let mut asked = self.asked.lock();
@@ -421,7 +429,7 @@ struct Ran {
 const PER_RUN: &[&str] =
     &["NEXTEST_RUN_ID", "NEXTEST_ATTEMPT_ID", "NEXTEST_TEST_GLOBAL_SLOT", "NEXTEST_TEST_GROUP_SLOT"];
 
-async fn run_test(
+fn run_test(
     d: &Arc<Daemon>,
     c: &Arc<Client>,
     policy: &crate::policy::Policy,
@@ -471,8 +479,7 @@ async fn run_test(
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(Explaining { c: c.clone(), label }),
-        })
-        .await?;
+        })?;
     Ok((outcome.result, outcome.cached))
 }
 
@@ -609,7 +616,7 @@ fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Re
     Ok(Arc::new(layer))
 }
 
-async fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -> Result<Answer> {
+fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -> Result<Answer> {
     let mut env: BTreeMap<Vec<u8>, Vec<u8>> = p.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
     let mut argv = vec![PLANNER_AT.to_vec()];
@@ -639,14 +646,13 @@ async fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<Stri
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(PlanObserver { client: c.clone() }),
-        })
-        .await?
+        })?
         .result;
     let store = d.store();
     Ok(Answer { args, out: store.read(&r.stdout)?, err: store.read(&r.stderr)?, code: r.code().unwrap_or(101) })
 }
 
-async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer, Option<Built>)> {
+fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer, Option<Built>)> {
     let kept = Arc::new(Mutex::new(Vec::new()));
     let cb = Arc::new(Client {
         args: args.clone(),
@@ -670,7 +676,7 @@ async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(A
     let mut code = 101;
     for attempt in 0..3 {
         kept.lock().clear();
-        match run_request(d, &cb, Some(&keep)).await {
+        match run_request(d, &cb, Some(&keep)) {
             Ok(Finish::Code(k)) => code = k,
             Ok(Finish::Retry) if attempt < 2 => {
                 cb.outbox.lock().0.clear();
@@ -737,14 +743,14 @@ fn config_version(text: &str) -> Option<String> {
     }
 }
 
-async fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<PathBuf> {
-    static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<PathBuf> {
+    static INSTALLING: crate::io::Mutex<()> = crate::io::Mutex::new(());
     let dir = d.cfg.state_dir.join("nextest");
     let wanted = match wanted {
         Some(w) => w,
         None => {
             let dir2 = dir.clone();
-            let newest = tokio::task::spawn_blocking(move || newest_release(&dir2)).await?;
+            let newest = crate::io::cpu(move || newest_release(&dir2));
             match newest {
                 Ok(version) => Wanted { version, by: "nobody (the newest release)".into() },
                 Err(e) => return newest_installed(&dir).ok_or(e).context("nextest is not installed on this server"),
@@ -755,14 +761,13 @@ async fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<Pat
     if program.is_file() {
         return Ok(program);
     }
-    let _one_at_a_time = INSTALLING.lock().await;
+    let _one_at_a_time = INSTALLING.lock();
     if program.is_file() {
         return Ok(program);
     }
     c.out.status("Installing", &format!("nextest {} on the server", wanted.version));
     let (dir2, version) = (dir.clone(), wanted.version.clone());
-    tokio::task::spawn_blocking(move || install(&dir2, &version))
-        .await?
+    crate::io::cpu(move || install(&dir2, &version))
         .with_context(|| format!("nextest {}, which {} asks for, cannot be installed on this server", wanted.version, wanted.by))
 }
 

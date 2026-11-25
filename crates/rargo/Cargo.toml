@@ -14,7 +14,6 @@ exclude = ["src/git/fixture.bin"]
 rargo-proto = { path = "../rargo-proto", version = "0.7.6" }
 rargo-net = { path = "../rargo-net", version = "0.7.6" }
 fusewire = { path = "../fusewire", version = "0.7.6" }
-tokio.workspace = true
 libc.workspace = true
 blake3.workspace = true
 rayon.workspace = true

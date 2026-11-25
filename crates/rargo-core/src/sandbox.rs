@@ -88,14 +88,14 @@ enum FromZygote {
 
 pub struct Zygote {
     sock: Mutex<UnixStream>,
-    pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ExitInfo>>>>,
+    pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
     next: AtomicU64,
     child: Mutex<Option<std::process::Child>>,
 }
 
 pub struct Running {
     pub id: u64,
-    pub done: tokio::sync::oneshot::Receiver<ExitInfo>,
+    pub done: Option<crate::io::oneshot::Receiver<ExitInfo>>,
 }
 
 fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
@@ -196,7 +196,7 @@ impl Zygote {
             .spawn()
             .with_context(|| format!("starting zygote {}", exe.display()))?;
         drop(theirs);
-        let pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ExitInfo>>>> = Default::default();
+        let pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
         let reader = ours.try_clone()?;
         let p2 = pending.clone();
         std::thread::Builder::new().name("zygote-reader".into()).spawn(move || {
@@ -225,7 +225,7 @@ impl Zygote {
         extra: &[RawFd],
     ) -> Result<Running> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = crate::io::oneshot::channel();
         assert!(self.pending.lock().insert(id, tx).is_none(), "spawn ids are unique");
         let msg = bincode::serialize(&ToZygote::Spawn {
             id,
@@ -244,7 +244,7 @@ impl Zygote {
             self.pending.lock().remove(&id);
             bail!("zygote is not reachable: {e}");
         }
-        Ok(Running { id, done: rx })
+        Ok(Running { id, done: Some(rx) })
     }
 
     pub fn kill(&self, id: u64) {
