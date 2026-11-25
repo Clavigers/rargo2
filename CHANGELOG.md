@@ -6,6 +6,21 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.4
+
+Protocol 7 (unchanged).
+
+- Every build uses the workspace's locked Nix shell or the bundled
+  default. Workers see the selected shell's closure. (#47)
+- The Reference comes from the released tag. CI checks the commands and
+  options it names. The page shows how to enter the bundled shell for
+  stock Cargo and how to commit a workspace override. (#28, #48)
+- One release command gates the commit, publishes the tag, deploys it,
+  checks the public service over UDP and TCP, and records the release
+  on its issues. (#27)
+- Gates with different directories now also get distinct network
+  namespaces and rig state by default. (#102)
+
 ## 0.6.3
 
 Protocol 7 (unchanged).
