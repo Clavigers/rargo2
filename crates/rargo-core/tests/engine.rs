@@ -78,7 +78,7 @@ impl Fx {
 
     fn view_of(&self, work: &Path) -> Arc<dyn View> {
         let g = self.memo.advance();
-        Arc::new(BaseView::new(
+        Arc::new(Hosted::new(BaseView::new(
             vec![
                 Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
                 Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(work)), traced: true },
@@ -86,7 +86,7 @@ impl Fx {
             ],
             self.memo.clone(),
             g,
-        ))
+        )))
     }
 
     fn req(&self, script: &str, env: &[(&str, &str)], client_env: &[(&str, &str)], declared: &[&str]) -> Request {

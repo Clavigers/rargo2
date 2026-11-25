@@ -139,6 +139,33 @@ impl BaseView {
         (e.0 >= self.min_gen.load(Ordering::Relaxed)).then(|| e.1.clone())
     }
 
+    fn invariants(&self) -> bool {
+        !self.mounts.is_empty()
+            && self.mounts.iter().any(|m| m.at == b"/")
+            && self.mounts.windows(2).all(|w| w[0].at.len() >= w[1].at.len())
+            && self.mounts.iter().all(|m| m.at.starts_with(b"/"))
+            && self.mounts.iter().enumerate().all(|(i, m)| self.mounts[i + 1..].iter().all(|o| o.at != m.at))
+    }
+
+    fn deposit(&self, req: &HostReq, answer: HostAnswer) {
+        let generation = self.memo.current();
+        match (&req.kind, answer) {
+            (HostKind::Lookup, HostAnswer::Lookup(looked)) => {
+                self.memo.looked.insert(req.key.clone(), (generation, looked));
+            }
+            (HostKind::List, HostAnswer::List(listed)) => {
+                let listed = match listed {
+                    Ok(list) => Ok(Arc::new(list)),
+                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+                };
+                self.memo.listed.insert(req.key.clone(), (generation, listed));
+            }
+            (HostKind::Lookup, HostAnswer::List(_)) | (HostKind::List, HostAnswer::Lookup(_)) => {
+                panic!("a host answer matches the request");
+            }
+        }
+    }
+
     fn step_host(&self, region: &HostRegion, rel: &[u8], name: &[u8], infer_at: Option<&[u8]>) -> Step<Looked> {
         let key = lookup_key(region, rel, name);
         if let Some(raw) = self.cached_lookup(&key) {
@@ -301,23 +328,15 @@ impl BaseView {
             }
         }
     }
+}
 
-    fn fulfill(&self, req: &HostReq) {
-        assert!(!self.memo.sealed.load(Ordering::SeqCst), "sealed view asked to read {}", req.path.display());
-        let generation = self.memo.current();
-        match req.kind {
-            HostKind::Lookup => {
-                self.memo.looked.insert(req.key.clone(), (generation, read_host_lookup(&req.path)));
-            }
-            HostKind::List => {
-                let listed = match read_host_list(&req.path) {
-                    Ok(list) => Ok(Arc::new(list)),
-                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
-                };
-                self.memo.listed.insert(req.key.clone(), (generation, listed));
-            }
-        }
-    }
+fn host_answer(view: &BaseView, req: &HostReq) {
+    assert!(!view.memo.sealed.load(Ordering::SeqCst), "sealed view asked to read {}", req.path.display());
+    let answer = match req.kind {
+        HostKind::Lookup => HostAnswer::Lookup(read_host_lookup(&req.path)),
+        HostKind::List => HostAnswer::List(read_host_list(&req.path)),
+    };
+    view.deposit(req, answer);
 }
 
 fn nix_store_region() -> HostRegion {
@@ -328,13 +347,21 @@ fn is_strictly_under(path: &[u8], dir: &[u8]) -> bool {
     path.len() > dir.len() && vpath_starts_with(path, dir)
 }
 
+fn given<T>(view: &BaseView, step: Step<T>) -> T {
+    assert!(view.invariants());
+    match step {
+        Step::Done(value) => value,
+        Step::Ask(_) => panic!("a base view is given its contents; the shell answers a host request"),
+    }
+}
+
 impl View for BaseView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        serve(self, |view| view.step_lookup(dir, name))
+        given(self, self.step_lookup(dir, name))
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        serve(self, |view| view.step_list(dir))
+        given(self, self.step_list(dir))
     }
 
     fn traced(&self, dir: &[u8]) -> bool {
@@ -346,7 +373,40 @@ impl View for BaseView {
     }
 
     fn stat(&self, path: &[u8]) -> Looked {
-        serve(self, |view| view.step_stat(path))
+        given(self, self.step_stat(path))
+    }
+}
+
+/// The shell around a base view. It is the only caller that turns a host request into a filesystem read.
+pub struct Hosted {
+    view: BaseView,
+}
+
+impl Hosted {
+    pub fn new(view: BaseView) -> Hosted {
+        Hosted { view }
+    }
+}
+
+impl View for Hosted {
+    fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+        drive(&self.view, |view| view.step_lookup(dir, name))
+    }
+
+    fn list(&self, dir: &[u8]) -> io::Result<Listing> {
+        drive(&self.view, |view| view.step_list(dir))
+    }
+
+    fn traced(&self, dir: &[u8]) -> bool {
+        self.view.mount_of(dir).0.traced
+    }
+
+    fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
+        &self.view.nix
+    }
+
+    fn stat(&self, path: &[u8]) -> Looked {
+        drive(&self.view, |view| view.step_stat(path))
     }
 }
 
@@ -361,16 +421,27 @@ struct HostReq {
     path: PathBuf,
 }
 
+enum HostAnswer {
+    Lookup(Looked),
+    List(io::Result<Listing>),
+}
+
 enum Step<T> {
     Done(T),
     Ask(HostReq),
 }
 
-fn serve<T>(view: &BaseView, mut step: impl FnMut(&BaseView) -> Step<T>) -> T {
+fn drive<T>(view: &BaseView, mut step: impl FnMut(&BaseView) -> Step<T>) -> T {
     for _ in 0..10_000 {
         match step(view) {
-            Step::Done(value) => return value,
-            Step::Ask(req) => view.fulfill(&req),
+            Step::Done(value) => {
+                assert!(view.invariants());
+                return value;
+            }
+            Step::Ask(req) => {
+                host_answer(view, &req);
+                assert!(view.invariants());
+            }
         }
     }
     panic!("host lookup did not settle");
@@ -591,12 +662,12 @@ impl View for BuildView {
             Some(LayerEnt::Entry(MEntry::Symlink(t))) => Looked::Symlink(t),
             Some(LayerEnt::Entry(MEntry::Whiteout)) => Looked::Absent,
             Some(LayerEnt::Entry(MEntry::Dir)) | Some(LayerEnt::Implied) => {
-                match self.base.lookup(dir, name) {
+                match drive(&self.base, |view| view.step_lookup(dir, name)) {
                     Looked::Dir(o) => Looked::Dir(o),
                     _ => Looked::Dir(OWN_DIR),
                 }
             }
-            None => self.base.lookup(dir, name),
+            None => drive(&self.base, |view| view.step_lookup(dir, name)),
         }
     }
 
@@ -605,7 +676,11 @@ impl View for BuildView {
         if let Some(seed) = &self.seed {
             layered.extend(seed.names(dir, &SEED_LEVELS));
         }
-        let base = if self.base_has_dir(dir) { self.base.list(dir)? } else { Listing::new() };
+        let base = if self.base_has_dir(dir) {
+            drive(&self.base, |view| view.step_list(dir))?
+        } else {
+            Listing::new()
+        };
         Ok(crate::view::merge_listings(base, layered.into_iter().map(|(name, entry)| {
             let dtype = match entry {
                 LayerEnt::Entry(MEntry::Whiteout) => None,
@@ -636,19 +711,17 @@ impl View for BuildView {
         let Some((dir, name)) = vsplit(path) else { return Looked::Dir(DIR_OWNER) };
         match self.layered(dir, name) {
             Some(_) => self.lookup(dir, name),
-            None => {
-                match self.base.stat(path) {
-                    Looked::Absent if self.layer_has_dir(dir) => self.base.lookup(dir, name),
-                    other => other,
-                }
-            }
+            None => match drive(&self.base, |view| view.step_stat(path)) {
+                Looked::Absent if self.layer_has_dir(dir) => drive(&self.base, |view| view.step_lookup(dir, name)),
+                other => other,
+            },
         }
     }
 }
 
 impl BuildView {
     fn base_has_dir(&self, dir: &[u8]) -> bool {
-        matches!(self.base.stat(dir), Looked::Dir(_))
+        matches!(drive(&self.base, |view| view.step_stat(dir)), Looked::Dir(_))
     }
 
     fn layer_has_dir(&self, dir: &[u8]) -> bool {
@@ -882,6 +955,27 @@ mod tests {
         assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
         let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
         assert!(!names.contains(&b"gone".to_vec()) && names.contains(&b"kept".to_vec()));
+    }
+
+    #[test]
+    fn a_base_view_is_given_its_contents() {
+        let memo = Arc::new(HostMemo::default());
+        let view = BaseView::new(
+            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/no/such/host-view")), traced: true }],
+            memo,
+            0,
+        );
+        let Step::Ask(req) = view.step_lookup(b"/", b"missing") else {
+            panic!("a miss asks the shell");
+        };
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = View::lookup(&view, b"/", b"missing");
+        }));
+        assert!(refused.is_err(), "the view does not read the host");
+        view.deposit(&req, HostAnswer::Lookup(host_dir()));
+        assert!(view.invariants());
+        assert!(matches!(View::lookup(&view, b"/", b"missing"), Looked::Dir(_)));
+        assert!(view.invariants());
     }
 }
 

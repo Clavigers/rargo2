@@ -439,7 +439,7 @@ struct Prepared {
     parts: ViewParts,
     generation: u64,
     policy: crate::policy::Policy,
-    plan_base: Arc<BaseView>,
+    plan_base: Arc<dyn View>,
     flake: Arc<crate::flake::FlakeEnv>,
     base: Arc<BaseView>,
     tr: Translator,
@@ -489,7 +489,7 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
         restricted,
     };
     let base = parts.build(d.memo.clone(), generation, false);
-    let plan_base = Arc::new(parts.build(d.memo.clone(), generation, true));
+    let plan_base: Arc<dyn View> = Arc::new(Hosted::new(parts.build(d.memo.clone(), generation, true)));
     let tr = Translator::new(vec![
         (String::from_utf8_lossy(WORKTREE_AT).into_owned(), c.root.clone()),
         (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), c.cargo_home.clone()),
