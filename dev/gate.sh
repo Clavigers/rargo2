@@ -10,6 +10,7 @@ clean() {
     [ -z "$(git status --porcelain)" ]
 }
 clean || { echo "gate requires a clean working tree" >&2; exit 2; }
+dev/gate-budget.sh raise-ok || exit 2
 commit=$(git rev-parse HEAD)
 L=${RARGO_GATE_DIR:-$work/gate}
 mkdir -p "$L"
@@ -193,6 +194,11 @@ fi
 result="$passed of ${#suites[@]} gate steps passed"
 elapsed=$(( $(date +%s) - gate_started ))
 echo "gate ${elapsed}s: $result"
+# The time ratchet (dev/gate-budget): a gate that got slower fails.
+if [ "$passed" -eq "${#suites[@]}" ] && ! dev/gate-budget.sh check "$elapsed" "$L" e2e e2e-copy e2e-flake e2e-auth e2e-components e2e-link e2e-worker; then
+    report all failure "gate ${elapsed}s is over the budget in dev/gate-budget"
+    exit 1
+fi
 if [ "$passed" -eq "${#suites[@]}" ]; then
     report all success "$result"
 else
