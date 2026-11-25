@@ -1,6 +1,7 @@
 use crate::hash::Hash;
 use crate::session_state::{
-    Answer, ClientSet, Effect, Hello, Next, Outgoing, Progress, Question, SessionState, bulk_size,
+    Accepted, Answer, ClientSet, Effect, Handshake, Next, Outgoing, Progress, Question, SessionState, Shake, Shook,
+    bulk_size,
 };
 use crate::snapshot::{Uploader, futures::BoxFuture};
 use crate::store::Store;
@@ -443,33 +444,37 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     keys: &Keys,
 ) -> Result<(String, bool, Sealer, Opener)> {
-    let mut buf = Vec::new();
-    let (user, msg1) = loop {
-        match crate::session_state::hello(&buf, secure::MAGIC) {
-            Hello::Need(n) => {
-                let have = buf.len();
-                buf.resize(n, 0);
-                stream.read_exact(&mut buf[have..]).await?;
+    let (mut hs, mut next) = Handshake::new(secure::MAGIC);
+    let mut keys_for = None;
+    loop {
+        next = match next {
+            Shake::Read(n) => {
+                let mut bytes = vec![0; n];
+                stream.read_exact(&mut bytes).await?;
+                hs.received(&bytes)
             }
-            Hello::Foreign(reply) => {
-                let _ = stream.write_all(&reply).await;
-                bail!("not a rargo client (or a different protocol version)");
+            Shake::Check { user, msg1 } => {
+                let accepted = keys
+                    .lookup(&user)
+                    .and_then(|(psk, admin)| secure::server_accept(&psk, &msg1).ok().map(|r| (r, admin)));
+                hs.checked(accepted.map(|((msg2, early, sealer, opener), admin)| {
+                    keys_for = Some((sealer, opener));
+                    Accepted { msg2, early: !early.is_empty(), admin }
+                }))
             }
-            Hello::BadUser => bail!("user name is not UTF-8"),
-            Hello::Hello { user, msg1 } => break (user, msg1),
-        }
-    };
-    let accepted =
-        keys.lookup(&user).and_then(|(psk, admin)| secure::server_accept(&psk, &msg1).ok().map(|r| (r, admin)));
-    let Some(((msg2, early, sealer, opener), admin)) = accepted else {
-        let _ = stream.write_all(&crate::session_state::refusal(crate::proto::REFUSED)).await;
-        bail!("refused `{user}`: unknown user or wrong key");
-    };
-    stream.write_all(&crate::session_state::welcome(&msg2)).await?;
-    if !early.is_empty() {
-        bail!("`{user}` sent a request with the handshake, which this protocol version does not do");
+            Shake::Reply { write, end } => {
+                let wrote = if write.is_empty() { Ok(()) } else { stream.write_all(&write).await };
+                return match end {
+                    Shook::Accepted { user, admin } => {
+                        wrote?;
+                        let (sealer, opener) = keys_for.expect("an accepted link has its keys");
+                        Ok((user, admin, sealer, opener))
+                    }
+                    Shook::Refused(why) => Err(anyhow!(why)),
+                };
+            }
+        };
     }
-    Ok((user, admin, sealer, opener))
 }
 
 pub fn bulk_of(m: &ServerMsg) -> usize {
