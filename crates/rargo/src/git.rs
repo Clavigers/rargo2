@@ -24,52 +24,75 @@ fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn relative_to(base: &Path, name: &str) -> PathBuf {
+    let path = PathBuf::from(name.trim());
+    if path.is_absolute() { path } else { base.join(path) }
+}
+
+fn git_link(root: &Path, contents: &[u8]) -> Option<PathBuf> {
+    let name = std::str::from_utf8(contents).ok()?.strip_prefix("gitdir:")?;
+    Some(relative_to(root, name))
+}
+
+enum HeadRef<'a> {
+    Detached(&'a str),
+    Symbolic(&'a str),
+}
+
+fn parse_head(contents: &[u8]) -> Option<(&str, HeadRef<'_>)> {
+    let text = std::str::from_utf8(contents).ok()?.trim();
+    let value = match text.strip_prefix("ref: ") {
+        Some(name) => HeadRef::Symbolic(name.trim()),
+        None if is_hex40(text) => HeadRef::Detached(text),
+        None => return None,
+    };
+    Some((text, value))
+}
+
+fn packed_ref<'a>(contents: &'a [u8], wanted: &str) -> Option<&'a str> {
+    std::str::from_utf8(contents).ok()?.lines().find_map(|line| {
+        let (id, name) = line.split_once(' ')?;
+        (name == wanted && is_hex40(id)).then_some(id)
+    })
+}
+
+fn loose_ref(contents: &[u8]) -> Option<&str> {
+    let id = std::str::from_utf8(contents).ok()?.trim();
+    is_hex40(id).then_some(id)
+}
+
 pub fn head(root: &Path) -> Option<Head> {
     let dot_git = root.join(".git");
     let git_dir = if dot_git.is_file() {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
-        let p = PathBuf::from(text.strip_prefix("gitdir:")?.trim());
-        if p.is_absolute() { p } else { root.join(p) }
+        git_link(root, &std::fs::read(&dot_git).ok()?)?
     } else {
         dot_git
     };
-    let text = std::fs::read_to_string(git_dir.join("HEAD")).ok()?.trim().to_string();
-    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
-        Ok(c) => {
-            let c = PathBuf::from(c.trim());
-            if c.is_absolute() { c } else { git_dir.join(c) }
-        }
-        Err(_) => git_dir.clone(),
-    };
+    let contents = std::fs::read(git_dir.join("HEAD")).ok()?;
+    let (text, value) = parse_head(&contents)?;
+    let common = std::fs::read_to_string(git_dir.join("commondir"))
+        .map_or_else(|_| git_dir.clone(), |name| relative_to(&git_dir, &name));
     let tags = tags_seal(&common);
-    let Some(name) = text.strip_prefix("ref: ").map(|s| s.trim().to_string()) else {
-        return is_hex40(&text).then(|| Head { commit: text.clone(), text, branch: None, common, tags });
-    };
-    let mut commit = None;
-    for dir in [&git_dir, &common] {
-        if let Ok(id) = std::fs::read_to_string(dir.join(&name)) {
-            commit = Some(id.trim().to_string());
-            break;
+    let (branch, commit) = match value {
+        HeadRef::Detached(commit) => (None, commit.to_string()),
+        HeadRef::Symbolic(name) => {
+            // The worktree's own ref shadows the shared ref and packed refs.
+            let loose = std::fs::read_to_string(git_dir.join(name)).or_else(|_| std::fs::read_to_string(common.join(name)));
+            let commit = match loose {
+                Ok(bytes) => loose_ref(bytes.as_bytes())?.to_string(),
+                Err(_) => packed_ref(&std::fs::read(common.join("packed-refs")).ok()?, name)?.to_string(),
+            };
+            (Some(name.to_string()), commit)
         }
-    }
-    if commit.is_none() {
-        let packed = std::fs::read_to_string(common.join("packed-refs")).ok()?;
-        commit = packed
-            .lines()
-            .find_map(|l| l.strip_suffix(name.as_str()).filter(|id| id.ends_with(' ')).map(|id| id.trim().to_string()));
-    }
-    let commit = commit.filter(|c| is_hex40(c))?;
-    Some(Head { text, branch: Some(name), commit, common, tags })
+    };
+    Some(Head { text: text.to_string(), branch, commit, common, tags })
 }
 
 fn tags_seal(common: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
-    let mut h = blake3::Hasher::new();
+    let mut records = Vec::new();
     let mut add = |name: &[u8], m: &std::fs::Metadata| {
-        h.update(name);
-        h.update(&m.len().to_le_bytes());
-        h.update(&m.mtime().to_le_bytes());
-        h.update(&m.mtime_nsec().to_le_bytes());
+        records.push((name.to_vec(), m.len(), m.mtime(), m.mtime_nsec()));
     };
     if let Ok(m) = std::fs::metadata(common.join("packed-refs")) {
         add(b"packed-refs", &m);
@@ -88,6 +111,17 @@ fn tags_seal(common: &Path) -> u64 {
                 add(e.path().as_os_str().as_bytes(), &m);
             }
         }
+    }
+    seal(records)
+}
+
+fn seal(records: Vec<(Vec<u8>, u64, i64, i64)>) -> u64 {
+    let mut h = blake3::Hasher::new();
+    for (name, len, seconds, nanos) in records {
+        h.update(&name);
+        h.update(&len.to_le_bytes());
+        h.update(&seconds.to_le_bytes());
+        h.update(&nanos.to_le_bytes());
     }
     u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap_or_default())
 }
@@ -111,9 +145,12 @@ fn tags_for(root: &Path, head: &Head, history: bool) -> Option<(String, Vec<Stri
         c.arg(format!("--points-at={}", head.commit));
     }
     c.arg("refs/tags");
-    let listed = output(c)?;
+    Some(stand_in_tags(&output(c)?))
+}
+
+fn stand_in_tags(listed: &[u8]) -> (String, Vec<String>) {
     let mut lines: Vec<(String, String, Option<String>)> = Vec::new();
-    for line in String::from_utf8_lossy(&listed).lines() {
+    for line in String::from_utf8_lossy(listed).lines() {
         let parts: Vec<&str> = line.split(' ').collect();
         match parts.as_slice() {
             [oid, "tag", peeled, name] => lines.push((name.to_string(), oid.to_string(), Some(peeled.to_string()))),
@@ -131,7 +168,7 @@ fn tags_for(root: &Path, head: &Head, history: bool) -> Option<(String, Vec<Stri
             objects.push(oid);
         }
     }
-    Some((text, objects))
+    (text, objects)
 }
 
 fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
@@ -172,16 +209,7 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
         c.args(["ls-tree", "-r", "-z", &head.commit]);
         c
     })?;
-    for rec in tree.split(|&b| b == 0) {
-        if rec.starts_with(b"120000 blob ") && rec.len() >= 52 {
-            ids.extend_from_slice(&rec[12..52]);
-            ids.push(b'\n');
-        }
-    }
-    for t in tag_objects {
-        ids.extend_from_slice(t.as_bytes());
-        ids.push(b'\n');
-    }
+    append_stand_in_objects(&mut ids, &tree, tag_objects);
     let mut pack = git(root)
         .args(["pack-objects", "--threads=1", "-q"])
         .arg(dir.join("objects/pack/pack"))
@@ -197,6 +225,23 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
     std::fs::write(dir.join("info/exclude"), format!("/{}\n", rargo_proto::GIT_SIDE)).ok()?;
     let read = git(root).env("GIT_INDEX_FILE", dir.join("index")).args(["read-tree", &head.commit]).status().ok()?;
     read.success().then_some(())
+}
+
+fn append_stand_in_objects(ids: &mut Vec<u8>, tree: &[u8], tag_objects: Vec<String>) {
+    for rec in tree.split(|&b| b == 0) {
+        if rec.starts_with(b"120000 blob ") && rec.len() >= 52 {
+            ids.extend_from_slice(&rec[12..52]);
+            ids.push(b'\n');
+        }
+    }
+    for t in tag_objects {
+        ids.extend_from_slice(t.as_bytes());
+        ids.push(b'\n');
+    }
+}
+
+pub fn ignored_paths(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.split(|&b| b == 0).filter(|path| !path.is_empty())
 }
 
 pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<PathBuf> {
@@ -243,21 +288,14 @@ pub fn history(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
         c.args(["rev-list", "--first-parent", &head.commit]);
         c
     })?;
-    let mut chain: Vec<&str> = std::str::from_utf8(&listed).ok()?.lines().collect();
-    chain.reverse();
+    let pieces = history_pieces(&listed)?;
     let tmp = store.join("heads").join(format!(".tmp-{}-{}", std::process::id(), head.commit));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("pack")).ok()?;
-    let mut start = 0;
-    for size in PIECES {
-        while start + size <= chain.len() {
-            let (before, last) = (start.checked_sub(1).map(|i| chain[i]), chain[start + size - 1]);
-            let piece = blake3::hash(format!("{}\n{last}", before.unwrap_or("")).as_bytes()).to_hex()[..32].to_string();
-            let (pack, idx) = piece_files(root, &pieces_dir, &piece, before, last)?;
-            for (src, ext) in [(&pack, "pack"), (&idx, "idx")] {
-                std::fs::hard_link(src, tmp.join("pack").join(format!("pack-{piece}.{ext}"))).ok()?;
-            }
-            start += size;
+    for HistoryPiece { key: piece, before, last } in pieces {
+        let (pack, idx) = piece_files(root, &pieces_dir, &piece, before, last)?;
+        for (src, ext) in [(&pack, "pack"), (&idx, "idx")] {
+            std::fs::hard_link(src, tmp.join("pack").join(format!("pack-{piece}.{ext}"))).ok()?;
         }
     }
     match std::fs::rename(&tmp, &at) {
@@ -272,6 +310,29 @@ pub fn history(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
     }
     sweep_history(&store);
     Some(at)
+}
+
+struct HistoryPiece<'a> {
+    key: String,
+    before: Option<&'a str>,
+    last: &'a str,
+}
+
+fn history_pieces(first_parent: &[u8]) -> Option<Vec<HistoryPiece<'_>>> {
+    let mut chain: Vec<_> = std::str::from_utf8(first_parent).ok()?.lines().collect();
+    chain.reverse();
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for size in PIECES {
+        while start + size <= chain.len() {
+            let before = start.checked_sub(1).map(|i| chain[i]);
+            let last = chain[start + size - 1];
+            let key = blake3::hash(format!("{}\n{last}", before.unwrap_or("")).as_bytes()).to_hex()[..32].to_string();
+            pieces.push(HistoryPiece { key, before, last });
+            start += size;
+        }
+    }
+    Some(pieces)
 }
 
 fn piece_files(root: &Path, dir: &Path, piece: &str, before: Option<&str>, last: &str) -> Option<(PathBuf, PathBuf)> {
@@ -331,20 +392,25 @@ fn sweep_history(store: &Path) {
 
 const HISTORY_CRATES: &[&str] = &["vergen", "vergen-gitcl", "vergen-git2", "vergen-gix", "shadow-rs", "git-version", "built", "git-testament"];
 
+fn history_input(rel: &[u8]) -> Option<&[u8]> {
+    let name = rel.rsplit(|&b| b == b'/').next().unwrap_or(rel);
+    matches!(name, b"build.rs" | b"Cargo.lock").then_some(name)
+}
+
+fn needs_history(name: &[u8], text: &str) -> bool {
+    if name == b"build.rs" {
+        text.contains("describe") || text.contains("rev-list")
+    } else {
+        text.lines().any(|l| l.strip_prefix("name = \"").and_then(|n| n.strip_suffix('"')).is_some_and(|n| HISTORY_CRATES.contains(&n)))
+    }
+}
+
 pub fn asks_for_history<'a>(root: &Path, files: impl Iterator<Item = &'a [u8]>) -> bool {
     use std::os::unix::ffi::OsStrExt;
     for rel in files {
-        let name = rel.rsplit(|&b| b == b'/').next().unwrap_or(rel);
-        if name != b"build.rs" && name != b"Cargo.lock" {
-            continue;
-        }
+        let Some(name) = history_input(rel) else { continue };
         let Ok(text) = std::fs::read_to_string(root.join(std::ffi::OsStr::from_bytes(rel))) else { continue };
-        let asks = if name == b"build.rs" {
-            text.contains("describe") || text.contains("rev-list")
-        } else {
-            text.lines().any(|l| l.strip_prefix("name = \"").and_then(|n| n.strip_suffix('"')).is_some_and(|n| HISTORY_CRATES.contains(&n)))
-        };
-        if asks {
+        if needs_history(name, &text) {
             return true;
         }
     }
@@ -520,23 +586,50 @@ mod tests {
     }
 
     #[test]
-    fn history_is_wanted_where_a_build_script_or_a_crate_asks_for_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        let put = |rel: &str, text: &str| {
-            std::fs::create_dir_all(r.join(rel).parent().unwrap()).unwrap();
-            std::fs::write(r.join(rel), text).unwrap();
-        };
-        put("crates/a/build.rs", "fn main() { git(&[\"rev-parse\", \"HEAD\"]); }");
-        put("Cargo.lock", "[[package]]\nname = \"serde\"\nversion = \"1.0.0\"\n");
-        let files = |list: &[&'static str]| list.iter().map(|f| f.as_bytes()).collect::<Vec<_>>();
-        let all = files(&["crates/a/build.rs", "Cargo.lock", "crates/a/src/lib.rs"]);
-        assert!(!asks_for_history(r, all.iter().copied()), "HEAD alone");
-        put("crates/b/build.rs", "fn main() { git(&[\"log\", \"-1\", \"--format=%(describe:tags)\"]); }");
-        let with_b = files(&["crates/a/build.rs", "crates/b/build.rs", "Cargo.lock"]);
-        assert!(asks_for_history(r, with_b.iter().copied()), "a build script that describes");
-        put("Cargo.lock", "[[package]]\nname = \"vergen-gitcl\"\nversion = \"1.0.0\"\n");
-        assert!(asks_for_history(r, all.iter().copied()), "a crate that asks git");
+    fn captured_worktree_submodule_and_packed_refs() {
+        const COMMIT: &str = "aa8336085721c9907cd5cfdb1e9239873f4c94c7";
+        const TAG: &str = "345dea299c18c71148e55a1573935dcd11cbf9c8";
+        const LINK: &str = "b285d1235d007189c79da4d8625e7f7565e329a2";
+        let packed = b"# pack-refs with: peeled fully-peeled sorted \naa8336085721c9907cd5cfdb1e9239873f4c94c7 refs/heads/feature/capture\naa8336085721c9907cd5cfdb1e9239873f4c94c7 refs/heads/main\n345dea299c18c71148e55a1573935dcd11cbf9c8 refs/tags/v1\n^aa8336085721c9907cd5cfdb1e9239873f4c94c7\n";
+        let (_, HeadRef::Symbolic(name)) = parse_head(b"ref: refs/heads/feature/capture\n").unwrap() else { panic!("expected worktree branch") };
+        assert_eq!(packed_ref(packed, name), Some(COMMIT));
+        assert_eq!(packed_ref(packed, "heads/main"), None);
+        let detached = format!("{COMMIT}\n");
+        let (_, HeadRef::Detached(id)) = parse_head(detached.as_bytes()).unwrap() else { panic!("expected detached commit") };
+        assert_eq!(id, COMMIT);
+        let common = relative_to(Path::new("/repo/.git/worktrees/worktree"), "../..\n");
+        assert_eq!(common, Path::new("/repo/.git/worktrees/worktree/../.."));
+        assert_eq!(git_link(Path::new("/repo/nested/module"), b"gitdir: ../../.git/modules/nested/module\n"),
+            Some(PathBuf::from("/repo/nested/module/../../.git/modules/nested/module")));
+
+        let listed = format!("{TAG} tag {COMMIT} refs/tags/v1\n");
+        let (refs, objects) = stand_in_tags(listed.as_bytes());
+        assert_eq!(packed_ref(refs.as_bytes(), "refs/tags/v1"), Some(TAG));
+        let tree = format!("120000 blob {LINK}\tlink\0");
+        let tree = [tree.as_bytes(), b"160000 commit 304d179b4a4bb58ed59cf102d34533f9e637d25c\tnested/module\0"].concat();
+        let mut ids = format!("{COMMIT}\n").into_bytes();
+        append_stand_in_objects(&mut ids, &tree, objects);
+        assert_eq!(ids, format!("{COMMIT}\n{LINK}\n{TAG}\n").into_bytes());
+        assert_eq!(ignored_paths(b"cache.log\0").collect::<Vec<_>>(), [b"cache.log".as_slice()]);
+    }
+
+    #[test]
+    fn history_piece_boundaries_and_detection_are_pure() {
+        let listed = (0..17).rev().map(|i| format!("{i:040x}\n")).collect::<String>();
+        let pieces = history_pieces(listed.as_bytes()).unwrap();
+        let first_end = format!("{:040x}", 15);
+        let final_end = format!("{:040x}", 16);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!((pieces[0].before, pieces[0].last), (None, first_end.as_str()));
+        assert_eq!((pieces[1].before, pieces[1].last), (Some(first_end.as_str()), final_end.as_str()));
+        assert_ne!(pieces[0].key, pieces[1].key);
+        assert!(!needs_history(b"build.rs", "git rev-parse HEAD"));
+        assert!(needs_history(b"build.rs", "git describe --tags"));
+        assert!(needs_history(b"build.rs", "git rev-list HEAD"));
+        assert!(needs_history(b"Cargo.lock", "name = \"vergen-gitcl\"\n"));
+        assert!(!needs_history(b"Cargo.lock", "name = \"serde\"\n"));
+        assert_eq!(history_input(b"nested/build.rs"), Some(b"build.rs".as_slice()));
+        assert_eq!(history_input(b"nested/src/lib.rs"), None);
     }
 
     fn walk(dir: &Path) -> u64 {
