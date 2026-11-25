@@ -406,7 +406,7 @@ fn flaky() {
     assert_ne!(std::env::var("NEXTEST_ATTEMPT").as_deref(), Ok("1"), "fails on its first attempt");
 }
 EOF
-norm() { sed -E 's/\[ *[0-9.]+s\]/[time]/g; s/run ID [0-9a-f-]+/run ID X/' | grep -E 'FLAKY|TRY|FAIL|PASS|Summary|Starting|fails on its first'; }
+norm() { sed -E 's/\[ *[0-9.]+s\]/[time]/g; s/run ID [0-9a-f-]+/run ID X/; s/finished in [0-9.]+s/finished in Ns/' | grep -E 'FLAKY|TRY|FAIL|PASS|Summary|Starting|fails on its first'; }
 out=$(cd "$T/nx-flaky" && "$R" nextest run --retries 2 2>&1); rc=$?
 newest=$(cat "$RARGO_STATE/nextest/newest-release")
 mkdir -p "$T/nextest-newest" && ln -sf "$RARGO_STATE/nextest/$newest/cargo-nextest" "$T/nextest-newest/cargo-nextest"
