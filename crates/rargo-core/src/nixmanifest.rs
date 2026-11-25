@@ -1,4 +1,4 @@
-use crate::db::{Db, Table};
+use crate::db::{Table, Tables};
 use crate::hash::Hash;
 use crate::view::{DType, FileInfo, FileSrc, HostSig, Listing, Looked, Owner};
 use anyhow::{Context, Result};
@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use rargo_proto::tree::{self, Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -70,89 +70,254 @@ fn meta_key(name: &[u8]) -> Vec<u8> {
     k
 }
 
-pub fn load(db: &Db, name: &[u8]) -> Option<StoredKind> {
+pub fn load(db: &dyn Tables, name: &[u8]) -> Option<StoredKind> {
     let v = db.get(Table::Meta, &meta_key(name))?;
     bincode::deserialize(&v).ok()
 }
 
-fn save(db: &Db, name: &[u8], kind: &StoredKind) -> Result<()> {
+fn save(db: &dyn Tables, name: &[u8], kind: &StoredKind) -> Result<()> {
     db.put(Table::Meta, &meta_key(name), &bincode::serialize(kind)?);
     Ok(())
 }
 
-struct Walked {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File { exec: bool },
+    Dir,
+    Link(Vec<u8>),
+    Other,
+}
+
+pub trait StoreFs: Send + Sync {
+    fn stat(&self, path: &Path) -> io::Result<Kind>;
+    fn list(&self, dir: &Path) -> io::Result<Vec<(Vec<u8>, Kind)>>;
+    fn hash(&self, path: &Path) -> io::Result<(Hash, u64)>;
+    fn host(&self, path: &Path) -> io::Result<(Kind, HostSig)>;
+}
+
+pub struct Disk;
+
+fn kind_of(path: &Path, meta: &fs::Metadata) -> io::Result<Kind> {
+    let ft = meta.file_type();
+    Ok(if ft.is_symlink() {
+        Kind::Link(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
+    } else if ft.is_dir() {
+        Kind::Dir
+    } else if ft.is_file() {
+        Kind::File { exec: meta.mode() & 0o111 != 0 }
+    } else {
+        Kind::Other
+    })
+}
+
+impl StoreFs for Disk {
+    fn stat(&self, path: &Path) -> io::Result<Kind> {
+        kind_of(path, &fs::symlink_metadata(path)?)
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<(Vec<u8>, Kind)>> {
+        let mut out = Vec::new();
+        for ent in fs::read_dir(dir)? {
+            let ent = ent?;
+            let path = ent.path();
+            out.push((ent.file_name().as_bytes().to_vec(), kind_of(&path, &fs::symlink_metadata(&path)?)?));
+        }
+        Ok(out)
+    }
+
+    fn hash(&self, path: &Path) -> io::Result<(Hash, u64)> {
+        Hash::of_path(path)
+    }
+
+    fn host(&self, path: &Path) -> io::Result<(Kind, HostSig)> {
+        let meta = fs::symlink_metadata(path)?;
+        Ok((kind_of(path, &meta)?, HostSig::of(&meta)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Ask {
+    Stat(PathBuf),
+    List(PathBuf),
+    Hash(PathBuf),
+}
+
+impl Ask {
+    fn path(&self) -> &Path {
+        match self {
+            Ask::Stat(p) | Ask::List(p) | Ask::Hash(p) => p,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum Answer {
+    Stat(Kind),
+    List(Vec<(Vec<u8>, Kind)>),
+    Hash(Hash, u64),
+}
+
+fn plain_name(name: &[u8]) -> bool {
+    !name.is_empty() && !name.contains(&b'/') && !name.contains(&0) && name != b"." && name != b".."
+}
+
+pub struct Walk {
+    root: PathBuf,
+    want: BTreeSet<Ask>,
+    asked: BTreeSet<Ask>,
+    top: Option<Kind>,
+    listed: BTreeMap<PathBuf, Vec<(Vec<u8>, Kind)>>,
+    hashed: BTreeMap<PathBuf, (Hash, u64)>,
+    failed: Option<String>,
+}
+
+impl Walk {
+    pub fn new(root: &Path) -> Walk {
+        Walk {
+            root: root.to_path_buf(),
+            want: BTreeSet::from([Ask::Stat(root.to_path_buf())]),
+            asked: BTreeSet::new(),
+            top: None,
+            listed: BTreeMap::new(),
+            hashed: BTreeMap::new(),
+            failed: None,
+        }
+    }
+
+    pub fn wants(&self) -> Vec<Ask> {
+        self.want.iter().cloned().collect()
+    }
+
+    pub fn saw(&mut self, ask: Ask, answer: io::Result<Answer>) {
+        if !self.want.remove(&ask) {
+            return;
+        }
+        self.asked.insert(ask.clone());
+        let answer = match answer {
+            Ok(a) => a,
+            Err(e) => {
+                self.failed = Some(format!("{}: {e}", ask.path().display()));
+                self.want.clear();
+                return;
+            }
+        };
+        match (ask, answer) {
+            (Ask::Stat(p), Answer::Stat(kind)) => {
+                match &kind {
+                    Kind::File { .. } => {
+                        self.want.insert(Ask::Hash(p));
+                    }
+                    Kind::Dir => {
+                        self.want.insert(Ask::List(p));
+                    }
+                    Kind::Link(_) => {}
+                    Kind::Other => {
+                        self.failed = Some(format!("{} is not a file, directory or symlink", p.display()));
+                    }
+                }
+                self.top = Some(kind);
+            }
+            (Ask::List(p), Answer::List(entries)) => {
+                let entries: Vec<(Vec<u8>, Kind)> = entries.into_iter().filter(|(n, _)| plain_name(n)).collect();
+                for (name, kind) in &entries {
+                    let child = p.join(std::ffi::OsStr::from_bytes(name));
+                    match kind {
+                        Kind::Dir => {
+                            self.want.insert(Ask::List(child));
+                        }
+                        Kind::File { .. } => {
+                            self.want.insert(Ask::Hash(child));
+                        }
+                        _ => {}
+                    }
+                }
+                self.listed.insert(p, entries);
+            }
+            (Ask::Hash(p), Answer::Hash(h, size)) => {
+                self.hashed.insert(p, (h, size));
+            }
+            (ask, answer) => {
+                self.failed = Some(format!("{}: {answer:?} does not answer {ask:?}", ask.path().display()));
+                self.want.clear();
+            }
+        }
+    }
+
+    fn tree(&self, dir: &Path) -> io::Result<Walked> {
+        let mut hashed = Vec::new();
+        let mut links = Vec::new();
+        let mut children = Vec::new();
+        for (name, kind) in self.listed.get(dir).ok_or_else(|| io::Error::other(format!("{} was not listed", dir.display())))? {
+            let child = dir.join(std::ffi::OsStr::from_bytes(name));
+            match kind {
+                Kind::File { exec } => {
+                    let (h, size) = self.hashed.get(&child).ok_or_else(|| io::Error::other(format!("{} was not hashed", child.display())))?;
+                    hashed.push((name.clone(), Node::File { hash: h.0, size: *size, exec: *exec }, *size));
+                }
+                Kind::Link(target) => links.push((name.clone(), target.clone())),
+                Kind::Dir => children.push((name.clone(), self.tree(&child)?)),
+                Kind::Other => {}
+            }
+        }
+        manifest(dir, hashed, links, children)
+    }
+
+    pub fn finish(self) -> io::Result<Fresh> {
+        if let Some(e) = self.failed {
+            return Err(io::Error::other(e));
+        }
+        if !self.want.is_empty() {
+            return Err(io::Error::other(format!("{} is not walked yet", self.root.display())));
+        }
+        match self.top.as_ref() {
+            Some(Kind::Link(target)) => Ok(Fresh { kind: StoredKind::Link(target.clone()), files: 0, bytes: 0 }),
+            Some(Kind::File { exec }) => {
+                let (hash, size) = *self.hashed.get(&self.root).ok_or_else(|| io::Error::other("the file was not hashed"))?;
+                Ok(Fresh { kind: StoredKind::File { hash, size, exec: *exec }, files: 1, bytes: size })
+            }
+            Some(Kind::Dir) => {
+                let walked = self.tree(&self.root)?;
+                Ok(Fresh { kind: StoredKind::Dir { root: walked.root, trees: walked.trees }, files: walked.files, bytes: walked.bytes })
+            }
+            _ => Err(io::Error::other(format!("{} was not looked at", self.root.display()))),
+        }
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        let inside = |a: &Ask| a.path().starts_with(&self.root);
+        let from_listing = |a: &Ask| {
+            let p = a.path();
+            if p == self.root {
+                return true;
+            }
+            let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else { return false };
+            self.listed.get(dir).is_some_and(|entries| {
+                entries.iter().any(|(n, k)| {
+                    n.as_slice() == name.as_bytes()
+                        && match a {
+                            Ask::List(_) => *k == Kind::Dir,
+                            Ask::Hash(_) => matches!(k, Kind::File { .. }),
+                            Ask::Stat(_) => false,
+                        }
+                })
+            })
+        };
+        self.want.iter().chain(&self.asked).all(|a| inside(a) && from_listing(a))
+            && self.want.is_disjoint(&self.asked)
+            && self.listed.keys().all(|d| self.asked.contains(&Ask::List(d.clone())))
+            && self.hashed.keys().all(|f| self.asked.contains(&Ask::Hash(f.clone())))
+            && self.listed.values().flatten().all(|(n, _)| plain_name(n))
+            && (self.failed.is_none() || self.want.is_empty())
+            && (self.top.is_some() || self.asked.is_empty() || self.failed.is_some())
+    }
+}
+
+pub struct Walked {
     root: Hash,
     trees: Vec<(Hash, Vec<u8>)>,
     files: u64,
     bytes: u64,
-}
-
-fn walk_dir(path: &Path, parallel: bool) -> io::Result<Walked> {
-    let mut files: Vec<(Vec<u8>, PathBuf, bool)> = Vec::new();
-    let mut dirs: Vec<(Vec<u8>, PathBuf)> = Vec::new();
-    let mut links: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    for ent in fs::read_dir(path)? {
-        let ent = ent?;
-        let name = ent.file_name().as_bytes().to_vec();
-        if name.is_empty()
-            || name.contains(&b'/')
-            || name.contains(&0)
-            || name == b"."
-            || name == b".."
-        {
-            continue;
-        }
-        let ft = ent.file_type()?;
-        if ft.is_symlink() {
-            let target = fs::read_link(ent.path())?;
-            links.push((name, target.as_os_str().as_bytes().to_vec()));
-        } else if ft.is_dir() {
-            dirs.push((name, ent.path()));
-        } else if ft.is_file() {
-            let exec = fs::symlink_metadata(ent.path())?.mode() & 0o111 != 0;
-            files.push((name, ent.path(), exec));
-        }
-    }
-    let hash_file =
-        |name: &Vec<u8>, path: &Path, exec: &bool| -> io::Result<(Vec<u8>, Node, u64)> {
-            let (h, size) = Hash::of_path(path)?;
-            Ok((
-                name.clone(),
-                Node::File {
-                    hash: h.0,
-                    size,
-                    exec: *exec,
-                },
-                size,
-            ))
-        };
-    let hashed: Vec<io::Result<(Vec<u8>, Node, u64)>> = if parallel {
-        files
-            .par_iter()
-            .map(|(name, path, exec)| hash_file(name, path, exec))
-            .collect()
-    } else {
-        files
-            .iter()
-            .map(|(name, path, exec)| hash_file(name, path, exec))
-            .collect()
-    };
-    let children: Vec<io::Result<(Vec<u8>, Walked)>> = if parallel {
-        dirs.par_iter()
-            .map(|(name, path)| Ok((name.clone(), walk_dir(path, true)?)))
-            .collect()
-    } else {
-        dirs.iter()
-            .map(|(name, path)| Ok((name.clone(), walk_dir(path, false)?)))
-            .collect()
-    };
-
-    manifest(
-        path,
-        hashed.into_iter().collect::<io::Result<Vec<_>>>()?,
-        links,
-        children.into_iter().collect::<io::Result<Vec<_>>>()?,
-    )
 }
 
 fn manifest(
@@ -199,59 +364,46 @@ fn manifest(
     })
 }
 
-struct Fresh {
+pub struct Fresh {
     kind: StoredKind,
     files: u64,
     bytes: u64,
 }
 
-fn hash_path(path: &Path) -> io::Result<Fresh> {
-    hash_path_mode(path, true)
+fn answer(fs: &dyn StoreFs, ask: &Ask) -> io::Result<Answer> {
+    match ask {
+        Ask::Stat(p) => fs.stat(p).map(Answer::Stat),
+        Ask::List(p) => fs.list(p).map(Answer::List),
+        Ask::Hash(p) => fs.hash(p).map(|(h, size)| Answer::Hash(h, size)),
+    }
 }
 
-fn hash_path_mode(path: &Path, parallel: bool) -> io::Result<Fresh> {
-    let meta = fs::symlink_metadata(path)?;
-    let ft = meta.file_type();
-    if ft.is_symlink() {
-        let target = fs::read_link(path)?;
-        return Ok(Fresh {
-            kind: StoredKind::Link(target.as_os_str().as_bytes().to_vec()),
-            files: 0,
-            bytes: 0,
-        });
+fn hash_path_mode(fs: &dyn StoreFs, path: &Path, parallel: bool) -> io::Result<Fresh> {
+    let mut walk = Walk::new(path);
+    loop {
+        let wants = walk.wants();
+        if wants.is_empty() {
+            break;
+        }
+        let answers: Vec<(Ask, io::Result<Answer>)> = if parallel {
+            wants.into_par_iter().map(|a| { let r = answer(fs, &a); (a, r) }).collect()
+        } else {
+            wants.into_iter().map(|a| { let r = answer(fs, &a); (a, r) }).collect()
+        };
+        for (ask, got) in answers {
+            walk.saw(ask, got);
+        }
     }
-    if ft.is_file() {
-        let (hash, size) = Hash::of_path(path)?;
-        let exec = meta.mode() & 0o111 != 0;
-        return Ok(Fresh {
-            kind: StoredKind::File { hash, size, exec },
-            files: 1,
-            bytes: size,
-        });
-    }
-    if ft.is_dir() {
-        let walked = walk_dir(path, parallel)?;
-        return Ok(Fresh {
-            kind: StoredKind::Dir {
-                root: walked.root,
-                trees: walked.trees,
-            },
-            files: walked.files,
-            bytes: walked.bytes,
-        });
-    }
-    Err(io::Error::other(format!(
-        "{} is not a file, directory or symlink",
-        path.display()
-    )))
+    walk.finish()
 }
 
-pub fn ensure(db: &Db, store: &Path, names: &[String]) -> Result<Prepared> {
-    prepare(db, store, names, None, &mut HashSet::new())
+pub fn ensure(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, names: &[String]) -> Result<Prepared> {
+    prepare(db, fs, store, names, None, &mut HashSet::new())
 }
 
 pub fn prepare(
-    db: &Db,
+    db: &dyn Tables,
+    fs: &dyn StoreFs,
     store: &Path,
     names: &[String],
     hosts: Option<&DashMap<Hash, FileSrc>>,
@@ -268,7 +420,7 @@ pub fn prepare(
             }
             None => {
                 let t = Instant::now();
-                let fresh = hash_path(&path).with_context(|| format!("hashing {name}"))?;
+                let fresh = hash_path_mode(fs, &path, true).with_context(|| format!("hashing {name}"))?;
                 cost.millis += t.elapsed().as_millis() as u64;
                 save(db, name.as_bytes(), &fresh.kind)?;
                 cost.new_paths += 1;
@@ -278,7 +430,7 @@ pub fn prepare(
             }
         };
         let kind = adopt(
-            db, name, &path, kind, was_cached, hosts, seen, &mut cost, true,
+            db, fs, name, &path, kind, was_cached, hosts, seen, &mut cost, true,
         )?;
         roots.push(identity(&kind));
     }
@@ -296,7 +448,8 @@ pub fn log_cost(cost: &Cost) {
 }
 
 pub fn schedule(
-    db: &Arc<Db>,
+    db: &Arc<dyn Tables>,
+    fs: &Arc<dyn StoreFs>,
     store: &Path,
     names: &[String],
     hosts: Option<&Arc<DashMap<Hash, FileSrc>>>,
@@ -308,11 +461,11 @@ pub fn schedule(
     let host_map = hosts.map(|m| m.as_ref());
     for name in names {
         let path = store.join(name);
-        if let Some(kind) = load(db, name.as_bytes()) {
+        if let Some(kind) = load(db.as_ref(), name.as_bytes()) {
             cost.reused_paths += 1;
             let mut guard = seen.lock();
             let kind = adopt(
-                db, name, &path, kind, true, host_map, &mut guard, &mut cost, false,
+                db.as_ref(), fs.as_ref(), name, &path, kind, true, host_map, &mut guard, &mut cost, false,
             )?;
             roots.push(identity(&kind));
         } else {
@@ -323,6 +476,7 @@ pub fn schedule(
     if !pending.is_empty() {
         enqueue(Job {
             db: Arc::clone(db),
+            fs: Arc::clone(fs),
             store: store.to_path_buf(),
             names: pending,
             hosts: hosts.cloned(),
@@ -333,7 +487,8 @@ pub fn schedule(
 }
 
 fn adopt(
-    db: &Db,
+    db: &dyn Tables,
+    fs: &dyn StoreFs,
     name: &str,
     path: &Path,
     mut kind: StoredKind,
@@ -344,14 +499,14 @@ fn adopt(
     parallel: bool,
 ) -> Result<StoredKind> {
     if let Some(hosts) = hosts.filter(|_| !seen.contains(name)) {
-        if let Err(e) = attach_kind(&kind, path, hosts) {
+        if let Err(e) = attach_kind(fs, &kind, path, hosts) {
             eprintln!(
                 "rargod: nix path {name} manifest does not match the files ({e}); hashing it again"
             );
             db.delete(Table::Meta, &meta_key(name.as_bytes()));
             let t = Instant::now();
             let fresh =
-                hash_path_mode(path, parallel).with_context(|| format!("hashing {name} again"))?;
+                hash_path_mode(fs, path, parallel).with_context(|| format!("hashing {name} again"))?;
             cost.millis += t.elapsed().as_millis() as u64;
             save(db, name.as_bytes(), &fresh.kind)?;
             if was_cached {
@@ -360,7 +515,7 @@ fn adopt(
             }
             cost.hashed_files += fresh.files;
             cost.hashed_bytes += fresh.bytes;
-            attach_kind(&fresh.kind, path, hosts).with_context(|| format!("remembering {name}"))?;
+            attach_kind(fs, &fresh.kind, path, hosts).with_context(|| format!("remembering {name}"))?;
             kind = fresh.kind;
         }
         seen.insert(name.to_string());
@@ -369,7 +524,8 @@ fn adopt(
 }
 
 struct Job {
-    db: Arc<Db>,
+    db: Arc<dyn Tables>,
+    fs: Arc<dyn StoreFs>,
     store: PathBuf,
     names: Vec<String>,
     hosts: Option<Arc<DashMap<Hash, FileSrc>>>,
@@ -496,10 +652,11 @@ fn hash_job(job: Job) {
     for name in job.names {
         wait_until_the_build_is_done();
         let path = job.store.join(&name);
-        if let Some(kind) = load(&job.db, name.as_bytes()) {
+        if let Some(kind) = load(job.db.as_ref(), name.as_bytes()) {
             let mut seen = job.seen.lock();
             if let Err(e) = adopt(
-                &job.db,
+                job.db.as_ref(),
+                job.fs.as_ref(),
                 &name,
                 &path,
                 kind,
@@ -514,7 +671,7 @@ fn hash_job(job: Job) {
             continue;
         }
         let t = Instant::now();
-        let fresh = match hash_path_mode(&path, false) {
+        let fresh = match hash_path_mode(job.fs.as_ref(), &path, false) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("rargod: nix path {name}: {e}");
@@ -525,14 +682,14 @@ fn hash_job(job: Job) {
         if let Some(hosts) = job.hosts.as_deref() {
             let mut seen = job.seen.lock();
             if !seen.contains(&name) {
-                if let Err(e) = attach_kind(&fresh.kind, &path, hosts) {
+                if let Err(e) = attach_kind(job.fs.as_ref(), &fresh.kind, &path, hosts) {
                     eprintln!("rargod: nix path {name} manifest does not match the files ({e})");
                     continue;
                 }
                 seen.insert(name.clone());
             }
         }
-        if let Err(e) = save(&job.db, name.as_bytes(), &fresh.kind) {
+        if let Err(e) = save(job.db.as_ref(), name.as_bytes(), &fresh.kind) {
             eprintln!("rargod: nix path {name}: {e:#}");
             continue;
         }
@@ -543,15 +700,15 @@ fn hash_job(job: Job) {
     log_cost(&cost);
 }
 
-fn attach_kind(kind: &StoredKind, path: &Path, hosts: &DashMap<Hash, FileSrc>) -> io::Result<()> {
+fn attach_kind(fs: &dyn StoreFs, kind: &StoredKind, path: &Path, hosts: &DashMap<Hash, FileSrc>) -> io::Result<()> {
     match kind {
         StoredKind::Dir { root, trees } => {
             let installed = PathTrees::decode(*root, trees)?;
-            attach_tree(&installed, *root, path, hosts)
+            attach_tree(fs, &installed, *root, path, hosts)
         }
-        StoredKind::File { hash, size, .. } => remember_file(path, *hash, *size, hosts),
+        StoredKind::File { hash, size, .. } => remember_file(fs, path, *hash, *size, hosts),
         StoredKind::Link(_) => {
-            if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            if matches!(fs.stat(path)?, Kind::Link(_)) {
                 Ok(())
             } else {
                 Err(io::Error::other("not a symlink"))
@@ -561,6 +718,7 @@ fn attach_kind(kind: &StoredKind, path: &Path, hosts: &DashMap<Hash, FileSrc>) -
 }
 
 fn attach_tree(
+    fs: &dyn StoreFs,
     trees: &PathTrees,
     digest: Hash,
     dir: &Path,
@@ -572,10 +730,10 @@ fn attach_tree(
     for (name, node) in &tree.entries {
         let path = dir.join(std::ffi::OsStr::from_bytes(name));
         match node {
-            Node::Dir(d) => attach_tree(trees, Hash(*d), &path, hosts)?,
-            Node::File { hash, size, .. } => remember_file(&path, Hash(*hash), *size, hosts)?,
+            Node::Dir(d) => attach_tree(fs, trees, Hash(*d), &path, hosts)?,
+            Node::File { hash, size, .. } => remember_file(fs, &path, Hash(*hash), *size, hosts)?,
             Node::Symlink(_) => {
-                if !fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                if !matches!(fs.stat(&path)?, Kind::Link(_)) {
                     return Err(io::Error::other(format!(
                         "{} is not a symlink",
                         path.display()
@@ -588,13 +746,14 @@ fn attach_tree(
 }
 
 fn remember_file(
+    fs: &dyn StoreFs,
     path: &Path,
     hash: Hash,
     size: u64,
     hosts: &DashMap<Hash, FileSrc>,
 ) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.file_type().is_file() || meta.len() != size {
+    let (kind, sig) = fs.host(path)?;
+    if !matches!(kind, Kind::File { .. }) || sig.size != size {
         return Err(io::Error::other(format!(
             "{} is not the manifested file",
             path.display()
@@ -602,7 +761,7 @@ fn remember_file(
     }
     hosts.entry(hash).or_insert_with(|| FileSrc::Host {
         path: Arc::from(path.to_path_buf()),
-        sig: HostSig::of(&meta),
+        sig,
     });
     Ok(())
 }
@@ -828,8 +987,219 @@ pub fn list_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use crate::db::MemTables;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Clone, Debug)]
+    enum Ent {
+        File(Vec<u8>, bool),
+        Dir,
+        Link(Vec<u8>),
+        Other,
+    }
+
+    #[derive(Default)]
+    struct FakeStore {
+        ents: BTreeMap<PathBuf, Ent>,
+        odd: BTreeMap<PathBuf, Vec<Vec<u8>>>,
+        broken: BTreeSet<PathBuf>,
+        hashed: AtomicU64,
+    }
+
+    impl FakeStore {
+        fn put(&mut self, path: &str, e: Ent) {
+            let path = PathBuf::from(path);
+            for a in path.ancestors().skip(1) {
+                if a.as_os_str().is_empty() || a == Path::new("/") {
+                    break;
+                }
+                self.ents.entry(a.to_path_buf()).or_insert(Ent::Dir);
+            }
+            self.ents.insert(path, e);
+        }
+
+        fn kind(e: &Ent) -> Kind {
+            match e {
+                Ent::File(_, exec) => Kind::File { exec: *exec },
+                Ent::Dir => Kind::Dir,
+                Ent::Link(t) => Kind::Link(t.clone()),
+                Ent::Other => Kind::Other,
+            }
+        }
+    }
+
+    fn missing(path: &Path) -> io::Error {
+        io::Error::new(io::ErrorKind::NotFound, format!("{} is missing", path.display()))
+    }
+
+    impl StoreFs for FakeStore {
+        fn stat(&self, path: &Path) -> io::Result<Kind> {
+            self.ents.get(path).map(FakeStore::kind).ok_or_else(|| missing(path))
+        }
+
+        fn list(&self, dir: &Path) -> io::Result<Vec<(Vec<u8>, Kind)>> {
+            if self.broken.contains(dir) {
+                return Err(io::Error::other("permission denied"));
+            }
+            if !matches!(self.ents.get(dir), Some(Ent::Dir)) {
+                return Err(missing(dir));
+            }
+            let mut out: Vec<(Vec<u8>, Kind)> = self
+                .ents
+                .iter()
+                .filter(|(p, _)| p.parent() == Some(dir))
+                .map(|(p, e)| (p.file_name().unwrap().as_bytes().to_vec(), FakeStore::kind(e)))
+                .collect();
+            for name in self.odd.get(dir).into_iter().flatten() {
+                out.push((name.clone(), Kind::File { exec: false }));
+            }
+            out.reverse();
+            Ok(out)
+        }
+
+        fn hash(&self, path: &Path) -> io::Result<(Hash, u64)> {
+            self.hashed.fetch_add(1, Ordering::Relaxed);
+            match self.ents.get(path) {
+                Some(Ent::File(data, _)) => Ok((Hash::of(data), data.len() as u64)),
+                _ => Err(missing(path)),
+            }
+        }
+
+        fn host(&self, path: &Path) -> io::Result<(Kind, HostSig)> {
+            let e = self.ents.get(path).ok_or_else(|| missing(path))?;
+            let size = if let Ent::File(d, _) = e { d.len() as u64 } else { 0 };
+            let ino = self.ents.keys().position(|p| p == path).unwrap() as u64;
+            Ok((FakeStore::kind(e), HostSig { dev: 1, ino, size, mtime_ns: 0, ctime_ns: 0 }))
+        }
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    fn model(fs: &FakeStore, dir: &Path) -> (Hash, u64, u64) {
+        let mut entries = Vec::new();
+        let (mut files, mut bytes) = (0, 0);
+        for (p, e) in fs.ents.iter().filter(|(p, _)| p.parent() == Some(dir)) {
+            let name = p.file_name().unwrap().as_bytes().to_vec();
+            match e {
+                Ent::File(data, exec) => {
+                    files += 1;
+                    bytes += data.len() as u64;
+                    entries.push((name, Node::File { hash: Hash::of(data).0, size: data.len() as u64, exec: *exec }));
+                }
+                Ent::Link(t) => entries.push((name, Node::Symlink(t.clone()))),
+                Ent::Dir => {
+                    let (h, f, b) = model(fs, p);
+                    files += f;
+                    bytes += b;
+                    entries.push((name, Node::Dir(h.0)));
+                }
+                Ent::Other => {}
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        (Hash(tree::digest(&Tree { entries }.encode())), files, bytes)
+    }
+
+    fn walk_shuffled(fs: &FakeStore, root: &Path, rng: &mut Rng) -> io::Result<Fresh> {
+        let mut walk = Walk::new(root);
+        assert!(walk.invariants());
+        let mut rounds = 0;
+        loop {
+            let mut wants = walk.wants();
+            if wants.is_empty() {
+                break;
+            }
+            rounds += 1;
+            assert!(rounds < 10_000);
+            let take = 1 + rng.below(wants.len() as u64) as usize;
+            for _ in 0..take {
+                let ask = wants.remove(rng.below(wants.len() as u64) as usize);
+                let got = answer(fs, &ask);
+                walk.saw(ask.clone(), got);
+                assert!(walk.invariants(), "after {ask:?}");
+                walk.saw(ask, Ok(Answer::Stat(Kind::Dir)));
+                assert!(walk.invariants(), "an answer to nothing asked is ignored");
+            }
+        }
+        walk.finish()
+    }
+
+    #[test]
+    fn generated_store_trees_walk_to_the_manifest_of_their_listing_in_any_order() {
+        let names: [&[u8]; 8] = [b"bin", b"lib", b"share", b"a.so", b"x", b"y y", b"\xff", b"-dash"];
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut fs = FakeStore::default();
+            let root = "/nix/store/0000000000000000000000000000000a-pkg";
+            fs.put(root, Ent::Dir);
+            let mut dirs = vec![PathBuf::from(root)];
+            for _ in 0..rng.below(40) {
+                let parent = dirs[rng.below(dirs.len() as u64) as usize].clone();
+                let name = std::ffi::OsStr::from_bytes(names[rng.below(names.len() as u64) as usize]);
+                let path = parent.join(name);
+                if fs.ents.contains_key(&path) {
+                    continue;
+                }
+                let e = match rng.below(10) {
+                    0..=4 => Ent::File(vec![rng.below(256) as u8; rng.below(5) as usize], rng.below(2) == 0),
+                    5..=7 => {
+                        dirs.push(path.clone());
+                        Ent::Dir
+                    }
+                    8 => Ent::Link(b"../lib".to_vec()),
+                    _ => Ent::Other,
+                };
+                fs.ents.insert(path, e);
+            }
+            if rng.below(3) == 0 {
+                fs.odd.insert(PathBuf::from(root), vec![b".".to_vec(), b"..".to_vec(), Vec::new(), b"a/b".to_vec(), b"nul\0".to_vec()]);
+            }
+            let (want, files, bytes) = model(&fs, Path::new(root));
+            for order in 0..3 {
+                let fresh = walk_shuffled(&fs, Path::new(root), &mut rng).unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+                assert_eq!(identity(&fresh.kind), want, "seed {seed} order {order}: the walk gives the listing's tree");
+                assert_eq!((fresh.files, fresh.bytes), (files, bytes), "seed {seed}");
+                let StoredKind::Dir { root: r, trees } = &fresh.kind else { panic!("a directory") };
+                assert!(PathTrees::decode(*r, trees).is_ok(), "seed {seed}: every tree is carried");
+            }
+            assert_eq!(identity(&hash_path_mode(&fs, Path::new(root), true).unwrap().kind), want, "seed {seed}: the shell's parallel walk agrees");
+        }
+    }
+
+    #[test]
+    fn single_files_links_and_failures_are_walked_as_their_kind_says() {
+        let mut fs = FakeStore::default();
+        fs.put("/s/f", Ent::File(b"file-path".to_vec(), true));
+        fs.put("/s/l", Ent::Link(b"f".to_vec()));
+        fs.put("/s/p", Ent::Other);
+        fs.put("/s/d/sub/x", Ent::File(b"x".to_vec(), false));
+        fs.broken.insert(PathBuf::from("/s/d/sub"));
+        let mut rng = Rng(7);
+        let f = walk_shuffled(&fs, Path::new("/s/f"), &mut rng).unwrap();
+        assert!(matches!(f.kind, StoredKind::File { size: 9, exec: true, .. }) && (f.files, f.bytes) == (1, 9));
+        let l = walk_shuffled(&fs, Path::new("/s/l"), &mut rng).unwrap();
+        assert!(matches!(&l.kind, StoredKind::Link(t) if t == b"f") && (l.files, l.bytes) == (0, 0));
+        let p = walk_shuffled(&fs, Path::new("/s/p"), &mut rng).err().unwrap();
+        assert_eq!(p.to_string(), "/s/p is not a file, directory or symlink");
+        let d = walk_shuffled(&fs, Path::new("/s/d"), &mut rng).err().unwrap();
+        assert_eq!(d.to_string(), "/s/d/sub: permission denied");
+        let gone = walk_shuffled(&fs, Path::new("/s/none"), &mut rng).err().unwrap();
+        assert_eq!(gone.to_string(), "/s/none: /s/none is missing");
+        let mut walk = Walk::new(Path::new("/s/f"));
+        walk.saw(Ask::Stat("/s/f".into()), Ok(Answer::Hash(Hash::ZERO, 0)));
+        assert!(walk.invariants());
+        assert!(walk.finish().is_err(), "an answer of the wrong shape fails the walk");
+        assert!(Walk::new(Path::new("/s/f")).finish().is_err(), "an unfinished walk has no manifest");
+    }
 
     #[test]
     fn generated_store_listings_have_a_stable_manifest() {
@@ -853,72 +1223,71 @@ mod tests {
         }
     }
 
-    fn tree(store: &Path) {
-        fs::create_dir_all(store.join("aaa/bin")).unwrap();
-        fs::create_dir_all(store.join("aaa/lib")).unwrap();
-        fs::create_dir_all(store.join("bbb")).unwrap();
-        fs::create_dir_all(store.join("ccc")).unwrap();
-        let tool = store.join("aaa/bin/tool");
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).mode(0o555);
-        opts.open(&tool).unwrap().write_all(b"tool-bytes").unwrap();
-        fs::write(store.join("aaa/lib/note"), b"note").unwrap();
-        std::os::unix::fs::symlink("../bin/tool", store.join("aaa/lib/to-tool")).unwrap();
-        fs::write(store.join("bbb/readme"), b"bee").unwrap();
-        fs::write(store.join("ccc/only"), b"cee").unwrap();
-        fs::write(store.join("fff"), b"file-path").unwrap();
-        std::os::unix::fs::symlink("fff", store.join("lll")).unwrap();
+    fn tree() -> FakeStore {
+        let mut fs = FakeStore::default();
+        fs.put("/store/aaa/bin/tool", Ent::File(b"tool-bytes".to_vec(), true));
+        fs.put("/store/aaa/lib/note", Ent::File(b"note".to_vec(), false));
+        fs.put("/store/aaa/lib/to-tool", Ent::Link(b"../bin/tool".to_vec()));
+        fs.put("/store/bbb/readme", Ent::File(b"bee".to_vec(), false));
+        fs.put("/store/ccc/only", Ent::File(b"cee".to_vec(), false));
+        fs.put("/store/fff", Ent::File(b"file-path".to_vec(), false));
+        fs.put("/store/lll", Ent::Link(b"fff".to_vec()));
+        fs
+    }
+
+    fn shared(fs: FakeStore) -> (Arc<dyn Tables>, Arc<FakeStore>, Arc<dyn StoreFs>) {
+        let fs = Arc::new(fs);
+        let dynfs: Arc<dyn StoreFs> = fs.clone();
+        (Arc::new(MemTables::default()), fs, dynfs)
+    }
+
+    fn wait_for(db: &Arc<dyn Tables>, name: &[u8]) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while load(db.as_ref(), name).is_none() {
+            assert!(Instant::now() < deadline, "{} was not hashed", String::from_utf8_lossy(name));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
     fn a_shared_store_path_is_manifested_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
-        tree(&store);
-        let db = Db::open(&tmp.path().join("db.redb")).unwrap();
-        let first = ensure(&db, &store, &["aaa".into(), "bbb".into()]).unwrap();
+        let fs = tree();
+        let db = MemTables::default();
+        let store = Path::new("/store");
+        let first = ensure(&db, &fs, store, &["aaa".into(), "bbb".into()]).unwrap();
         assert_eq!(first.cost.new_paths, 2);
         assert_eq!(first.cost.reused_paths, 0);
         assert_eq!(first.cost.hashed_files, 3);
-        let second = ensure(&db, &store, &["bbb".into(), "ccc".into()]).unwrap();
-        assert_eq!(
-            second.cost.reused_paths, 1,
-            "bbb was hashed with the first closure"
-        );
+        assert_eq!(fs.hashed.load(Ordering::Relaxed), 3);
+        let second = ensure(&db, &fs, store, &["bbb".into(), "ccc".into()]).unwrap();
+        assert_eq!(second.cost.reused_paths, 1, "bbb was hashed with the first closure");
         assert_eq!(second.cost.new_paths, 1);
         assert_eq!(second.cost.hashed_files, 1, "only ccc's file is new");
+        assert_eq!(fs.hashed.load(Ordering::Relaxed), 4);
         assert_eq!(second.roots[0], first.roots[1], "bbb keeps its tree");
-        let third = ensure(&db, &store, &["aaa".into(), "bbb".into()]).unwrap();
+        let third = ensure(&db, &fs, store, &["aaa".into(), "bbb".into()]).unwrap();
         assert_eq!(third.cost.hashed_files, 0);
         assert_eq!(third.cost.reused_paths, 2);
         assert_eq!(third.roots, first.roots);
+        assert_eq!(first.roots[0], model(&fs, Path::new("/store/aaa")).0);
     }
 
     #[test]
     fn hashing_a_store_path_does_not_block_the_caller() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
-        tree(&store);
-        let db = Arc::new(Db::open(&tmp.path().join("db.redb")).unwrap());
+        let (db, _, fs) = shared(tree());
+        let store = Path::new("/store");
         let seen = Arc::new(parking_lot::Mutex::new(HashSet::new()));
-        let first = schedule(&db, &store, &["aaa".into(), "bbb".into()], None, &seen).unwrap();
+        let first = schedule(&db, &fs, store, &["aaa".into(), "bbb".into()], None, &seen).unwrap();
         assert_eq!(first.roots, vec![Hash::ZERO, Hash::ZERO]);
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while load(&db, b"aaa").is_none() || load(&db, b"bbb").is_none() {
-            assert!(Instant::now() < deadline, "the paths were not hashed");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let second = schedule(&db, &store, &["bbb".into(), "ccc".into()], None, &seen).unwrap();
+        wait_for(&db, b"aaa");
+        wait_for(&db, b"bbb");
+        let second = schedule(&db, &fs, store, &["bbb".into(), "ccc".into()], None, &seen).unwrap();
         assert_ne!(second.roots[0], Hash::ZERO);
-        assert_eq!(second.roots[0], identity(&load(&db, b"bbb").unwrap()));
+        assert_eq!(second.roots[0], identity(&load(db.as_ref(), b"bbb").unwrap()));
         assert_eq!(second.cost.reused_paths, 1);
         assert_eq!(second.roots[1], Hash::ZERO);
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while load(&db, b"ccc").is_none() {
-            assert!(Instant::now() < deadline, "ccc was not hashed");
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let third = schedule(&db, &store, &["aaa".into(), "bbb".into()], None, &seen).unwrap();
+        wait_for(&db, b"ccc");
+        let third = schedule(&db, &fs, store, &["aaa".into(), "bbb".into()], None, &seen).unwrap();
         assert_eq!(third.cost.reused_paths, 2);
         assert_eq!(third.cost.new_paths, 0);
         assert!(third.roots.iter().all(|r| *r != Hash::ZERO));
@@ -927,19 +1296,17 @@ mod tests {
 
     #[test]
     fn hashing_records_files_in_the_caller_map() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
-        tree(&store);
-        let db = Arc::new(Db::open(&tmp.path().join("db-hosts.redb")).unwrap());
+        let (db, _, fs) = shared(tree());
         let seen = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let hosts = Arc::new(DashMap::new());
-        schedule(&db, &store, &["aaa".into()], Some(&hosts), &seen).unwrap();
+        schedule(&db, &fs, Path::new("/store"), &["aaa".into()], Some(&hosts), &seen).unwrap();
+        wait_for(&db, b"aaa");
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while load(&db, b"aaa").is_none() {
-            assert!(Instant::now() < deadline, "aaa was not hashed");
+        while hosts.len() < 2 {
+            assert!(Instant::now() < deadline, "the server map received the file locations");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(!hosts.is_empty(), "the server map received the file locations");
+        assert!(hosts.contains_key(&Hash::of(b"tool-bytes")) && hosts.contains_key(&Hash::of(b"note")));
     }
 
     #[test]
@@ -951,127 +1318,85 @@ mod tests {
             }
         }
         let _clear = Clear;
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
-        tree(&store);
-        let db = Arc::new(Db::open(&tmp.path().join("db-idle.redb")).unwrap());
+        let (db, fake, fs) = shared(tree());
         let seen = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         FORCE_ONE_CORE.store(true, std::sync::atomic::Ordering::Relaxed);
         let hold = hold_build();
-        let first = schedule(&db, &store, &["aaa".into()], None, &seen).unwrap();
+        let first = schedule(&db, &fs, Path::new("/store"), &["aaa".into()], None, &seen).unwrap();
         assert_eq!(first.roots, vec![Hash::ZERO]);
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert!(
-            load(&db, b"aaa").is_none(),
-            "hashing waits while the build holds the only core"
-        );
+        assert!(load(db.as_ref(), b"aaa").is_none() && fake.hashed.load(Ordering::Relaxed) == 0, "hashing waits while the build holds the only core");
         drop(hold);
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while load(&db, b"aaa").is_none() {
-            assert!(
-                Instant::now() < deadline,
-                "the path was not hashed after the build"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        wait_for(&db, b"aaa");
+    }
+
+    #[test]
+    fn a_manifest_that_no_longer_matches_the_files_is_hashed_again() {
+        let mut fs = tree();
+        let db = MemTables::default();
+        let hosts: DashMap<Hash, FileSrc> = DashMap::new();
+        let store = Path::new("/store");
+        ensure(&db, &fs, store, &["bbb".into()]).unwrap();
+        fs.put("/store/bbb/readme", Ent::File(b"changed".to_vec(), false));
+        let p = prepare(&db, &fs, store, &["bbb".into()], Some(&hosts), &mut HashSet::new()).unwrap();
+        assert_eq!((p.cost.reused_paths, p.cost.new_paths, p.cost.hashed_files), (0, 1, 1));
+        assert_eq!(p.roots[0], model(&fs, Path::new("/store/bbb")).0);
+        assert!(hosts.contains_key(&Hash::of(b"changed")));
     }
 
     #[test]
     fn lookups_follow_the_closure_and_the_tree() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
-        tree(&store);
-        let db = Db::open(&tmp.path().join("db.redb")).unwrap();
-        let names = [
-            "aaa".into(),
-            "bbb".into(),
-            "ccc".into(),
-            "fff".into(),
-            "lll".into(),
-        ];
-        let prepared = ensure(&db, &store, &names).unwrap();
+        let fs = tree();
+        let db = MemTables::default();
+        let names = ["aaa".into(), "bbb".into(), "ccc".into(), "fff".into(), "lll".into()];
+        ensure(&db, &fs, Path::new("/store"), &names).unwrap();
         let mut have: HashMap<Vec<u8>, Arc<Installed>> = HashMap::new();
         for name in &names {
             let kind = load(&db, name.as_bytes()).unwrap();
-            have.insert(
-                name.as_bytes().to_vec(),
-                Arc::new(Installed::from_kind(&kind).unwrap()),
-            );
+            have.insert(name.as_bytes().to_vec(), Arc::new(Installed::from_kind(&kind).unwrap()));
         }
-        let mut closure = vec![b"aaa".to_vec(), b"bbb".to_vec()];
-        closure.sort();
+        let closure = vec![b"aaa".to_vec(), b"bbb".to_vec()];
         let get = |n: &[u8]| have.get(n).cloned();
         let missing = |_: &[u8]| None;
         assert!(lookup_at(missing, &closure, b"/nix/store", b"aaa").is_none());
         assert!(lookup_at(missing, &closure, b"/nix/store/aaa/bin", b"tool").is_none());
-        assert!(matches!(
-            lookup_at(missing, &closure, b"/nix/store", b"ccc"),
-            Some(Looked::Absent)
-        ));
+        assert!(matches!(lookup_at(missing, &closure, b"/nix/store", b"ccc"), Some(Looked::Absent)));
         assert!(list_at(missing, &closure, b"/nix/store/aaa").is_none());
-        assert!(matches!(
-            lookup_at(get, &closure, b"/nix/store", b"aaa"),
-            Some(Looked::Dir(_))
-        ));
-        assert!(matches!(
-            lookup_at(get, &closure, b"/nix/store", b"ccc"),
-            Some(Looked::Absent)
-        ));
+        assert!(matches!(lookup_at(get, &closure, b"/nix/store", b"aaa"), Some(Looked::Dir(_))));
+        assert!(matches!(lookup_at(get, &closure, b"/nix/store", b"ccc"), Some(Looked::Absent)));
         assert!(lookup_at(get, &closure, b"/usr", b"bin").is_none());
-        let (want, size) = Hash::of_path(&store.join("aaa/bin/tool")).unwrap();
         match lookup_at(get, &closure, b"/nix/store/aaa/bin", b"tool") {
             Some(Looked::File(f)) => {
                 assert!(f.exec());
-                assert_eq!(f.size, size);
-                match f.src {
-                    FileSrc::Blob(h) => assert_eq!(h, want),
-                    _ => panic!("a store file is named by its content hash"),
-                }
+                assert_eq!(f.size, 10);
+                assert!(matches!(f.src, FileSrc::Blob(h) if h == Hash::of(b"tool-bytes")), "a store file is named by its content hash");
             }
             other => panic!("tool: {other:?}"),
         }
-        match lookup_at(get, &closure, b"/nix/store/aaa/lib", b"to-tool") {
-            Some(Looked::Symlink(t)) => assert_eq!(t, b"../bin/tool"),
-            other => panic!("symlink: {other:?}"),
-        }
-        match lookup_at(get, &closure, b"/nix/store/aaa/lib", b"missing") {
-            Some(Looked::Absent) => {}
-            other => panic!("missing: {other:?}"),
-        }
+        assert!(matches!(lookup_at(get, &closure, b"/nix/store/aaa/lib", b"to-tool"), Some(Looked::Symlink(t)) if t == b"../bin/tool"));
+        assert!(matches!(lookup_at(get, &closure, b"/nix/store/aaa/lib", b"missing"), Some(Looked::Absent)));
         let listing = list_at(get, &closure, b"/nix/store/aaa").unwrap().unwrap();
-        let mut names: Vec<_> = listing.into_iter().map(|(n, _)| n).collect();
-        names.sort();
-        assert_eq!(names, [b"bin".to_vec(), b"lib".to_vec()]);
+        let mut listed: Vec<_> = listing.into_iter().map(|(n, _)| n).collect();
+        listed.sort();
+        assert_eq!(listed, [b"bin".to_vec(), b"lib".to_vec()]);
         let top = list_at(get, &closure, b"/nix/store").unwrap().unwrap();
         assert_eq!(top.len(), 2);
         assert!(top.iter().any(|(n, t)| n == b"aaa" && *t == DType::Dir));
         assert!(top.iter().all(|(n, _)| n != b"ccc"));
         let file_closure = vec![b"fff".to_vec(), b"lll".to_vec()];
-        match lookup_at(get, &file_closure, b"/nix/store", b"fff") {
-            Some(Looked::File(f)) => assert_eq!(f.size, b"file-path".len() as u64),
-            other => panic!("file path: {other:?}"),
-        }
-        match lookup_at(get, &file_closure, b"/nix/store", b"lll") {
-            Some(Looked::Symlink(t)) => assert_eq!(t, b"fff"),
-            other => panic!("link path: {other:?}"),
-        }
-        let _ = prepared;
+        assert!(matches!(lookup_at(get, &file_closure, b"/nix/store", b"fff"), Some(Looked::File(f)) if f.size == 9));
+        assert!(matches!(lookup_at(get, &file_closure, b"/nix/store", b"lll"), Some(Looked::Symlink(t)) if t == b"fff"));
     }
 
     #[test]
     fn remembering_a_file_does_not_copy_its_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("store");
-        tree(&store);
-        let db = Db::open(&tmp.path().join("db.redb")).unwrap();
+        let fs = tree();
+        let db = MemTables::default();
         let hosts: DashMap<Hash, FileSrc> = DashMap::new();
-        let mut seen = HashSet::new();
-        prepare(&db, &store, &["aaa".into()], Some(&hosts), &mut seen).unwrap();
-        let (h, _) = Hash::of_path(&store.join("aaa/bin/tool")).unwrap();
+        prepare(&db, &fs, Path::new("/store"), &["aaa".into()], Some(&hosts), &mut HashSet::new()).unwrap();
+        let h = Hash::of(b"tool-bytes");
         match hosts.get(&h).map(|e| e.clone()) {
-            Some(FileSrc::Host { path, .. }) => {
-                assert_eq!(path.as_ref(), store.join("aaa/bin/tool").as_path())
-            }
+            Some(FileSrc::Host { path, .. }) => assert_eq!(path.as_ref(), Path::new("/store/aaa/bin/tool")),
             other => panic!("host file: {other:?}"),
         }
         assert!(db.get(Table::Meta, &meta_key(b"aaa")).is_some());
