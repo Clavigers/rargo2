@@ -365,6 +365,7 @@ pub struct OutFs {
     virt: std::sync::RwLock<OutputTree>,
     delivery: Mutex<()>,
     handles: Mutex<HashMap<u64, Handle>>,
+    registering: Mutex<std::collections::BTreeMap<u64, bool>>,
     next_fh: AtomicU64,
     source: Box<dyn Source>,
     session: OnceLock<Arc<Session>>,
@@ -436,6 +437,7 @@ impl OutFs {
             virt: std::sync::RwLock::new(OutputTree { files: virt, generation: 0 }),
             delivery: Mutex::new(()),
             handles: Mutex::new(HashMap::new()),
+            registering: Mutex::new(std::collections::BTreeMap::new()),
             next_fh: AtomicU64::new(1),
             source,
             session: OnceLock::new(),
@@ -611,10 +613,11 @@ impl OutFs {
         Ok(())
     }
 
-    fn open_handle(&self, node: u64, file: Content, how: How) -> Res<Opened> {
+    fn open_handle(&self, ctx: &Ctx, node: u64, file: Content, how: How) -> Res<Opened> {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         let mut backing_id = None;
+        let mut register = None;
         let content = how == How::Content;
         if let (Some(n), true, Some(s), Content::Open(file)) = (st.nodes.get_mut(&node), how != How::Daemon, self.session.get(), &file) {
             match &mut n.backing {
@@ -623,14 +626,16 @@ impl OutFs {
                     *refs += 1;
                     backing_id = Some(*id);
                 }
-                None if n.cached == 0 && s.caps().passthrough => {
-                    if let Ok(id) = s.backing_open(file.as_raw_fd()) {
-                        n.backing = Some((id, 1, content));
-                        backing_id = Some(id);
-                    }
-                }
+                None if n.cached == 0 && s.caps().passthrough => register = Some(file.as_raw_fd()),
                 _ => {}
             }
+        }
+        if let Some(fd) = register {
+            drop(st);
+            self.registering.lock().unwrap().insert(fh, content);
+            self.handles.lock().unwrap().insert(fh, Handle { file, node, through: false });
+            ctx.effects.register(fd, fh);
+            return Ok(Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: 0 });
         }
         if backing_id.is_none() {
             if let Some(n) = st.nodes.get_mut(&node) {
@@ -1121,13 +1126,13 @@ impl Filesystem for OutFs {
         Ok(self.entry(newparent, newname, &kind))
     }
 
-    fn open(&self, _ctx: &Ctx, nodeid: u64, flags: u32) -> Res<Opened> {
+    fn open(&self, ctx: &Ctx, nodeid: u64, flags: u32) -> Res<Opened> {
         let _t = self.timed("open");
         let rel = self.path(nodeid)?;
         let acc = flags as i32 & libc::O_ACCMODE;
         let keep = flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW);
         match Self::open_wide(&self.real(&rel), acc, keep, None) {
-            Ok(file) => return self.open_handle(nodeid, Content::Open(file), How::Real),
+            Ok(file) => return self.open_handle(ctx, nodeid, Content::Open(file), How::Real),
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(errno(e)),
             Err(_) => {}
         }
@@ -1136,14 +1141,14 @@ impl Filesystem for OutFs {
         match plan {
             VirtualOpen::Empty => {
                 self.opened_virtual.fetch_add(1, Ordering::Relaxed);
-                self.open_handle(nodeid, Content::Open(File::open("/dev/null").map_err(errno)?), How::Daemon)
+                self.open_handle(ctx, nodeid, Content::Open(File::open("/dev/null").map_err(errno)?), How::Daemon)
             }
             VirtualOpen::Read(file) => {
                 self.opened_virtual.fetch_add(1, Ordering::Relaxed);
                 if let Some(cached) = self.source.cached(&file.hash, file.size).and_then(|p| File::open(p).ok()) {
-                    return self.open_handle(nodeid, Content::Open(cached), How::Content);
+                    return self.open_handle(ctx, nodeid, Content::Open(cached), How::Content);
                 }
-                self.open_handle(nodeid, Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel }), How::Daemon)
+                self.open_handle(ctx, nodeid, Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel }), How::Daemon)
             }
             VirtualOpen::Materialize { file, with_content } => {
                 if self.state.lock().unwrap().nodes.get(&nodeid).is_some_and(|n| n.backing.is_some()) {
@@ -1151,12 +1156,12 @@ impl Filesystem for OutFs {
                 }
                 self.make_real(&rel, &file, with_content)?;
                 let file = Self::open_wide(&self.real(&rel), acc, keep, None).map_err(errno)?;
-                self.open_handle(nodeid, Content::Open(file), How::Real)
+                self.open_handle(ctx, nodeid, Content::Open(file), How::Real)
             }
         }
     }
 
-    fn create(&self, _ctx: &Ctx, parent: u64, name: &[u8], mode: u32, flags: u32) -> Res<(Entry, Opened)> {
+    fn create(&self, ctx: &Ctx, parent: u64, name: &[u8], mode: u32, flags: u32) -> Res<(Entry, Opened)> {
         let _t = self.timed("create");
         let rel = join(&self.path(parent)?, name);
         let had_virtual = {
@@ -1184,7 +1189,7 @@ impl Filesystem for OutFs {
         let md = file.metadata().map_err(errno)?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         let entry = self.entry(parent, name, &Kind::Real(md));
-        Ok((entry, self.open_handle(entry.nodeid, Content::Open(file), How::Real)?))
+        Ok((entry, self.open_handle(ctx, entry.nodeid, Content::Open(file), How::Real)?))
     }
 
     fn read(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
@@ -1220,7 +1225,54 @@ impl Filesystem for OutFs {
         Ok(data.len() as u32)
     }
 
-    fn release(&self, _nodeid: u64, fh: u64, _flags: u32) {
+    fn registered(&self, ctx: &Ctx, fh: u64, id: Res<i32>) -> Res<Opened> {
+        let content = self.registering.lock().unwrap().remove(&fh).ok_or(Errno(libc::EIO))?;
+        let node = self.handles.lock().unwrap().get(&fh).map(|h| h.node).ok_or(Errno(libc::EIO))?;
+        let mut st = self.state.lock().unwrap();
+        let through = match (st.nodes.get_mut(&node), id) {
+            (Some(n), Ok(id)) => match &mut n.backing {
+                None if n.cached == 0 => {
+                    n.backing = Some((id, 1, content));
+                    Some(id)
+                }
+                Some((held, refs, c)) if *c == content && n.cached == 0 => {
+                    *refs += 1;
+                    ctx.effects.unregister(id);
+                    Some(*held)
+                }
+                Some((_, _, c)) if *c != content => {
+                    ctx.effects.unregister(id);
+                    drop(st);
+                    self.handles.lock().unwrap().remove(&fh);
+                    return Err(Errno(libc::ETXTBSY));
+                }
+                _ => {
+                    ctx.effects.unregister(id);
+                    None
+                }
+            },
+            (None, Ok(id)) => {
+                ctx.effects.unregister(id);
+                None
+            }
+            (_, Err(_)) => None,
+        };
+        if through.is_none()
+            && let Some(n) = st.nodes.get_mut(&node)
+        {
+            n.cached += 1;
+        }
+        drop(st);
+        if let Some(h) = self.handles.lock().unwrap().get_mut(&fh) {
+            h.through = through.is_some();
+        }
+        Ok(match through {
+            Some(id) => Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: id },
+            None => Opened { fh, flags: FOPEN_KEEP_CACHE, backing_id: 0 },
+        })
+    }
+
+    fn release_in(&self, ctx: &Ctx, _nodeid: u64, fh: u64, _flags: u32) {
         let _t = self.timed("release");
         let Some(h) = self.handles.lock().unwrap().remove(&fh) else { return };
         let mut st = self.state.lock().unwrap();
@@ -1230,9 +1282,7 @@ impl Filesystem for OutFs {
             } else if let Some((id, refs, _)) = &mut n.backing {
                 *refs -= 1;
                 if *refs == 0 {
-                    if let Some(s) = self.session.get() {
-                        let _ = s.backing_close(*id);
-                    }
+                    ctx.effects.unregister(*id);
                     n.backing = None;
                 }
             }
