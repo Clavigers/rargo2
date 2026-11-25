@@ -117,7 +117,7 @@ pub fn resolve(host: &str) -> Result<String, String> {
         return Ok(server);
     }
     let url = format!("{}/.well-known/rargo.json", base_url(host));
-    let asked = agent().get(&url).call().map_err(|e| e.to_string()).and_then(|r| r.into_string().map_err(|e| e.to_string()));
+    let asked = agent().get(&url).call().map_err(|e| unfound(&e)).and_then(|r| r.into_string().map_err(|e| e.to_string()));
     let found = asked.and_then(|text| {
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("not a rargo answer: {e}"))?;
         let server = v.get("server").and_then(|s| s.as_str()).ok_or("the answer names no server")?.to_string();
@@ -131,8 +131,36 @@ pub fn resolve(host: &str) -> Result<String, String> {
             let _ = crate::write_atomic(&cached, text.as_bytes());
             Ok(server)
         }
-        Err(e) => read(false).ok_or_else(|| format!("cannot find the build server of `{host}` ({url}): {e}")),
+        Err(e) => read(false).ok_or_else(|| not_found_text(host, &e)),
     }
+}
+
+fn unfound(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("{}{code}", NOT_RARGO),
+        ureq::Error::Transport(t) => match t.kind() {
+            ureq::ErrorKind::Dns => NO_SUCH_HOST.into(),
+            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => NO_ANSWER.into(),
+            _ => t.to_string(),
+        },
+    }
+}
+
+const NO_SUCH_HOST: &str = "no such host";
+const NO_ANSWER: &str = "no answer";
+const NOT_RARGO: &str = "not rargo: ";
+
+pub fn not_found_text(host: &str, why: &str) -> String {
+    let what = if why == NO_SUCH_HOST {
+        "no machine has that name".to_string()
+    } else if why == NO_ANSWER {
+        "nothing answers there".to_string()
+    } else if let Some(code) = why.strip_prefix(NOT_RARGO) {
+        format!("it answers, but not as a rargo server (HTTP {code})")
+    } else {
+        why.to_string()
+    };
+    format!("cannot find the rargo server `{host}`: {what}. Check the name, then name the server again with `rargo @HOST`")
 }
 
 #[derive(Clone)]
@@ -306,6 +334,23 @@ pub fn auth(host: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_that_cannot_be_found_says_why_in_plain_words_and_what_to_do() {
+        for (why, says) in [
+            (NO_SUCH_HOST.to_string(), "no machine has that name"),
+            (NO_ANSWER.to_string(), "nothing answers there"),
+            (format!("{NOT_RARGO}404"), "it answers, but not as a rargo server (HTTP 404)"),
+            ("the answer names no server".to_string(), "the answer names no server"),
+        ] {
+            let text = not_found_text("nowhere.invalid", &why);
+            assert_eq!(
+                text,
+                format!("cannot find the rargo server `nowhere.invalid`: {says}. Check the name, then name the server again with `rargo @HOST`")
+            );
+            assert!(!text.contains("os error") && !text.contains(".well-known") && !text.contains("Dns"), "{text}");
+        }
+    }
 
     #[test]
     fn at_host_writes_the_users_config_and_keeps_the_rest_of_it() {

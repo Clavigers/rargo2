@@ -186,13 +186,7 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                     eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
                     let pumping = tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
-                    sess.send(ServerMsg::Stderr(
-                        format!(
-                            "error: {}\n       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n",
-                            crate::proto::REFUSED
-                        )
-                        .into_bytes(),
-                    ));
+                    sess.send(ServerMsg::Stderr(TOKEN_ENDED.as_bytes().to_vec()));
                     sess.send(ServerMsg::Exit(101));
                     let _ = pumping.await;
                     sess.close();
@@ -305,6 +299,21 @@ const TOKEN_USAGE: &str = "usage: rargo auth invite [--user NAME] [--admin] [--d
                            rargo auth allow GITHUB-LOGIN [--admin]\n       \
                            rargo auth disallow GITHUB-LOGIN";
 
+pub const TOKEN_ENDED: &str = "error: the rargo server no longer accepts this machine's token: it was revoked or has \
+expired. Run `rargo auth` to get a new one\n";
+
+pub const OUT_OF_SPACE: &str = "the build server has run out of disk space, so it cannot take in this worktree or keep \
+what it builds. Tell the server's administrator; once space is freed there, run this command again";
+
+pub fn failure(what: &str, e: &anyhow::Error) -> String {
+    let full = e.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            io.kind() == std::io::ErrorKind::StorageFull || matches!(io.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT))
+        })
+    });
+    if full { OUT_OF_SPACE.to_string() } else if what.is_empty() { format!("{e:#}") } else { format!("{what}: {e:#}") }
+}
+
 fn fail(sess: &Session, text: String) -> ServerMsg {
     sess.send(ServerMsg::Stderr(format!("error: {text}\n").into_bytes()));
     ServerMsg::Exit(101)
@@ -352,7 +361,7 @@ async fn serve(
                     }
                     say(&sess, out)
                 }
-                Ok(Err(e)) => fail(&sess, format!("{e:#}")),
+                Ok(Err(e)) => fail(&sess, failure("", &e)),
                 Err(e) => fail(&sess, format!("{e}")),
             };
         }
@@ -435,12 +444,12 @@ async fn serve(
         Ok(s) => s,
         Err(e) => {
             eprintln!("rargod: {}: syncing {}: {e:#}", req.who, req.root);
-            return fail(&sess, format!("syncing the worktree: {e:#}"));
+            return fail(&sess, failure("syncing the worktree", &e));
         }
     };
     let home = match d.home(&req.home_files) {
         Ok(h) => h,
-        Err(e) => return fail(&sess, format!("setting up the cargo configuration: {e:#}")),
+        Err(e) => return fail(&sess, failure("setting up the cargo configuration", &e)),
     };
     let env: HashMap<String, String> = req.env.iter().cloned().collect();
     let prio = crate::conn_state::priority(&env, req.stderr_tty);
@@ -475,7 +484,7 @@ async fn serve(
                 sess.send(ServerMsg::Stdout(text.into_bytes()));
                 ServerMsg::Exit(if r.agrees() { 0 } else { 1 })
             }
-            Err(e) => fail(&sess, format!("drift check could not run: {e:#}")),
+            Err(e) => fail(&sess, failure("drift check could not run", &e)),
         };
     }
     let client = Client {
@@ -612,5 +621,28 @@ fn status_figures(d: &Daemon) -> StatusFigures {
                 nix_lookups: n(&ps.nix_lookups),
             }
         }),
+    }
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_disk_anywhere_in_the_cause_is_told_as_the_server_being_out_of_space() {
+        let io = |code: i32| anyhow::Error::from(std::io::Error::from_raw_os_error(code));
+        let rows: Vec<(anyhow::Error, &str)> = vec![
+            (io(libc::ENOSPC).context("storing a manifest"), OUT_OF_SPACE),
+            (io(libc::EDQUOT), OUT_OF_SPACE),
+            (anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull)).context("a").context("b"), OUT_OF_SPACE),
+            (io(libc::EACCES).context("opening the store"), "syncing the worktree: opening the store: Permission denied (os error 13)"),
+            (anyhow::anyhow!("the client did not send directory manifest x"), "syncing the worktree: the client did not send directory manifest x"),
+        ];
+        for (e, want) in rows {
+            assert_eq!(failure("syncing the worktree", &e), want);
+        }
+        assert_eq!(failure("", &anyhow::anyhow!("no such token")), "no such token");
+        assert!(!OUT_OF_SPACE.contains("os error") && OUT_OF_SPACE.contains("administrator"));
+        assert!(TOKEN_ENDED.contains("it was revoked or has expired. Run `rargo auth`") && !TOKEN_ENDED.contains(crate::proto::REFUSED));
     }
 }

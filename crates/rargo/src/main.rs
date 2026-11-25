@@ -125,6 +125,24 @@ fn server_host() -> Result<(String, HostFrom), String> {
     host_from(&ConfigEnv { server: env_value("RARGO_SERVER"), ..ConfigEnv::default() })
 }
 
+pub fn plain_cause(why: &str) -> String {
+    let why = match why.rfind(" (os error ") {
+        Some(at) if why.ends_with(')') => &why[..at],
+        _ => why,
+    };
+    let mut chars = why.chars();
+    chars.next().map(|c| c.to_lowercase().chain(chars).collect()).unwrap_or_default()
+}
+
+fn unreachable_text(server: &str, why: &str) -> String {
+    format!(
+        "error: cannot reach the rargo server at {server}: {}\n       \
+         Check that the server runs and that this machine can reach it, or name another with `rargo @HOST`; \
+         RARGO_FALLBACK=cargo builds with plain cargo meanwhile\n",
+        plain_cause(why)
+    )
+}
+
 fn is_loopback(server: &str) -> bool {
     let name = server.rsplit_once(':').map_or(server, |(h, _)| h);
     name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
@@ -547,8 +565,7 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
             if std::env::var_os("RARGO_FALLBACK").is_some_and(|v| v == "cargo") {
                 passthrough(raw);
             }
-            eprintln!("error: cannot reach the rargo server at {}: {why}", cfg.server);
-            eprintln!("       (the server is named by `rargo @host`, in {}, or by RARGO_SERVER; RARGO_FALLBACK=cargo uses plain cargo instead)", project::config_path().display());
+            eprint!("{}", unreachable_text(&cfg.server, &why));
             std::process::exit(101);
         }
     }
@@ -1024,6 +1041,22 @@ fn exec(mut e: ExecRequest) -> ! {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unreachable_server_is_named_with_a_plain_cause_and_what_to_do() {
+        for (why, cause) in [
+            ("Connection refused (os error 111)", "connection refused"),
+            ("connection timed out", "connection timed out"),
+            ("No route to host (os error 113)", "no route to host"),
+            ("odd (os error) inside", "odd (os error) inside"),
+            ("", ""),
+        ] {
+            assert_eq!(super::plain_cause(why), cause, "{why}");
+        }
+        let text = super::unreachable_text("build.example:7459", "Connection refused (os error 111)");
+        assert!(text.starts_with("error: cannot reach the rargo server at build.example:7459: connection refused\n"), "{text}");
+        assert!(text.contains("`rargo @HOST`") && text.contains("RARGO_FALLBACK=cargo") && !text.contains("os error"), "{text}");
+    }
+
     #[test]
     fn configuration_precedence_and_errors_are_deterministic() {
         let path = Path::new("/config/rargo/config.toml");
