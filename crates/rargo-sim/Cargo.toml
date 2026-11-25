@@ -6,4 +6,6 @@ license.workspace = true
 publish = false
 
 [dependencies]
+rargo = { path = "../rargo" }
 rargo-core = { path = "../rargo-core" }
+rargo-proto = { path = "../rargo-proto" }

@@ -1,11 +1,16 @@
 use crate::model::{self, Project};
 use crate::rng::Rng;
+use rargo::daemon_state::{DaemonState, Link, Need};
+use rargo::known_digests::KnownDigests;
 use rargo_core::hash::Hash;
 use rargo_core::pool_state::{self, WorkerPool};
 use rargo_core::sched::Priority;
 use rargo_core::sched_state::{Broker, Effects, SchedState};
+use rargo_core::session_state::{self, ClientSet, Next, Outgoing, SessionState};
+use rargo_core::trees_state::{TreesState, Upload};
 use rargo_core::worker_state::{self, Carried, FromServer, Worker};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use rargo_proto::{Blob, ClientMsg, Delivery, Digest, ServerMsg};
 use std::fmt;
 
 pub const LIVENESS_MS: u64 = 120_000;
@@ -17,16 +22,20 @@ pub enum Bug {
     EvictPinned,
     StaleDelivery,
     NeverAnswer,
+    EvictClaimed,
+    StaleKnowledge,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 3] = [Bug::EvictPinned, Bug::StaleDelivery, Bug::NeverAnswer];
+    pub const ALL: [Bug; 5] = [Bug::EvictPinned, Bug::StaleDelivery, Bug::NeverAnswer, Bug::EvictClaimed, Bug::StaleKnowledge];
 
     pub fn name(self) -> &'static str {
         match self {
             Bug::EvictPinned => "evict-pinned",
             Bug::StaleDelivery => "stale-delivery",
             Bug::NeverAnswer => "never-answer",
+            Bug::EvictClaimed => "evict-claimed",
+            Bug::StaleKnowledge => "stale-knowledge",
         }
     }
 
@@ -109,6 +118,9 @@ pub struct Report {
     pub cache_hits: u64,
     pub cuts: u64,
     pub evictions: u64,
+    pub uploads: u64,
+    pub wants: u64,
+    pub client_cuts: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +133,7 @@ pub struct Config {
     pub fault_end_ms: u64,
     pub cut_per_mille: u64,
     pub max_latency_ms: u64,
+    pub client_cuts: u64,
 }
 
 impl Config {
@@ -134,6 +147,7 @@ impl Config {
             fault_end_ms: rng.range(0, 8_000),
             cut_per_mille: rng.range(0, 30),
             max_latency_ms: rng.range(1, 60),
+            client_cuts: rng.range(0, 3),
         }
     }
 }
@@ -165,14 +179,16 @@ enum Node {
 enum Up {
     Hello { cores: usize },
     Result { job: u64, output: Vec<u8> },
-    Upload { blob: Vec<u8> },
-    Hold { round: u64 },
+    Join,
+    Offer { round: u64, root: Digest, contents: Vec<Digest>, sending: Vec<Digest> },
+    Session(ClientMsg),
     Request { round: u64, action: usize, inputs: Vec<Hash> },
 }
 
 #[derive(Debug)]
 enum Down {
-    Done { round: u64, action: usize, output: Vec<u8> },
+    Session(ServerMsg),
+    Synced { round: u64, root: Digest },
 }
 
 #[derive(Debug)]
@@ -190,6 +206,8 @@ enum Ev {
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
+    Sync { client: u64 },
+    ClientCut { client: u64 },
 }
 
 struct WorkerNode {
@@ -211,8 +229,24 @@ struct Job {
     worker: Option<u64>,
 }
 
+struct Offer {
+    round: u64,
+    root: Digest,
+    contents: Vec<Hash>,
+    up: Upload,
+    arrived: BTreeSet<Hash>,
+}
+
+struct Sess {
+    state: SessionState,
+    has: ClientSet,
+    offer: Option<Offer>,
+}
+
 struct Server {
     pool: WorkerPool,
+    trees: TreesState,
+    sessions: BTreeMap<u64, Sess>,
     sched: SchedState,
     pipe: usize,
     store: BTreeMap<Hash, Vec<u8>>,
@@ -231,6 +265,15 @@ struct Client {
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
+    daemon: DaemonState,
+    up: bool,
+    epoch: u64,
+    cut_until: u64,
+    cache: BTreeMap<Digest, Vec<u8>>,
+    parts: BTreeMap<Digest, Vec<u8>>,
+    pending: BTreeMap<u64, Vec<Delivery>>,
+    contents: Vec<Digest>,
+    synced_round: u64,
 }
 
 pub struct World {
@@ -269,6 +312,8 @@ impl World {
             last: BTreeMap::new(),
             server: Server {
                 pool: WorkerPool::new(),
+                trees: TreesState::new(),
+                sessions: BTreeMap::new(),
                 sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
                 pipe: SERVER_TOKENS,
                 store: BTreeMap::new(),
@@ -289,6 +334,9 @@ impl World {
                 cache_hits: 0,
                 cuts: 0,
                 evictions: 0,
+                uploads: 0,
+                wants: 0,
+                client_cuts: 0,
             },
             trace: Vec::new(),
             project,
@@ -305,6 +353,9 @@ impl World {
         }
         for id in 1..=w.cfg.clients {
             let versions = vec![0; w.cfg.sources];
+            let mut daemon = DaemonState::new(KnownDigests::default());
+            daemon.added(1);
+            daemon.watched(1, true);
             w.clients.insert(
                 id,
                 Client {
@@ -314,6 +365,15 @@ impl World {
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
+                    daemon,
+                    up: false,
+                    epoch: 0,
+                    cut_until: 0,
+                    cache: BTreeMap::new(),
+                    parts: BTreeMap::new(),
+                    pending: BTreeMap::new(),
+                    contents: Vec::new(),
+                    synced_round: 0,
                 },
             );
             let at = w.rng.range(0, 500);
@@ -323,6 +383,11 @@ impl World {
             for id in 1..=w.cfg.workers {
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
                 w.schedule(at, Ev::Cut { worker: id });
+            }
+            for _ in 0..w.cfg.client_cuts {
+                let client = w.rng.range(1, w.cfg.clients);
+                let at = w.rng.range(0, w.cfg.fault_end_ms);
+                w.schedule(at, Ev::ClientCut { client });
             }
         }
         let at = w.rng.range(50, 400);
@@ -344,6 +409,7 @@ impl World {
     fn send(&mut self, from: Node, to: Node, msg: Msg) {
         let epoch = match (from, to) {
             (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].epoch,
+            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].epoch,
             _ => 0,
         };
         let latency = self.rng.range(1, self.cfg.max_latency_ms);
@@ -430,6 +496,22 @@ impl World {
         for w in self.workers.values() {
             w.sm.invariants();
         }
+        self.server.trees.invariants();
+        for c in self.clients.values() {
+            c.daemon.invariants();
+        }
+        for (client, sess) in &self.server.sessions {
+            let Some(o) = &sess.offer else { continue };
+            for h in &o.arrived {
+                if self.server.trees.holder(h) == Some(o.up) && !self.server.store.contains_key(h) {
+                    return Err(Kind::LostPinned(format!(
+                        "blob {} that client {client} uploaded for round {} is claimed and not in the store",
+                        h.hex(),
+                        o.round
+                    )));
+                }
+            }
+        }
         for (h, n) in &self.server.pins {
             if *n > 0 && !self.server.store.contains_key(h) {
                 return Err(Kind::LostPinned(format!("blob {} is pinned {n} times and not in the store", h.hex())));
@@ -453,8 +535,10 @@ impl World {
                 self.evict();
                 Ok(())
             }
-            Ev::Round { client } => {
-                self.round(client);
+            Ev::Round { client } => self.round(client),
+            Ev::Sync { client } => self.sync(client),
+            Ev::ClientCut { client } => {
+                self.client_cut(client);
                 Ok(())
             }
         }
@@ -471,6 +555,16 @@ impl World {
                 return Ok(());
             }
         }
+        let c = match (from, to) {
+            (Node::Client(c), _) | (_, Node::Client(c)) => Some(c),
+            _ => None,
+        };
+        if let Some(c) = c {
+            let client = &self.clients[&c];
+            if !client.up || client.epoch != epoch {
+                return Ok(());
+            }
+        }
         match (from, msg) {
             (_, Msg::Work(m)) => {
                 let w = w.expect("work goes to a worker");
@@ -482,7 +576,7 @@ impl World {
             }
             (_, Msg::Down(d)) => {
                 let Node::Client(c) = to else { unreachable!("down messages go to clients") };
-                self.client_done(c, d)
+                self.client_hears(c, d)
             }
             (Node::Worker(w), Msg::Up(u)) => self.server_from_worker(w, u),
             (Node::Client(c), Msg::Up(u)) => self.server_from_client(c, u),
@@ -596,11 +690,13 @@ impl World {
             return;
         }
         let ignore_pins = self.bug == Some(Bug::EvictPinned);
+        let ignore_claims = self.bug == Some(Bug::EvictClaimed);
         let candidates: Vec<Hash> = self
             .server
             .store
             .keys()
             .filter(|h| ignore_pins || self.server.pins.get(h).copied().unwrap_or(0) == 0)
+            .filter(|h| ignore_claims || self.server.trees.holder(h).is_none())
             .copied()
             .collect();
         if candidates.is_empty() {
@@ -632,19 +728,58 @@ impl World {
 
     fn server_from_client(&mut self, client: u64, u: Up) -> Step {
         match u {
-            Up::Upload { blob } => {
-                let h = Hash::of(&blob);
-                self.server.store.insert(h, blob);
-                self.pin(client, h);
+            Up::Join => {
+                self.drop_session(client);
+                let mut sess = Sess { state: SessionState::new(), has: ClientSet::default(), offer: None };
+                sess.state.knows(&mut sess.has, std::iter::empty());
+                self.server.sessions.insert(client, sess);
             }
-            Up::Hold { round } => {
-                let old = self.server.held.insert(client, (round, BTreeSet::new()));
-                for h in old.map(|(_, s)| s).unwrap_or_default() {
-                    let n = self.server.pins.get_mut(&h).expect("a held blob is pinned");
-                    *n -= 1;
-                    if *n == 0 {
-                        self.server.pins.remove(&h);
+            Up::Offer { round, root, contents, sending } => {
+                let contents: Vec<Hash> = contents.into_iter().map(Hash).collect();
+                let sending: BTreeSet<Hash> = sending.into_iter().map(Hash).collect();
+                let server = &mut self.server;
+                let sess = server.sessions.get_mut(&client).expect("a client joins before it offers");
+                if let Some(old) = sess.offer.take() {
+                    server.trees.release(old.up);
+                }
+                let up = server.trees.begin_upload();
+                let store = &server.store;
+                let claimed = server.trees.claim(up, &contents, &|h| store.contains_key(h));
+                let want: Vec<Digest> = claimed.mine.iter().filter(|h| !sending.contains(h)).map(|h| h.0).collect();
+                sess.offer = Some(Offer { round, root, contents, up, arrived: BTreeSet::new() });
+                if !want.is_empty() {
+                    self.report.wants += 1;
+                    self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::WantBlobs(want))));
+                }
+                self.try_finish_offer(client);
+            }
+            Up::Session(m) => {
+                let server = &mut self.server;
+                let sess = server.sessions.get_mut(&client).expect("a client joins before it uploads");
+                let step = sess.state.client(m);
+                if let Some(refused) = step.refused {
+                    return Err(Kind::StateMachine(format!("the server refused client {client}: {refused}")));
+                }
+                let mut wake = false;
+                for effect in step.effects {
+                    match effect {
+                        session_state::Effect::Store { hash, bytes } => {
+                            let h = Hash(hash);
+                            server.store.insert(h, bytes);
+                            sess.has.extend([hash]);
+                            if let Some(o) = &mut sess.offer
+                                && o.contents.contains(&h)
+                            {
+                                o.arrived.insert(h);
+                            }
+                            self.report.uploads += 1;
+                        }
+                        session_state::Effect::Wake => wake = true,
+                        other => return Err(Kind::StateMachine(format!("an upload of whole blobs had the effect {other:?}"))),
                     }
+                }
+                if wake {
+                    self.try_finish_offer(client);
                 }
             }
             Up::Request { round, action, inputs } => {
@@ -664,8 +799,7 @@ impl World {
                     && let Some(bytes) = self.server.store.get(&out).cloned()
                 {
                     self.report.cache_hits += 1;
-                    self.deliver_output(client, round, action, out, bytes);
-                    return Ok(());
+                    return self.deliver_output(client, round, action, out, bytes);
                 }
                 let job = self.server.next_job;
                 self.server.next_job += 1;
@@ -679,11 +813,86 @@ impl World {
         Ok(())
     }
 
-    fn deliver_output(&mut self, client: u64, round: u64, action: usize, out: Hash, bytes: Vec<u8>) {
+    fn drop_session(&mut self, client: u64) {
+        let Some(sess) = self.server.sessions.remove(&client) else { return };
+        let Some(o) = sess.offer else { return };
+        self.server.trees.release(o.up);
+        let others: Vec<u64> = self.server.sessions.iter().filter(|(_, s)| s.offer.is_some()).map(|(c, _)| *c).collect();
+        for other in others {
+            self.rewant(other);
+        }
+    }
+
+    fn rewant(&mut self, client: u64) {
+        let server = &mut self.server;
+        let Some(o) = server.sessions.get(&client).and_then(|s| s.offer.as_ref()) else { return };
+        let store = &server.store;
+        let orphans: Vec<Hash> =
+            o.contents.iter().filter(|h| !store.contains_key(h) && server.trees.holder(h).is_none()).copied().collect();
+        if orphans.is_empty() {
+            return;
+        }
+        let claimed = server.trees.claim(o.up, &orphans, &|h| store.contains_key(h));
+        let want: Vec<Digest> = claimed.mine.iter().map(|h| h.0).collect();
+        self.report.wants += 1;
+        self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::WantBlobs(want))));
+    }
+
+    fn try_finish_offer(&mut self, client: u64) {
+        let server = &mut self.server;
+        let Some(sess) = server.sessions.get_mut(&client) else { return };
+        let Some(o) = &sess.offer else { return };
+        if !o.contents.iter().all(|h| server.store.contains_key(h)) {
+            return;
+        }
+        let o = sess.offer.take().expect("checked above");
+        let same_round = server.held.get(&client).is_some_and(|(r, _)| *r == o.round);
+        let old = if same_round { None } else { server.held.insert(client, (o.round, BTreeSet::new())) };
+        for h in old.map(|(_, s)| s).unwrap_or_default() {
+            let n = server.pins.get_mut(&h).expect("a held blob is pinned");
+            *n -= 1;
+            if *n == 0 {
+                server.pins.remove(&h);
+            }
+        }
+        for h in &o.contents {
+            self.pin(client, *h);
+        }
+        self.server.trees.release(o.up);
+        self.send(Node::Server, Node::Client(client), Msg::Down(Down::Synced { round: o.round, root: o.root }));
+    }
+
+    fn deliver_output(&mut self, client: u64, round: u64, action: usize, out: Hash, bytes: Vec<u8>) -> Step {
         if self.server.held.get(&client).is_some_and(|(r, _)| *r == round) {
             self.pin(client, out);
         }
-        self.send(Node::Server, Node::Client(client), Msg::Down(Down::Done { round, action, output: bytes }));
+        let server = &mut self.server;
+        let Some(sess) = server.sessions.get_mut(&client) else { return Ok(()) };
+        let file = Delivery { path: format!("{round}/{action}"), hash: out.0, size: bytes.len() as u64, exec: false, own: true };
+        let Some(mut outgoing): Option<Outgoing> = sess.state.deliver(&mut sess.has, vec![file], Vec::new(), Vec::new()) else {
+            return Ok(());
+        };
+        let mut msgs = Vec::new();
+        loop {
+            match outgoing.step() {
+                Next::Read { hash, at, len, .. } => {
+                    let read = server.store.get(&Hash(hash)).map(|v| {
+                        let at = (at as usize).min(v.len());
+                        v[at..(at + len).min(v.len())].to_vec()
+                    });
+                    outgoing.read(read);
+                }
+                Next::Send(m) | Next::Bulk(m) => msgs.push(m),
+                Next::Unreadable(h) => {
+                    return Err(Kind::LostPinned(format!("output {} being delivered is gone", Hash(h).hex())));
+                }
+                Next::Gone | Next::Done => break,
+            }
+        }
+        for m in msgs {
+            self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(m)));
+        }
+        Ok(())
     }
 
     fn server_from_worker(&mut self, worker: u64, u: Up) -> Step {
@@ -706,9 +915,9 @@ impl World {
                 let out = Hash::of(&output);
                 self.server.store.insert(out, output.clone());
                 self.server.cache.insert(j.key, out);
-                self.deliver_output(j.client, j.round, j.action, out, output);
+                self.deliver_output(j.client, j.round, j.action, out, output)?;
             }
-            Up::Upload { .. } | Up::Hold { .. } | Up::Request { .. } => unreachable!("only clients say this"),
+            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } => unreachable!("only clients say this"),
         }
         Ok(())
     }
@@ -786,7 +995,7 @@ impl World {
         inputs
     }
 
-    fn round(&mut self, client: u64) {
+    fn round(&mut self, client: u64) -> Step {
         let c = self.clients.get_mut(&client).expect("known");
         c.round += 1;
         c.rounds_left -= 1;
@@ -798,17 +1007,80 @@ impl World {
         }
         c.outputs.clear();
         c.requested.clear();
-        let round = c.round;
-        let sources: Vec<Vec<u8>> = (0..self.cfg.sources).map(|s| model::source(s, c.versions[s])).collect();
-        self.send(Node::Client(client), Node::Server, Msg::Up(Up::Hold { round }));
-        for blob in sources {
-            self.send(Node::Client(client), Node::Server, Msg::Up(Up::Upload { blob }));
+        c.pending.clear();
+        c.daemon.changed(1, false);
+        self.sync(client)
+    }
+
+    fn sync(&mut self, client: u64) -> Step {
+        let now = self.now;
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.finished {
+            return Ok(());
         }
-        self.request_ready(client);
+        match c.daemon.link(c.up, Need::Must) {
+            Link::Use => {}
+            Link::Connect => {
+                if now < c.cut_until {
+                    let at = c.cut_until - now;
+                    self.schedule(at, Ev::Sync { client });
+                    return Ok(());
+                }
+                c.daemon.connected();
+                c.up = true;
+                c.epoch += 1;
+                let outputs = &c.outputs;
+                c.requested.retain(|a| outputs.contains_key(a));
+                c.pending.clear();
+                c.parts.clear();
+                self.send(Node::Client(client), Node::Server, Msg::Up(Up::Join));
+            }
+            Link::Skip => unreachable!("a sync needs the link"),
+        }
+        let sources = self.cfg.sources;
+        let c = self.clients.get_mut(&client).expect("known");
+        let _ = c.daemon.plan_scan(1, None, true);
+        c.daemon.scanned(1, None);
+        let blobs: Vec<Vec<u8>> = (0..sources).map(|s| model::source(s, c.versions[s])).collect();
+        let contents: Vec<Digest> = blobs.iter().map(|b| Hash::of(b).0).collect();
+        for (d, b) in contents.iter().zip(blobs) {
+            c.cache.insert(*d, b);
+        }
+        let root = Hash::of(&contents.concat()).0;
+        let (_, lacking) = c.daemon.offer(Some(1), &root, std::iter::empty(), contents.iter().map(|d| (d, ())));
+        let sending: Vec<Digest> = lacking.into_iter().map(|(d, ())| d).collect();
+        let upload: Vec<Blob> = sending.iter().map(|d| Blob::pack(*d, &c.cache[d])).collect();
+        c.contents = contents.clone();
+        let round = c.round;
+        self.send(Node::Client(client), Node::Server, Msg::Up(Up::Offer { round, root, contents, sending }));
+        for b in upload {
+            self.send(Node::Client(client), Node::Server, Msg::Up(Up::Session(ClientMsg::Blobs(vec![b]))));
+        }
+        Ok(())
+    }
+
+    fn client_cut(&mut self, client: u64) {
+        let now = self.now;
+        let until = now + self.rng.range(50, 2_000);
+        let c = self.clients.get_mut(&client).expect("known");
+        if !c.up {
+            return;
+        }
+        c.up = false;
+        c.cut_until = until;
+        let finished = c.finished;
+        self.report.client_cuts += 1;
+        self.drop_session(client);
+        if !finished {
+            self.schedule(until - now, Ev::Sync { client });
+        }
     }
 
     fn request_ready(&mut self, client: u64) {
         let c = &self.clients[&client];
+        if c.synced_round != c.round {
+            return;
+        }
         let ready = self.project.ready(&|a| c.outputs.contains_key(&a), &|a| c.requested.contains(&a));
         for action in ready {
             let c = &self.clients[&client];
@@ -819,8 +1091,77 @@ impl World {
         }
     }
 
-    fn client_done(&mut self, client: u64, d: Down) -> Step {
-        let Down::Done { round, action, output } = d;
+    fn client_hears(&mut self, client: u64, d: Down) -> Step {
+        let m = match d {
+            Down::Synced { round, root } => {
+                let c = self.clients.get_mut(&client).expect("known");
+                if round != c.round {
+                    return Ok(());
+                }
+                let contents = c.contents.clone();
+                c.daemon.synced(Some(1), root, contents.iter());
+                c.synced_round = round;
+                self.request_ready(client);
+                return Ok(());
+            }
+            Down::Session(m) => m,
+        };
+        let c = self.clients.get_mut(&client).expect("known");
+        match m {
+            ServerMsg::WantBlobs(want) => {
+                if self.bug == Some(Bug::StaleKnowledge) {
+                    return Ok(());
+                }
+                c.daemon.missing(want.iter());
+                let upload: Vec<Blob> = want.iter().filter_map(|d| c.cache.get(d).map(|b| Blob::pack(*d, b))).collect();
+                if upload.len() != want.len() {
+                    return Err(Kind::StateMachine(format!("the server wants content client {client} never had")));
+                }
+                for b in upload {
+                    self.send(Node::Client(client), Node::Server, Msg::Up(Up::Session(ClientMsg::Blobs(vec![b]))));
+                }
+            }
+            ServerMsg::Deliver { id, files, .. } => {
+                c.pending.insert(id, files);
+            }
+            ServerMsg::Blobs(blobs) => {
+                for b in blobs {
+                    let hash = b.hash;
+                    let bytes = b.unpack().map_err(|_| Kind::Drift(format!("client {client} got a blob that does not unpack")))?;
+                    if Hash::of(&bytes).0 != hash {
+                        return Err(Kind::Drift(format!("client {client} got a blob that does not match its hash")));
+                    }
+                    c.cache.insert(hash, bytes);
+                }
+            }
+            ServerMsg::BlobPart { hash, part, last } => {
+                let data = part.unpack().map_err(|_| Kind::Drift(format!("client {client} got a part that does not unpack")))?;
+                c.parts.entry(hash).or_default().extend(data);
+                if last {
+                    let bytes = c.parts.remove(&hash).unwrap_or_default();
+                    if Hash::of(&bytes).0 != hash {
+                        return Err(Kind::Drift(format!("client {client} put together a blob that does not match its hash")));
+                    }
+                    c.cache.insert(hash, bytes);
+                }
+            }
+            ServerMsg::Delivered { id } => {
+                let Some(files) = c.pending.remove(&id) else { return Ok(()) };
+                for f in files {
+                    let (round, action) = f.path.split_once('/').expect("a delivered path is round/action");
+                    let (round, action): (u64, usize) = (round.parse().expect("a round"), action.parse().expect("an action"));
+                    let Some(bytes) = self.clients[&client].cache.get(&f.hash).cloned() else {
+                        return Err(Kind::Drift(format!("client {client} was told {} is delivered without its content", f.path)));
+                    };
+                    self.client_done(client, round, action, bytes)?;
+                }
+            }
+            other => return Err(Kind::StateMachine(format!("client {client} did not expect {other:?}"))),
+        }
+        Ok(())
+    }
+
+    fn client_done(&mut self, client: u64, round: u64, action: usize, output: Vec<u8>) -> Step {
         let c = &self.clients[&client];
         if round != c.round || c.outputs.contains_key(&action) {
             return Ok(());
@@ -858,11 +1199,13 @@ fn label(ev: &Ev) -> String {
             let what = match msg {
                 Msg::Up(Up::Hello { .. }) => "hello",
                 Msg::Up(Up::Result { .. }) => "result",
-                Msg::Up(Up::Upload { .. }) => "upload",
-                Msg::Up(Up::Hold { .. }) => "hold",
+                Msg::Up(Up::Join) => "join",
+                Msg::Up(Up::Offer { .. }) => "offer",
+                Msg::Up(Up::Session(_)) => "upload",
                 Msg::Up(Up::Request { .. }) => "request",
                 Msg::Work(_) => "work",
-                Msg::Down(_) => "done",
+                Msg::Down(Down::Synced { .. }) => "synced",
+                Msg::Down(Down::Session(_)) => "deliver",
             };
             format!("{from:?}>{to:?}@{epoch}:{what};")
         }
@@ -871,6 +1214,8 @@ fn label(ev: &Ev) -> String {
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
+        Ev::Sync { client } => format!("sync {client};"),
+        Ev::ClientCut { client } => format!("client cut {client};"),
     }
 }
 

@@ -894,7 +894,9 @@ dependencies = [
 name = "rargo-sim"
 version = "0.7.6"
 dependencies = [
+ "rargo",
  "rargo-core",
+ "rargo-proto",
 ]
 
 [[package]]

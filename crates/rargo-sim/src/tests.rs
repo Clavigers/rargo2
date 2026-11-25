@@ -35,6 +35,9 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
     assert!(reports.iter().any(|r| r.cache_hits > 0), "actions are answered from the cache");
     assert!(reports.iter().any(|r| r.evictions > 0), "content is evicted");
+    assert!(reports.iter().any(|r| r.uploads > 0), "clients upload sources");
+    assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
+    assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
 }
 
 fn caught(bug: Bug, kind: fn(&Kind) -> bool) {
@@ -58,4 +61,14 @@ fn delivering_a_stale_output_is_caught() {
 #[test]
 fn never_answering_a_request_is_caught() {
     caught(Bug::NeverAnswer, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
+}
+
+#[test]
+fn evicting_content_an_upload_claimed_is_caught() {
+    caught(Bug::EvictClaimed, |k| matches!(k, Kind::LostPinned(_)));
+}
+
+#[test]
+fn a_client_trusting_what_the_server_no_longer_holds_is_caught() {
+    caught(Bug::StaleKnowledge, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
 }
