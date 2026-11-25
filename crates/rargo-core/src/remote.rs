@@ -2099,7 +2099,7 @@ impl Pool {
                 if held.contains(name) {
                     continue;
                 }
-                match crate::nixmanifest::load(engine.store.db(), name) {
+                match crate::nixmanifest::load(engine.store.db().as_ref(), name) {
                     Some(kind) => {
                         let id = crate::nixmanifest::identity(&kind);
                         if *root != Hash::ZERO && id != *root {
