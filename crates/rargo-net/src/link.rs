@@ -1,10 +1,13 @@
 use crate::{Auth, Conn, Endpoint};
 use rargo_proto::secure::{self, Opener, Sealer};
 use std::collections::VecDeque;
+use std::future::poll_fn;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// A TCP record is a little-endian length and then that many bytes.
@@ -125,18 +128,28 @@ impl FrameDecoder {
     }
 }
 
-struct TcpReader {
-    stream: TcpStream,
-    opener: Opener,
-    dec: FrameDecoder,
-    pending: VecDeque<Vec<u8>>,
+struct Inbox {
+    msgs: VecDeque<Vec<u8>>,
+    waker: Option<Waker>,
+    stop: bool,
+    eof: bool,
+}
+
+struct Shared {
+    mu: Mutex<Inbox>,
+    cv: Condvar,
 }
 
 pub struct TcpLink {
     wr: Mutex<(TcpStream, Sealer)>,
-    rd: Mutex<TcpReader>,
+    shared: Arc<Shared>,
     stopper: TcpStream,
     closed: AtomicBool,
+    reader: Mutex<Option<JoinHandle<()>>>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub enum Link {
@@ -152,16 +165,22 @@ impl Link {
         let _ = stream.set_nonblocking(false);
         let rd = stream.try_clone().expect("a tcp stream clones for reading");
         let stopper = stream.try_clone().expect("a tcp stream clones for closing");
+        let shared = Arc::new(Shared {
+            mu: Mutex::new(Inbox { msgs: VecDeque::new(), waker: None, stop: false, eof: false }),
+            cv: Condvar::new(),
+        });
+        let reading = Arc::clone(&shared);
+        // The socket read runs on its own thread. A caller waiting for a frame stays pending until one arrives.
+        let reader = std::thread::Builder::new()
+            .name("tcp-link".into())
+            .spawn(move || tcp_read(rd, opener, reading))
+            .expect("a tcp reader thread starts");
         Link::Tcp(TcpLink {
             wr: Mutex::new((stream, sealer)),
-            rd: Mutex::new(TcpReader {
-                stream: rd,
-                opener,
-                dec: FrameDecoder::new(FRAME_LIMIT),
-                pending: VecDeque::new(),
-            }),
+            shared,
             stopper,
             closed: AtomicBool::new(false),
+            reader: Mutex::new(Some(reader)),
         })
     }
 
@@ -233,18 +252,14 @@ impl Link {
     pub async fn recv(&self) -> Option<Vec<u8>> {
         match self {
             Link::Udp(c, _) => c.recv().await,
-            Link::Tcp(t) => recv_tcp(t),
+            Link::Tcp(t) => poll_fn(|cx| t.poll_recv(cx)).await,
         }
     }
 
     pub fn close(&self) {
         match self {
             Link::Udp(c, e) => e.forget(c.id),
-            Link::Tcp(t) => {
-                t.closed.store(true, Ordering::SeqCst);
-                let _ = t.stopper.shutdown(Shutdown::Both);
-                assert!(t.closed.load(Ordering::SeqCst));
-            }
+            Link::Tcp(t) => t.halt(),
         }
     }
 
@@ -263,33 +278,146 @@ impl Link {
     }
 }
 
-fn recv_tcp(t: &TcpLink) -> Option<Vec<u8>> {
-    let mut g = t.rd.lock().unwrap_or_else(|e| e.into_inner());
-    let TcpReader { stream, opener, dec, pending } = &mut *g;
+impl TcpLink {
+    fn poll_recv(&self, cx: &mut Context<'_>) -> Poll<Option<Vec<u8>>> {
+        let mut g = lock(&self.shared.mu);
+        if let Some(msg) = g.msgs.pop_front() {
+            let drained = g.msgs.is_empty();
+            g.waker = None;
+            drop(g);
+            if drained {
+                self.shared.cv.notify_one();
+            }
+            return Poll::Ready(Some(msg));
+        }
+        if g.eof {
+            return Poll::Ready(None);
+        }
+        g.waker = Some(cx.waker().clone());
+        if let Some(msg) = g.msgs.pop_front() {
+            let drained = g.msgs.is_empty();
+            g.waker = None;
+            drop(g);
+            if drained {
+                self.shared.cv.notify_one();
+            }
+            return Poll::Ready(Some(msg));
+        }
+        if g.eof {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    }
+
+    fn halt(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let waker = {
+            let mut g = lock(&self.shared.mu);
+            g.stop = true;
+            g.eof = true;
+            g.waker.take()
+        };
+        self.shared.cv.notify_all();
+        let _ = self.stopper.shutdown(Shutdown::Both);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        assert!(self.closed.load(Ordering::SeqCst));
+    }
+}
+
+impl Drop for TcpLink {
+    fn drop(&mut self) {
+        self.halt();
+        if let Some(reader) = lock(&self.reader).take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn deliver(shared: &Shared, msg: Vec<u8>) -> bool {
+    let waker = {
+        let mut g = lock(&shared.mu);
+        if g.stop {
+            return false;
+        }
+        g.msgs.push_back(msg);
+        g.waker.take()
+    };
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+    true
+}
+
+fn mark_eof(shared: &Shared) {
+    let waker = {
+        let mut g = lock(&shared.mu);
+        g.eof = true;
+        g.stop = true;
+        g.waker.take()
+    };
+    shared.cv.notify_all();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+fn tcp_read(mut stream: TcpStream, mut opener: Opener, shared: Arc<Shared>) {
+    let mut dec = FrameDecoder::new(FRAME_LIMIT);
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut buf = vec![0u8; 256 << 10];
+    let mut need_more = false;
     loop {
-        if t.closed.load(Ordering::SeqCst) {
-            return None;
+        if lock(&shared.mu).stop {
+            return;
         }
         while let Some(rec) = pending.pop_front() {
             match opener.open(&rec) {
-                Ok(Some(m)) => return Some(m),
-                Ok(None) => continue,
-                Err(_) => return None,
+                Ok(Some(msg)) => {
+                    need_more = false;
+                    if !deliver(&shared, msg) {
+                        return;
+                    }
+                }
+                Ok(None) => need_more = true,
+                Err(_) => {
+                    mark_eof(&shared);
+                    return;
+                }
             }
         }
-        let mut buf = [0u8; 256 << 10];
+        // At a frame boundary, with a message already waiting, the next read waits
+        // until that message is taken. A partial frame, or a record the opener has
+        // not finished, is read at once.
+        if !need_more && dec.missing() == 0 {
+            let mut g = lock(&shared.mu);
+            while !g.stop && !g.msgs.is_empty() {
+                g = shared.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            if g.stop {
+                return;
+            }
+        }
         let n = match stream.read(&mut buf) {
             Ok(0) => {
                 let _ = dec.end();
-                return None;
+                mark_eof(&shared);
+                return;
             }
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return None,
+            Err(_) => {
+                mark_eof(&shared);
+                return;
+            }
         };
         match dec.push(&buf[..n]) {
             Ok(frames) => pending.extend(frames),
-            Err(_) => return None,
+            Err(_) => {
+                mark_eof(&shared);
+                return;
+            }
         }
     }
 }
