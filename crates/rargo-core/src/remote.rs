@@ -1997,20 +1997,32 @@ impl Pool {
             let mut closure: Vec<(Vec<u8>, Hash)> = view.nix_closure().to_vec();
             closure.sort_by(|a, b| a.0.cmp(&b.0));
             let mut store_paths = Vec::new();
-            for (name, root) in &closure {
+            for (name, root) in &mut closure {
                 if held.contains(name) {
                     continue;
                 }
                 match crate::nixmanifest::load(engine.store.db(), name) {
-                    Some(kind) if crate::nixmanifest::identity(&kind) == *root => {
+                    Some(kind) => {
+                        let id = crate::nixmanifest::identity(&kind);
+                        if *root != Hash::ZERO && id != *root {
+                            eprintln!(
+                                "rargod: nix manifest for {} does not match the closure",
+                                String::from_utf8_lossy(name)
+                            );
+                            continue;
+                        }
+                        *root = id;
                         held.insert(name.clone());
                         store_paths.push(crate::nixmanifest::WirePath { name: name.clone(), kind });
                     }
-                    Some(_) => eprintln!(
-                        "rargod: nix manifest for {} does not match the closure",
-                        String::from_utf8_lossy(name)
-                    ),
-                    None => eprintln!("rargod: nix manifest for {} is missing", String::from_utf8_lossy(name)),
+                    None => {
+                        if *root != Hash::ZERO {
+                            eprintln!(
+                                "rargod: nix manifest for {} is missing",
+                                String::from_utf8_lossy(name)
+                            );
+                        }
+                    }
                 }
             }
             w.peer.post(&Msg::Run {
