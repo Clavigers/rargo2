@@ -90,6 +90,9 @@ release_binaries() {
         tail --pid="$pid" -f /dev/null
     done
     for pid in $(bin_pids); do
+        timeout 10 tail --pid="$pid" -f /dev/null || true
+    done
+    for pid in $(bin_pids); do
         kill -KILL "$pid" 2>/dev/null || true
     done
     for pid in $(bin_pids); do
@@ -99,6 +102,9 @@ release_binaries() {
         echo "gate: a process is still running a binary in $B" >&2
         return 1
     fi
+}
+gate_mounts() {
+    awk -v d="$L/" '$3 == "fuse.rargo" && index($2 "/", d) == 1 { print $2 }' /proc/mounts
 }
 release_binaries
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
@@ -155,6 +161,17 @@ for suite in e2e e2e-copy e2e-flake e2e-auth e2e-components e2e-link e2e-worker;
         report "$suite" failure "${description:-failure}"
     fi
 done
+left=""
+release_binaries || left="a process still runs from $B"
+if [ -n "$(gate_mounts)" ]; then
+    gate_mounts >&2
+    left="${left:+$left; }rargo mounts are left under $L"
+fi
+if [ -n "$left" ]; then
+    echo "gate: $left" >&2
+    report all failure "Gate left work behind: $left"
+    exit 1
+fi
 if ! clean || [ "$(git rev-parse HEAD)" != "$commit" ]; then
     report all error "Checkout changed during the gate"
     exit 2
