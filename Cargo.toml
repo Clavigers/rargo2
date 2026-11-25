@@ -2,9 +2,6 @@
 resolver = "2"
 members = ["crates/*"]
 
-[workspace.metadata.rargo]
-host = "rargo.rs"
-
 [workspace.package]
 version = "0.7.0"
 edition = "2024"

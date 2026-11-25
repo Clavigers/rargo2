@@ -70,8 +70,6 @@ pub const MANIFEST: &str = "Cargo.toml";
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct InManifest {
-    #[allow(dead_code)]
-    host: Option<String>,
     #[serde(default)]
     env: EnvPolicy,
     #[serde(default)]
@@ -139,7 +137,7 @@ mod tests {
             [workspace]
             members = ["crates/*"]
             [workspace.metadata.rargo]
-            host = "rargo.rs"
+            nextest = "0.9.100"
             [workspace.metadata.rargo.env]
             pass = ["DATABASE_URL", "PROTOC*"]
             [workspace.metadata.rargo.network]
@@ -165,8 +163,10 @@ mod tests {
 
     #[test]
     fn the_policy_is_the_manifests_table() {
-        let only_host = "[package]\nname = \"a\"\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n";
-        assert_eq!(Policy::load(Some(only_host)).unwrap(), Policy::default());
+        let empty = "[package]\nname = \"a\"\n[package.metadata.rargo]\n";
+        assert_eq!(Policy::load(Some(empty)).unwrap(), Policy::default());
+        let host = "[package]\nname = \"a\"\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n";
+        assert!(Policy::load(Some(host)).is_err());
         let package = "[package]\nname = \"a\"\n[package.metadata.docs.rs]\nall-features = true\n[package.metadata.rargo.sync]\ngit = false\n";
         assert_eq!(Policy::load(Some(package)).unwrap().sync.git, Some(GitSync::Flag(false)));
         let history = "[workspace.metadata.rargo.sync]\ngit = \"history\"\n";
