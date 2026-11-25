@@ -222,9 +222,9 @@ Protocol 7 (unchanged).
 Protocol 7 (unchanged).
 
 - `rargo auth remove` revokes the token on the server before forgetting
-  it, so a copy kept anywhere stops working and its open sessions end. If
-  the server cannot be reached it says so and names what an administrator
-  can run. (#22)
+  it, so a copy kept anywhere stops working and the next command on an
+  open session is refused. If the server cannot be reached it says so
+  and names what an administrator can run. (#22)
 
 ## 0.3.2
 

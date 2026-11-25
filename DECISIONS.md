@@ -1004,9 +1004,8 @@ Two consequences, both accepted:
   running (it was needed for crashed compilers); until then the server
   runs a few tokens short.
 
-Checked by e2e: a build script sleeping for ten minutes is gone within
-five seconds of its client being killed, the scheduler shows nothing
-running, and the next build works.
+Checked by e2e: a build script that is still running when its client is
+killed is stopped with it, and the next build works.
 
 ## D49. cargo's report files: future incompatibility and `--timings`
 
@@ -1886,10 +1885,10 @@ wire protocol is unchanged (protocol 7). They live in `tokens.json` in
 the server's state directory, rewritten whole under a lock by whoever
 changes it and read again by the server whenever the file has changed:
 `rargod token create|list|revoke|invite` on the server's machine take
-effect at once, with no restart. A token may expire. A session whose
-token was revoked or has expired is closed within seconds (looked at
-when anything arrives on the link, at most every other second). Tokens
-are the one way to say who may connect (D74).
+effect at once, with no restart. A token may expire. The next command on a session whose token was
+revoked or has expired is refused, and the session ends. A session that
+only sits idle is closed when the next message shows the token no longer
+works. Tokens are the one way to say who may connect (D74).
 
 *Secrets are not kept in plain text*, with a limit that has to be said:
 the file holds the key derived from the secret, not the secret, and an
@@ -1932,8 +1931,8 @@ device secret.
 
 - **The allow list** is in `tokens.json` beside the tokens:
   `rargod token allow LOGIN [--admin]`, `rargod token disallow LOGIN`
-  (which also revokes the tokens that account signed in for, so its
-  open sessions end within seconds), shown by `rargod token list`.
+  (which also revokes the tokens that account signed in for, so the
+  next command on an open session is refused), shown by `rargod token list`.
   Logins are compared without regard to case, as GitHub does.
 - **The application** (client id, client secret, the address the pages
   are reached at) is in `github.json` in the state directory, mode 600,
@@ -2095,8 +2094,9 @@ and several daemons with core caps. So:
   chosen because it is the path a new user takes.
 - *The gate* (`dev/gate.sh`), on the build machine, runs everything:
   the above plus `e2e.sh` in both output modes, `e2e-flake.sh`,
-  `e2e-link.sh` and `e2e-worker.sh`, the last two in a second network
-  rig so that a benchmark holding the first is not disturbed.
+  `e2e-auth.sh`, `e2e-components.sh`, `e2e-link.sh` and `e2e-worker.sh`,
+  at the same time. Each suite that uses a network rig has one of its
+  own, so a benchmark holding another rig is not disturbed.
 
 **What blocks a merge and what blocks a release.** A pull request is
 merged only when CI passed on it; a release is tagged only after the
@@ -2745,3 +2745,48 @@ server's proxy. Both suites run `rargo clippy` whatever the client has
 installed: e2e on a project without a flake, e2e-flake on a flake project
 that has `pkgs.clippy`. Without this change e2e-flake fails its new check
 ("the server cargo home bin's cargo-clippy ran"); with it, all 22 pass.
+
+## D86. The gate runs its suites at the same time (issue 112)
+
+The gate is the whole set of checks, and a pull request waits for all of
+it. The build, the unit tests and the mount tests go first, because the
+suites run the binaries they produce. After that the suites run together.
+Each already has its own directory and its own ports. `e2e-link` and
+`e2e-worker` each have a rig of their own (namespaces and state named
+from the gate directory), and the two scenarios inside `e2e-worker` do
+too: a wide worker, and a one-core worker whose states stay where they
+were made. A benchmark's rig is a different name and is not used.
+
+A check that needs something to have happened runs a command that returns
+when it has. `rargo --rargo-settle` returns when every push to a worker
+has been acknowledged, states sent ahead have been sent, and incremental
+state that is already due has come home. A file whose delay has not
+elapsed stays where it is. `rargo --rargo-daemon-sync` returns when the
+server holds the worktree. `rargo --rargo-daemon-stop` stops every daemon
+of that cache and returns when each has unmounted and exited. The next
+command on a revoked token is refused and the session ends. A rig is up
+when its server is serving and any worker has joined, and the client can
+reach the server. `dev/netns.sh` signals only the daemons in that rig's
+namespace, so one suite cannot stop another's. The leaf crates in
+`e2e-worker` are ordinary libraries. A worker that is stopped tells the
+server, and the server drops it then. `RARGO_HEDGE=0` on that suite's
+servers keeps a compile given to a worker from also running on an idle
+local core, so the state it leaves is the worker's. A compile that has
+to run on the server fetches its state from a worker that holds the
+state and has no core to take the compile. A build script's
+`cargo:warning=` lines are shown as the script prints them, and the
+same line is not shown again when the script's output is parsed.
+
+The servers the suites start through `dev/rargod.sh` take a share of the
+machine (`RARGO_CPU_QUOTA` 800%, `RARGO_MEMORY_MAX` 20G, unless the
+environment names another). A rig's caps stay what `dev/netns.sh` sets
+from the cores that rig is given. The service beside the gate keeps the
+headroom `CLAUDE.md` asks for.
+
+Before the gate copies its binaries over the ones already in its
+directory, every process still running those copies is gone. A daemon
+exits on SIGTERM. Its unmount-guard exits once the daemon does, and the
+mount goes with it. A check that a killed daemon's mount is gone waits
+on that daemon's guard. Another daemon can still be running with a
+guard whose title names the same directory, and that guard stays until
+its own daemon exits. `e2e-auth` stops every daemon under its own directory.

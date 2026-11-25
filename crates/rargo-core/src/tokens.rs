@@ -541,7 +541,7 @@ pub fn command(store: &TokenStore, args: &[String], asker: &Asker, usage: &str) 
                 }
                 bail!("none of your tokens that still work has the id `{id}` (you may revoke only your own)");
             }
-            let _ = writeln!(out, "revoked {n} token(s); their sessions end within seconds");
+            let _ = writeln!(out, "revoked {n} token(s); the next command on an open session is refused");
         }
         _ if !asker.admin => return Err(refuse()),
         "invite" => {

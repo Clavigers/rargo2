@@ -29,14 +29,44 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/        /'; }
 check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else bad "$name" "$@"; fi; }
+# Stop every daemon whose cache is `root` or a cache directory under it.
+# `--rargo-daemon-stop` reaches each socket in that cache and returns when
+# the daemon has unmounted and exited. A daemon it cannot reach (its socket
+# is already gone) is killed. The guard exits once its daemon is gone.
+reap_clients() {
+    local root=$1 pid c dpat gpat pids
+    if [ -d "$root/run" ]; then
+        (RARGO_CACHE_DIR=$root "$R" --rargo-daemon-stop) || true
+    fi
+    for c in "$root"/cache*; do
+        [ -d "$c" ] || continue
+        (RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop) || true
+    done
+    dpat=$(printf '%s' "$R --rargo-daemon $root/" | sed 's/[][(){}.^$*+?|\\]/\\&/g')
+    gpat=$(printf '%s' "unmount-guard: $root/" | sed 's/[][(){}.^$*+?|\\]/\\&/g')
+    pids=$(pgrep -f -- "$dpat" || true)
+    pkill -KILL -f -- "$dpat" 2>/dev/null || true
+    for pid in $pids; do
+        tail --pid="$pid" -f /dev/null
+    done
+    pids=$(pgrep -f -- "^$gpat" || true)
+    for pid in $pids; do
+        tail --pid="$pid" -f /dev/null
+    done
+    if pgrep -f -- "$dpat" >/dev/null 2>&1 || pgrep -f -- "^$gpat" >/dev/null 2>&1; then
+        return 1
+    fi
+    return 0
+}
 
+R=$B/rargo
+D="$B/rargod"
+reap_clients "$T" || { echo "daemons under $T are still running" >&2; exit 2; }
 umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
 pkill -KILL -f "fake-github.py [0-9]+ $T/github-who" 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
 export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config RARGO_CACHE_DIR=$T/cache RARGO_NO_BROWSER=1
-R=$B/rargo
-D="$B/rargod"
 
 echo "== an administrator, before the server runs"
 out=$("$B/rargod" --state "$T/state" --planner "$planner" --listen 0.0.0.0:$port --jobs 2 2>&1)
@@ -53,7 +83,7 @@ gh=$!
 export RARGO_GITHUB_URL=http://127.0.0.1:$ghport RARGO_GITHUB_API=http://127.0.0.1:$ghport
 "$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
 srv=$!
-for _ in $(seq 1 100); do grep -q "serving clients" "$T/srv.log" && break; sleep 0.1; done
+tail -n +1 -f --pid="$srv" "$T/srv.log" | awk '/serving clients/ { found=1; exit } END { exit found ? 0 : 1 }' || true
 grep -q "tokens required" "$T/srv.log"; check $? "the server runs with tokens" "$(cat "$T/srv.log")"
 
 echo "== the administrator, from a client"
@@ -85,7 +115,12 @@ out=$("$R" auth status 2>&1); grep -q "not authenticated" <<<"$out"; check $? "r
 
 "$R" auth >"$T/auth.out" 2>&1 &
 auth=$!
-for _ in $(seq 1 50); do grep -q "confirm there" "$T/auth.out" 2>/dev/null && grep -q -E '^ +[A-Z0-9]{4}-[A-Z0-9]{4}$' "$T/auth.out" && break; sleep 0.1; done
+tail -n +1 -f --pid="$auth" "$T/auth.out" | awk '
+/confirm there/ { c = 1 }
+/^ +[A-Z0-9]{4}-[A-Z0-9]{4}$/ { d = 1 }
+c && d { found = 1; exit }
+END { exit found ? 0 : 1 }
+' || true
 code=$(grep -E '^ +[A-Z0-9]{4}-[A-Z0-9]{4}$' "$T/auth.out" | tr -d ' ')
 url=$(grep -E '^ +http' "$T/auth.out" | tr -d ' ')
 [ -n "$code" ] && [ "$url" = "http://$host/auth?code=$code" ]; check $? "rargo auth shows an address and a code" "$(cat "$T/auth.out")"
@@ -137,7 +172,6 @@ out=$("$R" auth revoke bob 2>&1); [ $? != 0 ] && grep -q "only your own" <<<"$ou
 out=$(RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" build 2>&1); check $? "which still works" "$out"
 RARGO_TOKEN=$tok RARGO_CACHE_DIR=$T/cache-bob "$R" --rargo-daemon-stop >/dev/null 2>&1
 out=$(adm revoke "$id" 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargo auth revoke, by the administrator, ends ann's token" "$out"
-sleep 4
 echo "// changed" >>src/main.rs
 out=$("$R" build 2>&1); rc=$?
 [ $rc != 0 ]; check $? "a build with the revoked token fails, the session it had open included" "$out"
@@ -159,7 +193,6 @@ echo "// dave" >>src/main.rs
 out=$("$R" build 2>&1); check $? "and builds with it" "$out"
 out=$("$R" auth remove 2>&1); rc=$?
 [ $rc = 0 ] && grep -q "revoked the token for $host on the server" <<<"$out"; check $? "rargo auth remove says it revoked the token on the server" "$out"
-sleep 3
 echo "// dave again" >>src/main.rs
 out=$(RARGO_TOKEN=$tok3 RARGO_CACHE_DIR=$T/cache3b "$R" build 2>&1); rc=$?
 [ $rc != 0 ] && grep -q "does not know this token, or it was revoked or has expired" <<<"$out"; check $? "a copy of that token, kept aside and presented again, is refused" "$out"
@@ -172,7 +205,7 @@ out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"$tok\"}" "h
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok%%.*}\"}" "http://$host/auth/whoami"); grep -q '"user":null' <<<"$out"; check $? "and nobody for a token's id alone" "$out"
 out=$(curl -fsS -H 'Content-Type: application/json' -d "{\"token\":\"${tok3%%.*}.wrong-secret-wrong-secret\"}" "http://$host/auth/revoke"); grep -q '"revoked":false' <<<"$out"; check $? "a token cannot be revoked by its id alone" "$out"
 out=$("$R" auth remove 2>&1); [ $? != 0 ]; check $? "a second rargo auth remove has nothing to remove" "$out"
-for c in "$T/cache3" "$T/cache3b" "$T/cache3c"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+for c in "$T/cache3" "$T/cache3b" "$T/cache3c"; do reap_clients "$c" || true; done
 
 echo "== signing in with GitHub (a stand-in for it), with an allow list"
 printf 'the-app-secret\n' >"$T/app-secret"
@@ -185,7 +218,10 @@ mkdir -p "$HOME"
 cd "$T/proj" || exit 2
 "$R" auth >"$T/auth2.out" 2>&1 &
 auth=$!
-for _ in $(seq 1 50); do grep -q -E '^ +[A-Z0-9]{4}-[A-Z0-9]{4}$' "$T/auth2.out" 2>/dev/null && break; sleep 0.1; done
+tail -n +1 -f --pid="$auth" "$T/auth2.out" | awk '
+/^ +[A-Z0-9]{4}-[A-Z0-9]{4}$/ { found = 1; exit }
+END { exit found ? 0 : 1 }
+' || true
 code=$(grep -E '^ +[A-Z0-9]{4}-[A-Z0-9]{4}$' "$T/auth2.out" | tr -d ' ')
 out=$(curl -fsS "http://$host/auth?code=$code"); grep -q 'action="/auth/github"' <<<"$out" && ! grep -q 'name="invite"' <<<"$out"; check $? "the page offers GitHub and asks for no invitation" "$out"
 out=$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "http://$host/auth/github?code=$code")
@@ -204,11 +240,10 @@ echo "// carol" >>src/main.rs
 out=$("$R" build 2>&1); check $? "rargo build works with the token" "$out"
 out=$(adm tokens 2>&1); grep -q "Carol.*github" <<<"$out" && grep -q "may sign in: Carol" <<<"$out"; check $? "rargo auth tokens shows the token and the allow list" "$out"
 out=$(adm disallow carol 2>&1); grep -q "revoked 1 token" <<<"$out"; check $? "rargo auth disallow revokes what the account signed in for" "$out"
-sleep 4
 echo "// again" >>src/main.rs
 out=$("$R" build 2>&1); [ $? != 0 ]; check $? "and its builds stop" "$out"
 
-for c in "$T/cache" "$T/cache-bob" "$T/cache2" "$T/cache-admin"; do RARGO_CACHE_DIR=$c "$R" --rargo-daemon-stop >/dev/null 2>&1; done
+reap_clients "$T"; check $? "the suite's daemons are gone" "$(ps -eo args | grep -F "$T/" | grep -E 'rargo --rargo-daemon|unmount-guard' | grep -v grep || true)"
 kill $gh 2>/dev/null
 cd /
 kill $srv 2>/dev/null; wait $srv 2>/dev/null

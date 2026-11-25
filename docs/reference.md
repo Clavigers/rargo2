@@ -48,8 +48,10 @@ Everything that is not a build (`cargo add`, `cargo login`, `cargo fmt`) is hand
 | `rargo clean` | like `cargo clean`, and lets go of a mounted `target/` first |
 | `rargo --rargo-version` | the client's version and protocol |
 | `rargo --rargo-status` | what the server has been doing |
+| `rargo --rargo-settle` | return when workers have what was sent and state that is due has come home |
 | `rargo --rargo-daemon-status` | what the local daemon is doing |
-| `rargo --rargo-daemon-stop` | stop the local daemon |
+| `rargo --rargo-daemon-sync` | send the worktree to the server and return when it holds it |
+| `rargo --rargo-daemon-stop` | stop every local daemon of this cache |
 
 ## Nextest
 
@@ -91,7 +93,7 @@ Tokens, managed while the server runs. An administrator does it from any machine
 rargo auth invite --user ann     # a code ann enters on the rargo auth page
 rargo auth allow ann-on-github   # may sign in with GitHub instead
 rargo auth tokens
-rargo auth revoke ann            # her builds stop within seconds
+rargo auth revoke ann            # her next build is refused
 ```
 </figure>
 

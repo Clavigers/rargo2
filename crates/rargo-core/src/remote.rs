@@ -27,7 +27,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -125,6 +125,12 @@ pub enum Msg {
     Done { action: u64, result: Result<WDone, String> },
     /// Nobody wants this action's result any more: stop it.
     Cancel { action: u64 },
+    /// The worker has finished with a blob it was sent: the bytes are in
+    /// its store, or they could not be put there. Either way it is no
+    /// longer on the way.
+    Stored { blob: Hash },
+    /// The worker is leaving. The server drops it as soon as this arrives.
+    Bye,
 }
 
 fn dtype_to_u8(t: DType) -> u8 {
@@ -220,6 +226,25 @@ impl Peer {
     pub fn post(&self, m: &Msg) {
         if let Ok(b) = bincode::serialize(m) {
             let _ = if is_bulk(m) { self.bulk.send(b) } else { self.out.send(b) };
+        }
+    }
+
+    /// Sends `m` and returns when the peer has acknowledged the datagram.
+    /// The peer has the bytes; it may still be acting on them.
+    pub async fn deliver(&self, m: &Msg) {
+        let Ok(b) = bincode::serialize(m) else { return };
+        let framed = if b.len() >= COMPRESS_FROM { tokio::task::block_in_place(|| frame(b)) } else { frame(b) };
+        if self.conn.send(&framed).await.is_err() {
+            return;
+        }
+        loop {
+            let wake = self.conn.send_settled.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if self.conn.send_idle() {
+                return;
+            }
+            wake.await;
         }
     }
 
@@ -575,6 +600,9 @@ impl WorkerState {
             if let Err(e) = self.blobs.assemble(&self.peer, &blob, &recipe, inc.chunks).await {
                 eprintln!("rargo worker: pushed blob {blob} could not be assembled: {e:#}");
             }
+            // Said either way, so the server does not keep waiting on a blob
+            // that will never arrive.
+            self.peer.post(&Msg::Stored { blob });
             self.announced.lock().remove(&blob);
             if let Some(tx) = self.announce_tx.lock().remove(&blob) {
                 let _ = tx.send(true);
@@ -771,9 +799,22 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
     let tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>> = Arc::new(Mutex::new(HashMap::new()));
     peer.post(&Msg::Hello { cores, blobs: engine.store.all_hashes() });
     eprintln!("rargo worker: connected to {server}, {cores} cores");
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
+    let mut intr = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("signal");
     loop {
         let msg = tokio::select! {
             m = inbox.recv() => m,
+            _ = term.recv() => {
+                // The server drops this worker once it has the notice.
+                // Returning after the acknowledgement means the notice is
+                // there before this process is.
+                peer.deliver(&Msg::Bye).await;
+                return Ok(());
+            }
+            _ = intr.recv() => {
+                peer.deliver(&Msg::Bye).await;
+                return Ok(());
+            }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
                 if conn.is_closed() { None } else { continue }
             }
@@ -804,6 +845,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                 let s = state.clone();
                 tokio::spawn(async move { s.on_push(blob, recipe, chunks, part, of).await });
             }
+            Msg::Stored { .. } => {}
             Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed } => {
                 {
                     let mut ann = state.announced.lock();
@@ -1157,6 +1199,15 @@ fn state_home_after() -> Duration {
     }))
 }
 
+/// `RARGO_HEDGE=0` in rargod's environment: a compile given to a worker is
+/// not also run on an idle local core. On unless set, so a core that
+/// nothing else wants can finish the compile while the worker is still
+/// fetching what it needs.
+fn hedge() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RARGO_HEDGE").ok().as_deref() != Some("0"))
+}
+
 /// `RARGO_STATE_AHEAD=1` in rargod's environment: incremental states made
 /// on the server are sent to workers ahead of need. Off unless asked for:
 /// measured, the states' bytes cost the link more than the compiles that
@@ -1345,6 +1396,14 @@ pub struct Pool {
     /// States made here, to be sent to workers when the link is idle.
     ahead: Mutex<AheadQueue>,
     ahead_wake: tokio::sync::Notify,
+    /// Set under `ahead`'s lock before a state is taken off the queue, and
+    /// cleared when that send has been handed to the links.
+    ahead_busy: AtomicBool,
+    /// Set under `home_queue`'s lock before a due file is taken off it, and
+    /// cleared when that fetch has finished.
+    home_fetching: AtomicBool,
+    /// Woken when a transfer starts, finishes, or is given up.
+    settle_wake: tokio::sync::Notify,
     /// Files of incremental states that compiles left on workers: which
     /// worker, and the action that made them (for diagnosis).
     left_on: DashMap<Hash, (u64, String)>,
@@ -1403,6 +1462,9 @@ impl Pool {
             home_wake: tokio::sync::Notify::new(),
             ahead: Mutex::new(AheadQueue::default()),
             ahead_wake: tokio::sync::Notify::new(),
+            ahead_busy: AtomicBool::new(false),
+            home_fetching: AtomicBool::new(false),
+            settle_wake: tokio::sync::Notify::new(),
             left_on: DashMap::new(),
         });
         tokio::spawn(pool.clone().bring_states_home(engine.clone()));
@@ -1494,12 +1556,21 @@ impl Pool {
                 Msg::StderrLine { action, line } => self.event(&worker, action, Event::Line(line)),
                 Msg::Early { action, path, entry } => self.event(&worker, action, Event::Early(path, entry)),
                 Msg::Done { action, result } => self.event(&worker, action, Event::Done(result)),
+                Msg::Stored { blob } => {
+                    if let Some(w) = &worker {
+                        w.in_flight.lock().remove(&blob);
+                        self.settle_wake.notify_waiters();
+                    }
+                }
+                Msg::Bye => break,
                 _ => {}
             }
         }
         if let Some(w) = worker {
             eprintln!("rargod: worker {:x} is gone", w.id);
             w.alive.store(false, Ordering::SeqCst);
+            w.in_flight.lock().clear();
+            self.settle_wake.notify_waiters();
             // Whatever it was running is rerun locally.
             for a in w.actions.iter() {
                 let _ = a.events.send(Event::Done(Err("worker connection lost".into())));
@@ -1695,7 +1766,14 @@ impl Pool {
     /// lacks is sent, by chunk.
     async fn send_states_ahead(self: Arc<Self>, engine: Arc<Engine>) {
         loop {
-            let next = self.ahead.lock().next();
+            let next = {
+                let mut q = self.ahead.lock();
+                let next = q.next();
+                if next.is_some() {
+                    self.ahead_busy.store(true, Ordering::SeqCst);
+                }
+                next
+            };
             let Some(blobs) = next else {
                 self.ahead_wake.notified().await;
                 continue;
@@ -1727,6 +1805,8 @@ impl Pool {
                 self.stats.states_sent_ahead.fetch_add(1, Ordering::Relaxed);
                 self.stats.state_ahead_bytes.fetch_add(sent, Ordering::Relaxed);
             }
+            self.ahead_busy.store(false, Ordering::SeqCst);
+            self.settle_wake.notify_waiters();
         }
     }
 
@@ -1737,27 +1817,98 @@ impl Pool {
     /// it itself (`bring_home`).
     async fn bring_states_home(self: Arc<Self>, engine: Arc<Engine>) {
         loop {
-            let next = self.home_queue.lock().pop_front();
-            let Some((w, h, size, since)) = next else {
-                self.home_wake.notified().await;
-                continue;
-            };
-            if let Some(wait) = state_home_after().checked_sub(since.elapsed()) {
-                tokio::time::sleep(wait).await;
-            }
-            if engine.store.has(&h) || !w.alive.load(Ordering::Relaxed) {
-                continue;
-            }
-            let permit = engine.sched.acquire(crate::sched::Priority::Idle, 0).await;
-            match self.blobs.fetch(&w.peer, &h).await {
-                Ok(()) => {
-                    self.stats.state_homed_blobs.fetch_add(1, Ordering::Relaxed);
-                    self.stats.state_homed_bytes.fetch_add(size, Ordering::Relaxed);
+            let wake = self.home_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            // A file stays queued while its delay has not elapsed, so a
+            // caller that asks whether transfers are finished does not wait
+            // out that delay. The flag is set under the same lock as the
+            // pop, before anything awaits.
+            let due = {
+                let mut q = self.home_queue.lock();
+                match q.front() {
+                    Some((_, _, _, since)) => match state_home_after().checked_sub(since.elapsed()) {
+                        Some(wait) if !wait.is_zero() => Err(wait),
+                        _ => {
+                            self.home_fetching.store(true, Ordering::SeqCst);
+                            Ok(q.pop_front())
+                        }
+                    },
+                    None => Ok(None),
                 }
-                Err(e) => eprintln!("rargod: a file of an incremental state did not come home from worker {:x}: {e:#}", w.id),
+            };
+            match due {
+                Ok(None) => wake.await,
+                Err(wait) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait) => {}
+                        _ = wake => {}
+                    }
+                }
+                Ok(Some((w, h, size, _))) => {
+                    if !engine.store.has(&h) && w.alive.load(Ordering::Relaxed) {
+                        let permit = engine.sched.acquire(crate::sched::Priority::Idle, 0).await;
+                        match self.blobs.fetch(&w.peer, &h).await {
+                            Ok(()) => {
+                                self.stats.state_homed_blobs.fetch_add(1, Ordering::Relaxed);
+                                self.stats.state_homed_bytes.fetch_add(size, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                eprintln!("rargod: a file of an incremental state did not come home from worker {:x}: {e:#}", w.id)
+                            }
+                        }
+                        drop(permit);
+                    }
+                    self.home_fetching.store(false, Ordering::SeqCst);
+                    self.settle_wake.notify_waiters();
+                }
             }
-            drop(permit);
         }
+    }
+
+    /// Returns when every blob pushed to a worker has been acknowledged,
+    /// nothing is queued or being sent ahead, and no incremental state that
+    /// is already due has still to come home. A file whose delay has not
+    /// elapsed is left where it is.
+    pub async fn settle(&self) {
+        loop {
+            let wake = self.settle_wake.notified();
+            tokio::pin!(wake);
+            wake.as_mut().enable();
+            if self.transfers_idle() {
+                return;
+            }
+            wake.await;
+        }
+    }
+
+    fn transfers_idle(&self) -> bool {
+        {
+            let q = self.ahead.lock();
+            if self.ahead_busy.load(Ordering::SeqCst) || !q.is_empty() {
+                return false;
+            }
+        }
+        {
+            let q = self.home_queue.lock();
+            if self.home_fetching.load(Ordering::SeqCst) {
+                return false;
+            }
+            let after = state_home_after();
+            if q.iter().any(|(_, _, _, since)| since.elapsed() >= after) {
+                return false;
+            }
+        }
+        // After the queues: a send that took an item off a queue has either
+        // not started (the queue or the flag still says so) or has put the
+        // blob here.
+        let ws = self.workers.lock();
+        for w in ws.iter() {
+            if w.alive.load(Ordering::Relaxed) && !w.in_flight.lock().is_empty() {
+                return false;
+            }
+        }
+        true
     }
 
     /// Sends a blob the worker is expected to need, leaving out the chunks
@@ -2169,6 +2320,7 @@ impl Pool {
                 let now = std::time::Instant::now();
                 self.home_queue.lock().extend(left.into_iter().map(|(h, s)| (w.clone(), h, s, now)));
                 self.home_wake.notify_one();
+                self.settle_wake.notify_waiters();
             }
         }
         // A host file we served may have changed since.
@@ -2233,6 +2385,7 @@ impl RemoteRunner for Pool {
         }
         self.ahead.lock().offer(whose, blobs);
         self.ahead_wake.notify_one();
+        self.settle_wake.notify_waiters();
     }
 
     fn bring_home<'a>(
@@ -2474,7 +2627,7 @@ impl RemoteRunner for Pool {
                     // the worker: fetching it would cost more than the
                     // idle core is worth.)
                     permit = engine.sched.acquire(crate::sched::Priority::Idle, mem),
-                        if local.is_none() && remote.is_some() && !away && voice.owner() == NOBODY =>
+                        if local.is_none() && remote.is_some() && !away && hedge() && voice.owner() == NOBODY =>
                     {
                         self.stats.hedged.fetch_add(1, Ordering::Relaxed);
                         engine.stats.runs.fetch_add(1, Ordering::Relaxed);
@@ -2503,6 +2656,10 @@ mod tests {
         assert!(!is_bulk(&Msg::Req { rid: 1, body: Req::Chunks { blob: h, idx: vec![0] } }));
         assert!(!is_bulk(&Msg::Cancel { action: 1 }));
         assert!(!is_bulk(&Msg::Stdout { action: 1, data: Vec::new() }));
+        // An acknowledgement has to pass a blob that is still queued, or a
+        // caller waiting on it would wait for the bytes twice.
+        assert!(!is_bulk(&Msg::Stored { blob: h }));
+        assert!(!is_bulk(&Msg::Bye));
     }
 
     #[test]

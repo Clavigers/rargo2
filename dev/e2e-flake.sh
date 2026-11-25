@@ -179,7 +179,7 @@ after=$(runs b)
 actions=$(actions_since "$start_line")
 [ $rc -eq 0 ] && ok "B builds" || bad "B builds" "$out"
 # The imported cache does not populate B's Cargo registry. Offline planning
-# can fail until Cargo downloads the locked dependency. After the fetch
+# can fail while Cargo downloads the locked dependency. After the fetch
 # reuse the imported plan when its observations still match. Compiler and
 # build script actions must all be cache hits.
 plan_ok='Plan [cargo (planning)] exit=Some(0) tainted=false'
@@ -235,11 +235,7 @@ PATH="$T/no-tools" "$bin/rargod" --state "$T/no-nix" --listen "127.0.0.1:$(port 
     --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" --jobs 1 >"$T/no-nix.log" 2>&1 &
 no_nix=$!
 trap 'kill "$no_nix" 2>/dev/null; wait "$no_nix" 2>/dev/null; daemon a stop; daemon b stop' EXIT
-for _ in $(seq 1 100); do
-    grep -q "serving clients" "$T/no-nix.log" && break
-    kill -0 "$no_nix" 2>/dev/null || break
-    sleep .1
-done
+tail -n +1 -f --pid="$no_nix" "$T/no-nix.log" | awk '/serving clients/ { found=1; exit } END { exit found ? 0 : 1 }' || true
 out=$(on b "$R" build 2>&1); rc=$?
 [ "$rc" -ne 0 ] && has "$out" "rargod needs Nix with flakes to build" \
     && ok "the client is told that the server requires Nix with flakes" \

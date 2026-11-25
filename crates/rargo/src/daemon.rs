@@ -372,6 +372,9 @@ impl Daemon {
                     }
                     tokio::time::sleep(SETTLE).await;
                     let Some(mux) = d.mux_if_up().await else { continue };
+                    // The same lock a command holds, so a sync and this push
+                    // cannot each send the one edit.
+                    let _running = wt.running.lock().await;
                     let mut st = wt.state.lock().await;
                     if let Ok((snap, _)) = d.fresh(&wt, &mut st).await {
                         let _ = d.offer(&mux, &wt, &snap, Probe::Wait).await;
@@ -612,7 +615,10 @@ impl Daemon {
         let tree_bytes: u64 = encoded.iter().map(|t| t.len() as u64).sum();
         let blob_bytes: u64 = blobs.iter().map(|(_, s)| *s).sum();
         let id = mux.next_id();
-        if blob_bytes <= PUSH_BLIND {
+        // A caller that is waiting (a sync, or a command that asked to)
+        // needs the server to have applied the offer before this returns.
+        // A small edit otherwise goes out with no reply.
+        if blob_bytes <= PUSH_BLIND && probe != Probe::Wait {
             // An edit: the files and the manifests on their paths, in one
             // message.
             let snap2 = snap.clone();
@@ -1061,7 +1067,7 @@ impl Daemon {
         };
         let wt = self.worktree(&root);
         let _running = wt.running.lock().await;
-        let shown = self.out_for(&wt, req);
+        let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
             match std::fs::read(cargo_home.join(name)) {
@@ -1079,7 +1085,7 @@ impl Daemon {
         };
         // `RARGO_OFFER_WAIT=1` on a command: no request is sent before the
         // server has said that it holds the worktree's tree.
-        let mut probe = if var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
+        let mut probe = if req.kind == "sync" || var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
         loop {
             let mux = self.mux().await?;
             phase("link to the server ready");
@@ -1135,6 +1141,9 @@ impl Daemon {
                 }
                 snap
             };
+            if req.kind == "sync" {
+                return Ok(LocalReply::Exit(0));
+            }
             let (env, env_checked) = env_for(&snap.policy);
             let commits = match &snap.head {
                 Some(h) => {
