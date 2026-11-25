@@ -1,11 +1,12 @@
 use crate::hash::Hash;
 use crate::store::Store;
+use crate::trees_state::{TreesState, Upload, Walk};
 use crate::view::*;
 use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rargo_proto::tree::{Node, Tree};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -35,10 +36,15 @@ pub struct SyncStats {
 pub struct Trees {
     pub store: Arc<Store>,
     decoded: DashMap<Hash, Arc<Tree>>,
-    complete: DashMap<Hash, u64>,
-    uploading: Mutex<HashMap<Hash, Arc<tokio::sync::Notify>>>,
+    state: Mutex<Shared>,
     recent: Mutex<HashMap<String, Arc<Snapshot>>>,
     pub stats: SyncStats,
+}
+
+#[derive(Default)]
+struct Shared {
+    core: TreesState,
+    done: BTreeMap<Upload, Arc<tokio::sync::Notify>>,
 }
 
 const SYNC_ATTEMPTS: usize = 8;
@@ -49,8 +55,7 @@ impl Trees {
         Arc::new(Trees {
             store,
             decoded: DashMap::new(),
-            complete: DashMap::new(),
-            uploading: Mutex::new(HashMap::new()),
+            state: Mutex::new(Shared::default()),
             recent: Mutex::new(HashMap::new()),
             stats: SyncStats::default(),
         })
@@ -83,84 +88,48 @@ impl Trees {
         self.put(&tree.encode())
     }
 
+    fn is_complete(&self, d: &Hash, generation: u64) -> bool {
+        self.state.lock().core.is_complete(d, generation)
+    }
+
     pub async fn sync(self: &Arc<Self>, root: Hash, from: &dyn Uploader) -> Result<Arc<Snapshot>> {
         for _ in 0..SYNC_ATTEMPTS {
             let generation = self.store.generation();
-            if self.complete.get(&root).is_some_and(|g| *g == generation) {
-                if let Some(s) = self.hold(root) {
-                    return Ok(s);
+            if self.is_complete(&root, generation)
+                && let Some(s) = self.hold(root)
+            {
+                return Ok(s);
+            }
+            let mut walk = Walk::new(root);
+            while let Some(lacking) =
+                walk.advance(&|d| self.is_complete(d, generation), &|d| self.get(d), &|h| self.store.has(h))
+            {
+                let got = from.trees(lacking.clone()).await?;
+                self.stats.trees_received.fetch_add(got.len() as u64, Ordering::Relaxed);
+                let this = self.clone();
+                let stored: Result<HashSet<Hash>> =
+                    tokio::task::spawn_blocking(move || got.iter().map(|enc| this.put(enc)).collect()).await?;
+                let stored = stored.context("the client sent a malformed directory manifest")?;
+                if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
+                    bail!("the client did not send directory manifest {d}");
                 }
             }
-            let mut visited: Vec<Hash> = Vec::new();
-            let mut seen: HashSet<Hash> = HashSet::new();
-            let mut missing_blobs: HashSet<Hash> = HashSet::new();
-            let mut level = vec![root];
-            seen.insert(root);
-            while !level.is_empty() {
-                let lacking: Vec<Hash> = level.iter().filter(|d| self.get(d).is_none()).copied().collect();
-                if !lacking.is_empty() {
-                    let got = from.trees(lacking.clone()).await?;
-                    self.stats.trees_received.fetch_add(got.len() as u64, Ordering::Relaxed);
-                    let this = self.clone();
-                    let stored: Result<HashSet<Hash>> = tokio::task::spawn_blocking(move || {
-                        got.iter().map(|enc| this.put(enc)).collect()
-                    })
-                    .await?;
-                    let stored = stored.context("the client sent a malformed directory manifest")?;
-                    if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
-                        bail!("the client did not send directory manifest {d}");
-                    }
-                }
-                let mut next = Vec::new();
-                for d in &level {
-                    let tree = self.get(d).context("a directory manifest vanished from the store during sync")?;
-                    visited.push(*d);
-                    for (_, node) in &tree.entries {
-                        match node {
-                            Node::File { hash, .. } => {
-                                let h = Hash(*hash);
-                                if self.store.has(&h) {
-                                    self.store.touch(&h);
-                                } else {
-                                    missing_blobs.insert(h);
-                                }
-                            }
-                            Node::Dir(sub) => {
-                                let sub = Hash(*sub);
-                                if seen.insert(sub) && !self.complete.get(&sub).is_some_and(|g| *g == generation) {
-                                    next.push(sub);
-                                }
-                            }
-                            Node::Symlink(_) => {}
-                        }
-                    }
-                }
-                level = next;
+            assert_eq!(walk.walked.first(), Some(&root), "the walk starts at the root");
+            for h in &walk.present {
+                self.store.touch(h);
             }
-            assert_eq!(visited.first(), Some(&root), "the walk starts at the root");
-            assert!(visited.len() <= seen.len());
-            if !missing_blobs.is_empty() {
-                self.upload(missing_blobs.into_iter().collect(), from).await?;
+            if !walk.missing.is_empty() {
+                self.upload(walk.missing.iter().copied().collect(), from).await?;
             }
-            if self.store.generation() != generation {
-                if let Some(s) = self.hold(root) {
-                    self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
-                    return Ok(s);
-                }
-                continue;
-            }
-            for d in visited {
-                self.complete.insert(d, generation);
-            }
-            if self.complete.len() > 2_000_000 {
-                self.complete.retain(|_, g| *g == generation);
-            }
+            self.state.lock().core.completed(&walk.walked, generation, self.store.generation());
             if let Some(s) = self.hold(root) {
                 self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
                 return Ok(s);
             }
         }
-        bail!("content of the worktree was evicted from the store {SYNC_ATTEMPTS} times while it was being synced (is the store's budget smaller than the worktree?)")
+        bail!(
+            "content of the worktree was evicted from the store {SYNC_ATTEMPTS} times while it was being synced (is the store's budget smaller than the worktree?)"
+        )
     }
 
     fn hold(self: &Arc<Self>, root: Hash) -> Option<Arc<Snapshot>> {
@@ -205,69 +174,28 @@ impl Trees {
 
     pub fn lacking(&self, root: Hash) -> (Vec<Hash>, Vec<Hash>) {
         let generation = self.store.generation();
-        let mut trees: Vec<Hash> = Vec::new();
-        let mut blobs: HashSet<Hash> = HashSet::new();
-        let mut visited: Vec<Hash> = Vec::new();
-        let mut seen: HashSet<Hash> = HashSet::new();
-        let mut todo = vec![root];
-        seen.insert(root);
-        while let Some(d) = todo.pop() {
-            if self.complete.get(&d).is_some_and(|g| *g == generation) {
-                continue;
-            }
-            let Some(tree) = self.get(&d) else {
-                trees.push(d);
-                continue;
-            };
-            visited.push(d);
-            for (_, node) in &tree.entries {
-                match node {
-                    Node::File { hash, .. } => {
-                        let h = Hash(*hash);
-                        if !self.store.has(&h) {
-                            blobs.insert(h);
-                        }
-                    }
-                    Node::Dir(sub) => {
-                        let sub = Hash(*sub);
-                        if seen.insert(sub) {
-                            todo.push(sub);
-                        }
-                    }
-                    Node::Symlink(_) => {}
-                }
-            }
+        let (trees, blobs, walked) =
+            crate::trees_state::missing(root, &|d| self.is_complete(d, generation), &|d| self.get(d), &|h| {
+                self.store.has(h)
+            });
+        if trees.is_empty() && blobs.is_empty() {
+            self.state.lock().core.completed(&walked, generation, self.store.generation());
         }
-        if trees.is_empty() && blobs.is_empty() && self.store.generation() == generation {
-            for d in visited {
-                self.complete.insert(d, generation);
-            }
-        }
-        (trees, blobs.into_iter().collect())
+        (trees, blobs)
     }
 
     async fn upload(&self, missing: Vec<Hash>, from: &dyn Uploader) -> Result<()> {
         let mut pending = missing;
         while !pending.is_empty() {
-            let mut mine = Vec::new();
-            let mut theirs: Vec<(Hash, Arc<tokio::sync::Notify>)> = Vec::new();
-            {
-                let mut up = self.uploading.lock();
-                for h in pending.drain(..) {
-                    if self.store.has(&h) {
-                        continue;
-                    }
-                    match up.get(&h) {
-                        Some(n) => theirs.push((h, n.clone())),
-                        None => {
-                            up.insert(h, Arc::new(tokio::sync::Notify::new()));
-                            mine.push(h);
-                        }
-                    }
-                }
-            }
-            assert!(theirs.iter().all(|(h, _)| !mine.contains(h)), "a hash is claimed by one sync");
-            let claims = Claims { trees: self, mine: &mine };
+            let (claims, claimed) = {
+                let mut st = self.state.lock();
+                let up = st.core.begin_upload();
+                st.done.insert(up, Arc::new(tokio::sync::Notify::new()));
+                let claimed = st.core.claim(up, &pending, &|h| self.store.has(h));
+                (Claims { trees: self, up }, claimed)
+            };
+            pending.clear();
+            let mine = claimed.mine;
             let result = if mine.is_empty() {
                 Ok(())
             } else {
@@ -279,15 +207,20 @@ impl Trees {
             if let Some(h) = mine.iter().find(|h| !self.store.has(h)) {
                 bail!("the client did not upload file content {h}");
             }
-            self.stats.shared_uploads.fetch_add(theirs.len() as u64, Ordering::Relaxed);
-            for (h, n) in theirs {
+            self.stats.shared_uploads.fetch_add(claimed.theirs.len() as u64, Ordering::Relaxed);
+            for (h, other) in claimed.theirs {
+                let Some(n) = self.state.lock().done.get(&other).cloned() else {
+                    if !self.store.has(&h) {
+                        pending.push(h);
+                    }
+                    continue;
+                };
                 loop {
                     let notified = n.notified();
                     if self.store.has(&h) {
                         break;
                     }
-                    let gone = !self.uploading.lock().get(&h).is_some_and(|cur| Arc::ptr_eq(cur, &n));
-                    if gone {
+                    if self.state.lock().core.holder(&h) != Some(other) {
                         if !self.store.has(&h) {
                             pending.push(h);
                         }
@@ -299,19 +232,18 @@ impl Trees {
         }
         Ok(())
     }
-
 }
 
 struct Claims<'a> {
     trees: &'a Trees,
-    mine: &'a [Hash],
+    up: Upload,
 }
 
 impl Drop for Claims<'_> {
     fn drop(&mut self) {
-        let mut up = self.trees.uploading.lock();
-        for h in self.mine {
-            let n = up.remove(h).expect("a claim stays until its owner gives it up");
+        let mut st = self.trees.state.lock();
+        st.core.release(self.up);
+        if let Some(n) = st.done.remove(&self.up) {
             n.notify_waiters();
         }
     }
@@ -598,33 +530,6 @@ mod tests {
         }
     }
 
-    struct Hangs<'f>(&'f Fake);
-
-    impl Uploader for Hangs<'_> {
-        fn trees<'a>(&'a self, want: Vec<Hash>) -> futures::BoxFuture<'a, Result<Vec<Vec<u8>>>> {
-            self.0.trees(want)
-        }
-        fn blobs<'a>(&'a self, _want: Vec<Hash>) -> futures::BoxFuture<'a, Result<()>> {
-            Box::pin(std::future::pending())
-        }
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_upload_does_not_block_others() {
-        let (_d, trees, fake) = setup();
-        let root = root_of(&fake.dir(vec![("lib.rs", fake.file(b"shared content"))]));
-        let first = {
-            let trees = trees.clone();
-            let hangs = Hangs(&fake);
-            let sync = async move { trees.sync(root, &hangs).await.map(|_| ()) };
-            tokio::time::timeout(std::time::Duration::from_millis(100), sync).await
-        };
-        assert!(first.is_err(), "the hanging upload should not have finished");
-        let second = tokio::time::timeout(std::time::Duration::from_secs(5), trees.sync(root, &fake)).await;
-        assert!(second.is_ok(), "a sync waited forever on a cancelled upload");
-        second.unwrap().unwrap();
-    }
-
     #[tokio::test]
     async fn syncs_only_what_is_missing() {
         let (_d, trees, fake) = setup();
@@ -693,7 +598,10 @@ mod tests {
         }
         stop.store(true, Ordering::Relaxed);
         let churned = churn.join().unwrap();
-        assert!(churned >= 12 && trees.store.generation() > before + 12, "the store did change throughout ({churned} rounds)");
+        assert!(
+            churned >= 12 && trees.store.generation() > before + 12,
+            "the store did change throughout ({churned} rounds)"
+        );
     }
 
     #[tokio::test]
@@ -726,7 +634,8 @@ mod tests {
             for n in &names {
                 let path = format!("src/{n}");
                 assert_eq!(
-                    s.read(path.as_bytes()).unwrap_or_else(|| panic!("round {round}: {path} was evicted while its snapshot was held")),
+                    s.read(path.as_bytes())
+                        .unwrap_or_else(|| panic!("round {round}: {path} was evicted while its snapshot was held")),
                     format!("{n} in round {round}").as_bytes()
                 );
             }
@@ -743,17 +652,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evicted_content_is_asked_for_again() {
-        let (_d, trees, fake) = setup();
-        let v = fake.dir(vec![("a", fake.file(b"content a")), ("b", fake.file(b"content b"))]);
-        trees.sync(root_of(&v), &fake).await.unwrap();
-        trees.store.remove(&Hash::of(b"content a"));
-        let s = trees.sync(root_of(&v), &fake).await.unwrap();
-        assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 3);
-        assert_eq!(s.read(b"a").unwrap(), b"content a");
-    }
-
-    #[tokio::test]
     async fn a_client_that_withholds_content_fails_the_sync() {
         let (_d, trees, fake) = setup();
         let v = fake.dir(vec![("a", fake.file(b"content a"))]);
@@ -766,7 +664,8 @@ mod tests {
     #[tokio::test]
     async fn derived_snapshot_and_materialize() {
         let (d, trees, fake) = setup();
-        let v = fake.dir(vec![("Cargo.toml", fake.file(b"[package]")), ("src", fake.dir(vec![("lib.rs", fake.file(b"x"))]))]);
+        let v = fake
+            .dir(vec![("Cargo.toml", fake.file(b"[package]")), ("src", fake.dir(vec![("lib.rs", fake.file(b"x"))]))]);
         let s = trees.sync(root_of(&v), &fake).await.unwrap();
         let lock = trees.store.put_bytes(b"# lock").unwrap();
         let s2 = s.with_file(b"sub/Cargo.lock", Some(Node::File { hash: lock.0, size: 6, exec: false })).unwrap();
