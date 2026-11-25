@@ -274,7 +274,7 @@ impl Ctx<'_> {
             .into_par_iter()
             .map(|name| -> io::Result<Option<(Vec<u8>, Node, Option<Entry>)>> {
                 let child_rel = join(rel, &name);
-                if name == b".git" || name == crate::project::CONFIG.as_bytes() || excluded(self.exclude, &child_rel, &name) || (rel.is_empty() && name == b"target") {
+                if name == b".git" || excluded(self.exclude, &child_rel, &name) || (rel.is_empty() && name == b"target") {
                     return Ok(None);
                 }
                 let take = self.ignored.map(|i| i.take(&child_rel, &name, inside)).unwrap_or(Take::Keep);
@@ -578,24 +578,6 @@ mod tests {
 
     fn tree<'a>(s: &'a Scan, d: &Digest) -> Tree {
         Tree::decode(&s.trees[d]).unwrap()
-    }
-
-    #[test]
-    fn config_rargo_is_never_synced() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        write(r, "Cargo.toml", "[workspace]");
-        write(r, "config.rargo", "host = \"rargo.rs\"\n");
-        write(r, "crates/a/config.rargo", "host = \"rargo.rs\"\n");
-        write(r, "crates/a/src/lib.rs", "");
-        let s = scan(r, &Index::default(), &[], None).unwrap();
-        let top = tree(&s, &s.root);
-        assert!(top.get(b"Cargo.toml").is_some());
-        assert!(top.get(b"config.rargo").is_none());
-        let Some(Node::Dir(crates)) = top.get(b"crates").cloned() else { panic!("no crates/") };
-        let Some(Node::Dir(a)) = tree(&s, &crates).get(b"a").cloned() else { panic!("no crates/a") };
-        assert!(tree(&s, &a).get(b"config.rargo").is_none());
-        assert_eq!(s.file_count, 2);
     }
 
     #[test]

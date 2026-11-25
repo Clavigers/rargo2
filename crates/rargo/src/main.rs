@@ -86,10 +86,9 @@ fn server_host() -> Result<(String, HostFrom), String> {
     if let Some(h) = std::env::var("RARGO_SERVER").ok().filter(|v| !v.is_empty()) {
         return Ok((h, HostFrom::Env));
     }
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine the current directory: {e}"))?;
-    match project::project_host(&cwd)? {
+    match project::user_host()? {
         Some((h, path)) => Ok((h, HostFrom::File(path))),
-        None => Err(format!("no rargo server is named here: run `rargo @rargo.rs` (or `rargo @HOST` for a server of your own), which writes {}", project::CONFIG)),
+        None => Err(format!("no rargo server is named: run `rargo @rargo.rs` (or `rargo @HOST` for a server of your own), which writes {}", project::config_path().display())),
     }
 }
 
@@ -349,10 +348,9 @@ fn kind_needs_server(daemon_cmd: Option<&str>) -> bool {
 }
 
 fn at_host(host: &str) -> ! {
-    let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cannot determine the current directory: {e}")));
-    match project::set_host(&cwd, host) {
+    match project::set_host(host) {
         Ok(path) => {
-            eprintln!("{} now names `{host}` as this checkout's rargo server.", path.display());
+            eprintln!("{} now names `{host}` as your rargo server.", path.display());
             if host.contains(':') || project::resolve(host).is_ok() {
                 if project::credential(host).is_none() && std::env::var_os("RARGO_TOKEN").is_none() {
                     eprintln!("Next: `rargo auth`, then `rargo build`.");
@@ -384,7 +382,7 @@ fn auth_command(args: &[OsString]) -> ! {
                 println!(
                     "rargo auth [HOST]            get this machine a token for the project's server (or HOST), confirmed in a browser\n\
                      rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
-                     rargo auth status            which server this checkout builds on, what named it, and as whom\n\
+                     rargo auth status            which server you build on, what named it, and as whom\n\
                      rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here\n\
                      \n\
                      On the project's server, for an administrator (anyone may list and revoke their own tokens):\n\
@@ -507,7 +505,7 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
                 passthrough(raw);
             }
             eprintln!("error: cannot reach the rargo server at {}: {why}", cfg.server);
-            eprintln!("       (the server is named by `rargo @host`, in {}, or by RARGO_SERVER; RARGO_FALLBACK=cargo uses plain cargo instead)", project::CONFIG);
+            eprintln!("       (the server is named by `rargo @host`, in {}, or by RARGO_SERVER; RARGO_FALLBACK=cargo uses plain cargo instead)", project::config_path().display());
             std::process::exit(101);
         }
     }

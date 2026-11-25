@@ -25,11 +25,12 @@ git init -q .
 mkdir src
 printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\nitoa = "1"\n' >Cargo.toml
 printf 'fn main() {\n    let mut b = itoa::Buffer::new();\n    println!("hello from a remote build: {}", b.format(6 * 7));\n}\n' >src/main.rs
+printf '/target\n' >.gitignore
 git add -A && git -c user.name=new -c user.email=new@user.invalid commit -qm one
 step "rargo @$host"
 manifest=$(cat Cargo.toml)
 rargo "@$host"
-cat config.rargo
+cat "${XDG_CONFIG_HOME:-$HOME/.config}/rargo/config.toml"
 [ "$(cat Cargo.toml)" = "$manifest" ] || { echo "rargo @$host changed Cargo.toml"; exit 1; }
 [ -z "$(git status --porcelain)" ] || { git status --short; echo "rargo @$host left git status unclean"; exit 1; }
 step "rargo auth"
@@ -58,6 +59,12 @@ echo "$out"
 step "rargo test, rargo run"
 rargo test 2>&1 | tail -n 2
 rargo run -q
+step "a fresh clone builds with no further step"
+git clone -q "$work/hello" "$work/clone"
+cd "$work/clone"
+out=$(rargo run -q)
+[ "$out" = "hello from a remote build: 42" ]
+[ "$(cat Cargo.toml)" = "$manifest" ] && [ -z "$(git status --porcelain)" ] || { git status --short; echo "the clone is not clean"; exit 1; }
 rargo --rargo-daemon-stop || true
 echo
 echo "NEW-USER-PATH-OK in $(( $(date +%s) - t0 )) s"
