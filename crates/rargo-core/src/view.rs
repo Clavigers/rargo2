@@ -246,6 +246,12 @@ pub trait View: Send + Sync {
     fn hints(&self) -> Vec<Vec<u8>> {
         Vec::new()
     }
+    /// Store paths this action's `/nix/store` contains, sorted by name:
+    /// the name and the manifest's identity. Empty when the action sees
+    /// the host root.
+    fn nix_closure(&self) -> &[(Vec<u8>, Hash)] {
+        &[]
+    }
     /// Looks up a full path. Every parent must be a real directory.
     fn stat(&self, path: &[u8]) -> Looked {
         match vsplit(path) {

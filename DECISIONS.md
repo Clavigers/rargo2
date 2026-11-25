@@ -239,7 +239,9 @@ how its open ends were closed.
   and `/usr/bin/env` as symlinks into the closure. `HOME` is `/tmp`.
 - Store paths are not traced; the closure's identity is in every key.
   Reason: a store path's content is fixed by its name, and tracing it would
-  put thousands of pointless observations into every trace.
+  put thousands of pointless observations into every trace. A worker receives
+  each store path's manifest once, with the first action whose closure
+  contains it, and answers later lookups under that path itself.
 - Planning still runs against the host root, with the flake's environment.
   Reason: the forked cargo is a host binary and needs the host's libraries.
   Its trace is therefore machine-specific; the plan it produces is not.
@@ -2791,3 +2793,28 @@ mount goes with it. A check that a killed daemon's mount is gone waits
 on that daemon's guard. Another daemon can still be running with a
 guard whose title names the same directory, and that guard stays until
 its own daemon exits. `e2e-auth` stops every daemon under its own directory.
+
+## D89. A Nix store path is a content-addressed tree (issue 116)
+
+A closure is the list of (store path name, root identity). That identity
+is part of every action key (`flake-action-v2`): the flake source, the
+environment, and the manifest identity of each store path.
+
+The server hashes a store path into directory manifests the first time a
+closure containing it is resolved, and keeps the manifest in the meta
+table under the path's name. A path is immutable, so the manifest stays.
+Two closures that share a store path share that manifest: the second is
+hashed only for names the first did not have. The hash is the content
+hash the rest of the store uses. Only files, directories and symlinks
+are in the tree. The file bytes are not copied into the content store.
+The server sandbox still reads the host's `/nix/store` through the kernel.
+
+The first action with a closure that is sent to a worker carries, in
+that one message, the manifests of the closure's paths the worker does
+not yet hold. The worker installs them before the action starts. A
+lookup or a listing under a store path the worker holds is answered on
+the worker, including a name the action's closure does not contain,
+which is absent. File bytes move by hash, by chunk, and only when
+something opens the file. Store paths are not traced on a worker. What
+an action may see is unchanged: only its closure's store paths exist in
+its `/nix/store`.

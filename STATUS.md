@@ -1657,3 +1657,24 @@ cache that shares artifacts between them.
 On `08bf0d3`, three gates in a row on this machine each pass every suite.
 They take 127s, 104s and 103s. The scripts the gate and CI run do not wait
 on time.
+
+## Nix store trees (issue 116)
+
+On the worker suite, run back to back on this machine, a worker asks the
+server for 803 lookups under `/nix/store` in the wide phase and 624 in
+the one-core phase. With each closure's trees on the worker, both phases
+ask for 0. The suite takes 23s and 29s. An earlier wide run of the same
+questioning server asked for 1411, and that one-core run asked for 624;
+the suite took 25s.
+
+Hashing the suite's closure on its one-core server takes 4898 ms and
+5034 ms: 86844 files, 2493189332 bytes. That hash is the difference
+between the two suite times. A later resolve of the same store paths
+hashes nothing. The flake closure in `e2e-flake`, hashed while those
+pages were already cached, is 8760 files, 2242090134 bytes, 160 ms.
+
+A worker whose `/nix/store` holds only the libraries `rargod` itself is
+linked against builds the flake. One action runs there, and it asks for
+nothing under `/nix/store`. Two closures that share a store path share
+its tree (`a_shared_store_path_is_manifested_once`): the second hashes
+only the path the first did not have.

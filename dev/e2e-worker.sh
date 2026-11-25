@@ -219,6 +219,9 @@ out=$(R build 2>&1); check $? "the workspace builds after the worker was killed"
 out=$(R run -q 2>&1); [ "$out" = "total 22" ]; check $? "its program shows the last edit (total 22)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
+nix=$(stat 'nix store lookups')
+[ "${nix:-x}" = 0 ]; check $? "the worker asked for nothing under /nix/store ($nix)" "$(R --rargo-status)"
+grep "nix closure:" "$rig/srv.log" | sed 's/^/        /' || true
 grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 cd /
 "$here/netns.sh" down >/dev/null 2>&1
@@ -278,6 +281,9 @@ out=$(R build 2>&1); check $? "it builds after the worker died with states on it
 out=$(R run -q 2>&1); [ "$out" = "total 46" ]; check $? "its program shows the last edit (total 46)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
+nix=$(stat 'nix store lookups')
+[ "${nix:-x}" = 0 ]; check $? "the worker asked for nothing under /nix/store ($nix)" "$(R --rargo-status)"
+grep "nix closure:" "$rig/srv.log" | sed 's/^/        /' || true
 grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 
 cd /

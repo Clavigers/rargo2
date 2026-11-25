@@ -3,9 +3,12 @@
 //! An action is a command, a view and a filesystem served on demand. On a
 //! worker the view is a [`RemoteView`]: answers the server sent ahead
 //! (predicted from the action's previous trace) are used directly, anything
-//! else is asked for over the session. File content travels as chunks, and
-//! only chunks the receiver does not already hold. The worker traces the
-//! action exactly as the server would and sends the trace and outputs back.
+//! else is asked for over the session. A closure's store paths arrive as
+//! trees with the first action that needs them, and lookups under those
+//! paths are answered on the worker. File content travels as chunks, and
+//! only chunks the receiver does not already hold, and only when something
+//! opens the file. The worker traces the action exactly as the server would
+//! and sends the trace and outputs back.
 //!
 //! The server keeps all the state that matters: analysis, cache, scheduling.
 //! A worker has a content cache and nothing else to lose.
@@ -111,6 +114,11 @@ pub enum Msg {
         /// the action runs (the crate's sources): a name that is not listed
         /// does not exist, without asking.
         closed: Vec<Vec<u8>>,
+        /// This action's closure: store path name and manifest identity,
+        /// sorted by name. Only these names exist in its `/nix/store`.
+        closure: Vec<(Vec<u8>, Hash)>,
+        /// Manifests for closure paths this worker does not yet hold.
+        store_paths: Vec<crate::nixmanifest::WirePath>,
     },
     /// Part of a blob the worker is expected to need: its recipe and the
     /// chunks the server believes the worker lacks.
@@ -538,6 +546,8 @@ pub struct WorkerState {
     pub lookups_remote: AtomicU64,
     /// Contents an action needed that could not be had from the server.
     starved: AtomicU64,
+    /// Store paths whose manifests this worker holds.
+    nix: DashMap<Vec<u8>, Arc<crate::nixmanifest::Installed>>,
 }
 
 impl WorkerState {
@@ -653,6 +663,8 @@ pub struct RemoteView {
     untraced: Vec<Vec<u8>>,
     /// Directories whose listing in `listings` is complete.
     closed: HashSet<Vec<u8>>,
+    /// Store path names in this action's closure, sorted.
+    closure: Vec<Vec<u8>>,
 }
 
 impl RemoteView {
@@ -686,6 +698,12 @@ impl RemoteView {
 
 impl View for RemoteView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+        // The tree names every file by its content hash. An answer sent
+        // ahead may not, and would then ask the server to open the file.
+        if let Some(l) = crate::nixmanifest::lookup_at(|n| self.state.nix.get(n).map(|e| Arc::clone(e.value())), &self.closure, dir, name) {
+            self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
+            return l;
+        }
         let key = (dir.to_vec(), name.to_vec());
         if let Some(w) = self.entries.get(&key) {
             self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
@@ -722,6 +740,9 @@ impl View for RemoteView {
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
+        if let Some(l) = crate::nixmanifest::list_at(|n| self.state.nix.get(n).map(|e| Arc::clone(e.value())), &self.closure, dir) {
+            return l;
+        }
         if let Some(l) = self.listings.get(dir) {
             return Ok(l.clone());
         }
@@ -737,6 +758,10 @@ impl View for RemoteView {
     }
 
     fn traced(&self, dir: &[u8]) -> bool {
+        // Store paths are not traced: their identity is part of the action key.
+        if !self.closure.is_empty() && crate::nixmanifest::place(dir).is_some() {
+            return false;
+        }
         !self.untraced.iter().any(|u| vpath_starts_with(dir, u))
     }
 }
@@ -793,6 +818,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
         lookups_local: AtomicU64::new(0),
         lookups_remote: AtomicU64::new(0),
         starved: AtomicU64::new(0),
+        nix: DashMap::new(),
     });
     let s2 = state.clone();
     engine.content.set_fetcher(Arc::new(move |h| s2.ensure_blob(h)));
@@ -846,7 +872,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                 tokio::spawn(async move { s.on_push(blob, recipe, chunks, part, of).await });
             }
             Msg::Stored { .. } => {}
-            Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed } => {
+            Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed, closure, store_paths } => {
                 {
                     let mut ann = state.announced.lock();
                     let mut txs = state.announce_tx.lock();
@@ -858,6 +884,25 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                         }
                     }
                 }
+                // Installed before the action is spawned, so a later action on
+                // this connection sees the trees even when its own message
+                // did not carry them.
+                for path in &store_paths {
+                    if state.nix.contains_key(&path.name) {
+                        continue;
+                    }
+                    match crate::nixmanifest::Installed::from_kind(&path.kind) {
+                        Ok(inst) => {
+                            state.nix.insert(path.name.clone(), Arc::new(inst));
+                        }
+                        Err(e) => eprintln!(
+                            "rargo worker: nix path {} is not a tree: {e}",
+                            String::from_utf8_lossy(&path.name)
+                        ),
+                    }
+                }
+                let mut closure_names: Vec<Vec<u8>> = closure.into_iter().map(|(n, _)| n).collect();
+                closure_names.sort();
                 let state = state.clone();
                 let tasks2 = tasks.clone();
                 // Held across the spawn so that the task cannot finish and
@@ -874,6 +919,7 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                             .collect(),
                         untraced,
                         closed: closed.into_iter().collect(),
+                        closure: closure_names,
                     });
                     let aspec = ActionSpec {
                         kind: spec.kind,
@@ -1298,6 +1344,8 @@ pub struct Worker {
     in_flight: Mutex<HashMap<Hash, std::time::Instant>>,
     /// The files every compile reads (the toolchain) are on their way.
     warmed: std::sync::atomic::AtomicBool,
+    /// Store path names whose manifests have been sent to this worker.
+    store_paths: Mutex<HashSet<Vec<u8>>>,
 }
 
 impl Worker {
@@ -1372,6 +1420,9 @@ pub struct PoolStats {
     pub prefilled_entries: AtomicU64,
     pub lookups_served: AtomicU64,
     pub opens_served: AtomicU64,
+    /// Questions whose directory is `/nix/store` or under it: lookups,
+    /// listings and opens. A worker that holds the closure's trees asks none.
+    pub nix_lookups: AtomicU64,
 }
 
 /// The server's set of workers.
@@ -1486,6 +1537,12 @@ impl Pool {
         if v.is_empty() { "not measured yet".into() } else { v.join(", ") }
     }
 
+    /// Host files shown to actions, keyed by content hash, so a worker can
+    /// be sent the bytes of a store path without the file being copied in.
+    pub fn host_sources(&self) -> &Arc<DashMap<Hash, FileSrc>> {
+        &self.host_srcs
+    }
+
     pub fn worker_count(&self) -> usize {
         self.workers.lock().iter().filter(|w| w.alive.load(Ordering::Relaxed)).count()
     }
@@ -1534,6 +1591,7 @@ impl Pool {
                         link_free_at: Mutex::new(std::time::Instant::now()),
                         in_flight: Mutex::new(HashMap::new()),
                         warmed: std::sync::atomic::AtomicBool::new(false),
+                        store_paths: Mutex::new(HashSet::new()),
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
                     self.workers.lock().push(w.clone());
@@ -1585,11 +1643,18 @@ impl Pool {
         }
     }
 
+    fn note_nix(&self, dir: &[u8]) {
+        if dir == b"/nix/store" || dir.starts_with(b"/nix/store/") {
+            self.stats.nix_lookups.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Answers a worker's request (runs on a blocking thread).
     fn answer(&self, w: &Worker, body: Req) -> Resp {
         match body {
             Req::Lookup { action, dir, name } => {
                 let Some(a) = w.actions.get(&action).map(|a| a.clone()) else { return Resp::Err("no such action".into()) };
+                self.note_nix(&dir);
                 self.stats.lookups_served.fetch_add(1, Ordering::Relaxed);
                 a.asked.fetch_add(1, Ordering::Relaxed);
                 let looked = a.view.lookup(&dir, &name);
@@ -1612,6 +1677,7 @@ impl Pool {
             }
             Req::List { action, dir } => {
                 let Some(a) = w.actions.get(&action).map(|a| a.clone()) else { return Resp::Err("no such action".into()) };
+                self.note_nix(&dir);
                 Resp::Listing(
                     a.view
                         .list(&dir)
@@ -1621,6 +1687,7 @@ impl Pool {
             }
             Req::Open { action, dir, name } => {
                 let Some(a) = w.actions.get(&action).map(|a| a.clone()) else { return Resp::Err("no such action".into()) };
+                self.note_nix(&dir);
                 self.stats.opens_served.fetch_add(1, Ordering::Relaxed);
                 a.asked.fetch_add(1, Ordering::Relaxed);
                 let Looked::File(f) = a.view.lookup(&dir, &name) else {
@@ -2203,24 +2270,51 @@ impl Pool {
             listings.extend(l);
         }
         self.stats.prefilled_entries.fetch_add(prefill.len() as u64, Ordering::Relaxed);
-        w.peer.post(&Msg::Run {
-            action,
-            spec: WSpec {
-                kind: spec.kind,
-                argv: spec.argv.clone(),
-                env: spec.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                cwd: spec.cwd.clone(),
-                mkdirs: spec.mkdirs.clone(),
-                discard: spec.discard.clone(),
-                label: spec.label.clone(),
-            },
-            uid: req.uid,
-            gid: req.gid,
-            prefill,
-            listings,
-            untraced: spec.discard.clone(),
-            incoming: incoming.clone(),
-            closed,
+        // The decision of which trees to send and the post that carries them
+        // share one lock, so two actions cannot each believe the other is
+        // sending a path. Serializing the manifests is synchronous work.
+        tokio::task::block_in_place(|| {
+            let mut held = w.store_paths.lock();
+            let mut closure: Vec<(Vec<u8>, Hash)> = view.nix_closure().to_vec();
+            closure.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut store_paths = Vec::new();
+            for (name, root) in &closure {
+                if held.contains(name) {
+                    continue;
+                }
+                match crate::nixmanifest::load(engine.store.db(), name) {
+                    Some(kind) if crate::nixmanifest::identity(&kind) == *root => {
+                        held.insert(name.clone());
+                        store_paths.push(crate::nixmanifest::WirePath { name: name.clone(), kind });
+                    }
+                    Some(_) => eprintln!(
+                        "rargod: nix manifest for {} does not match the closure",
+                        String::from_utf8_lossy(name)
+                    ),
+                    None => eprintln!("rargod: nix manifest for {} is missing", String::from_utf8_lossy(name)),
+                }
+            }
+            w.peer.post(&Msg::Run {
+                action,
+                spec: WSpec {
+                    kind: spec.kind,
+                    argv: spec.argv.clone(),
+                    env: spec.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    cwd: spec.cwd.clone(),
+                    mkdirs: spec.mkdirs.clone(),
+                    discard: spec.discard.clone(),
+                    label: spec.label.clone(),
+                },
+                uid: req.uid,
+                gid: req.gid,
+                prefill,
+                listings,
+                untraced: spec.discard.clone(),
+                incoming: incoming.clone(),
+                closed,
+                closure,
+                store_paths,
+            });
         });
         if !incoming.is_empty() {
             // Push in the background; the action starts meanwhile and waits

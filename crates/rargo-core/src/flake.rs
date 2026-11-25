@@ -31,6 +31,8 @@ pub struct FlakeEnv {
     pub env: BTreeMap<String, String>,
     /// Store path names (`<hash>-<name>`, without `/nix/store/`).
     pub closure: Vec<String>,
+    /// Manifest identity of each closure entry, in the same order.
+    pub roots: Vec<Hash>,
     /// Identifies the environment; part of every action key.
     pub id: Hash,
 }
@@ -195,7 +197,34 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     for (k, v) in &env {
         h.field(k.as_bytes()).field(v.as_bytes());
     }
-    Ok(FlakeEnv { env, closure, id: h.finish() })
+    Ok(FlakeEnv { env, closure, roots: Vec::new(), id: h.finish() })
+}
+
+/// The action key: the flake source, the evaluated environment, and the
+/// manifest identity of every store path.
+fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
+    let mut h = KeyHasher::new("flake-action-v2");
+    h.field(&source.0);
+    for name in &env.closure {
+        h.field(name.as_bytes());
+    }
+    for (k, v) in &env.env {
+        h.field(k.as_bytes()).field(v.as_bytes());
+    }
+    for root in &env.roots {
+        h.field(&root.0);
+    }
+    h.finish()
+}
+
+fn log_cost(cost: &crate::nixmanifest::Cost) {
+    if cost.hashed_files == 0 && cost.new_paths == 0 {
+        return;
+    }
+    eprintln!(
+        "nix closure: hashed {} files, {} bytes, {} ms; reused {} paths",
+        cost.hashed_files, cost.hashed_bytes, cost.millis, cost.reused_paths
+    );
 }
 
 /// Resolve the workspace flake or the bundled shell for a workspace
@@ -250,10 +279,29 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     let store = &d.engine.store;
     let mut k = b"flake:".to_vec();
     k.extend_from_slice(&key.0);
+    let nix = Path::new("/nix/store");
+    let hosts = d.pool.get().map(|p| p.host_sources().clone());
+    let manifest = |closure: &[String]| {
+        crate::nixmanifest::prepare(
+            store.db(),
+            nix,
+            closure,
+            hosts.as_deref(),
+            &mut d.nix_attached.lock(),
+        )
+    };
     if let Some(v) = store.db().get(Table::Meta, &k) {
-        if let Ok(env) = bincode::deserialize::<FlakeEnv>(&v) {
+        if let Ok(mut env) = bincode::deserialize::<FlakeEnv>(&v) {
             // The closure may have been garbage-collected since.
-            if env.closure.iter().all(|c| Path::new("/nix/store").join(c).exists()) {
+            if env.closure.iter().all(|c| nix.join(c).exists()) {
+                let prepared = manifest(&env.closure)?;
+                log_cost(&prepared.cost);
+                env.roots = prepared.roots;
+                let id = action_id(&key, &env);
+                if id != env.id {
+                    env.id = id;
+                    store.db().put(Table::Meta, &k, &bincode::serialize(&env)?);
+                }
                 return Ok(Arc::new(env));
             }
         }
@@ -277,7 +325,10 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     let mut env = env?;
-    env.id = KeyHasher::new("flake-action-v1").field(&key.0).field(&env.id.0).finish();
+    let prepared = manifest(&env.closure)?;
+    log_cost(&prepared.cost);
+    env.roots = prepared.roots;
+    env.id = action_id(&key, &env);
     store.db().put(Table::Meta, &k, &bincode::serialize(&env)?);
     Ok(Arc::new(env))
 }

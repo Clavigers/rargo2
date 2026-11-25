@@ -10,6 +10,7 @@ pub mod engine;
 pub mod expand;
 pub mod flake;
 pub mod hash;
+pub mod nixmanifest;
 pub mod http;
 pub mod incr;
 pub mod cgroup;
