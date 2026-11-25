@@ -49,4 +49,4 @@ pass = ["DATABASE_URL"]                # given to every action
 
 ## Docs
 
-Read the docs at [rargo.rs/reference](https://rargo.rs/reference).
+Read the docs at [rargo.rs](https://rargo.rs/).
