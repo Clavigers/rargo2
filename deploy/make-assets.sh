@@ -5,6 +5,7 @@
 #     rargo-server-x86_64-unknown-linux-gnu.tar.gz   rargod, rargo-sandbox, planner-cargo
 #     install.sh, install-server.sh            the installers as of this commit
 #     rargo-default-flake.tar.gz              the default shell for stock Cargo
+#     reference.md                             the release reference
 #     protocol.md                              the release protocol and schema
 #     SHA256SUMS
 set -eu
@@ -44,5 +45,7 @@ number=$(sed -n 's/^pub const PROTO_VERSION: u32 = \([0-9][0-9]*\);$/\1/p' "$pro
     done
     printf '```\n'
 } >"$out/protocol.md"
-(cd "$out" && sha256sum rargo-x86_64-unknown-linux-musl rargo-server-x86_64-unknown-linux-gnu.tar.gz rargo-default-flake.tar.gz install.sh install-server.sh protocol.md >SHA256SUMS)
+awk -v version="$version" 'NR == 1 && $0 != "---" { exit 1 } {print} NR == 1 {print "small_subtitle: Rargo " version}' \
+    "$here/docs/reference.md" >"$out/reference.md"
+(cd "$out" && sha256sum rargo-x86_64-unknown-linux-musl rargo-server-x86_64-unknown-linux-gnu.tar.gz rargo-default-flake.tar.gz install.sh install-server.sh protocol.md reference.md >SHA256SUMS)
 ls -la "$out"

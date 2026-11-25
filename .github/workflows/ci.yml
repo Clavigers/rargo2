@@ -40,6 +40,8 @@ jobs:
         run: rargo test --locked --workspace --lib --bins
       - name: The tests that mount and make namespaces (built on the server, run here as root)
         run: dev/mount-tests.sh
+      - name: Reference commands and options
+        run: python3 dev/check-reference.py target/debug/rargo target/debug/rargod
       - name: The shipped client
         run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
       - name: The crates that are published
