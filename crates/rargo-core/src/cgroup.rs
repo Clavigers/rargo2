@@ -9,14 +9,28 @@ pub fn setup() -> Option<PathBuf> {
     if !delegated(&dir) {
         return None;
     }
-    let leaf = dir.join("daemon");
-    std::fs::create_dir_all(&leaf).ok()?;
     let procs = std::fs::read_to_string(membership_file(&dir)).ok()?;
-    for pid in procs.split_whitespace() {
-        std::fs::write(membership_file(&leaf), pid).ok()?;
+    for op in delegation_ops(&dir, &procs) {
+        match op {
+            DelegationOp::Create(path) => std::fs::create_dir_all(path).ok()?,
+            DelegationOp::Write(path, value) => std::fs::write(path, value).ok()?,
+        }
     }
-    std::fs::write(dir.join("cgroup.subtree_control"), "+memory").ok()?;
     Some(dir)
+}
+
+enum DelegationOp<'a> {
+    Create(PathBuf),
+    Write(PathBuf, &'a str),
+}
+
+fn delegation_ops<'a>(dir: &Path, procs: &'a str) -> Vec<DelegationOp<'a>> {
+    let leaf = dir.join("daemon");
+    let mut ops = vec![DelegationOp::Create(leaf.clone())];
+    let membership = membership_file(&leaf);
+    ops.extend(procs.split_whitespace().map(|pid| DelegationOp::Write(membership.clone(), pid)));
+    ops.push(DelegationOp::Write(dir.join("cgroup.subtree_control"), "+memory"));
+    ops
 }
 
 fn delegated_root(membership: &str) -> Option<PathBuf> {
@@ -116,5 +130,20 @@ impl Drop for ActionGroup {
                 Err(_) => return,
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegation_enables_memory_after_moving_processes() {
+        let root = delegated_root("0::/service/build.scope\n").unwrap();
+        let plan = delegation_ops(&root, "17\n23\n");
+        assert!(matches!(&plan[..], [DelegationOp::Create(leaf), DelegationOp::Write(a, "17"), DelegationOp::Write(b, "23"), DelegationOp::Write(control, "+memory")]
+            if leaf == &root.join("daemon") && a == &membership_file(leaf) && a == b && control == &root.join("cgroup.subtree_control")));
+        assert!(delegated_root("0::/\n").is_none());
     }
 }

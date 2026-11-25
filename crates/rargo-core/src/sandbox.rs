@@ -644,10 +644,12 @@ struct ExecPlan {
     argv: Vec<CString>,
     env: Vec<CString>,
     candidates: Vec<Vec<u8>>,
+    cwd: CString,
+    ids: Option<(u32, u32)>,
 }
 
 impl ExecPlan {
-    fn new(req: &SpawnReq) -> io::Result<Self> {
+    fn new(req: &SpawnReq, current: (u32, u32)) -> io::Result<Self> {
         let Some(prog) = req.argv.first() else { return Err(io::Error::from_raw_os_error(libc::EINVAL)) };
         let argv: Vec<CString> = req.argv.iter().map(|a| cstr(a)).collect();
         let env: Vec<CString> = req
@@ -679,7 +681,9 @@ impl ExecPlan {
                 })
                 .collect()
         };
-        Ok(Self { argv, env, candidates })
+        let cwd = cstr(&req.cwd);
+        let ids = ((req.uid, req.gid) != current).then_some((req.uid, req.gid));
+        Ok(Self { argv, env, candidates, cwd, ids })
     }
 }
 
@@ -690,6 +694,10 @@ fn exec_child(
     stderr: OwnedFd,
     extras: Vec<OwnedFd>,
 ) -> io::Error {
+    let exec = match ExecPlan::new(req, unsafe { (libc::getuid(), libc::getgid()) }) {
+        Ok(exec) => exec,
+        Err(error) => return error,
+    };
     unsafe {
         match &stdin {
             Some(fd) => {
@@ -717,21 +725,16 @@ fn exec_child(
         libc::sigemptyset(&mut mask);
         libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-        if req.gid != libc::getgid() || req.uid != libc::getuid() {
+        if let Some((uid, gid)) = exec.ids {
             libc::setgroups(0, std::ptr::null());
-            if libc::setgid(req.gid) != 0 || libc::setuid(req.uid) != 0 {
+            if libc::setgid(gid) != 0 || libc::setuid(uid) != 0 {
                 return io::Error::last_os_error();
             }
         }
-        let cwd = cstr(&req.cwd);
-        if libc::chdir(cwd.as_ptr()) != 0 {
+        if libc::chdir(exec.cwd.as_ptr()) != 0 {
             return io::Error::last_os_error();
         }
     }
-    let exec = match ExecPlan::new(req) {
-        Ok(exec) => exec,
-        Err(error) => return error,
-    };
     let mut argv_p: Vec<*const libc::c_char> = exec.argv.iter().map(|arg| arg.as_ptr()).collect();
     argv_p.push(std::ptr::null());
     let mut env_p: Vec<*const libc::c_char> = exec.env.iter().map(|var| var.as_ptr()).collect();
@@ -779,7 +782,10 @@ mod setup_tests {
                         expected.extend(["/fixture/sandbox/nix/store"; 2]);
                     }
                     assert_eq!(mounted, expected.into_iter().map(Path::new).collect::<Vec<_>>());
-                    let exec = ExecPlan::new(&req).unwrap();
+                    let exec = ExecPlan::new(&req, (0, 0)).unwrap();
+                    assert_eq!(exec.ids, Some((700, 701)));
+                    assert!(ExecPlan::new(&req, (700, 701)).unwrap().ids.is_none());
+                    assert_eq!(exec.cwd.as_bytes(), b"/work");
                     assert_eq!(exec.argv[0].as_bytes(), b"rustc");
                     assert_eq!(exec.candidates, [b"/usr/local/bin/rustc".to_vec(), b"/usr/bin/rustc".to_vec(), b"/bin/rustc".to_vec()]);
                 }

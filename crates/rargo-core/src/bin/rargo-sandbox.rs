@@ -18,12 +18,14 @@ impl View for HostView {
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) == Some("--internal-zygote") {
-        let fd = args.get(2).ok_or_else(|| anyhow::anyhow!("--internal-zygote requires a descriptor"))?.parse()?;
-        rargo_core::sandbox::zygote_main(fd);
-    }
+struct Options {
+    state: PathBuf,
+    passthrough: bool,
+    quiet: bool,
+    cmd: Vec<Vec<u8>>,
+}
+
+fn options(args: &[String]) -> anyhow::Result<Options> {
     let mut state = PathBuf::from("/root/rargo-work/sandbox-tool");
     let mut passthrough = true;
     let mut quiet = false;
@@ -43,6 +45,16 @@ fn main() -> anyhow::Result<()> {
     let cmd: Vec<Vec<u8>> = args[(i + 1).min(args.len())..].iter().map(|s| s.clone().into_bytes()).collect();
     anyhow::ensure!(!cmd.is_empty(), "usage: rargo-sandbox [options] -- CMD ARGS...");
 
+    Ok(Options { state, passthrough, quiet, cmd })
+}
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("--internal-zygote") {
+        let fd = args.get(2).ok_or_else(|| anyhow::anyhow!("--internal-zygote requires a descriptor"))?.parse()?;
+        rargo_core::sandbox::zygote_main(fd);
+    }
+    let Options { state, passthrough, quiet, cmd } = options(&args)?;
     let zygote = Zygote::start(&std::env::current_exe()?)?;
     std::fs::create_dir_all(&state)?;
     let db = Arc::new(rargo_core::db::Db::open(&state.join("db.redb"))?);
