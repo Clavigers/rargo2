@@ -1710,18 +1710,19 @@ impl crate::outfs::Source for Contents {
         }
     }
 
-    fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<Reader> {
+    fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<(Reader, Digest)> {
         let d = self.daemon()?;
         if let Some(path) = crate::place::cached(&d.cache, hash, size) {
-            return Ok(Reader::Whole(std::fs::File::open(path)?));
+            return Ok((Reader::Whole(std::fs::File::open(path)?), *hash));
         }
         if size >= rargo_proto::CHUNKED_FROM {
             if let Some(p) = self.handle.block_on(d.partial(*hash, size))? {
-                return Ok(Reader::Ranged(p));
+                let proven = *p.hash();
+                return Ok((Reader::Ranged(p), proven));
             }
         }
         let path = self.handle.block_on(d.fetch_content(*hash, size))?;
-        Ok(Reader::Whole(std::fs::File::open(path)?))
+        Ok((Reader::Whole(std::fs::File::open(path)?), *hash))
     }
 }
 

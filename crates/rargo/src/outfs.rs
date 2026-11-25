@@ -64,9 +64,21 @@ struct Inodes {
 impl Inodes {
     #[cfg(test)]
     fn invariants(&self) -> bool {
-        self.nodes.contains_key(&ROOT) && self.children.iter().all(|((parent, name), id)| {
-            self.nodes.get(id).is_some_and(|node| node.parent == *parent && node.name == *name)
-        })
+        let mut kids: BTreeMap<u64, u64> = BTreeMap::new();
+        for (id, node) in &self.nodes {
+            if *id != ROOT {
+                *kids.entry(node.parent).or_default() += 1;
+            }
+        }
+        self.nodes.contains_key(&ROOT)
+            && self.children.iter().all(|((parent, name), id)| {
+                self.nodes.get(id).is_some_and(|node| node.parent == *parent && node.name == *name)
+            })
+            && self.nodes.iter().all(|(id, node)| {
+                *id < self.next
+                    && node.kids == kids.get(id).copied().unwrap_or(0)
+                    && (*id == ROOT || (self.nodes.contains_key(&node.parent) && !node.name.is_empty()))
+            })
     }
 
     fn path(&self, mut id: u64) -> Res<Vec<u8>> {
@@ -195,17 +207,18 @@ impl OutputTree {
                     if !replaced_real && self.same(&path, &file) {
                         continue;
                     }
+                    self.remove_below(&path);
+                    let mut at = path.as_slice();
+                    while let Some(slash) = at.iter().rposition(|&b| b == b'/') {
+                        at = &at[..slash];
+                        self.files.remove(at);
+                    }
                     self.files.insert(path.clone(), file);
                     path
                 }
                 Edit::Remove(path) => {
-                    let prefix = below(&path);
                     self.files.remove(&path);
-                    let removed: Vec<_> = self.files.range(prefix.clone()..)
-                        .take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
-                    for key in removed {
-                        self.files.remove(&key);
-                    }
+                    self.remove_below(&path);
                     path
                 }
                 Edit::Shadow(path) => {
@@ -218,9 +231,24 @@ impl OutputTree {
         changed
     }
 
+    fn remove_below(&mut self, path: &[u8]) {
+        let prefix = below(path);
+        let removed: Vec<_> =
+            self.files.range(prefix.clone()..).take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
+        for key in removed {
+            self.files.remove(&key);
+        }
+    }
+
     #[cfg(test)]
     fn invariants(&self) -> bool {
-        self.files.keys().all(|path| !path.is_empty() && !path.starts_with(b"/") && !path.ends_with(b"/"))
+        self.files.keys().all(|path| {
+            !path.is_empty()
+                && !path.starts_with(b"/")
+                && !path.ends_with(b"/")
+                && !path.split(|&b| b == b'/').any(|part| part.is_empty())
+                && !self.has_below(path)
+        })
     }
 }
 
@@ -314,12 +342,27 @@ impl<F, R> Content<F, R> {
         }
     }
 
-    fn fetched(&mut self, request: &Fetch, content: Self) {
+    fn fetched(&mut self, request: &Fetch, proven: &Digest, content: Self) -> Result<(), Mismatch> {
+        if *proven != request.hash {
+            return Err(Mismatch);
+        }
         if matches!(self, Self::Unfetched(expected) if expected == request) {
             *self = content;
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        match self {
+            Self::Unfetched(fetch) => !fetch.rel.is_empty() && fetch.size > 0,
+            Self::Open(_) | Self::Ranged(_) => true,
+        }
     }
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct Mismatch;
 
 enum VirtualOpen {
     Empty,
@@ -355,7 +398,7 @@ pub enum Reader {
 pub trait Source: Send + Sync {
     fn cached(&self, hash: &Digest, size: u64) -> Option<PathBuf>;
     fn whole(&self, hash: &Digest, size: u64) -> std::io::Result<PathBuf>;
-    fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<Reader>;
+    fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<(Reader, Digest)>;
 }
 
 pub struct OutFs {
@@ -663,16 +706,22 @@ impl OutFs {
             ReadPlan::Ranged(reader) => return Ok(Reader::Ranged(reader.clone())),
             ReadPlan::Fetch(request) => request,
         };
-        let reader = self.source.reader(&request.hash, request.size).map_err(|e| {
+        let (reader, proven) = self.source.reader(&request.hash, request.size).map_err(|e| {
             eprintln!("rargo daemon: target/{}: its content could not be fetched: {e}", String::from_utf8_lossy(&request.rel));
             errno(e)
         })?;
-        if let Some(handle) = self.handles.lock().unwrap().get_mut(&fh) {
-            let content = match &reader {
-                Reader::Whole(file) => Content::Open(file.try_clone().map_err(errno)?),
-                Reader::Ranged(reader) => Content::Ranged(reader.clone()),
-            };
-            handle.file.fetched(&request, content);
+        let content = match &reader {
+            Reader::Whole(file) => Content::Open(file.try_clone().map_err(errno)?),
+            Reader::Ranged(reader) => Content::Ranged(reader.clone()),
+        };
+        let mut handles = self.handles.lock().unwrap();
+        let handle = handles.get_mut(&fh).ok_or(Errno(libc::EBADF))?;
+        if handle.file.fetched(&request, &proven, content).is_err() {
+            eprintln!(
+                "rargo daemon: target/{}: what was fetched is not the content asked for",
+                String::from_utf8_lossy(&request.rel)
+            );
+            return Err(Errno(libc::EIO));
         }
         Ok(reader)
     }
@@ -1393,34 +1442,202 @@ mod tests {
         assert_eq!(cookies.len(), names.len(), "no two of these names share a place");
     }
 
-    #[test]
-    fn generated_deliveries_and_late_reads_keep_the_right_content() {
-        let mut tree = OutputTree { files: Table::new(), generation: 0 };
-        for generation in 1..=64 {
-            let path = b"debug/app".to_vec();
-            let newer = vec![generation as u8; 30];
-            let older = vec![generation as u8 - 1; 30];
-            let file = |bytes: &[u8]| VFile { hash: *blake3::hash(bytes).as_bytes(), size: bytes.len() as u64, exec: true, mtime_ns: generation as i64 };
-            let put = |file| Edit::Put { path: path.clone(), file, replaced_real: false };
-            assert_eq!(tree.apply(generation, vec![put(file(&newer))]), [path.clone()]);
-            assert!(tree.invariants());
-            assert!(tree.apply(generation - 1, vec![put(file(&older))]).is_empty());
-            assert!(tree.invariants());
-            assert!(matches!(tree.lookup::<()>(&path, None), Some(Kind::Virtual(v)) if v.hash == file(&newer).hash));
-            let VirtualOpen::Read(entry) = tree.open(&path, false, false).ok().unwrap() else { panic!("expected a read") };
-            let request = Fetch { hash: entry.hash, size: entry.size, rel: path.clone() };
-            let old_request = Fetch { hash: file(&older).hash, ..request.clone() };
-            let mut handle = Content::<Vec<u8>, ()>::Unfetched(request.clone());
-            // The shell proves fetched bytes against the request's hash before returning a reader.
-            assert_ne!(*blake3::hash(&older).as_bytes(), request.hash);
-            handle.fetched(&old_request, Content::Open(older));
-            assert!(matches!(handle.read(), ReadPlan::Fetch(effect) if effect == request));
-            assert_eq!(*blake3::hash(&newer).as_bytes(), request.hash);
-            handle.fetched(&request, Content::Open(newer.clone()));
-            assert!(matches!(handle.read(), ReadPlan::Whole(bytes) if bytes[3..9] == newer[3..9]));
-            handle.fetched(&request, Content::Ranged(()));
-            assert!(matches!(handle.read(), ReadPlan::Whole(_)));
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
         }
+    }
+
+    type Planned = Vec<(u8, Vec<u8>, Option<VFile>)>;
+    type Opened = (Digest, Content<Vec<u8>, Vec<u8>>);
+
+    const PATHS: [&str; 8] = ["a", "a/b", "a/c", "a/b/x", "d/e/f", "d/e/g", "d", "h"];
+
+    fn bytes_of(path: &str, generation: u64, n: usize) -> Vec<u8> {
+        format!("{path}@{generation};").repeat(n + 1).into_bytes()
+    }
+
+    fn model_apply(model: &mut Table, edits: &Planned) {
+        for (kind, path, file) in edits {
+            let under = |key: &Vec<u8>| key.len() > path.len() && key.starts_with(path) && key[path.len()] == b'/';
+            match kind {
+                0 => {
+                    model.retain(|key, _| !under(key) && !(path.len() > key.len() && path.starts_with(key) && path[key.len()] == b'/'));
+                    model.insert(path.clone(), file.clone().unwrap());
+                }
+                1 => model.retain(|key, _| key != path && !under(key)),
+                _ => {
+                    model.remove(path);
+                }
+            }
+        }
+    }
+
+    fn walk(inodes: &mut Inodes, path: &[u8]) -> Vec<u64> {
+        let mut parent = ROOT;
+        let mut ids = Vec::new();
+        for part in path.split(|&b| b == b'/') {
+            parent = inodes.lookup(parent, part);
+            ids.push(parent);
+        }
+        ids
+    }
+
+    #[test]
+    fn generated_deliveries_reads_and_concurrent_fetches_return_only_proven_bytes_of_the_newest_tree() {
+        let (mut reads, mut refused, mut stale) = (0, 0, 0);
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let mut tree = OutputTree { files: Table::new(), generation: 0 };
+            let mut model = Table::new();
+            let mut nodes = HashMap::new();
+            nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
+            let mut inodes = Inodes { nodes, children: HashMap::new(), next: 2 };
+            let mut store: BTreeMap<Digest, Vec<u8>> = BTreeMap::new();
+            let mut next_generation = 0u64;
+            let mut applied = 0u64;
+            let mut deliveries: Vec<(u64, Planned)> = Vec::new();
+            let mut handles: Vec<Opened> = Vec::new();
+            let mut fetches: Vec<(usize, Fetch, Vec<u8>, bool)> = Vec::new();
+            let mut seen: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+            for step in 0..400 {
+                match rng.below(10) {
+                    0 | 1 if deliveries.len() < 3 => {
+                        next_generation += 1;
+                        let edits = (0..1 + rng.below(4))
+                            .map(|_| {
+                                let path = PATHS[rng.below(PATHS.len())];
+                                let kind = [0u8, 0, 0, 1, 2][rng.below(5)];
+                                let file = (kind == 0).then(|| {
+                                    let bytes = bytes_of(path, next_generation, rng.below(4));
+                                    let hash = *blake3::hash(&bytes).as_bytes();
+                                    let file = VFile { hash, size: bytes.len() as u64, exec: rng.below(2) == 0, mtime_ns: next_generation as i64 };
+                                    store.insert(hash, bytes);
+                                    file
+                                });
+                                (kind, path.as_bytes().to_vec(), file)
+                            })
+                            .collect();
+                        deliveries.push((next_generation, edits));
+                    }
+                    2 | 3 if !deliveries.is_empty() => {
+                        let (generation, edits) = deliveries.remove(rng.below(deliveries.len()));
+                        let as_edits = edits
+                            .iter()
+                            .map(|(kind, path, file)| match kind {
+                                0 => Edit::Put { path: path.clone(), file: file.clone().unwrap(), replaced_real: rng.below(4) == 0 },
+                                1 => Edit::Remove(path.clone()),
+                                _ => Edit::Shadow(path.clone()),
+                            })
+                            .collect();
+                        let changed = tree.apply(generation, as_edits);
+                        assert!(tree.invariants(), "seed {seed} step {step}");
+                        if generation > applied {
+                            applied = generation;
+                            model_apply(&mut model, &edits);
+                        } else {
+                            stale += 1;
+                            assert!(changed.is_empty(), "seed {seed} step {step}: a delivery older than the tree changes nothing");
+                        }
+                        assert_eq!(tree.generation, applied, "seed {seed} step {step}");
+                        for path in &changed {
+                            inodes.changed(path);
+                            assert!(inodes.invariants(), "seed {seed} step {step}");
+                            if let Some(before) = seen.remove(path) {
+                                let now = *walk(&mut inodes, path).last().unwrap();
+                                assert!(inodes.invariants());
+                                assert_ne!(now, before, "seed {seed} step {step}: a changed name gets a new inode");
+                                inodes.forget(now, 1);
+                                assert!(inodes.invariants());
+                            }
+                        }
+                    }
+                    4 => {
+                        let path = PATHS[rng.below(PATHS.len())].as_bytes();
+                        let ids = walk(&mut inodes, path);
+                        assert!(inodes.invariants(), "seed {seed} step {step}");
+                        assert_eq!(inodes.path(*ids.last().unwrap()).ok().unwrap(), path);
+                        seen.insert(path.to_vec(), *ids.last().unwrap());
+                        if rng.below(2) == 0 {
+                            for id in ids.iter().rev() {
+                                inodes.forget(*id, 1);
+                                assert!(inodes.invariants(), "seed {seed} step {step}");
+                            }
+                            seen.remove(path);
+                        }
+                    }
+                    5 => {
+                        let path = PATHS[rng.below(PATHS.len())].as_bytes();
+                        if let Ok(VirtualOpen::Read(file)) = tree.open(path, false, false) {
+                            assert_eq!(model.get(path).map(|f| f.hash), Some(file.hash), "seed {seed} step {step}: an open sees the newest tree");
+                            let content = Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel: path.to_vec() });
+                            assert!(content.invariants());
+                            handles.push((file.hash, content));
+                        }
+                    }
+                    6 if !handles.is_empty() => {
+                        let h = rng.below(handles.len());
+                        if let ReadPlan::Fetch(request) = handles[h].1.read() {
+                            let served = match rng.below(4) {
+                                0 => store.values().nth(rng.below(store.len())).unwrap().clone(),
+                                1 => {
+                                    let mut bytes = store[&request.hash].clone();
+                                    bytes[0] ^= 1;
+                                    bytes
+                                }
+                                _ => store[&request.hash].clone(),
+                            };
+                            fetches.push((h, request, served, rng.below(2) == 0));
+                        }
+                    }
+                    7 | 8 if !fetches.is_empty() => {
+                        let (h, request, served, ranged) = fetches.remove(rng.below(fetches.len()));
+                        let proven = *blake3::hash(&served).as_bytes();
+                        let content = if ranged { Content::Ranged(served) } else { Content::Open(served) };
+                        let result = handles[h].1.fetched(&request, &proven, content);
+                        assert!(handles[h].1.invariants(), "seed {seed} step {step}");
+                        assert_eq!(result.is_err(), proven != request.hash, "seed {seed} step {step}: a completion is refused exactly when its bytes are not the content asked for");
+                        refused += usize::from(result.is_err());
+                    }
+                    _ if !handles.is_empty() => {
+                        let h = rng.below(handles.len());
+                        let (opened, content) = &handles[h];
+                        let bytes = match content.read() {
+                            ReadPlan::Whole(bytes) | ReadPlan::Ranged(bytes) => bytes,
+                            ReadPlan::Fetch(request) => {
+                                assert_eq!(request.hash, *opened, "seed {seed} step {step}: a handle fetches what it opened");
+                                continue;
+                            }
+                        };
+                        assert_eq!(blake3::hash(bytes).as_bytes(), opened, "seed {seed} step {step}: a read returns only bytes of the content hash");
+                        reads += 1;
+                    }
+                    _ => {}
+                }
+                assert!(tree.invariants() && inodes.invariants(), "seed {seed} step {step}");
+                assert_eq!(tree.files.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "seed {seed} step {step}: the tree is the newest delivery's");
+                for path in PATHS {
+                    let path = path.as_bytes();
+                    let want = model.get(path).map(|file| file.hash);
+                    let got = match tree.lookup::<()>(path, None) {
+                        Some(Kind::Virtual(file)) => Some(file.hash),
+                        Some(Kind::VDir) => {
+                            let prefix = below(path);
+                            assert!(model.keys().any(|key| key.starts_with(&prefix)), "seed {seed} step {step}: a directory has something below it");
+                            None
+                        }
+                        _ => None,
+                    };
+                    assert_eq!(got, want, "seed {seed} step {step}: {}", String::from_utf8_lossy(path));
+                }
+            }
+        }
+        assert!(reads > 1000 && refused > 100 && stale > 100, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
     }
 
     #[test]
