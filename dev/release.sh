@@ -37,7 +37,9 @@ issues=$(printf '%s\n' "$notes" | { grep -oE '#[0-9]+' || true; } | cut -c2- | s
 
 if [ -z "$remote_tag" ]; then
     step='running the build-machine gate'
-    dev/gate.sh
+    # The suites run their own servers: a token or server meant for the
+    # service check below would reach their clients.
+    env -u RARGO_TOKEN -u RARGO_SERVER dev/gate.sh
     step='waiting for the successful gate status'
     dev/release-gate.sh "$commit" --wait
     step='creating and pushing the tag'
