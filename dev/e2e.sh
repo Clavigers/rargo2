@@ -190,6 +190,13 @@ n=$(find target -type f ! -name "*.d" ! -name CACHEDIR.TAG | wc -l)
 [ "$n" -le 4 ] && ok "target/ holds only requested artifacts ($n files)" || bad "target/ holds only requested artifacts" "$(find target -type f)"
 git -C "$A" add Cargo.lock && git -C "$A" -c user.name=t -c user.email=t@t commit -q -m lock
 
+if "$R" clean --dry-run >/dev/null 2>&1 && "$R" clean -vn >/dev/null 2>&1 && "$R" clean --help >/dev/null 2>&1 \
+    && [ -x target/debug/app ]; then
+    ok "clean previews and help leave the delivered artifact intact"
+else
+    bad "clean previews and help leave the delivered artifact intact"
+fi
+
 echo "== no-op rebuild"
 "$R" build >/dev/null 2>&1
 before=$(runs)
