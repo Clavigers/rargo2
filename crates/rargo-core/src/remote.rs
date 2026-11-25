@@ -1298,7 +1298,6 @@ pub struct Worker {
     overhead_samples: AtomicU64,
     link_free_at: Mutex<std::time::Instant>,
     in_flight: Mutex<HashMap<Hash, std::time::Instant>>,
-    warmed: std::sync::atomic::AtomicBool,
     store_paths: Mutex<HashSet<Vec<u8>>>,
 }
 
@@ -1500,7 +1499,6 @@ impl Pool {
                         overhead_samples: AtomicU64::new(0),
                         link_free_at: Mutex::new(std::time::Instant::now()),
                         in_flight: Mutex::new(HashMap::new()),
-                        warmed: std::sync::atomic::AtomicBool::new(false),
                         store_paths: Mutex::new(HashSet::new()),
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
@@ -2366,8 +2364,9 @@ impl RemoteRunner for Pool {
                     waiting
                 );
             }
-            let w = if engine.sched.free_tokens() > 0 && waiting == 0 {
-                match if away { self.lease(holders.as_deref()) } else { None } {
+            let placed = pool_state::placing(engine.sched.free_tokens() > 0, waiting > 0, away);
+            let w = if placed != pool_state::Placing::RaceLocal {
+                match if placed == pool_state::Placing::LeaseNow { self.lease(holders.as_deref()) } else { None } {
                     Some(w) => w,
                     None => {
                         self.stats.kept_local_no_wait.fetch_add(1, Ordering::Relaxed);
@@ -2426,7 +2425,7 @@ impl RemoteRunner for Pool {
                 eager_dispatch(),
             );
             if !send {
-                if known.is_some() && own.is_none() && !w.warmed.swap(true, Ordering::SeqCst) {
+                if self.core.lock().warm(w.id, known.is_some(), own.is_some()) {
                     let (tx, _rx) = mpsc::unbounded_channel();
                     let ra = Arc::new(RemoteAction {
                         view: req.view.clone(),
