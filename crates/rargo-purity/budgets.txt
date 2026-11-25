@@ -1,0 +1,3 @@
+suite	workspace	19000	rargo test --workspace --lib --bins on one test thread, measured at 12.4 s on rargo.rs
+test	default	500	any test without a line of its own; the slowest measured at 363 ms
+slow	snapshot::tests::a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held	15000	measured at 10.0 s: it waits on real eviction timing instead of a simulated clock

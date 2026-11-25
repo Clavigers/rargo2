@@ -1,0 +1,15 @@
+[package]
+name = "rargo-purity"
+publish = false
+description = "Static checks that keep rargo's code pure"
+version = "0.7.6"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/sadosystems/rargo2"
+homepage = "https://rargo.rs"
+
+[dependencies]
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit", "printing", "extra-traits"] }
+quote = { version = "1", default-features = false }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+
