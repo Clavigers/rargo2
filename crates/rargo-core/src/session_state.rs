@@ -6,6 +6,19 @@ pub const WINDOW: usize = 32 << 20;
 const _: () = assert!(WINDOW <= u32::MAX as usize && WINDOW > 0);
 pub const LAZY_BATCH: usize = 1 << 20;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Sizes {
+    pub part: usize,
+    pub batch: usize,
+    pub lazy_batch: usize,
+    pub lazy_small: u64,
+}
+
+impl Sizes {
+    pub const PROTOCOL: Sizes =
+        Sizes { part: PART_SIZE, batch: BATCH_SIZE, lazy_batch: LAZY_BATCH, lazy_small: LAZY_SMALL };
+}
+
 pub fn bulk_cost(bytes: usize) -> usize {
     bytes.clamp(1, WINDOW)
 }
@@ -94,8 +107,8 @@ impl ClientSet {
         push
     }
 
-    fn push_small(&mut self, sizes: &BTreeMap<Digest, u64>) -> Vec<(Digest, u64)> {
-        sizes.iter().filter(|(h, size)| **size <= LAZY_SMALL && self.set.insert(**h)).map(|(h, s)| (*h, *s)).collect()
+    fn push_small(&mut self, sizes: &BTreeMap<Digest, u64>, small: u64) -> Vec<(Digest, u64)> {
+        sizes.iter().filter(|(h, size)| **size <= small && self.set.insert(**h)).map(|(h, s)| (*h, *s)).collect()
     }
 }
 
@@ -120,11 +133,13 @@ pub struct Outgoing {
     ready: VecDeque<Next>,
     end: Option<ServerMsg>,
     end_always: bool,
+    sizes: Sizes,
 }
 
 impl Outgoing {
-    fn new(blobs: Vec<(Digest, u64)>, lazy: bool, end: ServerMsg, end_always: bool) -> Outgoing {
+    fn new(sizes: Sizes, blobs: Vec<(Digest, u64)>, lazy: bool, end: ServerMsg, end_always: bool) -> Outgoing {
         Outgoing {
+            sizes,
             todo: blobs.into(),
             lazy,
             batch: Vec::new(),
@@ -138,7 +153,7 @@ impl Outgoing {
     }
 
     fn limit(&self) -> usize {
-        if self.lazy { LAZY_BATCH } else { BATCH_SIZE }
+        if self.lazy { self.sizes.lazy_batch } else { self.sizes.batch }
     }
 
     fn blobs(&mut self) -> Next {
@@ -154,11 +169,11 @@ impl Outgoing {
         }
         if let Some((hash, size, sent)) = self.part {
             self.reading = Some((hash, false));
-            let len = PART_SIZE.min((size - sent) as usize).max(1);
+            let len = self.sizes.part.min((size - sent) as usize).max(1);
             return Next::Read { hash, at: sent, len, whole: false };
         }
         if let Some((hash, size)) = self.todo.pop_front() {
-            if self.lazy || size as usize <= PART_SIZE {
+            if self.lazy || size as usize <= self.sizes.part {
                 self.reading = Some((hash, true));
                 return Next::Read { hash, at: 0, len: size as usize, whole: true };
             }
@@ -232,6 +247,7 @@ pub struct SessionState {
     changed: bool,
     closed: bool,
     next_id: u64,
+    sizes: Sizes,
 }
 
 impl Default for SessionState {
@@ -252,7 +268,12 @@ fn sizes_of(files: &[Delivery], writes: &[Write]) -> BTreeMap<Digest, u64> {
 
 impl SessionState {
     pub fn new() -> SessionState {
+        SessionState::with_sizes(Sizes::PROTOCOL)
+    }
+
+    pub fn with_sizes(sizes: Sizes) -> SessionState {
         SessionState {
+            sizes,
             knows: false,
             lazy: false,
             delivered: BTreeSet::new(),
@@ -389,13 +410,13 @@ impl SessionState {
         self.delivered.extend(sizes.keys().copied());
         let deliver = ServerMsg::Deliver { id, files, writes };
         if self.lazy {
-            let small = has.push_small(&sizes);
-            let mut out = Outgoing::new(small, true, ServerMsg::Delivered { id }, false);
+            let small = has.push_small(&sizes, self.sizes.lazy_small);
+            let mut out = Outgoing::new(self.sizes, small, true, ServerMsg::Delivered { id }, false);
             out.ready.push_back(Next::Send(deliver));
             return Some(out);
         }
         let push = has.push(&sizes, self.knows);
-        let mut out = Outgoing::new(push, false, ServerMsg::Delivered { id }, false);
+        let mut out = Outgoing::new(self.sizes, push, false, ServerMsg::Delivered { id }, false);
         out.ready.push_back(Next::Send(deliver));
         if self.closed {
             out.ready.push_back(Next::Gone);
@@ -406,7 +427,7 @@ impl SessionState {
     pub fn fetch(&mut self, has: &mut ClientSet, id: u64, found: Vec<(Digest, Option<u64>)>) -> Outgoing {
         let wanted: Vec<(Digest, u64)> = found.into_iter().filter_map(|(h, size)| size.map(|s| (h, s))).collect();
         has.extend(wanted.iter().map(|(h, _)| *h));
-        Outgoing::new(wanted, false, ServerMsg::Fetched { id }, true)
+        Outgoing::new(self.sizes, wanted, false, ServerMsg::Fetched { id }, true)
     }
 
     pub fn take_bulk(&mut self, bytes: usize) -> Result<bool, Gone> {
@@ -491,10 +512,10 @@ impl SessionState {
     }
 }
 
-pub enum Hello {
+enum Hello {
     Need(usize),
     Foreign(Vec<u8>),
-    Hello { user: String, msg1: Vec<u8> },
+    Whole { user: String, msg1: Vec<u8> },
     BadUser,
 }
 
@@ -506,7 +527,7 @@ fn reply(status: u8, body: &[u8]) -> Vec<u8> {
     r
 }
 
-pub fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
+fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
     if buf.len() < 9 {
         return Hello::Need(9);
     }
@@ -526,27 +547,113 @@ pub fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
     }
     assert_eq!(buf.len(), msg_end, "the shell reads exactly what the hello needs");
     let Ok(user) = String::from_utf8(buf[9..user_end].to_vec()) else { return Hello::BadUser };
-    Hello::Hello { user, msg1: buf[user_end + 2..].to_vec() }
+    Hello::Whole { user, msg1: buf[user_end + 2..].to_vec() }
 }
 
-pub fn refusal(text: &str) -> Vec<u8> {
+fn refusal(text: &str) -> Vec<u8> {
     reply(1, format!("{text}\n").as_bytes())
 }
 
-pub fn welcome(msg2: &[u8]) -> Vec<u8> {
+fn welcome(msg2: &[u8]) -> Vec<u8> {
     reply(0, msg2)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Shake {
+    Read(usize),
+    Check { user: String, msg1: Vec<u8> },
+    Reply { write: Vec<u8>, end: Shook },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Shook {
+    Accepted { user: String, admin: bool },
+    Refused(String),
+}
+
+#[derive(Debug)]
+pub struct Accepted {
+    pub msg2: Vec<u8>,
+    pub early: bool,
+    pub admin: bool,
+}
+
+#[derive(Debug)]
+pub struct Handshake {
+    magic: [u8; 8],
+    buf: Vec<u8>,
+    user: Option<String>,
+    ended: bool,
+}
+
+impl Handshake {
+    pub fn new(magic: &[u8; 8]) -> (Handshake, Shake) {
+        let mut h = Handshake { magic: *magic, buf: Vec::new(), user: None, ended: false };
+        let first = h.received(&[]);
+        (h, first)
+    }
+
+    pub fn received(&mut self, bytes: &[u8]) -> Shake {
+        assert!(self.user.is_none() && !self.ended, "the hello is read before it is checked");
+        self.buf.extend_from_slice(bytes);
+        match hello(&self.buf, &self.magic) {
+            Hello::Need(n) => Shake::Read(n - self.buf.len()),
+            Hello::Foreign(write) => {
+                self.end(write, Shook::Refused("not a rargo client (or a different protocol version)".into()))
+            }
+            Hello::BadUser => self.end(Vec::new(), Shook::Refused("user name is not UTF-8".into())),
+            Hello::Whole { user, msg1 } => {
+                self.user = Some(user.clone());
+                Shake::Check { user, msg1 }
+            }
+        }
+    }
+
+    pub fn checked(&mut self, accepted: Option<Accepted>) -> Shake {
+        assert!(!self.ended, "a handshake ends once");
+        let user = self.user.clone().expect("a user is checked after the hello names them");
+        match accepted {
+            None => self.end(
+                refusal(rargo_proto::REFUSED),
+                Shook::Refused(format!("refused `{user}`: unknown user or wrong key")),
+            ),
+            Some(a) if a.early => self.end(
+                welcome(&a.msg2),
+                Shook::Refused(format!(
+                    "`{user}` sent a request with the handshake, which this protocol version does not do"
+                )),
+            ),
+            Some(a) => self.end(welcome(&a.msg2), Shook::Accepted { user, admin: a.admin }),
+        }
+    }
+
+    fn end(&mut self, write: Vec<u8>, end: Shook) -> Shake {
+        self.ended = true;
+        Shake::Reply { write, end }
+    }
+
+    pub fn invariants(&self) {
+        if self.user.is_some() {
+            assert!(matches!(hello(&self.buf, &self.magic), Hello::Whole { .. }), "a user comes from a whole hello");
+        }
+        if !self.ended && self.user.is_none() {
+            assert!(matches!(hello(&self.buf, &self.magic), Hello::Need(n) if n > self.buf.len()));
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SMALL: Sizes = Sizes { part: 4096, batch: 4096, lazy_batch: 2048, lazy_small: 1024 };
+
     fn content(i: u8) -> Vec<u8> {
         let len = match i % 12 {
-            0 => 2 * PART_SIZE + 4321,
-            1 => PART_SIZE + 1,
-            2 => LAZY_SMALL as usize + 7,
-            _ => 1 + (i as usize * 997) % 9000,
+            0 => 2 * SMALL.part + 321,
+            1 => SMALL.part + 1,
+            2 => SMALL.lazy_small as usize + 7,
+            _ => 1 + (i as usize * 997) % 1000,
         };
         (0..len).map(|k| (k as u32).wrapping_mul(2_654_435_761).wrapping_add(i as u32).to_le_bytes()[3]).collect()
     }
@@ -571,7 +678,7 @@ mod tests {
         assert!(matches!(hello(&buf, magic), Hello::Need(16)));
         buf.extend_from_slice(b"hi");
         match hello(&buf, magic) {
-            Hello::Hello { user, msg1 } => assert_eq!((user.as_str(), msg1.as_slice()), ("ann", &b"hi"[..])),
+            Hello::Whole { user, msg1 } => assert_eq!((user.as_str(), msg1.as_slice()), ("ann", &b"hi"[..])),
             _ => panic!("a whole hello is read"),
         }
         let Hello::Foreign(r) = hello(b"GET / HTTP", magic) else { panic!("another protocol is told so") };
@@ -583,9 +690,86 @@ mod tests {
         assert!(matches!(hello(&bad, magic), Hello::BadUser));
     }
 
+    fn shake_until_check(h: &mut Handshake, mut next: Shake, bytes: &[u8]) -> Shake {
+        let mut at = 0;
+        while let Shake::Read(n) = next {
+            assert!(n > 0);
+            assert!(at < bytes.len(), "the handshake asks only for what the hello holds");
+            let take = 1;
+            next = h.received(&bytes[at..at + take]);
+            at += take;
+            h.invariants();
+        }
+        assert_eq!(at, bytes.len(), "the handshake reads the hello and nothing after it");
+        next
+    }
+
+    fn a_hello(user: &str, msg1: &[u8]) -> Vec<u8> {
+        let mut b = b"rargo\x08\r\n".to_vec();
+        b.push(user.len() as u8);
+        b.extend_from_slice(user.as_bytes());
+        b.extend_from_slice(&(msg1.len() as u16).to_le_bytes());
+        b.extend_from_slice(msg1);
+        b
+    }
+
+    #[test]
+    fn the_handshake_accepts_refuses_and_rejects_early_data_as_steps() {
+        let magic = b"rargo\x08\r\n";
+        let bytes = a_hello("ann", b"m1");
+        let (mut h, first) = Handshake::new(magic);
+        assert_eq!(first, Shake::Read(9));
+        let next = shake_until_check(&mut h, first, &bytes);
+        assert_eq!(next, Shake::Check { user: "ann".into(), msg1: b"m1".to_vec() });
+        assert_eq!(
+            h.checked(Some(Accepted { msg2: b"xy".to_vec(), early: false, admin: true })),
+            Shake::Reply { write: welcome(b"xy"), end: Shook::Accepted { user: "ann".into(), admin: true } }
+        );
+        h.invariants();
+
+        let (mut h, first) = Handshake::new(magic);
+        shake_until_check(&mut h, first, &bytes);
+        let Shake::Reply { write, end: Shook::Refused(why) } = h.checked(None) else {
+            panic!("an unknown user is refused")
+        };
+        assert_eq!(write, refusal(rargo_proto::REFUSED));
+        assert_eq!(why, "refused `ann`: unknown user or wrong key");
+        h.invariants();
+
+        let (mut h, first) = Handshake::new(magic);
+        shake_until_check(&mut h, first, &bytes);
+        let Shake::Reply { write, end: Shook::Refused(why) } =
+            h.checked(Some(Accepted { msg2: b"xy".to_vec(), early: true, admin: false }))
+        else {
+            panic!("early data ends the link")
+        };
+        assert_eq!(write, welcome(b"xy"), "the client is welcomed before the link ends");
+        assert!(why.contains("sent a request with the handshake"));
+        h.invariants();
+
+        let (mut h, _) = Handshake::new(magic);
+        let Shake::Reply { write, end: Shook::Refused(why) } = h.received(b"GET / HTT") else {
+            panic!("another protocol is told so")
+        };
+        assert_eq!(write[0], 1);
+        assert!(why.starts_with("not a rargo client"));
+        h.invariants();
+
+        let (mut h, _) = Handshake::new(magic);
+        let mut bad = magic.to_vec();
+        bad.extend_from_slice(&[1, 0xff, 0, 0]);
+        let first = h.received(&bad[..9]);
+        assert_eq!(first, Shake::Read(3));
+        assert_eq!(
+            h.received(&bad[9..]),
+            Shake::Reply { write: Vec::new(), end: Shook::Refused("user name is not UTF-8".into()) }
+        );
+        h.invariants();
+    }
+
     #[test]
     fn the_window_holds_back_bulk_until_it_is_sent() {
-        let mut s = SessionState::new();
+        let mut s = SessionState::with_sizes(SMALL);
         assert_eq!(s.take_bulk(WINDOW - 10), Ok(true));
         assert_eq!(s.take_bulk(20), Ok(false));
         assert_eq!(s.take_bulk(0), Ok(true), "an empty message costs one byte");
@@ -598,7 +782,7 @@ mod tests {
 
     #[test]
     fn answers_go_only_to_the_question_asked() {
-        let mut s = SessionState::new();
+        let mut s = SessionState::with_sizes(SMALL);
         assert_eq!(s.client(ClientMsg::Trees(vec![])).effects, vec![], "nobody asked");
         assert!(matches!(s.ask(Question::Env(vec!["A".into()])), Ok(ServerMsg::WantEnv(v)) if v == ["A"]));
         assert_eq!(s.client(ClientMsg::Trees(vec![])).effects, vec![]);
@@ -612,7 +796,7 @@ mod tests {
 
     #[test]
     fn a_blob_whose_content_is_not_its_hash_is_refused() {
-        let mut s = SessionState::new();
+        let mut s = SessionState::with_sizes(SMALL);
         let good = content(5);
         let mut bad = Blob::pack(digest(&good), &good);
         bad.hash = digest(b"other");
@@ -632,7 +816,7 @@ mod tests {
     #[test]
     fn a_delivery_sends_whole_blobs_in_batches_and_big_ones_in_parts() {
         let (small, big) = (content(5), content(0));
-        let mut s = SessionState::new();
+        let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
         s.knows(&mut has, []);
         let mut out = s.deliver(&mut has, vec![delivery(&small), delivery(&big)], vec![]).unwrap();
@@ -678,12 +862,12 @@ mod tests {
     #[test]
     fn a_client_that_has_not_said_what_it_has_gets_nothing_pushed_and_a_lazy_one_gets_small_blobs() {
         let (small, mid) = (content(5), content(2));
-        let mut s = SessionState::new();
+        let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
         let mut out = s.deliver(&mut has, vec![delivery(&small)], vec![]).unwrap();
         assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
         assert!(matches!(out.step(), Next::Send(ServerMsg::Delivered { .. })));
-        let mut lazy = SessionState::new();
+        let mut lazy = SessionState::with_sizes(SMALL);
         lazy.set_lazy();
         let mut has = ClientSet::default();
         let mut out = lazy.deliver(&mut has, vec![delivery(&small), delivery(&mid)], vec![]).unwrap();
@@ -698,7 +882,7 @@ mod tests {
 
     #[test]
     fn a_fetch_ends_with_fetched_even_when_it_fails() {
-        let mut s = SessionState::new();
+        let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
         let mut out = s.fetch(&mut has, 7, vec![(digest(b"a"), Some(1)), (digest(b"gone"), None)]);
         assert!(matches!(out.step(), Next::Read { .. }));
@@ -875,7 +1059,7 @@ mod tests {
             self.waiting = false;
             self.asked = None;
             self.in_flight = 0;
-            self.s = SessionState::new();
+            self.s = SessionState::with_sizes(SMALL);
             if reconnect {
                 self.has = ClientSet::default();
                 self.known.clear();
@@ -887,6 +1071,7 @@ mod tests {
     #[test]
     fn generated_client_messages_never_leave_a_claim_and_never_send_a_blob_the_client_has() {
         let pool: Vec<Vec<u8>> = (0..24u8).map(content).collect();
+        let hashes: Vec<Digest> = pool.iter().map(|b| digest(b)).collect();
         for seed in 1..=200u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut w = World {
@@ -899,7 +1084,7 @@ mod tests {
                 receiving: BTreeMap::new(),
                 uploading: None,
                 has: ClientSet::default(),
-                s: SessionState::new(),
+                s: SessionState::with_sizes(SMALL),
                 sends: Vec::new(),
                 in_flight: 0,
                 waiting: false,
@@ -908,18 +1093,24 @@ mod tests {
             };
             for _ in 0..40 {
                 let i = rng.below(24) as usize;
-                w.store.insert(digest(&w.pool[i]), w.pool[i].clone());
+                w.store.insert(hashes[i], w.pool[i].clone());
             }
             w.start(&mut rng);
             for _ in 0..300 {
                 let pick = rng.below(24) as usize;
-                let h = digest(&w.pool[pick]);
+                let h = hashes[pick];
                 let ok = match rng.below(16) {
                     0 | 1 => {
                         let files: Vec<Delivery> = (0..1 + rng.below(3))
-                            .map(|_| &w.pool[rng.below(24) as usize])
-                            .filter(|b| w.store.contains_key(&digest(b)))
-                            .map(|b| delivery(b))
+                            .map(|_| rng.below(24) as usize)
+                            .filter(|i| w.store.contains_key(&hashes[*i]))
+                            .map(|i| Delivery {
+                                path: "f".into(),
+                                hash: hashes[i],
+                                size: w.pool[i].len() as u64,
+                                exec: false,
+                                own: false,
+                            })
                             .collect();
                         let twice = rng.below(3) == 0;
                         for _ in 0..1 + twice as usize {
@@ -969,7 +1160,7 @@ mod tests {
                     7 | 8 => {
                         let (i, at) = w.uploading.unwrap_or((pick, 0));
                         let bytes = w.pool[i].clone();
-                        let end = (at + PART_SIZE / 2 + rng.below(PART_SIZE as u64) as usize).min(bytes.len());
+                        let end = (at + SMALL.part / 2 + rng.below(SMALL.part as u64) as usize).min(bytes.len());
                         let last = end == bytes.len();
                         w.uploading = if last { None } else { Some((i, end)) };
                         let msg = ClientMsg::BlobPart {
@@ -986,8 +1177,7 @@ mod tests {
                         w.apply(step)
                     }
                     10 if !w.waiting && !w.s.is_closed() => {
-                        let want: Vec<Digest> =
-                            (0..1 + rng.below(3)).map(|_| digest(&w.pool[rng.below(24) as usize])).collect();
+                        let want: Vec<Digest> = (0..1 + rng.below(3)).map(|_| hashes[rng.below(24) as usize]).collect();
                         let store = &w.store;
                         let asked = w.s.want(&want, &|d| store.contains_key(d));
                         assert!(matches!(asked, ServerMsg::WantBlobs(v) if v == want));
