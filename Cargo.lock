@@ -875,6 +875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rargo-purity"
+version = "0.7.6"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "rargod"
 version = "0.7.6"
 dependencies = [

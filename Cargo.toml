@@ -27,5 +27,11 @@ tempfile = "3"
 opt-level = 1
 debug = "line-tables-only"
 
+[profile.dev.package.syn]
+opt-level = 3
+
+[profile.dev.package.proc-macro2]
+opt-level = 3
+
 [profile.release]
 debug = "line-tables-only"
