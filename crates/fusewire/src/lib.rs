@@ -46,10 +46,46 @@ impl From<io::Error> for Errno {
 pub type Res<T> = Result<T, Errno>;
 
 #[derive(Clone, Copy, Debug)]
-pub struct Ctx {
+pub struct Ctx<'a> {
     pub uid: u32,
     pub gid: u32,
     pub pid: u32,
+    pub effects: &'a Effects,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Effect {
+    Notify(Vec<u8>),
+    Register { fd: RawFd, token: u64 },
+    Unregister(i32),
+}
+
+#[derive(Debug, Default)]
+pub struct Effects(std::cell::RefCell<Vec<Effect>>);
+
+impl Effects {
+    pub fn register(&self, fd: RawFd, token: u64) {
+        self.0.borrow_mut().push(Effect::Register { fd, token });
+    }
+
+    pub fn unregister(&self, id: i32) {
+        self.0.borrow_mut().push(Effect::Unregister(id));
+    }
+
+    pub fn inval_entry(&self, parent: u64, name: &[u8]) {
+        self.0.borrow_mut().push(Effect::Notify(inval_entry_bytes(parent, name)));
+    }
+
+    fn take(&self) -> Vec<Effect> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+fn inval_entry_bytes(parent: u64, name: &[u8]) -> Vec<u8> {
+    let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
+    let mut bytes = Vec::new();
+    encode_reply(&mut bytes, 0, FUSE_NOTIFY_INVAL_ENTRY, &[as_bytes(&out), name, &[0]]);
+    bytes
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -191,7 +227,13 @@ pub trait Filesystem: Send + Sync + 'static {
     fn write(&self, ctx: &Ctx, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Res<u32> {
         Err(Errno::EROFS)
     }
+    fn registered(&self, ctx: &Ctx, token: u64, id: Res<i32>) -> Res<Opened> {
+        Err(Errno::EIO)
+    }
     fn release(&self, nodeid: u64, fh: u64, flags: u32) {}
+    fn release_in(&self, ctx: &Ctx, nodeid: u64, fh: u64, flags: u32) {
+        self.release(nodeid, fh, flags)
+    }
     fn fsync(&self, ctx: &Ctx, nodeid: u64, fh: u64, datasync: bool) -> Res<()> {
         Ok(())
     }
@@ -474,19 +516,41 @@ impl Session {
         Ok(fd)
     }
 
+    pub fn carry(&self, effect: &Effect) -> io::Result<i32> {
+        let fd = self.dev.as_raw_fd();
+        let status = match effect {
+            Effect::Notify(bytes) => {
+                let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+                return match written {
+                    w if w >= 0 => Ok(0),
+                    _ => match io::Error::last_os_error() {
+                        e if e.raw_os_error() == Some(libc::ENOENT) => Ok(0),
+                        e => Err(e),
+                    },
+                };
+            }
+            Effect::Register { fd: source, .. } => {
+                let map = fuse_backing_map { fd: *source, flags: 0, padding: 0 };
+                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _) }
+            }
+            Effect::Unregister(id) => {
+                let id = *id as u32;
+                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const _) }
+            }
+        };
+        if status < 0 { Err(io::Error::last_os_error()) } else { Ok(status) }
+    }
+
     pub fn backing_open(&self, fd: RawFd) -> io::Result<i32> {
-        DeviceEffect::Register(fd).execute(self.dev.as_raw_fd())
+        self.carry(&Effect::Register { fd, token: 0 })
     }
 
     pub fn backing_close(&self, id: i32) -> io::Result<()> {
-        DeviceEffect::Unregister(id).execute(self.dev.as_raw_fd()).map(|_| ())
+        self.carry(&Effect::Unregister(id)).map(|_| ())
     }
 
     pub fn notify_inval_entry(&self, parent: u64, name: &[u8]) -> io::Result<()> {
-        match DeviceEffect::invalidate(parent, name).execute(self.dev.as_raw_fd()) {
-            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            result => result.map(|_| ()),
-        }
+        self.carry(&Effect::Notify(inval_entry_bytes(parent, name))).map(|_| ())
     }
 
     pub fn auto_unmount_active(&self) -> bool {
@@ -780,41 +844,6 @@ fn open_out(o: &Opened) -> fuse_open_out {
     fuse_open_out { fh: o.fh, open_flags: o.flags, backing_id: o.backing_id }
 }
 
-enum DeviceEffect {
-    Write(Vec<u8>),
-    Register(RawFd),
-    Unregister(i32),
-}
-
-impl DeviceEffect {
-    fn invalidate(parent: u64, name: &[u8]) -> Self {
-        let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
-        let mut bytes = Vec::new();
-        encode_reply(&mut bytes, 0, FUSE_NOTIFY_INVAL_ENTRY, &[as_bytes(&out), name, &[0]]);
-        Self::Write(bytes)
-    }
-
-    fn write(fd: RawFd, bytes: &[u8]) -> io::Result<i32> {
-        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-        if written < 0 { Err(io::Error::last_os_error()) } else { Ok(0) }
-    }
-
-    fn execute(self, fd: RawFd) -> io::Result<i32> {
-        let status = match self {
-            Self::Write(bytes) => return Self::write(fd, &bytes),
-            Self::Register(source) => {
-                let map = fuse_backing_map { fd: source, flags: 0, padding: 0 };
-                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _) }
-            }
-            Self::Unregister(id) => {
-                let id = id as u32;
-                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const _) }
-            }
-        };
-        if status < 0 { Err(io::Error::last_os_error()) } else { Ok(status) }
-    }
-}
-
 fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
     let fd = dev.as_raw_fd();
     let mut storage = vec![0u64; BUF_SIZE / 8];
@@ -837,13 +866,24 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
         let n = n as usize;
         assert!(n <= BUF_SIZE);
         let buf = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
-        let result = handler.handle(&*fs, buf);
-        if !result.bytes.is_empty() {
-            let _ = DeviceEffect::write(fd, result.bytes);
-        }
-        if result.destroyed {
-            sess.connected.store(false, Ordering::SeqCst);
-            break;
+        let mut handled = handler.handle(&*fs, buf);
+        loop {
+            let mut registered = None;
+            for effect in std::mem::take(&mut handled.effects) {
+                let done = sess.carry(&effect);
+                if let Effect::Register { token, .. } = effect {
+                    registered = Some((token, done.map_err(Errno::from)));
+                }
+            }
+            if !handled.bytes.is_empty() {
+                unsafe { libc::write(fd, handled.bytes.as_ptr().cast(), handled.bytes.len()) };
+            }
+            if handled.destroyed {
+                sess.connected.store(false, Ordering::SeqCst);
+                return;
+            }
+            let Some((token, id)) = registered else { break };
+            handled = handler.registered(&*fs, token, id);
         }
     }
 }
@@ -852,47 +892,126 @@ pub struct RequestHandler {
     scratch: Vec<u8>,
     reply: Vec<u8>,
     max_write: u32,
+    awaiting: Option<Awaiting>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Awaiting {
+    unique: u64,
+    token: u64,
+    ctx: (u32, u32, u32),
+    entry: Option<fuse_entry_out>,
+}
+
+#[derive(Debug)]
 pub struct Handled<'a> {
     pub bytes: &'a [u8],
+    pub effects: Vec<Effect>,
     pub destroyed: bool,
 }
 
 impl RequestHandler {
     pub fn new(max_write: u32) -> Self {
-        Self { scratch: Vec::new(), reply: Vec::new(), max_write }
+        Self { scratch: Vec::new(), reply: Vec::new(), max_write, awaiting: None }
     }
 
     pub fn handle<F: Filesystem>(&mut self, fs: &F, request: &[u8]) -> Handled<'_> {
+        assert!(self.awaiting.is_none(), "a registration is carried out before the next request");
         self.reply.clear();
         let Some(hdr) = read_struct::<fuse_in_header>(request) else {
-            return Handled { bytes: &self.reply, destroyed: false };
+            return Handled { bytes: &self.reply, effects: Vec::new(), destroyed: false };
         };
         if hdr.unique == 0 {
-            return Handled { bytes: &self.reply, destroyed: false };
+            return Handled { bytes: &self.reply, effects: Vec::new(), destroyed: false };
         }
         if hdr.len as usize != request.len() {
             if !matches!(hdr.opcode, FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT) {
                 encode_reply(&mut self.reply, hdr.unique, -libc::EINVAL, &[]);
             }
-            return Handled { bytes: &self.reply, destroyed: false };
+            return Handled { bytes: &self.reply, effects: Vec::new(), destroyed: false };
         }
+        let effects = Effects::default();
+        let ctx = Ctx { uid: hdr.uid, gid: hdr.gid, pid: hdr.pid, effects: &effects };
         let destroyed = hdr.opcode == FUSE_DESTROY;
         if destroyed {
             fs.destroy();
             encode_reply(&mut self.reply, hdr.unique, 0, &[]);
         } else {
             let body = &request[std::mem::size_of::<fuse_in_header>()..];
-            dispatch(fs, &mut self.reply, &hdr, body, &mut self.scratch, self.max_write);
+            let mut call = Call { reply: &mut self.reply, out: &mut self.scratch, max_write: self.max_write, awaiting: None };
+            dispatch(fs, &ctx, &mut call, &hdr, body);
+            self.awaiting = call.awaiting;
         }
-        Handled { bytes: &self.reply, destroyed }
+        let mut effects = effects.take();
+        let registrations = effects.iter().filter(|e| matches!(e, Effect::Register { .. })).count();
+        match self.awaiting {
+            Some(a) => {
+                assert_eq!(registrations, 1, "an open awaits exactly one registration");
+                assert!(effects.iter().any(|e| matches!(e, Effect::Register { token, .. } if *token == a.token)));
+            }
+            None => effects.retain(|e| !matches!(e, Effect::Register { .. })),
+        }
+        Handled { bytes: &self.reply, effects, destroyed }
     }
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.reply.is_empty() || read_struct::<fuse_out_header>(&self.reply)
-            .is_some_and(|header| header.len as usize == self.reply.len() && header.unique != 0 && header.error <= 0)
+    pub fn registered<F: Filesystem>(&mut self, fs: &F, token: u64, id: Res<i32>) -> Handled<'_> {
+        let a = self.awaiting.take().expect("a registration answers an open that awaits it");
+        assert_eq!(a.token, token, "the registration is the one the open asked for");
+        self.reply.clear();
+        let effects = Effects::default();
+        let ctx = Ctx { uid: a.ctx.0, gid: a.ctx.1, pid: a.ctx.2, effects: &effects };
+        let opened = fs.registered(&ctx, token, id).and_then(|o| {
+            if o.flags & FOPEN_PASSTHROUGH != 0 && o.backing_id <= 0 { Err(Errno::EIO) } else { Ok(o) }
+        });
+        match (opened, a.entry) {
+            (Ok(o), Some(e)) => encode_reply(&mut self.reply, a.unique, 0, &[as_bytes(&e), as_bytes(&open_out(&o))]),
+            (Ok(o), None) => encode_reply(&mut self.reply, a.unique, 0, &[as_bytes(&open_out(&o))]),
+            (Err(e), _) => encode_reply(&mut self.reply, a.unique, -e.0, &[]),
+        }
+        let mut effects = effects.take();
+        effects.retain(|e| !matches!(e, Effect::Register { .. }));
+        Handled { bytes: &self.reply, effects, destroyed: false }
+    }
+
+    pub fn awaiting(&self) -> bool {
+        self.awaiting.is_some()
+    }
+
+    pub fn invariants(&self) {
+        if self.awaiting.is_some() {
+            assert!(self.reply.is_empty(), "an open that awaits its registration has not been answered");
+        }
+        if !self.reply.is_empty() {
+            let header = read_struct::<fuse_out_header>(&self.reply).expect("a reply has a header");
+            assert_eq!(header.len as usize, self.reply.len(), "a reply's length is its header's");
+            assert!(header.unique != 0 && header.error <= 0, "a reply answers a request");
+        }
+    }
+}
+
+struct Call<'a> {
+    reply: &'a mut Vec<u8>,
+    out: &'a mut Vec<u8>,
+    max_write: u32,
+    awaiting: Option<Awaiting>,
+}
+
+impl Call<'_> {
+    fn opened(&mut self, ctx: &Ctx, hdr: &fuse_in_header, entry: Option<fuse_entry_out>, o: Opened) {
+        let asked = ctx.effects.0.borrow().iter().find_map(|e| match e {
+            Effect::Register { token, .. } => Some(*token),
+            _ => None,
+        });
+        match asked {
+            Some(token) => {
+                self.awaiting =
+                    Some(Awaiting { unique: hdr.unique, token, ctx: (ctx.uid, ctx.gid, ctx.pid), entry });
+            }
+            None => match entry {
+                Some(e) => encode_reply(self.reply, hdr.unique, 0, &[as_bytes(&e), as_bytes(&open_out(&o))]),
+                None => encode_reply(self.reply, hdr.unique, 0, &[as_bytes(&open_out(&o))]),
+            },
+        }
     }
 }
 
@@ -939,15 +1058,11 @@ fn send_empty(out: &mut Vec<u8>, unique: u64, result: Res<()>) {
     send(out, unique, result);
 }
 
-fn dispatch<F: Filesystem>(
-    fs: &F,
-    reply: &mut Vec<u8>,
-    hdr: &fuse_in_header,
-    body: &[u8],
-    out: &mut Vec<u8>,
-    max_write: u32,
-) {
-    let ctx = Ctx { uid: hdr.uid, gid: hdr.gid, pid: hdr.pid };
+fn dispatch<F: Filesystem>(fs: &F, ctx: &Ctx, call: &mut Call, hdr: &fuse_in_header, body: &[u8]) {
+    let ctx = *ctx;
+    let max_write = call.max_write;
+    let reply = &mut *call.reply;
+    let out = &mut *call.out;
     let u = hdr.unique;
     let node = hdr.nodeid;
     match hdr.opcode {
@@ -1051,14 +1166,17 @@ fn dispatch<F: Filesystem>(
         }
         FUSE_OPEN => {
             let a = arg!(fuse_open_in, body, reply, hdr);
-            send(reply, u, fs.open(&ctx, node, a.flags).map(|o| open_out(&o)));
+            match fs.open(&ctx, node, a.flags) {
+                Ok(o) => call.opened(&ctx, hdr, None, o),
+                Err(e) => encode_reply(reply, u, -e.0, &[]),
+            }
         }
         FUSE_CREATE => {
             let a = arg!(fuse_create_in, body, reply, hdr);
             let (name, _) = names!(&body[std::mem::size_of::<fuse_create_in>()..], reply, hdr);
             let mode = a.mode & !a.umask;
             match fs.create(&ctx, node, name, mode, a.flags) {
-                Ok((e, o)) => encode_reply(reply, u, 0, &[as_bytes(&entry_out(&e)), as_bytes(&open_out(&o))]),
+                Ok((e, o)) => call.opened(&ctx, hdr, Some(entry_out(&e)), o),
                 Err(e) => encode_reply(reply, u, -e.0, &[]),
             };
         }
@@ -1097,7 +1215,7 @@ fn dispatch<F: Filesystem>(
         FUSE_RELEASE | FUSE_RELEASEDIR => {
             if hdr.opcode == FUSE_RELEASE {
                 if let Some(a) = read_struct::<fuse_release_in>(body) {
-                    fs.release(node, a.fh, a.flags);
+                    fs.release_in(&ctx, node, a.fh, a.flags);
                 }
             }
             encode_reply(reply, u, 0, &[]);
@@ -1149,116 +1267,589 @@ fn dispatch<F: Filesystem>(
 
 #[cfg(test)]
 mod request_tests {
-    use std::sync::atomic::AtomicU64;
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    const HEADER: usize = std::mem::size_of::<fuse_in_header>();
+    const OUT: usize = std::mem::size_of::<fuse_out_header>();
+    const BACKING_FD: RawFd = 99;
+
+    const RECORDED: &[(&str, &str)] = &[
+        ("INIT", "680000001a0000000200000000000000000000000000000000000000000000000000000000000000070000002d00000000000200fbffff73ff0500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+        ("LOOKUP", "2d0000000100000004000000000000000100000000000000000000000000000028212d000000000066696c6500"),
+        ("STATX", "400000003400000006000000000000000200000000000000000000000000000028212d00000000000000000000000000000000000000000000000000ff0f0000"),
+        ("GETATTR", "380000000300000008000000000000000200000000000000000000000000000028212d000000000000000000000000000000000000000000"),
+        ("GETATTR", "38000000030000000a00000000000000010000000000000000000000000000002a212d000000000000000000000000000000000000000000"),
+        ("OPENDIR", "300000001b0000000c00000000000000010000000000000000000000000000002a212d00000000000088010000000000"),
+        ("GETATTR", "38000000030000000e00000000000000010000000000000000000000000000002a212d000000000000000000000000000000000000000000"),
+        ("READDIR", "500000001c0000001000000000000000010000000000000000000000000000002a212d000000000000000000000000000000000000000000008000000000000000000000000000000088010000000000"),
+        ("READDIR", "500000001c0000001200000000000000010000000000000000000000000000002a212d000000000000000000000000000100000000000000008000000000000000000000000000000088010000000000"),
+        ("LOOKUP", "2d000000010000001400000000000000010000000000000000000000000000002c212d000000000066696c6500"),
+        ("OPEN", "300000000e0000001600000000000000020000000000000000000000000000002c212d00000000000080000000000000"),
+        ("GETATTR", "38000000030000001800000000000000020000000000000000000000000000002c212d000000000000000000000000000000000000000000"),
+        ("GETATTR", "38000000030000001a00000000000000020000000000000000000000000000002c212d000000000001000000000000001100000000000000"),
+        ("READ", "500000000f0000001c00000000000000020000000000000000000000000000002c212d000000000011000000000000000000000000000000001000000000000000000000000000000080000000000000"),
+        ("GETATTR", "38000000030000001e00000000000000020000000000000000000000000000002c212d000000000001000000000000001100000000000000"),
+        ("FLUSH", "40000000190000002000000000000000020000000000000000000000000000002c212d000000000011000000000000000000000000000000775d2e0b408f2a87"),
+        ("RELEASE", "40000000120000002200000000000000020000000000000000000000000000000000000000000000110000000000000000800000000000000000000000000000"),
+        ("LOOKUP", "30000000010000002400000000000000010000000000000000000000000000002e212d00000000006d697373696e6700"),
+        ("LOOKUP", "2d0000000100000026000000000000000100000000000000000000000000000031212d0000000000736c6f7700"),
+        ("OPEN", "300000000e00000028000000000000000300000000000000000000000000000031212d000000000000c0000000000000"),
+        ("GETATTR", "38000000030000002a000000000000000300000000000000000000000000000031212d000000000001000000000000001100000000000000"),
+        ("READ", "500000000f0000002c000000000000000300000000000000000000000000000031212d00000000001100000000000000000000000000000000100000020000000b59fdcb37768c1200c0000000000000"),
+        ("RELEASE", "40000000120000002e00000000000000030000000000000000000000000000000000000000000000110000000000000000c00000000000000000000000000000"),
+        ("LOOKUP", "2d0000000100000030000000000000000100000000000000000000000000000045212d0000000000676f6e6500"),
+        ("GETATTR", "380000000300000032000000000000000400000000000000000000000000000045212d000000000000000000000000000000000000000000"),
+        ("LOOKUP", "2d0000000100000034000000000000000100000000000000000000000000000048212d00000000007761697400"),
+        ("INTERRUPT", "300000002400000035000000000000000000000000000000000000000000000000000000000000003400000000000000"),
+        ("LOOKUP", "2d000000010000003600000000000000010000000000000000000000000000004a212d0000000000666c697000"),
+        ("GETATTR", "38000000030000003800000000000000050000000000000000000000000000004a212d000000000000000000000000000000000000000000"),
+        ("LOOKUP", "2d000000010000003a00000000000000010000000000000000000000000000004c212d0000000000666c697000"),
+        ("LOOKUP", "2d000000010000003c00000000000000010000000000000000000000000000004c212d0000000000666c697000"),
+        ("BATCH_FORGET", "500000002a0000003e0000000000000000000000000000000000000000000000000000000000000002000000000000000600000000000000010000000000000005000000000000000100000000000000"),
+        ("GETATTR", "38000000030000004000000000000000060000000000000000000000000000004c212d000000000000000000000000000000000000000000"),
+        ("STATFS", "28000000110000004200000000000000010000000000000000000000000000004f212d0000000000"),
+    ];
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        fn bytes(&mut self, n: usize) -> Vec<u8> {
+            (0..n).map(|_| self.below(256) as u8).collect()
+        }
+    }
+
+    fn attr(ino: u64) -> fuse_attr {
+        let mode = if ino == 1 { libc::S_IFDIR | 0o755 } else { libc::S_IFREG | 0o644 };
+        let nlink = if ino == 4 || ino == 5 { 0 } else { 1 };
+        fuse_attr { ino, size: if ino == 1 { 0 } else { 4 }, mode, nlink, blksize: 4096, ..fuse_attr::default() }
+    }
 
     #[derive(Default)]
     struct Memory {
-        forgotten: AtomicU64,
-        released: AtomicU64,
+        flips: AtomicU64,
+        next_fh: AtomicU64,
+        forgotten: Mutex<Vec<(u64, u64)>>,
+        released: Mutex<Vec<u64>>,
+        backing: Mutex<BTreeMap<u64, i32>>,
+    }
+
+    impl Memory {
+        fn node_of(&self, parent: u64, name: &[u8]) -> Res<u64> {
+            match (parent, name) {
+                (1, b"file") => Ok(2),
+                (1, b"slow") => Ok(3),
+                (1, b"gone") => Ok(4),
+                (1, b"flip") => Ok(5 + self.flips.fetch_add(1, Ordering::SeqCst).min(1)),
+                (1, b"through") => Ok(7),
+                (1, b"refused") => Ok(9),
+                _ => Err(Errno::ENOENT),
+            }
+        }
+
+        fn passthrough(&self, ctx: &Ctx) -> Opened {
+            let fh = 70 + self.next_fh.fetch_add(1, Ordering::SeqCst);
+            ctx.effects.register(BACKING_FD, fh);
+            Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: 0 }
+        }
+    }
+
+    fn entry(nodeid: u64) -> Entry {
+        Entry { nodeid, generation: 0, attr: attr(nodeid), entry_ttl: Duration::ZERO, attr_ttl: Duration::ZERO }
     }
 
     impl Filesystem for Memory {
         fn lookup(&self, _: &Ctx, parent: u64, name: &[u8]) -> Res<Entry> {
-            if parent != 1 || name != b"file" {
-                return Err(Errno(libc::ENOENT));
-            }
-            Ok(Entry { nodeid: 2, ..Entry::negative(Duration::ZERO) })
+            self.node_of(parent, name).map(entry)
+        }
+
+        fn forget(&self, nodeid: u64, nlookup: u64) {
+            self.forgotten.lock().unwrap().push((nodeid, nlookup));
         }
 
         fn getattr(&self, _: &Ctx, node: u64, _: Option<u64>) -> Res<(fuse_attr, Duration)> {
-            Ok((fuse_attr { ino: node, size: 4, ..fuse_attr::default() }, Duration::ZERO))
+            Ok((attr(node), Duration::ZERO))
         }
 
-        fn open(&self, _: &Ctx, _: u64, _: u32) -> Res<Opened> {
-            Ok(Opened { fh: 17, flags: 0, backing_id: 0 })
+        fn unlink(&self, ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
+            ctx.effects.inval_entry(parent, name);
+            Ok(())
+        }
+
+        fn open(&self, ctx: &Ctx, node: u64, _: u32) -> Res<Opened> {
+            match node {
+                7 => Ok(self.passthrough(ctx)),
+                9 => {
+                    ctx.effects.register(BACKING_FD, 0);
+                    Err(Errno::EACCES)
+                }
+                _ => Ok(Opened { fh: 17, flags: 0, backing_id: 0 }),
+            }
+        }
+
+        fn create(&self, ctx: &Ctx, _: u64, _: &[u8], _: u32, _: u32) -> Res<(Entry, Opened)> {
+            Ok((entry(8), self.passthrough(ctx)))
+        }
+
+        fn registered(&self, _: &Ctx, token: u64, id: Res<i32>) -> Res<Opened> {
+            Ok(match id {
+                Ok(id) => {
+                    self.backing.lock().unwrap().insert(token, id);
+                    Opened { fh: token, flags: FOPEN_PASSTHROUGH, backing_id: id }
+                }
+                Err(_) => Opened { fh: token, flags: FOPEN_KEEP_CACHE, backing_id: 0 },
+            })
         }
 
         fn read(&self, _: &Ctx, _: u64, _: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
             let start = offset.min(4) as usize;
-            let end = (start + size as usize).min(4);
-            out.extend_from_slice(&b"abcd"[start..end]);
+            out.extend_from_slice(&b"abcd"[start..(start + size as usize).min(4)]);
             Ok(())
         }
 
-        fn readdir(&self, _: &Ctx, _: u64, _: u64, _: u64, sink: &mut DirSink<'_>) -> Res<()> {
-            sink.push(2, 1, libc::DT_REG as u32, b"file");
+        fn readdir(&self, _: &Ctx, _: u64, _: u64, offset: u64, sink: &mut DirSink<'_>) -> Res<()> {
+            if offset == 0 {
+                sink.push(2, 1, libc::DT_REG as u32, b"file");
+            }
             Ok(())
         }
 
-        fn release(&self, _: u64, fh: u64, _: u32) {
-            self.released.store(fh, Ordering::Relaxed);
-        }
-
-        fn forget(&self, _: u64, count: u64) {
-            self.forgotten.store(count, Ordering::Relaxed);
+        fn release_in(&self, ctx: &Ctx, _: u64, fh: u64, _: u32) {
+            self.released.lock().unwrap().push(fh);
+            if let Some(id) = self.backing.lock().unwrap().remove(&fh) {
+                ctx.effects.unregister(id);
+            }
         }
     }
 
-    fn request(opcode: u32, nodeid: u64, body: &[u8]) -> Vec<u8> {
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn frame(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
         let header = fuse_in_header {
-            len: (std::mem::size_of::<fuse_in_header>() + body.len()) as u32, opcode,
-            unique: 51, nodeid, uid: 1000, gid: 1000, pid: 100, total_extlen: 0, padding: 0,
+            len: (HEADER + body.len()) as u32,
+            opcode,
+            unique,
+            nodeid,
+            uid: 1000,
+            gid: 1000,
+            pid: 100,
+            total_extlen: 0,
+            padding: 0,
         };
         [as_bytes(&header), body].concat()
     }
 
-    #[test]
-    fn memory_filesystem_replies_to_kernel_request_shapes() {
-        let fs = Memory::default();
-        let mut handler = RequestHandler::new(1024);
-        let mut run = |opcode, node, body: &[u8]| {
-            let frame = request(opcode, node, body);
-            let reply = handler.handle(&fs, &frame).bytes.to_vec();
-            assert!(handler.invariants());
-            reply
+    fn answer(unique: u64, error: i32, parts: &[&[u8]]) -> Vec<u8> {
+        let len = OUT + parts.iter().map(|p| p.len()).sum::<usize>();
+        let mut v = as_bytes(&fuse_out_header { len: len as u32, error, unique }).to_vec();
+        for p in parts {
+            v.extend_from_slice(p);
+        }
+        v
+    }
+
+    fn entry_reply(unique: u64, nodeid: u64) -> Vec<u8> {
+        let e = fuse_entry_out {
+            nodeid,
+            generation: 0,
+            entry_valid: 0,
+            attr_valid: 0,
+            entry_valid_nsec: 0,
+            attr_valid_nsec: 0,
+            attr: attr(nodeid),
         };
-        let payload = |reply: Vec<u8>| reply[std::mem::size_of::<fuse_out_header>()..].to_vec();
-        let lookup = run(FUSE_LOOKUP, 1, b"file\0");
-        assert_eq!(read_struct::<fuse_entry_out>(&payload(lookup)).unwrap().nodeid, 2);
-        let getattr = fuse_getattr_in { getattr_flags: 0, dummy: 0, fh: 0 };
-        assert_eq!(read_struct::<fuse_attr_out>(&payload(run(FUSE_GETATTR, 2, as_bytes(&getattr)))).unwrap().attr.size, 4);
-        let open = fuse_open_in { flags: 0, open_flags: 0 };
-        assert_eq!(read_struct::<fuse_open_out>(&payload(run(FUSE_OPEN, 2, as_bytes(&open)))).unwrap().fh, 17);
-        let read = fuse_read_in { fh: 17, offset: 1, size: 2, read_flags: 0, lock_owner: 0, flags: 0, padding: 0 };
-        assert_eq!(payload(run(FUSE_READ, 2, as_bytes(&read))), b"bc");
-        let listing = fuse_read_in { offset: 0, size: 256, ..read };
-        assert_eq!(read_struct::<fuse_dirent>(&payload(run(FUSE_READDIR, 1, as_bytes(&listing)))).unwrap().namelen, 4);
-        let release = fuse_release_in { fh: 17, flags: 0, release_flags: 0, lock_owner: 0 };
-        assert_eq!(read_struct::<fuse_out_header>(&run(FUSE_RELEASE, 2, as_bytes(&release))).unwrap().error, 0);
-        assert_eq!(fs.released.load(Ordering::Relaxed), 17);
-        assert!(run(FUSE_FORGET, 2, as_bytes(&fuse_forget_in { nlookup: 3 })).is_empty());
-        assert_eq!(fs.forgotten.load(Ordering::Relaxed), 3);
-        assert!(run(FUSE_INTERRUPT, 0, &1u64.to_ne_bytes()).is_empty());
+        answer(unique, 0, &[as_bytes(&e)])
+    }
+
+    fn opened_reply(unique: u64, fh: u64, flags: u32, backing_id: i32) -> Vec<u8> {
+        answer(unique, 0, &[as_bytes(&fuse_open_out { fh, open_flags: flags, backing_id })])
+    }
+
+    fn dirents(unique: u64, offset: u64, size: u32) -> Vec<u8> {
+        if offset != 0 || size < 32 {
+            return answer(unique, 0, &[]);
+        }
+        let d = fuse_dirent { ino: 2, off: 1, namelen: 4, typ: libc::DT_REG as u32 };
+        answer(unique, 0, &[as_bytes(&d), b"file", &[0; 4]])
+    }
+
+    fn data(unique: u64, offset: u64, size: u32, max_write: u32) -> Vec<u8> {
+        let start = offset.min(4) as usize;
+        answer(unique, 0, &[&b"abcd"[start..(start + size.min(max_write) as usize).min(4)]])
+    }
+
+    struct Model {
+        flips: u64,
+        forgotten: Vec<(u64, u64)>,
+        released: Vec<u64>,
+    }
+
+    impl Model {
+        fn lookup(&mut self, unique: u64, parent: u64, name: &[u8]) -> Vec<u8> {
+            let node = match (parent, name) {
+                (1, b"file") => 2,
+                (1, b"slow") => 3,
+                (1, b"gone") => 4,
+                (1, b"flip") => {
+                    self.flips += 1;
+                    if self.flips == 1 { 5 } else { 6 }
+                }
+                (1, b"through") => 7,
+                (1, b"refused") => 9,
+                _ => return answer(unique, -libc::ENOENT, &[]),
+            };
+            entry_reply(unique, node)
+        }
+    }
+
+    fn checked<'a>(h: &'a mut RequestHandler, fs: &Memory, request: &[u8]) -> (Vec<u8>, Vec<Effect>) {
+        let handled = h.handle(fs, request);
+        let out = (handled.bytes.to_vec(), handled.effects);
+        h.invariants();
+        out
+    }
+
+    fn after_registration(h: &mut RequestHandler, fs: &Memory, token: u64, id: Res<i32>) -> (Vec<u8>, Vec<Effect>) {
+        let handled = h.registered(fs, token, id);
+        let out = (handled.bytes.to_vec(), handled.effects);
+        h.invariants();
+        assert!(!h.awaiting());
+        out
     }
 
     #[test]
-    fn notification_bytes_share_the_reply_format() {
-        let DeviceEffect::Write(bytes) = DeviceEffect::invalidate(17, b"file") else { unreachable!() };
-        let header = read_struct::<fuse_out_header>(&bytes).unwrap();
-        assert_eq!(header.len as usize, bytes.len());
-        assert_eq!(header.unique, 0);
-        assert_eq!(header.error, FUSE_NOTIFY_INVAL_ENTRY);
-        let entry = read_struct::<fuse_notify_inval_entry_out>(&bytes[std::mem::size_of::<fuse_out_header>()..]).unwrap();
-        assert_eq!((entry.parent, entry.namelen), (17, 4));
-        assert!(bytes.ends_with(b"file\0"));
-    }
-
-    #[test]
-    fn incomplete_requests_are_rejected_without_losing_the_next_reply() {
+    fn recorded_kernel_requests_get_the_expected_replies() {
         let fs = Memory::default();
-        let mut handler = RequestHandler::new(1024);
-        let lookup = request(FUSE_LOOKUP, 1, b"file\0");
-        for len in 0..lookup.len() {
-            handler.handle(&fs, &lookup[..len]);
-            assert!(handler.invariants());
+        let mut h = RequestHandler::new(MAX_WRITE);
+        h.invariants();
+        let mut model = Model { flips: 0, forgotten: Vec::new(), released: Vec::new() };
+        let mut seen = std::collections::BTreeSet::new();
+        for (name, hex) in RECORDED {
+            let request = unhex(hex);
+            let hdr = read_struct::<fuse_in_header>(&request).unwrap();
+            let body = &request[HEADER..];
+            let (u, node) = (hdr.unique, hdr.nodeid);
+            let (bytes, effects) = checked(&mut h, &fs, &request);
+            assert!(effects.is_empty(), "{name}: the recorded requests ask for no device effects");
+            let want = match *name {
+                "LOOKUP" => model.lookup(u, node, abi::name_arg(body).unwrap().0),
+                "GETATTR" => {
+                    let a = fuse_attr_out { attr_valid: 0, attr_valid_nsec: 0, dummy: 0, attr: attr(node) };
+                    answer(u, 0, &[as_bytes(&a)])
+                }
+                "OPEN" => opened_reply(u, 17, 0, 0),
+                "READ" => {
+                    let r = read_struct::<fuse_read_in>(body).unwrap();
+                    data(u, r.offset, r.size, MAX_WRITE)
+                }
+                "READDIR" => {
+                    let r = read_struct::<fuse_read_in>(body).unwrap();
+                    dirents(u, r.offset, r.size)
+                }
+                "RELEASE" => {
+                    model.released.push(read_struct::<fuse_release_in>(body).unwrap().fh);
+                    answer(u, 0, &[])
+                }
+                "BATCH_FORGET" => {
+                    model.forgotten.extend([(6, 1), (5, 1)]);
+                    Vec::new()
+                }
+                "INTERRUPT" => Vec::new(),
+                "STATFS" => {
+                    let ctx = Ctx { uid: 0, gid: 0, pid: 0, effects: &Effects::default() };
+                    answer(u, 0, &[as_bytes(&fuse_statfs_out { st: fs.statfs(&ctx, 1).unwrap() })])
+                }
+                "INIT" | "STATX" | "OPENDIR" | "FLUSH" => answer(u, -libc::ENOSYS, &[]),
+                other => panic!("no expectation for the recorded {other}"),
+            };
+            assert_eq!(bytes, want, "{name} (unique {u})");
+            seen.insert(*name);
         }
-        for body in [&[][..], &b"file"[..]] {
-            let reply = handler.handle(&fs, &request(FUSE_LOOKUP, 1, body));
-            assert_eq!(read_struct::<fuse_out_header>(reply.bytes).unwrap().error, -libc::EINVAL);
-            assert!(handler.invariants());
+        for listed in ["LOOKUP", "GETATTR", "OPEN", "READ", "READDIR", "RELEASE", "BATCH_FORGET", "INTERRUPT"] {
+            assert!(seen.contains(listed), "the recording has a {listed}");
         }
-        assert_eq!(read_struct::<fuse_out_header>(handler.handle(&fs, &lookup).bytes).unwrap().error, 0);
-        assert!(handler.invariants());
+        assert_eq!(*fs.forgotten.lock().unwrap(), model.forgotten);
+        assert_eq!(*fs.released.lock().unwrap(), model.released);
+    }
+
+    #[test]
+    fn forgets_and_interrupts_get_no_reply_and_an_interrupted_request_still_answers() {
+        let fs = Memory::default();
+        let mut h = RequestHandler::new(MAX_WRITE);
+        h.invariants();
+        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_FORGET, 5, 2, as_bytes(&fuse_forget_in { nlookup: 3 })));
+        assert!(bytes.is_empty());
+        let mut batch = as_bytes(&fuse_batch_forget_in { count: 3, dummy: 0 }).to_vec();
+        batch.extend_from_slice(as_bytes(&fuse_forget_one { nodeid: 6, nlookup: 1 }));
+        batch.extend_from_slice(as_bytes(&fuse_forget_one { nodeid: 5, nlookup: 2 }));
+        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_BATCH_FORGET, 6, 0, &batch));
+        assert!(bytes.is_empty(), "a batch that claims more entries than it carries forgets those it carries");
+        assert_eq!(*fs.forgotten.lock().unwrap(), [(2, 3), (6, 1), (5, 2)]);
+
+        let mut waiting = RequestHandler::new(MAX_WRITE);
+        let open = frame(FUSE_OPEN, 52, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
+        let (bytes, effects) = checked(&mut waiting, &fs, &open);
+        assert!(bytes.is_empty() && waiting.awaiting(), "the open waits for its registration");
+        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 70 }]);
+        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_INTERRUPT, 53, 0, &52u64.to_ne_bytes()));
+        assert!(bytes.is_empty() && effects.is_empty(), "an interrupt of a request in flight on another worker");
+        let (bytes, _) = after_registration(&mut waiting, &fs, 70, Ok(4));
+        assert_eq!(bytes, opened_reply(52, 70, FOPEN_PASSTHROUGH, 4), "the interrupted request is still answered");
+        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_INTERRUPT, 54, 0, &999u64.to_ne_bytes()));
+        assert!(bytes.is_empty(), "an interrupt of an unknown request");
+        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_LOOKUP, 55, 1, b"file\0"));
+        assert_eq!(bytes, entry_reply(55, 2), "and the next request is answered");
+    }
+
+    #[test]
+    fn registrations_and_notifications_are_effects_in_the_result() {
+        let fs = Memory::default();
+        let mut h = RequestHandler::new(MAX_WRITE);
+        h.invariants();
+        let open = |u| frame(FUSE_OPEN, u, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
+        let (bytes, effects) = checked(&mut h, &fs, &open(10));
+        assert!(bytes.is_empty() && h.awaiting());
+        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 70 }]);
+        let (bytes, effects) = after_registration(&mut h, &fs, 70, Ok(5));
+        assert_eq!((bytes, effects), (opened_reply(10, 70, FOPEN_PASSTHROUGH, 5), Vec::new()));
+        let release = fuse_release_in { fh: 70, flags: 0, release_flags: 0, lock_owner: 0 };
+        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_RELEASE, 11, 7, as_bytes(&release)));
+        assert_eq!((bytes, effects), (answer(11, 0, &[]), vec![Effect::Unregister(5)]));
+
+        let (_, effects) = checked(&mut h, &fs, &open(12));
+        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 71 }]);
+        let (bytes, _) = after_registration(&mut h, &fs, 71, Err(Errno::EPERM));
+        assert_eq!(bytes, opened_reply(12, 71, FOPEN_KEEP_CACHE, 0), "a refused registration falls back to the cache");
+
+        let mut create = as_bytes(&fuse_create_in { flags: 0, mode: 0o644, umask: 0, open_flags: 0 }).to_vec();
+        create.extend_from_slice(b"made\0");
+        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_CREATE, 13, 1, &create));
+        assert!(bytes.is_empty() && effects == [Effect::Register { fd: BACKING_FD, token: 72 }]);
+        let (bytes, _) = after_registration(&mut h, &fs, 72, Ok(6));
+        let e = &entry_reply(13, 8)[OUT..];
+        let o = fuse_open_out { fh: 72, open_flags: FOPEN_PASSTHROUGH, backing_id: 6 };
+        assert_eq!(bytes, answer(13, 0, &[e, as_bytes(&o)]), "a create answers with its entry and the open");
+
+        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_OPEN, 14, 9, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 })));
+        assert_eq!(bytes, answer(14, -libc::EACCES, &[]));
+        assert!(effects.is_empty() && !h.awaiting(), "a failed open's registration is dropped");
+
+        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_UNLINK, 15, 1, b"file\0"));
+        assert_eq!(bytes, answer(15, 0, &[]));
+        let [Effect::Notify(note)] = effects.as_slice() else { panic!("one notification: {effects:?}") };
+        let header = read_struct::<fuse_out_header>(note).unwrap();
+        assert_eq!((header.len as usize, header.unique, header.error), (note.len(), 0, FUSE_NOTIFY_INVAL_ENTRY));
+        let inval = read_struct::<fuse_notify_inval_entry_out>(&note[OUT..]).unwrap();
+        assert_eq!((inval.parent, inval.namelen), (1, 4));
+        assert!(note.ends_with(b"file\0"));
+    }
+
+    #[test]
+    fn generated_requests_get_the_replies_of_a_model() {
+        let names: [&[u8]; 6] = [b"file", b"slow", b"gone", b"missing", b"through", b"x"];
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let fs = Memory::default();
+            let max_write = [2u32, 1024, MAX_WRITE][rng.below(3) as usize];
+            let mut h = RequestHandler::new(max_write);
+            h.invariants();
+            let mut model = Model { flips: 0, forgotten: Vec::new(), released: Vec::new() };
+            let mut held: BTreeMap<u64, i32> = BTreeMap::new();
+            let mut next_fh = 70u64;
+            let mut next_id = 1i32;
+            for step in 0..80u64 {
+                let u = 1000 + step * 2;
+                let node = 1 + rng.below(8);
+                match rng.below(9) {
+                    0 => {
+                        let name = names[rng.below(names.len() as u64) as usize];
+                        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_LOOKUP, u, 1, &[name, b"\0"].concat()));
+                        assert_eq!(bytes, model.lookup(u, 1, name), "seed {seed} step {step}");
+                    }
+                    1 => {
+                        let g = fuse_getattr_in { getattr_flags: 0, dummy: 0, fh: 0 };
+                        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_GETATTR, u, node, as_bytes(&g)));
+                        let a = fuse_attr_out { attr_valid: 0, attr_valid_nsec: 0, dummy: 0, attr: attr(node) };
+                        assert_eq!(bytes, answer(u, 0, &[as_bytes(&a)]), "seed {seed} step {step}");
+                    }
+                    2 => {
+                        let target = if rng.below(2) == 0 { 7 } else { 2 };
+                        let o = fuse_open_in { flags: 0, open_flags: 0 };
+                        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_OPEN, u, target, as_bytes(&o)));
+                        if target == 2 {
+                            assert_eq!(bytes, opened_reply(u, 17, 0, 0), "seed {seed} step {step}");
+                            continue;
+                        }
+                        let fh = next_fh;
+                        next_fh += 1;
+                        assert!(bytes.is_empty(), "seed {seed} step {step}: no reply before the registration");
+                        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: fh }]);
+                        if rng.below(4) == 0 {
+                            let (bytes, _) = after_registration(&mut h, &fs, fh, Err(Errno::EPERM));
+                            assert_eq!(bytes, opened_reply(u, fh, FOPEN_KEEP_CACHE, 0), "seed {seed} step {step}");
+                        } else {
+                            let id = next_id;
+                            next_id += 1;
+                            held.insert(fh, id);
+                            let (bytes, _) = after_registration(&mut h, &fs, fh, Ok(id));
+                            assert_eq!(bytes, opened_reply(u, fh, FOPEN_PASSTHROUGH, id), "seed {seed} step {step}");
+                        }
+                    }
+                    3 => {
+                        let r = fuse_read_in {
+                            fh: 17,
+                            offset: rng.below(6),
+                            size: rng.below(2 * max_write as u64) as u32,
+                            read_flags: 0,
+                            lock_owner: 0,
+                            flags: 0,
+                            padding: 0,
+                        };
+                        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_READ, u, 2, as_bytes(&r)));
+                        assert_eq!(bytes, data(u, r.offset, r.size, max_write), "seed {seed} step {step}");
+                    }
+                    4 => {
+                        let r = fuse_read_in {
+                            fh: 0,
+                            offset: rng.below(3),
+                            size: rng.below(64) as u32,
+                            read_flags: 0,
+                            lock_owner: 0,
+                            flags: 0,
+                            padding: 0,
+                        };
+                        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_READDIR, u, 1, as_bytes(&r)));
+                        assert_eq!(bytes, dirents(u, r.offset, r.size), "seed {seed} step {step}");
+                    }
+                    5 => {
+                        let fh = match held.keys().nth(rng.below(held.len() as u64 + 1) as usize) {
+                            Some(fh) => *fh,
+                            None => 17,
+                        };
+                        let r = fuse_release_in { fh, flags: 0, release_flags: 0, lock_owner: 0 };
+                        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_RELEASE, u, 2, as_bytes(&r)));
+                        assert_eq!(bytes, answer(u, 0, &[]), "seed {seed} step {step}");
+                        model.released.push(fh);
+                        let want: Vec<Effect> = held.remove(&fh).map(Effect::Unregister).into_iter().collect();
+                        assert_eq!(effects, want, "seed {seed} step {step}: a passthrough file's release unregisters it");
+                    }
+                    6 => {
+                        let n = rng.below(5);
+                        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_FORGET, u, node, as_bytes(&fuse_forget_in { nlookup: n })));
+                        assert!(bytes.is_empty(), "seed {seed} step {step}");
+                        model.forgotten.push((node, n));
+                    }
+                    7 => {
+                        let count = rng.below(4);
+                        let mut b = as_bytes(&fuse_batch_forget_in { count: count as u32, dummy: 0 }).to_vec();
+                        for _ in 0..count {
+                            let one = fuse_forget_one { nodeid: 1 + rng.below(8), nlookup: rng.below(3) };
+                            b.extend_from_slice(as_bytes(&one));
+                            model.forgotten.push((one.nodeid, one.nlookup));
+                        }
+                        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_BATCH_FORGET, u, 0, &b));
+                        assert!(bytes.is_empty(), "seed {seed} step {step}");
+                    }
+                    _ => {
+                        let target = u - 2 * rng.below(4);
+                        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_INTERRUPT, u, 0, &target.to_ne_bytes()));
+                        assert!(bytes.is_empty() && effects.is_empty(), "seed {seed} step {step}");
+                    }
+                }
+                assert!(!h.awaiting(), "seed {seed} step {step}");
+            }
+            assert_eq!(*fs.forgotten.lock().unwrap(), model.forgotten, "seed {seed}");
+            assert_eq!(*fs.released.lock().unwrap(), model.released, "seed {seed}");
+            assert_eq!(*fs.backing.lock().unwrap(), held, "seed {seed}: what is registered is what was not released");
+        }
+    }
+
+    #[test]
+    fn malformed_requests_never_panic_and_are_refused() {
+        let recorded: Vec<Vec<u8>> = RECORDED.iter().map(|(_, hex)| unhex(hex)).collect();
+        for seed in 1..=300u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+            let fs = Memory::default();
+            let mut h = RequestHandler::new([2u32, 1024, MAX_WRITE][rng.below(3) as usize]);
+            h.invariants();
+            for step in 0..100 {
+                let opcode = match rng.below(10) {
+                    0 => rng.below(u32::MAX as u64) as u32,
+                    _ => rng.below(64) as u32,
+                };
+                let unique = if rng.below(10) == 0 { 0 } else { 1 + rng.below(1 << 20) };
+                let mut request = match rng.below(4) {
+                    0 => {
+                        let r = &recorded[rng.below(recorded.len() as u64) as usize];
+                        r[..rng.below(r.len() as u64 + 1) as usize].to_vec()
+                    }
+                    1 => {
+                        let n = rng.below(96) as usize;
+                        let mut f = frame(opcode, unique, rng.below(10), &rng.bytes(n));
+                        let len = rng.below(f.len() as u64 + 64) as u32;
+                        f[..4].copy_from_slice(&len.to_ne_bytes());
+                        f
+                    }
+                    2 => {
+                        let wanted = match opcode % 6 {
+                            0 => as_bytes(&fuse_batch_forget_in { count: u32::MAX, dummy: 0 }).to_vec(),
+                            1 => as_bytes(&fuse_write_in {
+                                fh: 0,
+                                offset: 0,
+                                size: u32::MAX,
+                                write_flags: 0,
+                                lock_owner: 0,
+                                flags: 0,
+                                padding: 0,
+                            })
+                            .to_vec(),
+                            2 => as_bytes(&fuse_rename_in { newdir: 1 }).to_vec(),
+                            _ => {
+                                let n = rng.below(40) as usize;
+                                rng.bytes(n)
+                            }
+                        };
+                        let op = [FUSE_BATCH_FORGET, FUSE_WRITE, FUSE_RENAME, FUSE_SETATTR, FUSE_RENAME2, FUSE_MKNOD]
+                            [(opcode % 6) as usize];
+                        frame(op, unique, rng.below(10), &wanted)
+                    }
+                    _ => {
+                        let n = rng.below(96) as usize;
+                        let node = rng.below(10);
+                        frame(opcode, unique, node, &rng.bytes(n))
+                    }
+                };
+                if rng.below(8) == 0 && request.len() > HEADER {
+                    request.truncate(HEADER + rng.below((request.len() - HEADER) as u64) as usize);
+                }
+                let hdr = read_struct::<fuse_in_header>(&request);
+                let (bytes, effects) = checked(&mut h, &fs, &request);
+                if let Some(hdr) = hdr.filter(|_| !bytes.is_empty()) {
+                    let out = read_struct::<fuse_out_header>(&bytes).unwrap();
+                    assert_eq!(out.unique, hdr.unique, "seed {seed} step {step}: a reply answers its own request");
+                    if hdr.len as usize != request.len() {
+                        assert_eq!(out.error, -libc::EINVAL, "seed {seed} step {step}: a frame of the wrong length");
+                    }
+                }
+                if hdr.is_none_or(|hdr| hdr.unique == 0) {
+                    assert!(bytes.is_empty() && effects.is_empty(), "seed {seed} step {step}: nothing to answer");
+                }
+                if h.awaiting() {
+                    let [Effect::Register { token, .. }] = effects.as_slice() else { panic!("seed {seed}: {effects:?}") };
+                    after_registration(&mut h, &fs, *token, Ok(1 + step));
+                }
+            }
+        }
     }
 }
