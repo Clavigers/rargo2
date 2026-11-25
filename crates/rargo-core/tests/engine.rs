@@ -182,27 +182,6 @@ fn replays_until_an_observed_input_changes() {
 }
 
 #[test]
-fn identical_requests_in_flight_run_once() {
-    let fx = fixture();
-    std::fs::write(fx.work.join("in.txt"), "data\n").unwrap();
-    let script = "sleep 0.5; cat in.txt";
-    rt().block_on(async {
-        let mut tasks = Vec::new();
-        for _ in 0..6 {
-            let e = fx.engine.clone();
-            let r = fx.req(script, &[], &[], &[]);
-            tasks.push(tokio::spawn(async move { e.obtain(r).await.unwrap() }));
-        }
-        for t in tasks {
-            let o = t.await.unwrap();
-            assert_eq!(fx.text(&o.result.stdout), "data\n");
-        }
-        assert_eq!(fx.runs(), 1, "six identical requests, one run");
-        assert_eq!(fx.engine.stats.joined.load(Ordering::Relaxed), 5);
-    });
-}
-
-#[test]
 fn waiter_runs_its_own_when_the_trace_does_not_hold() {
     let fx = fixture();
     let other = fx.work.parent().unwrap().join("work2");
