@@ -49,9 +49,11 @@ fn nix() -> Command {
 
 fn defines_flake(rel: &[u8], extra: &[String]) -> bool {
     let top = !rel.contains(&b'/');
-    let nix = rel.ends_with(b".nix");
-    (top && (nix || rel == b"flake.lock" || rel == b"rust-toolchain" || rel == b"rust-toolchain.toml"))
-        || (rel.starts_with(b"nix/") && nix)
+    let name = rel.rsplit(|b| *b == b'/').next().unwrap_or(rel);
+    (top && (rel.ends_with(b".nix") || rel == b"rust-toolchain" || rel == b"rust-toolchain.toml"))
+        || name == b"flake.nix"
+        || name == b"flake.lock"
+        || rel.starts_with(b"nix/")
         || extra.iter().any(|e| under(rel, e.as_bytes()))
 }
 
@@ -67,21 +69,28 @@ fn may_hold(rel: &[u8], extra: &[String]) -> bool {
 const DEFAULT_FLAKE: &[u8] = include_bytes!("../../../nix/default/flake.nix");
 const DEFAULT_LOCK: &[u8] = include_bytes!("../../../nix/default/flake.lock");
 
-fn workspace_entry(root: &[u8], rel: &[u8], node: &Node, extra: &[String]) -> bool {
-    if let Node::Dir(_) = node {
-        if !root.is_empty() && under(root, rel) {
-            return true;
-        }
-    }
-    let inside = if root.is_empty() {
+fn inside<'a>(root: &[u8], rel: &'a [u8]) -> Option<&'a [u8]> {
+    if root.is_empty() {
         Some(rel)
     } else {
         rel.strip_prefix(root).and_then(|suffix| suffix.strip_prefix(b"/"))
-    };
-    inside.is_some_and(|p| match node {
-        Node::Dir(_) => may_hold(p, extra),
-        _ => defines_flake(p, extra),
-    })
+    }
+}
+
+fn above(root: &[u8], rel: &[u8], node: &Node) -> bool {
+    matches!(node, Node::Dir(_)) && !root.is_empty() && under(root, rel)
+}
+
+fn workspace_entry(root: &[u8], rel: &[u8], node: &Node, extra: &[String]) -> bool {
+    above(root, rel, node)
+        || inside(root, rel).is_some_and(|p| match node {
+            Node::Dir(_) => may_hold(p, extra),
+            _ => defines_flake(p, extra),
+        })
+}
+
+fn evaluated_entry(root: &[u8], rel: &[u8], node: &Node) -> bool {
+    above(root, rel, node) || inside(root, rel).is_some_and(|p| !under(p, b"target") && !under(p, b".git"))
 }
 
 fn store_names(text: &str, out: &mut BTreeSet<String>) {
@@ -192,8 +201,11 @@ pub fn source(tree: &dyn Worktree, dir: &Path, extra: &[String]) -> Source {
         let root = root.as_os_str().as_bytes();
         h.field(b"workspace");
         tree.walk(&mut |rel, node| {
-            if !workspace_entry(root, rel, node, extra) {
+            if !evaluated_entry(root, rel, node) {
                 return false;
+            }
+            if !workspace_entry(root, rel, node, extra) {
+                return matches!(node, Node::Dir(_));
             }
             match node {
                 Node::File { hash, .. } => {
@@ -410,7 +422,7 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
                 let out = (|| -> Result<Vec<u8>> {
                     let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
                         Some(root) => {
-                            snap.materialize(&at, uid, gid, &|rel, node| workspace_entry(root.as_os_str().as_bytes(), rel, node, extra))?;
+                            snap.materialize(&at, uid, gid, &|rel, node| evaluated_entry(root.as_os_str().as_bytes(), rel, node))?;
                             at.join(root)
                         }
                         None => {
@@ -510,10 +522,10 @@ mod tests {
     #[test]
     fn files_that_define_a_flake() {
         let none: Vec<String> = Vec::new();
-        for f in ["flake.nix", "flake.lock", "shell.nix", "rust-toolchain.toml", "nix/a/b.nix"] {
+        for f in ["flake.nix", "flake.lock", "shell.nix", "rust-toolchain.toml", "nix/a/b.nix", "nix/dev/flake.lock", "nix/patch.diff", "tools/sub/flake.nix", "tools/sub/flake.lock"] {
             assert!(defines_flake(f.as_bytes(), &none), "{f}");
         }
-        for f in ["Cargo.lock", "src/flake.nix", "nix/patch.diff", "script/cargo"] {
+        for f in ["Cargo.lock", "src/default.nix", "script/cargo", "src/flake.nix.bak"] {
             assert!(!defines_flake(f.as_bytes(), &none), "{f}");
         }
         let extra = vec!["Cargo.lock".to_string(), "script/cargo".to_string(), "nix/".to_string(), "crates/zed".to_string()];
@@ -804,6 +816,43 @@ mod tests {
         assert_ne!(source(&t, Path::new("ws/app"), &["scripts/tool".into()]).key, overlay.key, "an extra file keys the flake");
         t.file("flake.nix", "{ outputs = _: {}; }");
         assert_eq!(source(&t, Path::new("ws/app"), &none).root.as_deref(), Some(Path::new("ws")), "the nearest flake wins");
+    }
+
+    #[test]
+    fn a_flake_is_evaluated_against_its_whole_tree_but_keyed_by_the_files_that_define_it() {
+        let none: Vec<String> = Vec::new();
+        let mut t = MemTree::default();
+        t.file("ws/Cargo.toml", "[workspace]\n");
+        t.file("ws/flake.nix", "{ outputs = _: {}; }");
+        t.file("ws/nix/modules/partitions.nix", "{ partitions.dev.extraInputsFlake = ../dev; }");
+        t.file("ws/nix/dev/flake.nix", "{ outputs = _: {}; }");
+        t.file("ws/nix/dev/flake.lock", "{}");
+        t.file("ws/script/cargo", "#!/bin/sh");
+        t.file("ws/crates/zed/Cargo.toml", "[package]\nname = \"zed\"\n");
+        t.file("ws/target/debug/zed", "binary");
+        t.file("ws/.git", "gitdir: /elsewhere/.git/worktrees/ws");
+        let mut copied = Vec::new();
+        t.walk(&mut |rel, node| {
+            let take = evaluated_entry(b"ws", rel, node);
+            if take && !matches!(node, Node::Dir(_)) {
+                copied.push(String::from_utf8_lossy(rel).into_owned());
+            }
+            take
+        });
+        assert_eq!(
+            copied,
+            ["ws/Cargo.toml", "ws/crates/zed/Cargo.toml", "ws/flake.nix", "ws/nix/dev/flake.lock", "ws/nix/dev/flake.nix", "ws/nix/modules/partitions.nix", "ws/script/cargo"],
+            "nix sees the whole tree of the flake but its build outputs and its git"
+        );
+        let key = source(&t, Path::new("ws"), &none).key;
+        t.file("ws/nix/dev/flake.lock", "{ \"version\": 7 }");
+        let relocked = source(&t, Path::new("ws"), &none).key;
+        assert_ne!(relocked, key, "the lock of a flake under nix/ keys it");
+        t.file("ws/crates/zed/Cargo.toml", "[package]\nname = \"zed\"\nversion = \"2\"\n");
+        t.file("ws/target/debug/zed", "another binary");
+        assert_eq!(source(&t, Path::new("ws"), &none).key, relocked, "sources and outputs do not key it");
+        t.file("ws/tools/sub/flake.lock", "{}");
+        assert_ne!(source(&t, Path::new("ws"), &none).key, relocked, "a nested flake keys it");
     }
 
     #[test]
