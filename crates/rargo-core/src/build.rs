@@ -2251,11 +2251,13 @@ impl Run {
                     String::from_utf8_lossy(&text).lines().map(|l| format!("  {l}\n")).collect()
                 };
                 let pkg_descr = u.script.as_ref().map(|s| s.pkg_descr.as_str()).unwrap_or(&u.pkg);
+                let (stdout, stderr) = (indent(&r.stdout), indent(&r.stderr));
                 self.c.out.error(&format!(
-                    "failed to run custom build command for `{pkg_descr}`\n\nCaused by:\n  process didn't exit successfully: {shown} ({status})\n  --- stdout\n{}  --- stderr\n{}",
-                    indent(&r.stdout),
-                    indent(&r.stderr)
+                    "failed to run custom build command for `{pkg_descr}`\n\nCaused by:\n  process didn't exit successfully: {shown} ({status})\n  --- stdout\n{stdout}  --- stderr\n{stderr}"
                 ));
+                if let Some(hint) = network_hint(&u.pkg_name, self.policy.build_script_network(&u.pkg_name), &stderr, &stdout) {
+                    self.c.out.note(&hint);
+                }
             }
             _ => {
                 let errors = match cnt.errors {
@@ -2677,8 +2679,36 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
+fn network_hint(package: &str, allowed: bool, stderr: &str, stdout: &str) -> Option<String> {
+    const OFFLINE: [&str; 7] = [
+        "name resolution",
+        "dns error",
+        "could not resolve host",
+        "name or service not known",
+        "failed to lookup address",
+        "network is unreachable",
+        "no address associated with hostname",
+    ];
+    let said = format!("{stderr}{stdout}").to_lowercase();
+    (!allowed && OFFLINE.iter().any(|o| said.contains(o))).then(|| {
+        format!(
+            "build scripts run without network under rargo; if the build script of `{package}` needs it, name the package in the workspace's Cargo.toml:\n\n    [workspace.metadata.rargo.network]\n    build-scripts = [\"{package}\"]"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_build_script_that_failed_for_want_of_network_is_told_how_to_get_it() {
+        let dns = "  Failed to send HTTP request to download WebRTC\n      3: failed to lookup address information: Temporary failure in name resolution\n";
+        let hint = super::network_hint("webrtc-sys", false, dns, "").expect("a hint");
+        assert!(hint.contains("[workspace.metadata.rargo.network]") && hint.contains("build-scripts = [\"webrtc-sys\"]"), "{hint}");
+        assert_eq!(super::network_hint("webrtc-sys", true, dns, ""), None, "a script that has network is not told to ask for it");
+        assert_eq!(super::network_hint("cc-sys", false, "  error: linker `cc` not found\n", ""), None);
+        assert!(super::network_hint("curl-sys", false, "", "curl: (6) Could not resolve host: example.com\n").is_some());
+    }
+
     use super::*;
 
     #[test]
