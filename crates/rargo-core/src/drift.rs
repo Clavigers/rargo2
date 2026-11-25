@@ -119,40 +119,48 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     })()?;
     let stock_ran = (started, time());
 
-    let (tx, mut rx) = crate::io::unbounded_channel();
-    let mut env: HashMap<String, String> = (*who.env).clone();
-    env.insert("RARGO_VERIFY".into(), "1".into());
-    env.remove("CARGO_TARGET_DIR");
-    env.remove("CARGO_BUILD_TARGET_DIR");
-    let client = Client {
-        args: vec!["build".into()],
-        root: "/w".into(),
-        cwd: std::path::Path::new("/w").join(&who.dir).to_string_lossy().into_owned(),
-        cargo_home: "/c".into(),
-        env: Arc::new(ClientEnv::new(env, Vec::new(), None)),
-        uid,
-        gid,
-        prio: Priority::Background,
-        out: Output::new(tx, false, false),
-        session: None,
-        snapshot: snapshot.clone(),
-        worktree: String::new(),
-        commits: Arc::new(Vec::new()),
-        home: who.home.clone(),
-        outbox: Default::default(),
-        targets: Vec::new(),
+    let run = |args: &[&str], flag: &str| -> (i32, String) {
+        let (tx, mut rx) = crate::io::unbounded_channel();
+        let mut env: HashMap<String, String> = (*who.env).clone();
+        env.insert(flag.into(), "1".into());
+        env.remove("CARGO_TARGET_DIR");
+        env.remove("CARGO_BUILD_TARGET_DIR");
+        let client = Client {
+            args: args.iter().map(|a| a.to_string()).collect(),
+            root: "/w".into(),
+            cwd: std::path::Path::new("/w").join(&who.dir).to_string_lossy().into_owned(),
+            cargo_home: "/c".into(),
+            env: Arc::new(ClientEnv::new(env, Vec::new(), None)),
+            uid,
+            gid,
+            prio: Priority::Background,
+            out: Output::new(tx, false, false),
+            session: None,
+            snapshot: snapshot.clone(),
+            worktree: String::new(),
+            commits: Arc::new(Vec::new()),
+            home: who.home.clone(),
+            outbox: Default::default(),
+            targets: Vec::new(),
+        };
+        let code = handle(d.clone(), client).unwrap_or(0);
+        let mut text = String::new();
+        while let Some(m) = rx.recv() {
+            if let ServerMsg::Stderr(b) = m {
+                text.push_str(&String::from_utf8_lossy(&b));
+            }
+        }
+        (code, text)
     };
     let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
     let started = time();
-    let code = handle(d.clone(), client).unwrap_or(0);
+    let (code, mut text) = run(&["build"], "RARGO_VERIFY");
     let rargo_ran = (started, time());
-    let mut text = String::new();
-    while let Some(m) = rx.recv() {
-        if let ServerMsg::Stderr(b) = m {
-            text.push_str(&String::from_utf8_lossy(&b));
-        }
-    }
     let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
+    if code == 0 {
+        let (_, tests) = run(&["test", "--no-fail-fast"], crate::build::VERIFY_TESTS);
+        text.extend(tests.lines().filter(|l| l.starts_with("warning: verify: ") || l.starts_with("note: verify: ")).map(|l| format!("{l}\n")));
+    }
     Ok(compare(snapshot.id.hex(), (stock.status.success(), &String::from_utf8_lossy(&stock.stderr), stock_ran),
         (code == 0, &text, rargo_ran), verified_units))
 }

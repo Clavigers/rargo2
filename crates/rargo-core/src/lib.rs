@@ -10,6 +10,7 @@ pub mod drift;
 pub mod engine;
 pub mod expand;
 pub mod flake;
+pub mod fn_code;
 pub mod hash;
 pub mod nixmanifest;
 pub mod http;
