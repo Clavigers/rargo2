@@ -543,7 +543,7 @@ echo "== a target directory outside the worktree"
 cd "$A"
 out=$(CARGO_TARGET_DIR="$T/outside-target" "$R" build 2>&1); rc=$?
 ran=$("$T/outside-target/debug/app" 2>&1)
-[ $rc -eq 0 ] && [ -f "$T/outside-target/CACHEDIR.TAG" ] && [ "$ran" = "$(./target/debug/app 2>&1)" ] && ok "CARGO_TARGET_DIR outside the worktree gets the built program" || bad "CARGO_TARGET_DIR outside the worktree gets the built program" "rc=$rc
+[ $rc -eq 0 ] && [ -f "$T/outside-target/CACHEDIR.TAG" ] && has "$ran" "from build script / built-by-script / plain / 42 / unset" && ok "CARGO_TARGET_DIR outside the worktree gets the built program" || bad "CARGO_TARGET_DIR outside the worktree gets the built program" "rc=$rc
 $out
 $ran"
 rm -rf "$T/outside-target"
