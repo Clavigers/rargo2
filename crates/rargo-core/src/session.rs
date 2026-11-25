@@ -1,18 +1,19 @@
 use crate::hash::Hash;
+use crate::session_state::{Ask, ClientSet, Hello, Progress, SessionState};
 use crate::snapshot::{Uploader, futures::BoxFuture};
 use crate::store::Store;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
 use rargo_proto::secure::{self, Opener, Sealer};
 use rargo_proto::{Blob, ClientMsg, Delivery, Digest, PART_SIZE, ServerMsg, Write};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::sync::{Notify, oneshot};
 
 pub struct Keys {
     open: bool,
@@ -63,10 +64,6 @@ impl Keys {
     }
 }
 
-const WINDOW: usize = 32 << 20;
-const _: () = assert!(WINDOW <= u32::MAX as usize);
-const _: () = assert!(WINDOW > 0);
-
 fn bulk_size(m: &ServerMsg) -> usize {
     match m {
         ServerMsg::Blobs(v) => v.iter().map(|b| b.data.len()).sum(),
@@ -79,12 +76,11 @@ struct Part {
     path: PathBuf,
     file: std::fs::File,
     hasher: blake3::Hasher,
-    size: u64,
 }
 
 #[derive(Default)]
 pub struct ClientHas {
-    set: Mutex<HashSet<Digest>>,
+    set: Mutex<ClientSet>,
 }
 
 impl ClientHas {
@@ -96,21 +92,26 @@ impl ClientHas {
 pub struct Session {
     tx: UnboundedSender<ServerMsg>,
     has: Arc<ClientHas>,
-    knows: AtomicBool,
-    delivered: Mutex<HashSet<Digest>>,
-    lazy: AtomicBool,
-    window: Arc<Semaphore>,
+    state: Mutex<SessionState>,
     store: Arc<Store>,
     trees_reply: Mutex<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
     env_reply: Mutex<Option<oneshot::Sender<Vec<(String, Option<String>)>>>>,
     report_reply: Mutex<Option<oneshot::Sender<u32>>>,
     asking: tokio::sync::Mutex<()>,
     arrivals: Notify,
-    changed: AtomicBool,
-    closed: AtomicBool,
-    parts: Mutex<HashMap<Digest, Part>>,
-    next_id: AtomicU64,
+    window: Notify,
+    parts: Mutex<BTreeMap<Digest, Part>>,
     totals: Arc<crate::build::DaemonStats>,
+}
+
+fn sizes_of(files: &[Delivery], writes: &[Write]) -> BTreeMap<Digest, u64> {
+    let mut sizes: BTreeMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
+    for w in writes {
+        if let Write::File { hash, size, .. } = w {
+            sizes.insert(*hash, *size);
+        }
+    }
+    sizes
 }
 
 impl Session {
@@ -127,20 +128,15 @@ impl Session {
         let s = Arc::new(Session {
             tx,
             has,
-            knows: AtomicBool::new(false),
-            delivered: Mutex::new(HashSet::new()),
-            lazy: AtomicBool::new(false),
-            window: Arc::new(Semaphore::new(WINDOW)),
+            state: Mutex::new(SessionState::new()),
             store,
             trees_reply: Mutex::new(None),
             env_reply: Mutex::new(None),
             report_reply: Mutex::new(None),
             asking: tokio::sync::Mutex::new(()),
             arrivals: Notify::new(),
-            changed: AtomicBool::new(false),
-            closed: AtomicBool::new(false),
-            parts: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(1),
+            window: Notify::new(),
+            parts: Mutex::new(BTreeMap::new()),
             totals,
         });
         (s, rx)
@@ -148,35 +144,24 @@ impl Session {
 
     pub fn knows(&self, digests: impl IntoIterator<Item = Digest>) {
         self.has.extend(digests);
-        self.knows.store(true, Ordering::SeqCst);
+        self.state.lock().set_knows();
     }
 
     pub fn set_lazy(&self) {
-        self.lazy.store(true, Ordering::SeqCst);
+        self.state.lock().set_lazy();
     }
 
     pub fn is_lazy(&self) -> bool {
-        self.lazy.load(Ordering::SeqCst)
+        self.state.lock().is_lazy()
     }
 
     pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>) {
         if files.is_empty() && writes.is_empty() {
             return;
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        assert!(id > 0, "delivery ids start at 1");
-        let mut sizes: HashMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
-        for w in &writes {
-            if let Write::File { hash, size, .. } = w {
-                sizes.insert(*hash, *size);
-            }
-        }
-        let small: Vec<Digest> = {
-            let mut has = self.has.set.lock();
-            sizes.iter().filter(|(h, size)| **size <= rargo_proto::LAZY_SMALL && has.insert(**h)).map(|(h, _)| *h).collect()
-        };
-        assert!(small.len() <= sizes.len());
-        self.delivered.lock().extend(sizes.keys().copied());
+        let sizes = sizes_of(&files, &writes);
+        let id = self.state.lock().delivery(&sizes);
+        let small = self.has.set.lock().push_small(&sizes);
         self.send(ServerMsg::Deliver { id, files, writes });
         let mut batch: Vec<Blob> = Vec::new();
         let mut bytes = 0usize;
@@ -199,15 +184,17 @@ impl Session {
     }
 
     pub fn delivered(&self) -> HashSet<Digest> {
-        self.delivered.lock().clone()
+        self.state.lock().delivered().iter().copied().collect()
     }
 
     pub fn sent_bulk(&self, bytes: usize) {
-        self.window.add_permits(bytes.clamp(1, WINDOW));
+        self.state.lock().sent_bulk(bytes);
+        self.window.notify_waiters();
     }
 
     pub fn close_window(&self) {
-        self.window.close();
+        self.state.lock().close_window();
+        self.window.notify_waiters();
     }
 
     pub fn sender(&self) -> UnboundedSender<ServerMsg> {
@@ -219,7 +206,7 @@ impl Session {
     }
 
     fn gone(&self) -> anyhow::Error {
-        if self.changed.load(Ordering::SeqCst) {
+        if self.state.lock().has_changed() {
             anyhow!("the worktree changed while it was being synced")
         } else {
             anyhow!("the client went away")
@@ -227,25 +214,36 @@ impl Session {
     }
 
     async fn send_bulk(&self, m: ServerMsg) -> Result<()> {
-        let n = bulk_size(&m).clamp(1, WINDOW) as u32;
-        assert!(n >= 1);
-        assert!(n as usize <= WINDOW);
-        let permit = self.window.acquire_many(n).await.map_err(|_| self.gone())?;
-        permit.forget();
-        self.totals.bytes_out.fetch_add(n as u64, Ordering::Relaxed);
+        let bytes = bulk_size(&m);
+        loop {
+            let freed = self.window.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            match self.state.lock().take_bulk(bytes) {
+                Err(_) => return Err(self.gone()),
+                Ok(true) => break,
+                Ok(false) => {}
+            }
+            freed.await;
+        }
+        self.totals.bytes_out.fetch_add(crate::session_state::bulk_cost(bytes) as u64, Ordering::Relaxed);
         self.tx.send(m).map_err(|_| self.gone())
     }
 
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        let parts = self.state.lock().close();
         self.trees_reply.lock().take();
         self.env_reply.lock().take();
         self.report_reply.lock().take();
-        self.window.close();
+        self.window.notify_waiters();
         self.arrivals.notify_waiters();
-        for (_, p) in self.parts.lock().drain() {
-            let _ = std::fs::remove_file(&p.path);
+        let mut files = self.parts.lock();
+        for h in parts {
+            if let Some(p) = files.remove(&h) {
+                let _ = std::fs::remove_file(&p.path);
+            }
         }
+        assert!(files.is_empty(), "every partial upload is one the session knows of");
     }
 
     fn store_blob(&self, claimed: Digest, bytes: &[u8]) -> Result<()> {
@@ -270,22 +268,28 @@ impl Session {
             | ClientMsg::Cancel
             | ClientMsg::Ping(_) => bail!("unexpected message from the client"),
             ClientMsg::Trees(t) => {
-                if let Some(tx) = self.trees_reply.lock().take() {
+                if self.state.lock().answer(Ask::Trees)
+                    && let Some(tx) = self.trees_reply.lock().take()
+                {
                     let _ = tx.send(t);
                 }
             }
             ClientMsg::Env(e) => {
-                if let Some(tx) = self.env_reply.lock().take() {
+                if self.state.lock().answer(Ask::Env)
+                    && let Some(tx) = self.env_reply.lock().take()
+                {
                     let _ = tx.send(e);
                 }
             }
             ClientMsg::ReportId(id) => {
-                if let Some(tx) = self.report_reply.lock().take() {
+                if self.state.lock().answer(Ask::Report)
+                    && let Some(tx) = self.report_reply.lock().take()
+                {
                     let _ = tx.send(id);
                 }
             }
             ClientMsg::Changed => {
-                self.changed.store(true, Ordering::SeqCst);
+                self.state.lock().changed();
                 self.arrivals.notify_waiters();
             }
             ClientMsg::Blobs(blobs) => {
@@ -302,29 +306,31 @@ impl Session {
                 let done = tokio::task::block_in_place(|| -> Result<bool> {
                     self.totals.bytes_in.fetch_add(part.data.len() as u64, Ordering::Relaxed);
                     let data = part.unpack()?;
+                    let step = self.state.lock().part(hash, data.len() as u64, last);
                     let mut parts = self.parts.lock();
-                    let part = match parts.entry(hash) {
-                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                        std::collections::hash_map::Entry::Vacant(v) => {
-                            let path = self.store.tmp_path();
-                            let file = std::fs::File::create(&path)?;
-                            v.insert(Part { path, file, hasher: blake3::Hasher::new(), size: 0 })
-                        }
-                    };
-                    part.file.write_all(&data)?;
-                    part.hasher.update(&data);
-                    part.size += data.len() as u64;
-                    if !last {
-                        return Ok(false);
+                    if step.begin {
+                        let path = self.store.tmp_path();
+                        let file = match std::fs::File::create(&path) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                self.state.lock().part_failed(&hash);
+                                return Err(e.into());
+                            }
+                        };
+                        parts.insert(hash, Part { path, file, hasher: blake3::Hasher::new() });
                     }
-                    let part = parts.remove(&hash).unwrap();
+                    let Some(p) = parts.get_mut(&hash) else { bail!("a part arrived for an upload that was closed") };
+                    p.file.write_all(&data)?;
+                    p.hasher.update(&data);
+                    let Some(size) = step.finish else { return Ok(false) };
+                    let p = parts.remove(&hash).expect("the finished part is held");
                     drop(parts);
-                    drop(part.file);
-                    if *part.hasher.finalize().as_bytes() != hash {
-                        let _ = std::fs::remove_file(&part.path);
+                    drop(p.file);
+                    if *p.hasher.finalize().as_bytes() != hash {
+                        let _ = std::fs::remove_file(&p.path);
                         bail!("the client sent content that does not match its hash");
                     }
-                    self.store.install_hashed(&part.path, Hash(hash), part.size)?;
+                    self.store.install_hashed(&p.path, Hash(hash), size)?;
                     assert!(self.store.has(&Hash(hash)), "an installed blob is in the store");
                     self.totals.files_in.fetch_add(1, Ordering::Relaxed);
                     Ok(true)
@@ -341,10 +347,11 @@ impl Session {
         let _g = self.asking.lock().await;
         let (tx, rx) = oneshot::channel();
         *self.env_reply.lock() = Some(tx);
-        self.send(ServerMsg::WantEnv(names));
-        if self.closed.load(Ordering::SeqCst) {
+        if self.state.lock().ask(Ask::Env).is_err() {
+            self.env_reply.lock().take();
             return Err(self.gone());
         }
+        self.send(ServerMsg::WantEnv(names));
         rx.await.map_err(|_| self.gone())
     }
 
@@ -352,10 +359,11 @@ impl Session {
         let _g = self.asking.lock().await;
         let (tx, rx) = oneshot::channel();
         *self.report_reply.lock() = Some(tx);
-        self.send(ServerMsg::Report(Box::new(report)));
-        if self.closed.load(Ordering::SeqCst) {
+        if self.state.lock().ask(Ask::Report).is_err() {
+            self.report_reply.lock().take();
             return Err(self.gone());
         }
+        self.send(ServerMsg::Report(Box::new(report)));
         rx.await.map_err(|_| self.gone())
     }
 
@@ -363,29 +371,14 @@ impl Session {
         if files.is_empty() && writes.is_empty() {
             return Ok(());
         }
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        assert!(id > 0, "delivery ids start at 1");
-        let mut sizes: HashMap<Digest, u64> = files.iter().map(|f| (f.hash, f.size)).collect();
-        for w in &writes {
-            if let Write::File { hash, size, .. } = w {
-                sizes.insert(*hash, *size);
-            }
-        }
-        let push: Vec<(Digest, u64)> = {
-            let mut has = self.has.set.lock();
-            let knows = self.knows.load(Ordering::SeqCst);
-            let mut push = Vec::new();
-            for (h, size) in &sizes {
-                if has.insert(*h) && knows {
-                    push.push((*h, *size));
-                }
-            }
-            push
+        let sizes = sizes_of(&files, &writes);
+        let (id, knows, closed) = {
+            let mut st = self.state.lock();
+            (st.delivery(&sizes), st.knows(), st.is_closed())
         };
-        assert!(push.len() <= sizes.len());
-        self.delivered.lock().extend(sizes.keys().copied());
+        let push = self.has.set.lock().push(&sizes, knows);
         self.send(ServerMsg::Deliver { id, files, writes });
-        if self.closed.load(Ordering::SeqCst) {
+        if closed {
             return Err(self.gone());
         }
         self.send_blobs(push).await?;
@@ -425,7 +418,8 @@ impl Session {
                 continue;
             }
             let store = self.store.clone();
-            let mut file = tokio::fs::File::from_std(tokio::task::spawn_blocking(move || store.open_blob(&hash)).await??);
+            let mut file =
+                tokio::fs::File::from_std(tokio::task::spawn_blocking(move || store.open_blob(&hash)).await??);
             let mut sent = 0u64;
             loop {
                 let mut data = vec![0u8; PART_SIZE];
@@ -460,10 +454,11 @@ impl Uploader for Session {
             let _g = self.asking.lock().await;
             let (tx, rx) = oneshot::channel();
             *self.trees_reply.lock() = Some(tx);
-            self.send(ServerMsg::WantTrees(want.iter().map(|h| h.0).collect()));
-            if self.closed.load(Ordering::SeqCst) {
+            if self.state.lock().ask(Ask::Trees).is_err() {
+                self.trees_reply.lock().take();
                 return Err(self.gone());
             }
+            self.send(ServerMsg::WantTrees(want.iter().map(|h| h.0).collect()));
             rx.await.map_err(|_| self.gone())
         })
     }
@@ -471,22 +466,32 @@ impl Uploader for Session {
     fn blobs<'a>(&'a self, want: Vec<Hash>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let _g = self.asking.lock().await;
-            self.send(ServerMsg::WantBlobs(want.iter().map(|h| h.0).collect()));
-            let mut left: Vec<Hash> = want;
+            let digests: Vec<Digest> = want.iter().map(|h| h.0).collect();
+            self.state.lock().want(&digests, &|d| self.store.has(&Hash(*d)));
+            let wanting = Wanting(self);
+            self.send(ServerMsg::WantBlobs(digests));
             loop {
                 let arrived = self.arrivals.notified();
                 tokio::pin!(arrived);
                 arrived.as_mut().enable();
-                left.retain(|h| !self.store.has(h));
-                if left.is_empty() {
-                    return Ok(());
-                }
-                if self.closed.load(Ordering::SeqCst) || self.changed.load(Ordering::SeqCst) {
-                    return Err(self.gone());
+                match self.state.lock().progress(&|d| self.store.has(&Hash(*d))) {
+                    Progress::Done => break,
+                    Progress::Gone => return Err(self.gone()),
+                    Progress::Wait => {}
                 }
                 arrived.await;
             }
+            drop(wanting);
+            Ok(())
         })
+    }
+}
+
+struct Wanting<'a>(&'a Session);
+
+impl Drop for Wanting<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().abandon_want();
     }
 }
 
@@ -494,36 +499,29 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     keys: &Keys,
 ) -> Result<(String, bool, Sealer, Opener)> {
-    let mut magic = [0u8; 9];
-    stream.read_exact(&mut magic).await?;
-    if &magic[..8] != secure::MAGIC {
-        let text = b"this is a rargo build server; the client speaks a different protocol version\n";
-        let mut reply = vec![1u8];
-        reply.extend_from_slice(&(text.len() as u16).to_le_bytes());
-        reply.extend_from_slice(text);
-        let _ = stream.write_all(&reply).await;
-        bail!("not a rargo client (or a different protocol version)");
-    }
-    let mut user = vec![0u8; magic[8] as usize];
-    stream.read_exact(&mut user).await?;
-    let user = String::from_utf8(user).context("user name is not UTF-8")?;
-    let mut len = [0u8; 2];
-    stream.read_exact(&mut len).await?;
-    let mut msg1 = vec![0u8; u16::from_le_bytes(len) as usize];
-    stream.read_exact(&mut msg1).await?;
-    let refuse = format!("{}\n", crate::proto::REFUSED);
-    let accepted = keys.lookup(&user).and_then(|(psk, admin)| secure::server_accept(&psk, &msg1).ok().map(|r| (r, admin)));
+    let mut buf = Vec::new();
+    let (user, msg1) = loop {
+        match crate::session_state::hello(&buf, secure::MAGIC) {
+            Hello::Need(n) => {
+                let have = buf.len();
+                buf.resize(n, 0);
+                stream.read_exact(&mut buf[have..]).await?;
+            }
+            Hello::Foreign(reply) => {
+                let _ = stream.write_all(&reply).await;
+                bail!("not a rargo client (or a different protocol version)");
+            }
+            Hello::BadUser => bail!("user name is not UTF-8"),
+            Hello::Hello { user, msg1 } => break (user, msg1),
+        }
+    };
+    let accepted =
+        keys.lookup(&user).and_then(|(psk, admin)| secure::server_accept(&psk, &msg1).ok().map(|r| (r, admin)));
     let Some(((msg2, early, sealer, opener), admin)) = accepted else {
-        let mut reply = vec![1u8];
-        reply.extend_from_slice(&(refuse.len() as u16).to_le_bytes());
-        reply.extend_from_slice(refuse.as_bytes());
-        let _ = stream.write_all(&reply).await;
+        let _ = stream.write_all(&crate::session_state::refusal(crate::proto::REFUSED)).await;
         bail!("refused `{user}`: unknown user or wrong key");
     };
-    let mut reply = vec![0u8];
-    reply.extend_from_slice(&(msg2.len() as u16).to_le_bytes());
-    reply.extend_from_slice(&msg2);
-    stream.write_all(&reply).await?;
+    stream.write_all(&crate::session_state::welcome(&msg2)).await?;
     if !early.is_empty() {
         bail!("`{user}` sent a request with the handshake, which this protocol version does not do");
     }
