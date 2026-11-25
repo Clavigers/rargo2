@@ -244,15 +244,7 @@ fn read_struct<T: Copy>(b: &[u8]) -> Option<T> {
     Some(unsafe { std::ptr::read_unaligned(b.as_ptr() as *const T) })
 }
 
-fn cstr_arg(b: &[u8]) -> (&[u8], &[u8]) {
-    let (name, rest): (&[u8], &[u8]) = match b.iter().position(|&c| c == 0) {
-        Some(i) => (&b[..i], &b[i + 1..]),
-        None => (b, &[]),
-    };
-    assert!(!name.contains(&0));
-    assert!(name.len() + rest.len() <= b.len());
-    (name, rest)
-}
+
 
 pub struct Session {
     dev: OwnedFd,
@@ -483,38 +475,17 @@ impl Session {
     }
 
     pub fn backing_open(&self, fd: RawFd) -> io::Result<i32> {
-        let map = fuse_backing_map { fd, flags: 0, padding: 0 };
-        let r = unsafe {
-            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _)
-        };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(r)
+        DeviceEffect::Register(fd).execute(self.dev.as_raw_fd())
     }
 
     pub fn backing_close(&self, id: i32) -> io::Result<()> {
-        let id = id as u32;
-        let r = unsafe {
-            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const u32)
-        };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        DeviceEffect::Unregister(id).execute(self.dev.as_raw_fd()).map(|_| ())
     }
 
     pub fn notify_inval_entry(&self, parent: u64, name: &[u8]) -> io::Result<()> {
-        let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
-        let r = reply(
-            self.dev.as_raw_fd(),
-            0,
-            FUSE_NOTIFY_INVAL_ENTRY,
-            &[as_bytes(&out), name, &[0u8]],
-        );
-        match r {
+        match DeviceEffect::invalidate(parent, name).execute(self.dev.as_raw_fd()) {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            r => r,
+            result => result.map(|_| ()),
         }
     }
 
@@ -809,12 +780,51 @@ fn open_out(o: &Opened) -> fuse_open_out {
     fuse_open_out { fh: o.fh, open_flags: o.flags, backing_id: o.backing_id }
 }
 
+enum DeviceEffect {
+    Write(Vec<u8>),
+    Register(RawFd),
+    Unregister(i32),
+}
+
+impl DeviceEffect {
+    fn invalidate(parent: u64, name: &[u8]) -> Self {
+        let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
+        let mut bytes = Vec::new();
+        encode_reply(&mut bytes, 0, FUSE_NOTIFY_INVAL_ENTRY, &[as_bytes(&out), name, &[0]]);
+        Self::Write(bytes)
+    }
+
+    fn write(fd: RawFd, bytes: &[u8]) -> io::Result<i32> {
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written < 0 { Err(io::Error::last_os_error()) } else { Ok(0) }
+    }
+
+    fn execute(self, fd: RawFd) -> io::Result<i32> {
+        let status = match self {
+            Self::Write(bytes) => return Self::write(fd, &bytes),
+            Self::Register(source) => {
+                let map = fuse_backing_map { fd: source, flags: 0, padding: 0 };
+                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _) }
+            }
+            Self::Unregister(id) => {
+                let id = id as u32;
+                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const _) }
+            }
+        };
+        if status < 0 { Err(io::Error::last_os_error()) } else { Ok(status) }
+    }
+}
+
 fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
     let fd = dev.as_raw_fd();
     let mut storage = vec![0u64; BUF_SIZE / 8];
-    let mut out: Vec<u8> = Vec::with_capacity(128 * 1024);
+    let mut handler = RequestHandler::new(sess.caps.max_write);
     loop {
         let n = unsafe { libc::read(fd, storage.as_mut_ptr() as *mut libc::c_void, BUF_SIZE) };
+        if n == 0 {
+            sess.connected.store(false, Ordering::SeqCst);
+            break;
+        }
         if n < 0 {
             match io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::ENOENT) => continue,
@@ -827,47 +837,111 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
         let n = n as usize;
         assert!(n <= BUF_SIZE);
         let buf = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
-        let Some(hdr) = read_struct::<fuse_in_header>(buf) else { continue };
-        let body = &buf[std::mem::size_of::<fuse_in_header>()..];
-        if hdr.opcode == FUSE_DESTROY {
+        let result = handler.handle(&*fs, buf);
+        if !result.bytes.is_empty() {
+            let _ = DeviceEffect::write(fd, result.bytes);
+        }
+        if result.destroyed {
             sess.connected.store(false, Ordering::SeqCst);
-            fs.destroy();
-            let _ = reply(fd, hdr.unique, 0, &[]);
             break;
         }
-        dispatch(&*fs, fd, &hdr, body, &mut out, sess.caps.max_write);
+    }
+}
+
+pub struct RequestHandler {
+    scratch: Vec<u8>,
+    reply: Vec<u8>,
+    max_write: u32,
+}
+
+pub struct Handled<'a> {
+    pub bytes: &'a [u8],
+    pub destroyed: bool,
+}
+
+impl RequestHandler {
+    pub fn new(max_write: u32) -> Self {
+        Self { scratch: Vec::new(), reply: Vec::new(), max_write }
+    }
+
+    pub fn handle<F: Filesystem>(&mut self, fs: &F, request: &[u8]) -> Handled<'_> {
+        self.reply.clear();
+        let Some(hdr) = read_struct::<fuse_in_header>(request) else {
+            return Handled { bytes: &self.reply, destroyed: false };
+        };
+        if hdr.unique == 0 {
+            return Handled { bytes: &self.reply, destroyed: false };
+        }
+        if hdr.len as usize != request.len() {
+            if !matches!(hdr.opcode, FUSE_FORGET | FUSE_BATCH_FORGET | FUSE_INTERRUPT) {
+                encode_reply(&mut self.reply, hdr.unique, -libc::EINVAL, &[]);
+            }
+            return Handled { bytes: &self.reply, destroyed: false };
+        }
+        let destroyed = hdr.opcode == FUSE_DESTROY;
+        if destroyed {
+            fs.destroy();
+            encode_reply(&mut self.reply, hdr.unique, 0, &[]);
+        } else {
+            let body = &request[std::mem::size_of::<fuse_in_header>()..];
+            dispatch(fs, &mut self.reply, &hdr, body, &mut self.scratch, self.max_write);
+        }
+        Handled { bytes: &self.reply, destroyed }
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.reply.is_empty() || read_struct::<fuse_out_header>(&self.reply)
+            .is_some_and(|header| header.len as usize == self.reply.len() && header.unique != 0 && header.error <= 0)
+    }
+}
+
+fn encode_reply(out: &mut Vec<u8>, unique: u64, error: i32, parts: &[&[u8]]) {
+    let len = std::mem::size_of::<fuse_out_header>() + parts.iter().map(|part| part.len()).sum::<usize>();
+    out.extend(as_bytes(&fuse_out_header { len: len as u32, error, unique }));
+    for part in parts {
+        out.extend_from_slice(part);
     }
 }
 
 macro_rules! arg {
-    ($ty:ty, $body:expr, $fd:expr, $hdr:expr) => {
+    ($ty:ty, $body:expr, $reply:expr, $hdr:expr) => {
         match read_struct::<$ty>($body) {
             Some(v) => v,
             None => {
-                let _ = reply($fd, $hdr.unique, -libc::EINVAL, &[]);
+                encode_reply($reply, $hdr.unique, -libc::EINVAL, &[]);
                 return;
             }
         }
     };
 }
 
-fn send<T: Copy>(fd: RawFd, unique: u64, r: Res<T>) {
-    let _ = match r {
-        Ok(v) => reply(fd, unique, 0, &[as_bytes(&v)]),
-        Err(e) => reply(fd, unique, -e.0, &[]),
+macro_rules! names {
+    ($body:expr, $reply:expr, $hdr:expr) => {
+        match abi::name_arg($body) {
+            Some(value) => value,
+            None => {
+                encode_reply($reply, $hdr.unique, -libc::EINVAL, &[]);
+                return;
+            }
+        }
     };
 }
 
-fn send_empty(fd: RawFd, unique: u64, r: Res<()>) {
-    let _ = match r {
-        Ok(()) => reply(fd, unique, 0, &[]),
-        Err(e) => reply(fd, unique, -e.0, &[]),
-    };
+fn send<T: Copy>(out: &mut Vec<u8>, unique: u64, result: Res<T>) {
+    match result {
+        Ok(v) => encode_reply(out, unique, 0, &[as_bytes(&v)]),
+        Err(err) => encode_reply(out, unique, -err.0, &[]),
+    }
+}
+
+fn send_empty(out: &mut Vec<u8>, unique: u64, result: Res<()>) {
+    send(out, unique, result);
 }
 
 fn dispatch<F: Filesystem>(
     fs: &F,
-    fd: RawFd,
+    reply: &mut Vec<u8>,
     hdr: &fuse_in_header,
     body: &[u8],
     out: &mut Vec<u8>,
@@ -878,8 +952,8 @@ fn dispatch<F: Filesystem>(
     let node = hdr.nodeid;
     match hdr.opcode {
         FUSE_LOOKUP => {
-            let (name, _) = cstr_arg(body);
-            send(fd, u, fs.lookup(&ctx, node, name).map(|e| entry_out(&e)));
+            let (name, _) = names!(body, reply, hdr);
+            send(reply, u, fs.lookup(&ctx, node, name).map(|e| entry_out(&e)));
         }
         FUSE_FORGET => {
             if let Some(f) = read_struct::<fuse_forget_in>(body) {
@@ -897,12 +971,12 @@ fn dispatch<F: Filesystem>(
             }
         }
         FUSE_GETATTR => {
-            let a = arg!(fuse_getattr_in, body, fd, hdr);
+            let a = arg!(fuse_getattr_in, body, reply, hdr);
             let fh = (a.getattr_flags & FUSE_GETATTR_FH != 0).then_some(a.fh);
-            send(fd, u, fs.getattr(&ctx, node, fh).map(|(a, t)| attr_out(&a, t)));
+            send(reply, u, fs.getattr(&ctx, node, fh).map(|(a, t)| attr_out(&a, t)));
         }
         FUSE_SETATTR => {
-            let a = arg!(fuse_setattr_in, body, fd, hdr);
+            let a = arg!(fuse_setattr_in, body, reply, hdr);
             let v = a.valid;
             let time = |set: u32, now: u32, s: u64, ns: u32| {
                 if v & now != 0 {
@@ -922,94 +996,103 @@ fn dispatch<F: Filesystem>(
                 atime: time(FATTR_ATIME, FATTR_ATIME_NOW, a.atime, a.atimensec),
                 mtime: time(FATTR_MTIME, FATTR_MTIME_NOW, a.mtime, a.mtimensec),
             };
-            send(fd, u, fs.setattr(&ctx, node, &set).map(|(a, t)| attr_out(&a, t)));
+            send(reply, u, fs.setattr(&ctx, node, &set).map(|(a, t)| attr_out(&a, t)));
         }
         FUSE_READLINK => {
-            let _ = match fs.readlink(&ctx, node) {
-                Ok(t) => reply(fd, u, 0, &[&t]),
-                Err(e) => reply(fd, u, -e.0, &[]),
+            match fs.readlink(&ctx, node) {
+                Ok(t) => encode_reply(reply, u, 0, &[&t]),
+                Err(e) => encode_reply(reply, u, -e.0, &[]),
             };
         }
         FUSE_SYMLINK => {
-            let (name, rest) = cstr_arg(body);
-            let (target, _) = cstr_arg(rest);
-            send(fd, u, fs.symlink(&ctx, node, name, target).map(|e| entry_out(&e)));
+            let (name, rest) = names!(body, reply, hdr);
+            let Some((target, _)) = abi::nul_arg(rest) else {
+                encode_reply(reply, u, -libc::EINVAL, &[]);
+                return;
+            };
+            send(reply, u, fs.symlink(&ctx, node, name, target).map(|e| entry_out(&e)));
         }
         FUSE_MKNOD => {
-            let a = arg!(fuse_mknod_in, body, fd, hdr);
-            let (name, _) = cstr_arg(&body[std::mem::size_of::<fuse_mknod_in>()..]);
+            let a = arg!(fuse_mknod_in, body, reply, hdr);
+            let (name, _) = names!(&body[std::mem::size_of::<fuse_mknod_in>()..], reply, hdr);
             let mode = a.mode & !a.umask;
-            send(fd, u, fs.mknod(&ctx, node, name, mode, a.rdev).map(|e| entry_out(&e)));
+            send(reply, u, fs.mknod(&ctx, node, name, mode, a.rdev).map(|e| entry_out(&e)));
         }
         FUSE_MKDIR => {
-            let a = arg!(fuse_mkdir_in, body, fd, hdr);
-            let (name, _) = cstr_arg(&body[std::mem::size_of::<fuse_mkdir_in>()..]);
+            let a = arg!(fuse_mkdir_in, body, reply, hdr);
+            let (name, _) = names!(&body[std::mem::size_of::<fuse_mkdir_in>()..], reply, hdr);
             let mode = a.mode & !a.umask;
-            send(fd, u, fs.mkdir(&ctx, node, name, mode).map(|e| entry_out(&e)));
+            send(reply, u, fs.mkdir(&ctx, node, name, mode).map(|e| entry_out(&e)));
         }
         FUSE_UNLINK => {
-            let (name, _) = cstr_arg(body);
-            send_empty(fd, u, fs.unlink(&ctx, node, name));
+            let (name, _) = names!(body, reply, hdr);
+            send_empty(reply, u, fs.unlink(&ctx, node, name));
         }
         FUSE_RMDIR => {
-            let (name, _) = cstr_arg(body);
-            send_empty(fd, u, fs.rmdir(&ctx, node, name));
+            let (name, _) = names!(body, reply, hdr);
+            send_empty(reply, u, fs.rmdir(&ctx, node, name));
         }
         FUSE_RENAME => {
-            let a = arg!(fuse_rename_in, body, fd, hdr);
-            let (name, rest) = cstr_arg(&body[std::mem::size_of::<fuse_rename_in>()..]);
-            let (newname, _) = cstr_arg(rest);
-            send_empty(fd, u, fs.rename(&ctx, node, name, a.newdir, newname, 0));
+            let a = arg!(fuse_rename_in, body, reply, hdr);
+            let (name, rest) = names!(&body[std::mem::size_of::<fuse_rename_in>()..], reply, hdr);
+            let (newname, _) = names!(rest, reply, hdr);
+            send_empty(reply, u, fs.rename(&ctx, node, name, a.newdir, newname, 0));
         }
         FUSE_RENAME2 => {
-            let a = arg!(fuse_rename2_in, body, fd, hdr);
-            let (name, rest) = cstr_arg(&body[std::mem::size_of::<fuse_rename2_in>()..]);
-            let (newname, _) = cstr_arg(rest);
-            send_empty(fd, u, fs.rename(&ctx, node, name, a.newdir, newname, a.flags));
+            let a = arg!(fuse_rename2_in, body, reply, hdr);
+            let (name, rest) = names!(&body[std::mem::size_of::<fuse_rename2_in>()..], reply, hdr);
+            let (newname, _) = names!(rest, reply, hdr);
+            send_empty(reply, u, fs.rename(&ctx, node, name, a.newdir, newname, a.flags));
         }
         FUSE_LINK => {
-            let a = arg!(fuse_link_in, body, fd, hdr);
-            let (name, _) = cstr_arg(&body[std::mem::size_of::<fuse_link_in>()..]);
-            send(fd, u, fs.link(&ctx, a.oldnodeid, node, name).map(|e| entry_out(&e)));
+            let a = arg!(fuse_link_in, body, reply, hdr);
+            let (name, _) = names!(&body[std::mem::size_of::<fuse_link_in>()..], reply, hdr);
+            send(reply, u, fs.link(&ctx, a.oldnodeid, node, name).map(|e| entry_out(&e)));
         }
         FUSE_OPEN => {
-            let a = arg!(fuse_open_in, body, fd, hdr);
-            send(fd, u, fs.open(&ctx, node, a.flags).map(|o| open_out(&o)));
+            let a = arg!(fuse_open_in, body, reply, hdr);
+            send(reply, u, fs.open(&ctx, node, a.flags).map(|o| open_out(&o)));
         }
         FUSE_CREATE => {
-            let a = arg!(fuse_create_in, body, fd, hdr);
-            let (name, _) = cstr_arg(&body[std::mem::size_of::<fuse_create_in>()..]);
+            let a = arg!(fuse_create_in, body, reply, hdr);
+            let (name, _) = names!(&body[std::mem::size_of::<fuse_create_in>()..], reply, hdr);
             let mode = a.mode & !a.umask;
-            let _ = match fs.create(&ctx, node, name, mode, a.flags) {
-                Ok((e, o)) => reply(fd, u, 0, &[as_bytes(&entry_out(&e)), as_bytes(&open_out(&o))]),
-                Err(e) => reply(fd, u, -e.0, &[]),
+            match fs.create(&ctx, node, name, mode, a.flags) {
+                Ok((e, o)) => encode_reply(reply, u, 0, &[as_bytes(&entry_out(&e)), as_bytes(&open_out(&o))]),
+                Err(e) => encode_reply(reply, u, -e.0, &[]),
             };
         }
         FUSE_READ => {
-            let a = arg!(fuse_read_in, body, fd, hdr);
+            let a = arg!(fuse_read_in, body, reply, hdr);
             out.clear();
             let size = a.size.min(max_write);
-            let _ = match fs.read(&ctx, node, a.fh, a.offset, size, out) {
+            match fs.read(&ctx, node, a.fh, a.offset, size, out) {
                 Ok(()) => {
-                    assert!(out.len() <= size as usize, "read returns at most size bytes");
-                    reply(fd, u, 0, &[out])
+                    if out.len() > size as usize {
+                        encode_reply(reply, u, -libc::EIO, &[]);
+                    } else {
+                        encode_reply(reply, u, 0, &[out]);
+                    }
                 }
-                Err(e) => reply(fd, u, -e.0, &[]),
+                Err(e) => encode_reply(reply, u, -e.0, &[]),
             };
         }
         FUSE_WRITE => {
-            let a = arg!(fuse_write_in, body, fd, hdr);
+            let a = arg!(fuse_write_in, body, reply, hdr);
             let data = &body[std::mem::size_of::<fuse_write_in>()..];
-            let data = &data[..(a.size as usize).min(data.len())];
+            let Some(data) = data.get(..a.size as usize) else {
+                encode_reply(reply, u, -libc::EINVAL, &[]);
+                return;
+            };
             send(
-                fd,
+                reply,
                 u,
                 fs.write(&ctx, node, a.fh, a.offset, data)
                     .map(|n| fuse_write_out { size: n, padding: 0 }),
             );
         }
         FUSE_STATFS => {
-            send(fd, u, fs.statfs(&ctx, node).map(|st| fuse_statfs_out { st }));
+            send(reply, u, fs.statfs(&ctx, node).map(|st| fuse_statfs_out { st }));
         }
         FUSE_RELEASE | FUSE_RELEASEDIR => {
             if hdr.opcode == FUSE_RELEASE {
@@ -1017,34 +1100,34 @@ fn dispatch<F: Filesystem>(
                     fs.release(node, a.fh, a.flags);
                 }
             }
-            let _ = reply(fd, u, 0, &[]);
+            encode_reply(reply, u, 0, &[]);
         }
         FUSE_FSYNC => {
-            let a = arg!(fuse_fsync_in, body, fd, hdr);
-            send_empty(fd, u, fs.fsync(&ctx, node, a.fh, a.fsync_flags & 1 != 0));
+            let a = arg!(fuse_fsync_in, body, reply, hdr);
+            send_empty(reply, u, fs.fsync(&ctx, node, a.fh, a.fsync_flags & 1 != 0));
         }
         FUSE_FSYNCDIR | FUSE_SYNCFS => {
-            let _ = reply(fd, u, 0, &[]);
+            encode_reply(reply, u, 0, &[]);
         }
         FUSE_READDIR => {
-            let a = arg!(fuse_read_in, body, fd, hdr);
+            let a = arg!(fuse_read_in, body, reply, hdr);
             out.clear();
             let mut sink = DirSink { buf: out, cap: a.size as usize };
             let r = fs.readdir(&ctx, node, a.fh, a.offset, &mut sink);
             assert!(out.len() <= a.size as usize);
-            let _ = match r {
-                Ok(()) => reply(fd, u, 0, &[out]),
-                Err(e) => reply(fd, u, -e.0, &[]),
+            match r {
+                Ok(()) => encode_reply(reply, u, 0, &[out]),
+                Err(e) => encode_reply(reply, u, -e.0, &[]),
             };
         }
         FUSE_FALLOCATE => {
-            let a = arg!(fuse_fallocate_in, body, fd, hdr);
-            send_empty(fd, u, fs.fallocate(&ctx, node, a.fh, a.offset, a.length, a.mode));
+            let a = arg!(fuse_fallocate_in, body, reply, hdr);
+            send_empty(reply, u, fs.fallocate(&ctx, node, a.fh, a.offset, a.length, a.mode));
         }
         FUSE_LSEEK => {
-            let a = arg!(fuse_lseek_in, body, fd, hdr);
+            let a = arg!(fuse_lseek_in, body, reply, hdr);
             send(
-                fd,
+                reply,
                 u,
                 fs.lseek(&ctx, node, a.fh, a.offset, a.whence).map(|offset| fuse_lseek_out { offset }),
             );
@@ -1053,13 +1136,129 @@ fn dispatch<F: Filesystem>(
         FUSE_FLUSH | FUSE_OPENDIR | FUSE_ACCESS | FUSE_GETXATTR | FUSE_LISTXATTR
         | FUSE_SETXATTR | FUSE_REMOVEXATTR | FUSE_IOCTL | FUSE_POLL | FUSE_BMAP
         | FUSE_COPY_FILE_RANGE | FUSE_GETLK | FUSE_SETLK | FUSE_SETLKW | FUSE_STATX => {
-            let _ = reply(fd, u, -libc::ENOSYS, &[]);
+            encode_reply(reply, u, -libc::ENOSYS, &[]);
         }
         FUSE_TMPFILE => {
-            let _ = reply(fd, u, -libc::EOPNOTSUPP, &[]);
+            encode_reply(reply, u, -libc::EOPNOTSUPP, &[]);
         }
         _ => {
-            let _ = reply(fd, u, -libc::ENOSYS, &[]);
+            encode_reply(reply, u, -libc::ENOSYS, &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use std::sync::atomic::AtomicU64;
+    use super::*;
+
+    #[derive(Default)]
+    struct Memory {
+        forgotten: AtomicU64,
+        released: AtomicU64,
+    }
+
+    impl Filesystem for Memory {
+        fn lookup(&self, _: &Ctx, parent: u64, name: &[u8]) -> Res<Entry> {
+            if parent != 1 || name != b"file" {
+                return Err(Errno(libc::ENOENT));
+            }
+            Ok(Entry { nodeid: 2, ..Entry::negative(Duration::ZERO) })
+        }
+
+        fn getattr(&self, _: &Ctx, node: u64, _: Option<u64>) -> Res<(fuse_attr, Duration)> {
+            Ok((fuse_attr { ino: node, size: 4, ..fuse_attr::default() }, Duration::ZERO))
+        }
+
+        fn open(&self, _: &Ctx, _: u64, _: u32) -> Res<Opened> {
+            Ok(Opened { fh: 17, flags: 0, backing_id: 0 })
+        }
+
+        fn read(&self, _: &Ctx, _: u64, _: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
+            let start = offset.min(4) as usize;
+            let end = (start + size as usize).min(4);
+            out.extend_from_slice(&b"abcd"[start..end]);
+            Ok(())
+        }
+
+        fn readdir(&self, _: &Ctx, _: u64, _: u64, _: u64, sink: &mut DirSink<'_>) -> Res<()> {
+            sink.push(2, 1, libc::DT_REG as u32, b"file");
+            Ok(())
+        }
+
+        fn release(&self, _: u64, fh: u64, _: u32) {
+            self.released.store(fh, Ordering::Relaxed);
+        }
+
+        fn forget(&self, _: u64, count: u64) {
+            self.forgotten.store(count, Ordering::Relaxed);
+        }
+    }
+
+    fn request(opcode: u32, nodeid: u64, body: &[u8]) -> Vec<u8> {
+        let header = fuse_in_header {
+            len: (std::mem::size_of::<fuse_in_header>() + body.len()) as u32, opcode,
+            unique: 51, nodeid, uid: 1000, gid: 1000, pid: 100, total_extlen: 0, padding: 0,
+        };
+        [as_bytes(&header), body].concat()
+    }
+
+    #[test]
+    fn memory_filesystem_replies_to_kernel_request_shapes() {
+        let fs = Memory::default();
+        let mut handler = RequestHandler::new(1024);
+        let mut run = |opcode, node, body: &[u8]| {
+            let frame = request(opcode, node, body);
+            let reply = handler.handle(&fs, &frame).bytes.to_vec();
+            assert!(handler.invariants());
+            reply
+        };
+        let payload = |reply: Vec<u8>| reply[std::mem::size_of::<fuse_out_header>()..].to_vec();
+        let lookup = run(FUSE_LOOKUP, 1, b"file\0");
+        assert_eq!(read_struct::<fuse_entry_out>(&payload(lookup)).unwrap().nodeid, 2);
+        let getattr = fuse_getattr_in { getattr_flags: 0, dummy: 0, fh: 0 };
+        assert_eq!(read_struct::<fuse_attr_out>(&payload(run(FUSE_GETATTR, 2, as_bytes(&getattr)))).unwrap().attr.size, 4);
+        let open = fuse_open_in { flags: 0, open_flags: 0 };
+        assert_eq!(read_struct::<fuse_open_out>(&payload(run(FUSE_OPEN, 2, as_bytes(&open)))).unwrap().fh, 17);
+        let read = fuse_read_in { fh: 17, offset: 1, size: 2, read_flags: 0, lock_owner: 0, flags: 0, padding: 0 };
+        assert_eq!(payload(run(FUSE_READ, 2, as_bytes(&read))), b"bc");
+        let listing = fuse_read_in { offset: 0, size: 256, ..read };
+        assert_eq!(read_struct::<fuse_dirent>(&payload(run(FUSE_READDIR, 1, as_bytes(&listing)))).unwrap().namelen, 4);
+        let release = fuse_release_in { fh: 17, flags: 0, release_flags: 0, lock_owner: 0 };
+        assert_eq!(read_struct::<fuse_out_header>(&run(FUSE_RELEASE, 2, as_bytes(&release))).unwrap().error, 0);
+        assert_eq!(fs.released.load(Ordering::Relaxed), 17);
+        assert!(run(FUSE_FORGET, 2, as_bytes(&fuse_forget_in { nlookup: 3 })).is_empty());
+        assert_eq!(fs.forgotten.load(Ordering::Relaxed), 3);
+        assert!(run(FUSE_INTERRUPT, 0, &1u64.to_ne_bytes()).is_empty());
+    }
+
+    #[test]
+    fn notification_bytes_share_the_reply_format() {
+        let DeviceEffect::Write(bytes) = DeviceEffect::invalidate(17, b"file") else { unreachable!() };
+        let header = read_struct::<fuse_out_header>(&bytes).unwrap();
+        assert_eq!(header.len as usize, bytes.len());
+        assert_eq!(header.unique, 0);
+        assert_eq!(header.error, FUSE_NOTIFY_INVAL_ENTRY);
+        let entry = read_struct::<fuse_notify_inval_entry_out>(&bytes[std::mem::size_of::<fuse_out_header>()..]).unwrap();
+        assert_eq!((entry.parent, entry.namelen), (17, 4));
+        assert!(bytes.ends_with(b"file\0"));
+    }
+
+    #[test]
+    fn incomplete_requests_are_rejected_without_losing_the_next_reply() {
+        let fs = Memory::default();
+        let mut handler = RequestHandler::new(1024);
+        let lookup = request(FUSE_LOOKUP, 1, b"file\0");
+        for len in 0..lookup.len() {
+            handler.handle(&fs, &lookup[..len]);
+            assert!(handler.invariants());
+        }
+        for body in [&[][..], &b"file"[..]] {
+            let reply = handler.handle(&fs, &request(FUSE_LOOKUP, 1, body));
+            assert_eq!(read_struct::<fuse_out_header>(reply.bytes).unwrap().error, -libc::EINVAL);
+            assert!(handler.invariants());
+        }
+        assert_eq!(read_struct::<fuse_out_header>(handler.handle(&fs, &lookup).bytes).unwrap().error, 0);
+        assert!(handler.invariants());
     }
 }

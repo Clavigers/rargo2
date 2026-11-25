@@ -478,3 +478,13 @@ const _: () = {
     assert!(std::mem::size_of::<fuse_backing_map>() == 16);
     assert!(std::mem::size_of::<fuse_dirent>() == 24);
 };
+
+pub(crate) fn nul_arg(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = bytes.iter().position(|&byte| byte == 0)?;
+    Some((&bytes[..end], &bytes[end + 1..]))
+}
+
+pub(crate) fn name_arg(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (name, rest) = nul_arg(bytes)?;
+    (!name.is_empty() && !name.contains(&b'/')).then_some((name, rest))
+}
