@@ -423,6 +423,7 @@ impl HostRegion {
     }
 }
 
+#[derive(Clone)]
 enum MemNode {
     Dir(Owner),
     File { info: FileInfo, bytes: Vec<u8> },
@@ -430,6 +431,7 @@ enum MemNode {
     Other,
 }
 
+#[derive(Clone)]
 pub struct MemView {
     nodes: std::collections::BTreeMap<Vec<u8>, MemNode>,
 }
@@ -473,6 +475,23 @@ impl MemView {
 
     fn is_dir(&self, path: &[u8]) -> bool {
         path == b"/" || matches!(self.nodes.get(path), Some(MemNode::Dir(_)))
+    }
+}
+
+#[cfg(test)]
+impl MemView {
+    pub(crate) fn remove_tree(&mut self, path: &[u8]) {
+        assert_ne!(path, b"/");
+        self.nodes.retain(|p, _| p.as_slice() != path && !vpath_starts_with(p, path));
+    }
+
+    pub(crate) fn rewrite(&mut self, path: &[u8], bytes: &[u8]) {
+        let Some(MemNode::File { info, bytes: buf }) = self.nodes.get_mut(path) else {
+            panic!("rewrite expects a file");
+        };
+        info.size = bytes.len() as u64;
+        info.src = FileSrc::Blob(Hash::of(bytes));
+        *buf = bytes.to_vec();
     }
 }
 
