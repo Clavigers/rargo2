@@ -25,7 +25,8 @@ pub async fn connection(
         .await
         .context("nothing was sent")??;
     if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
-        return http.serve(stream).await;
+        let stream = stream.into_std()?;
+        return tokio::task::spawn_blocking(move || http.serve(stream)).await?;
     }
     let (user, admin, sealer, opener) =
         tokio::time::timeout(std::time::Duration::from_secs(20), session::accept(&mut stream, &keys))
