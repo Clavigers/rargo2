@@ -663,6 +663,8 @@ mod tests {
                 let routes = c.message(stream, msg, valid);
                 if ended {
                     assert!(routes.is_empty(), "seed {seed}: a closed connection routes nothing");
+                    assert!(c.running.is_empty(), "seed {seed}: a closed connection runs nothing");
+                    c.invariants();
                     continue;
                 }
                 for r in &routes {
