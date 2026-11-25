@@ -523,6 +523,45 @@ mod tests {
         (d, Trees::new(store), fake)
     }
 
+    struct Stalled;
+
+    impl Uploader for Stalled {
+        fn trees<'a>(&'a self, _want: Vec<Hash>) -> futures::BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+            Box::pin(std::future::ready(Ok(Vec::new())))
+        }
+        fn blobs<'a>(&'a self, _want: Vec<Hash>) -> futures::BoxFuture<'a, Result<()>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn dropping_a_sync_while_it_uploads_releases_its_claims_for_the_next_sync() {
+        let (_d, trees, fake) = setup();
+        let v = fake.dir(vec![("a", fake.file(b"content a")), ("b", fake.file(b"content b"))]);
+        for enc in fake.trees.lock().values() {
+            trees.put(enc).unwrap();
+        }
+        let blobs = [Hash::of(b"content a"), Hash::of(b"content b")];
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let stalled = Stalled;
+        let mut first: futures::BoxFuture<'_, Result<Arc<Snapshot>>> = Box::pin(trees.sync(root_of(&v), &stalled));
+        assert!(first.as_mut().poll(&mut cx).is_pending(), "the first sync waits on its client's upload");
+        let up = trees.state.lock().core.holder(&blobs[0]).expect("the first sync claims what it uploads");
+        assert_eq!(trees.state.lock().core.holder(&blobs[1]), Some(up));
+        drop(first);
+        for h in &blobs {
+            assert_eq!(trees.state.lock().core.holder(h), None, "a dropped sync leaves no claim behind");
+        }
+        assert!(!trees.state.lock().done.contains_key(&up), "and nothing waits on it");
+        let mut second: futures::BoxFuture<'_, Result<Arc<Snapshot>>> = Box::pin(trees.sync(root_of(&v), &fake));
+        match second.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(Ok(s)) => assert_eq!(s.read(b"b").unwrap(), b"content b"),
+            std::task::Poll::Ready(Err(e)) => panic!("the next sync of the same content fails: {e}"),
+            std::task::Poll::Pending => panic!("the next sync of the same content waits on the dropped one"),
+        }
+        trees.state.lock().core.invariants();
+    }
+
     fn root_of(n: &Node) -> Hash {
         match n {
             Node::Dir(d) => Hash(*d),
