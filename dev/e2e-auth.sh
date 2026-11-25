@@ -45,7 +45,7 @@ reap_clients() {
 R=$B/rargo
 D="$B/rargod"
 reap_clients "$T" || { echo "daemons under $T are still running" >&2; exit 2; }
-umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
+umount -l "$T/proj/target" "$T/proj2/target" "$T/clone1/target" "$T/clone2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
 pkill -KILL -f "fake-github.py [0-9]+ $T/github-who" 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
@@ -86,17 +86,26 @@ cd "$T/proj" || exit 2
 git init -q .
 printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' >Cargo.toml
 printf 'fn main() {\n    println!("built by the path");\n}\n' >src/main.rs
+printf '/target\n/Cargo.lock\n' >.gitignore
 git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
 manifest=$(sha256sum Cargo.toml)
+conf=$XDG_CONFIG_HOME/rargo/config.toml
 out=$("$R" build 2>&1); rc=$?
-[ $rc != 0 ] && grep -q 'no rargo server is named here: run `rargo @rargo.rs`' <<<"$out"; check $? "a build where nothing names a server says the one command to run" "$out"
+[ $rc != 0 ] && grep -q 'no rargo server is named: run `rargo @rargo.rs`' <<<"$out" && grep -q "$conf" <<<"$out"; check $? "with no config, a build says the one command to run" "$out"
+out=$("$R" auth status 2>&1); [ $? != 0 ] && grep -q 'rargo @rargo.rs' <<<"$out"; check $? "and so does rargo auth status" "$out"
+printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n\n[package.metadata.rargo]\nhost = "127.0.0.1:1"\n' >"$T/host-in-manifest.toml"
 out=$("$R" @$host 2>&1); rc=$?
-[ $rc = 0 ] && [ "$(cat config.rargo)" = "host = \"$host\"" ]; check $? "rargo @host writes config.rargo, a new file" "$out" "$(cat config.rargo 2>&1)"
-[ "$(sha256sum Cargo.toml)" = "$manifest" ]; check $? "and leaves Cargo.toml byte for byte as it was" "$(cat Cargo.toml)"
-[ -z "$(git status --porcelain)" ] && grep -qx '/config.rargo' .git/info/exclude && [ ! -e .gitignore ]; check $? "git status is clean: the file is in .git/info/exclude, .gitignore is not made" "$(git status --porcelain)" "$(cat .git/info/exclude)"
+[ $rc = 0 ] && [ "$(cat "$conf")" = "host = \"$host\"" ] && [ "$(stat -c %a "$conf")" = 600 ]; check $? "rargo @host writes a new config.toml in XDG_CONFIG_HOME, readable by its owner only" "$out" "$(ls -la "$conf" 2>&1; cat "$conf" 2>&1)"
+[ "$(sha256sum Cargo.toml)" = "$manifest" ] && [ -z "$(git status --porcelain)" ]; check $? "and touches nothing in the worktree: Cargo.toml as it was, git status clean" "$(git status --porcelain)"
 grep -q 'rargo auth' <<<"$out"; check $? "and says what comes next" "$out"
-out=$("$R" @127.0.0.1:1 2>&1); "$R" @$host >/dev/null 2>&1
-[ "$(cat config.rargo)" = "host = \"$host\"" ] && [ "$(grep -c config.rargo .git/info/exclude)" = 1 ]; check $? "a second rargo @host updates the file in place, and excludes it once" "$out" "$(cat config.rargo)" "$(cat .git/info/exclude)"
+out=$("$R" @127.0.0.1:1 2>&1); [ "$(cat "$conf")" = 'host = "127.0.0.1:1"' ]; check $? "a second rargo @host changes the host" "$out" "$(cat "$conf")"
+"$R" @$host >/dev/null 2>&1; [ "$(cat "$conf")" = "host = \"$host\"" ]; check $? "and back" "$(cat "$conf")"
+plain=$T/home-plain
+mkdir -p "$plain"
+out=$(env -u XDG_CONFIG_HOME HOME="$plain" "$R" @127.0.0.1:2 2>&1)
+[ "$(cat "$plain/.config/rargo/config.toml")" = 'host = "127.0.0.1:2"' ] && [ "$(cat "$conf")" = "host = \"$host\"" ]
+check $? "with XDG_CONFIG_HOME unset, the config is ~/.config/rargo/config.toml" "$out" "$(find "$plain" -type f)"
+out=$(env -u XDG_CONFIG_HOME HOME="$plain" "$R" auth status 2>&1); grep -qx "server named by $plain/.config/rargo/config.toml" <<<"$out"; check $? "and is read from there" "$out"
 out=$("$R" build 2>&1); rc=$?
 [ $rc != 0 ] && grep -q "not authenticated.*run \`rargo auth\`" <<<"$out"; check $? "a build before rargo auth says to run it" "$out"
 out=$("$R" auth status 2>&1); grep -q "not authenticated" <<<"$out"; check $? "rargo auth status says so too" "$out"
@@ -125,37 +134,29 @@ cred=$XDG_CONFIG_HOME/rargo/credentials.toml
 grep -q '^id = "t-' "$cred" && grep -q '^secret = "' "$cred" && grep -q '^name = "ann"' "$cred" && ! grep -q '^\(user\|key\) = ' "$cred"
 check $? "it is stored as the token's id, secret and holder" "$(sed 's/^secret = .*/secret = (hidden)/' "$cred")"
 out=$("$R" auth status 2>&1); grep -q "authenticated as ann" <<<"$out"; check $? "rargo auth status names the user" "$out"
-grep -qx "server named by $T/proj/config.rargo" <<<"$out"; check $? "and the file the server came from" "$out"
-out=$(RARGO_SERVER=127.0.0.1:1 "$R" auth status 2>&1); grep -qx "server named by RARGO_SERVER" <<<"$out" && grep -q "^127.0.0.1:1 " <<<"$out"; check $? "RARGO_SERVER outranks config.rargo" "$out"
+grep -qx "server named by $conf" <<<"$out"; check $? "and the file the server came from" "$out"
+out=$(RARGO_SERVER=127.0.0.1:1 "$R" auth status 2>&1); grep -qx "server named by RARGO_SERVER" <<<"$out" && grep -q "^127.0.0.1:1 " <<<"$out"; check $? "RARGO_SERVER outranks the config file" "$out"
 out=$(RARGO_SERVER=127.0.0.1:1 RARGO_NO_DAEMON=1 "$R" build 2>&1); grep -q "cannot reach the rargo server at 127.0.0.1:1" <<<"$out"; check $? "for a build too" "$out"
 out=$("$R" build 2>&1); check $? "rargo build works" "$out"
 out=$(./target/debug/hello 2>&1); [ "$out" = "built by the path" ]; check $? "and its binary runs" "$out"
+cp "$T/host-in-manifest.toml" Cargo.toml
+out=$("$R" build 2>&1); check $? "a host left in Cargo.toml has no effect: the build still goes to the configured server" "$out"
+git checkout -q Cargo.toml
 grep -q "ann@" "$T/srv.log" || ! grep -q "t-[a-z0-9]*@" "$T/srv.log"; check $? "the server knows the user by name, not by the token's id" "$(tail -n 3 "$T/srv.log")"
 
-echo "== a second project on the same machine needs no second rargo auth"
+echo "== fresh clones on the same machine need no further step"
+for c in clone1 clone2; do
+    git clone -q "$T/proj" "$T/$c"
+    sum=$(sha256sum "$T/$c/Cargo.toml")
+    out=$(cd "$T/$c" && "$R" run -q 2>&1); [ "$out" = "built by the path" ]; check $? "rargo run works in a fresh clone ($c)" "$out" \
+        "$("$R" --rargo-daemon-status 2>&1 | tail -n 6)" "$(tail -n 15 "$RARGO_CACHE_DIR/daemon.log" 2>&1)"
+    [ "$(sha256sum "$T/$c/Cargo.toml")" = "$sum" ] && [ -z "$(git -C "$T/$c" status --porcelain)" ]; check $? "and $c is clean, its Cargo.toml as cloned" "$(git -C "$T/$c" status --porcelain)"
+done
 mkdir -p "$T/proj2/src"; cd "$T/proj2" || exit 2
-git init -q .
 printf '[workspace]\nmembers = ["."]\n\n[package]\nname = "second"\nversion = "0.1.0"\nedition = "2021"\n' >Cargo.toml
-mkdir -p crates/inner/src
-printf '[workspace]\nmembers = [".", "crates/inner"]\n\n[package]\nname = "second"\nversion = "0.1.0"\nedition = "2021"\n' >Cargo.toml
-printf '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2021"\n' >crates/inner/Cargo.toml
-: >crates/inner/src/lib.rs
-printf 'fn main() {\n    let f = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("config.rargo");\n    println!("cargo:rustc-env=SEEN={}", f.exists());\n}\n' >build.rs
-printf 'fn main() {\n    println!("second {}", env!("SEEN"));\n}\n' >src/main.rs
-git add -A; git -c user.name=t -c user.email=t@t.invalid commit -qm one
-manifests=$(cat Cargo.toml crates/inner/Cargo.toml | sha256sum)
-out=$(cd crates/inner/src && "$R" @$host 2>&1); [ -f config.rargo ] && [ ! -e crates/inner/config.rargo ]; check $? "from a workspace member's directory, the file goes to the workspace's root" "$out" "$(find . -name config.rargo)"
-[ "$(cat Cargo.toml crates/inner/Cargo.toml | sha256sum)" = "$manifests" ] && [ -z "$(git status --porcelain)" ]; check $? "no manifest changes, and git status is clean" "$(git status --porcelain)"
-! grep -q "rargo auth" <<<"$out"; check $? "and is not sent to rargo auth again" "$out"
-out=$("$R" run -q 2>&1); [ "$out" = "second false" ]; check $? "rargo run works there, and the server never sees config.rargo" "$out" \
-    "$(ls -la target target/debug 2>&1 | head -n 20)" "$(grep -c " $PWD/target " /proc/self/mountinfo) mounts at target/" \
-    "$("$R" --rargo-daemon-status 2>&1 | tail -n 6)" "$(tail -n 15 "$RARGO_CACHE_DIR/daemon.log" 2>&1)"
+printf 'fn main() {\n    println!("second");\n}\n' >src/main.rs
+out=$("$R" run -q 2>&1); [ "$out" = "second" ]; check $? "a project that is not in git builds too" "$out"
 cargo metadata --format-version 1 --no-deps >/dev/null 2>"$T/cargo.err"; check $? "stock cargo reads the manifest" "$(cat "$T/cargo.err")"
-mkdir -p "$T/plain/src"; cd "$T/plain" || exit 2
-printf '[package]\nname = "plain"\nversion = "0.1.0"\nedition = "2021"\n' >Cargo.toml
-printf 'fn main() {\n    println!("plain");\n}\n' >src/main.rs
-out=$("$R" @$host 2>&1); [ "$(cat config.rargo)" = "host = \"$host\"" ] && [ ! -e .git ]; check $? "a package outside a workspace, not in git, gets config.rargo and nothing else" "$out" "$(ls -A)"
-out=$("$R" run -q 2>&1); [ "$out" = "plain" ]; check $? "and builds" "$out"
 "$R" --rargo-daemon-stop >/dev/null 2>&1
 
 echo "== the administrator, from a client, while ann builds"
@@ -188,6 +189,7 @@ echo "== rargo auth remove ends the token on the server too"
 export HOME=$T/home3 XDG_CONFIG_HOME=$T/home3/.config RARGO_CACHE_DIR=$T/cache3
 cred=$XDG_CONFIG_HOME/rargo/credentials.toml
 mkdir -p "$HOME"
+"$R" @$host >/dev/null 2>&1
 cd "$T/proj" || exit 2
 tok3=$(adm create --user dave 2>/dev/null)
 out=$("$R" auth --token "$tok3" 2>&1); check $? "rargo auth --token stores a token an administrator made" "$out"
@@ -219,6 +221,7 @@ out=$(adm allow Carol 2>&1); check $? "rargo auth allow puts an account on the a
 out=$(curl -fsS "http://$host/.well-known/rargo.json"); grep -q '"github":true' <<<"$out"; check $? "the server says that it signs in with GitHub" "$out"
 export HOME=$T/home2 XDG_CONFIG_HOME=$T/home2/.config RARGO_CACHE_DIR=$T/cache2
 mkdir -p "$HOME"
+"$R" @$host >/dev/null 2>&1
 cd "$T/proj" || exit 2
 "$R" auth >"$T/auth2.out" 2>&1 &
 auth=$!

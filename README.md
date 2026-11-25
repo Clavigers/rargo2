@@ -14,7 +14,7 @@ You need Linux.
 ```sh
 cargo install rargo                 # or: curl -fsSL https://rargo.rs/install.sh | sh
 cd my-project
-rargo @build.example                # the name of your server, kept in config.rargo, which git does not see
+rargo @build.example                # your server, kept in ~/.config/rargo/config.toml for every project
 rargo auth                          # enter the invitation your admin gave you
 rargo build
 ```

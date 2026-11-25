@@ -7,16 +7,16 @@ pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| crate::home_dir().join(".config")).join("rargo")
 }
 
-pub const CONFIG: &str = "config.rargo";
-
-pub fn workspace_root(cwd: &Path) -> Option<PathBuf> {
-    let (manifest, _) = rargo_proto::workspace::manifest_for(cwd, |p| std::fs::read_to_string(p).ok())?;
-    manifest.parent().map(Path::to_path_buf)
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
-pub fn project_host(cwd: &Path) -> Result<Option<(String, PathBuf)>, String> {
-    let Some(path) = workspace_root(cwd).map(|r| r.join(CONFIG)) else { return Ok(None) };
-    let text = match std::fs::read_to_string(&path) {
+pub fn user_host() -> Result<Option<(String, PathBuf)>, String> {
+    host_in(&config_path())
+}
+
+fn host_in(path: &Path) -> Result<Option<(String, PathBuf)>, String> {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -24,7 +24,7 @@ pub fn project_host(cwd: &Path) -> Result<Option<(String, PathBuf)>, String> {
     let table: toml::Table = text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
     match table.get("host") {
         None => Ok(None),
-        Some(toml::Value::String(h)) => Ok(Some((h.clone(), path))),
+        Some(toml::Value::String(h)) => Ok(Some((h.clone(), path.to_path_buf()))),
         Some(_) => Err(format!("{}: `host` is not a string", path.display())),
     }
 }
@@ -40,15 +40,16 @@ pub fn valid_host(host: &str) -> bool {
         && port.is_none_or(|p| p.parse::<u16>().is_ok())
 }
 
-pub fn set_host(cwd: &Path, host: &str) -> Result<PathBuf, String> {
+pub fn set_host(host: &str) -> Result<PathBuf, String> {
+    set_host_in(&config_path(), host)
+}
+
+fn set_host_in(path: &Path, host: &str) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if !valid_host(host) {
         return Err(format!("`{host}` is not a host: write a name (rargo.rs) or a name and a port (build.example:7459)"));
     }
-    let Some(root) = workspace_root(cwd) else {
-        return Err("no Cargo.toml here or above: `rargo @host` is run inside a cargo project".into());
-    };
-    let path = root.join(CONFIG);
-    let text = match std::fs::read_to_string(&path) {
+    let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -56,51 +57,24 @@ pub fn set_host(cwd: &Path, host: &str) -> Result<PathBuf, String> {
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
     doc["host"] = toml_edit::value(host);
     let new = doc.to_string();
-    if new != text {
-        crate::write_atomic(&path, new.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
+    if new == text {
+        return Ok(path.to_path_buf());
     }
-    exclude_from_git(&root).map_err(|e| format!("keeping {} out of git: {e}", path.display()))?;
-    Ok(path)
-}
-
-fn exclude_from_git(root: &Path) -> Result<(), String> {
-    let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string())
+    let dir = path.parent().ok_or_else(|| format!("{} has no directory", path.display()))?;
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".config.{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        f.write_all(new.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
     };
-    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else { return Ok(()) };
-    if git(&["check-ignore", "-q", CONFIG]).is_some() {
-        return Ok(());
-    }
-    let exclude = git(&["rev-parse", "--git-path", "info/exclude"]).ok_or("git does not say where its exclude file is")?;
-    let exclude = root.join(exclude);
-    let top = std::fs::canonicalize(&top).map_err(|e| format!("{top}: {e}"))?;
-    let here = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
-    let rel = here.strip_prefix(&top).map_err(|_| format!("{} is not inside {}", here.display(), top.display()))?;
-    let mut pattern = String::from("/");
-    for c in rel.join(CONFIG).to_string_lossy().chars() {
-        if matches!(c, '*' | '?' | '[' | '\\' | ' ') {
-            pattern.push('\\');
-        }
-        pattern.push(c);
-    }
-    if let Some(dir) = exclude.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&pattern);
-    text.push('\n');
-    std::fs::write(&exclude, text).map_err(|e| format!("{}: {e}", exclude.display()))
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("{}: {e}", path.display())
+    })?;
+    Ok(path.to_path_buf())
 }
 
 fn agent() -> ureq::Agent {
@@ -327,85 +301,29 @@ pub fn auth(host: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
-    fn host(cwd: &Path) -> Option<String> {
-        project_host(cwd).unwrap().map(|(h, _)| h)
-    }
-
     #[test]
-    fn at_host_writes_config_rargo_at_the_workspace_root_and_leaves_the_manifests() {
+    fn at_host_writes_the_users_config_and_keeps_the_rest_of_it() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let ws = dir.path();
-        std::fs::create_dir_all(ws.join("crates/a/src")).unwrap();
-        let manifest = "# our workspace\n[workspace]\nmembers = [\"crates/*\"]   # all of them\nresolver = \"2\"\n";
-        let member = "[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
-        std::fs::write(ws.join("Cargo.toml"), manifest).unwrap();
-        std::fs::write(ws.join("crates/a/Cargo.toml"), member).unwrap();
-        let written = set_host(&ws.join("crates/a/src"), "rargo.rs").unwrap();
-        assert_eq!(written, ws.join(CONFIG));
-        assert_eq!(std::fs::read_to_string(ws.join(CONFIG)).unwrap(), "host = \"rargo.rs\"\n");
-        assert_eq!(std::fs::read_to_string(ws.join("Cargo.toml")).unwrap(), manifest);
-        assert_eq!(std::fs::read_to_string(ws.join("crates/a/Cargo.toml")).unwrap(), member);
-        assert!(!ws.join("crates/a").join(CONFIG).exists());
-        assert_eq!(host(&ws.join("crates/a")).as_deref(), Some("rargo.rs"));
-        assert_eq!(project_host(ws).unwrap().unwrap().1, ws.join(CONFIG));
-        std::fs::write(ws.join(CONFIG), "# mine\nhost = \"rargo.rs\"\nother = 1\n").unwrap();
-        set_host(ws, "build.example:7459").unwrap();
-        assert_eq!(std::fs::read_to_string(ws.join(CONFIG)).unwrap(), "# mine\nhost = \"build.example:7459\"\nother = 1\n");
-        assert_eq!(host(ws).as_deref(), Some("build.example:7459"));
-        assert!(!ws.join(".git").exists());
-    }
-
-    #[test]
-    fn a_host_in_cargo_toml_is_not_read() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n").unwrap();
-        assert_eq!(host(dir.path()), None);
-        std::fs::write(dir.path().join(CONFIG), "host = 7\n").unwrap();
-        assert!(project_host(dir.path()).is_err());
-    }
-
-    #[test]
-    fn a_package_without_a_workspace_gets_its_own_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = "[package]\nname = \"solo\"\nversion = \"0.1.0\"\n\n[dependencies]\n";
-        std::fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
-        set_host(dir.path(), "rargo.rs").unwrap();
-        assert_eq!(std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(), manifest);
-        assert_eq!(host(dir.path()).as_deref(), Some("rargo.rs"));
-        assert!(set_host(dir.path(), "not a host").is_err());
-        assert!(set_host(dir.path(), "h:99999").is_err());
-        let empty = tempfile::tempdir().unwrap();
-        assert!(set_host(empty.path(), "rargo.rs").is_err());
-        assert_eq!(host(empty.path()), None);
-    }
-
-    #[test]
-    fn in_a_git_checkout_the_file_is_excluded_locally_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let top = dir.path();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git").arg("-C").arg(top).args(args).output().unwrap();
-            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-            String::from_utf8(out.stdout).unwrap()
-        };
-        git(&["init", "-q"]);
-        let ws = top.join("rust [1]");
-        std::fs::create_dir_all(&ws).unwrap();
-        std::fs::write(ws.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.1.0\"\n").unwrap();
-        set_host(&ws, "rargo.rs").unwrap();
-        set_host(&ws, "build.example:7459").unwrap();
-        let exclude = std::fs::read_to_string(top.join(".git/info/exclude")).unwrap();
-        assert_eq!(exclude.matches("/rust\\ \\[1]/config.rargo\n").count(), 1, "{exclude}");
-        assert!(!top.join(".gitignore").exists());
-        assert_eq!(git(&["status", "--porcelain", "--untracked-files=all"]), "?? \"rust [1]/Cargo.toml\"\n");
-        let other = tempfile::tempdir().unwrap();
-        let top = other.path();
-        std::process::Command::new("git").arg("-C").arg(top).args(["init", "-q"]).status().unwrap();
-        std::fs::write(top.join(".gitignore"), "config.rargo\n").unwrap();
-        std::fs::write(top.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.1.0\"\n").unwrap();
-        let before = std::fs::read_to_string(top.join(".git/info/exclude")).unwrap_or_default();
-        set_host(top, "rargo.rs").unwrap();
-        assert_eq!(std::fs::read_to_string(top.join(".git/info/exclude")).unwrap_or_default(), before);
+        let path = dir.path().join("new/rargo/config.toml");
+        assert_eq!(host_in(&path).unwrap(), None);
+        assert_eq!(set_host_in(&path, "rargo.rs").unwrap(), path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "host = \"rargo.rs\"\n");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(host_in(&path).unwrap(), Some(("rargo.rs".to_string(), path.clone())));
+        std::fs::write(&path, "# mine\nhost = \"rargo.rs\"\nother = 1\n").unwrap();
+        set_host_in(&path, "build.example:7459").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\nhost = \"build.example:7459\"\nother = 1\n");
+        assert_eq!(host_in(&path).unwrap().unwrap().0, "build.example:7459");
+        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert!(set_host_in(&path, "not a host").is_err());
+        assert!(set_host_in(&path, "h:99999").is_err());
+        assert_eq!(host_in(&path).unwrap().unwrap().0, "build.example:7459");
+        std::fs::write(&path, "host = 7\n").unwrap();
+        assert!(host_in(&path).is_err());
+        std::fs::write(&path, "other = 1\n").unwrap();
+        assert_eq!(host_in(&path).unwrap(), None);
     }
 
     #[test]
