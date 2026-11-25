@@ -202,7 +202,7 @@ pub fn spawn<T: Send + 'static>(body: impl FnOnce() -> T + 'static) -> JoinHandl
     let slot = Arc::new(TaskSlot::new());
     let task: Arc<dyn Finish> = slot.clone();
     let slot_for_body = slot.clone();
-    let id = spawn_raw(Spec { parent: None, race: None, task: Some(task) }, move || {
+    let id = spawn_raw(Spec { parent: None, race: None, task: Some(task), background: false }, move || {
         slot_for_body.set_ok(body());
     });
     JoinHandle { id, slot }
@@ -216,7 +216,7 @@ pub fn race_biased<T: 'static>(arms: Vec<Box<dyn FnOnce() -> T + '_>>) -> T {
     let mut ids = Vec::with_capacity(arms.len());
     for (index, arm) in arms.into_iter().enumerate() {
         let ptr = ptr as usize;
-        let id = spawn_raw(Spec { parent: Some(parent), race: Some(index as u16), task: None }, move || {
+        let id = spawn_raw(Spec { parent: Some(parent), race: Some(index as u16), task: None, background: false }, move || {
             let value = arm();
             unsafe { *(ptr as *mut Option<T>) = Some(value) };
         });
@@ -349,4 +349,14 @@ pub fn spawn_off<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -
         let _ = tx.send(spawn(body));
     });
     rx.recv().unwrap_or_else(|_| panic!("the event loop stopped before the fiber started"))
+}
+
+pub fn background(body: impl FnOnce() + Send + 'static) {
+    if on_loop() {
+        spawn_raw(Spec { parent: None, race: None, task: None, background: true }, body);
+        return;
+    }
+    post(move || {
+        spawn_raw(Spec { parent: None, race: None, task: None, background: true }, body);
+    });
 }

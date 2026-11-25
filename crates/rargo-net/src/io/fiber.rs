@@ -52,6 +52,7 @@ pub(super) struct Fiber {
     pub(super) parent: Option<u64>,
     pub(super) race: Option<u16>,
     pub(super) task: Option<Arc<dyn Finish>>,
+    pub(super) background: bool,
 }
 
 pub(super) struct Sched {
@@ -62,6 +63,10 @@ pub(super) struct Sched {
     pub(super) ready: VecDeque<u64>,
     pub(super) inbox: BTreeMap<u64, Resume>,
     pub(super) waiting: BTreeMap<u64, u64>,
+}
+
+pub fn loop_running() -> bool {
+    poke_global().lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 pub fn on_fiber() -> bool {
@@ -109,12 +114,14 @@ pub(super) struct Spec {
     pub(super) parent: Option<u64>,
     pub(super) race: Option<u16>,
     pub(super) task: Option<Arc<dyn Finish>>,
+    pub(super) background: bool,
 }
 
 pub(super) fn spawn_raw(spec: Spec, body: impl FnOnce()) -> u64 {
     let s = unsafe { &mut *sched_ptr() };
     let id = s.next_id;
     s.next_id += 1;
+    let background = spec.background || spec.parent.and_then(|p| s.fibers.get(&p)).is_some_and(|f| f.background);
     let co = unsafe {
         Coroutine::with_stack_unchecked(fresh_stack(), move |yielder: &Yielder<Resume, Pause>, _: Resume| {
             YIELDER.with(|c| c.set(yielder as *const Yielder<Resume, Pause>));
@@ -133,6 +140,7 @@ pub(super) fn spawn_raw(spec: Spec, body: impl FnOnce()) -> u64 {
             parent: spec.parent,
             race: spec.race,
             task: spec.task,
+            background,
         },
     );
     ready_id(s, id);
@@ -260,7 +268,7 @@ pub fn drive(workers: usize, main: impl FnOnce() + 'static) {
         }
     }
     let _clear = Clear;
-    spawn_raw(Spec { parent: None, race: None, task: None }, main);
+    spawn_raw(Spec { parent: None, race: None, task: None, background: false }, main);
     run(ptr);
 }
 
@@ -271,6 +279,15 @@ pub(super) fn run(sched: *mut Sched) {
             drain_poke(s);
             if s.fibers.is_empty() {
                 return;
+            }
+            if s.fibers.values().all(|fiber| fiber.background) {
+                let left: Vec<u64> = s.fibers.iter().filter(|(_, f)| !f.cancel).map(|(id, _)| *id).collect();
+                if !left.is_empty() {
+                    for id in left {
+                        cancel_request(id);
+                    }
+                    continue;
+                }
             }
             pick(s)
         };

@@ -1,5 +1,5 @@
 use crate::sched_state::{Broker, Effects, Job, SchedState};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
@@ -24,7 +24,7 @@ struct Inner {
 
 pub struct Scheduler {
     inner: Mutex<Inner>,
-    wake_broker: Condvar,
+    wake_broker: std::sync::OnceLock<crate::io::Notify>,
     born: Instant,
     pipe_r: OwnedFd,
     pipe_w: OwnedFd,
@@ -73,14 +73,12 @@ impl Scheduler {
                 next_job: 0,
                 shutdown: false,
             }),
-            wake_broker: Condvar::new(),
+            wake_broker: std::sync::OnceLock::new(),
             born: Instant::now(),
             pipe_r,
             pipe_w,
             pipe_try,
         });
-        let weak = Arc::downgrade(&s);
-        std::thread::Builder::new().name("jobserver".into()).spawn(move || broker(weak))?;
         Ok(s)
     }
 
@@ -104,7 +102,22 @@ impl Scheduler {
         self.inner.lock().state.spare() + self.in_pipe()
     }
 
+    fn kick(&self) {
+        if let Some(wake) = self.wake_broker.get() {
+            wake.notify_one();
+        }
+    }
+
+    fn start_broker(self: &Arc<Self>) {
+        self.wake_broker.get_or_init(|| {
+            let weak = Arc::downgrade(self);
+            crate::io::background(move || broker(weak));
+            crate::io::Notify::new()
+        });
+    }
+
     pub fn acquire(self: &Arc<Self>, prio: Priority, mem_kb: u64) -> Permit {
+        self.start_broker();
         let rx = {
             let mut i = self.inner.lock();
             self.prune(&mut i);
@@ -114,7 +127,7 @@ impl Scheduler {
             i.senders.insert(job, tx);
             let fx = i.state.request(job, prio, mem_kb);
             self.apply(&mut i, fx);
-            self.wake_broker.notify_one();
+            self.kick();
             rx
         };
         match rx.recv() {
@@ -169,7 +182,7 @@ impl Scheduler {
         let fx = i.state.release(job);
         self.apply(&mut i, fx);
         self.prune(&mut i);
-        self.wake_broker.notify_one();
+        self.kick();
     }
 
     pub fn restore(self: &Arc<Self>, tokens: usize) {
@@ -197,7 +210,7 @@ impl Scheduler {
 
     pub fn shutdown(&self) {
         self.inner.lock().shutdown = true;
-        self.wake_broker.notify_all();
+        self.kick();
         write_token(self.pipe_w.as_raw_fd());
     }
 }
@@ -205,43 +218,45 @@ impl Scheduler {
 fn broker(weak: std::sync::Weak<Scheduler>) {
     loop {
         let Some(s) = weak.upgrade() else { return };
-        {
+        let step = {
             let mut i = s.inner.lock();
-            loop {
-                if i.shutdown {
-                    return;
-                }
-                s.prune(&mut i);
-                match i.state.tick(s.now_ms(), s.in_pipe()) {
-                    Broker::Read => break,
-                    Broker::TakeForIdle => {
-                        if s.try_take() {
-                            let fx = i.state.idle_token();
-                            s.apply(&mut i, fx);
-                        }
-                        continue;
+            if i.shutdown {
+                return;
+            }
+            s.prune(&mut i);
+            match i.state.tick(s.now_ms(), s.in_pipe()) {
+                Broker::TakeForIdle => {
+                    if s.try_take() {
+                        let fx = i.state.idle_token();
+                        s.apply(&mut i, fx);
                     }
-                    Broker::Wait(ms) => {
-                        s.wake_broker.wait_for(&mut i, Duration::from_millis(ms));
-                    }
+                    continue;
                 }
+                step => step,
+            }
+        };
+        match step {
+            Broker::Wait(ms) => {
+                let wake = s.wake_broker.get().expect("the broker starts with its wake");
+                let _ = crate::io::timeout(Duration::from_millis(ms), || wake.notified());
                 if Arc::strong_count(&s) == 1 {
                     return;
                 }
             }
+            Broker::Read => {
+                let Ok(token) = crate::io::read_at(s.pipe_r.as_raw_fd(), 0, 1) else { continue };
+                if token.len() != 1 {
+                    continue;
+                }
+                let mut i = s.inner.lock();
+                if i.shutdown {
+                    return;
+                }
+                let fx = i.state.token_in(1);
+                s.apply(&mut i, fx);
+            }
+            Broker::TakeForIdle => unreachable!("taken above"),
         }
-        let fd = s.pipe_r.as_raw_fd();
-        let mut b = 0u8;
-        let r = unsafe { libc::read(fd, &mut b as *mut u8 as *mut _, 1) };
-        if r != 1 {
-            continue;
-        }
-        let mut i = s.inner.lock();
-        if i.shutdown {
-            return;
-        }
-        let fx = i.state.token_in(1);
-        s.apply(&mut i, fx);
     }
 }
 

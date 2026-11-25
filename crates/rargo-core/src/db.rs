@@ -1,6 +1,6 @@
 use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
 use anyhow::{Context, Result};
-use parking_lot::{Condvar, Mutex};
+use parking_lot::Mutex;
 use redb::{Database, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
@@ -86,7 +86,7 @@ struct Shared {
     db: Database,
     writer: Mutex<DbWriter>,
     flushing: Mutex<()>,
-    wake: Condvar,
+    wake: std::sync::OnceLock<crate::io::Notify>,
     stop: Mutex<bool>,
     born: Instant,
 }
@@ -99,7 +99,7 @@ impl Shared {
 
 pub struct Db {
     shared: Arc<Shared>,
-    writer: Mutex<Option<std::thread::JoinHandle<()>>>,
+    writing: std::sync::Once,
 }
 
 impl Db {
@@ -116,13 +116,28 @@ impl Db {
             db,
             writer: Mutex::new(DbWriter::new()),
             flushing: Mutex::new(()),
-            wake: Condvar::new(),
+            wake: std::sync::OnceLock::new(),
             stop: Mutex::new(false),
             born: Instant::now(),
         });
-        let s2 = shared.clone();
-        let writer = std::thread::Builder::new().name("db-writer".into()).spawn(move || writer_loop(s2))?;
-        Ok(Db { shared, writer: Mutex::new(Some(writer)) })
+        Ok(Db { shared, writing: std::sync::Once::new() })
+    }
+
+    fn written(&self) {
+        if let Some(wake) = self.shared.wake.get() {
+            wake.notify_one();
+            return;
+        }
+        if !crate::io::loop_running() {
+            return;
+        }
+        self.writing.call_once(|| {
+            let shared = self.shared.clone();
+            crate::io::background(move || {
+                let _ = shared.wake.set(crate::io::Notify::new());
+                writer_loop(shared)
+            });
+        });
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
@@ -138,13 +153,13 @@ impl Db {
     pub fn put(&self, table: Table, key: &[u8], val: &[u8]) {
         let now = self.shared.now_ms();
         self.shared.writer.lock().put(table, key, val, now);
-        self.shared.wake.notify_one();
+        self.written();
     }
 
     pub fn delete(&self, table: Table, key: &[u8]) {
         let now = self.shared.now_ms();
         self.shared.writer.lock().delete(table, key, now);
-        self.shared.wake.notify_one();
+        self.written();
     }
 
     pub fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
@@ -175,18 +190,17 @@ impl Db {
     }
 
     pub fn flush(&self) {
-        flush_once(&self.shared);
+        flush_off_the_loop(&self.shared);
     }
 }
 
 impl Drop for Db {
     fn drop(&mut self) {
         *self.shared.stop.lock() = true;
-        self.shared.wake.notify_all();
-        if let Some(h) = self.writer.lock().take() {
-            let _ = h.join();
+        if let Some(wake) = self.shared.wake.get() {
+            wake.notify_one();
         }
-        flush_once(&self.shared);
+        flush_off_the_loop(&self.shared);
     }
 }
 
@@ -229,32 +243,34 @@ fn flush_once(shared: &Shared) {
     }
 }
 
+fn flush_off_the_loop(shared: &Shared) {
+    if crate::io::on_fiber() {
+        crate::io::cpu(|| flush_once(shared));
+    } else {
+        flush_once(shared);
+    }
+}
+
 fn writer_loop(shared: Arc<Shared>) {
+    let wake = shared.wake.get().expect("the writer starts with its wake");
     loop {
-        {
-            let mut w = shared.writer.lock();
-            let now = shared.now_ms();
-            match w.due(now) {
-                Due::Now => {}
-                Due::Idle => {
-                    if *shared.stop.lock() {
-                        return;
-                    }
-                    shared.wake.wait_for(&mut w, Duration::from_millis(IDLE_MS));
-                    continue;
-                }
-                Due::At(t) => {
-                    if *shared.stop.lock() {
-                        return;
-                    }
-                    shared.wake.wait_for(&mut w, Duration::from_millis(t.saturating_sub(now).max(1)));
-                    continue;
-                }
-            }
-        }
         if *shared.stop.lock() {
             return;
         }
-        flush_once(&shared);
+        let wait = {
+            let w = shared.writer.lock();
+            let now = shared.now_ms();
+            match w.due(now) {
+                Due::Now => None,
+                Due::Idle => Some(IDLE_MS),
+                Due::At(t) => Some(t.saturating_sub(now).max(1)),
+            }
+        };
+        match wait {
+            None => crate::io::cpu(|| flush_once(&shared)),
+            Some(ms) => {
+                let _ = crate::io::timeout(Duration::from_millis(ms), || wake.notified());
+            }
+        }
     }
 }
