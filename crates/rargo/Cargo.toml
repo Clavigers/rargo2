@@ -11,9 +11,9 @@ keywords = ["cargo", "build", "remote", "cache"]
 categories = ["development-tools::build-utils", "command-line-utilities"]
 
 [dependencies]
-rargo-proto = { path = "../rargo-proto", version = "0.6.4" }
-rargo-net = { path = "../rargo-net", version = "0.6.4" }
-fusewire = { path = "../fusewire", version = "0.6.4" }
+rargo-proto = { path = "../rargo-proto", version = "0.6.5" }
+rargo-net = { path = "../rargo-net", version = "0.6.5" }
+fusewire = { path = "../fusewire", version = "0.6.5" }
 tokio.workspace = true
 libc.workspace = true
 blake3.workspace = true
