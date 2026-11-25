@@ -1,7 +1,7 @@
 From 440a9aa193a6c447506707afadb89ae8a96b1f95 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:20:18 +0100
-Subject: [PATCH 3/4] rargo: accept -Zno-codegen on the stable channel
+Subject: [PATCH 3/5] rargo: accept -Zno-codegen on the stable channel
 
 A compile with --emit=...,metadata,link -Zno-codegen writes exactly the
 metadata of the full build and stops. RUSTC_BOOTSTRAP cannot be used to

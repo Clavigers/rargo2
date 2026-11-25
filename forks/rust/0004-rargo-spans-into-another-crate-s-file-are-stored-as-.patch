@@ -1,7 +1,7 @@
 From ffa3c261d81a488a88c59c635bdd90763e191fb3 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:07:51 +0100
-Subject: [PATCH 4/4] rargo: spans into another crate's file are stored as
+Subject: [PATCH 4/5] rargo: spans into another crate's file are stored as
  lines and columns
 
 A crate that was not rebuilt after its dependency was recompiled with the

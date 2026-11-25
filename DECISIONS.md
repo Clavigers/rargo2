@@ -307,8 +307,9 @@ how its open ends were closed.
 
 ## D22. The rustc fork: what it changes and how rargo recognises it
 
-The fork is optional (rargo works with any toolchain) and small: three
-patches on rustc 1.100.0 (`forks/rust`).
+The fork is optional (rargo works with any toolchain) and small: five
+patches on rustc 1.100.0 (`forks/rust`). The fifth, stable dep-graph
+indices, is D84.
 
 - **Crate hash that ignores what dependents cannot see.** In 1.100 the crate
   hash is a digest of the encoded metadata plus the hash of the whole HIR.
@@ -2652,3 +2653,70 @@ given to the action, because they would change its key every time:
   sees a replay.
 - **A runner the repository configures for the host target is replaced.**
   The variable outranks cargo configuration.
+
+## D84. Dep-graph nodes keep their index across sessions (issue 114)
+
+rustc numbers the nodes of its incremental dep graph afresh every session,
+in the order they are written. Each record and each edge in `dep-graph.bin`
+holds those numbers, so one node more or less early in the file shifts every
+number after it. Measured on regex-syntax 0.8.12 (a 14.3 MB graph of 253,796
+nodes, `rustc` run directly with cargo's dev-profile flags,
+`dev/depgraph-share.sh`, records compared with `dev/depgraph-diff.py`):
+- one statement added to `Parser::parse`: only 6,923 of the second
+  session's 253,908 records were identical to a record of the first, and
+  none of its 177 chunks was in the first file;
+- yet 99.7% of the nodes were the same node, and 253,644 of 253,794
+  consecutive records came in the same order.
+
+**The change** (`forks/rust/0005`):
+- A node of the previous graph keeps its previous index, whether it is
+  promoted green or re-executed.
+- A new node gets an index above the previous index space.
+- The two fixed nodes (the zero-dependency anonymous node and the
+  always-red node) keep indices 0 and 1. The previous session's nodes at
+  those indices are new nodes when they are kept, since their slots are
+  taken.
+- The indices of nodes that are gone stay unused. The format already allows
+  this, because threads take indices in batches and leave the rest of a
+  batch empty.
+
+**Measured with the patch**, same build and edit
+(`crates/rargo-core/examples/chunkshare.rs` cuts both files with rargo's
+chunker):
+
+| | records identical | file in shared chunks |
+|---|---|---|
+| without the patch, after the edit | 6,923 of 253,908 | 0% (0 of 177 chunks) |
+| with it, after the edit | 253,225 of 253,908 | 66.2% (117 of 173) |
+| with it, after the edit is reverted | 253,758 of 253,866 | 76.4% (134 of 173) |
+
+rustc's output is not byte-identical from run to run, so the chunk figures
+move by about a point (a second run: 66.2% and 77.3%); the record counts
+do not.
+
+What still differs is the ~700 records of changed and new nodes, scattered
+through the file; each one spoils the 64 KiB chunk it lands in. Writing the
+records in index order instead of the order they are produced would cluster
+them, but needs the whole graph in memory at the end of a session, which
+rustc avoids on purpose. It is not done.
+
+**Bound on the index space.** Unused indices accumulate: about 90 per
+session in the edit-and-revert cycle above, since anonymous nodes executed
+again are new each session (their key mixes in the session count). Forty
+sessions (`dev/depgraph-sessions.sh`) grew the index space from 253,796 to
+257,328 slots for 253,908 nodes. The decoder allocates per slot, so the patch bounds it: a session
+whose previous graph has more than twice as many slots as nodes (plus 4,096)
+numbers its nodes afresh, as stock rustc does every time. At the rate
+above, that is one session in thousands.
+
+**Checked.**
+- rustc's incremental suite (`x.py test --stage 1 tests/incremental`): 180
+  of 180 pass.
+- `dev/fork-check.sh` with the patched toolchain: 13 of 13. It now takes
+  `RUSTUP_TOOLCHAIN` and `RARGO_FORK_CHECK` from the environment, so that a
+  build of the fork can be checked without replacing the toolchain `rargo`.
+- regex-syntax's own 149 tests pass when built through three incremental
+  sessions (build, edit, revert).
+- Not checked, and not true without the patch either: that the rlib after
+  many sessions equals a fresh incremental build of the same source. With
+  either compiler, the rlib and rmeta differ after four sessions.

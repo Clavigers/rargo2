@@ -15,4 +15,6 @@ The cargo fork is required: it is rargo's planner. The rustc fork is
 optional. Without it rargo works with any toolchain; with it (select it with
 `RUSTUP_TOOLCHAIN=rargo` or `rargo +rargo ...`) an edit that leaves a crate's
 interface alone does not rebuild the crates that depend on it, rlibs built
-incrementally are reproducible, and `check` shares work with `build`.
+incrementally are reproducible, `check` shares work with `build`, and
+successive incremental sessions write `dep-graph.bin` files that share most
+of their chunks (DECISIONS D84).
