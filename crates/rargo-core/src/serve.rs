@@ -36,7 +36,8 @@ pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>, 
     let mut first = [0u8; 4];
     let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.peek(&mut first)).await.context("nothing was sent")??;
     if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
-        return http.serve(stream).await;
+        let stream = stream.into_std()?;
+        return tokio::task::block_in_place(|| http.serve(stream));
     }
     let (user, admin, sealer, opener) =
         tokio::time::timeout(std::time::Duration::from_secs(20), session::accept(&mut stream, &keys))
