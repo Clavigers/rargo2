@@ -1,0 +1,354 @@
+From 28227ba0b1caecbb73213deb8c6b53d4718416af Mon Sep 17 00:00:00 2001
+From: rargo <noreply@rargo.invalid>
+Date: Wed, 25 Nov 2026 14:49:45 +0100
+Subject: [PATCH] rargo: -Z rargo-fn-slots marks the slot of every function
+ instance that runs
+
+---
+ compiler/rustc_codegen_llvm/src/base.rs       |   2 +
+ compiler/rustc_codegen_llvm/src/builder.rs    |  24 ++++
+ compiler/rustc_codegen_llvm/src/consts.rs     |  48 ++++++++
+ compiler/rustc_codegen_llvm/src/context.rs    |   4 +
+ compiler/rustc_codegen_ssa/src/mir/mod.rs     |   7 +-
+ .../rustc_codegen_ssa/src/traits/builder.rs   |   1 +
+ compiler/rustc_mir_transform/src/inline.rs    |   3 +
+ compiler/rustc_session/src/config.rs          |   2 +-
+ compiler/rustc_session/src/options.rs         |   3 +
+ library/std/src/sys/mod.rs                    |   2 +
+ library/std/src/sys/rargo_slots.rs            | 104 ++++++++++++++++++
+ 11 files changed, 198 insertions(+), 2 deletions(-)
+ create mode 100644 library/std/src/sys/rargo_slots.rs
+
+diff --git a/compiler/rustc_codegen_llvm/src/base.rs b/compiler/rustc_codegen_llvm/src/base.rs
+index 6e7c31f77..571d8cda6 100644
+--- a/compiler/rustc_codegen_llvm/src/base.rs
++++ b/compiler/rustc_codegen_llvm/src/base.rs
+@@ -187,6 +187,8 @@ fn module_codegen(
+                 cx.coverageinfo_finalize();
+             }
+ 
++            cx.rargo_finish_slots();
++
+             // Create the llvm.used variable.
+             if !cx.used_statics.is_empty() {
+                 cx.create_used_variable_impl(c"llvm.used", &cx.used_statics);
+diff --git a/compiler/rustc_codegen_llvm/src/builder.rs b/compiler/rustc_codegen_llvm/src/builder.rs
+index abc71f450..22103bdbb 100644
+--- a/compiler/rustc_codegen_llvm/src/builder.rs
++++ b/compiler/rustc_codegen_llvm/src/builder.rs
+@@ -700,6 +700,30 @@ fn load(&mut self, ty: &'ll Type, ptr: &'ll Value, align: Align) -> &'ll Value {
+         }
+     }
+ 
++    fn rargo_mark_slot(&mut self, instance: Instance<'tcx>) {
++        let name = self.tcx.symbol_name(instance).name.to_string();
++        let index = {
++            let mut slots = self.cx.rargo_slots.borrow_mut();
++            slots.push(name);
++            slots.len() - 1
++        };
++        let isize_ty = self.cx.type_isize();
++        let slot = self.inbounds_gep(self.cx.type_i8(), self.cx.rargo_slot_array(), &[self.cx.const_usize(index as u64)]);
++        let delta = self.load(isize_ty, self.cx.rargo_slot_delta(), self.tcx.data_layout.pointer_align().abi);
++        let at = self.ptrtoint(slot, isize_ty);
++        let at = self.add(at, delta);
++        let ptr = self.inttoptr(at, self.cx.type_ptr());
++        let seen = self.volatile_load(self.cx.type_i8(), ptr, Align::ONE);
++        let unmarked = self.icmp(IntPredicate::IntEQ, seen, self.cx.const_u8(0));
++        let mark = self.append_sibling_block("rargo_mark");
++        let marked = self.append_sibling_block("rargo_marked");
++        self.cond_br_with_expect(unmarked, mark, marked, Some(false));
++        self.switch_to_block(mark);
++        self.store_with_flags(self.cx.const_u8(1), ptr, Align::ONE, MemFlags::VOLATILE);
++        self.br(marked);
++        self.switch_to_block(marked);
++    }
++
+     fn volatile_load(&mut self, ty: &'ll Type, ptr: &'ll Value, align: Align) -> &'ll Value {
+         unsafe {
+             let load = self.load(ty, ptr, align);
+diff --git a/compiler/rustc_codegen_llvm/src/consts.rs b/compiler/rustc_codegen_llvm/src/consts.rs
+index bbb1141a9..1a41e1f8b 100644
+--- a/compiler/rustc_codegen_llvm/src/consts.rs
++++ b/compiler/rustc_codegen_llvm/src/consts.rs
+@@ -674,6 +674,54 @@ fn codegen_static_item(&mut self, def_id: DefId) {
+         }
+     }
+ 
++    pub(crate) fn rargo_slot_array(&self) -> &'ll Value {
++        if let Some(array) = self.rargo_slot_array.get() {
++            return array;
++        }
++        let array = self.declare_global("__rargo_slots_pending", self.type_array(self.type_i8(), 0));
++        self.rargo_slot_array.set(Some(array));
++        array
++    }
++
++    pub(crate) fn rargo_slot_delta(&self) -> &'ll Value {
++        let delta = self.declare_global("__rargo_slot_delta", self.type_isize());
++        if llvm::is_declaration(delta) {
++            llvm::set_initializer(delta, self.const_usize(0));
++            llvm::set_linkage(delta, llvm::Linkage::WeakAnyLinkage);
++            llvm::set_visibility(delta, llvm::Visibility::Hidden);
++        }
++        delta
++    }
++
++    pub(crate) fn rargo_finish_slots(&mut self) {
++        let Some(pending) = self.rargo_slot_array.take() else { return };
++        let names = self.rargo_slots.take();
++        let slots_ty = self.type_array(self.type_i8(), names.len() as u64);
++        let slots = self.define_global(&self.generate_local_symbol_name("rargo_slots"), slots_ty).unwrap();
++        llvm::set_initializer(slots, self.const_null(slots_ty));
++        llvm::set_linkage(slots, llvm::Linkage::InternalLinkage);
++        llvm::set_section(slots, c".rargo_slots");
++        set_global_alignment(self, slots, Align::ONE);
++        let mut bytes = Vec::new();
++        for name in &names {
++            bytes.extend_from_slice(name.as_bytes());
++            bytes.push(0);
++        }
++        let text = self.const_bytes(&bytes);
++        let table = self.define_global(&self.generate_local_symbol_name("rargo_slot_names"), self.val_ty(text)).unwrap();
++        llvm::set_initializer(table, text);
++        llvm::set_linkage(table, llvm::Linkage::InternalLinkage);
++        llvm::LLVMSetGlobalConstant(table, llvm::TRUE);
++        llvm::set_section(table, c".rargo_slot_names");
++        set_global_alignment(self, table, Align::ONE);
++        unsafe {
++            llvm::LLVMReplaceAllUsesWith(pending, slots);
++            llvm::LLVMDeleteGlobal(pending);
++        }
++        self.add_used_global(slots);
++        self.add_used_global(table);
++    }
++
+     /// Add a global value to a list to be stored in the `llvm.used` variable, an array of ptr.
+     pub(crate) fn add_used_global(&mut self, global: &'ll Value) {
+         self.used_statics.push(global);
+diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
+index 0ce3bfe07..795b43f23 100644
+--- a/compiler/rustc_codegen_llvm/src/context.rs
++++ b/compiler/rustc_codegen_llvm/src/context.rs
+@@ -125,6 +125,8 @@ pub(crate) struct FullCx<'ll, 'tcx> {
+     /// Statics that will be placed in the llvm.compiler.used variable
+     /// See <https://llvm.org/docs/LangRef.html#the-llvm-compiler-used-global-variable> for details
+     pub compiler_used_statics: RefCell<Vec<&'ll Value>>,
++    pub rargo_slots: RefCell<Vec<String>>,
++    pub rargo_slot_array: Cell<Option<&'ll Value>>,
+ 
+     /// Mapping of non-scalar types to llvm types.
+     pub type_lowering: RefCell<FxHashMap<(Ty<'tcx>, Option<VariantIdx>), &'ll Type>>,
+@@ -737,6 +739,8 @@ pub(crate) fn new(
+                 statics_to_rauw: RefCell::new(Vec::new()),
+                 used_statics: Vec::new(),
+                 compiler_used_statics: Default::default(),
++                rargo_slots: Default::default(),
++                rargo_slot_array: Cell::new(None),
+                 type_lowering: Default::default(),
+                 scalar_lltypes: Default::default(),
+                 coverage_cx,
+diff --git a/compiler/rustc_codegen_ssa/src/mir/mod.rs b/compiler/rustc_codegen_ssa/src/mir/mod.rs
+index aefa83565..4baf927c5 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/mod.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/mod.rs
+@@ -228,7 +228,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+         mir = tcx.arena.alloc(optimize_use_clone::<Bx>(cx, monomorphized_mir));
+     }
+ 
+-    let start_llbb = Bx::append_block(cx, llfn, "start");
++    let mut start_llbb = Bx::append_block(cx, llfn, "start");
+     let mut start_bx = Bx::build(cx, start_llbb);
+ 
+     if mir::traversal::mono_reachable(&mir, tcx, instance).any(|(bb, block)| {
+@@ -238,6 +238,11 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+         start_bx.set_personality_fn(cx.eh_personality());
+     }
+ 
++    if tcx.sess.opts.unstable_opts.rargo_fn_slots {
++        start_bx.rargo_mark_slot(instance);
++        start_llbb = start_bx.llbb();
++    }
++
+     let cleanup_kinds = base::wants_new_eh_instructions(&tcx.sess.target)
+         .then(|| analyze::cleanup_kinds(&mir, &nop_landing_pads));
+ 
+diff --git a/compiler/rustc_codegen_ssa/src/traits/builder.rs b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+index b7b694922..f8ad65bc1 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/builder.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+@@ -260,6 +260,7 @@ fn checked_binop(
+ 
+     fn load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
+     fn volatile_load(&mut self, ty: Self::Type, ptr: Self::Value, align: Align) -> Self::Value;
++    fn rargo_mark_slot(&mut self, _instance: Instance<'tcx>) {}
+     fn atomic_load(
+         &mut self,
+         ty: Self::Type,
+diff --git a/compiler/rustc_mir_transform/src/inline.rs b/compiler/rustc_mir_transform/src/inline.rs
+index 3fd414579..492fa54f3 100644
+--- a/compiler/rustc_mir_transform/src/inline.rs
++++ b/compiler/rustc_mir_transform/src/inline.rs
+@@ -45,6 +45,9 @@ struct CallSite<'tcx> {
+ 
+ impl<'tcx> crate::MirPass<'tcx> for Inline {
+     fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
++        if ctx.opts.unstable_opts.rargo_fn_slots {
++            return PassPolicy::optional(false);
++        }
+         match ctx.opts.unstable_opts.inline_mir {
+             Some(enabled) => PassPolicy::optional(enabled),
+             None => PassPolicy::optional(match ctx.mir_opt_level() {
+diff --git a/compiler/rustc_session/src/config.rs b/compiler/rustc_session/src/config.rs
+index 620c13d84..ca852b50f 100644
+--- a/compiler/rustc_session/src/config.rs
++++ b/compiler/rustc_session/src/config.rs
+@@ -3203,7 +3203,7 @@ pub fn check_nightly_options(
+             // rargo: `-Zno-codegen` is how the build system asks for a crate's metadata
+             // without its object code. It has to work without `RUSTC_BOOTSTRAP`, because that
+             // variable changes the crate hash and the metadata must be the full build's.
+-            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| x == "no-codegen") {
++            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| matches!(x.as_str(), "no-codegen" | "rargo-fn-slots" | "rargo-fn-slots=yes")) {
+                 continue;
+             }
+ 
+diff --git a/compiler/rustc_session/src/options.rs b/compiler/rustc_session/src/options.rs
+index 0e0671301..c86492fc4 100644
+--- a/compiler/rustc_session/src/options.rs
++++ b/compiler/rustc_session/src/options.rs
+@@ -2792,6 +2792,9 @@ pub(crate) fn parse_rust_version(slot: &mut Option<RustcVersion>, v: Option<&str
+         "enable queries of the dependency graph for regression testing (default: no)"),
+     randomize_layout: bool = (false, parse_bool, [TRACKED],
+         "randomize the layout of types (default: no)"),
++    rargo_fn_slots: bool = (false, parse_bool, [TRACKED],
++        "give every function instance a byte in `.rargo_slots` that it sets when it runs, \
++        named in `.rargo_slot_names` (default: no)"),
+     reg_struct_return: bool = (false, parse_bool, [TRACKED] { TARGET_MODIFIER: RegStructReturn },
+         "On x86-32 targets, it overrides the default ABI to return small structs in registers.
+         It is UNSOUND to link together crates that use different values for this flag!"),
+diff --git a/library/std/src/sys/mod.rs b/library/std/src/sys/mod.rs
+index 58c8dc43e..a0c323d88 100644
+--- a/library/std/src/sys/mod.rs
++++ b/library/std/src/sys/mod.rs
+@@ -1,6 +1,8 @@
+ #![allow(unsafe_op_in_unsafe_fn)]
+ 
+ mod configure_builtins;
++#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
++mod rargo_slots;
+ mod helpers;
+ mod pal;
+ mod personality;
+diff --git a/library/std/src/sys/rargo_slots.rs b/library/std/src/sys/rargo_slots.rs
+new file mode 100644
+index 000000000..03ec8f666
+--- /dev/null
++++ b/library/std/src/sys/rargo_slots.rs
+@@ -0,0 +1,104 @@
++use crate::os::unix::fs::FileExt;
++use crate::sync::atomic::{AtomicIsize, Ordering};
++
++#[unsafe(no_mangle)]
++static __rargo_slot_delta: AtomicIsize = AtomicIsize::new(0);
++
++#[used]
++#[unsafe(link_section = ".init_array.00098")]
++static RARGO_SLOTS_INIT: extern "C" fn() = {
++    extern "C" fn init() {
++        map_slots();
++    }
++    init
++};
++
++fn map_slots() {
++    let path = unsafe { libc::getenv(c"RARGO_FN_SLOTS".as_ptr()) };
++    if path.is_null() || unsafe { *path } == 0 {
++        return;
++    }
++    let Some((start, size)) = slot_range() else { return };
++    if size == 0 {
++        return;
++    }
++    unsafe {
++        let fd = libc::open(path, libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o644 as libc::c_uint);
++        if fd < 0 {
++            return;
++        }
++        let mut st: libc::stat64 = crate::mem::zeroed();
++        let ready = libc::fstat64(fd, &mut st) == 0
++            && (st.st_size >= size as i64 || libc::ftruncate64(fd, size as i64) == 0);
++        let map = if ready {
++            libc::mmap64(
++                crate::ptr::null_mut(),
++                size,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_SHARED,
++                fd,
++                0,
++            )
++        } else {
++            libc::MAP_FAILED
++        };
++        libc::close(fd);
++        if map == libc::MAP_FAILED {
++            return;
++        }
++        let map = map as *mut u8;
++        for i in 0..size {
++            if crate::ptr::read_volatile(start.add(i)) != 0 {
++                crate::ptr::write_volatile(map.add(i), 1);
++            }
++        }
++        __rargo_slot_delta.store(map.addr() as isize - start.addr() as isize, Ordering::SeqCst);
++    }
++}
++
++fn slot_range() -> Option<(*const u8, usize)> {
++    let exe = crate::fs::File::open("/proc/self/exe").ok()?;
++    let read = |at: u64, len: usize| -> Option<crate::vec::Vec<u8>> {
++        let mut buf = crate::vec![0u8; len];
++        exe.read_exact_at(&mut buf, at).ok()?;
++        Some(buf)
++    };
++    let field = |b: &[u8], at: usize, n: usize| -> Option<u64> {
++        let bytes = b.get(at..at.checked_add(n)?)?;
++        let mut v = [0u8; 8];
++        v[..n].copy_from_slice(bytes);
++        Some(u64::from_le_bytes(v))
++    };
++    let head = read(0, 64)?;
++    if head.get(..6)? != b"\x7fELF\x02\x01" {
++        return None;
++    }
++    let (phoff, phentsize, phnum) = (field(&head, 0x20, 8)?, field(&head, 0x36, 2)? as usize, field(&head, 0x38, 2)? as usize);
++    let (shoff, shentsize, shnum) = (field(&head, 0x28, 8)?, field(&head, 0x3a, 2)? as usize, field(&head, 0x3c, 2)? as usize);
++    let shstrndx = field(&head, 0x3e, 2)? as usize;
++    let phdrs = read(phoff, phentsize.checked_mul(phnum)?)?;
++    let phdr_vaddr = (0..phnum).find_map(|i| {
++        let h = phdrs.get(i * phentsize..)?;
++        let (kind, offset, vaddr, filesz) = (field(h, 0, 4)?, field(h, 8, 8)?, field(h, 16, 8)?, field(h, 32, 8)?);
++        (kind == 1 && offset <= phoff && phoff - offset < filesz).then(|| vaddr + (phoff - offset))
++    })?;
++    let bias = (unsafe { libc::getauxval(libc::AT_PHDR) } as u64).checked_sub(phdr_vaddr)?;
++    let delta_at = (crate::ptr::addr_of!(__rargo_slot_delta).addr() as u64).checked_sub(bias)?;
++    (0..phnum).find(|&i| {
++        let Some(h) = phdrs.get(i * phentsize..) else { return false };
++        let (Some(kind), Some(vaddr), Some(memsz)) = (field(h, 0, 4), field(h, 16, 8), field(h, 40, 8)) else { return false };
++        kind == 1 && vaddr <= delta_at && delta_at - vaddr < memsz
++    })?;
++    let shdrs = read(shoff, shentsize.checked_mul(shnum)?)?;
++    let strtab = shdrs.get(shstrndx.checked_mul(shentsize)?..)?;
++    let names = read(field(strtab, 0x18, 8)?, usize::try_from(field(strtab, 0x20, 8)?).ok()?)?;
++    (0..shnum).find_map(|i| {
++        let h = shdrs.get(i * shentsize..)?;
++        let name = names.get(usize::try_from(field(h, 0, 4)?).ok()?..)?;
++        if !name.starts_with(b".rargo_slots\0") {
++            return None;
++        }
++        let (addr, size) = (field(h, 0x10, 8)?, field(h, 0x20, 8)?);
++        Some((crate::ptr::with_exposed_provenance((bias + addr) as usize), usize::try_from(size).ok()?))
++    })
++}
+-- 
+2.43.0
+

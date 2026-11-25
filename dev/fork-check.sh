@@ -101,5 +101,137 @@ lib b b/lib.rs m2 -Zno-codegen
 cmp -s m1/libb.rmeta m2/libb.rmeta && ok "-Zno-codegen gives the full build's metadata byte for byte" || bad "-Zno-codegen gives the full build's metadata byte for byte"
 out=$(rustc -Zthis-is-not-allowed lib.rs 2>&1); grep -q "only accepted on the nightly" <<<"$out" && ok "other -Z flags are still refused on stable" || bad "other -Z flags are still refused on stable" "$out"
 
+echo "== function slots"
+mkdir -p slots && cd slots
+ulimit -c 0
+cat >prog.rs <<'EOF'
+use std::hint::black_box;
+unsafe extern "C" {
+    fn fork() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn _exit(code: i32) -> !;
+}
+#[inline(always)]
+fn inlined(x: u32) -> u32 { x * 3 }
+#[inline(never)]
+fn generic<T: Default + Copy>(t: T) -> T { black_box(t); T::default() }
+#[inline(never)]
+fn in_thread() -> u32 { black_box(5) }
+#[inline(never)]
+fn in_child() -> u32 { black_box(6) }
+#[inline(never)]
+fn before_abort() { black_box(()); }
+#[inline(never)]
+fn second_run() -> u32 { black_box(8) }
+#[inline(never)]
+fn never_called() -> u32 { black_box(9) }
+fn main() {
+    black_box(never_called as fn() -> u32);
+    if std::env::args().nth(1).as_deref() == Some("again") {
+        black_box(second_run());
+        return;
+    }
+    black_box(inlined(black_box(2)));
+    black_box(generic(1u32));
+    black_box(generic(2u64));
+    let add = |x: u32| x + black_box(1);
+    black_box(add(1));
+    std::thread::spawn(|| black_box(in_thread())).join().unwrap();
+    unsafe {
+        let pid = fork();
+        if pid == 0 {
+            black_box(in_child());
+            _exit(0);
+        }
+        let mut status = 0;
+        waitpid(pid, &mut status, 0);
+    }
+    before_abort();
+    std::process::abort();
+}
+EOF
+cat >marks.py <<'EOF'
+import sys
+exe, marks = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None
+d = open(exe, 'rb').read()
+u = lambda at, n: int.from_bytes(d[at:at + n], 'little')
+shoff, shentsize, shnum, shstrndx = u(0x28, 8), u(0x3a, 2), u(0x3c, 2), u(0x3e, 2)
+sec = lambda i: d[shoff + i * shentsize: shoff + (i + 1) * shentsize]
+strtab = sec(shstrndx)
+names_at = int.from_bytes(strtab[0x18:0x20], 'little')
+found = {}
+for i in range(shnum):
+    h = sec(i)
+    n = int.from_bytes(h[0:4], 'little')
+    name = d[names_at + n: d.index(b'\0', names_at + n)].decode()
+    found[name] = (int.from_bytes(h[0x18:0x20], 'little'), int.from_bytes(h[0x20:0x28], 'little'))
+if '.rargo_slots' not in found:
+    print('no-slots')
+    sys.exit(0)
+off, size = found['.rargo_slot_names']
+names = d[off:off + size].split(b'\0')[:-1]
+slots = found['.rargo_slots'][1]
+print('slots', slots, 'names', len(names))
+m = open(marks, 'rb').read() if marks else b''
+print('file', len(m))
+for i, n in enumerate(names):
+    print('+' if i < len(m) and m[i] else '-', n.decode())
+EOF
+rustc --edition=2021 -O -C codegen-units=4 -C symbol-mangling-version=v0 -Zrargo-fn-slots prog.rs -o prog 2>&1 | head -5
+rustc --edition=2021 -O prog.rs -o plain 2>&1 | head -5
+report=$(python3 -I marks.py prog)
+grep -q '^slots \([0-9]*\) names \1$' <<<"$report" && ok "every slot is named, in slot order ($(head -1 <<<"$report" | cut -d' ' -f2) slots)" || bad "every slot is named, in slot order" "$(head -1 <<<"$report")"
+[ "$(python3 -I marks.py plain)" = no-slots ] && ok "a build without the flag has no slots" || bad "a build without the flag has no slots"
+rm -f marks.bin
+env -u RARGO_FN_SLOTS bash -c './prog; true' >/dev/null 2>&1
+[ "$(ls)" = "$(printf 'marks.py\nplain\nprog\nprog.rs')" ] && ok "without RARGO_FN_SLOTS the program runs and writes nothing" || bad "without RARGO_FN_SLOTS the program runs and writes nothing" "$(ls)"
+RARGO_FN_SLOTS=$PWD/marks.bin bash -c './prog; true' >/dev/null 2>&1
+first=$(python3 -I marks.py prog marks.bin)
+RARGO_FN_SLOTS=$PWD/marks.bin ./prog again >/dev/null 2>&1
+second=$(python3 -I marks.py prog marks.bin)
+marked() { grep -cE "^\+ _R[A-Za-z0-9_]*_4prog$2\$" <<<"$1"; }
+unmarked() { grep -cE "^- _R[A-Za-z0-9_]*_4prog$2\$" <<<"$1"; }
+[ "$(sed -n 2p <<<"$first")" = "file $(head -1 <<<"$report" | cut -d' ' -f2)" ] && ok "the marks file is one byte per slot" || bad "the marks file is one byte per slot" "$(sed -n 2p <<<"$first")"
+for f in 4main 7inlined 9in_thread 8in_child 12before_abort; do
+    [ "$(marked "$first" "$f")" = 1 ] && ok "marked: $f" || bad "marked: $f" "$(grep "$f" <<<"$first")"
+done
+[ "$(marked "$first" "7generic[my]EB2_")" = 2 ] && ok "marked: generic at u32 and u64, one slot each" || bad "marked: generic at u32 and u64, one slot each" "$(grep generic <<<"$first")"
+[ "$(marked "$first" "4main(s_)?0B3_")" = 2 ] && ok "marked: both closures in main" || bad "marked: both closures in main" "$(grep 4prog4main <<<"$first")"
+[ "$(unmarked "$first" "12never_called")" = 1 ] && ok "unmarked: a function never called" || bad "unmarked: a function never called" "$(grep never_called <<<"$first")"
+[ "$(unmarked "$first" "10second_run")" = 1 ] && [ "$(marked "$second" "10second_run")" = 1 ] && [ "$(marked "$second" "8in_child")" = 1 ] && ok "a second run of the binary marks the same file" || bad "a second run of the binary marks the same file" "$(grep -E 'second_run|in_child' <<<"$second")"
+[ "$(grep -c '^+' <<<"$second")" -ge "$(grep -c '^+' <<<"$first")" ] && ok "marks are never cleared" || bad "marks are never cleared"
+mir_calls() { rustc --edition=2021 -O "$@" --emit=mir prog.rs -o - 2>/dev/null | sed -n '/^fn main()/,/^}/p' | grep -c 'inlined('; }
+[ "$(mir_calls)" = 0 ] && [ "$(mir_calls -Zrargo-fn-slots)" = 1 ] && ok "the MIR inliner keeps a function its own slot: main calls inlined() only with the flag" || bad "the MIR inliner keeps a function its own slot" "without: $(mir_calls), with: $(mir_calls -Zrargo-fn-slots)"
+cat >plugin.rs <<'EOF'
+#[unsafe(no_mangle)]
+pub extern "C" fn plugin_work(x: u32) -> u32 { std::hint::black_box(x).wrapping_mul(7) }
+EOF
+cat >host.rs <<'EOF'
+use std::hint::black_box;
+unsafe extern "C" {
+    fn dlopen(path: *const std::ffi::c_char, flags: i32) -> *mut u8;
+    fn dlsym(handle: *mut u8, name: *const std::ffi::c_char) -> *mut u8;
+}
+#[inline(never)]
+fn after_plugin() -> u32 { black_box(3) }
+fn main() {
+    let path = std::ffi::CString::new(std::env::args().nth(1).unwrap()).unwrap();
+    let work: extern "C" fn(u32) -> u32 = unsafe {
+        let h = dlopen(path.as_ptr(), 2);
+        assert!(!h.is_null());
+        std::mem::transmute(dlsym(h, c"plugin_work".as_ptr()))
+    };
+    for i in 0..1000 { black_box(work(i)); }
+    black_box(after_plugin());
+}
+EOF
+rustc --edition=2021 -O -C symbol-mangling-version=v0 -Zrargo-fn-slots --crate-type cdylib plugin.rs -o libplugin.so 2>&1 | head -5
+rustc --edition=2021 -O -C symbol-mangling-version=v0 -Zrargo-fn-slots host.rs -o host 2>&1 | head -5
+rm -f host.bin
+RARGO_FN_SLOTS=$PWD/host.bin ./host $PWD/libplugin.so >/dev/null 2>&1; rc=$?
+hosted=$(python3 -I marks.py host host.bin)
+[ $rc = 0 ] && [ "$(grep -cE '^\+ _R[A-Za-z0-9_]*_4host12after_plugin$' <<<"$hosted")" = 1 ] && ok "a cdylib with its own std, loaded into a marked process, leaves the process's marks alone" || bad "a cdylib with its own std, loaded into a marked process, leaves the process's marks alone" "exit $rc; $(grep after_plugin <<<"$hosted")"
+cd "$T"
+
 echo "fork-check: $((checks - fails)) of $checks passed"
 exit $fails
