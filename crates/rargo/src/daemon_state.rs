@@ -1,7 +1,16 @@
-use crate::git::Head;
-use crate::known::KnownDigests;
+use crate::known_digests::KnownDigests;
 use rargo_proto::Digest;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+#[derive(Clone)]
+pub struct Head {
+    pub text: String,
+    pub branch: Option<String>,
+    pub commit: String,
+    pub common: PathBuf,
+    pub tags: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {

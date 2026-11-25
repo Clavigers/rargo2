@@ -1,4 +1,4 @@
-use crate::daemon_state::{self, DaemonState, Need, ScanPlan};
+use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
 use crate::partial::Partial;
@@ -48,7 +48,7 @@ struct Mounted {
 struct Snap {
     scan: scan::Scan,
     policy: Policy,
-    head: Option<git::Head>,
+    head: Option<Head>,
     left_out: Option<scan::Ignored>,
 }
 

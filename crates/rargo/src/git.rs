@@ -5,6 +5,7 @@ mod object;
 mod sha1;
 mod write;
 
+use rargo::daemon_state::Head;
 use object::{Id, Object, Store, Type, from_hex, to_hex};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -18,14 +19,6 @@ pub enum Mode {
     History,
 }
 
-#[derive(Clone)]
-pub struct Head {
-    pub text: String,
-    pub branch: Option<String>,
-    pub commit: String,
-    pub common: PathBuf,
-    pub tags: u64,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
