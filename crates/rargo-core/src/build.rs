@@ -24,6 +24,9 @@ use std::time::Instant;
 use tokio::sync::watch;
 
 mod nextest;
+mod pure;
+
+use pure::*;
 
 const PLAN_PATH: &str = "/.rargo-plan";
 
@@ -122,12 +125,8 @@ const _: () = assert!(LEVEL_META < LEVEL_FULL);
 
 pub struct PlanData {
     pub plan: rp::Plan,
-    linking: Vec<bool>,
+    facts: PlanFacts,
     levels: Vec<OnceLock<Arc<Vec<u8>>>>,
-    rmeta_out: Vec<Vec<Vec<u8>>>,
-    doc_dir: Vec<Option<Vec<u8>>>,
-    doc_order: Vec<usize>,
-    doc_pos: Vec<Option<usize>>,
     meta_levels: Vec<OnceLock<Arc<Vec<u8>>>>,
     needs: OnceLock<Arc<Vec<u8>>>,
 }
@@ -135,191 +134,30 @@ pub struct PlanData {
 impl PlanData {
     fn new(plan: rp::Plan) -> PlanData {
         let n = plan.units.len();
-        let linking: Vec<bool> = plan.units.iter().map(|u| u.needs_objects).collect();
-        let rmeta_out: Vec<Vec<Vec<u8>>> = plan
-            .units
-            .iter()
-            .map(|u| u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect())
-            .collect();
-        let doc_dir = plan
-            .units
-            .iter()
-            .map(|u| match (&u.kind, &u.cmd) {
-                (rp::UnitKind::Doc, Some(cmd)) => {
-                    ["-o", "--out-dir"].iter().find_map(|f| arg_value(&cmd.args, f)).map(|d| d.as_bytes().to_vec())
-                }
-                _ => None,
-            })
-            .collect();
-        let doc_dir: Vec<Option<Vec<u8>>> = doc_dir;
-        let mut doc_order: Vec<usize> = Vec::new();
-        {
-            let mut seen = vec![false; n];
-            fn visit(i: usize, units: &[rp::Unit], is_doc: &dyn Fn(usize) -> bool, seen: &mut [bool], out: &mut Vec<usize>) {
-                if seen[i] {
-                    return;
-                }
-                seen[i] = true;
-                assert!(is_doc(i));
-                let mut deps: Vec<usize> = units[i].deps.iter().map(|d| d.unit as usize).filter(|&j| is_doc(j)).collect();
-                deps.sort_unstable();
-                for j in deps {
-                    visit(j, units, is_doc, seen, out);
-                }
-                assert!(!out.contains(&i), "a documentation unit is ordered once");
-                out.push(i);
-            }
-            let is_doc = |j: usize| doc_dir[j].is_some();
-            for i in 0..n {
-                if is_doc(i) {
-                    visit(i, &plan.units, &is_doc, &mut seen, &mut doc_order);
-                }
-            }
-        }
-        assert_eq!(doc_order.len(), doc_dir.iter().filter(|d| d.is_some()).count());
-        let mut doc_pos = vec![None; n];
-        for (pos, &i) in doc_order.iter().enumerate() {
-            assert!(doc_pos[i].is_none());
-            doc_pos[i] = Some(pos);
-        }
-        for u in &plan.units {
-            for d in &u.deps {
-                assert!((d.unit as usize) < n, "a dependency names a unit of the plan");
-            }
-        }
-        for &r in &plan.roots {
-            assert!((r as usize) < n, "a root names a unit of the plan");
-        }
-        assert_eq!(linking.len(), n);
-        assert_eq!(rmeta_out.len(), n);
+        let facts = plan_facts(&plan.units, &plan.roots);
         PlanData {
             plan,
-            linking,
-            doc_dir,
-            doc_order,
-            doc_pos,
+            facts,
             levels: (0..n).map(|_| OnceLock::new()).collect(),
-            rmeta_out,
             meta_levels: (0..n).map(|_| OnceLock::new()).collect(),
             needs: OnceLock::new(),
         }
     }
 
-    fn can_meta(&self, j: usize) -> bool {
-        self.plan.units[j].kind == rp::UnitKind::Compile && !self.rmeta_out[j].is_empty()
-    }
-
     fn meta_levels(&self, i: usize) -> Arc<Vec<u8>> {
-        self.meta_levels[i]
-            .get_or_init(|| {
-                let units = &self.plan.units;
-                let mut lv = vec![LEVEL_NONE; units.len()];
-                let mut stack: Vec<usize> = Vec::new();
-                for d in &units[i].deps {
-                    stack.push(d.unit as usize);
-                }
-                while let Some(j) = stack.pop() {
-                    if lv[j] != LEVEL_NONE {
-                        continue;
-                    }
-                    lv[j] = if self.can_meta(j) { LEVEL_META } else { LEVEL_FULL };
-                    for d in &units[j].deps {
-                        stack.push(d.unit as usize);
-                    }
-                }
-                assert_eq!(lv[i], LEVEL_NONE, "a unit does not depend on itself");
-                assert_eq!(lv.len(), units.len());
-                Arc::new(lv)
-            })
-            .clone()
+        self.meta_levels[i].get_or_init(|| Arc::new(meta_levels(&self.plan.units, &self.facts, i))).clone()
     }
 
     fn needs(&self) -> Arc<Vec<u8>> {
         self.needs
             .get_or_init(|| {
-                let units = &self.plan.units;
-                let mut need = vec![LEVEL_NONE; units.len()];
-                let mut work: Vec<usize> = Vec::new();
-                for &r in &self.plan.roots {
-                    let r = r as usize;
-                    need[r] = if units[r].kind == rp::UnitKind::Compile { LEVEL_META } else { LEVEL_FULL };
-                    work.push(r);
-                }
-                while let Some(i) = work.pop() {
-                    let sees = if need[i] == LEVEL_META { self.meta_levels(i) } else { self.levels(i) };
-                    for (k, &lv) in sees.iter().enumerate() {
-                        if lv == LEVEL_NONE {
-                            continue;
-                        }
-                        let lv = if units[k].kind == rp::UnitKind::Compile { lv } else { LEVEL_FULL };
-                        assert!(lv == LEVEL_META || lv == LEVEL_FULL);
-                        if lv > need[k] {
-                            need[k] = lv;
-                            work.push(k);
-                        }
-                    }
-                }
-                for &r in &self.plan.roots {
-                    assert_ne!(need[r as usize], LEVEL_NONE, "a root is needed");
-                }
-                for (k, &lv) in need.iter().enumerate() {
-                    if lv == LEVEL_META {
-                        assert_eq!(units[k].kind, rp::UnitKind::Compile, "only a compile stops at metadata");
-                    }
-                }
-                Arc::new(need)
+                Arc::new(needs(&self.plan.units, &self.plan.roots, &|i| self.meta_levels(i), &|i| self.levels(i)))
             })
             .clone()
     }
 
     fn levels(&self, i: usize) -> Arc<Vec<u8>> {
-        self.levels[i]
-            .get_or_init(|| {
-                let units = &self.plan.units;
-                let mut lv = vec![LEVEL_NONE; units.len()];
-                let mut stack: Vec<usize> = Vec::new();
-                for d in &units[i].deps {
-                    let j = d.unit as usize;
-                    let direct = if self.linking[i] || !(d.only_rmeta && units[j].rmeta_early) {
-                        LEVEL_FULL
-                    } else {
-                        LEVEL_META
-                    };
-                    if lv[j] < direct {
-                        if lv[j] == LEVEL_NONE {
-                            stack.push(j);
-                        }
-                        lv[j] = direct;
-                    }
-                }
-                while let Some(j) = stack.pop() {
-                    for d in &units[j].deps {
-                        let k = d.unit as usize;
-                        let want = if self.linking[i] || !units[k].rmeta_early { LEVEL_FULL } else { LEVEL_META };
-                        if lv[k] == LEVEL_NONE {
-                            stack.push(k);
-                        }
-                        if lv[k] < want {
-                            lv[k] = want;
-                        }
-                    }
-                }
-                assert_eq!(lv[i], LEVEL_NONE, "a unit does not depend on itself");
-                if self.linking[i] {
-                    assert!(lv.iter().all(|&l| l != LEVEL_META), "a linking unit sees its dependencies whole");
-                }
-                if let Some(pos) = self.doc_pos[i] {
-                    assert_eq!(self.doc_order[pos], i);
-                    for &j in &self.doc_order[..pos] {
-                        assert_ne!(j, i);
-                        if self.doc_dir[j] == self.doc_dir[i] {
-                            lv[j] = LEVEL_FULL;
-                        }
-                    }
-                }
-                Arc::new(lv)
-            })
-            .clone()
+        self.levels[i].get_or_init(|| Arc::new(levels(&self.plan.units, &self.facts, i))).clone()
     }
 }
 
@@ -384,60 +222,8 @@ struct Run {
     script_warnings: Mutex<Vec<String>>,
 }
 
-fn subcommand_pos(args: &[String]) -> Option<usize> {
-    let mut i = 0;
-    while i < args.len() {
-        let a = &args[i];
-        if a == "--" {
-            return None;
-        }
-        if !a.starts_with('-') {
-            assert!(i < args.len());
-            return Some(i);
-        }
-        if matches!(a.as_str(), "--config" | "-Z" | "--color" | "-C" | "--explain") {
-            i += 1;
-        }
-        i += 1;
-    }
-    None
-}
-
 fn bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
-}
-
-fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) -> BTreeMap<String, String> {
-    const SERVER: &[&str] =
-        &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"];
-    const NOT_FOR_ACTIONS: &[&str] = &["TERM", "NO_COLOR", "BROWSER", "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM"];
-    const DROP_PREFIXES: &[&str] = &[
-        "CARGO_PKG_", "CARGO_MANIFEST_", "CARGO_CRATE_", "CARGO_BIN_", "CARGO_CFG_", "CARGO_FEATURE_",
-        "CARGO_TERM_", "CARGO_DEP_", "RARGO_",
-    ];
-    const DROP: &[&str] = &[
-        "CARGO_HOME", "CARGO_MAKEFLAGS", "CARGO_PRIMARY_PACKAGE", "CARGO_TARGET_TMPDIR", "CARGO_SBOM_PATH",
-        "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_NET_OFFLINE", "CARGO_CACHE_RUSTC_INFO",
-        "CARGO_RUSTC_CURRENT_DIR",
-    ];
-    let mut out = BTreeMap::new();
-    for (k, v) in server {
-        if SERVER.contains(&k.as_str()) || k.starts_with("NIX_") {
-            out.insert(k.clone(), v.clone());
-        }
-    }
-    for (k, v) in client {
-        let dropped = DROP.contains(&k.as_str())
-            || NOT_FOR_ACTIONS.contains(&k.as_str())
-            || DROP_PREFIXES.iter().any(|p| k.starts_with(p));
-        if rargo_proto::env_allowed(k) && !dropped {
-            out.insert(k.clone(), v.clone());
-        }
-    }
-    out.insert("CARGO_HOME".into(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned());
-    out.insert("RUSTC_WRAPPER".into(), String::new());
-    out.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
-    out
 }
 
 impl Daemon {
@@ -945,12 +731,14 @@ fn add_components(
     components: &[(String, String)],
     run: &dyn Fn(&Path, &[String]) -> std::io::Result<std::process::Output>,
 ) -> std::result::Result<(), Vec<u8>> {
-    for (component, toolchain) in components {
-        let add = ["component", "add", component, "--toolchain", toolchain].map(String::from);
-        match run(Path::new("rustup"), &add) {
-            Ok(o) if o.status.success() => {}
-            Ok(o) => return Err(o.stderr),
-            Err(e) => return Err(format!("error: running rustup: {e}\n").into_bytes()),
+    for add in rustup_adds(components) {
+        let ran = run(Path::new("rustup"), &add);
+        let failed = match &ran {
+            Ok(o) => rustup_failure(Ok((o.status.success(), &o.stderr))),
+            Err(e) => rustup_failure(Err(&e.to_string())),
+        };
+        if let Some(said) = failed {
+            return Err(said);
         }
     }
     Ok(())
@@ -984,45 +772,6 @@ async fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String
             false
         }
     })
-}
-
-fn missing_components(stderr: &[u8]) -> Vec<(String, String)> {
-    let s = String::from_utf8_lossy(stderr);
-    let name = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut toolchain = None;
-    for line in s.lines() {
-        if let Some(rest) = line.split_once("is not installed for the toolchain '").map(|x| x.1) {
-            toolchain = rest.split_once('\'').map(|x| x.0.to_string()).filter(|t| name(t));
-        } else if let (Some(tc), Some(rest)) = (&toolchain, line.split_once("rustup component add ").map(|x| x.1)) {
-            let words: Vec<&str> = rest.split('`').next().unwrap_or("").split_whitespace().collect();
-            let mut i = 0;
-            let mut component = "";
-            while i < words.len() {
-                match words[i] {
-                    "--toolchain" | "--target" => i += 2,
-                    w if w.starts_with('-') => i += 1,
-                    w => {
-                        component = w;
-                        break;
-                    }
-                }
-            }
-            let pair = (component.to_string(), tc.clone());
-            if name(component) && !component.starts_with('-') && !out.contains(&pair) {
-                out.push(pair);
-            }
-            toolchain = None;
-        }
-    }
-    out
-}
-
-fn needs_network(stderr: &[u8]) -> bool {
-    let s = String::from_utf8_lossy(stderr);
-    ["--offline", "offline mode", "is not installed", "could not download", "syncing channel updates"]
-        .iter()
-        .any(|m| s.contains(m))
 }
 
 fn phase(started: Instant, c: &Client, what: &str) {
@@ -1344,13 +1093,6 @@ struct UnitObserver {
     pending: Mutex<Vec<u8>>,
 }
 
-fn script_warning_message(line: &str) -> Option<&str> {
-    let line = line.trim();
-    line.strip_prefix("cargo:warning=")
-        .or_else(|| line.strip_prefix("cargo::warning="))
-        .map(|msg| msg.trim_end())
-}
-
 impl Observer for UnitObserver {
     fn miss(&self) {
         self.run.note_working_on(self.i);
@@ -1449,21 +1191,6 @@ impl Observer for TestObserver {
         l.push('\n');
         self.out.out.raw_err(l.as_bytes());
     }
-}
-
-fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == flag {
-            return it.next().map(|s| s.as_str());
-        }
-        if let Some(rest) = a.strip_prefix(flag) {
-            if let Some(v) = rest.strip_prefix('=') {
-                return Some(v);
-            }
-        }
-    }
-    None
 }
 
 fn rustc_env_deps(r: &ActionResult, store: &Store) -> Vec<String> {
@@ -1586,11 +1313,11 @@ impl Run {
                 }
             }
         }
-        if self.pd.doc_dir[i].is_some() {
-            let pos = self.pd.doc_pos[i].unwrap_or(0);
+        if self.pd.facts.doc_dir[i].is_some() {
+            let pos = self.pd.facts.doc_pos[i].unwrap_or(0);
             self.layer.set_rank(i as u32, (plan.units.len() + pos) as u64);
-            let before = &self.pd.doc_order[..pos];
-            if let Some(&prev) = before.iter().rev().find(|&&j| self.pd.doc_dir[j] == self.pd.doc_dir[i]) {
+            let before = &self.pd.facts.doc_order[..pos];
+            if let Some(&prev) = before.iter().rev().find(|&&j| self.pd.facts.doc_dir[j] == self.pd.facts.doc_dir[i]) {
                 let mut rx = self.states[prev].subscribe();
                 while matches!(*rx.borrow_and_update(), UState::Pending | UState::Meta) {
                     if rx.changed().await.is_err() {
@@ -1655,7 +1382,7 @@ impl Run {
             v
         });
         if meta_only {
-            if self.pd.can_meta(i) {
+            if self.pd.facts.can_meta(i) {
                 args.push("-Zno-codegen".into());
             } else {
                 let mut after_extern = false;
@@ -2003,7 +1730,7 @@ impl Run {
                 return Ok(UState::Failed);
             }
         }
-        let meta = &self.pd.rmeta_out[i];
+        let meta = &self.pd.facts.rmeta_out[i];
         if meta_only {
             let early: Vec<_> = r.outputs.entries.iter().filter(|(p, _)| meta.contains(p)).cloned().collect();
             self.layer.add(i as u32, LEVEL_META, &early);
@@ -2637,8 +2364,8 @@ impl Run {
             }
         }
         let mut docs: BTreeMap<&[u8], (Hash, bool, u64)> = BTreeMap::new();
-        for &i in &self.pd.doc_order {
-            let (Some(dir), Some((r, _))) = (&self.pd.doc_dir[i], self.results[i].get()) else { continue };
+        for &i in &self.pd.facts.doc_order {
+            let (Some(dir), Some((r, _))) = (&self.pd.facts.doc_dir[i], self.results[i].get()) else { continue };
             for (path, e) in &r.outputs.entries {
                 if let (MEntry::File { hash, exec, size }, true) = (e, vpath_starts_with(path, dir)) {
                     docs.insert(path, (*hash, *exec, *size));
@@ -2890,15 +2617,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_build_script_warning_is_the_trimmed_value() {
-        assert_eq!(script_warning_message("cargo:warning=script-started"), Some("script-started"));
-        assert_eq!(script_warning_message("  cargo::warning=hello  \r"), Some("hello"));
-        assert_eq!(script_warning_message("cargo:warning="), Some(""));
-        assert_eq!(script_warning_message("cargo:rustc-cfg=has_generated"), None);
-        assert_eq!(script_warning_message("not a directive"), None);
-    }
-
-    #[test]
     fn the_stock_fingerprint_of_an_executable_s_unit() {
         assert_eq!(
             stock_fingerprint("/w/target/debug/build/app/02ffaad58935a0bc/out/it-02ffaad58935a0bc", "app").as_deref(),
@@ -2910,50 +2628,5 @@ mod tests {
         );
         assert_eq!(stock_fingerprint("/w/target/debug/out/x", "app"), None);
         assert_eq!(stock_fingerprint("/w/target/debug/app", "app"), None);
-    }
-
-    #[test]
-    fn rustups_word_for_a_missing_component_names_it_and_its_toolchain() {
-        let said = b"error: 'cargo-clippy' is not installed for the toolchain 'stable-x86_64-unknown-linux-gnu'.\n\
-                     help: run `rustup component add clippy` to install it\n\
-                     error: 'rustfmt' is not installed for the toolchain '1.99.0-x86_64-unknown-linux-gnu'.\n\
-                     help: run `rustup component add --toolchain 1.99.0-x86_64-unknown-linux-gnu rustfmt` to install it\n";
-        assert_eq!(
-            missing_components(said),
-            vec![
-                ("clippy".to_string(), "stable-x86_64-unknown-linux-gnu".to_string()),
-                ("rustfmt".to_string(), "1.99.0-x86_64-unknown-linux-gnu".to_string()),
-            ]
-        );
-        assert!(needs_network(said), "and the request goes to the fetch that adds them");
-        assert!(missing_components(b"error: could not download file\n").is_empty());
-        assert!(missing_components(b"is not installed for the toolchain 'x;rm'\nrustup component add a\n").is_empty());
-    }
-
-    #[test]
-    fn a_component_rustup_cannot_add_comes_back_in_rustups_words() {
-        use std::os::unix::process::ExitStatusExt;
-        let asked = std::sync::Mutex::new(Vec::new());
-        let run = |program: &Path, args: &[String]| {
-            asked.lock().unwrap().push(format!("{} {}", program.display(), args.join(" ")));
-            let ok = args[2] != "nope";
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(if ok { 0 } else { 1 << 8 }),
-                stdout: Vec::new(),
-                stderr: if ok { Vec::new() } else { b"error: toolchain 'T' does not contain component 'nope'\n".to_vec() },
-            })
-        };
-        let pair = |c: &str| (c.to_string(), "T".to_string());
-        assert_eq!(add_components(&[pair("rustfmt"), pair("clippy")], &run), Ok(()));
-        assert_eq!(
-            *asked.lock().unwrap(),
-            ["rustup component add rustfmt --toolchain T", "rustup component add clippy --toolchain T"]
-        );
-        assert_eq!(
-            add_components(&[pair("nope"), pair("clippy")], &run),
-            Err(b"error: toolchain 'T' does not contain component 'nope'\n".to_vec()),
-            "rustup's message, and nothing more is tried"
-        );
-        assert_eq!(asked.lock().unwrap().len(), 3);
     }
 }
