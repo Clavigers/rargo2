@@ -1,3 +1,6 @@
-suite	workspace	19000	rargo test --workspace --lib --bins on one test thread, measured at 12.4 s on rargo.rs
-test	default	500	any test without a line of its own; the slowest measured at 363 ms
-slow	snapshot::tests::a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held	15000	measured at 10.0 s: it waits on real eviction timing instead of a simulated clock
+measure	cpu	0	user and system CPU of each test run alone in its own process, from getrusage
+suite	workspace	10000	every test of every test program in the workspace, measured at 6.5 s of CPU
+test	default	600	any test without a line of its own; the most of those measured at 379 ms
+slow	rargo tests::writes_of_one_path_at_once_all_succeed	1300	measured at 842 ms: many threads write the same path at once
+slow	rargo_core nixmanifest::tests::generated_store_trees_walk_to_the_manifest_of_their_listing_in_any_order	1300	measured at 813 ms: generated trees are hashed by the manifest worker threads
+slow	rargo_core snapshot::tests::a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held	2500	measured at 1488 ms: it evicts and resyncs a real store on disk

@@ -21,8 +21,14 @@ async	crates/rargo/src/mux.rs	9	runs on tokio: .await (4), async blocks (3), asy
 async	crates/rargo/src/watch.rs	2	runs on tokio: async fns (1), .await (1); goes with the io_uring loop (#216)
 async	crates/rargod/Cargo.toml	1	depends on tokio; goes when the shell becomes one io_uring loop (#216)
 async	crates/rargod/src/main.rs	7	runs on tokio: .await (4), async blocks (2), async fns (1); goes with the io_uring loop (#216)
+ambient-io	crates/fusewire/build.rs	2	a Cargo build script, which runs at build time and has no io module to move into: the environment (1), processes (1)
 ambient-io	crates/fusewire/src/lib.rs	52	logic and I/O are not yet split, the I/O is not in an io module: libc calls (43), processes (6), the filesystem (2), threads and sleeps (1)
+ambient-io	crates/rargo-core/examples/cdcbench.rs	5	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: the filesystem (4), the clock (1)
+ambient-io	crates/rargo-core/examples/chunkshare.rs	2	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: processes (1), the filesystem (1)
+ambient-io	crates/rargo-core/examples/incrdump.rs	2	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: the filesystem (2)
+ambient-io	crates/rargo-core/examples/netbench.rs	1	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: the clock (1)
 ambient-io	crates/rargo-core/src/bin/rargo-sandbox.rs	10	logic and I/O are not yet split, the I/O is not in an io module: libc calls (4), the filesystem (3), the environment (1), the clock (1), processes (1)
+ambient-io	crates/rargo-core/src/build.rs	38	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (21), the clock (7), processes (7), libc calls (2), the environment (1)
 ambient-io	crates/rargo-core/src/build/nextest.rs	18	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (13), other (3), processes (2)
 ambient-io	crates/rargo-core/src/buildview.rs	3	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (3)
 ambient-io	crates/rargo-core/src/cgroup.rs	12	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (8), libc calls (2), threads and sleeps (2)
@@ -45,10 +51,15 @@ ambient-io	crates/rargo-core/src/snapshot.rs	5	logic and I/O are not yet split, 
 ambient-io	crates/rargo-core/src/store.rs	71	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (66), processes (3), the clock (1), libc calls (1)
 ambient-io	crates/rargo-core/src/tokens.rs	15	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (11), processes (2), the clock (1), libc calls (1)
 ambient-io	crates/rargo-core/src/view.rs	5	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (5)
+ambient-io	crates/rargo-net/build.rs	2	a Cargo build script, which runs at build time and has no io module to move into: the environment (1), processes (1)
+ambient-io	crates/rargo-net/examples/linkperf.rs	2	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: the clock (2)
 ambient-io	crates/rargo-net/src/endpoint.rs	9	logic and I/O are not yet split, the I/O is not in an io module: the network (9)
 ambient-io	crates/rargo-net/src/lib.rs	20	logic and I/O are not yet split, the I/O is not in an io module: the network (11), the clock (6), libc calls (3)
 ambient-io	crates/rargo-net/src/link.rs	9	logic and I/O are not yet split, the I/O is not in an io module: the network (8), threads and sleeps (1)
+ambient-io	crates/rargo-plan/examples/dump.rs	1	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: the filesystem (1)
 ambient-io	crates/rargo-plan/src/lib.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the environment (2)
+ambient-io	crates/rargo-purity/build.rs	4	a Cargo build script, which runs at build time and has no io module to move into: the filesystem (2), the environment (2)
+ambient-io	crates/rargo/build.rs	2	a Cargo build script, which runs at build time and has no io module to move into: the environment (1), processes (1)
 ambient-io	crates/rargo/src/cli.rs	1	logic and I/O are not yet split, the I/O is not in an io module: the network (1)
 ambient-io	crates/rargo/src/daemon.rs	55	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (33), the clock (9), processes (5), libc calls (4), the environment (3), threads and sleeps (1)
 ambient-io	crates/rargo/src/git.rs	43	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (36), the environment (3), processes (3), the clock (1)
@@ -66,6 +77,8 @@ ambient-io	crates/rargo/src/tmp.rs	12	logic and I/O are not yet split, the I/O i
 ambient-io	crates/rargo/src/watch.rs	6	logic and I/O are not yet split, the I/O is not in an io module: libc calls (5), the filesystem (1)
 ambient-io	crates/rargod/src/main.rs	19	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (7), the network (4), libc calls (3), the environment (2), threads and sleeps (2), the clock (1)
 locks	crates/fusewire/src/lib.rs	6	shares state between threads outside a shell or worker pool: atomics (4), std locks (2)
+locks	crates/rargo-core/examples/cdcbench.rs	10	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: atomics (6), once cells (2), dashmap (2)
+locks	crates/rargo-core/src/build.rs	64	shares state between threads outside a shell or worker pool: parking_lot locks (32), once cells (14), atomics (12), dashmap (6)
 locks	crates/rargo-core/src/buildview.rs	12	shares state between threads outside a shell or worker pool: dashmap (6), atomics (6)
 locks	crates/rargo-core/src/chunk.rs	4	shares state between threads outside a shell or worker pool: once cells (2), dashmap (2)
 locks	crates/rargo-core/src/db.rs	10	shares state between threads outside a shell or worker pool: parking_lot locks (10)
@@ -98,7 +111,10 @@ locks	crates/rargo/src/partial.rs	6	shares state between threads outside a shell
 locks	crates/rargo/src/status.rs	1	shares state between threads outside a shell or worker pool: channels (1)
 locks	crates/rargo/src/tmp.rs	6	shares state between threads outside a shell or worker pool: atomics (6)
 locks	crates/rargo/src/watch.rs	2	shares state between threads outside a shell or worker pool: std locks (2)
+hash-order	crates/rargo-core/examples/cdcbench.rs	3	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: HashMap or HashSet with the default random hasher
+hash-order	crates/rargo-core/examples/chunkshare.rs	1	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: HashMap or HashSet with the default random hasher
 hash-order	crates/rargo-core/src/ar.rs	1	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
+hash-order	crates/rargo-core/src/build.rs	31	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/build/pure.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/buildview.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/conn_state.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
