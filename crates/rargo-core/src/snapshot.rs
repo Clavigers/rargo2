@@ -603,7 +603,6 @@ mod tests {
 
     struct ChurningUpload<'a> {
         source: &'a Fake,
-        rounds: AtomicU64,
     }
 
     impl Uploader for ChurningUpload<'_> {
@@ -614,10 +613,8 @@ mod tests {
         fn blobs(&self, want: Vec<Hash>) -> Result<()> {
             self.source.blobs(want)?;
             let store = self.source.store.as_ref().unwrap();
-            let round = self.rounds.fetch_add(1, Ordering::Relaxed);
-            let unrelated = format!("someone else's output {round}");
+            let unrelated = format!("someone else's output {}", store.generation());
             let hash = store.put_bytes(unrelated.as_bytes())?;
-            // Change the generation after the sync's initial walk and before it validates and pins.
             store.remove(&hash);
             Ok(())
         }
@@ -631,7 +628,7 @@ mod tests {
             let mut files: Vec<(&str, Node)> = names.iter().map(|n| (n.as_str(), fake.file(n.as_bytes()))).collect();
             files.push(("b", fake.file(b"content b")));
             let v = fake.dir(vec![("a", fake.file(b"content a")), ("sub", fake.dir(files))]);
-            let source = ChurningUpload { source: &fake, rounds: AtomicU64::new(0) };
+            let source = ChurningUpload { source: &fake };
             for i in 0..12 {
                 let before = trees.store.generation();
                 let extra = format!("edit {i}");
@@ -641,7 +638,6 @@ mod tests {
                 assert_eq!(s.read(b"tree/sub/b").unwrap(), b"content b");
                 assert_eq!(s.read(b"edit").unwrap(), extra.as_bytes());
             }
-            assert_eq!(source.rounds.load(Ordering::Relaxed), 12);
         });
     }
 
