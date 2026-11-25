@@ -1,18 +1,3 @@
-//! rargo: the client. It syncs the worktree and the environment to the
-//! build server, where everything is analysed, scheduled and built, and
-//! brings back output, the artifacts that were asked for, and files the
-//! build wrote into the worktree. Commands that are not builds are handed
-//! to the real cargo unchanged.
-//!
-//! The work is done by a daemon (`daemon`), one per user and server on the
-//! machine, which this program starts when none is running and talks to
-//! over a Unix socket: the daemon keeps the link to the server and follows
-//! the worktrees, so a command itself only passes its arguments and
-//! environment along and relays what comes back.
-//!
-//! When this binary is installed under the name `cargo` (the shim), agents
-//! that type `cargo build` get rargo without knowing.
-
 mod daemon;
 mod git;
 mod known;
@@ -34,11 +19,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
-/// Subcommands the server handles.
 const ROUTED: &[&str] =
     &["build", "b", "check", "c", "clippy", "test", "t", "run", "r", "doc", "d", "bench", "rustc", "rustdoc", "nextest"];
 
-/// Writes a file by renaming a complete temporary file into place.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -56,17 +39,8 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
 }
 
-/// Where the server is and how to prove who we are there.
-///
-/// The server: `RARGO_SERVER`, else the host the project names in its
-/// `Cargo.toml` (`rargo @host`), else a server on this machine. A bare
-/// name is asked where its server is.
-/// Who we are: `RARGO_TOKEN`, else the token `rargo auth` stored for that
-/// host. A server on this machine that issues no tokens asks for none.
 pub struct Config {
-    /// The host as it is written (`rargo.rs`, `build.example:7459`).
     pub host: String,
-    /// The server's address.
     pub server: String,
     pub user: String,
     pub secret: Option<String>,
@@ -75,8 +49,6 @@ pub struct Config {
 
 pub fn load_config() -> Result<Config, String> {
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    // A daemon is told all of it by the command that starts it: it has no
-    // project around it to look into.
     let local_name = || env("USER").or_else(|| env("LOGNAME")).unwrap_or_else(|| "user".into());
     let from_token = |token: &str| -> Result<(String, Option<String>), String> {
         let (id, secret) = project::split_token(token).ok_or("RARGO_TOKEN is not a token (an id, a dot and a secret)")?;
@@ -105,8 +77,6 @@ pub fn load_config() -> Result<Config, String> {
     Ok(Config { host, server, user, secret, psk })
 }
 
-/// Whether a server at this address accepts anyone on its machine (one
-/// started without keys listens on the loopback interface only).
 fn is_loopback(server: &str) -> bool {
     let name = server.rsplit_once(':').map_or(server, |(h, _)| h);
     name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
@@ -121,7 +91,6 @@ pub fn cache_dir() -> PathBuf {
 
 pub fn hostname() -> String {
     let mut buf = [0u8; 256];
-    // SAFETY: the buffer is valid for its length.
     if unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } != 0 {
         return "unknown".into();
     }
@@ -129,8 +98,6 @@ pub fn hostname() -> String {
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
-/// The directory that is synced: the git worktree the current directory is
-/// in; without git, the outermost directory with a `Cargo.toml`.
 pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     let ancestors: Vec<&Path> = cwd.ancestors().collect();
     if let Some(d) = ancestors.iter().find(|d| d.join(".git").exists()) {
@@ -139,21 +106,16 @@ pub fn find_root(cwd: &Path) -> Option<PathBuf> {
     ancestors.iter().rev().find(|d| d.join("Cargo.toml").is_file()).map(|d| d.to_path_buf())
 }
 
-/// The parts of the project's policy the client acts on.
 #[derive(Default)]
 pub struct Policy {
     pub pass: Vec<String>,
     pub exclude: Vec<String>,
-    /// `[sync] git`: what the sandbox gets as `.git`.
     pub git: git::Mode,
-    /// `[sync] gitignored = false`: what git ignores is not synced, except
-    /// what `include` names.
     pub gitignored: bool,
     pub include: Vec<String>,
 }
 
 pub fn load_policy(root: &Path, start: &Path) -> Policy {
-    // A malformed table is the server's to report, with the build.
     let read = |path: &Path| std::fs::read_to_string(root.join(path)).ok();
     let policy = rargo_proto::workspace::manifest_for(start, read)
         .and_then(|(path, _)| read(&path)?.parse::<toml::Table>().ok())
@@ -201,8 +163,6 @@ fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-/// HEAD and its recent first-parent ancestors: a hint for the server's
-/// choice of incremental state. Asked of git once per HEAD and remembered.
 pub fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
     let head = &head.commit;
     let memo = wt_cache.join("commits");
@@ -235,10 +195,6 @@ pub fn load_asked(cache: &Path) -> Vec<String> {
     std::fs::read_to_string(cache.join("env-names")).map(|t| t.lines().map(String::from).collect()).unwrap_or_default()
 }
 
-/// Where the daemon for this server, user and program listens. The name
-/// covers everything a daemon is started with, so a changed configuration
-/// or a new version of the program gets a daemon of its own and the old
-/// one goes when it has been idle.
 fn daemon_socket(cfg: &Config, cache: &Path) -> PathBuf {
     let mut h = blake3::Hasher::new();
     for part in [cfg.server.as_bytes(), cfg.user.as_bytes(), &cfg.psk[..], cache.as_os_str().as_bytes()] {
@@ -259,13 +215,10 @@ fn daemon_socket(cfg: &Config, cache: &Path) -> PathBuf {
         }
     }
     let name = format!("{}.sock", &h.finalize().to_hex()[..20]);
-    // Beside the cache if the path fits a socket address, else in the
-    // user's runtime directory.
     let in_cache = cache.join("run").join(&name);
     if in_cache.as_os_str().len() < 100 {
         return in_cache;
     }
-    // SAFETY: no arguments, cannot fail.
     let uid = unsafe { libc::getuid() };
     let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
         Some(d) => PathBuf::from(d).join("rargo"),
@@ -274,9 +227,6 @@ fn daemon_socket(cfg: &Config, cache: &Path) -> PathBuf {
     dir.join(name)
 }
 
-/// Stops every daemon of `cache`. A daemon unmounts and exits before the
-/// reply ends, so reading the reply to its end returns when that daemon
-/// is gone. A socket that nobody is listening on is skipped.
 fn stop_daemons(cfg: &Config, cache: &Path, req: &LocalRequest) {
     use std::os::unix::net::UnixStream;
     let mut sockets = Vec::new();
@@ -301,7 +251,6 @@ fn stop_daemons(cfg: &Config, cache: &Path, req: &LocalRequest) {
     }
 }
 
-/// Makes the directory the socket lives in: ours alone.
 fn private_dir(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     match std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir) {
@@ -310,7 +259,6 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     let md = std::fs::symlink_metadata(dir)?;
-    // SAFETY: no arguments, cannot fail.
     if !md.is_dir() || md.uid() != unsafe { libc::getuid() } {
         return Err(std::io::Error::other(format!("{} is not a directory of this user", dir.display())));
     }
@@ -320,14 +268,11 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Starts a daemon on `socket`, detached from this command: a process of
-/// its own session whose parent is gone, with its output in a log file.
 fn start_daemon(socket: &Path, cache: &Path, cfg: &Config) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(cache)?;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(cache.join("daemon.log"))?;
     let mut cmd = std::process::Command::new(exe);
-    // The daemon gets what this command worked out (it runs in no project).
     cmd.env("RARGO_DAEMON_CONFIG", "1").env("RARGO_SERVER", &cfg.server);
     match &cfg.secret {
         Some(s) => cmd.env("RARGO_TOKEN", format!("{}.{s}", cfg.user)),
@@ -339,10 +284,6 @@ fn start_daemon(socket: &Path, cache: &Path, cfg: &Config) -> std::io::Result<()
         .stdout(log.try_clone()?)
         .stderr(log)
         .current_dir("/");
-    // SAFETY: only async-signal-safe calls between fork and exec. The
-    // child forks once more and exits, so the daemon is nobody's child
-    // and this command (which may turn into the user's program) never
-    // has to wait for it.
     unsafe {
         cmd.pre_exec(|| {
             match libc::fork() {
@@ -359,7 +300,6 @@ fn start_daemon(socket: &Path, cache: &Path, cfg: &Config) -> std::io::Result<()
     Ok(())
 }
 
-/// Connects to the daemon, starting one if there is none.
 fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::unix::net::UnixStream;
     let socket = daemon_socket(cfg, cache);
@@ -382,20 +322,16 @@ fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::
     }
 }
 
-/// `rargo auth` commands that the server answers.
 const TOKEN_COMMANDS: &[&str] = &["invite", "create", "tokens", "revoke", "allow", "disallow"];
 
-/// This process's mount namespace, as the kernel names it.
 pub fn mount_ns() -> String {
     std::fs::read_link("/proc/self/ns/mnt").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Commands about the local daemon need no server.
 fn kind_needs_server(daemon_cmd: Option<&str>) -> bool {
     daemon_cmd.is_none()
 }
 
-/// `rargo @host`.
 fn at_host(host: &str) -> ! {
     let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cannot determine the current directory: {e}")));
     match project::set_host(&cwd, host) {
@@ -414,8 +350,6 @@ fn at_host(host: &str) -> ! {
     }
 }
 
-/// `rargo auth [HOST]`, `rargo auth status`, `rargo auth remove [HOST]`,
-/// `rargo auth --token TOKEN [HOST]`.
 fn auth_command(args: &[OsString]) -> ! {
     let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     let mut what = "auth";
@@ -474,8 +408,6 @@ fn auth_command(args: &[OsString]) -> ! {
             if project::credential(&host).is_none() {
                 die(&format!("there is no token for {host} on this machine"));
             }
-            // Ended on the server first, so that a copy of it kept
-            // anywhere stops working too; forgotten here either way.
             let revoked = project::revoke_on_server(&host);
             if let Err(e) = project::forget(&host) {
                 die(&e);
@@ -493,7 +425,6 @@ fn auth_command(args: &[OsString]) -> ! {
         _ => {}
     }
     if let Some(token) = token {
-        // Asked of the server first: a token it does not admit is not kept.
         let stored = project::holder(&host, &token).and_then(|name| match name {
             Some(name) => project::store_token(&host, &token, &name).map(|()| name),
             None => Err(format!("{host}: {}", rargo_proto::REFUSED)),
@@ -515,8 +446,6 @@ fn auth_command(args: &[OsString]) -> ! {
     }
 }
 
-/// Asks a running daemon to give this worktree's output directory back to
-/// plain files.
 fn release_output() {
     let (Ok(cfg), Ok(cwd)) = (load_config(), std::env::current_dir().and_then(|d| d.canonicalize())) else { return };
     let socket = daemon_socket(&cfg, &cache_dir());
@@ -536,13 +465,11 @@ fn release_output() {
     let _ = stream.read_to_end(&mut rest);
 }
 
-/// Acts on one thing the daemon says. Returns only if more is to come.
 fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
     match reply {
         LocalReply::Stdout(b) => {
             let mut o = std::io::stdout().lock();
             if o.write_all(&b).and_then(|_| o.flush()).is_err() {
-                // Downstream closed (e.g. `| head`): stop like cargo does.
                 std::process::exit(141);
             }
         }
@@ -562,8 +489,6 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
     }
 }
 
-/// Hands the request to the daemon and relays what it says until the
-/// command is over.
 fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsString]) -> ! {
     let no_daemon = std::env::var_os("RARGO_NO_DAEMON").is_some_and(|v| v == "1");
     let stream = if no_daemon { Err(std::io::Error::other("RARGO_NO_DAEMON")) } else { connect_daemon(&cfg, &cache) };
@@ -600,25 +525,16 @@ fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsStrin
 
 fn main() {
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
-    // The drift check runs stock cargo; if this shim is the `cargo` it
-    // finds, step aside.
     if std::env::var_os("RARGO_BYPASS").is_some() {
         passthrough(&raw);
     }
-    // The daemon handles signals itself (it has directories to unmount).
     if raw.first().is_some_and(|a| a == "--rargo-version") {
-        // rargo's own version (`--version` is cargo's and is passed on).
         println!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION);
         return;
     }
-    // `rargo @host` names the project's server; `rargo auth` gets this
-    // machine a token for it. Neither is a name cargo uses.
     if let Some(host) = raw.first().and_then(|a| a.to_str()).and_then(|a| a.strip_prefix('@')) {
         at_host(host);
     }
-    // The token commands of an administrator (and a user's own tokens) are
-    // requests to the server like any other; the rest of `rargo auth` is
-    // this machine's.
     let token_command = raw.first().is_some_and(|a| a == "auth")
         && raw.get(1).and_then(|a| a.to_str()).is_some_and(|a| TOKEN_COMMANDS.contains(&a));
     if raw.first().is_some_and(|a| a == "auth") && !token_command {
@@ -633,27 +549,22 @@ fn main() {
     tmp::install_handlers();
     let mut args: Vec<String> = match raw.iter().map(|a| a.clone().into_string()).collect() {
         Ok(a) => a,
-        // cargo itself rejects non-UTF-8 arguments for build commands.
         Err(_) => passthrough(&raw),
     };
     let mut vars: Vec<(String, String)> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
-    // `rargo +nightly build` selects a toolchain like the rustup proxy does.
     if let Some(tc) = args.first().and_then(|a| a.strip_prefix('+')).map(|s| s.to_string()) {
         args.remove(0);
         vars.retain(|(k, _)| k != "RUSTUP_TOOLCHAIN");
         vars.push(("RUSTUP_TOOLCHAIN".into(), tc));
     }
-    // `nextest` runs the version the repository names, else this machine's
-    // own nextest's, which the server is told.
     if subcommand(&args) == Some("nextest")
         && !vars.iter().any(|(k, _)| k == "RARGO_NEXTEST_VERSION")
         && let Some(v) = own_nextest_version()
     {
         vars.push(("RARGO_NEXTEST_VERSION".into(), v));
     }
-    // Requests about the server itself need no worktree.
     let admin = match args.first().map(|s| s.as_str()) {
         Some("auth") if token_command => Some("__token"),
         Some("--rargo-status") => Some("__status"),
@@ -666,7 +577,6 @@ fn main() {
         _ => None,
     };
     let drift = args.first().map(|s| s.as_str()) == Some("--rargo-drift-check");
-    // Requests about the daemon on this machine.
     let daemon_cmd = match args.first().map(|s| s.as_str()) {
         Some("--rargo-daemon-status") => Some("status"),
         Some("--rargo-daemon-stop") => Some("stop"),
@@ -679,7 +589,6 @@ fn main() {
         let mut a = vec![cmd.to_string()];
         if matches!(cmd, "__export" | "__import") {
             match args.get(1) {
-                // A directory on the server.
                 Some(dir) => a.push(dir.clone()),
                 None => {
                     eprintln!("usage: rargo {} DIRECTORY-ON-THE-SERVER", args[0]);
@@ -688,7 +597,6 @@ fn main() {
             }
         }
         if cmd == "__token" {
-            // `tokens` is what the server calls `list`.
             let what = if args[1] == "tokens" { "list".to_string() } else { args[1].clone() };
             a.push(what);
             a.extend(args[2..].iter().cloned());
@@ -699,17 +607,12 @@ fn main() {
     } else {
         match subcommand(&args) {
             Some(cmd) if ROUTED.contains(&cmd) => {}
-            // `cargo clean` removes the output directory, which it cannot
-            // while the daemon shows results in it: the daemon lets go of
-            // it first.
             Some("clean") => {
                 release_output();
                 passthrough(&raw)
             }
             _ => passthrough(&raw),
         }
-        // Asking for help or version is cargo's business, except for
-        // nextest, which is the server's.
         if subcommand(&args) != Some("nextest")
             && args.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V")
         {
@@ -744,23 +647,18 @@ fn main() {
     };
     let cache = cache_dir();
     if kind == "stop" {
-        // Every daemon of this cache, not only the one whose socket matches
-        // the credentials held right now. Each unmounts and exits before
-        // its reply ends, so this returns when they are gone.
         stop_daemons(&cfg, &cache, &req);
         std::process::exit(0);
     }
     through_daemon(cfg, cache, req, &raw)
 }
 
-/// The first argument that is not an option: the subcommand.
 fn subcommand(args: &[String]) -> Option<&str> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if a == "--" {
             return None;
         }
-        // Global options that take a value.
         if matches!(a.as_str(), "--color" | "--config" | "-C" | "-Z" | "--explain") {
             it.next();
             continue;
@@ -773,8 +671,6 @@ fn subcommand(args: &[String]) -> Option<&str> {
     None
 }
 
-/// The version of the `cargo-nextest` on PATH, if there is one: the second
-/// word of `cargo-nextest nextest --version` (`cargo-nextest 0.9.100 (...)`).
 fn own_nextest_version() -> Option<String> {
     let out = std::process::Command::new("cargo-nextest")
         .args(["nextest", "--version"])
@@ -787,7 +683,6 @@ fn own_nextest_version() -> Option<String> {
     (words.next()? == "cargo-nextest").then(|| words.next().map(String::from)).flatten()
 }
 
-/// Finds the real cargo: the first `cargo` on PATH that is not this program.
 fn real_cargo() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("RARGO_REAL_CARGO") {
         return Some(PathBuf::from(p));
@@ -826,7 +721,6 @@ fn mount(src: Option<&Path>, tgt: &Path, fstype: Option<&str>, flags: libc::c_ul
     let tgt_c = cstr(tgt);
     let fs_c = fstype.map(|s| CString::new(s).unwrap());
     let data_c = data.map(|s| CString::new(s).unwrap());
-    // SAFETY: all pointers are valid C strings or null.
     let r = unsafe {
         libc::mount(
             src_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
@@ -839,15 +733,10 @@ fn mount(src: Option<&Path>, tgt: &Path, fstype: Option<&str>, flags: libc::c_ul
     if r != 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
-/// Enters a mount namespace in which each `(real, expected)` pair makes the
-/// real directory visible at the expected path, without touching the host:
-/// a new root is assembled on a tmpfs out of binds of the old root's entries.
 fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
-    // SAFETY: plain syscalls; this process is single-threaded here.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let os_err = std::io::Error::last_os_error;
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } != 0 {
-        // Not privileged: try a user namespace that maps us to ourselves.
         if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
             return Err(os_err());
         }
@@ -856,11 +745,6 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
         std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
     }
     mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
-    // The new root is a tmpfs mounted over an existing top-level directory;
-    // what that directory held is reached through a descriptor. It must not
-    // be one a worktree lies under: what is mounted below the covered
-    // directory (a worktree's output directory, served by the daemon)
-    // would not come along.
     let entries: Vec<std::fs::DirEntry> = std::fs::read_dir("/")?.filter_map(|e| e.ok()).collect();
     let covered = ["/tmp", "/mnt", "/media", "/srv", "/opt", "/home", "/var"]
         .into_iter()
@@ -894,8 +778,6 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
     for (real, at) in binds {
         let dst = new_root.join(at.trim_start_matches('/'));
         std::fs::create_dir_all(&dst)?;
-        // Paths below the covered directory are only reachable through the
-        // descriptor (none is a worktree, by the choice above).
         let real_p = match Path::new(real).strip_prefix(covered) {
             Ok(rest) => PathBuf::from(format!("/proc/self/fd/{}", tmp_fd.as_raw_fd())).join(rest),
             Err(_) => PathBuf::from(real),
@@ -903,7 +785,6 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
         mount(Some(&real_p), &dst, None, libc::MS_BIND | libc::MS_REC, None)?;
     }
     let root_c = cstr(new_root);
-    // SAFETY: valid C strings; pivot_root(".", ".") then detach the old root.
     unsafe {
         if libc::chdir(root_c.as_ptr()) != 0
             || libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) != 0
@@ -915,8 +796,6 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Replaces `expected` path prefixes with real ones, for running without a
-/// namespace.
 fn to_real(s: &str, binds: &[(String, String)]) -> String {
     let mut out = String::new();
     for (i, part) in s.split(':').enumerate() {
@@ -946,14 +825,9 @@ fn to_real(s: &str, binds: &[(String, String)]) -> String {
     out
 }
 
-/// Becomes the program `cargo run` would have started.
 fn exec(mut e: ExecRequest) -> ! {
-    // A path the client does not have (no cargo home, say) cannot be shown.
     e.binds.retain(|(real, _)| Path::new(real).exists());
-    // The fork must happen in a child so that this process (the one the
-    // shell is waiting for) keeps its place: unshare changes only us.
     if e.binds.is_empty() {
-        // Nothing to make appear anywhere: a plain process.
     } else if let Err(err) = enter_namespace(&e.binds) {
         if std::env::var_os("RARGO_QUIET_NS").is_none() {
             eprintln!(
@@ -971,8 +845,6 @@ fn exec(mut e: ExecRequest) -> ! {
     }
     let mut cmd = std::process::Command::new(&e.program);
     cmd.args(&e.args).current_dir(&e.cwd);
-    // The program is the user's: it gets the user's whole environment plus
-    // what cargo adds or removes.
     for (k, v) in &e.env {
         match v {
             Some(v) => cmd.env(k, v),
@@ -1004,7 +876,6 @@ mod tests {
             t.join().unwrap();
         }
         assert!(std::fs::read_to_string(&path).unwrap().ends_with(" 199"));
-        // No temporary is left beside it.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
@@ -1019,7 +890,6 @@ mod tests {
         assert_ne!(a, daemon_socket(&cfg("b:1"), cache));
         assert_ne!(a, daemon_socket(&cfg("a:1"), Path::new("/d")));
         assert!(a.starts_with("/c/run"));
-        // A cache path too long for a socket address: the runtime directory.
         let long = PathBuf::from(format!("/{}", "x".repeat(120)));
         assert!(!daemon_socket(&cfg("a:1"), &long).starts_with(&long));
     }

@@ -1,37 +1,11 @@
-//! The encrypted channel between client and server.
-//!
-//! Noise `NNpsk0` with a pre-shared key per token: both ends prove knowledge
-//! of the key, the session keys are fresh per connection, and everything
-//! after the first message is forward secret.
-//!
-//! Wire format:
-//!
-//! ```text
-//! client: MAGIC | u8 n | user (n bytes) | u16 len | handshake message 1
-//! server: u8 0 | u16 len | handshake message 2
-//!     or: u8 1 | u16 len | error text            (then closes)
-//! then, both ways: records of  u32 len | ciphertext
-//! ```
-//!
-//! The first handshake message may carry the request itself (encrypted
-//! under the pre-shared key), which saves a round trip per command. A
-//! record's plaintext is one flag byte (1 = last record of a message)
-//! followed by data; a message is the concatenation of its records.
-
 use snow::{HandshakeState, StatelessTransportState};
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
-/// Ends in the protocol version, so that a client of another version is
-/// told so instead of failing to decode.
 pub const MAGIC: &[u8; 8] = b"rargo\x08\r\n";
 const PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
-/// Plaintext bytes per record (Noise messages are at most 65535 bytes,
-/// including the 16-byte tag).
 const RECORD: usize = 65000;
-/// Largest request that still fits in the first handshake message.
 pub const EARLY_MAX: usize = 60000;
-/// Largest message accepted from the peer.
 const MESSAGE_MAX: usize = 1 << 30;
 const _: () = assert!(RECORD + 1 + 16 <= 65535, "a record with its flag and tag fits a Noise message");
 const _: () = assert!(EARLY_MAX + 256 <= 65535, "early data fits the first handshake message");
@@ -41,13 +15,11 @@ fn err(e: snow::Error) -> io::Error {
     io::Error::other(format!("secure channel: {e}"))
 }
 
-/// The key shared with the holder of a token, derived from its secret.
 pub fn psk_from_secret(secret: &[u8]) -> [u8; 32] {
     let trimmed = secret.trim_ascii();
     *blake3::Hasher::new_derive_key("rargo client key v1").update(trimmed).finalize().as_bytes()
 }
 
-/// The key used on a loopback-only server that has issued no token.
 pub fn open_psk() -> [u8; 32] {
     psk_from_secret(b"rargo: no key configured (loopback only)")
 }
@@ -64,12 +36,10 @@ pub struct Opener {
 }
 
 impl Sealer {
-    /// Appends the records carrying `msg` to `out`.
     pub fn seal(&mut self, msg: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
         let mut chunks = msg.chunks(RECORD).peekable();
         let mut plain = Vec::with_capacity(RECORD + 1);
         let mut cipher = vec![0u8; RECORD + 64];
-        // An empty message is still one record.
         let mut first = true;
         let nonce_before = self.nonce;
         let out_before = out.len();
@@ -93,8 +63,6 @@ impl Sealer {
 }
 
 impl Opener {
-    /// Takes one record's ciphertext; returns a message when it completes
-    /// one.
     pub fn open(&mut self, record: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let mut plain = vec![0u8; record.len()];
         let n = self.keys.read_message(self.nonce, record, &mut plain).map_err(err)?;
@@ -117,8 +85,6 @@ fn split(hs: HandshakeState) -> io::Result<(Sealer, Opener)> {
     Ok((Sealer { keys: keys.clone(), nonce: 0 }, Opener { keys, nonce: 0, partial: Vec::new() }))
 }
 
-/// Client side, step one: the bytes to send first. `early` (at most
-/// [`EARLY_MAX`] bytes) rides in the handshake message.
 pub fn client_start(user: &str, psk: &[u8; 32], early: &[u8]) -> io::Result<(HandshakeState, Vec<u8>)> {
     if user.len() > 255 {
         return Err(io::Error::other("user name too long"));
@@ -139,7 +105,6 @@ pub fn client_start(user: &str, psk: &[u8; 32], early: &[u8]) -> io::Result<(Han
     Ok((hs, out))
 }
 
-/// Client side, step two: the server's handshake message.
 pub fn client_finish(mut hs: HandshakeState, msg2: &[u8]) -> io::Result<(Sealer, Opener)> {
     let mut payload = vec![0u8; msg2.len()];
     hs.read_message(msg2, &mut payload).map_err(|_| {
@@ -148,9 +113,6 @@ pub fn client_finish(mut hs: HandshakeState, msg2: &[u8]) -> io::Result<(Sealer,
     split(hs)
 }
 
-/// Server side: answers the client's handshake message. Returns the reply
-/// to send (without the status byte and length), the early data, and the
-/// channel. Fails if the client does not hold `psk`.
 pub fn server_accept(psk: &[u8; 32], msg1: &[u8]) -> io::Result<(Vec<u8>, Vec<u8>, Sealer, Opener)> {
     let mut hs = snow::Builder::new(PARAMS.parse().map_err(err)?).psk(0, psk).map_err(err)?.build_responder().map_err(err)?;
     let mut early = vec![0u8; msg1.len()];
@@ -166,14 +128,12 @@ pub fn server_accept(psk: &[u8; 32], msg1: &[u8]) -> io::Result<(Vec<u8>, Vec<u8
     Ok((msg2, early, s, o))
 }
 
-/// Writes one message (blocking).
 pub fn write_msg<W: Write>(w: &mut W, sealer: &mut Sealer, msg: &[u8]) -> io::Result<()> {
     let mut buf = Vec::with_capacity(msg.len() + msg.len() / RECORD * 24 + 64);
     sealer.seal(msg, &mut buf)?;
     w.write_all(&buf)
 }
 
-/// Reads one message (blocking). `None` at a clean end of stream.
 pub fn read_msg<R: Read>(r: &mut R, opener: &mut Opener) -> io::Result<Option<Vec<u8>>> {
     loop {
         let mut len = [0u8; 4];
@@ -194,16 +154,10 @@ pub fn read_msg<R: Read>(r: &mut R, opener: &mut Opener) -> io::Result<Option<Ve
     }
 }
 
-// ---------------------------------------------------------------------------
-// The server-worker link
-// ---------------------------------------------------------------------------
 
 const LINK_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const LINK_PROLOGUE: &[u8] = b"rargo worker link v2";
 
-/// Encryption for a link whose messages arrive in any order (the transport
-/// between server and workers): every message names the nonces it was
-/// sealed with, and no nonce is used twice. Keys are fresh per connection.
 pub struct LinkCipher {
     keys: StatelessTransportState,
     next: std::sync::atomic::AtomicU64,
@@ -220,15 +174,10 @@ impl LinkCipher {
         })
     }
 
-    /// A key only the two ends of this connection know, derived from the
-    /// key agreement: for authenticating what travels outside the cipher
-    /// (datagram headers and acknowledgements).
     pub fn binding(&self) -> [u8; 32] {
         self.binding
     }
 
-    /// `u64 first nonce | records`, every record but the last carrying
-    /// [`RECORD`] bytes of plaintext.
     pub fn seal(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
         let records = msg.len().div_ceil(RECORD).max(1);
         let base = self.next.fetch_add(records as u64, std::sync::atomic::Ordering::Relaxed);
@@ -264,7 +213,6 @@ fn link_builder(psk: &[u8; 32]) -> io::Result<snow::Builder<'_>> {
     snow::Builder::new(LINK_PARAMS.parse().map_err(err)?).prologue(LINK_PROLOGUE).map_err(err)?.psk(0, psk).map_err(err)
 }
 
-/// The connecting side's first message.
 pub fn link_start(psk: &[u8; 32]) -> io::Result<(HandshakeState, Vec<u8>)> {
     let mut hs = link_builder(psk)?.build_initiator().map_err(err)?;
     let mut msg = vec![0u8; 128];
@@ -273,8 +221,6 @@ pub fn link_start(psk: &[u8; 32]) -> io::Result<(HandshakeState, Vec<u8>)> {
     Ok((hs, msg))
 }
 
-/// The accepting side: the reply and the cipher. Fails if the peer does
-/// not hold `psk`.
 pub fn link_accept(psk: &[u8; 32], msg1: &[u8]) -> io::Result<(Vec<u8>, LinkCipher)> {
     let mut hs = link_builder(psk)?.build_responder().map_err(err)?;
     let mut scratch = vec![0u8; msg1.len() + 16];
@@ -363,7 +309,6 @@ mod tests {
         let mut bad = sealed[3].clone();
         bad[RECORD + 100] ^= 1;
         assert!(server.open(&bad).is_err());
-        // The client cannot open its own messages (directions have their own keys).
         assert!(client.open(&sealed[1]).is_err());
         let (_, m1) = link_start(&psk_from_secret(b"other")).unwrap();
         assert!(link_accept(&k, &m1).is_err());

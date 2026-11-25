@@ -1,63 +1,3 @@
-//! Per-repository policy: the escape hatch for inputs that cannot be traced.
-//!
-//! Environment variables and the network are handled by rule, not by
-//! observation (DESIGN, "Sandbox and tracing"). The rules live in the
-//! active workspace or package manifest, under
-//! `[workspace.metadata.rargo]` (`[package.metadata.rargo]` where there is no
-//! workspace table): cargo ignores `metadata`, so the repository builds with
-//! plain cargo as before, and it needs no file of rargo's own. The tables
-//! are the ones below, each prefixed with `workspace.metadata.rargo.`.
-//!
-//! ```toml
-//! [env]
-//! # Always given to every action (and therefore part of every key).
-//! pass = ["DATABASE_URL", "PROTOC*"]
-//!
-//! [network]
-//! # Give host networking to all test runs, or only some packages' tests.
-//! tests = false
-//! test-packages = ["integration-tests"]
-//! # Build scripts of these packages may use the network.
-//! build-scripts = ["some-sys"]
-//!
-//! [flake]
-//! # Use the repository's flake devShell as the environment (default: true
-//! # when flake.nix exists).
-//! enabled = true
-//! # Files and directories the flake reads besides `flake.nix`,
-//! # `flake.lock`, `rust-toolchain(.toml)` and `.nix` files at the top and
-//! # under `nix/`. The environment is evaluated again when one changes.
-//! files = ["Cargo.lock", "script/cargo", "nix"]
-//!
-//! [sync]
-//! # Never sent to the build server, in addition to `.git` and cargo target
-//! # directories. A name matches at any depth; a path with a slash is taken
-//! # from the worktree root.
-//! exclude = ["node_modules", "data/fixtures-large"]
-//! # Whether what git ignores is synced. Default: true (a generated file or
-//! # a local `.env` may be an input). With false, it is not scanned, watched
-//! # or sent, except what `include` names (same patterns as `exclude`; a
-//! # file inside an ignored directory is named by its path).
-//! gitignored = false
-//! include = ["data/schema.sql"]
-//! # What build scripts see as `.git`, never file contents from git:
-//! # "head": HEAD (commit, branch, dirty or not) and the tags on it;
-//! # "history": also every commit before it and the tags on them, so that
-//! # `git describe --tags` and `git rev-list --count` answer as on the
-//! # client; false: no `.git` at all. Default (true): "history" where a
-//! # build script mentions `describe` or `rev-list`, or Cargo.lock names
-//! # a crate that asks git for history (vergen, shadow-rs, git-version,
-//! # built, git-testament), else "head".
-//! git = "history"
-//! ```
-//!
-//! Beside the tables, `nextest = "0.9.100"` directly under
-//! `[workspace.metadata.rargo]` names the nextest `rargo nextest` runs.
-//!
-//! The manifest is read from the snapshot, so editing it takes effect on
-//! the next command and the policy flows into action keys through the
-//! environment and network settings it produces.
-
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -70,11 +10,8 @@ pub struct Policy {
     pub network: NetPolicy,
     #[serde(default)]
     pub flake: FlakePolicy,
-    /// Read by the client, which decides what is synced; accepted here so
-    /// that the file means the same thing at both ends.
     #[serde(default)]
     pub sync: SyncPolicy,
-    /// The version of nextest `rargo nextest` runs.
     pub nextest: Option<String>,
 }
 
@@ -83,17 +20,12 @@ pub struct Policy {
 pub struct SyncPolicy {
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// Whether what git ignores is synced (default: yes).
     pub gitignored: Option<bool>,
-    /// What is synced although git ignores it, with `gitignored = false`.
     #[serde(default)]
     pub include: Vec<String>,
-    /// What the sandbox gets as `.git`.
     pub git: Option<GitSync>,
 }
 
-/// `[sync] git`: `true` (decided by what the build scripts ask), `false`
-/// (no `.git`), `"head"` or `"history"`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum GitSync {
@@ -135,8 +67,6 @@ pub struct FlakePolicy {
 
 pub const MANIFEST: &str = "Cargo.toml";
 
-/// What `[workspace.metadata.rargo]` holds: the policy's tables and the
-/// server's name (which the client reads; D67).
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct InManifest {
@@ -160,7 +90,6 @@ fn matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// The policy of the workspace or package that `dir` of the snapshot is in.
 pub fn snapshot_policy(snapshot: &crate::snapshot::Snapshot, dir: &std::path::Path) -> Result<Policy, String> {
     use std::os::unix::ffi::OsStrExt;
     let read = |path: &std::path::Path| snapshot.read(path.as_os_str().as_bytes()).map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
@@ -169,12 +98,8 @@ pub fn snapshot_policy(snapshot: &crate::snapshot::Snapshot, dir: &std::path::Pa
 }
 
 impl Policy {
-    /// The policy a manifest holds under `[workspace.metadata.rargo]`
-    /// (`[package.metadata.rargo]` where it has no workspace table); the
-    /// default policy where it holds none.
     pub fn load(manifest: Option<&str>) -> Result<Policy, String> {
         let Some(manifest) = manifest else { return Ok(Policy::default()) };
-        // A manifest cargo itself rejects is cargo's to report.
         let Ok(table) = manifest.parse::<toml::Table>() else { return Ok(Policy::default()) };
         let found = ["workspace", "package"]
             .iter()
@@ -184,7 +109,6 @@ impl Policy {
         Ok(Policy { env: m.env, network: m.network, flake: m.flake, sync: m.sync, nextest: m.nextest })
     }
 
-    /// Client variables the policy passes to every action.
     pub fn passed_env(&self, client: &HashMap<String, String>) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = client
             .iter()
@@ -241,10 +165,8 @@ mod tests {
 
     #[test]
     fn the_policy_is_the_manifests_table() {
-        // A manifest that only names the server holds the default policy.
         let only_host = "[package]\nname = \"a\"\n[package.metadata.rargo]\nhost = \"rargo.rs\"\n";
         assert_eq!(Policy::load(Some(only_host)).unwrap(), Policy::default());
-        // A package outside a workspace; other tools' metadata is not ours.
         let package = "[package]\nname = \"a\"\n[package.metadata.docs.rs]\nall-features = true\n[package.metadata.rargo.sync]\ngit = false\n";
         assert_eq!(Policy::load(Some(package)).unwrap().sync.git, Some(GitSync::Flag(false)));
         let history = "[workspace.metadata.rargo.sync]\ngit = \"history\"\n";
@@ -252,14 +174,11 @@ mod tests {
         let head = "[workspace.metadata.rargo.sync]\ngit = \"head\"\n";
         assert_eq!(Policy::load(Some(head)).unwrap().sync.git, Some(GitSync::Depth(GitDepth::Head)));
         assert!(Policy::load(Some("[workspace.metadata.rargo.sync]\ngit = \"all\"\n")).is_err());
-        // A workspace table comes before a package table of the same file.
         let both = "[workspace.metadata.rargo.sync]\nexclude = [\"a\"]\n[package]\nname = \"p\"\n[package.metadata.rargo.sync]\nexclude = [\"b\"]\n";
         assert_eq!(Policy::load(Some(both)).unwrap().sync.exclude, ["a"]);
-        // What git ignores, left out but for one path.
         let ignored = "[workspace.metadata.rargo.sync]\ngitignored = false\ninclude = [\"data/schema.sql\"]\n";
         let sync = Policy::load(Some(ignored)).unwrap().sync;
         assert_eq!((sync.gitignored, sync.include), (Some(false), vec!["data/schema.sql".to_string()]));
-        // No manifest, or one without the table.
         assert_eq!(Policy::load(None).unwrap(), Policy::default());
         assert_eq!(Policy::load(Some("[package]\nname = \"a\"\n")).unwrap(), Policy::default());
     }

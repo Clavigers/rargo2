@@ -1,25 +1,21 @@
-From 7bfc8765d007a7ed4325f73aa514599a6fc90db4 Mon Sep 17 00:00:00 2001
+From db83ffe366a8f9e55e6c52879ad5a8993be487bb Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:01:11 +0100
 Subject: [PATCH 5/8] rargo: lint mode replays rustc's unused_extern messages
  for cargo's unused_dependencies lint
 
 ---
- src/compiler/rargo.rs | 28 ++++++++++++++++++++++++++--
- 1 file changed, 26 insertions(+), 2 deletions(-)
+ src/compiler/rargo.rs | 24 ++++++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index d9f610695..48cc8bbed 100644
+index 6364a40..47f5b20 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -363,6 +363,23 @@ pub fn record_cmd(cmd: &ProcessBuilder) -> CargoResult<()> {
+@@ -345,6 +345,19 @@ pub fn record_cmd(cmd: &ProcessBuilder) -> CargoResult<()> {
      }
  }
  
-+/// Lint mode: rustc's `unused_extern` messages of the build that just ran,
-+/// by unit index (with the unit's description, to be sure it is the same
-+/// unit). Fed back through cargo's own stderr handling, so that cargo's
-+/// post-build `unused_dependencies` lint says exactly what it would have.
 +fn unused_externs_of(idx: u32) -> Option<String> {
 +    static LINES: OnceLock<HashMap<u32, (String, String)>> = OnceLock::new();
 +    let lines = LINES.get_or_init(|| {
@@ -33,10 +29,10 @@ index d9f610695..48cc8bbed 100644
 +    (u.desc == *desc).then(|| line.clone())
 +}
 +
- /// The `Executor` used in planning mode: records instead of running rustc.
  pub struct PlanExecutor;
  
-@@ -374,10 +391,17 @@ impl Executor for PlanExecutor {
+ impl Executor for PlanExecutor {
+@@ -355,10 +368,17 @@ impl Executor for PlanExecutor {
          _target: &Target,
          _mode: CompileMode,
          _on_stdout_line: &mut dyn FnMut(&str) -> CargoResult<()>,
@@ -56,6 +52,3 @@ index d9f610695..48cc8bbed 100644
      }
  
      fn force_rebuild(&self, _unit: &Unit) -> bool {
--- 
-2.54.0
-

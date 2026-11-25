@@ -1,6 +1,3 @@
-//! End-to-end tests of the action engine with real sandboxed processes.
-//! They mount a FUSE filesystem and create namespaces, so they need root.
-
 use rargo_core::buildview::*;
 use rargo_core::engine::*;
 use rargo_core::hash::Hash;
@@ -30,9 +27,6 @@ impl Drop for Fx {
     }
 }
 
-/// The sandbox helper: where cargo says it built it, or, for a test program
-/// that a build server compiled (the path it names is the server's), the
-/// one in the output directory this program lies in.
 fn sandbox_helper() -> std::path::PathBuf {
     let named = Path::new(env!("CARGO_BIN_EXE_rargo-sandbox"));
     if named.exists() {
@@ -42,9 +36,6 @@ fn sandbox_helper() -> std::path::PathBuf {
     me.ancestors().map(|d| d.join("rargo-sandbox")).find(|p| p.is_file()).unwrap_or_else(|| named.to_path_buf())
 }
 
-/// Where the tests make their stores and mounts: RARGO_TEST_TMP, or the
-/// work area's (on a filesystem FUSE passthrough can stack on, and not in
-/// the sandbox's /tmp).
 fn test_tmp() -> PathBuf {
     std::env::var_os("RARGO_TEST_TMP").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/root/rargo-work/test-tmp"))
 }
@@ -85,7 +76,6 @@ impl Fx {
             vec![
                 Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
                 Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(work)), traced: true },
-                // Keep the test's own scratch area out of the sandbox.
                 Mount { at: test_tmp().into_os_string().into_vec(), region: Region::Empty, traced: true },
             ],
             self.memo.clone(),
@@ -156,20 +146,16 @@ fn replays_until_an_observed_input_changes() {
         let Some(MEntry::File { hash, .. }) = a.result.outputs.get(b"/w/out.txt") else { panic!("no output") };
         assert_eq!(fx.text(hash), "one\n");
         assert_eq!(a.result.outputs.entries.len(), 1, "{:?}", a.result.outputs);
-        // The real directory was not written to.
         assert!(!fx.work.join("out.txt").exists());
         assert_eq!(fx.runs(), 1);
 
-        // Nothing changed: replay.
         let b = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
         assert!(b.cached);
         assert_eq!(fx.runs(), 1);
 
-        // A file the action never looked at changes: still a hit.
         std::fs::write(fx.work.join("other.txt"), "changed\n").unwrap();
         assert!(fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap().cached);
 
-        // A file it read changes: miss, new result.
         std::fs::write(fx.work.join("in.txt"), "two\n").unwrap();
         let c = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
         assert!(!c.cached);
@@ -177,12 +163,10 @@ fn replays_until_an_observed_input_changes() {
         assert_eq!(fx.text(hash), "two\n");
         assert_eq!(fx.runs(), 2);
 
-        // A path it probed and found absent appears: miss.
         std::fs::write(fx.work.join("missing.txt"), "now here\n").unwrap();
         assert!(!fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap().cached);
         assert_eq!(fx.runs(), 3);
 
-        // Going back to an earlier state hits the earlier trace.
         std::fs::remove_file(fx.work.join("missing.txt")).unwrap();
         std::fs::write(fx.work.join("in.txt"), "one\n").unwrap();
         let d = fx.engine.obtain(fx.req(script, &[], &[], &[])).await.unwrap();
@@ -215,15 +199,12 @@ fn identical_requests_in_flight_run_once() {
 #[test]
 fn waiter_runs_its_own_when_the_trace_does_not_hold() {
     let fx = fixture();
-    // Two "worktrees" with different content, shown at the same path.
     let other = fx.work.parent().unwrap().join("work2");
     std::fs::create_dir_all(&other).unwrap();
     std::fs::write(fx.work.join("in.txt"), "first\n").unwrap();
     std::fs::write(other.join("in.txt"), "second\n").unwrap();
     let script = "sleep 0.5; cat in.txt";
     rt().block_on(async {
-        // No trace exists yet, so both requests predict the same (empty)
-        // input set and the second waits for the first.
         let e = fx.engine.clone();
         let r1 = fx.req(script, &[], &[], &[]);
         let first = tokio::spawn(async move { e.obtain(r1).await.unwrap() });
@@ -238,8 +219,6 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
         assert_eq!(fx.engine.stats.joined.load(Ordering::Relaxed), 1);
         assert_eq!(fx.engine.stats.joined_then_ran.load(Ordering::Relaxed), 1);
 
-        // Now a trace exists and predicts `in.txt`. Requests that differ
-        // there do not wait for each other at all.
         std::fs::write(fx.work.join("in.txt"), "third\n").unwrap();
         std::fs::write(other.join("in.txt"), "fourth\n").unwrap();
         let e = fx.engine.clone();
@@ -262,24 +241,18 @@ fn declared_environment_variables_become_part_of_the_key() {
     let fx = fixture();
     let script = "echo value=$FOO";
     rt().block_on(async {
-        // First run without FOO; the action then declares it reads FOO, and
-        // since the client has FOO set, it is rerun with it.
         let a = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).await.unwrap();
         assert_eq!(fx.text(&a.result.stdout), "value=bar\n");
         assert_eq!(fx.runs(), 2);
-        // Same client environment: hit.
         let b = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).await.unwrap();
         assert!(b.cached);
         assert_eq!(fx.text(&b.result.stdout), "value=bar\n");
-        // A different value: its own run.
         let c = fx.engine.obtain(fx.req(script, &[], &[("FOO", "baz")], &["FOO"])).await.unwrap();
         assert!(!c.cached);
         assert_eq!(fx.text(&c.result.stdout), "value=baz\n");
-        // A client without FOO hits the very first run.
         let d = fx.engine.obtain(fx.req(script, &[], &[], &["FOO"])).await.unwrap();
         assert!(d.cached);
         assert_eq!(fx.text(&d.result.stdout), "value=\n");
-        // An unrelated client variable is never passed.
         let e = fx.engine.obtain(fx.req("echo other=$BAR", &[], &[("BAR", "x")], &[])).await.unwrap();
         assert_eq!(fx.text(&e.result.stdout), "other=\n");
     });
@@ -294,7 +267,6 @@ fn failures_are_not_cached_unless_allowed() {
         let b = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).await.unwrap();
         assert!(!b.cached);
         assert_eq!(fx.runs(), 2);
-        // A program that cannot be executed is an error, not a result.
         let mut r = fx.req("true", &[], &[], &[]);
         r.spec.argv = vec![b"/no/such/program".to_vec()];
         let err = fx.engine.obtain(r).await.err().expect("must fail").to_string();
@@ -305,7 +277,6 @@ fn failures_are_not_cached_unless_allowed() {
 #[test]
 fn large_directories_list_completely_through_a_build_view() {
     let fx = fixture();
-    // Enough entries with long names to need several READDIR round trips.
     let big = fx.work.join("big");
     std::fs::create_dir_all(&big).unwrap();
     for i in 0..400 {

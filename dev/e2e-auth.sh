@@ -1,18 +1,4 @@
 #!/bin/bash
-# End-to-end checks of the path a new user takes (D67):
-#   rargo @host   ->   rargo auth   ->   rargo build
-# against a server that admits tokens only, with nothing edited by hand, and
-# of what an administrator does with tokens while the server runs, from a
-# client (`rargo auth invite|create|tokens|revoke|allow|disallow`).
-#
-#   dev/e2e-auth.sh
-#
-# Runs on the build machine and on a CI runner: RARGO_BIN (rargod, rargo),
-# PLANNER (the cargo fork's binary) and RARGO_WORK (scratch directory) say
-# where things are.
-#
-# The browser's part (opening the page, entering the invitation) is played
-# with curl. Needs root (rargod) and a free loopback port.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -29,10 +15,6 @@ pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/        /'; }
 check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else bad "$name" "$@"; fi; }
-# Stop every daemon whose cache is `root` or a cache directory under it.
-# `--rargo-daemon-stop` reaches each socket in that cache and returns when
-# the daemon has unmounted and exited. A daemon it cannot reach (its socket
-# is already gone) is killed. The guard exits once its daemon is gone.
 reap_clients() {
     local root=$1 pid c dpat gpat pids
     if [ -d "$root/run" ]; then
@@ -75,7 +57,6 @@ admin=$("$D" token create --state "$T/state" --user admin --admin 2>/dev/null)
 [[ "$admin" == t-*.* ]]; check $? "rargod token create makes the administrator's own token, on the server's machine" "$admin"
 [ "$(stat -c %a "$T/state/tokens.json")" = 600 ]; check $? "the token file is readable by its owner only"
 
-# What stands in for GitHub in the sign-in checks further down.
 ghport=$((port + 1))
 echo mallory >"$T/github-who"
 python3 "$here/fake-github.py" $ghport "$T/github-who" &
@@ -87,7 +68,6 @@ tail -n +1 -f --pid="$srv" "$T/srv.log" | awk '/serving clients/ { found=1; exit
 grep -q "tokens required" "$T/srv.log"; check $? "the server runs with tokens" "$(cat "$T/srv.log")"
 
 echo "== the administrator, from a client"
-# Their own machine: a home, a cache and a token of their own, and no project.
 adm() { (cd "$T/admin" && HOME=$T/admin XDG_CONFIG_HOME=$T/admin/.config RARGO_CACHE_DIR=$T/cache-admin RARGO_SERVER=$host RARGO_TOKEN=$admin "$R" auth "$@"); }
 mkdir -p "$T/admin"
 invite=$(adm invite --user ann --uses 2 2>"$T/invite.err")

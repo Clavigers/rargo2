@@ -1,12 +1,3 @@
-//! rargod: the build server. Clients on any machine sync their worktree and
-//! environment to it; all analysis, scheduling and building happens here.
-//!
-//!   rargod --state DIR --planner PATH [--listen ADDR] [--cargo-home DIR]
-//!          [--store DIR] [--jobs N] [--mem-gb N]
-//!
-//! It must run as root (or with CAP_SYS_ADMIN): it mounts a FUSE filesystem,
-//! registers passthrough backing files and creates namespaces.
-
 use anyhow::{Context, Result, bail};
 use rargo_core::build::{Config, Daemon};
 use rargo_core::engine::Engine;
@@ -24,30 +15,19 @@ struct Opts {
     state: PathBuf,
     store: Option<PathBuf>,
     planner: PathBuf,
-    /// Address clients connect to.
     listen: std::net::SocketAddr,
-    /// The shared cargo home (registry and git checkouts).
     cargo_home: Option<PathBuf>,
-    /// The user actions run as; rargod's own by default.
     uid: Option<u32>,
     gid: Option<u32>,
     jobs: usize,
     mem_kb: u64,
     passthrough: bool,
-    /// Size the content store is kept under.
     store_budget: u64,
-    /// Whole blobs unused for this long are turned into chunks; 0 = never.
     cold_after_secs: u64,
-    /// Minutes between background drift checks; 0 turns them off.
     drift_minutes: u64,
-    /// Address to accept workers on.
     workers_listen: Option<std::net::SocketAddr>,
-    /// Run as a worker for the server at this address.
     worker_of: Option<std::net::SocketAddr>,
-    /// File holding the secret shared by the server and its workers.
     worker_key: Option<PathBuf>,
-    /// The address clients are told to connect to when they ask by name
-    /// (`/.well-known/rargo.json`): `HOST:PORT`.
     public: Option<String>,
 }
 
@@ -127,21 +107,15 @@ fn main() -> Result<()> {
         rargo_core::sandbox::zygote_main(args[2].parse()?);
     }
     let opts = parse_args(&args)?;
-    // Before anything is forked: arrange our cgroup so that each action can
-    // have its own (a no-op unless the cgroup was delegated to us).
     let cgroup_root = if std::env::var_os("RARGO_NO_CGROUPS").is_some() {
         None
     } else {
         rargo_core::cgroup::setup()
     };
-    // The zygote must exist before this process grows threads.
     let zygote = Zygote::start(&std::env::current_exe()?)?;
 
     std::fs::create_dir_all(&opts.state)?;
     let state = opts.state.canonicalize()?;
-    // (Decided before anything is mounted: a refusal leaves nothing behind.)
-    // Who may connect: the holders of tokens; where there are none and
-    // the server listens on the loopback interface, anyone on its machine.
     let tokens = Arc::new(rargo_core::tokens::TokenStore::new(state.join("tokens.json")));
     let keys = if tokens.path().exists() {
         Keys::with_tokens(tokens.clone())
@@ -165,9 +139,7 @@ fn main() -> Result<()> {
     let fs = Arc::new(SandboxFs::new(content.clone()));
     let mnt = state.join("mnt");
     std::fs::create_dir_all(&mnt)?;
-    // A previous instance may have died without unmounting.
     if let Ok(c) = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()) {
-        // SAFETY: valid C string; failure (nothing mounted) is expected.
         unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
     }
     let session = Arc::new(
@@ -186,8 +158,6 @@ fn main() -> Result<()> {
     engine.cgroup_root = cgroup_root.clone();
     let engine = Arc::new(engine);
     if let Some(server) = opts.worker_of {
-        // A worker: no analysis, no cache of results, no clients. It
-        // executes what the server sends and keeps a content cache.
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let key = link_key(&opts, server)?;
         let result = rt.block_on(rargo_core::remote::worker_main(engine, server, opts.jobs as u32, key));
@@ -197,7 +167,6 @@ fn main() -> Result<()> {
     let cargo_home = opts.cargo_home.clone().unwrap_or_else(|| state.join("cargo-home"));
     std::fs::create_dir_all(&cargo_home)?;
     let cargo_home = cargo_home.canonicalize()?;
-    // SAFETY: plain syscalls.
     let (uid, gid) = (opts.uid.unwrap_or(unsafe { libc::geteuid() }), opts.gid.unwrap_or(unsafe { libc::getegid() }));
     for dir in ["registry", "git"] {
         let p = cargo_home.join(dir);
@@ -224,9 +193,6 @@ fn main() -> Result<()> {
         opts.mem_kb >> 20,
     );
 
-    // Eviction replaces `cargo clean`: least recently used blobs go first,
-    // nothing used in the last ten minutes is touched, and a trace whose
-    // outputs are gone is simply a miss.
     {
         let d = daemon.clone();
         let budget = opts.store_budget;
@@ -236,14 +202,12 @@ fn main() -> Result<()> {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(20));
                 let store = &d.engine.store;
-                // Unreferenced blobs go first, on a slower beat.
                 if tick % 6 == 5 {
                     let (n, bytes) = d.collect_garbage(600);
                     if n > 0 {
                         eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
                     }
                 }
-                // What nobody has used for a while is kept as chunks.
                 if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
                     let fs = d.engine.fs.clone();
                     let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
@@ -282,8 +246,6 @@ fn main() -> Result<()> {
     let http_state = state.clone();
     let result = rt.block_on(async move {
         let listener = TcpListener::bind(listen).await.with_context(|| format!("listening on {listen}"))?;
-        // Client daemons connect over the UDP transport on the same port;
-        // TCP is for those whose network lets no UDP through.
         let users: rargo_core::net::UserKeys = {
             let keys = keys.clone();
             Arc::new(move |user| keys.psk(user))
@@ -311,10 +273,6 @@ fn main() -> Result<()> {
     result
 }
 
-/// `rargod token ...`: tokens and invitations, kept in the state directory
-/// of a server that may be running; it sees every change at once. All but
-/// `github` are also `rargo auth` commands for an administrator, from a
-/// client (`rargo_core::tokens::command`).
 fn token_command(args: &[String]) -> Result<()> {
     let usage = "usage: rargod token invite --state DIR [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
                  rargod token create --state DIR --user NAME [--admin] [--days N]\n       \
@@ -372,7 +330,6 @@ async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>, http
                 let (stream, peer) = match conn {
                     Ok(c) => c,
                     Err(e) => {
-                        // Out of descriptors or the like: keep serving.
                         eprintln!("rargod: accept failed: {e}");
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         continue;
@@ -392,9 +349,6 @@ async fn serve(daemon: Arc<Daemon>, listener: TcpListener, keys: Arc<Keys>, http
     Ok(())
 }
 
-/// The key for the server-worker link. A worker runs any command the server
-/// sends and the server believes the results, so a link that leaves this
-/// machine must have one.
 fn link_key(opts: &Opts, addr: std::net::SocketAddr) -> Result<rargo_core::net::LinkKey> {
     match &opts.worker_key {
         Some(path) => {

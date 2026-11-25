@@ -1,19 +1,4 @@
 #!/bin/bash
-# Builds the corpus for comparing chunking rules (#117): a project built by
-# rargo at N successive first-parent commits, oldest first. After each
-# build, one version is kept:
-#   OUT/vNN/target/       everything the build leaves in target/debug
-#   OUT/vNN/incremental/  the newest incremental state of every crate the
-#                         server holds, as files (crates/rargo-core/
-#                         examples/incrdump.rs)
-#
-#   dev/cdc-corpus.sh REPO TIP N OUT [rargo build arguments...]
-#
-# REPO is a git checkout of the project; it is not changed, the builds run
-# in a worktree of it (OUT/src). The builds go to a private rargod of their
-# own (state in OUT/server, port RARGO_CDC_PORT, default 7640), which keeps
-# every crate's state between builds and is stopped for each dump. RARGO_BIN
-# names the rargo and rargod to use, INCRDUMP the dump program.
 set -euo pipefail
 repo=$1 tip=$2 n=$3 out=$4
 shift 4

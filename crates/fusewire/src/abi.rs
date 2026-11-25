@@ -1,8 +1,3 @@
-//! Kernel FUSE ABI (protocol 7.45, Linux 7.0 `include/uapi/linux/fuse.h`).
-//!
-//! Only the parts this server speaks are declared. All structs are
-//! `#[repr(C)]` and match the kernel layout exactly.
-
 #![allow(non_camel_case_types, dead_code)]
 
 pub const FUSE_KERNEL_VERSION: u32 = 7;
@@ -10,7 +5,6 @@ pub const FUSE_KERNEL_MINOR_VERSION: u32 = 45;
 pub const FUSE_ROOT_ID: u64 = 1;
 pub const FUSE_MIN_READ_BUFFER: usize = 8192;
 
-// init flags
 pub const FUSE_ASYNC_READ: u64 = 1 << 0;
 pub const FUSE_POSIX_LOCKS: u64 = 1 << 1;
 pub const FUSE_ATOMIC_O_TRUNC: u64 = 1 << 3;
@@ -33,7 +27,6 @@ pub const FUSE_INIT_EXT: u64 = 1 << 30;
 pub const FUSE_DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
 pub const FUSE_PASSTHROUGH: u64 = 1 << 37;
 
-// open flags (fuse_open_out.open_flags)
 pub const FOPEN_DIRECT_IO: u32 = 1 << 0;
 pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 pub const FOPEN_NONSEEKABLE: u32 = 1 << 2;
@@ -43,7 +36,6 @@ pub const FOPEN_NOFLUSH: u32 = 1 << 5;
 pub const FOPEN_PARALLEL_DIRECT_WRITES: u32 = 1 << 6;
 pub const FOPEN_PASSTHROUGH: u32 = 1 << 7;
 
-// setattr valid bits
 pub const FATTR_MODE: u32 = 1 << 0;
 pub const FATTR_UID: u32 = 1 << 1;
 pub const FATTR_GID: u32 = 1 << 2;
@@ -57,12 +49,10 @@ pub const FATTR_CTIME: u32 = 1 << 10;
 
 pub const FUSE_GETATTR_FH: u32 = 1 << 0;
 
-// notify codes
 pub const FUSE_NOTIFY_INVAL_INODE: i32 = 2;
 pub const FUSE_NOTIFY_INVAL_ENTRY: i32 = 3;
 pub const FUSE_NOTIFY_DELETE: i32 = 6;
 
-// opcodes
 pub const FUSE_LOOKUP: u32 = 1;
 pub const FUSE_FORGET: u32 = 2;
 pub const FUSE_GETATTR: u32 = 3;
@@ -111,7 +101,6 @@ pub const FUSE_SYNCFS: u32 = 50;
 pub const FUSE_TMPFILE: u32 = 51;
 pub const FUSE_STATX: u32 = 52;
 
-// ioctls on /dev/fuse: _IOR(229, 0, u32), _IOW(229, 1, fuse_backing_map), _IOW(229, 2, u32)
 pub const FUSE_DEV_IOC_CLONE: libc::c_ulong = 0x8004_e500;
 pub const FUSE_DEV_IOC_BACKING_OPEN: libc::c_ulong = 0x4010_e501;
 pub const FUSE_DEV_IOC_BACKING_CLOSE: libc::c_ulong = 0x4004_e502;
@@ -421,7 +410,6 @@ pub struct fuse_dirent {
     pub off: u64,
     pub namelen: u32,
     pub typ: u32,
-    // name follows, padded to 8 bytes
 }
 
 #[repr(C)]

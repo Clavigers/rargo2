@@ -1,5 +1,3 @@
-//! Serving one client connection from handshake to exit code.
-
 use crate::build::{self, Client, Daemon};
 use crate::engine::{ClientEnv, EnvAsker};
 use crate::hash::Hash;
@@ -33,12 +31,8 @@ fn wants_color(req: &RunRequest, env: &HashMap<String, String>, tty: bool) -> bo
     }
 }
 
-/// Handles one accepted TCP connection: the fallback form of a client
-/// daemon's link.
 pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>, http: Arc<crate::http::Http>) -> Result<()> {
     let _ = stream.set_nodelay(true);
-    // The same port answers HTTP: what a browser or `rargo auth` asks
-    // before there is a key to speak the protocol with.
     let mut first = [0u8; 4];
     let n = tokio::time::timeout(std::time::Duration::from_secs(20), stream.peek(&mut first)).await.context("nothing was sent")??;
     if n == 4 && matches!(&first, b"GET " | b"POST" | b"HEAD") {
@@ -52,7 +46,6 @@ pub async fn connection(d: Arc<Daemon>, mut stream: TcpStream, keys: Arc<Keys>, 
     Ok(())
 }
 
-/// Handles one accepted connection of the UDP transport.
 pub async fn udp_connection(d: Arc<Daemon>, conn: Arc<crate::net::Conn>, endpoint: Arc<crate::net::Endpoint>, keys: Arc<Keys>) {
     let Some(user) = conn.user().map(String::from) else {
         endpoint.forget(conn.id);
@@ -67,15 +60,12 @@ struct Stream {
     abort: tokio::task::AbortHandle,
 }
 
-/// Forwards what a session queues for the client as frames of `stream`,
-/// until the command's final message or the end of the queue.
 async fn pump(link: Arc<Link>, stream: u32, mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
     assert_ne!(stream, crate::proto::KEEPALIVE, "keepalives are not a session's stream");
     let mut seq = 0u64;
     while let Some(m) = rx.recv().await {
         let last = matches!(m, ServerMsg::Exit(_) | ServerMsg::Exec(_) | ServerMsg::Fetched { .. });
         let bulk = session::bulk_of(&m);
-        // File contents are compressed already; listings are not.
         let msg = match (bulk, crate::proto::pack(&crate::proto::encode(&m))) {
             (0, Some(z)) => ServerMsg::Packed(z),
             _ => m,
@@ -95,8 +85,6 @@ async fn pump(link: Arc<Link>, stream: u32, mut rx: tokio::sync::mpsc::Unbounded
     sess.close_window();
 }
 
-/// Worktree content a client pushed without being asked. Returns what to
-/// answer, if the client wants to know what is still missing.
 fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     let stats = &d.trees.stats;
     stats.offers.fetch_add(1, Ordering::Relaxed);
@@ -122,11 +110,7 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     Some(ServerMsg::Missing { id: o.id, trees: trees.iter().map(|h| h.0).collect(), blobs: blobs.iter().map(|h| h.0).collect() })
 }
 
-/// Serves one client daemon for as long as its link lasts: every command
-/// is a stream; stream 0 carries what the daemon does on its own.
 pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
-    // What the client presented is a token's id; the name shown and
-    // recorded is its holder's.
     let user = keys.name_of(&presented);
     let mut checked = std::time::Instant::now();
     let has = Arc::new(ClientHas::default());
@@ -136,10 +120,6 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
     d.stats.links.fetch_add(1, Ordering::Relaxed);
     'link: loop {
-        // A revoked or expired token is refused on the next command. A
-        // session that only sits idle is closed when the next message
-        // shows the token no longer works, and that look happens at most
-        // every other second.
         if checked.elapsed() > std::time::Duration::from_secs(2) {
             if !keys.still_valid(&presented) {
                 eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
@@ -150,8 +130,6 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
         let raw = tokio::select! {
             m = link.recv() => m,
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                // A daemon sends something every few seconds; one that has
-                // been silent this long is gone (its machine went away).
                 if link.idle() > std::time::Duration::from_secs(180) { None } else { continue }
             }
         };
@@ -178,13 +156,10 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
             match (stream, msg) {
                 (CONTROL, ClientMsg::Ping(n)) => control.send(ServerMsg::Pong(n)),
                 (CONTROL, ClientMsg::Offer(o)) => {
-                    // In place: a request sent after it must find it done.
                     if let Some(reply) = tokio::task::block_in_place(|| offer(&d, *o)) {
                         control.send(reply);
                     }
                 }
-                // Contents the daemon lacks: a stream of its own, so that
-                // two fetches never mix.
                 (stream, ClientMsg::Fetch { id, hashes }) if stream != CONTROL => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
                     tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
@@ -217,7 +192,6 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                     tokio::spawn(pump(link.clone(), stream, rx, sess.clone()));
                     let blobs = d.client_blobs.clone();
                     tokio::task::spawn_blocking(move || {
-                        // About a megabyte per message.
                         for group in idx.chunks(16) {
                             let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
                             let chunks: Vec<(u32, crate::proto::Part)> =
@@ -266,8 +240,6 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
                     });
                 }
                 (stream, ClientMsg::Cancel) => {
-                    // The command is not wanted any more: queued actions
-                    // are dropped, running ones stopped.
                     let gone = streams.lock().remove(&stream);
                     if let Some(st) = gone {
                         st.sess.close();
@@ -291,7 +263,6 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
             }
         }
     }
-    // The daemon is gone, and every command it had running with it.
     let all: Vec<Stream> = streams.lock().drain().map(|(_, st)| st).collect();
     for st in all {
         st.sess.close();
@@ -301,7 +272,6 @@ pub async fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: boo
     link.close();
 }
 
-/// The token commands as a client types them.
 const TOKEN_USAGE: &str = "usage: rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
                            rargo auth create --user NAME [--admin] [--days N]\n       \
                            rargo auth tokens\n       \
@@ -338,7 +308,6 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
             }
             return say(&sess, status_text(&d));
         }
-        // `rargo auth invite|create|tokens|revoke|allow|disallow`.
         "__token" => {
             let Some(store) = keys.tokens().cloned() else {
                 return fail(&sess, "this server has issued no tokens: it admits anyone on its machine, and its tokens are made there (`rargod token`)".into());
@@ -367,9 +336,6 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
             return say(&sess, tokio::task::spawn_blocking(move || d2.incr.analyze()).await.unwrap_or_default());
         }
         "__gc" => {
-            // Explicit collection: everything unreferenced, regardless of
-            // age, unless something is running or queued, whose recently
-            // used blobs may be outputs not yet recorded anywhere.
             let (running, waiting, _, _) = d.engine.sched.snapshot();
             let age = if running + waiting == 0 { 0 } else { 600 };
             let d2 = d.clone();
@@ -406,9 +372,6 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
             );
         }
         "__export" | "__import" => {
-            // Cache transfer between servers; the directory is on the
-            // server. Administrators only: an import adds results every
-            // later build will trust.
             let Some(dir) = req.args.get(1).cloned() else { return fail(&sess, "a directory is required".into()) };
             let export = command == "__export";
             let d2 = d.clone();
@@ -429,8 +392,6 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
         _ => {}
     }
 
-    // What this worktree holds of earlier deliveries, if the client placed
-    // the last one completely and this server remembers it.
     let worktree = req.worktree.clone();
     let before: Option<Arc<std::collections::HashSet<crate::proto::Digest>>> = {
         let known = d.deliveries.lock();
@@ -442,7 +403,6 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
     if req.lazy {
         sess.set_lazy();
     }
-    // The worktree: bring whatever the store lacks over from the client.
     let snapshot = match d.trees.sync(Hash(req.tree), &*sess).await {
         Ok(s) => s,
         Err(e) => {
@@ -518,10 +478,8 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
             }
         }
         let mut b = [0u8; 8];
-        // SAFETY: filling a valid 8-byte buffer.
         unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
         let token = u64::from_le_bytes(b) | 1;
-        // Zero means "no delivery" in `RunRequest::delivered`.
         assert_ne!(token, 0);
         d.deliveries.lock().insert(worktree, (token, Arc::new(delivered)));
         sess.send(ServerMsg::DeliveryToken(token));

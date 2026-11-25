@@ -1,15 +1,4 @@
 #!/bin/bash
-# What the first command of a new client daemon costs: a client in its own
-# network namespace, a server with 24 cores one shaped link away.
-#
-#   [LABEL=after] dev/bench-restart.sh [REPO] [NAME DELAY_MS]...
-#
-# Default links: lan (1 ms each way) and 100ms (50 ms each way). For each,
-# after a full build: the daemon stopped and the same build run (7 times),
-# and the daemon stopped, a one-line edit that recompiles one crate and
-# nothing above it, and the build run (7 times). Medians go to
-# $RARGO_WORK/bench/restart.jsonl. A second passes between stopping a
-# daemon and the next command, so that the old daemon is gone.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)

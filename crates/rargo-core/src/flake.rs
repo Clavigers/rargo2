@@ -1,15 +1,3 @@
-//! Flake-restricted environments.
-//!
-//! A workspace flake or the bundled flake defines the build environment: the variables it exports become the action
-//! environment, and the sandbox root contains only the closure of store
-//! paths those variables refer to (plus the worktree, cargo home and a
-//! minimal `/etc`). Nothing of the host's `/usr` or `/home` is visible, so
-//! an action's key and observations mention only paths that are the same on
-//! every machine with the same flake.
-//!
-//! Evaluating the flake needs Nix, the network on first use, and seconds of
-//! time; the result is remembered under a hash of the flake's files.
-
 use crate::buildview::SynthEnt;
 use crate::db::Table;
 use crate::hash::{Hash, KeyHasher};
@@ -27,18 +15,12 @@ use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FlakeEnv {
-    /// Exported variables of the devShell, minus per-invocation noise.
     pub env: BTreeMap<String, String>,
-    /// Store path names (`<hash>-<name>`, without `/nix/store/`).
     pub closure: Vec<String>,
-    /// Manifest identity of each closure entry, in the same order.
     pub roots: Vec<Hash>,
-    /// Identifies the environment; part of every action key.
     pub id: Hash,
 }
 
-/// Variables `nix print-dev-env` reports that describe the Nix build that
-/// produced the shell rather than the shell's tools.
 const DROP: &[&str] = &[
     "HOME", "TMP", "TMPDIR", "TEMP", "TEMPDIR", "PWD", "OLDPWD", "SHLVL", "TERM", "NIX_BUILD_TOP",
     "NIX_BUILD_CORES", "NIX_LOG_FD", "NIX_STORE", "NIX_ENFORCE_PURITY", "SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "out",
@@ -65,10 +47,6 @@ fn nix() -> Command {
     c
 }
 
-/// Whether a path (relative to the worktree root) is one of the files that
-/// define the flake: `flake.nix`, `flake.lock`, every other `.nix` file at
-/// the top level or under `nix/`, and the toolchain file a devShell
-/// commonly reads.
 fn defines_flake(rel: &[u8], extra: &[String]) -> bool {
     let top = !rel.contains(&b'/');
     let nix = rel.ends_with(b".nix");
@@ -77,13 +55,11 @@ fn defines_flake(rel: &[u8], extra: &[String]) -> bool {
         || extra.iter().any(|e| under(rel, e.as_bytes()))
 }
 
-/// `rel` is `dir` or inside it.
 fn under(rel: &[u8], dir: &[u8]) -> bool {
     let dir = dir.strip_suffix(b"/").unwrap_or(dir);
     rel == dir || (rel.starts_with(dir) && rel.get(dir.len()) == Some(&b'/'))
 }
 
-/// Whether the walk has to enter directory `rel` to find defining files.
 fn may_hold(rel: &[u8], extra: &[String]) -> bool {
     rel == b"nix" || rel.starts_with(b"nix/") || extra.iter().any(|e| under(rel, e.as_bytes()) || under(e.as_bytes(), rel))
 }
@@ -116,7 +92,6 @@ fn store_names(text: &str, out: &mut BTreeSet<String>) {
         let end = after
             .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+' | '?' | '=')))
             .unwrap_or(after.len());
-        // A store path name is a 32-character hash, a dash and a name.
         if end > 33 && after.as_bytes()[32] == b'-' {
             out.insert(after[..end].to_string());
         }
@@ -124,7 +99,6 @@ fn store_names(text: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Evaluates the flake's devShell (as `uid`/`gid`, in `root`).
 fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     use std::os::unix::process::CommandExt;
     let run = |mut c: Command| -> Result<Vec<u8>> {
@@ -156,8 +130,6 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
             env.insert(name.clone(), value.to_string());
         }
     }
-    // The server's certificate bundle is shown at a fixed place in the
-    // sandbox (see `etc`); a dev shell entered by hand sees the machine's.
     if host_ca_bundle().is_some() {
         for var in ["SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO"] {
             env.entry(var.to_string()).or_insert_with(|| CA_AT.to_string());
@@ -168,10 +140,6 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     }
     let mut c = Command::new("nix-store");
     c.arg("-qR");
-    // A value can mention a path that is not there (a placeholder in a
-    // prefix map) or run a store path into what follows it
-    // (`-fmacro-prefix-map=/nix/store/..-dev=/nix/store/..`): `=` and `?`
-    // are legal in names.
     let roots: BTreeSet<String> = roots
         .into_iter()
         .filter_map(|r| {
@@ -200,8 +168,6 @@ fn evaluate(root: &Path, shell: &str, uid: u32, gid: u32) -> Result<FlakeEnv> {
     Ok(FlakeEnv { env, closure, roots: Vec::new(), id: h.finish() })
 }
 
-/// The action key: the flake source, the evaluated environment, and the
-/// manifest identity of every store path.
 fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
     let mut h = KeyHasher::new("flake-action-v2");
     h.field(&source.0);
@@ -227,9 +193,6 @@ fn log_cost(cost: &crate::nixmanifest::Cost) {
     );
 }
 
-/// Resolve the workspace flake or the bundled shell for a workspace
-/// without one. The action key includes both the evaluated environment
-/// and the source bytes that select it.
 pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
     static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     NIX_READY.get_or_init(|| match nix().arg("--version").output() {
@@ -292,7 +255,6 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     };
     if let Some(v) = store.db().get(Table::Meta, &k) {
         if let Ok(mut env) = bincode::deserialize::<FlakeEnv>(&v) {
-            // The closure may have been garbage-collected since.
             if env.closure.iter().all(|c| nix.join(c).exists()) {
                 let prepared = manifest(&env.closure)?;
                 log_cost(&prepared.cost);
@@ -338,13 +300,10 @@ impl FlakeEnv {
         Arc::new(self.closure.iter().map(|c| c.as_bytes().to_vec()).collect())
     }
 
-    /// First match for `program` in the environment's PATH.
     pub fn which(&self, program: &str) -> Option<String> {
         self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).is_file())
     }
 
-    /// A minimal `/etc`: enough for programs that look up the current user
-    /// or `localhost`.
     pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<HashMap<Vec<u8>, SynthEnt>>> {
         let mut m = HashMap::new();
         let mut file = |name: &str, content: String| -> Result<()> {
@@ -363,8 +322,6 @@ impl FlakeEnv {
         }
         file("group", group)?;
         file("hosts", "127.0.0.1 localhost\n::1 localhost\n".into())?;
-        // Names resolve for the actions the policy gives the host's
-        // network; the others have nothing to reach a resolver with.
         file("nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n".into())?;
         if let Ok(resolv) = std::fs::read_to_string("/etc/resolv.conf") {
             file("resolv.conf", resolv)?;
@@ -397,7 +354,6 @@ mod tests {
         for f in ["script/cargo2", "script/other", "crates/zed2/Cargo.toml", "Cargo.lock.bak"] {
             assert!(!defines_flake(f.as_bytes(), &extra), "{f}");
         }
-        // Directories on the way to a named file are entered, others not.
         assert!(may_hold(b"script", &extra) && may_hold(b"crates", &extra) && may_hold(b"crates/zed/src", &extra));
         assert!(!may_hold(b"crates/gpui", &extra) && !may_hold(b"docs", &extra));
     }

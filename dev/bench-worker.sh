@@ -1,20 +1,4 @@
 #!/bin/bash
-# The phase 4 measurement: does a worker shorten a cold build roughly in
-# proportion to the cores it adds, and is a warm build no slower with one?
-#
-#   [CORES=8] dev/bench-worker.sh [REPO] [BUILD ARGS...]      (default: ra, build)
-#
-# Server and workers run in separate network namespaces (dev/netns.sh) with
-# 1 ms delay each way, 0.1% loss and a 1 Gbit rate limit on every link. Each
-# daemon is capped at its own number of cores. Configurations:
-#   local-8      server with 8 cores, no worker
-#   8+8 fresh    server 8 + one worker of 8 that has never seen anything
-#   8+8 warm     the same after the server lost everything and the worker
-#                kept its content cache (the toolchain is already there)
-#   8+8+8 warm   two workers
-#   local-16     server with 16 cores, no worker (what the cores are worth
-#                without a network in between)
-# For each: a cold build, the same build again, and a rebuild after an edit.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +6,6 @@ export RARGO_BIN=${RARGO_BIN:-$work/dev-target/release}
 repo=${1:-ra}; shift || true
 args=("$@"); [ ${#args[@]} -eq 0 ] && args=(build)
 out=$work/bench/worker.jsonl
-# The client runs in its own namespace, one shaped link from the server.
 R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 export RARGO_HIDE=$work/bench/worker-wt
 export RARGO_CACHE_DIR=$work/bench/worker-client-cache
@@ -32,15 +15,13 @@ edit_file=$(cd "$base" && git ls-files 'crates/*/src/lib.rs' | head -1)
 
 secs() { local t0=$(date +%s.%N); "$@" >"$work/bench/worker-last.log" 2>&1; local rc=$?; echo "$(echo "$(date +%s.%N) - $t0" | bc) $rc"; }
 fresh_wt() {
-    # The previous configuration's daemon is gone with its rig; what it
-    # had mounted on the worktree's output directory may still be there.
     umount -l "$wt/target" 2>/dev/null
     git -C "$base" worktree remove --force "$wt" >/dev/null 2>&1
     rm -rf "$wt"
     git -C "$base" worktree prune
     git -C "$base" worktree add -q --detach "$wt" HEAD
 }
-measure() { # label
+measure() {
     . "$work/${RIG_STATE:-nstest}/client.env"
     rm -rf "$RARGO_CACHE_DIR"
     fresh_wt

@@ -1,13 +1,4 @@
 #!/bin/bash
-# Lands the current branch through a pull request that merges itself when
-# its checks pass (issue 4). Nobody reviews it; the checks are the gate.
-#
-#   dev/pr-land.sh "Title" BODY-FILE        (the body says: Closes #N)
-#
-# `gh pr merge --auto` waits for checks only where the branch has required
-# checks, which this repository's plan does not offer while it is private.
-# So this script does the waiting: it watches the PR's checks and merges
-# only if every one passed.
 set -euo pipefail
 title=$1; body=$2
 branch=$(git rev-parse --abbrev-ref HEAD)
@@ -15,7 +6,6 @@ branch=$(git rev-parse --abbrev-ref HEAD)
 [ -z "$(git status --porcelain)" ] || { echo "working tree is dirty" >&2; exit 1; }
 commit=$(git rev-parse HEAD)
 git fetch -q origin main
-# Only prose-only changes bypass the machine suites.
 run_gate=false
 while IFS= read -r -d '' path; do
     case "$path" in
@@ -33,7 +23,6 @@ if "$run_gate" && ! "$(dirname "$0")/gate.sh"; then
     echo "gate failed; not merged: $url" >&2
     exit 1
 fi
-# Checks take a moment to be registered.
 for _ in $(seq 1 30); do
     [ "$(gh pr checks "$url" --json name -q 'map(select(.name == "build-and-test" or .name == "new-user-path")) | length' 2>/dev/null || echo 0)" -eq 2 ] && break
     sleep 5
@@ -45,8 +34,6 @@ fi
 if gh pr checks "$url" --watch --fail-fast --interval 20 >/dev/null; then
     gh pr merge "$url" --squash --match-head-commit "$commit"
     git push -q origin ":$branch" 2>/dev/null || true
-    # In the main checkout: back on main. In a second worktree (main is
-    # checked out elsewhere): at what was merged.
     git fetch -q origin
     if git checkout -q main 2>/dev/null; then git pull -q --ff-only origin main; else git checkout -q --detach origin/main; fi
     echo "merged: $url"

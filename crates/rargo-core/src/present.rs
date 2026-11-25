@@ -1,13 +1,8 @@
-//! What the user sees: cargo-style status lines and diagnostics, with
-//! canonical sandbox paths turned back into the client's real paths.
-
 use crate::proto::ServerMsg;
 use tokio::sync::mpsc::UnboundedSender;
 
-/// Maps canonical sandbox paths back to where things really are.
 #[derive(Clone, Debug, Default)]
 pub struct Translator {
-    /// `(canonical prefix, real prefix)`, longest canonical first.
     pairs: Vec<(String, String)>,
 }
 
@@ -15,8 +10,6 @@ fn is_path_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b'~' | b'+')
 }
 
-/// Whether a path could start at `pos`: at the beginning, after a character
-/// that cannot be part of a path, or right after an ANSI escape sequence.
 fn boundary_before(s: &[u8], pos: usize) -> bool {
     if pos == 0 {
         return true;
@@ -26,7 +19,6 @@ fn boundary_before(s: &[u8], pos: usize) -> bool {
         return true;
     }
     if c == b'm' {
-        // `ESC [ digits ; digits m`
         let mut i = pos - 1;
         while i > 0 && (s[i - 1].is_ascii_digit() || s[i - 1] == b';') {
             i -= 1;
@@ -49,7 +41,6 @@ impl Translator {
         Translator { pairs }
     }
 
-    /// Replaces canonical path prefixes in free text.
     pub fn text(&self, s: &str) -> String {
         if self.pairs.is_empty() || !self.pairs.iter().any(|(c, _)| s.contains(c.as_str())) {
             return s.to_string();
@@ -77,7 +68,6 @@ impl Translator {
         out
     }
 
-    /// Translates one path exactly (no heuristics).
     pub fn path(&self, p: &str) -> String {
         for (canon, real) in &self.pairs {
             if p == canon {
@@ -92,7 +82,6 @@ impl Translator {
         p.to_string()
     }
 
-    /// The reverse: a real path as the sandbox sees it.
     pub fn to_canonical(&self, p: &str) -> String {
         for (canon, real) in &self.pairs {
             if p == real {
@@ -108,7 +97,6 @@ impl Translator {
     }
 }
 
-/// Removes ANSI escape sequences (CSI and OSC).
 pub fn strip_ansi(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -125,7 +113,6 @@ pub fn strip_ansi(s: &str) -> String {
                     continue;
                 }
                 b']' => {
-                    // OSC, terminated by BEL or ESC \
                     i += 2;
                     while i < b.len() {
                         if b[i] == 0x07 {
@@ -156,7 +143,6 @@ const CYAN: &str = "\x1b[1m\x1b[96m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
-/// The client's terminal, as far as rargod is concerned.
 pub struct Output {
     tx: UnboundedSender<ServerMsg>,
     pub color_err: bool,
@@ -164,7 +150,6 @@ pub struct Output {
     pub quiet: bool,
     pub verbose: bool,
     pub tr: Translator,
-    /// Where standard output goes instead of the client, when it is kept.
     kept: Option<std::sync::Arc<parking_lot::Mutex<Vec<u8>>>>,
 }
 
@@ -173,7 +158,6 @@ impl Output {
         Output { tx, color_err, color_out, quiet: false, verbose: false, tr: Translator::default(), kept: None }
     }
 
-    /// The same client with different presentation settings.
     pub fn derive(&self, quiet: bool, verbose: bool, tr: Translator) -> Output {
         Output {
             tx: self.tx.clone(),
@@ -186,8 +170,6 @@ impl Output {
         }
     }
 
-    /// The same client, with standard output kept in `into` instead of
-    /// shown; standard error is shown as usual.
     pub fn keeping_stdout(&self, into: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Output {
         Output { kept: Some(into), ..self.derive(self.quiet, self.verbose, self.tr.clone()) }
     }
@@ -196,7 +178,6 @@ impl Output {
         let _ = self.tx.send(m);
     }
 
-    /// Bytes for stderr, untouched.
     pub fn raw_err(&self, b: &[u8]) {
         if !b.is_empty() {
             self.send(ServerMsg::Stderr(b.to_vec()));
@@ -213,7 +194,6 @@ impl Output {
         }
     }
 
-    /// Text for stderr that may contain ANSI colour and canonical paths.
     pub fn err_text(&self, s: &str) {
         let t = self.tr.text(s);
         let t = if self.color_err { t } else { strip_ansi(&t) };
@@ -226,7 +206,6 @@ impl Output {
         self.raw_out(t.as_bytes());
     }
 
-    /// `   Compiling foo v0.1.0 (/path)`
     pub fn status(&self, verb: &str, msg: &str) {
         if self.quiet {
             return;
@@ -260,7 +239,6 @@ impl Output {
     }
 }
 
-/// cargo's `util::elapsed`.
 pub fn elapsed(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs >= 60 {
@@ -270,7 +248,6 @@ pub fn elapsed(d: std::time::Duration) -> String {
     }
 }
 
-/// How cargo displays a process (`ProcessBuilder`'s `Display`).
 pub fn display_cmd(program: &str, args: &[String]) -> String {
     let mut s = String::from("`");
     s.push_str(program);
@@ -282,7 +259,6 @@ pub fn display_cmd(program: &str, args: &[String]) -> String {
     s
 }
 
-/// How cargo describes an exit status (`cargo_util::exit_status_to_string`).
 pub fn describe_status(status: i32) -> String {
     if libc::WIFEXITED(status) {
         return format!("exit status: {}", libc::WEXITSTATUS(status));
@@ -326,13 +302,10 @@ mod tests {
         assert_eq!(t.text("\"manifest_path\":\"/w/Cargo.toml\""), "\"manifest_path\":\"/home/me/proj/Cargo.toml\"");
         assert_eq!(t.text("foo v0.1.0 (/w)"), "foo v0.1.0 (/home/me/proj)");
         assert_eq!(t.text("at /c/registry/src/x/lib.rs"), "at /home/me/.cargo/registry/src/x/lib.rs");
-        // Not paths.
         assert_eq!(t.text("see http://example.com/w/page"), "see http://example.com/w/page");
         assert_eq!(t.text("/work/x and /w2 and a/w/b"), "/work/x and /w2 and a/w/b");
         assert_eq!(t.text("/usr/lib/w/x"), "/usr/lib/w/x");
-        // After a colour escape.
         assert_eq!(t.text("\x1b[1m\x1b[94m/w/src/a.rs\x1b[0m"), "\x1b[1m\x1b[94m/home/me/proj/src/a.rs\x1b[0m");
-        // A plain word ending in `m` is not an escape.
         assert_eq!(t.text("from/w/x"), "from/w/x");
         assert_eq!(t.path("/w/a"), "/home/me/proj/a");
         assert_eq!(t.path("/w"), "/home/me/proj");

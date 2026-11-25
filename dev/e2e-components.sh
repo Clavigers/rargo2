@@ -1,7 +1,4 @@
 #!/bin/bash
-# The bundled Nix shell provides Clippy and rustfmt for the selected Rust
-# toolchain. Test both the pinned default and a project using a minimal
-# profile, including two requests that select the shell at the same time.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -27,7 +24,6 @@ port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); pr
 export RARGO_SERVER=127.0.0.1:$port
 RARGO_TOKEN=$("$bin/rargod" token create --state "$RARGO_STATE" --user e2e --admin 2>/dev/null)
 export RARGO_TOKEN
-# The client's own toolchain choice is not this suite's subject.
 unset RUSTUP_TOOLCHAIN CARGO_TARGET_DIR
 cleanup() {
     "$repo/dev/rargod.sh" stop >/dev/null 2>&1
@@ -39,9 +35,7 @@ trap cleanup EXIT
     exit 1
 }
 
-# A package with one thing clippy objects to (`len_zero`), and nothing
-# else to fetch.
-project() { # dir [toolchain file contents]
+project() {
     mkdir -p "$1/src"
     (
         cd "$1" || exit 1
@@ -78,7 +72,7 @@ for w in c d; do
 done
 
 echo "== a build script that runs rustfmt"
-script_project() { # dir build.rs
+script_project() {
     mkdir -p "$1/src"
     (
         cd "$1" || exit 1

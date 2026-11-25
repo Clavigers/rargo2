@@ -1,12 +1,4 @@
 #!/bin/bash
-# The gate's time ratchet. This check is allowed to depend on wall-clock
-# time (an exception to "nothing in the gate waits on or measures time").
-#   dev/gate-budget.sh raise-ok
-#       exit 1 if dev/gate-budget's total is higher than on origin/main
-#       and no commit since says `Gate-budget-raise: <why>`.
-#   dev/gate-budget.sh check ELAPSED GATE_DIR SUITE...
-#       exit 1, with a message, if ELAPSED is over the total. The message
-#       names each suite's time against its recorded time.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 file=dev/gate-budget

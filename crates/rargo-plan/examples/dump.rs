@@ -1,4 +1,3 @@
-//! Prints a plan file in readable form: `dump <plan> [unit-substring]`.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let bytes = std::fs::read(&args[1]).expect("read plan");

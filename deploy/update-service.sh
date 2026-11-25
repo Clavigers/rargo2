@@ -1,18 +1,4 @@
 #!/bin/bash
-# Builds a commit of this repository from a clean checkout and makes it the
-# running rargod service on this machine.
-#
-#   deploy/update-service.sh [COMMIT]        (default: origin's main)
-#
-# The service lives in $RARGO_SERVICE (default /root/rargo-work/service):
-#   src/                 the clean checkout
-#   releases/VERSION-COMMIT/   rargod, rargo-sandbox, rargo (same commit,
-#                        static, the one clients install), planner-cargo
-#   current -> releases/...    what rargod.service runs
-#   state/ cargo-home/ rustup/   kept across updates
-# Nothing is built from a working tree. The unit is restarted only when
-# the release changed; builds in progress end with it and are simply run
-# again by their clients.
 set -euo pipefail
 S=${RARGO_SERVICE:-/root/rargo-work/service}
 work=${RARGO_WORK:-/root/rargo-work}
@@ -38,14 +24,11 @@ if [ ! -x "$rel/rargod" ]; then
     cp "$S/build/release/rargod" "$S/build/release/rargo-sandbox" "$rel.tmp/"
     cp "$S/build/x86_64-unknown-linux-musl/release/rargo" "$rel.tmp/"
     strip "$rel.tmp/rargo"
-    # The planner is the cargo fork at forks/cargo/BASE with forks/cargo's
-    # patches, built by forks/build.sh; its checkout must be exactly that.
     planner=$work/cargo
     [ -z "$(git -C "$planner" status --porcelain)" ] || { echo "the planner checkout is not clean" >&2; exit 1; }
     n=$(ls "$S/src/forks/cargo/"*.patch | wc -l)
     [ "$(git -C "$planner" rev-parse --short=9 "HEAD~$n")" = "$(cat "$S/src/forks/cargo/BASE")" ] || { echo "the planner checkout is not BASE + $n patches" >&2; exit 1; }
     last=$(ls "$S/src/forks/cargo/"*.patch | tail -n 1)
-    # (A long subject continues on the patch's next line: compared by its start.)
     subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last" | head -n 1)
     case "$(git -C "$planner" log -1 --format=%s)" in
     "$subject"*) ;;
@@ -62,7 +45,6 @@ if [ "$(readlink "$S/current" 2>/dev/null)" != "$rel" ]; then
     systemctl restart rargod.service
     sleep 1
 fi
-# The client the agents and the gate build rargo with is the service's.
 install -m 755 "$rel/rargo" /usr/local/bin/rargo
 systemctl is-active rargod.service
 echo "running: $rel"

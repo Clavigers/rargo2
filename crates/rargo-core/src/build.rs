@@ -1,5 +1,3 @@
-//! Handling one client request: sync, plan, execute, present, deliver.
-
 use crate::buildview::*;
 use crate::engine::*;
 use crate::expand::{self, EnvRule, Scripts};
@@ -27,21 +25,14 @@ use tokio::sync::watch;
 
 mod nextest;
 
-/// Where the planner writes its plan inside the sandbox.
 const PLAN_PATH: &str = "/.rargo-plan";
 
 pub struct Config {
-    /// rargod's private directory (store, mount point, scratch space).
     pub state_dir: PathBuf,
-    /// The forked cargo.
     pub planner: PathBuf,
-    /// The server's cargo home: registry and git checkouts shared by every
-    /// client. Clients' own cargo configuration is laid over it per request.
     pub cargo_home: PathBuf,
-    /// The user actions run as.
     pub uid: u32,
     pub gid: u32,
-    /// The server's own environment: where its toolchains and tools are.
     pub server_env: HashMap<String, String>,
 }
 
@@ -51,65 +42,40 @@ pub struct DaemonStats {
     pub plans_decoded: AtomicU64,
     pub verify_units: AtomicU64,
     pub verify_mismatches: AtomicU64,
-    /// Bytes of worktree content received from clients.
     pub bytes_in: AtomicU64,
-    /// Bytes of artifacts sent to clients.
     pub bytes_out: AtomicU64,
-    /// Client daemons that have connected.
     pub links: AtomicU64,
-    /// File contents received from clients, asked for or pushed.
     pub files_in: AtomicU64,
 }
 
-/// State shared by all requests.
 pub struct Daemon {
-    /// Per worktree and toolchain: the last plan said the compiler is
-    /// rargo's rustc fork.
     fork_seen: DashMap<(String, String), bool>,
     pub cfg: Config,
     pub engine: Arc<Engine>,
     pub memo: Arc<HostMemo>,
-    /// Every worktree state clients have synced.
     pub trees: Arc<Trees>,
     pub parser: Parser,
     pub incr: crate::incr::IncrStore,
-    /// Workers, when the server accepts them.
     pub pool: OnceLock<Arc<crate::remote::Pool>>,
-    /// Store paths whose host files are already remembered for workers.
     pub(crate) nix_attached: Mutex<HashSet<String>>,
-    /// The most recent drift report, for `--rargo-status`.
     pub drift_report: Mutex<Option<String>>,
-    /// Who last built in each worktree, for the background drift check.
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    /// Per worktree: the token of its last delivery and everything that
-    /// worktree has been delivered up to then (see `serve`).
     pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
-    /// Chunk recipes of contents clients fetch by chunk.
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
-    /// Target directories seen per worktree, masked in later views.
     masks: DashMap<String, Vec<Vec<u8>>>,
-    /// Downloads into the shared cargo home happen one at a time.
     fetching: tokio::sync::Mutex<()>,
     scratch_seq: AtomicU64,
     pub stats: Arc<DaemonStats>,
 }
 
-/// A client's own cargo configuration, laid over the shared cargo home.
 pub struct Home {
-    /// A cargo home for unsandboxed cargo runs on behalf of this client:
-    /// its configuration files plus links to the shared downloads.
     pub dir: PathBuf,
-    /// The configuration files present in `dir`.
     pub files: Vec<String>,
 }
 
-/// One client request.
 pub struct Client {
     pub args: Vec<String>,
-    /// The worktree root, current directory and cargo home as the client
-    /// knows them. Never opened here: they translate paths in messages and
-    /// arguments, and name where artifacts go on the client.
     pub root: String,
     pub cwd: String,
     pub cargo_home: String,
@@ -118,15 +84,11 @@ pub struct Client {
     pub gid: u32,
     pub prio: Priority,
     pub out: Output,
-    /// The connection, absent for builds the server runs for itself.
     pub session: Option<Arc<Session>>,
     pub snapshot: Arc<Snapshot>,
-    /// Stable identity of the client's worktree.
     pub worktree: String,
-    /// HEAD and recent ancestors on the client (a hint, see D16).
     pub commits: Arc<Vec<[u8; 20]>>,
     pub home: Arc<Home>,
-    /// Files and writes waiting to go to the client.
     pub outbox: Arc<Mutex<(Vec<Delivery>, Vec<Write>)>>,
 }
 
@@ -136,11 +98,7 @@ impl Client {
             .context("the manifest must be inside the synced worktree")
     }
 
-    /// Queues files to place and writes to apply on the client. They go
-    /// out together when the request ends ([`Client::flush`]): one round
-    /// trip, however many steps produced something.
     pub fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) {
-        // A client with a virtual output directory is told at once.
         if let Some(s) = self.session.as_ref().filter(|s| s.is_lazy()) {
             s.deliver_lazy(files, writes);
             return;
@@ -150,7 +108,6 @@ impl Client {
         q.1.extend(writes);
     }
 
-    /// Sends everything queued.
     pub async fn flush(&self) -> Result<()> {
         let (files, writes) = std::mem::take(&mut *self.outbox.lock());
         match &self.session {
@@ -163,23 +120,15 @@ impl Client {
 const _: () = assert!(LEVEL_NONE < LEVEL_META);
 const _: () = assert!(LEVEL_META < LEVEL_FULL);
 
-/// A decoded plan with derived per-unit data.
 pub struct PlanData {
     pub plan: rp::Plan,
-    /// Unit links against its dependencies (needs their object code).
     linking: Vec<bool>,
     levels: Vec<OnceLock<Arc<Vec<u8>>>>,
-    /// Sandbox paths of each unit's metadata outputs, announced or not.
     rmeta_out: Vec<Vec<Vec<u8>>>,
-    /// For a documentation unit: the directory rustdoc writes to.
     doc_dir: Vec<Option<Vec<u8>>>,
-    /// Documentation units in the order they run (see `PlanData::new`).
     doc_order: Vec<usize>,
-    /// For a documentation unit: its place in `doc_order`.
     doc_pos: Vec<Option<usize>>,
-    /// Like `levels`, for a unit compiled for its metadata only.
     meta_levels: Vec<OnceLock<Arc<Vec<u8>>>>,
-    /// How much of each unit a metadata-only request for the roots needs.
     needs: OnceLock<Arc<Vec<u8>>>,
 }
 
@@ -192,11 +141,6 @@ impl PlanData {
             .iter()
             .map(|u| u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect())
             .collect();
-        // rustdoc keeps files that cover all crates (the search index, the
-        // crate list) in the output directory and extends them on every
-        // run. cargo lets the runs race under rustdoc's own lock; here the
-        // runs for one directory form a chain, each seeing its
-        // predecessors' output, so the last one's shared files are complete.
         let doc_dir = plan
             .units
             .iter()
@@ -208,8 +152,6 @@ impl PlanData {
             })
             .collect();
         let doc_dir: Vec<Option<Vec<u8>>> = doc_dir;
-        // The chain's order: dependencies first (cargo documents a crate
-        // after the crates it links to), otherwise by unit index.
         let mut doc_order: Vec<usize> = Vec::new();
         {
             let mut seen = vec![false; n];
@@ -263,16 +205,10 @@ impl PlanData {
         }
     }
 
-    /// The unit can stand in for itself with its metadata alone: it is a
-    /// library whose dependents compile against a `.rmeta`.
     fn can_meta(&self, j: usize) -> bool {
         self.plan.units[j].kind == rp::UnitKind::Compile && !self.rmeta_out[j].is_empty()
     }
 
-    /// What unit `i` may see of every other unit when it is compiled for
-    /// its metadata only (nothing is linked, so libraries are needed as
-    /// metadata; things that are executed, such as proc macros and build
-    /// script runs, are needed whole).
     fn meta_levels(&self, i: usize) -> Arc<Vec<u8>> {
         self.meta_levels[i]
             .get_or_init(|| {
@@ -298,10 +234,6 @@ impl PlanData {
             .clone()
     }
 
-    /// For a request that wants the roots' metadata only (`check` planned
-    /// as a build): how far each unit has to be taken. A unit nothing needs
-    /// is not run; one needed for its metadata is compiled without code
-    /// generation; one that something executes or links is built in full.
     fn needs(&self) -> Arc<Vec<u8>> {
         self.needs
             .get_or_init(|| {
@@ -319,7 +251,6 @@ impl PlanData {
                         if lv == LEVEL_NONE {
                             continue;
                         }
-                        // Only a compile can stop at metadata.
                         let lv = if units[k].kind == rp::UnitKind::Compile { lv } else { LEVEL_FULL };
                         assert!(lv == LEVEL_META || lv == LEVEL_FULL);
                         if lv > need[k] {
@@ -341,7 +272,6 @@ impl PlanData {
             .clone()
     }
 
-    /// How much of every other unit's output unit `i` may see.
     fn levels(&self, i: usize) -> Arc<Vec<u8>> {
         self.levels[i]
             .get_or_init(|| {
@@ -396,11 +326,9 @@ impl PlanData {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum UState {
     Pending,
-    /// The unit's metadata is available; it is still running.
     Meta,
     Done,
     Failed,
-    /// Not run because something it needs failed.
     Skipped,
 }
 
@@ -421,10 +349,7 @@ struct Ui {
     documented: HashSet<String>,
     scraped: HashSet<String>,
     seen_diag: HashSet<Hash>,
-    /// rustc's `unused_extern` message, by unit.
     unused_externs: BTreeMap<usize, String>,
-    /// The future-incompatibility warnings each unit's compiler reported,
-    /// as rendered by the compiler.
     future_incompat: BTreeMap<usize, Vec<String>>,
     counts: HashMap<usize, Counts>,
     said_waiting: bool,
@@ -439,43 +364,26 @@ struct Run {
     scripts: Mutex<Scripts>,
     states: Vec<watch::Sender<UState>>,
     results: Vec<OnceLock<(Arc<ActionResult>, bool)>>,
-    /// When each unit was asked for and answered (for `--timings`).
     times: Mutex<Vec<crate::timings::UnitTime>>,
     early: Mutex<HashMap<usize, Vec<(Vec<u8>, MEntry)>>>,
     ui: Mutex<Ui>,
     failed: AtomicBool,
-    /// An announced `.rmeta` turned out different in the final result.
     inconsistent: AtomicBool,
     base_env: BTreeMap<String, String>,
     no_cache_tests: bool,
-    /// The client asked to be told why things run (`RARGO_EXPLAIN`).
     explain: bool,
     root_id: Hash,
-    /// In a flake sandbox the forked cargo cannot run (its libraries are
-    /// the host's); processes that ask for `$CARGO` get the flake's cargo.
     cargo_override: Option<String>,
     policy: crate::policy::Policy,
-    /// Re-run every unit that came from the cache, cleanly, and compare.
     verify: bool,
     verified: AtomicU64,
-    /// `(message, canonical paths that differ)`; no paths means the
-    /// difference is in what the action said or whether it succeeded.
     verify_mismatches: Mutex<Vec<(String, Vec<Vec<u8>>)>>,
-    /// Units whose two runs differ in a way the tools themselves produce
-    /// (see `exec_unit`): reported, not counted as drift.
     verify_unreproducible: Mutex<Vec<String>>,
-    /// Each unit's cache key, once known (for looking up who read what).
     unit_keys: Vec<OnceLock<Hash>>,
-    /// Set when the request is a `check` planned as a build: how far each
-    /// unit has to be taken (see `PlanData::needs`).
     need: Option<Arc<Vec<u8>>>,
-    /// `cargo:warning=` lines already shown. `finish_script` skips one
-    /// copy of each, so a warning appears as the script prints it and
-    /// again only when the script prints it again.
     script_warnings: Mutex<Vec<String>>,
 }
 
-/// Position of the cargo subcommand in a command line.
 fn subcommand_pos(args: &[String]) -> Option<usize> {
     let mut i = 0;
     while i < args.len() {
@@ -487,7 +395,6 @@ fn subcommand_pos(args: &[String]) -> Option<usize> {
             assert!(i < args.len());
             return Some(i);
         }
-        // Global options that take a separate value.
         if matches!(a.as_str(), "--config" | "-Z" | "--color" | "-C" | "--explain") {
             i += 1;
         }
@@ -500,14 +407,9 @@ fn bytes(s: &str) -> Vec<u8> {
     s.as_bytes().to_vec()
 }
 
-/// The environment every action starts from: where things are on the
-/// server, and how the client wants cargo and rustc to behave. Everything
-/// else is withheld unless an action declares that it reads it.
 fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) -> BTreeMap<String, String> {
     const SERVER: &[&str] =
         &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"];
-    // Allowed through the protocol but only about presentation, which is
-    // applied when output is shown, or about rargo itself.
     const NOT_FOR_ACTIONS: &[&str] = &["TERM", "NO_COLOR", "BROWSER", "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM"];
     const DROP_PREFIXES: &[&str] = &[
         "CARGO_PKG_", "CARGO_MANIFEST_", "CARGO_CRATE_", "CARGO_BIN_", "CARGO_CFG_", "CARGO_FEATURE_",
@@ -533,8 +435,6 @@ fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) 
         }
     }
     out.insert("CARGO_HOME".into(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned());
-    // rargo is the compiler cache; a wrapper such as sccache would be run
-    // inside the sandbox where it cannot reach its server.
     out.insert("RUSTC_WRAPPER".into(), String::new());
     out.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     out
@@ -571,15 +471,12 @@ impl Daemon {
         }
     }
 
-    /// A fresh scratch directory on the store's filesystem. The caller
-    /// removes it.
     pub fn scratch(&self, what: &str) -> Result<PathBuf> {
         let n = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
         let dir = self.store().tmp_dir(&format!("{what}-{}-{n}", std::process::id()))?;
         Ok(dir)
     }
 
-    /// The cargo home overlay for a client's configuration files.
     pub fn home(&self, files: &[(String, Vec<u8>)]) -> Result<Arc<Home>> {
         const ALLOWED: &[&str] = &["config.toml", "config", "credentials.toml", "credentials"];
         let mut files: Vec<&(String, Vec<u8>)> = files.iter().filter(|(n, _)| ALLOWED.contains(&n.as_str())).collect();
@@ -590,7 +487,6 @@ impl Daemon {
         }
         let dir = self.cfg.state_dir.join("homes").join(h.finish().hex());
         let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
-        // Many clients with the same configuration arrive at once.
         static MAKING: Mutex<()> = Mutex::new(());
         let _one = MAKING.lock();
         if !dir.join(".complete").exists() {
@@ -604,7 +500,6 @@ impl Daemon {
                 std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
                 crate::snapshot::chown(&p, self.cfg.uid, self.cfg.gid);
             }
-            // Downloads and the locks that guard them are the shared ones.
             for shared in ["registry", "git", ".package-cache", ".package-cache-mutate", ".global-cache"] {
                 let link = dir.join(shared);
                 if std::fs::symlink_metadata(&link).is_err() {
@@ -620,8 +515,6 @@ impl Daemon {
         &self.engine.store
     }
 
-    /// Writes every trace and the blobs it refers to into `dir`, for
-    /// [`Daemon::import_cache`] on another machine.
     pub fn export_cache(&self, dir: &Path) -> Result<(usize, usize)> {
         let blobs = dir.join("blobs");
         std::fs::create_dir_all(&blobs)?;
@@ -653,8 +546,6 @@ impl Daemon {
         Ok((bundle.0.len(), written))
     }
 
-    /// Reads an export. Blob contents are hashed again on the way in, so a
-    /// damaged or forged export cannot put wrong bytes under a hash.
     pub fn import_cache(&self, dir: &Path) -> Result<(usize, usize)> {
         let raw = zstd::decode_all(&std::fs::read(dir.join("traces.bin"))?[..])?;
         let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
@@ -684,10 +575,6 @@ impl Daemon {
         Ok((n, blobs))
     }
 
-    /// Removes blobs nothing refers to any more: outputs of traces that
-    /// were displaced, superseded incremental states, captures of files
-    /// that have since changed. Blobs used within `min_age_secs` are left
-    /// alone so that running builds keep what they are using.
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
         let mut live = HashSet::new();
         self.engine.traces.mark(&mut live);
@@ -698,15 +585,9 @@ impl Daemon {
     }
 }
 
-/// Handles a request to completion. Returns the client's exit code, or the
-/// process the client should turn into.
 pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
     d.stats.requests.fetch_add(1, Ordering::Relaxed);
     let c = Arc::new(c);
-    // An inconsistency between an early-announced artifact and the final
-    // one invalidates work that started on the early one; everything is
-    // cached, so starting over is cheap.
-    // `nextest` runs nextest on the server against a build of rargo's own.
     if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {
         let result = match nextest::run(&d, &c).await {
             Ok(code) => code,
@@ -727,7 +608,6 @@ pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
             Ok(Finish::Code(code)) => result = Ok(code),
             Ok(Finish::Exec(e)) => result = Err(e),
             Ok(Finish::Retry) if attempt < 2 => {
-                // Whatever the abandoned attempt meant to place is stale.
                 c.outbox.lock().0.clear();
                 continue;
             }
@@ -736,9 +616,6 @@ pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
         }
         break;
     }
-    // What the request produced for the client goes out whatever the
-    // outcome: cargo would have left a lockfile it wrote, or files tests
-    // wrote before one failed, behind as well.
     if let Err(e) = c.flush().await {
         c.out.error(&format!("delivering results: {e:#}"));
         return Ok(101);
@@ -752,7 +629,6 @@ enum Finish {
     Retry,
 }
 
-/// Observer for the planning action.
 struct PlanObserver {
     client: Arc<Client>,
 }
@@ -767,11 +643,9 @@ impl Observer for PlanObserver {
 
 struct Prepared {
     snapshot: Arc<Snapshot>,
-    /// What the views are made of, and the host generation they see.
     parts: ViewParts,
     generation: u64,
     policy: crate::policy::Policy,
-    /// The view the planner runs against (always the host root).
     plan_base: Arc<BaseView>,
     flake: Arc<crate::flake::FlakeEnv>,
     base: Arc<BaseView>,
@@ -833,8 +707,6 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     }
     let client_env = c.env.to_map();
     let mut env = base_env(&d.cfg.server_env, &client_env);
-    // PATH, compilers and their flags come from the dev shell. HOME is a
-    // scratch place and Cargo's registry is supplied separately.
     for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         env.remove(k);
     }
@@ -852,13 +724,11 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
 
 struct Planned {
     data: Arc<PlanData>,
-    /// Cargo's own messages while planning (warnings about manifests etc.).
     stderr: Vec<u8>,
 }
 
 enum PlanOutcome {
     Ok(Planned),
-    /// Cargo refused; its message and exit code go to the client.
     Failed { stderr: Vec<u8>, stdout: Vec<u8>, code: i32 },
 }
 
@@ -883,7 +753,6 @@ async fn plan_with(
     env.insert(bytes("CARGO_CACHE_RUSTC_INFO"), bytes("0"));
     let mut argv = vec![PLANNER_AT.to_vec()];
     for a in args {
-        // Paths the user typed refer to the real worktree.
         let a = match a.split_once('=') {
             Some((flag, val)) if flag.starts_with("--") && val.starts_with('/') => {
                 format!("{flag}={}", p.tr.to_canonical(val))
@@ -929,8 +798,6 @@ async fn plan_with(
     let Some(MEntry::File { hash, .. }) = r.outputs.get(PLAN_PATH.as_bytes()) else {
         bail!("the planner did not write a plan");
     };
-    // cargo may have written or updated Cargo.lock; plain cargo would have
-    // done that in the worktree.
     let lock_writes = Manifest {
         entries: r.outputs.entries.iter().filter(|(p, _)| p.ends_with(b"/Cargo.lock")).cloned().collect(),
     };
@@ -952,22 +819,12 @@ async fn plan_with(
     Ok(PlanOutcome::Ok(Planned { data, stderr }))
 }
 
-/// Runs things only a networked, unsandboxed cargo can do (installing the
-/// toolchain and the components `failure` says are missing, updating the
-/// index, downloading crates, writing the lockfile) on the server, in a
-/// scratch copy of the snapshot, into the shared cargo home. A lockfile
-/// cargo wrote or changed goes back to the client, and the returned
-/// snapshot is the client's worktree with it applied. A command that may
-/// not fetch (`--locked`, `--frozen`, `--offline`) gets only the
-/// components. `None` when the fetch failed or was not allowed.
 async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], failure: &[u8]) -> Result<Option<Arc<Snapshot>>> {
     let components = missing_components(failure);
     let mut fetch_args = vec!["fetch".to_string()];
-    // A command that may not fetch still gets the components it needs.
     let mut offline = false;
     let scratch = d.scratch("fetch")?;
     let scratch_s = scratch.to_string_lossy().into_owned();
-    // Paths the user typed refer to the client's worktree.
     let local = |v: &str| -> String {
         let canon = p.tr.to_canonical(v);
         match canon.strip_prefix("/w") {
@@ -1000,8 +857,6 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
     let _one_at_a_time = d.fetching.lock().await;
     let planner = d.cfg.planner.clone();
     let cwd = PathBuf::from(format!("{scratch_s}{}", &p.sandbox_cwd[2..]));
-    // The server's own environment (so the toolchain manager and the
-    // network work), steered by what the client is allowed to pass.
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
     for (k, v) in base_env(&d.cfg.server_env, &c.env.to_map()) {
         env.insert(k, v);
@@ -1021,10 +876,7 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
             }
             cmd.output()
         };
-        // Asking the proxy for its version installs a missing toolchain.
         let _ = run(Path::new("rustc"), &["-V".to_string()]);
-        // A component the command needs (clippy for `cargo clippy`), which
-        // the toolchain was installed without: rustup said which.
         if let Err(said) = add_components(&components, &run) {
             return Ok(Err(said));
         }
@@ -1036,13 +888,11 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
     .await?;
     let out = match out {
         Ok(Ok(Some(o))) => o,
-        // rustup could not add a component: its own words.
         Ok(Err(said)) => {
             let _ = std::fs::remove_dir_all(&scratch);
             c.out.raw_err(&said);
             return Ok(None);
         }
-        // Only components were added: the same snapshot is planned again.
         Ok(Ok(None)) => {
             let _ = std::fs::remove_dir_all(&scratch);
             return Ok(Some(p.snapshot.clone()));
@@ -1056,7 +906,6 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
     let mut snapshot = p.snapshot.clone();
     let mut writes = Vec::new();
     if out.status.success() {
-        // Lockfiles cargo wrote or changed.
         let mut stack = vec![scratch.clone()];
         while let Some(dir) = stack.pop() {
             for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -1091,9 +940,6 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
     Ok(Some(snapshot))
 }
 
-/// Adds each component to its toolchain with `run` (rustup, as the
-/// client). `Err` is what rustup said when it could not, such as for a
-/// component that does not exist for that toolchain.
 fn add_components(
     components: &[(String, String)],
     run: &dyn Fn(&Path, &[String]) -> std::io::Result<std::process::Output>,
@@ -1109,9 +955,6 @@ fn add_components(
     Ok(())
 }
 
-/// Adds the components a build step found missing (a build script that
-/// runs rustfmt, say) to the server's toolchains, one request at a time.
-/// `false` when rustup could not; the client has been shown why.
 async fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, String)>) -> Result<bool> {
     let _one_at_a_time = d.fetching.lock().await;
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
@@ -1142,9 +985,6 @@ async fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String
     })
 }
 
-/// The components rustup says are missing, each with its toolchain:
-/// `error: 'cargo-clippy' is not installed for the toolchain 'T'.` followed
-/// by `help: run \`rustup component add clippy\` to install it`.
 fn missing_components(stderr: &[u8]) -> Vec<(String, String)> {
     let s = String::from_utf8_lossy(stderr);
     let name = |v: &str| !v.is_empty() && v.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
@@ -1154,8 +994,6 @@ fn missing_components(stderr: &[u8]) -> Vec<(String, String)> {
         if let Some(rest) = line.split_once("is not installed for the toolchain '").map(|x| x.1) {
             toolchain = rest.split_once('\'').map(|x| x.0.to_string()).filter(|t| name(t));
         } else if let (Some(tc), Some(rest)) = (&toolchain, line.split_once("rustup component add ").map(|x| x.1)) {
-            // `add clippy`, or `add --toolchain T clippy`: the first word
-            // that is neither an option nor an option's value.
             let words: Vec<&str> = rest.split('`').next().unwrap_or("").split_whitespace().collect();
             let mut i = 0;
             let mut component = "";
@@ -1186,8 +1024,6 @@ fn needs_network(stderr: &[u8]) -> bool {
         .any(|m| s.contains(m))
 }
 
-/// `RARGO_PHASES` in rargod's environment: one line per phase of every
-/// request on its stderr, with the time since the request was taken up.
 fn phase(started: Instant, c: &Client, what: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("RARGO_PHASES").is_some()) {
@@ -1195,13 +1031,10 @@ fn phase(started: Instant, c: &Client, what: &str) {
     }
 }
 
-/// What a build leaves for nextest to run against (see `nextest`).
 struct Built {
     layer: Arc<OutputsLayer>,
     units: usize,
-    /// The target and build directories, canonical.
     target_dirs: Vec<String>,
-    /// The environment the build's tests would run in.
     env: BTreeMap<String, String>,
     cargo_override: Option<String>,
 }
@@ -1209,18 +1042,12 @@ struct Built {
 async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
     let started = Instant::now();
     let mut args: Vec<String> = c.args.clone();
-    // rargo's own flag; cargo never sees it.
     let mut no_cache_tests = false;
     if let Some(pos) = args.iter().take_while(|a| *a != "--").position(|a| a == "--no-cache") {
         args.remove(pos);
         no_cache_tests = true;
     }
 
-    // The client's values of every variable any action has declared: one
-    // question, asked while the build is planned (a question per action
-    // looked up is a round trip per action, one after another down the
-    // dependency chain). A client that has answered before sends them
-    // with its request and is asked nothing.
     let env_known = {
         let (env, names) = (c.env.clone(), d.engine.traces.every_env_name());
         tokio::spawn(async move { env.ensure(&names).await })
@@ -1244,13 +1071,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
             },
         );
     }
-    // With rargo's rustc, `check` is a build that stops at metadata: the
-    // same compiler invocations as `build`, minus code generation, so the
-    // two commands (and `test`) share every crate's front-end work instead
-    // of each doing its own. Whether the compiler is the fork is only known
-    // from a plan; what the last plan for this worktree said is remembered.
     let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
-    // Opt-in: measured slower and larger in the 20-agent benchmark (D23).
     let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").as_deref() == Some("1"));
     let fork_key = (c.worktree.clone(), c.env.get("RUSTUP_TOOLCHAIN").unwrap_or_default());
     let mut as_build = check_at.is_some() && d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
@@ -1289,8 +1110,6 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
     env_known.await.map_err(|e| anyhow!("asking the client for its environment: {e}"))??;
     phase(started, c, "planned");
 
-    // A target directory elsewhere in the worktree must be masked too; the
-    // next request for this worktree will know.
     for dir in [&plan.target_dir, &plan.build_dir] {
         let b = dir.as_bytes().to_vec();
         if vpath_starts_with(&b, WORKTREE_AT) && b != vjoin(WORKTREE_AT, b"target") {
@@ -1301,8 +1120,6 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         }
     }
 
-    // The request-scoped presentation settings come from the plan (cargo
-    // parsed the command line), the colour choice from the client.
     let out = c.out.derive(
         plan.verbosity == rp::Verbosity::Quiet,
         plan.verbosity == rp::Verbosity::Verbose,
@@ -1370,8 +1187,6 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         });
     }
 
-    // If this build is dropped (its client went away), so are its units:
-    // those waiting never start, those running are killed.
     struct Units(Vec<tokio::task::JoinHandle<()>>);
     impl Drop for Units {
         fn drop(&mut self) {
@@ -1412,9 +1227,6 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
 
     if run.verify {
         let all = run.verify_mismatches.lock().clone();
-        // A file that differs but that no unit of this build read (an
-        // autoconf `config.log` left in OUT_DIR, say) cannot have changed
-        // anything; only differences someone consumed count.
         let read_by_someone = |path: &[u8]| -> bool {
             run.unit_keys.iter().filter_map(|k| k.get()).any(|k| {
                 d.engine.traces.traces(k).iter().any(|(_, t)| t.obs.iter().any(|(p, _)| p.as_ref() == path))
@@ -1444,14 +1256,8 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
         d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
     }
-    // cargo's unused_dependencies lint, when a local crate has an unused
-    // extern: the planner is run once more with rustc's reports and its
-    // post-build lint speaks for itself.
     {
         let unused = std::mem::take(&mut run.ui.lock().unused_externs);
-        // Only when cargo would say something: an extern of a local package
-        // that every unit of the same dependency kind left unused (cargo's
-        // `dep_kind_of`; dev-dependencies are never linted).
         let mut groups: HashMap<(&str, &str), Option<std::collections::BTreeSet<String>>> = HashMap::new();
         for (i, line) in &unused {
             let u = &plan.units[*i];
@@ -1488,8 +1294,6 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
                 unused.iter().map(|(i, l)| (*i, (plan.units[*i].desc.as_str(), l.as_str()))).collect();
             let json = serde_json::to_string(&map)?;
             if let PlanOutcome::Ok(lint) = plan_with(d, c, &p, &plan_args, &rp::split_env(rp::UNUSED_ENV, &json)).await? {
-                // Whatever the planner said while loading the workspace was
-                // shown already; what is new is the lint.
                 let before = String::from_utf8_lossy(&planned.stderr).into_owned();
                 let after = String::from_utf8_lossy(&lint.stderr).into_owned();
                 let new = match after.strip_prefix(before.as_str()) {
@@ -1519,11 +1323,9 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         run.write_timings(started);
     }
     if run.need.is_some() {
-        // A check leaves nothing in the target directory and has no steps.
         finished();
         return Ok(Finish::Code(0));
     }
-    // Place what was asked for into the real target directory.
     run.materialize_roots();
     run.write_depinfo();
     phase(started, c, "results listed for the client");
@@ -1537,14 +1339,10 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
 struct UnitObserver {
     run: Arc<Run>,
     i: usize,
-    /// The command as cargo would display it with `-v`.
     shown: String,
-    /// The tail of a build script's stdout that does not yet end in a newline.
     pending: Mutex<Vec<u8>>,
 }
 
-/// The message of a `cargo:warning=` or `cargo::warning=` line, as cargo's
-/// parser records it: the line is trimmed, and so is the end of the value.
 fn script_warning_message(line: &str) -> Option<&str> {
     let line = line.trim();
     line.strip_prefix("cargo:warning=")
@@ -1601,8 +1399,6 @@ impl Observer for UnitObserver {
 }
 
 impl UnitObserver {
-    /// Shows each `cargo:warning=` line as the script prints it. The rest
-    /// of a build script's stdout stays with the script until it exits.
     fn note_script_warnings(&self, data: &[u8]) {
         let u = &self.run.pd.plan.units[self.i];
         if !u.show_warnings {
@@ -1654,7 +1450,6 @@ impl Observer for TestObserver {
     }
 }
 
-/// The value following `flag` (either `flag value` or `flag=value`).
 fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -1670,8 +1465,6 @@ fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     None
 }
 
-/// Variables a rustc invocation read through `env!`/`option_env!`, from its
-/// dep-info output.
 fn rustc_env_deps(r: &ActionResult, store: &Store) -> Vec<String> {
     let mut out = Vec::new();
     for (path, e) in &r.outputs.entries {
@@ -1698,7 +1491,6 @@ impl Run {
         &self.pd.plan
     }
 
-    /// The unit is compiled for its metadata only in this request.
     fn meta_only(&self, i: usize) -> bool {
         let u = &self.plan().units[i];
         self.need.as_ref().is_some_and(|n| n[i] == LEVEL_META) && u.kind == rp::UnitKind::Compile && u.cmd.is_some()
@@ -1766,8 +1558,6 @@ impl Run {
         })
     }
 
-    /// How many commits back from HEAD `commit` is, if it is HEAD or one
-    /// of the recent ancestors the client named.
     fn commits_back(&self, commit: &[u8; 20]) -> Option<usize> {
         self.c.commits.iter().position(|c| c == commit)
     }
@@ -1776,7 +1566,6 @@ impl Run {
         let plan = self.plan();
         let u = &plan.units[i];
         if self.need.as_ref().is_some_and(|n| n[i] == LEVEL_NONE) {
-            // Nothing in this request needs the unit.
             return Ok(UState::Done);
         }
         let meta_only = self.meta_only(i);
@@ -1797,10 +1586,7 @@ impl Run {
             }
         }
         if self.pd.doc_dir[i].is_some() {
-            // The documentation chain: after the previous run for the same
-            // directory, however that one ended.
             let pos = self.pd.doc_pos[i].unwrap_or(0);
-            // Later runs rewrite the files earlier ones wrote.
             self.layer.set_rank(i as u32, (plan.units.len() + pos) as u64);
             let before = &self.pd.doc_order[..pos];
             if let Some(&prev) = before.iter().rev().find(|&&j| self.pd.doc_dir[j] == self.pd.doc_dir[i]) {
@@ -1813,11 +1599,6 @@ impl Run {
             }
         }
         if u.needs_objects && !meta_only {
-            // A linked unit needs the finished object code of everything
-            // below it. A library two levels down may have let its dependent
-            // start on its metadata alone and still be generating code, so
-            // direct dependencies being done is not enough (cargo adds the
-            // same transitive edges to its queue).
             let levels = self.pd.levels(i);
             for (j, lv) in levels.iter().enumerate() {
                 if *lv == LEVEL_FULL && !self.wait_dep(&rp::Dep { unit: j as u32, only_rmeta: false }).await {
@@ -1856,8 +1637,6 @@ impl Run {
                 }
             }
         }
-        // The crate's incremental directory: not an input and not an
-        // output of the build proper, but kept and shared (see `incr`).
         let incr_dir: Option<Vec<u8>> = match u.kind {
             rp::UnitKind::Compile => args
                 .iter()
@@ -1869,8 +1648,6 @@ impl Run {
         if let Some(dir) = &incr_dir {
             mkdirs.push(dir.clone());
         }
-        // The same action as the full build's, for looking up whether the
-        // full build has already been done (its metadata is then at hand).
         let full_argv: Option<Vec<Vec<u8>>> = meta_only.then(|| {
             let mut v = vec![bytes(&cmd.program)];
             v.extend(args.iter().map(|a| bytes(a)));
@@ -1878,13 +1655,8 @@ impl Run {
         });
         if meta_only {
             if self.pd.can_meta(i) {
-                // Everything up to and including metadata exactly as in the
-                // full build, then stop.
                 args.push("-Zno-codegen".into());
             } else {
-                // A linked target has no dependents; type-check it the way
-                // `cargo check` does.
-                // `cargo check` does: metadata out, libraries in as metadata.
                 let mut after_extern = false;
                 for a in args.iter_mut() {
                     if let Some(kinds) = a.strip_prefix("--emit=") {
@@ -1939,11 +1711,6 @@ impl Run {
             }),
             _ => Arc::new(rustc_env_deps),
         };
-        // Only successes are recorded. A failure can come from something no
-        // trace captures (a full disk, memory pressure, a bug in rargo), and
-        // replaying such a failure forever would be exactly the kind of wrong
-        // answer that makes people delete caches. Concurrent identical
-        // failures are still shared through in-flight deduplication.
         let cacheable: Arc<dyn Fn(&ActionResult) -> bool + Send + Sync> = Arc::new(|r| r.success());
         let mut from_full = match (&full_argv, self.verify) {
             (Some(argv), false) => self.d.engine.cached(&Request {
@@ -1967,8 +1734,6 @@ impl Run {
             _ => None,
         };
         self.times.lock()[i].start = Some(std::time::Instant::now());
-        // A step that failed because its toolchain lacks a component (a
-        // build script running rustfmt) runs again once rustup added it.
         let mut components_added = false;
         let outcome = loop {
             if let Some(o) = from_full.take() {
@@ -2002,8 +1767,6 @@ impl Run {
                 })
                 .await;
             let outcome = match outcome {
-                // Files of the seed were on a worker that has gone: the
-                // state is lost, the next best one will do.
                 Err(e) if e.downcast_ref::<crate::engine::SeedLost>().is_some() && seed.is_some() => {
                     if let Some(lost) = seed.take() {
                         self.d.incr.forget(&crate_key, lost.id);
@@ -2014,9 +1777,6 @@ impl Run {
                 other => other?,
             };
             let r = &outcome.result;
-            // A compiler that crashed (signal, or the exit code of an
-            // internal error) while reading someone's incremental state may
-            // have crashed because of that state: drop it and compile clean.
             let crashed = r.signal().is_some() || r.code() == Some(101);
             if crashed && !outcome.cached {
                 if let Some(bad) = seed.take() {
@@ -2029,7 +1789,6 @@ impl Run {
                 if !missing.is_empty() {
                     components_added = true;
                     if add_components_for(&self.d, &self.c, missing).await? {
-                        // What the failed run saw of the toolchain is gone.
                         self.base.renew();
                         continue;
                     }
@@ -2045,12 +1804,8 @@ impl Run {
             t.cached = outcome.cached;
             (t.wall_us, t.cpu_us, t.rss_kb) = (st.wall_us, st.cpu_us, st.max_rss_kb);
         }
-        // After the run: a first run is what reveals declared variables.
         let _ = self.unit_keys[i].set(self.d.engine.effective_key(&spec, &self.c.env));
         if self.verify && outcome.cached && outcome.result.success() {
-            // The cached result claims to be what this action produces from
-            // these inputs. Run it again from nothing (no cache, no
-            // incremental seed) and see.
             let clean = self
                 .d
                 .engine
@@ -2076,9 +1831,6 @@ impl Run {
                     Vec::new(),
                 ));
             } else if u.kind == rp::UnitKind::RunScript && {
-                // Compared as cargo reads it (the parsed instructions), not
-                // byte for byte: build scripts also print chatter that
-                // differs between runs and that cargo ignores.
                 let parsed = |h: &Hash| -> Option<String> {
                     let out = self.d.store().read(h).ok()?;
                     let s = u.script.as_ref()?;
@@ -2089,9 +1841,6 @@ impl Run {
                 };
                 parsed(&outcome.result.stdout) != parsed(&clean.result.stdout)
             } {
-                // What a build script prints is what cargo acts on.
-                // Say which lines: the first few `cargo:` lines only one of
-                // the two runs printed.
                 let lines = |h: &Hash| -> Vec<String> {
                     let out = self.d.store().read(h).unwrap_or_default();
                     String::from_utf8_lossy(&out).lines().filter(|l| l.starts_with("cargo:")).map(|l| l.to_string()).collect()
@@ -2106,8 +1855,6 @@ impl Run {
                     v
                 };
                 if sorted(&cached) == sorted(&clean_lines) {
-                    // A script that compiles C in parallel prints as the
-                    // compilers finish.
                     self.verify_unreproducible
                         .lock()
                         .push(format!("{}: prints the same instructions to cargo in a different order from run to run", u.desc));
@@ -2123,11 +1870,6 @@ impl Run {
                     ));
                 }
             } else if a != b {
-                // rustc's incremental mode names each codegen unit's files
-                // (objects inside an rlib, split debug info beside it) after
-                // the compilation session, and an object names its debug
-                // info file. Outputs that differ only in that session
-                // component are the same result.
                 let store = self.d.store().clone();
                 let neutral = incr_dir.is_some();
                 let stable_path = |p: &[u8]| -> Vec<u8> {
@@ -2146,9 +1888,6 @@ impl Run {
                     let (MEntry::File { hash: hx, .. }, MEntry::File { hash: hy, .. }) = (x, y) else { return None };
                     Some((store.read(hx).ok()?, store.read(hy).ok()?))
                 };
-                // The identifier that ties an object to its split debug
-                // info covers the session name as well: learn, from each
-                // `.dwo` pair, which identifier stands for which.
                 let mut ids = crate::ar::DwoIds::default();
                 let mut odd_dwo: HashSet<&Vec<u8>> = HashSet::new();
                 if neutral {
@@ -2171,13 +1910,6 @@ impl Run {
                     .map(|(_, (p, _))| (*p).clone())
                     .chain(clean_by.iter().filter(|(k, _)| !cached_by.contains_key(*k)).map(|(_, (p, _))| (*p).clone()))
                     .collect();
-                // Two ways in which the compiler's own output varies from
-                // run to run, both seen with stock cargo alone (D55):
-                // dependency information that lists the same files in
-                // another order (a procedural macro that tracks files in
-                // hash order; metadata and object code follow), and, with
-                // split debug info, anything linked (the linker's tables
-                // are laid out by names that include the session).
                 let reordered_inputs = differing.iter().filter(|p| p.ends_with(b".d")).any(|p| {
                     let k = stable_path(p);
                     let (Some((_, x)), Some((_, y))) = (cached_by.get(&k), clean_by.get(&k)) else { return false };
@@ -2205,8 +1937,6 @@ impl Run {
                 } else if !differing.is_empty() {
                     let shown: Vec<String> =
                         differing.iter().take(3).map(|p| self.c.out.tr.path(&String::from_utf8_lossy(p))).collect();
-                    // How the first of them differs, for whoever has to
-                    // decide what kind of difference this is.
                     let how = differing
                         .first()
                         .and_then(|p| {
@@ -2227,16 +1957,12 @@ impl Run {
                 }
             }
         }
-        // The state is recorded whether its files are here or still on the
-        // worker that ran the compile (see `incr`).
         if let (Some(dir), true, false, false) =
             (&incr_dir, outcome.result.success(), outcome.cached, outcome.side.is_empty())
         {
             let state = crate::incr::apply_changes(dir, seed.as_ref().map(|s| &*s.manifest), &outcome.side);
             if !state.entries.is_empty() {
                 self.d.incr.save(&crate_key, &wt, self.c.commits.first().copied(), &state);
-                // Workers get it in the background (what a worker made
-                // itself it already holds, and nothing is sent).
                 if let Some(remote) = self.d.engine.remote.get() {
                     let mut blobs: Vec<(Hash, u64)> = state
                         .entries
@@ -2261,7 +1987,6 @@ impl Run {
             return Ok(UState::Failed);
         }
 
-        // What was announced early must be what the unit finally produced.
         if let Some(early) = self.early.lock().get(&i) {
             for (path, e) in early {
                 if r.outputs.get(path) != Some(e) {
@@ -2279,8 +2004,6 @@ impl Run {
         }
         let meta = &self.pd.rmeta_out[i];
         if meta_only {
-            // Only the metadata is this unit's result here; whatever else
-            // the compiler left behind is not the real thing.
             let early: Vec<_> = r.outputs.entries.iter().filter(|(p, _)| meta.contains(p)).cloned().collect();
             self.layer.add(i as u32, LEVEL_META, &early);
             self.finish_unit_messages(i, &r, outcome.cached);
@@ -2294,8 +2017,6 @@ impl Run {
             self.layer.add(i as u32, LEVEL_META, &early);
             self.layer.add(i as u32, LEVEL_FULL, &late);
         }
-        // cargo links some outputs to friendlier names (`target/debug/app`);
-        // later units and tests refer to those names (`CARGO_BIN_EXE_*`).
         let mut uplifted: Vec<(Vec<u8>, MEntry)> = Vec::new();
         for o in &u.outputs {
             if let Some(e) = r.outputs.get(o.path.as_bytes()) {
@@ -2312,7 +2033,6 @@ impl Run {
         Ok(UState::Done)
     }
 
-    /// Parses a build script's output and records what cargo would have.
     async fn finish_script(self: &Arc<Self>, i: usize, r: &ActionResult) -> Result<bool> {
         let u = &self.plan().units[i];
         let Some(s) = u.script.clone() else { return Ok(true) };
@@ -2365,7 +2085,6 @@ impl Run {
         Ok(true)
     }
 
-    /// cargo's `note_working_on`: one status line per package.
     fn note_working_on(&self, i: usize) {
         let u = &self.plan().units[i];
         let mut ui = self.ui.lock();
@@ -2382,7 +2101,6 @@ impl Run {
         }
     }
 
-    /// `--timings`: the report goes where cargo puts its own.
     fn write_timings(&self, started: std::time::Instant) {
         let plan = self.plan();
         let times = self.times.lock().clone();
@@ -2422,11 +2140,6 @@ impl Run {
         self.c.out.status("Timing", &format!("report saved to {dated}"));
     }
 
-    /// cargo's `save_and_display_report`: the warnings compilers gave about
-    /// code a future Rust will reject go into the report file in the
-    /// client's target directory, where `cargo report
-    /// future-incompatibilities` finds them, and a closing message says so.
-    /// Returns the lines to show: `('w' | 'h' | 'n', text)`.
     async fn future_incompat_summary(&self) -> Result<Vec<(char, String)>> {
         let plan = self.plan();
         let reports = std::mem::take(&mut self.ui.lock().future_incompat);
@@ -2438,9 +2151,7 @@ impl Run {
             });
         }
         let tr = &self.c.out.tr;
-        // Per package (`name@version`): what its units reported.
         let mut per_package: BTreeMap<String, String> = BTreeMap::new();
-        // The packages themselves, once each, in a stable order.
         let mut pkgs: BTreeMap<String, &rp::Unit> = BTreeMap::new();
         for (&i, items) in &reports {
             let u = &plan.units[i];
@@ -2451,8 +2162,6 @@ impl Run {
                 tr.text(&u.pkg)
             ));
             for item in items {
-                // With the compiler's colours, as cargo keeps them; `cargo
-                // report` strips them when its output is not a terminal.
                 for l in tr.text(item).lines() {
                     text.push_str(&format!("> {l}\n"));
                 }
@@ -2461,8 +2170,6 @@ impl Run {
         }
         let mut suggestions: Vec<String> = Vec::new();
         if !pkgs.values().all(|u| u.is_local) {
-            // cargo would first look in the registry for newer versions of
-            // the packages; rargo does not ask the registry here.
             let upstream: Vec<String> = pkgs
                 .values()
                 .map(|u| {
@@ -2501,8 +2208,6 @@ impl Run {
                 names.join(", ")
             ),
         )];
-        // The report file is the client's; a build the server runs for
-        // itself has nowhere to keep one.
         let Some(session) = &self.c.session else { return Ok(out) };
         let id = session
             .report(rargo_proto::FutureReport {
@@ -2530,7 +2235,6 @@ impl Run {
         Ok(out)
     }
 
-    /// One line of rustc or rustdoc stderr (cargo's `on_stderr_line_inner`).
     fn compiler_line(&self, i: usize, line: &str, live: Option<&dyn Live>) {
         let plan = self.plan();
         let u = &plan.units[i];
@@ -2543,8 +2247,6 @@ impl Run {
             return;
         };
         if let Some(items) = v.get("future_incompat_report") {
-            // Collected into the report file and a closing warning, as
-            // cargo does (`future_incompat_summary`).
             let rendered: Vec<String> = items
                 .as_array()
                 .map(|a| a.iter().filter_map(|it| it["diagnostic"]["rendered"].as_str().map(|s| s.to_string())).collect())
@@ -2607,7 +2309,6 @@ impl Run {
                 return;
             }
         }
-        // Artifact notifications: the `.rmeta` is ready before the rest.
         if let Some(artifact) = v.get("artifact").and_then(|a| a.as_str()) {
             if artifact.ends_with(".rmeta") && u.rmeta_early {
                 if let Some(live) = live {
@@ -2623,11 +2324,9 @@ impl Run {
             return;
         }
         if v.get("unused_extern_names").is_some() {
-            // For cargo's unused_dependencies lint, after the build.
             self.ui.lock().unused_externs.insert(i, line.to_string());
             return;
         }
-        // JSON mode: forward the compiler's message wrapped like cargo does.
         let Some((_, message, level)) = diag else { return };
         if is_summary(message) {
             return;
@@ -2645,7 +2344,6 @@ impl Run {
         let message_json = if ansi {
             line.to_string()
         } else {
-            // cargo re-serialises with the rendered text stripped of colour.
             let mut obj = v.clone();
             if let Some(r) = obj.get("rendered").and_then(|r| r.as_str()).map(strip_ansi) {
                 obj["rendered"] = serde_json::Value::String(r);
@@ -2671,7 +2369,6 @@ impl Run {
         self.c.out.raw_out(self.c.out.tr.text(&msg).as_bytes());
     }
 
-    /// After a unit succeeded: warning summary and the artifact message.
     fn finish_unit_messages(&self, i: usize, r: &ActionResult, cached: bool) {
         let plan = self.plan();
         let u = &plan.units[i];
@@ -2705,7 +2402,6 @@ impl Run {
         }
     }
 
-    /// cargo's `report_warning_count`.
     fn report_warning_count(&self, u: &rp::Unit, cnt: &Counts) {
         let mut msg = format!("{} generated ", u.desc);
         match cnt.total {
@@ -2733,7 +2429,6 @@ impl Run {
     fn report_failure(&self, i: usize, cmd: &rp::Cmd, r: &ActionResult) {
         let plan = self.plan();
         let u = &plan.units[i];
-        // Warnings from the package's build scripts are shown with the error.
         {
             let scripts = self.scripts.lock();
             for meta in &u.script_metas {
@@ -2784,8 +2479,6 @@ impl Run {
                 } else {
                     format!("could not compile {}{errors}{warnings}", u.desc)
                 };
-                // cargo hides the command for plain "exit status 1 with
-                // errors shown" unless asked to be verbose.
                 let simple = r.code() == Some(1) && cnt.errors > 0;
                 if simple && !self.c.out.verbose {
                     self.c.out.error(&what);
@@ -2806,19 +2499,11 @@ impl Run {
         }
     }
 
-    /// Files an action wrote into the worktree itself (outside the target
-    /// directory) are written to the real worktree, as cargo would have let
-    /// the process do directly.
     fn apply_worktree_writes(&self, m: &Manifest) {
         let plan = self.plan();
         apply_writes(&self.c, &self.c.out.tr, &[&plan.target_dir, &plan.build_dir], m)
     }
 
-    /// The files cargo's `.d` file for root unit `root` lists (cargo's
-    /// `output_depinfo`): what rustc's dep-info names for the unit and for
-    /// every local unit below it, plus their build scripts'
-    /// `rerun-if-changed` paths. Canonical paths. `None` when a dep-info file
-    /// is missing, in which case cargo removes the `.d` file.
     fn depinfo_files(&self, root: usize) -> Option<std::collections::BTreeSet<PathBuf>> {
         let plan = self.plan();
         let store = self.d.store();
@@ -2863,7 +2548,6 @@ impl Run {
         Some(files)
     }
 
-    /// Writes cargo's `.d` files next to the uplifted artifacts of the roots.
     fn write_depinfo(&self) {
         let plan = self.plan();
         let mut writes: Vec<(PathBuf, Option<String>)> = Vec::new();
@@ -2883,8 +2567,6 @@ impl Run {
                 continue;
             }
             let files = self.depinfo_files(ri);
-            // cargo's `render_filename`: relative to the base directory when
-            // under it, as written otherwise.
             let base = plan.dep_info_basedir.as_ref().map(|b| PathBuf::from(self.c.out.tr.path(b)));
             let esc = |p: String| {
                 let p = match &base {
@@ -2918,7 +2600,6 @@ impl Run {
         self.c.deliver(Vec::new(), writes);
     }
 
-    /// Sends the requested artifacts to the client's target directory.
     fn materialize_roots(&self) {
         let plan = self.plan();
         let tr = &self.c.out.tr;
@@ -2930,7 +2611,6 @@ impl Run {
                 files.push(Delivery { path, hash: hash.0, size, exec, own });
             }
         };
-        // Units whose executables rargo runs itself in this request.
         let run_here: HashSet<u32> = plan
             .steps
             .iter()
@@ -2944,19 +2624,9 @@ impl Run {
             let Some((r, _)) = self.results[ri as usize].get() else { continue };
             for o in &u.outputs {
                 let Some(MEntry::File { hash, exec, size }) = r.outputs.get(o.path.as_bytes()) else { continue };
-                // Names cargo links (it removes the old file first): the
-                // client may share one copy between worktrees.
                 for d in o.hardlink.iter().chain(o.export_path.iter()) {
                     push(&mut files, tr.path(d), hash, *exec, *size, false);
                 }
-                // An executable at its own path, where rustc writes it in
-                // place. Wanted when the user asked for executables (test
-                // binaries have no other name), not when rargo ran them
-                // here. A file of its own, which replaces one stock cargo
-                // built there: stock cargo's fingerprint of that unit goes
-                // with it, so that its next build compiles the unit again
-                // rather than run rargo's executable (which names the
-                // sandbox's paths).
                 if u.executable.as_deref() == Some(o.path.as_str()) && !run_here.contains(&ri) {
                     push(&mut files, tr.path(&o.path), hash, *exec, *size, true);
                     if let Some(fp) = stock_fingerprint(&o.path, &u.pkg_name) {
@@ -2965,8 +2635,6 @@ impl Run {
                 }
             }
         }
-        // Generated documentation: every file rustdoc wrote, the later run
-        // winning where several wrote the same file.
         let mut docs: BTreeMap<&[u8], (Hash, bool, u64)> = BTreeMap::new();
         for &i in &self.pd.doc_order {
             let (Some(dir), Some((r, _))) = (&self.pd.doc_dir[i], self.results[i].get()) else { continue };
@@ -2977,13 +2645,11 @@ impl Run {
             }
         }
         for (path, (hash, exec, size)) in docs {
-            // rustdoc rewrites its shared files in place on the next run.
             push(&mut files, tr.path(&String::from_utf8_lossy(path)), &hash, exec, size, true);
         }
         if files.is_empty() {
             return;
         }
-        // What cargo leaves at the top of a target directory it creates.
         let mut tagged: HashSet<String> = HashSet::new();
         for dir in [&plan.target_dir, &plan.build_dir] {
             let dir = tr.path(dir);
@@ -2997,7 +2663,6 @@ impl Run {
         self.c.deliver(files, writes);
     }
 
-    /// Runs what cargo does after the build: tests, doctests, `cargo run`.
     async fn steps(self: &Arc<Self>) -> Result<Finish> {
         let plan = self.plan();
         let out = &self.c.out;
@@ -3020,9 +2685,6 @@ impl Run {
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
                     out.status("Running", &display_cmd(&cmd.program, &cmd.args));
-                    // The program is the user's and runs on the user's
-                    // machine: it gets the user's whole environment there
-                    // plus what cargo adds.
                     return Ok(Finish::Exec(ExecRequest {
                         program: cmd.program.clone(),
                         args: cmd.args.clone(),
@@ -3035,13 +2697,7 @@ impl Run {
                     }));
                 }
                 rp::Step::Open { cmd } => {
-                    // Whatever opens the documentation lives outside any
-                    // sandbox and has to be given the real path.
                     let real = |s: &String| out.tr.path(s);
-                    // The planner does not see the user's `$BROWSER` (it is
-                    // not an input to any build); cargo's order is the
-                    // configured browser, then `$BROWSER`, then the system
-                    // opener, which is what the plan falls back to.
                     let program = match self.c.env.get("BROWSER") {
                         Some(b) if cmd.program == "xdg-open" && !b.is_empty() => b,
                         _ => real(&cmd.program),
@@ -3092,8 +2748,6 @@ impl Run {
                             prio: self.c.prio,
                             no_cache: self.no_cache_tests,
                             seed_blobs: Default::default(),
-                            // A passing run is a fact about its inputs; a
-                            // failing one may be a flake and is run again.
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
                             observer: Arc::new(TestObserver {
@@ -3146,10 +2800,6 @@ impl Run {
     }
 }
 
-/// Where stock cargo keeps the fingerprint of the unit that writes the
-/// executable `exe`: `build/PKG/HASH/fingerprint` beside
-/// `build/PKG/HASH/out/EXE`, or `.fingerprint/PKG-HASH` beside
-/// `deps/EXE-HASH` in cargo's older layout.
 fn stock_fingerprint(exe: &str, pkg: &str) -> Option<String> {
     let (dir, file) = exe.rsplit_once('/')?;
     if let Some(unit) = dir.strip_suffix("/out") {
@@ -3162,7 +2812,6 @@ fn stock_fingerprint(exe: &str, pkg: &str) -> Option<String> {
     Some(format!("{profile}/.fingerprint/{pkg}-{hash}"))
 }
 
-/// Sends the worktree part of an action's outputs to the client's worktree.
 fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manifest) {
     let inside = |p: &[u8]| {
         vpath_starts_with(p, WORKTREE_AT)
@@ -3189,14 +2838,12 @@ fn apply_writes(c: &Client, tr: &Translator, target_dirs: &[&String], m: &Manife
     c.deliver(Vec::new(), writes);
 }
 
-/// The prerequisites named in a Makefile-style dep-info file (rustc's).
 fn parse_dep_info(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in text.lines() {
         if line.starts_with('#') {
             continue;
         }
-        // `target: a b\ c`: everything after the first unescaped `: `.
         let Some(at) = line.find(": ") else { continue };
         let mut cur = String::new();
         let mut chars = line[at + 2..].chars().peekable();
@@ -3222,7 +2869,6 @@ fn parse_dep_info(text: &str) -> Vec<String> {
     out
 }
 
-/// Removes `.` and `..` components without looking at the file system.
 fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -3261,7 +2907,6 @@ mod tests {
             stock_fingerprint("/w/target/debug/deps/it-02ffaad58935a0bc", "my-app").as_deref(),
             Some("/w/target/debug/.fingerprint/my-app-02ffaad58935a0bc")
         );
-        // A build script's OUT_DIR is no unit directory of an executable.
         assert_eq!(stock_fingerprint("/w/target/debug/out/x", "app"), None);
         assert_eq!(stock_fingerprint("/w/target/debug/app", "app"), None);
     }
@@ -3280,7 +2925,6 @@ mod tests {
             ]
         );
         assert!(needs_network(said), "and the request goes to the fetch that adds them");
-        // Nothing else is taken for a component, nor anything not a name.
         assert!(missing_components(b"error: could not download file\n").is_empty());
         assert!(missing_components(b"is not installed for the toolchain 'x;rm'\nrustup component add a\n").is_empty());
     }

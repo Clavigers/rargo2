@@ -1,10 +1,3 @@
-//! The sandbox filesystem: one FUSE mount, one top-level directory per action.
-//!
-//! Each action directory shows an immutable [`View`] with a private writable
-//! upper layer on top. Every lookup, readlink, readdir and open that reaches
-//! the view is recorded; together they are the action's trace. Whatever ends
-//! up in the upper layer is the action's output.
-
 use crate::view::*;
 use dashmap::DashMap;
 use fusewire::abi::*;
@@ -19,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// Timestamp shown for everything below the upper layer: 2000-01-01T00:00:00Z.
 pub const LOWER_MTIME: u64 = 946_684_800;
 
 const TTL: Duration = Duration::from_secs(365 * 86400);
@@ -29,7 +21,6 @@ const _: () = assert!(LOCAL_BITS < 32, "a local id fits in u32");
 const _: () = assert!(ROOT_LOCAL as u64 <= LOCAL_MASK);
 const ROOT_LOCAL: u32 = 1;
 const BACKING_CACHE_MAX: usize = 200_000;
-/// How long a backing id stays registered after it was last handed out.
 const RETIRE_GRACE: Duration = Duration::from_secs(60);
 
 fn nodeid(seq: u64, local: u32) -> u64 {
@@ -42,10 +33,7 @@ fn nodeid(seq: u64, local: u32) -> u64 {
 }
 
 enum Slot {
-    /// Entry that exists in the view.
     Lower(u32),
-    /// Entry created, moved or linked here by the action. The flag says
-    /// whether the view also has an entry of this name underneath.
     Upper(u32, bool),
     Negative,
     Whiteout,
@@ -53,12 +41,9 @@ enum Slot {
 
 struct Dir {
     parent: u32,
-    /// The view directory this node shows, if any.
     lower: Option<VPath>,
-    /// Whether lookups in this directory are recorded.
     traced: bool,
     entries: HashMap<Box<[u8]>, Slot>,
-    /// Something at or below this directory was modified.
     dirty: bool,
     owner: Owner,
     lower_listed: bool,
@@ -77,16 +62,10 @@ struct FileN {
     mode: u32,
     opens: u32,
     links: u32,
-    /// Opened through passthrough against the lower backing file.
     lower_pt_opens: u32,
-    /// Source as it was when the content was first read (for the trace).
     read_src: Option<FileSrc>,
-    /// Userspace I/O handle for lower files when passthrough is unavailable.
     file: Option<Arc<File>>,
-    /// Size and executable bit of the view file this node started as. Kept
-    /// after a copy-up: it is what the action observed.
     lower_meta: Option<(u64, bool)>,
-    /// The view's own notion of this file's identity, if it has one.
     lower_sem: Option<crate::hash::Hash>,
 }
 
@@ -94,9 +73,7 @@ enum Kind {
     Dir(Box<Dir>),
     File(Box<FileN>),
     Symlink { target: Vec<u8> },
-    /// A directory that exists only to be mounted over.
     Mount,
-    /// Fifo or socket created by the action. Never an output.
     Special { mode: u32, rdev: u32 },
 }
 
@@ -117,7 +94,6 @@ struct State {
     finished: bool,
 }
 
-/// Per-action filesystem state.
 pub struct ActionFs {
     pub seq: u64,
     view: Arc<dyn View>,
@@ -132,25 +108,17 @@ pub struct ActionFsConfig {
     pub view: Arc<dyn View>,
     pub uid: u32,
     pub gid: u32,
-    /// Directory on the store filesystem for this action's upper files.
     pub scratch: PathBuf,
-    /// Top-level names that are bare mountpoints (`proc`, `dev`, ...).
     pub mountpoints: Vec<Vec<u8>>,
-    /// Record files that were only looked up as "exists" rather than with
-    /// their size. Only sound for actions known not to act on sizes.
     pub size_blind: bool,
 }
 
-/// One entry of an action's upper layer.
 #[derive(Debug)]
 pub enum UpperKind {
     Dir,
-    /// A file written by the action; `path` is its scratch file.
     File { path: PathBuf, exec: bool },
-    /// A view file that the action moved or linked to a new name.
     LowerFile { info: FileInfo },
     Symlink(Vec<u8>),
-    /// The action deleted something the view has.
     Whiteout,
 }
 
@@ -163,8 +131,6 @@ pub struct UpperEnt {
 pub struct Finished {
     pub obs: Vec<(VPath, Obs)>,
     pub upper: Vec<UpperEnt>,
-    /// A host file changed while the action was reading it; the trace must
-    /// not be stored.
     pub tainted: bool,
 }
 
@@ -174,7 +140,6 @@ pub struct SandboxFs {
     content: Arc<Content>,
     session: OnceLock<Arc<Session>>,
     backing: DashMap<BackingKey, (i32, AtomicU64)>,
-    /// Backing ids no longer in the map, waiting to be closed.
     retired: Mutex<Vec<(std::time::Instant, i32)>>,
     tick: AtomicU64,
     stats: FsStats,
@@ -202,7 +167,6 @@ impl SandboxFs {
         }
     }
 
-    /// Must be called once after mounting, before any action runs.
     pub fn attach(&self, session: Arc<Session>) {
         let _ = self.session.set(session);
     }
@@ -215,7 +179,6 @@ impl SandboxFs {
         self.session.get().map(|s| s.caps().passthrough).unwrap_or(false)
     }
 
-    /// Name of an action's directory under the mountpoint.
     pub fn dir_name(seq: u64) -> String {
         format!("a{seq}")
     }
@@ -223,7 +186,7 @@ impl SandboxFs {
     pub fn create_action(&self, cfg: ActionFsConfig) -> Arc<ActionFs> {
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         let mut nodes = Vec::with_capacity(256);
-        nodes.push(Kind::Mount); // local id 0 is never used
+        nodes.push(Kind::Mount);
         let root_path: VPath = Arc::from(&b"/"[..]);
         let mut root = Dir {
             parent: 0,
@@ -240,7 +203,7 @@ impl SandboxFs {
         for m in &cfg.mountpoints {
             mounts.push(m.clone());
         }
-        nodes.push(Kind::Mount); // placeholder for root, replaced below
+        nodes.push(Kind::Mount);
         for m in mounts {
             let id = nodes.len() as u32;
             nodes.push(Kind::Mount);
@@ -268,9 +231,6 @@ impl SandboxFs {
         a
     }
 
-    /// Ends an action: no further operations are served for it. Returns what
-    /// it observed and what it wrote. Call only after all its processes are
-    /// gone.
     pub fn finish_action(&self, a: &Arc<ActionFs>) -> Finished {
         self.actions.remove(&a.seq);
         if let Some(s) = self.session.get() {
@@ -279,11 +239,6 @@ impl SandboxFs {
         let mut st = a.st.lock();
         assert!(!st.finished, "action finished twice");
         st.finished = true;
-        // Upper files were only ever opened by this action's processes, all
-        // of which are gone, so no reply can still refer to these ids. They
-        // are closed right away: the kernel's reference keeps the scratch
-        // file open for writing, and an output must not stay "text file
-        // busy" after its action has finished.
         if let Some(s) = self.session.get() {
             for id in st.backing_ids.drain(..) {
                 let _ = s.backing_close(id);
@@ -293,7 +248,6 @@ impl SandboxFs {
         let mut upper = Vec::new();
         walk_upper(&st, &*a.view, ROOT_LOCAL, b"/", false, &mut upper);
 
-        // Resolve raw observations. Hashing happens outside the lock.
         let raw = std::mem::take(&mut st.obs);
         let mut out: Vec<(VPath, Obs)> = Vec::with_capacity(raw.len());
         let mut to_hash: Vec<(usize, FileSrc, bool)> = Vec::new();
@@ -306,8 +260,6 @@ impl SandboxFs {
                 RawObs::Listing(h) => Obs::Listing(h),
                 RawObs::File(n) => {
                     let Kind::File(f) = &st.nodes[n as usize] else { continue };
-                    // What was observed is the view file the node started
-                    // as, even if the action later replaced its content.
                     let Some((size, exec)) = f.lower_meta else { continue };
                     match &f.read_src {
                         Some(_) if f.lower_sem.is_some() => Obs::File { hash: f.lower_sem.unwrap(), exec },
@@ -342,15 +294,6 @@ impl SandboxFs {
         Finished { obs: compact_obs(out), upper, tainted }
     }
 
-    /// The passthrough backing id for an immutable backing file, registering
-    /// it with the kernel on first use.
-    ///
-    /// Ids are small integers the kernel reuses as soon as they are closed,
-    /// and the kernel resolves the id in an open reply only after our write
-    /// of that reply has returned. An id must therefore never be closed
-    /// while a reply carrying it may still be in flight: registration
-    /// happens exactly once per key (under the map's entry lock), and ids
-    /// taken out of the map are closed only after a grace period.
     fn backing_id(&self, key: BackingKey, file: &File) -> Res<i32> {
         let tick = self.tick.fetch_add(1, Ordering::Relaxed);
         let id = match self.backing.entry(key) {
@@ -376,7 +319,6 @@ impl SandboxFs {
         self.retired.lock().push((std::time::Instant::now(), id));
     }
 
-    /// Closes retired ids whose grace period is over.
     fn reap_retired(&self) {
         let Some(sess) = self.session.get() else { return };
         let mut r = self.retired.lock();
@@ -405,8 +347,6 @@ impl SandboxFs {
         }
     }
 
-    /// Drops the cached backing file of a blob (call before evicting it, so
-    /// the kernel does not keep the unlinked file alive).
     pub fn forget_backing(&self, h: &crate::hash::Hash) {
         if let Some((_, (id, _))) = self.backing.remove(&BackingKey::Blob(*h)) {
             self.retire(id);
@@ -421,7 +361,6 @@ impl SandboxFs {
     }
 }
 
-/// Drops directory observations implied by a deeper positive observation.
 fn compact_obs(obs: Vec<(VPath, Obs)>) -> Vec<(VPath, Obs)> {
     let mut implied: std::collections::HashSet<&[u8]> = Default::default();
     for (p, o) in &obs {
@@ -469,8 +408,6 @@ fn emit_lower_entry(view: &dyn View, lower: &[u8], out_path: &[u8], name: &[u8],
     }
 }
 
-/// Collects the upper layer below `dir`. With `full`, the directory was moved
-/// or linked to a new place and its view content has to be emitted too.
 fn walk_upper(st: &State, view: &dyn View, dir: u32, dir_path: &[u8], full: bool, out: &mut Vec<UpperEnt>) {
     let Kind::Dir(d) = &st.nodes[dir as usize] else { return };
     if full {
@@ -643,8 +580,6 @@ impl ActionFs {
         Ok(id as u32)
     }
 
-    /// Resolves `name` in directory `parent`, consulting the view (and
-    /// recording the observation when `trace`) the first time.
     fn resolve(&self, st: &mut State, parent: u32, name: &[u8], trace: bool) -> Res<Option<u32>> {
         let (lower, traced) = match &st.nodes[parent as usize] {
             Kind::Dir(d) => {
@@ -765,8 +700,6 @@ impl ActionFs {
         Ok((path, Arc::new(file)))
     }
 
-    /// Whether the view has an entry under the slot that `name` currently
-    /// maps to (so that removing the upper entry must leave a whiteout).
     fn covers_lower(&self, st: &State, parent: u32, name: &[u8]) -> bool {
         match &st.nodes[parent as usize] {
             Kind::Dir(d) => match d.entries.get(name) {
@@ -838,9 +771,6 @@ impl ActionFs {
         Ok(self.merged_listing(st, local)?.is_empty())
     }
 
-    /// Creates the directory `path` and any missing parents in the upper
-    /// layer without recording observations. Used by the executor for
-    /// directories cargo would have created before running the action.
     pub fn mkdir_p(&self, path: &[u8]) -> Res<()> {
         let mut st = self.st.lock();
         let mut cur = ROOT_LOCAL;
@@ -878,8 +808,6 @@ impl ActionFs {
         Ok(n)
     }
 
-    /// Scratch path of the upper file at sandbox path `path`, if the action
-    /// has written one there.
     pub fn upper_file_at(&self, path: &[u8]) -> Option<(PathBuf, bool)> {
         let st = self.st.lock();
         let mut cur = ROOT_LOCAL;
@@ -949,9 +877,6 @@ impl ActionFs {
             };
             return Ok(Opened { fh: 0, flags: FOPEN_PASSTHROUGH, backing_id: id });
         }
-        // Either no passthrough, or the inode is still open against its old
-        // lower backing file; the kernel does not allow two backing files on
-        // one inode, so this handle does direct I/O through us.
         Ok(Opened { fh: 0, flags: if lower_pt { FOPEN_DIRECT_IO } else { 0 }, backing_id: 0 })
     }
 }
@@ -1016,7 +941,6 @@ impl Filesystem for SandboxFs {
                 Kind::File(f) => {
                     f.mode = mode & 0o7777;
                     let parent = f.parent;
-                    // A mode change on a view file is an output (exec bit).
                     if matches!(f.src, Src::Lower(_)) {
                         a.copy_up(self, &mut st, local, false)?;
                     }
@@ -1036,7 +960,6 @@ impl Filesystem for SandboxFs {
                 Kind::File(f) => {
                     if let Src::Upper { file, .. } = &f.src {
                         let ts = [conv(set.atime), conv(set.mtime)];
-                        // SAFETY: valid fd and a two-element timespec array.
                         unsafe { libc::futimens(file.as_raw_fd(), ts.as_ptr()) };
                     }
                 }
@@ -1271,8 +1194,6 @@ impl Filesystem for SandboxFs {
         } else if is_lower {
             let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!() };
             let Src::Lower(info) = &mut f.src else { unreachable!() };
-            // Fast path: the backing file is already registered with the
-            // kernel under the identity the lookup saw. No syscalls at all.
             if self.passthrough() {
                 let key = match &info.src {
                     FileSrc::Blob(h) => Some(BackingKey::Blob(*h)),
@@ -1414,7 +1335,6 @@ impl Filesystem for SandboxFs {
         }
         let list = a.merged_listing(&mut st, n)?;
         for (i, (name, t)) in list.iter().enumerate().skip(offset as usize) {
-            // Inode numbers in readdir are advisory; they only must be nonzero.
             let ino = crate::hash::Hash::of(name).0[..8].try_into().map(u64::from_le_bytes).unwrap_or(2) | 1;
             if !sink.push(ino, i as u64 + 1, t.as_dirent(), name) {
                 break;
@@ -1428,7 +1348,6 @@ impl Filesystem for SandboxFs {
         let st = a.st.lock();
         if let Some(Kind::File(f)) = st.nodes.get(n as usize) {
             if let Src::Upper { file, .. } = &f.src {
-                // SAFETY: valid fd.
                 let r = unsafe {
                     libc::fallocate(file.as_raw_fd(), mode as i32, offset as i64, length as i64)
                 };

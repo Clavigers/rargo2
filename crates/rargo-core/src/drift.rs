@@ -1,17 +1,3 @@
-//! The drift check: does plain cargo still agree with rargo?
-//!
-//! rargo is stricter than cargo in most ways (sandbox, clean environment)
-//! and looser in none that should matter, but "should" is not evidence. The
-//! check takes a worktree state a client synced and builds it twice on the
-//! server: with the stock cargo of the toolchain, unsandboxed, in a scratch
-//! copy; and with rargo in verify mode, where every unit that comes from
-//! the cache is also re-run from nothing (no cache, no incremental seed) and
-//! its outputs compared. Disagreement in either comparison is reported.
-//!
-//! The other half of "no drift" is on the client: what rargo leaves in a
-//! worktree must not stop stock cargo from working there. `dev/nodrift.sh`
-//! checks that.
-
 use crate::build::{Client, Daemon, Home, handle};
 use crate::engine::ClientEnv;
 use crate::present::Output;
@@ -23,17 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Who last used a worktree: the drift check builds with their settings.
 #[derive(Clone)]
 pub struct LastClient {
     pub env: Arc<HashMap<String, String>>,
     pub home: Arc<Home>,
-    /// The worktree root on the client, for reports.
     pub root: String,
-    /// Cargo invocation directory relative to the snapshot root.
     pub dir: std::path::PathBuf,
     pub at: Instant,
-    /// The snapshot the last drift check looked at.
     pub checked: Option<crate::hash::Hash>,
 }
 
@@ -44,8 +26,6 @@ pub struct Report {
     pub rargo_ok: bool,
     pub verified_units: u64,
     pub mismatches: Vec<String>,
-    /// Units that could not be compared because the tools do not
-    /// reproduce their output from run to run.
     pub unreproducible: usize,
     pub stock_secs: f64,
     pub rargo_secs: f64,
@@ -80,7 +60,6 @@ impl Report {
     }
 }
 
-/// Runs the check for `snapshot` with the settings of `who`.
 pub async fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient) -> Result<Report> {
     let scratch = d.scratch("drift")?;
     let result = check_in(d, snapshot, who, &scratch).await;
@@ -90,14 +69,12 @@ pub async fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient) 
 
 async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path) -> Result<Report> {
     let (uid, gid) = (d.cfg.uid, d.cfg.gid);
-    // 1. Stock cargo, unsandboxed, at low priority, in a real directory.
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
     for (k, v) in who.env.iter() {
         if rargo_proto::env_allowed(k) && !k.starts_with("RARGO_") && k != "CARGO_TARGET_DIR" && k != "CARGO_BUILD_TARGET_DIR" {
             env.insert(k.clone(), v.clone());
         }
     }
-    // Stock Cargo uses the same shell as the remote build.
     let policy = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
     let (dd, snap, dir, files) = (d.clone(), snapshot.clone(), who.dir.clone(), policy.flake.files.clone());
     let flake = tokio::task::spawn_blocking(move || crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid))
@@ -126,7 +103,6 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
             .current_dir(&stock_cwd)
             .env_clear()
             .envs(env.iter())
-            // If `cargo` on PATH is the rargo shim, it must step aside.
             .env("RARGO_BYPASS", "1")
             .env("RUSTC_WRAPPER", "")
             .env("RUSTC_WORKSPACE_WRAPPER", "")
@@ -141,7 +117,6 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     .await??;
     let stock_secs = started.elapsed().as_secs_f64();
 
-    // 2. rargo on the same snapshot, verifying every cached unit.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut env: HashMap<String, String> = (*who.env).clone();
     env.insert("RARGO_VERIFY".into(), "1".into());
@@ -204,13 +179,10 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     })
 }
 
-/// Background loop: every `interval`, check each worktree whose newest
-/// synced state has not been checked yet.
 pub async fn background(d: Arc<Daemon>, interval: std::time::Duration) {
     loop {
         tokio::time::sleep(interval).await;
         for (worktree, snapshot) in d.trees.recent() {
-            // Only when the machine is otherwise idle.
             let (running, waiting, _, _) = d.engine.sched.snapshot();
             if running + waiting > 0 {
                 continue;

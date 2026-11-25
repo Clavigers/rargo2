@@ -1,11 +1,3 @@
-//! One client connection: the encrypted channel, uploads coming in,
-//! artifacts going out.
-//!
-//! A [`Session`] is the server's handle on a client for the duration of
-//! one command: one stream of the client daemon's link (`serve::link`). Output is pushed through an ordered queue; bulk
-//! data (file contents) is additionally held back by a byte window so that
-//! a slow link applies back-pressure instead of filling memory.
-
 use crate::hash::Hash;
 use crate::snapshot::{Uploader, futures::BoxFuture};
 use crate::store::Store;
@@ -22,14 +14,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Notify, Semaphore, oneshot};
 
-/// Who may connect: the holders of tokens, or, for a server that has
-/// none and listens on the loopback interface, anyone on its machine.
 pub struct Keys {
-    /// Anyone who can reach the (loopback) port is accepted, as an
-    /// administrator.
     open: bool,
-    /// Tokens (`rargod token`, `rargo auth`), looked up as they are at that
-    /// moment: one made or revoked takes effect at once.
     tokens: Option<Arc<crate::tokens::TokenStore>>,
 }
 
@@ -46,8 +32,6 @@ impl Keys {
         self.tokens.as_ref()
     }
 
-    /// The key and standing of what a client presents as its user name:
-    /// the id of a token.
     fn lookup(&self, user: &str) -> Option<([u8; 32], bool)> {
         if self.open {
             return Some((secure::open_psk(), true));
@@ -55,14 +39,10 @@ impl Keys {
         self.tokens.as_ref()?.lookup(user).map(|(key, admin, _)| (key, admin))
     }
 
-    /// Whether what a client presented still admits it (a token may have
-    /// been revoked or have expired since).
     pub fn still_valid(&self, user: &str) -> bool {
         self.lookup(user).is_some()
     }
 
-    /// Who a client is, for display: the token's user; on an open server,
-    /// the name the client gave.
     pub fn name_of(&self, user: &str) -> String {
         if self.open {
             return user.to_string();
@@ -70,8 +50,6 @@ impl Keys {
         self.tokens.as_ref().and_then(|t| t.lookup(user)).map(|(_, _, name)| name).unwrap_or_else(|| user.to_string())
     }
 
-    /// The key of the token `user` names, for the UDP transport's key
-    /// agreement.
     pub fn psk(&self, user: &str) -> Option<[u8; 32]> {
         self.lookup(user).map(|(k, _)| k)
     }
@@ -85,9 +63,7 @@ impl Keys {
     }
 }
 
-/// Bytes of bulk data that may sit in the outgoing queue.
 const WINDOW: usize = 32 << 20;
-// Permits are acquired as `u32`.
 const _: () = assert!(WINDOW <= u32::MAX as usize);
 const _: () = assert!(WINDOW > 0);
 
@@ -106,8 +82,6 @@ struct Part {
     size: u64,
 }
 
-/// What the daemon at the other end of a link is known to hold: the
-/// contents this server sent it or listed in a delivery it placed.
 #[derive(Default)]
 pub struct ClientHas {
     set: Mutex<HashSet<Digest>>,
@@ -122,27 +96,20 @@ impl ClientHas {
 pub struct Session {
     tx: UnboundedSender<ServerMsg>,
     has: Arc<ClientHas>,
-    /// `has` covers what this command's worktree holds: what is not in it
-    /// is sent without being asked for. Otherwise nothing is sent blind
-    /// and the client fetches what it lacks.
     knows: AtomicBool,
-    /// Everything this command delivered.
     delivered: Mutex<HashSet<Digest>>,
-    /// The client fetches contents itself; see `RunRequest::lazy`.
     lazy: AtomicBool,
     window: Arc<Semaphore>,
     store: Arc<Store>,
     trees_reply: Mutex<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
     env_reply: Mutex<Option<oneshot::Sender<Vec<(String, Option<String>)>>>>,
     report_reply: Mutex<Option<oneshot::Sender<u32>>>,
-    /// One question to the client at a time.
     asking: tokio::sync::Mutex<()>,
     arrivals: Notify,
     changed: AtomicBool,
     closed: AtomicBool,
     parts: Mutex<HashMap<Digest, Part>>,
     next_id: AtomicU64,
-    /// The server's totals, which this session adds to as it goes.
     totals: Arc<crate::build::DaemonStats>,
 }
 
@@ -151,7 +118,6 @@ impl Session {
         Session::on_link(store, Arc::new(ClientHas::default()), Arc::new(crate::build::DaemonStats::default()))
     }
 
-    /// A session on a link whose other end is known to hold `has`.
     pub fn on_link(
         store: Arc<Store>,
         has: Arc<ClientHas>,
@@ -180,8 +146,6 @@ impl Session {
         (s, rx)
     }
 
-    /// The client holds `digests`, and with them the link's knowledge
-    /// covers this command's worktree.
     pub fn knows(&self, digests: impl IntoIterator<Item = Digest>) {
         self.has.extend(digests);
         self.knows.store(true, Ordering::SeqCst);
@@ -195,9 +159,6 @@ impl Session {
         self.lazy.load(Ordering::SeqCst)
     }
 
-    /// A delivery to a client that fetches contents itself: the names go
-    /// out now, with the contents of small files the client is not known
-    /// to hold. Nothing is waited for.
     pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>) {
         if files.is_empty() && writes.is_empty() {
             return;
@@ -237,12 +198,10 @@ impl Session {
         self.send(ServerMsg::Delivered { id });
     }
 
-    /// Everything this command has delivered so far.
     pub fn delivered(&self) -> HashSet<Digest> {
         self.delivered.lock().clone()
     }
 
-    /// Bulk data sent was handed to the link: room for more.
     pub fn sent_bulk(&self, bytes: usize) {
         self.window.add_permits(bytes.clamp(1, WINDOW));
     }
@@ -251,7 +210,6 @@ impl Session {
         self.window.close();
     }
 
-    /// The queue everything sent to the client goes through.
     pub fn sender(&self) -> UnboundedSender<ServerMsg> {
         self.tx.clone()
     }
@@ -268,7 +226,6 @@ impl Session {
         }
     }
 
-    /// Sends bulk data, waiting while too much is queued.
     async fn send_bulk(&self, m: ServerMsg) -> Result<()> {
         let n = bulk_size(&m).clamp(1, WINDOW) as u32;
         assert!(n >= 1);
@@ -279,7 +236,6 @@ impl Session {
         self.tx.send(m).map_err(|_| self.gone())
     }
 
-    /// The connection is over: wake everyone who is waiting for the client.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.trees_reply.lock().take();
@@ -303,8 +259,6 @@ impl Session {
         Ok(())
     }
 
-    /// Handles one message from the client. Runs on the connection's reader
-    /// task; file system work is done in place.
     pub fn incoming(&self, msg: ClientMsg) -> Result<()> {
         match msg {
             ClientMsg::Run(_)
@@ -383,7 +337,6 @@ impl Session {
         Ok(())
     }
 
-    /// Asks the client for the values of environment variables.
     pub async fn want_env(&self, names: Vec<String>) -> Result<Vec<(String, Option<String>)>> {
         let _g = self.asking.lock().await;
         let (tx, rx) = oneshot::channel();
@@ -395,8 +348,6 @@ impl Session {
         rx.await.map_err(|_| self.gone())
     }
 
-    /// Has the client add a future-incompatibility report to its report
-    /// file. Returns the report's number there.
     pub async fn report(&self, report: rargo_proto::FutureReport) -> Result<u32> {
         let _g = self.asking.lock().await;
         let (tx, rx) = oneshot::channel();
@@ -408,10 +359,6 @@ impl Session {
         rx.await.map_err(|_| self.gone())
     }
 
-    /// Places files on the client. The contents the client is known to
-    /// lack are sent along; nothing is asked, so a delivery costs no round
-    /// trip. Returns once everything has been queued; the stream is
-    /// ordered, so whatever is sent afterwards arrives after it.
     pub async fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>) -> Result<()> {
         if files.is_empty() && writes.is_empty() {
             return Ok(());
@@ -446,12 +393,10 @@ impl Session {
         Ok(())
     }
 
-    /// Counts chunk data sent to a client.
     pub fn count_out(&self, bytes: usize) {
         self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
-    /// Sends contents the client asked for, then says that that was all.
     pub async fn fetch(&self, id: u64, hashes: Vec<Digest>) -> Result<()> {
         let wanted: Vec<(Digest, u64)> =
             hashes.into_iter().filter_map(|h| self.store.size_of(&Hash(h)).map(|size| (h, size))).collect();
@@ -526,8 +471,6 @@ impl Uploader for Session {
     fn blobs<'a>(&'a self, want: Vec<Hash>) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let _g = self.asking.lock().await;
-            // Largest batches first would starve small files; keep the
-            // client's own order by asking for everything at once.
             self.send(ServerMsg::WantBlobs(want.iter().map(|h| h.0).collect()));
             let mut left: Vec<Hash> = want;
             loop {
@@ -547,8 +490,6 @@ impl Uploader for Session {
     }
 }
 
-/// Performs the server side of the handshake of a TCP link. Returns the
-/// user's name, whether they administer the server, and the channel.
 pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     keys: &Keys,
@@ -589,7 +530,6 @@ pub async fn accept<S: AsyncRead + AsyncWrite + Unpin>(
     Ok((user, admin, sealer, opener))
 }
 
-/// The size of a message that counts against the bulk window.
 pub fn bulk_of(m: &ServerMsg) -> usize {
     bulk_size(m)
 }

@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-"""Simulated agent swarm: N agents in N git worktrees of one repository run
-overlapping check / test / build commands with edits in between.
-
-  swarm.py --repo ra --mode stock|rargo [--agents 20] [--keep] [--tests nextest]
-
-Prints wall time, CPU time and disk use. `stock` gives every worktree its own
-target directory, which is what a swarm of agents using plain cargo gets.
-CPU time is read from the cgroup the work ran in: this script's own cgroup
-for stock (run it under `systemd-run --scope`), the server's for rargo (the
-clients' own CPU time is reported separately).
-
-In rargo mode the agents are clients of the build server at RARGO_SERVER
-whose state directory is RARGO_STATE; with --netns they run in that network
-namespace (see dev/netns.sh), so every byte crosses the shaped link.
-"""
 import argparse, os, subprocess, sys, time, shutil, threading, json
 
 WORK = os.environ.get("RARGO_WORK", "/root/rargo-work")
 RARGO = os.path.join(os.environ.get("RARGO_BIN") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "release"), "rargo")
 
-# Per repository: files agents edit (cheap leaf-ish and deep ones) and the
-# packages they test.
+
 REPOS = {
     "ra": dict(
         dir="ra",
@@ -43,8 +27,6 @@ REPOS = {
         tests=[["test", "-p", "bevy_utils"], ["test", "-p", "bevy_color"], ["test", "-p", "bevy_ptr"]],
         build=["build", "-p", "bevy_ecs"],
     ),
-    # Zed needs the dev shell of its flake for system libraries: rargo
-    # evaluates it on the server, stock cargo runs inside it (zed-cargo.sh).
     "zed": dict(
         dir="zed",
         check=["check"],
@@ -58,8 +40,6 @@ REPOS = {
 def cgroup_cpu_usec(pid):
     with open(f"/proc/{pid}/cgroup") as f:
         rel = f.read().strip().split("::", 1)[1]
-    # rargod puts itself in a `daemon` child of its scope and each action in
-    # a sibling; the scope is what everything ran in.
     if rel.endswith("/daemon"):
         rel = os.path.dirname(rel)
     path = "/sys/fs/cgroup" + rel
@@ -82,7 +62,6 @@ def du(path):
 
 def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=(), tests="test"):
     def run(args):
-        # The nextest variant: `nextest run` where the agents run `test`.
         if tests == "nextest" and args[0] == "test":
             args = ["nextest", "run"] + args[1:]
         cmd = (list(prefix) + [RARGO] if mode == "rargo" else [cfg.get("cargo", "cargo")]) + args
@@ -96,21 +75,16 @@ def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", prefix=(), tests
         log.flush()
         out = ""
         if p.returncode != 0:
-            # What the failed command itself printed.
             with open(log.name, "rb") as f:
                 f.seek(at)
                 out = f.read().decode(errors="replace")[-3000:]
         return (" ".join(args), p.returncode, time.time() - t, out)
 
     def edit(n):
-        # Agents overlap: several make the same edit to the same file.
-        # A body-only second edit changes the function the first one added.
         f = cfg["edits"][(i + (0 if edit_kind == "body" else n)) % len(cfg["edits"])]
         variant = (i // len(cfg["edits"]) + n) % 3
         path = os.path.join(wt, f)
         if edit_kind == "body" and n > 0:
-            # Change only the inside of the function the first edit added:
-            # nothing other crates can see moves.
             text = open(path).read()
             marker = "    let rargo_bench_value = "
             at = text.rindex(marker)
@@ -173,15 +147,11 @@ def main():
     if a.toolchain:
         env["RUSTUP_TOOLCHAIN"] = a.toolchain
     daemon_pid = None
-    # Only the network namespace is entered (`ip netns exec` would also give
-    # every command a mount namespace of its own, and the client daemon's
-    # virtual output directories would be invisible to the next command).
     prefix = ["nsenter", f"--net=/run/netns/{a.netns}"] if a.netns else []
     state = env.get("RARGO_STATE", os.path.join(WORK, "state"))
     client_cache = os.path.join(root, "client-cache")
     if a.mode == "rargo":
         env["RARGO_CACHE_DIR"] = client_cache
-        # The server with this state directory (others may be running).
         for pid in subprocess.run(["pgrep", "-x", "rargod"], capture_output=True, text=True).stdout.split():
             try:
                 cmdline = open(f"/proc/{pid}/cmdline").read().split("\0")
@@ -198,8 +168,6 @@ def main():
 
     results = {}
     logs = [open(os.path.join(root, f"agent{i:02d}.log"), "wb") for i in range(a.agents)]
-    # Bytes crossing the client link, both ways, as the client's interface
-    # counts them.
     def link_bytes():
         if not a.netns:
             return (0, 0)
@@ -219,11 +187,7 @@ def main():
     daemon_status = ""
     daemon_cpu = 0.0
     if a.mode == "rargo":
-        # What the client daemon did, and then its end: its virtual output
-        # directories are unmounted, so that what is measured below is what
-        # is really on the client's disk.
         daemon_status = subprocess.run(prefix + [RARGO, "--rargo-daemon-status"], env=env, capture_output=True, text=True).stdout
-        # The daemon's own CPU time (it is not a child of the commands).
         tick = os.sysconf("SC_CLK_TCK")
         for pid in subprocess.run(["pgrep", "-f", "--", f"--rargo-daemon {client_cache}"], capture_output=True, text=True).stdout.split():
             try:
@@ -239,8 +203,6 @@ def main():
     client_cpu = (self1.children_user + self1.children_system) - (self0.children_user + self0.children_system)
     failures = [(i, s) for i, steps in results.items() for s in steps if s[1] != 0]
     targets = [os.path.join(wt, "target") for wt in wts]
-    # One `du` over everything on the client side, so that an artifact
-    # shared between worktrees through the client's cache counts once.
     def du_all(paths):
         paths = [p for p in paths if os.path.exists(p)]
         if not paths:
@@ -277,7 +239,6 @@ def main():
         client_daemon_cpu_s=round(daemon_cpu, 1),
         client_daemon=" | ".join(l.strip() for l in daemon_status.splitlines() if l.startswith(("link", "scans", "pushed", "outputs"))),
         failures=len(failures),
-        # Which step of which agent, and the end of that agent's log.
         failed_steps=[dict(agent=i, step=st[0], rc=st[1], output=st[3]) for i, st in failures[:5]],
         step_mean_s=[round(sum(v) / len(v), 2) for _, v in sorted(per_step.items())],
         step_max_s=[round(max(v), 2) for _, v in sorted(per_step.items())],

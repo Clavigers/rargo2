@@ -1,7 +1,3 @@
-//! Throughput of rargo's UDP transport between two processes (for example
-//! across the network namespaces of `dev/netns.sh`):
-//!   netbench serve ADDR
-//!   netbench send ADDR MIB
 use rargo_core::net::Endpoint;
 use std::time::Instant;
 

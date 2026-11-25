@@ -1,19 +1,3 @@
-//! Describing a worktree as a content-addressed tree, quickly.
-//!
-//! Every command scans the whole worktree: one `lstat` per file, in
-//! parallel. A file is only read when its size, times or inode differ from
-//! what the index remembered when it was last hashed, so a scan costs time
-//! proportional to the number of files plus the bytes that changed.
-//!
-//! What is left out: `.git` (anywhere), cargo target directories (any
-//! directory holding a `CACHEDIR.TAG`, and `target` at the root), anything
-//! the project's policy excludes, and things that are neither file,
-//! directory nor symlink. Everything else is synced, whether git ignores it
-//! or not (an ignored `Cargo.lock` or generated source is as much an input
-//! to the build as a tracked file), unless the policy says
-//! `gitignored = false`: then what git ignores is left out too, except what
-//! the policy's `include` names ([`Ignored`]).
-
 use rargo_proto::Digest;
 use rargo_proto::tree::{Node, Tree};
 use rayon::prelude::*;
@@ -27,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// What the index remembers about a file it has hashed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub size: u64,
@@ -35,18 +18,13 @@ pub struct Entry {
     pub ctime_ns: i64,
     pub ino: u64,
     pub hash: Digest,
-    /// When the file was hashed. A file modified this close to being hashed
-    /// may have been modified again afterwards without its timestamps
-    /// moving, so it is hashed once more on the next scan.
     pub hashed_at_ns: i64,
 }
 
-/// Timestamps closer than this to the moment of hashing are not trusted.
 const RACY_NS: i64 = 50_000_000;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Index {
-    /// By path relative to the root.
     pub files: HashMap<Vec<u8>, Entry>,
 }
 
@@ -70,36 +48,21 @@ impl Index {
 #[derive(Clone)]
 pub struct Scan {
     pub root: Digest,
-    /// Encoded trees by digest.
     pub trees: HashMap<Digest, Vec<u8>>,
-    /// Where to read each distinct file content from, and its size.
     pub files: HashMap<Digest, (PathBuf, u64)>,
-    /// How many files of the worktree have each content (`files` names
-    /// one of them).
     refs: HashMap<Digest, u32>,
-    /// What `graft_git` added to `files`.
     grafted: Vec<Digest>,
-    /// Every directory of the worktree that is synced (what a watcher has
-    /// to watch).
     pub dirs: Vec<PathBuf>,
-    /// The tree of each of those directories, by its path from the root
-    /// ("" for the root): what [`rescan`] reuses.
     pub dir_trees: HashMap<Vec<u8>, Digest>,
-    /// The worktree's root tree, before `graft_git` adds `.git` to it.
     worktree_root: Vec<u8>,
-    /// How many directories were listed (the others were taken as they
-    /// were).
     pub listed_dirs: u64,
     pub index: Index,
-    /// The index differs from the one the scan started with.
     pub index_changed: bool,
     pub file_count: u64,
     pub hashed_files: u64,
     pub hashed_bytes: u64,
 }
 
-/// What a scan builds, behind locks for the directories scanned in
-/// parallel. A rescan starts from the scan before and edits it.
 #[derive(Default)]
 struct Maps {
     trees: Mutex<HashMap<Digest, Vec<u8>>>,
@@ -107,19 +70,13 @@ struct Maps {
     refs: Mutex<HashMap<Digest, u32>>,
     dir_trees: Mutex<HashMap<Vec<u8>, Digest>>,
     index: Mutex<HashMap<Vec<u8>, Entry>>,
-    /// Contents whose recorded path went while other files have it.
     relink: Mutex<HashSet<Digest>>,
 }
 
 struct Ctx<'a> {
     root: &'a Path,
-    /// A whole scan: the index of an earlier one, whose unchanged entries
-    /// spare reading files. A rescan uses its own index for that.
     old: Option<&'a Index>,
-    /// A rescan: the directories that may have changed, every directory
-    /// above them and the root. Others are taken as they were.
     on_path: Option<HashSet<Vec<u8>>>,
-    /// A rescan: the root's tree before.
     root_before: Vec<u8>,
     exclude: &'a [String],
     ignored: Option<&'a Ignored>,
@@ -181,9 +138,6 @@ fn join(rel: &[u8], name: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Whether a policy pattern excludes `rel`: a pattern with a slash (also
-/// just a leading one) is a path from the root, one without matches that
-/// name at any depth.
 fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
     patterns.iter().any(|p| {
         let anchored = p.trim_end_matches('/').contains('/');
@@ -192,31 +146,21 @@ fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
     })
 }
 
-/// What git ignores in a worktree, as git itself says (`.gitignore` files,
-/// `info/exclude`, the user's excludes file; a tracked file is never
-/// ignored), less what the policy's `include` takes back. An ignored
-/// directory is one entry and is not looked into, unless a path in
-/// `include` lies inside it: then only the way to that path is.
 #[derive(Debug, Default, PartialEq)]
 pub struct Ignored {
-    /// Paths from the root; a directory's without its trailing slash.
     paths: HashSet<Vec<u8>>,
     include: Vec<String>,
-    /// The directories that lead to a path `include` names.
     on_way: HashSet<Vec<u8>>,
 }
 
-/// What the scan does with one entry.
 #[derive(Debug, PartialEq)]
 enum Take {
     Skip,
     Keep,
-    /// Kept, but only the way to an included path inside it is.
     OnlyTheWay,
 }
 
 impl Ignored {
-    /// Asks git; `None` where git cannot say (no repository, no git).
     pub fn from_git(root: &Path, include: &[String]) -> Option<Ignored> {
         let out = std::process::Command::new("git")
             .arg("-C")
@@ -247,7 +191,6 @@ impl Ignored {
         me
     }
 
-    /// As if git had listed `listed` (directories with a trailing slash).
     #[cfg(test)]
     pub fn for_test(listed: &[&str], include: &[String]) -> Ignored {
         Ignored::new(listed.iter().map(|p| p.as_bytes()), include)
@@ -270,8 +213,6 @@ impl Ignored {
         }
     }
 
-    /// Whether the scan left `rel` (a path from the root) out because git
-    /// ignores it.
     pub fn left_out(&self, rel: &[u8]) -> bool {
         let mut inside = false;
         let mut at = 0;
@@ -300,7 +241,6 @@ fn is_cache_dir(dir: &Path) -> bool {
 }
 
 impl Ctx<'_> {
-    /// What the index knows about `rel`.
     fn cached(&self, rel: &[u8]) -> Option<Entry> {
         match self.old {
             Some(old) => old.files.get(rel).copied(),
@@ -308,13 +248,8 @@ impl Ctx<'_> {
         }
     }
 
-    /// Scans one directory; returns its tree's digest. `inside`: the
-    /// directory is one git ignores, entered only on the way to a path the
-    /// policy includes.
     fn dir(&self, rel: &[u8], inside: bool) -> io::Result<Digest> {
         let abs = if rel.is_empty() { self.root.to_path_buf() } else { self.root.join(OsStr::from_bytes(rel)) };
-        // A rescan: the directory as it was, if nothing below it may have
-        // changed; else what it held, to tell what went.
         let mut before: Option<Tree> = None;
         if let Some(on_path) = &self.on_path {
             let was = self.m.dir_trees.lock().unwrap().get(rel).copied();
@@ -349,7 +284,6 @@ impl Ctx<'_> {
                 let child_abs = abs.join(OsStr::from_bytes(&name));
                 let md = match std::fs::symlink_metadata(&child_abs) {
                     Ok(m) => m,
-                    // Removed since the directory was listed.
                     Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
                     Err(e) => return Err(e),
                 };
@@ -407,7 +341,6 @@ impl Ctx<'_> {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "names in a directory are unique");
         let old: HashMap<&[u8], &Node> = before.iter().flat_map(|t| t.entries.iter().map(|(n, x)| (n.as_slice(), x))).collect();
-        // What was here and is not, or is no longer what it was.
         for (name, was) in &old {
             let now = entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)).ok().map(|i| &entries[i].1);
             let child = join(rel, name);
@@ -423,7 +356,6 @@ impl Ctx<'_> {
                 (Node::Symlink(_), _) => {}
             }
         }
-        // What is here and was not.
         let mut index = Vec::with_capacity(index_add.len());
         for (name, hash, size, e) in index_add {
             let new = !matches!(old.get(name.as_slice()), Some(Node::File { hash: h, .. }) if *h == hash);
@@ -441,7 +373,6 @@ impl Ctx<'_> {
         Ok(digest)
     }
 
-    /// Removes directory `rel` of the scan before, and all below it.
     fn forget(&self, rel: &[u8], digest: Digest) -> io::Result<()> {
         let tree = {
             let trees = self.m.trees.lock().unwrap();
@@ -465,18 +396,11 @@ impl Ctx<'_> {
     }
 }
 
-/// Scans the worktree at `root`, leaving out what `ignored` says git
-/// ignores.
 pub fn scan(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
     scan_dir(root, Some(old), None, exclude, ignored)
 }
 
-/// Scans the worktree again, looking only at the directories in `changed`
-/// (absolute paths), those above them and the root: every other directory
-/// of `prev` is taken as it was, without being looked at. `prev` must have
-/// been made with the same `exclude` and `ignored`; it becomes the result.
 pub fn rescan(root: &Path, prev: Scan, changed: &HashSet<PathBuf>, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
-    // The root is always listed: `graft_git` replaced its tree.
     let mut on_path: HashSet<Vec<u8>> = [Vec::new()].into_iter().collect();
     for dir in changed {
         let Ok(rel) = dir.strip_prefix(root) else { continue };
@@ -491,17 +415,11 @@ pub fn rescan(root: &Path, prev: Scan, changed: &HashSet<PathBuf>, exclude: &[St
     scan_dir(root, None, Some((prev, on_path)), exclude, ignored)
 }
 
-/// Scans a directory the client keeps itself (the history of
-/// [`crate::git::history`]): everything in it, against its own index.
 pub fn scan_store(dir: &Path, old: &Index) -> io::Result<Scan> {
     scan_dir(dir, Some(old), None, &[], None)
 }
 
-/// Shows `git` (see `git::thin`) as the worktree's `.git`, with what
-/// `history` holds (a [`scan_store`] of `git::history`'s packs) in its
-/// `objects` directory beside its own.
 pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>) -> io::Result<()> {
-    // Small and immutable: scanned from scratch, grafted into the root.
     let mut sub = scan_dir(git, Some(&Index::default()), None, &[], None)?;
     let put = |top: &mut Tree, name: &[u8], node: Node| {
         match top.entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)) {
@@ -525,12 +443,6 @@ pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>
     }
     let mut top = Tree::decode(&scan.trees[&scan.root])?;
     if root.join(".git").is_file() {
-        // A linked worktree: `.git` is a file that names the git
-        // directory, and it is shown as one. Build scripts tell the two
-        // apart (rust-analyzer's asks cargo to rerun it when
-        // `.git/HEAD` changes, and finds no such file in a linked
-        // worktree); showing a directory made every commit rerun the
-        // script and recompile the crate where stock cargo does not.
         let text = format!("gitdir: {}\n", rargo_proto::GIT_SIDE);
         let gitfile = git.parent().unwrap_or(git).join("gitfile-v1");
         if std::fs::read(&gitfile).ok().as_deref() != Some(text.as_bytes()) {
@@ -545,8 +457,6 @@ pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>
         put(&mut top, b".git", Node::Dir(sub.root));
     }
     let encoded = top.encode();
-    // The root without `.git` is not part of the tree any more (no
-    // directory below the root can equal it).
     scan.trees.remove(&scan.root);
     scan.root = rargo_proto::tree::digest(&encoded);
     scan.trees.insert(scan.root, encoded);
@@ -558,8 +468,6 @@ pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>
     Ok(())
 }
 
-/// The directory with the entries of both `a` and `b`, directories of the
-/// same name merged, `b`'s entry taken where one of them is a file.
 fn merge(trees: &mut HashMap<Digest, Vec<u8>>, a: Digest, b: Digest) -> io::Result<Digest> {
     let mut out = Tree::decode(&trees[&a])?;
     for (name, node) in Tree::decode(&trees[&b])?.entries {
@@ -588,7 +496,6 @@ fn scan_dir(
 ) -> io::Result<Scan> {
     let (m, on_path, root_before, files_before) = match prev {
         Some((mut p, on_path)) => {
-            // Not the worktree's: `graft_git` adds them again.
             for h in p.grafted.drain(..) {
                 if !p.refs.contains_key(&h) {
                     p.files.remove(&h);
@@ -626,7 +533,6 @@ fn scan_dir(
     let index = m.index.into_inner().unwrap();
     let relink = m.relink.into_inner().unwrap();
     if !relink.is_empty() {
-        // Another file with the same content stands in for the one gone.
         for (rel, e) in &index {
             if relink.contains(&e.hash) {
                 files.insert(e.hash, (root.join(OsStr::from_bytes(rel)), e.size));
@@ -636,13 +542,11 @@ fn scan_dir(
     let dir_trees = m.dir_trees.into_inner().unwrap();
     let mut trees = m.trees.into_inner().unwrap();
     if trees.len() > 2 * dir_trees.len() + 256 {
-        // Trees of earlier scans that no directory has any more.
         let live: HashSet<&Digest> = dir_trees.values().collect();
         trees.retain(|d, _| live.contains(d));
     }
     let worktree_root = trees.get(&root_digest).cloned().unwrap_or_default();
     let hashed_files = ctx.hashed_files.into_inner();
-    // Unchanged when nothing was read and no path came or went.
     let index_changed = hashed_files > 0 || ctx.removed.into_inner() > 0 || index.len() != files_before;
     Ok(Scan {
         root: root_digest,
@@ -691,7 +595,6 @@ mod tests {
         write(r, "node_modules/m/i.js", "m");
         let exclude = vec!["node_modules".to_string()];
         let whole = || scan(r, &Index::default(), &exclude, None).unwrap();
-        // Equal to a whole scan in everything the daemon uses.
         let same = |a: &Scan, b: &Scan| {
             assert_eq!(a.root, b.root);
             let sorted = |s: &Scan| {
@@ -712,40 +615,30 @@ mod tests {
                 assert!(a.trees.contains_key(d), "every directory's tree is at hand");
             }
         };
-        // Past the window in which a file just written is read again.
         std::thread::sleep(std::time::Duration::from_millis(120));
         let s0 = scan(r, &Index::default(), &exclude, None).unwrap();
-        // Only what is synced is a directory to watch.
         let rel: HashSet<&[u8]> = s0.dirs.iter().map(|d| d.strip_prefix(r).unwrap().as_os_str().as_bytes()).collect();
         assert_eq!(rel, [&b""[..], b"src", b"src/deep", b"docs", b"docs/old"].into_iter().collect());
         assert_eq!(s0.listed_dirs, 5);
 
-        // A file changed, a directory made and one removed, all in places
-        // the rescan is told about.
         write(r, "src/deep/x.rs", "changed");
         write(r, "src/deep/new/y.rs", "y");
         std::fs::remove_dir_all(r.join("docs/old")).unwrap();
         let told: HashSet<PathBuf> = [r.join("src/deep"), r.join("docs"), r.join("docs/old")].into_iter().collect();
         let s1 = rescan(r, s0, &told, &exclude, None).unwrap();
         same(&s1, &whole());
-        // The root, src and docs on the way, src/deep and docs told, the
-        // new directory below src/deep.
         assert_eq!(s1.listed_dirs, 5);
         assert_eq!(s1.hashed_files, 2, "only the changed and the new file are read");
         assert!(s1.index_changed);
 
-        // A change where the rescan is not told is not looked at.
         write(r, "docs/a.md", "unseen");
         let s2 = rescan(r, s1.clone(), &[r.join("src")].into_iter().collect(), &exclude, None).unwrap();
         assert_eq!(s2.root, s1.root);
         assert_eq!(s2.listed_dirs, 2, "the root and src; src/deep and src/deep/new are taken as they were");
         assert!(!s2.index_changed);
-        // Told, it is.
         let s3 = rescan(r, s2, &[r.join("docs")].into_iter().collect(), &exclude, None).unwrap();
         same(&s3, &whole());
 
-        // Of two files with the same content, the one recorded goes: the
-        // other stands in. Then the other goes too: so does the content.
         let shared = *blake3::hash(b"same").as_bytes();
         let recorded = s3.files[&shared].0.clone();
         std::fs::remove_file(&recorded).unwrap();
@@ -758,12 +651,9 @@ mod tests {
         same(&s5, &whole());
         assert!(!s5.files.contains_key(&shared));
 
-        // With nothing told, only the root is looked at.
         let s6 = rescan(r, s5.clone(), &HashSet::new(), &exclude, None).unwrap();
         same(&s6, &s5);
         assert_eq!(s6.listed_dirs, 1);
-        // Also after `.git` was grafted onto the root: what the graft
-        // added is not the worktree's.
         let mut grafted = s6;
         let elsewhere = tempfile::tempdir().unwrap();
         write(elsewhere.path(), "HEAD", "ref: refs/heads/main");
@@ -806,7 +696,6 @@ mod tests {
             other => panic!("{name}: {other:?}"),
         };
 
-        // Without the option nothing changes: everything is synced.
         let all = scan(r, &Index::default(), &[], None).unwrap();
         assert!(names(&all, &all.root).contains(&"node_modules".to_string()));
 
@@ -832,11 +721,9 @@ mod tests {
         }
         assert!(!ignored.left_out(b"data"), "data/ is not left out whole");
 
-        // Without `include`, an ignored directory is one entry, left out.
         let ignored = Ignored::from_git(r, &[]).unwrap();
         let s = scan(r, &Index::default(), &[], Some(&ignored)).unwrap();
         assert_eq!(names(&s, &s.root), [".gitignore", "kept.log", "src"]);
-        // Outside a repository git cannot say.
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(Ignored::from_git(elsewhere.path(), &[]).is_none());
     }
@@ -851,13 +738,11 @@ mod tests {
         write(&stand_in, "HEAD", "ref: refs/heads/main\n");
         std::fs::create_dir_all(main.join(".git")).unwrap();
         std::fs::write(linked.join(".git"), "gitdir: /elsewhere/.git/worktrees/linked\n").unwrap();
-        // A checkout with a git directory is shown with a directory.
         let mut s = scan(&main, &Index::default(), &[], None).unwrap();
         graft_git(&mut s, &main, &stand_in, None).unwrap();
         let top = tree(&s, &s.root);
         assert!(matches!(top.get(b".git"), Some(Node::Dir(_))));
         assert!(top.get(rargo_proto::GIT_SIDE.as_bytes()).is_none());
-        // History's packs, beside the stand-in's own.
         let store = tmp.path().join("cache/git-history/r/heads/c");
         write(&stand_in, "objects/pack/pack-1.pack", "pack");
         write(&store, "pack/pack-2.pack", "history");
@@ -871,7 +756,6 @@ mod tests {
         assert!(packs.get(b"pack-1.pack").is_some() && packs.get(b"pack-2.pack").is_some(), "both packs side by side");
         let Some(Node::File { hash, .. }) = packs.get(b"pack-2.pack").cloned() else { panic!() };
         assert_eq!(s.files[&hash].0, store.join("pack/pack-2.pack"), "sent from the store");
-        // A linked worktree with a file that names the directory beside it.
         let mut s = scan(&linked, &Index::default(), &[], None).unwrap();
         graft_git(&mut s, &linked, &stand_in, None).unwrap();
         let top = tree(&s, &s.root);
@@ -918,7 +802,6 @@ mod tests {
         assert!(s.index_changed);
         let lib = *blake3::hash(b"pub fn a() {}").as_bytes();
         assert_eq!(s.files[&lib], (r.join("src/lib.rs"), 13));
-        // A directory grafted in as `.git`.
         write(tmp.path(), "thin/HEAD", "ref: refs/heads/main\n");
         let mut g = scan(r, &Index::default(), &exclude, None).unwrap();
         graft_git(&mut g, r, &tmp.path().join("thin"), None).unwrap();
@@ -938,7 +821,6 @@ mod tests {
         write(r, "a.rs", "one");
         write(r, "d/b.rs", "two");
         let s1 = scan(r, &Index::default(), &[], None).unwrap();
-        // Hashed just after being written: not trusted yet.
         let s2 = scan(r, &s1.index, &[], None).unwrap();
         assert_eq!(s2.hashed_files, 2);
         assert_eq!(s2.root, s1.root);
@@ -949,12 +831,10 @@ mod tests {
         assert_eq!(s4.hashed_files, 0);
         assert!(!s4.index_changed);
         assert_eq!(s4.root, s1.root);
-        // An edit changes the root and is the only thing read.
         write(r, "d/b.rs", "two!");
         let s5 = scan(r, &s4.index, &[], None).unwrap();
         assert_eq!(s5.hashed_files, 1);
         assert_ne!(s5.root, s1.root);
-        // Same size, same content hash path: a removed file leaves the index.
         std::fs::remove_file(r.join("a.rs")).unwrap();
         let s6 = scan(r, &s5.index, &[], None).unwrap();
         assert!(s6.index_changed);

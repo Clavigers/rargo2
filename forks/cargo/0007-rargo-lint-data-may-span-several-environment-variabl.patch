@@ -1,4 +1,4 @@
-From d3c9be03fef62b1ccdb7c63b00f239ca220234e5 Mon Sep 17 00:00:00 2001
+From aeae24ec7ad9a211122c76a2db0607edc367930b Mon Sep 17 00:00:00 2001
 From: rargo <rargo@localhost>
 Date: Mon, 23 Nov 2026 08:49:40 +0100
 Subject: [PATCH 7/8] rargo: lint data may span several environment variables
@@ -8,10 +8,10 @@ Subject: [PATCH 7/8] rargo: lint data may span several environment variables
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index b6e752bdb..33163167f 100644
+index 7dc1636..4ad78a5 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -377,7 +377,7 @@ fn unused_externs_of(idx: u32) -> Option<String> {
+@@ -355,7 +355,7 @@ fn unused_externs_of(idx: u32) -> Option<String> {
      static LINES: OnceLock<HashMap<u32, (String, String)>> = OnceLock::new();
      let lines = LINES.get_or_init(|| {
          #[allow(clippy::disallowed_methods)]
@@ -20,6 +20,3 @@ index b6e752bdb..33163167f 100644
          serde_json::from_str(&raw).unwrap_or_default()
      });
      let (desc, line) = lines.get(&idx)?;
--- 
-2.54.0
-

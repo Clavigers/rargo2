@@ -1,20 +1,10 @@
 #!/bin/bash
-# End-to-end checks of the client daemon and its link to the server: one
-# long-lived session over the UDP transport, changes pushed as they happen,
-# survival of an address change, of a daemon's and a server's death, and
-# TCP where UDP does not get through.
-#
-#   dev/e2e-link.sh
-#
-# Server and client in separate network namespaces (dev/netns.sh), the
-# server blind to the client's directories. Needs root.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
 . "$work/env.sh"
 E=${RARGO_E2E_LINK:-$work/e2e-link}
-# The rig's directory (dev/netns.sh): RIG_STATE under $RARGO_WORK, or as it is if absolute.
 case ${RIG_STATE:-nstest} in /*) rig=$RIG_STATE ;; *) rig=$work/${RIG_STATE:-nstest} ;; esac
 proj=$E/ws
 export RARGO_HIDE=$E
@@ -25,7 +15,6 @@ bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail
 check() { if [ "$1" = 0 ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
 R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
 dstat() { R --rargo-daemon-status 2>&1; }
-# A figure from the server's sync line: the number before PATTERN.
 sync_n() { R --rargo-status | grep '^sync' | grep -oE "[0-9]+ $1" | head -1 | cut -d' ' -f1; }
 daemons() { pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" | wc -l; }
 
@@ -60,20 +49,15 @@ R --rargo-daemon-sync
 [ "$(sync_n 'files received')" = $((files + 1)) ]; check $? "an edit is on the server once the daemon has synced it ($files -> $(sync_n 'files received') files)" "$(R --rargo-status | grep '^sync')"
 out=$(R run -q 2>&1); [ "$out" = "value 2" ]; check $? "the build that follows sees the edit" "$out"
 [ "$(sync_n 'files asked for')" = "$asked" ]; check $? "and the server had nothing to ask for" "$(R --rargo-status | grep '^sync')"
-# An edit and a build in the same instant: the change rides ahead of the
-# request, in order with it.
 sed -i 's/{ 2 }/{ 3 }/' crates/util/src/lib.rs; out=$(R run -q 2>&1)
 [ "$out" = "value 3" ]; check $? "a build started in the instant of an edit sees it" "$out"
 [ "$(sync_n 'files asked for')" = "$asked" ]; check $? "again without the server asking" "$(R --rargo-status | grep '^sync')"
-# A new directory with a new crate in it.
 mkdir -p crates/extra/src
 printf '[package]\nname = "extra"\nversion = "0.1.0"\nedition = "2021"\n' >crates/extra/Cargo.toml
 echo 'pub fn more() -> i32 { 40 }' >crates/extra/src/lib.rs
 printf 'extra = { path = "../extra" }\n' >>crates/app/Cargo.toml
 echo 'fn main() { println!("value {}", util::value() + extra::more()); }' >crates/app/src/main.rs
 out=$(R run -q 2>&1); [ "$out" = "value 43" ]; check $? "a crate added in a new directory is built" "$out"
-# The new crate is on the server, so the edit that follows is a change
-# of its own and not folded into that push.
 R --rargo-daemon-sync
 echo 'pub fn more() -> i32 { 50 }' >crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 53" ]; check $? "and an edit inside the new directory is seen" "$out"
@@ -107,7 +91,6 @@ st=$(dstat)
 grep -q '^link  *udp; 2 made' <<<"$st"; check $? "over a second link" "$st"
 
 echo "== a command that is interrupted"
-# Match only this run's build script while another rig runs the same suite.
 slow="slow_$BASHPID"
 slow_script="^[^ ]*build/$slow/[0-9a-f]*/out/build_script_build[^ ]*\$"
 mkdir -p "crates/$slow/src"
@@ -120,13 +103,9 @@ fn main() {
 }
 EOF
 echo '' >"crates/$slow/src/lib.rs"
-# A noninteractive Bash ignores SIGINT for asynchronous commands.
 env --default-signal=INT nsenter --no-fork --net=/run/netns/${RIG:-rargo}-cl \
     "$RARGO_BIN/rargo" build -p "$slow" >"$E/slow.log" 2>&1 &
 cl=$!
-# The pattern is the script running, as a command of one word: its
-# compiler and its linker name the same file among their arguments, and
-# were taken for it when they were looked at first.
 tail -n +1 -f --pid="$cl" "$E/slow.log" | awk '/script-started/ { found=1; exit } END { exit found ? 0 : 1 }' || true
 script=$(pgrep -f "$slow_script" | head -1)
 [ -n "$script" ]; check $? "a build script is running on the server" "$(cat "$E/slow.log"; kill -0 $cl 2>/dev/null && echo "(the command is still running)")"
@@ -145,7 +124,6 @@ echo "== without a daemon"
 out=$(RARGO_NO_DAEMON=1 R run -q 2>&1); [ "$out" = "value 83" ]; check $? "RARGO_NO_DAEMON=1 runs the command in one process" "$out"
 
 echo "== UDP does not get through"
-# Drop every UDP datagram the client sends (in its own namespace).
 ip netns exec ${RIG:-rargo}-cl tc qdisc replace dev eth0 root handle 1: prio
 ip netns exec ${RIG:-rargo}-cl tc filter add dev eth0 parent 1: protocol ip u32 match ip protocol 17 0xff action drop
 export RARGO_CACHE_DIR=$E/cache-tcp
@@ -181,15 +159,12 @@ after=$(shown 'bytes fetched')
 [ "$after" -gt "$before" ]; check $? "($((after - before)) bytes fetched, $(shown 'bytes reused') reused from the cache)" "$(dstat)"
 real=$(find "$E/cache/blobs" -type f | wc -l)
 ! find target -maxdepth 0 -newer "$E/cache" -type f | grep -q .; [ "$(shown 'made real')" = 0 ]; check $? "nothing was copied into the worktree ($(shown 'made real') files made real)" "$(dstat)"
-# Stock cargo in the same directory: it reads what is shown and writes its own.
 out=$(cargo build --offline 2>&1); check $? "stock cargo builds in the same target/" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 103" ]; check $? "and its binary runs" "$out"
 out=$(cargo test --offline -q 2>&1); check $? "stock cargo test works there" "$out"
 sed -i 's/{ 100 }/{ 110 }/' crates/extra/src/lib.rs
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "rargo after stock cargo: the new build replaces what stock cargo left" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(the file in target/ is the new one)" "$out"
-# A directory is listed in several reads while compilers add and remove
-# their temporaries: what stays must always be listed.
 mkdir -p target/stress
 for i in $(seq 1 400); do : >"target/stress/keep-with-a-long-enough-name-$i"; done
 ( for r in $(seq 1 150); do for j in 1 2 3 4 5 6 7 8 9 10 11 12; do : >"target/stress/a-temporary-$j"; done; rm -f target/stress/a-temporary-*; done ) &
@@ -199,19 +174,14 @@ for r in $(seq 1 150); do [ "$(ls target/stress | grep -c '^keep')" = 400 ] || s
 wait $churn
 [ $short = 0 ]; check $? "a listing read while files come and go names every file that stays ($short of 150 listings were short)"
 rm -rf target/stress
-# Copying as a fallback, on request.
 out=$(RARGO_OUTPUT=copy R build 2>&1); check $? "RARGO_OUTPUT=copy builds" "$out"
 ! mounted; check $? "and target/ is a plain directory again"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "with the binary copied into it" "$out"
 out=$(R build 2>&1); mounted; check $? "the next command without it shows results again" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "(same binary)" "$out"
-# cargo clean has to be able to remove the directory.
 out=$(R clean 2>&1); rc=$?
 [ $rc = 0 ] && [ ! -e target ]; check $? "clean removes target/" "$out"
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "and the next build fills it again" "$out"
-# Stock cargo's clean, typed by someone who knows nothing of the mount:
-# when the directory's last entry goes, the daemon gives the directory back
-# before cargo comes to remove it.
 mounted; check $? "target/ is served again"
 out=$(cargo clean 2>&1); rc=$?
 [ $rc = 0 ] && [ ! -e target ]; check $? "stock cargo clean succeeds on a served target/ and removes it" "$out"
@@ -221,13 +191,6 @@ out=$(cargo build --offline 2>&1); rc=$?
 out=$(cargo clean 2>&1); check $? "(and cleans a plain target/ as ever)" "$out"
 out=$(R run -q 2>&1); [ "$out" = "value 113" ] && mounted; check $? "rargo builds there after a stock clean, and serves target/ again" "$out"
 [ -x target/debug/app ]; check $? "with its results shown"
-# A daemon that is killed outright cannot unmount. What it left watching
-# does, at once and with no rargo command run: target/ is never a dead
-# mount, and stock cargo works in the worktree.
-# Returns when each named guard has exited and the path is not a rargo
-# mount. A guard exits when its daemon does, and unmounts if the daemon
-# did not. Only those pids are waited on: an earlier daemon can still be
-# running with a guard whose title names this same path.
 unmounted() {
     local path=$1 g
     shift
@@ -237,8 +200,6 @@ unmounted() {
     done
     ! grep -q " $path [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo
 }
-# (The daemon of the TCP part above is still running, with a cache of its
-# own; it is not this one, and its mount here was replaced long ago.)
 mine() { pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"; }
 guard=$(pgrep -P "$(mine)" -f "^unmount-guard: $proj/target")
 [ -n "$guard" ]; check $? "a process of the daemon's watches the mount, and not under the daemon's name" "$(pgrep -af unmount-guard)"
@@ -256,7 +217,6 @@ mounted; check $? "which mounts target/ again"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and shows the binary" "$out"
 
 echo "== a binary is read by range"
-# A machine whose cache holds none of it.
 export RARGO_CACHE_DIR=$E/cache-ranged
 echo 'fn main() { if std::env::args().any(|a| a == "panic") { panic!("asked to panic") } println!("value {}", util::value() + extra::more()); }' >crates/app/src/main.rs
 out=$(R build 2>&1); check $? "a build for a machine that has fetched nothing" "$out"
@@ -269,7 +229,6 @@ out=$(RUST_BACKTRACE=1 ./target/debug/app panic 2>&1)
 grep -q 'asked to panic' <<<"$out" && grep -q 'app/src/main.rs:1' <<<"$out"; check $? "a panic prints a backtrace with files and lines, from debug sections it had not fetched" "$out"
 traced=$(($(shown 'bytes fetched') - before))
 [ "$traced" -gt "$ran" ]; check $? "(which it fetched for that: $traced bytes in all)" "$(dstat)"
-# Read through to the end, it is the content the server holds.
 stored=$(find "$RARGO_STATE/store" -type f -size "${size}c" -exec sha256sum {} + | cut -d' ' -f1 | sort -u)
 read_through=$(sha256sum <target/debug/app | cut -d' ' -f1)
 [ -n "$stored" ] && [ "$read_through" = "$stored" ]; check $? "read through to the end, the file is byte for byte the server's content" "stored: $stored, read: $read_through"
@@ -282,9 +241,6 @@ out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and runs" "$
 export RARGO_CACHE_DIR=$E/cache
 
 echo "== a user who may not mount"
-# An unprivileged user gets the virtual directory through fusermount3.
-# The user has to be able to reach the files, which nothing under /root
-# allows: this one part of the suite uses a directory in /tmp.
 U=$(mktemp -d /tmp/rargo-e2e-user.XXXXXX)
 mkdir -p "$U/bin" "$U/home"
 cp "$RARGO_BIN/rargo" "$U/bin/"
@@ -297,8 +253,6 @@ out=$(asuser "$U/bin/rargo" build 2>&1); check $? "an unprivileged user builds" 
 grep -q " $U/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo; check $? "and has the virtual output directory (mounted through fusermount3)" "$(grep "$U" /proc/self/mountinfo; tail -3 "$U/cache/daemon.log")"
 out=$(asuser "$U/target/debug/app" 2>&1); [ "$out" = "value 113" ]; check $? "the binary runs out of it" "$out"
 out=$(asuser sh -c 'echo x >target/note && cat target/note' 2>&1); [ "$out" = x ]; check $? "the user can write there" "$out"
-# This user's daemon killed: the mount was made by fusermount3, and is
-# unmounted through it.
 ug=$(pgrep -f "^unmount-guard: $U/target$" || true)
 pkill -KILL -f "$U/bin/rargo --rargo-daemon "
 unmounted "$U/target" $ug; check $? "a killed daemon of this user leaves no mount either" "$(grep "$U" /proc/self/mountinfo)"

@@ -1,14 +1,4 @@
 #!/bin/bash
-# Flake-restricted sandboxes and cache portability between "machines".
-#
-# Two build servers with separate state directories and cargo homes, each
-# with a client whose worktree is at a different path and hidden from both
-# servers, stand in for two sites. A build on A is exported, imported on B,
-# and B must then build the same commit without running any compiler, build
-# script or test. The project has a registry dependency, so the servers
-# also fetch it themselves.
-#
-# Needs Nix with flakes and network access for the first evaluation.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -24,11 +14,11 @@ has() { grep -qF -- "$2" <<<"$1"; }
 
 base=${RARGO_E2E_FLAKE_PORT:-7471}
 port() { case $1 in a) echo $base ;; b) echo $((base + 1)) ;; esac; }
-daemon() { # name action
+daemon() {
     RARGO_LOG_ACTIONS=1 RARGO_CACHE_DIR=$T/home-$1/.cache/rargo RARGO_STATE=$T/state-$1 RARGO_SERVER=127.0.0.1:$(port "$1") RARGO_SERVER_CARGO_HOME=$T/state-$1/cargo-home \
         RARGO_HIDE="$T/a $T/b $T/home-a $T/home-b" "$repo/dev/rargod.sh" "$2" >/dev/null 2>&1
 }
-on() { # machine, command...
+on() {
     local m=$1; shift
     RARGO_SERVER=127.0.0.1:$(port "$m") RARGO_CACHE_DIR=$T/home-$m/.cache/rargo HOME=$T/home-$m CARGO_HOME=$T/home-$m/.cargo "$@"
 }
@@ -37,8 +27,6 @@ actions_since() { tail -n "+$(($1 + 1))" "$log" | sed -n 's/^rargod: action //p'
 
 daemon a stop; daemon b stop
 rm -rf "$T"; mkdir -p "$T/home-a" "$T/home-b" "$T/a" "$T/b/somewhere/else"
-# A server's cargo home holds rustup's proxies in bin; here one that fails
-# if it ever runs, since a build's tools are its flake's.
 mkdir -p "$T/state-a/cargo-home/bin"
 printf '#!/bin/sh\necho "the server cargo home bin'"'"'s cargo-clippy ran" >&2\nexit 1\n' >"$T/state-a/cargo-home/bin/cargo-clippy"
 chmod +x "$T/state-a/cargo-home/bin/cargo-clippy"
@@ -58,7 +46,6 @@ cat >"$P/flake.nix" <<'NIX'
     };
 }
 NIX
-# Reuse a lock file if one was made before, so the same nixpkgs is used.
 [ -f "$work/flake-test/proj/flake.lock" ] && cp "$work/flake-test/proj/flake.lock" "$P/flake.lock"
 cat >"$P/Cargo.toml" <<'TOML'
 [package]
@@ -173,15 +160,10 @@ has "$out" "imported" && ok "$out" || bad "import" "$out"
 before=$(runs b)
 log=$T/state-b/rargod.log
 start_line=$(wc -l <"$log")
-# Use A's command line so it can also replay the imported plan.
 out=$(RARGO_EXPLAIN=1 on b "$R" build 2>&1); rc=$?
 after=$(runs b)
 actions=$(actions_since "$start_line")
 [ $rc -eq 0 ] && ok "B builds" || bad "B builds" "$out"
-# The imported cache does not populate B's Cargo registry. Offline planning
-# can fail while Cargo downloads the locked dependency. After the fetch
-# reuse the imported plan when its observations still match. Compiler and
-# build script actions must all be cache hits.
 plan_ok='Plan [cargo (planning)] exit=Some(0) tainted=false'
 plan_offline='Plan [cargo (planning)] exit=Some(101) tainted=false'
 reuse=
@@ -189,10 +171,6 @@ case "$((after - before)):$actions" in
     "0:"|"1:$plan_ok"|"1:$plan_offline")
         reuse="B ran $((after - before)) planning action(s): compilers and build scripts all came from A's cache" ;;
     "2:$plan_offline"$'\n'"$plan_ok")
-        # The sparse index stores an HTTP cache validator alongside package
-        # records. Cargo can fetch different index bytes for the exact same
-        # locked crate. The planner observes the index; the build units do
-        # not. Allow a second plan only when its explanation names this.
         index_change=$(grep '^note: planning runs because /c/registry/index/[^/]*/\.cache/an/yh/anyhow was File .* is now a file of ' <<<"$out")
         if [ -n "$index_change" ] && [ "$(grep '^note: planning runs because ' <<<"$out" | tail -n 1)" = "$index_change" ]; then
             reuse="B replanned because the sparse index for the locked anyhow crate changed: $index_change"
@@ -239,9 +217,6 @@ wk_port=$((base + 3))
 nw_srv=
 nw_worker=
 trap 'kill ${nw_srv:-} ${nw_worker:-} 2>/dev/null; daemon a stop; daemon b stop' EXIT
-# The first compiles have no trace yet, so the server would keep them.
-# Eager dispatch sends them to the worker while the one local core is busy,
-# which is what shows that the worker can build without the host store.
 RARGO_HEDGE=0 RARGO_DISPATCH=eager systemd-run --scope -q -p CPUQuota=400% -p MemoryMax=20G -p Delegate=yes \
     "$bin/rargod" --state "$T/state-nw" --listen "127.0.0.1:$nw_port" \
     --workers-listen "127.0.0.1:$wk_port" \

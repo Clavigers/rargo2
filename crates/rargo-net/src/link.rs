@@ -1,15 +1,3 @@
-//! The link between a client daemon and the server: one long-lived,
-//! encrypted message channel per daemon.
-//!
-//! Normally it is a connection of the reliable-UDP transport, which keeps
-//! its congestion window between commands, follows the client when its
-//! address changes and delivers messages independently of each other. Where
-//! UDP does not get through, the same messages travel over one TCP
-//! connection, sealed as records (`rargo_proto::secure`).
-//!
-//! Messages may overtake each other on the UDP form; whoever needs an order
-//! numbers the messages (see `rargo_proto::Reorder`).
-
 use crate::{Auth, Conn, Endpoint};
 use rargo_proto::secure::{self, Opener, Sealer};
 use std::io;
@@ -33,11 +21,9 @@ pub enum Link {
     Tcp(TcpLink),
 }
 
-/// How long the UDP key agreement may take before TCP is tried.
 const UDP_WAIT: Duration = Duration::from_millis(2500);
 
 impl Link {
-    /// Wraps a TCP connection whose handshake is done.
     pub fn tcp(stream: TcpStream, sealer: Sealer, opener: Opener) -> Link {
         let _ = stream.set_nodelay(true);
         let (rd, wr) = stream.into_split();
@@ -49,9 +35,6 @@ impl Link {
         })
     }
 
-    /// Connects to the server as `user`: over UDP, or over TCP if no answer
-    /// comes back that way. `transport` is `"udp"`, `"tcp"` or anything
-    /// else for "UDP first".
     pub async fn connect(server: SocketAddr, user: &str, psk: &[u8; 32], transport: &str) -> io::Result<Link> {
         let mut udp_error = None;
         if transport != "tcp" {
@@ -60,7 +43,6 @@ impl Link {
             let wait = if transport == "udp" { Duration::from_secs(20) } else { UDP_WAIT };
             match tokio::time::timeout(wait, endpoint.connect(server)).await {
                 Ok(Ok(conn)) => return Ok(Link::Udp(conn, endpoint)),
-                // The server answered and said no: TCP would say the same.
                 Ok(Err(e)) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
                 Ok(Err(e)) => udp_error = Some(e),
                 Err(_) => udp_error = Some(io::Error::new(io::ErrorKind::TimedOut, "no answer over UDP")),
@@ -71,7 +53,6 @@ impl Link {
         }
         let mut stream = match TcpStream::connect(server).await {
             Ok(s) => s,
-            // Report the more telling of the two failures.
             Err(e) => return Err(if e.kind() == io::ErrorKind::ConnectionRefused { e } else { udp_error.unwrap_or(e) }),
         };
         let _ = stream.set_nodelay(true);
@@ -116,7 +97,6 @@ impl Link {
         }
     }
 
-    /// The next message; `None` once the link is closed or broken.
     pub async fn recv(&self) -> Option<Vec<u8>> {
         match self {
             Link::Udp(c, _) => c.recv().await,
@@ -164,8 +144,6 @@ impl Link {
         }
     }
 
-    /// Time since anything arrived from the peer (UDP), for telling a dead
-    /// peer from a quiet one.
     pub fn idle(&self) -> Duration {
         match self {
             Link::Udp(c, _) => c.idle(),

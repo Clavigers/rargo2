@@ -1,4 +1,4 @@
-From 488c0fec8d5aeff1072ad553f3d2f51c769b274e Mon Sep 17 00:00:00 2001
+From 3d5760c8bd69d049419cf93c0af212c6e7a42da9 Mon Sep 17 00:00:00 2001
 From: rargo <rargo@localhost>
 Date: Mon, 23 Nov 2026 10:25:49 +0100
 Subject: [PATCH 8/8] rargo: plan carries --timings and the future-incompat
@@ -6,14 +6,14 @@ Subject: [PATCH 8/8] rargo: plan carries --timings and the future-incompat
 
 ---
  src/compiler/rargo.rs       | 10 ++++++++++
- src/compiler/timings/mod.rs |  3 +++
- 2 files changed, 13 insertions(+)
+ src/compiler/timings/mod.rs |  1 +
+ 2 files changed, 11 insertions(+)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index 33163167f..c53de4866 100644
+index 4ad78a5..c22f5ec 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -71,6 +71,9 @@ struct Global {
+@@ -59,6 +59,9 @@ struct Global {
      deny_warnings: bool,
      rustc_fork: bool,
      dep_info_basedir: Option<String>,
@@ -23,7 +23,7 @@ index 33163167f..c53de4866 100644
  }
  
  fn state() -> &'static Mutex<State> {
-@@ -158,6 +161,9 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+@@ -145,6 +148,9 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
          verbosity: verbosity(gctx.shell().verbosity()),
          extra_verbose: gctx.extra_verbose(),
          keep_going: bcx.build_config.keep_going,
@@ -33,7 +33,7 @@ index 33163167f..c53de4866 100644
          deny_warnings: gctx.warning_handling()? == crate::context::WarningHandling::Deny,
          rustc_fork: bcx
              .target_data
-@@ -315,6 +321,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
+@@ -300,6 +306,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
          desc: super::descriptive_pkg_name(&unit.pkg.name(), &unit.target, &unit.mode),
          verb,
          is_local: unit.is_local(),
@@ -41,7 +41,7 @@ index 33163167f..c53de4866 100644
          show_warnings: unit.show_warnings(gctx),
          fix_hint,
          pkg_spec: unit.pkg.package_id().to_spec().to_string(),
-@@ -690,6 +697,9 @@ pub fn finish() -> CargoResult<()> {
+@@ -643,6 +650,9 @@ pub fn finish() -> CargoResult<()> {
          verbosity: g.verbosity,
          extra_verbose: g.extra_verbose,
          keep_going: g.keep_going,
@@ -52,20 +52,14 @@ index 33163167f..c53de4866 100644
          no_fail_fast,
          nocapture,
 diff --git a/src/compiler/timings/mod.rs b/src/compiler/timings/mod.rs
-index 4befbc61a..8229b24b1 100644
+index 4befbc6..2183819 100644
 --- a/src/compiler/timings/mod.rs
 +++ b/src/compiler/timings/mod.rs
-@@ -281,7 +281,10 @@ impl<'gctx> Timings<'gctx> {
-         build_runner: &BuildRunner<'_, '_>,
+@@ -282,6 +282,7 @@ impl<'gctx> Timings<'gctx> {
          error: &Option<anyhow::Error>,
      ) -> CargoResult<()> {
-+        // When planning for rargo nothing was compiled here: the server
-+        // that runs the plan writes the report.
          if let Some(logger) = build_runner.bcx.logger
 +            && !crate::compiler::rargo::active()
              && let Some(logs) = logger.get_logs()
          {
              let timings_path = build_runner
--- 
-2.54.0
-

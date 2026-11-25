@@ -1,15 +1,3 @@
-//! Running a process inside an action's sandbox.
-//!
-//! The daemon never forks itself. A small single-threaded zygote process
-//! (the same binary, re-executed) receives spawn requests over a socket,
-//! clones a child into fresh mount, PID, network, IPC and UTS namespaces, and
-//! reports exit status and resource usage back.
-//!
-//! Inside the PID namespace the cloned child is a minimal init: it builds the
-//! mount tree, pivots into the action's directory, runs the real command as
-//! PID 2 and exits when that command does, which makes the kernel kill
-//! anything the command left behind.
-
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -25,26 +13,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NetMode {
-    /// Fresh network namespace with only loopback.
     Loopback,
-    /// The host's network.
     Host,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Bind {
     pub host: PathBuf,
-    /// Absolute path inside the sandbox.
     pub inside: Vec<u8>,
     pub read_only: bool,
 }
 
-/// First file descriptor number given to extra inherited descriptors.
 pub const EXTRA_FD_BASE: i32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpawnReq {
-    /// Directory that becomes `/`.
     pub root: PathBuf,
     pub argv: Vec<Vec<u8>>,
     pub env: Vec<(Vec<u8>, Vec<u8>)>,
@@ -53,15 +36,12 @@ pub struct SpawnReq {
     pub gid: u32,
     pub net: NetMode,
     pub binds: Vec<Bind>,
-    /// cgroup directory to place the action in, if any.
     pub cgroup: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct ExitInfo {
-    /// Raw wait status of the command.
     pub status: i32,
-    /// Set when the sandbox could not be built or the program not executed.
     pub setup_failed: bool,
     pub user_us: u64,
     pub sys_us: u64,
@@ -92,7 +72,6 @@ enum FromZygote {
     Exited { id: u64, info: ExitInfo },
 }
 
-/// Handle to the zygote, held by the daemon.
 pub struct Zygote {
     sock: Mutex<UnixStream>,
     pending: Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<ExitInfo>>>>,
@@ -109,10 +88,8 @@ fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> 
     assert!(payload.len() <= u32::MAX as usize);
     assert!(fds.len() <= 16, "descriptors per message fit the control buffer");
     let len = (payload.len() as u32).to_le_bytes();
-    // The fds travel with the 4-byte length header.
     let mut iov = libc::iovec { iov_base: len.as_ptr() as *mut _, iov_len: 4 };
     let mut cbuf = [0u8; 128];
-    // SAFETY: zeroed msghdr is valid; fields are filled in below.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
@@ -121,7 +98,6 @@ fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> 
         assert!(space <= cbuf.len());
         msg.msg_control = cbuf.as_mut_ptr() as *mut _;
         msg.msg_controllen = space;
-        // SAFETY: control buffer is large enough for one cmsg with fds.len() ints.
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -131,7 +107,6 @@ fn send_msg(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> 
         }
     }
     loop {
-        // SAFETY: msg points to valid iov and control buffers.
         let r = unsafe { libc::sendmsg(sock.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -156,13 +131,11 @@ fn recv_msg(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     while got < 4 {
         let mut iov = libc::iovec { iov_base: len[got..].as_mut_ptr() as *mut _, iov_len: 4 - got };
         let mut cbuf = [0u8; 128];
-        // SAFETY: zeroed msghdr is valid; fields are filled in below.
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
         msg.msg_control = cbuf.as_mut_ptr() as *mut _;
         msg.msg_controllen = cbuf.len();
-        // SAFETY: msg points to valid buffers.
         let r = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -176,7 +149,6 @@ fn recv_msg(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
         }
         got += r as usize;
         assert!(got <= 4);
-        // SAFETY: walking the control messages the kernel filled in.
         unsafe {
             let mut c = libc::CMSG_FIRSTHDR(&msg);
             while !c.is_null() {
@@ -199,12 +171,9 @@ fn recv_msg(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
 }
 
 impl Zygote {
-    /// Starts the zygote by executing `exe --internal-zygote <fd>`.
     pub fn start(exe: &Path) -> Result<Arc<Zygote>> {
         let (ours, theirs) = UnixStream::pair()?;
-        // The child's end must survive exec.
         let theirs_fd = theirs.as_raw_fd();
-        // SAFETY: clearing FD_CLOEXEC on a valid fd.
         unsafe { libc::fcntl(theirs_fd, libc::F_SETFD, 0) };
         let child = std::process::Command::new(exe)
             .arg("--internal-zygote")
@@ -223,7 +192,6 @@ impl Zygote {
                     let _ = tx.send(info);
                 }
             }
-            // Zygote is gone: fail everything still waiting.
             p2.lock().clear();
         })?;
         Ok(Arc::new(Zygote {
@@ -234,9 +202,6 @@ impl Zygote {
         }))
     }
 
-    /// Spawns a sandboxed process. `stdout` and `stderr` are handed to it;
-    /// `extra` descriptors appear in the process as fds `EXTRA_FD_BASE..`
-    /// (they stay open in the caller).
     pub fn spawn(
         &self,
         req: SpawnReq,
@@ -277,7 +242,6 @@ impl Zygote {
 
 impl Drop for Zygote {
     fn drop(&mut self) {
-        // Closing the socket makes the zygote kill its children and exit.
         let _ = self.sock.lock().shutdown(std::net::Shutdown::Both);
         if let Some(mut c) = self.child.lock().take() {
             let _ = c.wait();
@@ -285,9 +249,6 @@ impl Drop for Zygote {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Zygote process
-// ---------------------------------------------------------------------------
 
 struct Child {
     id: u64,
@@ -295,18 +256,13 @@ struct Child {
     started: std::time::Instant,
 }
 
-/// Entry point of the zygote process. Never returns.
 pub fn zygote_main(fd: RawFd) -> ! {
-    // SAFETY: the fd was inherited from the daemon for this purpose.
     let sock = unsafe { UnixStream::from_raw_fd(fd) };
-    // SAFETY: plain syscalls configuring this process.
     unsafe {
         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
         libc::prctl(libc::PR_SET_NAME, c"rargo-zygote".as_ptr());
     }
-    // SIGCHLD through a signalfd so one poll covers requests and exits.
-    // SAFETY: standard signal mask and signalfd setup.
     let sigfd = unsafe {
         let mut mask: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut mask);
@@ -321,14 +277,12 @@ pub fn zygote_main(fd: RawFd) -> ! {
             libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: sigfd, events: libc::POLLIN, revents: 0 },
         ];
-        // SAFETY: fds is a valid array of two pollfds.
         let r = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
         if r < 0 {
             continue;
         }
         if fds[1].revents != 0 {
             let mut buf = [0u8; 1024];
-            // SAFETY: draining the signalfd into a local buffer.
             while unsafe { libc::read(sigfd, buf.as_mut_ptr() as *mut _, buf.len()) } > 0 {}
             reap(&sock, &mut children, &mut by_id);
         }
@@ -354,16 +308,13 @@ pub fn zygote_main(fd: RawFd) -> ! {
                     }
                     Ok(ToZygote::Kill { id }) => {
                         if let Some(pid) = by_id.get(&id) {
-                            // SAFETY: signalling a child we created.
                             unsafe { libc::kill(*pid, libc::SIGKILL) };
                         }
                     }
                     Err(_) => {}
                 },
-                // Daemon is gone.
                 Ok(None) | Err(_) => {
                     for pid in children.keys() {
-                        // SAFETY: signalling children we created.
                         unsafe { libc::kill(*pid, libc::SIGKILL) };
                     }
                     std::process::exit(0);
@@ -376,9 +327,7 @@ pub fn zygote_main(fd: RawFd) -> ! {
 fn reap(sock: &UnixStream, children: &mut HashMap<i32, Child>, by_id: &mut HashMap<u64, i32>) {
     loop {
         let mut status = 0i32;
-        // SAFETY: zeroed rusage is valid for wait4 to fill.
         let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-        // SAFETY: valid out-pointers.
         let pid = unsafe { libc::wait4(-1, &mut status, libc::WNOHANG, &mut ru) };
         if pid <= 0 {
             return;
@@ -386,7 +335,6 @@ fn reap(sock: &UnixStream, children: &mut HashMap<i32, Child>, by_id: &mut HashM
         let Some(child) = children.remove(&pid) else { continue };
         assert_eq!(by_id.remove(&child.id), Some(pid));
         assert_eq!(children.len(), by_id.len());
-        // Init reports the command's own wait status through the pipe.
         let mut buf = [0u8; 5];
         let mut f = std::fs::File::from(child.status_pipe);
         let mut info = ExitInfo {
@@ -403,7 +351,6 @@ fn reap(sock: &UnixStream, children: &mut HashMap<i32, Child>, by_id: &mut HashM
                 info.setup_failed = buf[4] != 0;
             }
             Err(_) => {
-                // Init died without reporting (killed, or setup crashed).
                 if !libc::WIFSIGNALED(status) {
                     info.setup_failed = true;
                 }
@@ -424,11 +371,9 @@ fn path_cstr(p: &Path) -> CString {
 
 fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
-    // SAFETY: fds is a valid two-element array.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: both fds were just created.
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
@@ -444,8 +389,6 @@ fn spawn_init(
     if req.net == NetMode::Loopback {
         flags |= libc::CLONE_NEWNET;
     }
-    // SAFETY: raw clone with a null stack behaves like fork; the zygote is
-    // single-threaded, so the child may run arbitrary code.
     let pid = unsafe {
         libc::syscall(libc::SYS_clone, (flags | libc::SIGCHLD) as libc::c_ulong, 0usize, 0usize, 0usize, 0usize)
     } as i32;
@@ -454,13 +397,10 @@ fn spawn_init(
     }
     if pid == 0 {
         drop(status_r);
-        // Into the action's cgroup before anything else is forked, so that
-        // every process of the action is accounted there ("0" is "me").
         if let Some(cg) = &req.cgroup {
             let _ = std::fs::write(cg.join("cgroup.procs"), "0");
         }
         let code = init_main(req, stdin, stdout, stderr, extras, status_w);
-        // SAFETY: terminating the init process without running destructors.
         unsafe { libc::_exit(code) };
     }
     Ok((pid, status_r))
@@ -471,7 +411,6 @@ fn mount(src: Option<&Path>, tgt: &Path, fstype: Option<&str>, flags: libc::c_ul
     let tgt_c = path_cstr(tgt);
     let fs_c = fstype.map(|s| CString::new(s).unwrap());
     let data_c = data.map(|s| CString::new(s).unwrap());
-    // SAFETY: all pointers are valid C strings or null.
     let r = unsafe {
         libc::mount(
             src_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
@@ -525,8 +464,6 @@ fn setup_mounts(req: &SpawnReq) -> io::Result<()> {
         }
     }
     let root_c = path_cstr(root);
-    // SAFETY: plain syscalls with valid C strings; pivot_root(".", ".")
-    // stacks the old root under the new one, which is then detached.
     unsafe {
         if libc::chdir(root_c.as_ptr()) != 0 {
             return Err(io::Error::last_os_error());
@@ -545,7 +482,6 @@ fn setup_mounts(req: &SpawnReq) -> io::Result<()> {
 }
 
 fn loopback_up() {
-    // SAFETY: standard SIOCSIFFLAGS on a fresh datagram socket.
     unsafe {
         let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
         if s < 0 {
@@ -564,7 +500,6 @@ fn loopback_up() {
 
 fn write_all_fd(fd: RawFd, mut b: &[u8]) {
     while !b.is_empty() {
-        // SAFETY: writing from a valid slice.
         let r = unsafe { libc::write(fd, b.as_ptr() as *const _, b.len()) };
         if r <= 0 {
             return;
@@ -573,7 +508,6 @@ fn write_all_fd(fd: RawFd, mut b: &[u8]) {
     }
 }
 
-/// PID 1 of the sandbox.
 fn init_main(
     req: &SpawnReq,
     stdin: Option<OwnedFd>,
@@ -588,7 +522,6 @@ fn init_main(
         buf[4] = setup_failed as u8;
         write_all_fd(status_w.as_raw_fd(), &buf);
     };
-    // SAFETY: plain prctl/sethostname calls.
     unsafe {
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
         let name = b"rargo";
@@ -606,7 +539,6 @@ fn init_main(
         report(126 << 8, true);
         return 126;
     };
-    // SAFETY: init is single-threaded; fork is safe.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         report(126 << 8, true);
@@ -614,13 +546,10 @@ fn init_main(
     }
     if pid == 0 {
         drop(exec_r);
-        // Move the error pipe out of the range the extra descriptors land in.
-        // SAFETY: duplicating a valid fd.
         let exec_w_hi = unsafe { libc::fcntl(exec_w.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
         drop(exec_w);
         let err = exec_child(req, stdin, stdout, stderr, extras);
         write_all_fd(exec_w_hi, &err.raw_os_error().unwrap_or(libc::EIO).to_le_bytes());
-        // SAFETY: terminating the failed child.
         unsafe { libc::_exit(127) };
     }
     drop(exec_w);
@@ -636,12 +565,9 @@ fn init_main(
         let prog = String::from_utf8_lossy(req.argv.first().map(|v| &v[..]).unwrap_or(b""));
         write_all_fd(stderr_fd, format!("rargo: cannot execute `{prog}`: {e}\n").as_bytes());
     }
-    // SAFETY: closing our copy of the fd.
     unsafe { libc::close(stderr_fd) };
-    // Reap until the command itself exits.
     loop {
         let mut status = 0;
-        // SAFETY: valid out-pointer.
         let r = unsafe { libc::waitpid(-1, &mut status, 0) };
         if r == pid {
             report(status, exec_failed);
@@ -661,8 +587,6 @@ fn exec_child(
     stderr: OwnedFd,
     extras: Vec<OwnedFd>,
 ) -> io::Error {
-    // SAFETY: fd juggling and credential changes in a freshly forked,
-    // single-threaded child.
     unsafe {
         match &stdin {
             Some(fd) => {
@@ -678,8 +602,6 @@ fn exec_child(
         }
         libc::dup2(stdout.as_raw_fd(), 1);
         libc::dup2(stderr.as_raw_fd(), 2);
-        // Extra descriptors: first out of the way, then to their final
-        // numbers (dup2 clears close-on-exec).
         let parked: Vec<i32> =
             extras.iter().map(|fd| libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100)).collect();
         drop(extras);
@@ -688,7 +610,6 @@ fn exec_child(
                 return io::Error::last_os_error();
             }
         }
-        // Everything else was opened O_CLOEXEC.
         let mut mask: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut mask);
         libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
@@ -743,7 +664,6 @@ fn exec_child(
     let mut last = io::Error::from_raw_os_error(libc::ENOENT);
     for c in candidates {
         let c = cstr(&c);
-        // SAFETY: argv and envp are NULL-terminated arrays of valid C strings.
         unsafe { libc::execve(c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
         let e = io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::ENOENT) && e.raw_os_error() != Some(libc::ENOTDIR) {

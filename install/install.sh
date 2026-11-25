@@ -1,12 +1,4 @@
 #!/bin/sh
-# Installs the rargo client: one static binary for Linux x86_64.
-#
-#   curl -fsSL https://rargo.rs/install.sh | sh
-#   curl -fsSL https://rargo.rs/install.sh | sh -s -- 0.2.1        a given version
-#
-# RARGO_INSTALL_DIR chooses where it goes (default: ~/.cargo/bin if it
-# exists, else ~/.local/bin). RARGO_DL chooses where it comes from.
-# `cargo install rargo` builds the same client from source.
 set -eu
 version=${1:-latest}
 base=${RARGO_DL:-https://rargo.rs/dl}
@@ -20,8 +12,6 @@ else dir=$HOME/.local/bin
 fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-# "latest" is turned into its number first, so that every file comes from
-# an address that never changes what it holds.
 if [ "$version" = latest ]; then
     version=$(curl -fsSL "$base/VERSION") || { echo "cannot read $base/VERSION" >&2; exit 1; }
 fi

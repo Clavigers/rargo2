@@ -1,11 +1,3 @@
-//! The action engine: given an action and the view it should run against,
-//! produce its result by the cheapest sound means.
-//!
-//! 1. A recorded trace whose observations all hold in the view: replay.
-//! 2. The same action already running for someone whose predicted inputs
-//!    agree with ours: wait, then check its trace against our view.
-//! 3. Otherwise run it in a sandbox, record the trace, store the outputs.
-
 use crate::hash::{Hash, KeyHasher};
 use crate::sandbox::{EXTRA_FD_BASE, SpawnReq, Zygote};
 use crate::sandboxfs::{ActionFs, ActionFsConfig, SandboxFs, UpperKind};
@@ -22,34 +14,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncReadExt;
 
-/// Receives an action's output, live or replayed.
 pub trait Observer: Send + Sync {
-    /// The action was not in the cache; it is about to run (or to wait for
-    /// an identical run already in flight).
     fn miss(&self) {}
-    /// Whether [`Observer::explain`] should be called on a miss.
     fn wants_explanation(&self) -> bool {
         false
     }
-    /// Why the cache did not have the action.
     fn explain(&self, _why: &str) {}
     fn stdout(&self, _data: &[u8]) {}
-    /// One line of stderr without the newline. `live` is present while the
-    /// action is actually running.
     fn stderr_line(&self, _line: &[u8], _live: Option<&dyn Live>) {}
 }
 
 pub struct NullObserver;
 impl Observer for NullObserver {}
 
-/// Access to a running action's upper layer.
 pub trait Live {
-    /// Stores a file the action has finished writing, before the action
-    /// ends, and returns its manifest entry.
     fn ingest(&self, path: &[u8]) -> Option<MEntry>;
 }
 
-/// [`Live`] for an action running on this machine.
 pub struct LiveCtl<'a> {
     action: &'a Arc<ActionFs>,
     store: &'a Store,
@@ -63,22 +44,14 @@ impl Live for LiveCtl<'_> {
     }
 }
 
-/// Asks a connected client for the values of variables.
 pub type EnvAsker = Arc<
     dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<(String, Option<String>)>>> + Send>>
         + Send
         + Sync,
 >;
 
-/// What the server knows of a client's environment.
-///
-/// A client sends the variables on the protocol's allow-list with its
-/// request. Any other variable is unknown until some action declares that it
-/// reads it; the client is then asked for it (and remembers to send it next
-/// time).
 pub struct ClientEnv {
     vars: parking_lot::RwLock<HashMap<String, String>>,
-    /// Names outside the allow-list the client has answered for.
     checked: parking_lot::RwLock<std::collections::HashSet<String>>,
     asker: Option<EnvAsker>,
 }
@@ -104,7 +77,6 @@ impl ClientEnv {
         self.vars.read().clone()
     }
 
-    /// Makes sure the client's values of `names` are known.
     pub async fn ensure(&self, names: &[String]) -> Result<()> {
         let Some(asker) = &self.asker else { return Ok(()) };
         let unknown: Vec<String> = {
@@ -133,28 +105,17 @@ impl ClientEnv {
 pub struct Request {
     pub spec: ActionSpec,
     pub view: Arc<dyn View>,
-    /// The requesting client's environment, consulted for variables the
-    /// action declares an interest in.
     pub client_env: Arc<ClientEnv>,
     pub uid: u32,
     pub gid: u32,
     pub prio: Priority,
-    /// Do not replay; always run.
     pub no_cache: bool,
-    /// Whether a finished run may be stored.
     pub cacheable: Arc<dyn Fn(&ActionResult) -> bool + Send + Sync>,
-    /// Environment variables the action turned out to depend on, derived
-    /// from its outputs.
     pub declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String> + Send + Sync>,
     pub observer: Arc<dyn Observer>,
-    /// The files of the state the view shows under the spec's `discard`
-    /// prefixes (an incremental seed), by content and size. Some of them
-    /// may be on a worker rather than in the store.
     pub seed_blobs: Arc<Vec<(Hash, u64)>>,
 }
 
-/// The seed a request was given cannot be completed: files of it were on a
-/// worker that is gone. The request is to be made again with another seed.
 #[derive(Debug)]
 pub struct SeedLost;
 
@@ -166,24 +127,16 @@ impl std::fmt::Display for SeedLost {
 
 impl std::error::Error for SeedLost {}
 
-/// Something that can run actions elsewhere.
 pub trait RemoteRunner: Send + Sync {
-    /// Whether a connected worker holds this blob.
     fn holds(&self, blob: &Hash) -> bool;
 
-    /// A crate's incremental state was just made here: workers may be
-    /// sent it ahead of need, so that the crate's next compile can run on
-    /// one of them. `whose` names the crate and the worktree.
     fn offer_state(&self, _whose: (Hash, String), _blobs: Arc<Vec<(Hash, u64)>>) {}
 
-    /// Fetches blobs that are held by workers into the store.
     fn bring_home<'a>(
         &'a self,
         blobs: &'a [Hash],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
 
-    /// Runs the action on a worker if that is expected to finish sooner
-    /// than waiting for a local core. `None` means "run it locally".
     fn try_run<'a>(
         &'a self,
         engine: &'a Engine,
@@ -202,17 +155,13 @@ pub trait RemoteRunner: Send + Sync {
 
 pub struct Outcome {
     pub result: Arc<ActionResult>,
-    /// The result was replayed from the cache.
     pub cached: bool,
-    /// What the action wrote under the spec's `discard` prefixes. Only
-    /// present when the action actually ran; never part of a trace.
     pub side: Vec<(Vec<u8>, MEntry)>,
 }
 
 #[derive(Default)]
 pub struct EngineStats {
     pub runs: AtomicU64,
-    /// Runs per [`ActionKind`], in the order of [`ActionKind::ALL`].
     pub runs_by_kind: [AtomicU64; 8],
     pub joined: AtomicU64,
     pub joined_then_ran: AtomicU64,
@@ -235,13 +184,9 @@ pub struct Engine {
     inflight: Mutex<HashMap<(Hash, Hash), tokio::sync::watch::Receiver<bool>>>,
     seq: AtomicU64,
     avg_wall_us: AtomicU64,
-    /// The newest trace per program, for guessing what an action that has
-    /// never run will look at (every rustc reads the same sysroot).
     profiles: dashmap::DashMap<Vec<u8>, Arc<Trace>>,
-    /// Workers that can run actions, if any are configured.
     pub remote: std::sync::OnceLock<Arc<dyn RemoteRunner>>,
     pub stats: EngineStats,
-    /// Per-action cgroups are created below this directory when set.
     pub cgroup_root: Option<PathBuf>,
 }
 
@@ -258,9 +203,6 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
-/// What an action holds while it runs. Dropped armed (its future was
-/// cancelled), it kills the process and tears the action directory down once
-/// the process is gone.
 struct Teardown {
     fs: Arc<SandboxFs>,
     sched: Arc<Scheduler>,
@@ -280,12 +222,7 @@ impl Drop for Teardown {
         let running = self.running.take();
         let (fs, action, scratch, group) = (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
         let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
-        // Waiting for a process to stop and die is not something to do on
-        // whichever thread happened to drop the future.
         let work = move || {
-            // A compiler killed in the middle of code generation takes the
-            // jobserver tokens of its helper threads with it. Stop it
-            // first, count them, and put them back once it is dead.
             let mut held = 0;
             if let (Some(_), Some(g)) = (&running, &group) {
                 g.freeze();
@@ -308,9 +245,6 @@ impl Drop for Teardown {
     }
 }
 
-/// What runs of the same kind share: the program, and for a compiler what it
-/// produces (a compile that links reads the standard library's object code
-/// and runs a linker; one that makes a library does neither).
 fn profile_key(spec: &ActionSpec) -> Option<Vec<u8>> {
     let mut key = spec.argv.first()?.clone();
     let mut it = spec.argv.iter();
@@ -338,17 +272,14 @@ fn default_mem_kb(kind: ActionKind) -> u64 {
 
 fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0; 2];
-    // SAFETY: fds is a valid two-element array.
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: both fds were just created.
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn async_reader(fd: OwnedFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
     use std::os::fd::AsRawFd;
-    // SAFETY: setting O_NONBLOCK on our own read end.
     unsafe {
         let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
         libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
@@ -384,8 +315,6 @@ impl Engine {
         }
     }
 
-    /// The spec with the client's values for every variable actions under
-    /// this key have declared an interest in.
     fn effective_spec(&self, base: &ActionSpec, client_env: &ClientEnv) -> (ActionSpec, Hash) {
         let base_key = base.weak_key();
         let needs = self.traces.needs_env(&base_key);
@@ -406,9 +335,6 @@ impl Engine {
         (spec, base_key)
     }
 
-    /// A digest of what the newest trace under `key` says the action reads,
-    /// evaluated in `view`. Two requests with the same digest are expected
-    /// to produce the same result.
     fn prediction(&self, key: &Hash, view: &dyn View) -> Hash {
         let traces = self.traces.traces(key);
         let Some((_, t)) = traces.first() else { return Hash::ZERO };
@@ -442,7 +368,6 @@ impl Engine {
         h.finish()
     }
 
-    /// A human-readable reason why no trace under `key` holds in `view`.
     fn explain_miss(&self, key: &Hash, view: &dyn View, no_cache: bool) -> String {
         if no_cache {
             return "caching was turned off for it".into();
@@ -490,8 +415,6 @@ impl Engine {
         }
     }
 
-    /// The recorded result of an action, if one holds for this view. Never
-    /// runs anything.
     pub fn cached(&self, req: &Request) -> Option<Outcome> {
         let (spec, base_key) = self.effective_spec(&req.spec, &req.client_env);
         let key = if spec.env.len() == req.spec.env.len() { base_key } else { spec.weak_key() };
@@ -500,20 +423,15 @@ impl Engine {
         Some(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() })
     }
 
-    /// The key the action's traces are stored under (its declared
-    /// environment variables folded in).
     pub fn effective_key(&self, spec: &ActionSpec, client_env: &ClientEnv) -> Hash {
         let (eff, base_key) = self.effective_spec(spec, client_env);
         if eff.env.len() == spec.env.len() { base_key } else { eff.weak_key() }
     }
 
-    /// Obtains the result of an action.
     pub async fn obtain(&self, req: Request) -> Result<Outcome> {
         let mut announced = false;
         let mut waited: Option<(Hash, Hash)> = None;
         loop {
-            // Variables actions under this key declared: the client's
-            // values must be known before the key can be formed.
             req.client_env.ensure(&self.traces.needs_env(&req.spec.weak_key())).await?;
             let (spec, base_key) = self.effective_spec(&req.spec, &req.client_env);
             let key = if spec.env.len() == req.spec.env.len() { base_key } else { spec.weak_key() };
@@ -534,7 +452,6 @@ impl Engine {
                 }
             }
 
-            // Someone else may already be computing exactly this.
             let pred = self.prediction(&key, &*req.view);
             let slot = (key, pred);
             let guard = {
@@ -543,9 +460,6 @@ impl Engine {
                     Some(rx) if !req.no_cache && waited != Some(slot) => Err(rx.clone()),
                     _ => {
                         let (tx, rx) = tokio::sync::watch::channel(false);
-                        // If another run occupies the slot (we already
-                        // waited on it once, or caching is off), ours simply
-                        // replaces the advertisement.
                         inflight.insert(slot, rx);
                         Ok(InflightGuard { engine: self, key: slot, tx })
                     }
@@ -554,8 +468,6 @@ impl Engine {
             let guard = match guard {
                 Err(mut rx) => {
                     self.stats.joined.fetch_add(1, Ordering::Relaxed);
-                    // Wait for the other run to finish, then look again. If
-                    // its trace does not hold for us, the next round runs.
                     while !*rx.borrow() {
                         if rx.changed().await.is_err() {
                             break;
@@ -580,8 +492,6 @@ impl Engine {
                 }
                 self.stats.tainted.fetch_add(1, Ordering::Relaxed);
                 if attempt >= 3 {
-                    // Inputs keep changing under the action; return what we
-                    // have without recording it.
                     break (result, None, side);
                 }
             };
@@ -606,8 +516,6 @@ impl Engine {
             }
             drop(guard);
 
-            // Did the action tell us about environment variables it reads
-            // that we did not give it?
             let declared = (req.declared_env)(&result, &self.store);
             if !declared.is_empty() {
                 let added = self.traces.add_needs_env(&base_key, &declared);
@@ -632,7 +540,6 @@ impl Engine {
         }
     }
 
-    /// Runs the action once, here or on a worker.
     async fn run(
         &self,
         spec: &ActionSpec,
@@ -644,7 +551,6 @@ impl Engine {
                 return r;
             }
         }
-        // Bytes can cross the link while the action waits for a core.
         self.seed_home(req).await?;
         let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind)).await;
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
@@ -664,13 +570,10 @@ impl Engine {
         r
     }
 
-    /// The files of the request's seed that are not in the store.
     pub fn seed_away(&self, req: &Request) -> Vec<(Hash, u64)> {
         req.seed_blobs.iter().filter(|(h, _)| !self.store.has(h)).copied().collect()
     }
 
-    /// Makes sure the request's seed is in the store, as an action that
-    /// runs here needs it: what is still on a worker is fetched now.
     pub async fn seed_home(&self, req: &Request) -> Result<()> {
         let away: Vec<Hash> = self.seed_away(req).into_iter().map(|(h, _)| h).collect();
         if away.is_empty() {
@@ -686,25 +589,20 @@ impl Engine {
         })
     }
 
-    /// A trace of some other run of the same program, if any.
     pub fn profile(&self, spec: &ActionSpec) -> Option<Arc<Trace>> {
         self.profiles.get(&profile_key(spec)?).map(|t| t.clone())
     }
 
     pub(crate) fn note_action_wall(&self, d: std::time::Duration) {
-        // Exponentially weighted average, for estimating queue waits.
         let old = self.avg_wall_us.load(Ordering::Relaxed);
         let new = if old == 0 { d.as_micros() as u64 } else { (old * 7 + d.as_micros() as u64) / 8 };
         self.avg_wall_us.store(new, Ordering::Relaxed);
     }
 
-    /// Average wall time of recent local actions.
     pub fn avg_action_wall(&self) -> std::time::Duration {
         std::time::Duration::from_micros(self.avg_wall_us.load(Ordering::Relaxed).max(200_000))
     }
 
-    /// Runs the action in a sandbox on this machine, without consulting the
-    /// scheduler or the cache.
     pub async fn execute(
         &self,
         spec: &ActionSpec,
@@ -721,13 +619,8 @@ impl Engine {
             gid,
             scratch: scratch.clone(),
             mountpoints: vec![b"proc".to_vec(), b"dev".to_vec(), b"sys".to_vec(), b"tmp".to_vec()],
-            // cargo checks that target source files exist while planning but
-            // never acts on their size; recording sizes would re-plan after
-            // every edit to a `lib.rs`.
             size_blind: spec.kind == ActionKind::Plan,
         });
-        // From here on the action directory must be torn down on every path,
-        // including the one where nobody waits for the result any more.
         let mut teardown = Teardown {
             fs: self.fs.clone(),
             sched: self.sched.clone(),
@@ -754,15 +647,11 @@ impl Engine {
             }
         };
 
-        // Turn the upper layer into a manifest, moving files into the store.
         let store = self.store.clone();
         let content = self.content.clone();
         let upper = fin.upper;
         let (entries, out_hash, err_hash) = tokio::task::spawn_blocking(move || -> Result<_> {
             use rayon::prelude::*;
-            // Several names may be hard links to one written file (rustc
-            // links its incremental `metadata.rmeta` to the output `.rmeta`):
-            // store each scratch file once.
             let mut scratch: Vec<(PathBuf, bool)> = upper
                 .iter()
                 .filter_map(|u| match &u.kind {
@@ -815,7 +704,6 @@ impl Engine {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "each output path appears once");
         let total = entries.len();
-        // Paths under a discard prefix are not part of the result.
         let (side, entries): (Vec<_>, Vec<_>) =
             entries.into_iter().partition(|(p, _)| spec.discard.iter().any(|d| vpath_starts_with(p, d)));
         assert_eq!(side.len() + entries.len(), total);
@@ -850,8 +738,6 @@ impl Engine {
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
         let mut env: BTreeMap<Vec<u8>, Vec<u8>> = spec.env.clone();
-        // The jobserver is how the action shares the machine; it is not an
-        // input, so it is added here and not part of the key.
         let js = format!(
             "-j --jobserver-fds={},{} --jobserver-auth={},{}",
             EXTRA_FD_BASE,
@@ -875,9 +761,6 @@ impl Engine {
             binds: vec![],
             cgroup: group.as_ref().map(|g| g.dir.clone()),
         };
-        // The process is kept where the caller can reach it: if this future
-        // is dropped (the client went away, another copy of the action won),
-        // the process is killed instead of running on unobserved.
         assert!(slot.is_none(), "one process per action");
         let running = slot.insert(self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?);
         let mut out_rd = async_reader(out_r)?;
@@ -923,7 +806,6 @@ impl Engine {
             }
             all
         };
-        // While it runs, watch how much memory all its processes hold.
         let peak_kb = std::sync::atomic::AtomicU64::new(0);
         let watch = async {
             let Some(g) = group else { return std::future::pending::<()>().await };

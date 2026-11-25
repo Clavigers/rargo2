@@ -1,29 +1,4 @@
 #!/usr/bin/env python3
-"""What is the best a worker could do for a cold build?
-
-    dev/sim-workers.py target/cargo-timings/cargo-timing.html [SHAPE ...]
-
-Replays the units of a build that was run with `--timings` (their measured
-frontend time, CPU time and dependencies come from the report's data block)
-on machines of other shapes. A SHAPE is core counts joined by `+`: `8` is one
-machine with 8 cores, `4+4` a server with 4 and a worker with 4.
-
-The model is the one rargo schedules by:
-
-- a unit runs on one machine from start to finish;
-- every running unit holds one core; while it generates code it also takes
-  cores nothing else on its machine wants, up to `--threads` (rustc's helper
-  threads and the shared jobserver);
-- a unit may start when the metadata of the libraries it depends on is ready
-  (when they finished, for anything that links);
-- the network is free: sending inputs and bringing results home take no time,
-  and a unit goes to whichever machine has a core.
-
-So the figure for `4+4` is a lower bound for a server with one worker: what
-remains of the distance to `8` when the link costs nothing is what whole-unit
-dispatch cannot give, because a core on another machine cannot help generate
-code for a unit that runs here.
-"""
 import argparse
 import json
 import re
@@ -47,9 +22,9 @@ class Unit:
         self.runs = u["runs"] and u["end"] is not None
         wall, cpu = u["wall"], u["cpu"]
         self.pipelined = False
-        self.front = 0.0   # serial seconds before the metadata is ready
-        self.work = 0.0    # core-seconds of code generation after that
-        self.tail = 0.0    # serial seconds at the end (archiving, linking)
+        self.front = 0.0
+        self.work = 0.0
+        self.tail = 0.0
         if not self.runs:
             return
         began = max(u["start"], u["end"] - wall)
@@ -58,9 +33,6 @@ class Unit:
             self.front = max(0.001, u["meta"] - began)
             self.work = max(0.0, cpu - self.front)
         else:
-            # No metadata announced (a binary, a test, a build script, a proc
-            # macro): split into a serial part and parallel work such that
-            # wall = serial + work / threads and cpu = serial + work.
             if cpu <= wall or threads <= 1:
                 self.front = wall
             else:
@@ -71,7 +43,6 @@ class Unit:
 
 
 def closure(units):
-    """For units that link: everything below them, not only direct deps."""
     memo = {}
 
     def below(i):
@@ -90,9 +61,7 @@ def closure(units):
 
 
 def simulate(units, machines, threads, order, place, dt=0.01):
-    """Returns the wall time of the build on `machines` (a list of core counts)."""
     below = closure(units)
-    # Longest path to the end of the build, for choosing what starts first.
     level = {}
 
     def bottom(i):
@@ -112,7 +81,7 @@ def simulate(units, machines, threads, order, place, dt=0.01):
         bottom(i)
 
     meta_at, done_at = {}, {}
-    state = {}  # i -> [machine, phase, remaining]; phase 0 frontend, 1 codegen
+    state = {}
     waiting = set(units)
     t = 0.0
 
@@ -131,7 +100,6 @@ def simulate(units, machines, threads, order, place, dt=0.01):
         return True
 
     while waiting or state:
-        # Units without a command finish as soon as what they wait for has.
         progressed = True
         while progressed:
             progressed = False
@@ -140,7 +108,6 @@ def simulate(units, machines, threads, order, place, dt=0.01):
                     waiting.discard(i)
                     meta_at[i] = done_at[i] = t
                     progressed = True
-        # Start what is ready, the longest remaining path first.
         used = [0] * len(machines)
         for m, _, _ in state.values():
             used[m] += 1
@@ -161,7 +128,6 @@ def simulate(units, machines, threads, order, place, dt=0.01):
             if waiting:
                 sys.exit("the dependency graph does not resolve (a cycle?)")
             break
-        # Cores nothing holds go to code generation on the same machine.
         extra = {i: 0 for i in state}
         for m in range(len(machines)):
             spare = machines[m] - used[m]

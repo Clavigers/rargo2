@@ -1,6 +1,4 @@
 #!/bin/sh
-# Model-checks a spec with TLC: dev/tla/run.sh StoreSync StoreSync_TRUE.cfg
-# Needs java and tla2tools.jar (TLA2TOOLS, default ~/.local/share/tla/tla2tools.jar).
 set -e
 cd "$(dirname "$0")"
 jar=${TLA2TOOLS:-$HOME/.local/share/tla/tla2tools.jar}

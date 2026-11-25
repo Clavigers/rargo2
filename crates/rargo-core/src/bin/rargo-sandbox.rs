@@ -1,8 +1,3 @@
-//! Developer tool: run one command inside a traced sandbox over the host
-//! filesystem and print what it observed and wrote.
-//!
-//!   rargo-sandbox [--state DIR] [--no-passthrough] [--quiet] -- CMD ARGS...
-
 use rargo_core::sandbox::{NetMode, SpawnReq, Zygote};
 use rargo_core::sandboxfs::{ActionFsConfig, SandboxFs, UpperKind};
 use rargo_core::view::*;

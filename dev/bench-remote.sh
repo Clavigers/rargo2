@@ -1,18 +1,4 @@
 #!/bin/bash
-# What one remote client sees: a client in its own network namespace builds
-# a repository through a build server one shaped link away. The server
-# cannot see the client's worktree.
-#
-#   dev/bench-remote.sh [REPO] [LABEL DELAY_MS RATE]...
-#
-# Default links: lan (1 ms each way, 1 Gbit) and wan (20 ms each way,
-# 100 Mbit). For each link, with a fresh server: the first sync and a cold
-# check, the same check again, a check after a one-file edit, a build of the
-# main binary (its download included), the same build again, and the build
-# from a second machine's fresh worktree at the same commit (nothing to
-# compile; everything is transfer). Stock cargo on the client's files, with
-# the server's core count, is measured once for comparison.
-# Results are appended to $RARGO_WORK/bench/remote.jsonl.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -33,9 +19,8 @@ zed) main=(build); edit=crates/collections/src/collections.rs; export GIT_LFS_SK
 esac
 stock=${stock:-cargo}
 secs() { local t0=$(date +%s.%N); "$@" >"$C/last.log" 2>&1; local rc=$?; printf '%.2f %s' "$(echo "$(date +%s.%N) - $t0" | bc)" "$rc"; }
-wt() { # name
+wt() {
     git -C "$base" worktree remove --force "$C/$1" >/dev/null 2>&1
-    # (What a daemon's output directory leaves behind: an empty target/.)
     grep -q " $C/$1/target " /proc/self/mountinfo || rm -rf "$C/$1"
     git -C "$base" worktree prune
     git -C "$base" worktree add -q --detach "$C/$1" HEAD
@@ -77,13 +62,10 @@ while [ $# -ge 3 ]; do
     read c4 r4 < <(secs R "${main[@]}")
     read c5 r5 < <(secs R "${main[@]}")
     mib=$(du -sm target | cut -f1)
-    # Another machine: its own cache, a fresh worktree with the same edit.
     wt two
     cd "$C/two" || exit 2
     printf '\n#[allow(dead_code)]\npub fn rargo_remote_bench() -> u32 { 7 }\n' >>"$edit"
     export RARGO_CACHE_DIR=$C/cache-2
-    # With the phases of the command, on the client (the command's
-    # stderr) and on the server (its log, if it runs with RARGO_PHASES).
     read c6 r6 < <(RARGO_SYNC_STATS=1 secs R "${main[@]}")
     { grep '^rargo: ' "$C/last.log"; grep "rargod: phase" "$work/${RIG_STATE:-nstest}/srv.log" | tail -5; } >"$work/bench/logs/remote-$repo-second-$label.phases" 2>/dev/null
     printf '{"repo":"%s","config":"rargo, %s (%s ms each way, %s)","cold_check_s":%s,"noop_check_s":%s,"edit_check_s":%s,"build_s":%s,"noop_build_s":%s,"second_machine_build_s":%s,"rc":[%s,%s,%s,%s,%s,%s],"target_mib":%s,"first_sync":"%s","sync":"%s"}\n' \

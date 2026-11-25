@@ -1,9 +1,3 @@
-# A release: push a tag vX.Y.Z whose commit has version X.Y.Z in Cargo.toml
-# and a section "## X.Y.Z" in CHANGELOG.md. Builds the static client, the
-# server archive (rargod, rargo-sandbox and the planner: cargo at
-# forks/cargo/BASE with forks/cargo's patches), publishes them with the
-# installers and the changelog section as a GitHub release, then publishes
-# the client's crates to crates.io through trusted publishing.
 name: release
 on:
   push:
@@ -21,12 +15,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: dev/release-gate.sh "$(git rev-parse HEAD)"
-      - name: Tag, manifest and changelog agree
+      - name: Tag and manifest agree
         run: |
           v=${GITHUB_REF_NAME#v}
           [ "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)" = "$v" ] || { echo "Cargo.toml is not at $v"; exit 1; }
-          awk -v v="$v" '$0 == "## " v {on=1; next} /^## / {on=0} on' CHANGELOG.md >notes.md
-          [ -s notes.md ] || { echo "CHANGELOG.md has no section for $v"; exit 1; }
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
       - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools libssl-dev zlib1g-dev pkg-config
       - name: Client (static) and server
@@ -46,7 +38,6 @@ jobs:
           git clone -q https://github.com/rust-lang/cargo.git planner
           git -C planner checkout -q -b rargo "$(cat forks/cargo/BASE)"
           git -C planner -c user.name=rargo -c user.email=noreply@rargo.invalid am "$PWD"/forks/cargo/*.patch
-          # The fork's manifest names rargo-plan where it lies on the build machine.
           sed -i "s|/root/rargo/crates/rargo-plan|$PWD/crates/rargo-plan|" planner/Cargo.toml
           grep -q "$PWD/crates/rargo-plan" planner/Cargo.toml
           (cd planner && CFG_RELEASE_CHANNEL=stable cargo build --release --bin cargo)
@@ -58,18 +49,13 @@ jobs:
         run: |
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-              --title "rargo ${GITHUB_REF_NAME#v}" --notes-file notes.md
+              --title "rargo ${GITHUB_REF_NAME#v}" --generate-notes
           fi
           if [ "$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft)" = true ]; then
             gh release upload "$GITHUB_REF_NAME" --clobber assets/*
             gh release edit "$GITHUB_REF_NAME" --draft=false
           fi
   crates:
-    # With the secret CARGO_REGISTRY_TOKEN set, that token publishes (needed
-    # the first time: trusted publishing can only be set up for a crate that
-    # exists). Without it, crates.io trusted publishing is used (STATUS.md,
-    # "Releasing"). If neither is in place this job fails and the release
-    # above stands.
     needs: assets
     runs-on: ubuntu-24.04
     permissions:

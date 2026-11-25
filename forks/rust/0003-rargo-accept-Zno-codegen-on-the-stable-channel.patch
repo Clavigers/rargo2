@@ -1,26 +1,20 @@
-From 440a9aa193a6c447506707afadb89ae8a96b1f95 Mon Sep 17 00:00:00 2001
+From f27e4db7e7057a75c084f1eae9e34a49cd33b41c Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:20:18 +0100
 Subject: [PATCH 3/5] rargo: accept -Zno-codegen on the stable channel
 
-A compile with --emit=...,metadata,link -Zno-codegen writes exactly the
-metadata of the full build and stops. RUSTC_BOOTSTRAP cannot be used to
-allow the flag because it changes the crate hash.
 ---
- compiler/rustc_session/src/config.rs | 6 ++++++
- 1 file changed, 6 insertions(+)
+ compiler/rustc_session/src/config.rs | 3 +++
+ 1 file changed, 3 insertions(+)
 
 diff --git a/compiler/rustc_session/src/config.rs b/compiler/rustc_session/src/config.rs
-index 18c401d0b..620c13d84 100644
+index 8baafdc..684d14a 100644
 --- a/compiler/rustc_session/src/config.rs
 +++ b/compiler/rustc_session/src/config.rs
-@@ -3200,6 +3200,12 @@ pub fn check_nightly_options(
+@@ -3198,6 +3198,9 @@ pub mod nightly_options {
              if really_allows_unstable_options {
                  continue;
              }
-+            // rargo: `-Zno-codegen` is how the build system asks for a crate's metadata
-+            // without its object code. It has to work without `RUSTC_BOOTSTRAP`, because that
-+            // variable changes the crate hash and the metadata must be the full build's.
 +            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| x == "no-codegen") {
 +                continue;
 +            }

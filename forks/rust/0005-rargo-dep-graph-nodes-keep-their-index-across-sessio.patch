@@ -1,24 +1,18 @@
-From 00f4f9362a72cac874c19470be127d68535a9bef Mon Sep 17 00:00:00 2001
+From ceb02fd2528dfebecb4c658c7c02f04dbfc9b179 Mon Sep 17 00:00:00 2001
 From: rargo <noreply@rargo.invalid>
 Date: Wed, 25 Nov 2026 03:44:38 +0100
 Subject: [PATCH 5/5] rargo: dep-graph nodes keep their index across sessions
 
-A node of the previous dep graph keeps its index in the next session's
-graph, and a new node gets an index above the previous index space, so
-the records and edge lists of unchanged nodes are the same bytes in both
-files. The two fixed nodes keep indices 0 and 1. The indices of nodes that
-are gone stay unused; once they are more than half the index space, a
-session numbers its nodes afresh.
 ---
- compiler/rustc_middle/src/dep_graph/graph.rs  | 21 +++--
- .../rustc_middle/src/dep_graph/serialized.rs  | 79 +++++++++++++++++--
- 2 files changed, 86 insertions(+), 14 deletions(-)
+ compiler/rustc_middle/src/dep_graph/graph.rs  | 19 +++---
+ .../rustc_middle/src/dep_graph/serialized.rs  | 59 +++++++++++++++++--
+ 2 files changed, 64 insertions(+), 14 deletions(-)
 
 diff --git a/compiler/rustc_middle/src/dep_graph/graph.rs b/compiler/rustc_middle/src/dep_graph/graph.rs
-index dcb5775f2..b93a91676 100644
+index dcb5775..f39efc8 100644
 --- a/compiler/rustc_middle/src/dep_graph/graph.rs
 +++ b/compiler/rustc_middle/src/dep_graph/graph.rs
-@@ -186,22 +186,18 @@ pub fn new(
+@@ -186,22 +186,18 @@ impl DepGraph {
          let colors = DepNodeColorMap::new(prev_index_space_len);
  
          // Instantiate a node with zero dependencies only once for anonymous queries.
@@ -45,12 +39,10 @@ index dcb5775f2..b93a91676 100644
          if prev_index_space_len > 0 {
              let prev_index =
                  const { SerializedDepNodeIndex::from_u32(DepNodeIndex::FOREVER_RED_NODE.as_u32()) };
-@@ -1266,6 +1262,15 @@ fn record_edge(
+@@ -1266,6 +1262,13 @@ impl CurrentDepGraph {
          assert_eq!(prior_value_fingerprint, value_fingerprint, "Unstable fingerprints for {key:?}");
      }
  
-+    /// Writes one of the nodes with a fixed `DepNodeIndex` (the same in every session) to the
-+    /// current dep-graph; it has no edges and no value fingerprint.
 +    fn alloc_reserved_node(&self, index: DepNodeIndex, key: DepNode) {
 +        self.encoder.send_reserved(index, key, Fingerprint::ZERO, &[]);
 +
@@ -62,45 +54,26 @@ index dcb5775f2..b93a91676 100644
      /// Assumes that this is a node that has no equivalent in the previous dep-graph.
      #[inline(always)]
 diff --git a/compiler/rustc_middle/src/dep_graph/serialized.rs b/compiler/rustc_middle/src/dep_graph/serialized.rs
-index 1c476fc91..6c9f32759 100644
+index 1c476fc..b35b1d1 100644
 --- a/compiler/rustc_middle/src/dep_graph/serialized.rs
 +++ b/compiler/rustc_middle/src/dep_graph/serialized.rs
-@@ -38,6 +38,12 @@
- //! Dep-graph indices are bulk allocated to threads inside `LocalEncoderState`. Having threads
- //! own these indices helps avoid races when they are conditionally used when marking nodes green.
- //! It also reduces congestion on the shared index count.
-+//!
-+//! A node that is in the previous graph keeps its previous index, and a new node gets an index
-+//! above the previous graph's index space, so a small change to the graph is a small change to
-+//! this file: the records and edge lists of the unchanged nodes stay byte for byte the same.
-+//! The indices of nodes that are gone stay unused. When more than half the index space is unused,
-+//! the session numbers every node afresh instead, so the index space stays bounded.
- 
- use std::cell::RefCell;
- use std::cmp::max;
-@@ -628,8 +634,16 @@ struct LocalEncoderResult {
+@@ -628,8 +628,12 @@ struct LocalEncoderResult {
      kind_stats: Vec<u32>,
  }
  
-+/// The indices that `DepGraph::new` gives its two fixed nodes (`SINGLETON_ZERO_DEPS_ANON_NODE`
-+/// and `FOREVER_RED_NODE`) in every session.
 +const RESERVED_INDICES: u32 = 2;
 +
  struct EncoderState {
      next_node_index: AtomicU64,
-+    /// Whether nodes of the previous graph keep their indices in this session.
 +    keep_indices: bool,
-+    /// The lowest index given to a node that is new in this session.
 +    new_index_base: u32,
      previous: Arc<SerializedDepGraph>,
      file: Lock<Option<FileEncoder<'static>>>,
      local: WorkerLocal<RefCell<LocalEncoderState>>,
-@@ -642,9 +656,17 @@ fn new(
+@@ -642,9 +646,15 @@ impl EncoderState {
          record_stats: bool,
          previous: Arc<SerializedDepGraph>,
      ) -> Self {
-+        // Keeping indices leaves the indices of the nodes that are gone unused; once they are
-+        // most of the index space, this session numbers its nodes afresh.
 +        let prev_len = previous.index_space_len();
 +        let keep_indices = prev_len <= 2 * previous.live_node_count() + 4096;
 +        let new_index_base =
@@ -114,13 +87,10 @@ index 1c476fc91..6c9f32759 100644
              stats: record_stats.then(|| Lock::new(FxHashMap::default())),
              file: Lock::new(Some(encoder)),
              local: WorkerLocal::new(|_| {
-@@ -688,6 +710,32 @@ fn bump_index(&self, local: &mut LocalEncoderState) {
+@@ -688,6 +698,28 @@ impl EncoderState {
          local.node_count += 1;
      }
  
-+    /// The index for a node of the previous graph: its previous index, or a new one when this
-+    /// session does not keep indices. The second value says which; pass it to `claim_index`
-+    /// once the node is encoded.
 +    #[inline]
 +    fn index_for_prev(
 +        &self,
@@ -134,7 +104,6 @@ index 1c476fc91..6c9f32759 100644
 +        }
 +    }
 +
-+    /// Marks an index returned by `index_for_prev` as used.
 +    #[inline]
 +    fn claim_index(&self, kept: bool, local: &mut LocalEncoderState) {
 +        if kept {
@@ -147,23 +116,19 @@ index 1c476fc91..6c9f32759 100644
      #[inline]
      fn record(
          &self,
-@@ -794,7 +842,9 @@ fn finish(&self, profiler: &SelfProfilerRef, current: &CurrentDepGraph) -> FileE
+@@ -794,7 +826,7 @@ impl EncoderState {
  
          let mut kind_stats: Vec<u32> = iter::repeat_n(0, DepKind::NUM_VARIANTS).collect();
  
 -        let mut node_max = 0;
-+        // Nodes of the previous graph that kept their indices may use any index below
-+        // `new_index_base`, and the reserved ones are always used.
 +        let mut node_max = self.new_index_base;
          let mut node_count = 0;
          let mut edge_count = 0;
  
-@@ -919,6 +969,23 @@ pub(crate) fn retained_dep_graph(&self) -> Option<RetainedDepGraph> {
+@@ -919,6 +951,21 @@ impl GraphEncoder {
          self.retained_graph.as_ref().map(|retained_graph| retained_graph.lock().clone())
      }
  
-+    /// Encodes one of the nodes that have a fixed index in every session
-+    /// (below `RESERVED_INDICES`).
 +    pub(crate) fn send_reserved(
 +        &self,
 +        index: DepNodeIndex,
@@ -182,7 +147,7 @@ index 1c476fc91..6c9f32759 100644
      /// Encodes a node that does not exists in the previous graph.
      pub(crate) fn send_new(
          &self,
-@@ -952,7 +1019,7 @@ pub(crate) fn send_and_color(
+@@ -952,7 +999,7 @@ impl GraphEncoder {
  
          let mut local = self.status.local.borrow_mut();
  
@@ -191,7 +156,7 @@ index 1c476fc91..6c9f32759 100644
          let color = if is_green { DesiredColor::Green { index } } else { DesiredColor::Red };
  
          // Use `try_set_color` to avoid racing when `send_promoted` is called concurrently
-@@ -963,7 +1030,7 @@ pub(crate) fn send_and_color(
+@@ -963,7 +1010,7 @@ impl GraphEncoder {
              TrySetColorResult::AlreadyGreen { index } => return index,
          }
  
@@ -200,7 +165,7 @@ index 1c476fc91..6c9f32759 100644
          self.status.encode_node(index, &node, &self.retained_graph, &mut *local);
          index
      }
-@@ -984,13 +1051,13 @@ pub(crate) fn send_promoted(
+@@ -984,13 +1031,13 @@ impl GraphEncoder {
          let _prof_timer = self.profiler.generic_activity("incr_comp_encode_dep_graph");
  
          let mut local = self.status.local.borrow_mut();

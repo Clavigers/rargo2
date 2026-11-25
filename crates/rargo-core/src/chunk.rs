@@ -1,15 +1,3 @@
-//! Chunking for transfer and for the cold tier.
-//!
-//! A blob is described by a recipe: an ordered list of chunk hashes and
-//! lengths. Two versions of an rlib that differ in one object share every
-//! other chunk, so only the changed part has to cross the network or be
-//! stored again.
-//!
-//! Boundaries are format-aware first and content-defined second: an `ar`
-//! archive is cut at its members, an ELF object at its sections, and what
-//! lies between structural boundaries is cut by a rolling hash (FastCDC
-//! style) so that an insertion shifts at most a couple of chunks.
-
 use crate::hash::Hash;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -36,8 +24,6 @@ pub type Recipe = Vec<ChunkRef>;
 fn gear() -> &'static [u64; 256] {
     static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
-        // Fixed pseudo-random table (splitmix64): both ends of a transfer
-        // must cut identically.
         let mut t = [0u64; 256];
         let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
         for v in t.iter_mut() {
@@ -51,11 +37,8 @@ fn gear() -> &'static [u64; 256] {
     })
 }
 
-/// Content-defined cut points inside `data`, appended to `cuts` as lengths.
 fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
     let g = gear();
-    // Two masks, as in FastCDC: harder to cut before the average size,
-    // easier after, which tightens the size distribution.
     const MASK_S: u64 = (1 << 18) - 1;
     const MASK_L: u64 = (1 << 14) - 1;
     let mut start = 0;
@@ -95,7 +78,6 @@ fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
     }
 }
 
-/// Section boundaries of a 64-bit little-endian ELF file, as offsets.
 fn elf_boundaries(data: &[u8]) -> Option<Vec<usize>> {
     if data.len() < 64 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
         return None;
@@ -113,7 +95,6 @@ fn elf_boundaries(data: &[u8]) -> Option<Vec<usize>> {
         let sh = shoff.checked_add(i * shentsize)?;
         let typ = data.get(sh + 4..sh + 8).map(|x| u32::from_le_bytes(x.try_into().unwrap()))?;
         let off = u64_at(sh + 0x18)?;
-        // SHT_NOBITS occupies no file space.
         if typ != 8 && off > 0 && off < data.len() {
             b.push(off);
         }
@@ -123,10 +104,6 @@ fn elf_boundaries(data: &[u8]) -> Option<Vec<usize>> {
     Some(b)
 }
 
-/// The parts of a 64-bit little-endian ELF file that only a debugger or a
-/// backtrace reads: its `.debug_*` and `.zdebug_*` sections, as `(start,
-/// end)` byte ranges, ascending, adjacent ones joined. Empty for anything
-/// else.
 pub fn debug_ranges(data: &[u8]) -> Vec<(u64, u64)> {
     debug_sections(data).unwrap_or_default()
 }
@@ -153,7 +130,6 @@ fn debug_sections(data: &[u8]) -> Option<Vec<(u64, u64)>> {
         let name = names.checked_add(u32_at(h)? as usize)?;
         let name = data.get(name..)?;
         let debug = name.starts_with(b".debug_") || name.starts_with(b".zdebug_");
-        // SHT_NOBITS occupies no file space.
         if !debug || u32_at(h + 4)? == 8 {
             continue;
         }
@@ -174,14 +150,11 @@ fn debug_sections(data: &[u8]) -> Option<Vec<(u64, u64)>> {
     Some(joined)
 }
 
-/// Structural boundaries of `data` (offsets, ascending, exclusive of 0 and
-/// the end).
 fn structural(data: &[u8]) -> Vec<usize> {
     if let Some(members) = crate::ar::members(data) {
         let mut b = Vec::new();
         for m in &members {
             b.push(m.header_offset);
-            // The member's own structure, if it is an object file.
             let start = m.data.as_ptr() as usize - data.as_ptr() as usize;
             b.push(start);
             if let Some(inner) = elf_boundaries(m.data) {
@@ -195,21 +168,15 @@ fn structural(data: &[u8]) -> Vec<usize> {
     elf_boundaries(data).unwrap_or_default()
 }
 
-/// Cuts `data` into chunks.
 pub fn chunk(data: &[u8]) -> Recipe {
     let mut bounds = structural(data);
     bounds.retain(|&o| o > 0 && o < data.len());
     bounds.push(data.len());
-    // The archive magic is its own tiny chunk, so that the first member
-    // chunks the same wherever it sits.
     let hard = if data.starts_with(b"!<arch>\n") { 8 } else { 0 };
     let mut lens: Vec<usize> = Vec::new();
     let mut start = 0;
     let mut i = 0;
     while start < data.len() {
-        // Structural regions smaller than the minimum are merged with what
-        // follows, so thousands of tiny sections do not become thousands of
-        // tiny chunks; the cut still lands on a structural boundary.
         assert!(i < bounds.len());
         let mut end = bounds[i];
         while end - start < MIN_CHUNK && i + 1 < bounds.len() && end != hard {
@@ -232,15 +199,12 @@ pub fn chunk(data: &[u8]) -> Recipe {
     out
 }
 
-/// Chunks a file (memory-mapped).
 pub fn chunk_file(file: &File) -> io::Result<Recipe> {
     let len = file.metadata()?.len() as usize;
     if len == 0 {
         return Ok(Vec::new());
     }
     use std::os::fd::AsRawFd;
-    // SAFETY: mapping a regular file read-only; the slice is not used after
-    // munmap. Blobs are immutable, so the mapping cannot change under us.
     unsafe {
         let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
         if p == libc::MAP_FAILED {
@@ -252,9 +216,6 @@ pub fn chunk_file(file: &File) -> io::Result<Recipe> {
     }
 }
 
-/// Where chunks can be found locally: inside which whole blob, at which
-/// offset. Blobs stay whole on disk; this index is how a new blob is put
-/// together from pieces of ones already present.
 #[derive(Default)]
 pub struct ChunkIndex {
     at: DashMap<Hash, (Hash, u64, u32)>,
@@ -293,7 +254,6 @@ impl ChunkIndex {
     }
 }
 
-/// Reads one chunk out of an open blob.
 pub fn read_chunk(file: &File, offset: u64, len: u32) -> io::Result<Vec<u8>> {
     assert!(len as usize <= MAX_CHUNK);
     let mut buf = vec![0u8; len as usize];
@@ -321,9 +281,6 @@ mod tests {
         r.iter().map(|c| c.len as usize).sum()
     }
 
-    /// A 64-bit little-endian ELF file with these sections (name, type,
-    /// bytes) after its header, then its section names, then the section
-    /// headers.
     fn elf(sections: &[(&str, u32, usize)]) -> (Vec<u8>, Vec<(u64, u64)>) {
         let mut data = vec![0u8; 64];
         data[..6].copy_from_slice(b"\x7fELF\x02\x01");
@@ -345,7 +302,7 @@ mod tests {
         }
         data.extend(&names);
         let shoff = data.len() as u64;
-        let mut headers = vec![0u8; 64]; // the null section
+        let mut headers = vec![0u8; 64];
         let all: Vec<(u32, u32, u64, u64)> = sections
             .iter()
             .enumerate()
@@ -381,8 +338,6 @@ mod tests {
             (".debug_empty", 1, 0),
             (".debugger_not", 1, 50),
         ]);
-        // Adjacent debug sections are one range; a named look-alike, an
-        // empty one and the rest are not debug sections.
         assert_eq!(debug_ranges(&data), vec![(at[1].0, at[2].1), at[4]]);
         assert!(debug_ranges(b"not an ELF file at all, just some text").is_empty());
         let mut broken = data.clone();
@@ -431,8 +386,6 @@ mod tests {
 
     #[test]
     fn archive_members_are_chunk_boundaries() {
-        // Replacing the middle member of an archive, even with one of a
-        // different size, leaves the chunks of the other members intact.
         let (m1, m2, m3) = (noise(300_000, 1), noise(200_000, 2), noise(400_000, 3));
         let m2b = noise(210_001, 4);
         let a = ar(&[("a.o", &m1), ("b.o", &m2), ("c.o", &m3)]);
@@ -442,7 +395,6 @@ mod tests {
         let set: std::collections::HashSet<Hash> = ra.iter().map(|c| c.hash).collect();
         let new: usize = rb.iter().filter(|c| !set.contains(&c.hash)).map(|c| c.len as usize).sum();
         assert!(new <= m2b.len() + 200, "only the replaced member is new ({new} bytes)");
-        // The same member content at a different position is still shared.
         let c = ar(&[("c.o", &m3), ("a.o", &m1)]);
         let rc = chunk(&c);
         let new: usize = rc.iter().filter(|c| !set.contains(&c.hash)).map(|c| c.len as usize).sum();

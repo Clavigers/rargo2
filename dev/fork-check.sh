@@ -1,12 +1,4 @@
 #!/bin/bash
-# Checks of rargo's rustc fork (toolchain `rargo`) on small crates, with
-# rustc invoked directly. What is checked is what rargo relies on:
-#   1. edits that keep the interface and the line numbers keep the crate hash
-#   2. edits that change line numbers or the interface change it
-#   3. a crate that was not rebuilt after such an edit to its dependency
-#      still gives correct positions to the crates that use both
-#   4. incremental rlibs are reproducible
-#   5. -Zno-codegen gives the full build's metadata, on stable
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 . "$work/env.sh"
@@ -17,8 +9,7 @@ fails=0; checks=0
 ok() { checks=$((checks + 1)); echo "  ok   $1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/       | /' | head -30; }
 svh() { python3 -c "import sys;d=open(sys.argv[1],'rb').read();print(d[24:40].hex())" "$1"; }
-lib() { # name src outdir [extra...]: compiles src as <name>/lib.rs (the
-    # file name is part of the crate hash, so every variant uses the same one)
+lib() {
     local name=$1 src=$2 out=$3; shift 3
     mkdir -p "$out" "$name"
     [ "$src" = "$name/lib.rs" ] || cp "$src" "$name/lib.rs"
@@ -57,9 +48,6 @@ lib b b/api.rs b3
 [ "$(svh b3/libb.rmeta)" != "$h0" ] && ok "a signature change changes it" || bad "a signature change changes it"
 
 echo "== a crate not rebuilt after its dependency changed bytes but not hash"
-# a's inlinable functions expand b's macro: a's metadata holds spans into
-# b's file. c is compiled against a as it was built over the old b, and
-# against a rebuilt over the new b; the positions c sees must be the same.
 mkdir -p a c
 cat >a/lib.rs <<'EOF'
 #[inline]
@@ -74,7 +62,7 @@ cp b/orig.rs b/lib.rs
 lib a a/lib.rs a_old --extern b=b0/libb.rlib
 cp b/longer.rs b/lib.rs
 lib a a/lib.rs a_new --extern b=b1/libb.rlib
-locs() { # a-dir out-dir
+locs() {
     rustc --crate-name c --edition=2021 --crate-type lib --emit=llvm-ir,link -C debuginfo=2 -C codegen-units=1 \
         -L "dependency=$T/b1" --extern a="$1/liba.rlib" --extern b=b1/libb.rlib c/lib.rs --out-dir "$2" 2>&1 || return 1
     grep -o 'DILocation(line: [0-9]*, column: [0-9]*' "$2/c.ll" | sort | uniq -c
@@ -90,10 +78,7 @@ EOF
 )
 grep -q "panicked\|internal compiler error" <<<"$out" && bad "an error involving both crates is reported without an internal error" "$out" || ok "an error involving both crates is reported without an internal error"
 grep -q 'b/lib.rs:8' <<<"$out" && ok "and points at b's function on its real line" || bad "and points at b's function on its real line" "$out"
-# A compile-time assertion inside b's macro, instantiated by c through a's
-# generic function: the error is reported at the span in b's file that a's
-# metadata recorded.
-pm() { # a-dir out-dir
+pm() {
     rustc --crate-name c --edition=2021 --crate-type lib --emit=link -L "dependency=$T/b1" \
         --extern a="$1/liba.rlib" --extern b=b1/libb.rlib - --out-dir "$2" 2>&1 <<'EOF'
 pub fn f() { a::checked::<u64>() }

@@ -12,5 +12,4 @@ homepage = "https://rargo.rs"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 
-# Built inside the cargo fork too; it keeps its own (default) lints there.
 [lints]

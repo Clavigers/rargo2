@@ -1,5 +1,3 @@
-//! rargo daemon internals.
-
 pub mod ar;
 pub mod build;
 pub mod buildview;

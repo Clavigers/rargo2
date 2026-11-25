@@ -1,5 +1,3 @@
-# Configuration for building rargo's rustc fork: as close to the official
-# distribution build as is practical without profile-guided optimisation.
 change-id = "ignore"
 
 [llvm]

@@ -1,7 +1,3 @@
-# Checks a deployed rargo server from outside its machine: the released
-# client builds, runs and tests a small workspace through it, over UDP and
-# over TCP (deploy/check-service.sh). The server and a key that may only
-# build are repository secrets.
 name: service check
 on:
   workflow_dispatch:
@@ -23,7 +19,6 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           gh release download ${VERSION:+"$VERSION"} --pattern 'rargo-x86_64-unknown-linux-musl' --pattern SHA256SUMS
-          # Only the client was downloaded; it must be there and match.
           sha256sum -c --ignore-missing --strict SHA256SUMS
           grep -q ' rargo-x86_64-unknown-linux-musl$' SHA256SUMS
           install -m 755 rargo-x86_64-unknown-linux-musl "$HOME/rargo"

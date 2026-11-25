@@ -1,10 +1,3 @@
-//! Client for the cargo fork's build-script output parsing service.
-//!
-//! Parsing build-script output with cargo's own parser (validation rules,
-//! old and new syntax, error messages) keeps rargo's behaviour identical to
-//! cargo's. The service is a long-lived child process speaking
-//! length-prefixed frames on stdin/stdout.
-
 use crate::hash::Hash;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -55,7 +48,6 @@ impl Parser {
         Ok(buf)
     }
 
-    /// Parses the stdout of a build-script run.
     pub fn parse(&self, script: &Script, stdout: &[u8]) -> Arc<ParseResp> {
         let req = rargo_plan::encode(&ParseReq { script: script.clone(), stdout: stdout.to_vec() });
         let key = Hash::of(&req);
@@ -85,7 +77,6 @@ impl Parser {
                 },
                 Err(e) => last_err = format!("build-script parser failed: {e}"),
             }
-            // Start over with a fresh process.
             if let Some(mut p) = guard.take() {
                 let _ = p.child.kill();
                 let _ = p.child.wait();

@@ -1,5 +1,3 @@
-//! Content hashes (blake3, 32 bytes).
-
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
@@ -36,8 +34,6 @@ impl Hash {
         Some(Hash(out))
     }
 
-    /// Hashes a file. Large files are memory-mapped and hashed on the rayon
-    /// pool; small ones are read directly.
     pub fn of_file(file: &File) -> io::Result<(Hash, u64)> {
         let len = file.metadata()?.len();
         let mut h = blake3::Hasher::new();
@@ -69,8 +65,6 @@ trait MmapFd {
 impl MmapFd for blake3::Hasher {
     fn update_mmap_rayon_fd(&mut self, file: &File) -> io::Result<()> {
         use std::os::fd::AsRawFd;
-        // blake3's own mmap helper wants a path; go through /proc/self/fd so
-        // the already-open file (not whatever the path names now) is hashed.
         let p = format!("/proc/self/fd/{}", file.as_raw_fd());
         self.update_mmap_rayon(p)?;
         Ok(())
@@ -89,7 +83,6 @@ impl fmt::Display for Hash {
     }
 }
 
-/// Incremental hasher for building keys out of several fields.
 pub struct KeyHasher(blake3::Hasher);
 
 impl KeyHasher {
@@ -100,7 +93,6 @@ impl KeyHasher {
         KeyHasher(h)
     }
 
-    /// Adds a length-prefixed field.
     pub fn field(&mut self, b: &[u8]) -> &mut Self {
         self.0.update(&(b.len() as u64).to_le_bytes());
         self.0.update(b);

@@ -1,6 +1,4 @@
 #!/bin/bash
-# The release requires the gate on this exact SHA. The status is either
-# already success, or it is not.
 set -euo pipefail
 commit=${1:?commit SHA}
 [ -z "${2:-}" ] || { echo "usage: dev/release-gate.sh SHA" >&2; exit 2; }

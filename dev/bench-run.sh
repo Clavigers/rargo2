@@ -1,16 +1,4 @@
 #!/bin/bash
-# What `rargo run` of a debug binary from a mounted target/ costs on a
-# machine that has never fetched it: wall time, and the bytes that cross
-# the client's link against the binary's size.
-#
-#   dev/bench-run.sh LABEL [DELAY_MS]       (client link: DELAY_MS each way, default 0)
-#
-# RARGO_BIN names the rargo and rargod to measure (LABEL says which they
-# are). A server with 24 cores builds rust-analyzer for a first worktree.
-# Then a fresh worktree of the same commit, with an empty client cache:
-# `rargo build -p rust-analyzer` (nothing to build), then, measured,
-# `rargo run -p rust-analyzer -- --version` and the same again (now from
-# the client's cache). Results go to $RARGO_WORK/bench/run.jsonl.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -32,10 +20,8 @@ git -C "$base" worktree prune
 CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1
 . "$work/$RIG_STATE/client.env"
 wt() { git -C "$base" worktree add -q --detach "$C/$1" HEAD; }
-# The server builds; the first machine's cache fills.
 wt a
 (cd "$C/a" && RARGO_CACHE_DIR=$C/cache-a t R build -p rust-analyzer) >/dev/null
-# A machine that has never fetched it.
 wt b
 cd "$C/b" || exit 2
 export RARGO_CACHE_DIR=$C/cache-b

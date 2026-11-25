@@ -1,18 +1,3 @@
-//! The content-addressed store.
-//!
-//! Blobs are whole files named by their blake3 hash under `blobs/xx/`. A blob
-//! may exist in two variants, plain (`<hex>`, mode 0444) and executable
-//! (`<hex>.x`, mode 0555), because a hard link shares its inode's mode with
-//! the file it is linked from.
-//!
-//! Blobs nobody has used for a while go cold: the file is cut into
-//! content-defined chunks (see `chunk`), each chunk is kept once, compressed,
-//! under `chunks/xx/`, and the whole file is deleted. A cold blob is put back
-//! together the moment anything asks for it, so the rest of rargo never sees
-//! the difference. This is what makes many near-identical large files cheap
-//! to keep, above all the incremental compilation states of successive
-//! snapshots of one crate.
-
 use crate::chunk::ChunkRef;
 use crate::db::{Db, Table};
 use crate::hash::Hash;
@@ -33,29 +18,21 @@ const FICLONE: libc::c_ulong = 0x4004_9409;
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BlobMeta {
     pub size: u64,
-    /// mtime of the blob file when it was stored, in nanoseconds. A blob whose
-    /// file no longer matches was written through a hard link and is dropped.
     pub mtime_ns: i64,
-    /// Seconds since the epoch.
     pub last_used: u64,
 }
 
-/// A blob held as chunks.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ColdMeta {
     size: u64,
     last_used: u64,
-    /// Bytes of chunk files that had to be written when it went cold (what
-    /// keeping it cost at the time; an estimate of what dropping it frees).
     added: u64,
     recipe: Vec<ChunkRef>,
 }
 
-/// Blobs smaller than this stay whole: there is nothing to share.
 const COLD_MIN_SIZE: u64 = 64 << 10;
 const COLD_DISK_KEY: &[u8] = b"cold-disk-bytes";
 
-/// How a blob ended up at a destination path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placed {
     Reflink,
@@ -75,25 +52,12 @@ pub struct Store {
     total: AtomicU64,
     chunks: PathBuf,
     cold: DashMap<Hash, ColdMeta>,
-    /// Bytes of chunk files on disk.
     cold_disk: AtomicU64,
-    /// Readers: anything reading or adding chunks. Writer: chunk collection.
     cold_lock: std::sync::RwLock<()>,
-    /// Bumped whenever a blob stops being whole or stops existing.
     generation: AtomicU64,
-    /// Moves of blobs between `meta` and `cold` begun, and ended. A blob
-    /// that goes cold or comes back is in one map, then both, then the
-    /// other, and a look at both maps that a move overlaps can see it in
-    /// neither: see [`Store::steady`].
     moves_begun: AtomicU64,
     moves_ended: AtomicU64,
-    /// Content that requests in progress hold: never evicted or swept. A
-    /// count per blob, one for each holder ([`Store::pin_all`]).
     pins: DashMap<Hash, u32>,
-    /// Held for reading while content is checked and pinned in one step,
-    /// and for writing by whoever removes a blob, around its look at the
-    /// pins and the removal: a blob is either pinned before it could be
-    /// removed or seen missing by the one who wanted to pin it.
     pin_gate: parking_lot::RwLock<()>,
 }
 
@@ -105,13 +69,10 @@ fn mtime_ns(m: &fs::Metadata) -> i64 {
     m.mtime() * 1_000_000_000 + m.mtime_nsec()
 }
 
-/// Tries to make `dst` a reflink clone of `src`.
 pub fn reflink(src: &File, dst: &File) -> bool {
-    // SAFETY: both fds are valid for the duration of the call.
     unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) == 0 }
 }
 
-/// Copies `src` into the new file `dst` (reflink if possible).
 pub fn clone_or_copy(src: &File, dst: &File) -> io::Result<bool> {
     if reflink(src, dst) {
         return Ok(true);
@@ -129,7 +90,6 @@ impl Store {
         let blobs = root.join("blobs");
         let tmp = root.join("tmp");
         fs::create_dir_all(&blobs)?;
-        // Scratch from a previous run is garbage.
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp)?;
         for i in 0..256 {
@@ -219,19 +179,15 @@ impl Store {
         self.reflink
     }
 
-    /// Bytes the store believes it occupies: whole blobs plus chunk files.
     pub fn total_bytes(&self) -> u64 {
         self.total.load(Ordering::Relaxed) + self.cold_disk.load(Ordering::Relaxed)
     }
 
-    /// `(blobs, bytes they stand for, bytes of chunk files on disk)` of the
-    /// cold tier.
     pub fn cold_stats(&self) -> (usize, u64, u64) {
         let logical = self.cold.iter().map(|e| e.value().size).sum();
         (self.cold.len(), logical, self.cold_disk.load(Ordering::Relaxed))
     }
 
-    /// Every blob hash in the store, whole or cold.
     pub fn all_hashes(&self) -> Vec<Hash> {
         self.meta.iter().map(|e| *e.key()).chain(self.cold.iter().map(|e| *e.key())).collect()
     }
@@ -248,14 +204,11 @@ impl Store {
         p
     }
 
-    /// A fresh path inside the store's scratch area (same filesystem as the
-    /// blobs, so files created here can be renamed into place).
     pub fn tmp_path(&self) -> PathBuf {
         let n = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
         self.tmp.join(format!("t{}-{n}", std::process::id()))
     }
 
-    /// Creates a scratch directory for one action's upper layer.
     pub fn tmp_dir(&self, name: &str) -> io::Result<PathBuf> {
         let p = self.tmp.join(name);
         fs::create_dir_all(&p)?;
@@ -270,8 +223,6 @@ impl Store {
         self.steady(|| self.meta.get(h).map(|m| m.size).or_else(|| self.cold.get(h).map(|m| m.size)))
     }
 
-    /// `look` at both maps as at one moment: again if a move between them
-    /// was under way when it began or began while it looked.
     fn steady<R>(&self, look: impl Fn() -> R) -> R {
         loop {
             let begun = self.moves_begun.load(Ordering::SeqCst);
@@ -285,7 +236,6 @@ impl Store {
         }
     }
 
-    /// Runs `step`, which moves blobs between the two maps, as a move.
     fn moving<R>(&self, step: impl FnOnce() -> R) -> R {
         self.moves_begun.fetch_add(1, Ordering::SeqCst);
         let r = step();
@@ -304,7 +254,6 @@ impl Store {
         self.db.put(Table::Meta, COLD_DISK_KEY, &self.cold_disk.load(Ordering::Relaxed).to_le_bytes());
     }
 
-    /// Stores one chunk if it is not there yet. Returns the bytes written.
     fn write_chunk(&self, c: &Hash, data: &[u8]) -> io::Result<u64> {
         let dst = self.chunk_path(c);
         if dst.exists() {
@@ -320,7 +269,6 @@ impl Store {
             f.write_all(&[tag])?;
             f.write_all(body)?;
         }
-        // Link rather than rename: of two writers of one chunk, one counts.
         let linked = fs::hard_link(&tmp, &dst);
         let _ = fs::remove_file(&tmp);
         match linked {
@@ -344,10 +292,6 @@ impl Store {
         Ok(data)
     }
 
-    /// Turns a whole blob into chunks and deletes the file. Blobs that are
-    /// small, or linked into a worktree (deleting the store's name would
-    /// free nothing), are left alone. `before` is called once the blob is
-    /// certain to go, before its file does. Returns the bytes freed.
     pub fn freeze(&self, h: &Hash, before: &dyn Fn(&Hash)) -> io::Result<Option<u64>> {
         let _g = self.cold_lock.read().unwrap();
         let Some(meta) = self.meta.get(h).map(|m| *m) else { return Ok(None) };
@@ -365,7 +309,6 @@ impl Store {
         let f = File::open(first)?;
         let m = f.metadata()?;
         if m.len() != meta.size || (variants.len() == 1 && mtime_ns(&m) != meta.mtime_ns) {
-            // Not the file that was stored; `open_blob` deals with that.
             return Ok(None);
         }
         let recipe = crate::chunk::chunk_file(&f)?;
@@ -387,14 +330,12 @@ impl Store {
         }
         assert_eq!(off, meta.size);
         self.cold_disk.fetch_add(added, Ordering::Relaxed);
-        // Used again while we were at it: leave it whole.
         if self.meta.get(h).map(|x| x.last_used != meta.last_used).unwrap_or(true) {
             return Ok(None);
         }
         before(h);
         let cm = ColdMeta { size: meta.size, last_used: meta.last_used, added, recipe };
         self.db.put(Table::Cold, &h.0, &bincode::serialize(&cm).unwrap());
-        // Still in the store, as chunks: the generation stays.
         let whole = self.moving(|| {
             self.cold.insert(*h, cm);
             self.meta.remove(h)
@@ -411,8 +352,6 @@ impl Store {
         Ok(Some((meta.size * variants.len() as u64).saturating_sub(added)))
     }
 
-    /// Freezes every whole blob not used for `min_idle_secs`. Returns
-    /// `(blobs, bytes freed)`.
     pub fn freeze_idle(&self, min_idle_secs: u64, before: &dyn Fn(&Hash)) -> (usize, u64) {
         let cutoff = now_secs().saturating_sub(min_idle_secs);
         let mut idle: Vec<(u64, Hash)> = self
@@ -432,7 +371,6 @@ impl Store {
         (n, freed)
     }
 
-    /// Puts a cold blob back together as a whole file.
     fn thaw(&self, h: &Hash) -> io::Result<()> {
         let _g = self.cold_lock.read().unwrap();
         let Some(cm) = self.cold.get(h).map(|m| m.clone()) else { return Ok(()) };
@@ -456,12 +394,9 @@ impl Store {
         })();
         if let Err(e) = built {
             let _ = fs::remove_file(&tmp);
-            // Whatever is wrong with it will not get better: the blob is
-            // gone, and what needed it is rebuilt.
             self.drop_cold(h);
             return Err(e);
         }
-        // `install` records the blob as whole and drops the cold entry.
         self.install(&tmp, *h, false, cm.size)
     }
 
@@ -472,8 +407,6 @@ impl Store {
         Ok(())
     }
 
-    /// Changes whenever something may have left the store. Whoever
-    /// remembers "everything under X is present" remembers it per generation.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
@@ -485,7 +418,6 @@ impl Store {
         Some(cm.added)
     }
 
-    /// Deletes chunk files no cold blob refers to.
     pub fn collect_chunks(&self) -> (usize, u64) {
         let _g = self.cold_lock.write().unwrap();
         let mut live: std::collections::HashSet<Hash> = std::collections::HashSet::new();
@@ -519,8 +451,6 @@ impl Store {
     fn record(&self, h: Hash, size: u64, mtime_ns: i64) {
         let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
         self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
-        // A blob that is whole again is not cold any more: a move, and
-        // nothing left the store, so the generation stays.
         let (old, was_cold) = self.moving(|| (self.meta.insert(h, m), self.cold.remove(&h).is_some()));
         match old {
             None => {
@@ -533,11 +463,9 @@ impl Store {
         }
     }
 
-    /// Marks blobs as used now (for LRU eviction).
     pub fn touch(&self, h: &Hash) {
         let now = now_secs();
         if let Some(mut m) = self.meta.get_mut(h) {
-            // Persist coarse-grained to keep write volume down.
             let stale = now.saturating_sub(m.last_used) > 600;
             m.last_used = now;
             if stale {
@@ -548,7 +476,6 @@ impl Store {
         }
     }
 
-    /// Path of an existing variant of the blob, preferring `exec`.
     fn existing(&self, h: &Hash, exec: bool) -> Option<PathBuf> {
         let p = self.path_of(h, exec);
         if p.exists() {
@@ -558,8 +485,6 @@ impl Store {
         q.exists().then_some(q)
     }
 
-    /// Opens a blob for reading, checking that the file is still the one that
-    /// was stored. A blob that fails the check is forgotten.
     pub fn open_blob(&self, h: &Hash) -> io::Result<File> {
         self.ensure_whole(h)?;
         let meta = self.meta.get(h).map(|m| *m);
@@ -568,7 +493,6 @@ impl Store {
         };
         let Some(p) = self.existing(h, false) else {
             if self.cold.contains_key(h) {
-                // It went cold between the two looks.
                 return self.open_blob(h);
             }
             self.forget(h);
@@ -580,7 +504,6 @@ impl Store {
         };
         let m = f.metadata()?;
         if m.len() != meta.size || mtime_ns(&m) != meta.mtime_ns {
-            // Verify by content before giving up: a touch does not corrupt.
             let (actual, _) = Hash::of_file(&f)?;
             if actual != *h {
                 self.forget(h);
@@ -627,7 +550,6 @@ impl Store {
         Ok(v)
     }
 
-    /// Stores bytes.
     pub fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash> {
         let h = Hash::of(bytes);
         if self.has(&h) {
@@ -644,8 +566,6 @@ impl Store {
         Ok(h)
     }
 
-    /// Moves a file that already lives on the store filesystem into the
-    /// store. The file must not be modified by anyone afterwards.
     pub fn put_file_move(&self, path: &Path, exec: bool) -> io::Result<(Hash, u64)> {
         let (h, size) = Hash::of_path(path)?;
         if self.has(&h) && self.existing(&h, exec).is_some() {
@@ -657,8 +577,6 @@ impl Store {
         Ok((h, size))
     }
 
-    /// Hard-links a finished file on the store filesystem into the store,
-    /// leaving the original name in place.
     pub fn put_file_link(&self, path: &Path, exec: bool) -> io::Result<(Hash, u64)> {
         let (h, size) = Hash::of_path(path)?;
         if self.has(&h) && self.existing(&h, exec).is_some() {
@@ -671,7 +589,6 @@ impl Store {
         Ok((h, size))
     }
 
-    /// Copies (reflinks when possible) an arbitrary file into the store.
     pub fn put_file_copy(&self, src: &File, exec: bool) -> io::Result<(Hash, u64)> {
         let tmp = self.tmp_path();
         let dst = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(&tmp)?;
@@ -684,8 +601,6 @@ impl Store {
         r
     }
 
-    /// Installs a scratch file whose hash the caller has already computed
-    /// while writing it.
     pub fn install_hashed(&self, tmp: &Path, h: Hash, size: u64) -> io::Result<()> {
         if self.has(&h) && self.existing(&h, false).is_some() {
             let _ = fs::remove_file(tmp);
@@ -706,7 +621,6 @@ impl Store {
         Ok(())
     }
 
-    /// Makes sure the requested variant exists and returns its path.
     fn variant(&self, h: &Hash, exec: bool) -> io::Result<PathBuf> {
         let want = self.path_of(h, exec);
         if want.exists() {
@@ -727,9 +641,6 @@ impl Store {
         Ok(want)
     }
 
-    /// Places a blob at `dest` as a file of its own (writable, not sharing
-    /// an inode with the store): a reflink where the filesystem has them,
-    /// a copy otherwise. For paths that other tools write in place.
     pub fn materialize_owned(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
         self.ensure_whole(h)?;
         let parent = dest.parent().context("destination has no parent")?;
@@ -756,16 +667,11 @@ impl Store {
         }
     }
 
-    /// Whether `dest` is already a hard link to the blob (nothing to place
-    /// and nothing to read to find that out).
     pub fn is_linked(&self, h: &Hash, exec: bool, dest: &Path) -> bool {
         let (Ok(d), Ok(s)) = (fs::metadata(dest), fs::metadata(self.path_of(h, exec))) else { return false };
         d.dev() == s.dev() && d.ino() == s.ino()
     }
 
-    /// Places a blob at `dest` without using extra space where the
-    /// filesystems allow it: reflink, then hard link, then copy. An existing
-    /// `dest` is replaced atomically.
     pub fn materialize(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
         self.ensure_whole(h)?;
         let meta = self.meta.get(h).map(|m| *m).with_context(|| format!("blob {h} not in store"))?;
@@ -790,7 +696,6 @@ impl Store {
             }
             if same_fs {
                 let src = self.variant(h, exec)?;
-                // Cheap integrity check before sharing the inode.
                 let m = fs::metadata(&src)?;
                 if m.len() != meta.size {
                     anyhow::bail!("blob {h} has the wrong size on disk");
@@ -817,10 +722,6 @@ impl Store {
         }
     }
 
-    /// Pins every one of `hashes` if the store holds them all (and says
-    /// whether it did). Pinned content stays until [`Store::unpin_all`],
-    /// whatever the budget; this is how a request keeps the worktree it
-    /// was given for as long as it runs.
     pub fn pin_all(&self, hashes: &[Hash]) -> bool {
         let _gate = self.pin_gate.read();
         if !hashes.iter().all(|h| self.has(h)) {
@@ -853,15 +754,10 @@ impl Store {
         self.pins.contains_key(h)
     }
 
-    /// Evicts least-recently-used blobs until the store is under `budget`
-    /// bytes. `pinned` blobs are never evicted. Returns bytes freed.
     pub fn evict_to(&self, budget: u64, pinned: &dyn Fn(&Hash) -> bool) -> u64 {
         self.evict(budget, 0, pinned, &|_| {})
     }
 
-    /// Like [`Store::evict_to`], but leaves alone anything used in the last
-    /// `min_age_secs` seconds (running builds touch what they use), and
-    /// calls `on_evict` before removing each blob.
     pub fn evict(
         &self,
         budget: u64,
@@ -874,7 +770,6 @@ impl Store {
             return 0;
         }
         let cutoff = now_secs().saturating_sub(min_age_secs);
-        // Whole blobs free their size; cold ones roughly what they added.
         let mut all: Vec<(u64, Hash, u64, bool)> = self
             .meta
             .iter()
@@ -905,7 +800,6 @@ impl Store {
                 freed += size;
                 continue;
             }
-            // Skip anything touched since the scan.
             if self.meta.get(&h).map(|m| m.last_used != seen_used).unwrap_or(true) {
                 continue;
             }
@@ -921,8 +815,6 @@ impl Store {
         freed
     }
 
-    /// Removes every blob that `live` does not contain and that has not been
-    /// used for `min_age_secs`. Returns `(blobs, bytes)` removed.
     pub fn sweep(
         &self,
         live: &std::collections::HashSet<Hash>,
@@ -968,7 +860,6 @@ impl Store {
         (dead.len() + dead_cold.len(), bytes)
     }
 
-    /// Removes a blob outright (used when its content turns out to be bad).
     pub fn remove(&self, h: &Hash) {
         self.forget(h);
         let _ = fs::remove_file(self.path_of(h, false));
@@ -998,7 +889,6 @@ mod tests {
         assert_ne!(placed, Placed::Copy);
         assert_eq!(fs::read(&dest).unwrap(), b"hello");
         assert_eq!(fs::metadata(&dest).unwrap().permissions().mode() & 0o111, 0o111);
-        // Replacing an existing destination works.
         let h2 = s.put_bytes(b"world").unwrap();
         s.materialize(&h2, false, &dest).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"world");
@@ -1011,9 +901,8 @@ mod tests {
         let dest = d.path().join("linked");
         let placed = s.materialize(&h, false, &dest).unwrap();
         if placed != Placed::Hardlink {
-            return; // reflink filesystems are immune
+            return;
         }
-        // Root can write through a 0444 hard link.
         let mut f = fs::OpenOptions::new().write(true).open(&dest).unwrap();
         f.write_all(b"CORRUPTED").unwrap();
         drop(f);
@@ -1038,7 +927,6 @@ mod tests {
     #[test]
     fn cold_blobs_come_back_and_share_chunks() {
         let (_d, s) = store();
-        // Two large files that differ in a few bytes in the middle.
         let mut a = vec![0u8; 3 << 20];
         let mut x = 0x1234_5678_9abc_def0u64;
         for b in a.iter_mut() {
@@ -1056,13 +944,10 @@ mod tests {
         assert!(s.freeze(&ha, &|_| {}).unwrap().is_some());
         assert!(s.freeze(&hb, &|_| {}).unwrap().is_some());
         assert_eq!(s.cold_stats().0, 2);
-        // The second file cost little beyond the first.
         assert!(s.total_bytes() < whole * 6 / 10, "{} vs {}", s.total_bytes(), whole);
         assert!(s.has(&ha) && s.size_of(&hb) == Some(b.len() as u64));
-        // Reading brings a blob back, byte for byte.
         assert_eq!(s.read(&hb).unwrap(), b);
         assert_eq!(s.cold_stats().0, 1);
-        // Dropping the other and collecting leaves no chunks behind.
         s.remove(&ha);
         s.collect_chunks();
         assert_eq!(s.cold_stats(), (0, 0, 0));
@@ -1080,7 +965,6 @@ mod tests {
         assert_eq!(s.freeze(&h, &|_| {}).unwrap(), None);
         std::fs::remove_file(&out).unwrap();
         assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-        // Materializing a cold blob thaws it first.
         s.materialize(&h, true, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), data);
         std::fs::remove_file(&out).unwrap();
@@ -1121,8 +1005,6 @@ mod tests {
         assert_eq!(watcher.join().unwrap(), 0, "a blob being thawed was reported missing");
     }
 
-    /// Blobs going cold and coming back on several threads at once, while
-    /// others look: none is ever reported missing or without a size.
     #[test]
     fn blobs_moving_on_many_threads_are_never_missing() {
         let (_d, s) = store();

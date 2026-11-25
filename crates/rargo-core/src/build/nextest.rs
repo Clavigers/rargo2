@@ -1,29 +1,9 @@
-//! `rargo nextest`: nextest runs on the server, against a build of rargo's
-//! own (D81).
-//!
-//! nextest asks cargo two things: the workspace's metadata, and a build of
-//! the test binaries (`cargo test --no-run --message-format
-//! json-render-diagnostics ...`), whose messages name the binaries to run.
-//! In rargo's sandbox the cargo nextest asks is a stand-in that gives the
-//! answers rargod has. An answer it does not have yet is a question: the
-//! stand-in writes it down and the run stops there. rargod answers (the
-//! metadata from cargo, the build from its own pipeline, so every compile
-//! is shared with `rargo test` and `rargo build`) and runs nextest again.
-//! The run with every answer at hand is the one the user sees. From there
-//! nextest decides everything: filters, retries, partitions, profiles and
-//! the files it writes are its own.
-
 use super::*;
 use std::io::Read;
 
-/// The stand-in and its answers, in the sandbox.
 const AT: &[u8] = b"/rargo/nextest";
-/// nextest itself, in the sandbox.
 const NEXTEST_AT: &[u8] = b"/rargo/cargo-nextest";
-/// Where the stand-in writes a question it has no answer to.
 const ASKED: &str = "/.rargo-nextest-asked";
-/// The real cargo, for whatever else asks the stand-in (a test that runs
-/// cargo itself).
 const REAL_CARGO_VAR: &str = "__RARGO_NEXTEST_CARGO";
 
 const STAND_IN: &str = r#"#!/bin/sh
@@ -72,7 +52,6 @@ mkdir -p /.rargo-nextest-q
 { printf '%s\0' "$PWD" "${NEXTEST_ATTEMPT:-1}" "$#" "$@"; /usr/bin/env -0; } >/.rargo-nextest-q/$sum-$len-$$
 "#;
 
-/// What cargo said, or what rargod says in its place.
 #[derive(Clone, Debug)]
 struct Answer {
     args: Vec<String>,
@@ -93,8 +72,6 @@ enum Question {
     Build(Vec<String>),
 }
 
-/// The stand-in's note: `metadata` or `build`, a newline, then the
-/// arguments, each ended by a NUL.
 fn parse_question(raw: &[u8]) -> Option<Question> {
     let nl = raw.iter().position(|&b| b == b'\n')?;
     let args: Vec<String> = raw[nl + 1..]
@@ -114,14 +91,11 @@ fn parse_question(raw: &[u8]) -> Option<Question> {
 
 pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     let mut args = c.args.clone();
-    // rargo's own flag; nextest never sees it.
     let mut no_cache = false;
     if let Some(pos) = args.iter().take_while(|a| *a != "--").position(|a| a == "--no-cache") {
         args.remove(pos);
         no_cache = true;
     }
-    // What cargo would hand the `cargo-nextest` program: everything after
-    // the subcommand's name.
     let at = subcommand_pos(&args).context("no subcommand")?;
     let mut p = prepare(d, c, c.snapshot.clone()).await?;
     let nextest = installed(d, c, wanted(c, &p)?).await?;
@@ -154,8 +128,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                 prio: c.prio,
                 no_cache: false,
                 seed_blobs: Default::default(),
-                // A run that stopped at a question asks it again on the
-                // same inputs.
                 cacheable: Arc::new(|r| r.outputs.get(ASKED.as_bytes()).is_some()),
                 declared_env: Arc::new(|_, _| Vec::new()),
                 observer: Arc::new(NullObserver),
@@ -181,9 +153,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             }
             Some(Question::Build(b)) => break b,
             None => {
-                // nextest finished without needing a build (`--version`,
-                // `show-config`, a mistake on the command line, cargo's
-                // metadata refused): what it said is the answer.
                 let store = d.store();
                 c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
                 c.out.err_text(&String::from_utf8_lossy(&store.read(&r.stderr)?));
@@ -199,9 +168,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     let (answer, built) = build(d, c, build_args).await?;
     answers.build = Some(answer);
 
-    // The runs against the build's results. Each test process nextest
-    // starts is a question until rargod has run that test as an action of
-    // its own; the run that asks nothing more is the one the user sees.
     let base = with_nextest(d, &p, &nextest);
     let (layer, levels) = match &built {
         Some(b) => (b.layer.clone(), Arc::new(vec![LEVEL_FULL; b.units])),
@@ -216,8 +182,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         let var = format!("CARGO_TARGET_{}_RUNNER", triple.to_uppercase().replace(['-', '.'], "_"));
         env.insert(bytes(&var), runner.clone());
     }
-    // nextest's own parallelism only paces the replays; the tests
-    // themselves are scheduled by rargod.
     if !c.env.contains_key("NEXTEST_TEST_THREADS") {
         env.insert(bytes("NEXTEST_TEST_THREADS"), bytes(&d.engine.sched.tokens().to_string()));
     }
@@ -247,8 +211,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                 prio: c.prio,
                 no_cache: false,
                 seed_blobs: Default::default(),
-                // A run that asked is a function of what it was given; so
-                // is one that passed. A failing one may be a flake.
                 cacheable: Arc::new(|r| r.success() || r.outputs.entries.iter().any(|(p, _)| is_test_question(p))),
                 declared_env: Arc::new(|_, _| Vec::new()),
                 observer: Arc::new(Explaining {
@@ -287,7 +249,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             if !q.listing {
                 if cached { replayed += 1 } else { run_now += 1 }
             }
-            // What a test wrote goes where a test's writes go.
             deliver_writes(c, &p, built.as_ref(), &result.outputs);
             let store = d.store();
             ran.insert(q.key.clone(), Ran {
@@ -302,8 +263,6 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
         }
     };
 
-    // The run the user sees: what nextest printed (but for its word about
-    // rargo's runner), then how many tests rargo replayed.
     let store = d.store();
     c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
     c.out.err_text(&without_runner_note(&String::from_utf8_lossy(&store.read(&r.stderr)?)));
@@ -326,29 +285,20 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
     }
 }
 
-/// nextest's stderr without the line in which it says it uses rargo's
-/// runner (it names every runner it uses; this one is rargo's business).
 fn without_runner_note(err: &str) -> String {
     err.split_inclusive('\n').filter(|l| !l.contains("using target runner `/rargo/nextest/runner`")).collect()
 }
 
-/// More runs of nextest than this, each asking for tests the last did
-/// not, means something keeps asking; the last run's word stands.
 const MOST_ROUNDS: usize = 16;
 
-/// What the runner writes when a test process has no recorded run.
 const TEST_QUESTIONS: &[u8] = b"/.rargo-nextest-q";
 
 fn is_test_question(path: &[u8]) -> bool {
     vpath_starts_with(path, TEST_QUESTIONS) && path != TEST_QUESTIONS
 }
 
-/// One test process nextest started (to list a binary's tests, or to run
-/// one of them), as the runner recorded it.
 #[derive(Debug, Clone, PartialEq)]
 struct TestQuestion {
-    /// The working directory, the attempt and the command line, one per
-    /// line: what the runner compares to find a recorded run.
     key: String,
     cwd: String,
     argv: Vec<String>,
@@ -357,9 +307,6 @@ struct TestQuestion {
 }
 
 impl TestQuestion {
-    /// The runner's note: the working directory, the attempt, the number of
-    /// arguments, the arguments, then the environment (`env -0`), each
-    /// ended by a NUL.
     fn parse(raw: &[u8]) -> Option<TestQuestion> {
         let mut fields = raw.split(|&b| b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
         let cwd = fields.next()?;
@@ -383,24 +330,16 @@ impl TestQuestion {
     }
 }
 
-/// A recorded run of a test process, as the runner replays it.
 struct Ran {
     q: String,
     out: Vec<u8>,
     err: Vec<u8>,
-    /// `exit N` or `signal N`.
     status: String,
 }
 
-/// Variables nextest gives a test that differ from one run to the next
-/// for the same test: not given to the action, whose key they would
-/// change every time.
 const PER_RUN: &[&str] =
     &["NEXTEST_RUN_ID", "NEXTEST_ATTEMPT_ID", "NEXTEST_TEST_GLOBAL_SLOT", "NEXTEST_TEST_GROUP_SLOT"];
 
-/// One test process as an action of its own: sandboxed, traced, cached
-/// under the binary, the command line and what it read. A failure is not
-/// cached, so a retry runs again.
 async fn run_test(
     d: &Arc<Daemon>,
     c: &Arc<Client>,
@@ -416,7 +355,6 @@ async fn run_test(
         if PER_RUN.contains(&k.as_str()) || k == REAL_CARGO_VAR || (k.starts_with("CARGO_TARGET_") && k.ends_with("_RUNNER")) {
             continue;
         }
-        // A test that runs cargo gets the real one, as under `rargo test`.
         let v = if k == "CARGO" { real_cargo.clone().unwrap_or_else(|| v.clone()) } else { v.clone() };
         env.insert(bytes(k), bytes(&v));
     }
@@ -449,8 +387,6 @@ async fn run_test(
             prio: c.prio,
             no_cache: no_cache && !q.listing,
             seed_blobs: Default::default(),
-            // A passing run is a fact about its inputs; a failing one may
-            // be a flake and is run again.
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
             observer: Arc::new(Explaining { c: c.clone(), label }),
@@ -459,8 +395,6 @@ async fn run_test(
     Ok((outcome.result, outcome.cached))
 }
 
-/// Says why an action runs, with `RARGO_EXPLAIN`; shows nothing else
-/// (nextest shows the output).
 struct Explaining {
     c: Arc<Client>,
     label: String,
@@ -475,8 +409,6 @@ impl Observer for Explaining {
     }
 }
 
-/// What a test or nextest wrote: the worktree part as tests' writes go,
-/// the target directory's files (a JUnit report) as artifacts do.
 fn deliver_writes(c: &Client, p: &Prepared, built: Option<&Built>, outputs: &Manifest) {
     let target_dirs: Vec<String> = match built {
         Some(b) => b.target_dirs.clone(),
@@ -504,8 +436,6 @@ fn deliver_writes(c: &Client, p: &Prepared, built: Option<&Built>, outputs: &Man
     }
 }
 
-/// POSIX `cksum` of `data`: the CRC the runner names a recorded run's
-/// directory by, with the length beside it.
 fn cksum(data: &[u8]) -> u32 {
     let mut crc: u32 = 0;
     let mut feed = |b: u8| {
@@ -525,8 +455,6 @@ fn cksum(data: &[u8]) -> u32 {
     !crc
 }
 
-/// An argument as the sandbox sees it: paths the user typed refer to the
-/// real worktree.
 fn canonical_arg(tr: &Translator, a: &str) -> String {
     match a.split_once('=') {
         Some((flag, val)) if flag.starts_with("--") && val.starts_with('/') => format!("{flag}={}", tr.to_canonical(val)),
@@ -535,7 +463,6 @@ fn canonical_arg(tr: &Translator, a: &str) -> String {
     }
 }
 
-/// The views' base, with nextest in it.
 fn with_nextest(d: &Daemon, p: &Prepared, nextest: &Path) -> Arc<BaseView> {
     let mut parts = p.parts.clone();
     parts.tools.push((NEXTEST_AT.to_vec(), nextest.to_path_buf()));
@@ -556,21 +483,17 @@ fn spec(p: &Prepared, argv: Vec<Vec<u8>>, env: BTreeMap<Vec<u8>, Vec<u8>>, net: 
     }
 }
 
-/// nextest's environment: the build's, with the stand-in as its cargo.
 fn action_env(base: &BTreeMap<String, String>, cargo: Option<&str>, c: &Client) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut env: BTreeMap<Vec<u8>, Vec<u8>> = base.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
     env.insert(bytes("CARGO"), vjoin(AT, b"cargo"));
     let real = cargo.map(bytes).unwrap_or_else(|| PLANNER_AT.to_vec());
     env.insert(bytes(REAL_CARGO_VAR), real);
-    // nextest colours what it prints when the client's terminal would show
-    // colour; the sandbox is no terminal.
     if c.out.color_err {
         env.insert(bytes("CARGO_TERM_COLOR"), bytes("always"));
     }
     env
 }
 
-/// The stand-ins, and the answers rargod has, as files for the sandbox.
 fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Result<Arc<OutputsLayer>> {
     let store = d.store();
     let mut entries = Vec::new();
@@ -581,9 +504,6 @@ fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Re
     };
     file("cargo", STAND_IN.as_bytes(), true)?;
     file("runner", RUNNER.as_bytes(), true)?;
-    // Recorded test runs, under the directory the runner looks in: the
-    // POSIX checksum and length of the question, then one directory per
-    // question with that checksum.
     let mut slots: HashMap<String, usize> = HashMap::new();
     for r in ran.values() {
         let dir = format!("t/{}-{}", cksum(r.q.as_bytes()), r.q.len());
@@ -608,8 +528,6 @@ fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Re
     Ok(Arc::new(layer))
 }
 
-/// `cargo metadata` as nextest asked for it, from the cargo rargo plans
-/// with (it sees the host, like planning).
 async fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -> Result<Answer> {
     let mut env: BTreeMap<Vec<u8>, Vec<u8>> = p.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
@@ -647,9 +565,6 @@ async fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<Stri
     Ok(Answer { args, out: store.read(&r.stdout)?, err: store.read(&r.stderr)?, code: r.code().unwrap_or(101) })
 }
 
-/// The build nextest asked for, by rargo's pipeline. What it prints on
-/// standard error goes to the client as it happens; its messages are the
-/// answer.
 async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer, Option<Built>)> {
     let kept = Arc::new(Mutex::new(Vec::new()));
     let cb = Arc::new(Client {
@@ -685,8 +600,6 @@ async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(A
         }
         break;
     }
-    // The messages name files as the client knows them; nextest reads them
-    // in the sandbox.
     let back = Translator::new(vec![
         (c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
         (c.cargo_home.clone(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned()),
@@ -695,25 +608,16 @@ async fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(A
     Ok((Answer { args, out, err: Vec::new(), code }, keep.into_inner()))
 }
 
-// nextest on the server.
 
 const RELEASES: &str = "https://github.com/nextest-rs/nextest/releases";
-/// The client's own nextest version, which the client sends with a
-/// `nextest` command.
 pub const CLIENT_VERSION_VAR: &str = "RARGO_NEXTEST_VERSION";
 
-/// The nextest a command asks for, and who asks.
 #[derive(Debug, PartialEq)]
 struct Wanted {
     version: String,
     by: String,
 }
 
-/// The version the repository names, else the client's own, else none
-/// (the newest). The repository names it with `nextest = "..."` under
-/// `[workspace.metadata.rargo]`, or with nextest's own `nextest-version`
-/// in `.config/nextest.toml` (the recommended version where it names
-/// one, else the required one).
 fn wanted(c: &Client, p: &Prepared) -> Result<Option<Wanted>> {
     let check = |version: &str, by: String| -> Result<Option<Wanted>> {
         if version_of(version).is_none() {
@@ -742,8 +646,6 @@ fn wanted(c: &Client, p: &Prepared) -> Result<Option<Wanted>> {
     }
 }
 
-/// `nextest-version` in nextest's configuration: `"0.9.100"`, or
-/// `{ required = "0.9.90", recommended = "0.9.100" }`.
 fn config_version(text: &str) -> Option<String> {
     let table = text.parse::<toml::Table>().ok()?;
     match table.get("nextest-version")? {
@@ -753,11 +655,6 @@ fn config_version(text: &str) -> Option<String> {
     }
 }
 
-/// The program of the nextest a command asks for, installed on first use
-/// beside the others: `STATE/nextest/VERSION/cargo-nextest`, the
-/// statically linked build (it runs in any root, a Nix shell's too) from
-/// nextest's releases on GitHub, checked against the release's SHA-256
-/// sum. Without a version asked for, the newest release.
 async fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<PathBuf> {
     static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let dir = d.cfg.state_dir.join("nextest");
@@ -768,7 +665,6 @@ async fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<Pat
             let newest = tokio::task::spawn_blocking(move || newest_release(&dir2)).await?;
             match newest {
                 Ok(version) => Wanted { version, by: "nobody (the newest release)".into() },
-                // Without word of the newest, the newest at hand.
                 Err(e) => return newest_installed(&dir).ok_or(e).context("nextest is not installed on this server"),
             }
         }
@@ -788,7 +684,6 @@ async fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<Pat
         .with_context(|| format!("nextest {}, which {} asks for, cannot be installed on this server", wanted.version, wanted.by))
 }
 
-/// The newest nextest release, asked of GitHub at most once a day.
 fn newest_release(dir: &Path) -> Result<String> {
     let note = dir.join("newest-release");
     let fresh = std::fs::metadata(&note)
@@ -799,7 +694,6 @@ fn newest_release(dir: &Path) -> Result<String> {
     {
         return Ok(v);
     }
-    // The newest release's page answers with a redirect to its tag.
     let url = format!("{RELEASES}/latest");
     let r = match agent(false).get(&url).call() {
         Ok(r) | Err(ureq::Error::Status(_, r)) => r,
@@ -827,7 +721,6 @@ fn version_of(name: &str) -> Option<Vec<u64>> {
     v.filter(|v| v.len() == 3)
 }
 
-/// `DIR/VERSION/cargo-nextest` of the highest version.
 fn newest_installed(dir: &Path) -> Option<PathBuf> {
     std::fs::read_dir(dir)
         .ok()?
@@ -924,7 +817,6 @@ mod tests {
             ))
         );
         assert_eq!(parse_question(b"metadata\nmetadata\0"), Some(Question::Metadata(vec!["metadata".into()])));
-        // Cut short, or about something else: no question.
         assert_eq!(parse_question(b"build\n--color=auto\0te"), None);
         assert_eq!(parse_question(b"install\nx\0"), None);
     }
@@ -954,7 +846,6 @@ mod tests {
         assert_eq!(q.argv, vec!["/w/target/debug/it-1", "--exact", "reads a fixture"]);
         assert_eq!(q.env, vec![("NEXTEST_ATTEMPT".into(), "2".into()), ("A".into(), "b=c".into())]);
         assert!(!q.listing);
-        // Cut short: no question.
         assert_eq!(TestQuestion::parse(b"/w\x001\x003\x00/w/x\x00"), None);
     }
 
@@ -978,7 +869,6 @@ mod tests {
             std::fs::create_dir_all(tmp.path().join(v)).unwrap();
             std::fs::write(tmp.path().join(v).join("cargo-nextest"), b"").unwrap();
         }
-        // A version without the program is not installed.
         std::fs::create_dir_all(tmp.path().join("0.10.0")).unwrap();
         assert_eq!(newest_installed(tmp.path()), Some(tmp.path().join("0.9.152/cargo-nextest")));
     }

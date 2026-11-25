@@ -1,22 +1,21 @@
-From 67899c80a34adce5027c4ae3244174d4cee20894 Mon Sep 17 00:00:00 2001
+From 2765d800e8af813d903553766a9f686c96f651f5 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:45:11 +0100
 Subject: [PATCH 4/8] rargo: doc's closing status and --open as plan steps
 
 ---
- src/compiler/rargo.rs |  7 +++++
- src/ops/cargo_doc.rs  | 63 +++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 70 insertions(+)
+ src/compiler/rargo.rs |  6 +++++
+ src/ops/cargo_doc.rs  | 59 +++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 65 insertions(+)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index 1b2e3449b..d9f610695 100644
+index 6b9ab31..6364a40 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -602,6 +602,13 @@ pub fn record_run(cmd: &ProcessBuilder) -> CargoResult<()> {
+@@ -564,6 +564,12 @@ pub fn record_run(cmd: &ProcessBuilder) -> CargoResult<()> {
      Ok(())
  }
  
-+/// Records the command that opens generated documentation.
 +pub fn record_open(cmd: &ProcessBuilder) -> CargoResult<()> {
 +    let cmd = cmd_of(cmd)?;
 +    state().lock().unwrap().steps.push(rp::Step::Open { cmd });
@@ -25,9 +24,9 @@ index 1b2e3449b..d9f610695 100644
 +
  static TEST_FLAGS: Mutex<(bool, bool)> = Mutex::new((false, false));
  
- /// Remembers `cargo test` options rargod needs when running the steps.
+ pub fn record_test_flags(no_fail_fast: bool, test_args: &[&str]) {
 diff --git a/src/ops/cargo_doc.rs b/src/ops/cargo_doc.rs
-index 9292c8a74..9ce8d651e 100644
+index 9292c8a..988bd04 100644
 --- a/src/ops/cargo_doc.rs
 +++ b/src/ops/cargo_doc.rs
 @@ -1,3 +1,4 @@
@@ -46,14 +45,10 @@ index 9292c8a74..9ce8d651e 100644
      if options.open_result {
          let name = &compilation.root_crate_names.get(0).ok_or_else(|| {
              anyhow::anyhow!(
-@@ -118,6 +123,64 @@ pub fn doc(ws: &Workspace<'_>, options: &DocOptions) -> CargoResult<()> {
+@@ -118,6 +123,60 @@ pub fn doc(ws: &Workspace<'_>, options: &DocOptions) -> CargoResult<()> {
      Ok(())
  }
  
-+/// rargo: while planning nothing has been generated yet, so what `doc` does
-+/// after the build is recorded as steps instead: the closing status line, and
-+/// for `--open` the command that opens the documentation (run by the client,
-+/// in the user's session).
 +fn rargo_doc_steps(
 +    ws: &Workspace<'_>,
 +    options: &DocOptions,
@@ -111,6 +106,3 @@ index 9292c8a74..9ce8d651e 100644
  fn merge_cross_crate_info(ws: &Workspace<'_>, compilation: &Compilation<'_>) -> CargoResult<()> {
      let Some(fingerprints) = compilation.rustdoc_fingerprints.as_ref() else {
          return Ok(());
--- 
-2.54.0
-

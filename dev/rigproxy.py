@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""Internet for the build server of the namespace rig (dev/netns.sh), which
-has no route out: an HTTP CONNECT proxy that listens on a unix socket in the
-host's network namespace, and a forwarder that listens on TCP inside the
-server's namespace and passes connections to that socket. A unix socket is
-a file, so it crosses network namespaces; no interface, route or firewall
-rule is touched.
-
-  rigproxy.py outside SOCKET          (run in the host namespace)
-  rigproxy.py inside SOCKET PORT      (run in the server's namespace)
-
-Actions that the policy lets use the network reach it with
-HTTPS_PROXY=http://127.0.0.1:PORT.
-"""
 import os, socket, sys, threading
 
 def pump(a, b):

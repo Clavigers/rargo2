@@ -1,18 +1,3 @@
-//! Tokens and invitations: who may connect.
-//!
-//! One JSON file in the state directory (`tokens.json`), rewritten whole
-//! under a lock by whoever changes it (`rargod token ...` on the server's
-//! machine, or the running server when an invitation is redeemed) and read
-//! again by the running server whenever it has changed, so nothing here
-//! needs a restart.
-//!
-//! A token is what a client presents: an id (sent as the user name of the
-//! handshake) and a secret. The file holds the key derived from the secret,
-//! not the secret; the derived key is what the handshake needs, so the file
-//! is as sensitive as the secrets themselves and is kept readable by its
-//! owner only (D67). An invitation is a code an administrator hands to a person;
-//! redeeming it (through `rargo auth`) makes a token.
-
 use anyhow::{Context, Result, anyhow, bail};
 use rargo_proto::secure;
 use serde::{Deserialize, Serialize};
@@ -22,30 +7,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Token {
-    /// What the client sends as its user name.
     pub id: String,
-    /// Who it is.
     pub user: String,
     #[serde(default)]
     pub admin: bool,
-    /// The handshake key derived from the secret, in hex.
     pub key: String,
     pub created: u64,
-    /// Seconds since the epoch after which it no longer works.
     #[serde(default)]
     pub expires: Option<u64>,
     #[serde(default)]
     pub revoked: bool,
-    /// Where it came from (an invitation, the command line).
     #[serde(default)]
     pub note: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Invite {
-    /// A hash of the code, in hex.
     pub code: String,
-    /// The name tokens made from it carry; none: whoever redeems it says.
     #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
@@ -53,13 +31,11 @@ pub struct Invite {
     #[serde(default)]
     pub expires: Option<u64>,
     pub uses_left: u32,
-    /// How long tokens made from it last; none: until revoked.
     #[serde(default)]
     pub token_days: Option<u32>,
     pub created: u64,
 }
 
-/// A GitHub account that may get a token by signing in (`rargo auth`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Allowed {
     pub login: String,
@@ -73,19 +49,14 @@ struct File {
     tokens: Vec<Token>,
     #[serde(default)]
     invites: Vec<Invite>,
-    /// The allow list of GitHub accounts.
     #[serde(default)]
     github: Vec<Allowed>,
 }
 
-/// The GitHub OAuth application a server signs people in with, and the
-/// address its pages are reached at (`github.json` in the state directory,
-/// written by `rargod token github`, read whenever it is needed).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Github {
     pub client_id: String,
     pub client_secret: String,
-    /// `https://rargo.rs`: where GitHub sends the browser back to.
     pub url: String,
 }
 
@@ -111,7 +82,6 @@ impl Github {
     }
 }
 
-/// A GitHub login: letters, digits and single hyphens, at most 39.
 pub fn valid_login(login: &str) -> bool {
     !login.is_empty() && login.len() <= 39 && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !login.starts_with('-')
 }
@@ -132,14 +102,10 @@ fn random(n: usize) -> Result<Vec<u8>> {
     Ok(b)
 }
 
-/// Letters and digits that are not mistaken for one another when read off
-/// a screen.
 const CLEAR: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const _: () = assert!(CLEAR.len() == 32);
 
 pub fn random_text(n: usize, alphabet: &[u8]) -> Result<String> {
-    // (256 is a multiple of 32, and of 62 it is not: bytes that would bias
-    // the choice are drawn again.)
     assert!(!alphabet.is_empty());
     assert!(alphabet.len() <= 256);
     assert!(alphabet.is_ascii(), "one byte per character");
@@ -173,7 +139,6 @@ fn unhex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Codes are compared without regard to case, dashes or spaces.
 pub fn normal_code(code: &str) -> String {
     code.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect()
 }
@@ -182,7 +147,6 @@ fn code_hash(code: &str) -> String {
     hex(blake3::Hasher::new_derive_key("rargo invitation v1").update(normal_code(code).as_bytes()).finalize().as_bytes())
 }
 
-/// A name that is safe to show, store and put into a file name.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
@@ -196,7 +160,6 @@ impl TokenStore {
         &self.path
     }
 
-    /// The file as it is now (read again only when it has changed).
     fn file(&self) -> Arc<File> {
         let stamp = std::fs::metadata(&self.path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
         let mut c = self.cached.lock();
@@ -205,7 +168,6 @@ impl TokenStore {
                 Ok(bytes) => match serde_json::from_slice::<File>(&bytes) {
                     Ok(f) => f,
                     Err(e) => {
-                        // A file that cannot be read admits nobody.
                         eprintln!("rargod: {}: {e}", self.path.display());
                         File::default()
                     }
@@ -217,7 +179,6 @@ impl TokenStore {
         c.1.clone()
     }
 
-    /// Changes the file under a lock held against other writers.
     fn change<T>(&self, f: impl FnOnce(&mut File) -> Result<T>) -> Result<T> {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
@@ -231,7 +192,6 @@ impl TokenStore {
             .mode(0o600)
             .open(self.path.with_extension("lock"))
             .context("opening the token lock file")?;
-        // SAFETY: a valid descriptor; released when `lock` is dropped.
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             bail!("locking the token file: {}", std::io::Error::last_os_error());
         }
@@ -253,7 +213,6 @@ impl TokenStore {
         Ok(out)
     }
 
-    /// The key and standing of the token `id`, if it works now.
     pub fn lookup(&self, id: &str) -> Option<([u8; 32], bool, String)> {
         let file = self.file();
         let t = file.tokens.iter().find(|t| t.id == id)?;
@@ -263,7 +222,6 @@ impl TokenStore {
         Some((unhex32(&t.key)?, t.admin, t.user.clone()))
     }
 
-    /// Makes a token. Returns it and its secret, which is not kept.
     pub fn create(&self, user: &str, admin: bool, days: Option<u32>, note: &str) -> Result<(Token, String)> {
         if !valid_name(user) {
             bail!("a user name is letters, digits, `-`, `_` and `.`, at most 64 of them");
@@ -298,8 +256,6 @@ impl TokenStore {
         self.file().invites.clone()
     }
 
-    /// Revokes the token `id`, or every token of the user `id`. Returns how
-    /// many were revoked.
     pub fn revoke(&self, id: &str) -> Result<usize> {
         self.change(|f| {
             let mut n = 0;
@@ -311,8 +267,6 @@ impl TokenStore {
         })
     }
 
-    /// Revokes the tokens of `user` that have the id, or (given the user's
-    /// own name) all of them.
     pub fn revoke_own(&self, id: &str, user: &str) -> Result<usize> {
         self.change(|f| {
             let mut n = 0;
@@ -324,7 +278,6 @@ impl TokenStore {
         })
     }
 
-    /// Puts a GitHub account on the allow list (or changes its standing).
     pub fn allow(&self, login: &str, admin: bool) -> Result<()> {
         if !valid_login(login) {
             bail!("`{login}` is not a GitHub login");
@@ -336,9 +289,6 @@ impl TokenStore {
         })
     }
 
-    /// Takes a GitHub account off the allow list and revokes the tokens it
-    /// got by signing in. Returns whether it was on the list and how many
-    /// tokens were revoked.
     pub fn disallow(&self, login: &str) -> Result<(bool, usize)> {
         self.change(|f| {
             let before = f.github.len();
@@ -352,8 +302,6 @@ impl TokenStore {
         })
     }
 
-    /// Whether a GitHub account may sign in, and as what (GitHub logins
-    /// do not distinguish case).
     pub fn allowed(&self, login: &str) -> Option<Allowed> {
         self.file().github.iter().find(|a| a.login.eq_ignore_ascii_case(login)).cloned()
     }
@@ -362,8 +310,6 @@ impl TokenStore {
         self.file().github.clone()
     }
 
-    /// A token revokes itself: whoever holds its text may end it. Returns
-    /// whether it was a token that still worked.
     pub fn revoke_self(&self, text: &str) -> Result<bool> {
         let Some((id, secret)) = text.trim().split_once('.') else { return Ok(false) };
         let key = hex(&secure::psk_from_secret(secret.as_bytes()));
@@ -378,7 +324,6 @@ impl TokenStore {
         })
     }
 
-    /// Whose token this is, given its whole text, if it works now.
     pub fn holder(&self, text: &str) -> Option<String> {
         let (id, secret) = text.trim().split_once('.')?;
         let key = hex(&secure::psk_from_secret(secret.as_bytes()));
@@ -390,7 +335,6 @@ impl TokenStore {
         Some(t.user.clone())
     }
 
-    /// Makes an invitation. Returns its code, which is not kept.
     pub fn invite(&self, user: Option<&str>, admin: bool, days: Option<u32>, uses: u32, token_days: Option<u32>) -> Result<String> {
         if let Some(u) = user {
             if !valid_name(u) {
@@ -419,14 +363,11 @@ impl TokenStore {
         Ok(code)
     }
 
-    /// Whether `code` is an invitation that can be used now, and for whom.
     pub fn invited(&self, code: &str) -> Option<Invite> {
         let h = code_hash(code);
         self.file().invites.iter().find(|i| i.code == h && i.uses_left > 0 && i.expires.is_none_or(|e| e > now())).cloned()
     }
 
-    /// Uses an invitation once: makes a token for `name` (or the name the
-    /// invitation carries). Returns the token and its secret.
     pub fn redeem(&self, code: &str, name: Option<&str>) -> Result<(Token, String)> {
         let h = code_hash(code);
         let (invite, user) = self.change(|f| {
@@ -445,29 +386,18 @@ impl TokenStore {
     }
 }
 
-/// The text a client keeps: the id and the secret in one string.
 pub fn token_text(t: &Token, secret: &str) -> String {
     format!("{}.{secret}", t.id)
 }
 
-/// Who asks for a token command: an administrator of the server, or the
-/// holder of a token who is not one.
 pub struct Asker<'a> {
     pub user: &'a str,
     pub admin: bool,
-    /// Where the request came from, kept with a token it makes.
     pub from: &'a str,
 }
 
-/// What a token command prints: for the terminal's standard output and its
-/// standard error.
 pub type Said = (String, String);
 
-/// The token commands of `rargod token` (on the server's machine) and of
-/// `rargo auth` (from a client, over its session): `invite`, `create`,
-/// `list`, `revoke`, `allow` and `disallow`, with their options. Someone
-/// who is not an administrator may list and revoke their own tokens and
-/// nothing else. A secret is in what this says only when it is made.
 pub fn command(store: &TokenStore, args: &[String], asker: &Asker, usage: &str) -> Result<Said> {
     let Some(what) = args.first().map(String::as_str) else { bail!("{usage}") };
     let (mut user, mut admin, mut days, mut uses, mut token_days) = (None::<String>, false, None::<u32>, 1u32, None::<u32>);
@@ -599,23 +529,18 @@ mod tests {
         assert_eq!(user, "ann");
         let text = std::fs::read_to_string(dir.path().join("tokens.json")).unwrap();
         assert!(!text.contains(&secret), "the secret is not in the file");
-        // Another handle on the same file (the command line beside the
-        // server) sees it, and what it changes is seen here.
         let other = TokenStore::new(dir.path().join("tokens.json"));
         assert!(other.lookup(&t.id).is_some());
         assert_eq!(other.revoke(&t.id).unwrap(), 1);
         assert!(store.lookup(&t.id).is_none(), "revoked");
         assert_eq!(other.revoke(&t.id).unwrap(), 0);
-        // Expired at once.
         let (t2, _) = store.create("bob", false, Some(0), "test").unwrap();
         assert!(store.lookup(&t2.id).is_none(), "expired");
         assert!(store.create("no spaces", false, None, "").is_err());
-        // A token may end itself, given its whole text and nothing less.
         let (t3, secret3) = store.create("carol", false, None, "test").unwrap();
         assert!(!store.revoke_self(&format!("{}.not-the-secret-of-it", t3.id)).unwrap());
         assert!(!store.revoke_self(&t3.id).unwrap());
         assert!(store.lookup(&t3.id).is_some());
-        // Its whole text also says whose it is, while it works.
         assert_eq!(store.holder(&token_text(&t3, &secret3)).as_deref(), Some("carol"));
         assert_eq!(store.holder(&format!("{}.not-the-secret-of-it", t3.id)), None);
         assert_eq!(store.holder(&t3.id), None);
@@ -640,11 +565,9 @@ mod tests {
         let (code, err) = command(&store, &args("invite --user cat --admin"), &boss, "usage").unwrap();
         assert!(err.contains("An invitation for cat (administrator)"), "{err}");
         command(&store, &args("allow some-login"), &boss, "usage").unwrap();
-        // The administrator sees everything, and no secret.
         let (all, _) = command(&store, &args("list"), &boss, "usage").unwrap();
         assert!(all.contains(" ann ") && all.contains(" bob ") && all.contains("some-login") && all.contains("for cat (administrator)"), "{all}");
         assert!(!all.contains(ann_token.split('.').nth(1).unwrap()) && !all.contains(code.trim()), "{all}");
-        // ann sees her own tokens only, and nothing of the allow list or the invitations.
         let (own, _) = command(&store, &args("list"), &ann, "usage").unwrap();
         assert!(own.contains(&ann_id) && !own.contains(" bob ") && !own.contains("some-login") && !own.contains("cat"), "{own}");
         for refused in ["invite", "create --user ann2", "allow x", "disallow some-login"] {
@@ -676,7 +599,6 @@ mod tests {
         assert!(store.lookup(&signed_in.id).is_none(), "the token it signed in for is revoked");
         assert!(store.lookup(&invited.id).is_some(), "a token from an invitation is another matter");
         assert_eq!(store.disallow("ann").unwrap(), (false, 0));
-        // The application's settings: kept beside the tokens, private.
         assert!(Github::load(dir.path()).is_none());
         Github { client_id: "id".into(), client_secret: "s".into(), url: "https://x".into() }.save(dir.path()).unwrap();
         assert_eq!(Github::load(dir.path()).unwrap().url, "https://x");
@@ -699,7 +621,6 @@ mod tests {
         store.redeem(&code, None).unwrap();
         assert!(store.redeem(&code, None).is_err(), "used up");
         assert!(store.redeem("AAAA-BBBB-CCCC-DDDD", None).is_err());
-        // Without a name of its own, the redeemer's is taken, if it is one.
         let open = store.invite(None, false, None, 2, None).unwrap();
         assert!(store.redeem(&open, Some("../etc")).is_err());
         assert_eq!(store.redeem(&open, Some("carol")).unwrap().0.user, "carol");

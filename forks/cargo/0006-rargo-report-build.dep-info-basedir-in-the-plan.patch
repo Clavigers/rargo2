@@ -1,4 +1,4 @@
-From e5aef15c4ed31565860152a6878ae2d1ddd49d6c Mon Sep 17 00:00:00 2001
+From 5dd861546f1b72aac90082dc8094488fd25b9b94 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:03:01 +0100
 Subject: [PATCH 6/8] rargo: report build.dep-info-basedir in the plan
@@ -8,18 +8,16 @@ Subject: [PATCH 6/8] rargo: report build.dep-info-basedir in the plan
  1 file changed, 7 insertions(+)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index 48cc8bbed..b6e752bdb 100644
+index 47f5b20..7dc1636 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -10,6 +10,7 @@
- //! `rustc` flags, environment variables, library search paths) flows through
- //! cargo's own code and ends up in the recorded commands as tokens.
+@@ -1,4 +1,5 @@
  
 +use crate::context::ConfigRelativePathResolveExt as _;
  use std::cell::Cell;
  use std::collections::HashMap;
  use std::ffi::OsStr;
-@@ -69,6 +70,7 @@ struct Global {
+@@ -57,6 +58,7 @@ struct Global {
      keep_going: bool,
      deny_warnings: bool,
      rustc_fork: bool,
@@ -27,7 +25,7 @@ index 48cc8bbed..b6e752bdb 100644
  }
  
  fn state() -> &'static Mutex<State> {
-@@ -163,6 +165,10 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+@@ -150,6 +152,10 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
              .sysroot
              .join("lib/rustlib/rargo-fork")
              .exists(),
@@ -38,7 +36,7 @@ index 48cc8bbed..b6e752bdb 100644
      };
      let mut st = state().lock().unwrap();
      st.global = Some(g);
-@@ -675,6 +681,7 @@ pub fn finish() -> CargoResult<()> {
+@@ -628,6 +634,7 @@ pub fn finish() -> CargoResult<()> {
          host: g.host,
          toolchain,
          rustc_fork: g.rustc_fork,
@@ -46,6 +44,3 @@ index 48cc8bbed..b6e752bdb 100644
          units,
          roots: std::mem::take(&mut st.roots),
          steps: std::mem::take(&mut st.steps),
--- 
-2.54.0
-

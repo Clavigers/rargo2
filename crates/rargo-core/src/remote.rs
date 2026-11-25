@@ -1,18 +1,3 @@
-//! Workers: running actions on other machines.
-//!
-//! An action is a command, a view and a filesystem served on demand. On a
-//! worker the view is a [`RemoteView`]: answers the server sent ahead
-//! (predicted from the action's previous trace) are used directly, anything
-//! else is asked for over the session. A closure's store paths arrive as
-//! trees with the first action that needs them, and lookups under those
-//! paths are answered on the worker. File content travels as chunks, and
-//! only chunks the receiver does not already hold, and only when something
-//! opens the file. The worker traces the action exactly as the server would
-//! and sends the trace and outputs back.
-//!
-//! The server keeps all the state that matters: analysis, cache, scheduling.
-//! A worker has a content cache and nothing else to lose.
-
 use crate::chunk::{self, ChunkIndex, ChunkRef, Recipe};
 use crate::engine::{Engine, Live, Observer, RemoteRunner, Request};
 use crate::hash::Hash;
@@ -34,9 +19,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
-// ---------------------------------------------------------------------------
-// Wire format
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum WLooked {
@@ -64,7 +46,6 @@ pub struct WDone {
     pub stats: Stats,
     pub obs: Vec<(VPath, Obs)>,
     pub entries: Vec<(Vec<u8>, MEntry)>,
-    /// What changed in the directories kept on the side (see `ActionSpec::discard`).
     side: Vec<(Vec<u8>, MEntry)>,
     pub tainted: bool,
 }
@@ -73,12 +54,9 @@ pub struct WDone {
 pub enum Req {
     Lookup { action: u64, dir: Vec<u8>, name: Vec<u8> },
     List { action: u64, dir: Vec<u8> },
-    /// The content hash of a file whose hash was not sent with the lookup.
     Open { action: u64, dir: Vec<u8>, name: Vec<u8> },
     Recipe { blob: Hash },
     Chunks { blob: Hash, idx: Vec<u32> },
-    /// Recipe plus, in the same reply, as many of the chunks the asker
-    /// lacks as fit: one round trip for a small file.
     Blob { blob: Hash },
 }
 
@@ -104,40 +82,21 @@ pub enum Msg {
         spec: WSpec,
         uid: u32,
         gid: u32,
-        /// Answers to lookups the action is expected to make.
         prefill: Vec<(Vec<u8>, Vec<u8>, WLooked)>,
         listings: Vec<(Vec<u8>, Vec<(Vec<u8>, u8)>)>,
         untraced: Vec<Vec<u8>>,
-        /// Blobs the server is about to push.
         incoming: Vec<Hash>,
-        /// Directories among `listings` that nothing will be added to while
-        /// the action runs (the crate's sources): a name that is not listed
-        /// does not exist, without asking.
         closed: Vec<Vec<u8>>,
-        /// This action's closure: store path name and manifest identity,
-        /// sorted by name. Only these names exist in its `/nix/store`.
         closure: Vec<(Vec<u8>, Hash)>,
-        /// Manifests for closure paths this worker does not yet hold.
         store_paths: Vec<crate::nixmanifest::WirePath>,
     },
-    /// Part of a blob the worker is expected to need: its recipe and the
-    /// chunks the server believes the worker lacks.
-    /// One of `of` messages that together push a blob. They may arrive
-    /// in any order (the transport delivers messages independently); the
-    /// recipe is in the one numbered 0.
     Push { blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, part: u32, of: u32 },
     Stdout { action: u64, data: Vec<u8> },
     StderrLine { action: u64, line: Vec<u8> },
-    /// A file the action finished early (an `.rmeta`).
     Early { action: u64, path: Vec<u8>, entry: MEntry },
     Done { action: u64, result: Result<WDone, String> },
-    /// Nobody wants this action's result any more: stop it.
     Cancel { action: u64 },
-    /// The worker has finished with a blob it was sent: the bytes are in
-    /// its store, or they could not be put there. Either way it is no
-    /// longer on the way.
     Stored { blob: Hash },
-    /// The worker is leaving. The server drops it as soon as this arrives.
     Bye,
 }
 
@@ -161,33 +120,20 @@ fn dtype_from_u8(b: u8) -> DType {
     }
 }
 
-// ---------------------------------------------------------------------------
-// RPC over a connection
-// ---------------------------------------------------------------------------
 
-/// Requests, replies and one-way messages over one [`Conn`].
 pub struct Peer {
     pub conn: Arc<Conn>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Resp>>>,
     next: AtomicU64,
-    /// Questions, answers, actions and their results.
     out: mpsc::UnboundedSender<Vec<u8>>,
-    /// File contents. Sent when nothing waits in `out`, so that a question
-    /// is not held up by the megabytes queued before it.
     bulk: mpsc::UnboundedSender<Vec<u8>>,
 }
 
-/// Whether a message carries file contents (and goes behind the others).
-/// The transport delivers messages independently and nothing relies on
-/// contents arriving before the message that needs them: an action waits
-/// for what it was told is coming.
 fn is_bulk(m: &Msg) -> bool {
     matches!(m, Msg::Push { .. } | Msg::Resp { body: Resp::Chunks(_) | Resp::Blob(_), .. })
 }
 
 impl Peer {
-    /// Wraps a connection. Messages other than replies are delivered to the
-    /// returned receiver.
     pub fn new(conn: Arc<Conn>) -> (Arc<Peer>, mpsc::UnboundedReceiver<Msg>) {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -230,15 +176,12 @@ impl Peer {
         (peer, in_rx)
     }
 
-    /// Sends a message without waiting.
     pub fn post(&self, m: &Msg) {
         if let Ok(b) = bincode::serialize(m) {
             let _ = if is_bulk(m) { self.bulk.send(b) } else { self.out.send(b) };
         }
     }
 
-    /// Sends `m` and returns when the peer has acknowledged the datagram.
-    /// The peer has the bytes; it may still be acting on them.
     pub async fn deliver(&self, m: &Msg) {
         let Ok(b) = bincode::serialize(m) else { return };
         let framed = if b.len() >= COMPRESS_FROM { tokio::task::block_in_place(|| frame(b)) } else { frame(b) };
@@ -265,9 +208,6 @@ impl Peer {
         rx
     }
 
-    /// Sends a request now; the returned future waits for its answer.
-    /// Several calls made before the first is awaited are in flight
-    /// together.
     pub fn call(&self, body: Req) -> impl std::future::Future<Output = Result<Resp>> + Send + 'static {
         let rx = self.start(body);
         async move {
@@ -280,11 +220,8 @@ impl Peer {
         }
     }
 
-    /// For threads outside the async runtime (FUSE workers).
     pub fn call_blocking(&self, body: Req) -> Result<Resp> {
         let rx = self.start(body);
-        // Usually called from FUSE threads; when called from an async
-        // worker thread, that thread has to be handed over first.
         let got = if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| rx.blocking_recv())
         } else {
@@ -298,11 +235,7 @@ impl Peer {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Blob transfer by chunk
-// ---------------------------------------------------------------------------
 
-/// Where the bytes of a blob can be read from on this side.
 pub trait BlobSource: Send + Sync {
     fn open(&self, h: &Hash) -> io::Result<std::fs::File>;
 }
@@ -314,8 +247,6 @@ impl BlobSource for StoreSource {
     }
 }
 
-/// The chunks of `recipe` to send along with it: those the asker is not
-/// known to have, up to about a megabyte.
 fn inline_indices(recipe: &Recipe, has: &dyn Fn(&Hash) -> bool) -> Vec<u32> {
     let mut out = Vec::new();
     let mut bytes = 0usize;
@@ -335,7 +266,6 @@ fn inline_indices(recipe: &Recipe, has: &dyn Fn(&Hash) -> bool) -> Vec<u32> {
     out
 }
 
-/// Shared by both ends: what we can serve and what we already hold.
 pub struct Blobs {
     pub store: Arc<Store>,
     pub index: ChunkIndex,
@@ -346,8 +276,6 @@ pub struct Blobs {
     outlines: dashmap::DashMap<Hash, Arc<Outline>>,
 }
 
-/// What proves a blob's parts and says which of them are read only on
-/// demand (see [`crate::proto::ServerMsg::Recipe`]).
 pub struct Outline {
     pub cvs: Vec<crate::proto::outline::Cv>,
     pub lazy: Vec<(u64, u64)>,
@@ -369,7 +297,6 @@ impl Blobs {
         }
     }
 
-    /// The outline of a blob we can serve.
     pub fn outline(&self, h: &Hash) -> Option<Arc<Outline>> {
         if let Some(o) = self.outlines.get(h) {
             return Some(o.clone());
@@ -380,8 +307,6 @@ impl Blobs {
             return Some(Arc::new(Outline { cvs: Vec::new(), lazy: Vec::new() }));
         }
         use std::os::fd::AsRawFd;
-        // SAFETY: a read-only private mapping of an immutable blob, unmapped
-        // after its last use below.
         let o = unsafe {
             let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
             if p == libc::MAP_FAILED {
@@ -407,7 +332,6 @@ impl Blobs {
         Some(o)
     }
 
-    /// The recipe of a blob we can serve.
     pub fn recipe(&self, h: &Hash) -> Option<Arc<Recipe>> {
         if let Some(r) = self.index.recipe(h) {
             return Some(r);
@@ -436,7 +360,6 @@ impl Blobs {
             .collect()
     }
 
-    /// A chunk we hold locally, if any.
     fn local_chunk(&self, c: &ChunkRef) -> Option<Vec<u8>> {
         let (blob, off, len) = self.index.locate(&c.hash)?;
         let f = self.source.open(&blob).ok()?;
@@ -449,8 +372,6 @@ impl Blobs {
         }
     }
 
-    /// Puts a blob together from its recipe: chunks given in `have`, chunks
-    /// found locally, and the rest requested from the peer.
     pub async fn assemble(
         &self,
         peer: &Peer,
@@ -480,8 +401,6 @@ impl Blobs {
         }
         assert_eq!(off, recipe.iter().map(|c| c.len as u64).sum::<u64>());
         let missing_count = missing.len();
-        // Ask for what is still missing, a megabyte at a time, several
-        // requests in flight.
         let mut batches: Vec<Vec<(u32, u64, u32)>> = Vec::new();
         let mut cur: Vec<(u32, u64, u32)> = Vec::new();
         let mut cur_bytes = 0usize;
@@ -518,8 +437,6 @@ impl Blobs {
             }
         }
         drop(file);
-        // The whole must hash to what was asked for, whatever the pieces
-        // claimed to be.
         let (got, size) = Hash::of_path(&tmp)?;
         if got != *h {
             let _ = std::fs::remove_file(&tmp);
@@ -532,7 +449,6 @@ impl Blobs {
         Ok(())
     }
 
-    /// Fetches a blob from the peer unless it is already here.
     pub async fn fetch(&self, peer: &Peer, h: &Hash) -> Result<()> {
         if self.store.has(h) {
             return Ok(());
@@ -543,7 +459,6 @@ impl Blobs {
         self.assemble(peer, h, &recipe, chunks.into_iter().collect()).await
     }
 
-    /// Fetches several blobs from the peer, a few at a time.
     pub async fn fetch_all(self: &Arc<Self>, peer: &Arc<Peer>, blobs: &[Hash]) -> Result<()> {
         for group in blobs.chunks(FETCH_TOGETHER) {
             let tasks: Vec<_> = group
@@ -567,12 +482,8 @@ impl Blobs {
     }
 }
 
-/// Blobs fetched from a peer at the same time.
 const FETCH_TOGETHER: usize = 8;
 
-// ---------------------------------------------------------------------------
-// Worker side
-// ---------------------------------------------------------------------------
 
 struct Incoming {
     recipe: Option<Recipe>,
@@ -585,21 +496,16 @@ pub struct WorkerState {
     blobs: Arc<Blobs>,
     engine: Arc<Engine>,
     handle: tokio::runtime::Handle,
-    /// Blobs announced by the server and not complete yet.
     announced: Mutex<HashMap<Hash, tokio::sync::watch::Receiver<bool>>>,
     announce_tx: Mutex<HashMap<Hash, tokio::sync::watch::Sender<bool>>>,
     partial: Mutex<HashMap<Hash, Incoming>>,
     pub lookups_local: AtomicU64,
     pub lookups_remote: AtomicU64,
-    /// Contents an action needed that could not be had from the server.
     starved: AtomicU64,
-    /// Store paths whose manifests this worker holds.
     nix: DashMap<Vec<u8>, Arc<crate::nixmanifest::Installed>>,
 }
 
 impl WorkerState {
-    /// Makes sure blob `h` is in the local store. Callable from any thread
-    /// that is not an async worker thread.
     fn ensure_blob(self: &Arc<Self>, h: &Hash) -> io::Result<()> {
         if self.blobs.store.has(h) {
             return Ok(());
@@ -607,7 +513,6 @@ impl WorkerState {
         let this = self.clone();
         let h = *h;
         let fut = async move {
-                // If the server is already pushing it, wait for that.
                 let waiting = this.announced.lock().get(&h).cloned();
                 if let Some(mut rx) = waiting {
                     let _ = tokio::time::timeout(Duration::from_secs(60), async {
@@ -637,11 +542,6 @@ impl WorkerState {
     }
 
     async fn on_push(self: &Arc<Self>, blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, part: u32, of: u32) {
-        // The messages of one push overtake each other: the blob is put
-        // together when all of them are here, whichever came last. (The
-        // recipe travels in the message numbered 0, which need not be the
-        // first to arrive; putting the blob together on the last-numbered
-        // message would use whatever recipe had come by then.)
         let complete = {
             let mut partial = self.partial.lock();
             let inc = partial.entry(blob).or_insert_with(|| Incoming { recipe: None, chunks: HashMap::new(), parts: 0 });
@@ -657,8 +557,6 @@ impl WorkerState {
             if let Err(e) = self.blobs.assemble(&self.peer, &blob, &recipe, inc.chunks).await {
                 eprintln!("rargo worker: pushed blob {blob} could not be assembled: {e:#}");
             }
-            // Said either way, so the server does not keep waiting on a blob
-            // that will never arrive.
             self.peer.post(&Msg::Stored { blob });
             self.announced.lock().remove(&blob);
             if let Some(tx) = self.announce_tx.lock().remove(&blob) {
@@ -701,16 +599,13 @@ impl LazyBlob for RemoteFile {
     }
 }
 
-/// The view of an action running on a worker.
 pub struct RemoteView {
     state: Arc<WorkerState>,
     action: u64,
     entries: DashMap<(Vec<u8>, Vec<u8>), WLooked>,
     listings: DashMap<Vec<u8>, Listing>,
     untraced: Vec<Vec<u8>>,
-    /// Directories whose listing in `listings` is complete.
     closed: HashSet<Vec<u8>>,
-    /// Store path names in this action's closure, sorted.
     closure: Vec<Vec<u8>>,
 }
 
@@ -745,8 +640,6 @@ impl RemoteView {
 
 impl View for RemoteView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        // The tree names every file by its content hash. An answer sent
-        // ahead may not, and would then ask the server to open the file.
         if let Some(l) = crate::nixmanifest::lookup_at(|n| self.state.nix.get(n).map(|e| Arc::clone(e.value())), &self.closure, dir, name) {
             self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
             return l;
@@ -765,9 +658,6 @@ impl View for RemoteView {
         let w = match self.state.peer.call_blocking(Req::Lookup { action: self.action, dir: dir.to_vec(), name: name.to_vec() }) {
             Ok(Resp::Looked(w)) => w,
             other => {
-                // Not an answer: the action was withdrawn, or the link is
-                // in trouble. Said aloud, because "absent" is what the
-                // compiler will make of it.
                 let why = match other {
                     Err(e) => format!("{e:#}"),
                     Ok(_) => "unexpected reply".to_string(),
@@ -805,7 +695,6 @@ impl View for RemoteView {
     }
 
     fn traced(&self, dir: &[u8]) -> bool {
-        // Store paths are not traced: their identity is part of the action key.
         if !self.closure.is_empty() && crate::nixmanifest::place(dir).is_some() {
             return false;
         }
@@ -824,8 +713,6 @@ impl Observer for WorkerObserver {
     }
 
     fn stderr_line(&self, line: &[u8], live: Option<&dyn Live>) {
-        // An rmeta the compiler has finished is stored right away so the
-        // server can hand it to dependents before the compile ends.
         if let (Some(live), true) = (live, line.starts_with(b"{")) {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) {
                 if let Some(artifact) = v.get("artifact").and_then(|a| a.as_str()) {
@@ -841,13 +728,11 @@ impl Observer for WorkerObserver {
     }
 }
 
-/// Runs a worker: connects to the server and executes what it is sent.
 pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: crate::net::LinkKey) -> Result<()> {
     let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key).await?;
     let conn = loop {
         match endpoint.connect(server).await {
             Ok(c) => break c,
-            // The server may simply not be up yet.
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => eprintln!("rargo worker: {server}: {e}; trying again"),
             Err(e) => return Err(e).with_context(|| format!("connecting to the server at {server}")),
         }
@@ -878,9 +763,6 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
         let msg = tokio::select! {
             m = inbox.recv() => m,
             _ = term.recv() => {
-                // The server drops this worker once it has the notice.
-                // Returning after the acknowledgement means the notice is
-                // there before this process is.
                 peer.deliver(&Msg::Bye).await;
                 return Ok(());
             }
@@ -931,9 +813,6 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                         }
                     }
                 }
-                // Installed before the action is spawned, so a later action on
-                // this connection sees the trees even when its own message
-                // did not carry them.
                 for path in &store_paths {
                     if state.nix.contains_key(&path.name) {
                         continue;
@@ -952,8 +831,6 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                 closure_names.sort();
                 let state = state.clone();
                 let tasks2 = tasks.clone();
-                // Held across the spawn so that the task cannot finish and
-                // deregister before it is registered.
                 let mut registry = tasks.lock();
                 let task = tokio::spawn(async move {
                     let view = Arc::new(RemoteView {
@@ -979,17 +856,11 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                         discard: spec.discard,
                         label: spec.label,
                     };
-                    // The worker's own scheduler shares its cores between
-                    // the actions it was given and their helper threads.
                     let permit = state.engine.sched.acquire(crate::sched::Priority::Agent, 0).await;
                     let obs = WorkerObserver { peer: state.peer.clone(), action };
                     let starved_before = state.starved.load(Ordering::SeqCst);
                     let r = state.engine.execute(&aspec, view, uid, gid, &obs).await;
                     drop(permit);
-                    // A file the action was shown could not be fetched: what
-                    // the action made of that (a compiler error about a
-                    // missing or unreadable file) is this worker's failure,
-                    // not the action's result. The server runs it itself.
                     let r = if state.starved.load(Ordering::SeqCst) != starved_before {
                         Err(anyhow!("an input's content could not be fetched from the server while the action ran"))
                     } else {
@@ -1012,8 +883,6 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
                 registry.insert(action, task.abort_handle());
             }
             Msg::Cancel { action } => {
-                // Dropping the task kills the action's process if it had
-                // started, or gives up its place in the queue if not.
                 if let Some(task) = tasks.lock().remove(&action) {
                     task.abort();
                 }
@@ -1023,15 +892,11 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
     }
 }
 
-// ---------------------------------------------------------------------------
-// Server side
-// ---------------------------------------------------------------------------
 
 const NOBODY: u8 = 0;
 const REMOTE: u8 = 1;
 const LOCAL: u8 = 2;
 
-/// Which of two copies of one action is the one whose output is shown.
 #[derive(Default)]
 struct Voice {
     owner: std::sync::atomic::AtomicU8,
@@ -1043,8 +908,6 @@ impl Voice {
         self.owner.load(Ordering::SeqCst)
     }
 
-    /// `who` is about to produce output: true if it is (now) the copy being
-    /// shown.
     fn claim(&self, who: u8) -> bool {
         match self.owner.compare_exchange(NOBODY, who, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => {
@@ -1056,7 +919,6 @@ impl Voice {
     }
 }
 
-/// The observer of the local copy: silent unless it is the copy shown.
 struct Gated<'a> {
     inner: &'a dyn Observer,
     voice: &'a Voice,
@@ -1075,14 +937,11 @@ impl Observer for Gated<'_> {
     }
 }
 
-/// The crate root a compiler command names: its first argument that is a
-/// Rust source file, made absolute.
 fn crate_root(argv: &[Vec<u8>], cwd: &[u8]) -> Option<Vec<u8>> {
     let file = argv.iter().skip(1).find(|a| a.ends_with(b".rs") && !a.starts_with(b"-"))?;
     Some(if file.starts_with(b"/") { file.clone() } else { vjoin(cwd, file) })
 }
 
-/// Whether a compiler command produces something that is linked.
 fn links(argv: &[Vec<u8>]) -> bool {
     let mut it = argv.iter();
     while let Some(a) = it.next() {
@@ -1100,8 +959,6 @@ fn links(argv: &[Vec<u8>]) -> bool {
     false
 }
 
-/// The libraries of the toolchain `program` (`<sysroot>/bin/rustc`) belongs
-/// to: everything in `<sysroot>/lib/rustlib/<target>/lib`.
 fn sysroot_libs(view: &dyn View, program: &[u8]) -> Vec<Vec<u8>> {
     let Some(sysroot) = vsplit(program).and_then(|(bin, _)| vsplit(bin)).map(|(root, _)| root.to_vec()) else {
         return Vec::new();
@@ -1122,14 +979,9 @@ fn sysroot_libs(view: &dyn View, program: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// At most this many directories and files of a crate travel ahead.
 const SOURCE_TREE_DIRS: usize = 300;
 const SOURCE_TREE_FILES: usize = 3000;
 
-/// The directories and `.rs` files below the directory of a crate root.
-/// A crate root that sits beside its `Cargo.toml` (a build script, a crate
-/// without `src/`) has the whole package below it, tests, vendored code and
-/// all: then only the root's own directory is taken, not what is below.
 fn source_tree(view: &dyn View, root: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let Some((top, _)) = vsplit(root) else { return (Vec::new(), Vec::new()) };
     let (mut dirs, mut files) = (Vec::new(), vec![root.to_vec()]);
@@ -1137,7 +989,6 @@ fn source_tree(view: &dyn View, root: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut recurse = true;
     while let Some(dir) = queue.pop() {
         if dirs.len() >= SOURCE_TREE_DIRS || files.len() >= SOURCE_TREE_FILES {
-            // Too large to be worth it; what was not listed is asked for.
             break;
         }
         let Ok(listing) = view.list(&dir) else { continue };
@@ -1157,7 +1008,6 @@ fn source_tree(view: &dyn View, root: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     (dirs, files)
 }
 
-/// The files a compiler command names with `--extern [opts:]name=path`.
 fn extern_paths(argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     let mut it = argv.iter();
@@ -1182,8 +1032,6 @@ fn extern_paths(argv: &[Vec<u8>]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Everything below `dirs` in `view`: what a lookup of each entry answers
-/// (files with their content hash) and the listing of each directory.
 #[allow(clippy::type_complexity)]
 fn side_tree(
     view: &dyn View,
@@ -1224,16 +1072,10 @@ enum Event {
 struct RemoteAction {
     view: Arc<dyn View>,
     events: mpsc::UnboundedSender<Event>,
-    /// Host files whose content was served; rechecked when the action ends.
     served: Mutex<Vec<FileSrc>>,
-    /// Questions the worker asked for this action (for `RARGO_TRACE_REMOTE`).
     asked: AtomicU64,
 }
 
-/// Messages bigger than this are compressed (zstd level 1) when that makes
-/// them smaller. rustc's outputs shrink several times (a 478 MB rlib with
-/// debug info to 81 MB) at a few hundred MB/s, which is much faster than
-/// the link.
 const COMPRESS_FROM: usize = 4 << 10;
 
 fn frame(b: Vec<u8>) -> Vec<u8> {
@@ -1267,24 +1109,16 @@ fn unframe(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     }
 }
 
-/// `RARGO_DISPATCH=eager` in rargod's environment: dispatch whenever no
-/// local core is free, without weighing transfer against waiting.
 fn eager_dispatch() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RARGO_DISPATCH").ok().as_deref() == Some("eager"))
 }
 
-/// `RARGO_REMOTE_INCR=0` in rargod's environment: crates that are compiled
-/// incrementally are never compiled on a worker (the rule of D55).
 fn remote_incr() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RARGO_REMOTE_INCR").ok().as_deref() != Some("0"))
 }
 
-/// `RARGO_STATE_HOME_AFTER_MS` in rargod's environment: how long a state
-/// lies on the worker that made it before it is fetched in the background
-/// (default: not at all). A compile here that needs it fetches it at once
-/// whatever this says.
 fn state_home_after() -> Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_millis(*MS.get_or_init(|| {
@@ -1292,29 +1126,18 @@ fn state_home_after() -> Duration {
     }))
 }
 
-/// `RARGO_HEDGE=0` in rargod's environment: a compile given to a worker is
-/// not also run on an idle local core. On unless set, so a core that
-/// nothing else wants can finish the compile while the worker is still
-/// fetching what it needs.
 fn hedge() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RARGO_HEDGE").ok().as_deref() != Some("0"))
 }
 
-/// `RARGO_STATE_AHEAD=1` in rargod's environment: incremental states made
-/// on the server are sent to workers ahead of need. Off unless asked for:
-/// measured, the states' bytes cost the link more than the compiles that
-/// could then leave the server gained (D65).
 fn state_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RARGO_STATE_AHEAD").ok().as_deref() == Some("1"))
 }
 
-/// A state larger than this in what a worker lacks of it is not sent ahead.
 const AHEAD_MAX: u64 = 256 << 20;
 
-/// States made on the server that workers have not been sent yet: the
-/// newest of each crate and worktree, newest first, a bounded number.
 #[derive(Default)]
 pub struct AheadQueue {
     waiting: std::collections::VecDeque<((Hash, String), Arc<Vec<(Hash, u64)>>)>,
@@ -1323,7 +1146,6 @@ pub struct AheadQueue {
 impl AheadQueue {
     const KEPT: usize = 512;
 
-    /// A newer state of a crate replaces the one still waiting.
     pub fn offer(&mut self, whose: (Hash, String), blobs: Arc<Vec<(Hash, u64)>>) {
         self.waiting.retain(|(w, _)| *w != whose);
         self.waiting.push_back((whose, blobs));
@@ -1334,7 +1156,6 @@ impl AheadQueue {
         debug_assert_eq!(self.waiting.iter().filter(|(w, _)| *w == self.waiting.back().unwrap().0).count(), 1, "one state per crate");
     }
 
-    /// The newest state waiting.
     pub fn next(&mut self) -> Option<Arc<Vec<(Hash, u64)>>> {
         self.waiting.pop_back().map(|(_, b)| b)
     }
@@ -1348,21 +1169,14 @@ impl AheadQueue {
     }
 }
 
-/// How long after the link is reckoned to have carried a blob an action is
-/// still told that it is coming.
 const IN_FLIGHT_SLACK: Duration = Duration::from_secs(2);
 
 fn still_in_flight(fl: &HashMap<Hash, std::time::Instant>, h: &Hash, now: std::time::Instant) -> bool {
     fl.get(h).is_some_and(|at| *at > now)
 }
 
-/// How much of an incremental state a worker may lack and still be given
-/// the compile: that much is sent along; a state it does not have is not
-/// (D31).
 const SEED_GAP: u64 = 4 << 20;
 
-/// `RARGO_TRACE_REMOTE` in rargod's environment: one line per remote
-/// action on its stderr, with where the time went.
 fn trace_remote() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RARGO_TRACE_REMOTE").is_some())
@@ -1379,19 +1193,11 @@ pub struct Worker {
     alive: std::sync::atomic::AtomicBool,
     pub pushed_bytes: AtomicU64,
     pub skipped_bytes: AtomicU64,
-    /// Moving average, in microseconds, of what running an action here cost
-    /// beyond the action itself (questions, pushes, bringing outputs home).
     overhead_us: AtomicU64,
     overhead_samples: AtomicU64,
-    /// When what has been queued for the worker will have crossed the link.
     link_free_at: Mutex<std::time::Instant>,
-    /// Contents on their way to the worker and when the link will have
-    /// carried them: an action that needs one is told it is coming (it is
-    /// sent ahead of contents and may arrive first).
     in_flight: Mutex<HashMap<Hash, std::time::Instant>>,
-    /// The files every compile reads (the toolchain) are on their way.
     warmed: std::sync::atomic::AtomicBool,
-    /// Store path names whose manifests have been sent to this worker.
     store_paths: Mutex<HashSet<Vec<u8>>>,
 }
 
@@ -1400,20 +1206,16 @@ impl Worker {
         let us = d.as_micros() as u64;
         let n = self.overhead_samples.fetch_add(1, Ordering::Relaxed);
         let old = self.overhead_us.load(Ordering::Relaxed);
-        // The first samples count fully, later ones by a quarter.
         let new = if n == 0 { us } else { (old * 3 + us) / 4 };
         self.overhead_us.store(new, Ordering::Relaxed);
     }
 
-    /// What dispatching costs beyond the action, once measured.
     fn overhead(&self) -> Option<Duration> {
         (self.overhead_samples.load(Ordering::Relaxed) >= 3)
             .then(|| Duration::from_micros(self.overhead_us.load(Ordering::Relaxed)))
     }
 }
 
-/// Serves blobs by hash: from the store, or from the host file an action
-/// was shown under that hash.
 struct ServerSource {
     store: Arc<Store>,
     host: Arc<DashMap<Hash, FileSrc>>,
@@ -1436,74 +1238,44 @@ pub struct PoolStats {
     pub dispatched: AtomicU64,
     pub kept_local_no_wait: AtomicU64,
     pub kept_local_transfer: AtomicU64,
-    /// Queued for both; a local core came free before a worker's.
     pub kept_local_first: AtomicU64,
     pub worker_failures: AtomicU64,
-    /// Not offered to workers: no worker has the crate's incremental state.
     pub kept_local_incremental: AtomicU64,
-    /// Dispatched with the incremental state the worker already held.
     pub seeded_in_place: AtomicU64,
-    /// Incrementally compiled crates dispatched without any state (their
-    /// first compile).
     pub unseeded_remote: AtomicU64,
-    /// Files of incremental states left on workers, to come home later.
     pub state_left_blobs: AtomicU64,
     pub state_left_bytes: AtomicU64,
-    /// Of those, fetched in the background on an idle core.
     pub state_homed_blobs: AtomicU64,
     pub state_homed_bytes: AtomicU64,
-    /// Fetched because a compile here needed them.
     pub state_needed_blobs: AtomicU64,
-    /// States made here and sent to workers ahead of need, and their size
-    /// in what the workers lacked.
     pub states_sent_ahead: AtomicU64,
     pub state_ahead_bytes: AtomicU64,
-    /// Dispatched, then run here because a local core fell idle first.
     pub hedged: AtomicU64,
-    /// Hedges where the local copy finished first.
     pub hedge_won: AtomicU64,
-    /// Hedges whose local copy was stopped because the worker's was ahead.
     pub hedge_stopped: AtomicU64,
     pub prefilled_entries: AtomicU64,
     pub lookups_served: AtomicU64,
     pub opens_served: AtomicU64,
-    /// Questions whose directory is `/nix/store` or under it: lookups,
-    /// listings and opens. A worker that holds the closure's trees asks none.
     pub nix_lookups: AtomicU64,
 }
 
-/// The server's set of workers.
 pub struct Pool {
     workers: Mutex<Vec<Arc<Worker>>>,
     blobs: Arc<Blobs>,
     host_srcs: Arc<DashMap<Hash, FileSrc>>,
     content: Arc<Content>,
     next_action: AtomicU64,
-    /// Path prefixes whose observations are specific to one crate and are
-    /// not borrowed from another action's trace (worktree, cargo home).
     pub profile_exclude: Vec<Vec<u8>>,
-    /// Bytes per second assumed for transfer estimates.
     pub bandwidth: AtomicU64,
     pub stats: PoolStats,
-    /// Signalled whenever a worker core becomes free.
     freed: tokio::sync::Notify,
-    /// Files of incremental states that are on a worker and not here, in
-    /// the order they were made.
     home_queue: Mutex<std::collections::VecDeque<(Arc<Worker>, Hash, u64, std::time::Instant)>>,
     home_wake: tokio::sync::Notify,
-    /// States made here, to be sent to workers when the link is idle.
     ahead: Mutex<AheadQueue>,
     ahead_wake: tokio::sync::Notify,
-    /// Set under `ahead`'s lock before a state is taken off the queue, and
-    /// cleared when that send has been handed to the links.
     ahead_busy: AtomicBool,
-    /// Set under `home_queue`'s lock before a due file is taken off it, and
-    /// cleared when that fetch has finished.
     home_fetching: AtomicBool,
-    /// Woken when a transfer starts, finishes, or is given up.
     settle_wake: tokio::sync::Notify,
-    /// Files of incremental states that compiles left on workers: which
-    /// worker, and the action that made them (for diagnosis).
     left_on: DashMap<Hash, (u64, String)>,
 }
 
@@ -1524,7 +1296,6 @@ fn to_wire(l: &Looked, content: &Content) -> WLooked {
 }
 
 impl Pool {
-    /// Starts listening for workers.
     pub async fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey) -> Result<Arc<Pool>> {
         let endpoint = Endpoint::bind_keyed(addr, true, key).await.with_context(|| format!("binding {addr}"))?;
         let host_srcs: Arc<DashMap<Hash, FileSrc>> = Arc::new(DashMap::new());
@@ -1541,11 +1312,8 @@ impl Pool {
             blobs,
             host_srcs,
             content: engine.content.clone(),
-            // Action ids start somewhere unpredictable, so that messages
-            // recorded from an earlier session mean nothing in this one.
             next_action: AtomicU64::new({
                 let mut b = [0u8; 8];
-                // SAFETY: filling a valid 8-byte buffer.
                 unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
                 u64::from_le_bytes(b) >> 1
             }),
@@ -1577,15 +1345,12 @@ impl Pool {
         Ok(pool)
     }
 
-    /// Measured cost of a remote action beyond running it, per worker.
     pub fn overhead_text(&self) -> String {
         let ws = self.workers.lock();
         let v: Vec<String> = ws.iter().filter_map(|w| w.overhead()).map(|d| format!("{:.2} s", d.as_secs_f64())).collect();
         if v.is_empty() { "not measured yet".into() } else { v.join(", ") }
     }
 
-    /// Host files shown to actions, keyed by content hash, so a worker can
-    /// be sent the bytes of a store path without the file being copied in.
     pub fn host_sources(&self) -> &Arc<DashMap<Hash, FileSrc>> {
         &self.host_srcs
     }
@@ -1594,8 +1359,6 @@ impl Pool {
         self.workers.lock().iter().filter(|w| w.alive.load(Ordering::Relaxed)).count()
     }
 
-    /// `(pushed, skipped)` bytes over all workers: what was sent ahead and
-    /// what did not need sending because the worker already had it.
     pub fn transfer_totals(&self) -> (u64, u64, u64, u64) {
         let ws = self.workers.lock();
         (
@@ -1613,8 +1376,6 @@ impl Pool {
             let msg = tokio::select! {
                 m = inbox.recv() => m,
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    // A worker with actions outstanding that has been silent
-                    // for a while is gone.
                     let busy = worker.as_ref().is_some_and(|w| !w.actions.is_empty());
                     if busy && conn.idle() > Duration::from_secs(30) { None } else { continue }
                 }
@@ -1676,7 +1437,6 @@ impl Pool {
             w.alive.store(false, Ordering::SeqCst);
             w.in_flight.lock().clear();
             self.settle_wake.notify_waiters();
-            // Whatever it was running is rerun locally.
             for a in w.actions.iter() {
                 let _ = a.events.send(Event::Done(Err("worker connection lost".into())));
             }
@@ -1696,7 +1456,6 @@ impl Pool {
         }
     }
 
-    /// Answers a worker's request (runs on a blocking thread).
     fn answer(&self, w: &Worker, body: Req) -> Resp {
         match body {
             Req::Lookup { action, dir, name } => {
@@ -1715,8 +1474,6 @@ impl Pool {
                     eprintln!("rargod: asked lookup {kind} {}/{}", String::from_utf8_lossy(&dir), String::from_utf8_lossy(&name));
                 }
                 let wire = to_wire(&looked, &self.content);
-                // If the answer names a hash, the worker may ask for those
-                // bytes; for a host file we must remember where they are.
                 if let (Looked::File(f), WLooked::File { hash: Some(h), .. }) = (&looked, &wire) {
                     self.remember_src(&a, *h, &f.src);
                 }
@@ -1751,7 +1508,6 @@ impl Pool {
             Req::Recipe { blob } => {
                 let r = self.blobs.recipe(&blob).map(|r| (*r).clone());
                 if let Some(r) = &r {
-                    // The worker is about to hold these chunks.
                     w.has_chunks.lock().extend(r.iter().map(|c| c.hash));
                     w.has_blobs.lock().insert(blob);
                 }
@@ -1806,7 +1562,6 @@ impl Pool {
         }
     }
 
-    /// Picks a worker with a free core; with `among`, only one of those.
     fn lease(&self, among: Option<&[u64]>) -> Option<Arc<Worker>> {
         let ws = self.workers.lock();
         let mut best: Option<&Arc<Worker>> = None;
@@ -1816,24 +1571,19 @@ impl Pool {
             }
         }
         let w = best?.clone();
-        // Racy by design: a brief oversubscription just queues on the
-        // worker's own scheduler.
         w.free.fetch_sub(1, Ordering::Relaxed);
         Some(w)
     }
 
     fn give_back(&self, w: &Worker) {
         w.free.fetch_add(1, Ordering::Relaxed);
-        // Whoever is woken may be waiting for another worker's core.
         self.freed.notify_waiters();
     }
 
-    /// A worker core, as soon as there is one.
     async fn lease_wait(&self, among: Option<&[u64]>) -> Arc<Worker> {
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
-            // Registered before looking, so a core freed in between is not missed.
             freed.as_mut().enable();
             if let Some(w) = self.lease(among) {
                 return w;
@@ -1842,8 +1592,6 @@ impl Pool {
         }
     }
 
-    /// The workers that hold the state `blobs` (all but `SEED_GAP` of it,
-    /// and that remainder is here to be sent).
     fn seed_holders(&self, blobs: &[(Hash, u64)], store: &Store) -> Vec<u64> {
         let ws = self.workers.lock();
         ws.iter()
@@ -1866,18 +1614,11 @@ impl Pool {
             .collect()
     }
 
-    /// A connected worker that holds `blob`.
     fn holder(&self, blob: &Hash) -> Option<Arc<Worker>> {
         let ws = self.workers.lock();
         ws.iter().find(|w| w.alive.load(Ordering::Relaxed) && w.has_blobs.lock().contains(blob)).cloned()
     }
 
-    /// Sends workers the incremental states compiles made here, newest
-    /// first, while their links have nothing else to carry. A compile
-    /// that starts from a state is only given to a worker that holds it
-    /// (D56), so a crate whose state is only here stays here; this is
-    /// what lets its next compile go to a worker. Only what a worker
-    /// lacks is sent, by chunk.
     async fn send_states_ahead(self: Arc<Self>, engine: Arc<Engine>) {
         loop {
             let next = {
@@ -1902,7 +1643,6 @@ impl Pool {
                 if missing.is_empty() || bytes > AHEAD_MAX {
                     continue;
                 }
-                // Behind whatever actions are waiting for on this link.
                 for _ in 0..60 {
                     let busy = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
                     if busy.is_zero() {
@@ -1913,8 +1653,6 @@ impl Pool {
                 if !w.alive.load(Ordering::Relaxed) {
                     continue;
                 }
-                // (Counted: what was sent, which is less than the files'
-                // sizes where the worker held some of their chunks.)
                 let sent: u64 = tokio::task::block_in_place(|| missing.iter().map(|(h, _)| self.push_blob(&w, *h)).sum());
                 self.stats.states_sent_ahead.fetch_add(1, Ordering::Relaxed);
                 self.stats.state_ahead_bytes.fetch_add(sent, Ordering::Relaxed);
@@ -1924,20 +1662,11 @@ impl Pool {
         }
     }
 
-    /// Fetches the files of incremental states that compiles left on
-    /// workers, oldest first, one at a time and only on a core nothing else
-    /// wants: putting a file together and checking it costs the CPU time
-    /// the builds are short of. A compile that needs a state sooner fetches
-    /// it itself (`bring_home`).
     async fn bring_states_home(self: Arc<Self>, engine: Arc<Engine>) {
         loop {
             let wake = self.home_wake.notified();
             tokio::pin!(wake);
             wake.as_mut().enable();
-            // A file stays queued while its delay has not elapsed, so a
-            // caller that asks whether transfers are finished does not wait
-            // out that delay. The flag is set under the same lock as the
-            // pop, before anything awaits.
             let due = {
                 let mut q = self.home_queue.lock();
                 match q.front() {
@@ -1980,10 +1709,6 @@ impl Pool {
         }
     }
 
-    /// Returns when every blob pushed to a worker has been acknowledged,
-    /// nothing is queued or being sent ahead, and no incremental state that
-    /// is already due has still to come home. A file whose delay has not
-    /// elapsed is left where it is.
     pub async fn settle(&self) {
         loop {
             let wake = self.settle_wake.notified();
@@ -2013,9 +1738,6 @@ impl Pool {
                 return false;
             }
         }
-        // After the queues: a send that took an item off a queue has either
-        // not started (the queue or the flag still says so) or has put the
-        // blob here.
         let ws = self.workers.lock();
         for w in ws.iter() {
             if w.alive.load(Ordering::Relaxed) && !w.in_flight.lock().is_empty() {
@@ -2025,11 +1747,7 @@ impl Pool {
         true
     }
 
-    /// Sends a blob the worker is expected to need, leaving out the chunks
-    /// it is known to hold.
     fn push_blob(&self, w: &Worker, h: Hash) -> u64 {
-        // Another action's push may have sent it since this one was planned.
-        // (Claimed before sending: pushes planned together run together.)
         if !w.has_blobs.lock().insert(h) {
             return 0;
         }
@@ -2046,7 +1764,6 @@ impl Pool {
         let need: u64 = missing.iter().map(|i| recipe[*i as usize].len as u64).sum();
         w.pushed_bytes.fetch_add(need, Ordering::Relaxed);
         w.skipped_bytes.fetch_add(total - need, Ordering::Relaxed);
-        // When the link will have carried this, at the rate seen so far.
         {
             let secs = need as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64;
             let mut free_at = w.link_free_at.lock();
@@ -2058,8 +1775,6 @@ impl Pool {
             }
             fl.insert(h, *free_at + IN_FLIGHT_SLACK);
         }
-        // Cut into messages of about a megabyte, counted first: the
-        // worker has to know when it has them all.
         let mut batches: Vec<Vec<u32>> = vec![Vec::new()];
         let mut bytes = 0usize;
         for i in missing {
@@ -2092,7 +1807,6 @@ impl Pool {
     }
 }
 
-/// Early outputs of a remote action, for the unit that is waiting on them.
 struct RemoteLive<'a> {
     early: &'a Mutex<HashMap<Vec<u8>, MEntry>>,
     pool: &'a Pool,
@@ -2103,7 +1817,6 @@ impl Live for RemoteLive<'_> {
     fn ingest(&self, path: &[u8]) -> Option<MEntry> {
         let entry = self.early.lock().get(path).cloned()?;
         if let MEntry::File { hash, .. } = &entry {
-            // Dependents may run here; the file has to be in our store.
             let (pool, worker, hash) = (self.pool, self.worker, *hash);
             let ok = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(pool.blobs.fetch(&worker.peer, &hash)).is_ok()
@@ -2119,11 +1832,6 @@ impl Live for RemoteLive<'_> {
 type RunResult = Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)>;
 
 impl Pool {
-    /// Predicts what an action will ask, from its last trace (or, for one
-    /// that has never run, from another run of the same program and its
-    /// command line), and answers in advance with what the view says now.
-    /// Returns the answers, the directory listings, and the contents the
-    /// worker lacks.
     #[allow(clippy::type_complexity)]
     async fn predict(
         &self,
@@ -2139,10 +1847,6 @@ impl Pool {
         let mut listings = Vec::new();
         let mut incoming: Vec<Hash> = Vec::new();
         let own = engine.traces.traces(key).first().map(|(_, t)| t.clone());
-        // No history of its own: borrow another run of the same program for
-        // everything outside the worktree and cargo home (the toolchain and
-        // system files every compile reads), and add the outputs of the
-        // units this one depends on.
         let predicted: Option<Vec<(VPath, Obs)>> = match &own {
             Some(t) => Some(t.obs.clone()),
             None => {
@@ -2156,21 +1860,10 @@ impl Pool {
                             .collect()
                     })
                     .unwrap_or_default();
-                // Hinted paths are looked up, not necessarily read.
                 obs.extend(view.hints().into_iter().map(|p| (VPath::from(p), Obs::Dir)));
-                // What the command line names as a dependency is read for
-                // certain: sent ahead, it is there when the compiler opens
-                // it, instead of one round trip per crate while it waits.
                 obs.extend(
                     extern_paths(&spec.argv).into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })),
                 );
-                // A compiler reads its crate's sources, and asks for many
-                // names beside them that do not exist (`foo.rs` or
-                // `foo/mod.rs`?). The source tree goes along whole: its
-                // listings, which answer those questions, and its files.
-                // A compile that links reads the standard library's object
-                // code; until one such compile has run here there is no
-                // history to say so.
                 if spec.kind == ActionKind::Rustc && links(&spec.argv) && engine.profile(spec).is_none() {
                     if let Some(program) = spec.argv.first() {
                         let view = view.clone();
@@ -2208,7 +1901,6 @@ impl Pool {
                         }
                         continue;
                     }
-                    // The walk to this path asks about every parent first.
                     let mut cur: &[u8] = path;
                     let mut chain = Vec::new();
                     while let Some((dir, name)) = vsplit(cur) {
@@ -2222,21 +1914,12 @@ impl Pool {
                         }
                         let looked = view.lookup(&dir, &name);
                         let mut w = to_wire(&looked, &content);
-                        // An answer that names a content (one this server
-                        // has hashed before) promises that the content can
-                        // be asked for by that name. For a file on this
-                        // machine's disk that means remembering where it
-                        // is; without this the worker's request for it was
-                        // refused and its compiler failed on the file.
                         if let (Looked::File(f), WLooked::File { hash: Some(h), .. }) = (&looked, &w) {
                             if let FileSrc::Host { .. } = &f.src {
                                 host_srcs.entry(*h).or_insert_with(|| f.src.clone());
                                 ra2.served.lock().push(f.src.clone());
                             }
                         }
-                        // Content the action read last time will be read
-                        // again: resolve its hash now and send the bytes
-                        // ahead.
                         if let (Looked::File(f), true) = (&looked, matches!(o, Obs::File { .. }) && vjoin(&dir, &name) == path[..]) {
                             if let Ok(h) = content.hash(&f.src) {
                                 if let FileSrc::Host { .. } = &f.src {
@@ -2264,7 +1947,6 @@ impl Pool {
             incoming.sort();
             incoming.dedup();
         }
-        // Only what was really listed counts as complete.
         closed.retain(|d| listings.iter().any(|(l, _)| l == d));
         Ok((prefill, listings, incoming, closed))
     }
@@ -2281,8 +1963,6 @@ impl Pool {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = mpsc::unbounded_channel();
         let t0 = std::time::Instant::now();
-        // The action's side directories (its incremental state) are shown
-        // as they are: it is only sent to a worker that holds that state.
         let view: Arc<dyn View> = req.view.clone();
         let ra = Arc::new(RemoteAction {
             view: view.clone(),
@@ -2296,9 +1976,6 @@ impl Pool {
             fn drop(&mut self) {
                 self.1.actions.remove(&self.2);
                 if !self.3.get() {
-                    // Given up before the worker finished (a local core ran
-                    // it first, or the client left): the worker's core is
-                    // only free once it has stopped.
                     self.1.peer.post(&Msg::Cancel { action: self.2 });
                 }
                 self.0.give_back(self.1);
@@ -2308,8 +1985,6 @@ impl Pool {
 
         let (mut prefill, mut listings, incoming, mut closed) = self.predict(w, engine, spec, key, &view, &ra).await?;
         if !req.seed_blobs.is_empty() {
-            // The compiler walks its whole state before anything else: the
-            // tree goes with the action instead of one question per file.
             let (view, content, dirs) = (view.clone(), self.content.clone(), spec.discard.clone());
             let (p, l) = tokio::task::spawn_blocking(move || side_tree(&*view, &content, &dirs)).await?;
             closed.extend(l.iter().map(|(d, _)| d.clone()));
@@ -2317,9 +1992,6 @@ impl Pool {
             listings.extend(l);
         }
         self.stats.prefilled_entries.fetch_add(prefill.len() as u64, Ordering::Relaxed);
-        // The decision of which trees to send and the post that carries them
-        // share one lock, so two actions cannot each believe the other is
-        // sending a path. Serializing the manifests is synchronous work.
         tokio::task::block_in_place(|| {
             let mut held = w.store_paths.lock();
             let mut closure: Vec<(Vec<u8>, Hash)> = view.nix_closure().to_vec();
@@ -2364,13 +2036,9 @@ impl Pool {
             });
         });
         if !incoming.is_empty() {
-            // Push in the background; the action starts meanwhile and waits
-            // only for what it actually opens.
             let w2 = w.clone();
             let blobs = incoming;
             let this: &Pool = self;
-            // The pushes only enqueue messages, so doing them inline on a
-            // blocking thread keeps their order without holding up events.
             tokio::task::block_in_place(|| {
                 for h in blobs {
                     this.push_blob(&w2, h);
@@ -2385,8 +2053,6 @@ impl Pool {
         let done = loop {
             let Some(ev) = rx.recv().await else { bail!("worker connection lost") };
             if !matches!(ev, Event::Done(_)) && !voice.claim(REMOTE) {
-                // The local copy spoke first and is the one being shown;
-                // this run is about to be withdrawn.
                 std::future::pending::<()>().await;
             }
             match ev {
@@ -2395,8 +2061,6 @@ impl Pool {
                     stdout.extend_from_slice(&d);
                 }
                 Event::Early(path, entry) => {
-                    // The worker made this file: dependents sent to it do
-                    // not need it pushed back.
                     if let MEntry::File { hash, .. } = &entry {
                         w.has_blobs.lock().insert(*hash);
                     }
@@ -2417,11 +2081,6 @@ impl Pool {
         };
 
         let t_done = t0.elapsed();
-        // Bring the outputs home. What the action left in the directories
-        // that are kept on the side (its incremental state) stays on the
-        // worker for now: the next compile of the crate there uses it in
-        // place, and it comes home in the background or when a compile
-        // here needs it.
         let mut wanted: Vec<Hash> = Vec::new();
         let mut wanted_bytes = 0u64;
         for (p, e) in &done.entries {
@@ -2464,7 +2123,6 @@ impl Pool {
                 self.settle_wake.notify_waiters();
             }
         }
-        // A host file we served may have changed since.
         let mut tainted = done.tainted;
         for src in ra.served.lock().iter() {
             if let FileSrc::Host { path, sig } = src {
@@ -2488,7 +2146,6 @@ impl Pool {
             stats: done.stats,
         };
         w.note_overhead(t0.elapsed().saturating_sub(Duration::from_micros(result.stats.wall_us)));
-        // Bandwidth as seen by output fetches of a meaningful size.
         {
             let bytes: u64 = wanted_bytes;
             let secs = (t0.elapsed() - t_done).as_secs_f64();
@@ -2534,7 +2191,6 @@ impl RemoteRunner for Pool {
         blobs: &'a [Hash],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            // Grouped by the worker that holds them.
             let mut by_worker: Vec<(Arc<Worker>, Vec<Hash>)> = Vec::new();
             for h in blobs {
                 if self.blobs.store.has(h) {
@@ -2562,22 +2218,11 @@ impl RemoteRunner for Pool {
         req: &'a Request,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RunResult>> + Send + 'a>> {
         Box::pin(async move {
-            // Planning and nextest (installed on the server) run locally.
-            // Host networking stays local too. Workers get the selected Nix
-            // closure through RemoteView.
             if matches!(spec.kind, ActionKind::Plan | ActionKind::Nextest)
                 || spec.net != NetMode::Loopback
             {
                 return None;
             }
-            // A crate that is compiled incrementally (a workspace member)
-            // goes where its state is. A compile that starts from a state
-            // is short only with that state at hand, and states are too
-            // big to send along (D31): such a compile is offered only to
-            // workers that hold the state it would start from, because
-            // they made it or one like it. A first compile, with no state
-            // anywhere, can run on any worker; what it leaves stays there
-            // and comes home later.
             let seeded = !spec.discard.is_empty();
             let mut holders: Option<Vec<u64>> = None;
             let mut away = false;
@@ -2596,11 +2241,6 @@ impl RemoteRunner for Pool {
                     holders = Some(ids);
                 }
             }
-            // A free local core is the better place, unless the state the
-            // compile starts from would have to be fetched first and the
-            // worker that holds it has a core free as well. A core held by
-            // a compiler's helper thread is as busy as one held by an
-            // action.
             let mem = engine.estimate_mem_kb(key, spec.kind);
             let (_, waiting, _, _) = engine.sched.snapshot();
             if trace_remote() && seeded {
@@ -2623,8 +2263,6 @@ impl RemoteRunner for Pool {
                     }
                 }
             } else {
-                // Every local core is busy: the action goes to whichever
-                // comes free first, a core here or a core on a worker.
                 tokio::select! {
                     biased;
                     w = self.lease_wait(holders.as_deref()) => w,
@@ -2642,19 +2280,9 @@ impl RemoteRunner for Pool {
                     }
                 }
             };
-            // Not when its inputs would take longer to arrive than it takes
-            // to run: the worker would sit waiting for bytes. That counts
-            // what is already queued on the link and what this action is
-            // known to read: from its last trace, or, if it has never run,
-            // from another run of the same program (the toolchain).
             let own = engine.traces.traces(key).first().map(|(_, t)| t.clone());
             let known = own.clone().or_else(|| engine.profile(spec));
             if known.is_none() && !eager_dispatch() {
-                // Nothing is known about what it reads (the first compile a
-                // server ever runs, a build script's own run): the worker
-                // would ask for everything one question at a time,
-                // toolchain included. It runs here, and what it reads is
-                // then known for the next of its kind.
                 self.give_back(&w);
                 self.stats.kept_local_transfer.fetch_add(1, Ordering::Relaxed);
                 return None;
@@ -2686,9 +2314,6 @@ impl RemoteRunner for Pool {
                 );
             }
             if bytes_time > engine.avg_action_wall() && !eager_dispatch() {
-                // A worker that lacks the toolchain would never be given
-                // anything; send it what every compile reads, once, so that
-                // it is useful a few seconds from now.
                 if own.is_none() && !w.warmed.swap(true, Ordering::SeqCst) {
                     let (tx, _rx) = mpsc::unbounded_channel();
                     let ra = Arc::new(RemoteAction {
@@ -2715,14 +2340,6 @@ impl RemoteRunner for Pool {
                 let which = if req.seed_blobs.is_empty() { &self.stats.unseeded_remote } else { &self.stats.seeded_in_place };
                 which.fetch_add(1, Ordering::Relaxed);
             }
-            // Hedge: should a local core that nothing else wants fall idle
-            // while the worker has the action (it may be fetching a
-            // toolchain, or simply be slower), the action also runs here,
-            // and whichever copy finishes first is the result; the other is
-            // stopped. Only one copy may be heard: the first to produce
-            // output or announce metadata is kept and the other stopped at
-            // once, because showing output twice, or announcing two
-            // different metadata files, is worse than waiting.
             let voice = Voice::default();
             let gated = Gated { inner: &*req.observer, voice: &voice };
             let mut remote = Some(Box::pin(self.run_on(&w, engine, spec, key, req, &voice)));
@@ -2746,7 +2363,6 @@ impl RemoteRunner for Pool {
                             return Some(Ok(r));
                         }
                         Err(e) => {
-                            // The worker failed, not the action: run it here.
                             eprintln!("rargod: worker {:x} failed `{}`: {e:#}; running locally", w.id, spec.label);
                             self.stats.worker_failures.fetch_add(1, Ordering::Relaxed);
                             engine.stats.remote_failed.fetch_add(1, Ordering::Relaxed);
@@ -2761,12 +2377,8 @@ impl RemoteRunner for Pool {
                         drop(permit);
                         engine.note_action_wall(started.elapsed());
                         self.stats.hedge_won.fetch_add(1, Ordering::Relaxed);
-                        // Dropping `remote` withdraws the action from the worker.
                         return Some(r);
                     }
-                    // (Not while the state the compile starts from is on
-                    // the worker: fetching it would cost more than the
-                    // idle core is worth.)
                     permit = engine.sched.acquire(crate::sched::Priority::Idle, mem),
                         if local.is_none() && remote.is_some() && !away && hedge() && voice.owner() == NOBODY =>
                     {
@@ -2797,8 +2409,6 @@ mod tests {
         assert!(!is_bulk(&Msg::Req { rid: 1, body: Req::Chunks { blob: h, idx: vec![0] } }));
         assert!(!is_bulk(&Msg::Cancel { action: 1 }));
         assert!(!is_bulk(&Msg::Stdout { action: 1, data: Vec::new() }));
-        // An acknowledgement has to pass a blob that is still queued, or a
-        // caller waiting on it would wait for the bytes twice.
         assert!(!is_bulk(&Msg::Stored { blob: h }));
         assert!(!is_bulk(&Msg::Bye));
     }
@@ -2826,12 +2436,10 @@ mod tests {
         q.offer(who(1, "/a"), state(1));
         q.offer(who(2, "/a"), state(2));
         q.offer(who(1, "/b"), state(3));
-        // The same crate in the same worktree again: only its newest waits.
         q.offer(who(1, "/a"), state(4));
         assert_eq!(q.len(), 3);
         let order: Vec<u64> = std::iter::from_fn(|| q.next()).map(|b| b[0].1).collect();
         assert_eq!(order, [4, 3, 2]);
-        // Bounded: the oldest give way.
         for n in 0..(super::AheadQueue::KEPT + 10) {
             q.offer((Hash([9; 32]), format!("/wt{n}")), state(7));
         }
