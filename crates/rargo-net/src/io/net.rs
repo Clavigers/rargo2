@@ -184,6 +184,15 @@ pub struct TcpStream {
 }
 pub struct UdpSocket {
     fd: OwnedFd,
+    late: Option<(std::time::Duration, std::sync::Arc<OwnedFd>)>,
+}
+
+fn link_rtt() -> Option<std::time::Duration> {
+    static RTT: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *RTT.get_or_init(|| {
+        let ms: u64 = std::env::var("RARGO_LINK_RTT_MS").ok()?.parse().ok()?;
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
 }
 pub struct UnixListener {
     fd: OwnedFd,
@@ -291,7 +300,33 @@ impl UdpSocket {
             unsafe { libc::close(fd) };
             return Err(err);
         }
-        Ok(Self { fd: OwnedFd { fd } })
+        let late = match link_rtt() {
+            Some(rtt) => {
+                let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if copy < 0 {
+                    let err = io::Error::last_os_error();
+                    unsafe { libc::close(fd) };
+                    return Err(err);
+                }
+                Some((rtt, std::sync::Arc::new(OwnedFd { fd: copy })))
+            }
+            None => None,
+        };
+        Ok(Self { fd: OwnedFd { fd }, late })
+    }
+
+    fn send_late(&self, buf: &[u8], addr: Option<SocketAddr>) -> bool {
+        let Some((rtt, fd)) = &self.late else { return false };
+        let (rtt, fd, buf) = (*rtt, std::sync::Arc::clone(fd), buf.to_vec());
+        background(move || {
+            sleep(rtt);
+            let op = match addr {
+                Some(addr) => Op::SendTo { fd: fd.fd, buf, addr },
+                None => Op::Send { fd: fd.fd, buf },
+            };
+            let _ = op_event(op);
+        });
+        true
     }
 
     pub fn set_buffers(&self, bytes: i32) {
@@ -314,6 +349,9 @@ impl UdpSocket {
     }
 
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        if self.send_late(buf, None) {
+            return Ok(buf.len());
+        }
         match op_event(Op::Send { fd: self.fd.fd, buf: buf.to_vec() })? {
             Event::Send { n } => Ok(n),
             _ => Err(io::Error::other("send")),
@@ -325,6 +363,9 @@ impl UdpSocket {
     }
 
     pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        if self.send_late(buf, Some(addr)) {
+            return Ok(buf.len());
+        }
         match op_event(Op::SendTo { fd: self.fd.fd, buf: buf.to_vec(), addr })? {
             Event::SendTo { n } => Ok(n),
             _ => Err(io::Error::other("send")),

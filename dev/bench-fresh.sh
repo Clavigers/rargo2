@@ -4,20 +4,20 @@ work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$here/../target/release}
 . "$work/env.sh"
+. "$here/bench-lib.sh"
 mode=${1:?copy or fuse}; delay=${2:-50}
 export RARGO_OUTPUT=$mode
 out=$work/bench/fresh.jsonl
 base=$work/bench/ra
 C=$work/fresh-client
 export RARGO_HIDE=$C
-R() { nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" "$@"; }
-rx() { ip netns exec ${RIG:-rargo}-cl cat /sys/class/net/eth0/statistics/rx_bytes; }
+R() { "$RARGO_BIN/rargo" "$@"; }
 t() { local t0=$(date +%s.%N); "$@" >>"$C/last.log" 2>&1 || echo "FAILED: $*" >&2; echo "$(date +%s.%N) - $t0" | bc; }
-"$here/netns.sh" down >/dev/null 2>&1
+bench_down
 rm -rf "$C"; mkdir -p "$C"
 git -C "$base" worktree prune
-CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1
-. "$work/${RIG_STATE:-nstest}/client.env"
+bench_up 24 0 0 $((2 * delay)) || exit 1
+. "$T/client.env"
 fresh() {
     git -C "$base" worktree add -q --detach "$C/$1" HEAD
     cd "$C/$1" || exit 2
@@ -37,5 +37,5 @@ printf '{"mode":"%s","rtt_ms":%s,"binary_bytes":%s,"first_worktree":{"build_s":%
     "$mode" $((2 * delay)) "$size" "$first_b" "$first_r" "$first_bytes" "$same_b" "$same_r" "$same_bytes" "$other_b" "$other_r" "$other_bytes" | tee -a "$out"
 for c in "$C/cache" "$C/cache-other-machine"; do RARGO_CACHE_DIR=$c R --rargo-daemon-stop; done
 for w in a b c; do git -C "$base" worktree remove --force "$C/$w" >/dev/null 2>&1; done
-"$here/netns.sh" down >/dev/null 2>&1
+bench_down
 rm -rf "$C"

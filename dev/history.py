@@ -61,7 +61,6 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--cores", type=int, default=6)
     ap.add_argument("--lane", type=int, default=0)
-    ap.add_argument("--netns", default=None)
     ap.add_argument("--cargo", default=None, help="fetch: the cargo binary to fetch with")
     ap.add_argument("--rargo", default=os.path.join(WORK, "bin-hist", "rargo"))
     a = ap.parse_args()
@@ -112,7 +111,6 @@ def main():
             dt, p = stock(wt, tc, a.cores)
             record(a.out, dict(variant="b", i=i, commit=c[:10], toolchain=tc, wall_s=round(dt, 2), rc=p.returncode, err=tail(p)))
     elif a.variant == "d":
-        prefix = ["nsenter", f"--net=/run/netns/{a.netns}"] if a.netns else []
         wts = {"every": worktree("d-every", commits[0][0]), "tenth": worktree("d-tenth", commits[0][0])}
         for i, (c, tc) in enumerate(commits, 1):
             if i in seen:
@@ -122,7 +120,7 @@ def main():
             checkout(wt, c)
             env = dict(os.environ, RUSTUP_TOOLCHAIN=tc)
             t = time.time()
-            p = subprocess.run([*prefix, a.rargo, *TARGET], cwd=wt, env=env, capture_output=True, text=True)
+            p = subprocess.run([a.rargo, *TARGET], cwd=wt, env=env, capture_output=True, text=True)
             dt = time.time() - t
             record(a.out, dict(variant="d", i=i, agent=agent, commit=c[:10], toolchain=tc, wall_s=round(dt, 2), rc=p.returncode, err=tail(p)))
 
