@@ -1024,6 +1024,10 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
         env.insert(k, v);
     }
     env.insert("CARGO_HOME".into(), c.home.dir.to_string_lossy().into_owned());
+    // Fetching reads the manifests too: on the channel planning uses.
+    if let Some(channel) = p.env.get(NIGHTLY_CHANNEL_ENV) {
+        env.insert(NIGHTLY_CHANNEL_ENV.into(), channel.clone());
+    }
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
     let out = tokio::task::spawn_blocking(move || -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
