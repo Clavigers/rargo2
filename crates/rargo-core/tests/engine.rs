@@ -331,6 +331,8 @@ fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
             assert!(e.to_string().contains("ran longer than 600 s"), "{e:#}");
         }
         assert_eq!(fx.runs(), 1, "three identical requests, one run, and no rerun by the waiters");
+    });
+    rt().block_on(async {
         let ok = fx.engine.obtain(fx.req("echo fine", &[], &[], &[])).await.unwrap();
         assert_eq!(fx.text(&ok.result.stdout), "fine\n");
     });
