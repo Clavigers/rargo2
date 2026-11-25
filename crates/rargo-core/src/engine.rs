@@ -1,6 +1,6 @@
 use crate::action_table::{ActionTable, Failure, Ran, ReqId, Start, Woken};
 use crate::hash::{Hash, KeyHasher};
-use crate::sandbox::{EXTRA_FD_BASE, SpawnReq, Zygote};
+use crate::sandbox::{HostLayout, Place, SetupSpec, Zygote};
 use crate::sandboxfs::{ActionFs, ActionFsConfig, SandboxFs, UpperKind};
 use crate::sched::{Priority, Scheduler};
 use crate::store::Store;
@@ -8,7 +8,7 @@ use crate::trace::*;
 use crate::view::*;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -193,6 +193,7 @@ pub struct Engine {
     pub remote: std::sync::OnceLock<Arc<dyn RemoteRunner>>,
     pub stats: EngineStats,
     pub cgroup_root: Option<PathBuf>,
+    pub place: Place,
     pub action_timeout: std::time::Duration,
 }
 
@@ -336,6 +337,7 @@ impl Engine {
             remote: std::sync::OnceLock::new(),
             stats: EngineStats::default(),
             cgroup_root: None,
+            place: Place::Server,
             action_timeout: std::time::Duration::from_secs(3600),
         }
     }
@@ -768,32 +770,23 @@ impl Engine {
         }
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
-        let mut env: BTreeMap<Vec<u8>, Vec<u8>> = spec.env.clone();
-        let js = format!(
-            "-j --jobserver-fds={},{} --jobserver-auth={},{}",
-            EXTRA_FD_BASE,
-            EXTRA_FD_BASE + 1,
-            EXTRA_FD_BASE,
-            EXTRA_FD_BASE + 1
-        );
-        for var in ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
-            env.insert(var.as_bytes().to_vec(), js.clone().into_bytes());
-        }
-        *group_slot = self.cgroup_root.as_ref().and_then(|r| crate::cgroup::ActionGroup::create(r, action.seq));
-        let group = group_slot.as_ref();
-        let sreq = SpawnReq {
+        let setup = SetupSpec { argv: spec.argv.clone(), env: spec.env.clone(), cwd: spec.cwd.clone(), net: spec.net };
+        let host = HostLayout {
+            place: self.place,
             root: self.mnt.join(SandboxFs::dir_name(action.seq)),
-            argv: spec.argv.clone(),
-            env: env.into_iter().collect(),
-            cwd: spec.cwd.clone(),
+            seq: action.seq,
+            cgroup_root: self.cgroup_root.clone(),
             uid,
             gid,
-            net: spec.net,
+            caller: unsafe { (libc::getuid(), libc::getgid()) },
+            flake: false,
             binds: vec![],
-            cgroup: group.as_ref().map(|g| g.dir.clone()),
         };
+        let plan = crate::sandbox::plan(&setup, &host)?;
+        *group_slot = plan.cgroup_dir().map(crate::cgroup::ActionGroup::open);
+        let group = group_slot.as_ref();
         assert!(slot.is_none(), "one process per action");
-        let running = slot.insert(self.zygote.spawn(sreq, None, out_w, err_w, &self.sched.jobserver_fds())?);
+        let running = slot.insert(self.zygote.spawn(plan, None, out_w, err_w, &self.sched.jobserver_fds())?);
         let mut out_rd = async_reader(out_r)?;
         let mut err_rd = async_reader(err_r)?;
         let live = LiveCtl { action, store: &self.store };

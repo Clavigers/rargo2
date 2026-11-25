@@ -1,4 +1,5 @@
-use rargo_core::sandbox::{NetMode, SpawnReq, Zygote};
+use rargo_core::sandbox::{HostLayout, NetMode, Place, SetupSpec, Zygote};
+use std::collections::BTreeMap;
 use rargo_core::sandboxfs::{ActionFsConfig, SandboxFs, UpperKind};
 use rargo_core::view::*;
 use std::os::fd::OwnedFd;
@@ -81,26 +82,30 @@ fn main() -> anyhow::Result<()> {
         mountpoints: vec![b"proc".to_vec(), b"dev".to_vec(), b"sys".to_vec(), b"tmp".to_vec()],
         size_blind: false,
     });
-    let env: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
+    let env: BTreeMap<Vec<u8>, Vec<u8>> = std::env::vars_os()
         .map(|(k, v)| (k.into_encoded_bytes(), v.into_encoded_bytes()))
         .collect();
     let cwd = std::env::current_dir()?.into_os_string().into_encoded_bytes();
-    let req = SpawnReq {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    let spec = SetupSpec { argv: cmd, env, cwd, net: NetMode::Loopback };
+    let host = HostLayout {
+        place: Place::Server,
         root: mnt.join(SandboxFs::dir_name(action.seq)),
-        argv: cmd,
-        env,
-        cwd,
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
-        net: NetMode::Loopback,
+        seq: action.seq,
+        cgroup_root: None,
+        uid,
+        gid,
+        caller: (uid, gid),
+        flake: false,
         binds: vec![],
-        cgroup: None,
     };
+    let plan = rargo_core::sandbox::plan(&spec, &host)?;
     let out: OwnedFd = std::io::stdout().as_fd().try_clone_to_owned()?;
     let err: OwnedFd = std::io::stderr().as_fd().try_clone_to_owned()?;
     use std::os::fd::AsFd;
     let start = std::time::Instant::now();
-    let running = zygote.spawn(req, None, out, err, &[])?;
+    let running = zygote.spawn(plan, None, out, err, &[])?;
     let info = running.done.blocking_recv()?;
     let wall = start.elapsed();
     let fin = fs.finish_action(&action);

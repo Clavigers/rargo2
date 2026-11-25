@@ -11,25 +11,17 @@ pub fn setup() -> Option<PathBuf> {
     }
     let procs = std::fs::read_to_string(membership_file(&dir)).ok()?;
     for op in delegation_ops(&dir, &procs) {
-        match op {
-            DelegationOp::Create(path) => std::fs::create_dir_all(path).ok()?,
-            DelegationOp::Write(path, value) => std::fs::write(path, value).ok()?,
-        }
+        crate::sandbox::apply(&op).ok()?;
     }
     Some(dir)
 }
 
-enum DelegationOp<'a> {
-    Create(PathBuf),
-    Write(PathBuf, &'a str),
-}
-
-fn delegation_ops<'a>(dir: &Path, procs: &'a str) -> Vec<DelegationOp<'a>> {
+pub(crate) fn delegation_ops(dir: &Path, procs: &str) -> Vec<crate::sandbox::Op> {
     let leaf = dir.join("daemon");
-    let mut ops = vec![DelegationOp::Create(leaf.clone())];
+    let mut ops = vec![crate::sandbox::Op::CreateDir { path: leaf.clone(), parents: true }];
     let membership = membership_file(&leaf);
-    ops.extend(procs.split_whitespace().map(|pid| DelegationOp::Write(membership.clone(), pid)));
-    ops.push(DelegationOp::Write(dir.join("cgroup.subtree_control"), "+memory"));
+    ops.extend(procs.split_whitespace().map(|pid| crate::sandbox::Op::Write { path: membership.clone(), data: pid.as_bytes().to_vec() }));
+    ops.push(crate::sandbox::Op::Write { path: dir.join("cgroup.subtree_control"), data: b"+memory".to_vec() });
     ops
 }
 
@@ -64,10 +56,8 @@ pub struct ActionGroup {
 }
 
 impl ActionGroup {
-    pub fn create(root: &Path, seq: u64) -> Option<ActionGroup> {
-        let dir = root.join(format!("action-{seq}"));
-        std::fs::create_dir(&dir).ok()?;
-        Some(ActionGroup { dir })
+    pub fn open(dir: PathBuf) -> ActionGroup {
+        ActionGroup { dir }
     }
 
     fn stat(&self, file: &str, keys: &[&str]) -> u64 {
@@ -140,10 +130,15 @@ mod tests {
 
     #[test]
     fn delegation_enables_memory_after_moving_processes() {
+        use expect_test::expect;
         let root = delegated_root("0::/service/build.scope\n").unwrap();
-        let plan = delegation_ops(&root, "17\n23\n");
-        assert!(matches!(&plan[..], [DelegationOp::Create(leaf), DelegationOp::Write(a, "17"), DelegationOp::Write(b, "23"), DelegationOp::Write(control, "+memory")]
-            if leaf == &root.join("daemon") && a == &membership_file(leaf) && a == b && control == &root.join("cgroup.subtree_control")));
+        let text = delegation_ops(&root, "17\n23\n").iter().map(|op| op.to_string()).collect::<Vec<_>>().join("\n");
+        expect![[r#"
+            ensure-dir /sys/fs/cgroup/service/build.scope/daemon
+            write /sys/fs/cgroup/service/build.scope/daemon/cgroup.procs 17
+            write /sys/fs/cgroup/service/build.scope/daemon/cgroup.procs 23
+            write /sys/fs/cgroup/service/build.scope/cgroup.subtree_control +memory"#]]
+        .assert_eq(&text);
         assert!(delegated_root("0::/\n").is_none());
     }
 }
