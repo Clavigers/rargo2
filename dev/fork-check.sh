@@ -10,8 +10,8 @@
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 . "$work/env.sh"
-export RUSTUP_TOOLCHAIN=rargo
-T=$work/fork-check
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-rargo}
+T=${RARGO_FORK_CHECK:-$work/fork-check}
 rm -rf "$T"; mkdir -p "$T"; cd "$T"
 fails=0; checks=0
 ok() { checks=$((checks + 1)); echo "  ok   $1"; }

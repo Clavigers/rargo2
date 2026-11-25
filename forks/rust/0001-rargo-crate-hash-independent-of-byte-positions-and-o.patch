@@ -1,7 +1,7 @@
 From a13cdc2b022065021a3185f6367de74186fcbc0f Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:20:18 +0100
-Subject: [PATCH 1/4] rargo: crate hash independent of byte positions and of
+Subject: [PATCH 1/5] rargo: crate hash independent of byte positions and of
  private bodies
 
 The crate hash (SVH) is derived from the encoded metadata. Three things made
