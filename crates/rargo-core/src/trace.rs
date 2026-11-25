@@ -1,5 +1,3 @@
-//! Action specifications, results, traces and the trace cache.
-
 use crate::db::{Db, Table};
 use crate::hash::{Hash, KeyHasher};
 use crate::sandbox::NetMode;
@@ -20,7 +18,6 @@ pub enum ActionKind {
     Test,
     Doctest,
     Other,
-    /// nextest, run on the test binaries of a build (`rargo nextest`).
     Nextest,
 }
 
@@ -36,7 +33,6 @@ impl ActionKind {
         ActionKind::Nextest,
     ];
 
-    /// How `--rargo-status` names the kind.
     pub fn name(self) -> &'static str {
         match self {
             ActionKind::Plan => "planning",
@@ -51,8 +47,6 @@ impl ActionKind {
     }
 }
 
-/// Everything rargod decides about an action before running it. Together
-/// with what the action then observes, this determines its result.
 #[derive(Clone, Debug)]
 pub struct ActionSpec {
     pub kind: ActionKind,
@@ -60,19 +54,13 @@ pub struct ActionSpec {
     pub env: BTreeMap<Vec<u8>, Vec<u8>>,
     pub cwd: Vec<u8>,
     pub net: NetMode,
-    /// Directories created (in the upper layer) before the process starts.
     pub mkdirs: Vec<Vec<u8>>,
-    /// Identifies the kind of root filesystem (host, or a flake closure).
     pub root_id: Hash,
-    /// Output paths under these prefixes are not part of the result.
     pub discard: Vec<Vec<u8>>,
-    /// Shown in logs and errors.
     pub label: String,
 }
 
 impl ActionSpec {
-    /// The weak key: canonical command line, working directory and
-    /// environment (DESIGN: "The trace cache").
     pub fn weak_key(&self) -> Hash {
         let mut h = KeyHasher::new("action-v1");
         h.u64(self.argv.len() as u64);
@@ -106,11 +94,9 @@ pub enum MEntry {
     File { hash: Hash, exec: bool, size: u64 },
     Symlink(Vec<u8>),
     Dir,
-    /// The action deleted this path.
     Whiteout,
 }
 
-/// What an action wrote, sorted by path.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub entries: Vec<(Vec<u8>, MEntry)>,
@@ -141,7 +127,6 @@ pub struct Stats {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActionResult {
-    /// Raw wait status.
     pub status: i32,
     pub stdout: Hash,
     pub stderr: Hash,
@@ -161,27 +146,22 @@ impl ActionResult {
     }
 }
 
-/// A recorded run: what was observed and what came out.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trace {
     pub obs: Vec<(VPath, Obs)>,
     pub result: ActionResult,
-    /// Seconds since the epoch.
     pub created: u64,
 }
 
 impl Trace {
-    /// Whether every observation still holds in `view`.
     pub fn holds(&self, view: &dyn View, content: &Content) -> bool {
         self.obs.iter().all(|(p, o)| obs_holds(view, content, p, o))
     }
 
-    /// The first observation that no longer holds (for explaining misses).
     pub fn first_mismatch(&self, view: &dyn View, content: &Content) -> Option<&(VPath, Obs)> {
         self.obs.iter().find(|(p, o)| !obs_holds(view, content, p, o))
     }
 
-    /// Whether everything the result refers to is still in the store.
     pub fn complete(&self, store: &Store) -> bool {
         store.has(&self.result.stdout)
             && store.has(&self.result.stderr)
@@ -211,13 +191,10 @@ pub struct CacheStats {
     pub stored: AtomicU64,
 }
 
-/// Weak key -> traces, newest first. Backed by the database, cached in
-/// memory.
 pub struct TraceCache {
     db: Arc<Db>,
     mem: DashMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>,
     next_id: AtomicU64,
-    /// Every declared variable name, once it has been asked for.
     env_names: parking_lot::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub stats: CacheStats,
 }
@@ -230,8 +207,6 @@ fn trace_key(weak: &Hash, id: u64) -> Vec<u8> {
 
 impl TraceCache {
     pub fn new(db: Arc<Db>) -> TraceCache {
-        // Ids only need to be unique and increasing within a key; seeding
-        // from the clock keeps them increasing across restarts.
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros() as u64)
@@ -259,13 +234,10 @@ impl TraceCache {
         list
     }
 
-    /// Traces recorded under `weak`, newest first.
     pub fn traces(&self, weak: &Hash) -> Arc<Vec<(u64, Arc<Trace>)>> {
         self.load(weak)
     }
 
-    /// Finds a trace under `weak` whose observations hold in `view` and
-    /// whose outputs are still stored.
     pub fn lookup(&self, weak: &Hash, view: &dyn View, content: &Content) -> Option<Arc<Trace>> {
         let list = self.load(weak);
         for (id, t) in list.iter() {
@@ -308,8 +280,6 @@ impl TraceCache {
         self.mem.insert(*weak, Arc::new(list));
     }
 
-    /// Environment variables that actions under `weak` have declared an
-    /// interest in.
     pub fn needs_env(&self, weak: &Hash) -> Vec<String> {
         let mut k = b"env:".to_vec();
         k.extend_from_slice(&weak.0);
@@ -319,7 +289,6 @@ impl TraceCache {
             .unwrap_or_default()
     }
 
-    /// Adds declared variables. Returns the ones that were new.
     pub fn add_needs_env(&self, weak: &Hash, vars: &[String]) -> Vec<String> {
         let mut cur = self.needs_env(weak);
         let mut added = Vec::new();
@@ -341,11 +310,6 @@ impl TraceCache {
         added
     }
 
-    /// Every variable any action has declared an interest in. A client is
-    /// asked for all of them at once when its request arrives, instead of
-    /// for a few at each action that is looked up (a round trip each,
-    /// one after another along the dependency chain, for a client that
-    /// has not been asked before).
     pub fn every_env_name(&self) -> Vec<String> {
         let mut names = self.env_names.lock();
         names
@@ -355,7 +319,6 @@ impl TraceCache {
             .collect()
     }
 
-    /// Every recorded trace with its weak key.
     pub fn all(&self) -> Vec<(Hash, Trace)> {
         let mut out = Vec::new();
         self.db.for_each(Table::Traces, |k, v| {
@@ -369,7 +332,6 @@ impl TraceCache {
         out
     }
 
-    /// Every "this command line reads these variables" record.
     pub fn all_needs_env(&self) -> Vec<(Hash, Vec<String>)> {
         self.db
             .scan_prefix(Table::Meta, b"env:")
@@ -381,7 +343,6 @@ impl TraceCache {
             .collect()
     }
 
-    /// Adds every blob referenced by any recorded trace to `live`.
     pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
         self.db.for_each(Table::Traces, |_, v| {
             let Ok(raw) = zstd::decode_all(v) else { return };

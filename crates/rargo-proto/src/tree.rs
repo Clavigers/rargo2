@@ -1,11 +1,3 @@
-//! The content-addressed description of a worktree.
-//!
-//! A directory is a [`Tree`]: its entries sorted by name, each a file (by
-//! content hash), a symlink, or another directory (by the digest of its
-//! tree). The digest of the root tree therefore names the complete content
-//! of a worktree, two worktrees share every subtree they have in common, and
-//! after an edit only the trees on the path to the edited file are new.
-
 use crate::Digest;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +10,6 @@ pub enum Node {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tree {
-    /// Sorted by name; names are single path components.
     pub entries: Vec<(Vec<u8>, Node)>,
 }
 
@@ -27,8 +18,6 @@ impl Tree {
         crate::encode(self)
     }
 
-    /// Decodes a tree and checks that it is well formed: names sorted,
-    /// unique, and each a single component.
     pub fn decode(bytes: &[u8]) -> std::io::Result<Tree> {
         let t: Tree = crate::decode(bytes)?;
         let bad = |why: &str| std::io::Error::other(format!("malformed tree: {why}"));
@@ -48,8 +37,6 @@ impl Tree {
     }
 }
 
-/// The digest of an encoded tree: the plain content hash, so that a tree is
-/// stored and fetched like any other content.
 pub fn digest(encoded: &[u8]) -> Digest {
     *blake3::hash(encoded).as_bytes()
 }

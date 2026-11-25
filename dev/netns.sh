@@ -1,39 +1,11 @@
 #!/bin/sh
-# A server, its workers and a client machine in separate network namespaces
-# on one machine, joined by veth pairs with injected latency, loss and a
-# rate limit (tc netem). Nothing is configured in the host's own network
-# namespace.
-#
-#   dev/netns.sh up SERVER_JOBS WORKER_JOBS [N_WORKERS] [DELAY_MS] [LOSS_PCT] [RATE]
-#   dev/netns.sh reset-server     (fresh server state, workers keep theirs)
-#   dev/netns.sh down
-#
-# The client's link is shaped separately: CLIENT_DELAY_MS (each way, default
-# 1), CLIENT_LOSS_PCT (default 0) and CLIENT_RATE (default 1gbit).
-# Clients run as `nsenter --net=/run/netns/rargo-cl` (their network
-# namespace only: the mount namespace stays the host's, where the client
-# daemon's output directories are mounted) with the variables in
-# $RARGO_WORK/nstest/client.env; the server cannot see the directories named
-# in RARGO_HIDE.
 set -eu
-# netem keeps every packet it is delaying in one queue, 1000 packets long
-# unless told otherwise: less than a 1 Gbit link has in flight at 20 ms of
-# delay, so the emulated link would drop what a real one carries. (TCP is
-# spared only because its segments are queued in batches.) The queue is
-# sized for the fastest, longest link used here.
 qlimit=${NETEM_LIMIT:-100000}
 work=${RARGO_WORK:-/root/rargo-work}
 B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
-# RIG names the rig (its namespaces are $RIG-srv, $RIG-cl, $RIG-wN) and
-# RIG_STATE its directory under $RARGO_WORK, so that a second rig can run
-# beside one that is in use.
 RIG=${RIG:-rargo}
-# (an absolute RIG_STATE is used as it is).
 case ${RIG_STATE:-nstest} in /*) T=$RIG_STATE ;; *) T=$work/${RIG_STATE:-nstest} ;; esac
-# Client daemons of this rig run in its client namespace. Other suites
-# use the same binaries in namespaces of their own, so a signal goes
-# only to a process whose network namespace is this rig's.
-signal_client_daemons() { # TERM or KILL
+signal_client_daemons() {
     ns=/run/netns/$RIG-cl
     [ -e "$ns" ] || return 0
     ino=$(stat -c %i "$ns")
@@ -43,7 +15,6 @@ signal_client_daemons() { # TERM or KILL
         fi
     done
 }
-# Pids of client daemons in this rig's client namespace, one per line.
 client_daemon_pids() {
     ns=/run/netns/$RIG-cl
     [ -e "$ns" ] || return 0
@@ -54,17 +25,14 @@ client_daemon_pids() {
         fi
     done
 }
-# Block on each pid. A pid that has already exited returns at once.
 wait_pids() {
     for pid in "$@"; do
         [ -n "$pid" ] || continue
         tail --pid="$pid" -f /dev/null
     done
 }
-# rargod of this rig has exited (its state directory is $T/...).
 wait_servers_gone() {
     pids=$(pgrep -f "rargod --state $T/" || true)
-    # shellcheck disable=SC2086
     wait_pids $pids
 }
 down() {
@@ -74,20 +42,16 @@ down() {
     ppids=$(pgrep -f "rigproxy.py [a-z]* $T/proxy.sock" || true)
     pkill -TERM -f "rargod --state $T/" 2>/dev/null || true
     pkill -TERM -f "rigproxy.py [a-z]* $T/proxy.sock" 2>/dev/null || true
-    # shellcheck disable=SC2086
     wait_pids $cpids $spids $ppids
     spids=$(pgrep -f "rargod --state $T/" || true)
     pkill -KILL -f "rargod --state $T/" 2>/dev/null || true
     signal_client_daemons KILL
     cpids=$(client_daemon_pids | tr '\n' ' ')
-    # shellcheck disable=SC2086
     wait_pids $spids $cpids
     for nsname in $(ip netns list 2>/dev/null | awk -v p="^$RIG-" '$1 ~ p {print $1}'); do
         ip netns del "$nsname" 2>/dev/null || true
     done
 }
-# The rig is up when the server is serving, any worker has joined, and
-# the client can reach the server.
 wait_up() {
     if [ "${n:-0}" -ge 1 ]; then
         if ! tail -n +1 -f --pid="$srvpid" "$T/srv.log" | awk '/joined/ { found=1; exit } END { exit found ? 0 : 1 }'; then
@@ -100,9 +64,6 @@ wait_up() {
 start_server() {
     mkdir -p "$T/srv"
     [ -f "$T/srv/tokens.json" ] || cp "$T/tokens.json" "$T/srv/tokens.json"
-    # RIG_PROXY=1: the server namespace has no route out; build scripts the
-    # policy lets use the network get out through a proxy (dev/rigproxy.py)
-    # at HTTPS_PROXY=http://127.0.0.1:3128.
     if [ "${RIG_PROXY:-}" = 1 ] && ! pgrep -f "rigproxy.py outside $T/proxy.sock" >/dev/null 2>&1; then
         here=$(cd "$(dirname "$0")" && pwd)
         nohup python3 "$here/rigproxy.py" outside "$T/proxy.sock" >/dev/null 2>&1 &
@@ -139,7 +100,6 @@ up)
     . "$work/env.sh"
     ip netns add $RIG-srv
     ip -n $RIG-srv link set lo up
-    # One bridge in the server's namespace; every worker hangs off it.
     ip -n $RIG-srv link add br0 type bridge
     ip -n $RIG-srv addr add 10.77.0.1/24 dev br0
     ip -n $RIG-srv link set br0 up
@@ -153,12 +113,10 @@ up)
         ip -n $RIG-srv link set "vs$i" up
         ip -n "$ns" addr add "10.77.0.$((i + 1))/24" dev eth0
         ip -n "$ns" link set eth0 up
-        # Shape both directions of the link.
         ip netns exec $RIG-srv tc qdisc add dev "vs$i" root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
         ip netns exec "$ns" tc qdisc add dev eth0 root netem delay "${delay}ms" loss "${loss}%" rate "$rate" limit "$qlimit"
         i=$((i + 1))
     done
-    # The client machine.
     ip netns add $RIG-cl
     ip -n $RIG-cl link set lo up
     ip link add vcl netns $RIG-srv type veth peer name eth0 netns $RIG-cl
@@ -170,8 +128,6 @@ up)
     ip netns exec $RIG-srv tc qdisc add dev vcl root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
     ip netns exec $RIG-cl tc qdisc add dev eth0 root netem delay "${cdelay}ms" loss "${closs}%" rate "$crate" limit "$qlimit"
     head -c 32 /dev/urandom >"$T/link.key"
-    # The rig's one user: a token, kept beside the server's state so that
-    # a server started on an emptied state directory admits it too.
     token=$("$B/rargod" token create --state "$T/srv" --user bench --admin 2>/dev/null)
     cp "$T/srv/tokens.json" "$T/tokens.json"
     printf 'export RARGO_SERVER=10.77.0.1:7459 RARGO_TOKEN=%s RARGO_STATE=%s\n' "$token" "$T/srv" >"$T/client.env"
@@ -185,8 +141,6 @@ up)
     true
     ;;
 reset-server)
-    # A fresh server (empty store and cache) with the same workers, which
-    # keep what they hold: the cold build of a server whose workers are warm.
     . "$T/params"
     . "$work/env.sh"
     pkill -TERM -f "rargod --state $T/" 2>/dev/null || true

@@ -1,31 +1,27 @@
-From 94f083f7d1f04642e32dec3c1f3ca257937fd03b Mon Sep 17 00:00:00 2001
+From b60d637f92e51c4a86fcd8b008e43275ce645bcb Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Sun, 22 Nov 2026 23:14:45 +0100
 Subject: [PATCH 1/8] rargo: planning mode
 
-With __RARGO_PLAN set, run the normal pipeline with process execution
-stubbed out and write a rargo_plan::Plan. Build-script results are
-placeholder tokens that rargod substitutes after running the scripts.
-With __RARGO_PARSE set, serve cargo's build-script output parser on stdio.
 ---
  Cargo.lock                            |  18 +
  Cargo.toml                            |   1 +
  src/bin/cargo/main.rs                 |  10 +
- src/compiler/build_runner/mod.rs      |  15 +-
+ src/compiler/build_runner/mod.rs      |  14 +-
  src/compiler/custom_build.rs          |  22 +-
  src/compiler/job_queue/mod.rs         |  22 +-
  src/compiler/mod.rs                   |  61 ++-
- src/compiler/rargo.rs                 | 677 ++++++++++++++++++++++++++
- src/compiler/unit.rs                  |   7 +
+ src/compiler/rargo.rs                 | 631 ++++++++++++++++++++++++++
+ src/compiler/unit.rs                  |   6 +
  src/ops/cargo_compile/mod.rs          |   6 +-
  src/ops/cargo_run.rs                  |   3 +
  src/ops/cargo_test.rs                 |  38 +-
- src/workspace/global_cache_tracker.rs |   6 +
- 13 files changed, 855 insertions(+), 31 deletions(-)
+ src/workspace/global_cache_tracker.rs |   4 +
+ 13 files changed, 805 insertions(+), 31 deletions(-)
  create mode 100644 src/compiler/rargo.rs
 
 diff --git a/Cargo.lock b/Cargo.lock
-index 12fef1bb8..97e020451 100644
+index 12fef1b..97e0204 100644
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -207,6 +207,15 @@ dependencies = [
@@ -68,7 +64,7 @@ index 12fef1bb8..97e020451 100644
  name = "redox_syscall"
  version = "0.5.18"
 diff --git a/Cargo.toml b/Cargo.toml
-index 064270474..2a0a4e6e3 100644
+index 0642704..2a0a4e6 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -215,6 +215,7 @@ rustfix.workspace = true
@@ -80,7 +76,7 @@ index 064270474..2a0a4e6e3 100644
  serde_ignored.workspace = true
  serde_json = { workspace = true, features = ["raw_value"] }
 diff --git a/src/bin/cargo/main.rs b/src/bin/cargo/main.rs
-index 4aeef336b..7ba136386 100644
+index 4aeef33..7ba1363 100644
 --- a/src/bin/cargo/main.rs
 +++ b/src/bin/cargo/main.rs
 @@ -15,6 +15,11 @@ mod commands;
@@ -108,7 +104,7 @@ index 4aeef336b..7ba136386 100644
  
  fn setup_logger() -> Option<tracing_chrome::FlushGuard> {
 diff --git a/src/compiler/build_runner/mod.rs b/src/compiler/build_runner/mod.rs
-index 09470a96b..e51fbd2c2 100644
+index 09470a9..e17ea64 100644
 --- a/src/compiler/build_runner/mod.rs
 +++ b/src/compiler/build_runner/mod.rs
 @@ -181,6 +181,10 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
@@ -133,12 +129,11 @@ index 09470a96b..e51fbd2c2 100644
          }
  
          for (script_meta, output) in self.build_script_outputs.lock().unwrap().iter() {
-@@ -305,6 +311,13 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
+@@ -305,6 +311,12 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
                  .or_insert_with(Vec::new)
                  .extend(output.env.iter().cloned());
  
 +            if planning {
-+                // One token stands for "every search path of every script".
 +                self.compilation
 +                    .native_dirs
 +                    .insert(rargo_plan::token::NATIVE_DIRS.into());
@@ -148,7 +143,7 @@ index 09470a96b..e51fbd2c2 100644
                  self.compilation
                      .native_dirs
 diff --git a/src/compiler/custom_build.rs b/src/compiler/custom_build.rs
-index 946e607a3..b22813b03 100644
+index 946e607..b22813b 100644
 --- a/src/compiler/custom_build.rs
 +++ b/src/compiler/custom_build.rs
 @@ -288,6 +288,9 @@ pub fn prepare(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResu
@@ -209,7 +204,7 @@ index 946e607a3..b22813b03 100644
          job.before(dirty);
      } else {
 diff --git a/src/compiler/job_queue/mod.rs b/src/compiler/job_queue/mod.rs
-index 5f14aa407..a7e0106c9 100644
+index 5f14aa4..a7e0106 100644
 --- a/src/compiler/job_queue/mod.rs
 +++ b/src/compiler/job_queue/mod.rs
 @@ -621,11 +621,13 @@ impl<'gctx> DrainState<'gctx> {
@@ -263,7 +258,7 @@ index 5f14aa407..a7e0106c9 100644
              && !unit.mode.is_doc()
              && !unit.mode.is_doc_scrape())
 diff --git a/src/compiler/mod.rs b/src/compiler/mod.rs
-index b6bf9ab51..c70c6d1bf 100644
+index b6bf9ab..c70c6d1 100644
 --- a/src/compiler/mod.rs
 +++ b/src/compiler/mod.rs
 @@ -73,6 +73,8 @@ use cargo_util_terminal::report::{AnnotationKind, Group, Level, Renderer, Snippe
@@ -384,21 +379,10 @@ index b6bf9ab51..c70c6d1bf 100644
              .with_context(|| format!("could not document `{}`", name));
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
 new file mode 100644
-index 000000000..ecfabd6d1
+index 0000000..4e24773
 --- /dev/null
 +++ b/src/compiler/rargo.rs
-@@ -0,0 +1,677 @@
-+//! rargo planning mode.
-+//!
-+//! With `__RARGO_PLAN=<file>` in the environment, cargo runs its normal
-+//! pipeline but never starts a compiler, build script, test or binary.
-+//! Each process it would have started is recorded instead, and the result is
-+//! written to `<file>` as a `rargo_plan::Plan` for rargod to execute.
-+//!
-+//! Build scripts "run" by returning a synthetic output made of placeholder
-+//! tokens, so everything cargo derives from build-script output (extra
-+//! `rustc` flags, environment variables, library search paths) flows through
-+//! cargo's own code and ends up in the recorded commands as tokens.
+@@ -0,0 +1,631 @@
 +
 +use std::cell::Cell;
 +use std::collections::HashMap;
@@ -423,7 +407,6 @@ index 000000000..ecfabd6d1
 +
 +static ACTIVE: AtomicU8 = AtomicU8::new(0);
 +
-+/// Whether cargo is in planning mode.
 +pub fn active() -> bool {
 +    match ACTIVE.load(Ordering::Relaxed) {
 +        1 => true,
@@ -513,7 +496,6 @@ index 000000000..ecfabd6d1
 +    }
 +}
 +
-+/// Records the facts about the whole build that rargod needs.
 +pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
 +    let bcx: &BuildContext<'_, '_> = build_runner.bcx;
 +    let gctx = bcx.gctx;
@@ -556,8 +538,6 @@ index 000000000..ecfabd6d1
 +    Ok(())
 +}
 +
-+/// Records everything static about `unit`. Called once for every unit that
-+/// is part of the build.
 +pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> CargoResult<u32> {
 +    let bcx = build_runner.bcx;
 +    let gctx = bcx.gctx;
@@ -718,12 +698,10 @@ index 000000000..ecfabd6d1
 +    }
 +}
 +
-+/// A job that only records, bypassing fingerprints.
 +pub fn dirty_job() -> Job {
 +    Job::new_dirty(Work::noop(), super::DirtyReason::Forced)
 +}
 +
-+/// Makes the job remember which unit it belongs to when it runs.
 +pub fn tag_job(job: &mut Job, idx: u32) {
 +    job.before(Work::new(move |_| {
 +        CURRENT.with(|c| c.set(idx));
@@ -731,7 +709,6 @@ index 000000000..ecfabd6d1
 +    }));
 +}
 +
-+/// Records the command of the unit currently "running" on this thread.
 +pub fn record_cmd(cmd: &ProcessBuilder) -> CargoResult<()> {
 +    let idx = CURRENT.with(|c| c.get());
 +    let cmd = cmd_of(cmd)?;
@@ -745,7 +722,6 @@ index 000000000..ecfabd6d1
 +    }
 +}
 +
-+/// The `Executor` used in planning mode: records instead of running rustc.
 +pub struct PlanExecutor;
 +
 +impl Executor for PlanExecutor {
@@ -771,8 +747,6 @@ index 000000000..ecfabd6d1
 +    Arc::new(PlanExecutor)
 +}
 +
-+/// The stand-in for running a build script: records the command and returns
-+/// an output that says "everything, as tokens".
 +pub fn fake_script_run(
 +    cmd: &ProcessBuilder,
 +    meta: &str,
@@ -782,7 +756,6 @@ index 000000000..ecfabd6d1
 +    record_cmd(cmd)?;
 +    let mut o = String::new();
 +    let mut line = |k: &str, v: String| {
-+        // The single-colon syntax is accepted for every rust-version.
 +        o.push_str("cargo:");
 +        o.push_str(k);
 +        o.push('=');
@@ -815,7 +788,6 @@ index 000000000..ecfabd6d1
 +    if targets.iter().any(|t| t.is_exe_example()) {
 +        line("rustc-link-arg-examples", token::link_arg("EXAMPLE", meta));
 +    }
-+    // An unknown key in the old syntax is metadata for dependents.
 +    line(&token::make(token::METADATA, meta), String::new());
 +    use std::os::unix::process::ExitStatusExt;
 +    Ok(std::process::Output {
@@ -825,9 +797,6 @@ index 000000000..ecfabd6d1
 +    })
 +}
 +
-+/// In planning mode a dynamic-library search path entry made of a token is
-+/// rewritten so rargod can apply cargo's "inside the target root" filter to
-+/// the real paths later. Returns `None` for ordinary paths.
 +pub fn dyn_search_entry(dir: &Path, root_output: &Path) -> Option<Option<std::path::PathBuf>> {
 +    let text = dir.to_str()?;
 +    if text == token::NATIVE_DIRS {
@@ -836,21 +805,17 @@ index 000000000..ecfabd6d1
 +    let artifact = format!("{}{}_", token::PREFIX, token::LIBPATH_ARTIFACT);
 +    let external = format!("{}{}_", token::PREFIX, token::LIBPATH_EXTERNAL);
 +    if let Some(pos) = text.find(&artifact) {
-+        // `<out_dir>/__RARGO_S_LPA_<meta>__` stands for every search path of
-+        // the script, in the order it printed them.
 +        let meta = text[pos + artifact.len()..].trim_end_matches(token::SUFFIX);
 +        return Some(Some(
 +            format!("{}@{}", token::make(token::DYN_LIBPATHS, meta), root_output.display()).into(),
 +        ));
 +    }
 +    if text.contains(&external) {
-+        // Covered by the artifact token's expansion.
 +        return Some(None);
 +    }
 +    None
 +}
 +
-+/// Converts cargo's parsed build output into the wire form.
 +pub fn convert_output(o: &super::BuildOutput) -> rp::BuildOutput {
 +    rp::BuildOutput {
 +        library_paths: o
@@ -891,9 +856,6 @@ index 000000000..ecfabd6d1
 +    }
 +}
 +
-+/// The parsing service: reads length-prefixed `ParseReq`s on stdin and
-+/// answers each with a length-prefixed `ParseResp`, using cargo's own
-+/// build-script output parser.
 +pub fn parse_service() -> ! {
 +    use crate::workspace::Edition;
 +    use crate::workspace::manifest::Target as T;
@@ -958,12 +920,10 @@ index 000000000..ecfabd6d1
 +    }
 +}
 +
-+/// Records a status line cargo prints after the build (`Running ...`).
 +pub fn record_status(verb: &str, msg: impl std::fmt::Display, when: rp::When) {
 +    state().lock().unwrap().steps.push(rp::Step::Status { verb: verb.to_string(), msg: msg.to_string(), when });
 +}
 +
-+/// Records a test, bench or doctest process.
 +pub fn record_exec(kind: rp::ExecKind, unit: &Unit, cmd: &ProcessBuilder, rerun: String) -> CargoResult<()> {
 +    let cmd = cmd_of(cmd)?;
 +    let mut st = state().lock().unwrap();
@@ -972,7 +932,6 @@ index 000000000..ecfabd6d1
 +    Ok(())
 +}
 +
-+/// Records the process `cargo run` would replace itself with.
 +pub fn record_run(cmd: &ProcessBuilder) -> CargoResult<()> {
 +    let display = cmd.to_string();
 +    let cmd = cmd_of(cmd)?;
@@ -982,20 +941,16 @@ index 000000000..ecfabd6d1
 +
 +static TEST_FLAGS: Mutex<(bool, bool)> = Mutex::new((false, false));
 +
-+/// Remembers `cargo test` options rargod needs when running the steps.
 +pub fn record_test_flags(no_fail_fast: bool, test_args: &[&str]) {
 +    let nocapture = test_args.contains(&"--nocapture") || test_args.contains(&"--no-capture");
 +    *TEST_FLAGS.lock().unwrap() = (no_fail_fast, nocapture);
 +}
 +
-+/// Writes the plan. Called once, when the cargo command has succeeded.
 +pub fn finish() -> CargoResult<()> {
 +    #[allow(clippy::disallowed_methods)]
 +    let Some(path) = std::env::var_os(rp::PLAN_ENV) else { return Ok(()) };
 +    let mut st = state().lock().unwrap();
 +    let Some(g) = st.global.take() else {
-+        // The command did not build anything (for example `cargo run` that
-+        // failed target selection would have errored before this point).
 +        anyhow::bail!("rargo: this cargo command did not produce a build plan");
 +    };
 +    let mut units = Vec::with_capacity(st.units.len());
@@ -1039,10 +994,6 @@ index 000000000..ecfabd6d1
 +    Ok(())
 +}
 +
-+/// When planning under rustup without a pinned toolchain, asks rustup which
-+/// toolchain applies to the current directory and pins it, so cargo's
-+/// proxy-bypass resolves the real `rustc` and every process in the plan
-+/// agrees on the toolchain. Must run before any other thread exists.
 +pub fn pin_toolchain() {
 +    #[allow(clippy::disallowed_methods)]
 +    if std::env::var_os(rp::PLAN_ENV).is_none() || std::env::var_os("RUSTUP_TOOLCHAIN").is_some() {
@@ -1052,12 +1003,10 @@ index 000000000..ecfabd6d1
 +        return;
 +    };
 +    if !out.status.success() {
-+        // Let cargo's own rustc probing report the problem.
 +        return;
 +    }
 +    let text = String::from_utf8_lossy(&out.stdout);
 +    let Some(name) = text.split_whitespace().next() else { return };
-+    // SAFETY: called at the very start of main, before any threads exist.
 +    unsafe {
 +        std::env::set_var("RUSTUP_TOOLCHAIN", name);
 +        if name.starts_with("nightly") || name.starts_with("dev") {
@@ -1066,15 +1015,14 @@ index 000000000..ecfabd6d1
 +    }
 +}
 diff --git a/src/compiler/unit.rs b/src/compiler/unit.rs
-index c65f19e6f..48e1a4f06 100644
+index c65f19e..6a6c5a7 100644
 --- a/src/compiler/unit.rs
 +++ b/src/compiler/unit.rs
-@@ -172,6 +172,13 @@ impl UnitInner {
+@@ -172,6 +172,12 @@ impl UnitInner {
      }
  }
  
 +impl Unit {
-+    /// Identity of the interned unit, usable as a `Send` map key.
 +    pub(crate) fn rargo_key(&self) -> usize {
 +        Rc::as_ptr(&self.inner) as usize
 +    }
@@ -1084,7 +1032,7 @@ index c65f19e6f..48e1a4f06 100644
  impl Hash for Unit {
      fn hash<H: Hasher>(&self, hasher: &mut H) {
 diff --git a/src/ops/cargo_compile/mod.rs b/src/ops/cargo_compile/mod.rs
-index 89f64c655..94404f888 100644
+index 89f64c6..94404f8 100644
 --- a/src/ops/cargo_compile/mod.rs
 +++ b/src/ops/cargo_compile/mod.rs
 @@ -133,7 +133,11 @@ impl CompileOptions {
@@ -1101,7 +1049,7 @@ index 89f64c655..94404f888 100644
  }
  
 diff --git a/src/ops/cargo_run.rs b/src/ops/cargo_run.rs
-index ef00c24d1..113b11f81 100644
+index ef00c24..113b11f 100644
 --- a/src/ops/cargo_run.rs
 +++ b/src/ops/cargo_run.rs
 @@ -123,6 +123,9 @@ pub fn run(
@@ -1115,7 +1063,7 @@ index ef00c24d1..113b11f81 100644
  
      process.exec_replace()
 diff --git a/src/ops/cargo_test.rs b/src/ops/cargo_test.rs
-index bdaa2bc18..ab33074af 100644
+index bdaa2bc..ab33074 100644
 --- a/src/ops/cargo_test.rs
 +++ b/src/ops/cargo_test.rs
 @@ -65,6 +65,7 @@ impl UnitTestError {
@@ -1199,22 +1147,17 @@ index bdaa2bc18..ab33074af 100644
              .concise(|shell| shell.status("Executable", &exe_display))?;
          gctx.shell()
 diff --git a/src/workspace/global_cache_tracker.rs b/src/workspace/global_cache_tracker.rs
-index 48b606d6c..9787d3bf3 100644
+index 48b606d..3544135 100644
 --- a/src/workspace/global_cache_tracker.rs
 +++ b/src/workspace/global_cache_tracker.rs
-@@ -1598,6 +1598,12 @@ impl DeferredGlobalLastUse {
+@@ -1598,6 +1598,10 @@ impl DeferredGlobalLastUse {
      ///
      /// This will log or display a warning to the user.
      pub fn save_no_error(&mut self, gctx: &GlobalContext) {
 +        if crate::compiler::rargo::active() {
-+            // Planning runs in a sandbox whose writes are discarded, and the
-+            // tracker database must not become an input of the plan.
 +            self.clear();
 +            return;
 +        }
          if let Err(e) = self.save_with_gctx(gctx) {
              // Because there is an assertion in auto-gc that checks if this is
              // empty, be sure to clear it so that assertion doesn't fail.
--- 
-2.54.0
-

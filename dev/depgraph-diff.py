@@ -1,11 +1,3 @@
-"""Compares two dep-graph.bin files record by record (#114).
-
-  python3 -I dev/depgraph-diff.py OLD NEW
-
-Prints how many of NEW's records are byte-identical to a record of OLD,
-how many have the same node (kind and key) but differ, how many nodes are
-new, and how far NEW's record order agrees with OLD's.
-"""
 import struct
 import sys
 
@@ -23,13 +15,10 @@ def leb(d, p):
 
 def parse(path):
     d = open(path, "rb").read()
-    # The file ends with the three counts and the encoder's end marker.
     end = b"rust-end-file"
     if d.endswith(end):
         d = d[: -len(end)]
     node_max, node_count, edge_count = struct.unpack("<QQQ", d[-24:])
-    # After the file header (magic, format version, the rustc version) come
-    # a few leb128 values of the session; the records start somewhere after.
     head_end = 7 + d[6]
     for start, kind_bits in ((s, k) for s in range(head_end, head_end + 80) for k in range(5, 13)):
         recs, p, ok = [], start, True
@@ -79,7 +68,6 @@ def main():
             fresh_bytes += len(r[3])
         if key in by_node:
             order.append(by_node[key])
-    # Records of NEW that follow the record that followed them in OLD.
     follows = sum(1 for a, b in zip(order, order[1:]) if b == a + 1)
     print(f"index space {old_max} -> {new_max}; records {len(old)} -> {len(new)}")
     print(f"identical {same} ({same_bytes} B), same node changed {changed} ({changed_bytes} B), "

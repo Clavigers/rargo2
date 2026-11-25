@@ -1,13 +1,3 @@
-//! Manifests of Nix store paths.
-//!
-//! A store path is a content-addressed tree: directory manifests whose
-//! leaves are content hashes, the same shape as a worktree. The path is
-//! hashed once, the first time a closure containing it is resolved, and the
-//! manifest is kept under the path's name. The file bytes stay on the host.
-//! Nothing is copied into the content store. A worker that is given the
-//! tree answers lookups and listings under that path itself, and fetches a
-//! file's bytes by hash only when something opens it.
-
 use crate::db::{Db, Table};
 use crate::hash::Hash;
 use crate::view::{DType, FileInfo, FileSrc, HostSig, Listing, Looked, Owner};
@@ -31,8 +21,6 @@ const NIX_DIR: Owner = Owner {
     mode: 0o555,
 };
 
-/// What hashing a set of store paths cost. A path already manifested counts
-/// as reused and adds no files.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cost {
     pub hashed_files: u64,
@@ -44,7 +32,6 @@ pub struct Cost {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepared {
-    /// One root identity per name, in the same order.
     pub roots: Vec<Hash>,
     pub cost: Cost,
 }
@@ -63,15 +50,12 @@ pub enum StoredKind {
     Link(Vec<u8>),
 }
 
-/// One store path on the wire: its name and its manifest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WirePath {
     pub name: Vec<u8>,
     pub kind: StoredKind,
 }
 
-/// The identity folded into an action key: the tree digest, the file's
-/// content hash, or the hash of a symlink's target.
 pub fn identity(kind: &StoredKind) -> Hash {
     match kind {
         StoredKind::Dir { root, .. } => *root,
@@ -231,16 +215,10 @@ fn hash_path(path: &Path) -> io::Result<Fresh> {
     )))
 }
 
-/// Manifests `names` under `store` (a directory of store paths; the tests
-/// pass a temporary one). A name that already has a manifest is not hashed
-/// again.
 pub fn ensure(db: &Db, store: &Path, names: &[String]) -> Result<Prepared> {
     prepare(db, store, names, None, &mut HashSet::new())
 }
 
-/// Manifests `names` and, for any name not in `seen`, remembers each file's
-/// host path under its content hash so a worker can be sent the bytes later.
-/// `seen` records names already remembered in this process.
 pub fn prepare(
     db: &Db,
     store: &Path,
@@ -357,8 +335,6 @@ fn remember_file(
     Ok(())
 }
 
-/// Where `dir` sits relative to `/nix/store`. `None` when `dir` is not that
-/// directory and not under it.
 pub enum Place {
     Root,
     Inside { name: Vec<u8>, sub: Vec<u8> },
@@ -511,9 +487,6 @@ fn in_closure(closure: &[Vec<u8>], name: &[u8]) -> bool {
     closure.binary_search_by(|n| n.as_slice().cmp(name)).is_ok()
 }
 
-/// Answers a lookup under `/nix/store` from `closure`. `None` when `dir` is
-/// not under `/nix/store`, or when `closure` is empty (this action has no
-/// store). A name outside `closure` is absent even if its tree is held.
 pub fn lookup_at(
     get: impl Fn(&[u8]) -> Option<Arc<Installed>>,
     closure: &[Vec<u8>],
@@ -597,7 +570,6 @@ mod tests {
         std::os::unix::fs::symlink("../bin/tool", store.join("aaa/lib/to-tool")).unwrap();
         fs::write(store.join("bbb/readme"), b"bee").unwrap();
         fs::write(store.join("ccc/only"), b"cee").unwrap();
-        // A single-file store path and a symlink store path.
         fs::write(store.join("fff"), b"file-path").unwrap();
         std::os::unix::fs::symlink("fff", store.join("lll")).unwrap();
     }
@@ -611,7 +583,6 @@ mod tests {
         let first = ensure(&db, &store, &["aaa".into(), "bbb".into()]).unwrap();
         assert_eq!(first.cost.new_paths, 2);
         assert_eq!(first.cost.reused_paths, 0);
-        // tool, note, readme. The symlink is not a file.
         assert_eq!(first.cost.hashed_files, 3);
         let second = ensure(&db, &store, &["bbb".into(), "ccc".into()]).unwrap();
         assert_eq!(
@@ -649,7 +620,6 @@ mod tests {
                 Arc::new(Installed::from_kind(&kind).unwrap()),
             );
         }
-        // The action's closure is aaa and bbb. ccc is held and still absent.
         let mut closure = vec![b"aaa".to_vec(), b"bbb".to_vec()];
         closure.sort();
         let get = |n: &[u8]| have.get(n).cloned();
@@ -690,7 +660,6 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert!(top.iter().any(|(n, t)| n == b"aaa" && *t == DType::Dir));
         assert!(top.iter().all(|(n, _)| n != b"ccc"));
-        // A file path and a symlink path, in their own closure.
         let file_closure = vec![b"fff".to_vec(), b"lll".to_vec()];
         match lookup_at(get, &file_closure, b"/nix/store", b"fff") {
             Some(Looked::File(f)) => assert_eq!(f.size, b"file-path".len() as u64),
@@ -719,7 +688,6 @@ mod tests {
             }
             other => panic!("host file: {other:?}"),
         }
-        // The manifest is a meta entry. The content store is not involved.
         assert!(db.get(Table::Meta, &meta_key(b"aaa")).is_some());
         assert!(db.get(Table::Blobs, &h.0).is_none());
     }

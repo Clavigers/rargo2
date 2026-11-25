@@ -1,27 +1,3 @@
-//! A delivered content read by range: what is read is fetched as it is
-//! read, and nothing is served that has not been proven against the
-//! content's hash.
-//!
-//! The content's bytes gather in a sparse file next to its place in the
-//! client's cache. They arrive by chunk (the server's recipe), and each
-//! chunk is checked against its own hash; they are served by group (see
-//! [`rargo_proto::outline`]), and a group is served only once all of it is
-//! here and its chaining value is the one in the outline, which was proven
-//! against the content hash when the reader was made. The recipe itself
-//! is not trusted: a recipe that puts the wrong bytes in a place fails the
-//! group's check.
-//!
-//! What is fetched: a read waits for the chunks under it, and its first
-//! read in a region asks for the rest of that region behind them, so a
-//! sequential read does not cost a round trip per chunk. The regions are
-//! the parts that only a debugger or a backtrace reads (the server names
-//! them: debug sections), each a region of its own, and everything else,
-//! one region. Running a debug binary so fetches its code and data at its
-//! first read and its debug information only for a backtrace.
-//!
-//! Once every group is proven, the file is the content: it is put in its
-//! place in the cache, and from then on it is an ordinary cached content.
-
 use rargo_proto::outline::{self, Cv, GROUP};
 use rargo_proto::Digest;
 use std::fs::File;
@@ -29,9 +5,6 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Fetches chunks for a [`Partial`]. `request` returns at once; each
-/// chunk is handed back with [`Partial::deliver`] as it arrives, and the
-/// ones that cannot be had with [`Partial::failed`].
 pub trait Chunks: Send + Sync {
     fn request(&self, p: &Arc<Partial>, idx: Vec<u32>);
 }
@@ -41,8 +14,6 @@ enum Chunk {
     Missing,
     Asked,
     Here,
-    /// The last request for it failed: a read that was waiting for it gets
-    /// an error, and a read that comes later asks again.
     Failed,
 }
 
@@ -50,8 +21,6 @@ enum Chunk {
 enum Group {
     Unproven,
     Good,
-    /// All its chunks are here, each matching its recipe hash, and still
-    /// the group is not the content: the recipe is wrong.
     Bad,
 }
 
@@ -59,9 +28,7 @@ struct State {
     chunks: Vec<Chunk>,
     groups: Vec<Group>,
     good: usize,
-    /// Whether the rest of a region has been asked for.
     started: Vec<bool>,
-    /// The file is the content and is in its place in the cache.
     done: bool,
 }
 
@@ -70,8 +37,6 @@ pub struct Partial {
     size: u64,
     recipe: Vec<(Digest, u32)>,
     offsets: Vec<u64>,
-    /// The region of each chunk: 0 for everything read at once, `1 + i`
-    /// for the `i`th range read only on demand.
     region: Vec<u32>,
     cvs: Vec<Cv>,
     file: File,
@@ -83,9 +48,6 @@ pub struct Partial {
 }
 
 impl Partial {
-    /// A reader of the content `hash` of `size` bytes, to be put at `slot`
-    /// in the cache once it is whole. Fails unless the outline proves the
-    /// content and the recipe covers it.
     pub fn new(
         hash: Digest,
         size: u64,
@@ -158,12 +120,10 @@ impl Partial {
         self.offsets[i as usize]
     }
 
-    /// Whether the content is whole, proven and in its place in the cache.
     pub fn is_done(&self) -> bool {
         self.st.lock().unwrap().done
     }
 
-    /// The chunks that hold bytes `start..end`.
     fn chunks_of(&self, start: u64, end: u64) -> std::ops::Range<usize> {
         assert!(start < end && end <= self.size);
         let first = self.offsets.partition_point(|&o| o <= start) - 1;
@@ -171,8 +131,6 @@ impl Partial {
         first..last
     }
 
-    /// Reads up to `len` bytes at `offset`, fetching and proving what is
-    /// not here yet. Blocks until they are proven.
     pub fn read_at(self: &Arc<Self>, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         let end = (offset + len as u64).min(self.size);
         if offset >= end {
@@ -184,8 +142,6 @@ impl Partial {
         Ok(out)
     }
 
-    /// Fetches what is missing of the whole content and waits until it is
-    /// in its place in the cache; says where that is.
     pub fn whole(self: &Arc<Self>) -> std::io::Result<PathBuf> {
         self.wait_for(0, self.size)?;
         assert!(self.is_done());
@@ -229,13 +185,11 @@ impl Partial {
                 }
             }
             if failed {
-                // What was asked for anyway is released for the next read.
                 for &c in &ask {
                     st.chunks[c as usize] = Chunk::Missing;
                 }
                 return Err(std::io::Error::other("part of the content could not be fetched"));
             }
-            // The rest of the regions this read is in, after it.
             let mut rest = Vec::new();
             for &c in &ask {
                 let r = self.region[c as usize] as usize;
@@ -264,8 +218,6 @@ impl Partial {
         }
     }
 
-    /// Chunk `i` arrived. It is kept only if it is the chunk the recipe
-    /// names; the groups it completes are proven.
     pub fn deliver(&self, i: u32, data: &[u8]) {
         let i = i as usize;
         let Some((hash, len)) = self.recipe.get(i) else { return };
@@ -287,7 +239,6 @@ impl Partial {
         let end = start + *len as u64;
         let mut st = self.st.lock().unwrap();
         st.chunks[i] = Chunk::Here;
-        // The groups that may be complete now.
         let (g0, g1) = ((start / GROUP) as usize, ((end - 1) / GROUP) as usize);
         let ready: Vec<usize> = (g0..=g1)
             .filter(|&g| {
@@ -322,7 +273,6 @@ impl Partial {
             }
         }
         if st.good == st.groups.len() && !st.done {
-            // Every group is proven, so the file is the content.
             use std::os::unix::fs::PermissionsExt;
             let placed = std::fs::set_permissions(&self.tmp, std::fs::Permissions::from_mode(0o444))
                 .and_then(|_| std::fs::rename(&self.tmp, &self.slot));
@@ -335,8 +285,6 @@ impl Partial {
         self.changed.notify_all();
     }
 
-    /// The chunks that could not be had. Their regions are asked for
-    /// again at the next read in them.
     pub fn failed(&self, idx: &[u32]) {
         let mut st = self.st.lock().unwrap();
         for &i in idx {
@@ -381,21 +329,15 @@ mod tests {
             .collect()
     }
 
-    /// Chunks of 50,000 bytes (so that chunks and groups do not line up),
-    /// the last one shorter.
     fn recipe_of(data: &[u8]) -> Vec<(Digest, u32)> {
         data.chunks(50_000).map(|c| (*blake3::hash(c).as_bytes(), c.len() as u32)).collect()
     }
 
-    /// A server answering from `data`, possibly wrongly, counting what it
-    /// sends.
     struct Server {
         data: Vec<u8>,
         recipe: Vec<(Digest, u32)>,
         sent: AtomicU64,
-        /// Bytes it sends wrong, at this offset of the content.
         corrupt_at: Option<u64>,
-        /// Whether it sends nothing at all.
         down: std::sync::atomic::AtomicBool,
     }
 
@@ -433,25 +375,20 @@ mod tests {
     #[test]
     fn a_read_fetches_its_region_and_not_the_parts_read_on_demand() {
         let size = 3_000_000;
-        // The middle third is read only on demand.
         let lazy = [(1_000_000, 2_000_000)];
         let (_dir, server, p) = setup(size, &lazy, None);
         let got = p.read_at(10, 100).unwrap();
         assert_eq!(got, server.data[10..110]);
         let sent = server.sent.load(Ordering::SeqCst);
-        // Everything but the chunks wholly inside the lazy range.
         assert!(sent < size as u64 * 3 / 4, "sent {sent}");
         assert!(sent >= size as u64 * 2 / 3 - 100_000, "sent {sent}");
         assert!(!p.is_done());
-        // Reading in the lazy range fetches it.
         let got = p.read_at(1_500_000, 70_000).unwrap();
         assert_eq!(got, server.data[1_500_000..1_570_000]);
         assert!(p.is_done());
         assert_eq!(server.sent.load(Ordering::SeqCst), size as u64, "each chunk once");
     }
 
-    /// A file read through to the end is the content, and is then in the
-    /// cache, read without the server.
     #[test]
     fn read_to_the_end_it_is_the_content_and_in_the_cache() {
         let size = 2_345_678;
@@ -470,8 +407,6 @@ mod tests {
         assert!(p.is_done());
         let slot = dir.path().join("ab").join("slot");
         assert_eq!(std::fs::read(&slot).unwrap(), server.data, "in its place in the cache");
-        // Without the server, a reader still reads (it has it all), and the
-        // cache has it.
         server.down.store(true, Ordering::SeqCst);
         assert_eq!(p.read_at(1_000_000, 10).unwrap(), server.data[1_000_000..1_000_010]);
         assert_eq!(p.whole().unwrap(), slot);
@@ -479,14 +414,11 @@ mod tests {
         assert_eq!(leftovers, vec![std::ffi::OsString::from("slot")]);
     }
 
-    /// A server that answers with wrong bytes: the reader gets an error,
-    /// never the bytes, and the rest of the content still reads.
     #[test]
     fn wrong_bytes_never_reach_the_reader() {
         let size = 1_500_000;
         let (_dir, server, p) = setup(size, &[], Some(700_000));
         assert!(p.read_at(699_990, 20).is_err(), "the chunk does not match its recipe hash");
-        // Bytes 655,360.. are the group that holds the start of that chunk.
         assert!(p.read_at(656_000, 10).is_err(), "nor does anything in its groups");
         assert_eq!(p.read_at(650_000, 10).unwrap(), server.data[650_000..650_010], "the group before is good");
         assert_eq!(p.read_at(0, 1000).unwrap(), server.data[..1000]);
@@ -494,8 +426,6 @@ mod tests {
         assert!(!p.is_done());
     }
 
-    /// A server whose recipe is wrong but self-consistent (its chunk hashes
-    /// are of the wrong bytes): the group's value catches it.
     #[test]
     fn a_wrong_recipe_is_caught_by_the_outline() {
         let dir = tempfile::tempdir().unwrap();
@@ -530,8 +460,6 @@ mod tests {
         assert!(Partial::new(hash, data.len() as u64, short, outline::outline(&data), &[], &dir.path().join("slot"), server).is_err());
     }
 
-    /// A failed fetch is an error for that read, and the next read asks
-    /// again.
     #[test]
     fn a_failed_fetch_is_asked_again() {
         let (_dir, server, p) = setup(1_300_000, &[], None);

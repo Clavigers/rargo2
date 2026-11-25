@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""A stand-in for the three GitHub addresses `rargo auth` uses, for tests.
-
-  fake-github.py PORT WHO-FILE
-
-WHO-FILE holds the login of whoever is "signed in to GitHub in the browser".
-  GET  /login/oauth/authorize    -> sends the browser back to redirect_uri with a code
-  POST /login/oauth/access_token -> an access token for that code (client secret checked)
-  GET  /user                     -> who the token belongs to
-"""
 import json, sys, urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 

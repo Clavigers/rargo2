@@ -1,23 +1,10 @@
-//! The report behind `--timings`: when each unit of a build started and
-//! finished, what it cost, and which results came from the cache.
-//!
-//! cargo's report describes cargo's own job queue; this one describes what
-//! the server did for this request. It is a single HTML file without
-//! scripts, placed where cargo puts its report
-//! (`target/cargo-timings/cargo-timing.html` and a dated copy).
-
 use std::time::{Duration, Instant};
 
-/// What happened to one unit during a build.
 #[derive(Clone, Default)]
 pub struct UnitTime {
-    /// Everything the unit depends on was ready and its result was asked for.
     pub start: Option<Instant>,
-    /// Its metadata was ready (dependents may start from here).
     pub meta: Option<Instant>,
     pub end: Option<Instant>,
-    /// The result came from the cache; `wall_us` and `cpu_us` are then what
-    /// producing it once cost.
     pub cached: bool,
     pub wall_us: u64,
     pub cpu_us: u64,
@@ -27,19 +14,12 @@ pub struct UnitTime {
 pub struct Row {
     pub name: String,
     pub time: UnitTime,
-    /// The unit's number in the plan.
     pub index: usize,
-    /// The units it waits for: `(number, its metadata is enough)`.
     pub deps: Vec<(usize, bool)>,
-    /// It is linked: it needs the object code of everything below it.
     pub needs_objects: bool,
-    /// It has a command. Units without one only tie others together; they
-    /// are part of the data and not of the page.
     pub runs: bool,
 }
 
-/// The rows as data, for tools (`dev/sim-workers.py`). Times are seconds
-/// since the build began.
 fn data(began: Instant, total: Duration, cores: usize, rows: &[Row]) -> String {
     let at = |t: Option<Instant>| t.map(|t| t.saturating_duration_since(began).as_secs_f64());
     let units: Vec<serde_json::Value> = rows
@@ -61,7 +41,6 @@ fn data(began: Instant, total: Duration, cores: usize, rows: &[Row]) -> String {
             })
         })
         .collect();
-    // `</` must not appear inside the element that carries the data.
     serde_json::json!({ "total": total.as_secs_f64(), "cores": cores, "units": units }).to_string().replace("</", "<\\/")
 }
 
@@ -73,10 +52,8 @@ fn secs(d: Duration) -> String {
     format!("{:.2}s", d.as_secs_f64())
 }
 
-/// `20261123T101500Z` for seconds since the epoch.
 pub fn stamp(unix: u64) -> String {
     let (days, rem) = (unix / 86400, unix % 86400);
-    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -89,8 +66,6 @@ pub fn stamp(unix: u64) -> String {
     format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// Renders the report. `began` is when the build started, `total` how long
-/// it took, `cores` how many the server schedules on.
 pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores: usize, every: &[Row]) -> String {
     let json = data(began, total, cores, every);
     let rows: Vec<&Row> = every.iter().filter(|r| r.runs && r.time.end.is_some()).collect();
@@ -124,7 +99,6 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
     fact("Cores the server schedules on", cores.to_string());
     h.push_str("</table>\n");
 
-    // The chart: one bar per unit that ran, in order of start.
     let mut order: Vec<&Row> = ran.clone();
     order.sort_by_key(|r| r.time.start);
     h.push_str("<h2>Units run for this build</h2>\n");
@@ -144,7 +118,6 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
             "<div class=\"chart\"><svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{:.0}\" height=\"{height:.0}\" role=\"img\" aria-label=\"When each unit ran\">\n",
             left * 2.0 + width + 320.0
         ));
-        // A grid line roughly every tenth of the build, on a round number.
         let step = [0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0]
             .into_iter()
             .find(|s| span / s <= 12.0)
@@ -186,7 +159,6 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
         h.push_str("</svg></div>\n");
     }
 
-    // The table: everything, most expensive first.
     let mut all: Vec<&Row> = rows.clone();
     all.sort_by_key(|r| std::cmp::Reverse((!r.time.cached, r.time.wall_us)));
     h.push_str(
@@ -208,7 +180,6 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
         h.push_str("</tr>\n");
     }
     h.push_str("</table>\n");
-    // Not a program: the same figures for tools that want to compute on them.
     h.push_str(&format!(
         "<script type=\"application/json\" id=\"rargo-timings\">{}</script>\n</body>\n</html>\n",
         json
@@ -251,13 +222,11 @@ mod tests {
         ];
         let html = render("build --timings", "2026-11-23", began, Duration::from_secs(1), 8, &rows);
         assert!(html.contains("2 (1 run for this build, 1 from the cache)"));
-        // The bar of `a` has both of its phases; `b` has no bar.
         assert_eq!(html.matches("class=\"front\"").count(), 1);
         assert_eq!(html.matches("class=\"back\"").count(), 1);
         assert!(html.contains("`b&lt;T&gt;` (bin)</td><td>from the cache"));
         assert!(html.contains("`a` (lib) 1.00s"));
         assert!(html.contains("200 MiB"));
-        // No program in the page; the data block parses and escapes names.
         assert!(!html.contains("<script>") && html.matches("<script").count() == 1);
         let json = html.split("id=\"rargo-timings\">").nth(1).unwrap().split("</script>").next().unwrap();
         let v: serde_json::Value = serde_json::from_str(json).unwrap();

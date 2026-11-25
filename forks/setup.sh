@@ -1,6 +1,4 @@
 #!/bin/sh
-# Clones upstream cargo and rustc at the pinned bases and applies rargo's
-# patches. Existing checkouts are left alone.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 work=${RARGO_WORK:-/root/rargo-work}
@@ -17,7 +15,6 @@ fi
 
 base=$(cat "$here/rust/BASE")
 if [ ! -d "$work/rust/.git" ]; then
-    # rustc's history is large; one commit is all the build needs.
     git init -q "$work/rust"
     git -C "$work/rust" remote add origin https://github.com/rust-lang/rust.git
     git -C "$work/rust" fetch --depth 1 origin "$base"

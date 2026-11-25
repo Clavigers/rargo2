@@ -1,15 +1,7 @@
 #!/bin/bash
-# Builds, runs and tests a small workspace through a rargo server, over UDP
-# and over TCP: the check that a deployed service works for a client.
-#
-#   RARGO_SERVER=host:port RARGO_TOKEN=token deploy/check-service.sh [path/to/rargo]
-#
-# The workspace has a registry dependency and a rust-toolchain.toml, so it
-# also checks that the server can download crates and install toolchains.
 set -u
 R=$(command -v "${1:-rargo}") || { echo "no rargo binary: $1" >&2; exit 2; }
 : "${RARGO_SERVER:?}"
-# Keep the caller's stored credentials available when no token is supplied.
 if [ -z "${RARGO_TOKEN:-}" ]; then
     export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 fi
@@ -45,7 +37,6 @@ bad() { echo "FAIL  $1"; shift; printf '%s\n' "$@" | sed 's/^/        /'; fail=1
 "$R" --rargo-version
 for transport in udp tcp; do
     export RARGO_TRANSPORT=$transport
-    # Each transport from nothing on the client: its own daemon and cache.
     export RARGO_CACHE_DIR=$T/cache-$transport
     echo "// $transport" >>src/main.rs
     out=$("$R" build 2>&1) && ok "$transport: build" || bad "$transport: build" "$out"

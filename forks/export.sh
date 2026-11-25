@@ -1,5 +1,4 @@
 #!/bin/sh
-# Regenerates forks/{cargo,rust}/*.patch from the working checkouts.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 work=${RARGO_WORK:-/root/rargo-work}

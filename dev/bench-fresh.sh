@@ -1,17 +1,4 @@
 #!/bin/bash
-# How long until a fresh worktree has a usable binary, and what crosses
-# the link for it.
-#
-#   dev/bench-fresh.sh copy|fuse [DELAY_MS]      (client link: DELAY_MS each way, default 50)
-#
-# A server with 24 cores has built rust-analyzer for one worktree. Then, on
-# the same commit:
-#   - a fresh worktree on a machine that has built there before (the
-#     client's cache holds the artifacts of the first worktree);
-#   - a fresh worktree on a machine that never has (empty client cache).
-# For each: `rargo build -p rust-analyzer`, then `rust-analyzer --version`
-# out of target/, with the bytes the client's interface received.
-# Results go to $RARGO_WORK/bench/fresh.jsonl.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -31,7 +18,7 @@ rm -rf "$C"; mkdir -p "$C"
 git -C "$base" worktree prune
 CLIENT_DELAY_MS=$delay "$here/netns.sh" up 24 0 0 >/dev/null 2>&1
 . "$work/${RIG_STATE:-nstest}/client.env"
-fresh() { # worktree name, cache directory -> "build_s run_s bytes"
+fresh() {
     git -C "$base" worktree add -q --detach "$C/$1" HEAD
     cd "$C/$1" || exit 2
     export RARGO_CACHE_DIR=$2
@@ -42,7 +29,6 @@ fresh() { # worktree name, cache directory -> "build_s run_s bytes"
     echo "$b $r $(( $(rx) - b0 ))"
     cd /
 }
-# The first worktree: the server builds, this client's cache fills.
 read first_b first_r first_bytes < <(fresh a "$C/cache")
 read same_b same_r same_bytes < <(fresh b "$C/cache")
 read other_b other_r other_bytes < <(fresh c "$C/cache-other-machine")

@@ -1,25 +1,3 @@
-//! Compares two rules for cutting chunks inside a structural region (#117):
-//! rargo's (a gear hash with two masks, FastCDC style, as in `chunk.rs`)
-//! and RepMaxCDC (`github.com/buildbarn/go-cdc`, ported from its reference
-//! `simple_rep_max_content_defined_chunker.go`). Structural boundaries
-//! (archive members, ELF sections) are the same for both.
-//!
-//!   cdcbench [--min N] [--horizon H] [--rules mask,repmax] PROJECT...
-//!
-//! Each PROJECT is a directory of versions `v00`, `v01`, ... (as made by
-//! `dev/cdc-corpus.sh`), each a tree of files. For each rule it prints:
-//! - the mean chunk size over every file of every version;
-//! - `store`: the bytes of the distinct chunks of the whole corpus, each
-//!   compressed with zstd level 3 as the cold tier does;
-//! - `send`: for each version after the first, the bytes of its chunks
-//!   that the version before it (of the same project) does not have,
-//!   summed;
-//! - the speed of finding the cuts on one core, over data in memory.
-//!
-//! The mask rule here is a copy of `chunk.rs`, and every file's cuts are
-//! checked against `rargo_core::chunk::chunk`. RepMaxCDC is cut in one
-//! pass, and every file's cuts are checked against the simple algorithm.
-//! A difference is fatal.
 use dashmap::DashMap;
 use rargo_core::chunk::{MAX_CHUNK, MIN_CHUNK, AVG_CHUNK};
 use rargo_core::hash::Hash;
@@ -29,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// The same table as `chunk.rs` (splitmix64), shared by both rules.
 fn gear() -> &'static [u64; 256] {
     static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
     T.get_or_init(|| {
@@ -52,7 +29,6 @@ enum Rule {
     RepMax { min: usize, horizon: usize },
 }
 
-/// `chunk.rs`'s `cdc`.
 fn mask(data: &[u8], cuts: &mut Vec<usize>) {
     let g = gear();
     const MASK_S: u64 = (1 << 18) - 1;
@@ -90,13 +66,8 @@ fn mask(data: &[u8], cuts: &mut Vec<usize>) {
     }
 }
 
-/// The width of the gear hash's window in go-cdc (`gearHashWindowSizeBytes`).
 const WINDOW: usize = 64;
 
-/// RepMaxCDC, as `simpleRepMaxChunkReader.ReadNextChunk`: each chunk is
-/// `[min, 2 min)` long (the last of a region may be shorter only if the
-/// region is). The cut is where the rolling hash is highest, looking up to
-/// `2 min + horizon` ahead.
 fn repmax(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>) {
     let g = gear();
     let peek = 2 * min + horizon;
@@ -136,11 +107,6 @@ fn repmax(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>) {
     }
 }
 
-/// The same cuts as [`repmax`], in one pass over the bytes. The simple
-/// algorithm scans for the highest hash, and when that lies too far out
-/// scans again over a shorter range: the hashes are the same, so the
-/// offsets at which the running maximum rises (the records) are kept from
-/// the first scan, and each repeat is a walk over them.
 fn repmax_fast(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>, records: &mut Vec<usize>) {
     let g = gear();
     let peek = 2 * min + horizon;
@@ -151,7 +117,6 @@ fn repmax_fast(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>, r
             cuts.push(avail);
             return;
         }
-        // The scan covers offsets i < limit (cut at min + i + 1).
         let limit = avail - 2 * min;
         let d = &data[pos..];
         let mut hash: u64 = 0;
@@ -161,10 +126,6 @@ fn repmax_fast(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>, r
         let mut best = hash;
         records.clear();
         records.push(0);
-        // Scan until min bytes pass without a new record, or the range ends.
-        // Eight bytes at a time while that cannot overshoot either bound
-        // (as go-cdc does): the hash of each of the eight comes from the
-        // hash before them shifted, plus a sum over the eight alone.
         let mut i = 0;
         loop {
             let stop = limit.min(records[records.len() - 1] + min);
@@ -184,8 +145,6 @@ fn repmax_fast(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>, r
             hash = (hash << 8).wrapping_add(s);
             i += 8;
         }
-        // A new record inside the block may have moved the stop forward, but
-        // never back: the bytes left are done one at a time.
         while i < limit && i < records[records.len() - 1] + min {
             hash = (hash << 1).wrapping_add(g[d[min + i] as usize]);
             if best < hash {
@@ -194,9 +153,6 @@ fn repmax_fast(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>, r
             }
             i += 1;
         }
-        // The simple algorithm's repeats: with offsets up to `lim`, it ends
-        // at the first record whose next record is more than min further
-        // (or beyond `lim`).
         let mut lim = limit;
         let off = loop {
             let mut j = 0;
@@ -214,7 +170,6 @@ fn repmax_fast(data: &[u8], min: usize, horizon: usize, cuts: &mut Vec<usize>, r
     }
 }
 
-/// `chunk.rs`'s `elf_boundaries`.
 fn elf_boundaries(data: &[u8]) -> Option<Vec<usize>> {
     if data.len() < 64 || &data[..4] != b"\x7fELF" || data[4] != 2 || data[5] != 1 {
         return None;
@@ -241,7 +196,6 @@ fn elf_boundaries(data: &[u8]) -> Option<Vec<usize>> {
     Some(b)
 }
 
-/// `chunk.rs`'s `structural`.
 fn structural(data: &[u8]) -> Vec<usize> {
     if let Some(members) = rargo_core::ar::members(data) {
         let mut b = Vec::new();
@@ -260,12 +214,10 @@ fn structural(data: &[u8]) -> Vec<usize> {
     elf_boundaries(data).unwrap_or_default()
 }
 
-/// `chunk.rs`'s `chunk`, with the rule inside a region chosen, as lengths.
 fn cuts(data: &[u8], rule: Rule) -> Vec<usize> {
     cuts_by(data, rule, false)
 }
 
-/// [`cuts`], with RepMaxCDC by the simple algorithm if `simple`.
 fn cuts_by(data: &[u8], rule: Rule, simple: bool) -> Vec<usize> {
     let mut records = Vec::new();
     let mut bounds = structural(data);
@@ -333,7 +285,6 @@ struct Totals {
 }
 
 fn measure(projects: &[PathBuf], rule: Rule) -> Totals {
-    // Distinct chunks of the whole corpus: hash -> compressed length.
     let distinct: DashMap<Hash, ()> = DashMap::new();
     let store_raw = AtomicU64::new(0);
     let store_zstd = AtomicU64::new(0);
@@ -352,8 +303,6 @@ fn measure(projects: &[PathBuf], rule: Rule) -> Totals {
                 .map(|p| {
                     let Ok(data) = std::fs::read(p) else { return Vec::new() };
                     let lens = cuts(&data, rule);
-                    // The copy of chunk.rs against chunk.rs; the one-pass
-                    // RepMaxCDC against the simple one.
                     let reference: Vec<usize> = match rule {
                         Rule::Mask => rargo_core::chunk::chunk(&data).iter().map(|c| c.len as usize).collect(),
                         Rule::RepMax { .. } => cuts_by(&data, rule, true),
@@ -367,8 +316,6 @@ fn measure(projects: &[PathBuf], rule: Rule) -> Totals {
                         let piece = &data[pos..pos + len];
                         pos += len;
                         if let Rule::RepMax { min, .. } = rule {
-                            // No chunk reaches 2 min (only the last of a
-                            // structural region may be below min).
                             if len >= 2 * min {
                                 oob.fetch_add(1, Ordering::Relaxed);
                             }
@@ -377,7 +324,6 @@ fn measure(projects: &[PathBuf], rule: Rule) -> Totals {
                         if distinct.insert(h, ()).is_none() {
                             store_raw.fetch_add(len as u64, Ordering::Relaxed);
                             let z = zstd::bulk::compress(piece, 3).expect("zstd").len();
-                            // The cold tier keeps a chunk raw if compressing does not help.
                             store_zstd.fetch_add(z.min(len) as u64, Ordering::Relaxed);
                         }
                         out.push((h, len as u32));
@@ -394,8 +340,6 @@ fn measure(projects: &[PathBuf], rule: Rule) -> Totals {
                 let first_here = here.insert(*h);
                 all_bytes += *len as u64;
                 if let Some(prev) = &previous {
-                    // A chunk the previous version has, or one already counted
-                    // in this version, is not sent again.
                     if first_here && !prev.contains(h) {
                         new_bytes += *len as u64;
                     }
@@ -428,8 +372,6 @@ fn measure(projects: &[PathBuf], rule: Rule) -> Totals {
     }
 }
 
-/// MiB/s of finding the cuts (structure and rule; no hashing of chunks) on
-/// one core, over up to `limit` bytes of the first version of each project.
 fn speed(projects: &[PathBuf], rules: &[Rule], limit: u64) -> Vec<f64> {
     let mut sample: Vec<Vec<u8>> = Vec::new();
     let mut total = 0u64;
@@ -458,7 +400,6 @@ fn speed(projects: &[PathBuf], rules: &[Rule], limit: u64) -> Vec<f64> {
         .iter()
         .map(|&rule| {
             let mut best = f64::MAX;
-            // The best of three runs.
             for _ in 0..3 {
                 let t = Instant::now();
                 let mut n = 0usize;
@@ -488,7 +429,6 @@ fn main() {
             _ => projects.push(PathBuf::from(a)),
         }
     }
-    // Bonanza's horizon: eight times the minimum.
     let horizon = horizon.unwrap_or(8 * min);
     let rules: Vec<Rule> = which
         .iter()

@@ -2,8 +2,6 @@
 resolver = "2"
 members = ["crates/*"]
 
-# rargo is built with rargo: builds, in CI as on any machine, run on this
-# server and share its cache.
 [workspace.metadata.rargo]
 host = "rargo.rs"
 

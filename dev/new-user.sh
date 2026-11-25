@@ -1,13 +1,4 @@
 #!/bin/sh
-# The path of a new user, on a machine that has nothing of rargo:
-#
-#   cargo install rargo  (or the install script)  ->  rargo @HOST  ->  rargo auth  ->  rargo build
-#
-#   INVITE=XXXX-XXXX-XXXX-XXXX dev/new-user.sh [HOST] [cargo|script]     (default: rargo.rs, cargo)
-#
-# Nothing is edited by hand. The one thing a person does in a browser
-# (entering the invitation on the page `rargo auth` names) is done with
-# curl. Needs: sh, curl, git, and cargo for the `cargo` way.
 set -eu
 host=${1:-rargo.rs}
 how=${2:-cargo}
@@ -50,7 +41,6 @@ done
 [ -n "$url" ] || { cat "$work/auth.out"; echo "rargo auth showed no address"; exit 1; }
 code=${url##*code=}
 echo "the page: $url"
-# The person's part.
 curl -fsS "$url" >/dev/null
 curl -fsS --data-urlencode "code=$code" --data-urlencode "invite=$INVITE" "${url%%/auth*}/auth/approve" | grep -o 'holds a token for <b>[^<]*</b>'
 wait $auth

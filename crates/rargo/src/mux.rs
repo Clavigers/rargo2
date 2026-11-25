@@ -1,6 +1,3 @@
-//! The daemon's end of its link to the server: every command a stream,
-//! stream 0 for what the daemon does on its own.
-
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
 use std::collections::HashMap;
@@ -10,12 +7,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::{Semaphore, oneshot};
 
-/// Bytes of file contents that may wait to be sent.
 const WINDOW: usize = 32 << 20;
-/// A keepalive this often keeps a NAT's mapping alive and tells the server
-/// where the client is now.
 const PING_EVERY: Duration = Duration::from_secs(10);
-/// Nothing heard for this long: the link is dead.
 const DEAD_AFTER: Duration = Duration::from_secs(45);
 
 const _: () = assert!(WINDOW <= u32::MAX as usize, "a window's permits fit acquire_many");
@@ -24,7 +17,6 @@ const _: () = assert!(DEAD_AFTER.as_secs() > 2 * PING_EVERY.as_secs());
 struct Out {
     seq: u64,
     tx: UnboundedSender<(Vec<u8>, usize)>,
-    /// Keepalives: sent ahead of whatever is queued.
     urgent: UnboundedSender<Vec<u8>>,
 }
 
@@ -35,12 +27,9 @@ pub struct Mux {
     streams: Mutex<HashMap<u32, UnboundedSender<ServerMsg>>>,
     next_stream: AtomicU32,
     next_id: AtomicU64,
-    /// Who waits for the answer to an offer.
     missing: Mutex<HashMap<u64, oneshot::Sender<(Vec<Digest>, Vec<Digest>)>>>,
     dead: AtomicBool,
-    /// Woken when the link dies.
     pub gone: tokio::sync::Notify,
-    /// When the server was last heard from (any frame).
     last_heard: Mutex<Instant>,
     pub bytes_out: AtomicU64,
     pub bytes_in: AtomicU64,
@@ -65,7 +54,6 @@ impl Mux {
             bytes_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
         });
-        // Writer: frames leave in the order they were queued.
         let m = mux.clone();
         tokio::spawn(async move {
             loop {
@@ -91,7 +79,6 @@ impl Mux {
             }
             m.die();
         });
-        // Reader.
         let m = mux.clone();
         tokio::spawn(async move {
             let mut order: Reorder<ServerMsg> = Reorder::new(true);
@@ -127,7 +114,6 @@ impl Mux {
             }
             m.die();
         });
-        // Keepalives.
         let m = mux.clone();
         tokio::spawn(async move {
             let mut n = 0u64;
@@ -136,11 +122,6 @@ impl Mux {
                 if m.is_dead() {
                     break;
                 }
-                // Alive while anything arrives: frames, or (on the UDP
-                // transport) so much as an acknowledgement. A server busy
-                // taking in a large upload answers keepalives late, and
-                // that must not look like a dead link; over TCP, where
-                // only frames can be seen, the patience is longer.
                 let frames = m.last_heard.lock().unwrap().elapsed();
                 let quiet = if m.link.kind() == "udp" { frames.min(m.link.idle()) } else { frames };
                 let limit = if m.link.kind() == "udp" { DEAD_AFTER } else { DEAD_AFTER * 8 };
@@ -164,8 +145,6 @@ impl Mux {
         self.dead.load(Ordering::SeqCst) || self.link.is_closed()
     }
 
-    /// The link is gone: everyone waiting on it is told so (their channels
-    /// close).
     pub fn die(&self) {
         if self.dead.swap(true, Ordering::SeqCst) {
             return;
@@ -190,7 +169,6 @@ impl Mux {
 
     fn queue(&self, stream: u32, msg: &ClientMsg, bulk: usize) {
         let mut encoded_msg = None;
-        // File contents are compressed already; manifests are not.
         if matches!(msg, ClientMsg::Trees(_) | ClientMsg::Env(_) | ClientMsg::Run(_) | ClientMsg::Fetch { .. }) {
             if let Some(z) = rargo_proto::pack(&rargo_proto::encode(msg)) {
                 encoded_msg = Some(ClientMsg::Packed(z));
@@ -205,13 +183,10 @@ impl Mux {
         let _ = out.tx.send((frame, bulk));
     }
 
-    /// Queues a message. Messages reach the server in the order they were
-    /// queued, whatever their streams.
     pub fn post(&self, stream: u32, msg: &ClientMsg) {
         self.queue(stream, msg, 0);
     }
 
-    /// Queues file contents, waiting while too much is queued already.
     pub async fn post_bulk(&self, stream: u32, msg: &ClientMsg, bytes: usize) -> std::io::Result<()> {
         let n = bytes.clamp(1, WINDOW);
         assert!(n >= 1);
@@ -226,7 +201,6 @@ impl Mux {
         Ok(())
     }
 
-    /// Opens a stream for a command.
     pub fn open(&self) -> (u32, UnboundedSender<ServerMsg>, UnboundedReceiver<ServerMsg>) {
         let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
         assert_ne!(id, CONTROL);
@@ -236,7 +210,6 @@ impl Mux {
         (id, tx, rx)
     }
 
-    /// Gives a stream up before its command has finished.
     pub fn cancel(&self, stream: u32) {
         if self.streams.lock().unwrap().remove(&stream).is_some() {
             self.post(stream, &ClientMsg::Cancel);
@@ -247,21 +220,16 @@ impl Mux {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Registers for the answer to the offer `id`.
     pub fn expect_missing(&self, id: u64) -> oneshot::Receiver<(Vec<Digest>, Vec<Digest>)> {
         let (tx, rx) = oneshot::channel();
         assert!(self.missing.lock().unwrap().insert(id, tx).is_none(), "offer {id} awaited twice");
         rx
     }
 
-    /// Asks the server for contents, on a stream of its own; they arrive
-    /// on `to`, followed by [`ServerMsg::Fetched`] with the returned id.
     pub fn fetch(&self, hashes: Vec<Digest>, to: &UnboundedSender<ServerMsg>) -> u64 {
         self.ask(to, |id| ClientMsg::Fetch { id, hashes })
     }
 
-    /// Sends a question on a stream of its own; the answer arrives on
-    /// `to`, ending with [`ServerMsg::Fetched`] with the returned id.
     pub fn ask(&self, to: &UnboundedSender<ServerMsg>, question: impl FnOnce(u64) -> ClientMsg) -> u64 {
         let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
         assert_ne!(stream, CONTROL);

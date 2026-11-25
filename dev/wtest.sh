@@ -1,6 +1,4 @@
 #!/bin/sh
-# Starts a server and one worker on loopback for development.
-#   dev/wtest.sh start SERVER_JOBS WORKER_JOBS | stop
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}

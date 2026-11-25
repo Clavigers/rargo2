@@ -1,66 +1,22 @@
-//! A thin `.git` for the server's sandbox.
-//!
-//! Build scripts commonly ask git about the commit they are built from
-//! (`git log -1`, `git rev-parse HEAD`, `git describe --always --dirty`, or
-//! simply reading `.git/HEAD`), and some about history (`git describe
-//! --tags` for the last release and the distance to it, `git rev-list
-//! --count HEAD`). The real `.git` is never synced: it can be gigabytes,
-//! and nothing in it but the answer to those questions is an input to a
-//! build. Instead the client makes a directory that is to git a clone
-//! without file contents:
-//!
-//! - always: `HEAD`, the branch it points to, the commit object, its
-//!   trees, the targets of tracked symlinks, an index read from that
-//!   commit, and the tags on it. It depends only on the commit and the
-//!   tags, so it is made once per commit and shared by every worktree at
-//!   that commit; a few hundred kilobytes for a large repository.
-//! - with history ([`Mode::History`]): every commit before HEAD (without
-//!   their trees) and every tag on them, so history queries answer as on
-//!   the client. The commits are packed in pieces that never change once
-//!   made ([`PIECES`]), so a new commit sends a small pack, not the
-//!   history again. Without history the stand-in is a clone of depth one
-//!   (a `shallow` file).
-//!
-//! History costs: rust-analyzer's 42,000 commits are 26 MiB, 11 MiB
-//! compressed, where its sources compress to 4 MiB. So it is sent where
-//! the project asks for it, and by default where a build evidently asks
-//! git for history ([`asks_for_history`]).
-//!
-//! What never works in the sandbox: file contents from git (`git diff`,
-//! `git show HEAD:path`), and anything that reads the trees of commits
-//! before HEAD (`git log -- path`).
-
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// What the sandbox gets as `.git` (the policy's `[sync] git`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Mode {
-    /// Nothing.
     Off,
-    /// [`Mode::History`] where [`asks_for_history`] says so, else
-    /// [`Mode::Head`].
     #[default]
     Detect,
-    /// HEAD and the tags on it.
     Head,
-    /// Also every commit before HEAD and the tags on them.
     History,
 }
 
-/// HEAD as found in the git directory.
 #[derive(Clone)]
 pub struct Head {
-    /// The text of the `HEAD` file.
     pub text: String,
-    /// The branch (`refs/heads/main`) when HEAD is symbolic.
     pub branch: Option<String>,
-    /// The commit id in hex.
     pub commit: String,
-    /// The repository's common git directory.
     pub common: PathBuf,
-    /// Changes when a tag is made, moved or removed (see `tags_seal`).
     pub tags: u64,
 }
 
@@ -68,7 +24,6 @@ fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Reads HEAD straight from the git directory (no process is started).
 pub fn head(root: &Path) -> Option<Head> {
     let dot_git = root.join(".git");
     let git_dir = if dot_git.is_file() {
@@ -107,8 +62,6 @@ pub fn head(root: &Path) -> Option<Head> {
     Some(Head { text, branch: Some(name), commit, common, tags })
 }
 
-/// A digest of where the tags are kept (`packed-refs` and the files under
-/// `refs/tags`, by name, size and time), read without starting git.
 fn tags_seal(common: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let mut h = blake3::Hasher::new();
@@ -149,9 +102,6 @@ fn output(mut c: Command) -> Option<Vec<u8>> {
     c.output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
 }
 
-/// The tags the stand-in carries: those on HEAD, or with history those
-/// on any commit before it too. Returns the text of a `packed-refs` file
-/// and the annotated tag objects it names.
 fn tags_for(root: &Path, head: &Head, history: bool) -> Option<(String, Vec<String>)> {
     let mut c = git(root);
     c.args(["for-each-ref", "--format=%(objectname) %(objecttype) %(*objectname) %(refname)"]);
@@ -168,7 +118,6 @@ fn tags_for(root: &Path, head: &Head, history: bool) -> Option<(String, Vec<Stri
         match parts.as_slice() {
             [oid, "tag", peeled, name] => lines.push((name.to_string(), oid.to_string(), Some(peeled.to_string()))),
             [oid, "commit", "", name] => lines.push((name.to_string(), oid.to_string(), None)),
-            // A tag of a tree or a blob says nothing about commits.
             _ => {}
         }
     }
@@ -190,7 +139,6 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
     std::fs::create_dir_all(dir.join("refs/heads")).ok()?;
     std::fs::write(dir.join("HEAD"), format!("{}\n", head.text)).ok()?;
     if let Some(branch) = &head.branch {
-        // A branch name is a relative path below the git directory.
         if branch.split('/').any(|c| c.is_empty() || c == "." || c == "..") || branch.starts_with('/') {
             return None;
         }
@@ -199,13 +147,10 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
         std::fs::write(p, format!("{}\n", head.commit)).ok()?;
     }
     if !history {
-        // The history ends here, as in a clone of depth one.
         std::fs::write(dir.join("shallow"), format!("{}\n", head.commit)).ok()?;
     }
     let (refs, tag_objects) = tags_for(root, head, history)?;
     std::fs::write(dir.join("packed-refs"), refs).ok()?;
-    // git abbreviates object names to a length that grows with the
-    // repository; the stand-in is tiny, so it is told the real one's.
     let short = output({
         let mut c = git(root);
         c.args(["rev-parse", "--short", &head.commit]);
@@ -217,14 +162,11 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
         format!("[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tabbrev = {abbrev}\n"),
     )
     .ok()?;
-    // The commit and its trees, without file contents...
     let mut ids = output({
         let mut c = git(root);
         c.args(["rev-list", "--objects", "--no-object-names", "--filter=blob:none", "--no-walk", &head.commit]);
         c
     })?;
-    // ...plus the targets of tracked symlinks, which git compares by
-    // reading the object...
     let tree = output({
         let mut c = git(root);
         c.args(["ls-tree", "-r", "-z", &head.commit]);
@@ -236,7 +178,6 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
             ids.push(b'\n');
         }
     }
-    // ...and the annotated tags.
     for t in tag_objects {
         ids.extend_from_slice(t.as_bytes());
         ids.push(b'\n');
@@ -252,20 +193,12 @@ fn build(root: &Path, head: &Head, history: bool, dir: &Path) -> Option<()> {
     if !pack.wait().ok()?.success() {
         return None;
     }
-    // Where the stand-in is shown beside a `.git` file (a linked worktree),
-    // it is not part of what git sees in the worktree.
     std::fs::create_dir_all(dir.join("info")).ok()?;
     std::fs::write(dir.join("info/exclude"), format!("/{}\n", rargo_proto::GIT_SIDE)).ok()?;
-    // An index that says "exactly this commit is checked out".
     let read = git(root).env("GIT_INDEX_FILE", dir.join("index")).args(["read-tree", &head.commit]).status().ok()?;
     read.success().then_some(())
 }
 
-/// The thin git directory for the worktree's HEAD, made on first use and
-/// kept in the client's cache. With `history` it has no `shallow` file
-/// and the commits before HEAD are in [`history`]'s packs. `None`
-/// when the worktree is not a git checkout, has no commit yet, or git is
-/// not installed.
 pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<PathBuf> {
     let key = blake3::hash(format!("v4\n{}\n{}\n{}\n{history}", head.text, head.commit, head.tags).as_bytes()).to_hex()[..32].to_string();
     let all = cache.join("git");
@@ -273,19 +206,16 @@ pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<Pat
     if dir.join("HEAD").is_file() {
         return Some(dir);
     }
-    // Half-made directories of clients that were killed.
     crate::tmp::sweep(&all, ".tmp-");
     let tmp = all.join(format!(".tmp-{}-{key}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let made = build(root, head, history, &tmp).and_then(|()| match std::fs::rename(&tmp, &dir) {
         Ok(()) => Some(()),
-        // Another client got there first.
         Err(_) if dir.join("HEAD").is_file() => Some(()),
         Err(_) => None,
     });
     let _ = std::fs::remove_dir_all(&tmp);
     made?;
-    // Commits nobody has built at for a while are not worth keeping.
     for e in std::fs::read_dir(&all).into_iter().flatten().flatten() {
         let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
         if e.path() != dir && old.is_some_and(|a| a.as_secs() > 14 * 86400) {
@@ -295,18 +225,8 @@ pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<Pat
     Some(dir)
 }
 
-/// The sizes of the pieces history is packed in, largest first: a piece
-/// of size `n` covers `n` commits of the first-parent chain, starting at a
-/// multiple of `n` counted from the root, with whatever was merged into
-/// them. A piece never changes once its last commit exists, so a new
-/// commit adds a piece of one, and a larger piece only when the smaller
-/// ones before it fill one up.
 const PIECES: [usize; 4] = [4096, 256, 16, 1];
 
-/// The commits before HEAD as packs, in a directory of their own per
-/// HEAD (`pack/`), shown inside `.git/objects` beside the stand-in's pack.
-/// The pieces are kept once per repository (all its worktrees) and linked
-/// into each HEAD's directory; what nobody used for 14 days goes.
 pub fn history(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
     let common = head.common.canonicalize().unwrap_or_else(|_| head.common.clone());
@@ -342,7 +262,6 @@ pub fn history(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
     }
     match std::fs::rename(&tmp, &at) {
         Ok(()) => {}
-        // Another client got there first.
         Err(_) if at.join("pack").is_dir() => {
             let _ = std::fs::remove_dir_all(&tmp);
         }
@@ -355,12 +274,9 @@ pub fn history(root: &Path, head: &Head, cache: &Path) -> Option<PathBuf> {
     Some(at)
 }
 
-/// The pack of one piece: the commits `last` reaches that `before` does
-/// not. Made once; its files are named by the piece.
 fn piece_files(root: &Path, dir: &Path, piece: &str, before: Option<&str>, last: &str) -> Option<(PathBuf, PathBuf)> {
     let (pack, idx) = (dir.join(format!("{piece}.pack")), dir.join(format!("{piece}.idx")));
     if pack.is_file() && idx.is_file() {
-        // In use again: not to be swept.
         let _ = std::fs::File::options().append(true).open(&pack).and_then(|f| f.set_modified(std::time::SystemTime::now()));
         return Some((pack, idx));
     }
@@ -385,7 +301,6 @@ fn piece_files(root: &Path, dir: &Path, piece: &str, before: Option<&str>, last:
         .ok()?;
     {
         let mut input = packer.stdin.take()?;
-        // Written from another thread: the list can fill the pipe both ways.
         std::thread::spawn(move || input.write_all(&commits));
     }
     let mut name = String::new();
@@ -399,8 +314,6 @@ fn piece_files(root: &Path, dir: &Path, piece: &str, before: Option<&str>, last:
     (moved || (pack.is_file() && idx.is_file())).then_some((pack, idx))
 }
 
-/// Removes the HEAD directories nobody used for 14 days, then the pieces
-/// none of the remaining ones links to.
 fn sweep_history(store: &Path) {
     let stale = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 14 * 86400);
     for e in std::fs::read_dir(store.join("heads")).into_iter().flatten().flatten() {
@@ -416,13 +329,8 @@ fn sweep_history(store: &Path) {
     }
 }
 
-/// The crates that ask git for history from a build script or a macro.
 const HISTORY_CRATES: &[&str] = &["vergen", "vergen-gitcl", "vergen-git2", "vergen-gix", "shadow-rs", "git-version", "built", "git-testament"];
 
-/// Whether a build of this worktree evidently asks git for history: a
-/// `build.rs` in it mentions `describe` or `rev-list`, or a `Cargo.lock`
-/// in it names one of [`HISTORY_CRATES`]. `files` are the worktree's
-/// paths, relative to `root`.
 pub fn asks_for_history<'a>(root: &Path, files: impl Iterator<Item = &'a [u8]>) -> bool {
     use std::os::unix::ffi::OsStrExt;
     for rel in files {
@@ -481,7 +389,6 @@ mod tests {
         let thin_dir = thin(&repo, &h, &cache, false).unwrap();
         assert_eq!(thin(&repo, &h, &cache, false).unwrap(), thin_dir, "made once per commit");
 
-        // What the server's sandbox shows: the files and the thin `.git`.
         let copy = tmp.path().join("copy");
         std::fs::create_dir_all(copy.join("src")).unwrap();
         std::fs::write(copy.join("src/lib.rs"), "pub fn b() {}\n").unwrap();
@@ -495,7 +402,6 @@ mod tests {
         let short = run(&repo, &["rev-parse", "--short", "HEAD"]);
         assert_eq!(run(&copy, &["describe", "--always", "--dirty"]), short);
         assert_eq!(run(&copy, &["log", "-1", "--format=%h"]), short);
-        // A repository that abbreviates to more than the default.
         run(&repo, &["config", "core.abbrev", "11"]);
         let h11 = head(&repo).unwrap();
         let other_cache = tmp.path().join("cache11");
@@ -505,12 +411,10 @@ mod tests {
         std::fs::write(copy.join("src/lib.rs"), "pub fn c() {}\n").unwrap();
         assert_eq!(run(&copy, &["status", "--porcelain"]), "M src/lib.rs");
         assert!(run(&copy, &["describe", "--always", "--dirty"]).ends_with("-dirty"));
-        // No history and no file contents came along.
         assert_eq!(run(&copy, &["rev-list", "--count", "HEAD"]), "1");
         let size: u64 = walk(&thin_dir);
         assert!(size < 20_000, "{size} bytes");
 
-        // A linked worktree and a detached HEAD resolve too.
         let wt = tmp.path().join("wt");
         run(&repo, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap(), "HEAD~1"]);
         let h2 = head(&wt).unwrap();
@@ -520,8 +424,6 @@ mod tests {
         assert!(head(tmp.path()).is_none());
     }
 
-    /// What the server's sandbox shows at `copy`: `stand_in` as `.git`, with
-    /// the history's loose objects in its object directory.
     fn show(stand_in: &Path, history: Option<&Path>, copy: &Path) {
         let _ = std::fs::remove_dir_all(copy.join(".git"));
         assert!(Command::new("cp").arg("-r").arg(stand_in).arg(copy.join(".git")).status().unwrap().success());
@@ -537,7 +439,6 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         run(&repo, &["init", "-q"]);
-        // The side branch writes a file of its own: the merge is clean.
         let commit = |msg: &str| {
             let file = if msg.starts_with("side") || msg == "elsewhere" { "g" } else { "f" };
             std::fs::write(repo.join(file), msg).unwrap();
@@ -548,7 +449,6 @@ mod tests {
         run(&repo, &["tag", "-a", "v0.1.0", "-m", "first release"]);
         commit("two");
         commit("three");
-        // A branch merged back, with a lightweight tag on it.
         run(&repo, &["checkout", "-q", "-b", "side", "HEAD~1"]);
         commit("side one");
         run(&repo, &["tag", "side-light"]);
@@ -559,7 +459,6 @@ mod tests {
         run(&repo, &["tag", "-a", "v0.2.0", "-m", "second release"]);
         commit("five");
         commit("six");
-        // A tag on a commit HEAD does not reach.
         run(&repo, &["checkout", "-q", "side"]);
         commit("elsewhere");
         run(&repo, &["tag", "elsewhere"]);
@@ -592,7 +491,6 @@ mod tests {
         assert_eq!(run(&copy, &["rev-list", "--count", "HEAD"]), "9");
         assert_eq!(run(&copy, &["tag"]), run(&repo, &["tag", "--merged", "HEAD"]), "only the tags HEAD reaches");
 
-        // A new commit adds a piece of one commit; the others stay.
         let pieces = objects.parent().unwrap().parent().unwrap().join("pieces");
         let before = packs(&pieces);
         commit("seven");
@@ -601,7 +499,6 @@ mod tests {
         assert_eq!(objects7.parent(), objects.parent(), "one store per repository");
         assert_eq!(packs(&pieces), before + 1);
         assert_eq!(packs(&objects7.join("pack")), before + 1, "the first-parent chain is 8 commits: 8 pieces of one");
-        // A tag made without a new commit makes another stand-in.
         let seen = thin(&repo, &h7, &cache, true).unwrap();
         run(&repo, &["tag", "-a", "v0.3.0", "-m", "third release"]);
         let tagged = head(&repo).unwrap();
@@ -612,7 +509,6 @@ mod tests {
         show(&stand_in, Some(&objects7), &copy);
         assert_eq!(run(&copy, &["describe"]), "v0.3.0");
 
-        // Without history, the tags on HEAD come along all the same.
         let bare = thin(&repo, &tagged, &cache, false).unwrap();
         show(&bare, None, &copy);
         assert_eq!(run(&copy, &["describe", "--tags"]), "v0.3.0");

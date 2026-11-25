@@ -1,26 +1,4 @@
 #!/bin/sh
-# Installs a rargo build server on this machine (Linux x86_64, glibc 2.39 or
-# newer, root, FUSE, Nix with flakes) and starts it as a systemd service.
-#
-#   curl -fsSL https://rargo.rs/install-server.sh | sudo sh
-#   curl -fsSL https://rargo.rs/install-server.sh | sudo sh -s -- 0.2.1
-#
-# What it puts where (RARGO_PREFIX is prepended to all of it; default none):
-#   /usr/local/lib/rargo/VERSION/    rargod, rargo-sandbox, planner-cargo
-#   /usr/local/lib/rargo/current     -> the version that runs
-#   /var/lib/rargo/state/            store and cache
-#   /var/lib/rargo/{rustup,cargo-home}/   toolchains and crates (beside the
-#                                    state, which builds cannot see)
-#   /var/lib/rargo/state/tokens.json who may connect (rargod token ...)
-#   /etc/systemd/system/rargod.service
-# Settings, all optional, from the environment:
-#   RARGO_LISTEN (0.0.0.0:7459)  RARGO_JOBS (all cores)  RARGO_MEM_GB
-#   RARGO_ADMIN (admin: name of the first user, invited if nobody is yet)
-#   RARGO_PUBLIC  HOST:PORT clients are told to connect to, if not the
-#                 name they asked
-#   RARGO_NO_SERVICE=1  install the files and print the command, start nothing
-# Running it again with a newer version upgrades in place; the state and
-# the tokens are kept. The server must be reachable on its port over UDP and TCP.
 set -eu
 version=${1:-latest}
 base=${RARGO_DL:-https://rargo.rs/dl}
@@ -41,8 +19,6 @@ fi
 nix_bin=${nix%/*}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-# "latest" is turned into its number first, so that every file comes from
-# an address that never changes what it holds.
 if [ "$version" = latest ]; then
     version=$(curl -fsSL "$base/VERSION") || { echo "cannot read $base/VERSION" >&2; exit 1; }
 fi
@@ -62,14 +38,11 @@ install -m 755 "$tmp/rargo-server/rargod" "$tmp/rargo-server/rargo-sandbox" "$tm
 install -d "$lib/$real/default-flake"
 install -m 644 "$tmp/rargo-server/default-flake/flake.nix" "$tmp/rargo-server/default-flake/flake.lock" "$lib/$real/default-flake/"
 ln -sfn "$lib/$real" "$lib/current"
-# Toolchains: rargod uses rustup and installs what a project asks for.
 export RUSTUP_HOME=$home/rustup CARGO_HOME=$home/cargo-home
 if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     echo "installing rustup into $home"
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable >/dev/null
 fi
-# Who may connect: the holders of tokens, which people get through an
-# invitation (`rargo auth`). The first user is invited here.
 invite=""
 if [ ! -s "$state/tokens.json" ]; then
     invite=$("$lib/current/rargod" token invite --state "$state" --user "$admin" --admin --uses 5 --days 30 2>/dev/null)

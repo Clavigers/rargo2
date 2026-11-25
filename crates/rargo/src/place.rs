@@ -1,13 +1,3 @@
-//! Putting what the server sends where it belongs: artifacts into the
-//! target directory, files a build wrote into the worktree.
-//!
-//! Artifacts cargo itself would hard-link into place (`target/debug/app`)
-//! are kept once in the client's cache and shared between worktrees: as a
-//! reflink where the file system has them, as a read-only hard link
-//! otherwise. Files other tools rewrite in place (an executable at the path
-//! rustc writes it to, documentation, source files) are always ordinary
-//! writable files of their own.
-
 use crate::scan::hash_file;
 use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
@@ -20,8 +10,6 @@ fn hex(d: &Digest) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// What was placed where, so that an unchanged artifact is recognised by a
-/// `stat` instead of being hashed or fetched again.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Placed {
     files: HashMap<String, (u64, i64, u64, Digest)>,
@@ -54,7 +42,6 @@ pub struct Placer {
     pub changed: bool,
     pending: HashMap<Digest, Vec<Dest>>,
     parts: HashMap<Digest, Part>,
-    /// Directories already cleared of what dead clients left behind.
     swept: std::collections::HashSet<PathBuf>,
     pub fetched_bytes: u64,
     pub reused_files: u64,
@@ -72,7 +59,6 @@ fn reflink(src: &Path, dst: &Path) -> bool {
     else {
         return false;
     };
-    // SAFETY: both descriptors are valid for the duration of the call.
     let ok = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as libc::Ioctl, s.as_raw_fd()) } == 0;
     if !ok {
         let _ = std::fs::remove_file(dst);
@@ -94,8 +80,6 @@ fn mode(exec: bool, writable: bool) -> std::fs::Permissions {
     })
 }
 
-/// Where the cache holds a content, if it does (in either of its two
-/// modes) with the right size.
 pub fn cached(cache_dir: &Path, hash: &Digest, size: u64) -> Option<PathBuf> {
     let h = hex(hash);
     let dir = cache_dir.join("blobs").join(&h[..2]);
@@ -104,17 +88,13 @@ pub fn cached(cache_dir: &Path, hash: &Digest, size: u64) -> Option<PathBuf> {
         .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() == size).unwrap_or(false))
 }
 
-/// Where a content fetched for the cache alone goes.
 pub fn cache_slot(cache_dir: &Path, hash: &Digest) -> PathBuf {
     let h = hex(hash);
     assert_eq!(h.len(), 64);
     cache_dir.join("blobs").join(&h[..2]).join(&h[2..])
 }
 
-/// Temporary names are unique in the process: a daemon places for several
-/// commands at once.
 impl Drop for Placer {
-    /// A command that was interrupted leaves no half-received files.
     fn drop(&mut self) {
         for (_, part) in self.parts.drain() {
             let _ = std::fs::remove_file(&part.tmp);
@@ -124,7 +104,6 @@ impl Drop for Placer {
 
 impl Placer {
     pub fn new(cache_dir: &Path, placed: Placed) -> Placer {
-        // Downloads a killed client never finished.
         crate::tmp::sweep(&cache_dir.join("blobs"), ".incoming-");
         Placer {
             swept: Default::default(),
@@ -144,9 +123,6 @@ impl Placer {
         self.cache.join(&h[..2]).join(if exec { format!("{}.x", &h[2..]) } else { h[2..].to_string() })
     }
 
-    /// A temporary name beside `dest`. The first time a directory is
-    /// written to, temporaries that clients which no longer exist left in
-    /// it are removed.
     fn tmp_beside(&mut self, dest: &Path) -> (PathBuf, crate::tmp::Temp) {
         if let Some(dir) = dest.parent() {
             if self.swept.insert(dir.to_path_buf()) {
@@ -161,14 +137,11 @@ impl Placer {
         (tmp, watched)
     }
 
-    /// Whether `dest` already holds this content in the right form.
     fn already(&self, d: &Dest, hash: &Digest, size: u64) -> bool {
         let Ok(md) = std::fs::symlink_metadata(&d.path) else { return false };
         if !md.is_file() || md.len() != size || (md.mode() & 0o111 != 0) != d.exec {
             return false;
         }
-        // A file of its own must not share an inode with anything, and must
-        // be writable.
         if d.own && (md.nlink() > 1 || md.mode() & 0o200 == 0) {
             return false;
         }
@@ -187,8 +160,6 @@ impl Placer {
         }
     }
 
-    /// Makes `dest` a file with the content of `src` (a cache entry or a
-    /// finished download).
     fn install(&mut self, src: &Path, d: &Dest, hash: &Digest, src_is_cache: bool) -> io::Result<()> {
         if let Some(parent) = d.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -201,7 +172,6 @@ impl Placer {
             if reflink(src, &tmp) {
                 std::fs::set_permissions(&tmp, mode(d.exec, true))?;
             } else if !d.own && src_is_cache && std::fs::hard_link(src, &tmp).is_ok() {
-                // Shares the cache's inode and its read-only mode.
             } else {
                 std::fs::copy(src, &tmp)?;
                 std::fs::set_permissions(&tmp, mode(d.exec, true))?;
@@ -216,8 +186,6 @@ impl Placer {
         Ok(())
     }
 
-    /// A finished download at `tmp` goes to everyone waiting for it; if
-    /// nobody is (content for a virtual output directory), into the cache.
     fn arrived(&mut self, hash: Digest, tmp: &Path) -> io::Result<()> {
         assert!(!self.parts.contains_key(&hash), "a finished download is no longer a part");
         let dests = self.pending.remove(&hash).unwrap_or_default();
@@ -232,7 +200,6 @@ impl Placer {
             });
         }
         let result = (|| -> io::Result<()> {
-            // Anything shareable goes through the cache, once per mode.
             let mut cached: HashMap<bool, PathBuf> = HashMap::new();
             for d in dests.iter().filter(|d| !d.own) {
                 if cached.contains_key(&d.exec) {
@@ -249,8 +216,6 @@ impl Placer {
                     }
                     Ok(())
                 })();
-                // The cache may be on another file system or unwritable;
-                // then the artifact is simply not shared.
                 if made.is_ok() && std::fs::set_permissions(&ctmp, mode(d.exec, false)).is_ok() && std::fs::rename(&ctmp, &cp).is_ok() {
                     cached.insert(d.exec, cp);
                 } else {
@@ -312,8 +277,6 @@ impl Placer {
         self.arrived(hash, &part.tmp)
     }
 
-    /// Applies a delivery as far as possible without new content and
-    /// returns the hashes whose content is needed.
     pub fn deliver(&mut self, files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
         let mut wanted: Vec<(Dest, Digest, u64)> = Vec::new();
         for w in writes {
@@ -336,7 +299,6 @@ impl Placer {
                     let _ = std::fs::remove_file(&path);
                 }
                 Write::Text { path, text: Some(text) } => {
-                    // Unchanged: leave the file (and its mtime) alone.
                     if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
                         crate::write_atomic(Path::new(&path), text.as_bytes())?;
                     }
@@ -356,12 +318,10 @@ impl Placer {
                 self.note(&d.path.clone(), &hash);
                 continue;
             }
-            // In the cache from another worktree (or an earlier build)?
             let mut from_cache = None;
             for exec in [d.exec, !d.exec] {
                 let cp = self.cache_path(&hash, exec);
                 let fits = std::fs::metadata(&cp).map(|m| m.len() == size).unwrap_or(false);
-                // The cache is only as good as its content: check it.
                 if fits && hash_file(&cp, size).map(|h| h == hash).unwrap_or(false) {
                     from_cache = Some((cp, exec == d.exec));
                     break;
@@ -382,7 +342,6 @@ impl Placer {
         Ok(need)
     }
 
-    /// The contents still waited for.
     pub fn wanting(&self) -> Vec<Digest> {
         self.pending.keys().copied().collect()
     }
@@ -391,13 +350,10 @@ impl Placer {
         self.pending.contains_key(hash) || self.parts.contains_key(hash)
     }
 
-    /// Whether everything asked for has arrived.
     pub fn settled(&self) -> bool {
         self.pending.is_empty() && self.parts.is_empty()
     }
 
-    /// Removes cache entries no worktree links to that have not been
-    /// written for a while; at most once an hour.
     pub fn prune(&self) {
         let marker = self.cache.join(".pruned");
         let age = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
@@ -408,7 +364,6 @@ impl Placer {
         for shard in std::fs::read_dir(&self.cache).into_iter().flatten().flatten() {
             let p = shard.path();
             if !p.is_dir() {
-                // A download a killed client left behind.
                 if age(&p).is_some_and(|a| a.as_secs() > 86400) && p != marker {
                     let _ = std::fs::remove_file(&p);
                 }
@@ -456,19 +411,15 @@ mod tests {
         assert_eq!(std::fs::read(&c).unwrap(), content);
         let (ma, mc) = (std::fs::metadata(&a).unwrap(), std::fs::metadata(&c).unwrap());
         assert!(ma.mode() & 0o111 != 0 && mc.mode() & 0o111 != 0);
-        // The file of its own is writable and shares nothing.
         assert_eq!(mc.nlink(), 1);
         assert!(mc.mode() & 0o200 != 0);
         assert_ne!(ma.ino(), mc.ino());
-        // Again: nothing is needed, nothing is rewritten.
         let before = mtime_ns(&ma);
         assert!(p.deliver(vec![d(&a, content, true, false), d(&c, content, true, true)], vec![]).unwrap().is_empty());
         assert_eq!(mtime_ns(&std::fs::metadata(&a).unwrap()), before);
-        // Another worktree: served from the cache without the server.
         let mut p2 = Placer::new(&cache, Placed::default());
         assert!(p2.deliver(vec![d(&b, content, true, false)], vec![]).unwrap().is_empty());
         assert_eq!(std::fs::read(&b).unwrap(), content);
-        // Content that does not match its hash is refused.
         let need = p2.deliver(vec![d(&tmp.path().join("x"), b"wanted", false, true)], vec![]).unwrap();
         assert!(p2.blob(need[0], b"forged").is_err());
     }

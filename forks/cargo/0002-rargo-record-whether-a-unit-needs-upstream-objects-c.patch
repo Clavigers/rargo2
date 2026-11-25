@@ -1,18 +1,18 @@
-From c7fd570d6ebd927ce946cef33f1f081ec8af916e Mon Sep 17 00:00:00 2001
+From 11f00f17f2e918dd0a3375474a446845c5198634 Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Sun, 22 Nov 2026 23:39:31 +0100
 Subject: [PATCH 2/8] rargo: record whether a unit needs upstream objects;
  cdylib token only for cdylib packages
 
 ---
- src/compiler/rargo.rs | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
+ src/compiler/rargo.rs | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index ecfabd6d1..b1c8ced65 100644
+index 4e24773..39723cb 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -294,6 +294,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
+@@ -279,6 +279,7 @@ pub fn record_unit(build_runner: &mut BuildRunner<'_, '_>, unit: &Unit) -> Cargo
          deps,
          outputs,
          rmeta_early,
@@ -20,19 +20,14 @@ index ecfabd6d1..b1c8ced65 100644
          pkg: unit.pkg.to_string(),
          pkg_id: format!("{:?}", unit.pkg.package_id()),
          pkg_name: unit.pkg.name().to_string(),
-@@ -409,7 +410,11 @@ pub fn fake_script_run(
+@@ -387,7 +388,9 @@ pub fn fake_script_run(
      );
      line("rustc-link-search", token::make(token::LIBPATH_EXTERNAL, meta));
      line("rustc-link-arg", token::link_arg("ALL", meta));
 -    line("rustc-link-arg-cdylib", token::link_arg("CDYLIB", meta));
-+    // cargo warns when a package without a cdylib target prints this, so
-+    // the token only stands in where it can apply.
 +    if targets.iter().any(|t| t.is_cdylib()) {
 +        line("rustc-link-arg-cdylib", token::link_arg("CDYLIB", meta));
 +    }
      if targets.iter().any(|t| t.is_bin()) {
          line("rustc-link-arg-bins", token::link_arg("BIN", meta));
          for t in targets.iter().filter(|t| t.is_bin()) {
--- 
-2.54.0
-

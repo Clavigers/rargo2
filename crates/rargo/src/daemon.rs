@@ -1,14 +1,3 @@
-//! The client daemon: one per user and server on a client machine.
-//!
-//! The `rargo` command starts it on first use and talks to it over a Unix
-//! socket. The daemon holds the one long-lived link to the server, so no
-//! command pays for a connection, a key agreement or a slow start. It
-//! watches the worktrees it has seen and pushes their changes to the server
-//! as they happen, so a build usually finds the server up to date and the
-//! command needs neither a scan nor an upload. It is still a dumb client:
-//! it syncs files and environment and places what comes back; nothing
-//! about the build is decided here.
-
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
 use crate::partial::Partial;
@@ -28,82 +17,53 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-/// Manifests larger than this in all are offered by their root first.
 const PROBE_FROM: u64 = 32 << 10;
-/// Contents read by range that are kept for more reading at most.
 const MOST_PARTIALS: usize = 64;
 
-/// A change smaller than this is pushed whole, without asking the server
-/// what it lacks: an edit. Anything bigger (a worktree seen for the first
-/// time, a branch switch) sends the manifests and asks, because another
-/// client has usually uploaded most of it already.
 const PUSH_BLIND: u64 = 1 << 20;
-/// How long after a change the daemon waits before scanning: an editor's
-/// write-and-rename or a checkout is many events.
 const SETTLE: Duration = Duration::from_millis(20);
 
 #[derive(Default)]
 pub struct Counters {
     pub commands: AtomicU64,
     pub scans: AtomicU64,
-    /// Scans that looked only at some directories, and how many they
-    /// looked at.
     pub rescans: AtomicU64,
     pub rescanned_dirs: AtomicU64,
-    /// Commands that needed no scan: every directory is watched and none
-    /// had an event.
     pub scans_spared: AtomicU64,
     pub offers: AtomicU64,
-    /// Large trees the server said it had when shown the root alone.
     pub probes_known: AtomicU64,
     pub offered_bytes: AtomicU64,
     pub links: AtomicU64,
-    /// Contents fetched because something read them: whole, by chunk,
-    /// and the bytes of them that the cache already held.
     pub fetched_contents: AtomicU64,
     pub fetched_bytes: AtomicU64,
     pub reused_bytes: AtomicU64,
 }
 
-/// A worktree's output directory, mounted.
 struct Mounted {
     fs: Arc<OutFs>,
     session: Arc<fusewire::Session>,
     dir: PathBuf,
-    /// The device number the mount has: if the directory shows another,
-    /// something else has been mounted over it (another daemon for the
-    /// same worktree) or it was unmounted.
     dev: u64,
 }
 
-/// A worktree as one scan saw it.
 struct Snap {
     scan: scan::Scan,
     policy: Policy,
     head: Option<git::Head>,
-    /// What the scan left out because git ignores it (`gitignored = false`).
     left_out: Option<scan::Ignored>,
 }
 
 struct WtState {
     policy_dir: PathBuf,
-    /// The index to start from before the first scan.
     loaded: Option<scan::Index>,
     last: Option<Arc<Snap>>,
-    /// The directories of the last scan that have a watch, and its
-    /// descriptor.
     watched: HashMap<PathBuf, i32>,
-    /// Those that have none (the watch limit, or an error).
     unwatched: HashSet<PathBuf>,
-    /// The watch limit was reported for this worktree.
     told_limit: bool,
-    /// For the user, with the next command's output.
     note: Option<String>,
 }
 
 impl Worktree {
-    /// Something changed, where is not known: the next scan is of
-    /// everything.
     fn rescan_all(&self) {
         self.everything.store(true, Ordering::SeqCst);
         self.dirty.store(true, Ordering::SeqCst);
@@ -116,20 +76,13 @@ struct Worktree {
     wt_id: String,
     wt_cache: PathBuf,
     state: tokio::sync::Mutex<WtState>,
-    /// Something changed since the last scan (or may have).
     dirty: AtomicBool,
-    /// Where: the directories with events since the last scan.
     events: Mutex<HashSet<PathBuf>>,
-    /// Somewhere unknown: the next scan is of the whole worktree.
     everything: AtomicBool,
-    /// How many directories of the last scan have no watch.
     unwatched: AtomicUsize,
     changed: tokio::sync::Notify,
-    /// One command at a time places files (as cargo locks its build
-    /// directory).
     running: tokio::sync::Mutex<()>,
     last_used: Mutex<Instant>,
-    /// The virtual output directory, if this worktree has one.
     out: Mutex<Option<Mounted>>,
     out_failed: AtomicBool,
 }
@@ -143,58 +96,35 @@ pub struct Daemon {
     worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
     watcher: Option<Arc<Watcher>>,
     next_wt: AtomicU64,
-    /// Variable names servers have asked about.
     asked: Mutex<Vec<String>>,
     active: AtomicUsize,
     last_active: Mutex<Instant>,
     pub counters: Counters,
-    /// One first sync of a worktree at a time (see `offer`).
     big_sync: tokio::sync::Mutex<()>,
-    /// One fetch per content at a time.
     fetching: Mutex<HashMap<Digest, Arc<tokio::sync::Mutex<()>>>>,
-    /// Contents in `target/` being read by range, by when they were first
-    /// read (see `partial`). Each is shared by every reader of it, and is
-    /// let go once it is whole in the cache.
     partials: Mutex<HashMap<Digest, (u64, Arc<Partial>)>>,
-    /// Chunks the cache holds: in which content, where. Kept in the cache
-    /// across daemons (see `known`).
     chunks: Mutex<crate::known::Chunks>,
     chunks_changed: AtomicBool,
-    /// Trees and file contents the server is believed to hold: what was
-    /// sent to it or what it said it has, by this daemon or earlier ones.
-    /// Only ever a hint: the server asks for whatever it turns out to lack.
     held: crate::known::Held,
     handle: tokio::runtime::Handle,
 }
 
 enum Outcome {
     Final(LocalReply),
-    /// The worktree changed while it was being sent: scan again.
     Changed,
-    /// The request went out on the bet that the server had the worktree's
-    /// tree, and it had not: offer it (in the way given) and ask again.
     NotThere(Probe),
 }
 
-/// How a tree that is new to this daemon is offered.
 #[derive(Clone, Copy, PartialEq)]
 enum Probe {
-    /// By its root first, and the server's answer is waited for.
     Wait,
-    /// By its root, and the answer is left to the caller, who sends the
-    /// request at once: a server that has the tree (a commit someone
-    /// built) then answers the request one round trip earlier.
     Bet,
-    /// With all its manifests (the server is known to lack some).
     Whole,
 }
 
 enum Offered {
-    /// The server has what the snapshot holds.
     Sent,
-    /// The worktree changed while it was read.
     Changed,
-    /// The root went out; the answer says what the server lacks.
     Bet(tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>),
 }
 
@@ -206,9 +136,6 @@ fn var<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
     vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
 }
 
-/// The link to the server could not be made: the only failure reported as
-/// a server that cannot be reached (an error of the same kind from anything
-/// else, a local file that is missing say, is reported as itself).
 #[derive(Debug)]
 struct NoLink(std::io::Error);
 
@@ -224,8 +151,6 @@ impl std::error::Error for NoLink {
     }
 }
 
-/// `e`, from making the link, marked as the server being out of reach if it
-/// says so (a server that answers and refuses is not).
 fn no_link(e: std::io::Error) -> std::io::Error {
     use std::io::ErrorKind::*;
     if matches!(e.kind(), ConnectionRefused | TimedOut | NotFound | HostUnreachable | NetworkUnreachable) {
@@ -240,8 +165,6 @@ fn is_no_link(e: &std::io::Error) -> bool {
 }
 
 impl Daemon {
-    /// `watch`: follow worktrees with inotify (a daemon does; a command
-    /// that runs without one has nothing to gain from it).
     pub fn new(cfg: Config, cache: PathBuf, watch: bool) -> Arc<Daemon> {
         let chunks = crate::known::load_chunks(&cache);
         let held = crate::known::Held::load(&cache, &cfg.server, &cfg.user);
@@ -303,7 +226,6 @@ impl Daemon {
         d
     }
 
-    /// The link to the server, made if there is none (or none alive).
     async fn mux(&self) -> std::io::Result<Arc<Mux>> {
         let mut g = self.mux.lock().await;
         if let Some(m) = &*g {
@@ -323,7 +245,6 @@ impl Daemon {
         Ok(m)
     }
 
-    /// The link, if one is up.
     async fn mux_if_up(&self) -> Option<Arc<Mux>> {
         self.mux.lock().await.clone().filter(|m| !m.is_dead())
     }
@@ -368,20 +289,16 @@ impl Daemon {
         });
         all.insert(root.to_path_buf(), wt.clone());
         if self.watcher.is_some() {
-            // Changes travel to the server as they happen.
             let (d, w) = (self.clone(), Arc::downgrade(&wt));
             tokio::spawn(async move {
                 loop {
                     let Some(wt) = w.upgrade() else { break };
                     wt.changed.notified().await;
-                    // No longer followed.
                     if !d.worktrees.lock().unwrap().values().any(|x| x.id == wt.id) {
                         break;
                     }
                     tokio::time::sleep(SETTLE).await;
                     let Some(mux) = d.mux_if_up().await else { continue };
-                    // The same lock a command holds, so a sync and this push
-                    // cannot each send the one edit.
                     let _running = wt.running.lock().await;
                     let mut st = wt.state.lock().await;
                     if let Ok((snap, _)) = d.fresh(&wt, &mut st).await {
@@ -393,12 +310,7 @@ impl Daemon {
         wt
     }
 
-    /// The worktree as it is now: the last scan if every directory is
-    /// watched and none had an event, a new scan otherwise: of the
-    /// directories that had events or have no watch, or of everything when
-    /// where is not known. The flag says whether a scan was needed.
     async fn fresh(&self, wt: &Arc<Worktree>, st: &mut WtState) -> std::io::Result<(Arc<Snap>, bool)> {
-        // HEAD is not under the watched directories; reading it is cheap.
         let head = git::head(&wt.root);
         let watching = self.watcher.is_some();
         if let Some(last) = &st.last {
@@ -412,28 +324,22 @@ impl Daemon {
                 return Ok((last.clone(), false));
             }
         }
-        // Cleared before looking: a change during the scan marks it again.
         wt.dirty.store(false, Ordering::SeqCst);
         let everything = wt.everything.swap(false, Ordering::SeqCst) || !watching;
         let mut changed: HashSet<PathBuf> = std::mem::take(&mut *wt.events.lock().unwrap());
         changed.extend(st.unwatched.iter().cloned());
         if let Some(w) = &self.watcher {
-            // A directory removed (and perhaps made again) lost its watch.
             changed.extend(st.watched.iter().filter(|(d, wd)| !w.watches(**wd, d)).map(|(d, _)| d.clone()));
         }
         let (root, cache, wt_cache) = (wt.root.clone(), self.cache.clone(), wt.wt_cache.clone());
-        // Taken, so that a rescan can edit it rather than copy it.
         let (previous, loaded) = (st.last.take(), st.loaded.take());
         let policy_dir = st.policy_dir.clone();
         let snap = tokio::task::spawn_blocking(move || -> std::io::Result<Snap> {
             let mut policy = crate::load_policy(&root, &policy_dir);
-            // The client's own cache, should someone keep it in the worktree.
             if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
             let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
-            // Only directories that may have changed are looked at, unless
-            // what is synced at all changed since.
             let reusable = previous.as_ref().is_some_and(|p| {
                 !everything
                     && p.policy.exclude == policy.exclude
@@ -445,8 +351,6 @@ impl Daemon {
             let scanned = match previous {
                 Some(p) if reusable => {
                     let prev = Arc::try_unwrap(p).map(|s| s.scan).unwrap_or_else(|shared| shared.scan.clone());
-                    // Should the scan before not add up, the whole worktree
-                    // is scanned, against the index on disk.
                     scan::rescan(&root, prev, &changed, &policy.exclude, left_out.as_ref())
                         .or_else(|_| whole(&scan::Index::load(&wt_cache.join("index"))))
                 }
@@ -464,14 +368,11 @@ impl Daemon {
                     git::Mode::History => Some(true),
                     git::Mode::Detect => Some(git::asks_for_history(&root, scan.index.files.keys().map(|k| k.as_slice()))),
                 };
-                // History that cannot be had (git failed) leaves HEAD.
                 let objects = if history == Some(true) { git::history(&root, h, &cache) } else { None };
                 let thin = history.and_then(|_| git::thin(&root, h, &cache, objects.is_some()));
                 if let Some(thin) = thin {
                     let stored = match &objects {
                         Some(dir) => {
-                            // One index for all of a repository's HEADs:
-                            // they link the same pieces under the same names.
                             let at = dir.parent().and_then(Path::parent).unwrap_or(dir).join("index");
                             let s = scan::scan_store(dir, &scan::Index::load(&at))?;
                             if s.index_changed {
@@ -502,11 +403,6 @@ impl Daemon {
         Ok((snap, true))
     }
 
-    /// Watches the directories of `snap` that have no watch, and stops
-    /// watching those it no longer has. A directory watched only now may
-    /// have changed while it was scanned: the next scan looks at it again.
-    /// What cannot be watched is looked at by every scan; the watch limit
-    /// is said once, with the setting that raises it.
     fn watch(&self, w: &Watcher, wt: &Worktree, st: &mut WtState, snap: &Snap) {
         let now: HashSet<&PathBuf> = snap.scan.dirs.iter().collect();
         let mut unwatched = HashSet::new();
@@ -523,7 +419,6 @@ impl Daemon {
                     st.watched.insert(dir.clone(), wd);
                     added.push(dir.clone());
                 }
-                // Removed since the scan: its parent had an event.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => added.push(dir.clone()),
                 Err(e) => {
                     if e.raw_os_error() == Some(libc::ENOSPC) {
@@ -549,7 +444,6 @@ impl Daemon {
         let mut note = failed.unwrap_or_default();
         if over_limit > 0 && !st.told_limit {
             let limit = Watcher::limit().unwrap_or(0);
-            // Room for these and as many again, in round numbers.
             let enough = (limit + 2 * over_limit as u64).div_ceil(65536) * 65536;
             note.push_str(&format!(
                 "rargo: {over_limit} of the {} directories of {} are not watched: the kernel allows {limit} inotify watches per user, and they are in use. \
@@ -566,9 +460,6 @@ impl Daemon {
         }
     }
 
-    /// Brings the server up to `snap` without being asked: everything of
-    /// it the server is not believed to hold. Returns `false` if a file no
-    /// longer has the content the scan saw.
     async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>, probe: Probe) -> std::io::Result<Offered> {
         let delta = || -> (Vec<Digest>, Vec<(Digest, u64)>) {
             (
@@ -580,10 +471,6 @@ impl Daemon {
         if trees.is_empty() && blobs.is_empty() {
             return Ok(Offered::Sent);
         }
-        // Much to send: one such sync at a time. Twenty worktrees of one
-        // commit that start together would otherwise each upload the
-        // repository; after the first, the others have next to nothing
-        // to send.
         let _one_at_a_time = if blobs.iter().map(|(_, s)| *s).sum::<u64>() > PUSH_BLIND {
             let turn = self.big_sync.lock().await;
             (trees, blobs) = delta();
@@ -596,7 +483,6 @@ impl Daemon {
         };
         self.counters.offers.fetch_add(1, Ordering::Relaxed);
         if std::env::var_os("RARGO_DAEMON_TRACE").is_some() {
-            // Which directories the new manifests are.
             let new: HashSet<&Digest> = trees.iter().collect();
             let mut paths: Vec<String> = Vec::new();
             let mut todo: Vec<(String, Digest)> = vec![(String::new(), snap.scan.root)];
@@ -623,12 +509,7 @@ impl Daemon {
         let tree_bytes: u64 = encoded.iter().map(|t| t.len() as u64).sum();
         let blob_bytes: u64 = blobs.iter().map(|(_, s)| *s).sum();
         let id = mux.next_id();
-        // A caller that is waiting (a sync, or a command that asked to)
-        // needs the server to have applied the offer before this returns.
-        // A small edit otherwise goes out with no reply.
         if blob_bytes <= PUSH_BLIND && probe != Probe::Wait {
-            // An edit: the files and the manifests on their paths, in one
-            // message.
             let snap2 = snap.clone();
             let wanted: Vec<Digest> = blobs.iter().map(|(d, _)| *d).collect();
             let packed = tokio::task::spawn_blocking(move || -> Option<Vec<Blob>> {
@@ -651,15 +532,8 @@ impl Daemon {
             let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: packed, ask: false }));
             mux.post_bulk(CONTROL, &msg, (tree_bytes + blob_bytes) as usize).await?;
         } else {
-            // Much is new to this daemon, not necessarily to the server:
-            // the manifests go, and the server says what it lacks.
             let mut encoded = encoded;
             let mut tree_bytes = tree_bytes;
-            // First the root alone: a server that has this tree (another
-            // worktree's commit, a branch another agent built) says so in
-            // one small round trip, where the manifests of a repository
-            // take several to get through a link that is just starting.
-            // One that lacks any manifest is sent them all, as before.
             let mut known = if tree_bytes > PROBE_FROM && probe != Probe::Whole {
                 let answer = mux.expect_missing(id);
                 let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: Vec::new(), blobs: Vec::new(), ask: true }));
@@ -685,7 +559,6 @@ impl Daemon {
                 if lacking_trees.is_empty() {
                     break lacking_blobs;
                 }
-                // Manifests it was believed to have are gone there.
                 encoded = lacking_trees.iter().filter_map(|d| snap.scan.trees.get(d).cloned()).collect();
                 if encoded.len() != lacking_trees.len() {
                     return Err(std::io::Error::other("the server asked for a directory this worktree does not have"));
@@ -703,13 +576,10 @@ impl Daemon {
         Ok(Offered::Sent)
     }
 
-    /// Notes that the server holds everything of `snap`.
     fn has_now(&self, snap: &Snap) {
         self.held.add(snap.scan.trees.keys().chain(snap.scan.files.keys()));
     }
 
-    /// Writes down what outlives this daemon: what the server holds and
-    /// where the cache holds chunks.
     pub fn save_known(&self) {
         if let Err(e) = self.held.save() {
             eprintln!("rargo daemon: cannot keep what the server holds: {e}");
@@ -722,15 +592,10 @@ impl Daemon {
         }
     }
 
-    /// The worktree's virtual output directory, mounted if it can be and
-    /// the command does not say otherwise (`RARGO_OUTPUT=copy`, an output
-    /// directory of its own choosing).
     fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> Option<(Arc<OutFs>, PathBuf)> {
         let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
             || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
-        // A command in another mount namespace (a container, a sandbox)
-        // would not see what this daemon mounts.
         let same_ns = req.mount_ns == crate::mount_ns();
         let want = self.watcher.is_some() && var(&req.vars, "RARGO_OUTPUT") != Some("copy") && !elsewhere && same_ns;
         let mut g = wt.out.lock().unwrap();
@@ -746,8 +611,6 @@ impl Daemon {
             if m.session.shown() && std::fs::metadata(&m.dir).map(|md| md.dev()).ok() == Some(m.dev) {
                 return Some((m.fs.clone(), m.dir.clone()));
             }
-            // No longer what is seen at the directory (another daemon, for
-            // another server, mounted its own there): start over.
             if let Some(m) = g.take() {
                 m.fs.save();
                 m.session.unmount();
@@ -773,8 +636,6 @@ impl Daemon {
 
     fn mount_out(self: &Arc<Self>, wt: &Arc<Worktree>) -> std::io::Result<Mounted> {
         let dir = wt.root.join("target");
-        // What a daemon that is gone, or another version of this one, left
-        // mounted there.
         release_mounts(&dir);
         if std::fs::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
             return Err(std::io::Error::other("`target` is a symbolic link"));
@@ -786,10 +647,7 @@ impl Daemon {
         }
         let source = Box::new(Contents { d: Arc::downgrade(self), handle: self.handle.clone() });
         let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
-        // SAFETY: no arguments, cannot fail.
         let root = unsafe { libc::geteuid() } == 0;
-        // auto_unmount: a daemon that is killed must not leave `target/` as
-        // a dead mount for editors, stock cargo and the next `ls` to trip on.
         let opts = fusewire::MountOptions {
             fsname: "rargo".into(),
             allow_other: root,
@@ -799,9 +657,6 @@ impl Daemon {
         };
         let session = Arc::new(fusewire::Session::mount(&dir, &opts)?);
         fs.attach(session.clone());
-        // Enough threads that a parallel build's name operations (a
-        // compiler per core, each creating and renaming files) do not
-        // queue behind each other.
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8).clamp(8, 32);
         session.spawn_workers(fs.clone(), threads)?;
         let dev = {
@@ -811,7 +666,6 @@ impl Daemon {
         Ok(Mounted { fs, session, dir, dev })
     }
 
-    /// Unmounts every virtual output directory (the daemon is going).
     fn unmount_all(&self) {
         let all: Vec<Arc<Worktree>> = self.worktrees.lock().unwrap().values().cloned().collect();
         for wt in all {
@@ -822,8 +676,6 @@ impl Daemon {
         }
     }
 
-    /// Gives a worktree's output directory back to plain files: unmounted,
-    /// and nothing delivered remembered (`cargo clean` is about to run).
     fn release(&self, cwd: &Path) {
         let Some(root) = crate::find_root(cwd) else { return };
         let wt = self.worktrees.lock().unwrap().get(&root).cloned();
@@ -836,10 +688,6 @@ impl Daemon {
         }
     }
 
-    /// A reader of a content that fetches it by range as it is read: the
-    /// one already reading it, or a new one made from the server's recipe
-    /// and outline. None if the server cannot outline it (then it is
-    /// fetched whole).
     async fn partial(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<Option<Arc<Partial>>> {
         if let Some((_, p)) = self.partials.lock().unwrap().get(&hash) {
             return Ok(Some(p.clone()));
@@ -866,8 +714,6 @@ impl Daemon {
         let p = tokio::task::block_in_place(|| Partial::new(hash, size, chunks, outline, &lazy, &slot, fetcher))?;
         self.counters.fetched_contents.fetch_add(1, Ordering::Relaxed);
         let mut partials = self.partials.lock().unwrap();
-        // Readers given up on (their files closed before they were read
-        // through) are let go, oldest first.
         while partials.len() >= MOST_PARTIALS {
             let Some(oldest) = partials.iter().min_by_key(|(_, (n, _))| *n).map(|(h, _)| *h) else { break };
             partials.remove(&oldest);
@@ -877,8 +723,6 @@ impl Daemon {
         Ok(Some(p))
     }
 
-    /// Hands `p` the chunks of `idx` that contents in the cache hold; says
-    /// which are left.
     fn reuse_chunks(&self, p: &Partial, idx: Vec<u32>) -> Vec<u32> {
         use std::os::unix::fs::FileExt;
         let mut need = Vec::new();
@@ -903,8 +747,6 @@ impl Daemon {
         need
     }
 
-    /// Asks the server for chunks of `p` and hands them over as they
-    /// arrive; says which did not.
     async fn fetch_chunks(self: &Arc<Self>, p: &Arc<Partial>, idx: Vec<u32>) -> Vec<u32> {
         let Ok(mux) = self.mux().await else { return idx };
         let mut left: HashSet<u32> = idx.iter().copied().collect();
@@ -931,8 +773,6 @@ impl Daemon {
         left
     }
 
-    /// A content read by range is whole in the cache now: its chunks are
-    /// known there, and the reader is let go.
     fn read_through(&self, p: &Partial) {
         let mut index = self.chunks.lock().unwrap();
         if index.len() > crate::known::MOST_CHUNKS {
@@ -946,10 +786,6 @@ impl Daemon {
         self.partials.lock().unwrap().remove(p.hash());
     }
 
-    /// Makes sure a content is in the cache, fetching it from the server
-    /// if need be: by chunk when it is large, so that what the cache holds
-    /// of it already (an earlier version of the same binary, say) is not
-    /// sent again.
     async fn fetch_content(self: &Arc<Self>, hash: Digest, size: u64) -> std::io::Result<PathBuf> {
         if let Some(p) = crate::place::cached(&self.cache, &hash, size) {
             return Ok(p);
@@ -985,7 +821,6 @@ impl Daemon {
                     offsets.push(at);
                     at += *len as u64;
                 }
-                // What the cache holds already.
                 let mut need: Vec<u32> = Vec::new();
                 tokio::task::block_in_place(|| {
                     use std::os::unix::fs::FileExt;
@@ -1044,7 +879,6 @@ impl Daemon {
                 return Ok(slot);
             }
         }
-        // Small, or unknown to the server's chunker: whole.
         let id = mux.fetch(vec![hash], &tx);
         let mut placer = Placer::new(&self.cache, Placed::default());
         loop {
@@ -1071,7 +905,6 @@ impl Daemon {
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "the server no longer has this content"))
     }
 
-    /// Runs one command for the `rargo` program at the other end of `out`.
     pub async fn command(self: Arc<Self>, req: LocalRequest, out: UnboundedSender<LocalReply>) {
         self.active.fetch_add(1, Ordering::SeqCst);
         struct Active<'a>(&'a Daemon);
@@ -1090,8 +923,6 @@ impl Daemon {
                 if is_no_link(&e) {
                     LocalReply::Unreachable(e.to_string())
                 } else {
-                    // A server that does not know us: no token, or one that
-                    // was revoked or has expired.
                     let hint = if e.to_string().contains(rargo_proto::REFUSED) {
                         "       (this machine is not authenticated there, or its token no longer works: run `rargo auth`)\n"
                     } else {
@@ -1159,7 +990,6 @@ impl Daemon {
                 match self.converse(&mux, run, None, None, None, req, out, &said, None).await {
                     Ok(Outcome::Final(reply)) => return Ok(reply),
                     Ok(Outcome::Changed | Outcome::NotThere(_)) => return Err(std::io::Error::other("unexpected answer from the server")),
-                    // A link that died between commands: once more on a new one.
                     Err(_) if mux.is_dead() && !said.load(Ordering::SeqCst) && !retried => retried = true,
                     Err(e) => return Err(e),
                 }
@@ -1192,8 +1022,6 @@ impl Daemon {
                 let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
             }
         };
-        // `RARGO_OFFER_WAIT=1` on a command: no request is sent before the
-        // server has said that it holds the worktree's tree.
         let mut probe = if req.kind == "sync" || var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
         loop {
             let mux = self.mux().await?;
@@ -1226,8 +1054,6 @@ impl Daemon {
                     };
                     let _ = out.send(LocalReply::Stderr(text.into_bytes()));
                 }
-                // Sent before the request and in order with it, so the
-                // server has the change when it looks at the request.
                 phase("worktree read");
                 match self.offer(&mux, &wt, &snap, probe).await {
                     Ok(Offered::Sent) => phase("worktree offered and what the server lacked sent"),
@@ -1298,7 +1124,6 @@ impl Daemon {
         }
     }
 
-    /// One command's conversation with the server, on a stream of its own.
     #[allow(clippy::too_many_arguments)]
     async fn converse(
         &self,
@@ -1313,8 +1138,6 @@ impl Daemon {
         mut bet: Option<tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
     ) -> std::io::Result<Outcome> {
         let (stream, tx, mut rx) = mux.open();
-        // Whatever ends this conversation early (the command was
-        // interrupted, an error) withdraws the request.
         struct Withdraw<'a>(&'a Mux, u32);
         impl Drop for Withdraw<'_> {
             fn drop(&mut self) {
@@ -1331,8 +1154,6 @@ impl Daemon {
         let mut delivery_ready = false;
         let mut last: Option<LocalReply> = None;
         let mut token: Option<u64> = None;
-        // What the server said on stderr, kept while the worktree leaves out
-        // what git ignores: a failure that names such a path is explained.
         let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
         let mut heard: Vec<u8> = Vec::new();
         loop {
@@ -1340,7 +1161,6 @@ impl Daemon {
                 break;
             }
             let msg = tokio::select! {
-                // The answer to the root this request was sent behind.
                 lacking = async { bet.as_mut().unwrap().await }, if bet.is_some() => {
                     bet = None;
                     let (trees, blobs) = lacking.map_err(|_| lost())?;
@@ -1351,8 +1171,6 @@ impl Daemon {
                         self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    // The server could not have started on it: withdrawn,
-                    // and asked again when it has the tree.
                     mux.post(stream, &ClientMsg::Changed);
                     return Ok(Outcome::NotThere(if trees.is_empty() { Probe::Wait } else { Probe::Whole }));
                 }
@@ -1363,8 +1181,6 @@ impl Daemon {
             };
             let Some(msg) = msg else { return Err(lost()) };
             if bet.is_some() && matches!(msg, ServerMsg::WantTrees(_) | ServerMsg::WantBlobs(_)) {
-                // The server is asking for the tree piece by piece: it
-                // lacks it. Sent whole instead.
                 mux.post(stream, &ClientMsg::Changed);
                 return Ok(Outcome::NotThere(Probe::Whole));
             }
@@ -1400,7 +1216,6 @@ impl Daemon {
                         .map(|n| (n.clone(), req.vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone())))
                         .collect();
                     mux.post(stream, &ClientMsg::Env(values));
-                    // Sent unasked from now on.
                     let mut asked = self.asked.lock().unwrap();
                     let before = asked.len();
                     for n in names {
@@ -1415,8 +1230,6 @@ impl Daemon {
                 ServerMsg::Deliver { files, writes, .. } => {
                     said.store(true, Ordering::SeqCst);
                     tokio::task::block_in_place(|| -> std::io::Result<()> {
-                        // What belongs in a virtual output directory is
-                        // shown there; the rest is placed as files.
                         let (files, writes) = match shown {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
                             None => (files, writes),
@@ -1471,9 +1284,6 @@ impl Daemon {
                 | ServerMsg::Recipe { .. }
                 | ServerMsg::Chunks { .. } => {}
             }
-            // A second delivery can finish while its predecessor's fetch
-            // is still in flight. Let that fetch finish before requesting
-            // more digests so multipart replies for a hash cannot mix.
             if delivery_ready && fetching.is_none() {
                 delivery_ready = false;
                 let hashes = placer.wanting();
@@ -1563,9 +1373,6 @@ impl Daemon {
     }
 }
 
-/// The next message on a channel the link feeds, or an error once the
-/// link is dead.
-/// The contents of delivered files in `target/`, for the mount.
 struct Contents {
     d: std::sync::Weak<Daemon>,
     handle: tokio::runtime::Handle,
@@ -1591,8 +1398,6 @@ impl crate::outfs::Source for Contents {
         }
     }
 
-    /// Small contents are fetched whole (one round trip either way); a
-    /// larger one by range, unless the server cannot outline it.
     fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<Reader> {
         let d = self.daemon()?;
         if let Some(path) = crate::place::cached(&d.cache, hash, size) {
@@ -1608,8 +1413,6 @@ impl crate::outfs::Source for Contents {
     }
 }
 
-/// Fetches the chunks a [`Partial`] asks for: from contents the cache
-/// holds where it can, from the server otherwise.
 struct ChunkFetcher {
     d: std::sync::Weak<Daemon>,
     handle: tokio::runtime::Handle,
@@ -1650,24 +1453,18 @@ async fn next_msg(mux: &Arc<Mux>, rx: &mut tokio::sync::mpsc::UnboundedReceiver<
     }
 }
 
-/// Unmounts whatever is mounted at `dir` (lazily: a file system whose
-/// daemon is gone cannot be asked).
 fn release_mounts(dir: &Path) {
     let Ok(info) = std::fs::read_to_string("/proc/self/mountinfo") else { return };
     let here = dir.to_string_lossy();
     let mounts = info.lines().filter(|l| l.split(' ').nth(4) == Some(here.as_ref())).count();
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
     for _ in 0..mounts {
-        // SAFETY: valid NUL-terminated path.
         if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } != 0 {
-            // Not allowed to: the helper that mounted it unmounts it.
             fusewire::unmount_with_helper(dir);
         }
     }
 }
 
-/// Shows the part of a delivery that lies in the virtual output directory
-/// mounted at `dir`, and returns the rest.
 fn show(
     fs: &Arc<OutFs>,
     dir: &Path,
@@ -1703,7 +1500,6 @@ fn show(
             }
             Write::Text { text: Some(text), .. } => {
                 let real = fs.real_for_write(&rel)?;
-                // Unchanged: leave the file (and its mtime) alone.
                 if std::fs::read_to_string(&real).ok().as_deref() != Some(text.as_str()) {
                     crate::write_atomic(&real, text.as_bytes())?;
                     fs.wrote(&rel);
@@ -1730,8 +1526,6 @@ fn show(
     Ok((rest_files, rest_writes))
 }
 
-/// The path of a directory inside the mount, as `real_for_write` wants it
-/// (it makes the parents of what it is given).
 fn join_rel(rel: &[u8]) -> Vec<u8> {
     assert!(!rel.ends_with(b"/"));
     let mut p = rel.to_vec();
@@ -1739,8 +1533,6 @@ fn join_rel(rel: &[u8]) -> Vec<u8> {
     p
 }
 
-/// Sends the contents the server lacks. Returns `false` if a file no
-/// longer has the content the scan saw.
 async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
     let mut small: Vec<(Digest, PathBuf, u64)> = Vec::new();
     let mut large: Vec<(Digest, PathBuf)> = Vec::new();
@@ -1748,7 +1540,6 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
         let Some((path, size)) = snap.scan.files.get(&h).cloned() else { return Ok(false) };
         if size as usize > rargo_proto::PART_SIZE { large.push((h, path)) } else { small.push((h, path, size)) }
     }
-    // Small files travel in batches, read and compressed in parallel.
     assert!(small.iter().all(|(_, _, size)| *size as usize <= rargo_proto::PART_SIZE));
     let wanted = small.len();
     let mut batches: Vec<Vec<(Digest, PathBuf)>> = vec![Vec::new()];
@@ -1791,8 +1582,6 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
     for (h, path) in large {
         let Ok(mut f) = std::fs::File::open(&path) else { return Ok(false) };
         let mut hasher = blake3::Hasher::new();
-        // One part is held back so that the last one is only sent once the
-        // whole file is known to be what the scan saw.
         let mut held: Option<Vec<u8>> = None;
         loop {
             let (buf, file) = tokio::task::spawn_blocking(move || -> std::io::Result<(Vec<u8>, std::fs::File)> {
@@ -1832,9 +1621,6 @@ async fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>
     Ok(true)
 }
 
-// ---------------------------------------------------------------------------
-// The socket the `rargo` command talks to
-// ---------------------------------------------------------------------------
 
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
@@ -1886,16 +1672,12 @@ async fn serve_command(d: Arc<Daemon>, stream: tokio::net::UnixStream, socket: P
                     return;
                 }
             }
-            // The command sends nothing after its request: anything read
-            // here is its end (interrupted, killed, its output closed).
             _ = rd.read(&mut probe) => break,
         }
     }
-    // Nobody is listening any more: the request is withdrawn.
     work.abort();
 }
 
-/// Runs the daemon on `socket` until it has been idle for a while.
 pub fn serve(socket: &Path) -> ! {
     let cfg = match crate::load_config() {
         Ok(c) => c,
@@ -1905,7 +1687,6 @@ pub fn serve(socket: &Path) -> ! {
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("tokio runtime");
     let socket = socket.to_path_buf();
     rt.block_on(async move {
-        // One daemon per socket: whoever holds the lock is it.
         let lock_path = socket.with_extension("lock");
         let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
             Ok(f) => f,
@@ -1913,11 +1694,7 @@ pub fn serve(socket: &Path) -> ! {
         };
         {
             use std::os::fd::AsRawFd;
-            // A daemon that was told to stop lets go of the lock as it
-            // exits, after it answered: it is waited for. One that holds
-            // it longer is running (or starting) and serves the socket.
             let started = Instant::now();
-            // SAFETY: valid descriptor.
             while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 if started.elapsed() > Duration::from_secs(3) {
                     std::process::exit(0);
@@ -1939,8 +1716,6 @@ pub fn serve(socket: &Path) -> ! {
         let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("signal handler");
         loop {
             tokio::select! {
-                // Told to go: the output directories go back to being
-                // plain directories first.
                 _ = term.recv() => {
                     d.unmount_all();
                     d.save_known();
@@ -1960,11 +1735,8 @@ pub fn serve(socket: &Path) -> ! {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    // A daemon that shows output directories stays: what
-                    // it shows would vanish with it.
                     let showing = d.worktrees.lock().unwrap().values().any(|w| w.out.lock().unwrap().is_some());
                     let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
-                    // Someone removed the socket: nobody can reach us.
                     d.save_known();
                     if quiet || !socket.exists() {
                         d.unmount_all();
@@ -1973,8 +1745,6 @@ pub fn serve(socket: &Path) -> ! {
                         }
                         break;
                     }
-                    // Worktrees nobody has built in for a long time are
-                    // not followed any more.
                     let stale: Vec<Arc<Worktree>> = {
                         let mut all = d.worktrees.lock().unwrap();
                         let old: Vec<PathBuf> = all
@@ -1988,7 +1758,6 @@ pub fn serve(socket: &Path) -> ! {
                         if let Some(w) = &d.watcher {
                             w.forget(wt.id);
                         }
-                        // Ends its sync task.
                         wt.changed.notify_one();
                     }
                 }
@@ -1999,8 +1768,6 @@ pub fn serve(socket: &Path) -> ! {
     std::process::exit(0)
 }
 
-/// Runs one command without a daemon, in this process: for machines where
-/// a daemon cannot be started, and for `RARGO_NO_DAEMON=1`.
 pub fn inline(cfg: Config, cache: PathBuf, req: LocalRequest, mut each: impl FnMut(LocalReply)) {
     let (tx, mut rx) = unbounded_channel::<LocalReply>();
     let worker = std::thread::spawn(move || {
@@ -2017,12 +1784,8 @@ pub fn inline(cfg: Config, cache: PathBuf, req: LocalRequest, mut each: impl FnM
     let _ = worker.join();
 }
 
-/// How much of a command's stderr is kept to explain a failure.
 const HEARD_MAX: usize = 1 << 20;
 
-/// A note for a failed command whose error output names a path the
-/// worktree leaves out because git ignores it: the build server never had
-/// it. At most three paths are named.
 fn left_out_note(ignored: &scan::Ignored, root: &Path, heard: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(heard);
     let mut named: Vec<String> = Vec::new();
@@ -2046,9 +1809,6 @@ fn left_out_note(ignored: &scan::Ignored, root: &Path, heard: &[u8]) -> Option<S
     ))
 }
 
-/// The paths in `text` that lie in the worktree at `root`, from its root,
-/// with `.` and `..` resolved: absolute ones under the root, and relative
-/// ones taken from the root.
 fn paths_in<'t>(text: &'t str, root: &'t str) -> impl Iterator<Item = String> + 't {
     let path_char = |c: char| c.is_alphanumeric() || "._-/+@".contains(c);
     let rooted = format!("{}/", root.trim_end_matches('/'));
@@ -2081,11 +1841,9 @@ mod left_out_tests {
     fn a_failure_that_names_a_path_git_ignores_is_explained() {
         let root = "/home/ann/proj";
         let found = |text: &str| paths_in(text, root).collect::<Vec<_>>();
-        // As rustc and build scripts write paths.
         assert_eq!(found("error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`: No such file"), ["crates/util/local-note.txt"]);
         assert_eq!(found("open data/big.bin: not found."), ["data/big.bin"]);
         assert_eq!(found("at /home/ann/proj/src/main.rs:12:5"), ["src/main.rs"]);
-        // Not elsewhere, and not above the root.
         assert!(found("couldn't read `/elsewhere/data/big.bin` or /home/ann/proj/../x").is_empty());
 
         let ignored = scan::Ignored::for_test(&["junk/", "crates/util/local-note.txt"], &[]);
@@ -2114,11 +1872,8 @@ mod tests {
         assert!(is_no_link(&refused));
         assert_eq!(refused.kind(), ErrorKind::ConnectionRefused);
         assert_eq!(refused.to_string(), "connection refused");
-        // A missing local file is reported as itself.
         assert!(!is_no_link(&Error::from_raw_os_error(libc::ENOENT)));
-        // A server that answers and turns the token down is not out of reach.
         assert!(!is_no_link(&no_link(Error::new(ErrorKind::PermissionDenied, rargo_proto::REFUSED))));
-        // Through `?` the mark stays.
         let passed = (|| -> std::io::Result<()> { Err(no_link(Error::new(ErrorKind::TimedOut, "timed out")))? })();
         assert!(is_no_link(&passed.unwrap_err()));
     }

@@ -1,12 +1,3 @@
-//! Views: the immutable filesystem an action is shown, and observations made
-//! against it.
-//!
-//! A view answers three questions about a sandbox path: what is here
-//! (`lookup`), what does this directory contain (`list`), and where do this
-//! file's bytes come from (`FileSrc`). The sandbox filesystem asks them on
-//! behalf of a running action and records the answers; the trace cache asks
-//! them again later to decide whether a recorded trace still holds.
-
 use crate::hash::Hash;
 use crate::store::Store;
 use dashmap::DashMap;
@@ -18,7 +9,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// An absolute, normalised sandbox path as bytes (`/`, `/usr/lib`).
 pub type VPath = Arc<[u8]>;
 
 pub fn vjoin(dir: &[u8], name: &[u8]) -> Vec<u8> {
@@ -35,7 +25,6 @@ pub fn vjoin(dir: &[u8], name: &[u8]) -> Vec<u8> {
     v
 }
 
-/// Splits `/a/b` into (`/a`, `b`). The root has no parent.
 pub fn vsplit(path: &[u8]) -> Option<(&[u8], &[u8])> {
     if path == b"/" || path.is_empty() {
         return None;
@@ -63,27 +52,18 @@ pub fn show(p: &[u8]) -> String {
     String::from_utf8_lossy(p).into_owned()
 }
 
-/// What an action saw at a path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Obs {
     Absent,
     Dir,
-    /// Hash of the sorted `(name, type)` entries.
     Listing(Hash),
     Symlink(Vec<u8>),
-    /// A file that was looked up but never opened.
     Meta { size: u64, exec: bool },
-    /// A file that was looked up but never opened, by an action known not
-    /// to act on file sizes (the planner): only its existence and
-    /// executable bit were observed.
     IsFile { exec: bool },
-    /// A file whose content was read.
     File { hash: Hash, exec: bool },
-    /// Something that is neither file, directory nor symlink.
     Other,
 }
 
-/// Identity of a host file at the moment it was looked at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct HostSig {
     pub dev: u64,
@@ -116,21 +96,14 @@ impl HostSig {
     }
 }
 
-/// A blob that can be produced on demand.
 pub trait LazyBlob: Send + Sync {
-    /// Writes the content into the store and returns its hash.
     fn materialize(&self, store: &Store) -> io::Result<Hash>;
 }
 
-/// Where a file's bytes come from.
 #[derive(Clone)]
 pub enum FileSrc {
-    /// Already in the store.
     Blob(Hash),
-    /// A file on the host, read in place.
     Host { path: Arc<Path>, sig: HostSig },
-    /// Content whose hash is only known once it is fetched (a file on the
-    /// server, seen from a worker).
     Lazy(Arc<dyn LazyBlob>),
 }
 
@@ -144,14 +117,12 @@ impl std::fmt::Debug for FileSrc {
     }
 }
 
-/// `uid`/`gid` value meaning "the user the action runs as".
 pub const OWNER_SELF: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Owner {
     pub uid: u32,
     pub gid: u32,
-    /// Permission bits only.
     pub mode: u32,
 }
 
@@ -166,9 +137,6 @@ pub struct FileInfo {
     pub size: u64,
     pub owner: Owner,
     pub src: FileSrc,
-    /// What readers of this file depend on, when that is less than its
-    /// bytes (see [`Content::metadata_identity`]). Observations of the file
-    /// record this instead of the content hash.
     pub sem: Option<Hash>,
 }
 
@@ -184,7 +152,6 @@ pub enum Looked {
     Dir(Owner),
     Symlink(Vec<u8>),
     File(FileInfo),
-    /// Exists but is not representable (device, socket, fifo).
     Other,
 }
 
@@ -217,7 +184,6 @@ impl DType {
 
 pub type Listing = Vec<(Vec<u8>, DType)>;
 
-/// Canonical hash of a directory listing.
 pub fn listing_hash(entries: &Listing) -> Hash {
     let mut sorted: Vec<&(Vec<u8>, DType)> = entries.iter().collect();
     sorted.sort();
@@ -231,28 +197,17 @@ pub fn listing_hash(entries: &Listing) -> Hash {
 }
 
 pub trait View: Send + Sync {
-    /// What is `name` in directory `dir`. `dir` is known to be a directory
-    /// in this view.
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked;
-    /// Entries of directory `dir`.
     fn list(&self, dir: &[u8]) -> io::Result<Listing>;
-    /// Whether observations under this directory belong in a trace.
     fn traced(&self, _dir: &[u8]) -> bool {
         true
     }
-    /// Paths an action running against this view is likely to look at,
-    /// beyond what its own history says (the outputs of the units it
-    /// depends on). Used to answer a worker's lookups in advance.
     fn hints(&self) -> Vec<Vec<u8>> {
         Vec::new()
     }
-    /// Store paths this action's `/nix/store` contains, sorted by name:
-    /// the name and the manifest's identity. Empty when the action sees
-    /// the host root.
     fn nix_closure(&self) -> &[(Vec<u8>, Hash)] {
         &[]
     }
-    /// Looks up a full path. Every parent must be a real directory.
     fn stat(&self, path: &[u8]) -> Looked {
         match vsplit(path) {
             None => Looked::Dir(Owner { uid: 0, gid: 0, mode: 0o755 }),
@@ -261,21 +216,17 @@ pub trait View: Send + Sync {
     }
 }
 
-/// Key under which a passthrough backing file can be shared between actions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BackingKey {
     Blob(Hash),
     Host(HostSig),
 }
 
-/// Resolves [`FileSrc`]s to bytes and hashes.
-/// Brings a blob that is not in the local store into it.
 pub type Fetcher = Arc<dyn Fn(&Hash) -> io::Result<()> + Send + Sync>;
 
 pub struct Content {
     pub store: Arc<Store>,
     host_hashes: DashMap<HostSig, Hash>,
-    /// On a worker: how to get a blob the server has and we do not.
     fetcher: std::sync::OnceLock<Fetcher>,
     meta_ids: DashMap<Hash, Option<Hash>>,
 }
@@ -290,17 +241,6 @@ impl Content {
         }
     }
 
-    /// The identity of a crate metadata file (`.rmeta`) written by rargo's
-    /// rustc fork, for the purposes of whoever compiles against it.
-    ///
-    /// The fork's metadata carries a crate hash that covers everything a
-    /// dependent's compilation can depend on, and deliberately not the
-    /// positions of things that only matter for messages (see the fork's
-    /// patch notes). Two metadata files with the same crate hash are the
-    /// same input to a dependent even when their bytes differ, which is what
-    /// makes an edit inside a function body stop at the crate it is in.
-    /// Files from a stock compiler have no such identity (`None`): their
-    /// bytes are what counts.
     pub fn metadata_identity(&self, blob: &Hash) -> Option<Hash> {
         if let Some(v) = self.meta_ids.get(blob) {
             return *v;
@@ -310,7 +250,6 @@ impl Content {
             let mut f = self.store.open_blob(blob).ok()?;
             let mut head = [0u8; 40];
             f.read_exact(&mut head).ok()?;
-            // The fork marks its metadata format in the seventh header byte.
             if &head[..7] != b"rust\0\0\x01" {
                 return None;
             }
@@ -326,8 +265,6 @@ impl Content {
         let _ = self.fetcher.set(f);
     }
 
-    /// Opens a blob, fetching it first if this store does not have it and
-    /// there is somewhere to fetch it from.
     fn open_blob(&self, h: &Hash) -> io::Result<File> {
         if !self.store.has(h) {
             if let Some(fetch) = self.fetcher.get() {
@@ -341,8 +278,6 @@ impl Content {
         self.store.db()
     }
 
-    /// Opens the file for reading. For host files the returned source carries
-    /// the signature of the file actually opened.
     pub fn open(&self, src: &FileSrc) -> io::Result<(File, BackingKey, FileSrc)> {
         match src {
             FileSrc::Blob(h) => Ok((self.open_blob(h)?, BackingKey::Blob(*h), src.clone())),
@@ -362,7 +297,6 @@ impl Content {
         }
     }
 
-    /// The content hash if it is known without reading the file.
     pub fn known_hash(&self, src: &FileSrc) -> Option<Hash> {
         match src {
             FileSrc::Blob(h) => Some(*h),
@@ -379,9 +313,6 @@ impl Content {
         }
     }
 
-    /// The content hash, reading the file if needed. For host files this
-    /// fails with `ESTALE` if the file no longer matches the signature the
-    /// source was created with.
     pub fn hash(&self, src: &FileSrc) -> io::Result<Hash> {
         if let Some(h) = self.known_hash(src) {
             return Ok(h);
@@ -416,7 +347,6 @@ impl Content {
     }
 }
 
-/// Decides whether an observation still holds in `view`.
 pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> bool {
     if let Obs::Listing(want) = obs {
         return match view.list(path) {
@@ -441,8 +371,6 @@ pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> 
             }
             match content.known_hash(&f.src) {
                 Some(h) => h == *hash,
-                // Not hashed in this store yet: a host file never read
-                // before. Read it once; the answer is remembered.
                 None => content.hash(&f.src).map(|h| h == *hash).unwrap_or(false),
             }
         }
@@ -450,7 +378,6 @@ pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> 
     }
 }
 
-/// A directory tree on the host shown at some sandbox path.
 pub struct HostRegion {
     pub real: PathBuf,
 }
@@ -472,7 +399,6 @@ impl HostRegion {
         p
     }
 
-    /// `rel_dir` is the directory relative to the region root (`/` or `/a/b`).
     pub fn lookup(&self, rel_dir: &[u8], name: &[u8]) -> Looked {
         let p = self.real_path(rel_dir, name);
         let Ok(m) = std::fs::symlink_metadata(&p) else { return Looked::Absent };

@@ -1,8 +1,5 @@
-//! Cargo manifest selection shared by the worktree scanner and the snapshot reader.
-
 use std::path::{Component, Path, PathBuf};
 
-/// The directory for manifest discovery, relative to the synced worktree.
 pub fn command_dir(root: &Path, cwd: &Path, args: &[String]) -> Option<PathBuf> {
     let mut cargo_args = args.iter().take_while(|arg| arg.as_str() != "--");
     let mut start = cwd.to_path_buf();
@@ -29,7 +26,6 @@ pub fn command_dir(root: &Path, cwd: &Path, args: &[String]) -> Option<PathBuf> 
     Some(dir)
 }
 
-/// The nearest enclosing workspace, or the nearest package outside a workspace.
 pub fn manifest_for(start: &Path, read: impl Fn(&Path) -> Option<String>) -> Option<(PathBuf, &'static str)> {
     let mut package = None;
     for dir in start.ancestors() {

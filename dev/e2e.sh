@@ -1,16 +1,4 @@
 #!/bin/bash
-# End-to-end checks against a private build server.
-#
-#   dev/e2e.sh            run everything
-#
-# The server and the client run on this machine but share nothing except a
-# TCP port: the server runs in a mount namespace in which the client's
-# directory (worktrees, cache, cargo home) is an empty file system, has its
-# own cargo home, and requires a token.
-#
-# Uses private directories under $RARGO_WORK. Set RARGO_E2E_ROOT to an
-# existing directory on a reflink filesystem to put the store and the client
-# there. Stops its server when done. Requires root (FUSE mount, namespaces).
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -22,30 +10,21 @@ export RARGO_BIN=$bin
 R=$bin/rargo
 E=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/e2e.XXXXXXXX") || exit 1
 E=$(cd "$E" && pwd -P) || exit 1
-# Everything the client owns lives under $T; the server cannot see it.
 T=$E/client
 mkdir -p "$T" "$E/store"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 export RARGO_SERVER=127.0.0.1:$port
 export RARGO_HIDE=$T
 export RARGO_CACHE_DIR=$T/.rargo-cache
-# Two users of the server: an administrator, whose token the suite uses,
-# and one who is not.
 mkdir -p "$RARGO_STATE"
 RARGO_TOKEN=$("$bin/rargod" token create --state "$RARGO_STATE" --user e2e --admin 2>/dev/null)
 export RARGO_TOKEN
 guest_token=$("$bin/rargod" token create --state "$RARGO_STATE" --user guest 2>/dev/null)
-# The server gets a cargo home of its own. Its bin holds what a real
-# server's does, rustup's proxies, here one that fails if it ever runs: a
-# build's tools are its flake's.
 export RARGO_SERVER_CARGO_HOME=$RARGO_STATE/cargo-home
 mkdir -p "$RARGO_SERVER_CARGO_HOME/bin"
 printf '#!/bin/sh\necho "the server cargo home bin'"'"'s cargo-clippy ran" >&2\nexit 1\n' >"$RARGO_SERVER_CARGO_HOME/bin/cargo-clippy"
 chmod +x "$RARGO_SERVER_CARGO_HOME/bin/cargo-clippy"
-# The stock Cargo checks intentionally exercise the fixture's own target/.
 unset CARGO_TARGET_DIR
-# Stock cargo is the toolchain a project without a toolchain file builds
-# with: the nightly the bundled shell names, whose cargo the planner is.
 RUSTUP_TOOLCHAIN=$(sed -n 's/.*toolchainFile == null then { channel = "\(nightly-[0-9-]*\)"; }.*/\1/p' "$(dirname "$0")/../nix/default/flake.nix")
 [ -n "$RUSTUP_TOOLCHAIN" ] || { echo "e2e: no default toolchain in nix/default/flake.nix" >&2; exit 2; }
 export RUSTUP_TOOLCHAIN
@@ -55,14 +34,12 @@ checks=0
 
 ok() { checks=$((checks + 1)); echo "  ok   $1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/       | /' | head -40; }
-expect() { # description, command...
+expect() {
     local d=$1; shift
     if out=$("$@" 2>&1); then ok "$d"; else bad "$d" "$out"; fi
 }
 has() { grep -qF -- "$2" <<<"$1"; }
 runs() { "$R" --rargo-status | awk '/^actions run/ {print $3}'; }
-# Files and directory manifests the server has received from clients so
-# far (pushed by their daemons or asked for).
 asked_files() { "$R" --rargo-status | sed -n 's/^sync .* manifests and \([0-9]*\) files received.*/\1/p'; }
 asked_trees() { "$R" --rargo-status | sed -n 's/^sync .*states, \([0-9]*\) manifests.*/\1/p'; }
 
@@ -84,7 +61,6 @@ out=$(RARGO_TOKEN=$guest_token "$R" --rargo-gc 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" "may not administer" && has "$out" "rargod token create --admin" && ok "a user who is not an administrator cannot collect garbage, and is told how an administrator is made" || bad "a user who is not an administrator cannot collect garbage, and is told how an administrator is made" "$out"
 expect "the right token is accepted" "$R" --rargo-status
 
-# --- a small workspace -----------------------------------------------------
 A=$T/a
 mkdir -p "$A/crates/util/src" "$A/crates/app/src" "$A/crates/app/tests" "$A/crates/mac/src"
 cat >"$A/Cargo.toml" <<'EOF'
@@ -188,7 +164,6 @@ fn writes_a_snapshot() {
 }
 EOF
 echo fixture >"$A/crates/app/tests/fixture.txt"
-# A file git ignores but the build reads, and a large one a test reads.
 printf '/target\nlocal-note.txt\n/junk\n' >"$A/.gitignore"
 echo "ignored by git" >"$A/crates/util/local-note.txt"
 head -c 3000000 /dev/urandom >"$A/crates/app/tests/large.bin"
@@ -216,7 +191,6 @@ n=$(find target -type f ! -name "*.d" ! -name CACHEDIR.TAG | wc -l)
 git -C "$A" add Cargo.lock && git -C "$A" -c user.name=t -c user.email=t@t commit -q -m lock
 
 echo "== no-op rebuild"
-# The lockfile the first build created is new to the planner: one re-plan.
 "$R" build >/dev/null 2>&1
 before=$(runs)
 out=$("$R" build 2>&1)
@@ -228,21 +202,17 @@ echo "== second worktree at the same commit"
 B=$T/b
 git -C "$A" worktree add -q "$B" -b other
 cd "$B"
-# git does not check out ignored files; the build needs this one.
 cp "$A/crates/util/local-note.txt" crates/util/
 before=$(runs); files=$(asked_files); trees=$(asked_trees)
 start=$(date +%s%N)
 out=$("$R" build 2>&1); rc=$?
 ms=$(( ($(date +%s%N) - start) / 1000000 ))
 after=$(runs)
-# Its branch is another one: what stands in for .git differs in HEAD.
-# ...and it is a linked worktree: its `.git` is a file, and is shown as one.
 [ $(( $(asked_files) - files )) -eq 2 ] && ok "the second worktree uploaded two files: the HEAD naming its branch and its .git file" || bad "the second worktree uploaded two files: the HEAD naming its branch and its .git file" "before=$files after=$(asked_files)"
 [ $(( $(asked_trees) - trees )) -le 4 ] && ok "and $(( $(asked_trees) - trees )) directory manifests (the root and those on the way to its branch)" || bad "the second worktree uploaded only the manifests on the way to its branch" "before=$trees after=$(asked_trees)"
 [ $rc -eq 0 ] && [ "$before" = "$after" ] && ok "second worktree built with zero actions in ${ms}ms" || bad "second worktree built with zero actions" "rc=$rc before=$before after=$after
 $out"
 [ "$(stat -c %i "$A/target/debug/app")" = "$(stat -c %i "$B/target/debug/app")" ] && ok "artifact shares an inode with the first worktree (no extra disk)" || {
-    # On reflink filesystems the inodes differ but the extents are shared.
     cmp -s "$A/target/debug/app" "$B/target/debug/app" && ok "artifact identical to the first worktree's" || bad "artifact identical to the first worktree's"
 }
 out=$(./target/debug/app 2>&1)
@@ -250,7 +220,6 @@ has "$out" "from build script" && ok "second worktree's binary runs" || bad "sec
 
 echo "== one-file edit rebuilds only dependents"
 cd "$B"
-# (Counted before the edit: the daemon may push it as soon as it is made.)
 before=$(runs); files=$(asked_files); trees=$(asked_trees)
 sed -i 's/pub fn double(x: i32) -> i32 { x \* 2 }/pub fn double(x: i32) -> i32 { x + x }/' crates/util/src/lib.rs
 out=$("$R" build 2>&1); rc=$?
@@ -305,8 +274,6 @@ out=$("$R" test 2>&1); rc=$?
 has "$out" "Running tests/it.rs (target/debug/" && ok "test status lines" || bad "test status lines" "$out"
 has "$out" "Doc-tests util" && ok "doctests run" || bad "doctests run" "$out"
 [ "$(cat crates/app/tests/written-by-test.txt 2>/dev/null)" = "snapshot" ] && ok "file written by a test appears in the worktree" || bad "file written by a test appears in the worktree"
-# The file the test wrote is new to the worktree, so what read that
-# directory (the planner, the test itself) runs once more and then settles.
 before=$(runs); "$R" test >/dev/null 2>&1; after=$(runs)
 [ $((after - before)) -le 2 ] && ok "after a test wrote into the worktree, $((after - before)) action(s) reran once" || bad "bounded reruns after a test wrote into the worktree" "delta=$((after - before))"
 before=$(runs)
@@ -328,7 +295,6 @@ before=$(runs); "$R" test --no-cache >/dev/null 2>&1; after=$(runs)
 
 echo "== nextest on the server"
 cd "$A"
-# Runs of one kind of action so far (`actions by kind` in the status).
 kind_runs() { "$R" --rargo-status | sed -n "s/^actions by kind.* $1 \([0-9]*\).*/\1/p"; }
 command -v cargo-nextest >/dev/null 2>&1 && bad "the client has no nextest" "$(command -v cargo-nextest)" || ok "the client has no nextest"
 "$R" test >/dev/null 2>&1
@@ -339,8 +305,6 @@ rustc_after=$(kind_runs rustc); scripts_after=$(kind_runs "build scripts")
 $out"
 [ -n "$rustc_after" ] && [ "$rustc_before" = "$rustc_after" ] && [ "$scripts_before" = "$scripts_after" ] && ok "after rargo test, every compile of rargo nextest was a cache hit (rustc runs: $rustc_before before, $rustc_after after)" || bad "after rargo test, every compile of rargo nextest was a cache hit" "rustc $rustc_before -> $rustc_after, build scripts $scripts_before -> $scripts_after"
 echo changed >crates/app/tests/fixture.txt
-# Every test runs: with nextest's fail-fast, how many of the others finish
-# before it stops depends on timing.
 out=$("$R" nextest run --no-fail-fast 2>&1); rc=$?
 [ $rc -eq 100 ] && has "$out" "FAIL [" && has "$out" "app::it reads_a_fixture" && grep -qE "5 tests run: 4 passed, 1 failed" <<<"$out" && ok "a failing test: nextest's failure output and summary, exit 100" || bad "a failing test: nextest's failure output and summary, exit 100" "rc=$rc
 $out"
@@ -358,21 +322,18 @@ out=$("$R" nextest run --profile ci 2>&1); rc=$?
 $out
 $(ls -la target/nextest/ci 2>&1)"
 rm -rf .config
-# Stock nextest (the server's copy, on the client's PATH) with stock cargo.
 mkdir -p "$T/nextest-bin" && ln -sf "$(ls "$RARGO_STATE"/nextest/*/cargo-nextest | head -1)" "$T/nextest-bin/cargo-nextest"
 out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
 [ $rc -eq 0 ] && grep -qE "5 tests run: 5 passed" <<<"$out" && ok "stock cargo nextest in the same worktree" || bad "stock cargo nextest in the same worktree" "rc=$rc
 $out"
 expect "and rargo nextest still works afterwards" "$R" nextest run
-# rargo's test executables replaced stock's: stock's next build compiles
-# them again rather than run rargo's.
 out=$(PATH="$T/nextest-bin:$PATH" cargo nextest run --offline 2>&1); rc=$?
 [ $rc -eq 0 ] && grep -qE "5 tests run: 5 passed" <<<"$out" && ok "and stock cargo nextest again after it" || bad "and stock cargo nextest again after it" "rc=$rc
 $out"
 "$R" nextest run >/dev/null 2>&1
 
 echo "== nextest: the version a project names"
-nx_project() { # directory, manifest lines, [.config/nextest.toml]
+nx_project() {
     mkdir -p "$1/src" && git init -q "$1"
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n%s' "$(basename "$1")" "$2" >"$1/Cargo.toml"
     echo '#[test] fn t() {}' >"$1/src/lib.rs"
@@ -431,7 +392,6 @@ out=$("$R" nextest run --no-cache 2>&1); rc=$?
 after=$(kind_runs tests)
 [ $rc -eq 0 ] && [ $((after - before)) -eq 5 ] && has "$out" "Replayed 0 of 5 test runs" && ok "--no-cache runs every test" || bad "--no-cache runs every test" "rc=$rc tests run: $before -> $after
 $out"
-# A test that fails on its first attempt and passes on the second.
 nx_project "$T/nx-flaky" ""
 cat >"$T/nx-flaky/src/lib.rs" <<'EOF'
 #[test]
@@ -452,15 +412,13 @@ $(norm <<<"$stock")"
 
 echo "== nextest: rargo's against stock's, in the same worktree"
 cd "$A"
-# What may differ: timings, run IDs, thread IDs, and the lines of the
-# build (cargo's and rargo's) and rargo's own.
 nnorm() {
     sed -E -e 's/\[ *[0-9.]+s\]/[time]/g' -e 's/run ID [0-9a-f-]+/run ID X/' -e "s/(thread '[^']*') \([0-9]+\)/\1 (N)/g" \
         -e 's/finished in [0-9.]+s/finished in Ns/' |
         grep -vE '^ *(Compiling|Finished|Replayed|Installing|Blocking|Locking|Downloaded|Running|Executable) |^warning: util@'
 }
 jnorm() { sed -E -e 's/ (uuid|timestamp|time)="[^"]*"//g' -e "s/(thread &apos;[^&]*&apos;) \([0-9]+\)/\1 (N)/g" -e 's/finished in [0-9.]+s/finished in Ns/g' "$1"; }
-against_stock() { # description, arguments for `nextest run`...
+against_stock() {
     local d=$1; shift
     stock=$(PATH="$T/nextest-newest:$PATH" cargo nextest run --offline "$@" 2>&1); src=$?
     out=$("$R" nextest run "$@" 2>&1); rc=$?
@@ -480,7 +438,6 @@ against_stock "a partition" --test-threads 1 --partition count:2/2
 cd "$T/nx-flaky"
 against_stock "a flaky test with retries" --test-threads 1 --retries 2
 cd "$A"
-# The JUnit file a profile asks for, with a failure in it.
 mkdir -p .config
 printf '[profile.ci.junit]\npath = "junit.xml"\nstore-success-output = true\n' >.config/nextest.toml
 echo changed >crates/app/tests/fixture.txt
@@ -531,7 +488,6 @@ cd "$A"
 expect "check" "$R" check
 before=$(runs); "$R" check >/dev/null 2>&1; after=$(runs)
 [ "$before" = "$after" ] && ok "check is cached" || bad "check is cached"
-# The server runs clippy, from the build's flake: the client needs none.
 out=$("$R" clippy 2>&1); rc=$?
 [ $rc -eq 0 ] && ok "clippy" || bad "clippy" "$out"
 
@@ -540,7 +496,6 @@ C=$T/c
 mkdir -p "$C"
 cp -r "$A/crates" "$A/Cargo.toml" "$A/Cargo.lock" "$C/"
 printf '/target\n' >"$C/.gitignore"
-# A different crate name makes every action new to the cache.
 sed -i 's/name = "app"/name = "app2"/' "$C/crates/app/Cargo.toml"
 sed -i 's/CARGO_BIN_EXE_app/CARGO_BIN_EXE_app2/' "$C/crates/app/tests/it.rs"
 sed -i 's/from build script/from another build script/' "$C/crates/util/build.rs"
@@ -555,15 +510,9 @@ for p in $pids; do wait "$p" || allok=0; done
 after=$(runs)
 delta=$((after - before))
 [ $allok -eq 1 ] && ok "8 concurrent builds succeeded" || bad "8 concurrent builds succeeded" "$(cat "$C/.build.log")"
-# One build needs 7 actions (plan, mac, util build script x2, util, app, and the plan is shared).
-# One build is 5 new actions: plan, build script compile and run, util, app2.
-# The proc macro is byte-identical to the first workspace's and is a hit.
 [ "$delta" -ge 5 ] && [ "$delta" -le 6 ] && ok "8 identical cold builds ran $delta actions in total (one build's worth)" || bad "8 identical cold builds ran about one build's worth of actions" "delta=$delta"
 
 echo "== the first commands of many linked worktrees at once, in a new daemon"
-# Linked worktrees of one repository share files in the client's cache
-# (the \`.git\` file they are shown); a new daemon writes them as each
-# worktree's first command scans it.
 for i in $(seq 8 23); do git -C "$C" worktree add -q --detach "$T/c$i" HEAD; done
 FC=$T/.rargo-cache-first
 pids=""
@@ -720,7 +669,6 @@ out=$(PATH="$T/shim:$PATH" RARGO_SERVER=127.0.0.1:1 RARGO_FALLBACK=cargo CARGO_T
 [ $rc -eq 0 ] && [ -x "$T/shim-target/debug/app" ] && ok "without a server the shim falls back to the real cargo" || bad "without a server the shim falls back to the real cargo" "$out"
 out=$(RARGO_SERVER=127.0.0.1:1 "$R" build 2>&1); rc=$?
 [ $rc -eq 101 ] && has "$out" "cannot reach the rargo server" && ok "without a server and without the fallback, the error says so" || bad "without a server and without the fallback, the error says so" "$out"
-# That command's daemon (for another server) mounted target/ in its turn.
 echo "after another server" >crates/util/local-note.txt
 out=$("$R" build 2>&1); rc=$?
 ran=$(./target/debug/app 2>&1)
@@ -768,7 +716,6 @@ out=$("$R" build 2>&1); rc=$?
 [ $rc -ne 0 ] && has "$out" "Cargo.toml: [workspace.metadata.rargo]" && ok "an unknown key in the manifest's policy is an error that names the table" || bad "an unknown key in the manifest's policy is an error that names the table" "$out"
 cp "$T/Cargo.toml.before-policy" Cargo.toml
 rm -f crates/app/tests/policy.rs
-# Build scripts: the one the manifest names may use the network, another may not.
 for c in netprobe netprobe2; do
     mkdir -p crates/$c/src
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' $c >crates/$c/Cargo.toml
@@ -790,13 +737,8 @@ out=$("$R" build -p netprobe 2>&1)
 has "$out" "netprobe@0.1.0: build script net=false" && ok "and loses it again when the manifest no longer names it" || bad "and loses it again when the manifest no longer names it" "$out"
 rm -rf crates/netprobe crates/netprobe2
 kill $listener 2>/dev/null
-# What the policy excludes is never uploaded.
-# (Counted before the edit, and the directory made after it is excluded:
-# the daemon may push a change as soon as it is made.)
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\nexclude = ["big-data"]\n' >>Cargo.toml
-# The manifest is on the server, so the directory made next is already
-# excluded and is not uploaded with the edit.
 "$R" --rargo-daemon-sync
 mkdir -p big-data && head -c 1500000 /dev/urandom >big-data/blob
 expect "a build with a directory the manifest excludes" "$R" build
@@ -806,14 +748,9 @@ rm -rf big-data
 expect "without the policy the workspace builds again" "$R" build
 
 echo "== what git ignores, left out (sync.gitignored = false) and taken back (sync.include)"
-# The fixture's util crate reads local-note.txt, which git ignores (the
-# first build shows it is synced by default), and git ignores /junk.
 echo "ignored by git" >crates/util/local-note.txt
-# Counted before the edit, the ignored files changed after it (see above).
 files=$(asked_files)
 printf '\n[workspace.metadata.rargo.sync]\ngitignored = false\n' >>Cargo.toml
-# The manifest is on the server before the ignored files change, so
-# neither the file nor the directory is uploaded with the edit.
 "$R" --rargo-daemon-sync
 echo "changed, and still ignored" >crates/util/local-note.txt
 head -c 1500000 /dev/urandom >junk/blob2
@@ -909,7 +846,6 @@ out=$(cd "$nested/rust/member" && "$R" --rargo-drift-check 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "stock cargo builds" && has "$out" "rargo builds" && ok "the drift check builds the nested package on both sides" || bad "the drift check builds the nested package on both sides" "$out"
 
 echo "== build scripts that ask git about HEAD and history"
-# No build so far asked git for history: none was sent.
 [ ! -e "$RARGO_CACHE_DIR/git-history" ] && ok "builds whose scripts ask git nothing about history send none" || bad "builds whose scripts ask git nothing about history send none" "$(ls "$RARGO_CACHE_DIR/git-history")"
 G=$T/g
 mkdir -p "$G/src"
@@ -942,13 +878,11 @@ gc() { git -C "$G" -c user.name=t -c user.email=t@t "$@"; }
 git -C "$G" init -q -b trunk && git -C "$G" add -A && gc commit -q -m "first commit"
 gc tag -a v0.1.0 -m "first release"
 cd "$G"
-"$R" build >/dev/null 2>&1   # writes Cargo.lock
+"$R" build >/dev/null 2>&1
 git -C "$G" add -A && gc commit -q -m "second commit"
 gc checkout -q -b side HEAD~1 && echo side >side.txt && git -C "$G" add side.txt && gc commit -q -m "side commit" && gc tag side-light
 gc checkout -q trunk && gc merge -q --no-ff -m "merge side" side
 head1=$(git -C "$G" rev-parse HEAD)
-# Stock cargo reruns this build script only when .git/HEAD changes: each
-# of its runs starts from an empty target directory.
 stock() { CARGO_TARGET_DIR=$(mktemp -d "$T/stock-g.XXXXXX") cargo run -q --offline 2>&1; }
 out=$("$R" run -q 2>&1); rc=$?
 want=$(stock)
@@ -977,7 +911,6 @@ out=$("$R" run -q 2>&1)
 [ "$out" = "none|none|none|none|none|none" ] && ok "with sync.git = false the sandbox has no repository" || bad "with sync.git = false the sandbox has no repository" "$out"
 git -C "$G" checkout -q Cargo.toml
 
-# --- reports cargo writes into target/, and clients that go away ------------
 echo "== a directory removed and made again is watched again"
 M=$T/m
 mkdir -p "$M/src" "$M/data"
@@ -986,7 +919,7 @@ printf 'fn main() {\n    println!("{}", include_str!("../data/v.txt").trim());\n
 echo one >"$M/data/v.txt"
 cd "$M"
 out=$("$R" run -q 2>&1); [ "$out" = one ] && ok "built ($out)" || bad "built" "$out"
-"$R" run -q >/dev/null 2>&1   # the directories watched since the first scan are looked at once more
+"$R" run -q >/dev/null 2>&1
 rm -rf "$M/data" && mkdir "$M/data" && echo two >"$M/data/v.txt"
 out=$("$R" run -q 2>&1); [ "$out" = two ] && ok "the new directory's file is seen ($out)" || bad "the new directory's file is seen" "$out"
 "$R" run -q >/dev/null 2>&1
@@ -994,8 +927,6 @@ echo three >"$M/data/v.txt"
 out=$("$R" run -q 2>&1); [ "$out" = three ] && ok "and so is a later change in it ($out)" || bad "and so is a later change in it" "$out"
 
 echo "== more directories than the daemon may watch"
-# A daemon of its own, in a user namespace whose limit is 40 watches (the
-# limit is per user namespace; the machine's own is not touched).
 W=$T/w
 WC=$T/w-cache
 mkdir -p "$W/src"
@@ -1037,8 +968,6 @@ st=$("$R" --rargo-daemon-status 2>&1)
 pushed=$(sed -n 's/^pushed *\([0-9]*\) changes, \([0-9]*\) bytes.*/\2/p' <<<"$st")
 size=$(wc -c <src/main.rs)
 [ -n "$pushed" ] && [ "$pushed" -gt "$size" ] && [ "$pushed" -lt $((size + 2000)) ] && ok "and offers only what changed: $pushed bytes, the edited file and the manifests on its path" || bad "and offers only what changed" "$st"
-# The server lets go of a content the record says it has; the content
-# comes back to the worktree. The server asks for it.
 echo second >note.txt
 out=$("$R" run -q 2>&1); [ "$out" = second ] && ok "built again ($out)" || bad "built again" "$out"
 gc=$("$R" --rargo-gc 2>&1)
@@ -1081,8 +1010,6 @@ page=$H/target/cargo-timings/cargo-timing.html
     && grep -q 'from the cache' "$page" && [ "$(ls "$H/target/cargo-timings" | wc -l)" = 2 ] \
     && ok "--timings writes a report of what ran and what came from the cache" || bad "--timings writes a report of what ran and what came from the cache" "$out
 $(ls -la "$H/target/cargo-timings" 2>&1)"
-# A client that was killed outright left temporaries; the next one that
-# writes there removes them, and nobody else's.
 true & dead=$!; wait $dead
 : >"$H/target/debug/.rargo-tmp-$dead-7-app"
 : >"$H/target/debug/.rargo-tmp-$$-7-app"
@@ -1092,7 +1019,6 @@ printf 'fn main() { println!("{} and again", old::E::B as i32); }\n' >"$H/app/sr
     && ok "temporaries of a killed client are removed by the next one, those of a live process are kept" \
     || bad "temporaries of a killed client are removed by the next one, those of a live process are kept" "$(ls -A "$H/target/debug")"
 rm -f "$H/target/debug/.rargo-tmp-$$-7-app"
-# A client that goes away takes its running actions with it.
 mkdir -p "$H/slowcancel/src"
 printf '[package]\nname = "slowcancel"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$H/slowcancel/Cargo.toml"
 cat >"$H/slowcancel/build.rs" <<'EOF'

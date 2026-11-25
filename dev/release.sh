@@ -1,5 +1,4 @@
 #!/bin/bash
-# Cut and deploy the version on main, or resume the same tagged release.
 set -Eeuo pipefail
 step=setup
 trap 'echo "Release failed during $step. Run dev/release.sh again for this version to resume." >&2' ERR
@@ -31,14 +30,12 @@ else
 fi
 manifest=$(git show "$commit:Cargo.toml" | sed -n 's/^version = "\([^"]*\)"$/\1/p' | head -n 1)
 [ "$manifest" = "$version" ] || die "Cargo.toml at $commit is at $manifest"
-notes=$(git show "$commit:CHANGELOG.md" | awk -v v="$version" '$0 == "## " v {on=1; next} /^## / {on=0} on && NF')
-[ -n "$notes" ] || die "CHANGELOG.md has no notes for $version"
+prev=$(git describe --tags --abbrev=0 "$commit^" 2>/dev/null || true)
+notes=$(git log --format=%s "${prev:+$prev..}$commit")
 issues=$(printf '%s\n' "$notes" | { grep -oE '#[0-9]+' || true; } | cut -c2- | sort -un)
 
 if [ -z "$remote_tag" ]; then
     step='running the build-machine gate'
-    # The suites run their own servers: a token or server meant for the
-    # service check below would reach their clients.
     env -u RARGO_TOKEN -u RARGO_SERVER dev/gate.sh
     step='checking the gate status'
     dev/release-gate.sh "$commit"
@@ -48,8 +45,6 @@ if [ -z "$remote_tag" ]; then
     else
         git tag -a "$tag" "$commit" -m "rargo $version"
     fi
-    # Repeating a push of the same tag is safe even if GitHub accepted
-    # the first request before returning an error.
     for attempt in 1 2 3; do
         if git push origin "refs/tags/$tag"; then
             break

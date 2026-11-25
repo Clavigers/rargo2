@@ -1,6 +1,3 @@
-//! Measures the transport over a real (or shaped) link.
-//!   linkperf serve ADDR            echoes nothing, counts what arrives
-//!   linkperf send ADDR MIB         sends MIB mebibytes, then asks for them back
 use rargo_net::{Auth, Endpoint};
 use std::time::Instant;
 
@@ -25,7 +22,6 @@ fn main() {
                         }
                     });
                     tokio::spawn(async move {
-                        // Whatever arrives is counted; a message of 8 bytes asks for that many mebibytes back.
                         while let Some(m) = c.recv().await {
                             if m.len() == 8 {
                                 let n = u64::from_le_bytes(m[..].try_into().unwrap());

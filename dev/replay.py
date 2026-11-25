@@ -1,21 +1,8 @@
 #!/usr/bin/env python3
-"""Replays a repository's recent history through rargo, one commit at a time.
-
-For each of the last N first-parent commits (oldest first) the worktree is
-moved to the commit and one cargo command is run. Reported per commit: wall
-time, actions run and their CPU time. The first commit is the cold build;
-the rest show what a real change costs to rebuild.
-
-Used to compare compilers under rargo (stock rustc against rargo's fork,
-whose crate hash survives edits that do not change what dependents can
-see): same daemon options, same history, different RUSTUP_TOOLCHAIN.
-
-  dev/replay.py --repo ra --commits 30 --toolchain rargo -- build -p rust-analyzer
-"""
 import argparse, json, os, re, subprocess, sys, time
 
 WORK = os.environ.get("RARGO_WORK", "/root/rargo-work")
-# Set by --netns: the command that puts the client into its network namespace.
+
 PREFIX = []
 
 
@@ -96,8 +83,6 @@ def main():
     if a.out:
         with open(a.out, "a") as f:
             f.write(json.dumps(summary) + "\n")
-    # The client daemon's output directory is unmounted before the
-    # worktree goes.
     if not a.stock:
         subprocess.run([*PREFIX, a.rargo, "--rargo-daemon-stop"], env=env, capture_output=True)
         time.sleep(1)

@@ -1,5 +1,4 @@
 #!/bin/bash
-# Run the suites on the checked-out commit and publish their results.
 set -euo pipefail
 gate_started=$(date +%s)
 work=${RARGO_WORK:-/root/rargo-work}
@@ -49,13 +48,9 @@ step() {
     fi
     report "$name" "$status" "${description:-$status}"
 }
-# Every suite's files are under this gate's directory (the mount tests'
-# scratch area too), so that two gates with different gate directories
-# share nothing.
 mkdir -p "$L/work/tmp"
 export RARGO_TEST_TMP=${RARGO_TEST_TMP:-$L/work/tmp}
 export RARGO_E2E_ROOT=${RARGO_E2E_ROOT:-$L/work/tmp}
-# Use the repository's build server.
 unset CARGO_TARGET_DIR
 step build rargo build --release --locked
 step unit rargo test --release --locked --workspace --lib --bins
@@ -67,12 +62,8 @@ if [ "$passed" -ne 3 ]; then
 fi
 B=$L/bin
 mkdir -p "$B"
-# The copy replaces these files, which it can do only when nothing still
-# has them mapped. A suite's daemon exits on SIGTERM. The process that
-# unmounts its mount ignores that signal and exits once the daemon is gone.
 release_binaries() {
     local pid comm
-    # Processes whose executable is one of the binaries about to be replaced.
     bin_pids() {
         local p e out=""
         for p in /proc/[0-9]*; do
@@ -86,8 +77,6 @@ release_binaries() {
         done
         printf '%s\n' "$out"
     }
-    # A daemon exits on SIGTERM. The guard ignores that signal and exits
-    # once the daemon is gone, which is what takes the mount with it.
     for pid in $(bin_pids); do
         comm=$(cat "/proc/$pid/comm" 2>/dev/null || true)
         [ "$comm" = unmount-guard ] && continue
@@ -112,20 +101,10 @@ release_binaries() {
 release_binaries
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
-# The suites that follow run at the same time. Each rargod they start
-# through dev/rargod.sh stays inside a share of the machine, so the
-# service beside them keeps the headroom CLAUDE.md asks for. A rig's own
-# caps are set in dev/netns.sh from the cores that rig is given.
 export RARGO_CPU_QUOTA=${RARGO_CPU_QUOTA:-800%}
 export RARGO_MEMORY_MAX=${RARGO_MEMORY_MAX:-20G}
-# One rig name for this gate. Suites that use a rig append their own
-# suffix, so each has namespaces and state of its own and a benchmark's
-# rig is left alone.
 export RIG=${RIG:-g$(printf '%s' "$L" | sha256sum | cut -c1-6)} RIG_STATE=${RIG_STATE:-$L/work/rig}
-# Each suite's directory is under this gate's directory, and the suites
-# that listen on fixed ports get free ones. What the environment already
-# names stays.
-free_pair() { # a port P such that P and P + 1 are free on loopback
+free_pair() {
     python3 -I -c '
 import socket
 for _ in range(200):
@@ -145,13 +124,8 @@ export RARGO_E2E_AUTH=${RARGO_E2E_AUTH:-$L/work/e2e-auth}
 export E2E_AUTH_PORT=${E2E_AUTH_PORT:-$(free_pair)}
 export RARGO_E2E_LINK=${RARGO_E2E_LINK:-$L/work/e2e-link}
 export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
-# The toolchains e2e-components installs components into: kept between
-# runs of this gate.
 export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
-# mktemp needs the parent of each suite's directory to exist already.
 mkdir -p "$L/work/e2e" "$L/work/e2e-copy" "$L/work/e2e-components"
-# Directories, rigs and ports are already per suite. They run together;
-# the gate's time is the slowest of them, plus the build above.
 declare -A suite_pid
 launch() {
     local name=$1
@@ -194,7 +168,6 @@ fi
 result="$passed of ${#suites[@]} gate steps passed"
 elapsed=$(( $(date +%s) - gate_started ))
 echo "gate ${elapsed}s: $result"
-# The time ratchet (dev/gate-budget): a gate that got slower fails.
 if [ "$passed" -eq "${#suites[@]}" ] && ! dev/gate-budget.sh check "$elapsed" "$L" e2e e2e-copy e2e-flake e2e-auth e2e-components e2e-link e2e-worker; then
     report all failure "gate ${elapsed}s is over the budget in dev/gate-budget"
     exit 1

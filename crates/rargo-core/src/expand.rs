@@ -1,11 +1,3 @@
-//! Substituting real build-script results for the placeholder tokens in a
-//! planned command (see `rargo_plan::token`).
-//!
-//! The planner ran cargo's own code against token-valued build-script
-//! output, so each token sits exactly where cargo would have put the real
-//! values. Expansion therefore only has to know, per token kind, how one
-//! placeholder turns into zero or more real arguments or variables.
-
 use anyhow::{Result, bail};
 use rargo_plan::{BuildOutput, Cmd, LinkArgKind, LinkArgTarget, token};
 use std::collections::{BTreeSet, HashMap};
@@ -36,7 +28,6 @@ enum LinkArgSel {
 
 const META_LEN: usize = 16;
 
-/// Finds the first token in `s`. Returns its byte range and meaning.
 fn find_token(s: &str) -> Option<(std::ops::Range<usize>, Tok<'_>)> {
     if let Some(pos) = s.find(token::NATIVE_DIRS) {
         return Some((pos..pos + token::NATIVE_DIRS.len(), Tok::NativeDirs));
@@ -73,7 +64,6 @@ fn find_token(s: &str) -> Option<(std::ops::Range<usize>, Tok<'_>)> {
     if let Some(after) = rest.strip_prefix("LA_") {
         if after.starts_with("SB_") {
             let (m, end) = meta_at("LA_SB_".len())?;
-            // The binary name follows the token to the end of the string.
             return Some((pos..s.len(), Tok::LinkArg(m, LinkArgSel::Bin(s[end..].to_string()))));
         }
         for (tag, kind) in [
@@ -94,7 +84,6 @@ fn find_token(s: &str) -> Option<(std::ops::Range<usize>, Tok<'_>)> {
 }
 
 fn script<'a>(scripts: &'a Scripts, meta: &str) -> Result<&'a BuildOutput> {
-    // Metadata tokens pass through cargo's `envify`, which upper-cases.
     let lower = meta.to_ascii_lowercase();
     match scripts.get(&lower) {
         Some(o) => Ok(o),
@@ -102,12 +91,10 @@ fn script<'a>(scripts: &'a Scripts, meta: &str) -> Result<&'a BuildOutput> {
     }
 }
 
-/// cargo's `envify`.
 pub fn envify(s: &str) -> String {
     s.chars().flat_map(|c| c.to_uppercase()).map(|c| if c == '-' { '_' } else { c }).collect()
 }
 
-/// cargo's `get_dynamic_search_path`: strips a `KIND=` prefix.
 fn dyn_path(p: &str) -> &str {
     match p.split_once('=') {
         Some(("native" | "crate" | "dependency" | "framework" | "all", rest)) => rest,
@@ -115,8 +102,6 @@ fn dyn_path(p: &str) -> &str {
     }
 }
 
-/// Every link-search path of every script, in cargo's `BTreeSet<PathBuf>`
-/// order.
 fn native_dirs(scripts: &Scripts) -> Vec<String> {
     let set: BTreeSet<PathBuf> =
         scripts.values().flat_map(|o| o.library_paths.iter().map(|(_, p)| PathBuf::from(p))).collect();
@@ -131,16 +116,12 @@ fn link_arg_matches(t: &LinkArgTarget, sels: &[LinkArgSel]) -> bool {
     })
 }
 
-/// Whether script-provided environment may replace an existing variable.
-/// In rustc invocations cargo applies script variables last; in processes it
-/// runs for the user (tests, `cargo run`) cargo's own `CARGO_*` come after.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnvRule {
     ScriptWins,
     CargoVarsWin,
 }
 
-/// Expands every token in `cmd`.
 pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> Result<Cmd> {
     let mut args: Vec<String> = Vec::with_capacity(cmd.args.len());
     let mut i = 0;
@@ -151,8 +132,6 @@ pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> R
             i += 1;
             continue;
         };
-        // Tokens that stand for a whole argument take their flag with them:
-        // `--cfg TOKEN` becomes `--cfg a --cfg b` or nothing at all.
         let flagged = |values: Vec<String>, args: &mut Vec<String>| -> Result<()> {
             let Some(flag) = args.pop() else { bail!("internal error: token `{arg}` without a flag") };
             for v in values {
@@ -178,7 +157,6 @@ pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> R
                 if !arg.starts_with("link-arg=") {
                     bail!("internal error: unexpected link-arg token position in `{arg}`");
                 }
-                // Gather the run of `-C link-arg=TOKEN` pairs for this script.
                 assert!(range.start >= "link-arg=".len());
                 let mut sels = vec![first];
                 let mut j = i + 1;
@@ -245,8 +223,6 @@ pub fn expand(cmd: &Cmd, scripts: &Scripts, dylib_var: &str, rule: EnvRule) -> R
 
     assert!(env.len() >= cmd.env.iter().filter(|(k, _)| find_token(k).is_none()).count());
     let out = Cmd { program: cmd.program.clone(), args, env, cwd: cmd.cwd.clone() };
-    // Anything left over is a token form this code does not know; failing
-    // here is far better than passing a placeholder to a compiler.
     let leftover = out.args.iter().chain(out.env.iter().map(|(k, _)| k)).any(|s| s.contains(token::PREFIX))
         || out.env.iter().any(|(_, v)| v.as_deref().is_some_and(|v| v.contains(token::PREFIX)))
         || out.program.contains(token::PREFIX);
@@ -367,7 +343,6 @@ mod tests {
 
     #[test]
     fn library_paths_keep_cargo_order() {
-        // cargo emits all artifact-type paths, then all external ones.
         let a1 = format!("/w/target/debug/build/a/out/{}", t(token::LIBPATH_ARTIFACT, M1));
         let a2 = format!("/w/target/debug/build/b/out/{}", t(token::LIBPATH_ARTIFACT, M2));
         let c = cmd(
@@ -413,7 +388,6 @@ mod tests {
                 "link-arg=-Wl,--last", "-C", "opt-level=3"
             ]
         );
-        // A different binary's token selects nothing extra.
         let c = cmd(&["-C", &format!("link-arg={}", token::link_arg_bin(M1, "other")), "-g"], &[]);
         let e = expand(&c, &scripts(), "LD_LIBRARY_PATH", EnvRule::ScriptWins).unwrap();
         assert_eq!(e.args, ["-g"]);
@@ -438,8 +412,6 @@ mod tests {
         assert_eq!(get("DEP_Z_INCLUDE").as_deref(), Some("/inc"));
         assert_eq!(get("DEP_Z_ROOT_DIR").as_deref(), Some("/r"));
         assert_eq!(get("CARGO_PKG_NAME").as_deref(), Some("evil"));
-        // Script order for one script, then the sorted set of all; only
-        // paths under the target root survive, without their kind prefix.
         assert_eq!(
             get("LD_LIBRARY_PATH").as_deref(),
             Some(
@@ -447,7 +419,6 @@ mod tests {
                  /w/target/debug/build/b/out/lib:/w/target/debug/shared:/w/target/debug/build/a/out:/sysroot/lib"
             )
         );
-        // `-L` for doctests lists every path, unfiltered and sorted.
         assert_eq!(
             e.args,
             [
@@ -461,7 +432,6 @@ mod tests {
                 "native=/w/target/debug/build/a/out"
             ]
         );
-        // For processes cargo runs for the user, its own variables win.
         let e = expand(&c, &s, "LD_LIBRARY_PATH", EnvRule::CargoVarsWin).unwrap();
         let get = |k: &str| e.env.iter().find(|(n, _)| n == k).and_then(|(_, v)| v.clone());
         assert_eq!(get("CARGO_PKG_NAME").as_deref(), Some("real"));

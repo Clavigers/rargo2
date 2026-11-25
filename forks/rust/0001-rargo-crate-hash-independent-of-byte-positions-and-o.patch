@@ -1,49 +1,36 @@
-From a13cdc2b022065021a3185f6367de74186fcbc0f Mon Sep 17 00:00:00 2001
+From 5394ad4899d2f900edf9ee7a58c4e2058662eddf Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:20:18 +0100
 Subject: [PATCH 1/5] rargo: crate hash independent of byte positions and of
  private bodies
 
-The crate hash (SVH) is derived from the encoded metadata. Three things made
-it change on edits no dependent can observe:
-
-- Span byte offsets were part of the hashed bytes. They are now written with
-  a fixed width and left out of the hash; what a dependent can observe of a
-  span (file, line and column of both ends) is hashed instead.
-- The source-file tables (content hash, line table) were hashed. They are now
-  encoded last and left out; the identities of the files are hashed.
-- The hash of the whole HIR was folded in. Only items that leave no trace in
-  the metadata (global assembly) are folded in now.
-
-The metadata header's seventh byte is 1 to mark the format.
 ---
- compiler/rustc_metadata/src/rmeta/decoder.rs |   5 +-
- compiler/rustc_metadata/src/rmeta/encoder.rs | 145 +++++++++++++++++--
- compiler/rustc_metadata/src/rmeta/mod.rs     |   7 +-
- compiler/rustc_span/src/lib.rs               |   5 +
- 4 files changed, 142 insertions(+), 20 deletions(-)
+ compiler/rustc_metadata/src/rmeta/decoder.rs |   4 +-
+ compiler/rustc_metadata/src/rmeta/encoder.rs | 115 ++++++++++++++++---
+ compiler/rustc_metadata/src/rmeta/mod.rs     |   4 +-
+ compiler/rustc_span/src/lib.rs               |   4 +
+ 4 files changed, 107 insertions(+), 20 deletions(-)
 
 diff --git a/compiler/rustc_metadata/src/rmeta/decoder.rs b/compiler/rustc_metadata/src/rmeta/decoder.rs
-index 27b36c23d..70a1e2d8e 100644
+index 27b36c2..3c03a57 100644
 --- a/compiler/rustc_metadata/src/rmeta/decoder.rs
 +++ b/compiler/rustc_metadata/src/rmeta/decoder.rs
-@@ -564,8 +564,9 @@ fn decode(decoder: &mut MetadataDecodeContext<'a, 'tcx>) -> SpanData {
+@@ -564,8 +564,8 @@ impl<'a, 'tcx> Decodable<MetadataDecodeContext<'a, 'tcx>> for SpanData {
  
          debug_assert!(tag.kind() == SpanKind::Local || tag.kind() == SpanKind::Foreign);
  
 -        let lo = BytePos::decode(decoder);
 -        let len = tag.length().unwrap_or_else(|| BytePos::decode(decoder));
-+        // rargo: offset and length are fixed-width (see `SpanData::encode`).
 +        let lo = BytePos(u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap()));
 +        let len = BytePos(u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap()));
          let hi = lo + len;
  
          let tcx = decoder.tcx;
 diff --git a/compiler/rustc_metadata/src/rmeta/encoder.rs b/compiler/rustc_metadata/src/rmeta/encoder.rs
-index afa5646be..ecf11cd00 100644
+index afa5646..8cc6a20 100644
 --- a/compiler/rustc_metadata/src/rmeta/encoder.rs
 +++ b/compiler/rustc_metadata/src/rmeta/encoder.rs
-@@ -23,7 +23,6 @@
+@@ -23,7 +23,6 @@ use rustc_hir::definitions::DefPathData;
  use rustc_hir_pretty::id_to_string;
  use rustc_index::IndexVec;
  use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
@@ -51,22 +38,13 @@ index afa5646be..ecf11cd00 100644
  use rustc_middle::middle::dependency_format::Linkage;
  use rustc_middle::mir::interpret;
  use rustc_middle::query::Providers;
-@@ -49,9 +48,27 @@
+@@ -49,9 +48,17 @@ use crate::diagnostics::{FailCreateFileEncoder, FailWriteFile};
  use crate::eii::EiiMapEncodedKeyValue;
  use crate::rmeta::*;
  
-+/// rargo: byte ranges of the metadata file that do not take part in the crate hash.
-+///
-+/// Byte positions of spans and the source-file tables that turn positions into lines change
-+/// whenever any earlier line of a source file changes length, even though nothing a dependent
-+/// crate can observe (line and column numbers) has changed. Those bytes are still written, so a
-+/// dependent decodes correct spans, but they are left out of the hash; what they mean (file,
-+/// line, column) is hashed separately in `span_hasher`.
 +#[derive(Default)]
 +struct HashSkips {
-+    /// Number of bytes handed to the flush hook so far.
 +    flushed: usize,
-+    /// Ranges `[start, end)` in file offsets, in increasing order.
 +    ranges: std::collections::VecDeque<(usize, usize)>,
 +}
 +
@@ -74,12 +52,11 @@ index afa5646be..ecf11cd00 100644
      opaque: FileEncoder<'a>,
      metadata_hasher: Arc<Mutex<XxHash3_128>>,
 +    hash_skips: Arc<Mutex<HashSkips>>,
-+    /// Digest of the position-independent meaning of every encoded span.
 +    span_hasher: XxHash3_128,
      tcx: TyCtxt<'tcx>,
      feat: &'tcx rustc_feature::Features,
      tables: TableBuilders,
-@@ -343,22 +360,43 @@ fn encode(&self, s: &mut EncodeContext<'a, 'tcx>) {
+@@ -343,22 +350,38 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for SpanData {
              (SpanKind::Local, metadata_index)
          };
  
@@ -92,8 +69,6 @@ index afa5646be..ecf11cd00 100644
          let len = self.hi - self.lo;
  
 -        let tag = SpanTag::new(kind, ctxt, len.0 as usize);
-+        // rargo: what a dependent crate can observe of this span is its file, lines and
-+        // columns. That goes into the crate hash; the byte offsets below do not.
 +        let (line_col_lo, line_col_hi) = {
 +            let line_col = |pos: rustc_span::BytePos| {
 +                let rel = source_file.relative_position(pos);
@@ -106,9 +81,6 @@ index afa5646be..ecf11cd00 100644
 +        };
 +        let stable_file_id = source_file.stable_id;
 +
-+        // The tag never carries the length inline, and offset and length are fixed-width, so
-+        // that a span whose byte position changed occupies exactly the same bytes as before
-+        // and nothing after it moves.
 +        let tag = SpanTag::new(kind, ctxt, usize::MAX);
          tag.encode(s);
          if tag.context().is_none() {
@@ -132,12 +104,11 @@ index afa5646be..ecf11cd00 100644
          }
  
          // Encode the index of the `SourceFile` for the span, in order to make decoding faster.
-@@ -380,6 +418,15 @@ fn encode(&self, e: &mut EncodeContext<'a, 'tcx>) {
+@@ -380,6 +403,14 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for [u8] {
      }
  }
  
 +impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
-+    /// rargo: excludes the file bytes `[start, end)` from the crate hash.
 +    fn skip_in_hash(&mut self, start: usize, end: usize) {
 +        if start < end {
 +            self.hash_skips.lock().unwrap().ranges.push_back((start, end));
@@ -148,15 +119,11 @@ index afa5646be..ecf11cd00 100644
  impl<'a, 'tcx> TyEncoder<'tcx> for EncodeContext<'a, 'tcx> {
      const CLEAR_CROSS_CRATE: bool = true;
  
-@@ -731,11 +778,30 @@ macro_rules! stat {
+@@ -731,11 +762,26 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
  
          // Encode source_map. This needs to be done last, because encoding `Span`s tells us which
          // `SourceFiles` we actually need to encode.
 -        let source_map = stat!("source-map", || self.encode_source_map());
-+        // rargo: the source-file tables (content hashes, line tables) are not part of the
-+        // crate hash; the identities of the files are. They are encoded after everything else
-+        // that is hashed (the two small tables below used to follow them), so that their size
-+        // does not move anything the hash covers.
          let target_modifiers = stat!("target-modifiers", || self.encode_target_modifiers());
          let denied_partial_mitigations = stat!("denied-partial-mitigations", || self
              .encode_enabled_denied_partial_mitigations());
@@ -180,27 +147,20 @@ index afa5646be..ecf11cd00 100644
          let root = stat!("crate-root", || {
              let attrs = tcx.hir_krate_attrs();
              self.lazy(CrateRoot {
-@@ -802,6 +868,9 @@ macro_rules! stat {
+@@ -802,6 +848,8 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
          // `crate_hash` query computes directly without consulting `local_crate_hash`.
          let hash = if tcx.sess.opts.unstable_opts.metadata_crate_hash {
              self.opaque.flush();
-+            // rargo: fold in what the spans mean (see `HashSkips`).
 +            let spans = self.span_hasher.finish_128().to_le_bytes();
 +            self.metadata_hasher.lock().unwrap().write(&spans);
              Svh::new(Fingerprint::from_le_bytes(
                  self.metadata_hasher.lock().unwrap().finish_128().to_le_bytes(),
              ))
-@@ -2635,22 +2704,64 @@ fn with_encode_metadata_header(
+@@ -2635,22 +2683,55 @@ fn with_encode_metadata_header(
      if metadata_crate_hash {
          // Fold in inputs that are not part of the encoded metadata bytes, reduced to a single
          // fingerprint via the stable hasher and then mixed into the byte digest.
 -        let hir_body_hash = compute_hir_hash(tcx);
-+        //
-+        // rargo: upstream folds in the hash of the whole HIR here, bodies included, which makes
-+        // the crate hash change on every edit and defeats the point of deriving it from the
-+        // metadata. Everything a dependent can learn about this crate it learns from the
-+        // metadata; the HIR hash was there for items that leave no trace in it, of which
-+        // global assembly is the one that exists. Only those items are folded in.
 +        let global_asm_hash = tcx
 +            .hir_crate_items(())
 +            .owners()
@@ -221,8 +181,6 @@ index afa5646be..ecf11cd00 100644
      }
  
 -    // Feed every flushed byte into `metadata_hasher` so the SVH covers the entire encoded metadata.
-+    // Feed every flushed byte into `metadata_hasher` so the SVH covers the encoded metadata,
-+    // except for the ranges registered in `hash_skips` (rargo: byte positions; see `HashSkips`).
 +    let hash_skips: Arc<Mutex<HashSkips>> = Arc::default();
      let mut flush_strategy = {
          let metadata_hasher = Arc::clone(&metadata_hasher);
@@ -244,7 +202,6 @@ index afa5646be..ecf11cd00 100644
 +                            skips.ranges.pop_front();
 +                            off = off.max(b);
 +                        } else {
-+                            // The range continues in a later flush.
 +                            skips.ranges.front_mut().unwrap().0 = end;
 +                            off = end;
 +                        }
@@ -260,7 +217,7 @@ index afa5646be..ecf11cd00 100644
      };
  
      let mut encoder = if metadata_crate_hash {
-@@ -2678,6 +2789,8 @@ fn with_encode_metadata_header(
+@@ -2678,6 +2759,8 @@ fn with_encode_metadata_header(
      let mut ecx = EncodeContext {
          opaque: encoder,
          metadata_hasher: Arc::clone(&metadata_hasher),
@@ -270,41 +227,37 @@ index afa5646be..ecf11cd00 100644
          feat: tcx.features(),
          tables: Default::default(),
 diff --git a/compiler/rustc_metadata/src/rmeta/mod.rs b/compiler/rustc_metadata/src/rmeta/mod.rs
-index e3f3257ac..e2f896fe2 100644
+index e3f3257..9cc0e7d 100644
 --- a/compiler/rustc_metadata/src/rmeta/mod.rs
 +++ b/compiler/rustc_metadata/src/rmeta/mod.rs
-@@ -70,7 +70,9 @@ pub(crate) fn rustc_version(cfg_version: &'static str) -> String {
+@@ -70,7 +70,7 @@ const METADATA_VERSION: u8 = 11;
  /// which represent the hashed and unhashed metadata contents respectively, the
  /// crate hash (SVH), and the rustc version string. See the offset constants
  /// below for the exact layout.
 -pub const METADATA_HEADER: &[u8] = &[b'r', b'u', b's', b't', 0, 0, 0, METADATA_VERSION];
-+// rargo: the seventh byte is 1 (upstream: 0) to mark metadata whose crate hash is independent
-+// of byte positions; see `SpanData::encode` in `encoder.rs`.
 +pub const METADATA_HEADER: &[u8] = &[b'r', b'u', b's', b't', 0, 0, 1, METADATA_VERSION];
  
  /// Fixed-size fields encoded immediately after `METADATA_HEADER`, in order:
  /// `CrateRoot` position (u64), `CrateRootUnhashed` position (u64), crate hash
-@@ -305,9 +307,10 @@ pub(crate) struct CrateRoot {
+@@ -305,9 +305,9 @@ pub(crate) struct CrateRoot {
  
      def_path_hash_map: LazyValue<DefPathHashMapRef<'static>>,
  
 -    source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>,
      target_modifiers: LazyArray<TargetModifier>,
      denied_partial_mitigations: LazyArray<DeniedPartialMitigation>,
-+    // rargo: encoded last of the lazily referenced data; see `encode_crate_root`.
 +    source_map: LazyTable<u32, Option<LazyValue<rustc_span::SourceFile>>>,
  
      compiler_builtins: bool,
      needs_allocator: bool,
 diff --git a/compiler/rustc_span/src/lib.rs b/compiler/rustc_span/src/lib.rs
-index 20950c1a5..e8118eba0 100644
+index 20950c1..5f423a1 100644
 --- a/compiler/rustc_span/src/lib.rs
 +++ b/compiler/rustc_span/src/lib.rs
-@@ -2135,6 +2135,11 @@ fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+@@ -2135,6 +2135,10 @@ impl fmt::Debug for SourceFile {
  pub struct StableSourceFileId(Hash128);
  
  impl StableSourceFileId {
-+    /// rargo: the id as bytes, for hashing outside the stable-hashing machinery.
 +    pub fn to_le_bytes(self) -> [u8; 16] {
 +        self.0.as_u128().to_le_bytes()
 +    }

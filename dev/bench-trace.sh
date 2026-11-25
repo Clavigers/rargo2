@@ -1,22 +1,4 @@
 #!/bin/bash
-# What does running every compiler in a traced sandbox cost?
-#
-#   dev/bench-trace.sh [REPO] [COMMAND...]        (default: ra, check)
-#
-# The same cold command twice, both capped at 24 cores: stock cargo on the
-# files directly, and rargo (fresh server and store, client on this machine
-# so that no link is involved). For rargo the CPU time is split by where it
-# was spent:
-#   actions, user     the compilers computing (stock cargo's user time is the
-#                     reference)
-#   actions, system   the compilers in the kernel; what exceeds stock cargo's
-#                     system time is the kernel's side of the sandbox file
-#                     system (FUSE round trips, namespace setup)
-#   server, fuse      rargod's threads that answer the sandbox file system:
-#                     the server's side of tracing
-#   server, other     everything else in rargod: planning, hashing and
-#                     storing outputs, scheduling, talking to the client
-# One JSON line per run goes to $RARGO_WORK/bench/trace.jsonl.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -36,7 +18,6 @@ fresh_wt() {
     git -C "$base" worktree add -q --detach "$wt" HEAD
 }
 
-# --- stock cargo -----------------------------------------------------------
 fresh_wt
 cd "$wt" || exit 2
 cargo fetch -q >/dev/null 2>&1
@@ -48,7 +29,6 @@ stock_wall=$(echo "$(date +%s.%N) - $t0" | bc)
 read stock_user stock_sys <"$work/bench/trace-stock.time"
 cd /
 
-# --- rargo -----------------------------------------------------------------
 export RARGO_STATE=$work/state-trace
 export RARGO_BIN=${RARGO_BIN:-$repo/target/release}
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
@@ -61,7 +41,6 @@ rm -rf "$RARGO_STATE" "$RARGO_CACHE_DIR"
 fresh_wt
 "$repo/dev/rargod.sh" start >/dev/null || { cat "$RARGO_STATE/rargod.log"; exit 1; }
 pid=$(pgrep -f "rargod --state $RARGO_STATE " | head -1)
-# The scope the server and its actions run in.
 cg=/sys/fs/cgroup$(sed -n 's/^0:://p' "/proc/$pid/cgroup")
 while [ "${cg%.scope}" = "$cg" ] && [ "$cg" != /sys/fs/cgroup ]; do cg=$(dirname "$cg"); done
 cd "$wt" || exit 2
@@ -70,15 +49,12 @@ t0=$(date +%s.%N)
 rargo_rc=$?
 rargo_wall=$(echo "$(date +%s.%N) - $t0" | bc)
 cd /
-# Per-thread CPU of the server, by thread name.
 threads=$(for t in /proc/$pid/task/*; do
     comm=$(cat "$t/comm" 2>/dev/null) || continue
-    # Fields 14 and 15 of stat, counted after the closing parenthesis.
     read -r ut st < <(sed 's/^.*) //' "$t/stat" 2>/dev/null | awk '{print $12, $13}')
     echo "$comm ${ut:-0} ${st:-0}"
 done)
 fuse=$(awk -v t="$tick" '$1 ~ /^fuse-/ {s += $2 + $3} END {printf "%.2f", s / t}' <<<"$threads")
-# The whole process, threads that have exited included.
 read -r put pst < <(sed 's/^.*) //' "/proc/$pid/stat" | awk '{print $12, $13}')
 server_user=$(awk -v t="$tick" -v v="$put" 'BEGIN {printf "%.2f", v / t}')
 server_sys=$(awk -v t="$tick" -v v="$pst" 'BEGIN {printf "%.2f", v / t}')

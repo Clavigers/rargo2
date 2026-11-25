@@ -1,25 +1,3 @@
-//! Shared incremental compilation state.
-//!
-//! rustc validates every piece of an incremental session directory against
-//! the current source before reusing it, so any state is a safe starting
-//! point for any source; a closer one is just faster. After a compile, the
-//! crate's incremental directory is stored as an immutable manifest. Before
-//! the next compile of that crate, anywhere, the best available state is
-//! shown to rustc as a private copy-on-write layer.
-//!
-//! "Best": the state made nearest to the worktree's HEAD. That is the
-//! worktree's own last state if it was made at HEAD or nearer to it than
-//! anyone else's (an agent editing where it stands); otherwise the state
-//! another worktree made at the nearest ancestor (an agent that has just
-//! arrived at a commit finds what was built one commit earlier, not what
-//! it built itself ten commits ago); else the newest state of all.
-//!
-//! A state made by a compile on a worker is recorded at once, while its
-//! files are still on the worker: they come home in the background, or
-//! when a compile here needs them, and a later compile on that worker uses
-//! them where they are. Such a state is usable for as long as every file
-//! is either here or held by a connected worker.
-
 use crate::db::{Db, Table};
 use crate::hash::Hash;
 use crate::store::Store;
@@ -32,18 +10,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateMeta {
-    /// Blob holding the encoded [`Manifest`] of the incremental directory.
     pub manifest: Hash,
     pub worktree: String,
-    /// HEAD commit of the worktree when the state was made, if any.
     pub commit: Option<[u8; 20]>,
     pub created: u64,
     pub bytes: u64,
 }
 
-/// How many states to keep per crate besides the newest of each worktree.
 const KEEP_EXTRA: usize = 2;
-/// Worktrees whose latest state is kept, per crate.
 const KEEP_WORKTREES: usize = 32;
 const _: () = assert!(KEEP_WORKTREES > 0);
 
@@ -61,19 +35,15 @@ pub struct IncrStore {
     db: Arc<Db>,
     store: Arc<Store>,
     next: AtomicU64,
-    /// Whether a blob that is not in the store can be had from elsewhere
-    /// (a connected worker holds it).
     held: std::sync::OnceLock<Box<dyn Fn(&Hash) -> bool + Send + Sync>>,
     pub stats: IncrStats,
 }
 
-/// A state chosen as the starting point of a compile.
 #[derive(Clone)]
 pub struct Seed {
     pub id: u64,
     pub manifest: Arc<Manifest>,
     pub kind: SeedKind,
-    /// Every file of the state, by content and size.
     pub blobs: Arc<Vec<(Hash, u64)>>,
 }
 
@@ -88,7 +58,6 @@ fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Which state was chosen, for statistics and tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeedKind {
     SameWorktree,
@@ -111,8 +80,6 @@ impl IncrStore {
         }
     }
 
-    /// Says how to tell whether a blob that is not here is held by a
-    /// connected worker.
     pub fn set_held(&self, f: Box<dyn Fn(&Hash) -> bool + Send + Sync>) {
         let _ = self.held.set(f);
     }
@@ -127,7 +94,6 @@ impl IncrStore {
                 Some((id, bincode::deserialize(&val).ok()?))
             })
             .collect();
-        // Newest first.
         v.sort_by(|a, b| b.0.cmp(&a.0));
         assert!(v.windows(2).all(|w| w[0].0 > w[1].0), "state ids are unique");
         v
@@ -136,8 +102,6 @@ impl IncrStore {
     fn load(&self, meta: &StateMeta) -> Option<(Arc<Manifest>, Arc<Vec<(Hash, u64)>>)> {
         let raw = self.store.read(&meta.manifest).ok()?;
         let m: Manifest = bincode::deserialize(&raw).ok()?;
-        // Every file must still be there, or with a worker; states are
-        // evicted freely.
         let mut blobs: Vec<(Hash, u64)> = Vec::new();
         for (_, e) in &m.entries {
             if let MEntry::File { hash, size, .. } = e {
@@ -156,9 +120,6 @@ impl IncrStore {
         Some((Arc::new(m), Arc::new(blobs)))
     }
 
-    /// Picks a seed for `crate_key`. `distance(c)` says how many commits
-    /// back from the requesting worktree's HEAD commit `c` is (0 for HEAD
-    /// itself), or `None` if it is not HEAD or one of its recent ancestors.
     pub fn pick(
         &self,
         crate_key: &Hash,
@@ -172,13 +133,9 @@ impl IncrStore {
             .filter(|(_, m)| m.worktree != worktree)
             .filter_map(|s| s.1.commit.as_ref().and_then(distance).map(|d| (d, s)))
             .collect();
-        // Nearest first; among equals the newest (the list is newest first).
         near.sort_by_key(|(d, _)| *d);
         assert!(own.iter().all(|(_, m)| m.worktree == worktree));
         assert!(near.iter().all(|(_, (_, m))| m.worktree != worktree));
-        // The worktree's own state leads unless someone else's was made
-        // nearer to HEAD: at HEAD when its own is from further back, or at
-        // an ancestor when its own is from somewhere that is none.
         let own_first = match (own.first(), near.first()) {
             (Some(_), None) => true,
             (Some((_, m)), Some((best, _))) => match &m.commit {
@@ -216,8 +173,6 @@ impl IncrStore {
         None
     }
 
-    /// Stores the state `manifest` (the full content of the incremental
-    /// directory after a compile).
     pub fn save(&self, crate_key: &Hash, worktree: &str, commit: Option<[u8; 20]>, manifest: &Manifest) {
         let Ok(raw) = bincode::serialize(manifest) else { return };
         let Ok(h) = self.store.put_bytes(&raw) else { return };
@@ -235,7 +190,6 @@ impl IncrStore {
         self.prune(crate_key);
     }
 
-    /// Keeps the newest state of each recent worktree plus a few others.
     fn prune(&self, crate_key: &Hash) {
         let all = self.list(crate_key);
         let mut seen_worktrees: Vec<&str> = Vec::new();
@@ -255,18 +209,15 @@ impl IncrStore {
         assert!(extra <= KEEP_EXTRA);
     }
 
-    /// Forgets a state rustc crashed on.
     pub fn discard(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
         self.stats.discarded_after_crash.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Forgets a state whose files were lost with a worker.
     pub fn forget(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
     }
 
-    /// Adds every blob referenced by a kept state to `live`.
     pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
         let mut metas: Vec<StateMeta> = Vec::new();
         self.db.for_each(Table::Incr, |_, v| {
@@ -286,9 +237,6 @@ impl IncrStore {
         }
     }
 
-    /// Where the bytes of the stored states are, and how much of them a
-    /// chunk-level store would share that the file-level store does not.
-    /// Reads every state file once; meant for an idle daemon.
     pub fn analyze(&self) -> String {
         use std::collections::{BTreeMap, HashMap, HashSet};
         fn kind(path: &[u8]) -> &'static str {
@@ -385,8 +333,6 @@ impl IncrStore {
     }
 }
 
-/// The content of the incremental directory after an action: the seed with
-/// the action's changes (additions, replacements, deletions) applied.
 pub fn apply_changes(dir: &[u8], seed: Option<&Manifest>, changes: &[(Vec<u8>, MEntry)]) -> Manifest {
     let mut map: BTreeMap<Vec<u8>, MEntry> = BTreeMap::new();
     if let Some(s) = seed {
@@ -400,7 +346,6 @@ pub fn apply_changes(dir: &[u8], seed: Option<&Manifest>, changes: &[(Vec<u8>, M
         }
         match e {
             MEntry::Whiteout => {
-                // A deleted directory takes everything below it along.
                 let doomed: Vec<Vec<u8>> =
                     map.keys().filter(|k| vpath_starts_with(k, p)).cloned().collect();
                 for k in doomed {
@@ -452,28 +397,20 @@ mod tests {
             MEntry::File { hash, .. } => String::from_utf8(s.read(hash).unwrap()).unwrap(),
             _ => unreachable!(),
         };
-        // A new worktree branched from main: the ancestor's state wins over
-        // the newer unrelated one.
         let s1 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
         assert_eq!((content(&s1.manifest).as_str(), s1.kind), ("main state", SeedKind::Ancestor));
         assert_eq!(s1.blobs.len(), 1);
-        // With no ancestry information, the newest of all.
         let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
         assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
-        // Once the worktree has its own state, that one.
         incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]));
-        // Its own state, made at HEAD, beats the ancestor's.
         let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
         let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
         assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
-        // The worktree moves on ten commits; another worktree has built
-        // at the commit just before: that state is nearer than its own.
         incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]));
         let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
         let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
         assert_eq!((content(&s5.manifest).as_str(), s5.kind), ("one commit back", SeedKind::Ancestor));
         incr.forget(&k, s5.id);
-        // A state rustc crashed on is not offered again.
         incr.discard(&k, s3.id);
         let s4 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
         assert_eq!(content(&s4.manifest), "main state");
@@ -508,7 +445,6 @@ mod tests {
         let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
         assert!(seed.blobs.contains(&(away, 33)));
         assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
-        // The worker goes away: the state cannot be completed any more.
         connected.store(false, Ordering::Relaxed);
         assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
         assert_eq!(incr.state_count(&k), 0);
@@ -545,7 +481,6 @@ mod tests {
                 incr.save(&k, wt, None, &manifest(&s, &[("/i/x", &format!("{wt} {round}"))]));
             }
         }
-        // Latest of a, latest of b, and KEEP_EXTRA older ones.
         assert_eq!(incr.state_count(&k), 2 + KEEP_EXTRA);
     }
 }

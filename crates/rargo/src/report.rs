@@ -1,17 +1,9 @@
-//! cargo's future-incompatibility report file (`OnDiskReports` in cargo's
-//! `future_incompat.rs`), kept in the target directory. The server sends
-//! what a build's compilers reported; it is added here so that `cargo report
-//! future-incompatibilities` shows it, whichever of rargo and cargo ran the
-//! build.
-
 use rargo_proto::{FutureReport, REPORT_ID};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// cargo's `ON_DISK_VERSION`.
 const VERSION: u32 = 0;
-/// cargo's `MAX_REPORTS`.
 const MAX_REPORTS: usize = 5;
 
 #[derive(Serialize, Deserialize)]
@@ -28,9 +20,6 @@ struct Report {
     per_package: BTreeMap<String, String>,
 }
 
-/// Adds the report to the file unless it is there already, and returns its
-/// number. A file that cannot be read (absent, or written by a cargo with
-/// another format) is started afresh, as cargo does.
 pub fn save(r: &FutureReport) -> std::io::Result<u32> {
     let path = Path::new(&r.path);
     let mut disk = std::fs::read(path)
@@ -70,7 +59,6 @@ mod tests {
         let p = tmp.path().join("target/.future-incompat-report.json");
         assert_eq!(save(&report(&p, "a")).unwrap(), 1);
         assert_eq!(save(&report(&p, "b")).unwrap(), 2);
-        // The same warnings again are the same report.
         assert_eq!(save(&report(&p, "a")).unwrap(), 1);
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         assert_eq!(v["version"], 0);
@@ -81,14 +69,12 @@ mod tests {
             v["reports"][1]["suggestion_message"],
             "run `cargo report future-incompatibilities --id 2 --package old@0.1.0`"
         );
-        // Only the newest five are kept.
         for t in ["c", "d", "e", "f"] {
             save(&report(&p, t)).unwrap();
         }
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
         let ids: Vec<u64> = v["reports"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
         assert_eq!(ids, vec![2, 3, 4, 5, 6]);
-        // A file in a format this does not know is replaced.
         std::fs::write(&p, br#"{"version":9,"next_id":40,"reports":[]}"#).unwrap();
         assert_eq!(save(&report(&p, "a")).unwrap(), 1);
     }

@@ -1,7 +1,3 @@
-//! How much of one file the other already holds, in rargo's chunks: the
-//! bytes of NEW in chunks that OLD also has, and the bytes left to send.
-//!
-//!   cargo run --example chunkshare -- OLD NEW
 use rargo_core::chunk::chunk;
 use std::collections::HashSet;
 

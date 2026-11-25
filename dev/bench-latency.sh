@@ -1,15 +1,4 @@
 #!/bin/bash
-# What one command costs when there is nothing, or next to nothing, to
-# build: a client in its own network namespace, a server with 24 cores one
-# shaped link away.
-#
-#   [LABEL=after] dev/bench-latency.sh [REPO] [NAME DELAY_MS]...
-#
-# Default links: lan (1 ms each way), 40ms (20 ms each way), 100ms (50 ms
-# each way). For each, after a full build: the same build again (7 times),
-# a build right after a one-line edit that recompiles one crate and nothing
-# above it (7 times), and the same with a second between edit and build.
-# Medians go to $RARGO_WORK/bench/latency.jsonl.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)

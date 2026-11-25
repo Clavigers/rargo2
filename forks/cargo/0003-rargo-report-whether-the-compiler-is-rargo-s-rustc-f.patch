@@ -1,4 +1,4 @@
-From 34fd9a42ccd108fc9fcc42e2e8e7ffd2271fc21c Mon Sep 17 00:00:00 2001
+From 31ec02c38d1661b0928f3409b3d155817e47728f Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 01:07:23 +0100
 Subject: [PATCH 3/8] rargo: report whether the compiler is rargo's rustc fork
@@ -9,10 +9,10 @@ Subject: [PATCH 3/8] rargo: report whether the compiler is rargo's rustc fork
  1 file changed, 8 insertions(+)
 
 diff --git a/src/compiler/rargo.rs b/src/compiler/rargo.rs
-index b1c8ced65..1b2e3449b 100644
+index 39723cb..6b9ab31 100644
 --- a/src/compiler/rargo.rs
 +++ b/src/compiler/rargo.rs
-@@ -68,6 +68,7 @@ struct Global {
+@@ -56,6 +56,7 @@ struct Global {
      extra_verbose: bool,
      keep_going: bool,
      deny_warnings: bool,
@@ -20,7 +20,7 @@ index b1c8ced65..1b2e3449b 100644
  }
  
  fn state() -> &'static Mutex<State> {
-@@ -156,6 +157,12 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
+@@ -143,6 +144,12 @@ pub fn record_global(build_runner: &BuildRunner<'_, '_>) -> CargoResult<()> {
          extra_verbose: gctx.extra_verbose(),
          keep_going: bcx.build_config.keep_going,
          deny_warnings: gctx.warning_handling()? == crate::context::WarningHandling::Deny,
@@ -33,7 +33,7 @@ index b1c8ced65..1b2e3449b 100644
      };
      let mut st = state().lock().unwrap();
      st.global = Some(g);
-@@ -636,6 +643,7 @@ pub fn finish() -> CargoResult<()> {
+@@ -594,6 +601,7 @@ pub fn finish() -> CargoResult<()> {
          build_dir: g.build_dir,
          host: g.host,
          toolchain,
@@ -41,6 +41,3 @@ index b1c8ced65..1b2e3449b 100644
          units,
          roots: std::mem::take(&mut st.roots),
          steps: std::mem::take(&mut st.steps),
--- 
-2.54.0
-

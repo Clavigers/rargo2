@@ -1,11 +1,4 @@
 #!/bin/bash
-# The 20-agent swarm with rargo's rustc fork against the stock compiler, all
-# under rargo, with a body-only second edit (dev/swarm.py --edit body):
-#   stable          stock rustc 1.100.0
-#   fork            the fork, check planned as a build (RARGO_CHECK_AS_BUILD=1)
-#   fork-cargo-check  the fork, check the cargo way (the default)
-# Results go to $RARGO_WORK/bench/results.jsonl with these labels.
-#   dev/bench-fork.sh [REPO] [AGENTS]
 set -eu
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,7 +9,7 @@ export RARGO_STATE=$work/state-fork-bench
 export RARGO_SERVER=127.0.0.1:7473
 export RARGO_HIDE=$work/swarm
 out=$work/bench/results.jsonl
-run() { # label toolchain check-as-build
+run() {
     "$here/rargod.sh" stop >/dev/null 2>&1 || true
     rm -rf "$RARGO_STATE"
     "$here/rargod.sh" start >/dev/null

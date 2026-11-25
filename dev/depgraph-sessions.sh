@@ -1,17 +1,11 @@
 #!/bin/bash
-# Many incremental sessions of regex-syntax with a compiler (#114): the edit
-# of depgraph-share.sh goes in and out N times. Prints each session's index
-# space and record count, then checks the last incremental build's rmeta
-# against a clean build of the same source.
-#
-#   dev/depgraph-sessions.sh RUSTC OUT_DIR [N]
 set -euo pipefail
 rustc=$1 out=$2 n=${3:-40}
 src=${REGEX_SYNTAX:-/root/rargo-work/cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/regex-syntax-0.8.12}
 rm -rf "$out"; mkdir -p "$out/target" "$out/clean"
 cp -a "$src" "$out/src-crate"
 cd "$out/src-crate"
-build() { # incremental dir, output dir
+build() {
     "$rustc" --crate-name regex_syntax --edition 2021 src/lib.rs --crate-type lib \
         --emit=metadata,link -C embed-bitcode=no -C debuginfo=2 \
         --cfg 'feature="default"' --cfg 'feature="std"' --cfg 'feature="unicode"' \

@@ -1,11 +1,4 @@
 #!/bin/bash
-# The 20-agent swarm (dev/swarm.py), its clients in their own network
-# namespace, served by a server in another, without and with a worker
-# behind a netem link (1 ms each way, 0.1% loss, 1 Gbit): the phase 4
-# criterion on a workload with parallelism across actions.
-#   [CORES=8] dev/bench-worker-swarm.sh [REPO] [AGENTS]
-# Configurations: local-C, C+C (one fresh worker), local-2C.
-# Results go to $RARGO_WORK/bench/results.jsonl, labelled "worker-swarm ...".
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -13,12 +6,11 @@ export RARGO_BIN=${RARGO_BIN:-$work/dev-target/release}
 repo=${1:-ra}; agents=${2:-20}; c=${CORES:-8}
 . "$work/env.sh"
 export RARGO_HIDE=$work/swarm
-run() { # label
+run() {
     . "$work/${RIG_STATE:-nstest}/client.env"
     python3 "$here/swarm.py" --repo "$repo" --mode rargo --agents "$agents" --label "worker-swarm $1" \
         --netns ${RIG:-rargo}-cl --out "$work/bench/results.jsonl"
     nsenter --net=/run/netns/${RIG:-rargo}-cl "$RARGO_BIN/rargo" --rargo-status | grep -A2 '^workers' | tr -s ' ' | head -c 1400; echo
-    # Kept: the next configuration starts from an empty rig.
     mkdir -p "$work/bench/logs"
     for f in srv w1; do
         [ -f "$work/${RIG_STATE:-nstest}/$f.log" ] && cp "$work/${RIG_STATE:-nstest}/$f.log" "$work/bench/logs/worker-swarm-${1// /_}-$f.log"

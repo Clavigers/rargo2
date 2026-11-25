@@ -1,14 +1,3 @@
-//! What the client knows that outlives a daemon, kept in its cache:
-//!
-//! - which trees and contents a server holds ([`Held`]), so that the first
-//!   command of a new daemon offers only what changed. It is a hint: the
-//!   server is asked to build a root, finds what it lacks and asks for it,
-//!   so a record that is stale (the server evicted something, or another
-//!   server answers at that address) costs round trips, never a wrong
-//!   build;
-//! - which chunks the cache holds and where ([`load_chunks`]): every chunk
-//!   taken from it is checked against its hash first.
-
 use rargo_proto::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -16,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// More is not kept: the record starts over (it is only a hint).
 const MOST: usize = 4_000_000;
 
 const HELD_MAGIC: &[u8] = b"rargo-held-1\n";
@@ -24,13 +12,10 @@ const CHUNKS_MAGIC: &[u8] = b"rargo-chunks-1\n";
 
 const _: () = assert!(MOST <= u32::MAX as usize);
 
-/// The first eight bytes of a digest: enough to tell contents apart in a
-/// hint (one that collides is offered again, or asked for by the server).
 fn short(d: &Digest) -> u64 {
     u64::from_le_bytes(d[..8].try_into().expect("eight bytes"))
 }
 
-/// The trees and contents a server is believed to hold.
 pub struct Held {
     path: PathBuf,
     set: Mutex<HashSet<u64>>,
@@ -38,7 +23,6 @@ pub struct Held {
 }
 
 impl Held {
-    /// The record for `server` and `user`, in `cache`.
     pub fn load(cache: &Path, server: &str, user: &str) -> Held {
         let key = blake3::hash(format!("{server}\0{user}").as_bytes()).to_hex()[..32].to_string();
         let path = cache.join("held").join(key);
@@ -54,7 +38,6 @@ impl Held {
         Held { path, set: Mutex::new(set), changed: AtomicBool::new(false) }
     }
 
-    /// Of `items`, those whose digest the server is not believed to hold.
     pub fn lacking<'a, T>(&self, items: impl Iterator<Item = (&'a Digest, T)>) -> Vec<(Digest, T)> {
         let set = self.set.lock().unwrap();
         items.filter(|(d, _)| !set.contains(&short(d))).map(|(d, t)| (*d, t)).collect()
@@ -77,7 +60,6 @@ impl Held {
         self.set.lock().unwrap().len()
     }
 
-    /// Writes the record if it changed since it was read or last written.
     pub fn save(&self) -> io::Result<()> {
         if !self.changed.swap(false, Ordering::SeqCst) {
             return Ok(());
@@ -99,8 +81,6 @@ impl Held {
     }
 }
 
-/// Where the cache holds each chunk: in which content, at which offset,
-/// how long.
 pub type Chunks = HashMap<Digest, (Digest, u64, u32)>;
 
 pub fn chunks_path(cache: &Path) -> PathBuf {
@@ -144,7 +124,6 @@ pub fn save_chunks(cache: &Path, chunks: &Chunks) -> io::Result<()> {
     crate::write_atomic(&chunks_path(cache), &b)
 }
 
-/// Most chunks kept in the index; past it, the index starts over.
 pub const MOST_CHUNKS: usize = MOST;
 
 #[cfg(test)]
@@ -163,10 +142,8 @@ mod tests {
         let again = Held::load(tmp.path(), "build.example:7459", "ann");
         assert_eq!(all(&again), vec![(c, 3)]);
         assert_eq!(again.len(), 2);
-        // Another server, or another user: a record of its own.
         assert_eq!(all(&Held::load(tmp.path(), "other.example:7459", "ann")).len(), 3);
         assert_eq!(all(&Held::load(tmp.path(), "build.example:7459", "bob")).len(), 3);
-        // A damaged record is no record.
         let path = std::fs::read_dir(tmp.path().join("held")).unwrap().next().unwrap().unwrap().path();
         std::fs::write(&path, b"rargo-held-1\nabc").unwrap();
         assert_eq!(Held::load(tmp.path(), "build.example:7459", "ann").len(), 0);

@@ -1,27 +1,3 @@
-//! The little HTTP a rargo server speaks on its TCP port, for what has to
-//! happen before a client holds a key: finding the server's real address
-//! from a name (`/.well-known/rargo.json`) and `rargo auth`, where a person
-//! confirms in a browser that a terminal may have a token (D67).
-//!
-//! Requests are small and each connection carries one. A public server
-//! puts something that speaks HTTPS in front (rargo.rs forwards these paths
-//! to it); on a private network the port is asked directly.
-//!
-//! The flow of `rargo auth`:
-//!   1. the client POSTs `/auth/start` and gets a device secret (which it
-//!      keeps) and a short code (which it shows);
-//!   2. the person opens `/auth?code=...`, sees the same code, and enters
-//!      an invitation an administrator gave them (`rargod token invite`);
-//!   3. the client, polling `/auth/poll` with its device secret, is given a
-//!      token made for that person.
-//! The code only names the request; it grants nothing without the
-//! invitation, and the token goes only to whoever holds the device secret.
-//!
-//! Where the server has a GitHub OAuth application (`rargod token github`),
-//! step 2 is signing in with GitHub instead: the page sends the browser to
-//! GitHub and back, the server asks GitHub who that was, and an account on
-//! the server's allow list (`rargod token allow LOGIN`) gets the token.
-
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, bail};
@@ -41,22 +17,16 @@ struct Pending {
     code: String,
     made: Instant,
     tries: u32,
-    /// The token's text and the user's name, once approved.
     granted: Option<(String, String)>,
     denied: bool,
-    /// What the browser carries to GitHub and back, naming this request.
     state: Option<String>,
 }
 
 pub struct Http {
     keys: Arc<Keys>,
-    /// The address clients are told to connect to (`--public`); none: the
-    /// name the request was sent to, with the port the server listens on.
     public: Option<String>,
     port: u16,
-    /// The server's state directory (the GitHub application's settings).
     state: Option<std::path::PathBuf>,
-    /// By device secret.
     pending: parking_lot::Mutex<HashMap<String, Pending>>,
 }
 
@@ -106,7 +76,6 @@ fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-/// A code as it is shown: `ABCD-EFGH`.
 fn shown(code: &str) -> String {
     let c = normal_code(code);
     if c.len() == 8 {
@@ -119,9 +88,6 @@ fn shown(code: &str) -> String {
 }
 
 fn page(title: &str, body: &str) -> String {
-    // On rargo.rs the site's own style sheet is found at /index.css and the
-    // page looks like the rest of the site; elsewhere the few rules here
-    // are all there is.
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
@@ -140,7 +106,6 @@ impl Http {
         Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(HashMap::new()) }
     }
 
-    /// With the state directory, where a GitHub application may be set up.
     pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
         self.state = Some(state);
         self
@@ -169,7 +134,6 @@ impl Http {
             }
             Err(_) => return Ok(()),
         };
-        // (Signing in asks GitHub two questions over HTTPS, which blocks.)
         let (status, kind, body) = tokio::task::block_in_place(|| self.answer(&req));
         respond(&mut stream, status, kind, body.as_bytes()).await
     }
@@ -202,8 +166,6 @@ impl Http {
                 };
                 json(self.poll(device.as_deref().unwrap_or("")))
             }
-            // A client forgetting its token ends it here too (`rargo auth
-            // remove`): the token's own text is the authority.
             ("POST", "/auth/revoke") => {
                 let token = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|v| v.get("token")?.as_str().map(String::from));
                 let done = match (self.keys.tokens(), token) {
@@ -215,8 +177,6 @@ impl Http {
                 }
                 json(serde_json::json!({ "revoked": done }))
             }
-            // Whose token this is (`rargo auth --token`): its own text again,
-            // and nothing for a token that does not work.
             ("POST", "/auth/whoami") => {
                 let token = serde_json::from_slice::<serde_json::Value>(&req.body).ok().and_then(|v| v.get("token")?.as_str().map(String::from));
                 let user = match (self.keys.tokens(), token) {
@@ -338,7 +298,6 @@ impl Http {
     fn approve(&self, code: &str, invite: &str, name: Option<&str>) -> Result<String> {
         let store = self.keys.tokens().context("this server does not issue tokens")?;
         let code = normal_code(code);
-        // Found and counted under the lock; the token is made outside it.
         {
             let mut pending = self.pending.lock();
             let Some(p) = pending.values_mut().find(|p| p.code == code && p.made.elapsed() < PENDING_FOR) else {
@@ -365,8 +324,6 @@ impl Http {
                 p.granted = Some((tokens::token_text(&token, &secret), token.user.clone()));
             }
             None => {
-                // The request went away meanwhile: nobody can pick the
-                // token up, so it must not stay valid.
                 let _ = store.revoke(&token.id);
                 bail!("the terminal stopped waiting: run `rargo auth` again");
             }
@@ -375,8 +332,6 @@ impl Http {
         Ok(token.user)
     }
 
-    /// Where the browser is sent to sign in: GitHub, with something that
-    /// names this request for the way back.
     fn to_github(&self, code: &str) -> Result<String> {
         let gh = self.github().context("this server does not sign people in with GitHub")?;
         let code = normal_code(code);
@@ -397,8 +352,6 @@ impl Http {
         ))
     }
 
-    /// The browser is back from GitHub: who was it, and may they?
-    /// Returns the flow's code and the account's login.
     fn from_github(&self, state: &str, gh_code: &str) -> Result<(String, String)> {
         let gh = self.github().context("this server does not sign people in with GitHub")?;
         let store = self.keys.tokens().context("this server does not issue tokens")?;
@@ -485,7 +438,6 @@ impl Http {
     }
 }
 
-/// GitHub's addresses; other ones stand in for it in tests.
 fn github_url() -> String {
     std::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
 }
@@ -522,7 +474,6 @@ async fn read_request(stream: &mut TcpStream) -> Result<Request> {
         let v = v.trim();
         match k.to_ascii_lowercase().as_str() {
             "host" => host = v.to_string(),
-            // What the name was before something forwarded the request.
             "x-forwarded-host" => host = v.to_string(),
             "content-length" => length = v.parse().context("Content-Length")?,
             "content-type" => json = v.starts_with("application/json"),

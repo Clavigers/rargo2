@@ -6,9 +6,6 @@ worktree and environment to a build server, the server does all analysis,
 scheduling and compiling for everyone, and you get back output and the
 artifacts you asked for.
 
-`DESIGN.md` says why and how, `STATUS.md` what was verified and measured,
-`DECISIONS.md` how each open end was closed.
-
 ## The server
 
 Linux, root (it mounts a FUSE filesystem and creates namespaces).

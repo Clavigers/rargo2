@@ -1,11 +1,4 @@
 #!/bin/sh
-# Builds rargo's rustc fork (compiler, standard library, rustdoc, clippy) and
-# registers it with rustup as the toolchain `rargo`. The marker file is how
-# the planner recognises the fork (see DECISIONS D22).
-#
-# The build is the distribution configuration minus profile-guided
-# optimisation, so this compiler is slower than an official release of the
-# same version (about 1.4x in CPU time on a `cargo check` of rust-analyzer).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 work=${RARGO_WORK:-/root/rargo-work}

@@ -1,10 +1,3 @@
-//! A small FUSE server library that talks to `/dev/fuse` directly.
-//!
-//! Why not libfuse: rargo's sandbox filesystem lives or dies by per-request
-//! latency, so this crate gives the filesystem full control over what the
-//! kernel is allowed to cache, runs one worker thread per cloned device fd,
-//! and exposes passthrough backing files (Linux 6.9+).
-
 pub mod abi;
 
 use abi::*;
@@ -16,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// A raw errno value returned to the kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Errno(pub i32);
 
@@ -53,7 +45,6 @@ impl From<io::Error> for Errno {
 
 pub type Res<T> = Result<T, Errno>;
 
-/// Who is asking.
 #[derive(Clone, Copy, Debug)]
 pub struct Ctx {
     pub uid: u32,
@@ -61,10 +52,8 @@ pub struct Ctx {
     pub pid: u32,
 }
 
-/// Reply to lookup-like operations.
 #[derive(Clone, Copy, Debug)]
 pub struct Entry {
-    /// 0 means "does not exist" (a cacheable negative entry).
     pub nodeid: u64,
     pub generation: u64,
     pub attr: fuse_attr,
@@ -84,11 +73,9 @@ impl Entry {
     }
 }
 
-/// Reply to open/create.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Opened {
     pub fh: u64,
-    /// `FOPEN_*` bits. Set `FOPEN_PASSTHROUGH` together with `backing_id`.
     pub flags: u32,
     pub backing_id: i32,
 }
@@ -110,16 +97,12 @@ pub struct SetAttr {
     pub mtime: Option<TimeSet>,
 }
 
-/// Collects directory entries for a READDIR reply.
 pub struct DirSink<'a> {
     buf: &'a mut Vec<u8>,
     cap: usize,
 }
 
 impl DirSink<'_> {
-    /// Adds an entry. `next_off` is the offset the kernel passes back to
-    /// continue after this entry. Returns false when the buffer is full (the
-    /// entry was not added).
     pub fn push(&mut self, ino: u64, next_off: u64, dtype: u32, name: &[u8]) -> bool {
         let ent = std::mem::size_of::<fuse_dirent>() + name.len();
         let padded = (ent + 7) & !7;
@@ -138,7 +121,6 @@ impl DirSink<'_> {
     }
 }
 
-/// What was negotiated with the kernel.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Caps {
     pub minor: u32,
@@ -146,8 +128,6 @@ pub struct Caps {
     pub max_write: u32,
 }
 
-/// The operations a filesystem implements. Every method may be called from
-/// any worker thread concurrently.
 #[allow(unused_variables)]
 pub trait Filesystem: Send + Sync + 'static {
     fn lookup(&self, ctx: &Ctx, parent: u64, name: &[u8]) -> Res<Entry>;
@@ -199,7 +179,6 @@ pub trait Filesystem: Send + Sync + 'static {
     ) -> Res<(Entry, Opened)> {
         Err(Errno::EROFS)
     }
-    /// Userspace read path. Append up to `size` bytes to `out`.
     fn read(
         &self,
         ctx: &Ctx,
@@ -209,7 +188,6 @@ pub trait Filesystem: Send + Sync + 'static {
         size: u32,
         out: &mut Vec<u8>,
     ) -> Res<()>;
-    /// Userspace write path.
     fn write(&self, ctx: &Ctx, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Res<u32> {
         Err(Errno::EROFS)
     }
@@ -256,8 +234,6 @@ pub trait Filesystem: Send + Sync + 'static {
 }
 
 fn as_bytes<T: Copy>(v: &T) -> &[u8] {
-    // SAFETY: T is a plain repr(C) ABI struct without padding-sensitive
-    // invariants; reading its bytes is fine.
     unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
@@ -265,7 +241,6 @@ fn read_struct<T: Copy>(b: &[u8]) -> Option<T> {
     if b.len() < std::mem::size_of::<T>() {
         return None;
     }
-    // SAFETY: length checked; T is a plain ABI struct valid for any bit pattern.
     Some(unsafe { std::ptr::read_unaligned(b.as_ptr() as *const T) })
 }
 
@@ -279,49 +254,28 @@ fn cstr_arg(b: &[u8]) -> (&[u8], &[u8]) {
     (name, rest)
 }
 
-/// A mounted FUSE filesystem.
 pub struct Session {
     dev: OwnedFd,
     mountpoint: PathBuf,
     caps: Caps,
     unmounted: AtomicBool,
-    /// Mounted by `fusermount3`, and to be unmounted by it.
     helper: bool,
-    /// What unmounts the directory if this process dies without doing so.
     guard: std::sync::Mutex<Option<Guard>>,
-    /// The kernel's id for this mount, where it tells (see `mount_id`).
     mount_id: Option<u64>,
-    /// The kernel still serves this mount through us: no worker has been
-    /// told that it is gone.
     connected: AtomicBool,
 }
 
-/// Something outside this process that unmounts the directory when the
-/// process is gone, however it went (`MountOptions::auto_unmount`). A
-/// killed FUSE server otherwise leaves its mount behind, and everything
-/// that touches the directory gets "Transport endpoint is not connected".
-///
-/// It is a child of ours, blocked reading the pipe we hold the other end
-/// of. A byte tells it we unmounted ourselves; end of file that we died.
-/// (`fusermount3` has an `auto_unmount` of its own. It unmounts only if
-/// opening the directory fails in one particular way when it looks, and
-/// after a kill it mostly does not: it left the mount in every trial.)
 struct Guard {
     pipe: OwnedFd,
     pid: libc::pid_t,
 }
 
-/// Mount options.
 #[derive(Clone, Debug)]
 pub struct MountOptions {
     pub fsname: String,
     pub allow_other: bool,
     pub default_permissions: bool,
-    /// Ask for passthrough if the kernel has it.
     pub passthrough: bool,
-    /// Have the directory unmounted when this process dies without
-    /// unmounting it (killed, crashed), so that it is never left as a dead
-    /// mount. For mounts in a directory other programs keep using.
     pub auto_unmount: bool,
 }
 
@@ -348,7 +302,6 @@ const _: () = assert!(
 );
 
 impl Session {
-    /// Mounts at `mountpoint` and completes the INIT handshake.
     pub fn mount(mountpoint: &Path, opts: &MountOptions) -> io::Result<Session> {
         let dev = open_dev()?;
         let meta = std::fs::metadata(mountpoint)?;
@@ -372,7 +325,6 @@ impl Session {
         let fstype = CString::new(format!("fuse.{}", opts.fsname)).unwrap();
         let cdata = CString::new(data).unwrap();
         let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME;
-        // SAFETY: all pointers are valid NUL-terminated strings.
         let r = unsafe {
             libc::mount(
                 src.as_ptr(),
@@ -391,16 +343,12 @@ impl Session {
             if e.raw_os_error() != Some(libc::EPERM) {
                 return Err(e);
             }
-            // Not allowed to mount: the set-uid helper every FUSE
-            // installation has does it for its user.
             helper = true;
             mount_with_helper(mountpoint, opts)
                 .map_err(|h| io::Error::new(h.kind(), format!("mount: {e}; fusermount3: {h}")))?
         };
         let mount_id = mount_id(&tgt);
         if opts.auto_unmount {
-            // Without a guard the mount still works; `auto_unmount_active`
-            // says which it is.
             guard = spawn_guard(&tgt, mount_id, helper).ok();
         }
         let mut sess = Session {
@@ -425,7 +373,6 @@ impl Session {
     fn handshake(&mut self, opts: &MountOptions) -> io::Result<()> {
         let mut buf = vec![0u8; BUF_SIZE];
         let n = loop {
-            // SAFETY: buf is a valid writable buffer of the given length.
             let n = unsafe {
                 libc::read(self.dev.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
             };
@@ -466,8 +413,6 @@ impl Session {
         if passthrough {
             want |= FUSE_PASSTHROUGH;
         } else {
-            // Mutually exclusive with passthrough in the kernel; without
-            // passthrough it batches small userspace writes.
             want |= FUSE_WRITEBACK_CACHE;
         }
         let flags = want & kflags;
@@ -508,8 +453,6 @@ impl Session {
         &self.mountpoint
     }
 
-    /// Starts `threads` worker threads serving `fs`. Returns their handles;
-    /// they exit when the filesystem is unmounted.
     pub fn spawn_workers<F: Filesystem>(
         self: &Arc<Self>,
         fs: Arc<F>,
@@ -532,7 +475,6 @@ impl Session {
     fn clone_dev(&self) -> io::Result<OwnedFd> {
         let fd = open_dev()?;
         let master: u32 = self.dev.as_raw_fd() as u32;
-        // SAFETY: valid fd and pointer to a u32.
         let r = unsafe { libc::ioctl(fd.as_raw_fd(), FUSE_DEV_IOC_CLONE as libc::Ioctl, &master as *const u32) };
         if r != 0 {
             return Err(io::Error::last_os_error());
@@ -540,11 +482,8 @@ impl Session {
         Ok(fd)
     }
 
-    /// Registers `fd` as a passthrough backing file. Returns the backing id to
-    /// put in an open reply. The fd may be closed afterwards.
     pub fn backing_open(&self, fd: RawFd) -> io::Result<i32> {
         let map = fuse_backing_map { fd, flags: 0, padding: 0 };
-        // SAFETY: valid fd and pointer to the ioctl argument struct.
         let r = unsafe {
             libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _)
         };
@@ -556,7 +495,6 @@ impl Session {
 
     pub fn backing_close(&self, id: i32) -> io::Result<()> {
         let id = id as u32;
-        // SAFETY: valid fd and pointer to a u32.
         let r = unsafe {
             libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const u32)
         };
@@ -566,8 +504,6 @@ impl Session {
         Ok(())
     }
 
-    /// Tells the kernel to drop the dentry `name` under `parent` (and with it
-    /// the subtree's cached state once unused).
     pub fn notify_inval_entry(&self, parent: u64, name: &[u8]) -> io::Result<()> {
         let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
         let r = reply(
@@ -577,22 +513,15 @@ impl Session {
             &[as_bytes(&out), name, &[0u8]],
         );
         match r {
-            // Not cached is not an error.
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
             r => r,
         }
     }
 
-    /// Whether something will unmount the directory if this process dies
-    /// (`MountOptions::auto_unmount` was asked for and could be set up).
     pub fn auto_unmount_active(&self) -> bool {
         self.guard.lock().unwrap().is_some()
     }
 
-    /// Whether the mount point still shows this file system: it was not
-    /// unmounted, by us or by anyone else (who may have mounted something
-    /// else there since, with this mount's device number and, before Linux
-    /// 6.8, its mount id).
     pub fn shown(&self) -> bool {
         if self.unmounted.load(Ordering::SeqCst) || !self.connected.load(Ordering::SeqCst) {
             return false;
@@ -601,32 +530,22 @@ impl Session {
         match (self.mount_id, mount_id(&tgt)) {
             (Some(mine), Some(there)) => mine == there,
             (Some(_), None) => false,
-            // The kernel tells no ids; the caller compares device numbers.
             (None, _) => true,
         }
     }
 
-    /// Lazily unmounts. Worker threads exit once the kernel reports ENODEV.
     pub fn unmount(&self) {
         if self.unmounted.swap(true, Ordering::SeqCst) {
             return;
         }
         let tgt = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()).ok();
         if let Some(Guard { pipe, pid }) = self.guard.lock().unwrap().take() {
-            // Stand the guard down before unmounting, and wait for it: one
-            // that outlived this call could take a later mount of the same
-            // directory for the one it guards.
-            // SAFETY: a valid descriptor and a one-byte buffer; pid is our
-            // own child.
             unsafe {
                 libc::write(pipe.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1);
                 drop(pipe);
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
         }
-        // Only what is still this mount: where it is gone already, or
-        // something else was mounted over it, the path names something
-        // that is not ours to unmount.
         let ours = match (self.mount_id, tgt.as_deref().and_then(mount_id)) {
             (Some(mine), Some(there)) => mine == there,
             _ => true,
@@ -637,28 +556,16 @@ impl Session {
         if self.helper {
             unmount_with_helper(&self.mountpoint);
         } else if let Some(tgt) = tgt {
-            // SAFETY: valid C string.
             unsafe { libc::umount2(tgt.as_ptr(), libc::MNT_DETACH) };
         }
     }
 }
 
-/// The kernel's id of the mount `path` is the root of or lies in, without
-/// asking the file system anything (a dead FUSE mount cannot answer).
-/// The id is the one the kernel never gives to another mount (Linux 6.8)
-/// where it has one, else the one it reuses once a mount is gone (Linux
-/// 5.8): a mount that replaced ours at the same directory can have our
-/// old reused id, and the same device number. `None` where the kernel
-/// tells neither or the path cannot be reached. Only system calls: safe
-/// in a forked child.
 fn mount_id(path: &std::ffi::CStr) -> Option<u64> {
     const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
     const STATX_MNT_ID: u32 = 0x1000;
     const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
-    // struct statx is 256 bytes; stx_mask is its first field and
-    // stx_mnt_id the 64-bit field at offset 144.
     let mut buf = [0u64; 32];
-    // SAFETY: a valid path and a buffer of the size the kernel writes.
     let r = unsafe {
         libc::syscall(
             libc::SYS_statx,
@@ -673,27 +580,10 @@ fn mount_id(path: &std::ffi::CStr) -> Option<u64> {
     (r == 0 && mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE) != 0).then_some(buf[18])
 }
 
-/// Forks the process that unmounts `tgt` if this one dies without telling
-/// it that it unmounted itself. Returns the pipe that tells it and its pid.
-///
-/// The child runs nothing but system calls on memory prepared here (this
-/// process has other threads; after fork only the calling one exists and
-/// no lock or allocator can be trusted). It is in a session of its own, so
-/// what is sent to this process's group, a terminal's interrupt or a
-/// service manager's stop, does not reach it first. And it is not to be
-/// found under this program's name: a fork has its parent's name and
-/// command line, and whoever kills a stuck server by either (`pkill -9`,
-/// `pkill -9 -f`) would kill the guard with it and be left with the dead
-/// mount. It shows as `unmount-guard: DIRECTORY`.
-///
-/// A mount made by `fusermount3` (`helper`) is one this user may not
-/// unmount: the guard then runs `fusermount3 -u -z`, as `unmount` does.
 fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io::Result<Guard> {
     let name = c"unmount-guard";
     let mut title = b"unmount-guard: ".to_vec();
     title.extend_from_slice(tgt.to_bytes());
-    // Where the kernel reads this process's command line from: fields 48
-    // and 49 of /proc/self/stat, counted from after the name in brackets.
     let args: Option<(usize, usize)> = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
         let rest = &s[s.rfind(')')? + 1..];
         let mut f = rest.split_ascii_whitespace().skip(45);
@@ -704,15 +594,11 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
     let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
     argv.push(std::ptr::null());
     let mut p = [0 as libc::c_int; 2];
-    // SAFETY: a valid two-element array.
     if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         return Err(io::Error::last_os_error());
     }
     let (r, w) = (p[0], p[1]);
-    // A second pipe on which the guard says that it is set up. Until then
-    // it still looks like this process, and nobody is told of the mount.
     let mut q = [0 as libc::c_int; 2];
-    // SAFETY: a valid two-element array; r and w were just returned.
     if unsafe { libc::pipe2(q.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
         let e = io::Error::last_os_error();
         unsafe {
@@ -722,11 +608,9 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
         return Err(e);
     }
     let (ready_r, ready_w) = (q[0], q[1]);
-    // SAFETY: fork; the child calls only async-signal-safe functions.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
         let e = io::Error::last_os_error();
-        // SAFETY: all four were just returned by pipe2.
         unsafe {
             libc::close(r);
             libc::close(w);
@@ -736,13 +620,10 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
         return Err(e);
     }
     if pid == 0 {
-        // SAFETY: system calls only, on values and memory set up before
-        // the fork; ends in _exit.
         unsafe {
             libc::setsid();
             libc::prctl(libc::PR_SET_NAME, name.as_ptr());
             if let Some((start, end)) = args {
-                // This copy of the argument strings is the child's own.
                 let (area, len) = (start as *mut u8, end - start);
                 std::ptr::write_bytes(area, 0, len);
                 std::ptr::copy_nonoverlapping(title.as_ptr(), area, title.len().min(len - 1));
@@ -751,14 +632,10 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
                 libc::signal(sig, libc::SIG_IGN);
             }
             libc::write(ready_w, [1u8].as_ptr() as *const libc::c_void, 1);
-            // Keep nothing of the parent's but the pipe: not its end of
-            // the pipe (we would never see it close), not the FUSE
-            // connection, not its sockets and files.
             if r > 0 {
                 libc::syscall(libc::SYS_close_range, 0 as libc::c_uint, (r - 1) as libc::c_uint, 0 as libc::c_uint);
             }
             if libc::syscall(libc::SYS_close_range, (r + 1) as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) != 0 {
-                // A kernel without close_range (before 5.9).
                 for fd in (r + 1)..65536 {
                     libc::close(fd);
                 }
@@ -767,16 +644,12 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
             loop {
                 let n = libc::read(r, byte.as_mut_ptr() as *mut libc::c_void, 1);
                 if n > 0 {
-                    // The parent unmounted, or is about to.
                     libc::_exit(0);
                 }
                 if n == 0 || *libc::__errno_location() != libc::EINTR {
                     break;
                 }
             }
-            // The parent is gone and did not unmount. Unmount what it
-            // mounted; if the path has since become something else (not a
-            // mount any more, or another one), leave that alone.
             let still_ours = match (mount_id, self::mount_id(tgt)) {
                 (Some(mine), Some(there)) => mine == there,
                 _ => true,
@@ -791,8 +664,6 @@ fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io:
             libc::_exit(0);
         }
     }
-    // SAFETY: descriptors of ours; w was just returned by pipe2. The read
-    // ends with the guard's byte, or with end of file if it died.
     unsafe {
         libc::close(r);
         libc::close(ready_w);
@@ -811,8 +682,6 @@ impl Drop for Session {
     }
 }
 
-/// Unmounts (lazily) through `fusermount3`, for mounts a user without the
-/// right to unmount made through it.
 pub fn unmount_with_helper(mountpoint: &Path) {
     let _ = std::process::Command::new("fusermount3")
         .args(["-u", "-z", "-q", "--"])
@@ -823,17 +692,12 @@ pub fn unmount_with_helper(mountpoint: &Path) {
         .status();
 }
 
-/// Has `fusermount3` mount at `mountpoint` and hand over the descriptor of
-/// the connection (it sends it over the socket named in `_FUSE_COMMFD`).
 fn mount_with_helper(mountpoint: &Path, opts: &MountOptions) -> io::Result<OwnedFd> {
     let mut pair = [0 as libc::c_int; 2];
-    // SAFETY: a valid two-element array for the descriptors.
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: both were just returned by socketpair.
     let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
-    // SAFETY: plain fcntl on our own descriptor.
     unsafe { libc::fcntl(ours.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
     let mut options = format!("rw,nosuid,nodev,noatime,fsname={0},subtype={0}", opts.fsname);
     if opts.default_permissions {
@@ -850,22 +714,18 @@ fn mount_with_helper(mountpoint: &Path, opts: &MountOptions) -> io::Result<Owned
     if !out.status.success() {
         return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()));
     }
-    // One message with one descriptor in its control data.
     let mut byte = [0u8; 1];
     let mut iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut libc::c_void, iov_len: 1 };
     let mut control = [0u8; 64];
-    // SAFETY: zeroed msghdr filled with valid pointers below.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
     msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
     msg.msg_controllen = control.len() as _;
-    // SAFETY: valid socket and message header.
     let n = unsafe { libc::recvmsg(ours.as_raw_fd(), &mut msg, 0) };
     if n < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: the kernel filled the control buffer; the macros walk it.
     unsafe {
         let mut c = libc::CMSG_FIRSTHDR(&msg);
         while !c.is_null() {
@@ -881,12 +741,10 @@ fn mount_with_helper(mountpoint: &Path, opts: &MountOptions) -> io::Result<Owned
 }
 
 fn open_dev() -> io::Result<OwnedFd> {
-    // SAFETY: valid C string literal.
     let fd = unsafe { libc::open(c"/dev/fuse".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: fd was just returned by open.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
@@ -894,8 +752,6 @@ fn reply(fd: RawFd, unique: u64, error: i32, parts: &[&[u8]]) -> io::Result<()> 
     let len: usize = std::mem::size_of::<fuse_out_header>() + parts.iter().map(|p| p.len()).sum::<usize>();
     assert!(parts.len() < 5, "iov has room for the header and four parts");
     assert!(len <= u32::MAX as usize);
-    // A reply (unique != 0) carries a negated errno; a notification
-    // (unique == 0) carries its positive notify code.
     if unique != 0 {
         assert!(error <= 0);
     } else {
@@ -916,7 +772,6 @@ fn reply(fd: RawFd, unique: u64, error: i32, parts: &[&[u8]]) -> io::Result<()> 
         n += 1;
     }
     assert_eq!(iov[..n].iter().map(|v| v.iov_len).sum::<usize>(), len);
-    // SAFETY: iov entries point to live buffers for the duration of the call.
     let r = unsafe { libc::writev(fd, iov.as_ptr(), n as i32) };
     if r < 0 {
         return Err(io::Error::last_os_error());
@@ -956,16 +811,13 @@ fn open_out(o: &Opened) -> fuse_open_out {
 
 fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
     let fd = dev.as_raw_fd();
-    // u64 storage keeps the buffer 8-byte aligned.
     let mut storage = vec![0u64; BUF_SIZE / 8];
     let mut out: Vec<u8> = Vec::with_capacity(128 * 1024);
     loop {
-        // SAFETY: storage is a valid writable buffer of BUF_SIZE bytes.
         let n = unsafe { libc::read(fd, storage.as_mut_ptr() as *mut libc::c_void, BUF_SIZE) };
         if n < 0 {
             match io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) | Some(libc::EAGAIN) | Some(libc::ENOENT) => continue,
-                // Unmounted or connection aborted.
                 _ => {
                     sess.connected.store(false, Ordering::SeqCst);
                     break;
@@ -974,7 +826,6 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
         }
         let n = n as usize;
         assert!(n <= BUF_SIZE);
-        // SAFETY: the first n bytes were initialised by the kernel.
         let buf = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
         let Some(hdr) = read_struct::<fuse_in_header>(buf) else { continue };
         let body = &buf[std::mem::size_of::<fuse_in_header>()..];
@@ -1199,10 +1050,6 @@ fn dispatch<F: Filesystem>(
             );
         }
         FUSE_INTERRUPT => {}
-        // Replying ENOSYS makes the kernel stop sending these for the life of
-        // the mount: no flush on close, no xattr probes on exec and write, no
-        // opendir/releasedir pairs, no access() calls (default_permissions
-        // already checks modes).
         FUSE_FLUSH | FUSE_OPENDIR | FUSE_ACCESS | FUSE_GETXATTR | FUSE_LISTXATTR
         | FUSE_SETXATTR | FUSE_REMOVEXATTR | FUSE_IOCTL | FUSE_POLL | FUSE_BMAP
         | FUSE_COPY_FILE_RANGE | FUSE_GETLK | FUSE_SETLK | FUSE_SETLKW | FUSE_STATX => {

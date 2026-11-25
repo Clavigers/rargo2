@@ -1,20 +1,3 @@
-//! The output directory as a virtual file system.
-//!
-//! The daemon mounts this over a worktree's `target/`. What the server
-//! built appears in it as soon as the server says so, as names with a size
-//! and a content hash; the content is fetched into the client's cache when
-//! something first reads the file, and never copied into the worktree. Everything
-//! else (whatever stock cargo or anything else writes there) goes to the
-//! real directory underneath the mount, which this file system shows
-//! through. Unmounted, `target/` is that real directory: an ordinary cargo
-//! output directory that lacks only what was never opened for writing.
-//!
-//! A name is real if the directory underneath has it, else virtual if the
-//! server delivered it, else absent. Writing to a virtual file first makes
-//! it real (its content is fetched and copied). Removing or renaming a
-//! virtual file changes the table of delivered names; nothing is hidden
-//! behind whiteouts.
-
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
 use crate::partial::Partial;
@@ -32,29 +15,19 @@ use std::time::Duration;
 
 const TTL: Duration = Duration::from_secs(3600);
 const ROOT: u64 = 1;
-/// The operations whose number and time are counted.
 const OPS: [&str; 20] = ["lookup", "forget", "getattr", "setattr", "readlink", "symlink", "mknod", "mkdir", "unlink", "rmdir", "rename", "link", "open", "create", "read", "write", "release", "fsync", "readdir", "statfs"];
 
-/// A change to a directory's names.
 enum Patch {
     Add(Vec<u8>, u32),
     Del(Vec<u8>),
 }
 
-/// What is kept of a directory that has been listed: its names by cookie,
-/// kept up to date by every operation that adds or removes one, so that a
-/// listing is a walk through this map and never a look at the disk again.
-/// `deps` in a build of Zed holds tens of thousands of files, is listed
-/// by every compiler, and changes between any two of those listings.
 #[derive(Default)]
 struct DirState {
     live: Option<BTreeMap<u64, (Vec<u8>, u32)>>,
-    /// While the names are being read from the disk: the changes made
-    /// meanwhile, applied when the reading is done.
     building: Option<Vec<Patch>>,
 }
 
-/// Adds the time since it was made to an operation's total when dropped.
 struct Timed<'a>(&'a OutFs, usize, std::time::Instant);
 
 impl Drop for Timed<'_> {
@@ -63,10 +36,8 @@ impl Drop for Timed<'_> {
         self.0.op_nanos[self.1].fetch_add(self.2.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
-/// How long a listing whose reading has begun may be continued from.
 const LISTING_KEPT: Duration = Duration::from_secs(30);
 
-/// A delivered file that has not been made real.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VFile {
     pub hash: Digest,
@@ -80,26 +51,16 @@ struct Node {
     name: Vec<u8>,
     nlookup: u64,
     kids: u64,
-    /// Handles open on it, by how they do their I/O: the kernel does not
-    /// let one file be open both ways.
     cached: u32,
-    /// The kernel's handle on the file behind this node while it is open
-    /// for passthrough, how many opens share it (the kernel refuses a
-    /// second, different one), and whether it is a cached content rather
-    /// than the real file.
     backing: Option<(i32, u32, bool)>,
 }
 
-/// The nodes the kernel knows. Held only to translate between node
-/// numbers and paths, never across a system call: stock cargo and two
-/// dozen compilers do their name operations here at once.
 struct State {
     nodes: HashMap<u64, Node>,
     children: HashMap<(u64, Vec<u8>), u64>,
     next: u64,
 }
 
-/// Delivered files by path relative to the mount.
 type Table = BTreeMap<Vec<u8>, VFile>;
 
 struct Handle {
@@ -108,52 +69,31 @@ struct Handle {
     through: bool,
 }
 
-/// What a handle reads and writes.
 enum Content {
     Open(File),
-    /// A delivered file opened for reading whose content is not in the
-    /// client's cache: nothing is fetched until it is read. Stock cargo
-    /// opens every output it is about to replace (to see whether it is the
-    /// file it links there), and a fetch on open would bring each over the
-    /// link only for it to be overwritten.
     Unfetched { hash: Digest, size: u64, rel: Vec<u8> },
-    /// A delivered file being read: what is read is fetched as it is read
-    /// (see [`crate::partial`]).
     Ranged(Arc<Partial>),
 }
 
-/// How the kernel does a handle's I/O.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum How {
-    /// Through the daemon.
     Daemon,
-    /// Itself, on the real file.
     Real,
-    /// Itself, on a content in the client's cache (reading only).
     Content,
 }
 
-/// What a delivered file reads, once it is read.
 pub enum Reader {
-    /// The content, whole in the client's cache.
     Whole(File),
-    /// The content, fetched by range as it is read.
     Ranged(Arc<Partial>),
 }
 
-/// Where the contents of delivered files come from.
 pub trait Source: Send + Sync {
-    /// The content in the client's cache, if it is there whole.
     fn cached(&self, hash: &Digest, size: u64) -> Option<PathBuf>;
-    /// The content, whole in the client's cache, fetched if need be.
     fn whole(&self, hash: &Digest, size: u64) -> std::io::Result<PathBuf>;
-    /// A reader of the content, which fetches no more than it must.
     fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<Reader>;
 }
 
 pub struct OutFs {
-    /// The real directory under the mount, reached through a descriptor
-    /// opened before mounting.
     under: PathBuf,
     _under_fd: File,
     state: Mutex<State>,
@@ -164,11 +104,8 @@ pub struct OutFs {
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
-    /// Directories that have been listed, by node.
     dirs: Mutex<HashMap<u64, DirState>>,
-    /// Listings being read, by directory node (see `readdir`).
     listings: Mutex<HashMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
-    /// Directories already cleared of dead clients' temporaries.
     swept: Mutex<std::collections::HashSet<Vec<u8>>>,
     uid: u32,
     gid: u32,
@@ -200,8 +137,6 @@ fn below(prefix: &[u8]) -> Vec<u8> {
     p
 }
 
-/// A name's place in its directory's listing: 63 bits of a hash of it,
-/// never zero.
 fn name_cookie(name: &[u8]) -> u64 {
     let h = blake3::hash(name);
     let c = (u64::from_le_bytes(h.as_bytes()[..8].try_into().unwrap()) >> 1).max(1);
@@ -213,13 +148,10 @@ fn name_cookie(name: &[u8]) -> u64 {
 enum Kind {
     Real(std::fs::Metadata),
     Virtual(VFile),
-    /// A directory that exists only because delivered files are below it.
     VDir,
 }
 
 impl OutFs {
-    /// `dir` is the directory to mount over; `table` is where the list of
-    /// delivered names is kept between runs of the daemon.
     pub fn new(dir: &Path, table: &Path, source: Box<dyn Source>) -> std::io::Result<Arc<OutFs>> {
         let fd = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_PATH).open(dir)?;
         let under = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
@@ -230,7 +162,6 @@ impl OutFs {
             .unwrap_or_default();
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        // SAFETY: no arguments, cannot fail.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Ok(Arc::new(OutFs {
             under,
@@ -259,8 +190,6 @@ impl OutFs {
         Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), std::time::Instant::now())
     }
 
-    /// How many of each operation were served and how long they took in
-    /// the daemon, most expensive first.
     pub fn op_report(&self) -> String {
         let mut rows: Vec<(u64, u64, &str)> = OPS
             .iter()
@@ -276,11 +205,6 @@ impl OutFs {
         let _ = self.session.set(session);
     }
 
-    /// When the last entry of the output directory has been removed (a
-    /// stock `cargo clean`, an `rm -rf target/*`), the directory is given
-    /// back: unmounted before the removal is answered, so that whoever
-    /// emptied it finds a plain, empty directory it can remove, and nothing
-    /// delivered is remembered. The next rargo command mounts it again.
     fn give_back_if_empty(&self, parent: u64) {
         if parent != ROOT || !self.virt.read().unwrap().is_empty() {
             return;
@@ -296,7 +220,6 @@ impl OutFs {
         }
     }
 
-    /// Writes the table of delivered names if it changed.
     pub fn save(&self) {
         if !self.dirty.swap(false, Ordering::SeqCst) {
             return;
@@ -312,7 +235,6 @@ impl OutFs {
     }
 
     fn real(&self, rel: &[u8]) -> PathBuf {
-        // (`under` is a link in /proc; "." makes it the directory.)
         if rel.is_empty() { self.under.join(".") } else { self.under.join(std::ffi::OsStr::from_bytes(rel)) }
     }
 
@@ -344,7 +266,6 @@ impl OutFs {
         virt.range(prefix.clone()..).next().filter(|(k, _)| k.starts_with(&prefix)).map(|_| Kind::VDir)
     }
 
-    /// The path of a node.
     fn path(&self, id: u64) -> Res<Vec<u8>> {
         Self::path_of(&self.state.lock().unwrap(), id)
     }
@@ -431,8 +352,6 @@ impl OutFs {
         id
     }
 
-    /// The name no longer leads to the node it led to (removed, replaced):
-    /// the next lookup gets a new node.
     fn detach(&self, parent: u64, name: &[u8]) {
         self.state.lock().unwrap().children.remove(&(parent, name.to_vec()));
     }
@@ -449,8 +368,6 @@ impl OutFs {
         Ok(())
     }
 
-    /// Turns the virtual file at `rel` into a real one, with its content
-    /// unless the caller is about to truncate it.
     fn make_real(&self, rel: &[u8], v: &VFile, with_content: bool) -> Res<()> {
         self.make_parents(rel)?;
         let dst = self.real(rel);
@@ -473,14 +390,6 @@ impl OutFs {
         Ok(())
     }
 
-    /// Registers an open file. Unless `how` is [`How::Daemon`], the
-    /// kernel may read (and for a real file write) it itself
-    /// (passthrough), through this very descriptor: no second open.
-    ///
-    /// A node's opens for passthrough share one file, so a real file is
-    /// not opened while the node reads a cached content that way (its
-    /// writes would go to the cache), nor the other way round: that open
-    /// fails as the kernel's own conflicting opens do, text file busy.
     fn open_handle(&self, node: u64, file: Content, how: How) -> Res<Opened> {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
@@ -515,10 +424,6 @@ impl OutFs {
         })
     }
 
-    /// Opens a real file for as much as the caller may later want: all
-    /// opens of a file share the first one's descriptor in the kernel, so
-    /// it is opened for reading and writing where that is allowed.
-    /// The file behind a handle that writes: only a real file's.
     fn handle_file(&self, fh: u64) -> Res<Option<File>> {
         match &self.handles.lock().unwrap().get(&fh).ok_or(Errno(libc::EBADF))?.file {
             Content::Open(file) => Ok(Some(file.try_clone().map_err(errno)?)),
@@ -526,9 +431,6 @@ impl OutFs {
         }
     }
 
-    /// What a handle reads: on its first read of a delivered file, the
-    /// content's reader. It is made without the table of handles locked,
-    /// so other handles go on meanwhile.
     fn handle_reader(&self, fh: u64) -> Res<Reader> {
         let (hash, size, rel) = match &self.handles.lock().unwrap().get(&fh).ok_or(Errno(libc::EBADF))?.file {
             Content::Open(file) => return Ok(Reader::Whole(file.try_clone().map_err(errno)?)),
@@ -563,7 +465,6 @@ impl OutFs {
         }
     }
 
-    /// Tells a listed directory that a name was added or removed.
     fn patch(&self, dir: u64, p: Patch) {
         let mut dirs = self.dirs.lock().unwrap();
         let Some(d) = dirs.get_mut(&dir) else { return };
@@ -583,15 +484,11 @@ impl OutFs {
         }
     }
 
-    /// Forgets what is kept of a directory's names (something changed
-    /// them in a way that is not followed name by name).
     fn unlist(&self, dir: u64) {
         self.dirs.lock().unwrap().remove(&dir);
         self.listings.lock().unwrap().remove(&dir);
     }
 
-    /// The names in the directory `rel`, real ones and delivered ones that
-    /// are not also real, in the order of their cookies.
     fn listing(&self, rel: &[u8]) -> Vec<(u64, Vec<u8>, u32)> {
         let mut out: Vec<(u64, Vec<u8>, u32)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(self.real(rel)) {
@@ -617,7 +514,6 @@ impl OutFs {
                         Some(i) => (&rest[..i], libc::DT_DIR),
                         None => (rest, libc::DT_REG),
                     };
-                    // (The table is sorted: a directory's files are together.)
                     if last != Some(name) {
                         out.push((name_cookie(name), name.to_vec(), t as u32));
                         last = Some(name);
@@ -625,8 +521,6 @@ impl OutFs {
                 }
             }
         }
-        // Real first among equal names, so that a real name hides a
-        // delivered one.
         let delivered = out.split_off(real);
         out.sort();
         for d in delivered {
@@ -637,9 +531,6 @@ impl OutFs {
         out
     }
 
-    /// Whether the table of delivered names has anything at `rel` or
-    /// below it. Most names a build touches have not: those operations go
-    /// straight to the real directory.
     fn touches_virtual(&self, rel: &[u8]) -> bool {
         let virt = self.virt.read().unwrap();
         if virt.is_empty() {
@@ -658,10 +549,6 @@ impl OutFs {
         }
     }
 
-    /// The name at `rel` now means something else: forget what the kernel
-    /// remembers of it. The kernel also remembers names that did not
-    /// exist; if a directory on the way to `rel` is not known here, the
-    /// kernel may hold such a memory of it, and that is what is dropped.
     fn changed(&self, rel: &[u8]) {
         let mut parent = ROOT;
         let mut name: &[u8] = rel;
@@ -684,10 +571,7 @@ impl OutFs {
         self.inval(parent, name);
     }
 
-    // -- what the server delivers -----------------------------------------
 
-    /// A file the server built: it appears at `rel` now, its content
-    /// stays where it is until something opens it.
     pub fn deliver(&self, rel: &[u8], v: VFile) {
         self.sweep_beside(rel);
         if self.virt.read().unwrap().get(rel).is_some_and(|old| old.hash == v.hash && old.exec == v.exec)
@@ -695,7 +579,6 @@ impl OutFs {
         {
             return;
         }
-        // A real file of that name is what an earlier build left: replaced.
         match std::fs::symlink_metadata(self.real(rel)) {
             Ok(md) if md.is_dir() => {
                 let _ = std::fs::remove_dir_all(self.real(rel));
@@ -710,14 +593,10 @@ impl OutFs {
         self.changed(rel);
     }
 
-    /// A new delivery begins: directories are swept once per delivery.
     pub fn begin_delivery(&self) {
         self.swept.lock().unwrap().clear();
     }
 
-    /// The first time a delivery puts something into a directory: removes
-    /// the temporaries that copying clients which no longer exist left in
-    /// it (`.rargo-tmp-<pid>-...`).
     fn sweep_beside(&self, rel: &[u8]) {
         let dir = match rel.iter().rposition(|&b| b == b'/') {
             Some(i) => rel[..i].to_vec(),
@@ -733,7 +612,6 @@ impl OutFs {
             let Some(pid) = text.strip_prefix(crate::tmp::BESIDE).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<i32>().ok()) else {
                 continue;
             };
-            // SAFETY: signal 0 only checks for existence.
             let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
             if !alive && std::fs::remove_file(e.path()).is_ok() {
                 self.changed(&join(&dir, name.as_bytes()));
@@ -741,12 +619,10 @@ impl OutFs {
         }
     }
 
-    /// Whether `rel` already shows this content.
     pub fn shows(&self, rel: &[u8], hash: &Digest) -> bool {
         self.virt.read().unwrap().get(rel).is_some_and(|v| v.hash == *hash) && std::fs::symlink_metadata(self.real(rel)).is_err()
     }
 
-    /// Removes whatever is at `rel`, real or delivered.
     pub fn remove(&self, rel: &[u8]) {
         match std::fs::symlink_metadata(self.real(rel)) {
             Ok(md) if md.is_dir() => {
@@ -769,9 +645,6 @@ impl OutFs {
         self.changed(rel);
     }
 
-    /// The real path for something the daemon writes itself (a small
-    /// generated file, a symlink, a directory); the caller writes there and
-    /// then calls [`OutFs::wrote`].
     pub fn real_for_write(&self, rel: &[u8]) -> std::io::Result<PathBuf> {
         if let Some(i) = rel.iter().rposition(|&b| b == b'/') {
             std::fs::create_dir_all(self.real(&rel[..i]))?;
@@ -793,10 +666,6 @@ impl Filesystem for OutFs {
         let rel = join(&self.path(parent)?, name);
         match self.kind(&rel) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
-            // Remembered by the kernel like a name that exists: a build
-            // asks for many names that do not. Whatever makes the name
-            // exist behind the kernel's back (a delivery) says so
-            // (`changed`).
             None => Ok(Entry::negative(TTL)),
         }
     }
@@ -807,8 +676,6 @@ impl Filesystem for OutFs {
         let mut st = self.state.lock().unwrap();
         let mut id = nodeid;
         let mut drop_by = nlookup;
-        // A node goes when the kernel has forgotten it and nothing below
-        // it is known any more; its parent may then go too.
         while id != ROOT {
             let Some(n) = st.nodes.get_mut(&id) else { break };
             n.nlookup = n.nlookup.saturating_sub(drop_by);
@@ -850,7 +717,6 @@ impl Filesystem for OutFs {
         let kind = self.kind(&rel).ok_or(Errno(libc::ENOENT))?;
         match kind {
             Kind::Virtual(mut v) if set.size.is_none() => {
-                // Times and the executable bit are kept in the table.
                 if let Some(mode) = set.mode {
                     v.exec = mode & 0o111 != 0;
                 }
@@ -885,7 +751,6 @@ impl Filesystem for OutFs {
             };
             let times = [spec(set.atime), spec(set.mtime)];
             let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-            // SAFETY: valid path and a two-element timespec array.
             if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
                 return Err(Errno::last());
             }
@@ -936,7 +801,6 @@ impl Filesystem for OutFs {
         }
         let make = || std::fs::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
         match make() {
-            // The parent may exist only by the delivered files below it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.make_parents(&rel)?;
                 make().map_err(errno)?
@@ -976,8 +840,6 @@ impl Filesystem for OutFs {
         }
         match std::fs::remove_dir(self.real(&rel)) {
             Ok(()) => {}
-            // It was a directory only by the delivered files below it,
-            // and those are gone.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(errno(e)),
         }
@@ -997,8 +859,6 @@ impl Filesystem for OutFs {
             let st = self.state.lock().unwrap();
             (join(&Self::path_of(&st, parent)?, name), join(&Self::path_of(&st, newparent)?, newname))
         };
-        // Nothing delivered at either name or below: the real directory's
-        // rename, and nothing else (what compilers do thousands of times).
         let plain = flags == 0 && !self.touches_virtual(&from) && !self.touches_virtual(&to);
         if plain {
             let go = || std::fs::rename(self.real(&from), self.real(&to));
@@ -1024,8 +884,6 @@ impl Filesystem for OutFs {
                 }
                 self.make_parents(&to)?;
                 std::fs::rename(self.real(&from), self.real(&to)).map_err(errno)?;
-                // Only a table that has the name is written to: renames of
-                // real files are what compilers do all day.
                 if self.virt.read().unwrap().contains_key(&to) {
                     self.virt.write().unwrap().remove(&to);
                     self.dirty.store(true, Ordering::SeqCst);
@@ -1050,7 +908,6 @@ impl Filesystem for OutFs {
                 None => {}
             },
         }
-        // Delivered files below a renamed directory move with it.
         if self.has_virtual_below(&from) {
             let mut virt = self.virt.write().unwrap();
             let moved: Vec<Vec<u8>> = virt.range(from_below.clone()..).take_while(|(k, _)| k.starts_with(&from_below)).map(|(k, _)| k.clone()).collect();
@@ -1064,8 +921,6 @@ impl Filesystem for OutFs {
             self.dirty.store(true, Ordering::SeqCst);
         }
         if plain {
-            // A real name left one directory and arrived in another (or
-            // the same) as what it was.
             let t = match std::fs::symlink_metadata(self.real(&to)) {
                 Ok(md) if md.is_dir() => libc::DT_DIR,
                 Ok(md) if md.file_type().is_symlink() => libc::DT_LNK,
@@ -1077,7 +932,6 @@ impl Filesystem for OutFs {
             self.unlist(parent);
             self.unlist(newparent);
         }
-        // The node moves with the name; what was at the new name is gone.
         let mut st = self.state.lock().unwrap();
         st.children.remove(&(newparent, newname.to_vec()));
         if let Some(id) = st.children.remove(&(parent, name.to_vec())) {
@@ -1105,7 +959,6 @@ impl Filesystem for OutFs {
             (Self::path_of(&st, nodeid)?, join(&Self::path_of(&st, newparent)?, newname))
         };
         if !self.touches_virtual(&to) && !self.virt.read().unwrap().contains_key(&from) {
-            // Real to real: one link, one look at the result.
             let go = || std::fs::hard_link(self.real(&from), self.real(&to));
             match go() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1127,7 +980,6 @@ impl Filesystem for OutFs {
                 self.make_parents(&to)?;
                 std::fs::hard_link(self.real(&from), self.real(&to)).map_err(errno)?;
             }
-            // A second name for the same content.
             Kind::Virtual(v) => {
                 self.virt.write().unwrap().insert(to.clone(), v);
                 self.dirty.store(true, Ordering::SeqCst);
@@ -1144,9 +996,6 @@ impl Filesystem for OutFs {
         let rel = self.path(nodeid)?;
         let acc = flags as i32 & libc::O_ACCMODE;
         let keep = flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_NOFOLLOW);
-        // A real file wins over a delivered one of the same name, so the
-        // real directory is simply tried first: one system call for the
-        // usual case.
         match Self::open_wide(&self.real(&rel), acc, keep, None) {
             Ok(file) => return self.open_handle(nodeid, Content::Open(file), How::Real),
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(errno(e)),
@@ -1159,15 +1008,12 @@ impl Filesystem for OutFs {
             if v.size == 0 {
                 return self.open_handle(nodeid, Content::Open(File::open("/dev/null").map_err(errno)?), How::Daemon);
             }
-            // A content the cache holds whole is read by the kernel itself,
-            // through the cached file; any other is fetched as it is read.
             if let Some(file) = self.source.cached(&v.hash, v.size).and_then(|p| File::open(p).ok()) {
                 return self.open_handle(nodeid, Content::Open(file), How::Content);
             }
             return self.open_handle(nodeid, Content::Unfetched { hash: v.hash, size: v.size, rel }, How::Daemon);
         }
         if self.state.lock().unwrap().nodes.get(&nodeid).is_some_and(|n| n.backing.is_some()) {
-            // Read by the kernel from the cache: see `open_handle`.
             return Err(Errno(libc::ETXTBSY));
         }
         self.make_real(&rel, &v, keep & libc::O_TRUNC == 0)?;
@@ -1189,7 +1035,6 @@ impl Filesystem for OutFs {
         let keep = flags as i32 & (libc::O_TRUNC | libc::O_APPEND | libc::O_EXCL | libc::O_NOFOLLOW);
         let open = || Self::open_wide(&self.real(&rel), acc, keep, Some(mode & 0o7777));
         let file = match open() {
-            // The directory may exist only by the delivered files in it.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.make_parents(&rel)?;
                 open().map_err(errno)?
@@ -1197,11 +1042,9 @@ impl Filesystem for OutFs {
             r => r.map_err(errno)?,
         };
         if had_virtual && self.virt.write().unwrap().remove(&rel).is_some() {
-            // The delivered file of that name is replaced: a new node.
             self.dirty.store(true, Ordering::SeqCst);
             self.detach(parent, name);
         }
-        // What was just opened is what the name is: no second look.
         let md = file.metadata().map_err(errno)?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         let entry = self.entry(parent, name, &Kind::Real(md));
@@ -1262,22 +1105,12 @@ impl Filesystem for OutFs {
 
     fn fsync(&self, _ctx: &Ctx, _nodeid: u64, fh: u64, datasync: bool) -> Res<()> {
         let _t = self.timed("fsync");
-        // A delivered file read through a handle has nothing to sync.
         let Some(file) = self.handle_file(fh)? else { return Ok(()) };
         if datasync { file.sync_data() } else { file.sync_all() }.map_err(errno)
     }
 
     fn readdir(&self, _ctx: &Ctx, nodeid: u64, _fh: u64, offset: u64, sink: &mut DirSink) -> Res<()> {
         let _t = self.timed("readdir");
-        // The kernel reads a directory about a hundred names at a time. A
-        // listing is put together once, when its reading starts, and the
-        // calls that continue it use that: putting it together for every
-        // call made a compiler's look through a directory of fifty
-        // thousand files (Zed's `deps`, with unpacked debug information)
-        // five hundred times as expensive as it is, and every compiler
-        // looks through that directory.
-        // (Names are listed in the order of a hash of themselves, and a
-        // call continues after the hash it was given: see below.)
         {
             let dirs = self.dirs.lock().unwrap();
             if let Some(live) = dirs.get(&nodeid).and_then(|d| d.live.as_ref()) {
@@ -1293,9 +1126,6 @@ impl Filesystem for OutFs {
         let listing = match cached {
             Some(l) => l,
             None => {
-                // Read from the disk once; changes made while that goes
-                // on are noted and applied afterwards, so that what is
-                // kept is complete whatever the build is doing meanwhile.
                 let mine = {
                     let mut dirs = self.dirs.lock().unwrap();
                     let d = dirs.entry(nodeid).or_default();
@@ -1332,11 +1162,6 @@ impl Filesystem for OutFs {
                 l
             }
         };
-        // The place in a listing is not a position, which every removal
-        // before it would shift, but a number that belongs to the name:
-        // names are listed in the order of a hash of themselves, and a
-        // call continues after the hash it was given. A name that is there
-        // throughout is listed exactly once.
         let from = listing.partition_point(|(cookie, _, _)| *cookie <= offset);
         for (cookie, name, t) in &listing[from..] {
             if !sink.push(u64::MAX - 1, *cookie, *t, name) {
@@ -1349,7 +1174,6 @@ impl Filesystem for OutFs {
     fn statfs(&self, _ctx: &Ctx, _nodeid: u64) -> Res<fuse_kstatfs> {
         let _t = self.timed("statfs");
         let c = std::ffi::CString::new(self.under.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-        // SAFETY: valid path and a zeroed statvfs to fill.
         let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
         if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
             return Err(Errno::last());
@@ -1383,7 +1207,6 @@ mod tests {
         assert_eq!(cookies.len(), names.len(), "no two of these names share a place");
     }
 
-    /// Serves one content, counting its fetches; nothing is cached.
     struct Counting {
         fetches: Arc<AtomicU64>,
         content: PathBuf,
@@ -1402,8 +1225,6 @@ mod tests {
         }
     }
 
-    /// Stock cargo opens each output it is about to replace and reads none
-    /// of them: opening a delivered file fetches nothing, reading it does.
     #[test]
     fn a_delivered_file_is_fetched_when_read_not_when_opened() {
         let dir = tempfile::tempdir().unwrap();

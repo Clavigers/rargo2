@@ -1,35 +1,25 @@
-From ffa3c261d81a488a88c59c635bdd90763e191fb3 Mon Sep 17 00:00:00 2001
+From 5eede15804ae5f6f8f261521c18f49c385374bfb Mon Sep 17 00:00:00 2001
 From: sadosystems <noreply@rargo.invalid>
 Date: Mon, 23 Nov 2026 02:07:51 +0100
 Subject: [PATCH 4/5] rargo: spans into another crate's file are stored as
  lines and columns
 
-A crate that was not rebuilt after its dependency was recompiled with the
-same crate hash but different byte offsets (an edit that keeps line numbers)
-still pointed into the dependency by the old offsets; a post-monomorphization
-error inside the dependency's macro was reported 5 columns off. Such spans
-are now stored as the lines and columns of both ends and resolved against
-the dependency's current line table.
 ---
- compiler/rustc_metadata/src/rmeta/decoder.rs | 30 +++++++++++++++++---
- compiler/rustc_metadata/src/rmeta/encoder.rs | 14 +++++++--
- 2 files changed, 38 insertions(+), 6 deletions(-)
+ compiler/rustc_metadata/src/rmeta/decoder.rs | 26 +++++++++++++++++---
+ compiler/rustc_metadata/src/rmeta/encoder.rs | 11 +++++++--
+ 2 files changed, 32 insertions(+), 5 deletions(-)
 
 diff --git a/compiler/rustc_metadata/src/rmeta/decoder.rs b/compiler/rustc_metadata/src/rmeta/decoder.rs
-index 70a1e2d8e..9c600ba93 100644
+index 3c03a57..8088db2 100644
 --- a/compiler/rustc_metadata/src/rmeta/decoder.rs
 +++ b/compiler/rustc_metadata/src/rmeta/decoder.rs
-@@ -564,10 +564,15 @@ fn decode(decoder: &mut MetadataDecodeContext<'a, 'tcx>) -> SpanData {
+@@ -564,9 +564,12 @@ impl<'a, 'tcx> Decodable<MetadataDecodeContext<'a, 'tcx>> for SpanData {
  
          debug_assert!(tag.kind() == SpanKind::Local || tag.kind() == SpanKind::Foreign);
  
--        // rargo: offset and length are fixed-width (see `SpanData::encode`).
 -        let lo = BytePos(u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap()));
 -        let len = BytePos(u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap()));
 -        let hi = lo + len;
-+        // rargo: fixed-width positions (see `SpanData::encode`): offset and length for a span
-+        // in the crate's own files, lines and columns of both ends for a span in another
-+        // crate's file.
 +        let mut word = || u32::from_le_bytes(decoder.read_raw_bytes(4).try_into().unwrap());
 +        let raw = if tag.kind() == SpanKind::Foreign {
 +            [word(), word(), word(), word()]
@@ -39,7 +29,7 @@ index 70a1e2d8e..9c600ba93 100644
  
          let tcx = decoder.tcx;
  
-@@ -628,6 +633,23 @@ fn decode(decoder: &mut MetadataDecodeContext<'a, 'tcx>) -> SpanData {
+@@ -627,6 +630,23 @@ impl<'a, 'tcx> Decodable<MetadataDecodeContext<'a, 'tcx>> for SpanData {
              foreign_cdata.imported_source_file(tcx, metadata_index)
          };
  
@@ -64,19 +54,16 @@ index 70a1e2d8e..9c600ba93 100644
          debug_assert!(
              lo + source_file.original_start_pos <= source_file.original_end_pos,
 diff --git a/compiler/rustc_metadata/src/rmeta/encoder.rs b/compiler/rustc_metadata/src/rmeta/encoder.rs
-index ecf11cd00..febb7d5be 100644
+index 8cc6a20..28fa7fc 100644
 --- a/compiler/rustc_metadata/src/rmeta/encoder.rs
 +++ b/compiler/rustc_metadata/src/rmeta/encoder.rs
-@@ -386,8 +386,18 @@ fn encode(&self, s: &mut EncodeContext<'a, 'tcx>) {
+@@ -371,8 +371,15 @@ impl<'a, 'tcx> Encodable<EncodeContext<'a, 'tcx>> for SpanData {
              ctxt.encode(s);
          }
          let start = s.position();
 -        s.emit_raw_bytes(&lo.0.to_le_bytes());
 -        s.emit_raw_bytes(&len.0.to_le_bytes());
 +        if kind == SpanKind::Foreign {
-+            // A span into another crate's file is stored as lines and columns: that crate
-+            // may be recompiled with different byte offsets and the same crate hash, and its
-+            // current line table is what the reader of this span will have.
 +            s.emit_raw_bytes(&line_col_lo.0.to_le_bytes());
 +            s.emit_raw_bytes(&line_col_lo.1.to_le_bytes());
 +            s.emit_raw_bytes(&line_col_hi.0.to_le_bytes());

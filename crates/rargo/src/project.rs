@@ -1,22 +1,6 @@
-//! Which server a project builds on and how this machine proves who it is
-//! there: `rargo @host`, `rargo auth`, and what a build reads of both (D67).
-//!
-//! The server is a property of the project: `host` under
-//! `[workspace.metadata.rargo]` (or `[package.metadata.rargo]`) in its
-//! `Cargo.toml`, a table cargo ignores. What is personal stays on the
-//! machine: one token per server in `~/.config/rargo/credentials.toml`,
-//! readable by its owner only.
-//!
-//! A host is written either as `name:port`, which is the server's address,
-//! or as a bare name, which is asked over HTTPS where its server is
-//! (`https://name/.well-known/rargo.json`): a name like `rargo.rs` may be
-//! served by something that carries web traffic and nothing else.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// How long an answer to "where is the server of this name" is used
-/// without asking again.
 const DISCOVERY_FRESH: Duration = Duration::from_secs(24 * 3600);
 
 pub fn config_dir() -> PathBuf {
@@ -27,8 +11,6 @@ fn host_in(table: &toml::Table, kind: &str) -> Option<String> {
     table.get(kind)?.get("metadata")?.get("rargo")?.get("host")?.as_str().map(String::from)
 }
 
-/// The host the project around `cwd` names: the workspace's if a manifest
-/// on the way up has one, else the nearest package's.
 pub fn project_host(cwd: &Path) -> Option<String> {
     let mut package: Option<String> = None;
     for dir in cwd.ancestors() {
@@ -44,7 +26,6 @@ pub fn project_host(cwd: &Path) -> Option<String> {
     package
 }
 
-/// A host as a person may type it: a name or an address, an optional port.
 pub fn valid_host(host: &str) -> bool {
     let (name, port) = match host.rsplit_once(':') {
         Some((n, p)) => (n, Some(p)),
@@ -56,8 +37,6 @@ pub fn valid_host(host: &str) -> bool {
         && port.is_none_or(|p| p.parse::<u16>().is_ok())
 }
 
-/// `rargo @host`: names the server in the project's manifest, leaving the
-/// rest of the file as it is.
 pub fn set_host(cwd: &Path, host: &str) -> Result<PathBuf, String> {
     if !valid_host(host) {
         return Err(format!("`{host}` is not a host: write a name (rargo.rs) or a name and a port (build.example:7459)"));
@@ -70,8 +49,6 @@ pub fn set_host(cwd: &Path, host: &str) -> Result<PathBuf, String> {
     let section = doc[kind].or_insert(toml_edit::table());
     let metadata = section["metadata"].or_insert(toml_edit::table());
     if let Some(t) = metadata.as_table_mut() {
-        // `[workspace.metadata.rargo]`, not a `[workspace.metadata]` header
-        // with nothing in it.
         t.set_implicit(true);
     }
     let rargo = metadata["rargo"].or_insert(toml_edit::table());
@@ -87,8 +64,6 @@ fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build()
 }
 
-/// Where the web side of a host is asked: HTTPS for a name, the server's
-/// own port for an address with one.
 pub fn base_url(host: &str) -> String {
     if let Ok(b) = std::env::var("RARGO_AUTH_URL") {
         return b.trim_end_matches('/').to_string();
@@ -96,7 +71,6 @@ pub fn base_url(host: &str) -> String {
     if host.contains(':') { format!("http://{host}") } else { format!("https://{host}") }
 }
 
-/// The address of the server a host stands for.
 pub fn resolve(host: &str) -> Result<String, String> {
     if host.contains(':') {
         return Ok(host.to_string());
@@ -128,17 +102,14 @@ pub fn resolve(host: &str) -> Result<String, String> {
             let _ = crate::write_atomic(&cached, text.as_bytes());
             Ok(server)
         }
-        // The answer of another day is better than none.
         Err(e) => read(false).ok_or_else(|| format!("cannot find the build server of `{host}` ({url}): {e}")),
     }
 }
 
 #[derive(Clone)]
 pub struct Credential {
-    /// The token's id, presented as who is connecting.
     pub id: String,
     pub secret: String,
-    /// Whose token it is, as the server said.
     pub name: String,
 }
 
@@ -162,7 +133,6 @@ fn save_credentials(all: &toml::Table) -> Result<(), String> {
     let path = credentials_path();
     let dir = config_dir();
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    // Never readable by others, not even for the moment of writing.
     let tmp = dir.join(format!(".credentials.{}", std::process::id()));
     let text = format!("# Tokens for rargo servers, one per host. Written by `rargo auth`; keep it private.\n{all}");
     let write = || -> std::io::Result<()> {
@@ -174,7 +144,6 @@ fn save_credentials(all: &toml::Table) -> Result<(), String> {
     write().map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Splits a token's text (`id.secret`) into what is presented and the key.
 pub fn split_token(token: &str) -> Option<(&str, &str)> {
     let (id, secret) = token.trim().split_once('.')?;
     (!id.is_empty() && secret.len() >= 16).then_some((id, secret))
@@ -191,9 +160,6 @@ pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
     save_credentials(&all)
 }
 
-/// Tells the host's server to revoke the token this machine holds for it.
-/// `Ok(true)`: revoked there; `Ok(false)`: the server did not know it as a
-/// token that works (already revoked, or expired).
 pub fn revoke_on_server(host: &str) -> Result<bool, String> {
     let Some(c) = credential(host) else { return Ok(false) };
     let url = format!("{}/auth/revoke", base_url(host));
@@ -209,8 +175,6 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
     Ok(v.get("revoked").and_then(|r| r.as_bool()).unwrap_or(false))
 }
 
-/// Whose token this is, as the host's server says; `None` for a token it
-/// does not admit.
 pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
     split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
     let url = format!("{}/auth/whoami", base_url(host));
@@ -239,8 +203,6 @@ fn open_in_browser(url: &str) {
     if std::env::var_os("RARGO_NO_BROWSER").is_some() {
         return;
     }
-    // Only where there is a display to open it on; a failure is nothing
-    // (the address is printed either way).
     if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
@@ -252,8 +214,6 @@ fn open_in_browser(url: &str) {
         .spawn();
 }
 
-/// `rargo auth`: asks the host's server for a token for this machine, which
-/// a person grants on a page in their browser.
 pub fn auth(host: &str) -> Result<String, String> {
     let base = base_url(host);
     let post = |path: &str, body: serde_json::Value| -> Result<serde_json::Value, String> {
@@ -288,7 +248,6 @@ pub fn auth(host: &str) -> Result<String, String> {
         }
         let answer = match post("/auth/poll", serde_json::json!({ "device": device })) {
             Ok(a) => a,
-            // The network may hiccup while a person reads a page.
             Err(e) => {
                 failures += 1;
                 if failures > 10 {
@@ -324,7 +283,6 @@ mod tests {
         let manifest = "# our workspace\n[workspace]\nmembers = [\"crates/*\"]   # all of them\nresolver = \"2\"\n\n[workspace.dependencies]\nserde = \"1\"\n";
         std::fs::write(ws.join("Cargo.toml"), manifest).unwrap();
         std::fs::write(ws.join("crates/a/Cargo.toml"), "[package]\nname = \"a\"\nversion = \"0.1.0\"\n").unwrap();
-        // From inside a member: the workspace's manifest is the one.
         let written = set_host(&ws.join("crates/a/src"), "rargo.rs").unwrap();
         assert_eq!(written, ws.join("Cargo.toml"));
         let text = std::fs::read_to_string(ws.join("Cargo.toml")).unwrap();
@@ -332,7 +290,6 @@ mod tests {
         assert!(text.contains("[workspace.metadata.rargo]\nhost = \"rargo.rs\"\n"), "{text}");
         assert!(!text.contains("[workspace.metadata]\n"), "{text}");
         assert_eq!(project_host(&ws.join("crates/a")).as_deref(), Some("rargo.rs"));
-        // Again with another host: one entry, changed in place.
         set_host(ws, "build.example:7459").unwrap();
         let text = std::fs::read_to_string(ws.join("Cargo.toml")).unwrap();
         assert_eq!(text.matches("host =").count(), 1);
