@@ -1051,26 +1051,30 @@ printf 'fn main() { println!("{} and again", old::E::B as i32); }\n' >"$H/app/sr
     && ok "temporaries of a killed client are removed by the next one, those of a live process are kept" \
     || bad "temporaries of a killed client are removed by the next one, those of a live process are kept" "$(ls -A "$H/target/debug")"
 rm -f "$H/target/debug/.rargo-tmp-$$-7-app"
-mkdir -p "$H/slowcancel/src"
-printf '[package]\nname = "slowcancel"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' >"$H/slowcancel/Cargo.toml"
-cat >"$H/slowcancel/build.rs" <<'EOF'
+pkg=slowcancel$$
+mkdir -p "$H/$pkg/src"
+printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\nbuild = "build.rs"\n' "$pkg" >"$H/$pkg/Cargo.toml"
+cat >"$H/$pkg/build.rs" <<'EOF'
 fn main() {
     println!("cargo:warning=script-started");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     std::thread::park();
 }
 EOF
-: >"$H/slowcancel/src/lib.rs"
-printf '[workspace]\nresolver = "2"\nmembers = ["old", "app", "slowcancel"]\n' >"$H/Cargo.toml"
-"$R" build -p slowcancel >"$T/cancel.log" 2>&1 &
+: >"$H/$pkg/src/lib.rs"
+printf '[workspace]\nresolver = "2"\nmembers = ["old", "app", "%s"]\n' "$pkg" >"$H/Cargo.toml"
+"$R" build -p "$pkg" >"$T/cancel.log" 2>&1 &
 client=$!
 tail -n +1 -f --pid="$client" "$T/cancel.log" | awk '/script-started/ { found=1; exit } END { exit found ? 0 : 1 }' || true
-script=$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$' | head -1)
+# The executable name is shared with the copy suite, which runs this at the same time.
+# The package name is this shell, so the path is this run's process.
+pat="^[^ ]*build/${pkg}/[0-9a-f]*/out/build_script_build[^ ]*\$"
+script=$(pgrep -f "$pat" | head -1)
 kill "$client" 2>/dev/null; wait "$client" 2>/dev/null
 if [ -n "$script" ]; then
     tail --pid="$script" -f /dev/null
 fi
-[ -n "$script" ] && [ -z "$(pgrep -f '^[^ ]*build/slowcancel/[0-9a-f]*/out/build_script_build[^ ]*$')" ] \
+[ -n "$script" ] && ! kill -0 "$script" 2>/dev/null \
     && ok "an action still running when its client goes away is stopped" \
     || bad "an action still running when its client goes away is stopped" "script pid: ${script:-never started}; $(cat "$T/cancel.log")"
 left=$(find "$H/target" -name '.rargo-tmp-*' | head -3)
