@@ -333,12 +333,12 @@ fn fds_send(token: u64, fd: i32, buf: Vec<u8>, fds: &[i32], inflight: &mut BTree
     if !fds.is_empty() {
         let bytes = std::mem::size_of_val(fds) as u32;
         msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = unsafe { libc::CMSG_SPACE(bytes) } as usize;
+        msg.msg_controllen = unsafe { libc::CMSG_SPACE(bytes) } as _;
         unsafe {
             let c = libc::CMSG_FIRSTHDR(&*msg);
             (*c).cmsg_level = libc::SOL_SOCKET;
             (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(bytes) as usize;
+            (*c).cmsg_len = libc::CMSG_LEN(bytes) as _;
             std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c).cast::<i32>(), fds.len());
         }
     }
@@ -355,7 +355,7 @@ fn fds_recv(token: u64, fd: i32, len: usize, inflight: &mut BTreeMap<u64, Slot>)
     msg.msg_iov = (&*iov as *const libc::iovec).cast_mut();
     msg.msg_iovlen = 1;
     msg.msg_control = cbuf.as_mut_ptr().cast();
-    msg.msg_controllen = cbuf.len();
+    msg.msg_controllen = cbuf.len() as _;
     let entry = opcode::RecvMsg::new(types::Fd(fd), (&*msg as *const libc::msghdr).cast_mut())
         .flags(libc::MSG_CMSG_CLOEXEC as u32)
         .build()
@@ -370,7 +370,7 @@ fn received_fds(msg: &libc::msghdr) -> Vec<i32> {
         let mut c = libc::CMSG_FIRSTHDR(msg);
         while !c.is_null() {
             if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let n = ((*c).cmsg_len - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<i32>();
+                let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<i32>();
                 let data = libc::CMSG_DATA(c).cast::<i32>();
                 for i in 0..n {
                     fds.push(std::ptr::read_unaligned(data.add(i)));
