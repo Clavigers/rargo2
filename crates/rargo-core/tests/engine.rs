@@ -318,8 +318,8 @@ fn large_directories_list_completely_through_a_build_view() {
 #[test]
 fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
     let fx = fixture_with(std::time::Duration::from_secs(600));
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
-    rt.block_on(async {
+    let paused = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    paused.block_on(async {
         let mut tasks = Vec::new();
         for _ in 0..3 {
             let e = fx.engine.clone();
