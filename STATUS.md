@@ -1651,3 +1651,9 @@ That was the first implementation, where worktrees could share the store's
 file system. The server's store can still be on a reflink file system
 (`--store`); worktrees are now on other machines, and it is the client's
 cache that shares artifacts between them.
+
+## Gate
+
+On `08bf0d3`, three gates in a row on this machine each pass every suite.
+They take 127s, 104s and 103s. The scripts the gate and CI run do not wait
+on time.
