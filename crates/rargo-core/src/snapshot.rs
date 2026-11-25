@@ -321,20 +321,17 @@ impl Trees {
                     }
                 }
             }
+            // The claims go when the upload ends, and also when this future
+            // is dropped in the middle of it (the request was cancelled):
+            // otherwise whoever waits on them would wait forever.
+            let claims = Claims { trees: self, mine: &mine };
             let result = if mine.is_empty() {
                 Ok(())
             } else {
                 self.stats.blobs_requested.fetch_add(mine.len() as u64, Ordering::Relaxed);
                 from.blobs(mine.clone()).await
             };
-            {
-                let mut up = self.uploading.lock();
-                for h in &mine {
-                    if let Some(n) = up.remove(h) {
-                        n.notify_waiters();
-                    }
-                }
-            }
+            drop(claims);
             result?;
             if let Some(h) = mine.iter().find(|h| !self.store.has(h)) {
                 bail!("the client did not upload file content {h}");
@@ -362,6 +359,27 @@ impl Trees {
         Ok(())
     }
 
+}
+
+/// Uploads one sync has claimed in [`Trees::uploading`]; dropping it gives
+/// them up and wakes their waiters.
+struct Claims<'a> {
+    trees: &'a Trees,
+    mine: &'a [Hash],
+}
+
+impl Drop for Claims<'_> {
+    fn drop(&mut self) {
+        let mut up = self.trees.uploading.lock();
+        for h in self.mine {
+            if let Some(n) = up.remove(h) {
+                n.notify_waiters();
+            }
+        }
+    }
+}
+
+impl Trees {
     /// Remembers `snap` as the newest state of `worktree`.
     pub fn remember(&self, worktree: &str, snap: &Arc<Snapshot>) {
         let mut r = self.recent.lock();
@@ -660,6 +678,39 @@ mod tests {
             Node::Dir(d) => Hash(*d),
             _ => unreachable!(),
         }
+    }
+
+    /// A client that never finishes an upload (its command is cancelled
+    /// while the server waits for it).
+    struct Hangs<'f>(&'f Fake);
+
+    impl Uploader for Hangs<'_> {
+        fn trees<'a>(&'a self, want: Vec<Hash>) -> futures::BoxFuture<'a, Result<Vec<Vec<u8>>>> {
+            self.0.trees(want)
+        }
+        fn blobs<'a>(&'a self, _want: Vec<Hash>) -> futures::BoxFuture<'a, Result<()>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// Found by the TLA+ model (dev/tla/StoreSync.tla): a request cancelled
+    /// in the middle of an upload must not leave its claim behind, or every
+    /// later sync that needs the same content waits for it forever.
+    #[tokio::test]
+    async fn a_cancelled_upload_does_not_block_others() {
+        let (_d, trees, fake) = setup();
+        let root = root_of(&fake.dir(vec![("lib.rs", fake.file(b"shared content"))]));
+        let first = {
+            let trees = trees.clone();
+            let hangs = Hangs(&fake);
+            let sync = async move { trees.sync(root, &hangs).await.map(|_| ()) };
+            // Run the first sync until it is waiting for its upload, then drop it.
+            tokio::time::timeout(std::time::Duration::from_millis(100), sync).await
+        };
+        assert!(first.is_err(), "the hanging upload should not have finished");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), trees.sync(root, &fake)).await;
+        assert!(second.is_ok(), "a sync waited forever on a cancelled upload");
+        second.unwrap().unwrap();
     }
 
     #[tokio::test]
