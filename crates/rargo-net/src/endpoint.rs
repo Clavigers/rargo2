@@ -77,11 +77,13 @@ impl EndpointState {
         self.invariants();
     }
 
-    pub fn peer(&self, id: u64) -> Option<SocketAddr> {
+    #[cfg(test)]
+    fn peer(&self, id: u64) -> Option<SocketAddr> {
         self.conns.get(&id).map(|c| c.peer)
     }
 
-    pub fn last_heard(&self, id: u64) -> Option<u64> {
+    #[cfg(test)]
+    fn last_heard(&self, id: u64) -> Option<u64> {
         self.conns.get(&id).map(|c| c.last_heard)
     }
 
