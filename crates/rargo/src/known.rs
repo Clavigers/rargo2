@@ -2,8 +2,6 @@ use rargo_proto::Digest;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const MOST: usize = 4_000_000;
 
@@ -16,68 +14,79 @@ fn short(d: &Digest) -> u64 {
     u64::from_le_bytes(d[..8].try_into().expect("eight bytes"))
 }
 
-pub struct Held {
-    path: PathBuf,
-    set: Mutex<HashSet<u64>>,
-    changed: AtomicBool,
+#[derive(Default)]
+pub struct KnownDigests {
+    set: HashSet<u64>,
+    changed: bool,
 }
 
-impl Held {
-    pub fn load(cache: &Path, server: &str, user: &str) -> Held {
-        let key = blake3::hash(format!("{server}\0{user}").as_bytes()).to_hex()[..32].to_string();
-        let path = cache.join("held").join(key);
-        let set = std::fs::read(&path)
-            .ok()
-            .and_then(|raw| {
-                let body = raw.strip_prefix(HELD_MAGIC)?;
-                let (whole, rest) = body.as_chunks::<8>();
-                rest.is_empty().then(|| whole.iter().map(|c| u64::from_le_bytes(*c)).collect())
-            })
-            .unwrap_or_default();
-        assert!(path.starts_with(cache));
-        Held { path, set: Mutex::new(set), changed: AtomicBool::new(false) }
+impl KnownDigests {
+    pub fn decode(raw: &[u8]) -> Option<Self> {
+        let body = raw.strip_prefix(HELD_MAGIC)?;
+        let (whole, rest) = body.as_chunks::<8>();
+        rest.is_empty().then(|| Self { set: whole.iter().map(|c| u64::from_le_bytes(*c)).collect(), changed: false })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut ids: Vec<_> = self.set.iter().copied().collect();
+        ids.sort_unstable();
+        let mut bytes = Vec::with_capacity(HELD_MAGIC.len() + 8 * ids.len());
+        bytes.extend_from_slice(HELD_MAGIC);
+        for id in ids {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        bytes
     }
 
     pub fn lacking<'a, T>(&self, items: impl Iterator<Item = (&'a Digest, T)>) -> Vec<(Digest, T)> {
-        let set = self.set.lock().unwrap();
-        items.filter(|(d, _)| !set.contains(&short(d))).map(|(d, t)| (*d, t)).collect()
+        items.filter(|(d, _)| !self.set.contains(&short(d))).map(|(d, t)| (*d, t)).collect()
     }
 
-    pub fn add<'a>(&self, digests: impl Iterator<Item = &'a Digest>) {
-        let mut set = self.set.lock().unwrap();
-        let before = set.len();
-        set.extend(digests.map(short));
-        if set.len() > MOST {
-            set.clear();
+    pub fn add<'a>(&mut self, digests: impl Iterator<Item = &'a Digest>) {
+        let before = self.set.len();
+        self.set.extend(digests.map(short));
+        if self.set.len() > MOST {
+            self.set.clear();
+            self.changed = true;
         }
-        assert!(set.len() <= MOST);
-        if set.len() != before {
-            self.changed.store(true, Ordering::SeqCst);
+        self.changed |= self.set.len() != before;
+    }
+
+    pub fn forget<'a>(&mut self, digests: impl Iterator<Item = &'a Digest>) {
+        for digest in digests {
+            self.changed |= self.set.remove(&short(digest));
         }
     }
 
     pub fn len(&self) -> usize {
-        self.set.lock().unwrap().len()
+        self.set.len()
     }
 
-    pub fn save(&self) -> io::Result<()> {
-        if !self.changed.swap(false, Ordering::SeqCst) {
-            return Ok(());
-        }
-        let body: Vec<u8> = {
-            let set = self.set.lock().unwrap();
-            let mut b = Vec::with_capacity(HELD_MAGIC.len() + 8 * set.len());
-            b.extend_from_slice(HELD_MAGIC);
-            for v in set.iter() {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            assert_eq!(b.len(), HELD_MAGIC.len() + 8 * set.len());
-            b
-        };
-        if let Some(dir) = self.path.parent() {
+    pub fn take_changes(&mut self) -> Option<Vec<u8>> {
+        std::mem::take(&mut self.changed).then(|| self.encode())
+    }
+
+    pub fn save_failed(&mut self) {
+        self.changed = true;
+    }
+}
+
+pub struct HeldFile(PathBuf);
+
+impl HeldFile {
+    pub fn load(cache: &Path, server: &str, user: &str) -> (Self, KnownDigests) {
+        let key = blake3::hash(format!("{server}\0{user}").as_bytes()).to_hex()[..32].to_string();
+        let path = cache.join("held").join(key);
+        let held = std::fs::read(&path).ok().and_then(|raw| KnownDigests::decode(&raw)).unwrap_or_default();
+        assert!(path.starts_with(cache));
+        (Self(path), held)
+    }
+
+    pub fn save(&self, body: &[u8]) -> io::Result<()> {
+        if let Some(dir) = self.0.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        crate::write_atomic(&self.path, &body).inspect_err(|_| self.changed.store(true, Ordering::SeqCst))
+        crate::write_atomic(&self.0, body)
     }
 }
 
@@ -134,19 +143,19 @@ mod tests {
     fn what_the_server_holds_and_the_chunks_outlive_the_daemon() {
         let tmp = tempfile::tempdir().unwrap();
         let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
-        let all = |h: &Held| h.lacking([(&a, 1), (&b, 2), (&c, 3)].into_iter());
-        let held = Held::load(tmp.path(), "build.example:7459", "ann");
+        let all = |h: &KnownDigests| h.lacking([(&a, 1), (&b, 2), (&c, 3)].into_iter());
+        let (file, mut held) = HeldFile::load(tmp.path(), "build.example:7459", "ann");
         assert_eq!(all(&held).len(), 3);
         held.add([a, b].iter());
-        held.save().unwrap();
-        let again = Held::load(tmp.path(), "build.example:7459", "ann");
+        file.save(&held.encode()).unwrap();
+        let (_, again) = HeldFile::load(tmp.path(), "build.example:7459", "ann");
         assert_eq!(all(&again), vec![(c, 3)]);
         assert_eq!(again.len(), 2);
-        assert_eq!(all(&Held::load(tmp.path(), "other.example:7459", "ann")).len(), 3);
-        assert_eq!(all(&Held::load(tmp.path(), "build.example:7459", "bob")).len(), 3);
+        assert_eq!(all(&HeldFile::load(tmp.path(), "other.example:7459", "ann").1).len(), 3);
+        assert_eq!(all(&HeldFile::load(tmp.path(), "build.example:7459", "bob").1).len(), 3);
         let path = std::fs::read_dir(tmp.path().join("held")).unwrap().next().unwrap().unwrap().path();
         std::fs::write(&path, b"rargo-held-1\nabc").unwrap();
-        assert_eq!(Held::load(tmp.path(), "build.example:7459", "ann").len(), 0);
+        assert_eq!(HeldFile::load(tmp.path(), "build.example:7459", "ann").1.len(), 0);
 
         let mut chunks = Chunks::new();
         chunks.insert(a, (b, 4096, 512));

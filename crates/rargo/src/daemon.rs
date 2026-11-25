@@ -7,7 +7,7 @@ use crate::{Config, Policy, git, report, scan};
 use rargo_net::link::Link;
 use rargo_proto::{Blob, CONTROL, ClientMsg, Digest, LocalReply, LocalRequest, Offer, PROTO_VERSION, RunRequest, ServerMsg};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -33,7 +33,6 @@ pub struct Counters {
     pub offers: AtomicU64,
     pub probes_known: AtomicU64,
     pub offered_bytes: AtomicU64,
-    pub links: AtomicU64,
     pub fetched_contents: AtomicU64,
     pub fetched_bytes: AtomicU64,
     pub reused_bytes: AtomicU64,
@@ -87,6 +86,62 @@ struct Worktree {
     out_failed: AtomicBool,
 }
 
+struct DaemonState {
+    session_up: bool,
+    connections: u64,
+    held: crate::known::KnownDigests,
+    synced: BTreeMap<u64, Digest>,
+}
+
+impl DaemonState {
+    fn new(held: crate::known::KnownDigests) -> Self {
+        Self { session_up: false, connections: 0, held, synced: BTreeMap::new() }
+    }
+
+    fn observe_session(&mut self, up: bool) -> bool {
+        self.session_up = up;
+        self.session_up
+    }
+
+    fn connected(&mut self) {
+        self.connections += 1;
+        self.session_up = true;
+    }
+
+    fn expire_worktree(&mut self, worktree: u64) {
+        self.synced.remove(&worktree);
+    }
+
+    fn synced<'a>(&mut self, worktree: Option<u64>, root: Digest, contents: impl Iterator<Item = &'a Digest>) {
+        self.held.add(contents);
+        if let Some(worktree) = worktree {
+            self.synced.insert(worktree, root);
+        }
+    }
+
+    fn missing<'a>(&mut self, worktree: Option<u64>, contents: impl Iterator<Item = &'a Digest>) {
+        self.held.forget(contents);
+        if let Some(worktree) = worktree {
+            self.synced.remove(&worktree);
+        }
+    }
+
+    fn reuse_scan(previous: Option<&git::Head>, next: Option<&git::Head>, watching: bool, all_watched: bool, dirty: bool) -> bool {
+        let same_head = match (previous, next) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text && a.tags == b.tags,
+            _ => false,
+        };
+        same_head && watching && all_watched && !dirty
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.synced.keys().all(|&worktree| worktree > 0)
+            && self.held.len() <= crate::known::MOST_CHUNKS
+    }
+}
+
 pub struct Daemon {
     cfg: Config,
     cache: PathBuf,
@@ -105,7 +160,9 @@ pub struct Daemon {
     partials: Mutex<HashMap<Digest, (u64, Arc<Partial>)>>,
     chunks: Mutex<crate::known::Chunks>,
     chunks_changed: AtomicBool,
-    held: crate::known::Held,
+    knowledge: Mutex<DaemonState>,
+    held_file: crate::known::HeldFile,
+    saving_held: Mutex<()>,
     handle: tokio::runtime::Handle,
 }
 
@@ -167,7 +224,7 @@ fn is_no_link(e: &std::io::Error) -> bool {
 impl Daemon {
     pub fn new(cfg: Config, cache: PathBuf, watch: bool) -> Arc<Daemon> {
         let chunks = crate::known::load_chunks(&cache);
-        let held = crate::known::Held::load(&cache, &cfg.server, &cfg.user);
+        let (held_file, held) = crate::known::HeldFile::load(&cache, &cfg.server, &cfg.user);
         let watcher = if watch {
             match Watcher::new() {
                 Ok(w) => Some(Arc::new(w)),
@@ -197,7 +254,9 @@ impl Daemon {
             partials: Mutex::new(HashMap::new()),
             chunks: Mutex::new(chunks),
             chunks_changed: AtomicBool::new(false),
-            held,
+            knowledge: Mutex::new(DaemonState::new(held)),
+            held_file,
+            saving_held: Mutex::new(()),
             handle: tokio::runtime::Handle::current(),
         });
         if let Some(w) = d.watcher.clone() {
@@ -228,10 +287,9 @@ impl Daemon {
 
     async fn mux(&self) -> std::io::Result<Arc<Mux>> {
         let mut g = self.mux.lock().await;
-        if let Some(m) = &*g {
-            if !m.is_dead() {
-                return Ok(m.clone());
-            }
+        let up = g.as_ref().is_some_and(|mux| !mux.is_dead());
+        if self.knowledge.lock().unwrap().observe_session(up) {
+            return Ok(g.as_ref().unwrap().clone());
         }
         let addr = tokio::net::lookup_host(&self.cfg.server)
             .await
@@ -239,14 +297,16 @@ impl Daemon {
             .next()
             .ok_or_else(|| no_link(std::io::Error::new(std::io::ErrorKind::NotFound, "the server's name has no address")))?;
         let link = Link::connect(addr, &self.cfg.user, &self.cfg.psk, &self.transport).await.map_err(no_link)?;
-        self.counters.links.fetch_add(1, Ordering::Relaxed);
         let m = Mux::new(link);
         *g = Some(m.clone());
+        self.knowledge.lock().unwrap().connected();
         Ok(m)
     }
 
     async fn mux_if_up(&self) -> Option<Arc<Mux>> {
-        self.mux.lock().await.clone().filter(|m| !m.is_dead())
+        let link = self.mux.lock().await;
+        let up = link.as_ref().is_some_and(|mux| !mux.is_dead());
+        if self.knowledge.lock().unwrap().observe_session(up) { link.clone() } else { None }
     }
 
     fn worktree(self: &Arc<Self>, root: &Path) -> Arc<Worktree> {
@@ -314,12 +374,7 @@ impl Daemon {
         let head = git::head(&wt.root);
         let watching = self.watcher.is_some();
         if let Some(last) = &st.last {
-            let same_head = match (&last.head, &head) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.commit == b.commit && a.text == b.text && a.tags == b.tags,
-                _ => false,
-            };
-            if same_head && watching && st.unwatched.is_empty() && !wt.dirty.load(Ordering::SeqCst) {
+            if DaemonState::reuse_scan(last.head.as_ref(), head.as_ref(), watching, st.unwatched.is_empty(), wt.dirty.load(Ordering::SeqCst)) {
                 self.counters.scans_spared.fetch_add(1, Ordering::Relaxed);
                 return Ok((last.clone(), false));
             }
@@ -464,9 +519,10 @@ impl Daemon {
 
     async fn offer(&self, mux: &Arc<Mux>, wt: &Arc<Worktree>, snap: &Arc<Snap>, probe: Probe) -> std::io::Result<Offered> {
         let delta = || -> (Vec<Digest>, Vec<(Digest, u64)>) {
+            let knowledge = self.knowledge.lock().unwrap();
             (
-                self.held.lacking(snap.scan.trees.keys().map(|d| (d, ()))).into_iter().map(|(d, ())| d).collect(),
-                self.held.lacking(snap.scan.files.iter().map(|(d, (_, size))| (d, *size))),
+                knowledge.held.lacking(snap.scan.trees.keys().map(|d| (d, ()))).into_iter().map(|(d, ())| d).collect(),
+                knowledge.held.lacking(snap.scan.files.iter().map(|(d, (_, size))| (d, *size))),
             )
         };
         let (mut trees, mut blobs) = delta();
@@ -544,6 +600,9 @@ impl Daemon {
                     return Ok(Offered::Bet(answer));
                 }
                 let (lacking_trees, lacking_blobs) = answer.await.map_err(|_| lost())?;
+                if !lacking_trees.is_empty() || !lacking_blobs.is_empty() {
+                    self.knowledge.lock().unwrap().missing(Some(wt.id), lacking_trees.iter().chain(&lacking_blobs));
+                }
                 lacking_trees.is_empty().then_some(lacking_blobs)
             } else {
                 None
@@ -558,6 +617,9 @@ impl Daemon {
                 let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: Vec::new(), ask: true }));
                 mux.post_bulk(CONTROL, &msg, tree_bytes as usize).await?;
                 let (lacking_trees, lacking_blobs) = answer.await.map_err(|_| lost())?;
+                if !lacking_trees.is_empty() || !lacking_blobs.is_empty() {
+                    self.knowledge.lock().unwrap().missing(Some(wt.id), lacking_trees.iter().chain(&lacking_blobs));
+                }
                 if lacking_trees.is_empty() {
                     break lacking_blobs;
                 }
@@ -574,17 +636,22 @@ impl Daemon {
                 return Ok(Offered::Changed);
             }
         }
-        self.has_now(snap);
+        self.has_now(Some(wt), snap);
         Ok(Offered::Sent)
     }
 
-    fn has_now(&self, snap: &Snap) {
-        self.held.add(snap.scan.trees.keys().chain(snap.scan.files.keys()));
+    fn has_now(&self, worktree: Option<&Arc<Worktree>>, snap: &Snap) {
+        self.knowledge.lock().unwrap().synced(worktree.map(|wt| wt.id), snap.scan.root, snap.scan.trees.keys().chain(snap.scan.files.keys()));
     }
 
     pub fn save_known(&self) {
-        if let Err(e) = self.held.save() {
-            eprintln!("rargo daemon: cannot keep what the server holds: {e}");
+        {
+            let _serial = self.saving_held.lock().unwrap();
+            let state = self.knowledge.lock().unwrap().held.take_changes();
+            if let Some(body) = state && let Err(e) = self.held_file.save(&body) {
+                self.knowledge.lock().unwrap().held.save_failed();
+                eprintln!("rargo daemon: cannot keep what the server holds: {e}");
+            }
         }
         if self.chunks_changed.swap(false, Ordering::SeqCst) {
             let chunks = self.chunks.lock().unwrap().clone();
@@ -1168,11 +1235,12 @@ impl Daemon {
                     let (trees, blobs) = lacking.map_err(|_| lost())?;
                     if trees.is_empty() && blobs.is_empty() {
                         if let Some(s) = snap {
-                            self.has_now(s);
+                            self.has_now(wt, s);
                         }
                         self.counters.probes_known.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
+                    self.knowledge.lock().unwrap().missing(wt.map(|wt| wt.id), trees.iter().chain(&blobs));
                     mux.post(stream, &ClientMsg::Changed);
                     return Ok(Outcome::NotThere(if trees.is_empty() { Probe::Wait } else { Probe::Whole }));
                 }
@@ -1197,10 +1265,12 @@ impl Daemon {
                     let _ = out.send(LocalReply::Stderr(b));
                 }
                 ServerMsg::WantTrees(want) => {
+                    self.knowledge.lock().unwrap().missing(wt.map(|wt| wt.id), want.iter());
                     let trees: Vec<Vec<u8>> = want.iter().filter_map(|d| snap.and_then(|s| s.scan.trees.get(d)).cloned()).collect();
                     mux.post(stream, &ClientMsg::Trees(trees));
                 }
                 ServerMsg::WantBlobs(want) => {
+                    self.knowledge.lock().unwrap().missing(wt.map(|wt| wt.id), want.iter());
                     let ok = match snap {
                         Some(s) => upload(mux, stream, s, want).await?,
                         None => false,
@@ -1319,6 +1389,10 @@ impl Daemon {
             Some(m) => (m.kind(), m.bytes_out.load(Ordering::Relaxed), m.bytes_in.load(Ordering::Relaxed)),
             None => ("none", 0, 0),
         };
+        let (links, held) = {
+            let state = self.knowledge.lock().unwrap();
+            (state.connections, state.held.len())
+        };
         let (worktrees, watched) = {
             let all = self.worktrees.lock().unwrap();
             (all.len(), all.values().filter(|w| w.unwatched.load(Ordering::SeqCst) == 0).count())
@@ -1344,7 +1418,7 @@ impl Daemon {
              held                {} trees and contents the server is believed to hold (kept across daemons)\n\
              outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on first read, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
-            c.links.load(Ordering::Relaxed),
+            links,
             c.commands.load(Ordering::Relaxed),
             c.scans.load(Ordering::Relaxed),
             c.rescans.load(Ordering::Relaxed),
@@ -1353,7 +1427,7 @@ impl Daemon {
             c.offers.load(Ordering::Relaxed),
             c.offered_bytes.load(Ordering::Relaxed),
             c.probes_known.load(Ordering::Relaxed),
-            self.held.len(),
+            held,
             outs.0,
             outs.1,
             outs.2,
@@ -1747,6 +1821,7 @@ pub fn serve(socket: &Path) -> ! {
                         old.iter().filter_map(|p| all.remove(p)).collect()
                     };
                     for wt in stale {
+                        d.knowledge.lock().unwrap().expire_worktree(wt.id);
                         if let Some(w) = &d.watcher {
                             w.forget(wt.id);
                         }
@@ -1855,6 +1930,34 @@ mod left_out_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reconnect_retains_hints_and_negative_reports_invalidate_them() {
+        let digests: Vec<_> = (1..=64).map(|byte| [byte; 32]).collect();
+        let mut state = DaemonState::new(crate::known::KnownDigests::default());
+        let mut server = std::collections::BTreeSet::new();
+        for (i, digest) in digests.iter().enumerate() {
+            state.connected();
+            assert!(state.invariants());
+            state.synced(Some(1), *digest, std::iter::once(digest));
+            server.insert(*digest);
+            assert!(state.invariants());
+            assert_eq!(state.synced.get(&1), Some(digest));
+            assert!(!state.observe_session(false));
+            assert!(state.invariants());
+            let lost = digests[(i / 3) % (i + 1)];
+            server.remove(&lost);
+            state.connected();
+            assert!(state.invariants());
+            state.missing(Some(1), std::iter::once(&lost));
+            assert!(state.invariants());
+            assert!(!state.synced.contains_key(&1));
+            let missing = state.held.lacking(digests[..=i].iter().map(|digest| (digest, ())));
+            assert_eq!(missing.into_iter().map(|(digest, ())| digest).collect::<Vec<_>>(),
+                digests[..=i].iter().copied().filter(|digest| !server.contains(digest)).collect::<Vec<_>>());
+        }
+        assert_eq!(state.connections, 128);
+    }
+
     use super::*;
 
     #[test]
