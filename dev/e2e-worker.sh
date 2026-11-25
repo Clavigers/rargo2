@@ -25,43 +25,71 @@ rargod_pids() {
         [ "$comm" = rargod ] && echo "$pid"
     done
 }
-stop_worker() {
-    local before srv pid
-    before=$(grep -c "is gone" "$rig/srv.log" 2>/dev/null || true)
+# Follow the server log only while that server lives, and only for a minute.
+# A line that never arrives fails here; the server is left running.
+wait_srv_line() {
+    local pat=$1 need=$2 srv
     srv=$(rargod_pids "$rig/srv" | head -1)
-    for pid in $(rargod_pids "$rig/w1"); do
-        kill -TERM "$pid" 2>/dev/null || true
-        tail --pid="$pid" -f /dev/null
-    done
-    tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk -v need="$((${before:-0} + 1))" '
-        /is gone/ { c++; if (c >= need) { found = 1; exit } }
+    if [ -z "$srv" ]; then
+        echo "the server is not running" >&2
+        return 1
+    fi
+    timeout 60 tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk -v pat="$pat" -v need="$need" '
+        index($0, pat) { c++; if (c + 0 >= need + 0) { found = 1; exit } }
         END { exit found ? 0 : 1 }
     '
+}
+stop_worker() {
+    local before pid saw=0
+    before=$(grep -c "is gone" "$rig/srv.log" 2>/dev/null || true)
+    for pid in $(rargod_pids "$rig/w1"); do
+        saw=1
+        kill -TERM "$pid" 2>/dev/null || true
+        timeout 20 tail --pid="$pid" -f /dev/null || kill -KILL "$pid" 2>/dev/null || true
+    done
+    if [ "$saw" != 1 ]; then
+        echo "no worker process to stop" >&2
+        return 1
+    fi
+    if ! wait_srv_line "is gone" "$((${before:-0} + 1))"; then
+        echo "the worker did not go away" >&2
+        return 1
+    fi
 }
 wait_worker_gone() { stop_worker; }
 wait_hashed() {
-    local srv
     if grep -q "nix closure:" "$rig/srv.log" 2>/dev/null; then
         return 0
     fi
-    srv=$(rargod_pids "$rig/srv" | head -1)
-    [ -n "$srv" ] || return 1
-    tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk '/nix closure:/ { found=1; exit } END { exit found ? 0 : 1 }'
+    if ! wait_srv_line "nix closure:" 1; then
+        echo "the closure hash did not finish" >&2
+        return 1
+    fi
 }
 worker_holds_only() {
-    local joined srv wpid
-    stop_worker
+    local joined
+    stop_worker || return 1
     joined=$(grep -c "joined" "$rig/srv.log" 2>/dev/null || true)
-    srv=$(rargod_pids "$rig/srv" | head -1)
     nohup systemd-run --scope -q -p CPUQuota=100% -p MemoryMax=30G -p Delegate=yes \
         ip netns exec "${RIG}-w1" "$RARGO_BIN/rargod" --state "$rig/w1" --worker 10.77.0.1:7711 \
         --worker-key "$rig/link.key" --jobs 0 >>"$rig/w1.log" 2>&1 &
-    wpid=$!
-    tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk -v need="$((${joined:-0} + 1))" '
-        /joined/ { c++; if (c >= need) { found = 1; exit } }
-        END { exit found ? 0 : 1 }
-    '
-    echo "$wpid" >"$rig/w1.scope"
+    if ! wait_srv_line "joined" "$((${joined:-0} + 1))"; then
+        echo "the worker did not join" >&2
+        tail -n 20 "$rig/w1.log" >&2 || echo "no worker log was written" >&2
+        return 1
+    fi
+}
+rig_up() {
+    local out rc
+    out=$("$here/netns.sh" up "$@" 2>&1)
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        bad "the rig came up with a worker" "$out"
+        timeout 20 "$here/netns.sh" down >/dev/null 2>&1 || true
+        echo
+        echo "$pass passed, $fail failed"
+        exit 1
+    fi
 }
 
 if [ -z "${E2E_WORKER_PHASE:-}" ]; then
@@ -135,7 +163,7 @@ rm -rf "$E"; mkdir -p "$proj"
 for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
-"$here/netns.sh" up 1 4 1 1 0 1gbit >/dev/null 2>&1
+rig_up 1 4 1 1 0 1gbit
 . "$rig/client.env"
 cd "$proj" || exit 2
 
@@ -183,7 +211,7 @@ out=$(R build 2>&1); check $? "the workspace builds after a third edit" "$out"
 settle
 ahead=$(stat 'states made here sent to workers ahead')
 [ "${ahead:-0}" -ge 1 ]; check $? "states made on the server were sent to the worker ahead of need ($ahead)" "$(R --rargo-status)"
-wait_worker_gone
+wait_worker_gone; check $? "the worker is gone" "$(tail -5 "$rig/srv.log")"
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 3 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "the workspace builds after the worker was killed" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 22" ]; check $? "its program shows the last edit (total 22)" "$out"
@@ -209,7 +237,7 @@ rm -rf "$proj" "$RARGO_CACHE_DIR"; mkdir -p "$proj"
 for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
-RARGO_STATE_HOME_AFTER_MS=3600000 "$here/netns.sh" up 1 1 1 1 0 1gbit >/dev/null 2>&1
+RARGO_STATE_HOME_AFTER_MS=3600000 rig_up 1 1 1 1 0 1gbit
 . "$rig/client.env"
 cd "$proj" || exit 2
 out=$(R build 2>&1); check $? "one-core worker: a workspace builds" "$out"
@@ -235,12 +263,12 @@ out=$(R run -q 2>&1); [ "$out" = "total 604" ]; check $? "its program shows the 
 none=$(R --rargo-status | grep '^incremental' | grep -oE '[0-9]+ none' | cut -d' ' -f1)
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 5 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "one-core worker: it builds after a second edit" "$out"
-worker_holds_only
+worker_holds_only; check $? "the worker is back with no core" "$(tail -20 "$rig/w1.log" 2>/dev/null)"
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 6 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "one-core worker: it builds while the worker has no core" "$out"
 needed=$(stat 'files were fetched for a compile here')
 [ "${needed:-0}" -ge 1 ]; check $? "a compile on the server fetched the state it started from ($needed files)" "$(R --rargo-status)"
-wait_worker_gone
+wait_worker_gone; check $? "the worker is gone" "$(tail -5 "$rig/srv.log")"
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 7 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "it builds after the worker died with states on it" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 46" ]; check $? "its program shows the last edit (total 46)" "$out"

@@ -52,10 +52,50 @@ down() {
         ip netns del "$nsname" 2>/dev/null || true
     done
 }
+live_server() {
+    for pid in $(pgrep -f "rargod --state $T/srv " || true); do
+        comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+        comm=${comm# }
+        comm=${comm% }
+        if [ "$comm" = rargod ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    done
+    return 1
+}
+# Follow pid when one is given, so a dead server ends the wait, and give up
+# after 30s either way. The server itself is left running.
+wait_for_line() {
+    file=$1
+    pat=$2
+    pid=${3:-}
+    if [ -n "$pid" ]; then
+        timeout 30 tail -n +1 -f --pid="$pid" "$file"
+    else
+        timeout 30 tail -n +1 -f "$file"
+    fi | awk -v pat="$pat" 'index($0, pat) { found = 1; exit } END { exit found ? 0 : 1 }'
+}
+show_worker_logs() {
+    i=1
+    while [ "$i" -le "${n:-0}" ]; do
+        echo "----- worker $i ($T/w$i.log) -----" >&2
+        if [ -s "$T/w$i.log" ]; then
+            tail -n 20 "$T/w$i.log" >&2
+        elif [ -f "$T/w$i.log" ]; then
+            echo "the worker log is empty" >&2
+        else
+            echo "no worker log was written" >&2
+        fi
+        i=$((i + 1))
+    done
+}
 wait_up() {
     if [ "${n:-0}" -ge 1 ]; then
-        if ! tail -n +1 -f --pid="$srvpid" "$T/srv.log" | awk '/joined/ { found=1; exit } END { exit found ? 0 : 1 }'; then
+        sp=$(live_server || true)
+        if ! wait_for_line "$T/srv.log" "joined" "$sp"; then
             echo "no worker joined" >&2
+            show_worker_logs
             return 1
         fi
     fi
@@ -76,9 +116,9 @@ start_server() {
         "$B/rargod" --state "$T/srv" --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
         --listen 10.77.0.1:7459 --cargo-home "$work/cargo-home" \
         --jobs "$sj" --workers-listen 10.77.0.1:7711 --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
-    srvpid=$!
-    if ! tail -n +1 -f --pid="$srvpid" "$T/srv.log" | awk '/serving clients/ { found=1; exit } END { exit found ? 0 : 1 }'; then
+    if ! wait_for_line "$T/srv.log" "serving clients"; then
         echo "rargod did not start" >&2
+        tail -n 20 "$T/srv.log" >&2 || true
         return 1
     fi
 }
@@ -86,9 +126,10 @@ start_workers() {
     i=1
     while [ "$i" -le "$n" ]; do
         mkdir -p "$T/w$i"
+        : >"$T/w$i.log"
         nohup systemd-run --scope -q -p CPUQuota=$((wj * 100))% -p MemoryMax=30G -p Delegate=yes \
             ip netns exec "$RIG-w$i" "$B/rargod" --state "$T/w$i" --worker 10.77.0.1:7711 --worker-key "$T/link.key" --jobs "$wj" \
-            >"$T/w$i.log" 2>&1 &
+            >>"$T/w$i.log" 2>&1 &
         i=$((i + 1))
     done
 }
