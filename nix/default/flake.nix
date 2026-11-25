@@ -30,7 +30,11 @@
         components = pkgs.lib.unique ((toolchain.components or []) ++ [ "clippy" "rustfmt" "rust-src" ]);
       });
       tools = with pkgs; [ gcc binutils pkg-config cmake gnumake perl python3 git ];
-      libs = with pkgs; [ openssl zlib sqlite ];
+      libs = with pkgs; [
+        openssl zlib sqlite
+        udev alsa-lib wayland libxkbcommon vulkan-loader fontconfig freetype
+        libx11 libxcursor libxi libxrandr libxext libxrender libxfixes libxcb
+      ];
     in {
       devShells.${system} = {
         system = pkgs.mkShell {

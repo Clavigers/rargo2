@@ -45,6 +45,17 @@ exclude = ["node_modules"]             # never sent to the server
 pass = ["DATABASE_URL"]                # given to every action
 ```
 
+## Toolchain and system libraries
+
+The server builds in the dev shell of the project's `flake.nix` (`devShells.<system>.default`).
+A project without one gets rargo's default flake. It has:
+
+- the Rust toolchain that `rust-toolchain.toml` names (a pinned nightly if there is none), with `rust-src`, `clippy` and `rustfmt`;
+- gcc, cmake, pkg-config, perl, python3 and git;
+- the libraries openssl, zlib, sqlite, udev, alsa, wayland, xkbcommon, vulkan-loader, fontconfig, freetype and the X11 libraries.
+
+If a build script needs another library, add a `flake.nix` that puts it in the shell's `buildInputs`.
+
 `rargo --help` lists the other commands.
 
 ## Docs
