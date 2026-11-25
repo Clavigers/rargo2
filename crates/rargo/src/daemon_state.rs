@@ -1,7 +1,16 @@
-use crate::git::Head;
-use crate::known::KnownDigests;
+use crate::known_digests::KnownDigests;
 use rargo_proto::Digest;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+#[derive(Clone)]
+pub struct Head {
+    pub text: String,
+    pub branch: Option<String>,
+    pub commit: String,
+    pub common: PathBuf,
+    pub tags: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {
@@ -65,6 +74,7 @@ impl DaemonState {
                 wt.synced = None;
             }
         }
+        debug_assert!(self.worktrees.values().all(|wt| wt.synced.is_none()), "nothing is synced over a link that is down");
         match need {
             Need::Must => Link::Connect,
             Need::IfUp => Link::Skip,
@@ -85,6 +95,7 @@ impl DaemonState {
 
     pub fn expired(&mut self, worktree: u64) {
         self.worktrees.remove(&worktree);
+        debug_assert!(!self.worktrees.contains_key(&worktree));
     }
 
     pub fn changed(&mut self, worktree: u64, everything: bool) {
@@ -92,12 +103,14 @@ impl DaemonState {
             wt.dirty = true;
             wt.everything |= everything;
         }
+        debug_assert!(self.worktrees.get(&worktree).is_none_or(|wt| wt.dirty), "a changed worktree is scanned again");
     }
 
     pub fn watched(&mut self, worktree: u64, all: bool) {
         if let Some(wt) = self.worktrees.get_mut(&worktree) {
             wt.all_watched = all;
         }
+        debug_assert!(self.worktrees.get(&worktree).is_none_or(|wt| wt.all_watched == all));
     }
 
     pub fn all_watched(&self) -> usize {
@@ -113,6 +126,7 @@ impl DaemonState {
         let everything = std::mem::take(&mut wt.everything) || !watching || wt.scanned.is_none();
         wt.dirty = false;
         wt.scanned = None;
+        debug_assert!(!wt.everything, "a planned scan takes the wish for a full one");
         ScanPlan::Scan { everything }
     }
 
@@ -120,6 +134,7 @@ impl DaemonState {
         if let Some(wt) = self.worktrees.get_mut(&worktree) {
             wt.scanned = Some(head);
         }
+        debug_assert!(self.worktrees.get(&worktree).is_none_or(|wt| wt.scanned.is_some()));
     }
 
     pub fn offer<'a, T>(
@@ -151,6 +166,10 @@ impl DaemonState {
         {
             wt.synced = Some(root);
         }
+        debug_assert!(
+            self.worktrees.values().all(|wt| wt.synced.is_none_or(|d| self.held.holds(&d))),
+            "every synced root is held"
+        );
     }
 
     pub fn missing<'a>(&mut self, contents: impl Iterator<Item = &'a Digest>) {
@@ -158,9 +177,9 @@ impl DaemonState {
         for wt in self.worktrees.values_mut() {
             wt.synced = None;
         }
+        debug_assert!(self.worktrees.values().all(|wt| wt.synced.is_none()), "missing content unsyncs every worktree");
     }
 
-    #[cfg(test)]
     pub fn invariants(&self) {
         assert!(self.connections > 0 || !self.up, "the session is up only after a link was made");
         for (id, wt) in &self.worktrees {

@@ -1,6 +1,5 @@
 mod cli;
 mod daemon;
-mod daemon_state;
 mod git;
 mod known;
 mod loader;
@@ -201,7 +200,7 @@ fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-pub fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
+pub fn recent_commits(root: &Path, head: &rargo::daemon_state::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
     let head = &head.commit;
     let memo = wt_cache.join("commits");
     let parse = |text: &str| -> Vec<[u8; 20]> { text.lines().filter_map(parse_hex20).collect() };

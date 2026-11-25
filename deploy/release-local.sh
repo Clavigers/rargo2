@@ -3,7 +3,7 @@ set -euo pipefail
 tag=${1:?a tag, vX.Y.Z}
 v=${tag#v}
 repo=$(cd "$(dirname "$0")/.." && pwd)
-"$repo/dev/release-gate.sh" "$(git -C "$repo" rev-parse "$tag^{commit}")"
+"$repo/dev/ci-passed.sh" "$(git -C "$repo" rev-parse "$tag^{commit}")"
 dl=${RARGO_SITE_DATA:-/root/rargo-hq/data}/dl
 mkdir -p "$dl/$v.tmp"
 (cd "$repo" && gh release download "$tag" --dir "$dl/$v.tmp" --clobber)

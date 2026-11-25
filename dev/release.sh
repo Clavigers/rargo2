@@ -35,10 +35,8 @@ notes=$(git log --format=%s "${prev:+$prev..}$commit")
 issues=$(printf '%s\n' "$notes" | { grep -oE '#[0-9]+' || true; } | cut -c2- | sort -un)
 
 if [ -z "$remote_tag" ]; then
-    step='running the build-machine gate'
-    env -u RARGO_TOKEN RARGO_SERVER=rargo.rs dev/gate.sh 9>&-
-    step='checking the gate status'
-    dev/release-gate.sh "$commit"
+    step='waiting for CI on the release commit'
+    dev/ci-passed.sh --wait "$commit"
     step='creating and pushing the tag'
     if git show-ref --verify --quiet "refs/tags/$tag"; then
         [ "$(git rev-parse "$tag^{commit}")" = "$commit" ] || die "$tag points at a different commit"
@@ -53,8 +51,8 @@ if [ -z "$remote_tag" ]; then
         sleep 2
     done
 else
-    step='checking the tagged commit gate'
-    dev/release-gate.sh "$commit"
+    step='checking CI on the tagged commit'
+    dev/ci-passed.sh "$commit"
 fi
 
 step='waiting for the release workflow'

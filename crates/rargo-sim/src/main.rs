@@ -17,7 +17,7 @@ fn main() -> Result<(), String> {
                 seeds = a.parse().map_err(|_| "not a seed")?..b.parse().map_err(|_| "not a seed")?;
             }
             "--bug" => bug = Some(Bug::parse(value).ok_or_else(|| format!("no such bug: {value}"))?),
-            other => return Err(format!("usage: rargo-sim (--seed N | --seeds A..B) [--bug evict-pinned|stale-delivery|never-answer]; not {other}")),
+            other => return Err(format!("usage: rargo-sim (--seed N | --seeds A..B) [--bug evict-pinned|stale-delivery|never-answer|evict-claimed|stale-knowledge]; not {other}")),
         }
         i += 2;
     }

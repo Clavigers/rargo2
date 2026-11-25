@@ -115,7 +115,7 @@ hash-order	crates/rargo-net/src/lib.rs	2	HashMap or HashSet with the default ran
 hash-order	crates/rargo-proto/src/lib.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/daemon.rs	18	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo/src/known.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
+hash-order	crates/rargo/src/known.rs	1	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/place.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/scan.rs	23	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map

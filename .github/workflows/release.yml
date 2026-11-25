@@ -4,17 +4,17 @@ on:
     tags: ['v*']
 permissions:
   contents: write
-  statuses: read
+  checks: read
 jobs:
   assets:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - name: Require the build-machine gate on the tag commit
+      - name: Require CI on the tag commit
         env:
           GH_TOKEN: ${{ github.token }}
-        run: dev/release-gate.sh "$(git rev-parse HEAD)"
+        run: dev/ci-passed.sh "$(git rev-parse HEAD)"
       - name: Tag and manifest agree
         run: |
           v=${GITHUB_REF_NAME#v}
