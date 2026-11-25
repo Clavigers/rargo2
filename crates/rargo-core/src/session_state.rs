@@ -532,10 +532,12 @@ fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
         return Hello::Need(9);
     }
     if &buf[..8] != magic {
-        return Hello::Foreign(reply(
-            1,
-            b"this is a rargo build server; the client speaks a different protocol version\n",
-        ));
+        let text = if buf[..5] == magic[..5] && buf[6..8] == magic[6..8] {
+            crate::conn_state::protocol_mismatch(buf[5] as u32)
+        } else {
+            "this is a rargo build server; the client speaks another protocol".to_string()
+        };
+        return Hello::Foreign(refusal(&text));
     }
     let user_end = 9 + buf[8] as usize;
     if buf.len() < user_end + 2 {
@@ -683,6 +685,9 @@ mod tests {
         }
         let Hello::Foreign(r) = hello(b"GET / HTTP", magic) else { panic!("another protocol is told so") };
         assert_eq!(r[0], 1);
+        let Hello::Foreign(r) = hello(b"rargo\x07\r\n\x03", magic) else { panic!("an older client is told so") };
+        let text = String::from_utf8(r[3..].to_vec()).unwrap();
+        assert!(text.starts_with("this rargo (protocol 7) is older") && text.contains("install.sh | sh -s -- "), "{text}");
         assert_eq!(welcome(b"xy"), vec![0, 2, 0, b'x', b'y']);
         assert_eq!(refusal("no"), vec![1, 3, 0, b'n', b'o', b'\n']);
         let mut bad = magic.to_vec();
