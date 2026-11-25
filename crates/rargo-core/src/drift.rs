@@ -60,14 +60,14 @@ impl Report {
     }
 }
 
-pub async fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient) -> Result<Report> {
+pub async fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, time: fn() -> Instant) -> Result<Report> {
     let scratch = d.scratch("drift")?;
-    let result = check_in(d, snapshot, who, &scratch).await;
+    let result = check_in(d, snapshot, who, &scratch, time).await;
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
 
-async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path) -> Result<Report> {
+async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path, time: fn() -> Instant) -> Result<Report> {
     let (uid, gid) = (d.cfg.uid, d.cfg.gid);
     let mut env: HashMap<String, String> = d.cfg.server_env.clone();
     for (k, v) in who.env.iter() {
@@ -91,7 +91,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         env.entry(k).or_insert(v);
     }
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
-    let started = Instant::now();
+    let started = time();
     let stock_cwd = scratch.join(&who.dir);
     let stock = tokio::task::spawn_blocking(move || -> Result<std::process::Output> {
         use std::os::unix::process::CommandExt;
@@ -115,7 +115,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         c.output().context("running stock cargo")
     })
     .await??;
-    let stock_secs = started.elapsed().as_secs_f64();
+    let stock_secs = time().saturating_duration_since(started).as_secs_f64();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut env: HashMap<String, String> = (*who.env).clone();
@@ -140,34 +140,39 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         outbox: Default::default(),
     };
     let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
-    let started = Instant::now();
+    let started = time();
     let code = handle(d.clone(), client).await.unwrap_or(0);
-    let rargo_secs = started.elapsed().as_secs_f64();
+    let rargo_secs = time().saturating_duration_since(started).as_secs_f64();
     let mut text = String::new();
     while let Ok(m) = rx.try_recv() {
         if let ServerMsg::Stderr(b) = m {
             text.push_str(&String::from_utf8_lossy(&b));
         }
     }
+    let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
+    Ok(compare(snapshot.id.hex(), (stock.status.success(), &String::from_utf8_lossy(&stock.stderr), stock_secs),
+        (code == 0, &text, rargo_secs), verified_units))
+}
+
+fn compare(snapshot: String, stock: (bool, &str, f64), rargo: (bool, &str, f64), verified_units: u64) -> Report {
+    let (stock_ok, stock_stderr, stock_secs) = stock;
+    let (rargo_ok, text, rargo_secs) = rargo;
     let mismatches: Vec<String> = text
         .lines()
         .filter_map(|l| l.strip_prefix("warning: verify: ").map(|s| s.to_string()))
         .collect();
     let unreproducible = text.lines().filter(|l| l.starts_with("note: verify: not compared: ")).count();
-    let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
-    let stock_ok = stock.status.success();
-    let rargo_ok = code == 0;
     let mut detail = String::new();
     if stock_ok != rargo_ok {
         let tail = |s: &str| s.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         detail = format!(
             "  --- stock cargo (last lines)\n{}\n  --- rargo (last lines)\n{}\n",
-            tail(&String::from_utf8_lossy(&stock.stderr)),
-            tail(&text)
+            tail(stock_stderr),
+            tail(text)
         );
     }
-    Ok(Report {
-        snapshot: snapshot.id.hex(),
+    Report {
+        snapshot,
         stock_ok,
         rargo_ok,
         verified_units,
@@ -176,10 +181,10 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         stock_secs,
         rargo_secs,
         detail,
-    })
+    }
 }
 
-pub async fn background(d: Arc<Daemon>, interval: std::time::Duration) {
+pub async fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> Instant) {
     loop {
         tokio::time::sleep(interval).await;
         for (worktree, snapshot) in d.trees.recent() {
@@ -191,7 +196,7 @@ pub async fn background(d: Arc<Daemon>, interval: std::time::Duration) {
             if who.checked == Some(snapshot.id) {
                 continue;
             }
-            let text = match check(&d, &snapshot, &who).await {
+            let text = match check(&d, &snapshot, &who, time).await {
                 Ok(r) => format!("{}: {}", who.root, r.render()),
                 Err(e) => format!("{}: drift check could not run: {e:#}\n", who.root),
             };
@@ -201,5 +206,25 @@ pub async fn background(d: Arc<Daemon>, interval: std::time::Duration) {
                 c.checked = Some(snapshot.id);
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drift_uses_build_results_and_verification_messages() {
+        let same = compare("abcdef".into(), (true, "", 1.5), (true, "note: verify: not compared: bin", 2.0), 3);
+        assert!(same.agrees());
+        assert_eq!(same.unreproducible, 1);
+        assert!(same.render().contains("stock cargo builds (1.5s), rargo builds (2.0s)"));
+        let content = compare("abcdef".into(), (true, "", 0.0), (true, "warning: verify: artifact differs", 0.0), 1);
+        assert!(!content.agrees());
+        assert_eq!(content.mismatches, ["artifact differs"]);
+        let exit = compare("abcdef".into(), (false, "stock failure", 0.0), (true, "rargo success", 0.0), 0);
+        assert!(!exit.agrees());
+        assert!(exit.detail.contains("stock failure") && exit.detail.contains("rargo success"));
     }
 }

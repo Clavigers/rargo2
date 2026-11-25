@@ -318,7 +318,8 @@ impl Engine {
         zygote: Arc<Zygote>,
         sched: Arc<Scheduler>,
     ) -> Engine {
-        let traces = TraceCache::new(store.db().clone());
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let traces = TraceCache::new(store.db().clone(), seed);
         Engine {
             store,
             content,

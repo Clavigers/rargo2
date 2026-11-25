@@ -1,27 +1,48 @@
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Default)]
-pub struct UnitTime {
-    pub start: Option<Instant>,
-    pub meta: Option<Instant>,
-    pub end: Option<Instant>,
+#[derive(Clone)]
+pub struct UnitTime<T = Instant> {
+    pub start: Option<T>,
+    pub meta: Option<T>,
+    pub end: Option<T>,
     pub cached: bool,
     pub wall_us: u64,
     pub cpu_us: u64,
     pub rss_kb: u64,
 }
 
+impl<T> Default for UnitTime<T> {
+    fn default() -> Self {
+        Self { start: None, meta: None, end: None, cached: false, wall_us: 0, cpu_us: 0, rss_kb: 0 }
+    }
+}
+
+impl UnitTime<Instant> {
+    pub fn relative_to(self, began: Instant) -> UnitTime<Duration> {
+        let relative = |at: Instant| at.saturating_duration_since(began);
+        UnitTime {
+            start: self.start.map(relative),
+            meta: self.meta.map(relative),
+            end: self.end.map(relative),
+            cached: self.cached,
+            wall_us: self.wall_us,
+            cpu_us: self.cpu_us,
+            rss_kb: self.rss_kb,
+        }
+    }
+}
+
 pub struct Row {
     pub name: String,
-    pub time: UnitTime,
+    pub time: UnitTime<Duration>,
     pub index: usize,
     pub deps: Vec<(usize, bool)>,
     pub needs_objects: bool,
     pub runs: bool,
 }
 
-fn data(began: Instant, total: Duration, cores: usize, rows: &[Row]) -> String {
-    let at = |t: Option<Instant>| t.map(|t| t.saturating_duration_since(began).as_secs_f64());
+fn data(total: Duration, cores: usize, rows: &[Row]) -> String {
+    let at = |t: Option<Duration>| t.map(|t| t.as_secs_f64());
     let units: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -66,14 +87,13 @@ pub fn stamp(unix: u64) -> String {
     format!("{y:04}{m:02}{d:02}T{:02}{:02}{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores: usize, every: &[Row]) -> String {
-    let json = data(began, total, cores, every);
+pub fn render(command: &str, when: &str, total: Duration, cores: usize, every: &[Row]) -> String {
+    let json = data(total, cores, every);
     let rows: Vec<&Row> = every.iter().filter(|r| r.runs && r.time.end.is_some()).collect();
     let ran: Vec<&Row> = rows.iter().copied().filter(|r| !r.time.cached && r.time.start.is_some() && r.time.end.is_some()).collect();
     let cached = rows.iter().filter(|r| r.time.cached).count();
     let cpu: u64 = ran.iter().map(|r| r.time.cpu_us).sum();
     let saved: u64 = rows.iter().filter(|r| r.time.cached).map(|r| r.time.wall_us).sum();
-    let since = |t: Instant| t.saturating_duration_since(began);
 
     let mut h = String::new();
     h.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>rargo build timings</title>\n<style>\n");
@@ -133,8 +153,8 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
             t += step;
         }
         for (n, r) in order.iter().enumerate() {
-            let (s, e) = (since(r.time.start.unwrap()), since(r.time.end.unwrap()));
-            let m = r.time.meta.map(since).filter(|m| *m >= s && *m <= e).unwrap_or(e);
+            let (s, e) = (r.time.start.unwrap(), r.time.end.unwrap());
+            let m = r.time.meta.filter(|m| *m >= s && *m <= e).unwrap_or(e);
             let y = 16.0 + n as f64 * row_h;
             h.push_str(&format!(
                 "<rect class=\"front\" x=\"{:.1}\" y=\"{y:.1}\" width=\"{:.1}\" height=\"13\"/>",
@@ -169,11 +189,11 @@ pub fn render(command: &str, when: &str, began: Instant, total: Duration, cores:
     for r in all {
         let t = &r.time;
         let cell = |v: Option<String>| format!("<td class=\"n\">{}</td>", v.unwrap_or_default());
-        let (s, e) = (t.start.map(since), t.end.map(since));
+        let (s, e) = (t.start, t.end);
         h.push_str(&format!("<tr><td>{}</td><td>{}</td>", esc(&r.name), if t.cached { "from the cache" } else { "run" }));
         h.push_str(&cell(s.map(secs)));
         h.push_str(&cell(s.zip(e).map(|(s, e)| secs(e.saturating_sub(s)))));
-        h.push_str(&cell(s.zip(t.meta.map(since)).filter(|_| !t.cached).map(|(s, m)| secs(m.saturating_sub(s)))));
+        h.push_str(&cell(s.zip(t.meta).filter(|_| !t.cached).map(|(s, m)| secs(m.saturating_sub(s)))));
         h.push_str(&cell(Some(secs(Duration::from_micros(t.wall_us)))));
         h.push_str(&cell(Some(secs(Duration::from_micros(t.cpu_us)))));
         h.push_str(&cell((t.rss_kb > 0).then(|| format!("{:.0} MiB", t.rss_kb as f64 / 1024.0))));
@@ -200,8 +220,7 @@ mod tests {
 
     #[test]
     fn report_lists_runs_and_cache_hits() {
-        let began = Instant::now();
-        let at = |ms: u64| Some(began + Duration::from_millis(ms));
+        let at = |ms: u64| Some(Duration::from_millis(ms));
         let rows = vec![
             Row {
                 name: "`a` (lib)".into(),
@@ -220,7 +239,7 @@ mod tests {
                 runs: true,
             },
         ];
-        let html = render("build --timings", "2026-11-23", began, Duration::from_secs(1), 8, &rows);
+        let html = render("build --timings", "2026-11-23", Duration::from_secs(1), 8, &rows);
         assert!(html.contains("2 (1 run for this build, 1 from the cache)"));
         assert_eq!(html.matches("class=\"front\"").count(), 1);
         assert_eq!(html.matches("class=\"back\"").count(), 1);

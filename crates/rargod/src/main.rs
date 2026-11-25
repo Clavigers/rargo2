@@ -242,7 +242,7 @@ fn main() -> Result<()> {
     if opts.drift_minutes > 0 {
         let d = daemon.clone();
         let every = std::time::Duration::from_secs(opts.drift_minutes * 60);
-        rt.spawn(rargo_core::drift::background(d, every));
+        rt.spawn(rargo_core::drift::background(d, every, std::time::Instant::now));
     }
     let keys = Arc::new(keys);
     let listen = opts.listen;

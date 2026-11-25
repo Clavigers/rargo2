@@ -468,7 +468,7 @@ async fn serve(
             at: std::time::Instant::now(),
             checked: None,
         };
-        return match crate::drift::check(&d, &snapshot, &who).await {
+        return match crate::drift::check(&d, &snapshot, &who, std::time::Instant::now).await {
             Ok(r) => {
                 let text = r.render();
                 *d.drift_report.lock() = Some(format!("{}: {text}", req.root));
