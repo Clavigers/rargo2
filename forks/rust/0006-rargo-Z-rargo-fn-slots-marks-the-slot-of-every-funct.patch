@@ -1,4 +1,4 @@
-From d80b8320cbccf171ac8254b3e4326dc80432739e Mon Sep 17 00:00:00 2001
+From 71543a2fd881dc18bd97ae4c3d9c22da983dbcc4 Mon Sep 17 00:00:00 2001
 From: rargo <noreply@rargo.invalid>
 Date: Wed, 25 Nov 2026 14:49:45 +0100
 Subject: [PATCH 6/7] rargo: -Z rargo-fn-slots marks the slot of every function
@@ -179,13 +179,13 @@ index 3fd414579..492fa54f3 100644
              Some(enabled) => PassPolicy::optional(enabled),
              None => PassPolicy::optional(match ctx.mir_opt_level() {
 diff --git a/compiler/rustc_session/src/config.rs b/compiler/rustc_session/src/config.rs
-index 620c13d84..ca852b50f 100644
+index 684d14a1f..b298b7019 100644
 --- a/compiler/rustc_session/src/config.rs
 +++ b/compiler/rustc_session/src/config.rs
-@@ -3203,7 +3203,7 @@ pub fn check_nightly_options(
-             // rargo: `-Zno-codegen` is how the build system asks for a crate's metadata
-             // without its object code. It has to work without `RUSTC_BOOTSTRAP`, because that
-             // variable changes the crate hash and the metadata must be the full build's.
+@@ -3198,7 +3198,7 @@ pub fn check_nightly_options(
+             if really_allows_unstable_options {
+                 continue;
+             }
 -            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| x == "no-codegen") {
 +            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| matches!(x.as_str(), "no-codegen" | "rargo-fn-slots" | "rargo-fn-slots=yes")) {
                  continue;

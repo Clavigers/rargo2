@@ -1,4 +1,4 @@
-From b4363b87b64295ad093920e4382bd13cf7e69fc3 Mon Sep 17 00:00:00 2001
+From 9b514f7760175a40d7ae082130f1565617550524 Mon Sep 17 00:00:00 2001
 From: rargo <noreply@rargo.invalid>
 Date: Wed, 25 Nov 2026 15:26:20 +0100
 Subject: [PATCH 7/7] rargo: -Z rargo-fn-ids gives every function instance an
@@ -493,13 +493,13 @@ index 492fa54f3..0b632a47c 100644
          }
          match ctx.opts.unstable_opts.inline_mir {
 diff --git a/compiler/rustc_session/src/config.rs b/compiler/rustc_session/src/config.rs
-index ca852b50f..de7433d9e 100644
+index b298b7019..b473913bf 100644
 --- a/compiler/rustc_session/src/config.rs
 +++ b/compiler/rustc_session/src/config.rs
-@@ -3203,7 +3203,7 @@ pub fn check_nightly_options(
-             // rargo: `-Zno-codegen` is how the build system asks for a crate's metadata
-             // without its object code. It has to work without `RUSTC_BOOTSTRAP`, because that
-             // variable changes the crate hash and the metadata must be the full build's.
+@@ -3198,7 +3198,7 @@ pub fn check_nightly_options(
+             if really_allows_unstable_options {
+                 continue;
+             }
 -            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| matches!(x.as_str(), "no-codegen" | "rargo-fn-slots" | "rargo-fn-slots=yes")) {
 +            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| matches!(x.as_str(), "no-codegen" | "rargo-fn-slots" | "rargo-fn-slots=yes" | "rargo-fn-ids" | "rargo-fn-ids=yes")) {
                  continue;
