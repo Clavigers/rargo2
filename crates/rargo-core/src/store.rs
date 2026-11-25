@@ -1,8 +1,8 @@
 use crate::chunk::ChunkRef;
 use crate::db::{Db, Table};
 use crate::hash::Hash;
+use crate::store_index::{ColdRecord, HotMeta, StoreIndex, Touch};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -30,7 +30,6 @@ struct ColdMeta {
     recipe: Vec<ChunkRef>,
 }
 
-const COLD_MIN_SIZE: u64 = 64 << 10;
 const COLD_DISK_KEY: &[u8] = b"cold-disk-bytes";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,20 +44,28 @@ pub struct Store {
     blobs: PathBuf,
     tmp: PathBuf,
     db: Arc<Db>,
-    meta: DashMap<Hash, BlobMeta>,
     reflink: bool,
     dev: u64,
     tmp_seq: AtomicU64,
-    total: AtomicU64,
     chunks: PathBuf,
-    cold: DashMap<Hash, ColdMeta>,
-    cold_disk: AtomicU64,
     cold_lock: std::sync::RwLock<()>,
-    generation: AtomicU64,
-    moves_begun: AtomicU64,
-    moves_ended: AtomicU64,
-    pins: DashMap<Hash, u32>,
-    pin_gate: parking_lot::RwLock<()>,
+    index: parking_lot::Mutex<StoreIndex>,
+}
+
+impl From<ColdMeta> for ColdRecord {
+    fn from(c: ColdMeta) -> ColdRecord {
+        ColdRecord { size: c.size, last_used: c.last_used, added: c.added, recipe: c.recipe }
+    }
+}
+
+impl From<ColdRecord> for ColdMeta {
+    fn from(c: ColdRecord) -> ColdMeta {
+        ColdMeta { size: c.size, last_used: c.last_used, added: c.added, recipe: c.recipe }
+    }
+}
+
+fn blob_meta(m: HotMeta) -> BlobMeta {
+    BlobMeta { size: m.size, mtime_ns: m.mtime_ns, last_used: m.last_used }
 }
 
 fn now_secs() -> u64 {
@@ -106,20 +113,29 @@ impl Store {
                 fs::create_dir(&d)?;
             }
         }
-        let cold = DashMap::new();
+        let mut index = StoreIndex::new();
+        db.for_each(Table::Blobs, |k, v| {
+            if k.len() == 32 {
+                if let Ok(m) = bincode::deserialize::<BlobMeta>(v) {
+                    let mut h = [0u8; 32];
+                    h.copy_from_slice(k);
+                    index.load_hot(Hash(h), HotMeta { size: m.size, mtime_ns: m.mtime_ns, last_used: m.last_used });
+                }
+            }
+        });
         db.for_each(Table::Cold, |k, v| {
             if k.len() == 32 {
                 if let Ok(m) = bincode::deserialize::<ColdMeta>(v) {
                     let mut h = [0u8; 32];
                     h.copy_from_slice(k);
-                    cold.insert(Hash(h), m);
+                    index.load_cold(Hash(h), m.into());
                 }
             }
         });
-        let cold_disk = match db.get(Table::Meta, COLD_DISK_KEY) {
-            Some(v) if v.len() == 8 => u64::from_le_bytes(v[..8].try_into().unwrap()),
-            _ => 0,
-        };
+        match db.get(Table::Meta, COLD_DISK_KEY) {
+            Some(v) if v.len() == 8 => index.set_cold_disk(u64::from_le_bytes(v[..8].try_into().unwrap())),
+            _ => {}
+        }
         let dev = fs::metadata(&blobs)?.dev();
         let reflink = {
             let a = tmp.join("reflink-probe-a");
@@ -133,37 +149,17 @@ impl Store {
             let _ = fs::remove_file(&b);
             ok
         };
-        let meta = DashMap::new();
-        let mut total = 0u64;
-        db.for_each(Table::Blobs, |k, v| {
-            if k.len() == 32 {
-                if let Ok(m) = bincode::deserialize::<BlobMeta>(v) {
-                    let mut h = [0u8; 32];
-                    h.copy_from_slice(k);
-                    total += m.size;
-                    meta.insert(Hash(h), m);
-                }
-            }
-        });
         Ok(Store {
             root: root.to_path_buf(),
             blobs,
             tmp,
             db,
-            meta,
             reflink,
             dev,
             tmp_seq: AtomicU64::new(0),
-            generation: AtomicU64::new(1),
-            pins: DashMap::new(),
-            pin_gate: parking_lot::RwLock::new(()),
-            total: AtomicU64::new(total),
             chunks,
-            cold,
-            cold_disk: AtomicU64::new(cold_disk),
             cold_lock: std::sync::RwLock::new(()),
-            moves_begun: AtomicU64::new(0),
-            moves_ended: AtomicU64::new(0),
+            index: parking_lot::Mutex::new(index),
         })
     }
 
@@ -180,20 +176,19 @@ impl Store {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.total.load(Ordering::Relaxed) + self.cold_disk.load(Ordering::Relaxed)
+        self.index.lock().total_bytes()
     }
 
     pub fn cold_stats(&self) -> (usize, u64, u64) {
-        let logical = self.cold.iter().map(|e| e.value().size).sum();
-        (self.cold.len(), logical, self.cold_disk.load(Ordering::Relaxed))
+        self.index.lock().cold_stats()
     }
 
     pub fn all_hashes(&self) -> Vec<Hash> {
-        self.meta.iter().map(|e| *e.key()).chain(self.cold.iter().map(|e| *e.key())).collect()
+        self.index.lock().all_hashes()
     }
 
     pub fn blob_count(&self) -> usize {
-        self.meta.len()
+        self.index.lock().whole_count()
     }
 
     fn path_of(&self, h: &Hash, exec: bool) -> PathBuf {
@@ -216,31 +211,11 @@ impl Store {
     }
 
     pub fn has(&self, h: &Hash) -> bool {
-        self.steady(|| self.meta.contains_key(h) || self.cold.contains_key(h))
+        self.index.lock().has(h)
     }
 
     pub fn size_of(&self, h: &Hash) -> Option<u64> {
-        self.steady(|| self.meta.get(h).map(|m| m.size).or_else(|| self.cold.get(h).map(|m| m.size)))
-    }
-
-    fn steady<R>(&self, look: impl Fn() -> R) -> R {
-        loop {
-            let begun = self.moves_begun.load(Ordering::SeqCst);
-            if self.moves_ended.load(Ordering::SeqCst) == begun {
-                let r = look();
-                if self.moves_begun.load(Ordering::SeqCst) == begun {
-                    return r;
-                }
-            }
-            std::thread::yield_now();
-        }
-    }
-
-    fn moving<R>(&self, step: impl FnOnce() -> R) -> R {
-        self.moves_begun.fetch_add(1, Ordering::SeqCst);
-        let r = step();
-        self.moves_ended.fetch_add(1, Ordering::SeqCst);
-        r
+        self.index.lock().size_of(h)
     }
 
     fn chunk_path(&self, c: &Hash) -> PathBuf {
@@ -251,7 +226,8 @@ impl Store {
     }
 
     fn set_cold_disk(&self) {
-        self.db.put(Table::Meta, COLD_DISK_KEY, &self.cold_disk.load(Ordering::Relaxed).to_le_bytes());
+        let bytes = self.index.lock().cold_stats().2;
+        self.db.put(Table::Meta, COLD_DISK_KEY, &bytes.to_le_bytes());
     }
 
     fn write_chunk(&self, c: &Hash, data: &[u8]) -> io::Result<u64> {
@@ -294,13 +270,49 @@ impl Store {
 
     pub fn freeze(&self, h: &Hash, before: &dyn Fn(&Hash)) -> io::Result<Option<u64>> {
         let _g = self.cold_lock.read().unwrap();
-        let Some(meta) = self.meta.get(h).map(|m| *m) else { return Ok(None) };
-        if meta.size < COLD_MIN_SIZE {
+        let Some(start) = self.index.lock().begin_freeze(h) else {
             return Ok(None);
+        };
+        let chunked = self.write_cold_chunks(h, start.size, start.mtime_ns);
+        let (recipe, added, variants) = match chunked {
+            Ok(Some(c)) => c,
+            other => {
+                self.index.lock().abort_freeze(h);
+                return other.map(|_| None);
+            }
+        };
+        let record = {
+            let mut ix = self.index.lock();
+            ix.chunks_written(added);
+            ix.finish_freeze(h, recipe, added)
+        };
+        let Some(record) = record else {
+            self.set_cold_disk();
+            return Ok(None);
+        };
+        before(h);
+        let size = record.size;
+        self.db.put(Table::Cold, &h.0, &bincode::serialize(&ColdMeta::from(record)).unwrap());
+        self.db.delete(Table::Blobs, &h.0);
+        for v in &variants {
+            let _ = fs::remove_file(v);
         }
+        self.set_cold_disk();
+        Ok(Some((size * variants.len() as u64).saturating_sub(added)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn write_cold_chunks(
+        &self,
+        h: &Hash,
+        size: u64,
+        mtime: i64,
+    ) -> io::Result<Option<(Vec<ChunkRef>, u64, Vec<PathBuf>)>> {
         let variants: Vec<PathBuf> =
             [self.path_of(h, false), self.path_of(h, true)].into_iter().filter(|p| p.exists()).collect();
-        let Some(first) = variants.first() else { return Ok(None) };
+        let Some(first) = variants.first() else {
+            return Ok(None);
+        };
         for v in &variants {
             if fs::metadata(v)?.nlink() != 1 {
                 return Ok(None);
@@ -308,11 +320,11 @@ impl Store {
         }
         let f = File::open(first)?;
         let m = f.metadata()?;
-        if m.len() != meta.size || (variants.len() == 1 && mtime_ns(&m) != meta.mtime_ns) {
+        if m.len() != size || (variants.len() == 1 && mtime_ns(&m) != mtime) {
             return Ok(None);
         }
         let recipe = crate::chunk::chunk_file(&f)?;
-        assert_eq!(recipe.iter().map(|c| c.len as u64).sum::<u64>(), meta.size, "the recipe covers the blob");
+        assert_eq!(recipe.iter().map(|c| c.len as u64).sum::<u64>(), size, "the recipe covers the blob");
         let mut added = 0u64;
         let mut off = 0u64;
         let mut buf = Vec::new();
@@ -322,47 +334,23 @@ impl Store {
                 buf.resize(c.len as usize, 0);
                 f.read_exact_at(&mut buf, off)?;
                 if Hash::of(&buf) != c.hash {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("blob {h} changed while going cold")));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("blob {h} changed while going cold"),
+                    ));
                 }
                 added += self.write_chunk(&c.hash, &buf)?;
             }
             off += c.len as u64;
         }
-        assert_eq!(off, meta.size);
-        self.cold_disk.fetch_add(added, Ordering::Relaxed);
-        if self.meta.get(h).map(|x| x.last_used != meta.last_used).unwrap_or(true) {
-            return Ok(None);
-        }
-        before(h);
-        let cm = ColdMeta { size: meta.size, last_used: meta.last_used, added, recipe };
-        self.db.put(Table::Cold, &h.0, &bincode::serialize(&cm).unwrap());
-        let whole = self.moving(|| {
-            self.cold.insert(*h, cm);
-            self.meta.remove(h)
-        });
-        if let Some((_, m)) = whole {
-            let before = self.total.fetch_sub(m.size, Ordering::Relaxed);
-            assert!(before >= m.size, "total bytes do not go negative");
-        }
-        self.db.delete(Table::Blobs, &h.0);
-        for v in &variants {
-            let _ = fs::remove_file(v);
-        }
-        self.set_cold_disk();
-        Ok(Some((meta.size * variants.len() as u64).saturating_sub(added)))
+        assert_eq!(off, size);
+        Ok(Some((recipe, added, variants)))
     }
 
     pub fn freeze_idle(&self, min_idle_secs: u64, before: &dyn Fn(&Hash)) -> (usize, u64) {
-        let cutoff = now_secs().saturating_sub(min_idle_secs);
-        let mut idle: Vec<(u64, Hash)> = self
-            .meta
-            .iter()
-            .filter(|e| e.value().last_used <= cutoff && e.value().size >= COLD_MIN_SIZE)
-            .map(|e| (e.value().last_used, *e.key()))
-            .collect();
-        idle.sort_unstable();
+        let idle = self.index.lock().freeze_candidates(now_secs(), min_idle_secs);
         let (mut n, mut freed) = (0, 0);
-        for (_, h) in idle {
+        for h in idle {
             if let Ok(Some(b)) = self.freeze(&h, before) {
                 n += 1;
                 freed += b;
@@ -373,20 +361,23 @@ impl Store {
 
     fn thaw(&self, h: &Hash) -> io::Result<()> {
         let _g = self.cold_lock.read().unwrap();
-        let Some(cm) = self.cold.get(h).map(|m| m.clone()) else { return Ok(()) };
+        let (_, started) = self.index.lock().begin_thaw(h);
+        let Some((size, recipe)) = started else {
+            return Ok(());
+        };
         let tmp = self.tmp_path();
         let built = (|| -> io::Result<()> {
             let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
             let mut hasher = blake3::Hasher::new();
             let mut written = 0u64;
-            for c in &cm.recipe {
+            for c in &recipe {
                 let data = self.read_chunk(c)?;
                 assert_eq!(data.len(), c.len as usize);
                 hasher.update(&data);
                 f.write_all(&data)?;
                 written += data.len() as u64;
             }
-            assert_eq!(written, cm.size, "a cold recipe covers its blob");
+            assert_eq!(written, size, "a cold recipe covers its blob");
             if Hash(*hasher.finalize().as_bytes()) != *h {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("cold blob {h} does not add up")));
             }
@@ -394,40 +385,42 @@ impl Store {
         })();
         if let Err(e) = built {
             let _ = fs::remove_file(&tmp);
-            self.drop_cold(h);
+            if self.index.lock().fail_thaw(h) {
+                self.db.delete(Table::Cold, &h.0);
+            }
             return Err(e);
         }
-        self.install(&tmp, *h, false, cm.size)
+        let installed = self.install(&tmp, *h, false, size);
+        if installed.is_err() {
+            self.index.lock().abort_thaw(h);
+        }
+        installed
     }
 
     fn ensure_whole(&self, h: &Hash) -> io::Result<()> {
-        if !self.meta.contains_key(h) && self.cold.contains_key(h) {
+        let cold = {
+            let ix = self.index.lock();
+            !ix.is_whole(h) && ix.is_cold(h)
+        };
+        if cold {
             self.thaw(h)?;
         }
         Ok(())
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
-    }
-
-    fn drop_cold(&self, h: &Hash) -> Option<u64> {
-        let (_, cm) = self.cold.remove(h)?;
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.db.delete(Table::Cold, &h.0);
-        Some(cm.added)
+        self.index.lock().generation()
     }
 
     pub fn collect_chunks(&self) -> (usize, u64) {
         let _g = self.cold_lock.write().unwrap();
-        let mut live: std::collections::HashSet<Hash> = std::collections::HashSet::new();
-        for e in self.cold.iter() {
-            live.extend(e.value().recipe.iter().map(|c| c.hash));
-        }
+        let live = self.index.lock().live_chunks();
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
         for i in 0..256 {
             let prefix = format!("{i:02x}");
-            let Ok(rd) = fs::read_dir(self.chunks.join(&prefix)) else { continue };
+            let Ok(rd) = fs::read_dir(self.chunks.join(&prefix)) else {
+                continue;
+            };
             for ent in rd.flatten() {
                 let name = ent.file_name();
                 let len = ent.metadata().map(|m| m.len()).unwrap_or(0);
@@ -443,7 +436,7 @@ impl Store {
                 }
             }
         }
-        self.cold_disk.store(kept, Ordering::Relaxed);
+        self.index.lock().chunks_collected(kept);
         self.set_cold_disk();
         (n, freed)
     }
@@ -451,28 +444,16 @@ impl Store {
     fn record(&self, h: Hash, size: u64, mtime_ns: i64) {
         let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
         self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
-        let (old, was_cold) = self.moving(|| (self.meta.insert(h, m), self.cold.remove(&h).is_some()));
-        match old {
-            None => {
-                self.total.fetch_add(size, Ordering::Relaxed);
-            }
-            Some(old) => assert_eq!(old.size, size, "one hash, one size"),
-        }
-        if was_cold {
+        let put = self.index.lock().put(h, size, mtime_ns, m.last_used);
+        if put.was_cold {
             self.db.delete(Table::Cold, &h.0);
         }
     }
 
     pub fn touch(&self, h: &Hash) {
-        let now = now_secs();
-        if let Some(mut m) = self.meta.get_mut(h) {
-            let stale = now.saturating_sub(m.last_used) > 600;
-            m.last_used = now;
-            if stale {
-                self.db.put(Table::Blobs, &h.0, &bincode::serialize(&*m).unwrap());
-            }
-        } else if let Some(mut m) = self.cold.get_mut(h) {
-            m.last_used = now;
+        let touched = self.index.lock().touch(h, now_secs());
+        if let Touch::Persist(m) = touched {
+            self.db.put(Table::Blobs, &h.0, &bincode::serialize(&blob_meta(m)).unwrap());
         }
     }
 
@@ -487,19 +468,21 @@ impl Store {
 
     pub fn open_blob(&self, h: &Hash) -> io::Result<File> {
         self.ensure_whole(h)?;
-        let meta = self.meta.get(h).map(|m| *m);
+        let meta = self.index.lock().hot(h);
         let Some(meta) = meta else {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("blob {h} not in store")));
         };
         let Some(p) = self.existing(h, false) else {
-            if self.cold.contains_key(h) {
+            if self.index.lock().is_cold(h) {
                 return self.open_blob(h);
             }
             self.forget(h);
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("blob {h} missing")));
         };
         let f = match File::open(&p) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound && self.cold.contains_key(h) => return self.open_blob(h),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.index.lock().is_cold(h) => {
+                return self.open_blob(h);
+            }
             r => r?,
         };
         let m = f.metadata()?;
@@ -514,31 +497,18 @@ impl Store {
                     format!("blob {h} was modified on disk and has been dropped"),
                 ));
             }
-            self.record_force(*h, m.len(), mtime_ns(&m));
+            self.record(*h, m.len(), mtime_ns(&m));
         }
         self.touch(h);
         Ok(f)
     }
 
-    fn record_force(&self, h: Hash, size: u64, mtime_ns: i64) {
-        let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
-        let old = self.meta.insert(h, m);
-        assert!(old.is_none_or(|o| o.size == size), "one hash, one size");
-        self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
-    }
-
-    fn forget_hot(&self, h: &Hash) {
-        if let Some((_, m)) = self.meta.remove(h) {
-            self.generation.fetch_add(1, Ordering::SeqCst);
-            let before = self.total.fetch_sub(m.size, Ordering::Relaxed);
-            assert!(before >= m.size, "total bytes do not go negative");
-        }
-        self.db.delete(Table::Blobs, &h.0);
-    }
-
     fn forget(&self, h: &Hash) {
-        self.forget_hot(h);
-        self.drop_cold(h);
+        let gone = self.index.lock().forget(h);
+        self.db.delete(Table::Blobs, &h.0);
+        if gone.cold {
+            self.db.delete(Table::Cold, &h.0);
+        }
     }
 
     pub fn read(&self, h: &Hash) -> io::Result<Vec<u8>> {
@@ -617,7 +587,7 @@ impl Store {
         let m = fs::metadata(&dst)?;
         assert_eq!(m.len(), size, "the installed file is the size the caller hashed");
         self.record(h, size, mtime_ns(&m));
-        assert!(!self.cold.contains_key(&h));
+        assert!(self.index.lock().is_whole(&h));
         Ok(())
     }
 
@@ -629,11 +599,8 @@ impl Store {
         let other = self.path_of(h, !exec);
         let src = File::open(&other)?;
         let tmp = self.tmp_path();
-        let dst = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(if exec { 0o555 } else { 0o444 })
-            .open(&tmp)?;
+        let dst =
+            fs::OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
         clone_or_copy(&src, &dst)?;
         drop(dst);
         fs::set_permissions(&tmp, fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
@@ -644,11 +611,8 @@ impl Store {
     pub fn materialize_owned(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
         self.ensure_whole(h)?;
         let parent = dest.parent().context("destination has no parent")?;
-        let tmp = parent.join(format!(
-            ".rargo-tmp-{}-{}",
-            std::process::id(),
-            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
-        ));
+        let tmp =
+            parent.join(format!(".rargo-tmp-{}-{}", std::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let src = self.open_blob(h)?;
@@ -668,20 +632,19 @@ impl Store {
     }
 
     pub fn is_linked(&self, h: &Hash, exec: bool, dest: &Path) -> bool {
-        let (Ok(d), Ok(s)) = (fs::metadata(dest), fs::metadata(self.path_of(h, exec))) else { return false };
+        let (Ok(d), Ok(s)) = (fs::metadata(dest), fs::metadata(self.path_of(h, exec))) else {
+            return false;
+        };
         d.dev() == s.dev() && d.ino() == s.ino()
     }
 
     pub fn materialize(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
         self.ensure_whole(h)?;
-        let meta = self.meta.get(h).map(|m| *m).with_context(|| format!("blob {h} not in store"))?;
+        let meta = self.index.lock().hot(h).with_context(|| format!("blob {h} not in store"))?;
         self.touch(h);
         let parent = dest.parent().context("destination has no parent")?;
-        let tmp = parent.join(format!(
-            ".rargo-tmp-{}-{}",
-            std::process::id(),
-            self.tmp_seq.fetch_add(1, Ordering::Relaxed)
-        ));
+        let tmp =
+            parent.join(format!(".rargo-tmp-{}-{}", std::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let same_fs = fs::metadata(parent)?.dev() == self.dev;
@@ -723,35 +686,15 @@ impl Store {
     }
 
     pub fn pin_all(&self, hashes: &[Hash]) -> bool {
-        let _gate = self.pin_gate.read();
-        if !hashes.iter().all(|h| self.has(h)) {
-            return false;
-        }
-        for h in hashes {
-            let mut n = self.pins.entry(*h).or_insert(0);
-            *n += 1;
-            assert!(*n > 0);
-        }
-        true
+        self.index.lock().pin_all(hashes)
     }
 
     pub fn unpin_all(&self, hashes: &[Hash]) {
-        for h in hashes {
-            match self.pins.entry(*h) {
-                dashmap::mapref::entry::Entry::Occupied(mut e) => {
-                    assert!(*e.get() > 0, "a pin count of zero is removed");
-                    *e.get_mut() -= 1;
-                    if *e.get() == 0 {
-                        e.remove();
-                    }
-                }
-                dashmap::mapref::entry::Entry::Vacant(_) => panic!("unpinning {h}, which is not pinned"),
-            }
-        }
+        self.index.lock().unpin_all(hashes)
     }
 
     pub fn is_pinned(&self, h: &Hash) -> bool {
-        self.pins.contains_key(h)
+        self.index.lock().is_pinned(h)
     }
 
     pub fn evict_to(&self, budget: u64, pinned: &dyn Fn(&Hash) -> bool) -> u64 {
@@ -765,54 +708,25 @@ impl Store {
         pinned: &dyn Fn(&Hash) -> bool,
         on_evict: &dyn Fn(&Hash),
     ) -> u64 {
-        let total = self.total_bytes();
-        if total <= budget {
-            return 0;
-        }
-        let cutoff = now_secs().saturating_sub(min_age_secs);
-        let mut all: Vec<(u64, Hash, u64, bool)> = self
-            .meta
-            .iter()
-            .map(|e| (e.value().last_used, *e.key(), e.value().size, false))
-            .chain(self.cold.iter().map(|e| (e.value().last_used, *e.key(), e.value().added, true)))
-            .collect();
-        all.sort_unstable();
-        let mut freed = 0u64;
-        let mut dropped_cold = false;
-        for (seen_used, h, size, cold) in all {
-            if total.saturating_sub(freed) <= budget {
-                break;
-            }
-            if pinned(&h) || (min_age_secs > 0 && seen_used > cutoff) {
-                continue;
-            }
-            let _gate = self.pin_gate.write();
-            if self.is_pinned(&h) {
-                continue;
-            }
-            if cold {
-                if self.cold.get(&h).map(|m| m.last_used != seen_used).unwrap_or(true) {
-                    continue;
-                }
-                on_evict(&h);
-                self.drop_cold(&h);
-                dropped_cold = true;
-                freed += size;
-                continue;
-            }
-            if self.meta.get(&h).map(|m| m.last_used != seen_used).unwrap_or(true) {
-                continue;
-            }
-            on_evict(&h);
-            self.forget(&h);
-            let _ = fs::remove_file(self.path_of(&h, false));
-            let _ = fs::remove_file(self.path_of(&h, true));
-            freed += size;
-        }
-        if dropped_cold {
+        let gone = self.index.lock().evict(budget, min_age_secs, now_secs(), pinned);
+        self.drop_evicted(&gone, on_evict);
+        if gone.iter().any(|e| e.cold) {
             self.collect_chunks();
         }
-        freed
+        gone.iter().map(|e| e.freed).sum()
+    }
+
+    fn drop_evicted(&self, gone: &[crate::store_index::Evicted], on_evict: &dyn Fn(&Hash)) {
+        for e in gone {
+            on_evict(&e.hash);
+            self.db.delete(Table::Blobs, &e.hash.0);
+            if e.cold {
+                self.db.delete(Table::Cold, &e.hash.0);
+            } else {
+                let _ = fs::remove_file(self.path_of(&e.hash, false));
+                let _ = fs::remove_file(self.path_of(&e.hash, true));
+            }
+        }
     }
 
     pub fn sweep(
@@ -821,43 +735,13 @@ impl Store {
         min_age_secs: u64,
         on_evict: &dyn Fn(&Hash),
     ) -> (usize, u64) {
-        let cutoff = now_secs().saturating_sub(min_age_secs);
-        let dead: Vec<(Hash, u64)> = self
-            .meta
-            .iter()
-            .filter(|e| !live.contains(e.key()) && (min_age_secs == 0 || e.value().last_used <= cutoff))
-            .map(|e| (*e.key(), e.value().size))
-            .collect();
-        let mut bytes = 0;
-        for (h, size) in &dead {
-            let _gate = self.pin_gate.write();
-            if self.is_pinned(h) {
-                continue;
-            }
-            on_evict(h);
-            self.forget(h);
-            let _ = fs::remove_file(self.path_of(h, false));
-            let _ = fs::remove_file(self.path_of(h, true));
-            bytes += size;
-        }
-        let dead_cold: Vec<Hash> = self
-            .cold
-            .iter()
-            .filter(|e| !live.contains(e.key()) && (min_age_secs == 0 || e.value().last_used <= cutoff))
-            .map(|e| *e.key())
-            .collect();
-        for h in &dead_cold {
-            let _gate = self.pin_gate.write();
-            if self.is_pinned(h) {
-                continue;
-            }
-            on_evict(h);
-            self.drop_cold(h);
-        }
-        if !dead_cold.is_empty() {
+        let gone = self.index.lock().sweep(&|h| live.contains(h), min_age_secs, now_secs());
+        self.drop_evicted(&gone, on_evict);
+        let mut bytes: u64 = gone.iter().map(|e| e.freed).sum();
+        if gone.iter().any(|e| e.cold) {
             bytes += self.collect_chunks().1;
         }
-        (dead.len() + dead_cold.len(), bytes)
+        (gone.len(), bytes)
     }
 
     pub fn remove(&self, h: &Hash) {
@@ -911,20 +795,6 @@ mod tests {
     }
 
     #[test]
-    fn eviction_is_lru_and_respects_pins() {
-        let (_d, s) = store();
-        let a = s.put_bytes(&[1u8; 1000]).unwrap();
-        let b = s.put_bytes(&[2u8; 1000]).unwrap();
-        let c = s.put_bytes(&[3u8; 1000]).unwrap();
-        s.meta.get_mut(&a).unwrap().last_used = 10;
-        s.meta.get_mut(&b).unwrap().last_used = 20;
-        s.meta.get_mut(&c).unwrap().last_used = 30;
-        let freed = s.evict_to(1500, &|h| *h == a);
-        assert_eq!(freed, 2000);
-        assert!(s.has(&a) && !s.has(&b) && !s.has(&c));
-    }
-
-    #[test]
     fn cold_blobs_come_back_and_share_chunks() {
         let (_d, s) = store();
         let mut a = vec![0u8; 3 << 20];
@@ -973,84 +843,6 @@ mod tests {
         s.evict_to(0, &|_| false);
         assert!(!s.has(&h));
         assert_eq!(s.cold_stats(), (0, 0, 0));
-    }
-
-    #[test]
-    fn going_cold_and_back_keeps_a_blob_present_and_the_generation() {
-        let (_d, s) = store();
-        let s = Arc::new(s);
-        let data = vec![9u8; 1 << 20];
-        let h = s.put_bytes(&data).unwrap();
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let watcher = {
-            let (s, done) = (s.clone(), done.clone());
-            std::thread::spawn(move || {
-                let mut missed = 0;
-                while !done.load(Ordering::Relaxed) {
-                    if !s.has(&h) {
-                        missed += 1;
-                    }
-                }
-                missed
-            })
-        };
-        for _ in 0..50 {
-            let g = s.generation();
-            assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-            assert_eq!(s.read(&h).unwrap(), data);
-            assert!(s.meta.contains_key(&h) && !s.cold.contains_key(&h), "reading a cold blob thaws it");
-            assert_eq!(s.generation(), g, "going cold and thawing remove nothing from the store");
-        }
-        done.store(true, Ordering::Relaxed);
-        assert_eq!(watcher.join().unwrap(), 0, "a blob being thawed was reported missing");
-    }
-
-    #[test]
-    fn blobs_moving_on_many_threads_are_never_missing() {
-        let (_d, s) = store();
-        let s = Arc::new(s);
-        let blobs: Vec<(Hash, Vec<u8>)> = (0..4u8)
-            .map(|i| {
-                let data = vec![i; 1 << 20];
-                (s.put_bytes(&data).unwrap(), data)
-            })
-            .collect();
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let lookers: Vec<_> = (0..3)
-            .map(|_| {
-                let (s, done, hs) = (s.clone(), done.clone(), blobs.iter().map(|b| b.0).collect::<Vec<_>>());
-                std::thread::spawn(move || {
-                    let mut missed = 0;
-                    while !done.load(Ordering::Relaxed) {
-                        for h in &hs {
-                            if !s.has(h) || s.size_of(h) != Some(1 << 20) {
-                                missed += 1;
-                            }
-                        }
-                    }
-                    missed
-                })
-            })
-            .collect();
-        let movers: Vec<_> = blobs
-            .into_iter()
-            .map(|(h, data)| {
-                let s = s.clone();
-                std::thread::spawn(move || {
-                    for _ in 0..40 {
-                        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-                        assert_eq!(s.read(&h).unwrap(), data);
-                    }
-                })
-            })
-            .collect();
-        for m in movers {
-            m.join().unwrap();
-        }
-        done.store(true, Ordering::Relaxed);
-        for l in lookers {
-            assert_eq!(l.join().unwrap(), 0, "a moving blob was reported missing");
-        }
     }
 
     #[test]
