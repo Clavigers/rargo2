@@ -193,3 +193,10 @@ fn the_loop_ends_with_its_last_foreground_fiber_and_cancels_the_background() {
         yield_now();
     });
 }
+
+#[test]
+fn blocking_work_runs_beside_a_busy_cpu_pool() {
+    drive(1, || {
+        assert_eq!(cpu(|| call(|| blocking(|| 41 + 1))), 42);
+    });
+}

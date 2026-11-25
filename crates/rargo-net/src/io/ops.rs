@@ -34,6 +34,7 @@ pub enum Op {
     RecvFds { fd: i32, len: usize },
     Readable { fd: i32 },
     Cpu(Box<dyn FnOnce() + Send>),
+    Blocking(Box<dyn FnOnce() + Send>),
 }
 
 
@@ -81,7 +82,7 @@ impl Event {
 
 pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) -> io::Result<io_uring::squeue::Entry> {
     let entry = match op {
-        Op::Cpu(_) => unreachable!("cpu work does not enter the ring"),
+        Op::Cpu(_) | Op::Blocking(_) => unreachable!("pool work does not enter the ring"),
         Op::Recv { fd, len, flags } => {
             let mut buf = vec![0u8; len];
             let entry = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32).flags(flags).build().user_data(token);

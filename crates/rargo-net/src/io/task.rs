@@ -231,6 +231,14 @@ pub fn race_biased<T: 'static>(arms: Vec<Box<dyn FnOnce() -> T + '_>>) -> T {
 }
 
 pub fn cpu<R: Send>(body: impl FnOnce() -> R + Send) -> R {
+    on_pool(false, body)
+}
+
+pub fn blocking<R: Send>(body: impl FnOnce() -> R + Send) -> R {
+    on_pool(true, body)
+}
+
+fn on_pool<R: Send>(blocking: bool, body: impl FnOnce() -> R + Send) -> R {
     struct Pack<F, R> {
         body: Option<F>,
         out: Option<Result<R, Box<dyn Any + Send>>>,
@@ -253,7 +261,7 @@ pub fn cpu<R: Send>(body: impl FnOnce() -> R + Send) -> R {
     let go = typed_exec(&mut pack);
     let ptr = &mut pack as *mut Pack<_, R> as usize;
     let event = park_op(
-        Op::Cpu(Box::new(move || go(ptr))),
+        if blocking { Op::Blocking(Box::new(move || go(ptr))) } else { Op::Cpu(Box::new(move || go(ptr))) },
         true,
     );
     if let Event::Failed(err) = event {
