@@ -556,8 +556,15 @@ mod tests {
     #[derive(Default)]
     struct Model {
         pins: BTreeMap<Hash, u32>,
-        moving: BTreeSet<Hash>,
+        freezing: BTreeSet<Hash>,
+        thawing: BTreeMap<Hash, u32>,
         sizes: BTreeMap<Hash, u64>,
+    }
+
+    impl Model {
+        fn moving(&self) -> BTreeSet<Hash> {
+            self.freezing.iter().chain(self.thawing.keys()).copied().collect()
+        }
     }
 
     #[test]
@@ -570,7 +577,7 @@ mod tests {
             for _ in 0..200 {
                 now += rng.below(50);
                 let x = h(rng.below(12) as u8);
-                match rng.below(10) {
+                match rng.below(11) {
                     0 | 1 => {
                         let size = *m.sizes.entry(x).or_insert(if rng.below(2) == 0 {
                             100 + rng.below(1000)
@@ -578,7 +585,8 @@ mod tests {
                             COLD_MIN_SIZE + rng.below(1 << 20)
                         });
                         ix.put(x, size, 1, now);
-                        m.moving.remove(&x);
+                        m.freezing.remove(&x);
+                        m.thawing.remove(&x);
                     }
                     2 => {
                         ix.touch(&x, now);
@@ -605,11 +613,11 @@ mod tests {
                     }
                     5 => {
                         if ix.begin_freeze(&x).is_some() {
-                            m.moving.insert(x);
+                            m.freezing.insert(x);
                         }
                     }
                     6 => {
-                        if m.moving.contains(&x) && ix.hot(&x).is_some() {
+                        if m.freezing.contains(&x) && ix.hot(&x).is_some() {
                             let size = ix.size_of(&x).unwrap();
                             if rng.below(4) == 0 {
                                 ix.abort_freeze(&x);
@@ -618,25 +626,41 @@ mod tests {
                                 ix.chunks_written(added);
                                 ix.finish_freeze(&x, recipe(size), added);
                             }
-                            m.moving.remove(&x);
+                            m.freezing.remove(&x);
                         }
                     }
                     7 => {
-                        if let (Thaw::Build, Some((size, _))) = ix.begin_thaw(&x) {
-                            m.moving.insert(x);
-                            if rng.below(5) == 0 {
-                                ix.fail_thaw(&x);
-                            } else if rng.below(4) == 0 {
-                                ix.abort_thaw(&x);
-                                ix.abort_thaw(&x);
-                            } else {
-                                ix.put(x, size, 2, now);
+                        let cold: Vec<Hash> = ix.blobs.iter().filter(|(_, b)| !b.is_whole()).map(|(h, _)| *h).collect();
+                        let t = if cold.is_empty() { x } else { cold[rng.below(cold.len() as u64) as usize] };
+                        if let (Thaw::Build, Some(_)) = ix.begin_thaw(&t) {
+                            *m.thawing.entry(t).or_insert(0) += 1;
+                        }
+                    }
+                    9 => {
+                        let open = m.thawing.len() as u64;
+                        if let Some((&t, _)) = m.thawing.iter().nth(rng.below(open.max(1)) as usize) {
+                            match rng.below(5) {
+                                0 => {
+                                    assert!(ix.fail_thaw(&t), "seed {seed}: {t}, being thawed, could not fail");
+                                    m.thawing.remove(&t);
+                                }
+                                1 | 2 => {
+                                    ix.abort_thaw(&t);
+                                    let n = m.thawing.get_mut(&t).unwrap();
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        m.thawing.remove(&t);
+                                    }
+                                }
+                                _ => {
+                                    ix.put(t, m.sizes[&t], 2, now);
+                                    m.thawing.remove(&t);
+                                }
                             }
-                            m.moving.remove(&x);
                         }
                     }
                     8 => {
-                        let before: Vec<Hash> = m.moving.iter().copied().filter(|p| ix.has(p)).collect();
+                        let before: Vec<Hash> = m.moving().into_iter().filter(|p| ix.has(p)).collect();
                         let budget = rng.below(3 << 20);
                         let min_age = rng.below(2) * 100;
                         let total = ix.total_bytes();
@@ -661,12 +685,19 @@ mod tests {
                         let live = |p: &Hash| p.0[0].is_multiple_of(2);
                         let gone = ix.sweep(&live, 0, now);
                         for e in &gone {
-                            assert!(!m.pins.contains_key(&e.hash) && !live(&e.hash) && !m.moving.contains(&e.hash));
+                            assert!(!m.pins.contains_key(&e.hash) && !live(&e.hash) && !m.moving().contains(&e.hash));
                         }
                     }
                 }
-                for p in &m.moving {
+                for p in &m.moving() {
                     assert!(ix.has(p), "seed {seed}: {p}, being moved, was reported missing");
+                }
+                for (t, n) in &m.thawing {
+                    let thawers = match &ix.blobs[t].tier {
+                        Tier::Thawing { thawers, .. } => *thawers,
+                        _ => 0,
+                    };
+                    assert_eq!(thawers, *n, "seed {seed}: {t} has its open thaws");
                 }
                 ix.invariants();
             }
