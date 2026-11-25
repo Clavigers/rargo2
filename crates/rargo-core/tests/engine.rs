@@ -41,6 +41,10 @@ fn test_tmp() -> PathBuf {
 }
 
 fn fixture() -> Fx {
+    fixture_with(std::time::Duration::from_secs(3600))
+}
+
+fn fixture_with(action_timeout: std::time::Duration) -> Fx {
     let base = test_tmp();
     let base = base.as_path();
     std::fs::create_dir_all(base).unwrap();
@@ -59,7 +63,9 @@ fn fixture() -> Fx {
     session.spawn_workers(fs.clone(), 4).unwrap();
     let zygote = Zygote::start(&sandbox_helper()).unwrap();
     let sched = Scheduler::new(8, u64::MAX).unwrap();
-    let engine = Arc::new(Engine::new(store, content, fs, mnt, zygote, sched));
+    let mut engine = Engine::new(store, content, fs, mnt, zygote, sched);
+    engine.action_timeout = action_timeout;
+    let engine = Arc::new(engine);
     let work = tmp.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
     Fx { work, engine, memo: Arc::new(HostMemo::default()), session, _tmp: tmp }
@@ -306,5 +312,28 @@ fn large_directories_list_completely_through_a_build_view() {
         });
         let o = fx.engine.obtain(r).await.unwrap();
         assert_eq!(fx.text(&o.result.stdout), "400\n400\n0\n");
+    });
+}
+
+#[test]
+fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
+    let fx = fixture_with(std::time::Duration::from_secs(600));
+    let paused = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    paused.block_on(async {
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            let e = fx.engine.clone();
+            let r = fx.req("sleep 100000", &[], &[], &[]);
+            tasks.push(tokio::spawn(async move { e.obtain(r).await }));
+        }
+        for t in tasks {
+            let e = t.await.unwrap().err().expect("a hung action fails");
+            assert!(e.to_string().contains("ran longer than 600 s"), "{e:#}");
+        }
+        assert_eq!(fx.runs(), 1, "three identical requests, one run, and no rerun by the waiters");
+    });
+    rt().block_on(async {
+        let ok = fx.engine.obtain(fx.req("echo fine", &[], &[], &[])).await.unwrap();
+        assert_eq!(fx.text(&ok.result.stdout), "fine\n");
     });
 }
