@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -262,12 +262,12 @@ pub struct Delivery<'a> {
 impl Delivery<'_> {
     fn remove_real(&self, rel: &[u8]) -> bool {
         let real = self.fs.real(rel);
-        match std::fs::symlink_metadata(&real) {
+        match rargo_net::io::file::symlink_metadata(&real) {
             Ok(md) if md.is_dir() => {
                 let _ = std::fs::remove_dir_all(&real);
             }
             Ok(_) => {
-                let _ = std::fs::remove_file(&real);
+                let _ = rargo_net::io::file::remove_file(&real);
             }
             Err(_) => return false,
         }
@@ -455,7 +455,7 @@ fn name_cookie(name: &[u8]) -> u64 {
     c
 }
 
-enum Kind<T = std::fs::Metadata> {
+enum Kind<T = rargo_net::io::file::Stat> {
     Real(T),
     Virtual(VFile),
     VDir,
@@ -465,7 +465,7 @@ impl OutFs {
     pub fn new(dir: &Path, table: &Path, source: Box<dyn Source>) -> std::io::Result<Arc<OutFs>> {
         let fd = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_PATH).open(dir)?;
         let under = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
-        let virt: Table = std::fs::read(table)
+        let virt: Table = rargo_net::io::file::read(table)
             .ok()
             .and_then(|raw| zstd::stream::decode_all(&raw[..]).ok())
             .and_then(|plain| bincode::deserialize(&plain).ok())
@@ -524,8 +524,8 @@ impl OutFs {
         if std::fs::read_dir(&self.under).map(|mut d| d.next().is_some()).unwrap_or(true) {
             return;
         }
-        let _ = std::fs::remove_file(&self.table);
-        let _ = std::fs::remove_file(self.table.with_file_name("delivered"));
+        let _ = rargo_net::io::file::remove_file(&self.table);
+        let _ = rargo_net::io::file::remove_file(self.table.with_file_name("delivered"));
         self.dirty.store(false, Ordering::SeqCst);
         if let Some(session) = self.session.get() {
             session.unmount();
@@ -551,7 +551,7 @@ impl OutFs {
     }
 
     fn kind(&self, rel: &[u8]) -> Option<Kind> {
-        let real = std::fs::symlink_metadata(self.real(rel)).ok();
+        let real = rargo_net::io::file::symlink_metadata(self.real(rel)).ok();
         self.virt.read().unwrap().lookup(rel, real)
     }
 
@@ -629,7 +629,7 @@ impl OutFs {
 
     fn make_parents(&self, rel: &[u8]) -> Res<()> {
         if let Some(i) = rel.iter().rposition(|&b| b == b'/') {
-            std::fs::create_dir_all(self.real(&rel[..i])).map_err(errno)?;
+            rargo_net::io::file::create_dir_all(self.real(&rel[..i])).map_err(errno)?;
         }
         Ok(())
     }
@@ -643,8 +643,8 @@ impl OutFs {
             let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", std::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
             std::fs::copy(&src, &tmp).map_err(errno)?;
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
-            std::fs::rename(&tmp, &dst).map_err(|e| {
-                let _ = std::fs::remove_file(&tmp);
+            rargo_net::io::file::rename(&tmp, &dst).map_err(|e| {
+                let _ = rargo_net::io::file::remove_file(&tmp);
                 errno(e)
             })?;
         } else {
@@ -848,7 +848,7 @@ impl OutFs {
                 continue;
             };
             let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
-            if !alive && std::fs::remove_file(e.path()).is_ok() {
+            if !alive && rargo_net::io::file::remove_file(e.path()).is_ok() {
                 self.changed(&join(&dir, name.as_bytes()));
             }
         }
@@ -856,7 +856,7 @@ impl OutFs {
 
     pub fn real_for_write(&self, rel: &[u8]) -> std::io::Result<PathBuf> {
         if let Some(i) = rel.iter().rposition(|&b| b == b'/') {
-            std::fs::create_dir_all(self.real(&rel[..i]))?;
+            rargo_net::io::file::create_dir_all(self.real(&rel[..i]))?;
         }
         Ok(self.real(rel))
     }
@@ -868,7 +868,7 @@ impl Filesystem for OutFs {
         let _t = self.timed("lookup");
         let rel = join(&self.path(parent)?, name);
         let tree = self.virt.read().unwrap();
-        let real = std::fs::symlink_metadata(self.real(&rel)).ok();
+        let real = rargo_net::io::file::symlink_metadata(self.real(&rel)).ok();
         match tree.lookup(&rel, real) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
             None => Ok(Entry::negative(TTL)),
@@ -914,7 +914,7 @@ impl Filesystem for OutFs {
                 return Ok((self.attr(nodeid, &Kind::Virtual(v)), TTL));
             }
             Kind::Virtual(v) => self.make_real(&rel, &v, set.size != Some(0))?,
-            Kind::VDir => std::fs::create_dir_all(self.real(&rel)).map_err(errno)?,
+            Kind::VDir => rargo_net::io::file::create_dir_all(self.real(&rel)).map_err(errno)?,
             Kind::Real(_) => {}
         }
         let path = self.real(&rel);
@@ -989,7 +989,7 @@ impl Filesystem for OutFs {
             }
             r => r.map_err(errno)?,
         }
-        let md = std::fs::symlink_metadata(self.real(&rel)).map_err(errno)?;
+        let md = rargo_net::io::file::symlink_metadata(self.real(&rel)).map_err(errno)?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_DIR as u32));
         Ok(self.entry(parent, name, &Kind::Real(md)))
     }
@@ -997,7 +997,7 @@ impl Filesystem for OutFs {
     fn unlink(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<()> {
         let _t = self.timed("unlink");
         let rel = join(&self.path(parent)?, name);
-        let real = std::fs::remove_file(self.real(&rel));
+        let real = rargo_net::io::file::remove_file(self.real(&rel));
         let listed = self.virt.read().unwrap().files.contains_key(&rel);
         let virt = listed && self.virt.write().unwrap().files.remove(&rel).is_some();
         if virt {
@@ -1020,7 +1020,7 @@ impl Filesystem for OutFs {
         if self.has_virtual_below(&rel) {
             return Err(Errno(libc::ENOTEMPTY));
         }
-        match std::fs::remove_dir(self.real(&rel)) {
+        match rargo_net::io::file::remove_dir(self.real(&rel)) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(errno(e)),
@@ -1043,9 +1043,9 @@ impl Filesystem for OutFs {
         };
         let plain = flags == 0 && !self.touches_virtual(&from) && !self.touches_virtual(&to);
         if plain {
-            let go = || std::fs::rename(self.real(&from), self.real(&to));
+            let go = || rargo_net::io::file::rename(self.real(&from), self.real(&to));
             match go() {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(self.real(&from)).is_ok() => {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && rargo_net::io::file::symlink_metadata(self.real(&from)).is_ok() => {
                     self.make_parents(&to)?;
                     go().map_err(errno)?
                 }
@@ -1065,7 +1065,7 @@ impl Filesystem for OutFs {
                     return Err(Errno(libc::ENOTEMPTY));
                 }
                 self.make_parents(&to)?;
-                std::fs::rename(self.real(&from), self.real(&to)).map_err(errno)?;
+                rargo_net::io::file::rename(self.real(&from), self.real(&to)).map_err(errno)?;
                 if self.virt.read().unwrap().files.contains_key(&to) {
                     self.virt.write().unwrap().files.remove(&to);
                     self.dirty.store(true, Ordering::SeqCst);
@@ -1075,7 +1075,7 @@ impl Filesystem for OutFs {
                 match &dst {
                     Some(Kind::Real(md)) if md.is_dir() => return Err(Errno(libc::EISDIR)),
                     Some(Kind::VDir) => return Err(Errno(libc::EISDIR)),
-                    Some(Kind::Real(_)) => std::fs::remove_file(self.real(&to)).map_err(errno)?,
+                    Some(Kind::Real(_)) => rargo_net::io::file::remove_file(self.real(&to)).map_err(errno)?,
                     _ => {}
                 }
                 let mut tree = self.virt.write().unwrap();
@@ -1085,7 +1085,7 @@ impl Filesystem for OutFs {
                 self.dirty.store(true, Ordering::SeqCst);
             }
             Kind::VDir => match &dst {
-                Some(Kind::Real(md)) if md.is_dir() => std::fs::remove_dir(self.real(&to)).map_err(errno)?,
+                Some(Kind::Real(md)) if md.is_dir() => rargo_net::io::file::remove_dir(self.real(&to)).map_err(errno)?,
                 Some(Kind::Real(_)) | Some(Kind::Virtual(_)) => return Err(Errno(libc::ENOTDIR)),
                 Some(Kind::VDir) => return Err(Errno(libc::ENOTEMPTY)),
                 None => {}
@@ -1105,7 +1105,7 @@ impl Filesystem for OutFs {
             self.dirty.store(true, Ordering::SeqCst);
         }
         if plain {
-            let t = match std::fs::symlink_metadata(self.real(&to)) {
+            let t = match rargo_net::io::file::symlink_metadata(self.real(&to)) {
                 Ok(md) if md.is_dir() => libc::DT_DIR,
                 Ok(md) if md.file_type().is_symlink() => libc::DT_LNK,
                 _ => libc::DT_REG,
@@ -1143,7 +1143,7 @@ impl Filesystem for OutFs {
             (st.path(nodeid)?, join(&st.path(newparent)?, newname))
         };
         if !self.touches_virtual(&to) && !self.virt.read().unwrap().files.contains_key(&from) {
-            let go = || std::fs::hard_link(self.real(&from), self.real(&to));
+            let go = || rargo_net::io::file::hard_link(self.real(&from), self.real(&to));
             match go() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     self.make_parents(&to)?;
@@ -1151,7 +1151,7 @@ impl Filesystem for OutFs {
                 }
                 r => r.map_err(errno)?,
             }
-            let md = std::fs::symlink_metadata(self.real(&to)).map_err(errno)?;
+            let md = rargo_net::io::file::symlink_metadata(self.real(&to)).map_err(errno)?;
             let t = if md.file_type().is_symlink() { libc::DT_LNK } else { libc::DT_REG };
             self.patch(newparent, Patch::Add(newname.to_vec(), t as u32));
             return Ok(self.entry(newparent, newname, &Kind::Real(md)));
@@ -1162,7 +1162,7 @@ impl Filesystem for OutFs {
         match self.kind(&from).ok_or(Errno(libc::ENOENT))? {
             Kind::Real(_) => {
                 self.make_parents(&to)?;
-                std::fs::hard_link(self.real(&from), self.real(&to)).map_err(errno)?;
+                rargo_net::io::file::hard_link(self.real(&from), self.real(&to)).map_err(errno)?;
             }
             Kind::Virtual(v) => {
                 self.virt.write().unwrap().files.insert(to.clone(), v);
@@ -1235,7 +1235,7 @@ impl Filesystem for OutFs {
             self.dirty.store(true, Ordering::SeqCst);
             self.detach(parent, name);
         }
-        let md = file.metadata().map_err(errno)?;
+        let md = rargo_net::io::file::Stat::of(&file.metadata().map_err(errno)?);
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         let entry = self.entry(parent, name, &Kind::Real(md));
         Ok((entry, self.open_handle(ctx, entry.nodeid, Content::Open(file), How::Real)?))

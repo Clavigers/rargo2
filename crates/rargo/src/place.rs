@@ -3,7 +3,7 @@ use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 fn hex(d: &Digest) -> String {
@@ -19,7 +19,7 @@ pub struct Placed {
 
 impl Placed {
     pub fn load(path: &Path) -> Placed {
-        std::fs::read(path).ok().and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default()
+        rargo_net::io::file::read(path).ok().and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default()
     }
     pub fn save(&self, path: &Path) -> io::Result<()> {
         crate::write_atomic(path, &bincode::serialize(self).map_err(io::Error::other)?)
@@ -500,13 +500,9 @@ impl Waiting {
     }
 }
 
-fn mtime_ns(m: &std::fs::Metadata) -> i64 {
-    m.mtime() * 1_000_000_000 + m.mtime_nsec()
-}
-
 fn look_at(look: &Look) -> Sight {
     match look {
-        Look::Stat(p) => Sight::Stat(std::fs::symlink_metadata(p).ok().map(|md| Stat {
+        Look::Stat(p) => Sight::Stat(rargo_net::io::file::symlink_metadata(p).ok().map(|md| Stat {
             kind: if md.is_file() {
                 Kind::File
             } else if md.is_dir() {
@@ -519,11 +515,11 @@ fn look_at(look: &Look) -> Sight {
             size: md.len(),
             mode: md.mode() & 0o7777,
             links: md.nlink(),
-            mtime: mtime_ns(&md),
+            mtime: md.mtime_ns(),
             ino: md.ino(),
         })),
         Look::Hash(p, size) => Sight::Hash(hash_file(p, *size).ok()),
-        Look::Read(p) => Sight::Read(std::fs::read(p).ok()),
+        Look::Read(p) => Sight::Read(rargo_net::io::file::read(p).ok()),
         Look::List(dir) => {
             let mut names: Vec<String> =
                 std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| e.file_name().into_string().ok()).collect();
@@ -544,7 +540,7 @@ fn reflink(src: &Path, dst: &Path) -> bool {
     };
     let ok = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as libc::Ioctl, s.as_raw_fd()) } == 0;
     if !ok {
-        let _ = std::fs::remove_file(dst);
+        let _ = rargo_net::io::file::remove_file(dst);
     }
     ok
 }
@@ -567,7 +563,7 @@ fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
                     return Err(io::Error::other("the file system cannot share this file's blocks"));
                 }
             }
-            How::Link => std::fs::hard_link(&way.from, &tmp)?,
+            How::Link => rargo_net::io::file::hard_link(&way.from, &tmp)?,
             How::Copy => {
                 std::fs::copy(&way.from, &tmp)?;
             }
@@ -576,10 +572,10 @@ fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
         if let Some(m) = way.mode {
             std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(m))?;
         }
-        std::fs::rename(&tmp, to)
+        rargo_net::io::file::rename(&tmp, to)
     })();
     if done.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = rargo_net::io::file::remove_file(&tmp);
     }
     done
 }
@@ -591,7 +587,7 @@ fn install(to: &Path, ways: &[Way]) -> io::Result<()> {
             How::Move => way
                 .mode
                 .map_or(Ok(()), |m| std::fs::set_permissions(&way.from, std::fs::Permissions::from_mode(m)))
-                .and_then(|()| std::fs::rename(&way.from, to)),
+                .and_then(|()| rargo_net::io::file::rename(&way.from, to)),
             _ => place_beside(to, way),
         };
         match done {
@@ -606,7 +602,7 @@ pub fn cached(cache_dir: &Path, hash: &Digest, size: u64) -> Option<PathBuf> {
     let blobs = cache_dir.join("blobs");
     [cache_path(&blobs, hash, false), cache_path(&blobs, hash, true)]
         .into_iter()
-        .find(|p| std::fs::metadata(p).map(|m| m.is_file() && m.len() == size).unwrap_or(false))
+        .find(|p| rargo_net::io::file::metadata(p).map(|m| m.is_file() && m.len() == size).unwrap_or(false))
 }
 
 pub fn cache_slot(cache_dir: &Path, hash: &Digest) -> PathBuf {
@@ -632,7 +628,7 @@ pub struct Placer {
 impl Drop for Placer {
     fn drop(&mut self) {
         for (_, part) in self.parts.drain() {
-            let _ = std::fs::remove_file(&part.tmp);
+            let _ = rargo_net::io::file::remove_file(&part.tmp);
         }
     }
 }
@@ -655,20 +651,20 @@ impl Placer {
         for op in ops {
             match op {
                 Op::Remove(path) => {
-                    if let Ok(md) = std::fs::symlink_metadata(&path) {
-                        let _ = if md.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
+                    if let Ok(md) = rargo_net::io::file::symlink_metadata(&path) {
+                        let _ = if md.is_dir() { std::fs::remove_dir_all(path) } else { rargo_net::io::file::remove_file(path) };
                     }
                 }
                 Op::Unlink(path) => {
-                    let _ = std::fs::remove_file(path);
+                    let _ = rargo_net::io::file::remove_file(path);
                 }
-                Op::Dir(path) => std::fs::create_dir_all(path)?,
+                Op::Dir(path) => rargo_net::io::file::create_dir_all(path)?,
                 Op::Symlink(path, target) => {
                     use std::os::unix::ffi::OsStrExt;
                     if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                        rargo_net::io::file::create_dir_all(parent)?;
                     }
-                    let _ = std::fs::remove_file(&path);
+                    let _ = rargo_net::io::file::remove_file(&path);
                     std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), path)?;
                 }
                 Op::Text(path, text) => crate::write_atomic(&path, text.as_bytes())?,
@@ -679,8 +675,8 @@ impl Placer {
                     }
                 }
                 Op::Record(path, hash) => {
-                    if let Ok(md) = std::fs::symlink_metadata(&path) {
-                        self.placed.files.insert(path.to_string_lossy().into_owned(), (md.len(), mtime_ns(&md), md.ino(), hash));
+                    if let Ok(md) = rargo_net::io::file::symlink_metadata(&path) {
+                        self.placed.files.insert(path.to_string_lossy().into_owned(), (md.len(), md.mtime_ns(), md.ino(), hash));
                         self.changed = true;
                     }
                 }
@@ -693,12 +689,12 @@ impl Placer {
         assert!(!self.parts.contains_key(&hash), "a finished download is no longer a part");
         let ops = self.waiting.arrived(&self.cache, hash, tmp);
         let done = self.run(ops);
-        let _ = std::fs::remove_file(tmp);
+        let _ = rargo_net::io::file::remove_file(tmp);
         done
     }
 
     fn scratch(&mut self) -> io::Result<PathBuf> {
-        std::fs::create_dir_all(&self.cache)?;
+        rargo_net::io::file::create_dir_all(&self.cache)?;
         Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), crate::tmp::seq())))
     }
 
@@ -709,7 +705,7 @@ impl Placer {
         self.fetched_bytes += bytes.len() as u64;
         let tmp = self.scratch()?;
         let _watched = crate::tmp::watch(&tmp);
-        std::fs::write(&tmp, bytes)?;
+        rargo_net::io::file::write(&tmp, bytes)?;
         self.arrived(hash, &tmp)
     }
 
@@ -729,9 +725,9 @@ impl Placer {
         let part = self.parts.remove(&hash).unwrap();
         assert!(!self.parts.contains_key(&hash));
         drop(part.file);
-        let size = std::fs::metadata(&part.tmp)?.len();
+        let size = rargo_net::io::file::metadata(&part.tmp)?.len();
         if hash_file(&part.tmp, size)? != hash {
-            let _ = std::fs::remove_file(&part.tmp);
+            let _ = rargo_net::io::file::remove_file(&part.tmp);
             return Err(io::Error::other("the server sent content that does not match its hash"));
         }
         self.arrived(hash, &part.tmp)
@@ -771,24 +767,24 @@ impl Placer {
 
     pub fn prune(&self) {
         let marker = self.cache.join(".pruned");
-        let age = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        let age = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
         if age(&marker).is_some_and(|a| a.as_secs() < 3600) || !self.cache.is_dir() {
             return;
         }
-        let _ = std::fs::write(&marker, b"");
+        let _ = rargo_net::io::file::write(&marker, b"");
         for shard in std::fs::read_dir(&self.cache).into_iter().flatten().flatten() {
             let p = shard.path();
             if !p.is_dir() {
                 if age(&p).is_some_and(|a| a.as_secs() > 86400) && p != marker {
-                    let _ = std::fs::remove_file(&p);
+                    let _ = rargo_net::io::file::remove_file(&p);
                 }
                 continue;
             }
             for f in std::fs::read_dir(&p).into_iter().flatten().flatten() {
                 let fp = f.path();
-                let Ok(md) = std::fs::metadata(&fp) else { continue };
+                let Ok(md) = rargo_net::io::file::metadata(&fp) else { continue };
                 if md.nlink() == 1 && age(&fp).is_some_and(|a| a.as_secs() > 3 * 86400) {
-                    let _ = std::fs::remove_file(&fp);
+                    let _ = rargo_net::io::file::remove_file(&fp);
                 }
             }
         }
@@ -798,6 +794,7 @@ impl Placer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     struct Rng(u64);
 

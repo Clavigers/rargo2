@@ -842,7 +842,7 @@ impl Daemon {
                     .iter()
                     .map(|h| {
                         let (path, _) = snap2.scan.files.get(h)?;
-                        let bytes = std::fs::read(path).ok()?;
+                        let bytes = rargo_net::io::file::read(path).ok()?;
                         (*blake3::hash(&bytes).as_bytes() == *h).then(|| Blob::pack(*h, &bytes))
                     })
                     .collect()
@@ -970,13 +970,13 @@ impl Daemon {
     fn mount_out(self: &Arc<Self>, wt: &Arc<Worktree>) -> std::io::Result<Mounted> {
         let dir = wt.root.join("target");
         release_mounts(&dir);
-        if std::fs::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        if rargo_net::io::file::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
             return Err(std::io::Error::other("`target` is a symbolic link"));
         }
-        std::fs::create_dir_all(&dir)?;
+        rargo_net::io::file::create_dir_all(&dir)?;
         let tag = dir.join("CACHEDIR.TAG");
         if !tag.exists() {
-            std::fs::write(&tag, rargo_proto::CACHEDIR_TAG)?;
+            rargo_net::io::file::write(&tag, rargo_proto::CACHEDIR_TAG)?;
         }
         let source = Box::new(Contents { d: Arc::downgrade(self) });
         let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
@@ -1012,8 +1012,8 @@ impl Daemon {
             if let Some(m) = wt.out.lock().unwrap().take() {
                 m.session.unmount();
             }
-            let _ = std::fs::remove_file(wt.wt_cache.join("virtual"));
-            let _ = std::fs::remove_file(wt.wt_cache.join("delivered"));
+            let _ = rargo_net::io::file::remove_file(wt.wt_cache.join("virtual"));
+            let _ = rargo_net::io::file::remove_file(wt.wt_cache.join("delivered"));
         }
     }
 
@@ -1060,7 +1060,7 @@ impl Daemon {
             let held = self.chunks.lock().unwrap().get(&chunk).copied();
             let local = held.and_then(|(blob, off, l)| {
                 let slot = crate::place::cache_slot(&self.cache, &blob);
-                let path = crate::place::cached(&self.cache, &blob, std::fs::metadata(&slot).ok()?.len())?;
+                let path = crate::place::cached(&self.cache, &blob, rargo_net::io::file::metadata(&slot).ok()?.len())?;
                 let mut buf = vec![0u8; l as usize];
                 std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
                 (l == len).then_some(buf)
@@ -1141,7 +1141,7 @@ impl Daemon {
                 let slot = crate::place::cache_slot(&self.cache, &hash);
                 let tmp = slot.with_file_name(format!(".incoming-{}-{}", std::process::id(), mux.next_id()));
                 if let Some(parent) = slot.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    rargo_net::io::file::create_dir_all(parent)?;
                 }
                 let file = std::fs::File::create(&tmp)?;
                 let mut offsets = Vec::with_capacity(recipe.len());
@@ -1156,7 +1156,7 @@ impl Daemon {
                     for (i, (chunk, len)) in recipe.iter().enumerate() {
                         let held = self.chunks.lock().unwrap().get(chunk).copied();
                         let local = held.and_then(|(blob, off, l)| {
-                            let path = crate::place::cached(&self.cache, &blob, std::fs::metadata(crate::place::cache_slot(&self.cache, &blob)).ok()?.len())?;
+                            let path = crate::place::cached(&self.cache, &blob, rargo_net::io::file::metadata(crate::place::cache_slot(&self.cache, &blob)).ok()?.len())?;
                             let mut buf = vec![0u8; l as usize];
                             std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
                             (l == *len && *blake3::hash(&buf).as_bytes() == *chunk).then_some(buf)
@@ -1192,11 +1192,11 @@ impl Daemon {
                 drop(file);
                 let whole = io::cpu(|| scan::hash_file(&tmp, size));
                 if whole.ok() != Some(hash) {
-                    let _ = std::fs::remove_file(&tmp);
+                    let _ = rargo_net::io::file::remove_file(&tmp);
                     return Err(std::io::Error::other("the server sent content that does not match its hash"));
                 }
                 let _ = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
-                std::fs::rename(&tmp, &slot)?;
+                rargo_net::io::file::rename(&tmp, &slot)?;
                 let mut index = self.chunks.lock().unwrap();
                 if index.len() > crate::known::MOST_CHUNKS {
                     index.clear();
@@ -1241,7 +1241,7 @@ impl Daemon {
     fn close_down(&self, socket: &Path) {
         self.unmount_all();
         self.save_known();
-        let _ = std::fs::remove_file(socket);
+        let _ = rargo_net::io::file::remove_file(socket);
     }
 
     pub fn command(self: Arc<Self>, req: LocalRequest, out: UnboundedSender<LocalReply>) {
@@ -1369,7 +1369,7 @@ impl Daemon {
         let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
-            match std::fs::read(cargo_home.join(name)) {
+            match rargo_net::io::file::read(cargo_home.join(name)) {
                 Ok(b) if b.len() <= 1 << 20 => home_files.push((name.to_string(), b)),
                 _ => {}
             }
@@ -1456,7 +1456,7 @@ impl Daemon {
                         None => Vec::new(),
                     };
                     let delivered =
-                        std::fs::read_to_string(wt.wt_cache.join("delivered")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
+                        rargo_net::io::file::read_to_string(wt.wt_cache.join("delivered")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
                     let run = RunRequest {
                         root: root.to_string_lossy().into_owned(),
                         env,
@@ -1846,7 +1846,7 @@ fn next_msg(mux: &Arc<Mux>, rx: &mut UnboundedReceiver<ServerMsg>) -> std::io::R
 }
 
 fn mountinfo() -> String {
-    std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+    rargo_net::io::file::read_to_string("/proc/self/mountinfo").unwrap_or_default()
 }
 
 fn mounts_at<'a>(info: &'a str, dir: &Path) -> impl Iterator<Item = &'a str> {
@@ -1891,19 +1891,19 @@ fn show(
         };
         match w {
             Write::Dir { .. } => {
-                std::fs::create_dir_all(fs.real_for_write(&join_rel(&rel))?)?;
+                rargo_net::io::file::create_dir_all(fs.real_for_write(&join_rel(&rel))?)?;
                 delivery.wrote(&rel);
             }
             Write::Remove { .. } | Write::Text { text: None, .. } => delivery.remove(&rel),
             Write::Symlink { target, .. } => {
                 let real = fs.real_for_write(&rel)?;
-                let _ = std::fs::remove_file(&real);
+                let _ = rargo_net::io::file::remove_file(&real);
                 std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
                 delivery.wrote(&rel);
             }
             Write::Text { text: Some(text), .. } => {
                 let real = fs.real_for_write(&rel)?;
-                if std::fs::read_to_string(&real).ok().as_deref() != Some(text.as_str()) {
+                if rargo_net::io::file::read_to_string(&real).ok().as_deref() != Some(text.as_str()) {
                     crate::write_atomic(&real, text.as_bytes())?;
                     delivery.wrote(&rel);
                 }
@@ -2047,7 +2047,7 @@ fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> s
                     batch
                         .par_iter()
                         .map(|file| {
-                            let bytes = std::fs::read(&file.path).ok()?;
+                            let bytes = rargo_net::io::file::read(&file.path).ok()?;
                             (bytes.len() as u64 == file.size && *blake3::hash(&bytes).as_bytes() == file.hash)
                                 .then(|| Blob::pack(file.hash, &bytes))
                         })
@@ -2238,7 +2238,7 @@ pub fn serve(socket: &Path) -> ! {
                 io::sleep(Duration::from_millis(20));
             }
         }
-        let _ = std::fs::remove_file(&socket);
+        let _ = rargo_net::io::file::remove_file(&socket);
         let listener = match io::UnixListener::bind(&socket) {
             Ok(l) => l,
             Err(e) => crate::die(&format!("{}: {e}", socket.display())),

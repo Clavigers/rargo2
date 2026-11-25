@@ -24,8 +24,12 @@ pub enum Op {
     Read { fd: i32, off: u64, len: usize },
     Write { fd: i32, off: u64, buf: Vec<u8> },
     OpenAt { dir: i32, path: CString, flags: i32, mode: u32 },
-    Statx { dir: i32, path: CString },
+    Statx { dir: i32, path: CString, flags: i32 },
     RenameAt { old_dir: i32, old: CString, new_dir: i32, new: CString },
+    UnlinkAt { dir: i32, path: CString, flags: i32 },
+    MkdirAt { dir: i32, path: CString, mode: u32 },
+    LinkAt { old_dir: i32, old: CString, new_dir: i32, new: CString },
+    SymlinkAt { target: CString, new_dir: i32, new: CString },
     Fsync { fd: i32 },
     Close { fd: i32 },
     Timeout { ms: u64 },
@@ -54,6 +58,7 @@ pub enum Event {
     Open { fd: i32 },
     Stat { buf: Box<libc::statx> },
     Renamed,
+    Done,
     Synced,
     Closed,
     Timeout,
@@ -149,10 +154,10 @@ pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) ->
             inflight.insert(token, Slot { kind: Kind::Open, path: Some(path), ..Slot::empty(Kind::Open) });
             entry
         }
-        Op::Statx { dir, path } => {
+        Op::Statx { dir, path, flags } => {
             let stat = Box::new(unsafe { std::mem::zeroed::<libc::statx>() });
             let entry = opcode::Statx::new(types::Fd(dir), path.as_ptr(), (&*stat as *const libc::statx).cast::<types::statx>().cast_mut())
-                .flags(libc::AT_STATX_SYNC_AS_STAT)
+                .flags(libc::AT_STATX_SYNC_AS_STAT | flags)
                 .mask(libc::STATX_BASIC_STATS)
                 .build()
                 .user_data(token);
@@ -162,6 +167,26 @@ pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) ->
         Op::RenameAt { old_dir, old, new_dir, new } => {
             let entry = opcode::RenameAt::new(types::Fd(old_dir), old.as_ptr(), types::Fd(new_dir), new.as_ptr()).build().user_data(token);
             inflight.insert(token, Slot { kind: Kind::Rename, path: Some(old), path2: Some(new), ..Slot::empty(Kind::Rename) });
+            entry
+        }
+        Op::UnlinkAt { dir, path, flags } => {
+            let entry = opcode::UnlinkAt::new(types::Fd(dir), path.as_ptr()).flags(flags).build().user_data(token);
+            inflight.insert(token, Slot { path: Some(path), ..Slot::empty(Kind::Path) });
+            entry
+        }
+        Op::MkdirAt { dir, path, mode } => {
+            let entry = opcode::MkDirAt::new(types::Fd(dir), path.as_ptr()).mode(mode).build().user_data(token);
+            inflight.insert(token, Slot { path: Some(path), ..Slot::empty(Kind::Path) });
+            entry
+        }
+        Op::LinkAt { old_dir, old, new_dir, new } => {
+            let entry = opcode::LinkAt::new(types::Fd(old_dir), old.as_ptr(), types::Fd(new_dir), new.as_ptr()).build().user_data(token);
+            inflight.insert(token, Slot { path: Some(old), path2: Some(new), ..Slot::empty(Kind::Path) });
+            entry
+        }
+        Op::SymlinkAt { target, new_dir, new } => {
+            let entry = opcode::SymlinkAt::new(types::Fd(new_dir), target.as_ptr(), new.as_ptr()).build().user_data(token);
+            inflight.insert(token, Slot { path: Some(target), path2: Some(new), ..Slot::empty(Kind::Path) });
             entry
         }
         Op::Fsync { fd } => {
@@ -422,6 +447,7 @@ pub(super) fn event_of(slot: Slot, res: i32) -> Event {
         Kind::Open => Event::Open { fd: res },
         Kind::Stat => Event::Stat { buf: stat.unwrap_or_else(|| Box::new(unsafe { std::mem::zeroed() })) },
         Kind::Rename => Event::Renamed,
+        Kind::Path => Event::Done,
         Kind::Fsync => Event::Synced,
         Kind::Close => Event::Closed,
         Kind::Timeout => Event::Timeout,

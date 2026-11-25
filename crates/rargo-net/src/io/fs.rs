@@ -34,7 +34,7 @@ pub fn open_at(dir: i32, path: &Path, flags: i32, mode: u32) -> io::Result<i32> 
 
 pub fn stat_at(dir: i32, path: &Path) -> io::Result<Box<libc::statx>> {
     let path = c_path(path)?;
-    match op_event(Op::Statx { dir, path })? {
+    match op_event(Op::Statx { dir, path, flags: 0 })? {
         Event::Stat { buf } => Ok(buf),
         _ => Err(io::Error::other("stat")),
     }

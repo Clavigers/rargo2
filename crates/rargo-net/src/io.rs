@@ -1,5 +1,6 @@
 
 mod fiber;
+pub mod file;
 mod fs;
 mod fuse;
 mod net;
