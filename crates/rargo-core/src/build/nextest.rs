@@ -618,6 +618,9 @@ fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Re
 
 fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -> Result<Answer> {
     let mut env: BTreeMap<Vec<u8>, Vec<u8>> = p.env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
+    if let Some(channel) = p.channel {
+        env.insert(bytes(super::CHANNEL_VAR), bytes(channel));
+    }
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
     let mut argv = vec![PLANNER_AT.to_vec()];
     argv.extend(args.iter().map(|a| bytes(a)));
