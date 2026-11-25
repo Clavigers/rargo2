@@ -9,7 +9,8 @@ Everyone who uses the same server shares one cache.
 
 ## Use a server
 
-You need Linux.
+You need Linux. To run what rargo builds on your machine, with `rargo run` or straight from `target/`, you also need [Nix](https://nixos.org/download/).
+Built programs use the build server's C library from the Nix store; the first `rargo run` fetches it into the store, and the program then runs either way.
 
 ```sh
 cargo install rargo                 # or: curl -fsSL https://rargo.rs/install.sh | sh
