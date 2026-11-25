@@ -250,6 +250,73 @@ pub fn link_finish(mut hs: HandshakeState, msg2: &[u8]) -> io::Result<LinkCipher
     LinkCipher::new(hs)
 }
 
+/// An initiator handshake whose ephemeral key was supplied by the caller.
+pub struct LinkPending(HandshakeState);
+
+impl LinkPending {
+    pub fn finish(self, msg: &[u8]) -> io::Result<LinkCipher> {
+        link_finish(self.0, msg)
+    }
+}
+
+fn link_builder_fixed<'a>(psk: &'a [u8; 32], ephemeral: &'a [u8]) -> io::Result<snow::Builder<'a>> {
+    let params = LINK_PARAMS.parse().map_err(err)?;
+    let resolver = snow::resolvers::FallbackResolver::new(Box::new(SuppliedResolver), Box::new(snow::resolvers::DefaultResolver));
+    Ok(snow::Builder::with_resolver(params, Box::new(resolver))
+        .prologue(LINK_PROLOGUE)
+        .map_err(err)?
+        .psk(0, psk)
+        .map_err(err)?
+        .fixed_ephemeral_key_for_testing_only(ephemeral))
+}
+
+pub fn link_start_with(psk: &[u8; 32], ephemeral: &[u8; 32]) -> io::Result<(LinkPending, Vec<u8>)> {
+    let mut hs = link_builder_fixed(psk, ephemeral)?.build_initiator().map_err(err)?;
+    let mut msg = vec![0u8; 128];
+    let n = hs.write_message(&[], &mut msg).map_err(err)?;
+    msg.truncate(n);
+    Ok((LinkPending(hs), msg))
+}
+
+pub fn link_accept_with(psk: &[u8; 32], msg1: &[u8], ephemeral: &[u8; 32]) -> io::Result<(Vec<u8>, LinkCipher)> {
+    let mut hs = link_builder_fixed(psk, ephemeral)?.build_responder().map_err(err)?;
+    let mut scratch = vec![0u8; msg1.len() + 16];
+    hs.read_message(msg1, &mut scratch).map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "link key mismatch"))?;
+    let mut msg2 = vec![0u8; 128];
+    let n = hs.write_message(&[], &mut msg2).map_err(err)?;
+    msg2.truncate(n);
+    Ok((msg2, LinkCipher::new(hs)?))
+}
+
+/// Randomness comes from the caller. Asking this resolver for bytes is a bug.
+struct SuppliedRng;
+
+impl snow::types::Random for SuppliedRng {
+    fn try_fill_bytes(&mut self, _dest: &mut [u8]) -> Result<(), snow::Error> {
+        Err(snow::Error::Rng)
+    }
+}
+
+struct SuppliedResolver;
+
+impl snow::resolvers::CryptoResolver for SuppliedResolver {
+    fn resolve_rng(&self) -> Option<Box<dyn snow::types::Random>> {
+        Some(Box::new(SuppliedRng))
+    }
+
+    fn resolve_dh(&self, _choice: &snow::params::DHChoice) -> Option<Box<dyn snow::types::Dh>> {
+        None
+    }
+
+    fn resolve_hash(&self, _choice: &snow::params::HashChoice) -> Option<Box<dyn snow::types::Hash>> {
+        None
+    }
+
+    fn resolve_cipher(&self, _choice: &snow::params::CipherChoice) -> Option<Box<dyn snow::types::Cipher>> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

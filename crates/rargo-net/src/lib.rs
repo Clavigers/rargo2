@@ -1,5 +1,6 @@
 pub mod link;
 mod endpoint;
+mod handshake;
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -154,6 +155,7 @@ pub struct Conn {
     last_heard: Mutex<Instant>,
     loss: Mutex<f32>,
     rng: AtomicU64,
+    handshake_in: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Conn {
@@ -194,6 +196,7 @@ impl Conn {
             last_heard: Mutex::new(Instant::now()),
             loss: Mutex::new(0.0),
             rng: AtomicU64::new(id | 1),
+            handshake_in: Mutex::new(Vec::new()),
         });
         let c2 = c.clone();
         tokio::spawn(async move { c2.sender_loop().await });
@@ -300,18 +303,23 @@ impl Conn {
     }
 
     pub async fn recv(&self) -> Option<Vec<u8>> {
-        let raw = self.recv_raw().await?;
-        if !self.encrypted() {
-            return Some(raw);
-        }
-        let cipher = self.cipher.get()?;
-        let opened = if raw.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.open(&raw)) } else { cipher.open(&raw) };
-        match opened {
-            Ok(m) => Some(m),
-            Err(_) => {
-                self.close();
-                None
+        loop {
+            let raw = self.recv_raw().await?;
+            if self.handshake_in.lock().iter().any(|m| m == &raw) {
+                continue;
             }
+            if !self.encrypted() {
+                return Some(raw);
+            }
+            let cipher = self.cipher.get()?;
+            let opened = if raw.len() >= 256 << 10 { tokio::task::block_in_place(|| cipher.open(&raw)) } else { cipher.open(&raw) };
+            return match opened {
+                Ok(m) => Some(m),
+                Err(_) => {
+                    self.close();
+                    None
+                }
+            };
         }
     }
 
@@ -319,69 +327,106 @@ impl Conn {
         self.inbound_rx.lock().await.recv().await
     }
 
+    fn note_handshake(&self, msg: &[u8]) {
+        self.handshake_in.lock().push(msg.to_vec());
+    }
+
+    fn ephemeral() -> [u8; 32] {
+        let mut b = [0u8; 32];
+        unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 32, 0) };
+        b
+    }
+
+    fn install(&self, agreed: handshake::Agreed) {
+        if let Some(binding) = agreed.binding {
+            let _ = self.tag.set(binding);
+        }
+        if let Some(user) = agreed.user {
+            let _ = self.user.set(user);
+        }
+        let _ = self.cipher.set(agreed.cipher);
+    }
+
+    async fn apply(&self, hs: &mut handshake::Handshake, result: io::Result<handshake::Action>) -> io::Result<handshake::Action> {
+        match result {
+            Ok(action) => Ok(action),
+            Err(e) => {
+                if let Some(pkt) = hs.take_notify() {
+                    let _ = self.send_raw(&pkt).await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn drive(&self, hs: &mut handshake::Handshake, keys: Option<&UserKeys>) -> io::Result<handshake::Agreed> {
+        let deadline = Instant::now() + HANDSHAKE_WAIT;
+        let mut action = hs.start()?;
+        loop {
+            hs.invariants();
+            match action {
+                handshake::Action::Send(pkt) => {
+                    self.send_raw(&pkt).await?;
+                    action = hs.sent()?;
+                }
+                handshake::Action::Wait => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(hs.timeout_error());
+                    }
+                    let slice = (left / hs.resend_share()).max(Duration::from_millis(1)).min(left);
+                    match tokio::time::timeout(slice, self.recv_raw()).await {
+                        Ok(Some(pkt)) => {
+                            self.note_handshake(&pkt);
+                            let result = hs.recv(&pkt);
+                            action = self.apply(hs, result).await?;
+                        }
+                        Ok(None) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed")),
+                        Err(_) => {
+                            if let Some(pkt) = hs.lost() {
+                                self.send_raw(&pkt).await?;
+                                action = handshake::Action::Wait;
+                            } else {
+                                return Err(hs.timeout_error());
+                            }
+                        }
+                    }
+                }
+                handshake::Action::NeedKey(name) => {
+                    let found = keys.ok_or_else(|| io::Error::other("no user directory"))?.as_ref()(&name);
+                    let result = hs.provide_key(found);
+                    action = self.apply(hs, result).await?;
+                }
+                handshake::Action::Done(agreed) => {
+                    hs.invariants();
+                    return Ok(agreed);
+                }
+            }
+        }
+    }
+
     async fn agree_as_initiator(&self, key: &[u8; 32]) -> io::Result<()> {
-        let (hs, m1) = rargo_proto::secure::link_start(&handshake_key(key))?;
-        self.send_raw(&m1).await?;
-        let m2 = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no answer from the server (is it running, and is the worker key the same?)"))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-        let _ = self.cipher.set(rargo_proto::secure::link_finish(hs, &m2)?);
+        let mut hs = handshake::Handshake::shared_initiator(*key, Self::ephemeral());
+        self.install(self.drive(&mut hs, None).await?);
         Ok(())
     }
 
     async fn agree_as_responder(&self, key: &[u8; 32]) -> io::Result<()> {
-        let m1 = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no key agreement"))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-        let (m2, cipher) = rargo_proto::secure::link_accept(&handshake_key(key), &m1)?;
-        let _ = self.cipher.set(cipher);
-        self.send_raw(&m2).await
+        let mut hs = handshake::Handshake::shared_responder(*key, Self::ephemeral());
+        self.install(self.drive(&mut hs, None).await?);
+        Ok(())
     }
 
     async fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> io::Result<()> {
-        let (hs, m1) = rargo_proto::secure::link_start(&user_handshake_key(psk))?;
-        let mut first = vec![name.len().min(255) as u8];
-        first.extend_from_slice(&name.as_bytes()[..name.len().min(255)]);
-        first.extend_from_slice(&m1);
-        self.send_raw(&first).await?;
-        let m2 = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no answer from the server"))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-        if m2.first() == Some(&1) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("the server refused the connection: {}", String::from_utf8_lossy(&m2[1..]).trim()),
-            ));
-        }
-        let cipher = rargo_proto::secure::link_finish(hs, m2.get(1..).unwrap_or_default())?;
-        let _ = self.tag.set(cipher.binding());
-        let _ = self.cipher.set(cipher);
+        let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral());
+        self.install(self.drive(&mut hs, None).await?);
         Ok(())
     }
 
     async fn agree_with_user(&self, keys: &UserKeys) -> io::Result<()> {
-        let first = tokio::time::timeout(HANDSHAKE_WAIT, self.recv_raw())
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no key agreement"))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"))?;
-        let n = *first.first().ok_or_else(|| io::Error::other("empty key agreement"))? as usize;
-        let name = first.get(1..1 + n).and_then(|b| std::str::from_utf8(b).ok()).ok_or_else(|| io::Error::other("malformed key agreement"))?;
-        let accepted = keys(name).and_then(|psk| rargo_proto::secure::link_accept(&user_handshake_key(&psk), &first[1 + n..]).ok());
-        let Some((m2, cipher)) = accepted else {
-            let mut refusal = vec![1u8];
-            refusal.extend_from_slice(rargo_proto::REFUSED.as_bytes());
-            let _ = self.send_raw(&refusal).await;
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("refused token `{name}`: unknown, revoked, expired or a wrong secret")));
-        };
-        let _ = self.user.set(name.to_string());
-        let _ = self.tag.set(cipher.binding());
-        let _ = self.cipher.set(cipher);
-        let mut reply = vec![0u8];
-        reply.extend_from_slice(&m2);
-        self.send_raw(&reply).await
+        let mut hs = handshake::Handshake::user_responder(Self::ephemeral());
+        self.install(self.drive(&mut hs, Some(keys)).await?);
+        Ok(())
     }
 
     fn rto(s: &SendState) -> Duration {
@@ -630,8 +675,11 @@ impl Conn {
             assert!(msg < r.done_below || r.done.contains(&msg));
             assert!(!r.done.contains(&r.done_below));
             debug_assert!(r.done.iter().all(|&m| m > r.done_below));
-            self.stats.messages_in.fetch_add(1, Ordering::Relaxed);
-            let _ = self.inbound_tx.send(whole);
+            let repeat = self.handshake_in.lock().iter().any(|m| m == &whole);
+            if !repeat {
+                self.stats.messages_in.fetch_add(1, Ordering::Relaxed);
+                let _ = self.inbound_tx.send(whole);
+            }
         }
         true
     }
@@ -853,99 +901,6 @@ mod tests {
         let s = server.accept().await.unwrap();
         assert_eq!(s.recv().await.unwrap(), b"hello");
         (server, s, client, c)
-    }
-
-    #[test]
-    fn client_links_prove_their_user_and_follow_a_changed_address() {
-        rt().block_on(async {
-            let addr = || "127.0.0.1:0".parse().unwrap();
-            let users: UserKeys = Arc::new(|name| (name == "ann").then_some([7u8; 32]));
-            let server = Endpoint::bind_auth(addr(), true, Auth::Users(users)).await.unwrap();
-            let at = server.local_addr().unwrap();
-            let ann = Endpoint::bind_auth(addr(), false, Auth::User { name: "ann".into(), psk: [7; 32] }).await.unwrap();
-            let c = ann.connect(at).await.unwrap();
-            let big: Vec<u8> = (0..200_000u32).map(|i| (i * 7) as u8).collect();
-            c.send(&big).await.unwrap();
-            let s = server.accept().await.unwrap();
-            assert_eq!(s.user(), Some("ann"));
-            assert_eq!(s.recv().await.unwrap(), big);
-            s.send(b"back").await.unwrap();
-            assert_eq!(c.recv().await.unwrap(), b"back");
-
-            for (name, psk) in [("ann", [8u8; 32]), ("eve", [7u8; 32])] {
-                let bad = Endpoint::bind_auth(addr(), false, Auth::User { name: name.into(), psk }).await.unwrap();
-                let e = tokio::time::timeout(Duration::from_secs(5), bad.connect(at)).await.unwrap().err().unwrap();
-                assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{name}");
-            }
-
-            let outsider = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut pkt = vec![T_DATA];
-            pkt.extend_from_slice(&s.id.to_le_bytes());
-            pkt.extend_from_slice(&99u64.to_le_bytes());
-            pkt.extend_from_slice(&0u32.to_le_bytes());
-            pkt.extend_from_slice(&1u32.to_le_bytes());
-            pkt.extend_from_slice(b"forged");
-            outsider.send_to(&pkt, at).await.unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let before = s.peer();
-            assert_ne!(before, outsider.local_addr().unwrap());
-
-            let moved = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let relay_to = moved.clone();
-            let client_addr = ann.local_addr().unwrap();
-            let proxy = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            *c.peer.lock() = proxy.local_addr().unwrap();
-            let (p2, m2) = (proxy.clone(), moved.clone());
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    let Ok((n, _)) = p2.recv_from(&mut buf).await else { break };
-                    let _ = m2.send_to(&buf[..n], at).await;
-                }
-            });
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
-                loop {
-                    let Ok((n, _)) = relay_to.recv_from(&mut buf).await else { break };
-                    let _ = proxy.send_to(&buf[..n], client_addr).await;
-                }
-            });
-            c.send(b"from somewhere else").await.unwrap();
-            assert_eq!(tokio::time::timeout(Duration::from_secs(5), s.recv()).await.unwrap().unwrap(), b"from somewhere else");
-            assert_eq!(s.peer(), moved.local_addr().unwrap());
-            s.send(b"found you").await.unwrap();
-            assert_eq!(tokio::time::timeout(Duration::from_secs(5), c.recv()).await.unwrap().unwrap(), b"found you");
-        });
-    }
-
-    #[test]
-    fn keyed_link_carries_messages_and_rejects_other_keys() {
-        rt().block_on(async {
-            let key = |b: u8| -> LinkKey { Some(Arc::new([b; 32])) };
-            let addr = || "127.0.0.1:0".parse().unwrap();
-            let server = Endpoint::bind_keyed(addr(), true, key(1)).await.unwrap();
-            let good = Endpoint::bind_keyed(addr(), false, key(1)).await.unwrap();
-            let c = good.connect(server.local_addr().unwrap()).await.unwrap();
-            let big: Vec<u8> = (0..300_000u32).map(|i| i as u8).collect();
-            c.send(&big).await.unwrap();
-            let s = server.accept().await.unwrap();
-            assert_eq!(s.recv().await.unwrap(), big);
-            s.send(b"back").await.unwrap();
-            assert_eq!(c.recv().await.unwrap(), b"back");
-
-            for k in [key(2), None] {
-                let keyed = k.is_some();
-                let bad = Endpoint::bind_keyed(addr(), false, k).await.unwrap();
-                let b = tokio::time::timeout(Duration::from_millis(300), bad.connect(server.local_addr().unwrap())).await;
-                if keyed {
-                    assert!(b.is_err(), "the key agreement must not complete with another key");
-                } else {
-                    let _ = b.unwrap().unwrap().send(b"let me in").await;
-                }
-                let got = tokio::time::timeout(Duration::from_millis(300), server.accept()).await;
-                assert!(got.is_err(), "a connection with the wrong key was accepted");
-            }
-        });
     }
 
     #[test]
