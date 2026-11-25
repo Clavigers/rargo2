@@ -499,7 +499,7 @@ enum Act {
 
 fn intake(buf: &mut Vec<u8>, item: ReadItem) -> Intake {
     match item {
-        ReadItem::Ended => Intake::Silent,
+        ReadItem::Ended => Intake::Reply(bad_request("the request ended early")),
         ReadItem::Socket(kind, _) if matches!(kind, ErrorKind::TimedOut | ErrorKind::WouldBlock) => Intake::Silent,
         ReadItem::Socket(_, msg) => Intake::Reply(bad_request(msg)),
         ReadItem::Chunk(bytes) => {
@@ -1036,11 +1036,16 @@ mod tests {
     }
 
     #[test]
-    fn malformed_requests_are_400_and_an_early_end_or_timeout_is_silent() {
+    fn malformed_requests_are_400_and_a_timeout_is_silent() {
         let mut buf = Vec::new();
         assert!(matches!(intake(&mut buf, ReadItem::Socket(ErrorKind::TimedOut, "timed out".into())), Intake::Silent));
         assert!(matches!(intake(&mut buf, ReadItem::Socket(ErrorKind::WouldBlock, "again".into())), Intake::Silent));
-        assert!(matches!(intake(&mut buf, ReadItem::Ended), Intake::Silent));
+        let Intake::Reply(outcome) = intake(&mut buf, ReadItem::Ended) else { panic!("early end") };
+        assert_eq!(body_of(&outcome), (400, "text/plain", "bad request: the request ended early\n"));
+        let mut short = Vec::new();
+        assert!(matches!(intake(&mut short, ReadItem::Chunk(b"POST /auth/poll HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc".to_vec())), Intake::More));
+        let Intake::Reply(outcome) = intake(&mut short, ReadItem::Ended) else { panic!("short body") };
+        assert_eq!(body_of(&outcome), (400, "text/plain", "bad request: the request ended early\n"));
         let Intake::Reply(outcome) = intake(&mut Vec::new(), ReadItem::Socket(ErrorKind::ConnectionReset, "reset".into())) else { panic!("io") };
         let (status, kind, body) = body_of(&outcome);
         assert_eq!((status, kind, body), (400, "text/plain", "bad request: reset\n"));
