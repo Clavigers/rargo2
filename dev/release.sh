@@ -38,14 +38,23 @@ issues=$(printf '%s\n' "$notes" | { grep -oE '#[0-9]+' || true; } | cut -c2- | s
 if [ -z "$remote_tag" ]; then
     step='running the build-machine gate'
     dev/gate.sh
-    dev/release-gate.sh "$commit"
+    step='waiting for the successful gate status'
+    dev/release-gate.sh "$commit" --wait
     step='creating and pushing the tag'
     if git show-ref --verify --quiet "refs/tags/$tag"; then
         [ "$(git rev-parse "$tag^{commit}")" = "$commit" ] || die "$tag points at a different commit"
     else
         git tag -a "$tag" "$commit" -m "rargo $version"
     fi
-    git push origin "refs/tags/$tag"
+    # Repeating a push of the same tag is safe even if GitHub accepted
+    # the first request before returning an error.
+    for attempt in 1 2 3; do
+        if git push origin "refs/tags/$tag"; then
+            break
+        fi
+        [ "$attempt" -lt 3 ] || die "could not push $tag after $attempt attempts"
+        sleep 2
+    done
 else
     step='checking the tagged commit gate'
     dev/release-gate.sh "$commit"
