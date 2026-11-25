@@ -1472,7 +1472,7 @@ fn show(
         Path::new(path).strip_prefix(dir).ok().filter(|r| !r.as_os_str().is_empty()).map(|r| r.as_os_str().as_bytes().to_vec())
     };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
-    fs.begin_delivery();
+    let mut delivery = fs.begin_delivery();
     let mut rest_writes = Vec::new();
     for w in writes {
         let path = match &w {
@@ -1485,26 +1485,24 @@ fn show(
         match w {
             Write::Dir { .. } => {
                 std::fs::create_dir_all(fs.real_for_write(&join_rel(&rel))?)?;
-                fs.wrote(&rel);
+                delivery.wrote(&rel);
             }
-            Write::Remove { .. } | Write::Text { text: None, .. } => fs.remove(&rel),
+            Write::Remove { .. } | Write::Text { text: None, .. } => delivery.remove(&rel),
             Write::Symlink { target, .. } => {
                 let real = fs.real_for_write(&rel)?;
                 let _ = std::fs::remove_file(&real);
                 std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
-                fs.wrote(&rel);
+                delivery.wrote(&rel);
             }
             Write::Text { text: Some(text), .. } => {
                 let real = fs.real_for_write(&rel)?;
                 if std::fs::read_to_string(&real).ok().as_deref() != Some(text.as_str()) {
                     crate::write_atomic(&real, text.as_bytes())?;
-                    fs.wrote(&rel);
+                    delivery.wrote(&rel);
                 }
             }
             Write::File { hash, size, exec, .. } => {
-                if !fs.shows(&rel, &hash) {
-                    fs.deliver(&rel, VFile { hash, size, exec, mtime_ns: now });
-                }
+                delivery.put(&rel, VFile { hash, size, exec, mtime_ns: now });
             }
         }
     }
@@ -1512,9 +1510,7 @@ fn show(
     for f in files {
         match inside(&f.path) {
             Some(rel) => {
-                if !fs.shows(&rel, &f.hash) {
-                    fs.deliver(&rel, VFile { hash: f.hash, size: f.size, exec: f.exec, mtime_ns: now });
-                }
+                delivery.put(&rel, VFile { hash: f.hash, size: f.size, exec: f.exec, mtime_ns: now });
             }
             None => rest_files.push(f),
         }
