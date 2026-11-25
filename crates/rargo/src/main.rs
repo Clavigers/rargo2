@@ -800,7 +800,10 @@ fn ignored_compiler_wrappers(args: &[String], vars: &[(String, String)], cwd: &P
     }
     let cargo_home = var("CARGO_HOME").map(|path| cwd.join(path))
         .unwrap_or_else(|| Path::new(var("HOME").unwrap_or("/")).join(".cargo"));
-    for dir in cwd.ancestors().map(|path| path.join(".cargo")).chain(std::iter::once(cargo_home)) {
+    // Only worktree files and the selected Cargo home are sent for the remote build.
+    let root = find_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let project_configs = cwd.ancestors().take_while(|path| path.starts_with(&root)).map(|path| path.join(".cargo"));
+    for dir in project_configs.chain(std::iter::once(cargo_home)) {
         let legacy = dir.join("config");
         files.push(if legacy.is_file() { legacy } else { dir.join("config.toml") });
     }
