@@ -26,6 +26,7 @@ use tokio::sync::watch;
 mod nextest;
 mod pure;
 mod request;
+mod nextest_run;
 
 use request::{BuildRequest, Effect, End, Go, OnFailure, Unit};
 
