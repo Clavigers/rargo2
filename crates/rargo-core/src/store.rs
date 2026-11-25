@@ -1,3 +1,4 @@
+use crate::io::file::PathRing as _;
 use crate::chunk::ChunkRef;
 use crate::db::{Db, Table};
 use crate::hash::Hash;
@@ -93,7 +94,7 @@ impl Store {
         crate::io::file::create_dir_all(&tmp)?;
         for i in 0..256 {
             let d = blobs.join(format!("{i:02x}"));
-            if !d.exists() {
+            if !d.ring_exists() {
                 crate::io::file::create_dir(&d)?;
             }
         }
@@ -101,7 +102,7 @@ impl Store {
         crate::io::file::create_dir_all(&chunks)?;
         for i in 0..256 {
             let d = chunks.join(format!("{i:02x}"));
-            if !d.exists() {
+            if !d.ring_exists() {
                 crate::io::file::create_dir(&d)?;
             }
         }
@@ -228,7 +229,7 @@ impl Store {
 
     fn write_chunk(&self, c: &Hash, data: &[u8]) -> io::Result<u64> {
         let dst = self.chunk_path(c);
-        if dst.exists() {
+        if dst.ring_exists() {
             return Ok(0);
         }
         let packed = zstd::bulk::compress(data, 3)?;
@@ -305,7 +306,7 @@ impl Store {
         mtime: i64,
     ) -> io::Result<Option<(Vec<ChunkRef>, u64, Vec<PathBuf>)>> {
         let variants: Vec<PathBuf> =
-            [self.path_of(h, false), self.path_of(h, true)].into_iter().filter(|p| p.exists()).collect();
+            [self.path_of(h, false), self.path_of(h, true)].into_iter().filter(|p| p.ring_exists()).collect();
         let Some(first) = variants.first() else {
             return Ok(None);
         };
@@ -325,7 +326,7 @@ impl Store {
         let mut off = 0u64;
         let mut buf = Vec::new();
         for c in &recipe {
-            if !self.chunk_path(&c.hash).exists() {
+            if !self.chunk_path(&c.hash).ring_exists() {
                 buf.resize(c.len as usize, 0);
                 f.read_exact_at(&mut buf, off)?;
                 if Hash::of(&buf) != c.hash {
@@ -413,7 +414,7 @@ impl Store {
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
         for i in 0..256 {
             let prefix = format!("{i:02x}");
-            let Ok(rd) = std::fs::read_dir(self.chunks.join(&prefix)) else {
+            let Ok(rd) = crate::io::file::read_dir(self.chunks.join(&prefix)) else {
                 continue;
             };
             for ent in rd.flatten() {
@@ -454,11 +455,11 @@ impl Store {
 
     fn existing(&self, h: &Hash, exec: bool) -> Option<PathBuf> {
         let p = self.path_of(h, exec);
-        if p.exists() {
+        if p.ring_exists() {
             return Some(p);
         }
         let q = self.path_of(h, !exec);
-        q.exists().then_some(q)
+        q.ring_exists().then_some(q)
     }
 
     pub fn open_blob(&self, h: &Hash) -> io::Result<File> {
@@ -577,7 +578,7 @@ impl Store {
 
     fn install(&self, tmp: &Path, h: Hash, exec: bool, size: u64) -> io::Result<()> {
         let dst = self.path_of(&h, exec);
-        std::fs::set_permissions(tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
+        crate::io::file::set_permissions(tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
         crate::io::file::rename(tmp, &dst)?;
         let m = crate::io::file::metadata(&dst)?;
         assert_eq!(m.len(), size, "the installed file is the size the caller hashed");
@@ -588,7 +589,7 @@ impl Store {
 
     fn variant(&self, h: &Hash, exec: bool) -> io::Result<PathBuf> {
         let want = self.path_of(h, exec);
-        if want.exists() {
+        if want.ring_exists() {
             return Ok(want);
         }
         let other = self.path_of(h, !exec);
@@ -598,7 +599,7 @@ impl Store {
             OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
         clone_or_copy(&src, &dst)?;
         drop(dst);
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
+        crate::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
         crate::io::file::rename(&tmp, &want)?;
         Ok(want)
     }

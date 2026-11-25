@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -521,7 +521,7 @@ impl OutFs {
         if parent != ROOT || !self.virt.read().unwrap().files.is_empty() {
             return;
         }
-        if std::fs::read_dir(&self.under).map(|mut d| d.next().is_some()).unwrap_or(true) {
+        if rargo_net::io::file::read_dir(&self.under).map(|mut d| d.next().is_some()).unwrap_or(true) {
             return;
         }
         let _ = rargo_net::io::file::remove_file(&self.table);
@@ -641,14 +641,14 @@ impl OutFs {
         if with_content && v.size > 0 {
             let src = self.source.whole(&v.hash, v.size).map_err(errno)?;
             let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", std::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
-            std::fs::copy(&src, &tmp).map_err(errno)?;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
+            rargo_net::io::file::copy(&src, &tmp).map_err(errno)?;
+            rargo_net::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
             rargo_net::io::file::rename(&tmp, &dst).map_err(|e| {
                 let _ = rargo_net::io::file::remove_file(&tmp);
                 errno(e)
             })?;
         } else {
-            std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(mode).open(&dst).map_err(errno)?;
+            rargo_net::io::file::OpenOptions::new().write(true).create(true).truncate(true).mode(mode).open(&dst).map_err(errno)?;
         }
         self.virt.write().unwrap().files.remove(rel);
         self.dirty.store(true, Ordering::SeqCst);
@@ -767,7 +767,7 @@ impl OutFs {
 
     fn listing(&self, rel: &[u8]) -> Vec<(u64, Vec<u8>, u32)> {
         let mut out: Vec<(u64, Vec<u8>, u32)> = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(self.real(rel)) {
+        if let Ok(rd) = rargo_net::io::file::read_dir(self.real(rel)) {
             for e in rd.flatten() {
                 let t = match e.file_type() {
                     Ok(t) if t.is_dir() => libc::DT_DIR,
@@ -840,7 +840,7 @@ impl OutFs {
         if !self.swept.lock().unwrap().insert(dir.clone()) {
             return;
         }
-        let Ok(rd) = std::fs::read_dir(self.real(&dir)) else { return };
+        let Ok(rd) = rargo_net::io::file::read_dir(self.real(&dir)) else { return };
         for e in rd.flatten() {
             let name = e.file_name();
             let Some(text) = name.to_str() else { continue };
@@ -919,11 +919,11 @@ impl Filesystem for OutFs {
         }
         let path = self.real(&rel);
         if let Some(size) = set.size {
-            let f = std::fs::OpenOptions::new().write(true).open(&path).map_err(errno)?;
+            let f = rargo_net::io::file::OpenOptions::new().write(true).open(&path).map_err(errno)?;
             f.set_len(size).map_err(errno)?;
         }
         if let Some(mode) = set.mode {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777)).map_err(errno)?;
+            rargo_net::io::file::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777)).map_err(errno)?;
         }
         if set.atime.is_some() || set.mtime.is_some() {
             let spec = |t: Option<TimeSet>| match t {
@@ -943,7 +943,7 @@ impl Filesystem for OutFs {
     fn readlink(&self, _ctx: &Ctx, nodeid: u64) -> Res<Vec<u8>> {
         let _t = self.timed("readlink");
         let rel = self.path(nodeid)?;
-        std::fs::read_link(self.real(&rel)).map(|t| t.as_os_str().as_bytes().to_vec()).map_err(errno)
+        rargo_net::io::file::read_link(self.real(&rel)).map(|t| t.as_os_str().as_bytes().to_vec()).map_err(errno)
     }
 
     fn symlink(&self, _ctx: &Ctx, parent: u64, name: &[u8], target: &[u8]) -> Res<Entry> {
@@ -953,7 +953,7 @@ impl Filesystem for OutFs {
             return Err(Errno(libc::EEXIST));
         }
         self.make_parents(&rel)?;
-        std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), self.real(&rel)).map_err(errno)?;
+        rargo_net::io::file::symlink(std::ffi::OsStr::from_bytes(target), self.real(&rel)).map_err(errno)?;
         let kind = self.kind(&rel).ok_or(Errno(libc::EIO))?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_LNK as u32));
         Ok(self.entry(parent, name, &kind))
@@ -969,7 +969,7 @@ impl Filesystem for OutFs {
             return Err(Errno(libc::EEXIST));
         }
         self.make_parents(&rel)?;
-        std::fs::OpenOptions::new().write(true).create_new(true).mode(mode & 0o7777).open(self.real(&rel)).map_err(errno)?;
+        rargo_net::io::file::OpenOptions::new().write(true).create_new(true).mode(mode & 0o7777).open(self.real(&rel)).map_err(errno)?;
         let kind = self.kind(&rel).ok_or(Errno(libc::EIO))?;
         self.patch(parent, Patch::Add(name.to_vec(), libc::DT_REG as u32));
         Ok(self.entry(parent, name, &kind))

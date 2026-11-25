@@ -413,7 +413,7 @@ impl Blobs {
         drop(file);
         let (got, size) = Hash::of_path(&tmp)?;
         if got != *h {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = crate::io::file::remove_file(&tmp);
             bail!("blob {h} arrived with the wrong content");
         }
         self.store.install_hashed(&tmp, got, size)?;

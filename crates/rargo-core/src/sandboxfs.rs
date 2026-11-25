@@ -1018,7 +1018,7 @@ impl ActionFs {
             f.links = f.links.saturating_sub(1);
             if f.links == 0 && f.opens == 0 {
                 if let Src::Upper { path, .. } = &f.src {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::io::file::remove_file(path);
                 }
             }
         }

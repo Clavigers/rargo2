@@ -2,7 +2,6 @@ use crate::sched_state::{Broker, Effects, Job, SchedState};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::OpenOptionsExt;
 use crate::io::oneshot;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -61,7 +60,7 @@ impl Scheduler {
         for _ in 0..tokens {
             write_token(pipe_w.as_raw_fd());
         }
-        let pipe_try: OwnedFd = std::fs::OpenOptions::new()
+        let pipe_try: OwnedFd = crate::io::file::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(format!("/proc/self/fd/{}", pipe_r.as_raw_fd()))?

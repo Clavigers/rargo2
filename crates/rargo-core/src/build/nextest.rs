@@ -758,11 +758,11 @@ fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<PathBuf> 
         }
     };
     let program = dir.join(&wanted.version).join("cargo-nextest");
-    if program.is_file() {
+    if program.ring_is_file() {
         return Ok(program);
     }
     let _one_at_a_time = INSTALLING.lock();
-    if program.is_file() {
+    if program.ring_is_file() {
         return Ok(program);
     }
     c.out.status("Installing", &format!("nextest {} on the server", wanted.version));
@@ -773,11 +773,11 @@ fn installed(d: &Daemon, c: &Client, wanted: Option<Wanted>) -> Result<PathBuf> 
 
 fn newest_release(dir: &Path) -> Result<String> {
     let note = dir.join("newest-release");
-    let fresh = std::fs::metadata(&note)
+    let fresh = crate::io::file::metadata(&note)
         .and_then(|m| m.modified())
         .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(24 * 3600)));
     if fresh
-        && let Some(v) = std::fs::read_to_string(&note).ok().map(|s| s.trim().to_string()).filter(|v| version_of(v).is_some())
+        && let Some(v) = crate::io::file::read_to_string(&note).ok().map(|s| s.trim().to_string()).filter(|v| version_of(v).is_some())
     {
         return Ok(v);
     }
@@ -796,10 +796,10 @@ fn newest_release(dir: &Path) -> Result<String> {
         .filter(|v| version_of(v).is_some())
         .with_context(|| format!("{url} names `{tag}`, which is not a nextest release"))?
         .to_string();
-    std::fs::create_dir_all(dir)?;
+    crate::io::file::create_dir_all(dir)?;
     let tmp = dir.join(format!(".newest-release.{}", std::process::id()));
-    std::fs::write(&tmp, &version)?;
-    std::fs::rename(&tmp, &note)?;
+    crate::io::file::write(&tmp, &version)?;
+    crate::io::file::rename(&tmp, &note)?;
     Ok(version)
 }
 
@@ -809,13 +809,13 @@ fn version_of(name: &str) -> Option<Vec<u64>> {
 }
 
 fn newest_installed(dir: &Path) -> Option<PathBuf> {
-    std::fs::read_dir(dir)
+    crate::io::file::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let bin = e.path().join("cargo-nextest");
-            Some((version_of(&name)?, bin)).filter(|(_, b)| b.is_file())
+            Some((version_of(&name)?, bin)).filter(|(_, b)| b.ring_is_file())
         })
         .max_by(|a, b| a.0.cmp(&b.0))
         .map(|(_, b)| b)
@@ -867,17 +867,17 @@ fn install(dir: &Path, version: &str) -> Result<PathBuf> {
     let program = program.with_context(|| format!("{base}.tar.gz holds no `cargo-nextest`"))?;
     let tmp = dir.join(format!(".{version}.{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp)?;
+    crate::io::file::create_dir_all(&tmp)?;
     {
         use std::os::unix::fs::PermissionsExt;
         let bin = tmp.join("cargo-nextest");
-        std::fs::write(&bin, &program)?;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
+        crate::io::file::write(&bin, &program)?;
+        crate::io::file::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
     }
     let to = dir.join(version);
-    if let Err(e) = std::fs::rename(&tmp, &to) {
+    if let Err(e) = crate::io::file::rename(&tmp, &to) {
         let _ = std::fs::remove_dir_all(&tmp);
-        if !to.join("cargo-nextest").is_file() {
+        if !to.join("cargo-nextest").ring_is_file() {
             return Err(e).with_context(|| format!("installing nextest {version} at {}", to.display()));
         }
     }

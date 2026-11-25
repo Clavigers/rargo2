@@ -97,7 +97,7 @@ pub(crate) fn owner(name: &str, prefix: &str) -> Option<u32> {
 }
 
 pub fn sweep(dir: &Path, prefix: &str) -> usize {
-    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(rd) = rargo_net::io::file::read_dir(dir) else { return 0 };
     let mut gone: Vec<PathBuf> = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name();
@@ -109,9 +109,9 @@ pub fn sweep(dir: &Path, prefix: &str) -> usize {
     let total = gone.len();
     let mut n = 0;
     for p in gone {
-        let removed = match std::fs::symlink_metadata(&p) {
-            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&p).is_ok(),
-            Ok(_) => std::fs::remove_file(&p).is_ok(),
+        let removed = match rargo_net::io::file::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => rargo_net::io::file::remove_dir_all(&p).is_ok(),
+            Ok(_) => rargo_net::io::file::remove_file(&p).is_ok(),
             Err(_) => false,
         };
         n += removed as usize;

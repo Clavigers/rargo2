@@ -166,8 +166,8 @@ fn route<T: Send + 'static>(
 ) -> io::Result<T> {
     if on_fiber() {
         on_ring()
-    } else if loop_running() && !on_loop() {
-        super::call(on_ring)
+    } else if let Some(owner) = super::task::home() {
+        super::task::call_home(owner, on_ring)
     } else {
         direct()
     }
@@ -287,6 +287,75 @@ pub fn read_to_string(path: impl AsRef<Path>) -> io::Result<String> {
 pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> {
     let f = File::create(path)?;
     f.write_all_at(bytes.as_ref(), 0)
+}
+
+fn offload<T: Send>(body: impl FnOnce() -> T + Send) -> T {
+    if on_fiber() { super::blocking(body) } else { body() }
+}
+
+pub fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
+    let (from, to) = (from.as_ref(), to.as_ref());
+    let src = File::open(from)?;
+    let mode = src.metadata()?.mode() & 0o7777;
+    let dst = OpenOptions::new().write(true).create(true).truncate(true).mode(mode).open(to)?;
+    let copied = copy_fd(std::os::fd::AsRawFd::as_raw_fd(&src), std::os::fd::AsRawFd::as_raw_fd(&dst))?;
+    dst.set_mode(mode)?;
+    Ok(copied)
+}
+
+pub fn read_dir(path: impl AsRef<Path>) -> io::Result<std::vec::IntoIter<io::Result<std::fs::DirEntry>>> {
+    let path = path.as_ref();
+    offload(|| std::fs::read_dir(path).map(|d| d.collect::<Vec<_>>().into_iter()))
+}
+
+pub fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
+    let path = path.as_ref();
+    offload(|| std::fs::remove_dir_all(path))
+}
+
+pub fn set_permissions(path: impl AsRef<Path>, mode: std::fs::Permissions) -> io::Result<()> {
+    let path = path.as_ref();
+    offload(|| std::fs::set_permissions(path, mode))
+}
+
+pub fn read_link(path: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
+    let path = path.as_ref();
+    offload(|| std::fs::read_link(path))
+}
+
+pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
+    let path = path.as_ref();
+    offload(|| std::fs::canonicalize(path))
+}
+
+pub fn set_modified(path: impl AsRef<Path>, at: SystemTime) -> io::Result<()> {
+    let path = path.as_ref();
+    offload(|| std::fs::File::options().append(true).open(path).and_then(|f| f.set_modified(at)))
+}
+
+pub trait PathRing {
+    fn ring_exists(&self) -> bool;
+    fn ring_is_file(&self) -> bool;
+    fn ring_is_dir(&self) -> bool;
+    fn ring_canonicalize(&self) -> io::Result<std::path::PathBuf>;
+}
+
+impl PathRing for Path {
+    fn ring_exists(&self) -> bool {
+        exists(self)
+    }
+
+    fn ring_is_file(&self) -> bool {
+        metadata(self).is_ok_and(|m| m.is_file())
+    }
+
+    fn ring_is_dir(&self) -> bool {
+        metadata(self).is_ok_and(|m| m.is_dir())
+    }
+
+    fn ring_canonicalize(&self) -> io::Result<std::path::PathBuf> {
+        canonicalize(self)
+    }
 }
 
 #[derive(Clone, Debug)]

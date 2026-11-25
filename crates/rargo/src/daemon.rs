@@ -1,3 +1,4 @@
+use rargo_net::io::file::PathRing as _;
 use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
@@ -657,7 +658,7 @@ impl Daemon {
         let policy_dir = st.policy_dir.clone();
         let snap = io::cpu(move || -> std::io::Result<Snap> {
             let mut policy = crate::load_policy(&root, &policy_dir);
-            if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
+            if let Ok(inside) = cache.ring_canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
             let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
@@ -974,7 +975,7 @@ impl Daemon {
         }
         rargo_net::io::file::create_dir_all(&dir)?;
         let tag = dir.join("CACHEDIR.TAG");
-        if !tag.exists() {
+        if !tag.ring_exists() {
             rargo_net::io::file::write(&tag, rargo_proto::CACHEDIR_TAG)?;
         }
         let source = Box::new(Contents { d: Arc::downgrade(self) });
@@ -1191,7 +1192,7 @@ impl Daemon {
                     let _ = rargo_net::io::file::remove_file(&tmp);
                     return Err(std::io::Error::other("the server sent content that does not match its hash"));
                 }
-                let _ = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
+                let _ = rargo_net::io::file::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
                 rargo_net::io::file::rename(&tmp, &slot)?;
                 let mut index = self.chunks.lock().unwrap();
                 if index.len() > crate::known::MOST_CHUNKS {
@@ -1894,7 +1895,7 @@ fn show(
             Write::Symlink { target, .. } => {
                 let real = fs.real_for_write(&rel)?;
                 let _ = rargo_net::io::file::remove_file(&real);
-                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
+                rargo_net::io::file::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
                 delivery.wrote(&rel);
             }
             Write::Text { text: Some(text), .. } => {

@@ -1,3 +1,4 @@
+use crate::io::file::PathRing as _;
 use crate::buildview::*;
 use crate::engine::*;
 use crate::expand::{self, EnvRule, Scripts};
@@ -281,24 +282,24 @@ impl Daemon {
         let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
         static MAKING: Mutex<()> = Mutex::new(());
         let _one = MAKING.lock();
-        if !dir.join(".complete").exists() {
+        if !dir.join(".complete").ring_exists() {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::create_dir_all(&dir)?;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            crate::io::file::create_dir_all(&dir)?;
+            crate::io::file::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
             crate::snapshot::chown(&dir, self.cfg.uid, self.cfg.gid);
             for (name, content) in &files {
                 let p = dir.join(name);
-                std::fs::write(&p, content)?;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                crate::io::file::write(&p, content)?;
+                crate::io::file::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
                 crate::snapshot::chown(&p, self.cfg.uid, self.cfg.gid);
             }
             for shared in ["registry", "git", ".package-cache", ".package-cache-mutate", ".global-cache"] {
                 let link = dir.join(shared);
-                if std::fs::symlink_metadata(&link).is_err() {
-                    std::os::unix::fs::symlink(self.cfg.cargo_home.join(shared), &link)?;
+                if crate::io::file::symlink_metadata(&link).is_err() {
+                    crate::io::file::symlink(self.cfg.cargo_home.join(shared), &link)?;
                 }
             }
-            std::fs::write(dir.join(".complete"), b"")?;
+            crate::io::file::write(dir.join(".complete"), b"")?;
         }
         Ok(Arc::new(Home { dir, files: names }))
     }
@@ -309,7 +310,7 @@ impl Daemon {
 
     pub fn export_cache(&self, dir: &Path) -> Result<(usize, usize)> {
         let blobs = dir.join("blobs");
-        std::fs::create_dir_all(&blobs)?;
+        crate::io::file::create_dir_all(&blobs)?;
         let traces = self.engine.traces.all();
         let mut wanted: HashSet<Hash> = HashSet::new();
         for (_, t) in &traces {
@@ -324,7 +325,7 @@ impl Daemon {
         let mut written = 0;
         for h in &wanted {
             let dest = blobs.join(h.hex());
-            if dest.exists() {
+            if dest.ring_exists() {
                 continue;
             }
             let Ok(mut src) = self.store().open_blob(h) else { continue };
@@ -334,15 +335,15 @@ impl Daemon {
         }
         let bundle = (traces, self.engine.traces.all_needs_env());
         let raw = bincode::serialize(&bundle)?;
-        std::fs::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
+        crate::io::file::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
         Ok((bundle.0.len(), written))
     }
 
     pub fn import_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let raw = zstd::decode_all(&std::fs::read(dir.join("traces.bin"))?[..])?;
+        let raw = zstd::decode_all(&crate::io::file::read(dir.join("traces.bin"))?[..])?;
         let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
         let mut blobs = 0;
-        for e in std::fs::read_dir(dir.join("blobs"))?.flatten() {
+        for e in crate::io::file::read_dir(dir.join("blobs"))?.flatten() {
             let Some(want) = e.file_name().to_str().and_then(Hash::from_hex) else { continue };
             if self.store().has(&want) {
                 continue;
@@ -699,7 +700,7 @@ fn fetch(
     if out.status.success() {
         let mut stack = vec![scratch.clone()];
         while let Some(dir) = stack.pop() {
-            for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            for e in crate::io::file::read_dir(&dir).into_iter().flatten().flatten() {
                 let Ok(ft) = e.file_type() else { continue };
                 let path = e.path();
                 if ft.is_dir() {
@@ -707,7 +708,7 @@ fn fetch(
                 } else if ft.is_file() && e.file_name() == "Cargo.lock" {
                     let Ok(rel) = path.strip_prefix(&scratch) else { continue };
                     let rel_b = rel.as_os_str().as_encoded_bytes();
-                    let content = std::fs::read(&path)?;
+                    let content = crate::io::file::read(&path)?;
                     let hash = d.store().put_bytes(&content)?;
                     let node = rargo_proto::tree::Node::File { hash: hash.0, size: content.len() as u64, exec: false };
                     if snapshot.node(rel_b).as_ref() != Some(&node) {

@@ -5,6 +5,7 @@ mod object;
 mod sha1;
 mod write;
 
+use rargo_net::io::file::PathRing as _;
 use rargo::daemon_state::Head;
 use object::{Id, Object, Store, Type, from_hex, to_hex};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -400,7 +401,7 @@ impl Source for Disk {
 
     fn list(&self, dir: &Path) -> Option<Vec<(Vec<u8>, Kind)>> {
         use std::os::unix::ffi::OsStrExt;
-        let mut out: Vec<(Vec<u8>, Kind)> = std::fs::read_dir(dir)
+        let mut out: Vec<(Vec<u8>, Kind)> = rargo_net::io::file::read_dir(dir)
             .ok()?
             .flatten()
             .filter_map(|e| {
@@ -490,7 +491,7 @@ fn tags_seal(common: &Path) -> u64 {
     }
     let mut stack = vec![common.join("refs/tags")];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = rargo_net::io::file::read_dir(&dir) else { continue };
         let mut entries: Vec<_> = rd.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
@@ -536,7 +537,7 @@ pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<Pat
     let key = blake3::hash(format!("v4\n{}\n{}\n{}\n{history}", head.text, head.commit, head.tags).as_bytes()).to_hex()[..32].to_string();
     let all = cache.join("git");
     let dir = all.join(&key);
-    if dir.join("HEAD").is_file() {
+    if dir.join("HEAD").ring_is_file() {
         return Some(dir);
     }
     crate::tmp::sweep(&all, ".tmp-");
@@ -544,12 +545,12 @@ pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<Pat
     let _ = std::fs::remove_dir_all(&tmp);
     let made = build(root, head, history, &tmp).and_then(|()| match rargo_net::io::file::rename(&tmp, &dir) {
         Ok(()) => Some(()),
-        Err(_) if dir.join("HEAD").is_file() => Some(()),
+        Err(_) if dir.join("HEAD").ring_is_file() => Some(()),
         Err(_) => None,
     });
     let _ = std::fs::remove_dir_all(&tmp);
     made?;
-    for e in std::fs::read_dir(&all).into_iter().flatten().flatten() {
+    for e in rargo_net::io::file::read_dir(&all).into_iter().flatten().flatten() {
         let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
         if e.path() != dir && old.is_some_and(|a| a.as_secs() > 14 * 86400) {
             let _ = std::fs::remove_dir_all(e.path());
@@ -562,11 +563,11 @@ const PIECES: [usize; 4] = [4096, 256, 16, 1];
 
 pub fn history(head: &Head, cache: &Path) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
-    let common = head.common.canonicalize().unwrap_or_else(|_| head.common.clone());
+    let common = head.common.ring_canonicalize().unwrap_or_else(|_| head.common.clone());
     let key = blake3::hash(common.as_os_str().as_bytes()).to_hex()[..32].to_string();
     let store_dir = cache.join("git-history").join(key);
     let at = store_dir.join("heads").join(&head.commit);
-    if at.join("pack").is_dir() {
+    if at.join("pack").ring_is_dir() {
         return Some(at);
     }
     let pieces_dir = store_dir.join("pieces");
@@ -576,7 +577,7 @@ pub fn history(head: &Head, cache: &Path) -> Option<PathBuf> {
     let chain = first_parents(&Disk, &mut store, &shallow, from_hex(head.commit.as_bytes())?)?;
     let listed: Vec<String> = chain.iter().map(to_hex).collect();
     let pieces = history_pieces(&listed);
-    let have = |piece: &HistoryPiece| ["pack", "idx"].iter().all(|ext| pieces_dir.join(format!("{}.{ext}", piece.key)).is_file());
+    let have = |piece: &HistoryPiece| ["pack", "idx"].iter().all(|ext| pieces_dir.join(format!("{}.{ext}", piece.key)).ring_is_file());
     let owner = if pieces.iter().all(have) {
         None
     } else {
@@ -594,7 +595,7 @@ pub fn history(head: &Head, cache: &Path) -> Option<PathBuf> {
     }
     match rargo_net::io::file::rename(&tmp, &at) {
         Ok(()) => {}
-        Err(_) if at.join("pack").is_dir() => {
+        Err(_) if at.join("pack").ring_is_dir() => {
             let _ = std::fs::remove_dir_all(&tmp);
         }
         Err(_) => {
@@ -636,7 +637,7 @@ fn piece_commits(owner: &HashMap<Id, usize>, piece: &HistoryPiece) -> Vec<Id> {
 
 fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner: Option<&HashMap<Id, usize>>) -> Option<(PathBuf, PathBuf)> {
     let (pack, idx) = (dir.join(format!("{}.pack", piece.key)), dir.join(format!("{}.idx", piece.key)));
-    if pack.is_file() && idx.is_file() {
+    if pack.ring_is_file() && idx.ring_is_file() {
         let _ = std::fs::File::options().append(true).open(&pack).and_then(|f| f.set_modified(std::time::SystemTime::now()));
         return Some((pack, idx));
     }
@@ -653,18 +654,18 @@ fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner
         && rargo_net::io::file::rename(&made_pack, &pack).is_ok();
     let _ = rargo_net::io::file::remove_file(&made_pack);
     let _ = rargo_net::io::file::remove_file(&made_idx);
-    (moved || (pack.is_file() && idx.is_file())).then_some((pack, idx))
+    (moved || (pack.ring_is_file() && idx.ring_is_file())).then_some((pack, idx))
 }
 
 fn sweep_history(store: &Path) {
     let stale = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 14 * 86400);
-    for e in std::fs::read_dir(store.join("heads")).into_iter().flatten().flatten() {
+    for e in rargo_net::io::file::read_dir(store.join("heads")).into_iter().flatten().flatten() {
         if stale(&e.path()) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
     use std::os::unix::fs::MetadataExt;
-    for e in std::fs::read_dir(store.join("pieces")).into_iter().flatten().flatten() {
+    for e in rargo_net::io::file::read_dir(store.join("pieces")).into_iter().flatten().flatten() {
         if e.metadata().is_ok_and(|m| m.nlink() == 1) && stale(&e.path()) {
             let _ = rargo_net::io::file::remove_file(e.path());
         }

@@ -479,7 +479,7 @@ pub fn read_host_lookup(path: &Path) -> Looked {
             sem: None,
         })
     } else if ft.is_symlink() {
-        match std::fs::read_link(path) {
+        match crate::io::file::read_link(path) {
             Ok(t) => Looked::Symlink(t.as_os_str().as_bytes().to_vec()),
             Err(_) => Looked::Absent,
         }
@@ -490,7 +490,7 @@ pub fn read_host_lookup(path: &Path) -> Looked {
 
 pub fn read_host_list(path: &Path) -> io::Result<Listing> {
     let mut out = Vec::new();
-    for e in std::fs::read_dir(path)? {
+    for e in crate::io::file::read_dir(path)? {
         let e = e?;
         let ft = e.file_type()?;
         let kind = if ft.is_dir() {

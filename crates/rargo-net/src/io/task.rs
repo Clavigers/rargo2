@@ -260,6 +260,11 @@ fn on_pool<R: Send>(blocking: bool, body: impl FnOnce() -> R + Send) -> R {
         }
         exec::<F, R>
     }
+    let owner = poke_arc();
+    let body = move || {
+        let _home = Home::enter(owner);
+        body()
+    };
     let mut pack = Pack { body: Some(body), out: None };
     let go = typed_exec(&mut pack);
     let ptr = &mut pack as *mut Pack<_, R> as usize;
@@ -345,10 +350,47 @@ pub fn call<R: Send + 'static>(body: impl FnOnce() -> R + Send + 'static) -> R {
     rx.recv().unwrap_or_else(|_| panic!("the event loop stopped before the call finished"))
 }
 
+thread_local! {
+    static HOME: std::cell::RefCell<Option<Arc<Poke>>> = const { std::cell::RefCell::new(None) };
+}
+
+struct Home;
+
+impl Home {
+    fn enter(owner: Arc<Poke>) -> Home {
+        HOME.with(|h| *h.borrow_mut() = Some(owner));
+        Home
+    }
+}
+
+impl Drop for Home {
+    fn drop(&mut self) {
+        HOME.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+pub(super) fn home() -> Option<Arc<Poke>> {
+    HOME.with(|h| h.borrow().clone())
+}
+
+pub(super) fn call_home<R: Send + 'static>(owner: Arc<Poke>, body: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    post_to(&owner, move || {
+        spawn(move || {
+            let _ = tx.send(body());
+        });
+    });
+    rx.recv().unwrap_or_else(|_| panic!("the loop that runs this pool thread stopped"))
+}
+
 pub(super) fn post(job: impl FnOnce() + Send + 'static) {
     let poke = poke_global().lock().unwrap_or_else(|e| e.into_inner()).clone().expect("the event loop is running");
+    post_to(&poke, job);
+}
+
+fn post_to(poke: &Arc<Poke>, job: impl FnOnce() + Send + 'static) {
     poke.spawn.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(job));
-    signal_poke(&poke);
+    signal_poke(poke);
 }
 
 pub fn spawn_off<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> JoinHandle<T> {

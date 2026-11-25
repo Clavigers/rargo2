@@ -385,7 +385,7 @@ impl Snapshot {
 
     pub fn materialize(&self, dest: &Path, uid: u32, gid: u32, keep: &dyn Fn(&[u8], &Node) -> bool) -> Result<()> {
         let store = self.trees.store.clone();
-        std::fs::create_dir_all(dest)?;
+        crate::io::file::create_dir_all(dest)?;
         chown(dest, uid, gid);
         let mut failure: Option<anyhow::Error> = None;
         self.walk(&mut |rel, node| {
@@ -395,8 +395,8 @@ impl Snapshot {
             let path = dest.join(std::ffi::OsStr::from_bytes(rel));
             let done: Result<()> = (|| {
                 match node {
-                    Node::Dir(_) => std::fs::create_dir_all(&path)?,
-                    Node::Symlink(t) => std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(t), &path)?,
+                    Node::Dir(_) => crate::io::file::create_dir_all(&path)?,
+                    Node::Symlink(t) => crate::io::file::symlink(std::ffi::OsStr::from_bytes(t), &path)?,
                     Node::File { hash, exec, .. } => {
                         store.materialize_owned(&Hash(*hash), *exec, &path)?;
                     }
