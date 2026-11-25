@@ -264,12 +264,18 @@ impl Delivery<'_> {
 
 impl Drop for Delivery<'_> {
     fn drop(&mut self) {
-        let changed = self.fs.virt.write().unwrap().apply(self.generation, std::mem::take(&mut self.edits));
-        if !changed.is_empty() {
-            self.fs.dirty.store(true, Ordering::SeqCst);
-        }
-        for path in changed {
-            self.fs.changed(&path);
+        let invalidations = {
+            let mut tree = self.fs.virt.write().unwrap();
+            let changed = tree.apply(self.generation, std::mem::take(&mut self.edits));
+            if !changed.is_empty() {
+                self.fs.dirty.store(true, Ordering::SeqCst);
+            }
+            let mut inodes = self.fs.state.lock().unwrap();
+            changed.iter().map(|path| inodes.changed(path)).collect::<Vec<_>>()
+        };
+        for (parent, name) in invalidations {
+            self.fs.unlist(parent);
+            self.fs.inval(parent, &name);
         }
     }
 }
@@ -807,7 +813,9 @@ impl Filesystem for OutFs {
     fn lookup(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<Entry> {
         let _t = self.timed("lookup");
         let rel = join(&self.path(parent)?, name);
-        match self.kind(&rel) {
+        let tree = self.virt.read().unwrap();
+        let real = std::fs::symlink_metadata(self.real(&rel)).ok();
+        match tree.lookup(&rel, real) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
             None => Ok(Entry::negative(TTL)),
         }
