@@ -2,7 +2,7 @@ use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
 use crate::partial::Partial;
 use crate::place::{Placed, Placer};
-use crate::watch::{Event, Watcher};
+use crate::watch::{Registration, Watcher};
 use crate::{Config, Policy, git, report, scan};
 use rargo_net::link::Link;
 use rargo_proto::{Blob, CONTROL, ClientMsg, Digest, LocalReply, LocalRequest, Offer, PROTO_VERSION, RunRequest, ServerMsg};
@@ -206,16 +206,16 @@ impl Daemon {
                 loop {
                     let Ok(events) = w.next().await else { break };
                     let all: Vec<Arc<Worktree>> = d2.worktrees.lock().unwrap().values().cloned().collect();
-                    for ev in events {
-                        for wt in &all {
-                            match &ev {
-                                Event::Changed(id, dir) if *id == wt.id => {
-                                    wt.events.lock().unwrap().insert(dir.clone());
-                                }
-                                Event::Moved(id) if *id == wt.id => wt.everything.store(true, Ordering::SeqCst),
-                                Event::Overflow => wt.everything.store(true, Ordering::SeqCst),
-                                _ => continue,
-                            }
+                    for wt in all {
+                        let paths = events.dirty.get(&wt.id);
+                        let rescan = events.rescan_all || events.rescan.contains(&wt.id);
+                        if let Some(paths) = paths {
+                            wt.events.lock().unwrap().extend(paths.iter().cloned());
+                        }
+                        if rescan {
+                            wt.everything.store(true, Ordering::SeqCst);
+                        }
+                        if paths.is_some() || rescan {
                             wt.dirty.store(true, Ordering::SeqCst);
                             wt.changed.notify_one();
                         }
@@ -415,15 +415,17 @@ impl Daemon {
             }
             st.watched.remove(dir);
             match w.add(dir, wt.id) {
-                Ok(wd) => {
+                Ok(Registration::Watched(wd)) => {
                     st.watched.insert(dir.clone(), wd);
                     added.push(dir.clone());
                 }
+                Ok(Registration::Poll(dir)) => {
+                    over_limit += 1;
+                    unwatched.insert(dir);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => added.push(dir.clone()),
                 Err(e) => {
-                    if e.raw_os_error() == Some(libc::ENOSPC) {
-                        over_limit += 1;
-                    } else if failed.is_none() && !st.unwatched.contains(dir) {
+                    if failed.is_none() && !st.unwatched.contains(dir) {
                         failed = Some(format!("rargo: cannot watch {} ({e}); it is looked at again for every command\n", dir.display()));
                     }
                     unwatched.insert(dir.clone());
