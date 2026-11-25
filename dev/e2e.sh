@@ -661,6 +661,15 @@ opened=$(cat "$T/opened" 2>/dev/null)
 [ $rc -eq 0 ] && has "$out" "Opening $A/target/doc/app/index.html" && [ "$opened" = "$A/target/doc/app/index.html" ] && [ -f "$opened" ] && ok "doc --open starts the browser on the real file" || bad "doc --open starts the browser on the real file" "$out
 opened: $opened"
 
+echo "== unsupported Cargo features"
+out=$(RUSTC_WRAPPER="$T/unused-wrapper" RUSTC_WORKSPACE_WRAPPER="$T/unused-workspace-wrapper" "$R" check 2>&1); rc=$?
+[ "$rc" -eq 0 ] && grep -Fq 'RUSTC_WRAPPER is ignored for remote builds' <<<"$out" \
+    && grep -Fq 'RUSTC_WORKSPACE_WRAPPER is ignored for remote builds' <<<"$out" \
+    && ok "remote builds say when compiler wrappers are ignored" || bad "remote builds say when compiler wrappers are ignored" "$out"
+out=$("$R" build -Zunstable-options --unit-graph 2>&1); rc=$?
+[ "$rc" -eq 2 ] && grep -Fq 'rargo does not support --unit-graph for remote builds' <<<"$out" \
+    && ok "remote builds explicitly reject unit graphs" || bad "remote builds explicitly reject unit graphs" "$out"
+
 echo "== the cargo shim"
 cd "$A"
 mkdir -p "$T/shim"
