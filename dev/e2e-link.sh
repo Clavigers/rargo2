@@ -90,6 +90,36 @@ out=$(R run -q 2>&1); [ "$out" = "value 83" ]; check $? "the daemon connects aga
 st=$(dstat)
 grep -q '^link  *udp; 2 made' <<<"$st"; check $? "over a second link" "$st"
 
+stop_daemons() {
+    local pids
+    pids=$(pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" || true)
+    pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E" 2>/dev/null || true
+    for pid in $pids; do timeout 10 tail --pid="$pid" -f /dev/null; done
+}
+
+echo "== the machine sleeps: nothing gets through for longer than the link may be silent"
+stop_daemons
+out=$(RARGO_LINK_DEAD_SECS=3 R run -q 2>&1); [ "$out" = "value 83" ]; check $? "a daemon that calls its link dead after 3 s of silence builds" "$out"
+made() { dstat | grep '^link' | grep -oE '[0-9]+ made' | cut -d' ' -f1; }
+links=$(made)
+ip netns exec ${RIG:-rargo}-cl tc qdisc replace dev eth0 root handle 1: prio
+ip netns exec ${RIG:-rargo}-cl tc filter add dev eth0 parent 1: protocol all u32 match u32 0 0 action drop
+sleep 4
+ip netns exec ${RIG:-rargo}-cl tc qdisc del dev eth0 root
+sed -i 's/{ 80 }/{ 85 }/' crates/extra/src/lib.rs
+out=$(R run -q 2>&1); [ "$out" = "value 88" ]; check $? "after 4 s in which nothing got through, the next command builds the edit" "$out"
+[ "$(daemons)" = 1 ]; check $? "(through the same daemon)"
+[ "$(made)" -gt "$links" ]; check $? "on a new link: the silent one was found dead and replaced ($links, then $(made) made)" "$(dstat)"
+
+echo "== the machine sleeps: the daemon is frozen"
+pids=$(pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" || true)
+kill -STOP $pids
+sleep 3
+kill -CONT $pids
+sed -i 's/{ 85 }/{ 80 }/' crates/extra/src/lib.rs
+out=$(R run -q 2>&1); [ "$out" = "value 83" ]; check $? "a daemon frozen for 3 s, as in a suspend, builds the next edit" "$out"
+[ "$(daemons)" = 1 ]; check $? "(the same daemon)"
+
 echo "== the server goes away during a build"
 pids=$(pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E" || true)
 pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E" 2>/dev/null || true
@@ -265,6 +295,21 @@ out=$(cargo test --offline -q 2>&1); check $? "stock cargo test works there too"
 out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "the next rargo command starts a daemon and builds" "$out"
 mounted; check $? "which mounts target/ again"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "and shows the binary" "$out"
+
+echo "== a dead mount: the daemon and what watches its mount are both killed"
+guard=$(pgrep -P "$(mine)" -f "^unmount-guard: $proj/target")
+daemon=$(mine)
+kill -KILL $guard; timeout 10 tail --pid="$guard" -f /dev/null
+kill -KILL $daemon; timeout 10 tail --pid="$daemon" -f /dev/null
+out=$(ls target 2>&1)
+mounted && grep -q 'not connected' <<<"$out"; check $? "target/ is left a dead mount (\"Transport endpoint is not connected\")" "$out
+$(grep "$proj" /proc/self/mountinfo)"
+sed -i 's/{ 110 }/{ 120 }/' crates/extra/src/lib.rs
+out=$(R run -q 2>&1); [ "$out" = "value 123" ]; check $? "the next rargo command recovers and builds the edit" "$out"
+[ "$(grep -c " $proj/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo)" = 1 ] && mounted; check $? "target/ is one live mount again" "$(grep "$proj" /proc/self/mountinfo)"
+out=$(./target/debug/app 2>&1); [ "$out" = "value 123" ]; check $? "and the binary in it is the new one" "$out"
+sed -i 's/{ 120 }/{ 110 }/' crates/extra/src/lib.rs
+out=$(R run -q 2>&1); [ "$out" = "value 113" ]; check $? "(and the edit back)" "$out"
 
 echo "== a binary is read by range"
 export RARGO_CACHE_DIR=$E/cache-ranged
