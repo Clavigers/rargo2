@@ -1,6 +1,6 @@
 # rargo
 
-rargo is remote cargo. A build server does your Rust builds.
+rargo is remote cargo.
 
 `rargo build`, `check`, `test`, `run`, `clippy` and `doc` work like the cargo commands.
 They do not build on your machine.
