@@ -24,6 +24,7 @@ pub use rargo_proto as proto;
 pub mod sandbox;
 pub mod serve;
 pub mod session;
+pub mod pool_state;
 pub mod session_state;
 pub mod worker_state;
 pub mod snapshot;

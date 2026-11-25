@@ -6,6 +6,7 @@ use crate::sandbox::NetMode;
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
+use crate::pool_state::{self, Outcome, Settle, Who};
 use crate::worker_state;
 use anyhow::{Context, Result, anyhow, bail};
 use dashmap::DashMap;
@@ -16,7 +17,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
@@ -124,8 +125,7 @@ fn dtype_from_u8(b: u8) -> DType {
 
 pub struct Peer {
     pub conn: Arc<Conn>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Resp>>>,
-    next: AtomicU64,
+    calls: Mutex<pool_state::Calls<oneshot::Sender<Resp>>>,
     out: mpsc::UnboundedSender<Vec<u8>>,
     bulk: mpsc::UnboundedSender<Vec<u8>>,
 }
@@ -139,7 +139,7 @@ impl Peer {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (bulk_tx, mut bulk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (in_tx, in_rx) = mpsc::unbounded_channel();
-        let peer = Arc::new(Peer { conn: conn.clone(), pending: Mutex::new(HashMap::new()), next: AtomicU64::new(1), out: out_tx, bulk: bulk_tx });
+        let peer = Arc::new(Peer { conn: conn.clone(), calls: Mutex::new(pool_state::Calls::default()), out: out_tx, bulk: bulk_tx });
         let c = conn.clone();
         tokio::spawn(async move {
             loop {
@@ -162,7 +162,8 @@ impl Peer {
                 let Ok(msg) = bincode::deserialize::<Msg>(&raw) else { continue };
                 match msg {
                     Msg::Resp { rid, body } => {
-                        if let Some(tx) = p.pending.lock().remove(&rid) {
+                        let waiter = p.calls.lock().answer(rid);
+                        if let Some(tx) = waiter {
                             let _ = tx.send(body);
                         }
                     }
@@ -173,6 +174,8 @@ impl Peer {
                     }
                 }
             }
+            let lost = p.calls.lock().lost();
+            drop(lost);
         });
         (peer, in_rx)
     }
@@ -201,10 +204,8 @@ impl Peer {
     }
 
     fn start(&self, body: Req) -> oneshot::Receiver<Resp> {
-        let rid = self.next.fetch_add(1, Ordering::Relaxed);
-        assert!(rid > 0, "request ids start at 1");
         let (tx, rx) = oneshot::channel();
-        assert!(self.pending.lock().insert(rid, tx).is_none(), "request ids are not reused");
+        let rid = self.calls.lock().start(tx);
         self.post(&Msg::Req { rid, body });
         rx
     }
@@ -1035,29 +1036,21 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
 }
 
 
-const NOBODY: u8 = 0;
-const REMOTE: u8 = 1;
-const LOCAL: u8 = 2;
-
 #[derive(Default)]
 struct Voice {
-    owner: std::sync::atomic::AtomicU8,
+    race: Mutex<pool_state::Race>,
     changed: tokio::sync::Notify,
 }
 
 impl Voice {
-    fn owner(&self) -> u8 {
-        self.owner.load(Ordering::SeqCst)
-    }
-
-    fn claim(&self, who: u8) -> bool {
-        match self.owner.compare_exchange(NOBODY, who, Ordering::SeqCst, Ordering::SeqCst) {
-            Ok(_) => {
-                self.changed.notify_one();
-                true
-            }
-            Err(current) => current == who,
+    fn claim(&self, who: Who) -> bool {
+        let mut race = self.race.lock();
+        let first = race.owner().is_none();
+        let ok = race.claim(who);
+        if ok && first {
+            self.changed.notify_one();
         }
+        ok
     }
 }
 
@@ -1068,12 +1061,12 @@ struct Gated<'a> {
 
 impl Observer for Gated<'_> {
     fn stdout(&self, data: &[u8]) {
-        if self.voice.claim(LOCAL) {
+        if self.voice.claim(Who::Local) {
             self.inner.stdout(data);
         }
     }
     fn stderr_line(&self, line: &[u8], live: Option<&dyn Live>) {
-        if self.voice.claim(LOCAL) {
+        if self.voice.claim(Who::Local) {
             self.inner.stderr_line(line, live);
         }
     }
@@ -1328,7 +1321,6 @@ pub struct Worker {
     pub id: u64,
     peer: Arc<Peer>,
     pub cores: usize,
-    free: AtomicUsize,
     has_blobs: Mutex<HashSet<Hash>>,
     has_chunks: Mutex<HashSet<Hash>>,
     actions: DashMap<u64, Arc<RemoteAction>>,
@@ -1403,6 +1395,7 @@ pub struct PoolStats {
 
 pub struct Pool {
     workers: Mutex<Vec<Arc<Worker>>>,
+    core: Mutex<pool_state::WorkerPool>,
     blobs: Arc<Blobs>,
     host_srcs: Arc<DashMap<Hash, FileSrc>>,
     content: Arc<Content>,
@@ -1451,6 +1444,7 @@ impl Pool {
         ));
         let pool = Arc::new(Pool {
             workers: Mutex::new(Vec::new()),
+            core: Mutex::new(pool_state::WorkerPool::new()),
             blobs,
             host_srcs,
             content: engine.content.clone(),
@@ -1498,7 +1492,7 @@ impl Pool {
     }
 
     pub fn worker_count(&self) -> usize {
-        self.workers.lock().iter().filter(|w| w.alive.load(Ordering::Relaxed)).count()
+        self.core.lock().count()
     }
 
     pub fn transfer_totals(&self) -> (u64, u64, u64, u64) {
@@ -1529,7 +1523,6 @@ impl Pool {
                         id: conn.id,
                         peer: peer.clone(),
                         cores: cores as usize,
-                        free: AtomicUsize::new(cores as usize),
                         has_blobs: Mutex::new(blobs.into_iter().collect()),
                         has_chunks: Mutex::new(HashSet::new()),
                         actions: DashMap::new(),
@@ -1545,9 +1538,8 @@ impl Pool {
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
                     self.workers.lock().push(w.clone());
-                    for _ in 0..cores {
-                        self.freed.notify_one();
-                    }
+                    let fx = self.core.lock().joined(w.id, cores as usize);
+                    self.pool_effects(fx);
                     worker = Some(w);
                     peer.post(&Msg::Welcome);
                 }
@@ -1579,15 +1571,38 @@ impl Pool {
             w.alive.store(false, Ordering::SeqCst);
             w.in_flight.lock().clear();
             self.settle_wake.notify_waiters();
-            for a in w.actions.iter() {
-                let _ = a.events.send(Event::Done(Err("worker connection lost".into())));
+            let fx = self.core.lock().left(w.id);
+            for e in fx {
+                if let pool_state::Effect::Lost { action } = e
+                    && let Some(a) = w.actions.get(&action)
+                {
+                    let _ = a.events.send(Event::Done(Err("worker connection lost".into())));
+                }
             }
             self.workers.lock().retain(|x| x.id != w.id);
         }
     }
 
+    fn pool_effects(&self, fx: Vec<pool_state::Effect>) {
+        for e in fx {
+            match e {
+                pool_state::Effect::Wake => self.freed.notify_one(),
+                pool_state::Effect::Lost { .. } => unreachable!("a lost action is told where its worker leaves"),
+                pool_state::Effect::Cancel { worker, action } => {
+                    if let Some(w) = self.workers.lock().iter().find(|w| w.id == worker) {
+                        w.peer.post(&Msg::Cancel { action });
+                    }
+                }
+            }
+        }
+    }
+
     fn event(&self, worker: &Option<Arc<Worker>>, action: u64, ev: Event) {
-        if let Some(a) = worker.as_ref().and_then(|w| w.actions.get(&action)) {
+        let Some(w) = worker else { return };
+        if !self.core.lock().route(w.id, action) {
+            return;
+        }
+        if let Some(a) = w.actions.get(&action) {
             let _ = a.events.send(ev);
         }
     }
@@ -1706,20 +1721,15 @@ impl Pool {
 
     fn lease(&self, among: Option<&[u64]>) -> Option<Arc<Worker>> {
         let ws = self.workers.lock();
-        let mut best: Option<&Arc<Worker>> = None;
-        for w in ws.iter().filter(|w| w.alive.load(Ordering::Relaxed) && among.is_none_or(|ids| ids.contains(&w.id))) {
-            if w.free.load(Ordering::Relaxed) > 0 && best.is_none_or(|b| w.free.load(Ordering::Relaxed) > b.free.load(Ordering::Relaxed)) {
-                best = Some(w);
-            }
-        }
-        let w = best?.clone();
-        w.free.fetch_sub(1, Ordering::Relaxed);
-        Some(w)
+        let id = self.core.lock().lease(among)?;
+        Some(ws.iter().find(|w| w.id == id).expect("a worker in the pool is listed").clone())
     }
 
     fn give_back(&self, w: &Worker) {
-        w.free.fetch_add(1, Ordering::Relaxed);
-        self.freed.notify_waiters();
+        let fx = self.core.lock().give_back(w.id);
+        if !fx.is_empty() {
+            self.freed.notify_waiters();
+        }
     }
 
     async fn lease_wait(&self, among: Option<&[u64]>) -> Arc<Worker> {
@@ -2117,13 +2127,15 @@ impl Pool {
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
                 self.1.actions.remove(&self.2);
-                if !self.3.get() {
-                    self.1.peer.post(&Msg::Cancel { action: self.2 });
-                }
+                let fx = self.0.core.lock().finished(self.2, self.3.get());
+                self.0.pool_effects(fx);
                 self.0.give_back(self.1);
             }
         }
         let cleanup = Cleanup(self, w, action, std::cell::Cell::new(false));
+        if !self.core.lock().sent(action, w.id) {
+            bail!("worker connection lost");
+        }
 
         let (mut prefill, mut listings, incoming, mut closed) = self.predict(w, engine, spec, key, &view, &ra).await?;
         if !req.seed_blobs.is_empty() {
@@ -2206,7 +2218,7 @@ impl Pool {
         let t_sent = t0.elapsed();
         let done = loop {
             let Some(ev) = rx.recv().await else { bail!("worker connection lost") };
-            if !matches!(ev, Event::Done(_)) && !voice.claim(REMOTE) {
+            if !matches!(ev, Event::Done(_)) && !voice.claim(Who::Remote) {
                 std::future::pending::<()>().await;
             }
             match ev {
@@ -2436,11 +2448,6 @@ impl RemoteRunner for Pool {
             };
             let own = engine.traces.traces(key).first().map(|(_, t)| t.clone());
             let known = own.clone().or_else(|| engine.profile(spec));
-            if known.is_none() && !eager_dispatch() {
-                self.give_back(&w);
-                self.stats.kept_local_transfer.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
             let missing: u64 = match &known {
                 Some(t) => {
                     let has = w.has_blobs.lock();
@@ -2467,8 +2474,14 @@ impl RemoteRunner for Pool {
                     engine.avg_action_wall().as_secs_f64()
                 );
             }
-            if bytes_time > engine.avg_action_wall() && !eager_dispatch() {
-                if own.is_none() && !w.warmed.swap(true, Ordering::SeqCst) {
+            let send = pool_state::worth_sending(
+                known.is_some(),
+                bytes_time.as_micros() as u64,
+                engine.avg_action_wall().as_micros() as u64,
+                eager_dispatch(),
+            );
+            if !send {
+                if known.is_some() && own.is_none() && !w.warmed.swap(true, Ordering::SeqCst) {
                     let (tx, _rx) = mpsc::unbounded_channel();
                     let ra = Arc::new(RemoteAction {
                         view: req.view.clone(),
@@ -2500,29 +2513,34 @@ impl RemoteRunner for Pool {
             type Local<'f> = std::pin::Pin<Box<dyn std::future::Future<Output = RunResult> + Send + 'f>>;
             let mut local: Option<(Local<'_>, crate::sched::Permit, std::time::Instant)> = None;
             loop {
-                match voice.owner() {
-                    REMOTE if local.is_some() => {
+                let settled = voice.race.lock().settle();
+                match settled {
+                    Some(Settle::StopLocal) => {
                         self.stats.hedge_stopped.fetch_add(1, Ordering::Relaxed);
                         local = None;
                     }
-                    LOCAL => remote = None,
-                    _ => {}
+                    Some(Settle::DropRemote) => remote = None,
+                    None => {}
                 }
+                let may_hedge = voice.race.lock().may_hedge(away, hedge());
                 tokio::select! {
-                    r = async { remote.as_mut().expect("guarded").await }, if remote.is_some() => match r {
-                        Ok(r) => {
-                            if local.is_some() {
-                                self.stats.hedge_stopped.fetch_add(1, Ordering::Relaxed);
+                    r = async { remote.as_mut().expect("guarded").await }, if remote.is_some() => {
+                        let outcome = voice.race.lock().remote_ended(r.is_ok());
+                        match r {
+                            Ok(r) => {
+                                if matches!(outcome, Outcome::Use { stopped_other: true, .. }) {
+                                    self.stats.hedge_stopped.fetch_add(1, Ordering::Relaxed);
+                                }
+                                return Some(Ok(r));
                             }
-                            return Some(Ok(r));
-                        }
-                        Err(e) => {
-                            eprintln!("rargod: worker {:x} failed `{}`: {e:#}; running locally", w.id, spec.label);
-                            self.stats.worker_failures.fetch_add(1, Ordering::Relaxed);
-                            engine.stats.remote_failed.fetch_add(1, Ordering::Relaxed);
-                            remote = None;
-                            if local.is_none() {
-                                return None;
+                            Err(e) => {
+                                eprintln!("rargod: worker {:x} failed `{}`: {e:#}; running locally", w.id, spec.label);
+                                self.stats.worker_failures.fetch_add(1, Ordering::Relaxed);
+                                engine.stats.remote_failed.fetch_add(1, Ordering::Relaxed);
+                                remote = None;
+                                if outcome == Outcome::RunElsewhere {
+                                    return None;
+                                }
                             }
                         }
                     },
@@ -2530,12 +2548,14 @@ impl RemoteRunner for Pool {
                         let (_, permit, started) = local.take().expect("guarded");
                         drop(permit);
                         engine.note_action_wall(started.elapsed());
+                        voice.race.lock().local_ended();
                         self.stats.hedge_won.fetch_add(1, Ordering::Relaxed);
                         return Some(r);
                     }
                     permit = engine.sched.acquire(crate::sched::Priority::Idle, mem),
-                        if local.is_none() && remote.is_some() && !away && hedge() && voice.owner() == NOBODY =>
+                        if local.is_none() && remote.is_some() && may_hedge =>
                     {
+                        voice.race.lock().hedged();
                         self.stats.hedged.fetch_add(1, Ordering::Relaxed);
                         engine.stats.runs.fetch_add(1, Ordering::Relaxed);
                         let run: Local<'_> = Box::pin(engine.execute(spec, req.view.clone(), req.uid, req.gid, &gated));
