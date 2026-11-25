@@ -6,6 +6,7 @@ use crate::sandbox::NetMode;
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
+use crate::worker_state;
 use anyhow::{Context, Result, anyhow, bail};
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -20,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WLooked {
     Absent,
     Other,
@@ -485,114 +486,341 @@ impl Blobs {
 const FETCH_TOGETHER: usize = 8;
 
 
-struct Incoming {
-    recipe: Option<Recipe>,
-    chunks: HashMap<u32, Vec<u8>>,
-    parts: u32,
+#[derive(Debug)]
+struct Wire;
+
+#[derive(Debug)]
+struct RunWire {
+    spec: WSpec,
+    uid: u32,
+    gid: u32,
+    untraced: Vec<Vec<u8>>,
+    closure: Vec<Vec<u8>>,
 }
 
+impl std::fmt::Debug for Req {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Req::Lookup { .. } => "Lookup",
+            Req::List { .. } => "List",
+            Req::Open { .. } => "Open",
+            Req::Recipe { .. } => "Recipe",
+            Req::Chunks { .. } => "Chunks",
+            Req::Blob { .. } => "Blob",
+        })
+    }
+}
+
+impl worker_state::Carried for Wire {
+    type Run = RunWire;
+    type Part = (u32, Recipe, Vec<(u32, Vec<u8>)>);
+    type Serve = Req;
+}
+
+type WEffect = worker_state::Effect<Wire>;
+
 pub struct WorkerState {
-    peer: Arc<Peer>,
+    peer: Mutex<Option<Arc<Peer>>>,
     blobs: Arc<Blobs>,
     engine: Arc<Engine>,
     handle: tokio::runtime::Handle,
-    announced: Mutex<HashMap<Hash, tokio::sync::watch::Receiver<bool>>>,
-    announce_tx: Mutex<HashMap<Hash, tokio::sync::watch::Sender<bool>>>,
-    partial: Mutex<HashMap<Hash, Incoming>>,
-    pub lookups_local: AtomicU64,
-    pub lookups_remote: AtomicU64,
+    core: Mutex<worker_state::Worker<Wire>>,
+    woken: parking_lot::Condvar,
+    tasks: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    born: std::time::Instant,
+    lookups_local: AtomicU64,
+    lookups_remote: AtomicU64,
     starved: AtomicU64,
     nix: DashMap<Vec<u8>, Arc<crate::nixmanifest::Installed>>,
 }
 
+fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current().is_ok() { tokio::task::block_in_place(f) } else { f() }
+}
+
 impl WorkerState {
+    fn peer(&self) -> Option<Arc<Peer>> {
+        self.peer.lock().clone()
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.born.elapsed().as_millis() as u64
+    }
+
     fn ensure_blob(self: &Arc<Self>, h: &Hash) -> io::Result<()> {
-        if self.blobs.store.has(h) {
-            return Ok(());
-        }
-        let this = self.clone();
-        let h = *h;
-        let fut = async move {
-                let waiting = this.announced.lock().get(&h).cloned();
-                if let Some(mut rx) = waiting {
-                    let _ = tokio::time::timeout(Duration::from_secs(60), async {
-                        while !*rx.borrow() {
-                            if rx.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    })
-                    .await;
-                    if this.blobs.store.has(&h) {
-                        return Ok(());
+        blocking(|| {
+            let mut core = self.core.lock();
+            loop {
+                let has = self.blobs.store.has(h);
+                match core.need(*h, has) {
+                    worker_state::Need::Have => return Ok(()),
+                    worker_state::Need::Wait => {
+                        self.woken.wait_for(&mut core, Duration::from_secs(1));
+                    }
+                    worker_state::Need::Gone => {
+                        self.starved.fetch_add(1, Ordering::SeqCst);
+                        return Err(io::Error::other(format!("content {h} is not here and the server is gone")));
+                    }
+                    worker_state::Need::Fetch => {
+                        drop(core);
+                        let got = match self.peer() {
+                            Some(peer) => self.handle.block_on(self.blobs.fetch(&peer, h)),
+                            None => Err(anyhow!("no link to the server")),
+                        };
+                        self.core.lock().fetched(*h);
+                        self.woken.notify_all();
+                        return got.map_err(|e| {
+                            self.starved.fetch_add(1, Ordering::SeqCst);
+                            eprintln!("rargo worker: content {h} could not be had from the server: {e:#}");
+                            io::Error::other(format!("{e:#}"))
+                        });
                     }
                 }
-                this.blobs.fetch(&this.peer, &h).await
-        };
-        let r = if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.handle.block_on(fut))
-        } else {
-            self.handle.block_on(fut)
-        };
-        r.map_err(|e| {
-            self.starved.fetch_add(1, Ordering::SeqCst);
-            eprintln!("rargo worker: content {h} could not be had from the server: {e:#}");
-            io::Error::other(format!("{e:#}"))
+            }
         })
     }
 
-    async fn on_push(self: &Arc<Self>, blob: Hash, recipe: Recipe, chunks: Vec<(u32, Vec<u8>)>, part: u32, of: u32) {
-        let complete = {
-            let mut partial = self.partial.lock();
-            let inc = partial.entry(blob).or_insert_with(|| Incoming { recipe: None, chunks: HashMap::new(), parts: 0 });
-            if part == 0 {
-                inc.recipe = Some(recipe);
+    fn ask(&self, token: u64, q: worker_state::Query) -> Option<worker_state::Reply> {
+        use worker_state::{Asked, Query, Reply};
+        blocking(|| {
+            let mut core = self.core.lock();
+            loop {
+                match core.query(token, q.clone()) {
+                    Asked::Known(r) => {
+                        self.lookups_local.fetch_add(1, Ordering::Relaxed);
+                        return Some(r);
+                    }
+                    Asked::Gone => return None,
+                    Asked::Wait => {
+                        self.woken.wait_for(&mut core, Duration::from_secs(1));
+                    }
+                    Asked::Ask { ticket, action } => {
+                        drop(core);
+                        self.lookups_remote.fetch_add(1, Ordering::Relaxed);
+                        let req = match &q {
+                            Query::Lookup { dir, name } => Req::Lookup { action, dir: dir.clone(), name: name.clone() },
+                            Query::List { dir } => Req::List { action, dir: dir.clone() },
+                            Query::Open { dir, name } => Req::Open { action, dir: dir.clone(), name: name.clone() },
+                        };
+                        let got = match self.peer() {
+                            Some(peer) => peer.call_blocking(req),
+                            None => Err(anyhow!("no link to the server")),
+                        };
+                        let reply = match got {
+                            Ok(Resp::Looked(w)) => Some(Reply::Looked(w)),
+                            Ok(Resp::Listing(l)) => Some(Reply::Listing(l)),
+                            Ok(Resp::Opened(o)) => Some(Reply::Opened(o)),
+                            other => {
+                                if let Query::Lookup { dir, name } = &q {
+                                    let why = match other {
+                                        Err(e) => format!("{e:#}"),
+                                        Ok(_) => "unexpected reply".to_string(),
+                                    };
+                                    eprintln!(
+                                        "rargo worker: action {action:x}: no answer about {}/{}: {why}",
+                                        String::from_utf8_lossy(dir),
+                                        String::from_utf8_lossy(name)
+                                    );
+                                }
+                                None
+                            }
+                        };
+                        self.core.lock().answered(ticket, reply.clone());
+                        self.woken.notify_all();
+                        return reply;
+                    }
+                }
             }
-            inc.chunks.extend(chunks);
-            inc.parts += 1;
-            if inc.parts >= of.max(1) && inc.recipe.is_some() { partial.remove(&blob) } else { None }
+        })
+    }
+
+    fn server_msg(self: &Arc<Self>, msg: Msg) {
+        use worker_state::{FromServer, Run};
+        let from = match msg {
+            Msg::Welcome => FromServer::Welcome,
+            Msg::Req { rid, body } => FromServer::Ask {
+                rid,
+                serve: matches!(body, Req::Recipe { .. } | Req::Blob { .. } | Req::Chunks { .. }).then_some(body),
+            },
+            Msg::Push { blob, recipe, chunks, part, of } => {
+                FromServer::Push { blob, first: part == 0, of, part: (part, recipe, chunks) }
+            }
+            Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed, closure, store_paths } => {
+                for path in &store_paths {
+                    if self.nix.contains_key(&path.name) {
+                        continue;
+                    }
+                    match crate::nixmanifest::Installed::from_kind(&path.kind) {
+                        Ok(inst) => {
+                            self.nix.insert(path.name.clone(), Arc::new(inst));
+                        }
+                        Err(e) => eprintln!(
+                            "rargo worker: nix path {} is not a tree: {e}",
+                            String::from_utf8_lossy(&path.name)
+                        ),
+                    }
+                }
+                let mut closure: Vec<Vec<u8>> = closure.into_iter().map(|(n, _)| n).collect();
+                closure.sort();
+                FromServer::Run(Run {
+                    action,
+                    incoming,
+                    prefill,
+                    listings,
+                    closed,
+                    run: RunWire { spec, uid, gid, untraced, closure },
+                })
+            }
+            Msg::Cancel { action } => FromServer::Cancel { action },
+            _ => FromServer::Other,
         };
-        if let Some(inc) = complete {
-            let recipe = inc.recipe.unwrap_or_default();
-            if let Err(e) = self.blobs.assemble(&self.peer, &blob, &recipe, inc.chunks).await {
-                eprintln!("rargo worker: pushed blob {blob} could not be assembled: {e:#}");
-            }
-            self.peer.post(&Msg::Stored { blob });
-            self.announced.lock().remove(&blob);
-            if let Some(tx) = self.announce_tx.lock().remove(&blob) {
-                let _ = tx.send(true);
+        let now = self.now_ms();
+        let fx = {
+            let mut core = self.core.lock();
+            let mut fx = core.server(from, &|h| self.blobs.store.has(h), now);
+            fx.extend(core.tick(now));
+            fx
+        };
+        self.woken.notify_all();
+        self.carry(fx);
+    }
+
+    fn tick(self: &Arc<Self>) {
+        let fx = self.core.lock().tick(self.now_ms());
+        self.carry(fx);
+    }
+
+    fn carry(self: &Arc<Self>, fx: Vec<WEffect>) {
+        for e in fx {
+            match e {
+                WEffect::Connect { .. } | WEffect::Quit | WEffect::Hello => {
+                    unreachable!("the link's own effects are carried out by worker_main")
+                }
+                WEffect::Serve { rid, serve } => {
+                    let Some(peer) = self.peer() else { continue };
+                    let blobs = self.blobs.clone();
+                    self.handle.spawn_blocking(move || {
+                        let resp = match serve {
+                            Req::Recipe { blob } => Resp::Recipe(blobs.recipe(&blob).map(|r| (*r).clone())),
+                            Req::Blob { blob } => Resp::Blob(blobs.recipe(&blob).map(|r| {
+                                let idx = inline_indices(&r, &|_| false);
+                                let chunks = blobs.serve_chunks(&blob, &idx).unwrap_or_default();
+                                ((*r).clone(), idx.into_iter().zip(chunks).collect())
+                            })),
+                            Req::Chunks { blob, idx } => match blobs.serve_chunks(&blob, &idx) {
+                                Ok(c) => Resp::Chunks(c),
+                                Err(e) => Resp::Err(format!("{e:#}")),
+                            },
+                            _ => unreachable!("the core serves only content requests"),
+                        };
+                        peer.post(&Msg::Resp { rid, body: resp });
+                    });
+                }
+                WEffect::Refuse { rid } => {
+                    if let Some(peer) = self.peer() {
+                        peer.post(&Msg::Resp { rid, body: Resp::Err("not a worker request".into()) });
+                    }
+                }
+                WEffect::Assemble { blob, parts } => {
+                    let Some(peer) = self.peer() else { continue };
+                    let state = self.clone();
+                    self.handle.spawn(async move {
+                        let mut recipe = None;
+                        let mut chunks = HashMap::new();
+                        for (part, r, c) in parts {
+                            if part == 0 {
+                                recipe = Some(r);
+                            }
+                            chunks.extend(c);
+                        }
+                        let recipe = recipe.unwrap_or_default();
+                        if let Err(e) = state.blobs.assemble(&peer, &blob, &recipe, chunks).await {
+                            eprintln!("rargo worker: pushed blob {blob} could not be assembled: {e:#}");
+                        }
+                        let fx = state.core.lock().assembled(blob);
+                        state.woken.notify_all();
+                        state.carry(fx);
+                    });
+                }
+                WEffect::Stored { blob } => {
+                    if let Some(peer) = self.peer() {
+                        peer.post(&Msg::Stored { blob });
+                    }
+                }
+                WEffect::Start { token, action, run } => self.start(token, action, run),
+                WEffect::Abort { token } => {
+                    if let Some(task) = self.tasks.lock().remove(&token) {
+                        task.abort();
+                    }
+                }
+                WEffect::Report { .. } => unreachable!("a run reports from its own task"),
             }
         }
+    }
+
+    fn start(self: &Arc<Self>, token: u64, action: u64, run: RunWire) {
+        let Some(peer) = self.peer() else { return };
+        let state = self.clone();
+        let mut registry = self.tasks.lock();
+        let task = self.handle.spawn(async move {
+            let RunWire { spec, uid, gid, untraced, closure } = run;
+            let view = Arc::new(RemoteView { state: state.clone(), token, untraced, closure });
+            let aspec = ActionSpec {
+                kind: spec.kind,
+                argv: spec.argv,
+                env: spec.env.into_iter().collect::<BTreeMap<_, _>>(),
+                cwd: spec.cwd,
+                net: NetMode::Loopback,
+                mkdirs: spec.mkdirs,
+                root_id: Hash::ZERO,
+                discard: spec.discard,
+                label: spec.label,
+            };
+            let permit = state.engine.sched.acquire(crate::sched::Priority::Agent, 0).await;
+            let obs = WorkerObserver { peer: peer.clone(), action };
+            let starved_before = state.starved.load(Ordering::SeqCst);
+            let r = state.engine.execute(&aspec, view, uid, gid, &obs).await;
+            drop(permit);
+            let r = if state.starved.load(Ordering::SeqCst) != starved_before {
+                Err(anyhow!("an input's content could not be fetched from the server while the action ran"))
+            } else {
+                r
+            };
+            let result = match r {
+                Ok((res, obs, tainted, side)) => Ok(WDone {
+                    status: res.status,
+                    stats: res.stats,
+                    obs,
+                    entries: res.outputs.entries.clone(),
+                    side,
+                    tainted,
+                }),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            state.tasks.lock().remove(&token);
+            let fx = state.core.lock().ended(token);
+            if fx.iter().any(|e| matches!(e, WEffect::Report { .. })) {
+                peer.post(&Msg::Done { action, result });
+            }
+        });
+        registry.insert(token, task.abort_handle());
     }
 }
 
 struct RemoteFile {
     state: Arc<WorkerState>,
-    action: u64,
+    token: u64,
     dir: Vec<u8>,
     name: Vec<u8>,
-    hash: std::sync::OnceLock<Hash>,
 }
 
 impl LazyBlob for RemoteFile {
     fn materialize(&self, _store: &Store) -> io::Result<Hash> {
-        let h = match self.hash.get() {
-            Some(h) => *h,
-            None => {
-                let r = self
-                    .state
-                    .peer
-                    .call_blocking(Req::Open { action: self.action, dir: self.dir.clone(), name: self.name.clone() })
-                    .map_err(|e| io::Error::other(format!("{e:#}")))?;
-                let Resp::Opened(Ok(h)) = r else {
-                    return Err(io::Error::from_raw_os_error(match r {
-                        Resp::Opened(Err(errno)) => errno,
-                        _ => libc::EIO,
-                    }));
-                };
-                let _ = self.hash.set(h);
-                h
-            }
+        let q = worker_state::Query::Open { dir: self.dir.clone(), name: self.name.clone() };
+        let h = match self.state.ask(self.token, q) {
+            Some(worker_state::Reply::Opened(Ok(h))) => h,
+            Some(worker_state::Reply::Opened(Err(errno))) => return Err(io::Error::from_raw_os_error(errno)),
+            _ => return Err(io::Error::from_raw_os_error(libc::EIO)),
         };
         self.state.ensure_blob(&h)?;
         Ok(h)
@@ -601,11 +829,8 @@ impl LazyBlob for RemoteFile {
 
 pub struct RemoteView {
     state: Arc<WorkerState>,
-    action: u64,
-    entries: DashMap<(Vec<u8>, Vec<u8>), WLooked>,
-    listings: DashMap<Vec<u8>, Listing>,
+    token: u64,
     untraced: Vec<Vec<u8>>,
-    closed: HashSet<Vec<u8>>,
     closure: Vec<Vec<u8>>,
 }
 
@@ -627,10 +852,9 @@ impl RemoteView {
                     Some(h) => FileSrc::Blob(*h),
                     None => FileSrc::Lazy(Arc::new(RemoteFile {
                         state: self.state.clone(),
-                        action: self.action,
+                        token: self.token,
                         dir: dir.to_vec(),
                         name: name.to_vec(),
-                        hash: std::sync::OnceLock::new(),
                     })),
                 },
             }),
@@ -644,52 +868,20 @@ impl View for RemoteView {
             self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
             return l;
         }
-        let key = (dir.to_vec(), name.to_vec());
-        if let Some(w) = self.entries.get(&key) {
-            self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
-            return self.convert(dir, name, &w);
+        let q = worker_state::Query::Lookup { dir: dir.to_vec(), name: name.to_vec() };
+        match self.state.ask(self.token, q) {
+            Some(worker_state::Reply::Looked(w)) => self.convert(dir, name, &w),
+            _ => Looked::Absent,
         }
-        if self.closed.contains(dir) && self.listings.get(dir).is_some_and(|l| !l.iter().any(|(n, _)| n == name)) {
-            self.state.lookups_local.fetch_add(1, Ordering::Relaxed);
-            self.entries.insert(key, WLooked::Absent);
-            return Looked::Absent;
-        }
-        self.state.lookups_remote.fetch_add(1, Ordering::Relaxed);
-        let w = match self.state.peer.call_blocking(Req::Lookup { action: self.action, dir: dir.to_vec(), name: name.to_vec() }) {
-            Ok(Resp::Looked(w)) => w,
-            other => {
-                let why = match other {
-                    Err(e) => format!("{e:#}"),
-                    Ok(_) => "unexpected reply".to_string(),
-                };
-                eprintln!(
-                    "rargo worker: action {:x}: no answer about {}/{}: {why}",
-                    self.action,
-                    String::from_utf8_lossy(dir),
-                    String::from_utf8_lossy(name)
-                );
-                WLooked::Absent
-            }
-        };
-        let l = self.convert(dir, name, &w);
-        self.entries.insert(key, w);
-        l
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
         if let Some(l) = crate::nixmanifest::list_at(|n| self.state.nix.get(n).map(|e| Arc::clone(e.value())), &self.closure, dir) {
             return l;
         }
-        if let Some(l) = self.listings.get(dir) {
-            return Ok(l.clone());
-        }
-        match self.state.peer.call_blocking(Req::List { action: self.action, dir: dir.to_vec() }) {
-            Ok(Resp::Listing(Ok(l))) => {
-                let l: Listing = l.into_iter().map(|(n, t)| (n, dtype_from_u8(t))).collect();
-                self.listings.insert(dir.to_vec(), l.clone());
-                Ok(l)
-            }
-            Ok(Resp::Listing(Err(errno))) => Err(io::Error::from_raw_os_error(errno)),
+        match self.state.ask(self.token, worker_state::Query::List { dir: dir.to_vec() }) {
+            Some(worker_state::Reply::Listing(Ok(l))) => Ok(l.into_iter().map(|(n, t)| (n, dtype_from_u8(t))).collect()),
+            Some(worker_state::Reply::Listing(Err(errno))) => Err(io::Error::from_raw_os_error(errno)),
             _ => Err(io::Error::from_raw_os_error(libc::EIO)),
         }
     }
@@ -728,25 +920,52 @@ impl Observer for WorkerObserver {
     }
 }
 
+const BYE_WAIT: Duration = Duration::from_secs(5);
+
+enum LinkEnd {
+    Lost,
+    Stop,
+}
+
+async fn serve_link(
+    state: &Arc<WorkerState>,
+    conn: &Arc<Conn>,
+    inbox: &mut mpsc::UnboundedReceiver<Msg>,
+    term: &mut tokio::signal::unix::Signal,
+    intr: &mut tokio::signal::unix::Signal,
+) -> LinkEnd {
+    loop {
+        let msg = tokio::select! {
+            m = inbox.recv() => m,
+            _ = term.recv() => return LinkEnd::Stop,
+            _ = intr.recv() => return LinkEnd::Stop,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                if conn.is_closed() {
+                    None
+                } else {
+                    state.tick();
+                    continue;
+                }
+            }
+        };
+        let Some(msg) = msg else { return LinkEnd::Lost };
+        state.server_msg(msg);
+    }
+}
+
 pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: crate::net::LinkKey) -> Result<()> {
     let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key).await?;
-    let conn = loop {
-        match endpoint.connect(server).await {
-            Ok(c) => break c,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => eprintln!("rargo worker: {server}: {e}; trying again"),
-            Err(e) => return Err(e).with_context(|| format!("connecting to the server at {server}")),
-        }
-    };
-    let (peer, mut inbox) = Peer::new(conn.clone());
     let blobs = Arc::new(Blobs::new(engine.store.clone(), None));
+    let (core, first) = worker_state::Worker::new();
     let state = Arc::new(WorkerState {
-        peer: peer.clone(),
-        blobs: blobs.clone(),
+        peer: Mutex::new(None),
+        blobs,
         engine: engine.clone(),
         handle: tokio::runtime::Handle::current(),
-        announced: Mutex::new(HashMap::new()),
-        announce_tx: Mutex::new(HashMap::new()),
-        partial: Mutex::new(HashMap::new()),
+        core: Mutex::new(core),
+        woken: parking_lot::Condvar::new(),
+        tasks: Mutex::new(HashMap::new()),
+        born: std::time::Instant::now(),
         lookups_local: AtomicU64::new(0),
         lookups_remote: AtomicU64::new(0),
         starved: AtomicU64::new(0),
@@ -754,142 +973,65 @@ pub async fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, ke
     });
     let s2 = state.clone();
     engine.content.set_fetcher(Arc::new(move |h| s2.ensure_blob(h)));
-    let tasks: Arc<Mutex<HashMap<u64, tokio::task::AbortHandle>>> = Arc::new(Mutex::new(HashMap::new()));
-    peer.post(&Msg::Hello { cores, blobs: engine.store.all_hashes() });
-    eprintln!("rargo worker: connected to {server}, {cores} cores");
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal");
     let mut intr = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).expect("signal");
-    loop {
-        let msg = tokio::select! {
-            m = inbox.recv() => m,
-            _ = term.recv() => {
-                peer.deliver(&Msg::Bye).await;
-                return Ok(());
-            }
-            _ = intr.recv() => {
-                peer.deliver(&Msg::Bye).await;
-                return Ok(());
-            }
-            _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                if conn.is_closed() { None } else { continue }
+    let mut todo: std::collections::VecDeque<WEffect> = first.into();
+    while let Some(effect) = todo.pop_front() {
+        let after_ms = match effect {
+            WEffect::Connect { after_ms } => after_ms,
+            other => {
+                state.carry(vec![other]);
+                continue;
             }
         };
-        let Some(msg) = msg else { bail!("server connection closed") };
-        match msg {
-            Msg::Welcome => {}
-            Msg::Req { rid, body } => {
-                let (peer, blobs) = (peer.clone(), blobs.clone());
-                tokio::task::spawn_blocking(move || {
-                    let resp = match body {
-                        Req::Recipe { blob } => Resp::Recipe(blobs.recipe(&blob).map(|r| (*r).clone())),
-                        Req::Blob { blob } => Resp::Blob(blobs.recipe(&blob).map(|r| {
-                            let idx = inline_indices(&r, &|_| false);
-                            let chunks = blobs.serve_chunks(&blob, &idx).unwrap_or_default();
-                            ((*r).clone(), idx.into_iter().zip(chunks).collect())
-                        })),
-                        Req::Chunks { blob, idx } => match blobs.serve_chunks(&blob, &idx) {
-                            Ok(c) => Resp::Chunks(c),
-                            Err(e) => Resp::Err(format!("{e:#}")),
-                        },
-                        _ => Resp::Err("not a worker request".into()),
-                    };
-                    peer.post(&Msg::Resp { rid, body: resp });
-                });
+        let connected = tokio::select! {
+            c = async {
+                tokio::time::sleep(Duration::from_millis(after_ms)).await;
+                endpoint.connect(server).await
+            } => c,
+            _ = term.recv() => return Ok(()),
+            _ = intr.recv() => return Ok(()),
+        };
+        let conn = match connected {
+            Ok(c) => c,
+            Err(e) => {
+                let timed_out = e.kind() == std::io::ErrorKind::TimedOut;
+                eprintln!("rargo worker: {server}: {e}; trying again");
+                let fx = state.core.lock().connect_failed(timed_out);
+                if fx.iter().any(|e| matches!(e, WEffect::Quit)) {
+                    return Err(e).with_context(|| format!("connecting to the server at {server}"));
+                }
+                todo.extend(fx);
+                continue;
             }
-            Msg::Push { blob, recipe, chunks, part, of } => {
-                let s = state.clone();
-                tokio::spawn(async move { s.on_push(blob, recipe, chunks, part, of).await });
+        };
+        let (peer, mut inbox) = Peer::new(conn.clone());
+        *state.peer.lock() = Some(peer.clone());
+        for e in state.core.lock().connected() {
+            assert!(matches!(e, WEffect::Hello), "a new link says hello");
+            peer.post(&Msg::Hello { cores, blobs: engine.store.all_hashes() });
+        }
+        eprintln!("rargo worker: connected to {server}, {cores} cores");
+        match serve_link(&state, &conn, &mut inbox, &mut term, &mut intr).await {
+            LinkEnd::Stop => {
+                let _ = tokio::time::timeout(BYE_WAIT, peer.deliver(&Msg::Bye)).await;
+                return Ok(());
             }
-            Msg::Stored { .. } => {}
-            Msg::Run { action, spec, uid, gid, prefill, listings, untraced, incoming, closed, closure, store_paths } => {
-                {
-                    let mut ann = state.announced.lock();
-                    let mut txs = state.announce_tx.lock();
-                    for h in incoming {
-                        if !state.blobs.store.has(&h) && !ann.contains_key(&h) {
-                            let (tx, rx) = tokio::sync::watch::channel(false);
-                            ann.insert(h, rx);
-                            txs.insert(h, tx);
-                        }
+            LinkEnd::Lost => {
+                eprintln!("rargo worker: the connection to {server} was lost; connecting again");
+                *state.peer.lock() = None;
+                let fx = state.core.lock().link_lost();
+                state.woken.notify_all();
+                for e in fx {
+                    match e {
+                        WEffect::Connect { .. } => todo.push_back(e),
+                        other => state.carry(vec![other]),
                     }
                 }
-                for path in &store_paths {
-                    if state.nix.contains_key(&path.name) {
-                        continue;
-                    }
-                    match crate::nixmanifest::Installed::from_kind(&path.kind) {
-                        Ok(inst) => {
-                            state.nix.insert(path.name.clone(), Arc::new(inst));
-                        }
-                        Err(e) => eprintln!(
-                            "rargo worker: nix path {} is not a tree: {e}",
-                            String::from_utf8_lossy(&path.name)
-                        ),
-                    }
-                }
-                let mut closure_names: Vec<Vec<u8>> = closure.into_iter().map(|(n, _)| n).collect();
-                closure_names.sort();
-                let state = state.clone();
-                let tasks2 = tasks.clone();
-                let mut registry = tasks.lock();
-                let task = tokio::spawn(async move {
-                    let view = Arc::new(RemoteView {
-                        state: state.clone(),
-                        action,
-                        entries: prefill.into_iter().map(|(d, n, w)| ((d, n), w)).collect(),
-                        listings: listings
-                            .into_iter()
-                            .map(|(d, l)| (d, l.into_iter().map(|(n, t)| (n, dtype_from_u8(t))).collect()))
-                            .collect(),
-                        untraced,
-                        closed: closed.into_iter().collect(),
-                        closure: closure_names,
-                    });
-                    let aspec = ActionSpec {
-                        kind: spec.kind,
-                        argv: spec.argv,
-                        env: spec.env.into_iter().collect::<BTreeMap<_, _>>(),
-                        cwd: spec.cwd,
-                        net: NetMode::Loopback,
-                        mkdirs: spec.mkdirs,
-                        root_id: Hash::ZERO,
-                        discard: spec.discard,
-                        label: spec.label,
-                    };
-                    let permit = state.engine.sched.acquire(crate::sched::Priority::Agent, 0).await;
-                    let obs = WorkerObserver { peer: state.peer.clone(), action };
-                    let starved_before = state.starved.load(Ordering::SeqCst);
-                    let r = state.engine.execute(&aspec, view, uid, gid, &obs).await;
-                    drop(permit);
-                    let r = if state.starved.load(Ordering::SeqCst) != starved_before {
-                        Err(anyhow!("an input's content could not be fetched from the server while the action ran"))
-                    } else {
-                        r
-                    };
-                    let result = match r {
-                        Ok((res, obs, tainted, side)) => Ok(WDone {
-                            status: res.status,
-                            stats: res.stats,
-                            obs,
-                            entries: res.outputs.entries.clone(),
-                            side,
-                            tainted,
-                        }),
-                        Err(e) => Err(format!("{e:#}")),
-                    };
-                    tasks2.lock().remove(&action);
-                    state.peer.post(&Msg::Done { action, result });
-                });
-                registry.insert(action, task.abort_handle());
             }
-            Msg::Cancel { action } => {
-                if let Some(task) = tasks.lock().remove(&action) {
-                    task.abort();
-                }
-            }
-            _ => {}
         }
     }
+    unreachable!("the worker either stops or connects again")
 }
 
 
