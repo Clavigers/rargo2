@@ -17,6 +17,10 @@ jobs:
       RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
+      - name: The service deploys published releases only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: dev/update-service-test.sh
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: Realise the flake closure for binaries from the build server
         run: nix develop --command true

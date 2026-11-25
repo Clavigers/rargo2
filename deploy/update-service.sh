@@ -1,15 +1,26 @@
 #!/bin/bash
 set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+refuse() {
+    echo "deploy/update-service.sh: $1" >&2
+    echo "The service runs released versions only: dev/release.sh X.Y.Z releases and deploys one; deploy/update-service.sh vX.Y.Z deploys a published release again." >&2
+    exit 1
+}
+want=${1:-}
+[[ "$want" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || refuse "'$want' is not a release tag (vX.Y.Z)"
+assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-sadosystems/rargo2}" --json isDraft,assets \
+    --jq 'select(.isDraft | not) | .assets[].name' 2>/dev/null) || refuse "$want has no published release"
+grep -qx rargo-x86_64-unknown-linux-musl <<<"$assets" || refuse "the release $want does not have the client (rargo-x86_64-unknown-linux-musl)"
 S=${RARGO_SERVICE:-/root/rargo-work/service}
 work=${RARGO_WORK:-/root/rargo-work}
-repo=$(cd "$(dirname "$0")/.." && pwd)
-want=${1:-origin/main}
 . "$work/env.sh"
 if [ ! -d "$S/src/.git" ]; then
     git clone -q "$(git -C "$repo" remote get-url origin)" "$S/src"
 fi
 git -C "$S/src" fetch -q origin
-commit=$(git -C "$S/src" rev-parse --short=7 "$want^{commit}")
+git -C "$S/src" fetch -q origin "refs/tags/$want:refs/tags/$want"
+commit=$(git -C "$S/src" rev-parse --short=7 "refs/tags/$want^{commit}")
+[ "$(git -C "$S/src" show "$commit:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)" = "${want#v}" ] || refuse "Cargo.toml at $want is not at ${want#v}"
 git -C "$S/src" checkout -q --detach "$commit"
 [ -z "$(git -C "$S/src" status --porcelain)" ] || { echo "the checkout is not clean" >&2; exit 1; }
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$S/src/Cargo.toml" | head -n 1)
