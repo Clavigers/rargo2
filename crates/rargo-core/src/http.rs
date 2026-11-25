@@ -1,21 +1,24 @@
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const PENDING_FOR: Duration = Duration::from_secs(600);
+const PENDING_FOR_MS: u64 = 600_000;
 const MAX_PENDING: usize = 1000;
 const MAX_TRIES: u32 = 5;
+const DEVICE_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const _: () = assert!(MAX_PENDING > 0);
 const _: () = assert!(MAX_TRIES > 0);
+const _: () = assert!(!DEVICE_ALPHABET.is_empty() && !CODE_ALPHABET.is_empty());
 
 struct Pending {
     code: String,
-    made: Instant,
+    made: u64,
     tries: u32,
     granted: Option<(String, String)>,
     denied: bool,
@@ -23,102 +26,222 @@ struct Pending {
 }
 
 #[derive(Default)]
-struct PendingState(BTreeMap<String, Pending>);
+struct AuthState {
+    pending: BTreeMap<String, Pending>,
+}
 
-impl PendingState {
-    fn begin(&mut self, device: String, code: String, now: Instant) -> bool {
-        if self.0.values().any(|p| p.code == code) || self.0.contains_key(&device) {
+impl AuthState {
+    fn sweep(&mut self, now: u64) {
+        self.pending.retain(|_, p| now.saturating_sub(p.made) < PENDING_FOR_MS);
+    }
+
+    fn begin(&mut self, device: String, code: String, now: u64) -> bool {
+        if device.is_empty() || code.is_empty() || self.pending.values().any(|p| p.code == code) || self.pending.contains_key(&device) {
             return false;
         }
-        self.0.insert(device, Pending { code, made: now, tries: 0, granted: None, denied: false, state: None });
+        self.pending.insert(device, Pending { code, made: now, tries: 0, granted: None, denied: false, state: None });
         true
     }
 
-    fn poll(&mut self, device: &str, now: Instant) -> serde_json::Value {
-        let Some(pending) = self.0.get(device) else {
+    fn poll(&mut self, device: &str, now: u64) -> serde_json::Value {
+        let Some(pending) = self.pending.get(device) else {
             return serde_json::json!({ "status": "expired" });
         };
-        let status = if now.saturating_duration_since(pending.made) >= PENDING_FOR {
-            "expired"
-        } else if pending.denied {
-            "denied"
-        } else if pending.granted.is_some() {
-            let (token, user) = self.0.remove(device).and_then(|p| p.granted).unwrap();
+        if now.saturating_sub(pending.made) >= PENDING_FOR_MS {
+            self.pending.remove(device);
+            return serde_json::json!({ "status": "expired" });
+        }
+        if pending.denied {
+            self.pending.remove(device);
+            return serde_json::json!({ "status": "denied" });
+        }
+        if pending.granted.is_some() {
+            let (token, user) = self.pending.remove(device).and_then(|p| p.granted).expect("a granted sign-in holds its token");
             return serde_json::json!({ "status": "approved", "token": token, "user": user });
-        } else {
-            return serde_json::json!({ "status": "pending" });
-        };
-        self.0.remove(device);
-        serde_json::json!({ "status": status })
+        }
+        serde_json::json!({ "status": "pending" })
     }
 
-    fn authorize(&mut self, code: &str, now: Instant) -> Result<&mut Pending> {
-        let found = self.0.values_mut().find(|p| p.code == code && now.saturating_duration_since(p.made) < PENDING_FOR);
+    fn authorize(&mut self, code: &str, now: u64) -> Result<&mut Pending> {
+        let found = self.pending.values_mut().find(|p| p.code == code && now.saturating_sub(p.made) < PENDING_FOR_MS);
         let pending = found.context("no terminal is waiting with this code (it is good for ten minutes): run `rargo auth` again")?;
         if pending.granted.is_some() {
-            bail!("this code has been confirmed already");
+            anyhow::bail!("this code has been confirmed already");
         }
         Ok(pending)
     }
 
-    fn invite_attempt(&mut self, code: &str, now: Instant) -> Result<()> {
+    fn invite_attempt(&mut self, code: &str, now: u64) -> Result<()> {
         let pending = self.authorize(code, now)?;
         if !pending.denied {
             pending.tries += 1;
             pending.denied = pending.tries > MAX_TRIES;
         }
         if pending.denied {
-            bail!("too many wrong invitations for this code: run `rargo auth` again");
+            anyhow::bail!("too many wrong invitations for this code: run `rargo auth` again");
         }
         Ok(())
     }
 
-    #[cfg(test)]
+    fn grant(&mut self, code: &str, token: String, user: String) -> bool {
+        match self.pending.values_mut().find(|p| p.code == code) {
+            Some(p) if !p.denied && p.granted.is_none() => {
+                p.granted = Some((token, user));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn take_github(&mut self, state: &str, now: u64) -> Option<String> {
+        self.pending.values().find(|p| p.state.as_deref() == Some(state) && now.saturating_sub(p.made) < PENDING_FOR_MS).map(|p| p.code.clone())
+    }
+
+    fn grant_github(&mut self, state: &str, token: String, user: String) -> Option<String> {
+        match self.pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
+            Some(p) if !p.denied && p.granted.is_none() => {
+                let code = p.code.clone();
+                p.granted = Some((token, user));
+                p.state = None;
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+
     fn invariants(&self) -> bool {
-        self.0.len() <= MAX_PENDING
-            && self.0.values().all(|p| p.tries <= MAX_TRIES + 1 && !(p.denied && p.granted.is_some()))
-            && self.0.values().map(|p| &p.code).collect::<std::collections::BTreeSet<_>>().len() == self.0.len()
+        self.pending.len() <= MAX_PENDING
+            && self.pending.values().all(|p| {
+                !p.code.is_empty()
+                    && p.tries <= MAX_TRIES + 1
+                    && !(p.denied && p.granted.is_some())
+                    && p.granted.as_ref().is_none_or(|(token, user)| !token.is_empty() && !user.is_empty())
+            })
+            && self.pending.values().map(|p| p.code.as_str()).collect::<std::collections::BTreeSet<_>>().len() == self.pending.len()
     }
 }
 
-struct GithubExchange<'a> {
-    fields: [(&'static str, &'a str); 4],
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GithubIn {
+    client_id: String,
+    client_secret: String,
+    url: String,
+    authorize: String,
+    api: String,
 }
 
-impl<'a> GithubExchange<'a> {
-    fn new(github: &'a tokens::Github, code: &'a str, callback: &'a str) -> Self {
-        Self { fields: [
-            ("client_id", github.client_id.as_str()),
-            ("client_secret", github.client_secret.as_str()),
-            ("code", code),
-            ("redirect_uri", callback),
-        ] }
-    }
-
-    fn identified(answer: &serde_json::Value) -> Result<&str> {
-        if let Some(access) = answer.get("access_token").and_then(serde_json::Value::as_str) {
-            return Ok(access);
-        }
-        bail!("GitHub did not confirm the sign-in ({})", answer.get("error_description").and_then(serde_json::Value::as_str).unwrap_or("no reason given"))
-    }
-
-    fn login(answer: &serde_json::Value) -> Result<&str> {
-        let login = answer.get("login").and_then(serde_json::Value::as_str).context("GitHub did not say who signed in")?;
-        if !tokens::valid_login(login) {
-            bail!("GitHub named an account this server cannot use");
-        }
-        Ok(login)
-    }
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Issued {
+    id: String,
+    user: String,
+    token: String,
 }
 
-pub struct Http {
-    keys: Arc<Keys>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllowedIn {
+    login: String,
+    admin: bool,
+}
+
+struct Cfg {
     public: Option<String>,
     port: u16,
-    state: Option<std::path::PathBuf>,
-    pending: parking_lot::Mutex<PendingState>,
+    has_tokens: bool,
 }
 
+enum ReadItem {
+    Chunk(Vec<u8>),
+    Ended,
+    Socket(ErrorKind, String),
+}
+
+#[derive(Debug)]
+enum Intake {
+    More,
+    Silent,
+    Reply(Outcome),
+    Ready(Request),
+}
+
+#[derive(Clone, Debug)]
+enum Outcome {
+    Redirect(String),
+    Body { status: u16, kind: &'static str, body: String },
+}
+
+#[derive(Debug)]
+enum Effect {
+    Random { n: usize, alphabet: &'static [u8] },
+    LoadGithub,
+    Post { url: String, accept: &'static str, fields: Vec<(&'static str, String)>, timeout_secs: u64 },
+    Get { url: String, accept: &'static str, user_agent: &'static str, bearer: String, timeout_secs: u64 },
+    Redeem { invite: String, name: Option<String> },
+    Create { login: String, admin: bool },
+    Revoke { id: String },
+    RevokeSelf { token: String },
+    Holder { token: String },
+    Allowed { login: String },
+}
+
+enum Event {
+    Request(Request),
+    Drawn(Result<String, String>),
+    Github(Option<GithubIn>),
+    Body(Result<String, String>),
+    Redeemed(Result<Issued, String>),
+    Created(Result<Issued, String>),
+    Revoked,
+    RevokedSelf(bool),
+    Holder(Option<String>),
+    Allowed(Option<AllowedIn>),
+}
+
+enum NeedGh {
+    Discovery { host: String },
+    Page { code: String },
+    Redirect { code: String },
+    Callback { state: String, code: String },
+}
+
+enum DrawNext {
+    Device,
+    Code { device: String },
+    Oauth { code: String, gh: GithubIn },
+}
+
+enum Wait {
+    Github(NeedGh),
+    Draw(DrawNext),
+    Exchange { terminal: String, oauth_state: String, gh: GithubIn },
+    User { terminal: String, oauth_state: String },
+    Allow { terminal: String, oauth_state: String, login: String },
+    Create { terminal: String, oauth_state: String },
+    Redeem { code: String, shown: String },
+    RevokeStop { page_code: String, github: bool },
+    RevokeSelf,
+    Holder,
+    AuthPage { code: String, error: String },
+}
+
+#[derive(Default)]
+struct Phase {
+    wait: Option<Wait>,
+}
+
+impl Phase {
+    fn invariants(&self) -> bool {
+        match &self.wait {
+            Some(Wait::Draw(DrawNext::Code { device })) => !device.is_empty(),
+            Some(Wait::Redeem { code, .. }) => !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+            Some(Wait::Exchange { terminal, oauth_state, .. } | Wait::User { terminal, oauth_state } | Wait::Allow { terminal, oauth_state, .. } | Wait::Create { terminal, oauth_state }) => {
+                !terminal.is_empty() && !oauth_state.is_empty()
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug)]
 struct Request {
     method: String,
     path: String,
@@ -128,45 +251,69 @@ struct Request {
     json: bool,
 }
 
-enum Endpoint<'a> {
-    Discovery(&'a str),
+enum Goal {
+    Discovery(String),
     Start,
     Poll(String),
     Revoke(Option<String>),
     Who(Option<String>),
-    Page(&'a str),
-    Github(&'a str),
-    Callback { state: &'a str, code: &'a str },
+    Page(String),
+    Github(String),
+    Callback { state: String, code: String },
     Approve { code: String, invite: String, name: String },
     Missing,
 }
 
 impl Request {
-    fn endpoint(&self) -> Endpoint<'_> {
-        let query = |key: &str| self.query.get(key).map(String::as_str).unwrap_or("");
+    fn goal(&self) -> Goal {
+        let query = |key: &str| self.query.get(key).map(String::as_str).unwrap_or("").to_string();
         let json_field = |key: &str| {
-            serde_json::from_slice::<serde_json::Value>(&self.body).ok()
-                .and_then(|v| v.get(key)?.as_str().map(String::from))
+            serde_json::from_slice::<serde_json::Value>(&self.body).ok().and_then(|v| v.get(key)?.as_str().map(String::from))
         };
         match (self.method.as_str(), self.path.as_str()) {
-            ("GET" | "HEAD", "/.well-known/rargo.json") => Endpoint::Discovery(&self.host),
-            ("POST", "/auth/start") => Endpoint::Start,
+            ("GET" | "HEAD", "/.well-known/rargo.json") => Goal::Discovery(self.host.clone()),
+            ("POST", "/auth/start") => Goal::Start,
             ("POST", "/auth/poll") => {
                 let device = if self.json { json_field("device") } else { form(&String::from_utf8_lossy(&self.body)).remove("device") };
-                Endpoint::Poll(device.unwrap_or_default())
+                Goal::Poll(device.unwrap_or_default())
             }
-            ("POST", "/auth/revoke") => Endpoint::Revoke(json_field("token")),
-            ("POST", "/auth/whoami") => Endpoint::Who(json_field("token")),
-            ("GET", "/auth") => Endpoint::Page(query("code")),
-            ("GET", "/auth/github") => Endpoint::Github(query("code")),
-            ("GET", "/auth/github/callback") => Endpoint::Callback { state: query("state"), code: query("code") },
+            ("POST", "/auth/revoke") => Goal::Revoke(json_field("token")),
+            ("POST", "/auth/whoami") => Goal::Who(json_field("token")),
+            ("GET", "/auth") => Goal::Page(query("code")),
+            ("GET", "/auth/github") => Goal::Github(query("code")),
+            ("GET", "/auth/github/callback") => Goal::Callback { state: query("state"), code: query("code") },
             ("POST", "/auth/approve") => {
                 let fields = form(&String::from_utf8_lossy(&self.body));
                 let field = |key: &str| fields.get(key).map_or("", |v| v.trim()).to_owned();
-                Endpoint::Approve { code: field("code"), invite: field("invite"), name: field("name") }
+                Goal::Approve { code: field("code"), invite: field("invite"), name: field("name") }
             }
-            _ => Endpoint::Missing,
+            _ => Goal::Missing,
         }
+    }
+}
+
+struct GithubExchange<'a> {
+    fields: [(&'static str, &'a str); 4],
+}
+
+impl<'a> GithubExchange<'a> {
+    fn new(github: &'a GithubIn, code: &'a str, callback: &'a str) -> Self {
+        Self { fields: [("client_id", github.client_id.as_str()), ("client_secret", github.client_secret.as_str()), ("code", code), ("redirect_uri", callback)] }
+    }
+
+    fn identified(answer: &serde_json::Value) -> Result<&str> {
+        if let Some(access) = answer.get("access_token").and_then(serde_json::Value::as_str) {
+            return Ok(access);
+        }
+        anyhow::bail!("GitHub did not confirm the sign-in ({})", answer.get("error_description").and_then(serde_json::Value::as_str).unwrap_or("no reason given"))
+    }
+
+    fn login(answer: &serde_json::Value) -> Result<&str> {
+        let login = answer.get("login").and_then(serde_json::Value::as_str).context("GitHub did not say who signed in")?;
+        if !tokens::valid_login(login) {
+            anyhow::bail!("GitHub named an account this server cannot use");
+        }
+        Ok(login)
     }
 }
 
@@ -194,13 +341,10 @@ fn percent_decode(s: &str) -> String {
 }
 
 fn form(s: &str) -> HashMap<String, String> {
-    s.split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (percent_decode(k), percent_decode(v))
-        })
-        .collect()
+    s.split('&').filter(|p| !p.is_empty()).map(|p| {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        (percent_decode(k), percent_decode(v))
+    }).collect()
 }
 
 fn escape(s: &str) -> String {
@@ -230,242 +374,6 @@ fn page(title: &str, body: &str) -> String {
          button{{font-size:1rem;padding:.4rem 1rem}}.err{{color:#a00}}</style>\
          <link rel=\"stylesheet\" href=\"/index.css\"></head><body><header><h1 class=\"title\">{title}</h1></header>{body}</body></html>"
     )
-}
-
-impl Http {
-    pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
-        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(PendingState::default()) }
-    }
-
-    pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
-        self.state = Some(state);
-        self
-    }
-
-    fn github(&self) -> Option<tokens::Github> {
-        tokens::Github::load(self.state.as_deref()?)
-    }
-
-    fn server_for(&self, host: &str) -> String {
-        match &self.public {
-            Some(p) => p.clone(),
-            None => {
-                let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
-                format!("{name}:{}", self.port)
-            }
-        }
-    }
-
-    pub fn serve(&self, mut stream: TcpStream) -> Result<()> {
-        stream.set_nonblocking(false)?;
-        stream.set_write_timeout(Some(Duration::from_secs(20)))?;
-        let req = match read_request(&mut stream) {
-            Ok(req) => req,
-            Err(e) => {
-                if e.downcast_ref::<std::io::Error>().is_some_and(|e| matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)) {
-                    return Ok(());
-                }
-                return respond(&mut stream, 400, "text/plain", format!("bad request: {e}\n").as_bytes());
-            }
-        };
-        let (status, kind, body) = self.answer(req.endpoint(), Instant::now());
-        respond(&mut stream, status, kind, body.as_bytes())
-    }
-
-    fn answer(&self, endpoint: Endpoint<'_>, now: Instant) -> (u16, &'static str, String) {
-        let json = |v: serde_json::Value| (200, "application/json", v.to_string());
-        let render_auth = |code: &str, error: Option<&str>| auth_page(code, error, self.keys.tokens().is_some(), self.github().is_some());
-        match endpoint {
-            Endpoint::Discovery(host) => json(serde_json::json!({
-                "server": self.server_for(host),
-                "protocol": crate::proto::PROTO_VERSION,
-                "version": env!("CARGO_PKG_VERSION"),
-                "auth": self.keys.tokens().is_some(),
-                "github": self.github().is_some(),
-            })),
-            Endpoint::Start => match self.start_at(now) {
-                Ok((device, code)) => json(serde_json::json!({
-                    "device": device,
-                    "code": shown(&code),
-                    "path": format!("/auth?code={}", shown(&code)),
-                    "interval": 2,
-                    "expires_in": PENDING_FOR.as_secs(),
-                })),
-                Err(e) => (503, "application/json", serde_json::json!({ "error": format!("{e:#}") }).to_string()),
-            },
-            Endpoint::Poll(device) => json(self.poll_at(&device, now)),
-            Endpoint::Revoke(token) => {
-                let done = match (self.keys.tokens(), token) {
-                    (Some(store), Some(t)) => store.revoke_self(&t).unwrap_or(false),
-                    _ => false,
-                };
-                if done {
-                    eprintln!("rargod: a token was revoked by its holder (`rargo auth remove`)");
-                }
-                json(serde_json::json!({ "revoked": done }))
-            }
-            Endpoint::Who(token) => {
-                let user = match (self.keys.tokens(), token) {
-                    (Some(store), Some(t)) => store.holder(&t),
-                    _ => None,
-                };
-                json(serde_json::json!({ "user": user }))
-            }
-            Endpoint::Page(code) => (200, "text/html; charset=utf-8", render_auth(code, None)),
-            Endpoint::Github(code) => match self.to_github(code, now) {
-                Ok(location) => (302, "location", location),
-                Err(e) => (403, "text/html; charset=utf-8", render_auth(code, Some(&format!("{e:#}")))),
-            },
-            Endpoint::Callback { state, code } => {
-                match self.from_github(state, code, now) {
-                    Ok((code, user)) => (
-                        200,
-                        "text/html; charset=utf-8",
-                        page(
-                            "Authenticated",
-                            &format!(
-                                "<p>The terminal showing <code class=\"code\">{}</code> now holds a token for the GitHub account <b>{}</b>.</p>\
-                                 <p>You can close this page and go back to it: <code>rargo build</code> will work.</p>",
-                                escape(&shown(&code)),
-                                escape(&user)
-                            ),
-                        ),
-                    ),
-                    Err(e) => (403, "text/html; charset=utf-8", page("rargo auth", &format!("<p class=\"err\">{}</p><p>Run <code>rargo auth</code> again to start over.</p>", escape(&format!("{e:#}"))))),
-                }
-            }
-            Endpoint::Approve { code, invite, name } => {
-                match self.approve_at(&code, &invite, (!name.is_empty()).then_some(name.as_str()), now) {
-                    Ok(user) => (
-                        200,
-                        "text/html; charset=utf-8",
-                        page(
-                            "Authenticated",
-                            &format!(
-                                "<p>The terminal showing <code class=\"code\">{}</code> now holds a token for <b>{}</b>.</p>\
-                                 <p>You can close this page and go back to it: <code>rargo build</code> will work.</p>",
-                                escape(&shown(&code)),
-                                escape(&user)
-                            ),
-                        ),
-                    ),
-                    Err(e) => (403, "text/html; charset=utf-8", render_auth(&code, Some(&format!("{e:#}")))),
-                }
-            }
-            Endpoint::Missing => (404, "text/plain", "this is a rargo build server; see https://rargo.rs\n".to_string()),
-        }
-    }
-
-    fn start_at(&self, now: Instant) -> Result<(String, String)> {
-        if self.keys.tokens().is_none() {
-            bail!("this server does not issue tokens");
-        }
-        let mut pending = self.pending.lock();
-        pending.0.retain(|_, p| now.saturating_duration_since(p.made) < PENDING_FOR);
-        if pending.0.len() >= MAX_PENDING {
-            bail!("too many requests are waiting to be confirmed; try again in a few minutes");
-        }
-        loop {
-            let device = tokens::random_text(40, b"abcdefghijklmnopqrstuvwxyz0123456789")?;
-            let code = tokens::random_text(8, b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789")?;
-            if pending.begin(device.clone(), code.clone(), now) {
-                return Ok((device, code));
-            }
-        }
-    }
-
-    fn approve_at(&self, code: &str, invite: &str, name: Option<&str>, now: Instant) -> Result<String> {
-        let store = self.keys.tokens().context("this server does not issue tokens")?;
-        let code = normal_code(code);
-        self.pending.lock().invite_attempt(&code, now)?;
-        let (token, secret) = store.redeem(invite, name)?;
-        let mut pending = self.pending.lock();
-        match pending.0.values_mut().find(|p| p.code == code) {
-            Some(p) if !p.denied && p.granted.is_none() => {
-                p.granted = Some((tokens::token_text(&token, &secret), token.user.clone()));
-            }
-            _ => {
-                let _ = store.revoke(&token.id);
-                bail!("the terminal stopped waiting: run `rargo auth` again");
-            }
-        }
-        eprintln!("rargod: a token for {} was issued through `rargo auth`", token.user);
-        Ok(token.user)
-    }
-
-    fn to_github(&self, code: &str, now: Instant) -> Result<String> {
-        let gh = self.github().context("this server does not sign people in with GitHub")?;
-        let code = normal_code(code);
-        let state = tokens::random_text(32, b"abcdefghijklmnopqrstuvwxyz0123456789")?;
-        let mut pending = self.pending.lock();
-        let p = pending.authorize(&code, now)?;
-        p.state = Some(state.clone());
-        Ok(format!(
-            "{}/login/oauth/authorize?client_id={}&redirect_uri={}%2Fauth%2Fgithub%2Fcallback&state={state}&allow_signup=false",
-            github_url(),
-            gh.client_id,
-            gh.url.replace(':', "%3A").replace('/', "%2F"),
-        ))
-    }
-
-    fn from_github(&self, state: &str, gh_code: &str, now: Instant) -> Result<(String, String)> {
-        let gh = self.github().context("this server does not sign people in with GitHub")?;
-        let store = self.keys.tokens().context("this server does not issue tokens")?;
-        if state.is_empty() || gh_code.is_empty() {
-            bail!("GitHub sent the browser back without a sign-in (it was cancelled there)");
-        }
-        let code = {
-            let pending = self.pending.lock();
-            let Some(p) = pending.0.values().find(|p| p.state.as_deref() == Some(state) && now.saturating_duration_since(p.made) < PENDING_FOR) else {
-                bail!("this sign-in belongs to no terminal that is still waiting");
-            };
-            p.code.clone()
-        };
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
-        let callback = format!("{}/auth/github/callback", gh.url);
-        let exchange = GithubExchange::new(&gh, gh_code, &callback);
-        let answer: serde_json::Value = agent
-            .post(&format!("{}/login/oauth/access_token", github_url()))
-            .set("Accept", "application/json")
-            .send_form(&exchange.fields)
-            .map_err(|e| anyhow::anyhow!("asking GitHub: {e}"))
-            .and_then(|r| r.into_string().context("reading GitHub's answer"))
-            .and_then(|t| serde_json::from_str(&t).context("GitHub's answer"))?;
-        let access = GithubExchange::identified(&answer)?;
-        let who: serde_json::Value = agent
-            .get(&format!("{}/user", github_api()))
-            .set("Authorization", &format!("Bearer {access}"))
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", "rargod")
-            .call()
-            .map_err(|e| anyhow::anyhow!("asking GitHub who signed in: {e}"))
-            .and_then(|r| r.into_string().context("reading GitHub's answer"))
-            .and_then(|t| serde_json::from_str(&t).context("GitHub's answer"))?;
-        let login = GithubExchange::login(&who)?;
-        let Some(allowed) = store.allowed(login) else {
-            bail!(
-                "the GitHub account {login} is not on this server's allow list. Its administrator adds it with: rargod token allow {login}"
-            );
-        };
-        let (token, secret) = store.create(&allowed.login, allowed.admin, None, "github")?;
-        let mut pending = self.pending.lock();
-        match pending.0.values_mut().find(|p| p.state.as_deref() == Some(state)) {
-            Some(p) if !p.denied && p.granted.is_none() => {
-                p.granted = Some((tokens::token_text(&token, &secret), token.user.clone()));
-                p.state = None;
-            }
-            _ => {
-                let _ = store.revoke(&token.id);
-                bail!("the terminal stopped waiting: run `rargo auth` again");
-            }
-        }
-        eprintln!("rargod: a token for the GitHub account {} was issued through `rargo auth`", token.user);
-        Ok((code, token.user))
-    }
-
-    fn poll_at(&self, device: &str, now: Instant) -> serde_json::Value {
-        self.pending.lock().poll(device, now)
-    }
 }
 
 fn auth_page(code: &str, error: Option<&str>, auth: bool, github: bool) -> String {
@@ -504,6 +412,485 @@ fn auth_page(code: &str, error: Option<&str>, auth: bool, github: bool) -> Strin
     )
 }
 
+fn server_for_host(cfg: &Cfg, host: &str) -> String {
+    match &cfg.public {
+        Some(p) => p.clone(),
+        None => {
+            let name = host.rsplit_once(':').map_or(host, |(h, _)| h);
+            format!("{name}:{}", cfg.port)
+        }
+    }
+}
+
+fn json_ok(v: serde_json::Value) -> Outcome {
+    Outcome::Body { status: 200, kind: "application/json", body: v.to_string() }
+}
+
+fn html(status: u16, body: String) -> Outcome {
+    Outcome::Body { status, kind: "text/html; charset=utf-8", body }
+}
+
+fn bad_request(msg: impl std::fmt::Display) -> Outcome {
+    Outcome::Body { status: 400, kind: "text/plain", body: format!("bad request: {msg}\n") }
+}
+
+fn service_error(msg: &str) -> Outcome {
+    Outcome::Body { status: 503, kind: "application/json", body: serde_json::json!({ "error": msg }).to_string() }
+}
+
+fn callback_error(msg: &str) -> Outcome {
+    html(403, page("rargo auth", &format!("<p class=\"err\">{}</p><p>Run <code>rargo auth</code> again to start over.</p>", escape(msg))))
+}
+
+fn authenticated(code: &str, user: &str, github: bool) -> Outcome {
+    let who = if github {
+        format!("a token for the GitHub account <b>{}</b>", escape(user))
+    } else {
+        format!("a token for <b>{}</b>", escape(user))
+    };
+    html(
+        200,
+        page(
+            "Authenticated",
+            &format!(
+                "<p>The terminal showing <code class=\"code\">{}</code> now holds {who}.</p>\
+                 <p>You can close this page and go back to it: <code>rargo build</code> will work.</p>",
+                escape(&shown(code))
+            ),
+        ),
+    )
+}
+
+fn issued_note(user: &str, github: bool) -> String {
+    if github {
+        format!("rargod: a token for the GitHub account {user} was issued through `rargo auth`")
+    } else {
+        format!("rargod: a token for {user} was issued through `rargo auth`")
+    }
+}
+
+fn authorize_url(gh: &GithubIn, state: &str) -> String {
+    format!(
+        "{}/login/oauth/authorize?client_id={}&redirect_uri={}%2Fauth%2Fgithub%2Fcallback&state={state}&allow_signup=false",
+        gh.authorize,
+        gh.client_id,
+        gh.url.replace(':', "%3A").replace('/', "%2F"),
+    )
+}
+
+fn parse_github(body: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(body).map_err(|e| format!("GitHub's answer: {e}"))
+}
+
+fn ask(phase: &mut Phase, wait: Wait, effect: Effect) -> Act {
+    phase.wait = Some(wait);
+    Act::Ask(effect)
+}
+
+fn done(phase: &mut Phase, outcome: Outcome, notes: Vec<String>) -> Act {
+    phase.wait = None;
+    Act::Done { outcome, notes }
+}
+
+enum Act {
+    Ask(Effect),
+    Done { outcome: Outcome, notes: Vec<String> },
+}
+
+fn intake(buf: &mut Vec<u8>, item: ReadItem) -> Intake {
+    match item {
+        ReadItem::Ended => Intake::Silent,
+        ReadItem::Socket(kind, _) if matches!(kind, ErrorKind::TimedOut | ErrorKind::WouldBlock) => Intake::Silent,
+        ReadItem::Socket(_, msg) => Intake::Reply(bad_request(msg)),
+        ReadItem::Chunk(bytes) => {
+            buf.extend_from_slice(&bytes);
+            match parse_request(buf) {
+                Ok(None) => Intake::More,
+                Ok(Some(req)) => Intake::Ready(req),
+                Err(e) => Intake::Reply(bad_request(e)),
+            }
+        }
+    }
+}
+
+/// One step of the sign-in handler. `now` is milliseconds supplied by the shell.
+/// Random draws, the GitHub application and token-store results arrive as events.
+/// GitHub calls and token-store writes leave as effects.
+fn handle(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: u64) -> Act {
+    let act = step(state, phase, event, cfg, now);
+    assert!(state.invariants() && phase.invariants());
+    act
+}
+
+fn step(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: u64) -> Act {
+    let wait = phase.wait.take();
+    match (wait, event) {
+        (None, Event::Request(req)) => begin_request(state, phase, req, cfg, now),
+        (Some(Wait::Github(need)), Event::Github(app)) => match need {
+            NeedGh::Discovery { host } => done(phase, discovery(cfg, &host, app.is_some()), Vec::new()),
+            NeedGh::Page { code } => done(phase, html(200, auth_page(&code, None, cfg.has_tokens, app.is_some())), Vec::new()),
+            NeedGh::Redirect { code } => match app {
+                None => done(phase, html(403, auth_page(&code, Some("this server does not sign people in with GitHub"), cfg.has_tokens, false)), Vec::new()),
+                Some(gh) => ask(phase, Wait::Draw(DrawNext::Oauth { code, gh }), Effect::Random { n: 32, alphabet: DEVICE_ALPHABET }),
+            },
+            NeedGh::Callback { state: oauth, code } => callback_open(state, phase, cfg, now, oauth, code, app),
+        },
+        (Some(Wait::Draw(next)), Event::Drawn(drawn)) => match (next, drawn) {
+            (DrawNext::Device, Err(e)) | (DrawNext::Code { .. }, Err(e)) => done(phase, service_error(&e), Vec::new()),
+            (DrawNext::Device, Ok(device)) => ask(phase, Wait::Draw(DrawNext::Code { device }), Effect::Random { n: 8, alphabet: CODE_ALPHABET }),
+            (DrawNext::Code { device }, Ok(code)) => {
+                if state.begin(device.clone(), code.clone(), now) {
+                    done(phase, started(&device, &code), Vec::new())
+                } else {
+                    ask(phase, Wait::Draw(DrawNext::Device), Effect::Random { n: 40, alphabet: DEVICE_ALPHABET })
+                }
+            }
+            (DrawNext::Oauth { code, .. }, Err(e)) => done(phase, html(403, auth_page(&code, Some(&e), cfg.has_tokens, true)), Vec::new()),
+            (DrawNext::Oauth { code, gh }, Ok(oauth)) => match state.authorize(&normal_code(&code), now) {
+                Err(e) => done(phase, html(403, auth_page(&code, Some(&format!("{e:#}")), cfg.has_tokens, true)), Vec::new()),
+                Ok(p) => {
+                    p.state = Some(oauth.clone());
+                    done(phase, Outcome::Redirect(authorize_url(&gh, &oauth)), Vec::new())
+                }
+            },
+        },
+        (Some(Wait::Exchange { terminal, oauth_state, gh }), Event::Body(body)) => match body.and_then(|t| parse_github(&t)) {
+            Err(e) => done(phase, callback_error(&e), Vec::new()),
+            Ok(answer) => match GithubExchange::identified(&answer) {
+                Err(e) => done(phase, callback_error(&format!("{e:#}")), Vec::new()),
+                Ok(access) => ask(
+                    phase,
+                    Wait::User { terminal, oauth_state },
+                    Effect::Get { url: format!("{}/user", gh.api), accept: "application/vnd.github+json", user_agent: "rargod", bearer: access.to_string(), timeout_secs: 15 },
+                ),
+            },
+        },
+        (Some(Wait::User { terminal, oauth_state }), Event::Body(body)) => match body.and_then(|t| parse_github(&t)) {
+            Err(e) => done(phase, callback_error(&e), Vec::new()),
+            Ok(answer) => match GithubExchange::login(&answer) {
+                Err(e) => done(phase, callback_error(&format!("{e:#}")), Vec::new()),
+                Ok(login) => ask(phase, Wait::Allow { terminal, oauth_state, login: login.to_string() }, Effect::Allowed { login: login.to_string() }),
+            },
+        },
+        (Some(Wait::Allow { terminal, oauth_state, login }), Event::Allowed(allowed)) => match allowed {
+            None => done(phase, callback_error(&format!("the GitHub account {login} is not on this server's allow list. Its administrator adds it with: rargod token allow {login}")), Vec::new()),
+            Some(allowed) => ask(phase, Wait::Create { terminal, oauth_state }, Effect::Create { login: allowed.login, admin: allowed.admin }),
+        },
+        (Some(Wait::Create { terminal, oauth_state }), Event::Created(created)) => match created {
+            Err(e) => done(phase, callback_error(&e), Vec::new()),
+            Ok(issued) => match state.grant_github(&oauth_state, issued.token, issued.user.clone()) {
+                Some(code) => done(phase, authenticated(&code, &issued.user, true), vec![issued_note(&issued.user, true)]),
+                None => ask(phase, Wait::RevokeStop { page_code: terminal, github: true }, Effect::Revoke { id: issued.id }),
+            },
+        },
+        (Some(Wait::Redeem { code, shown }), Event::Redeemed(redeemed)) => match redeemed {
+            Err(e) => ask(phase, Wait::AuthPage { code: shown, error: e }, Effect::LoadGithub),
+            Ok(issued) => {
+                if state.grant(&code, issued.token, issued.user.clone()) {
+                    done(phase, authenticated(&shown, &issued.user, false), vec![issued_note(&issued.user, false)])
+                } else {
+                    ask(phase, Wait::RevokeStop { page_code: shown, github: false }, Effect::Revoke { id: issued.id })
+                }
+            }
+        },
+        (Some(Wait::RevokeStop { page_code, github }), Event::Revoked) => {
+            let msg = "the terminal stopped waiting: run `rargo auth` again";
+            if github {
+                done(phase, callback_error(msg), Vec::new())
+            } else {
+                ask(phase, Wait::AuthPage { code: page_code, error: msg.to_string() }, Effect::LoadGithub)
+            }
+        }
+        (Some(Wait::AuthPage { code, error }), Event::Github(app)) => done(phase, html(403, auth_page(&code, Some(&error), cfg.has_tokens, app.is_some())), Vec::new()),
+        (Some(Wait::RevokeSelf), Event::RevokedSelf(done_it)) => {
+            let notes = done_it.then(|| "rargod: a token was revoked by its holder (`rargo auth remove`)".to_string()).into_iter().collect();
+            done(phase, json_ok(serde_json::json!({ "revoked": done_it })), notes)
+        }
+        (Some(Wait::Holder), Event::Holder(user)) => done(phase, json_ok(serde_json::json!({ "user": user })), Vec::new()),
+        _ => done(phase, Outcome::Body { status: 500, kind: "text/plain", body: "the handler was given an event it did not ask for\n".into() }, Vec::new()),
+    }
+}
+
+fn begin_request(state: &mut AuthState, phase: &mut Phase, req: Request, cfg: &Cfg, now: u64) -> Act {
+    match req.goal() {
+        Goal::Discovery(host) => ask(phase, Wait::Github(NeedGh::Discovery { host }), Effect::LoadGithub),
+        Goal::Start => start(state, phase, cfg, now),
+        Goal::Poll(device) => done(phase, json_ok(state.poll(&device, now)), Vec::new()),
+        Goal::Revoke(token) => match (cfg.has_tokens, token) {
+            (true, Some(token)) => ask(phase, Wait::RevokeSelf, Effect::RevokeSelf { token }),
+            _ => done(phase, json_ok(serde_json::json!({ "revoked": false })), Vec::new()),
+        },
+        Goal::Who(token) => match (cfg.has_tokens, token) {
+            (true, Some(token)) => ask(phase, Wait::Holder, Effect::Holder { token }),
+            _ => done(phase, json_ok(serde_json::json!({ "user": None::<String> })), Vec::new()),
+        },
+        Goal::Page(code) => ask(phase, Wait::Github(NeedGh::Page { code }), Effect::LoadGithub),
+        Goal::Github(code) => ask(phase, Wait::Github(NeedGh::Redirect { code }), Effect::LoadGithub),
+        Goal::Callback { state: oauth, code } => ask(phase, Wait::Github(NeedGh::Callback { state: oauth, code }), Effect::LoadGithub),
+        Goal::Approve { code, invite, name } => approve(state, phase, cfg, now, code, invite, name),
+        Goal::Missing => done(phase, Outcome::Body { status: 404, kind: "text/plain", body: "this is a rargo build server; see https://rargo.rs\n".into() }, Vec::new()),
+    }
+}
+
+fn discovery(cfg: &Cfg, host: &str, github: bool) -> Outcome {
+    json_ok(serde_json::json!({
+        "server": server_for_host(cfg, host),
+        "protocol": crate::proto::PROTO_VERSION,
+        "version": env!("CARGO_PKG_VERSION"),
+        "auth": cfg.has_tokens,
+        "github": github,
+    }))
+}
+
+fn started(device: &str, code: &str) -> Outcome {
+    json_ok(serde_json::json!({
+        "device": device,
+        "code": shown(code),
+        "path": format!("/auth?code={}", shown(code)),
+        "interval": 2,
+        "expires_in": PENDING_FOR_MS / 1000,
+    }))
+}
+
+fn start(state: &mut AuthState, phase: &mut Phase, cfg: &Cfg, now: u64) -> Act {
+    if !cfg.has_tokens {
+        return done(phase, service_error("this server does not issue tokens"), Vec::new());
+    }
+    state.sweep(now);
+    if state.pending.len() >= MAX_PENDING {
+        return done(phase, service_error("too many requests are waiting to be confirmed; try again in a few minutes"), Vec::new());
+    }
+    ask(phase, Wait::Draw(DrawNext::Device), Effect::Random { n: 40, alphabet: DEVICE_ALPHABET })
+}
+
+fn approve(state: &mut AuthState, phase: &mut Phase, cfg: &Cfg, now: u64, code: String, invite: String, name: String) -> Act {
+    if !cfg.has_tokens {
+        return done(phase, html(403, auth_page(&code, None, false, false)), Vec::new());
+    }
+    let normalized = normal_code(&code);
+    if let Err(e) = state.invite_attempt(&normalized, now) {
+        return ask(phase, Wait::AuthPage { code, error: format!("{e:#}") }, Effect::LoadGithub);
+    }
+    let name = (!name.is_empty()).then_some(name);
+    ask(phase, Wait::Redeem { code: normalized, shown: code }, Effect::Redeem { invite, name })
+}
+
+fn callback_open(state: &mut AuthState, phase: &mut Phase, cfg: &Cfg, now: u64, oauth: String, gh_code: String, app: Option<GithubIn>) -> Act {
+    let Some(gh) = app else {
+        return done(phase, callback_error("this server does not sign people in with GitHub"), Vec::new());
+    };
+    if !cfg.has_tokens {
+        return done(phase, callback_error("this server does not issue tokens"), Vec::new());
+    }
+    if oauth.is_empty() || gh_code.is_empty() {
+        return done(phase, callback_error("GitHub sent the browser back without a sign-in (it was cancelled there)"), Vec::new());
+    }
+    let Some(terminal) = state.take_github(&oauth, now) else {
+        return done(phase, callback_error("this sign-in belongs to no terminal that is still waiting"), Vec::new());
+    };
+    let callback = format!("{}/auth/github/callback", gh.url);
+    let exchange = GithubExchange::new(&gh, &gh_code, &callback);
+    let fields = exchange.fields.iter().map(|(k, v)| (*k, (*v).to_string())).collect();
+    ask(
+        phase,
+        Wait::Exchange { terminal, oauth_state: oauth, gh: gh.clone() },
+        Effect::Post { url: format!("{}/login/oauth/access_token", gh.authorize), accept: "application/json", fields, timeout_secs: 15 },
+    )
+}
+
+fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
+    let Some(head_end) = buf.windows(4).position(|part| part == b"\r\n\r\n").map(|i| i + 4) else {
+        if buf.len() > 16 << 10 {
+            anyhow::bail!("the request's head is too long");
+        }
+        return Ok(None);
+    };
+    if head_end > 16 << 10 {
+        anyhow::bail!("the request's head is too long");
+    }
+    let head = std::str::from_utf8(&buf[..head_end - 4]).context("invalid request header text")?;
+    let mut lines = head.split("\r\n");
+    let mut first = lines.next().unwrap_or("").split(' ');
+    let (Some(method), Some(target), Some("HTTP/1.0" | "HTTP/1.1"), None) = (first.next(), first.next(), first.next(), first.next()) else {
+        anyhow::bail!("malformed request line");
+    };
+    if method.is_empty() || !target.starts_with('/') {
+        anyhow::bail!("malformed request target");
+    }
+    let mut host = String::new();
+    let mut length = None;
+    let mut json = false;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else { anyhow::bail!("malformed request header") };
+        let v = v.trim();
+        match k.to_ascii_lowercase().as_str() {
+            "host" => host = v.to_string(),
+            "x-forwarded-host" => host = v.to_string(),
+            "content-length" if length.is_none() => length = Some(v.parse::<usize>().context("Content-Length")?),
+            "content-length" => anyhow::bail!("multiple Content-Length headers"),
+            "content-type" => json = v.starts_with("application/json"),
+            _ => {}
+        }
+    }
+    let length = length.unwrap_or(0);
+    if length > 64 << 10 {
+        anyhow::bail!("the request's body is too long");
+    }
+    let Some(body) = buf.get(head_end..head_end + length) else { return Ok(None) };
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    Ok(Some(Request { method: method.into(), path: path.into(), query: form(query), host, body: body.to_vec(), json }))
+}
+
+fn next_item(stream: &mut TcpStream, deadline: Instant) -> ReadItem {
+    let remain = deadline.saturating_duration_since(Instant::now());
+    if remain.is_zero() {
+        return ReadItem::Socket(ErrorKind::TimedOut, "timed out".into());
+    }
+    if let Err(e) = stream.set_read_timeout(Some(remain)) {
+        return ReadItem::Socket(e.kind(), e.to_string());
+    }
+    let mut chunk = [0u8; 2048];
+    match stream.read(&mut chunk) {
+        Ok(0) => ReadItem::Ended,
+        Ok(n) => ReadItem::Chunk(chunk[..n].to_vec()),
+        Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => ReadItem::Socket(e.kind(), e.to_string()),
+        Err(e) => ReadItem::Socket(e.kind(), e.to_string()),
+    }
+}
+
+fn write_outcome(stream: &mut TcpStream, outcome: &Outcome) -> Result<()> {
+    match outcome {
+        Outcome::Redirect(location) => {
+            let head = format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n");
+            stream.write_all(head.as_bytes())?;
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            Ok(())
+        }
+        Outcome::Body { status, kind, body } => {
+            let reason = match status {
+                200 => "OK",
+                400 => "Bad Request",
+                403 => "Forbidden",
+                404 => "Not Found",
+                _ => "Service Unavailable",
+            };
+            let head = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
+            stream.write_all(head.as_bytes())?;
+            stream.write_all(body.as_bytes())?;
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            Ok(())
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+pub struct Http {
+    keys: Arc<Keys>,
+    public: Option<String>,
+    port: u16,
+    state: Option<std::path::PathBuf>,
+    pending: parking_lot::Mutex<AuthState>,
+}
+
+impl Http {
+    pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
+        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(AuthState::default()) }
+    }
+
+    pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
+        self.state = Some(state);
+        self
+    }
+
+    fn view_cfg(&self) -> Cfg {
+        Cfg { public: self.public.clone(), port: self.port, has_tokens: self.keys.tokens().is_some() }
+    }
+
+    fn github(&self) -> Option<tokens::Github> {
+        tokens::Github::load(self.state.as_deref()?)
+    }
+
+    fn server_for(&self, host: &str) -> String {
+        server_for_host(&self.view_cfg(), host)
+    }
+
+    pub fn serve(&self, mut stream: TcpStream) -> Result<()> {
+        stream.set_nonblocking(false)?;
+        stream.set_write_timeout(Some(Duration::from_secs(20)))?;
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let req = loop {
+            match intake(&mut buf, next_item(&mut stream, deadline)) {
+                Intake::More => {}
+                Intake::Silent => return Ok(()),
+                Intake::Reply(outcome) => return write_outcome(&mut stream, &outcome),
+                Intake::Ready(req) => break req,
+            }
+        };
+        let now = now_ms();
+        let cfg = self.view_cfg();
+        let mut phase = Phase::default();
+        let mut event = Event::Request(req);
+        loop {
+            let act = {
+                let mut st = self.pending.lock();
+                let act = handle(&mut st, &mut phase, event, &cfg, now);
+                assert!(st.invariants() && phase.invariants());
+                act
+            };
+            match act {
+                Act::Done { outcome, notes } => {
+                    for note in notes {
+                        eprintln!("{note}");
+                    }
+                    return write_outcome(&mut stream, &outcome);
+                }
+                Act::Ask(effect) => event = self.perform(effect),
+            }
+        }
+    }
+
+    fn perform(&self, effect: Effect) -> Event {
+        match effect {
+            Effect::Random { n, alphabet } => Event::Drawn(tokens::random_text(n, alphabet).map_err(|e| format!("{e:#}"))),
+            Effect::LoadGithub => Event::Github(self.load_github()),
+            Effect::Post { url, accept, fields, timeout_secs } => Event::Body(post_form(&url, accept, &fields, timeout_secs)),
+            Effect::Get { url, accept, user_agent, bearer, timeout_secs } => Event::Body(get_bearer(&url, accept, user_agent, &bearer, timeout_secs)),
+            Effect::Redeem { invite, name } => Event::Redeemed(self.redeem(&invite, name.as_deref())),
+            Effect::Create { login, admin } => Event::Created(self.create_token(&login, admin)),
+            Effect::Revoke { id } => {
+                if let Some(store) = self.keys.tokens() {
+                    let _ = store.revoke(&id);
+                }
+                Event::Revoked
+            }
+            Effect::RevokeSelf { token } => Event::RevokedSelf(self.keys.tokens().and_then(|store| store.revoke_self(&token).ok()).unwrap_or(false)),
+            Effect::Holder { token } => Event::Holder(self.keys.tokens().and_then(|store| store.holder(&token))),
+            Effect::Allowed { login } => Event::Allowed(self.keys.tokens().and_then(|store| store.allowed(&login)).map(|a| AllowedIn { login: a.login, admin: a.admin })),
+        }
+    }
+
+    fn load_github(&self) -> Option<GithubIn> {
+        let g = self.github()?;
+        Some(GithubIn { client_id: g.client_id, client_secret: g.client_secret, url: g.url, authorize: github_url(), api: github_api() })
+    }
+
+    fn redeem(&self, invite: &str, name: Option<&str>) -> Result<Issued, String> {
+        let store = self.keys.tokens().context("this server does not issue tokens").map_err(|e| format!("{e:#}"))?;
+        let (token, secret) = store.redeem(invite, name).map_err(|e| format!("{e:#}"))?;
+        Ok(Issued { id: token.id.clone(), user: token.user.clone(), token: tokens::token_text(&token, &secret) })
+    }
+
+    fn create_token(&self, login: &str, admin: bool) -> Result<Issued, String> {
+        let store = self.keys.tokens().context("this server does not issue tokens").map_err(|e| format!("{e:#}"))?;
+        let (token, secret) = store.create(login, admin, None, "github").map_err(|e| format!("{e:#}"))?;
+        Ok(Issued { id: token.id.clone(), user: token.user.clone(), token: tokens::token_text(&token, &secret) })
+    }
+}
+
 fn github_url() -> String {
     std::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
 }
@@ -512,215 +899,430 @@ fn github_api() -> String {
     std::env::var("RARGO_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').to_string()
 }
 
-fn read_request(stream: &mut TcpStream) -> Result<Request> {
-    let mut bytes = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(request) = parse_request(&bytes)? {
-            return Ok(request);
-        }
-        let remain = deadline.saturating_duration_since(Instant::now());
-        if remain.is_zero() {
-            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
-        }
-        stream.set_read_timeout(Some(remain))?;
-        let mut chunk = [0u8; 2048];
-        let n = stream.read(&mut chunk)?;
-        if n == 0 {
-            bail!("the request ended early");
-        }
-        bytes.extend_from_slice(&chunk[..n]);
-    }
+fn agent(timeout_secs: u64) -> ureq::Agent {
+    ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs)).build()
 }
 
-fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
-    let Some(head_end) = buf.windows(4).position(|part| part == b"\r\n\r\n").map(|i| i + 4) else {
-        if buf.len() > 16 << 10 {
-            bail!("the request's head is too long");
-        }
-        return Ok(None);
-    };
-    if head_end > 16 << 10 {
-        bail!("the request's head is too long");
-    }
-    let head = std::str::from_utf8(&buf[..head_end - 4]).context("invalid request header text")?;
-    let mut lines = head.split("\r\n");
-    let mut first = lines.next().unwrap_or("").split(' ');
-    let (Some(method), Some(target), Some("HTTP/1.0" | "HTTP/1.1"), None) = (first.next(), first.next(), first.next(), first.next()) else {
-        bail!("malformed request line");
-    };
-    if method.is_empty() || !target.starts_with('/') {
-        bail!("malformed request target");
-    }
-    let mut host = String::new();
-    let mut length = None;
-    let mut json = false;
-    for line in lines {
-        let Some((k, v)) = line.split_once(':') else { bail!("malformed request header") };
-        let v = v.trim();
-        match k.to_ascii_lowercase().as_str() {
-            "host" => host = v.to_string(),
-            "x-forwarded-host" => host = v.to_string(),
-            "content-length" if length.is_none() => length = Some(v.parse::<usize>().context("Content-Length")?),
-            "content-length" => bail!("multiple Content-Length headers"),
-            "content-type" => json = v.starts_with("application/json"),
-            _ => {}
-        }
-    }
-    let length = length.unwrap_or(0);
-    if length > 64 << 10 {
-        bail!("the request's body is too long");
-    }
-    let Some(body) = buf.get(head_end..head_end + length) else { return Ok(None) };
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    Ok(Some(Request { method: method.into(), path: path.into(), query: form(query), host, body: body.to_vec(), json }))
+fn post_form(url: &str, accept: &str, fields: &[(&'static str, String)], timeout_secs: u64) -> Result<String, String> {
+    let owned: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    agent(timeout_secs).post(url).set("Accept", accept).send_form(&owned).map_err(|e| anyhow!("asking GitHub: {e}")).and_then(|r| r.into_string().context("reading GitHub's answer")).map_err(|e| format!("{e:#}"))
 }
 
-fn respond(stream: &mut TcpStream, status: u16, kind: &str, body: &[u8]) -> Result<()> {
-    if status == 302 {
-        let head = format!(
-            "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-            String::from_utf8_lossy(body)
-        );
-        stream.write_all(head.as_bytes())?;
-        let _ = stream.shutdown(std::net::Shutdown::Write);
-        return Ok(());
-    }
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        404 => "Not Found",
-        _ => "Service Unavailable",
-    };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(head.as_bytes())?;
-    stream.write_all(body)?;
-    let _ = stream.shutdown(std::net::Shutdown::Write);
-    Ok(())
+fn get_bearer(url: &str, accept: &str, user_agent: &str, bearer: &str, timeout_secs: u64) -> Result<String, String> {
+    agent(timeout_secs)
+        .get(url)
+        .set("Authorization", &format!("Bearer {bearer}"))
+        .set("Accept", accept)
+        .set("User-Agent", user_agent)
+        .call()
+        .map_err(|e| anyhow!("asking GitHub who signed in: {e}"))
+        .and_then(|r| r.into_string().context("reading GitHub's answer"))
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const NOW: u64 = 1_700_000_000_000;
+
+    fn cfg(tokens: bool) -> Cfg {
+        Cfg { public: None, port: 7459, has_tokens: tokens }
+    }
+
+    fn gh() -> GithubIn {
+        GithubIn { client_id: "Iv1.abc".into(), client_secret: "sec".into(), url: "https://build.example".into(), authorize: "https://github.com".into(), api: "https://api.github.com".into() }
+    }
+
+    fn issued(id: &str, user: &str) -> Issued {
+        Issued { id: id.into(), user: user.into(), token: format!("{id}.secret") }
+    }
+
+    fn parsed(raw: &str) -> Request {
+        let mut buf = Vec::new();
+        match intake(&mut buf, ReadItem::Chunk(raw.as_bytes().to_vec())) {
+            Intake::Ready(req) => req,
+            Intake::More => panic!("fixture needs another chunk"),
+            Intake::Silent => panic!("fixture was silent"),
+            Intake::Reply(outcome) => panic!("fixture was rejected: {}", body_of(&outcome).2),
+        }
+    }
+
+    fn call(method: &str, target: &str, kind: Option<&str>, body: &str) -> Request {
+        let extra = match kind {
+            Some(k) => format!("Content-Type: {k}\r\nContent-Length: {}\r\n", body.len()),
+            None if !body.is_empty() => format!("Content-Length: {}\r\n", body.len()),
+            None => String::new(),
+        };
+        parsed(&format!("{method} {target} HTTP/1.1\r\nHost: build.example\r\n{extra}\r\n{body}"))
+    }
+
+    fn body_of(outcome: &Outcome) -> (u16, &'static str, &str) {
+        match outcome {
+            Outcome::Body { status, kind, body } => (*status, *kind, body),
+            Outcome::Redirect(location) => panic!("redirect {location}"),
+        }
+    }
+
+    struct Script {
+        random: Vec<Result<String, String>>,
+        github: Vec<Option<GithubIn>>,
+        body: Vec<Result<String, String>>,
+        redeem: Vec<Result<Issued, String>>,
+        created: Vec<Result<Issued, String>>,
+        allowed: Vec<Option<AllowedIn>>,
+        holder: Vec<Option<String>>,
+        revoked_self: Vec<bool>,
+        effects: Vec<String>,
+    }
+
+    impl Script {
+        fn answer(&mut self, effect: Effect) -> Event {
+            self.effects.push(match &effect {
+                Effect::Random { n, .. } => format!("random {n}"),
+                Effect::LoadGithub => "github".into(),
+                Effect::Post { url, fields, .. } => format!("post {url} {}", fields.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")),
+                Effect::Get { url, bearer, .. } => format!("get {url} {bearer}"),
+                Effect::Redeem { invite, name } => format!("redeem {invite} {}", name.as_deref().unwrap_or("-")),
+                Effect::Create { login, admin } => format!("create {login} {admin}"),
+                Effect::Revoke { id } => format!("revoke {id}"),
+                Effect::RevokeSelf { token } => format!("revoke-self {token}"),
+                Effect::Holder { token } => format!("holder {token}"),
+                Effect::Allowed { login } => format!("allowed {login}"),
+            });
+            fn take<T>(name: &str, slot: &mut Vec<T>) -> T {
+                slot.pop().unwrap_or_else(|| panic!("no scripted answer for {name}"))
+            }
+            match effect {
+                Effect::Random { .. } => Event::Drawn(take("random", &mut self.random)),
+                Effect::LoadGithub => Event::Github(take("github", &mut self.github)),
+                Effect::Post { .. } | Effect::Get { .. } => Event::Body(take("body", &mut self.body)),
+                Effect::Redeem { .. } => Event::Redeemed(take("redeem", &mut self.redeem)),
+                Effect::Create { .. } => Event::Created(take("created", &mut self.created)),
+                Effect::Revoke { .. } => Event::Revoked,
+                Effect::RevokeSelf { .. } => Event::RevokedSelf(take("revoke-self", &mut self.revoked_self)),
+                Effect::Holder { .. } => Event::Holder(take("holder", &mut self.holder)),
+                Effect::Allowed { .. } => Event::Allowed(take("allowed", &mut self.allowed)),
+            }
+        }
+    }
+
+    impl Default for Script {
+        fn default() -> Self {
+            Self { random: Vec::new(), github: Vec::new(), body: Vec::new(), redeem: Vec::new(), created: Vec::new(), allowed: Vec::new(), holder: Vec::new(), revoked_self: Vec::new(), effects: Vec::new() }
+        }
+    }
+
+    fn drive(st: &mut AuthState, req: Request, now: u64, cfg: &Cfg, script: &mut Script) -> (Outcome, Vec<String>) {
+        let mut phase = Phase::default();
+        let mut event = Event::Request(req);
+        for _ in 0..20 {
+            let act = handle(st, &mut phase, event, cfg, now);
+            assert!(st.invariants());
+            assert!(phase.invariants());
+            match act {
+                Act::Done { outcome, notes } => return (outcome, notes),
+                Act::Ask(effect) => event = script.answer(effect),
+            }
+        }
+        panic!("handler did not settle");
+    }
+
+    fn script_rev<T>(items: Vec<T>) -> Vec<T> {
+        let mut items = items;
+        items.reverse();
+        items
+    }
+
+    #[test]
+    fn malformed_requests_are_400_and_an_early_end_or_timeout_is_silent() {
+        let mut buf = Vec::new();
+        assert!(matches!(intake(&mut buf, ReadItem::Socket(ErrorKind::TimedOut, "timed out".into())), Intake::Silent));
+        assert!(matches!(intake(&mut buf, ReadItem::Socket(ErrorKind::WouldBlock, "again".into())), Intake::Silent));
+        assert!(matches!(intake(&mut buf, ReadItem::Ended), Intake::Silent));
+        let Intake::Reply(outcome) = intake(&mut Vec::new(), ReadItem::Socket(ErrorKind::ConnectionReset, "reset".into())) else { panic!("io") };
+        let (status, kind, body) = body_of(&outcome);
+        assert_eq!((status, kind, body), (400, "text/plain", "bad request: reset\n"));
+        let Intake::Reply(outcome) = intake(&mut Vec::new(), ReadItem::Chunk(b"GET /oops HTTP/2.0\r\n\r\n".to_vec())) else { panic!("line") };
+        assert_eq!(body_of(&outcome).2, "bad request: malformed request line\n");
+        let mut buf = Vec::new();
+        assert!(matches!(intake(&mut buf, ReadItem::Chunk(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n1234".to_vec())), Intake::More));
+        assert!(matches!(intake(&mut buf, ReadItem::Chunk(b"5".to_vec())), Intake::Ready(_)));
+        assert!(parse_request(&vec![b'A'; (16 << 10) + 1]).is_err());
+    }
+
     #[test]
     fn routes_decode_input_before_any_endpoint_effect() {
         fn get(path: &str) -> Request {
-            parse_request(format!("GET {path} HTTP/1.1\r\nHost: build.example\r\n\r\n").as_bytes()).unwrap().unwrap()
+            parsed(&format!("GET {path} HTTP/1.1\r\nHost: build.example\r\n\r\n"))
         }
-        assert!(matches!(get("/.well-known/rargo.json").endpoint(), Endpoint::Discovery("build.example")));
-        assert!(matches!(get("/auth?code=AB%2DCD").endpoint(), Endpoint::Page("AB-CD")));
-        assert!(matches!(get("/auth/github?code=AB%2DCD").endpoint(), Endpoint::Github("AB-CD")));
-        assert!(matches!(get("/auth/github/callback?state=abc&code=x").endpoint(), Endpoint::Callback { state: "abc", code: "x" }));
-        assert!(matches!(get("/missing").endpoint(), Endpoint::Missing));
-        let post = |path: &str, body: &str, kind: &str| {
-            parse_request(format!("POST {path} HTTP/1.1\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
-                .unwrap().unwrap()
-        };
-        assert!(matches!(post("/auth/start", "", "text/plain").endpoint(), Endpoint::Start));
-        assert!(matches!(post("/auth/poll", "device=abc", "application/x-www-form-urlencoded").endpoint(), Endpoint::Poll(device) if device == "abc"));
-        assert!(matches!(post("/auth/approve", "code=abc&name=Ann+Lee", "application/x-www-form-urlencoded").endpoint(),
-            Endpoint::Approve { code, name, .. } if code == "abc" && name == "Ann Lee"));
+        assert!(matches!(get("/.well-known/rargo.json").goal(), Goal::Discovery(host) if host == "build.example"));
+        assert!(matches!(get("/auth?code=AB%2DCD").goal(), Goal::Page(code) if code == "AB-CD"));
+        assert!(matches!(get("/auth/github?code=AB%2DCD").goal(), Goal::Github(code) if code == "AB-CD"));
+        assert!(matches!(get("/auth/github/callback?state=abc&code=x").goal(), Goal::Callback { state, code } if state == "abc" && code == "x"));
+        assert!(matches!(get("/missing").goal(), Goal::Missing));
+        let post = |path: &str, body: &str, kind: &str| parsed(&format!("POST {path} HTTP/1.1\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\r\n{body}", body.len()));
+        assert!(matches!(post("/auth/start", "", "text/plain").goal(), Goal::Start));
+        assert!(matches!(post("/auth/poll", "device=abc", "application/x-www-form-urlencoded").goal(), Goal::Poll(device) if device == "abc"));
+        assert!(matches!(post("/auth/approve", "code=abc&name=Ann+Lee", "application/x-www-form-urlencoded").goal(), Goal::Approve { code, name, .. } if code == "abc" && name == "Ann Lee"));
         for route in ["/auth/revoke", "/auth/whoami"] {
             let request = post(route, r#"{"token":"fixture"}"#, "application/json");
-            assert!(matches!(request.endpoint(), Endpoint::Revoke(Some(token)) | Endpoint::Who(Some(token)) if token == "fixture"));
+            assert!(matches!(request.goal(), Goal::Revoke(Some(token)) | Goal::Who(Some(token)) if token == "fixture"));
         }
         assert!(auth_page("abc", None, false, false).contains("does not issue tokens"));
         assert!(auth_page("abc", Some("<error>"), true, false).contains("&lt;error&gt;"));
         assert!(auth_page("abc", None, true, true).contains("Sign in with GitHub"));
-        assert!(parse_request(b"GET / HTTP/1.1\r\nBroken header\r\n\r\n").is_err());
-        assert!(parse_request(b"POST / HTTP/1.1\r\nContent-Length: x\r\n\r\n").is_err());
-        assert!(parse_request(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n1234").unwrap().is_none());
+        assert_eq!(form("code=AB%2DCD&name=a+b")["code"], "AB-CD");
+        assert_eq!(form("code=AB%2DCD&name=a+b")["name"], "a b");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(server_for_host(&Cfg { public: None, port: 7459, has_tokens: false }, "build.example:8080"), "build.example:7459");
+        assert_eq!(server_for_host(&Cfg { public: Some("b.example:1".into()), port: 7459, has_tokens: false }, "rargo.rs"), "b.example:1");
+        assert_eq!(Http::new(Arc::new(Keys::open()), None, 7459).server_for("build.example"), "build.example:7459");
     }
 
     #[test]
-    fn github_responses_and_pending_terminal_transitions_are_pure() {
+    fn discovery_start_poll_revoke_whoami_pages_and_the_missing_route() {
+        let mut st = AuthState::default();
+        let c = cfg(true);
+        let mut script = Script { github: script_rev(vec![Some(gh())]), ..Script::default() };
+        let (outcome, notes) = drive(&mut st, parsed("GET /.well-known/rargo.json HTTP/1.1\r\nHost: build.example:9\r\n\r\n"), NOW, &c, &mut script);
+        assert!(notes.is_empty());
+        let body = serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap();
+        assert_eq!(body["server"], "build.example:7459");
+        assert_eq!(body["protocol"], crate::proto::PROTO_VERSION);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(body["auth"], true);
+        assert_eq!(body["github"], true);
+        let (outcome, _) = drive(&mut AuthState::default(), parsed("GET /.well-known/rargo.json HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &cfg(false), &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        let body = serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap();
+        assert_eq!(body["auth"], false);
+        assert_eq!(body["github"], false);
+
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &cfg(false), &mut Script::default());
+        assert_eq!(body_of(&outcome).0, 503);
+        assert!(body_of(&outcome).2.contains("does not issue tokens"));
+        let mut script = Script { random: script_rev(vec![Ok("deviceone".into()), Ok("ABCD2345".into())]), ..Script::default() };
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &c, &mut script);
+        let body = serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap();
+        assert_eq!(body["device"], "deviceone");
+        assert_eq!(body["code"], "ABCD-2345");
+        assert_eq!(body["path"], "/auth?code=ABCD-2345");
+        assert_eq!(body["interval"], 2);
+        assert_eq!(body["expires_in"], 600);
+        assert!(st.begin("other".into(), "ABCD2345".into(), NOW) == false);
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"deviceone"}"#), NOW, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "pending");
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/x-www-form-urlencoded"), "device=someone-else"), NOW, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "expired");
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"deviceone"}"#), NOW + PENDING_FOR_MS - 1, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "pending");
+
+        let (outcome, notes) = drive(&mut st, call("POST", "/auth/revoke", Some("application/json"), r#"{"token":"t.s"}"#), NOW, &c, &mut Script { revoked_self: script_rev(vec![true]), ..Script::default() });
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["revoked"], true);
+        assert_eq!(notes, vec!["rargod: a token was revoked by its holder (`rargo auth remove`)".to_string()]);
+        let (outcome, notes) = drive(&mut st, call("POST", "/auth/revoke", None, ""), NOW, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["revoked"], false);
+        assert!(notes.is_empty());
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/whoami", Some("application/json"), r#"{"token":"t.s"}"#), NOW, &c, &mut Script { holder: script_rev(vec![Some("ann".into())]), ..Script::default() });
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["user"], "ann");
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/whoami", Some("application/json"), r#"{"token":"no"}"#), NOW, &cfg(false), &mut Script::default());
+        assert!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["user"].is_null());
+
+        let (outcome, _) = drive(&mut st, parsed("GET /auth?code=abcd2345 HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), ..Script::default() });
+        let (status, _, page) = body_of(&outcome);
+        assert_eq!(status, 200);
+        assert!(page.contains("Sign in with GitHub") && page.contains("ABCD-2345"));
+        let (outcome, _) = drive(&mut st, parsed("GET /auth?code=abcd2345 HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("Invitation") && !body_of(&outcome).2.contains("Sign in with GitHub"));
+        let (outcome, _) = drive(&mut st, parsed("GET /auth HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &cfg(false), &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("does not issue tokens"));
+        let (outcome, _) = drive(&mut st, parsed("GET /nope HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &c, &mut Script::default());
+        assert_eq!(body_of(&outcome), (404, "text/plain", "this is a rargo build server; see https://rargo.rs\n"));
+    }
+
+    #[test]
+    fn a_terminal_gets_its_token_only_after_the_code_is_confirmed() {
+        let mut st = AuthState::default();
+        let c = cfg(true);
+        let mut script = Script { random: script_rev(vec![Ok("d1".into()), Ok("SAMECODE".into()), Ok("d2".into()), Ok("ABCD2345".into())]), ..Script::default() };
+        assert!(st.begin("taken".into(), "SAMECODE".into(), NOW));
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &c, &mut script);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["code"], "ABCD-2345");
+        assert!(script.effects.iter().filter(|e| e.starts_with("random")).count() >= 3, "a colliding code draws again");
+
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=abcd-2345&invite=NOPE&name="), NOW, &c, &mut Script { redeem: script_rev(vec![Err("this invitation is not known, has been used or has expired".into())]), github: script_rev(vec![None]), ..Script::default() });
+        assert_eq!(body_of(&outcome).0, 403);
+        assert!(body_of(&outcome).2.contains("not known"));
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"d2"}"#), NOW, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "pending");
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ZZZZZZZZ&invite=INVITE&name="), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("no terminal is waiting"));
+        let mut script = Script { redeem: script_rev(vec![Ok(issued("t-ann", "ann"))]), ..Script::default() };
+        let (outcome, notes) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD-2345&invite=INVITE&name=Ann"), NOW, &c, &mut script);
+        assert_eq!(body_of(&outcome).0, 200);
+        assert!(body_of(&outcome).2.contains("Authenticated") && body_of(&outcome).2.contains("ABCD-2345") && body_of(&outcome).2.contains(">ann<"));
+        assert_eq!(notes, vec!["rargod: a token for ann was issued through `rargo auth`".to_string()]);
+        assert_eq!(script.effects[0], "redeem INVITE Ann");
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD-2345&invite=INVITE&name="), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("confirmed already"));
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"d2"}"#), NOW, &c, &mut Script::default());
+        let got = serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap();
+        assert_eq!(got["status"], "approved");
+        assert_eq!(got["user"], "ann");
+        assert_eq!(got["token"], "t-ann.secret");
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"d2"}"#), NOW, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "expired");
+    }
+
+    #[test]
+    fn wrong_invitations_are_counted_per_code_and_a_stopped_terminal_revokes() {
+        let mut st = AuthState::default();
+        let c = cfg(true);
+        assert!(st.begin("device".into(), "ABCD2345".into(), NOW));
+        for _ in 0..MAX_TRIES {
+            let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD2345&invite=BAD-INVITE&name="), NOW, &c, &mut Script { redeem: script_rev(vec![Err("no".into())]), github: script_rev(vec![None]), ..Script::default() });
+            assert_eq!(body_of(&outcome).0, 403);
+            assert!(st.invariants());
+        }
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD2345&invite=GOOD-INVITE&name="), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("too many wrong invitations"));
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"device"}"#), NOW, &c, &mut Script::default());
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "denied");
+
+        assert!(st.begin("later".into(), "BBBBBBBB".into(), NOW));
+        let mut phase = Phase::default();
+        let act = handle(&mut st, &mut phase, Event::Request(call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=BBBBBBBB&invite=INV&name=")), &c, NOW);
+        assert!(st.invariants() && phase.invariants());
+        assert!(matches!(act, Act::Ask(Effect::Redeem { .. })));
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"later"}"#), NOW + PENDING_FOR_MS, &c, &mut Script::default()).0).2).unwrap()["status"], "expired");
+        let act = handle(&mut st, &mut phase, Event::Redeemed(Ok(issued("t-x", "ann"))), &c, NOW);
+        assert!(st.invariants() && phase.invariants());
+        let Act::Ask(Effect::Revoke { id }) = act else { panic!("the issued token is revoked") };
+        assert_eq!(id, "t-x");
+        let act = handle(&mut st, &mut phase, Event::Revoked, &c, NOW);
+        assert!(st.invariants() && phase.invariants());
+        let Act::Ask(Effect::LoadGithub) = act else { panic!("the error page asks which form to show") };
+        let act = handle(&mut st, &mut phase, Event::Github(None), &c, NOW);
+        let Act::Done { outcome, notes } = act else { panic!("done") };
+        assert!(notes.is_empty());
+        assert!(body_of(&outcome).2.contains("stopped waiting"));
+    }
+
+    #[test]
+    fn too_many_waiting_terminals_are_refused_and_expired_ones_do_not_count() {
+        let mut st = AuthState::default();
+        let c = cfg(true);
+        for i in 0..MAX_PENDING {
+            assert!(st.begin(format!("d{i}"), format!("C{i:07}"), NOW));
+        }
+        assert!(st.invariants());
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &c, &mut Script::default());
+        assert_eq!(body_of(&outcome).0, 503);
+        assert!(body_of(&outcome).2.contains("too many"));
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW + PENDING_FOR_MS, &c, &mut Script { random: script_rev(vec![Ok("fresh-device".into()), Ok("FFFF2222".into())]), ..Script::default() });
+        assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["code"], "FFFF-2222");
+        assert!(st.invariants());
+    }
+
+    #[test]
+    fn github_sign_in_covers_every_outcome_with_recorded_responses() {
+        let mut st = AuthState::default();
+        let c = cfg(true);
+        assert!(st.begin("device".into(), "ABCD2345".into(), NOW));
+        let req = parsed("GET /auth/github?code=abcd2345 HTTP/1.1\r\nHost: build.example\r\n\r\n");
+        let mut script = Script { github: script_rev(vec![Some(gh())]), random: script_rev(vec![Ok("oauthstateoauthstateoauthstate01".into())]), ..Script::default() };
+        let (outcome, _) = drive(&mut st, req, NOW, &c, &mut script);
+        let Outcome::Redirect(location) = outcome else { panic!("302") };
+        assert_eq!(location, "https://github.com/login/oauth/authorize?client_id=Iv1.abc&redirect_uri=https%3A%2F%2Fbuild.example%2Fauth%2Fgithub%2Fcallback&state=oauthstateoauthstateoauthstate01&allow_signup=false");
+        let (outcome, _) = drive(&mut AuthState::default(), parsed("GET /auth/github?code=NOPE HTTP/1.1\r\nHost: h\r\n\r\n"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), random: script_rev(vec![Ok("s".repeat(32))]), ..Script::default() });
+        assert_eq!(body_of(&outcome).0, 403);
+        assert!(body_of(&outcome).2.contains("no terminal is waiting"));
+        let (outcome, _) = drive(&mut st, parsed("GET /auth/github?code=ABCD2345 HTTP/1.1\r\nHost: h\r\n\r\n"), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("does not sign people in with GitHub"));
+
+        let callback = |query: &str| parsed(&format!("GET /auth/github/callback?{query} HTTP/1.1\r\nHost: h\r\n\r\n"));
+        let (outcome, _) = drive(&mut st, callback("state=&code="), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("cancelled"));
+        let (outcome, _) = drive(&mut st, callback("state=nope&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("no terminal that is still waiting"));
+        let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &cfg(false), &mut Script { github: script_rev(vec![Some(gh())]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("does not issue tokens"));
+        let refused = r#"{"error":"bad_verification_code","error_description":"The code passed is incorrect or expired."}"#;
+        let mut script = Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Ok(refused.into())]), ..Script::default() };
+        let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut script);
+        assert!(body_of(&outcome).2.contains("incorrect or expired"));
+        assert!(script.effects.iter().any(|e| e.starts_with("post https://github.com/login/oauth/access_token ") && e.contains("code=gh") && e.contains("redirect_uri=https://build.example/auth/github/callback")));
+        let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Err("asking GitHub: refused".into())]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("asking GitHub: refused"));
+        let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Ok(r#"{"access_token":"tok"}"#.into()), Ok(r#"{"id":1}"#.into())]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("did not say who signed in"));
+        let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Ok(r#"{"access_token":"tok"}"#.into()), Ok(r#"{"login":"octocat"}"#.into())]), allowed: script_rev(vec![None]), ..Script::default() });
+        assert!(body_of(&outcome).2.contains("not on this server's allow list") && body_of(&outcome).2.contains("rargod token allow octocat"));
+
+        let mut script = Script {
+            github: script_rev(vec![Some(gh())]),
+            body: script_rev(vec![Ok(r#"{"access_token":"tok"}"#.into()), Ok(r#"{"login":"OctoCat"}"#.into())]),
+            allowed: script_rev(vec![Some(AllowedIn { login: "octocat".into(), admin: true })]),
+            created: script_rev(vec![Ok(issued("t-gh", "octocat"))]),
+            ..Script::default()
+        };
+        let (outcome, notes) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut script);
+        assert_eq!(body_of(&outcome).0, 200);
+        assert!(body_of(&outcome).2.contains("Authenticated") && body_of(&outcome).2.contains("GitHub account") && body_of(&outcome).2.contains(">octocat<") && body_of(&outcome).2.contains("ABCD-2345"));
+        assert_eq!(notes, vec!["rargod: a token for the GitHub account octocat was issued through `rargo auth`".to_string()]);
+        assert!(script.effects.iter().any(|e| e == "get https://api.github.com/user tok"));
+        assert!(script.effects.iter().any(|e| e == "create octocat true"));
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"device"}"#), NOW, &c, &mut Script::default());
+        let got = serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap();
+        assert_eq!(got["token"], "t-gh.secret");
+        assert_eq!(got["user"], "octocat");
+    }
+
+    #[test]
+    fn a_terminal_that_stops_while_the_browser_is_at_github_loses_the_token() {
+        let mut st = AuthState::default();
+        let c = cfg(true);
+        assert!(st.begin("device".into(), "ABCD2345".into(), NOW));
+        let mut phase = Phase::default();
+        st.pending.get_mut("device").unwrap().state = Some("st".into());
+        let mut event = Event::Request(parsed("GET /auth/github/callback?state=st&code=gh HTTP/1.1\r\nHost: h\r\n\r\n"));
+        let mut saw_revoke = false;
+        for _ in 0..8 {
+            let act = handle(&mut st, &mut phase, event, &c, NOW);
+            assert!(st.invariants() && phase.invariants());
+            match act {
+                Act::Done { outcome, .. } => {
+                    assert!(saw_revoke);
+                    assert!(body_of(&outcome).2.contains("stopped waiting"));
+                    return;
+                }
+                Act::Ask(Effect::LoadGithub) => event = Event::Github(Some(gh())),
+                Act::Ask(Effect::Post { .. }) => {
+                    st.pending.remove("device");
+                    event = Event::Body(Ok(r#"{"access_token":"tok"}"#.into()));
+                }
+                Act::Ask(Effect::Get { .. }) => event = Event::Body(Ok(r#"{"login":"octocat"}"#.into())),
+                Act::Ask(Effect::Allowed { .. }) => event = Event::Allowed(Some(AllowedIn { login: "octocat".into(), admin: false })),
+                Act::Ask(Effect::Create { .. }) => event = Event::Created(Ok(issued("t-gh", "octocat"))),
+                Act::Ask(Effect::Revoke { id }) => {
+                    assert_eq!(id, "t-gh");
+                    saw_revoke = true;
+                    event = Event::Revoked;
+                }
+                Act::Ask(other) => panic!("unexpected {other:?}"),
+            }
+        }
+        panic!("did not finish");
+    }
+
+    #[test]
+    fn github_json_helpers_reject_a_refusal_and_a_nameless_account() {
         let success = serde_json::json!({"access_token": "fixture"});
         let refused = serde_json::json!({"error": "bad_verification_code", "error_description": "The code passed is incorrect or expired."});
         assert_eq!(GithubExchange::identified(&success).unwrap(), "fixture");
         assert!(GithubExchange::identified(&refused).unwrap_err().to_string().contains("incorrect or expired"));
         assert_eq!(GithubExchange::login(&serde_json::json!({"login":"octocat","id":583231})).unwrap(), "octocat");
         assert!(GithubExchange::login(&serde_json::json!({"message":"Bad credentials"})).is_err());
-        let now = Instant::now();
-        let mut pending = PendingState::default();
-        assert!(pending.begin("fixture".into(), "ABCD2345".into(), now));
-        assert!(pending.invariants());
-        assert!(!pending.begin("other".into(), "ABCD2345".into(), now));
-        assert!(pending.invariants());
-        assert_eq!(pending.poll("fixture", now)["status"], "pending");
-        assert!(pending.invariants());
-        for _ in 0..MAX_TRIES {
-            assert!(pending.invite_attempt("ABCD2345", now).is_ok());
-            assert!(pending.invariants());
-        }
-        assert!(pending.invite_attempt("ABCD2345", now).is_err());
-        assert!(pending.invariants());
-        assert_eq!(pending.poll("fixture", now)["status"], "denied");
-        assert!(pending.invariants());
-        assert!(pending.begin("fixture".into(), "ABCD2345".into(), now));
-        assert!(pending.invariants());
-        assert_eq!(pending.poll("fixture", now + PENDING_FOR)["status"], "expired");
-        assert!(pending.invariants());
-    }
-
-    fn http() -> (tempfile::TempDir, Http) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(tokens::TokenStore::new(dir.path().join("tokens.json")));
-        let keys = Arc::new(Keys::with_tokens(store));
-        (dir, Http::new(keys, None, 7459))
-    }
-
-    #[test]
-    fn a_terminal_gets_its_token_only_after_the_code_is_confirmed_with_an_invitation() {
-        let (_dir, h) = http();
-        let now = Instant::now();
-        let invite = h.keys.tokens().unwrap().invite(Some("ann"), false, None, 1, None).unwrap();
-        let (device, code) = h.start_at(now).unwrap();
-        assert_eq!(h.poll_at(&device, now)["status"], "pending");
-        assert_eq!(h.poll_at("someone-else", now)["status"], "expired");
-        assert!(h.approve_at(&code, "WRONG-WRONG-WRONG-WRON", None, now).is_err());
-        assert_eq!(h.poll_at(&device, now)["status"], "pending");
-        assert!(h.approve_at("ZZZZ-ZZZZ", &invite, None, now).is_err(), "an unknown code uses up nothing");
-        assert_eq!(h.approve_at(&shown(&code).to_lowercase(), &invite, None, now).unwrap(), "ann");
-        assert!(h.approve_at(&code, &invite, None, now).is_err(), "confirmed once");
-        let got = h.poll_at(&device, now);
-        assert_eq!(got["status"], "approved");
-        assert_eq!(got["user"], "ann");
-        let token = got["token"].as_str().unwrap();
-        let (id, _secret) = token.split_once('.').unwrap();
-        assert!(h.keys.still_valid(id));
-        assert_eq!(h.keys.name_of(id), "ann");
-        assert_eq!(h.poll_at(&device, now)["status"], "expired", "handed out once");
-    }
-
-    #[test]
-    fn wrong_invitations_are_counted_per_code() {
-        let (_dir, h) = http();
-        let now = Instant::now();
-        let (device, code) = h.start_at(now).unwrap();
-        for _ in 0..MAX_TRIES {
-            assert!(h.approve_at(&code, "AAAA-AAAA-AAAA-AAAA", None, now).is_err());
-        }
-        let invite = h.keys.tokens().unwrap().invite(Some("ann"), false, None, 1, None).unwrap();
-        assert!(h.approve_at(&code, &invite, None, now).is_err(), "the code is spent");
-        assert_eq!(h.poll_at(&device, now)["status"], "denied");
-        assert!(h.keys.tokens().unwrap().invited(&invite).is_some(), "the invitation is not");
-    }
-
-    #[test]
-    fn the_address_clients_are_told_is_the_public_one_or_the_name_asked() {
-        let (_dir, h) = http();
-        assert_eq!(h.server_for("build.example"), "build.example:7459");
-        assert_eq!(h.server_for("build.example:8080"), "build.example:7459");
-        let dir = tempfile::tempdir().unwrap();
-        let keys = Arc::new(Keys::with_tokens(Arc::new(tokens::TokenStore::new(dir.path().join("t.json")))));
-        assert_eq!(Http::new(keys, Some("b.example:1".into()), 7459).server_for("rargo.rs"), "b.example:1");
-        assert_eq!(form("code=AB%2DCD&name=a+b")["code"], "AB-CD");
-        assert_eq!(form("code=AB%2DCD&name=a+b")["name"], "a b");
-        assert_eq!(percent_decode("100%"), "100%");
+        assert!(GithubExchange::login(&serde_json::json!({"login":"-nope"})).is_err());
     }
 }
