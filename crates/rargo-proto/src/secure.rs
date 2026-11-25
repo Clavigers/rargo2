@@ -36,13 +36,14 @@ pub struct Opener {
 }
 
 impl Sealer {
-    pub fn seal(&mut self, msg: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    /// Ciphertext records, one per chunk, with no length prefix. The caller frames them.
+    pub fn seal_records(&mut self, msg: &[u8]) -> io::Result<Vec<Vec<u8>>> {
         let mut chunks = msg.chunks(RECORD).peekable();
         let mut plain = Vec::with_capacity(RECORD + 1);
         let mut cipher = vec![0u8; RECORD + 64];
+        let mut records = Vec::new();
         let mut first = true;
         let nonce_before = self.nonce;
-        let out_before = out.len();
         while first || chunks.peek().is_some() {
             first = false;
             let chunk = chunks.next().unwrap_or(&[]);
@@ -51,9 +52,21 @@ impl Sealer {
             plain.extend_from_slice(chunk);
             let n = self.keys.write_message(self.nonce, &plain, &mut cipher).map_err(err)?;
             self.nonce += 1;
-            out.extend_from_slice(&(n as u32).to_le_bytes());
             assert_eq!(n, plain.len() + 16, "ciphertext is plaintext plus the tag");
-            out.extend_from_slice(&cipher[..n]);
+            records.push(cipher[..n].to_vec());
+        }
+        let count = msg.len().div_ceil(RECORD).max(1);
+        assert_eq!(self.nonce - nonce_before, count as u64);
+        assert_eq!(records.len(), count);
+        Ok(records)
+    }
+
+    pub fn seal(&mut self, msg: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        let nonce_before = self.nonce;
+        let out_before = out.len();
+        for rec in self.seal_records(msg)? {
+            out.extend_from_slice(&(rec.len() as u32).to_le_bytes());
+            out.extend_from_slice(&rec);
         }
         let records = msg.len().div_ceil(RECORD).max(1);
         assert_eq!(self.nonce - nonce_before, records as u64);
