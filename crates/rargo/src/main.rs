@@ -644,7 +644,16 @@ fn main() {
         match subcommand(&args) {
             Some(cmd) if ROUTED.contains(&cmd) => {}
             Some("clean") => {
-                release_output();
+                let read_only = args.iter().take_while(|arg| *arg != "--").any(|arg| {
+                    matches!(arg.as_str(), "--dry-run" | "--help")
+                        || arg.strip_prefix('-').is_some_and(|short| {
+                            short.chars().all(|flag| matches!(flag, 'h' | 'n' | 'q' | 'v'))
+                                && short.contains(['h', 'n'])
+                        })
+                });
+                if !read_only {
+                    release_output();
+                }
                 passthrough(&raw)
             }
             _ => passthrough(&raw),
