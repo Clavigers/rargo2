@@ -181,25 +181,48 @@ pub struct Engine {
     pub zygote: Arc<Zygote>,
     pub traces: TraceCache,
     pub sched: Arc<Scheduler>,
-    inflight: Mutex<HashMap<(Hash, Hash), tokio::sync::watch::Receiver<bool>>>,
+    inflight: Mutex<HashMap<(Hash, Hash), tokio::sync::watch::Receiver<Flight>>>,
     seq: AtomicU64,
     avg_wall_us: AtomicU64,
     profiles: dashmap::DashMap<Vec<u8>, Arc<Trace>>,
     pub remote: std::sync::OnceLock<Arc<dyn RemoteRunner>>,
     pub stats: EngineStats,
     pub cgroup_root: Option<PathBuf>,
+    pub action_timeout: std::time::Duration,
 }
+
+#[derive(Clone)]
+enum Flight {
+    Running,
+    Done,
+    TimedOut(Arc<str>),
+}
+
+#[derive(Debug)]
+pub struct ActionTimedOut {
+    label: String,
+    secs: u64,
+}
+
+impl std::fmt::Display for ActionTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`{}` ran longer than {} s and was stopped", self.label, self.secs)
+    }
+}
+
+impl std::error::Error for ActionTimedOut {}
 
 struct InflightGuard<'a> {
     engine: &'a Engine,
     key: (Hash, Hash),
-    tx: tokio::sync::watch::Sender<bool>,
+    tx: tokio::sync::watch::Sender<Flight>,
+    end: Flight,
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
         self.engine.inflight.lock().remove(&self.key);
-        let _ = self.tx.send(true);
+        let _ = self.tx.send(self.end.clone());
     }
 }
 
@@ -312,6 +335,7 @@ impl Engine {
             remote: std::sync::OnceLock::new(),
             stats: EngineStats::default(),
             cgroup_root: None,
+            action_timeout: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -459,19 +483,23 @@ impl Engine {
                 match inflight.get(&slot) {
                     Some(rx) if !req.no_cache && waited != Some(slot) => Err(rx.clone()),
                     _ => {
-                        let (tx, rx) = tokio::sync::watch::channel(false);
+                        let (tx, rx) = tokio::sync::watch::channel(Flight::Running);
                         inflight.insert(slot, rx);
-                        Ok(InflightGuard { engine: self, key: slot, tx })
+                        Ok(InflightGuard { engine: self, key: slot, tx, end: Flight::Done })
                     }
                 }
             };
-            let guard = match guard {
+            let mut guard = match guard {
                 Err(mut rx) => {
                     self.stats.joined.fetch_add(1, Ordering::Relaxed);
-                    while !*rx.borrow() {
+                    while matches!(*rx.borrow(), Flight::Running) {
                         if rx.changed().await.is_err() {
                             break;
                         }
+                    }
+                    let ended = rx.borrow().clone();
+                    if let Flight::TimedOut(why) = ended {
+                        bail!("{why}");
                     }
                     waited = Some(slot);
                     continue;
@@ -486,7 +514,16 @@ impl Engine {
             let (result, obs, side) = loop {
                 attempt += 1;
                 assert!(attempt <= 3);
-                let (result, obs, tainted, side) = self.run(&spec, &req).await?;
+                let ran = self.run(&spec, &req).await;
+                let (result, obs, tainted, side) = match ran {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Some(t) = e.downcast_ref::<ActionTimedOut>() {
+                            guard.end = Flight::TimedOut(Arc::from(t.to_string()));
+                        }
+                        return Err(e);
+                    }
+                };
                 if !tainted {
                     break (result, Some(obs), side);
                 }
@@ -815,9 +852,14 @@ impl Engine {
                 peak_kb.fetch_max(g.anon_kb(), Ordering::Relaxed);
             }
         };
+        let id = running.id;
         let (stdout, stderr, info) = tokio::select! {
             r = async { tokio::join!(read_out, read_err, &mut running.done) } => r,
             _ = watch => unreachable!("the memory watch never finishes"),
+            _ = tokio::time::sleep(self.action_timeout) => {
+                self.zygote.kill(id);
+                return Err(ActionTimedOut { label: spec.label.clone(), secs: self.action_timeout.as_secs() }.into());
+            }
         };
         let mut info = info.context("the sandbox helper process died")?;
         if let Some(g) = group {

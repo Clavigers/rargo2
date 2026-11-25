@@ -21,6 +21,7 @@ struct Opts {
     gid: Option<u32>,
     jobs: usize,
     mem_kb: u64,
+    action_timeout_secs: u64,
     passthrough: bool,
     store_budget: u64,
     cold_after_secs: u64,
@@ -49,6 +50,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
         gid: None,
         jobs: cpus,
         mem_kb: total_kb / 10 * 7,
+        action_timeout_secs: 3600,
         passthrough: true,
         store_budget: 100 << 30,
         cold_after_secs: 30 * 60,
@@ -70,6 +72,7 @@ fn parse_args(args: &[String]) -> Result<Opts> {
             "--uid" => o.uid = Some(val()?.parse()?),
             "--gid" => o.gid = Some(val()?.parse()?),
             "--jobs" => o.jobs = val()?.parse()?,
+            "--action-timeout-secs" => o.action_timeout_secs = val()?.parse()?,
             "--mem-gb" => o.mem_kb = val()?.parse::<u64>()? << 20,
             "--no-passthrough" => o.passthrough = false,
             "--drift-interval-min" => o.drift_minutes = val()?.parse()?,
@@ -156,6 +159,7 @@ fn main() -> Result<()> {
     let sched = Scheduler::new(opts.jobs, opts.mem_kb)?;
     let mut engine = Engine::new(store.clone(), content, fs, mnt, zygote, sched);
     engine.cgroup_root = cgroup_root.clone();
+    engine.action_timeout = std::time::Duration::from_secs(opts.action_timeout_secs);
     let engine = Arc::new(engine);
     if let Some(server) = opts.worker_of {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
