@@ -55,6 +55,9 @@ fn ambient_io_is_found_through_imports_and_macros_but_not_in_the_shell() {
     );
     assert!(found("crates/a/src/io.rs", text).is_empty());
     assert!(found("crates/a/src/io/disk.rs", text).is_empty());
+    for not_shell in ["crates/a/src/build.rs", "crates/a/build.rs", "crates/a/examples/bench.rs"] {
+        assert_eq!(of(Check::AmbientIo, &found(not_shell, text)).len(), 5, "{not_shell}");
+    }
     assert!(found("crates/a/src/lib.rs", "fn f() -> std::time::Duration { let x = libc::EINTR; todo!() }").is_empty());
     let shadowed = "use std::fs; use std::sync::atomic::{AtomicU8, Ordering};\n\
         fn f(fs: &dyn Store, a: &AtomicU8) { fs.stat(); a.load(Ordering::Relaxed); }";

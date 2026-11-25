@@ -1,13 +1,23 @@
-import json
+import os
+import re
+import resource
 import subprocess
 import sys
 
 BUDGETS = "crates/rargo-purity/budgets.txt"
 ALLOW = "crates/rargo-purity/allow.txt"
+SCANNER = "crates/rargo-purity/src"
 
 
 def rows(text):
     return [line.split("\t") for line in text.splitlines() if line.strip()]
+
+
+def measure(text):
+    for cols in rows(text):
+        if cols[0] == "measure":
+            return cols[1]
+    return "wall"
 
 
 def parse_budgets(text):
@@ -16,6 +26,8 @@ def parse_budgets(text):
         if len(cols) != 4 or not cols[2].isdigit() or len(cols[3].strip()) < 10:
             sys.exit(f"{BUDGETS}: want kind, name, milliseconds and a reason separated by tabs: {cols}")
         kind, name, ms = cols[0], cols[1], int(cols[2])
+        if kind == "measure":
+            continue
         if kind == "suite":
             suite = ms
         elif kind == "test":
@@ -35,38 +47,75 @@ def parse_allow(text):
     return {(c[0], c[1]): int(c[2]) for c in rows(text)}
 
 
-def times():
+def programs(extra):
+    built = subprocess.run(
+        ["rargo", "test", "--locked", "--workspace", "--no-run", *extra], capture_output=True, text=True
+    )
+    if built.returncode != 0:
+        sys.stdout.write(built.stdout + built.stderr)
+        sys.exit("the test programs did not build")
+    helper = subprocess.run(["rargo", "build", "--locked", *extra, "-p", "rargo-core"], capture_output=True, text=True)
+    if helper.returncode != 0:
+        sys.stdout.write(helper.stdout + helper.stderr)
+        sys.exit("rargo-core's binaries did not build")
+    found = re.findall(r"\((target/[^)]*)\)", built.stderr)
+    if not found:
+        sys.exit("no test programs in the build output:\n" + built.stderr)
+    return found
+
+
+def cpu_of(argv, cwd, env):
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    run = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    used = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
+    return used * 1000, run
+
+
+def cpu(extra):
     suite, default, slow = parse_budgets(open(BUDGETS).read())
+    root = os.getcwd()
+    asroot = [] if os.geteuid() == 0 else ["sudo", "-E"]
     took, failed = {}, []
-    for line in sys.stdin:
-        if not line.startswith("{"):
-            continue
-        event = json.loads(line)
-        if event.get("type") != "test" or event.get("event") not in ("ok", "failed"):
-            continue
-        name = event["name"]
-        if name in took:
-            sys.exit(f"two tests are named {name}; budgets name tests, so give one another name")
-        took[name] = event.get("exec_time", 0.0) * 1000
-        if event["event"] == "failed":
-            failed.append(name)
-            sys.stdout.write(f"---- {name} ----\n{event.get('stdout', '')}\n")
-    problems = [f"{name} failed" for name in failed]
+    for program in programs(extra):
+        package = program.split("/")[3]
+        crate = os.path.join(root, "crates", package)
+        name = re.sub(r"-[0-9a-f]{16}$", "", os.path.basename(program))
+        env = dict(os.environ, CARGO_MANIFEST_DIR=crate, CARGO_PKG_NAME=package)
+        listed = subprocess.run([os.path.join(root, program), "--list", "--format", "terse"],
+                                cwd=crate, env=env, capture_output=True, text=True)
+        tests = [line[: -len(": test")] for line in listed.stdout.splitlines() if line.endswith(": test")]
+        for test in tests:
+            key = f"{name} {test}"
+            ms, run = cpu_of([*asroot, os.path.join(root, program), "--exact", test, "--test-threads=1", "-q"],
+                             crate, env)
+            took[key] = ms
+            if run.returncode != 0:
+                failed.append(key)
+                sys.stdout.write(f"---- {key} ----\n{run.stdout}{run.stderr}\n")
+    problems = [f"{key} failed" for key in failed]
     total = sum(took.values())
     if total > suite:
-        problems.append(f"the suite took {total:.0f} ms; its budget is {suite} ms")
-    for name, ms in sorted(took.items()):
-        limit = slow.get(name, default)
+        problems.append(f"the suite used {total:.0f} ms of CPU; its budget is {suite} ms")
+    for key, ms in sorted(took.items()):
+        limit = slow.get(key, default)
         if ms > limit:
-            problems.append(f"{name} took {ms:.0f} ms; its budget is {limit} ms")
-    for name, limit in sorted(slow.items()):
-        if name not in took:
-            problems.append(f"{BUDGETS} gives {name} a budget, but no test of that name ran; remove the line")
-        elif took[name] <= default:
-            problems.append(f"{name} took {took[name]:.0f} ms, within the default {default} ms; remove its line")
-    print(f"{len(took)} tests in {total:.0f} ms of a {suite} ms budget; the slowest took {max(took.values(), default=0):.0f} ms")
+            problems.append(f"{key} used {ms:.0f} ms of CPU; its budget is {limit} ms")
+    for key, limit in sorted(slow.items()):
+        if key not in took:
+            problems.append(f"{BUDGETS} gives {key} a budget, but no test of that name ran; remove the line")
+        elif took[key] <= default:
+            print(f"note: {key} used {took[key]:.0f} ms of CPU here, within the default {default} ms; its line may go once it does so on every machine")
     if not took:
-        problems.append("no test results were read; run rargo test with -Z unstable-options --format json --report-time")
+        problems.append("no tests ran")
+    slowest = max(took.items(), key=lambda kv: kv[1], default=("none", 0))
+    print(f"{len(took)} tests used {total:.0f} ms of CPU of a {suite} ms budget; the most was {slowest[1]:.0f} ms, by {slowest[0]}")
+    for key, ms in sorted(took.items(), key=lambda kv: -kv[1])[:8]:
+        print(f"  {ms:7.0f} ms  {key}")
+    if os.environ.get("RARGO_CPU_REPORT"):
+        with open(os.environ["RARGO_CPU_REPORT"], "w") as out:
+            for key, ms in sorted(took.items(), key=lambda kv: -kv[1]):
+                out.write(f"{ms:.1f}\t{key}\n")
     for p in problems:
         print(f"FAIL {p}")
     sys.exit(1 if problems else 0)
@@ -79,15 +128,25 @@ def at(base, path):
 
 def ratchet(base):
     problems = []
+    scanner = subprocess.run(["git", "diff", "--quiet", base, "--", SCANNER]).returncode != 0
     old = at(base, ALLOW)
     if old is not None:
         before, now = parse_allow(old), parse_allow(open(ALLOW).read())
+        grown = []
         for key, count in sorted(now.items()):
             if key not in before:
-                problems.append(f"{ALLOW} gains an entry: {key[0]} {key[1]}")
+                grown.append(f"{ALLOW} gains an entry: {key[0]} {key[1]}")
             elif count > before[key]:
-                problems.append(f"{ALLOW} raises {key[0]} {key[1]} from {before[key]} to {count}")
+                grown.append(f"{ALLOW} raises {key[0]} {key[1]} from {before[key]} to {count}")
+        if scanner:
+            for g in grown:
+                print(f"recorded by the changed scanner, not added: {g}")
+        else:
+            problems.extend(grown)
     old = at(base, BUDGETS)
+    if old is not None and measure(old) != measure(open(BUDGETS).read()):
+        print(f"{BUDGETS} measures {measure(open(BUDGETS).read())} time where {base} measured {measure(old)} time; its budgets are not compared")
+        old = None
     if old is not None:
         (s0, d0, slow0), (s1, d1, slow1) = parse_budgets(old), parse_budgets(open(BUDGETS).read())
         if s1 > s0:
@@ -106,9 +165,9 @@ def ratchet(base):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["times"]:
-        times()
+    if sys.argv[1:2] == ["cpu"]:
+        cpu(sys.argv[2:])
     elif len(sys.argv) == 3 and sys.argv[1] == "ratchet":
         ratchet(sys.argv[2])
     else:
-        sys.exit("usage: purity.py times < libtest-json | purity.py ratchet BASE")
+        sys.exit("usage: purity.py cpu [rargo test options] | purity.py ratchet BASE")

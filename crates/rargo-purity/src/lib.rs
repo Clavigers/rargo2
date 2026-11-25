@@ -106,7 +106,7 @@ pub fn compare(check: Check, findings: &[Finding], allow: &[Entry]) -> Result<()
 }
 
 pub fn is_shell(file: &str) -> bool {
-    file.ends_with("/io.rs") || file.contains("/io/") || file.contains("/examples/") || file.ends_with("build.rs")
+    file.ends_with("/io.rs") || file.contains("/io/")
 }
 
 const AMBIENT: &[&str] = &[
