@@ -31,7 +31,7 @@ cd /
 
 export RARGO_STATE=$work/state-trace
 export RARGO_BIN=${RARGO_BIN:-$repo/target/release}
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+port=$(python3 -I "$repo/dev/free-ports.py" 1)
 export RARGO_SERVER=127.0.0.1:$port
 export RARGO_HIDE=$wt
 export RARGO_CACHE_DIR=$work/bench/trace-client-cache

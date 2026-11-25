@@ -12,7 +12,7 @@ E=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/e2e.XXXXXXXX") || exit 1
 E=$(cd "$E" && pwd -P) || exit 1
 T=$E/client
 mkdir -p "$T" "$E/store"
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+port=$(python3 -I "$repo/dev/free-ports.py" 1)
 export RARGO_SERVER=127.0.0.1:$port
 export RARGO_HIDE=$T
 export RARGO_CACHE_DIR=$T/.rargo-cache
@@ -680,7 +680,7 @@ echo "ignored by git" >crates/util/local-note.txt
 echo "== policy in Cargo.toml ([workspace.metadata.rargo])"
 cd "$A"
 cp Cargo.toml "$T/Cargo.toml.before-policy"
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+port=$(python3 -I "$repo/dev/free-ports.py" 1)
 python3 -c "
 import socket, sys
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

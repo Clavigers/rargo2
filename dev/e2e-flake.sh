@@ -12,6 +12,7 @@ ok() { checks=$((checks + 1)); echo "  ok   $1"; }
 bad() { checks=$((checks + 1)); fails=$((fails + 1)); echo "  FAIL $1"; [ -n "${2:-}" ] && echo "$2" | sed 's/^/       | /' | head -30; }
 has() { grep -qF -- "$2" <<<"$1"; }
 
+ports=4
 base=${RARGO_E2E_FLAKE_PORT:-7471}
 port() { case $1 in a) echo $base ;; b) echo $((base + 1)) ;; esac; }
 daemon() {

@@ -9,6 +9,7 @@ planner=${PLANNER:-$work/cargo/target/release/cargo}
 mkdir -p "$work"
 unset RARGO_SERVER RARGO_TOKEN RARGO_STATE RARGO_HIDE
 T=${RARGO_E2E_AUTH:-$work/e2e-auth}
+ports=2
 port=${E2E_AUTH_PORT:-7466}
 host=127.0.0.1:$port
 pass=0; fail=0

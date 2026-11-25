@@ -20,7 +20,7 @@ T=$E/client
 mkdir -p "$T" "$E/store"
 export RARGO_STATE RARGO_HIDE=$T RARGO_CACHE_DIR=$T/.rargo-cache
 export RARGO_SERVER_CARGO_HOME=$RARGO_STATE/cargo-home
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+port=$(python3 -I "$repo/dev/free-ports.py" 1)
 export RARGO_SERVER=127.0.0.1:$port
 RARGO_TOKEN=$("$bin/rargod" token create --state "$RARGO_STATE" --user e2e --admin 2>/dev/null)
 export RARGO_TOKEN
