@@ -53,8 +53,11 @@ pub fn members(bytes: &[u8]) -> Option<Vec<Member<'_>>> {
         if name == "//" {
             longnames = data;
         }
+        assert!(out.last().is_none_or(|m: &Member<'_>| m.header_offset < pos), "members ascend");
+        assert_eq!(data.len(), size);
         out.push(Member { name, header_offset: pos, data });
         pos = end + (end & 1);
+        assert!(pos > start || size == 0);
     }
     Some(out)
 }
@@ -103,6 +106,7 @@ pub fn session_neutral(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
         }
         out.to_mut()[at - SESSION..at].fill(b'0');
     }
+    assert_eq!(out.len(), bytes.len(), "length is unchanged");
     out
 }
 
@@ -176,10 +180,14 @@ fn differences(a: &[u8], b: &[u8]) -> Option<Vec<(usize, usize)>> {
     let mut out: Vec<(usize, usize)> = Vec::new();
     for i in (0..a.len()).filter(|&i| a[i] != b[i]) {
         match out.last_mut() {
-            Some((_, end)) if i < *end + DWO_ID => *end = i + 1,
+            Some((_, end)) if i < *end + DWO_ID => {
+                assert!(i >= *end);
+                *end = i + 1
+            }
             _ => out.push((i, i + 1)),
         }
     }
+    assert!(out.iter().all(|&(s, e)| s < e && e <= a.len()));
     Some(out)
 }
 
@@ -200,6 +208,7 @@ impl DwoIds {
         match differences(&a, &b).as_deref() {
             Some([]) => true,
             Some(&[(s, e)]) if e - s <= DWO_ID => {
+                assert!(s < e);
                 self.0.insert((a[s..e].to_vec(), b[s..e].to_vec()));
                 true
             }

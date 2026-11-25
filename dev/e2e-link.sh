@@ -224,7 +224,7 @@ out=$(R run -q 2>&1); [ "$out" = "value 113" ] && mounted; check $? "rargo build
 # A daemon that is killed outright cannot unmount. What it left watching
 # does, at once and with no rargo command run: target/ is never a dead
 # mount, and stock cargo works in the worktree.
-# Block until each named guard has exited and the path is not a rargo
+# Returns when each named guard has exited and the path is not a rargo
 # mount. A guard exits when its daemon does, and unmounts if the daemon
 # did not. Only those pids are waited on: an earlier daemon can still be
 # running with a guard whose title names this same path.

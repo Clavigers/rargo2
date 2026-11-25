@@ -158,6 +158,9 @@ impl Client {
     }
 }
 
+const _: () = assert!(LEVEL_NONE < LEVEL_META);
+const _: () = assert!(LEVEL_META < LEVEL_FULL);
+
 /// A decoded plan with derived per-unit data.
 pub struct PlanData {
     pub plan: rp::Plan,
@@ -181,8 +184,8 @@ pub struct PlanData {
 impl PlanData {
     fn new(plan: rp::Plan) -> PlanData {
         let n = plan.units.len();
-        let linking = plan.units.iter().map(|u| u.needs_objects).collect();
-        let rmeta_out = plan
+        let linking: Vec<bool> = plan.units.iter().map(|u| u.needs_objects).collect();
+        let rmeta_out: Vec<Vec<Vec<u8>>> = plan
             .units
             .iter()
             .map(|u| u.outputs.iter().filter(|o| o.flavor == "Rmeta").map(|o| o.path.clone().into_bytes()).collect())
@@ -213,11 +216,13 @@ impl PlanData {
                     return;
                 }
                 seen[i] = true;
+                assert!(is_doc(i));
                 let mut deps: Vec<usize> = units[i].deps.iter().map(|d| d.unit as usize).filter(|&j| is_doc(j)).collect();
                 deps.sort_unstable();
                 for j in deps {
                     visit(j, units, is_doc, seen, out);
                 }
+                assert!(!out.contains(&i), "a documentation unit is ordered once");
                 out.push(i);
             }
             let is_doc = |j: usize| doc_dir[j].is_some();
@@ -227,10 +232,22 @@ impl PlanData {
                 }
             }
         }
+        assert_eq!(doc_order.len(), doc_dir.iter().filter(|d| d.is_some()).count());
         let mut doc_pos = vec![None; n];
         for (pos, &i) in doc_order.iter().enumerate() {
+            assert!(doc_pos[i].is_none());
             doc_pos[i] = Some(pos);
         }
+        for u in &plan.units {
+            for d in &u.deps {
+                assert!((d.unit as usize) < n, "a dependency names a unit of the plan");
+            }
+        }
+        for &r in &plan.roots {
+            assert!((r as usize) < n, "a root names a unit of the plan");
+        }
+        assert_eq!(linking.len(), n);
+        assert_eq!(rmeta_out.len(), n);
         PlanData {
             plan,
             linking,
@@ -272,6 +289,8 @@ impl PlanData {
                         stack.push(d.unit as usize);
                     }
                 }
+                assert_eq!(lv[i], LEVEL_NONE, "a unit does not depend on itself");
+                assert_eq!(lv.len(), units.len());
                 Arc::new(lv)
             })
             .clone()
@@ -300,10 +319,19 @@ impl PlanData {
                         }
                         // Only a compile can stop at metadata.
                         let lv = if units[k].kind == rp::UnitKind::Compile { lv } else { LEVEL_FULL };
+                        assert!(lv == LEVEL_META || lv == LEVEL_FULL);
                         if lv > need[k] {
                             need[k] = lv;
                             work.push(k);
                         }
+                    }
+                }
+                for &r in &self.plan.roots {
+                    assert_ne!(need[r as usize], LEVEL_NONE, "a root is needed");
+                }
+                for (k, &lv) in need.iter().enumerate() {
+                    if lv == LEVEL_META {
+                        assert_eq!(units[k].kind, rp::UnitKind::Compile, "only a compile stops at metadata");
                     }
                 }
                 Arc::new(need)
@@ -344,8 +372,14 @@ impl PlanData {
                         }
                     }
                 }
+                assert_eq!(lv[i], LEVEL_NONE, "a unit does not depend on itself");
+                if self.linking[i] {
+                    assert!(lv.iter().all(|&l| l != LEVEL_META), "a linking unit sees its dependencies whole");
+                }
                 if let Some(pos) = self.doc_pos[i] {
+                    assert_eq!(self.doc_order[pos], i);
                     for &j in &self.doc_order[..pos] {
+                        assert_ne!(j, i);
                         if self.doc_dir[j] == self.doc_dir[i] {
                             lv[j] = LEVEL_FULL;
                         }
@@ -448,6 +482,7 @@ fn subcommand_pos(args: &[String]) -> Option<usize> {
             return None;
         }
         if !a.starts_with('-') {
+            assert!(i < args.len());
             return Some(i);
         }
         // Global options that take a separate value.
@@ -742,6 +777,28 @@ struct Prepared {
     env: BTreeMap<String, String>,
 }
 
+/// Makes cargo treat itself as a nightly cargo.
+const NIGHTLY_CHANNEL_ENV: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
+
+/// Whether the compiler at `rustc` (a store path, so its answer never
+/// changes) is a nightly or a locally built one, the channels on which
+/// cargo allows unstable features.
+fn nightly_rustc(rustc: &str) -> bool {
+    static SEEN: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+    if let Some(&n) = SEEN.lock().get(rustc) {
+        return n;
+    }
+    let version = std::process::Command::new(rustc).arg("-V").env_clear().output().ok().filter(|o| o.status.success());
+    let n = version.is_some_and(|o| nightly_version(&String::from_utf8_lossy(&o.stdout)));
+    SEEN.lock().insert(rustc.to_owned(), n);
+    n
+}
+
+/// `rustc 1.102.0-nightly (bdf712ee8 2026-11-21)`, or `-dev`: nightly.
+fn nightly_version(v: &str) -> bool {
+    v.split_whitespace().nth(1).is_some_and(|ver| ver.ends_with("-nightly") || ver.ends_with("-dev"))
+}
+
 async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
     let dir = c.policy_dir()?;
     let policy = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
@@ -800,6 +857,12 @@ async fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> R
     env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
+    }
+    // The planner is a cargo built on stable, and cargo allows nightly
+    // features (`cargo-features` in a manifest, `-Z` flags) by its own
+    // channel: it plans on the channel of the toolchain that builds.
+    if flake.which("rustc").is_some_and(|rustc| nightly_rustc(&rustc)) {
+        env.insert(NIGHTLY_CHANNEL_ENV.into(), "nightly".into());
     }
     Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env })
 }
@@ -1637,6 +1700,7 @@ fn rustc_env_deps(r: &ActionResult, store: &Store) -> Vec<String> {
         for line in String::from_utf8_lossy(&text).lines() {
             if let Some(rest) = line.strip_prefix("# env-dep:") {
                 let name = rest.split('=').next().unwrap_or(rest);
+                assert!(!name.contains('='));
                 if !name.is_empty() && !out.iter().any(|n| n == name) {
                     out.push(name.to_string());
                 }
@@ -1702,6 +1766,8 @@ impl Run {
         seed: Option<Arc<OutputsLayer>>,
     ) -> Arc<dyn View> {
         let mut levels = if self.meta_only(i) { self.pd.meta_levels(i) } else { self.pd.levels(i) };
+        assert_eq!(levels.len(), self.plan().units.len());
+        assert_eq!(levels[i], LEVEL_NONE, "a unit's own view excludes itself unless asked");
         if include_self {
             let mut lv = (*levels).clone();
             lv[i] = LEVEL_FULL;
@@ -3169,6 +3235,7 @@ fn parse_dep_info(text: &str) -> Vec<String> {
             out.push(cur);
         }
     }
+    assert!(out.iter().all(|p| !p.is_empty()), "a prerequisite is never empty");
     out
 }
 
@@ -3184,6 +3251,7 @@ fn normalize(p: &Path) -> PathBuf {
             c => out.push(c),
         }
     }
+    assert!(out.components().all(|c| !matches!(c, std::path::Component::CurDir | std::path::Component::ParentDir)));
     out
 }
 
@@ -3198,6 +3266,15 @@ mod tests {
         assert_eq!(script_warning_message("cargo:warning="), Some(""));
         assert_eq!(script_warning_message("cargo:rustc-cfg=has_generated"), None);
         assert_eq!(script_warning_message("not a directive"), None);
+    }
+
+    #[test]
+    fn a_nightly_or_local_compiler_is_on_the_nightly_channel() {
+        assert!(nightly_version("rustc 1.102.0-nightly (bdf712ee8 2026-11-21)\n"));
+        assert!(nightly_version("rustc 1.103.0-dev\n"));
+        assert!(!nightly_version("rustc 1.97.1 (8bab26f4f 2026-07-14)\n"));
+        assert!(!nightly_version("rustc 1.98.0-beta.3 (0123abcde 2026-11-20)\n"));
+        assert!(!nightly_version(""));
     }
 
     #[test]

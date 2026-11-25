@@ -33,6 +33,9 @@ const RECORD: usize = 65000;
 pub const EARLY_MAX: usize = 60000;
 /// Largest message accepted from the peer.
 const MESSAGE_MAX: usize = 1 << 30;
+const _: () = assert!(RECORD + 1 + 16 <= 65535, "a record with its flag and tag fits a Noise message");
+const _: () = assert!(EARLY_MAX + 256 <= 65535, "early data fits the first handshake message");
+const _: () = assert!(EARLY_MAX < RECORD);
 
 fn err(e: snow::Error) -> io::Error {
     io::Error::other(format!("secure channel: {e}"))
@@ -68,6 +71,8 @@ impl Sealer {
         let mut cipher = vec![0u8; RECORD + 64];
         // An empty message is still one record.
         let mut first = true;
+        let nonce_before = self.nonce;
+        let out_before = out.len();
         while first || chunks.peek().is_some() {
             first = false;
             let chunk = chunks.next().unwrap_or(&[]);
@@ -77,8 +82,12 @@ impl Sealer {
             let n = self.keys.write_message(self.nonce, &plain, &mut cipher).map_err(err)?;
             self.nonce += 1;
             out.extend_from_slice(&(n as u32).to_le_bytes());
+            assert_eq!(n, plain.len() + 16, "ciphertext is plaintext plus the tag");
             out.extend_from_slice(&cipher[..n]);
         }
+        let records = msg.len().div_ceil(RECORD).max(1);
+        assert_eq!(self.nonce - nonce_before, records as u64);
+        assert_eq!(out.len() - out_before, msg.len() + records * (1 + 16 + 4));
         Ok(())
     }
 }
@@ -96,7 +105,9 @@ impl Opener {
         if self.partial.len() + n > MESSAGE_MAX {
             return Err(io::Error::other("secure channel: message too large"));
         }
+        assert!(n <= record.len());
         self.partial.extend_from_slice(&plain[1..n]);
+        assert!(self.partial.len() <= MESSAGE_MAX);
         Ok(if plain[0] == 1 { Some(std::mem::take(&mut self.partial)) } else { None })
     }
 }
@@ -114,13 +125,17 @@ pub fn client_start(user: &str, psk: &[u8; 32], early: &[u8]) -> io::Result<(Han
     }
     let mut hs = snow::Builder::new(PARAMS.parse().map_err(err)?).psk(0, psk).map_err(err)?.build_initiator().map_err(err)?;
     let mut msg = vec![0u8; early.len() + 256];
+    assert!(early.len() <= EARLY_MAX);
     let n = hs.write_message(early, &mut msg).map_err(err)?;
+    assert!(n <= u16::MAX as usize);
+    assert!(n >= early.len());
     let mut out = Vec::with_capacity(n + 16 + user.len());
     out.extend_from_slice(MAGIC);
     out.push(user.len() as u8);
     out.extend_from_slice(user.as_bytes());
     out.extend_from_slice(&(n as u16).to_le_bytes());
     out.extend_from_slice(&msg[..n]);
+    assert_eq!(out.len(), MAGIC.len() + 1 + user.len() + 2 + n);
     Ok((hs, out))
 }
 
@@ -146,6 +161,7 @@ pub fn server_accept(psk: &[u8; 32], msg1: &[u8]) -> io::Result<(Vec<u8>, Vec<u8
     let mut msg2 = vec![0u8; 256];
     let n = hs.write_message(&[], &mut msg2).map_err(err)?;
     msg2.truncate(n);
+    assert!(n <= u16::MAX as usize);
     let (s, o) = split(hs)?;
     Ok((msg2, early, s, o))
 }
@@ -223,7 +239,7 @@ impl LinkCipher {
             let chunk = &msg[i * RECORD..((i + 1) * RECORD).min(msg.len())];
             at += self.keys.write_message(base + i as u64, chunk, &mut out[at..]).map_err(err)?;
         }
-        debug_assert_eq!(at, out.len());
+        assert_eq!(at, out.len());
         Ok(out)
     }
 
@@ -238,6 +254,7 @@ impl LinkCipher {
         for (i, rec) in body.chunks(RECORD + 16).enumerate() {
             at += self.keys.read_message(base + i as u64, rec, &mut out[at..]).map_err(err)?;
         }
+        assert!(at <= body.len());
         out.truncate(at);
         Ok(out)
     }

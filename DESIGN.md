@@ -351,12 +351,14 @@ directory that results are copied into.
 - What the server built appears there as soon as the server has it: a
   name, a size, an executable bit and a content hash, sent while the
   build is still running. Nothing is copied into the worktree.
-- Content is fetched when something opens the file, into the client's
-  cache, which all worktrees of the machine share. Large contents are
+- Content is fetched when something first reads the file, into the
+  client's cache, which all worktrees of the machine share. Opening alone
+  fetches nothing: stock cargo opens each output it is about to replace,
+  and reads none of them. Large contents are
   fetched by chunk (content-defined chunks, the same as between server and
   workers), so the next version of a binary costs the chunks that
   changed. Small files (dependency information, fingerprints, generated
-  sources) are sent along with their names, because fetching each on open
+  sources) are sent along with their names, because fetching each when read
   would cost a round trip apiece.
 - Underneath the mount is the real `target/` directory. Everything that
   is written locally lands there: what stock cargo builds, what a test

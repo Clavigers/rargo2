@@ -70,6 +70,7 @@ struct Stream {
 /// Forwards what a session queues for the client as frames of `stream`,
 /// until the command's final message or the end of the queue.
 async fn pump(link: Arc<Link>, stream: u32, mut rx: tokio::sync::mpsc::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
+    assert_ne!(stream, crate::proto::KEEPALIVE, "keepalives are not a session's stream");
     let mut seq = 0u64;
     while let Some(m) = rx.recv().await {
         let last = matches!(m, ServerMsg::Exit(_) | ServerMsg::Exec(_) | ServerMsg::Fetched { .. });
@@ -338,6 +339,7 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
             let Some(store) = keys.tokens().cloned() else {
                 return fail(&sess, "this server has issued no tokens: it admits anyone on its machine, and its tokens are made there (`rargod token`)".into());
             };
+            assert!(!req.args.is_empty(), "a command was named");
             let args = req.args[1..].to_vec();
             let (asker_user, from) = (user.clone(), format!("rargo auth, by {user}"));
             let said = tokio::task::spawn_blocking(move || {
@@ -515,6 +517,8 @@ async fn serve(d: Arc<Daemon>, req: RunRequest, user: String, admin: bool, keys:
         // SAFETY: filling a valid 8-byte buffer.
         unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
         let token = u64::from_le_bytes(b) | 1;
+        // Zero means "no delivery" in `RunRequest::delivered`.
+        assert_ne!(token, 0);
         d.deliveries.lock().insert(worktree, (token, Arc::new(delivered)));
         sess.send(ServerMsg::DeliveryToken(token));
     }

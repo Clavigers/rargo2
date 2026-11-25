@@ -17,6 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 const SLOTS: usize = 64;
 const PATH_MAX: usize = 4096;
 
+const _: () = assert!(SLOTS > 0);
+const _: () = assert!(PATH_MAX as u32 == libc::PATH_MAX as u32);
+
 struct Slot {
     /// The path in `buf` is complete and the file may exist.
     live: AtomicBool,
@@ -42,6 +45,8 @@ pub struct Temp {
 impl Drop for Temp {
     fn drop(&mut self) {
         if let Some(i) = self.slot {
+            assert!(TABLE[i].taken.load(Ordering::SeqCst));
+            assert!(TABLE[i].live.load(Ordering::SeqCst));
             TABLE[i].live.store(false, Ordering::SeqCst);
             TABLE[i].taken.store(false, Ordering::SeqCst);
         }
@@ -58,6 +63,7 @@ pub fn watch(path: &Path) -> Temp {
         if s.taken.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             continue;
         }
+        assert!(!s.live.load(Ordering::SeqCst), "a free slot is never live");
         // SAFETY: we hold `taken` and `live` is false, so nobody reads `buf`.
         unsafe {
             let buf = &mut *s.buf.get();
@@ -117,6 +123,7 @@ fn alive(pid: u32) -> bool {
 fn owner(name: &str, prefix: &str) -> Option<u32> {
     let rest = name.strip_prefix(prefix)?;
     let (pid, _) = rest.split_once('-')?;
+    assert!(!pid.contains('-'));
     pid.parse().ok()
 }
 
@@ -132,6 +139,7 @@ pub fn sweep(dir: &Path, prefix: &str) -> usize {
             gone.push(e.path());
         }
     }
+    let total = gone.len();
     let mut n = 0;
     for p in gone {
         let removed = match std::fs::symlink_metadata(&p) {
@@ -141,6 +149,7 @@ pub fn sweep(dir: &Path, prefix: &str) -> usize {
         };
         n += removed as usize;
     }
+    assert!(n <= total);
     n
 }
 

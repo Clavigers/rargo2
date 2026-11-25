@@ -109,6 +109,7 @@ impl Link {
                 let (wr, sealer) = &mut *g;
                 let mut buf = Vec::with_capacity(msg.len() + msg.len() / 1000 + 64);
                 sealer.seal(msg, &mut buf)?;
+                assert!(buf.len() > msg.len(), "every message is at least one sealed record");
                 wr.write_all(&buf).await?;
                 wr.flush().await
             }
@@ -151,6 +152,7 @@ impl Link {
             Link::Tcp(t) => {
                 t.closed.store(true, Ordering::SeqCst);
                 t.closing.notify_waiters();
+                assert!(t.closed.load(Ordering::SeqCst));
             }
         }
     }

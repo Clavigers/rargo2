@@ -35,8 +35,13 @@ mkdir -p "$RARGO_STATE"
 RARGO_TOKEN=$("$bin/rargod" token create --state "$RARGO_STATE" --user e2e --admin 2>/dev/null)
 export RARGO_TOKEN
 guest_token=$("$bin/rargod" token create --state "$RARGO_STATE" --user guest 2>/dev/null)
-# The server gets a cargo home of its own.
+# The server gets a cargo home of its own. Its bin holds what a real
+# server's does, rustup's proxies, here one that fails if it ever runs: a
+# build's tools are its flake's.
 export RARGO_SERVER_CARGO_HOME=$RARGO_STATE/cargo-home
+mkdir -p "$RARGO_SERVER_CARGO_HOME/bin"
+printf '#!/bin/sh\necho "the server cargo home bin'"'"'s cargo-clippy ran" >&2\nexit 1\n' >"$RARGO_SERVER_CARGO_HOME/bin/cargo-clippy"
+chmod +x "$RARGO_SERVER_CARGO_HOME/bin/cargo-clippy"
 # The stock Cargo checks intentionally exercise the fixture's own target/.
 unset CARGO_TARGET_DIR
 echo "e2e: state=$RARGO_STATE client=$T server=$RARGO_SERVER"
@@ -521,10 +526,9 @@ cd "$A"
 expect "check" "$R" check
 before=$(runs); "$R" check >/dev/null 2>&1; after=$(runs)
 [ "$before" = "$after" ] && ok "check is cached" || bad "check is cached"
-if command -v cargo-clippy >/dev/null 2>&1; then
-    out=$("$R" clippy 2>&1); rc=$?
-    [ $rc -eq 0 ] && ok "clippy" || bad "clippy" "$out"
-fi
+# The server runs clippy, from the build's flake: the client needs none.
+out=$("$R" clippy 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "clippy" || bad "clippy" "$out"
 
 echo "== concurrent cold builds from many worktrees"
 C=$T/c

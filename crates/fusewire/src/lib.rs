@@ -123,6 +123,8 @@ impl DirSink<'_> {
     pub fn push(&mut self, ino: u64, next_off: u64, dtype: u32, name: &[u8]) -> bool {
         let ent = std::mem::size_of::<fuse_dirent>() + name.len();
         let padded = (ent + 7) & !7;
+        assert!(padded >= ent);
+        assert!(!name.contains(&0), "dirent names carry no NUL");
         if self.buf.len() + padded > self.cap {
             return false;
         }
@@ -130,6 +132,8 @@ impl DirSink<'_> {
         self.buf.extend_from_slice(as_bytes(&d));
         self.buf.extend_from_slice(name);
         self.buf.resize(self.buf.len() + (padded - ent), 0);
+        assert!(self.buf.len() <= self.cap);
+        assert_eq!(self.buf.len() % 8, 0, "dirents stay 8-byte aligned");
         true
     }
 }
@@ -266,10 +270,13 @@ fn read_struct<T: Copy>(b: &[u8]) -> Option<T> {
 }
 
 fn cstr_arg(b: &[u8]) -> (&[u8], &[u8]) {
-    match b.iter().position(|&c| c == 0) {
+    let (name, rest): (&[u8], &[u8]) = match b.iter().position(|&c| c == 0) {
         Some(i) => (&b[..i], &b[i + 1..]),
         None => (b, &[]),
-    }
+    };
+    assert!(!name.contains(&0));
+    assert!(name.len() + rest.len() <= b.len());
+    (name, rest)
 }
 
 /// A mounted FUSE filesystem.
@@ -332,6 +339,13 @@ impl Default for MountOptions {
 
 const MAX_WRITE: u32 = 1 << 20;
 const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
+const _: () = assert!(MAX_WRITE % 4096 == 0);
+const _: () = assert!(MAX_WRITE / 4096 <= u16::MAX as u32);
+const _: () = assert!(BUF_SIZE % 8 == 0);
+const _: () = assert!(BUF_SIZE >= FUSE_MIN_READ_BUFFER);
+const _: () = assert!(
+    BUF_SIZE >= MAX_WRITE as usize + std::mem::size_of::<fuse_in_header>() + std::mem::size_of::<fuse_write_in>()
+);
 
 impl Session {
     /// Mounts at `mountpoint` and completes the INIT handshake.
@@ -403,6 +417,8 @@ impl Session {
             sess.unmount();
             return Err(e);
         }
+        assert_eq!(sess.caps.max_write, MAX_WRITE);
+        assert!(sess.caps.minor >= 31);
         Ok(sess)
     }
 
@@ -471,6 +487,10 @@ impl Session {
             request_timeout: 0,
             unused: [0; 11],
         };
+        assert!(out.minor >= 31);
+        assert!(out.minor <= FUSE_KERNEL_MINOR_VERSION);
+        assert!(flags & !kflags == 0, "only flags the kernel offers");
+        assert!(!(flags & FUSE_PASSTHROUGH != 0 && flags & FUSE_WRITEBACK_CACHE != 0));
         reply(self.dev.as_raw_fd(), hdr.unique, 0, &[as_bytes(&out)])?;
         self.caps = Caps {
             minor: out.minor,
@@ -505,6 +525,7 @@ impl Session {
                 .spawn(move || worker(sess, fd, fs))?;
             handles.push(h);
         }
+        assert_eq!(handles.len(), threads.max(1));
         Ok(handles)
     }
 
@@ -871,6 +892,15 @@ fn open_dev() -> io::Result<OwnedFd> {
 
 fn reply(fd: RawFd, unique: u64, error: i32, parts: &[&[u8]]) -> io::Result<()> {
     let len: usize = std::mem::size_of::<fuse_out_header>() + parts.iter().map(|p| p.len()).sum::<usize>();
+    assert!(parts.len() < 5, "iov has room for the header and four parts");
+    assert!(len <= u32::MAX as usize);
+    // A reply (unique != 0) carries a negated errno; a notification
+    // (unique == 0) carries its positive notify code.
+    if unique != 0 {
+        assert!(error <= 0);
+    } else {
+        assert!(error > 0);
+    }
     let hdr = fuse_out_header { len: len as u32, error, unique };
     let mut iov: [libc::iovec; 5] = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 5];
     iov[0] = libc::iovec {
@@ -885,6 +915,7 @@ fn reply(fd: RawFd, unique: u64, error: i32, parts: &[&[u8]]) -> io::Result<()> 
         iov[n] = libc::iovec { iov_base: p.as_ptr() as *mut libc::c_void, iov_len: p.len() };
         n += 1;
     }
+    assert_eq!(iov[..n].iter().map(|v| v.iov_len).sum::<usize>(), len);
     // SAFETY: iov entries point to live buffers for the duration of the call.
     let r = unsafe { libc::writev(fd, iov.as_ptr(), n as i32) };
     if r < 0 {
@@ -917,6 +948,9 @@ fn attr_out(a: &fuse_attr, ttl: Duration) -> fuse_attr_out {
 }
 
 fn open_out(o: &Opened) -> fuse_open_out {
+    if o.flags & FOPEN_PASSTHROUGH != 0 {
+        assert!(o.backing_id > 0, "passthrough needs a backing id");
+    }
     fuse_open_out { fh: o.fh, open_flags: o.flags, backing_id: o.backing_id }
 }
 
@@ -939,6 +973,7 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
             }
         }
         let n = n as usize;
+        assert!(n <= BUF_SIZE);
         // SAFETY: the first n bytes were initialised by the kernel.
         let buf = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
         let Some(hdr) = read_struct::<fuse_in_header>(buf) else { continue };
@@ -1104,7 +1139,10 @@ fn dispatch<F: Filesystem>(
             out.clear();
             let size = a.size.min(max_write);
             let _ = match fs.read(&ctx, node, a.fh, a.offset, size, out) {
-                Ok(()) => reply(fd, u, 0, &[out]),
+                Ok(()) => {
+                    assert!(out.len() <= size as usize, "read returns at most size bytes");
+                    reply(fd, u, 0, &[out])
+                }
                 Err(e) => reply(fd, u, -e.0, &[]),
             };
         }
@@ -1142,6 +1180,7 @@ fn dispatch<F: Filesystem>(
             out.clear();
             let mut sink = DirSink { buf: out, cap: a.size as usize };
             let r = fs.readdir(&ctx, node, a.fh, a.offset, &mut sink);
+            assert!(out.len() <= a.size as usize);
             let _ = match r {
                 Ok(()) => reply(fd, u, 0, &[out]),
                 Err(e) => reply(fd, u, -e.0, &[]),

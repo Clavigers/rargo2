@@ -21,6 +21,9 @@ use std::sync::Arc;
 pub const MIN_CHUNK: usize = 16 << 10;
 pub const AVG_CHUNK: usize = 64 << 10;
 pub const MAX_CHUNK: usize = 256 << 10;
+const _: () = assert!(MIN_CHUNK < AVG_CHUNK);
+const _: () = assert!(AVG_CHUNK < MAX_CHUNK);
+const _: () = assert!(MAX_CHUNK <= u32::MAX as usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
@@ -80,10 +83,14 @@ fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
                 i += 1;
             }
         }
+        assert!(cut - start > MIN_CHUNK);
+        assert!(cut - start <= MAX_CHUNK);
         cuts.push(cut - start);
         start = cut;
     }
+    assert!(start <= data.len());
     if start < data.len() {
+        assert!(data.len() - start <= MIN_CHUNK);
         cuts.push(data.len() - start);
     }
 }
@@ -152,11 +159,13 @@ pub fn chunk(data: &[u8]) -> Recipe {
         // Structural regions smaller than the minimum are merged with what
         // follows, so thousands of tiny sections do not become thousands of
         // tiny chunks; the cut still lands on a structural boundary.
+        assert!(i < bounds.len());
         let mut end = bounds[i];
         while end - start < MIN_CHUNK && i + 1 < bounds.len() && end != hard {
             i += 1;
             end = bounds[i];
         }
+        assert!(end > start, "structural bounds ascend");
         i += 1;
         cdc(&data[start..end], &mut lens);
         start = end;
@@ -167,6 +176,8 @@ pub fn chunk(data: &[u8]) -> Recipe {
         out.push(ChunkRef { hash: Hash::of(&data[pos..pos + len]), len: len as u32 });
         pos += len;
     }
+    assert_eq!(pos, data.len(), "recipe covers the input");
+    assert_eq!(out.is_empty(), data.is_empty());
     out
 }
 
@@ -207,6 +218,7 @@ impl ChunkIndex {
             off += c.len as u64;
         }
         self.recipes.insert(blob, recipe);
+        assert!(self.recipes.contains_key(&blob));
     }
 
     pub fn recipe(&self, blob: &Hash) -> Option<Arc<Recipe>> {
@@ -232,6 +244,7 @@ impl ChunkIndex {
 
 /// Reads one chunk out of an open blob.
 pub fn read_chunk(file: &File, offset: u64, len: u32) -> io::Result<Vec<u8>> {
+    assert!(len as usize <= MAX_CHUNK);
     let mut buf = vec![0u8; len as usize];
     file.read_exact_at(&mut buf, offset)?;
     Ok(buf)

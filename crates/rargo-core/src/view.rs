@@ -22,12 +22,16 @@ use std::sync::Arc;
 pub type VPath = Arc<[u8]>;
 
 pub fn vjoin(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    assert!(dir.starts_with(b"/"), "sandbox paths are absolute: {}", show(dir));
+    assert!(dir == b"/" || !dir.ends_with(b"/"), "sandbox paths are normalised: {}", show(dir));
+    assert!(!name.is_empty());
     let mut v = Vec::with_capacity(dir.len() + 1 + name.len());
     if dir != b"/" {
         v.extend_from_slice(dir);
     }
     v.push(b'/');
     v.extend_from_slice(name);
+    assert!(vpath_starts_with(&v, dir));
     v
 }
 
@@ -38,7 +42,10 @@ pub fn vsplit(path: &[u8]) -> Option<(&[u8], &[u8])> {
     }
     let i = path.iter().rposition(|&c| c == b'/')?;
     let parent = if i == 0 { &b"/"[..] } else { &path[..i] };
-    Some((parent, &path[i + 1..]))
+    let name = &path[i + 1..];
+    assert!(!name.contains(&b'/'));
+    assert!(parent.len() < path.len());
+    Some((parent, name))
 }
 
 pub fn vpath_starts_with(path: &[u8], prefix: &[u8]) -> bool {
@@ -104,6 +111,7 @@ impl HostSig {
         k[16..24].copy_from_slice(&self.size.to_le_bytes());
         k[24..32].copy_from_slice(&self.mtime_ns.to_le_bytes());
         k[32..40].copy_from_slice(&self.ctime_ns.to_le_bytes());
+        const _: () = assert!(std::mem::size_of::<HostSig>() == 40);
         k
     }
 }
@@ -341,6 +349,7 @@ impl Content {
                 Ok((f, BackingKey::Host(sig), FileSrc::Host { path: path.clone(), sig }))
             }
             FileSrc::Lazy(_) => {
+                assert!(self.known_hash(src).is_none(), "lazy content has no hash before it is fetched");
                 let h = self.hash(src)?;
                 Ok((self.open_blob(&h)?, BackingKey::Blob(h), FileSrc::Blob(h)))
             }
@@ -382,6 +391,7 @@ impl Content {
                 if before != *sig {
                     return Err(io::Error::from_raw_os_error(libc::ESTALE));
                 }
+                assert_eq!(before.size, sig.size);
                 let (h, _) = Hash::of_file(&f)?;
                 let after = HostSig::of(&f.metadata()?);
                 if after != before {

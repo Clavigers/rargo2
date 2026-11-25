@@ -18,6 +18,9 @@ const PING_EVERY: Duration = Duration::from_secs(10);
 /// Nothing heard for this long: the link is dead.
 const DEAD_AFTER: Duration = Duration::from_secs(45);
 
+const _: () = assert!(WINDOW <= u32::MAX as usize, "a window's permits fit acquire_many");
+const _: () = assert!(DEAD_AFTER.as_secs() > 2 * PING_EVERY.as_secs());
+
 struct Out {
     seq: u64,
     tx: UnboundedSender<(Vec<u8>, usize)>,
@@ -211,6 +214,8 @@ impl Mux {
     /// Queues file contents, waiting while too much is queued already.
     pub async fn post_bulk(&self, stream: u32, msg: &ClientMsg, bytes: usize) -> std::io::Result<()> {
         let n = bytes.clamp(1, WINDOW);
+        assert!(n >= 1);
+        assert!(n <= WINDOW);
         let permit = self
             .window
             .acquire_many(n as u32)
@@ -224,8 +229,10 @@ impl Mux {
     /// Opens a stream for a command.
     pub fn open(&self) -> (u32, UnboundedSender<ServerMsg>, UnboundedReceiver<ServerMsg>) {
         let id = self.next_stream.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id, CONTROL);
+        assert_ne!(id, rargo_proto::KEEPALIVE);
         let (tx, rx) = unbounded_channel();
-        self.streams.lock().unwrap().insert(id, tx.clone());
+        assert!(self.streams.lock().unwrap().insert(id, tx.clone()).is_none());
         (id, tx, rx)
     }
 
@@ -243,7 +250,7 @@ impl Mux {
     /// Registers for the answer to the offer `id`.
     pub fn expect_missing(&self, id: u64) -> oneshot::Receiver<(Vec<Digest>, Vec<Digest>)> {
         let (tx, rx) = oneshot::channel();
-        self.missing.lock().unwrap().insert(id, tx);
+        assert!(self.missing.lock().unwrap().insert(id, tx).is_none(), "offer {id} awaited twice");
         rx
     }
 
@@ -257,7 +264,9 @@ impl Mux {
     /// `to`, ending with [`ServerMsg::Fetched`] with the returned id.
     pub fn ask(&self, to: &UnboundedSender<ServerMsg>, question: impl FnOnce(u64) -> ClientMsg) -> u64 {
         let stream = self.next_stream.fetch_add(1, Ordering::Relaxed);
-        self.streams.lock().unwrap().insert(stream, to.clone());
+        assert_ne!(stream, CONTROL);
+        assert_ne!(stream, rargo_proto::KEEPALIVE);
+        assert!(self.streams.lock().unwrap().insert(stream, to.clone()).is_none());
         let id = stream as u64;
         self.post(stream, &question(id));
         id

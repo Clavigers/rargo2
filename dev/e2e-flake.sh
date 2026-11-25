@@ -37,6 +37,11 @@ actions_since() { tail -n "+$(($1 + 1))" "$log" | sed -n 's/^rargod: action //p'
 
 daemon a stop; daemon b stop
 rm -rf "$T"; mkdir -p "$T/home-a" "$T/home-b" "$T/a" "$T/b/somewhere/else"
+# A server's cargo home holds rustup's proxies in bin; here one that fails
+# if it ever runs, since a build's tools are its flake's.
+mkdir -p "$T/state-a/cargo-home/bin"
+printf '#!/bin/sh\necho "the server cargo home bin'"'"'s cargo-clippy ran" >&2\nexit 1\n' >"$T/state-a/cargo-home/bin/cargo-clippy"
+chmod +x "$T/state-a/cargo-home/bin/cargo-clippy"
 trap 'daemon a stop; daemon b stop' EXIT
 
 P=$T/a/proj
@@ -48,7 +53,7 @@ cat >"$P/flake.nix" <<'NIX'
   outputs = { self, nixpkgs }:
     let pkgs = nixpkgs.legacyPackages.x86_64-linux; in {
       devShells.x86_64-linux.default = pkgs.mkShell {
-        packages = [ pkgs.rustc pkgs.cargo pkgs.gcc ];
+        packages = [ pkgs.rustc pkgs.cargo pkgs.clippy pkgs.gcc ];
       };
     };
 }
@@ -104,6 +109,8 @@ has "$out" "built with: gcc (GCC)" && ok "build script ran the flake's compiler 
 file target/debug/flaky | grep -q "interpreter /nix/store/" && ok "binary is linked against the flake's libc" || bad "binary is linked against the flake's libc" "$(file target/debug/flaky)"
 out=$(on a "$R" test 2>&1); rc=$?
 [ $rc -eq 0 ] && has "$out" "1 passed" && ok "test confirms the host filesystem is not visible" || bad "test confirms the host filesystem is not visible" "$out"
+out=$(on a "$R" clippy 2>&1); rc=$?
+[ $rc -eq 0 ] && ok "clippy runs the flake's clippy" || bad "clippy runs the flake's clippy" "$out"
 git -C "$P" add Cargo.lock; git -C "$P" -c user.name=t -c user.email=t@t commit -q -m lock
 on a "$R" build >/dev/null 2>&1; on a "$R" test >/dev/null 2>&1
 a_hash=$(sha256sum target/debug/flaky | cut -d' ' -f1)

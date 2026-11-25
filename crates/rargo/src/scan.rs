@@ -139,8 +139,10 @@ impl Maps {
     fn drop_file(&self, hash: Digest, path: &Path) {
         let mut refs = self.refs.lock().unwrap();
         let Some(n) = refs.get_mut(&hash) else { return };
+        assert!(*n > 0, "a counted content has a reference");
         *n -= 1;
         let mut files = self.files.lock().unwrap();
+        assert!(files.contains_key(&hash), "a counted content has a file");
         if *n == 0 {
             refs.remove(&hash);
             files.remove(&hash);
@@ -168,12 +170,14 @@ pub fn hash_file(path: &Path, size: u64) -> io::Result<Digest> {
 }
 
 fn join(rel: &[u8], name: &[u8]) -> Vec<u8> {
+    assert!(!name.is_empty());
     let mut v = Vec::with_capacity(rel.len() + 1 + name.len());
     if !rel.is_empty() {
         v.extend_from_slice(rel);
         v.push(b'/');
     }
     v.extend_from_slice(name);
+    assert_eq!(v.len(), rel.len() + name.len() + usize::from(!rel.is_empty()));
     v
 }
 
@@ -401,6 +405,7 @@ impl Ctx<'_> {
             entries.push((name, node));
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "names in a directory are unique");
         let old: HashMap<&[u8], &Node> = before.iter().flat_map(|t| t.entries.iter().map(|(n, x)| (n.as_slice(), x))).collect();
         // What was here and is not, or is no longer what it was.
         for (name, was) in &old {
@@ -428,6 +433,7 @@ impl Ctx<'_> {
             index.push((join(rel, &name), e));
         }
         let encoded = Tree { entries }.encode();
+        debug_assert!(Tree::decode(&encoded).is_ok());
         let digest = rargo_proto::tree::digest(&encoded);
         self.m.trees.lock().unwrap().insert(digest, encoded);
         self.m.dir_trees.lock().unwrap().insert(rel.to_vec(), digest);
@@ -566,6 +572,7 @@ fn merge(trees: &mut HashMap<Digest, Vec<u8>>, a: Digest, b: Digest) -> io::Resu
             Err(i) => out.entries.insert(i, (name, node)),
         }
     }
+    assert!(out.entries.windows(2).all(|w| w[0].0 < w[1].0), "a merged directory stays sorted");
     let encoded = out.encode();
     let digest = rargo_proto::tree::digest(&encoded);
     trees.insert(digest, encoded);
