@@ -161,11 +161,19 @@ pub enum Command {
     Build,
 }
 
+const SERVER_IN_CARGO_TOML_UNTIL: u32 = 7;
+
 pub fn protocol_mismatch(client: u32) -> String {
     let server = env!("CARGO_PKG_VERSION");
     let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {server}");
     let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching version") };
-    format!("this rargo is {age} than the build server, which runs rargo {server}; {verb} with: {install}")
+    let rename = if client <= SERVER_IN_CARGO_TOML_UNTIL {
+        "; then name the server once more with `rargo @HOST`, as you did before: the new rargo keeps it in your own \
+         configuration, not in Cargo.toml"
+    } else {
+        ""
+    };
+    format!("this rargo is {age} than the build server, which runs rargo {server}; {verb} with: {install}{rename}")
 }
 
 pub fn command(version: u32, args: &[String], admin: bool, user: &str) -> Command {
@@ -577,10 +585,14 @@ mod tests {
         let Command::Fail(old) = command(PROTO_VERSION - 1, &a(&["build"]), false, "bob") else { panic!("an old client") };
         let server = format!("which runs rargo {}", env!("CARGO_PKG_VERSION"));
         assert!(old.starts_with("this rargo is older than the build server, ") && old.contains(&server), "{old}");
-        assert!(old.ends_with(&format!("update it with: {install}")) && !old.contains("protocol"), "{old}");
+        assert!(old.contains(&format!("update it with: {install}; then name the server once more with `rargo @HOST`")), "{old}");
+        assert!(old.ends_with("not in Cargo.toml") && !old.contains("protocol"), "{old}");
+        for client in [1, 6, SERVER_IN_CARGO_TOML_UNTIL] {
+            assert!(protocol_mismatch(client).contains("`rargo @HOST`"), "a client that kept its server in Cargo.toml: {client}");
+        }
         let Command::Fail(new) = command(PROTO_VERSION + 1, &a(&["build"]), false, "bob") else { panic!("a new client") };
         assert!(new.starts_with("this rargo is newer than the build server, ") && new.ends_with(&install), "{new}");
-        assert!(new.contains("install the matching version with: ") && !new.contains("protocol"), "{new}");
+        assert!(new.contains("install the matching version with: ") && !new.contains("protocol") && !new.contains("rargo @HOST"), "{new}");
         assert_eq!(command(PROTO_VERSION, &a(&["__export", "/d"]), true, "ann"), Command::Export("/d".into()));
         assert_eq!(
             command(PROTO_VERSION, &a(&["__import"]), true, "ann"),
