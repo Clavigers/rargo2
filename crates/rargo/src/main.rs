@@ -1035,8 +1035,49 @@ fn exec(mut e: ExecRequest) -> ! {
         };
     }
     let err = cmd.exec();
-    eprintln!("error: could not execute process `{}` (never executed)\n\nCaused by:\n  {err}", e.program);
+    let file = Path::new(&e.cwd).join(&e.program);
+    let loader = std::fs::File::open(&file).ok().and_then(|f| {
+        let mut head = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::Read::take(f, 64 << 10), &mut head).ok()?;
+        elf_interpreter(&head).map(|i| String::from_utf8_lossy(i).into_owned())
+    });
+    match loader.filter(|l| !Path::new(l).exists()) {
+        Some(loader) => eprint!("{}", missing_loader_text(&e.program, &loader)),
+        None => eprintln!("error: could not execute process `{}` (never executed)\n\nCaused by:\n  {err}", e.program),
+    }
     std::process::exit(101)
+}
+
+fn elf_interpreter(head: &[u8]) -> Option<&[u8]> {
+    let bytes = |at: usize, n: usize| head.get(at..at.checked_add(n)?);
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes(at, 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes(at, 4)?.try_into().ok()?));
+    let u64_at = |at: usize| Some(u64::from_le_bytes(bytes(at, 8)?.try_into().ok()?));
+    if head.get(..6)? != b"\x7fELF\x02\x01" {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (u64_at(0x20)? as usize, u16_at(0x36)? as usize, u16_at(0x38)? as usize);
+    (0..phnum).find_map(|i| {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if u32_at(ph)? != 3 {
+            return None;
+        }
+        let (offset, size) = (u64_at(ph.checked_add(8)?)? as usize, u64_at(ph.checked_add(32)?)? as usize);
+        let interp = head.get(offset..offset.checked_add(size)?)?;
+        Some(interp.strip_suffix(b"\0").unwrap_or(interp))
+    })
+}
+
+fn missing_loader_text(program: &str, loader: &str) -> String {
+    let store = loader.strip_prefix("/nix/store/").and_then(|rest| rest.split('/').next()).map(|name| format!("/nix/store/{name}"));
+    let fetch = match store {
+        Some(path) => format!(
+            "       The build server links with Nix's C library. Install Nix (https://nixos.org/download), then fetch it once with:\n       \
+             nix-store --realise {path} --add-root ~/.cache/rargo/nix-libc\n"
+        ),
+        None => String::new(),
+    };
+    format!("error: `{program}` cannot start here: it needs the program loader {loader}, which this machine does not have.\n{fetch}")
 }
 
 #[cfg(test)]
@@ -1055,6 +1096,41 @@ mod tests {
         let text = super::unreachable_text("build.example:7459", "Connection refused (os error 111)");
         assert!(text.starts_with("error: cannot reach the rargo server at build.example:7459: connection refused\n"), "{text}");
         assert!(text.contains("`rargo @HOST`") && text.contains("RARGO_FALLBACK=cargo") && !text.contains("os error"), "{text}");
+    }
+
+    #[test]
+    fn a_program_whose_loader_is_missing_is_explained_with_the_command_that_fetches_it() {
+        let elf = |interp: &[u8], phnum: u16| {
+            let mut f = vec![0u8; 0x200];
+            f[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            f[0x20..0x28].copy_from_slice(&0x40u64.to_le_bytes());
+            f[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+            f[0x38..0x3a].copy_from_slice(&phnum.to_le_bytes());
+            let second = 0x40 + 56;
+            f[second..second + 4].copy_from_slice(&3u32.to_le_bytes());
+            f[second + 8..second + 16].copy_from_slice(&0x100u64.to_le_bytes());
+            f[second + 32..second + 40].copy_from_slice(&(interp.len() as u64 + 1).to_le_bytes());
+            f[0x100..0x100 + interp.len()].copy_from_slice(interp);
+            f
+        };
+        let nix = b"/nix/store/r3hvhzl5fxhrgn0rfy5g7rda17702pj4-glibc-2.44-57/lib/ld-linux-x86-64.so.2";
+        assert_eq!(super::elf_interpreter(&elf(nix, 2)), Some(&nix[..]));
+        assert_eq!(super::elf_interpreter(&elf(b"/lib64/ld-linux-x86-64.so.2", 2)), Some(&b"/lib64/ld-linux-x86-64.so.2"[..]));
+        assert_eq!(super::elf_interpreter(&elf(nix, 1)), None, "a program without PT_INTERP is static");
+        let mut far = elf(nix, 2);
+        far[0x20..0x28].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(super::elf_interpreter(&far), None, "headers past what was read are not guessed");
+        assert_eq!(super::elf_interpreter(b"#!/bin/sh\n"), None);
+        assert_eq!(super::elf_interpreter(&elf(nix, 2)[..0x30]), None);
+
+        let text = super::missing_loader_text("target/debug/app", std::str::from_utf8(nix).unwrap());
+        assert_eq!(
+            text,
+            "error: `target/debug/app` cannot start here: it needs the program loader /nix/store/r3hvhzl5fxhrgn0rfy5g7rda17702pj4-glibc-2.44-57/lib/ld-linux-x86-64.so.2, which this machine does not have.\n       \
+             The build server links with Nix's C library. Install Nix (https://nixos.org/download), then fetch it once with:\n       \
+             nix-store --realise /nix/store/r3hvhzl5fxhrgn0rfy5g7rda17702pj4-glibc-2.44-57 --add-root ~/.cache/rargo/nix-libc\n"
+        );
+        assert!(!super::missing_loader_text("app", "/opt/ld.so").contains("nix-store"));
     }
 
     #[test]
