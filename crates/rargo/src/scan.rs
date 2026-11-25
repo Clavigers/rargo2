@@ -2,14 +2,12 @@ use rargo_proto::Digest;
 use rargo_proto::tree::{Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
@@ -64,47 +62,35 @@ pub struct Scan {
 }
 
 #[derive(Default)]
-struct Maps {
-    trees: Mutex<HashMap<Digest, Vec<u8>>>,
-    files: Mutex<HashMap<Digest, (PathBuf, u64)>>,
-    refs: Mutex<HashMap<Digest, u32>>,
-    dir_trees: Mutex<HashMap<Vec<u8>, Digest>>,
-    index: Mutex<HashMap<Vec<u8>, Entry>>,
-    relink: Mutex<HashSet<Digest>>,
+struct ScanState {
+    trees: HashMap<Digest, Vec<u8>>,
+    files: HashMap<Digest, (PathBuf, u64)>,
+    refs: HashMap<Digest, u32>,
+    dir_trees: HashMap<Vec<u8>, Digest>,
+    index: HashMap<Vec<u8>, Entry>,
+    relink: HashSet<Digest>,
+    listed_dirs: u64,
+    removed: u64,
+    hashed_files: u64,
+    hashed_bytes: u64,
 }
 
-struct Ctx<'a> {
-    root: &'a Path,
-    old: Option<&'a Index>,
-    on_path: Option<HashSet<Vec<u8>>>,
-    root_before: Vec<u8>,
-    exclude: &'a [String],
-    ignored: Option<&'a Ignored>,
-    m: Maps,
-    listed_dirs: AtomicU64,
-    removed: AtomicU64,
-    hashed_files: AtomicU64,
-    hashed_bytes: AtomicU64,
-}
-
-impl Maps {
-    fn add_file(&self, hash: Digest, path: PathBuf, size: u64) {
-        *self.refs.lock().unwrap().entry(hash).or_insert(0) += 1;
-        self.files.lock().unwrap().entry(hash).or_insert((path, size));
+impl ScanState {
+    fn add_file(&mut self, hash: Digest, path: PathBuf, size: u64) {
+        *self.refs.entry(hash).or_insert(0) += 1;
+        self.files.entry(hash).or_insert((path, size));
     }
 
-    fn drop_file(&self, hash: Digest, path: &Path) {
-        let mut refs = self.refs.lock().unwrap();
-        let Some(n) = refs.get_mut(&hash) else { return };
+    fn drop_file(&mut self, hash: Digest, path: &Path) {
+        let Some(n) = self.refs.get_mut(&hash) else { return };
         assert!(*n > 0, "a counted content has a reference");
         *n -= 1;
-        let mut files = self.files.lock().unwrap();
-        assert!(files.contains_key(&hash), "a counted content has a file");
+        assert!(self.files.contains_key(&hash), "a counted content has a file");
         if *n == 0 {
-            refs.remove(&hash);
-            files.remove(&hash);
-        } else if files.get(&hash).is_some_and(|(p, _)| p == path) {
-            self.relink.lock().unwrap().insert(hash);
+            self.refs.remove(&hash);
+            self.files.remove(&hash);
+        } else if self.files.get(&hash).is_some_and(|(p, _)| p == path) {
+            self.relink.insert(hash);
         }
     }
 }
@@ -240,158 +226,200 @@ fn is_cache_dir(dir: &Path) -> bool {
     }
 }
 
-impl Ctx<'_> {
-    fn cached(&self, rel: &[u8]) -> Option<Entry> {
-        match self.old {
-            Some(old) => old.files.get(rel).copied(),
-            None => self.m.index.lock().unwrap().get(rel).copied(),
+enum Directory {
+    Reuse(Digest),
+    Listing(Vec<(Vec<u8>, Observed)>),
+}
+
+enum Observed {
+    Directory(Directory),
+    Symlink(Vec<u8>),
+    File { entry: Entry, exec: bool, hashed: bool },
+}
+
+struct ScanPlan<'a> {
+    old: Option<&'a Index>,
+    previous: Option<&'a Scan>,
+    on_path: Option<&'a HashSet<Vec<u8>>>,
+    exclude: &'a [String],
+    ignored: Option<&'a Ignored>,
+}
+
+impl ScanPlan<'_> {
+    fn reuse(&self, rel: &[u8]) -> Option<Digest> {
+        if self.on_path?.contains(rel) {
+            return None;
         }
+        self.previous?.dir_trees.get(rel).copied()
     }
 
-    fn dir(&self, rel: &[u8], inside: bool) -> io::Result<Digest> {
-        let abs = if rel.is_empty() { self.root.to_path_buf() } else { self.root.join(OsStr::from_bytes(rel)) };
-        let mut before: Option<Tree> = None;
-        if let Some(on_path) = &self.on_path {
-            let was = self.m.dir_trees.lock().unwrap().get(rel).copied();
-            if let Some(d) = was {
-                if !on_path.contains(rel) {
-                    return Ok(d);
-                }
-                before = Some(if rel.is_empty() {
-                    Tree::decode(&self.root_before)?
-                } else {
-                    let trees = self.m.trees.lock().unwrap();
-                    Tree::decode(trees.get(&d).ok_or_else(|| io::Error::other("a tree of the last scan is missing"))?)?
-                });
+    fn take(&self, dir: &[u8], name: &[u8], inside: bool) -> Option<(Vec<u8>, Take)> {
+        let child = join(dir, name);
+        if name == b".git" || excluded(self.exclude, &child, name) || (dir.is_empty() && name == b"target") {
+            return None;
+        }
+        let take = self.ignored.map_or(Take::Keep, |i| i.take(&child, name, inside));
+        (take != Take::Skip).then_some((child, take))
+    }
+
+    fn reuse_file(&self, rel: &[u8], stamp: Stamp) -> Option<Entry> {
+        let index = self.old.or_else(|| self.previous.map(|scan| &scan.index))?;
+        let old = index.files.get(rel).copied()?;
+        let same = old.size == stamp.size && old.mtime_ns == stamp.mtime_ns && old.ctime_ns == stamp.ctime_ns && old.ino == stamp.ino;
+        let settled = stamp.mtime_ns.max(stamp.ctime_ns) + RACY_NS < old.hashed_at_ns;
+        (same && settled).then_some(old)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Stamp {
+    size: u64,
+    mtime_ns: i64,
+    ctime_ns: i64,
+    ino: u64,
+}
+
+fn observe_dir(root: &Path, rel: &[u8], inside: bool, plan: &ScanPlan<'_>) -> io::Result<Directory> {
+    if let Some(digest) = plan.reuse(rel) {
+        return Ok(Directory::Reuse(digest));
+    }
+    let abs = if rel.is_empty() { root.to_path_buf() } else { root.join(OsStr::from_bytes(rel)) };
+    let mut names = std::fs::read_dir(&abs)?
+        .map(|entry| entry.map(|entry| entry.file_name().as_bytes().to_vec()))
+        .collect::<io::Result<Vec<_>>>()?;
+    names.sort();
+    let nodes: Vec<_> = names.into_par_iter().map(|name| {
+        observe_entry(root, rel, &name, inside, plan).map(|entry| entry.map(|value| (name, value)))
+    }).collect();
+    let listing = nodes.into_iter().collect::<io::Result<Vec<_>>>()?.into_iter().flatten().collect();
+    Ok(Directory::Listing(listing))
+}
+
+fn observe_entry(root: &Path, rel: &[u8], name: &[u8], inside: bool, plan: &ScanPlan<'_>) -> io::Result<Option<Observed>> {
+    let Some((child, take)) = plan.take(rel, name, inside) else { return Ok(None) };
+    let path = root.join(OsStr::from_bytes(&child));
+    let md = match std::fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if md.is_dir() {
+        if is_cache_dir(&path) {
+            return Ok(None);
+        }
+        return match observe_dir(root, &child, take == Take::OnlyTheWay, plan) {
+            Ok(dir) => Ok(Some(Observed::Directory(dir))),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        };
+    }
+    if md.is_symlink() {
+        return Ok(std::fs::read_link(&path).ok().map(|target| Observed::Symlink(target.as_os_str().as_bytes().to_vec())));
+    }
+    if !md.is_file() || take == Take::OnlyTheWay {
+        return Ok(None);
+    }
+    let exec = md.mode() & 0o111 != 0;
+    let stamp = Stamp {
+        size: md.len(),
+        mtime_ns: md.mtime() * 1_000_000_000 + md.mtime_nsec(),
+        ctime_ns: md.ctime() * 1_000_000_000 + md.ctime_nsec(),
+        ino: md.ino(),
+    };
+    if let Some(entry) = plan.reuse_file(&child, stamp) {
+        return Ok(Some(Observed::File { entry, exec, hashed: false }));
+    }
+    let hashed_at_ns = now_ns();
+    let hash = match hash_file(&path, stamp.size) {
+        Ok(hash) => hash,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", path.display()))),
+    };
+    let entry = Entry { size: stamp.size, mtime_ns: stamp.mtime_ns, ctime_ns: stamp.ctime_ns, ino: stamp.ino, hash, hashed_at_ns };
+    Ok(Some(Observed::File { entry, exec, hashed: true }))
+}
+
+impl ScanState {
+    fn dir(&mut self, root: &Path, rel: &[u8], directory: Directory, root_before: &[u8]) -> io::Result<Digest> {
+        let listing = match directory {
+            Directory::Reuse(digest) => return Ok(digest),
+            Directory::Listing(listing) => listing,
+        };
+        self.listed_dirs += 1;
+        let before = self.dir_trees.get(rel).map(|d| {
+            if rel.is_empty() {
+                Tree::decode(root_before)
+            } else {
+                self.decode(d)
             }
-        }
-        self.listed_dirs.fetch_add(1, Ordering::Relaxed);
-        let mut names: Vec<Vec<u8>> = Vec::new();
-        for e in std::fs::read_dir(&abs)? {
-            names.push(e?.file_name().as_bytes().to_vec());
-        }
-        let nodes: Vec<io::Result<Option<(Vec<u8>, Node, Option<Entry>)>>> = names
-            .into_par_iter()
-            .map(|name| -> io::Result<Option<(Vec<u8>, Node, Option<Entry>)>> {
-                let child_rel = join(rel, &name);
-                if name == b".git" || excluded(self.exclude, &child_rel, &name) || (rel.is_empty() && name == b"target") {
-                    return Ok(None);
-                }
-                let take = self.ignored.map(|i| i.take(&child_rel, &name, inside)).unwrap_or(Take::Keep);
-                if take == Take::Skip {
-                    return Ok(None);
-                }
-                let child_abs = abs.join(OsStr::from_bytes(&name));
-                let md = match std::fs::symlink_metadata(&child_abs) {
-                    Ok(m) => m,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(e),
-                };
-                let ft = md.file_type();
-                if ft.is_dir() {
-                    if is_cache_dir(&child_abs) {
-                        return Ok(None);
-                    }
-                    return match self.dir(&child_rel, take == Take::OnlyTheWay) {
-                        Ok(d) => Ok(Some((name, Node::Dir(d), None))),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-                        Err(e) => Err(e),
-                    };
-                }
-                if ft.is_symlink() {
-                    return match std::fs::read_link(&child_abs) {
-                        Ok(t) => Ok(Some((name, Node::Symlink(t.as_os_str().as_bytes().to_vec()), None))),
-                        Err(_) => Ok(None),
-                    };
-                }
-                if !ft.is_file() || take == Take::OnlyTheWay {
-                    return Ok(None);
-                }
-                let exec = md.mode() & 0o111 != 0;
-                let (mtime_ns, ctime_ns) =
-                    (md.mtime() * 1_000_000_000 + md.mtime_nsec(), md.ctime() * 1_000_000_000 + md.ctime_nsec());
-                if let Some(old) = self.cached(&child_rel) {
-                    let same = old.size == md.len() && old.mtime_ns == mtime_ns && old.ctime_ns == ctime_ns && old.ino == md.ino();
-                    let settled = mtime_ns.max(ctime_ns) + RACY_NS < old.hashed_at_ns;
-                    if same && settled {
-                        return Ok(Some((name, Node::File { hash: old.hash, size: old.size, exec }, Some(old))));
-                    }
-                }
-                let hashed_at_ns = now_ns();
-                let hash = match hash_file(&child_abs, md.len()) {
-                    Ok(h) => h,
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(e) => return Err(io::Error::new(e.kind(), format!("{}: {e}", child_abs.display()))),
-                };
-                self.hashed_files.fetch_add(1, Ordering::Relaxed);
-                self.hashed_bytes.fetch_add(md.len(), Ordering::Relaxed);
-                let entry = Entry { size: md.len(), mtime_ns, ctime_ns, ino: md.ino(), hash, hashed_at_ns };
-                Ok(Some((name, Node::File { hash, size: md.len(), exec }, Some(entry))))
-            })
-            .collect();
-        let mut entries = Vec::with_capacity(nodes.len());
+        }).transpose()?;
+        let old: BTreeMap<_, _> = before.iter().flat_map(|t| t.entries.iter().map(|(n, x)| (n.as_slice(), x))).collect();
+        let mut entries = Vec::with_capacity(listing.len());
         let mut index_add = Vec::new();
-        for n in nodes {
-            let Some((name, node, entry)) = n? else { continue };
-            if let (Node::File { hash, size, .. }, Some(e)) = (&node, entry) {
-                index_add.push((name.clone(), *hash, *size, e));
-            }
+        for (name, observed) in listing {
+            let child = join(rel, &name);
+            let node = match observed {
+                Observed::Directory(dir) => Node::Dir(self.dir(root, &child, dir, root_before)?),
+                Observed::Symlink(target) => Node::Symlink(target),
+                Observed::File { entry, exec, hashed } => {
+                    if hashed {
+                        self.hashed_files += 1;
+                        self.hashed_bytes += entry.size;
+                    }
+                    index_add.push((name.clone(), child, entry));
+                    Node::File { hash: entry.hash, size: entry.size, exec }
+                }
+            };
             entries.push((name, node));
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "names in a directory are unique");
-        let old: HashMap<&[u8], &Node> = before.iter().flat_map(|t| t.entries.iter().map(|(n, x)| (n.as_slice(), x))).collect();
         for (name, was) in &old {
             let now = entries.binary_search_by(|(n, _)| n.as_slice().cmp(name)).ok().map(|i| &entries[i].1);
             let child = join(rel, name);
             match (was, now) {
                 (Node::File { hash, .. }, Some(Node::File { hash: h, .. })) if h == hash => {}
-                (Node::File { hash, .. }, _) => {
-                    self.m.drop_file(*hash, &abs.join(OsStr::from_bytes(name)));
-                    self.m.index.lock().unwrap().remove(&child);
-                    self.removed.fetch_add(1, Ordering::Relaxed);
-                }
+                (Node::File { hash, .. }, _) => self.forget_file(root, &child, *hash),
                 (Node::Dir(_), Some(Node::Dir(_))) => {}
-                (Node::Dir(d), _) => self.forget(&child, *d)?,
+                (Node::Dir(d), _) => self.forget(root, &child, *d)?,
                 (Node::Symlink(_), _) => {}
             }
         }
-        let mut index = Vec::with_capacity(index_add.len());
-        for (name, hash, size, e) in index_add {
-            let new = !matches!(old.get(name.as_slice()), Some(Node::File { hash: h, .. }) if *h == hash);
-            if new {
-                self.m.add_file(hash, abs.join(OsStr::from_bytes(&name)), size);
+        index_add.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (name, child, entry) in index_add {
+            if !matches!(old.get(name.as_slice()), Some(Node::File { hash, .. }) if *hash == entry.hash) {
+                self.add_file(entry.hash, root.join(OsStr::from_bytes(&child)), entry.size);
             }
-            index.push((join(rel, &name), e));
+            self.index.insert(child, entry);
         }
         let encoded = Tree { entries }.encode();
         debug_assert!(Tree::decode(&encoded).is_ok());
         let digest = rargo_proto::tree::digest(&encoded);
-        self.m.trees.lock().unwrap().insert(digest, encoded);
-        self.m.dir_trees.lock().unwrap().insert(rel.to_vec(), digest);
-        self.m.index.lock().unwrap().extend(index);
+        self.trees.insert(digest, encoded);
+        self.dir_trees.insert(rel.to_vec(), digest);
         Ok(digest)
     }
 
-    fn forget(&self, rel: &[u8], digest: Digest) -> io::Result<()> {
-        let tree = {
-            let trees = self.m.trees.lock().unwrap();
-            Tree::decode(trees.get(&digest).ok_or_else(|| io::Error::other("a tree of the last scan is missing"))?)?
-        };
-        let abs = self.root.join(OsStr::from_bytes(rel));
-        for (name, node) in tree.entries {
+    fn decode(&self, digest: &Digest) -> io::Result<Tree> {
+        Tree::decode(self.trees.get(digest).ok_or_else(|| io::Error::other("a tree of the last scan is missing"))?)
+    }
+
+    fn forget_file(&mut self, root: &Path, child: &[u8], hash: Digest) {
+        self.drop_file(hash, &root.join(OsStr::from_bytes(child)));
+        self.index.remove(child);
+        self.removed += 1;
+    }
+
+    fn forget(&mut self, root: &Path, rel: &[u8], digest: Digest) -> io::Result<()> {
+        for (name, node) in self.decode(&digest)?.entries {
             let child = join(rel, &name);
             match node {
-                Node::Dir(d) => self.forget(&child, d)?,
-                Node::File { hash, .. } => {
-                    self.m.drop_file(hash, &abs.join(OsStr::from_bytes(&name)));
-                    self.m.index.lock().unwrap().remove(&child);
-                    self.removed.fetch_add(1, Ordering::Relaxed);
-                }
+                Node::Dir(d) => self.forget(root, &child, d)?,
+                Node::File { hash, .. } => self.forget_file(root, &child, hash),
                 Node::Symlink(_) => {}
             }
         }
-        self.m.dir_trees.lock().unwrap().remove(rel);
+        self.dir_trees.remove(rel);
         Ok(())
     }
 }
@@ -494,75 +522,76 @@ fn scan_dir(
     exclude: &[String],
     ignored: Option<&Ignored>,
 ) -> io::Result<Scan> {
-    let (m, on_path, root_before, files_before) = match prev {
-        Some((mut p, on_path)) => {
-            for h in p.grafted.drain(..) {
-                if !p.refs.contains_key(&h) {
-                    p.files.remove(&h);
-                }
-            }
-            let n = p.index.files.len();
-            let m = Maps {
-                trees: Mutex::new(p.trees),
-                files: Mutex::new(p.files),
-                refs: Mutex::new(p.refs),
-                dir_trees: Mutex::new(p.dir_trees),
-                index: Mutex::new(p.index.files),
-                relink: Mutex::new(HashSet::new()),
-            };
-            (m, Some(on_path), p.worktree_root, n)
-        }
-        None => (Maps::default(), None, Vec::new(), old.map(|o| o.files.len()).unwrap_or(0)),
-    };
-    let ctx = Ctx {
-        root,
+    let plan = ScanPlan {
         old,
-        on_path,
-        root_before,
+        previous: prev.as_ref().map(|(scan, _)| scan),
+        on_path: prev.as_ref().map(|(_, paths)| paths),
         exclude,
         ignored,
-        m,
-        listed_dirs: AtomicU64::new(0),
-        removed: AtomicU64::new(0),
-        hashed_files: AtomicU64::new(0),
-        hashed_bytes: AtomicU64::new(0),
     };
-    let root_digest = ctx.dir(b"", false)?;
-    let m = ctx.m;
-    let mut files = m.files.into_inner().unwrap();
-    let index = m.index.into_inner().unwrap();
-    let relink = m.relink.into_inner().unwrap();
-    if !relink.is_empty() {
-        for (rel, e) in &index {
-            if relink.contains(&e.hash) {
-                files.insert(e.hash, (root.join(OsStr::from_bytes(rel)), e.size));
+    let observed = observe_dir(root, b"", false, &plan)?;
+    finish_scan(root, old, prev.map(|(scan, _)| scan), observed)
+}
+
+fn finish_scan(root: &Path, old: Option<&Index>, previous: Option<Scan>, observed: Directory) -> io::Result<Scan> {
+    let (mut state, root_before, files_before) = match previous {
+        Some(mut scan) => {
+            for hash in scan.grafted.drain(..) {
+                if !scan.refs.contains_key(&hash) {
+                    scan.files.remove(&hash);
+                }
+            }
+            let count = scan.index.files.len();
+            let state = ScanState {
+                trees: scan.trees,
+                files: scan.files,
+                refs: scan.refs,
+                dir_trees: scan.dir_trees,
+                index: scan.index.files,
+                ..ScanState::default()
+            };
+            (state, scan.worktree_root, count)
+        }
+        None => (ScanState::default(), Vec::new(), old.map_or(0, |index| index.files.len())),
+    };
+    let root_digest = state.dir(root, b"", observed, &root_before)?;
+    if !state.relink.is_empty() {
+        let mut candidates: BTreeMap<Digest, (&Vec<u8>, u64)> = BTreeMap::new();
+        for (path, entry) in &state.index {
+            if state.relink.contains(&entry.hash) {
+                let candidate = candidates.entry(entry.hash).or_insert((path, entry.size));
+                if path < candidate.0 {
+                    *candidate = (path, entry.size);
+                }
             }
         }
+        for (hash, (path, size)) in candidates {
+            state.files.insert(hash, (root.join(OsStr::from_bytes(path)), size));
+        }
     }
-    let dir_trees = m.dir_trees.into_inner().unwrap();
-    let mut trees = m.trees.into_inner().unwrap();
-    if trees.len() > 2 * dir_trees.len() + 256 {
-        let live: HashSet<&Digest> = dir_trees.values().collect();
-        trees.retain(|d, _| live.contains(d));
+    let worktree_root = state.trees.get(&root_digest).cloned().unwrap_or_default();
+    if state.trees.len() > 2 * state.dir_trees.len() + 256 {
+        let live: HashSet<_> = state.dir_trees.values().collect();
+        state.trees.retain(|d, _| live.contains(d));
     }
-    let worktree_root = trees.get(&root_digest).cloned().unwrap_or_default();
-    let hashed_files = ctx.hashed_files.into_inner();
-    let index_changed = hashed_files > 0 || ctx.removed.into_inner() > 0 || index.len() != files_before;
+    let mut dirs: Vec<_> = state.dir_trees.keys().map(|rel| if rel.is_empty() { root.to_path_buf() } else { root.join(OsStr::from_bytes(rel)) }).collect();
+    dirs.sort_unstable();
+    let index_changed = state.hashed_files > 0 || state.removed > 0 || state.index.len() != files_before;
     Ok(Scan {
         root: root_digest,
-        trees,
-        files,
-        refs: m.refs.into_inner().unwrap(),
+        trees: state.trees,
+        files: state.files,
+        refs: state.refs,
         grafted: Vec::new(),
-        dirs: dir_trees.keys().map(|rel| if rel.is_empty() { root.to_path_buf() } else { root.join(OsStr::from_bytes(rel)) }).collect(),
-        dir_trees,
+        dirs,
+        dir_trees: state.dir_trees,
         worktree_root,
-        listed_dirs: ctx.listed_dirs.into_inner(),
-        file_count: index.len() as u64,
-        index: Index { files: index },
+        listed_dirs: state.listed_dirs,
+        file_count: state.index.len() as u64,
+        index: Index { files: state.index },
         index_changed,
-        hashed_files,
-        hashed_bytes: ctx.hashed_bytes.into_inner(),
+        hashed_files: state.hashed_files,
+        hashed_bytes: state.hashed_bytes,
     })
 }
 
@@ -814,31 +843,66 @@ mod tests {
         assert_eq!(g.files[&head].0, tmp.path().join("thin/HEAD"));
     }
 
+    fn invariants(scan: &Scan, root: &Path) -> bool {
+        scan.dir_trees.get(b"".as_slice()) == Some(&scan.root)
+            && scan.dir_trees.values().all(|hash| scan.trees.contains_key(hash))
+            && scan.refs.values().map(|&n| u64::from(n)).sum::<u64>() == scan.file_count
+            && scan.files.iter().all(|(hash, (path, size))| {
+                path.strip_prefix(root).ok().and_then(|rel| scan.index.files.get(rel.as_os_str().as_bytes()))
+                    .is_some_and(|entry| &entry.hash == hash && &entry.size == size)
+            })
+    }
+
     #[test]
-    fn unchanged_files_are_not_read_again() {
-        let tmp = tempfile::tempdir().unwrap();
-        let r = tmp.path();
-        write(r, "a.rs", "one");
-        write(r, "d/b.rs", "two");
-        let s1 = scan(r, &Index::default(), &[], None).unwrap();
-        let s2 = scan(r, &s1.index, &[], None).unwrap();
-        assert_eq!(s2.hashed_files, 2);
-        assert_eq!(s2.root, s1.root);
-        std::thread::sleep(std::time::Duration::from_millis(120));
-        let s3 = scan(r, &s2.index, &[], None).unwrap();
-        assert_eq!(s3.hashed_files, 2, "hashed within the racy window of the write");
-        let s4 = scan(r, &s3.index, &[], None).unwrap();
-        assert_eq!(s4.hashed_files, 0);
-        assert!(!s4.index_changed);
-        assert_eq!(s4.root, s1.root);
-        write(r, "d/b.rs", "two!");
-        let s5 = scan(r, &s4.index, &[], None).unwrap();
-        assert_eq!(s5.hashed_files, 1);
-        assert_ne!(s5.root, s1.root);
-        std::fs::remove_file(r.join("a.rs")).unwrap();
-        let s6 = scan(r, &s5.index, &[], None).unwrap();
-        assert!(s6.index_changed);
-        assert_eq!(s6.index.files.len(), 1);
+    fn incremental_model_relinks_identical_content_and_reuses_unvisited_directories() {
+        let root = Path::new("/test-tree");
+        let entry = Entry { size: 1, mtime_ns: 0, ctime_ns: 0, ino: 1, hash: [4; 32], hashed_at_ns: RACY_NS + 1 };
+        let file = |hashed| Observed::File { entry, exec: false, hashed };
+        let leaf = b"file".to_vec();
+        let observed = Directory::Listing(vec![
+            (b"a".to_vec(), Observed::Directory(Directory::Listing(vec![(leaf.clone(), file(true))]))),
+            (b"b".to_vec(), Observed::Directory(Directory::Listing(vec![(leaf, file(true))]))),
+            (b"link".to_vec(), Observed::Symlink(b"b/file".to_vec())),
+        ]);
+        let old = finish_scan(root, None, None, observed).unwrap();
+        assert!(invariants(&old, root));
+        assert_eq!(old.files[&entry.hash].0, root.join("a/file"));
+        assert_eq!(old.hashed_files, 2);
+        assert_eq!(old.listed_dirs, 3);
+
+        let on_path = HashSet::from([Vec::new(), b"a".to_vec()]);
+        let plan = ScanPlan { old: None, previous: Some(&old), on_path: Some(&on_path), exclude: &[], ignored: None };
+        let keep = plan.reuse(b"b").unwrap();
+        assert_eq!(plan.reuse(b"a"), None);
+        let observed = Directory::Listing(vec![
+            (b"b".to_vec(), Observed::Directory(Directory::Reuse(keep))),
+            (b"link".to_vec(), Observed::Symlink(b"b/file".to_vec())),
+        ]);
+        let new = finish_scan(root, None, Some(old), observed).unwrap();
+        assert!(invariants(&new, root));
+        assert_eq!(new.files[&entry.hash].0, root.join("b/file"));
+        assert_eq!(new.hashed_files, 0);
+        assert_eq!(new.listed_dirs, 1);
+        assert_eq!(new.file_count, 1);
+        assert!(new.index_changed);
+    }
+
+    #[test]
+    fn metadata_shortcuts_and_ignore_decisions_are_pure() {
+        let stamp = Stamp { size: 5, mtime_ns: 1, ctime_ns: 2, ino: 3 };
+        let entry = Entry { size: 5, mtime_ns: 1, ctime_ns: 2, ino: 3, hash: [7; 32], hashed_at_ns: 2 + RACY_NS };
+        let mut index = Index { files: HashMap::from([(b"hello".to_vec(), entry)]) };
+        let ignored = Ignored::for_test(&["secret", "vendored/"], &["vendored/src".into()]);
+        let plan = ScanPlan { old: Some(&index), previous: None, on_path: None, exclude: &[], ignored: Some(&ignored) };
+        assert_eq!(plan.reuse_file(b"hello", stamp), None);
+        index.files.get_mut(b"hello".as_slice()).unwrap().hashed_at_ns += 1;
+        let plan = ScanPlan { old: Some(&index), previous: None, on_path: None, exclude: &[], ignored: Some(&ignored) };
+        assert!(plan.reuse_file(b"hello", stamp).is_some());
+        assert_eq!(plan.reuse_file(b"hello", Stamp { ino: 6, ..stamp }), None);
+        assert_eq!(plan.take(b"", b"secret", false), None);
+        assert_eq!(plan.take(b"", b"target", false), None);
+        assert_eq!(plan.take(b"", b"vendored", false).unwrap().1, Take::OnlyTheWay);
+        assert_eq!(plan.take(b"vendored", b"src", true).unwrap().1, Take::Keep);
     }
 
     #[test]
