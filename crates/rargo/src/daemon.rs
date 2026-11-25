@@ -1418,7 +1418,7 @@ impl Daemon {
              held                {} trees and contents the server is believed to hold (kept across daemons)\n\
              outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on first read, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
-            c.links.load(Ordering::Relaxed),
+            links,
             c.commands.load(Ordering::Relaxed),
             c.scans.load(Ordering::Relaxed),
             c.rescans.load(Ordering::Relaxed),
