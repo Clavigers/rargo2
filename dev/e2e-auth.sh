@@ -63,7 +63,8 @@ echo mallory >"$T/github-who"
 python3 "$here/fake-github.py" $ghport "$T/github-who" &
 gh=$!
 export RARGO_GITHUB_URL=http://127.0.0.1:$ghport RARGO_GITHUB_API=http://127.0.0.1:$ghport
-"$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >"$T/srv.log" 2>&1 &
+: >"$T/srv.log"
+"$D" --state "$T/state" --planner "$planner" --listen $host --jobs 4 --mem-gb 8 >>"$T/srv.log" 2>&1 &
 srv=$!
 tail -n +1 -f --pid="$srv" "$T/srv.log" | awk '/serving clients/ { found=1; exit } END { exit found ? 0 : 1 }' || true
 grep -q "tokens required" "$T/srv.log"; check $? "the server runs with tokens" "$(cat "$T/srv.log")"
