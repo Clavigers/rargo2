@@ -55,7 +55,7 @@ pub struct Counters {
     pub probes_known: AtomicU64,
     pub offered_bytes: AtomicU64,
     pub links: AtomicU64,
-    /// Contents fetched because something opened them: whole, by chunk,
+    /// Contents fetched because something read them: whole, by chunk,
     /// and the bytes of them that the cache already held.
     pub fetched_contents: AtomicU64,
     pub fetched_bytes: AtomicU64,
@@ -1413,7 +1413,7 @@ impl Daemon {
              scans               {} of whole worktrees, {} of {} directories that had changed or have no watch, {} spared (nothing had changed)\n\
              pushed              {} changes, {} bytes; {} trees the server had already (asked by root)\n\
              held                {} trees and contents the server is believed to hold (kept across daemons)\n\
-             outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on open, {} bytes fetched, {} bytes reused from the cache\n",
+             outputs             {} worktrees with a virtual output directory showing {} files; {} opened, {} made real; {} contents fetched on first read, {} bytes fetched, {} bytes reused from the cache\n",
             self.cfg.server,
             c.links.load(Ordering::Relaxed),
             c.commands.load(Ordering::Relaxed),
