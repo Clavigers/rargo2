@@ -22,7 +22,7 @@ struct Report {
 
 pub fn save(r: &FutureReport) -> std::io::Result<u32> {
     let path = Path::new(&r.path);
-    let mut disk = std::fs::read(path)
+    let mut disk = rargo_net::io::file::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice::<OnDisk>(&b).ok())
         .filter(|d| d.version == VERSION)

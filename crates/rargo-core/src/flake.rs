@@ -1,3 +1,4 @@
+use crate::io::file::PathRing as _;
 use crate::buildview::SynthEnt;
 use crate::db::Table;
 use crate::hash::{Hash, KeyHasher};
@@ -38,7 +39,7 @@ const CA_AT: &str = "/etc/ca-certificates.crt";
 fn host_ca_bundle() -> Option<Vec<u8>> {
     ["/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"]
         .iter()
-        .find_map(|p| std::fs::read(p).ok())
+        .find_map(|p| crate::io::file::read(p).ok())
 }
 
 fn nix() -> Command {
@@ -413,7 +414,7 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     let done = loop {
         match resolution.need() {
             Need::Exists(names) => {
-                let present = crate::io::cpu(|| names.into_iter().filter(|n| nix_store.join(n).exists()).collect());
+                let present = crate::io::cpu(|| names.into_iter().filter(|n| nix_store.join(n).ring_exists()).collect());
                 resolution.exists(&present);
             }
             Need::Evaluate => {
@@ -427,10 +428,10 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
                         }
                         None => {
                             crate::snapshot::chown(&at, uid, gid);
-                            std::fs::write(at.join("flake.nix"), DEFAULT_FLAKE)?;
-                            std::fs::write(at.join("flake.lock"), DEFAULT_LOCK)?;
+                            crate::io::file::write(at.join("flake.nix"), DEFAULT_FLAKE)?;
+                            crate::io::file::write(at.join("flake.lock"), DEFAULT_LOCK)?;
                             if let Some((name, data)) = &src.toolchain {
-                                std::fs::write(at.join(name), data)?;
+                                crate::io::file::write(at.join(name), data)?;
                             }
                             at.clone()
                         }
@@ -482,7 +483,7 @@ impl FlakeEnv {
     }
 
     pub fn which(&self, program: &str) -> Option<String> {
-        self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).is_file())
+        self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).ring_is_file())
     }
 
     pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<HashMap<Vec<u8>, SynthEnt>>> {
@@ -504,7 +505,7 @@ impl FlakeEnv {
         file("group", group)?;
         file("hosts", "127.0.0.1 localhost\n::1 localhost\n".into())?;
         file("nsswitch.conf", "passwd: files\ngroup: files\nhosts: files dns\n".into())?;
-        if let Ok(resolv) = std::fs::read_to_string("/etc/resolv.conf") {
+        if let Ok(resolv) = crate::io::file::read_to_string("/etc/resolv.conf") {
             file("resolv.conf", resolv)?;
         }
         if let Some(bundle) = host_ca_bundle() {

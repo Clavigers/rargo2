@@ -30,6 +30,7 @@ pub enum Op {
     MkdirAt { dir: i32, path: CString, mode: u32 },
     LinkAt { old_dir: i32, old: CString, new_dir: i32, new: CString },
     SymlinkAt { target: CString, new_dir: i32, new: CString },
+    Ftruncate { fd: i32, len: u64 },
     Fsync { fd: i32 },
     Close { fd: i32 },
     Timeout { ms: u64 },
@@ -182,6 +183,11 @@ pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) ->
         Op::LinkAt { old_dir, old, new_dir, new } => {
             let entry = opcode::LinkAt::new(types::Fd(old_dir), old.as_ptr(), types::Fd(new_dir), new.as_ptr()).build().user_data(token);
             inflight.insert(token, Slot { path: Some(old), path2: Some(new), ..Slot::empty(Kind::Path) });
+            entry
+        }
+        Op::Ftruncate { fd, len } => {
+            let entry = opcode::Ftruncate::new(types::Fd(fd), len).build().user_data(token);
+            inflight.insert(token, Slot::empty(Kind::Path));
             entry
         }
         Op::SymlinkAt { target, new_dir, new } => {

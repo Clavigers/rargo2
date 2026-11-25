@@ -1,3 +1,4 @@
+use crate::io::file::PathRing as _;
 use crate::build::{Client, Daemon, Home, handle};
 use crate::engine::ClientEnv;
 use crate::present::Output;
@@ -96,8 +97,8 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
         use std::os::unix::process::CommandExt;
         let stock_cwd = crate::io::cpu(|| -> Result<std::path::PathBuf> {
             snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
-            let stock_cwd = stock_cwd.canonicalize()?;
-            anyhow::ensure!(stock_cwd.starts_with(scratch2.canonicalize()?), "drift check directory is outside the snapshot");
+            let stock_cwd = stock_cwd.ring_canonicalize()?;
+            anyhow::ensure!(stock_cwd.starts_with(scratch2.ring_canonicalize()?), "drift check directory is outside the snapshot");
             Ok(stock_cwd)
         })?;
         let mut c = std::process::Command::new("nice");

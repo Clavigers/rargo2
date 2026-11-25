@@ -66,18 +66,17 @@ impl Github {
     }
 
     pub fn load(state: &Path) -> Option<Github> {
-        let g: Github = serde_json::from_slice(&std::fs::read(Self::path(state)).ok()?).ok()?;
+        let g: Github = serde_json::from_slice(&crate::io::file::read(Self::path(state)).ok()?).ok()?;
         (!g.client_id.is_empty() && !g.client_secret.is_empty()).then_some(g)
     }
 
     pub fn save(&self, state: &Path) -> Result<()> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let path = Self::path(state);
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-        let mut w = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        let mut w = crate::io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
         w.write_all(&serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
+        crate::io::file::rename(&tmp, &path)?;
         Ok(())
     }
 }
@@ -98,7 +97,7 @@ pub fn now() -> u64 {
 fn random(n: usize) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).context("reading /dev/urandom")?;
+    crate::io::file::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).context("reading /dev/urandom")?;
     Ok(b)
 }
 
@@ -161,10 +160,10 @@ impl TokenStore {
     }
 
     fn file(&self) -> Arc<Tokens> {
-        let stamp = std::fs::metadata(&self.path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
+        let stamp = crate::io::file::metadata(&self.path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
         let mut c = self.cached.lock();
         if c.0 != stamp || stamp.is_none() {
-            let (file, warning) = Tokens::read(std::fs::read(&self.path).ok().as_deref());
+            let (file, warning) = Tokens::read(crate::io::file::read(&self.path).ok().as_deref());
             if let Some(w) = warning {
                 eprintln!("rargod: {}: {w}", self.path.display());
             }
@@ -175,11 +174,10 @@ impl TokenStore {
 
     fn change<T>(&self, f: impl FnOnce(&mut Tokens) -> Result<T>) -> Result<T> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::io::file::create_dir_all(dir)?;
         }
-        let lock = std::fs::OpenOptions::new()
+        let lock = crate::io::file::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
@@ -189,7 +187,7 @@ impl TokenStore {
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             bail!("locking the token file: {}", std::io::Error::last_os_error());
         }
-        let mut file: Tokens = match std::fs::read(&self.path) {
+        let mut file: Tokens = match crate::io::file::read(&self.path) {
             Ok(bytes) => Tokens::decode(&bytes).with_context(|| format!("{}", self.path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Tokens::default(),
             Err(e) => return Err(e).with_context(|| format!("{}", self.path.display())),
@@ -198,11 +196,11 @@ impl TokenStore {
         let tmp = self.path.with_extension(format!("tmp{}", std::process::id()));
         {
             use std::io::Write;
-            let mut w = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+            let mut w = crate::io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
             w.write_all(&file.encode()?)?;
             w.sync_all()?;
         }
-        std::fs::rename(&tmp, &self.path)?;
+        crate::io::file::rename(&tmp, &self.path)?;
         *self.cached.lock() = (None, Arc::new(Tokens::default()));
         Ok(out)
     }

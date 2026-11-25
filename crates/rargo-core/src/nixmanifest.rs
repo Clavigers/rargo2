@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -97,7 +96,7 @@ pub trait StoreFs: Send + Sync {
 
 pub struct Disk;
 
-fn kind_of(path: &Path, meta: &fs::Metadata) -> io::Result<Kind> {
+fn kind_of(path: &Path, meta: &crate::io::file::Stat) -> io::Result<Kind> {
     let ft = meta.file_type();
     Ok(if ft.is_symlink() {
         Kind::Link(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
@@ -112,7 +111,7 @@ fn kind_of(path: &Path, meta: &fs::Metadata) -> io::Result<Kind> {
 
 impl StoreFs for Disk {
     fn stat(&self, path: &Path) -> io::Result<Kind> {
-        kind_of(path, &fs::symlink_metadata(path)?)
+        kind_of(path, &crate::io::file::symlink_metadata(path)?)
     }
 
     fn list(&self, dir: &Path) -> io::Result<Vec<(Vec<u8>, Kind)>> {
@@ -120,7 +119,7 @@ impl StoreFs for Disk {
         for ent in fs::read_dir(dir)? {
             let ent = ent?;
             let path = ent.path();
-            out.push((ent.file_name().as_bytes().to_vec(), kind_of(&path, &fs::symlink_metadata(&path)?)?));
+            out.push((ent.file_name().as_bytes().to_vec(), kind_of(&path, &crate::io::file::symlink_metadata(&path)?)?));
         }
         Ok(out)
     }
@@ -130,7 +129,7 @@ impl StoreFs for Disk {
     }
 
     fn host(&self, path: &Path) -> io::Result<(Kind, HostSig)> {
-        let meta = fs::symlink_metadata(path)?;
+        let meta = crate::io::file::symlink_metadata(path)?;
         Ok((kind_of(path, &meta)?, HostSig::of(&meta)))
     }
 }

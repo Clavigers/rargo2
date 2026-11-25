@@ -1,3 +1,4 @@
+use rargo_net::io::file::PathRing as _;
 use rargo_proto::Digest;
 use rargo_proto::tree::{Node, Tree};
 use rayon::prelude::*;
@@ -6,7 +7,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::{self, ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,7 @@ fn index_bytes(index: &Index) -> io::Result<Vec<u8>> {
 
 impl Index {
     pub fn load(path: &Path) -> Index {
-        index_from_bytes(std::fs::read(path).ok().as_deref())
+        index_from_bytes(rargo_net::io::file::read(path).ok().as_deref())
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -108,7 +108,7 @@ pub fn hash_file(path: &Path, size: u64) -> io::Result<Digest> {
     if size >= 4 << 20 {
         h.update_mmap_rayon(path)?;
     } else {
-        let mut f = std::fs::File::open(path)?;
+        let mut f = rargo_net::io::file::File::open(path)?;
         let mut buf = Vec::with_capacity(size as usize + 1);
         f.read_to_end(&mut buf)?;
         h.update(&buf);
@@ -365,10 +365,10 @@ pub fn scan_store(dir: &Path, old: &Index) -> io::Result<Scan> {
 pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>) -> io::Result<()> {
     let fresh = Index::default();
     let sub = drive(ScanCore::whole(git, Some(&fresh), &[], None))?;
-    let gitfile = if root.join(".git").is_file() {
+    let gitfile = if root.join(".git").ring_is_file() {
         let text = format!("gitdir: {}\n", rargo_proto::GIT_SIDE);
         let path = git.parent().unwrap_or(git).join("gitfile-v1");
-        if std::fs::read(&path).ok().as_deref() != Some(text.as_bytes()) {
+        if rargo_net::io::file::read(&path).ok().as_deref() != Some(text.as_bytes()) {
             crate::write_atomic(&path, text.as_bytes())?;
         }
         Some((path, text))
@@ -943,25 +943,25 @@ fn read_host(root: &Path, asks: &[Ask]) -> Vec<Answer> {
 fn host_one(root: &Path, ask: &Ask) -> Answer {
     match ask {
         Ask::List { rel } => Answer::List(list_dir(&abs(root, rel))),
-        Ask::Meta { rel } => Answer::Meta(match std::fs::symlink_metadata(abs(root, rel)) {
+        Ask::Meta { rel } => Answer::Meta(match rargo_net::io::file::symlink_metadata(abs(root, rel)) {
             Ok(md) => Ok(meta_of(&md)),
             Err(e) => Err(e),
         }),
         Ask::Cache { rel } => Answer::Cache(cache_tag(&abs(root, rel))),
-        Ask::Link { rel } => Answer::Link(std::fs::read_link(abs(root, rel)).ok().map(|target| target.as_os_str().as_bytes().to_vec())),
+        Ask::Link { rel } => Answer::Link(rargo_net::io::file::read_link(abs(root, rel)).ok().map(|target| target.as_os_str().as_bytes().to_vec())),
         Ask::Content { rel, size } => Answer::Content { at_ns: now_ns(), hash: hash_file(&abs(root, rel), *size) },
     }
 }
 
 fn list_dir(abs_path: &Path) -> io::Result<Vec<Vec<u8>>> {
     let mut names = Vec::new();
-    for entry in std::fs::read_dir(abs_path)? {
+    for entry in rargo_net::io::file::read_dir(abs_path)? {
         names.push(entry?.file_name().as_bytes().to_vec());
     }
     Ok(names)
 }
 
-fn meta_of(md: &std::fs::Metadata) -> Meta {
+fn meta_of(md: &rargo_net::io::file::Stat) -> Meta {
     let kind = if md.is_symlink() {
         Kind::Symlink
     } else if md.is_dir() {
@@ -983,7 +983,7 @@ fn meta_of(md: &std::fs::Metadata) -> Meta {
 
 fn cache_tag(dir: &Path) -> Option<Vec<u8>> {
     let mut head = vec![0u8; rargo_proto::CACHEDIR_SIGNATURE.len()];
-    let mut file = std::fs::File::open(dir.join("CACHEDIR.TAG")).ok()?;
+    let mut file = rargo_net::io::file::File::open(dir.join("CACHEDIR.TAG")).ok()?;
     file.read_exact(&mut head).ok()?;
     Some(head)
 }

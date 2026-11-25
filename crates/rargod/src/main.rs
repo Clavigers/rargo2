@@ -1,3 +1,4 @@
+use rargo_core::io::file::PathRing as _;
 use anyhow::{Context, Result, bail};
 use rargo_core::build::{Config, Daemon};
 use rargo_core::engine::Engine;
@@ -34,7 +35,7 @@ struct Opts {
 
 fn parse_args(args: &[String]) -> Result<Opts> {
     let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
-    let total_kb = std::fs::read_to_string("/proc/meminfo")
+    let total_kb = rargo_core::io::file::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
             s.lines().find(|l| l.starts_with("MemTotal:")).and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
@@ -117,10 +118,10 @@ fn main() -> Result<()> {
     };
     let zygote = Zygote::start(&std::env::current_exe()?)?;
 
-    std::fs::create_dir_all(&opts.state)?;
-    let state = opts.state.canonicalize()?;
+    rargo_core::io::file::create_dir_all(&opts.state)?;
+    let state = opts.state.ring_canonicalize()?;
     let tokens = Arc::new(rargo_core::tokens::TokenStore::new(state.join("tokens.json")));
-    let keys = if tokens.path().exists() {
+    let keys = if tokens.path().ring_exists() {
         Keys::with_tokens(tokens.clone())
     } else if opts.listen.ip().is_loopback() {
         Keys::open()
@@ -132,7 +133,7 @@ fn main() -> Result<()> {
     };
     let planner = match opts.worker_of {
         Some(_) => PathBuf::new(),
-        None => opts.planner.canonicalize().with_context(|| format!("planner {}", opts.planner.display()))?,
+        None => opts.planner.ring_canonicalize().with_context(|| format!("planner {}", opts.planner.display()))?,
     };
     let db = Arc::new(rargo_core::db::Db::open(&state.join("db.redb"))?);
     let default_store = state.join("store");
@@ -141,7 +142,7 @@ fn main() -> Result<()> {
     let content = Arc::new(Content::new(store.clone()));
     let fs = Arc::new(SandboxFs::new(content.clone()));
     let mnt = state.join("mnt");
-    std::fs::create_dir_all(&mnt)?;
+    rargo_core::io::file::create_dir_all(&mnt)?;
     if let Ok(c) = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()) {
         unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
     }
@@ -180,12 +181,12 @@ fn main() -> Result<()> {
     let (uid, gid) = (opts.uid.unwrap_or(unsafe { libc::geteuid() }), opts.gid.unwrap_or(unsafe { libc::getegid() }));
     for dir in ["registry", "git"] {
         let p = cargo_home.join(dir);
-        if !p.exists() {
-            std::fs::create_dir_all(&p)?;
+        if !p.ring_exists() {
+            rargo_core::io::file::create_dir_all(&p)?;
             rargo_core::snapshot::chown(&p, uid, gid);
         }
     }
-    let cargo_home = cargo_home.canonicalize()?;
+    let cargo_home = cargo_home.ring_canonicalize()?;
     let server_env = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
@@ -305,7 +306,7 @@ fn token_command(args: &[String]) -> Result<()> {
     let Some(state) = state else { bail!("{usage}") };
     if rest.first().map(String::as_str) == Some("github") {
         let (Some(client_id), Some(file), Some(url)) = (client_id, secret_file, url) else { bail!("{usage}") };
-        let client_secret = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?.trim().to_string();
+        let client_secret = rargo_core::io::file::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?.trim().to_string();
         if client_id.is_empty() || client_secret.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
             bail!("a client id, a secret and an address starting with https:// are needed");
         }
@@ -389,7 +390,7 @@ fn accept_client(d: Arc<Daemon>, stream: io::TcpStream, keys: Arc<Keys>, http: A
 fn link_key(opts: &Opts, addr: std::net::SocketAddr) -> Result<rargo_core::net::LinkKey> {
     match &opts.worker_key {
         Some(path) => {
-            let secret = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            let secret = rargo_core::io::file::read(path).with_context(|| format!("reading {}", path.display()))?;
             if secret.len() < 16 {
                 anyhow::bail!("{}: a worker key needs at least 16 bytes", path.display());
             }

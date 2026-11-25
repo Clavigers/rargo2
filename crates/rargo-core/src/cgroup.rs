@@ -4,12 +4,12 @@ pub fn setup() -> Option<PathBuf> {
     if unsafe { libc::geteuid() } != 0 {
         return None;
     }
-    let me = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let me = crate::io::file::read_to_string("/proc/self/cgroup").ok()?;
     let dir = delegated_root(&me)?;
     if !delegated(&dir) {
         return None;
     }
-    let procs = std::fs::read_to_string(membership_file(&dir)).ok()?;
+    let procs = crate::io::file::read_to_string(membership_file(&dir)).ok()?;
     for op in delegation_ops(&dir, &procs) {
         crate::sandbox::apply(&op).ok()?;
     }
@@ -61,7 +61,7 @@ impl ActionGroup {
     }
 
     fn stat(&self, file: &str, keys: &[&str]) -> u64 {
-        let Ok(text) = std::fs::read_to_string(self.dir.join(file)) else { return 0 };
+        let Ok(text) = crate::io::file::read_to_string(self.dir.join(file)) else { return 0 };
         text.lines()
             .filter_map(|l| l.split_once(' '))
             .filter(|(k, _)| keys.contains(k))
@@ -78,7 +78,7 @@ impl ActionGroup {
     }
 
     pub fn freeze(&self) {
-        if std::fs::write(self.dir.join("cgroup.freeze"), "1").is_err() {
+        if crate::io::file::write(self.dir.join("cgroup.freeze"), "1").is_err() {
             return;
         }
         for _ in 0..50 {
@@ -90,13 +90,13 @@ impl ActionGroup {
     }
 
     pub fn helper_tokens(&self) -> usize {
-        let Ok(procs) = std::fs::read_to_string(self.dir.join("cgroup.procs")) else { return 0 };
+        let Ok(procs) = crate::io::file::read_to_string(self.dir.join("cgroup.procs")) else { return 0 };
         let mut held = 0;
         for pid in procs.split_whitespace() {
-            let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { continue };
+            let Ok(tasks) = crate::io::file::read_dir(format!("/proc/{pid}/task")) else { continue };
             let workers = tasks
                 .flatten()
-                .filter_map(|t| std::fs::read_to_string(t.path().join("comm")).ok())
+                .filter_map(|t| crate::io::file::read_to_string(t.path().join("comm")).ok())
                 .filter(|comm| is_codegen_thread(comm))
                 .count();
             held += workers.saturating_sub(1);
@@ -112,7 +112,7 @@ fn is_codegen_thread(comm: &str) -> bool {
 impl Drop for ActionGroup {
     fn drop(&mut self) {
         for _ in 0..50 {
-            match std::fs::remove_dir(&self.dir) {
+            match crate::io::file::remove_dir(&self.dir) {
                 Ok(()) => return,
                 Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
                     std::thread::sleep(std::time::Duration::from_millis(2))

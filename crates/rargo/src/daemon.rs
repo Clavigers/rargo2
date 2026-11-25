@@ -1,3 +1,4 @@
+use rargo_net::io::file::PathRing as _;
 use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
@@ -9,7 +10,6 @@ use rargo_net::link::Link;
 use rargo_proto::{Blob, CONTROL, ClientMsg, Digest, LocalReply, LocalRequest, Offer, PROTO_VERSION, RunRequest, ServerMsg};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -658,7 +658,7 @@ impl Daemon {
         let policy_dir = st.policy_dir.clone();
         let snap = io::cpu(move || -> std::io::Result<Snap> {
             let mut policy = crate::load_policy(&root, &policy_dir);
-            if let Ok(inside) = cache.canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
+            if let Ok(inside) = cache.ring_canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
             let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
@@ -975,7 +975,7 @@ impl Daemon {
         }
         rargo_net::io::file::create_dir_all(&dir)?;
         let tag = dir.join("CACHEDIR.TAG");
-        if !tag.exists() {
+        if !tag.ring_exists() {
             rargo_net::io::file::write(&tag, rargo_proto::CACHEDIR_TAG)?;
         }
         let source = Box::new(Contents { d: Arc::downgrade(self) });
@@ -1053,7 +1053,6 @@ impl Daemon {
     }
 
     fn reuse_chunks(&self, p: &Partial, idx: Vec<u32>) -> Vec<u32> {
-        use std::os::unix::fs::FileExt;
         let mut need = Vec::new();
         for i in idx {
             let (chunk, len) = p.recipe()[i as usize];
@@ -1062,7 +1061,7 @@ impl Daemon {
                 let slot = crate::place::cache_slot(&self.cache, &blob);
                 let path = crate::place::cached(&self.cache, &blob, rargo_net::io::file::metadata(&slot).ok()?.len())?;
                 let mut buf = vec![0u8; l as usize];
-                std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
+                rargo_net::io::file::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
                 (l == len).then_some(buf)
             });
             match local {
@@ -1143,7 +1142,7 @@ impl Daemon {
                 if let Some(parent) = slot.parent() {
                     rargo_net::io::file::create_dir_all(parent)?;
                 }
-                let file = std::fs::File::create(&tmp)?;
+                let file = rargo_net::io::file::File::create(&tmp)?;
                 let mut offsets = Vec::with_capacity(recipe.len());
                 let mut at = 0u64;
                 for (_, len) in &recipe {
@@ -1152,13 +1151,12 @@ impl Daemon {
                 }
                 let mut need: Vec<u32> = Vec::new();
                 io::cpu(|| {
-                    use std::os::unix::fs::FileExt;
                     for (i, (chunk, len)) in recipe.iter().enumerate() {
                         let held = self.chunks.lock().unwrap().get(chunk).copied();
                         let local = held.and_then(|(blob, off, l)| {
                             let path = crate::place::cached(&self.cache, &blob, rargo_net::io::file::metadata(crate::place::cache_slot(&self.cache, &blob)).ok()?.len())?;
                             let mut buf = vec![0u8; l as usize];
-                            std::fs::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
+                            rargo_net::io::file::File::open(path).ok()?.read_exact_at(&mut buf, off).ok()?;
                             (l == *len && *blake3::hash(&buf).as_bytes() == *chunk).then_some(buf)
                         });
                         match local {
@@ -1175,7 +1173,6 @@ impl Daemon {
                     loop {
                         match next_msg(&mux, &mut rx)? {
                             ServerMsg::Chunks { chunks, .. } => io::cpu(|| -> std::io::Result<()> {
-                                use std::os::unix::fs::FileExt;
                                 for (i, part) in chunks {
                                     let data = part.unpack()?;
                                     self.counters.fetched_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
@@ -1195,7 +1192,7 @@ impl Daemon {
                     let _ = rargo_net::io::file::remove_file(&tmp);
                     return Err(std::io::Error::other("the server sent content that does not match its hash"));
                 }
-                let _ = std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
+                let _ = rargo_net::io::file::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
                 rargo_net::io::file::rename(&tmp, &slot)?;
                 let mut index = self.chunks.lock().unwrap();
                 if index.len() > crate::known::MOST_CHUNKS {
@@ -1786,7 +1783,7 @@ impl crate::outfs::Source for Contents {
     fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<(Reader, Digest)> {
         let d = self.daemon()?;
         if let Some(path) = crate::place::cached(&d.cache, hash, size) {
-            return Ok((Reader::Whole(std::fs::File::open(path)?), *hash));
+            return Ok((Reader::Whole(rargo_net::io::file::File::open(path)?), *hash));
         }
         if size >= rargo_proto::CHUNKED_FROM {
             let d2 = d.clone();
@@ -1798,7 +1795,7 @@ impl crate::outfs::Source for Contents {
         }
         let hash = *hash;
         let path = io::call(move || d.fetch_content(hash, size))?;
-        Ok((Reader::Whole(std::fs::File::open(path)?), hash))
+        Ok((Reader::Whole(rargo_net::io::file::File::open(path)?), hash))
     }
 }
 
@@ -1898,7 +1895,7 @@ fn show(
             Write::Symlink { target, .. } => {
                 let real = fs.real_for_write(&rel)?;
                 let _ = rargo_net::io::file::remove_file(&real);
-                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
+                rargo_net::io::file::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
                 delivery.wrote(&rel);
             }
             Write::Text { text: Some(text), .. } => {
@@ -2062,23 +2059,19 @@ fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> s
         }
     }
     for UploadFile { hash, path, size } in multipart {
-        let Ok(mut f) = std::fs::File::open(&path) else { return Ok(false) };
+        let Ok(mut f) = rargo_net::io::file::File::open(&path) else { return Ok(false) };
         let mut content = Multipart { hash, size, part_size, bytes: 0, hasher: blake3::Hasher::new(), held: None };
         loop {
-            let (buf, file) = io::cpu(move || -> std::io::Result<(Vec<u8>, std::fs::File)> {
-                let mut buf = vec![0u8; part_size];
-                let mut n = 0;
-                while n < buf.len() {
-                    let got = f.read(&mut buf[n..])?;
-                    if got == 0 {
-                        break;
-                    }
-                    n += got;
+            let mut buf = vec![0u8; part_size];
+            let mut n = 0;
+            while n < buf.len() {
+                let got = std::io::Read::read(&mut f, &mut buf[n..])?;
+                if got == 0 {
+                    break;
                 }
-                buf.truncate(n);
-                Ok((buf, f))
-            })?;
-            f = file;
+                n += got;
+            }
+            buf.truncate(n);
             if buf.is_empty() {
                 break;
             }
@@ -2224,7 +2217,7 @@ pub fn serve(socket: &Path) -> ! {
     let socket = socket.to_path_buf();
     io::drive(4, move || {
         let lock_path = socket.with_extension("lock");
-        let lock = match std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
+        let lock = match rargo_net::io::file::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path) {
             Ok(f) => f,
             Err(e) => crate::die(&format!("{}: {e}", lock_path.display())),
         };

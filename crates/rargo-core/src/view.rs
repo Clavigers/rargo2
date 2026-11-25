@@ -2,10 +2,9 @@ use crate::hash::Hash;
 use crate::store::Store;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use crate::io::file::File;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -74,7 +73,7 @@ pub struct HostSig {
 }
 
 impl HostSig {
-    pub fn of(m: &std::fs::Metadata) -> HostSig {
+    pub fn of(m: &crate::io::file::Stat) -> HostSig {
         HostSig {
             dev: m.dev(),
             ino: m.ino(),
@@ -286,10 +285,7 @@ impl Content {
         match src {
             FileSrc::Blob(h) => Ok((self.open_blob(h)?, BackingKey::Blob(*h), src.clone())),
             FileSrc::Host { path, .. } => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(path)?;
+                let f = crate::io::file::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
                 let sig = HostSig::of(&f.metadata()?);
                 Ok((f, BackingKey::Host(sig), FileSrc::Host { path: path.clone(), sig }))
             }
@@ -324,10 +320,7 @@ impl Content {
         match src {
             FileSrc::Blob(h) => Ok(*h),
             FileSrc::Host { path, sig } => {
-                let f = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                    .open(path)?;
+                let f = crate::io::file::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
                 let before = HostSig::of(&f.metadata()?);
                 if before != *sig {
                     return Err(io::Error::from_raw_os_error(libc::ESTALE));

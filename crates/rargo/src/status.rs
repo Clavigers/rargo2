@@ -27,7 +27,7 @@ pub fn run() {
     let mount = target
         .as_deref()
         .map_or("outside a Rust worktree", |target| {
-            let Ok(info) = std::fs::read("/proc/self/mountinfo") else {
+            let Ok(info) = rargo_net::io::file::read("/proc/self/mountinfo") else {
                 return "unavailable";
             };
             match (rargo_mount(&info, target), daemon) {
@@ -38,7 +38,7 @@ pub fn run() {
                     let (send, recv) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
                         let _ = send.send(
-                            std::fs::read_dir(target)
+                            rargo_net::io::file::read_dir(target)
                                 .and_then(|mut entries| entries.next().transpose())
                                 .map(|_| ()),
                         );

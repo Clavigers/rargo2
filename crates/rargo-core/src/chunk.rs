@@ -1,9 +1,8 @@
 use crate::hash::Hash;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use crate::io::file::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
 pub const MIN_CHUNK: usize = 16 << 10;

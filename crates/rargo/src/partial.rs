@@ -1,7 +1,6 @@
 use rargo_proto::outline::{self, Cv, GROUP};
 use rargo_proto::Digest;
-use std::fs::File;
-use std::os::unix::fs::FileExt;
+use rargo_net::io::file::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -248,11 +247,11 @@ impl Partial {
     ) -> std::io::Result<Arc<Partial>> {
         let state = RangeState::new(&hash, size, recipe, cvs, lazy).map_err(std::io::Error::other)?;
         let dir = slot.parent().ok_or_else(|| std::io::Error::other("no cache directory"))?;
-        std::fs::create_dir_all(dir)?;
+        rargo_net::io::file::create_dir_all(dir)?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = slot.with_file_name(format!(".partial-{}-{n}", std::process::id()));
-        let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
+        let file = rargo_net::io::file::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
         file.set_len(size)?;
         Ok(Arc::new(Partial {
             hash,
@@ -350,8 +349,8 @@ impl Partial {
         }
         if st.can_place() {
             use std::os::unix::fs::PermissionsExt;
-            let placed = std::fs::set_permissions(&self.tmp, std::fs::Permissions::from_mode(0o444))
-                .and_then(|_| std::fs::rename(&self.tmp, &self.slot));
+            let placed = rargo_net::io::file::set_permissions(&self.tmp, std::fs::Permissions::from_mode(0o444))
+                .and_then(|_| rargo_net::io::file::rename(&self.tmp, &self.slot));
             match placed {
                 Ok(()) => st.done = true,
                 Err(e) => eprintln!("rargo daemon: content {}: could not be put in the cache: {e}", hex(&self.hash)),
@@ -372,7 +371,7 @@ impl Partial {
 impl Drop for Partial {
     fn drop(&mut self) {
         if !self.st.get_mut().map(|s| s.done).unwrap_or(false) {
-            let _ = std::fs::remove_file(&self.tmp);
+            let _ = rargo_net::io::file::remove_file(&self.tmp);
         }
     }
 }

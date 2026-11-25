@@ -169,7 +169,7 @@ impl Watcher {
     pub fn limit() -> Option<u64> {
         ["/proc/sys/user/max_inotify_watches", "/proc/sys/fs/inotify/max_user_watches"]
             .iter()
-            .find_map(|p| std::fs::read_to_string(p).ok()?.trim().parse().ok())
+            .find_map(|p| rargo_net::io::file::read_to_string(p).ok()?.trim().parse().ok())
     }
 
     pub fn forget(&self, owner: u64) {

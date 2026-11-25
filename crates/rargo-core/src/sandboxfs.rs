@@ -4,9 +4,8 @@ use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::fs::File;
+use crate::io::file::File;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -848,13 +847,7 @@ impl ActionFs {
         let n = st.next_upper;
         st.next_upper += 1;
         let path = self.scratch.join(n.to_string());
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o644)
-            .custom_flags(libc::O_CLOEXEC)
-            .open(&path)?;
+        let file = crate::io::file::OpenOptions::new().read(true).write(true).create_new(true).mode(0o644).open(&path)?;
         Ok((path, Arc::new(file)))
     }
 
@@ -1025,7 +1018,7 @@ impl ActionFs {
             f.links = f.links.saturating_sub(1);
             if f.links == 0 && f.opens == 0 {
                 if let Src::Upper { path, .. } = &f.src {
-                    let _ = std::fs::remove_file(path);
+                    let _ = crate::io::file::remove_file(path);
                 }
             }
         }
@@ -1432,7 +1425,7 @@ impl Filesystem for SandboxFs {
         } else if is_lower {
             enum Next {
                 Cached(i32),
-                Opened { file: std::fs::File, key: BackingKey },
+                Opened { file: crate::io::file::File, key: BackingKey },
             }
             let (next, actual) = {
                 let Kind::File(f) = &mut st.nodes[n as usize] else { unreachable!() };

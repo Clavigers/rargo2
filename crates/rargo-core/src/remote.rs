@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -245,12 +244,12 @@ impl Peer {
 
 
 pub trait BlobSource: Send + Sync {
-    fn open(&self, h: &Hash) -> io::Result<std::fs::File>;
+    fn open(&self, h: &Hash) -> io::Result<crate::io::file::File>;
 }
 
 struct StoreSource(Arc<Store>);
 impl BlobSource for StoreSource {
-    fn open(&self, h: &Hash) -> io::Result<std::fs::File> {
+    fn open(&self, h: &Hash) -> io::Result<crate::io::file::File> {
         self.0.open_blob(h)
     }
 }
@@ -371,7 +370,7 @@ impl Blobs {
             return Ok(());
         }
         let tmp = self.store.tmp_path();
-        let file = std::fs::File::create(&tmp)?;
+        let file = crate::io::file::File::create(&tmp)?;
         let mut off = 0u64;
         let mut missing: Vec<(u32, u64, u32)> = Vec::new();
         for (i, c) in recipe.iter().enumerate() {
@@ -414,7 +413,7 @@ impl Blobs {
         drop(file);
         let (got, size) = Hash::of_path(&tmp)?;
         if got != *h {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = crate::io::file::remove_file(&tmp);
             bail!("blob {h} arrived with the wrong content");
         }
         self.store.install_hashed(&tmp, got, size)?;
@@ -1370,7 +1369,7 @@ struct ServerSource {
 }
 
 impl BlobSource for ServerSource {
-    fn open(&self, h: &Hash) -> io::Result<std::fs::File> {
+    fn open(&self, h: &Hash) -> io::Result<crate::io::file::File> {
         if self.store.has(h) {
             return self.store.open_blob(h);
         }
@@ -1712,7 +1711,7 @@ impl Pool {
                         "in the store, but unreadable".to_string()
                     } else {
                         match self.host_srcs.get(&blob).map(|s| s.clone()) {
-                            Some(FileSrc::Host { path, sig }) => match std::fs::symlink_metadata(&path) {
+                            Some(FileSrc::Host { path, sig }) => match crate::io::file::symlink_metadata(&path) {
                                 Ok(m) if HostSig::of(&m) == sig => format!("{} is unchanged but could not be read", path.display()),
                                 Ok(_) => format!("{} has changed since it was shown", path.display()),
                                 Err(e) => format!("{}: {e}", path.display()),
@@ -2297,7 +2296,7 @@ impl Pool {
         let mut tainted = done.tainted;
         for src in ra.served.lock().iter() {
             if let FileSrc::Host { path, sig } = src {
-                match std::fs::symlink_metadata(path) {
+                match crate::io::file::symlink_metadata(path) {
                     Ok(m) if HostSig::of(&m) == *sig => {}
                     _ => tainted = true,
                 }
