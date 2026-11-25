@@ -215,6 +215,21 @@ pub fn subcommand_pos(args: &[String]) -> Option<usize> {
     None
 }
 
+pub fn offline_args(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--" => break,
+            "--manifest-path" | "--config" | "--lockfile-path" => {
+                it.next();
+            }
+            "--locked" | "--frozen" | "--offline" => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 pub fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) -> BTreeMap<String, String> {
     const SERVER: &[&str] =
         &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"];
