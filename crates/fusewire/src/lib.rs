@@ -475,38 +475,17 @@ impl Session {
     }
 
     pub fn backing_open(&self, fd: RawFd) -> io::Result<i32> {
-        let map = fuse_backing_map { fd, flags: 0, padding: 0 };
-        let r = unsafe {
-            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _)
-        };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(r)
+        DeviceEffect::Register(fd).execute(self.dev.as_raw_fd())
     }
 
     pub fn backing_close(&self, id: i32) -> io::Result<()> {
-        let id = id as u32;
-        let r = unsafe {
-            libc::ioctl(self.dev.as_raw_fd(), FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const u32)
-        };
-        if r < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        DeviceEffect::Unregister(id).execute(self.dev.as_raw_fd()).map(|_| ())
     }
 
     pub fn notify_inval_entry(&self, parent: u64, name: &[u8]) -> io::Result<()> {
-        let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
-        let r = reply(
-            self.dev.as_raw_fd(),
-            0,
-            FUSE_NOTIFY_INVAL_ENTRY,
-            &[as_bytes(&out), name, &[0u8]],
-        );
-        match r {
+        match DeviceEffect::invalidate(parent, name).execute(self.dev.as_raw_fd()) {
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(()),
-            r => r,
+            result => result.map(|_| ()),
         }
     }
 
@@ -801,6 +780,41 @@ fn open_out(o: &Opened) -> fuse_open_out {
     fuse_open_out { fh: o.fh, open_flags: o.flags, backing_id: o.backing_id }
 }
 
+enum DeviceEffect {
+    Write(Vec<u8>),
+    Register(RawFd),
+    Unregister(i32),
+}
+
+impl DeviceEffect {
+    fn invalidate(parent: u64, name: &[u8]) -> Self {
+        let out = fuse_notify_inval_entry_out { parent, namelen: name.len() as u32, flags: 0 };
+        let mut bytes = Vec::new();
+        encode_reply(&mut bytes, 0, FUSE_NOTIFY_INVAL_ENTRY, &[as_bytes(&out), name, &[0]]);
+        Self::Write(bytes)
+    }
+
+    fn write(fd: RawFd, bytes: &[u8]) -> io::Result<i32> {
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written < 0 { Err(io::Error::last_os_error()) } else { Ok(0) }
+    }
+
+    fn execute(self, fd: RawFd) -> io::Result<i32> {
+        let status = match self {
+            Self::Write(bytes) => return Self::write(fd, &bytes),
+            Self::Register(source) => {
+                let map = fuse_backing_map { fd: source, flags: 0, padding: 0 };
+                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _) }
+            }
+            Self::Unregister(id) => {
+                let id = id as u32;
+                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const _) }
+            }
+        };
+        if status < 0 { Err(io::Error::last_os_error()) } else { Ok(status) }
+    }
+}
+
 fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
     let fd = dev.as_raw_fd();
     let mut storage = vec![0u64; BUF_SIZE / 8];
@@ -825,7 +839,7 @@ fn worker<F: Filesystem>(sess: Arc<Session>, dev: OwnedFd, fs: Arc<F>) {
         let buf = unsafe { std::slice::from_raw_parts(storage.as_ptr() as *const u8, n) };
         let result = handler.handle(&*fs, buf);
         if !result.bytes.is_empty() {
-            unsafe { libc::write(fd, result.bytes.as_ptr().cast(), result.bytes.len()) };
+            let _ = DeviceEffect::write(fd, result.bytes);
         }
         if result.destroyed {
             sess.connected.store(false, Ordering::SeqCst);
@@ -1216,6 +1230,18 @@ mod request_tests {
         assert!(run(FUSE_FORGET, 2, as_bytes(&fuse_forget_in { nlookup: 3 })).is_empty());
         assert_eq!(fs.forgotten.load(Ordering::Relaxed), 3);
         assert!(run(FUSE_INTERRUPT, 0, &1u64.to_ne_bytes()).is_empty());
+    }
+
+    #[test]
+    fn notification_bytes_share_the_reply_format() {
+        let DeviceEffect::Write(bytes) = DeviceEffect::invalidate(17, b"file") else { unreachable!() };
+        let header = read_struct::<fuse_out_header>(&bytes).unwrap();
+        assert_eq!(header.len as usize, bytes.len());
+        assert_eq!(header.unique, 0);
+        assert_eq!(header.error, FUSE_NOTIFY_INVAL_ENTRY);
+        let entry = read_struct::<fuse_notify_inval_entry_out>(&bytes[std::mem::size_of::<fuse_out_header>()..]).unwrap();
+        assert_eq!((entry.parent, entry.namelen), (17, 4));
+        assert!(bytes.ends_with(b"file\0"));
     }
 
     #[test]
