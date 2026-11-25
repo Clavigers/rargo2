@@ -2781,7 +2781,8 @@ The servers the suites start through `dev/rargod.sh` take a share of the
 machine (`RARGO_CPU_QUOTA` 800%, `RARGO_MEMORY_MAX` 20G, unless the
 environment names another). A rig's caps stay what `dev/netns.sh` sets
 from the cores that rig is given. The service beside the gate keeps the
-headroom `CLAUDE.md` asks for.
+headroom `CLAUDE.md` asks for. No check leaves the gate. The release
+workflow asks once whether `gate/all` for its commit is already success.
 
 Before the gate copies its binaries over the ones already in its
 directory, every process still running those copies is gone. A daemon
