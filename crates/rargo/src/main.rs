@@ -1,3 +1,4 @@
+mod cli;
 mod daemon;
 mod daemon_state;
 mod git;
@@ -13,16 +14,12 @@ mod status;
 mod tmp;
 mod watch;
 
-use rargo_proto::secure;
 use rargo_proto::{ExecRequest, LocalReply, LocalRequest};
 use std::ffi::{CString, OsString};
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-
-const ROUTED: &[&str] =
-    &["build", "b", "check", "c", "clippy", "test", "t", "run", "r", "doc", "d", "bench", "rustc", "rustdoc", "nextest"];
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -41,6 +38,7 @@ fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/".into()))
 }
 
+#[derive(Clone, PartialEq)]
 pub struct Config {
     pub host: String,
     pub server: String,
@@ -49,80 +47,58 @@ pub struct Config {
     pub psk: [u8; 32],
 }
 
-fn env_value(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config").field("host", &self.host).field("server", &self.server).field("user", &self.user).field("secret", &self.secret.as_ref().map(|_| "…")).finish_non_exhaustive()
+    }
 }
 
-#[derive(Default)]
-struct ConfigEnv {
-    daemon: Option<String>,
-    server: Option<String>,
-    token: Option<String>,
-    user: Option<String>,
-    logname: Option<String>,
+struct Real {
+    vars: Vec<(String, String)>,
+    handlers: std::sync::Once,
 }
 
-impl ConfigEnv {
+impl Real {
     fn read() -> Self {
-        Self {
-            daemon: env_value("RARGO_DAEMON_CONFIG"),
-            server: env_value("RARGO_SERVER"),
-            token: env_value("RARGO_TOKEN"),
-            user: env_value("USER"),
-            logname: env_value("LOGNAME"),
-        }
+        let vars = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
+        Real { vars, handlers: std::sync::Once::new() }
     }
 
-    fn host(&self, path: &Path, text: Result<Option<&str>, String>) -> Result<(String, HostFrom), String> {
-        if let Some(h) = &self.server {
-            return Ok((h.clone(), HostFrom::Env));
-        }
-        if self.daemon.is_some() {
-            return Err("the daemon was started without a server".into());
-        }
-        match text?.map(|text| project::parse_host(path, text)).transpose()?.flatten() {
-            Some(h) => Ok((h, HostFrom::File(path.to_path_buf()))),
-            None => Err(format!("no rargo server is named: run `rargo @rargo.rs` (or `rargo @HOST` for a server of your own), which writes {}", path.display())),
-        }
+    fn handle_signals(&self) {
+        self.handlers.call_once(tmp::install_handlers);
+    }
+}
+
+impl cli::World for Real {
+    fn vars(&self) -> &[(String, String)] {
+        &self.vars
     }
 
-    fn finish(self, host: String, server: Result<String, String>, stored: Option<project::Credential>) -> Result<Config, String> {
-        let server = server?;
-        let (user, secret) = if let Some(token) = &self.token {
-            let (id, secret) = project::split_token(token).ok_or("RARGO_TOKEN is not a token (an id, a dot and a secret)")?;
-            (id.to_string(), Some(secret.to_string()))
-        } else if let Some(c) = stored.filter(|_| self.daemon.is_none()) {
-            (c.id, Some(c.secret))
-        } else {
-            (self.user.or(self.logname).unwrap_or_else(|| "user".into()), None)
-        };
-        let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
-        Ok(Config { host, server, user, secret, psk })
+    fn config_path(&self) -> PathBuf {
+        project::config_path()
+    }
+
+    fn config_text(&self) -> Result<Option<String>, String> {
+        project::read_config(&project::config_path())
+    }
+
+    fn resolve(&self, host: &str) -> Result<String, String> {
+        self.handle_signals();
+        project::resolve(host)
+    }
+
+    fn credential(&self, host: &str) -> Option<project::Credential> {
+        project::credential(host)
+    }
+
+    fn nextest_version(&self) -> Option<String> {
+        self.handle_signals();
+        own_nextest_version()
     }
 }
 
 pub fn load_config() -> Result<Config, String> {
-    let input = ConfigEnv::read();
-    let (host, _) = host_from(&input)?;
-    let server = if input.daemon.is_some() { Ok(host.clone()) } else { project::resolve(&host) };
-    let credential = if server.is_ok() && input.daemon.is_none() && input.token.is_none() { project::credential(&host) } else { None };
-    input.finish(host, server, credential)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum HostFrom {
-    Env,
-    File(PathBuf),
-}
-
-fn host_from(input: &ConfigEnv) -> Result<(String, HostFrom), String> {
-    let path = project::config_path();
-    let text = if input.server.is_some() || input.daemon.is_some() { Ok(None) } else { project::read_config(&path) };
-    input.host(&path, text.as_ref().map(|text| text.as_deref()).map_err(Clone::clone))
-}
-
-fn server_host() -> Result<(String, HostFrom), String> {
-    host_from(&ConfigEnv { server: env_value("RARGO_SERVER"), ..ConfigEnv::default() })
+    cli::config(&Real::read())
 }
 
 pub fn plain_cause(why: &str) -> String {
@@ -141,11 +117,6 @@ fn unreachable_text(server: &str, why: &str) -> String {
          RARGO_FALLBACK=cargo builds with plain cargo meanwhile\n",
         plain_cause(why)
     )
-}
-
-fn is_loopback(server: &str) -> bool {
-    let name = server.rsplit_once(':').map_or(server, |(h, _)| h);
-    name == "localhost" || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 pub fn cache_dir() -> PathBuf {
@@ -379,145 +350,51 @@ fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::
     }
 }
 
-const TOKEN_COMMANDS: &[&str] = &["invite", "create", "tokens", "revoke", "allow", "disallow"];
 
 pub fn mount_ns() -> String {
     std::fs::read_link("/proc/self/ns/mnt").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-fn at_host(host: &str) -> ! {
+fn name_server(world: &Real, host: &str) -> ! {
     match project::set_host(host) {
         Ok(path) => {
-            eprintln!("{} now names `{host}` as your rargo server.", path.display());
-            if host.contains(':') || project::resolve(host).is_ok() {
-                if project::credential(host).is_none() && std::env::var_os("RARGO_TOKEN").is_none() {
-                    eprintln!("Next: `rargo auth`, then `rargo build`.");
-                }
-            } else {
-                eprintln!("warning: no rargo server answers for `{host}` right now (https://{host}/.well-known/rargo.json)");
-            }
+            eprintln!("{}", cli::named(world, host, &path));
             std::process::exit(0)
         }
         Err(e) => die(&e),
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct AuthArgs {
-    action: &'static str,
-    host: Option<String>,
-    token: Option<String>,
-}
-
-fn parse_auth(args: &[OsString]) -> Result<Option<AuthArgs>, String> {
-    let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-    let mut what = "auth";
-    let mut host: Option<String> = None;
-    let mut token: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "status" if i == 0 => what = "status",
-            "remove" if i == 0 => what = "remove",
-            "--token" => {
-                i += 1;
-                token = Some(args.get(i).cloned().ok_or("`--token` needs the token")?);
-            }
-            "-h" | "--help" => {
-                return Ok(None);
-            }
-            a if a.starts_with('-') => return Err(format!("unknown option `{a}` (see `rargo auth --help`)")),
-            a if host.is_none() => host = Some(a.trim_start_matches('@').to_string()),
-            a => return Err(format!("unexpected `{a}` (see `rargo auth --help`)")),
-        }
-        i += 1;
-    }
-    Ok(Some(AuthArgs { action: what, host, token }))
-}
-
-fn auth_command(args: &[OsString]) -> ! {
-    let Some(AuthArgs { action: what, host, token }) = parse_auth(args).unwrap_or_else(|e| die(&e)) else {
-        println!(
-            "rargo auth [HOST]            get this machine a token for the project's server (or HOST), confirmed in a browser\n\
-             rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
-             rargo auth status            which server you build on, what named it, and as whom\n\
-             rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here\n\
-             \n\
-             On the project's server, for an administrator (anyone may list and revoke their own tokens):\n\
-             rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n\
-             rargo auth create --user NAME [--admin] [--days N]\n\
-             rargo auth tokens\n\
-             rargo auth revoke ID-OR-USER\n\
-             rargo auth allow GITHUB-LOGIN [--admin]\n\
-             rargo auth disallow GITHUB-LOGIN"
-        );
-        std::process::exit(0)
-    };
-    let (host, from) = match host {
-        Some(h) => (h, None),
-        None => match server_host() {
-            Ok((h, from)) => (h, Some(from)),
-            Err(e) => die(&format!("{e}; or say `rargo auth HOST`")),
-        },
-    };
-    if !project::valid_host(&host) {
-        die(&format!("`{host}` is not a host"));
-    }
-    match what {
-        "status" => {
-            match &from {
-                Some(HostFrom::Env) => println!("server named by RARGO_SERVER"),
-                Some(HostFrom::File(path)) => println!("server named by {}", path.display()),
-                None => {}
-            }
-            let server = project::resolve(&host).unwrap_or_else(|e| format!("unknown ({e})"));
-            match project::credential(&host) {
-                Some(c) if c.name.is_empty() => println!("{host} (server {server}): authenticated (token {})", c.id),
-                Some(c) => println!("{host} (server {server}): authenticated as {} (token {})", c.name, c.id),
-                None => println!("{host} (server {server}): not authenticated; run `rargo auth`"),
-            }
-            std::process::exit(0)
-        }
-        "remove" => {
-            if project::credential(&host).is_none() {
-                die(&format!("there is no token for {host} on this machine"));
-            }
+fn auth_command(world: &Real, auth: cli::Auth) -> ! {
+    match auth {
+        cli::Auth::Status { host, from } => println!("{}", cli::auth_status(world, &host, from.as_ref())),
+        cli::Auth::Remove { host } => {
             let revoked = project::revoke_on_server(&host);
             if let Err(e) = project::forget(&host) {
                 die(&e);
             }
-            match revoked {
-                Ok(true) => println!("revoked the token for {host} on the server and forgot it here"),
-                Ok(false) => println!("forgot the token for {host} (the server did not know it as a token that still works)"),
-                Err(e) => {
-                    println!("forgot the token for {host} on this machine");
-                    eprintln!("warning: the server could not be told to revoke it ({e}); it keeps working for whoever has a copy until an administrator runs `rargod token revoke`");
-                }
+            let (said, warned) = cli::removed(&host, revoked);
+            println!("{said}");
+            if let Some(w) = warned {
+                eprintln!("{w}");
             }
-            std::process::exit(0)
         }
-        _ => {}
-    }
-    if let Some(token) = token {
-        let stored = project::holder(&host, &token).and_then(|name| match name {
-            Some(name) => project::store_token(&host, &token, &name).map(|()| name),
-            None => Err(format!("{host}: {}", rargo_proto::REFUSED)),
-        });
-        match stored {
-            Ok(name) => {
-                println!("stored the token for {host}, held by {name}");
-                std::process::exit(0)
+        cli::Auth::Store { host, token } => {
+            let stored = project::holder(&host, &token).and_then(|name| match name {
+                Some(name) => project::store_token(&host, &token, &name).map(|()| name),
+                None => Err(format!("{host}: {}", rargo_proto::REFUSED)),
+            });
+            match stored {
+                Ok(name) => println!("stored the token for {host}, held by {name}"),
+                Err(e) => die(&format!("rargo auth: {e}")),
             }
+        }
+        cli::Auth::Login { host } => match project::auth(&host) {
+            Ok(name) => println!("Authenticated to {host} as {name}. `rargo build` now builds there."),
             Err(e) => die(&format!("rargo auth: {e}")),
-        }
+        },
     }
-    match project::auth(&host) {
-        Ok(name) => {
-            println!("Authenticated to {host} as {name}. `rargo build` now builds there.");
-            std::process::exit(0)
-        }
-        Err(e) => die(&format!("rargo auth: {e}")),
-    }
+    std::process::exit(0)
 }
 
 fn release_output() {
@@ -571,8 +448,7 @@ fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsStrin
             if !no_daemon && std::env::var_os("RARGO_QUIET_DAEMON").is_none() {
                 eprintln!("warning: rargo runs without its daemon ({e}); every command connects to the server anew");
             }
-            let cfg2 = Config { host: cfg.host.clone(), server: cfg.server.clone(), user: cfg.user.clone(), secret: cfg.secret.clone(), psk: cfg.psk };
-            daemon::inline(cfg2, cache, req, |reply| relay(reply, &cfg, raw));
+            daemon::inline(cfg.clone(), cache, req, |reply| relay(reply, &cfg, raw));
             die("the command ended without a result");
         }
     };
@@ -597,66 +473,35 @@ fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsStrin
 }
 
 fn main() {
+    let argv0 = std::env::args_os().next();
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if std::env::var_os("RARGO_BYPASS").is_some() {
-        passthrough(&raw);
-    }
-    let cargo_link = std::env::args_os().next().is_some_and(|arg| Path::new(&arg).file_name().is_some_and(|name| name == "cargo"));
-    if !cargo_link && raw.first().is_some_and(|a| a == "status") {
-        match raw.get(1).and_then(|arg| arg.to_str()) {
-            Some("--help" | "-h") if raw.len() == 2 => println!("Usage: rargo status\n\nShow your server, account, daemon, mount and versions."),
-            None if raw.len() == 1 => status::run(),
-            _ => die("usage: rargo status"),
-        }
-        return;
-    }
-    if !cargo_link && raw.len() == 1 && raw.first().is_some_and(|a| a == "--help" || a == "-h") {
-        println!("rargo status    Show your server, account, daemon, mount and versions.\n");
-    }
-    if raw.first().is_some_and(|a| a == "--rargo-version") {
-        println!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION);
-        return;
-    }
-    if let Some(host) = raw.first().and_then(|a| a.to_str()).and_then(|a| a.strip_prefix('@')) {
-        at_host(host);
-    }
-    let token_command = raw.first().is_some_and(|a| a == "auth")
-        && raw.get(1).and_then(|a| a.to_str()).is_some_and(|a| TOKEN_COMMANDS.contains(&a));
-    if raw.first().is_some_and(|a| a == "auth") && !token_command {
-        auth_command(&raw[1..]);
-    }
-    if raw.first().is_some_and(|a| a == "--rargo-daemon") {
-        match raw.get(1) {
-            Some(socket) => daemon::serve(Path::new(socket)),
-            None => die("usage: rargo --rargo-daemon SOCKET"),
-        }
-    }
-    tmp::install_handlers();
-    let vars = std::env::vars_os().filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))).collect();
-    let route = prepare_route(&raw, vars, token_command);
-    let (args, mut vars, kind) = match route {
-        Route::Local { release } => {
+    let world = Real::read();
+    let (cfg, args, vars, kind) = match cli::plan(&world, argv0.as_deref(), &raw) {
+        cli::Plan::Cargo { release, banner } => {
+            if banner {
+                println!("{}", cli::BANNER);
+            }
             if release {
+                world.handle_signals();
                 release_output();
             }
             passthrough(&raw)
         }
-        Route::Usage(message) => {
-            eprintln!("{message}");
-            std::process::exit(2);
+        cli::Plan::Print(text) => {
+            println!("{text}");
+            return;
         }
-        Route::Remote { args, vars, kind } => (args, vars, kind),
+        cli::Plan::Status => return status::run(),
+        cli::Plan::Fail { text, code } => {
+            eprintln!("{text}");
+            std::process::exit(code)
+        }
+        cli::Plan::Name(host) => name_server(&world, &host),
+        cli::Plan::Auth(auth) => auth_command(&world, auth),
+        cli::Plan::Daemon(socket) => daemon::serve(Path::new(&socket)),
+        cli::Plan::Remote { config, args, vars, kind } => (config, args, vars, kind),
     };
-    if subcommand(&args) == Some("nextest")
-        && !vars.iter().any(|(k, _)| k == "RARGO_NEXTEST_VERSION")
-        && let Some(v) = own_nextest_version()
-    {
-        vars.push(("RARGO_NEXTEST_VERSION".into(), v));
-    }
-    let cfg = load_config().unwrap_or_else(|e| die(&e));
-    if cfg.secret.is_none() && !is_loopback(&cfg.server) && matches!(kind, "admin" | "drift" | "build") {
-        die(&format!("this machine is not authenticated to {}: run `rargo auth`", cfg.host));
-    }
+    world.handle_signals();
     let cwd = match std::env::current_dir().and_then(|d| d.canonicalize()) {
         Ok(d) => d,
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
@@ -681,96 +526,6 @@ fn main() {
         std::process::exit(0);
     }
     through_daemon(cfg, cache, req, &raw)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Route {
-    Local { release: bool },
-    Usage(String),
-    Remote { args: Vec<String>, vars: Vec<(String, String)>, kind: &'static str },
-}
-
-fn prepare_route(raw: &[OsString], mut vars: Vec<(String, String)>, token_command: bool) -> Route {
-    let Ok(mut args) = raw.iter().map(|a| a.clone().into_string()).collect::<Result<Vec<_>, _>>() else {
-        return Route::Local { release: false };
-    };
-    if let Some(tc) = args.first().and_then(|a| a.strip_prefix('+')).map(str::to_owned) {
-        args.remove(0);
-        vars.retain(|(k, _)| k != "RUSTUP_TOOLCHAIN");
-        vars.push(("RUSTUP_TOOLCHAIN".into(), tc));
-    }
-    let admin = match args.first().map(|s| s.as_str()) {
-        Some("auth") if token_command => Some("__token"),
-        Some("--rargo-status") => Some("__status"),
-        Some("--rargo-settle") => Some("__settle"),
-        Some("--rargo-gc") => Some("__gc"),
-        Some("--rargo-incr-stats") => Some("__incr"),
-        Some("--rargo-compact") => Some("__compact"),
-        Some("--rargo-export") => Some("__export"),
-        Some("--rargo-import") => Some("__import"),
-        _ => None,
-    };
-    let drift = args.first().map(|s| s.as_str()) == Some("--rargo-drift-check");
-    let daemon_cmd = match args.first().map(|s| s.as_str()) {
-        Some("--rargo-daemon-status") => Some("status"),
-        Some("--rargo-daemon-stop") => Some("stop"),
-        Some("--rargo-daemon-sync") => Some("sync"),
-        _ => None,
-    };
-    if daemon_cmd.is_some() {
-        args.clear();
-    } else if let Some(cmd) = admin {
-        let mut a = vec![cmd.to_string()];
-        if matches!(cmd, "__export" | "__import") {
-            match args.get(1) {
-                Some(dir) => a.push(dir.clone()),
-                None => {
-                    return Route::Usage(format!("usage: rargo {} DIRECTORY-ON-THE-SERVER", args[0]));
-                }
-            }
-        }
-        if cmd == "__token" {
-            let what = if args[1] == "tokens" { "list".to_string() } else { args[1].clone() };
-            a.push(what);
-            a.extend(args[2..].iter().cloned());
-        }
-        args = a;
-    } else if drift {
-        args = vec!["__drift".into()];
-    } else {
-        match subcommand(&args) {
-            Some(cmd) if ROUTED.contains(&cmd) => {}
-            Some("clean") => {
-                let read_only = args.iter().take_while(|arg| *arg != "--").any(|arg| {
-                    matches!(arg.as_str(), "--dry-run" | "--help")
-                        || arg.strip_prefix('-').is_some_and(|short| {
-                            short.chars().all(|flag| matches!(flag, 'h' | 'n' | 'q' | 'v'))
-                                && short.contains(['h', 'n'])
-                        })
-                });
-                return Route::Local { release: !read_only };
-            }
-            _ => return Route::Local { release: false },
-        }
-        if subcommand(&args) != Some("nextest")
-            && args.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V")
-        {
-            return Route::Local { release: false };
-        }
-        if args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--unit-graph") {
-            return Route::Usage("error: rargo does not support --unit-graph for remote builds; use local Cargo to get a unit graph with local paths".into());
-        }
-    }
-    let kind = if let Some(daemon) = daemon_cmd {
-        daemon
-    } else if admin.is_some() {
-        "admin"
-    } else if drift {
-        "drift"
-    } else {
-        "build"
-    };
-    Route::Remote { args, vars, kind }
 }
 
 fn wrapper_config_keys(table: &toml::Table) -> impl Iterator<Item = &'static str> + '_ {
@@ -825,24 +580,6 @@ fn ignored_compiler_wrappers(args: &[String], vars: &[(String, String)], cwd: &P
         }
     }
     sources
-}
-
-fn subcommand(args: &[String]) -> Option<&str> {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--" {
-            return None;
-        }
-        if matches!(a.as_str(), "--color" | "--config" | "-C" | "-Z" | "--explain") {
-            it.next();
-            continue;
-        }
-        if a.starts_with('-') {
-            continue;
-        }
-        return Some(a);
-    }
-    None
 }
 
 fn own_nextest_version() -> Option<String> {
@@ -1125,75 +862,6 @@ mod tests {
     }
 
     #[test]
-    fn configuration_precedence_and_errors_are_deterministic() {
-        let path = Path::new("/config/rargo/config.toml");
-        let env = ConfigEnv { server: Some("env:1".into()), ..ConfigEnv::default() };
-        assert_eq!(env.host(path, Err("bad file".into())).unwrap(), ("env:1".into(), HostFrom::Env));
-        let env = ConfigEnv::default();
-        assert_eq!(env.host(path, Ok(Some("host = \"file:1\""))).unwrap(), ("file:1".into(), HostFrom::File(path.into())));
-        assert_eq!(env.host(path, Ok(Some("host = 7"))).unwrap_err(), "/config/rargo/config.toml: `host` is not a string");
-        assert_eq!(env.host(path, Err("bad file".into())).unwrap_err(), "bad file");
-        for text in [None, Some("other = 7")] {
-            assert_eq!(env.host(path, Ok(text)).unwrap_err(), "no rargo server is named: run `rargo @rargo.rs` (or `rargo @HOST` for a server of your own), which writes /config/rargo/config.toml");
-        }
-        let daemon = ConfigEnv { daemon: Some("1".into()), ..ConfigEnv::default() };
-        assert_eq!(daemon.host(path, Ok(Some("host = \"file:1\""))).unwrap_err(), "the daemon was started without a server");
-
-        let stored = project::Credential { id: "stored".into(), secret: "0123456789abcdef".into(), name: String::new() };
-        for (daemon, token, user, logname, has_stored, expected) in [
-            (None, Some("explicit.0123456789abcdef"), Some("u"), Some("l"), true, "explicit"),
-            (None, None, Some("u"), Some("l"), true, "stored"),
-            (Some("1"), None, Some("u"), Some("l"), true, "u"),
-            (None, None, None, Some("l"), false, "l"),
-            (None, None, None, None, false, "user"),
-        ] {
-            let env = ConfigEnv { daemon: daemon.map(str::to_owned), token: token.map(str::to_owned), user: user.map(str::to_owned),
-                logname: logname.map(str::to_owned), server: None };
-            let cfg = env.finish("host".into(), Ok("server:1".into()), has_stored.then(|| stored.clone())).unwrap();
-            assert_eq!(cfg.user, expected);
-            assert_eq!(cfg.secret.is_some(), matches!(expected, "explicit" | "stored"));
-            assert_eq!(cfg.server, "server:1");
-        }
-        let env = ConfigEnv { token: Some("bad".into()), ..ConfigEnv::default() };
-        assert_eq!(env.finish("host".into(), Ok("server:1".into()), Some(stored)).err().unwrap(),
-            "RARGO_TOKEN is not a token (an id, a dot and a secret)");
-        assert_eq!(ConfigEnv::default().finish("host".into(), Err("discovery failed".into()), None).err().unwrap(),
-            "discovery failed");
-    }
-
-    #[test]
-    fn routing_and_auth_parse_without_io() {
-        let args = |words: &[&str]| words.iter().copied().map(OsString::from).collect::<Vec<_>>();
-        for (words, release) in [
-            (&["clean"][..], true),
-            (&["clean", "-vn"], false),
-            (&["clean", "--help"], false),
-            (&["check", "--version"], false),
-            (&["metadata"], false),
-        ] {
-            assert_eq!(prepare_route(&args(words), vec![], false), Route::Local { release });
-        }
-        let vars = vec![("RUSTUP_TOOLCHAIN".into(), "stable".into()), ("RUSTFLAGS".into(), "-Wwarn".into())];
-        assert_eq!(prepare_route(&args(&["+nightly", "check", "--", "-h"]), vars, false),
-            Route::Remote { args: vec!["check".into(), "--".into(), "-h".into()],
-                vars: vec![("RUSTFLAGS".into(), "-Wwarn".into()), ("RUSTUP_TOOLCHAIN".into(), "nightly".into())], kind: "build" });
-        assert_eq!(prepare_route(&args(&["--rargo-export"]), vec![], false),
-            Route::Usage("usage: rargo --rargo-export DIRECTORY-ON-THE-SERVER".into()));
-        assert_eq!(prepare_route(&args(&["auth", "tokens"]), vec![], true),
-            Route::Remote { args: vec!["__token".into(), "list".into()], vars: vec![], kind: "admin" });
-        for (words, error) in [
-            (&["--token"][..], "`--token` needs the token"),
-            (&["-x"], "unknown option `-x` (see `rargo auth --help`)"),
-            (&["a", "b"], "unexpected `b` (see `rargo auth --help`)"),
-        ] {
-            assert_eq!(parse_auth(&args(words)).unwrap_err(), error);
-        }
-        assert_eq!(parse_auth(&args(&["-h"])).unwrap(), None);
-        assert_eq!(parse_auth(&args(&["remove", "@build"])).unwrap(),
-            Some(AuthArgs { action: "remove", host: Some("build".into()), token: None }));
-    }
-
-    #[test]
     fn writes_of_one_path_at_once_all_succeed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shared");
@@ -1227,13 +895,5 @@ mod tests {
         assert!(a.starts_with("/c/run"));
         let long = PathBuf::from(format!("/{}", "x".repeat(120)));
         assert!(!daemon_socket(&cfg("a:1"), &long).starts_with(&long));
-    }
-
-    #[test]
-    fn subcommands_are_found_behind_global_options() {
-        let a = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
-        assert_eq!(subcommand(&a(&["--color", "always", "build"])), Some("build"));
-        assert_eq!(subcommand(&a(&["-q", "test", "--", "x"])), Some("test"));
-        assert_eq!(subcommand(&a(&["--", "build"])), None);
     }
 }
