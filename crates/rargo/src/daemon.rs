@@ -185,6 +185,159 @@ enum Offered {
     Bet(tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>),
 }
 
+enum CommandEffect {
+    Relay(LocalReply),
+    Trees(Vec<Digest>),
+    Upload(Vec<Digest>),
+    Environment(Vec<String>),
+    Deliver(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>),
+    Blobs(Vec<Blob>),
+    Part(Digest, rargo_proto::Part, bool),
+    VerifyFetch,
+    Report(Box<rargo_proto::FutureReport>),
+    ExplainExit(i32),
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandPhase {
+    Sync,
+    Running,
+    Finished,
+}
+
+struct CommandState {
+    phase: CommandPhase,
+    retry_used: bool,
+    changes: u8,
+    probe: Probe,
+    visible: bool,
+    capture_errors: bool,
+    heard: Vec<u8>,
+    fetching: Option<(u64, Vec<Digest>)>,
+    delivery_ready: bool,
+    last: Option<LocalReply>,
+    token: Option<u64>,
+}
+
+impl CommandState {
+    fn new(probe: Probe) -> Self {
+        Self {
+            phase: CommandPhase::Sync, retry_used: false, changes: 0, probe, visible: false, capture_errors: false,
+            heard: Vec::new(), fetching: None, delivery_ready: false, last: None, token: None,
+        }
+    }
+
+    fn start(&mut self, capture_errors: bool) {
+        self.phase = CommandPhase::Running;
+        self.visible = false;
+        self.capture_errors = capture_errors;
+        self.heard.clear();
+        self.fetching = None;
+        self.delivery_ready = false;
+        self.last = None;
+        self.token = None;
+    }
+
+    fn retry(&mut self, disconnected: bool) -> bool {
+        if !disconnected || self.visible || self.retry_used {
+            return false;
+        }
+        self.retry_used = true;
+        self.phase = CommandPhase::Sync;
+        true
+    }
+
+    fn changed(&mut self) -> bool {
+        self.changes += 1;
+        self.phase = CommandPhase::Sync;
+        self.visible = false;
+        self.changes < 5
+    }
+
+    fn not_there(&mut self, probe: Probe) {
+        self.probe = probe;
+        self.phase = CommandPhase::Sync;
+        self.visible = false;
+    }
+
+    fn server(&mut self, msg: ServerMsg) -> CommandEffect {
+        match msg {
+            ServerMsg::Stdout(bytes) => {
+                self.visible = true;
+                CommandEffect::Relay(LocalReply::Stdout(bytes))
+            }
+            ServerMsg::Stderr(bytes) => {
+                self.visible = true;
+                if self.capture_errors && self.heard.len() < HEARD_MAX {
+                    self.heard.extend_from_slice(&bytes[..bytes.len().min(HEARD_MAX - self.heard.len())]);
+                }
+                CommandEffect::Relay(LocalReply::Stderr(bytes))
+            }
+            ServerMsg::WantTrees(want) => CommandEffect::Trees(want),
+            ServerMsg::WantBlobs(want) => CommandEffect::Upload(want),
+            ServerMsg::WantEnv(names) => CommandEffect::Environment(names),
+            ServerMsg::Deliver { files, writes, .. } => {
+                self.visible = true;
+                CommandEffect::Deliver(files, writes)
+            }
+            ServerMsg::Blobs(blobs) => CommandEffect::Blobs(blobs),
+            ServerMsg::BlobPart { hash, part, last } => CommandEffect::Part(hash, part, last),
+            ServerMsg::Delivered { .. } => {
+                self.delivery_ready = true;
+                CommandEffect::None
+            }
+            ServerMsg::Fetched { id } if self.fetching.as_ref().is_some_and(|(sent, _)| *sent == id) => CommandEffect::VerifyFetch,
+            ServerMsg::DeliveryToken(token) => {
+                self.token = Some(token);
+                CommandEffect::None
+            }
+            ServerMsg::Report(report) => CommandEffect::Report(report),
+            ServerMsg::Exit(code) => {
+                self.last = Some(LocalReply::Exit(code));
+                CommandEffect::ExplainExit(code)
+            }
+            ServerMsg::Exec(exec) => {
+                self.last = Some(LocalReply::Exec(exec));
+                CommandEffect::None
+            }
+            _ => CommandEffect::None,
+        }
+    }
+
+    fn ready_to_fetch(&mut self) -> bool {
+        if self.fetching.is_none() { std::mem::take(&mut self.delivery_ready) } else { false }
+    }
+
+    fn request_fetch(&mut self, id: u64, hashes: Vec<Digest>) {
+        self.fetching = Some((id, hashes));
+    }
+
+    fn verified_fetch(&mut self, complete: bool) -> Result<(), &'static str> {
+        if !complete {
+            return Err("the server did not send every file it announced");
+        }
+        self.fetching = None;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Option<LocalReply> {
+        if self.fetching.is_some() {
+            return None;
+        }
+        let reply = self.last.take()?;
+        self.phase = CommandPhase::Finished;
+        Some(reply)
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.changes <= 5 && self.heard.len() <= HEARD_MAX
+            && (self.phase != CommandPhase::Finished || (self.last.is_none() && self.fetching.is_none()))
+            && self.fetching.as_ref().is_none_or(|(_, hashes)| !hashes.is_empty())
+    }
+}
+
 fn lost() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the server went away")
 }
@@ -1049,17 +1202,17 @@ impl Daemon {
                 .collect();
             (env, asked)
         };
-        let mut retried = false;
+        let probe = if req.kind == "sync" || var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
+        let mut command = CommandState::new(probe);
         if req.kind == "admin" {
             loop {
                 let mux = self.mux().await?;
                 let (env, env_checked) = env_for(&Policy::default());
                 let run = RunRequest { env, env_checked, ..base.clone() };
-                let said = AtomicBool::new(false);
-                match self.converse(&mux, run, None, None, None, req, out, &said, None).await {
+                match self.converse(&mux, run, None, None, None, req, out, &mut command, None).await {
                     Ok(Outcome::Final(reply)) => return Ok(reply),
                     Ok(Outcome::Changed | Outcome::NotThere(_)) => return Err(std::io::Error::other("unexpected answer from the server")),
-                    Err(_) if mux.is_dead() && !said.load(Ordering::SeqCst) && !retried => retried = true,
+                    Err(_) if command.retry(mux.is_dead()) => {},
                     Err(e) => return Err(e),
                 }
             }
@@ -1084,14 +1237,12 @@ impl Daemon {
             }
         }
         let stats = var(&req.vars, "RARGO_SYNC_STATS").is_some();
-        let mut changes = 0;
         let taken_up = Instant::now();
         let phase = |what: &str| {
             if stats {
                 let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
             }
         };
-        let mut probe = if req.kind == "sync" || var(&req.vars, "RARGO_OFFER_WAIT").is_some() { Probe::Wait } else { Probe::Bet };
         loop {
             let mux = self.mux().await?;
             phase("link to the server ready");
@@ -1124,23 +1275,19 @@ impl Daemon {
                     let _ = out.send(LocalReply::Stderr(text.into_bytes()));
                 }
                 phase("worktree read");
-                match self.offer(&mux, &wt, &snap, probe).await {
+                match self.offer(&mux, &wt, &snap, command.probe).await {
                     Ok(Offered::Sent) => phase("worktree offered and what the server lacked sent"),
                     Ok(Offered::Bet(answer)) => {
                         phase("worktree offered by its root, answer not awaited");
                         bet = Some(answer);
                     }
                     Ok(Offered::Changed) => {
-                        changes += 1;
-                        if changes >= 5 {
+                        if !command.changed() {
                             return Ok(Self::fail(out, "the worktree kept changing while it was being synced".into()));
                         }
                         continue;
                     }
-                    Err(_) if mux.is_dead() && !retried => {
-                        retried = true;
-                        continue;
-                    }
+                    Err(_) if command.retry(mux.is_dead()) => continue,
                     Err(e) => return Err(e),
                 }
                 snap
@@ -1169,25 +1316,23 @@ impl Daemon {
                 lazy: shown.is_some(),
                 ..base.clone()
             };
-            let said = AtomicBool::new(false);
             phase("request sent");
-            match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &said, bet).await {
+            match self.converse(&mux, run, Some(&snap), Some(&wt), shown.as_ref(), req, out, &mut command, bet).await {
                 Ok(Outcome::Final(reply)) => {
                     phase("answer complete");
                     return Ok(reply);
                 }
                 Ok(Outcome::NotThere(how)) => {
                     phase("the server lacked the tree: offering it");
-                    probe = how;
+                    command.not_there(how);
                 }
                 Ok(Outcome::Changed) => {
                     wt.rescan_all();
-                    changes += 1;
-                    if changes >= 5 {
+                    if !command.changed() {
                         return Ok(Self::fail(out, "the worktree kept changing while it was being synced".into()));
                     }
                 }
-                Err(_) if mux.is_dead() && !said.load(Ordering::SeqCst) && !retried => retried = true,
+                Err(_) if command.retry(mux.is_dead()) => {},
                 Err(e) => return Err(e),
             }
         }
@@ -1203,7 +1348,7 @@ impl Daemon {
         shown: Option<&(Arc<OutFs>, PathBuf)>,
         req: &LocalRequest,
         out: &UnboundedSender<LocalReply>,
-        said: &AtomicBool,
+        command: &mut CommandState,
         mut bet: Option<tokio::sync::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
     ) -> std::io::Result<Outcome> {
         let (stream, tx, mut rx) = mux.open();
@@ -1219,15 +1364,11 @@ impl Daemon {
         let mut placer = tokio::task::block_in_place(|| {
             Placer::new(&self.cache, placed_path.as_deref().map(Placed::load).unwrap_or_default())
         });
-        let mut fetching: Option<(u64, Vec<Digest>)> = None;
-        let mut delivery_ready = false;
-        let mut last: Option<LocalReply> = None;
-        let mut token: Option<u64> = None;
         let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
-        let mut heard: Vec<u8> = Vec::new();
-        loop {
-            if let (Some(_), None) = (&last, &fetching) {
-                break;
+        command.start(left_out.is_some());
+        let final_reply = loop {
+            if let Some(reply) = command.finish() {
+                break reply;
             }
             let msg = tokio::select! {
                 lacking = async { bet.as_mut().unwrap().await }, if bet.is_some() => {
@@ -1252,24 +1393,14 @@ impl Daemon {
                 mux.post(stream, &ClientMsg::Changed);
                 return Ok(Outcome::NotThere(Probe::Whole));
             }
-            match msg {
-                ServerMsg::Stdout(b) => {
-                    said.store(true, Ordering::SeqCst);
-                    let _ = out.send(LocalReply::Stdout(b));
-                }
-                ServerMsg::Stderr(b) => {
-                    said.store(true, Ordering::SeqCst);
-                    if left_out.is_some() && heard.len() < HEARD_MAX {
-                        heard.extend_from_slice(&b[..b.len().min(HEARD_MAX - heard.len())]);
-                    }
-                    let _ = out.send(LocalReply::Stderr(b));
-                }
-                ServerMsg::WantTrees(want) => {
+            match command.server(msg) {
+                CommandEffect::Relay(reply) => { let _ = out.send(reply); }
+                CommandEffect::Trees(want) => {
                     self.knowledge.lock().unwrap().missing(wt.map(|wt| wt.id), want.iter());
                     let trees: Vec<Vec<u8>> = want.iter().filter_map(|d| snap.and_then(|s| s.scan.trees.get(d)).cloned()).collect();
                     mux.post(stream, &ClientMsg::Trees(trees));
                 }
-                ServerMsg::WantBlobs(want) => {
+                CommandEffect::Upload(want) => {
                     self.knowledge.lock().unwrap().missing(wt.map(|wt| wt.id), want.iter());
                     let ok = match snap {
                         Some(s) => upload(mux, stream, s, want).await?,
@@ -1280,7 +1411,7 @@ impl Daemon {
                         return Ok(Outcome::Changed);
                     }
                 }
-                ServerMsg::WantEnv(names) => {
+                CommandEffect::Environment(names) => {
                     let values: Vec<(String, Option<String>)> = names
                         .iter()
                         .map(|n| (n.clone(), req.vars.iter().find(|(k, _)| k == n).map(|(_, v)| v.clone())))
@@ -1297,8 +1428,7 @@ impl Daemon {
                         let _ = crate::write_atomic(&self.cache.join("env-names"), (asked.join("\n") + "\n").as_bytes());
                     }
                 }
-                ServerMsg::Deliver { files, writes, .. } => {
-                    said.store(true, Ordering::SeqCst);
+                CommandEffect::Deliver(files, writes) => {
                     tokio::task::block_in_place(|| -> std::io::Result<()> {
                         let (files, writes) = match shown {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
@@ -1308,27 +1438,21 @@ impl Daemon {
                         Ok(())
                     })?;
                 }
-                ServerMsg::Blobs(blobs) => tokio::task::block_in_place(|| -> std::io::Result<()> {
+                CommandEffect::Blobs(blobs) => tokio::task::block_in_place(|| -> std::io::Result<()> {
                     for b in blobs {
                         let hash = b.hash;
                         placer.blob(hash, &b.unpack()?)?;
                     }
                     Ok(())
                 })?,
-                ServerMsg::BlobPart { hash, part, last } => {
+                CommandEffect::Part(hash, part, last) => {
                     tokio::task::block_in_place(|| -> std::io::Result<()> { placer.part(hash, &part.unpack()?, last) })?
                 }
-                ServerMsg::Delivered { .. } => delivery_ready = true,
-                ServerMsg::Fetched { id } => {
-                    if let Some((sent, hashes)) = &fetching && *sent == id {
-                        if hashes.iter().any(|hash| placer.awaiting(hash)) {
-                            return Err(std::io::Error::other("the server did not send every file it announced"));
-                        }
-                        fetching = None;
-                    }
+                CommandEffect::VerifyFetch => {
+                    let complete = command.fetching.as_ref().is_some_and(|(_, hashes)| hashes.iter().all(|hash| !placer.awaiting(hash)));
+                    command.verified_fetch(complete).map_err(std::io::Error::other)?;
                 }
-                ServerMsg::DeliveryToken(t) => token = Some(t),
-                ServerMsg::Report(r) => {
+                CommandEffect::Report(r) => {
                     let id = match tokio::task::block_in_place(|| report::save(&r)) {
                         Ok(id) => id,
                         Err(e) => {
@@ -1339,30 +1463,23 @@ impl Daemon {
                     };
                     mux.post(stream, &ClientMsg::ReportId(id));
                 }
-                ServerMsg::Exit(code) => {
+                CommandEffect::ExplainExit(code) => {
                     if let (true, Some((ignored, wt))) = (code != 0, left_out) {
-                        if let Some(note) = left_out_note(ignored, &wt.root, &heard) {
+                        if let Some(note) = left_out_note(ignored, &wt.root, &command.heard) {
                             let _ = out.send(LocalReply::Stderr(note.into_bytes()));
                         }
                     }
-                    last = Some(LocalReply::Exit(code))
                 }
-                ServerMsg::Exec(e) => last = Some(LocalReply::Exec(e)),
-                ServerMsg::Packed(_)
-                | ServerMsg::Missing { .. }
-                | ServerMsg::Pong(_)
-                | ServerMsg::Recipe { .. }
-                | ServerMsg::Chunks { .. } => {}
+                CommandEffect::None => {}
             }
-            if delivery_ready && fetching.is_none() {
-                delivery_ready = false;
+            if command.ready_to_fetch() {
                 let hashes = placer.wanting();
                 if !hashes.is_empty() {
                     let id = mux.fetch(hashes.clone(), &tx);
-                    fetching = Some((id, hashes));
+                    command.request_fetch(id, hashes);
                 }
             }
-        }
+        };
         if let Some((fs, _)) = shown {
             tokio::task::block_in_place(|| fs.save());
         }
@@ -1376,11 +1493,11 @@ impl Daemon {
                     placer.prune();
                 }
             }
-            if let (Some(t), Some(wt)) = (token, wt) {
+            if let (Some(t), Some(wt)) = (command.token, wt) {
                 let _ = crate::write_atomic(&wt.wt_cache.join("delivered"), format!("{t}\n").as_bytes());
             }
         });
-        Ok(Outcome::Final(last.expect("left the loop with a final message")))
+        Ok(Outcome::Final(final_reply))
     }
 
     async fn status(&self, out: &UnboundedSender<LocalReply>) -> LocalReply {
@@ -1542,9 +1659,7 @@ fn show(
     writes: Vec<rargo_proto::Write>,
 ) -> std::io::Result<(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>)> {
     use rargo_proto::Write;
-    let inside = |path: &str| -> Option<Vec<u8>> {
-        Path::new(path).strip_prefix(dir).ok().filter(|r| !r.as_os_str().is_empty()).map(|r| r.as_os_str().as_bytes().to_vec())
-    };
+    let inside = |path: &str| target_relative(dir, Path::new(path));
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
     let mut delivery = fs.begin_delivery();
     let mut rest_writes = Vec::new();
@@ -1590,6 +1705,10 @@ fn show(
         }
     }
     Ok((rest_files, rest_writes))
+}
+
+fn target_relative(dir: &Path, path: &Path) -> Option<Vec<u8>> {
+    path.strip_prefix(dir).ok().filter(|r| !r.as_os_str().is_empty()).map(|r| r.as_os_str().as_bytes().to_vec())
 }
 
 fn join_rel(rel: &[u8]) -> Vec<u8> {
@@ -2033,6 +2152,69 @@ fn paths_in<'t>(text: &'t str, root: &'t str) -> impl Iterator<Item = String> + 
 
 #[cfg(test)]
 mod left_out_tests {
+    #[test]
+    fn command_retries_a_silent_failure_once_and_preserves_visible_output() {
+        let mut command = CommandState::new(Probe::Bet);
+        command.start(true);
+        assert!(command.invariants());
+        assert!(command.retry(true));
+        assert!(command.invariants());
+        command.start(true);
+        assert!(command.invariants());
+        assert!(!command.retry(true));
+        assert!(command.invariants());
+
+        let mut command = CommandState::new(Probe::Wait);
+        command.start(true);
+        assert!(command.invariants());
+        let msgs = [
+            ServerMsg::Stdout(b"first".to_vec()),
+            ServerMsg::Stderr(b"second".to_vec()),
+            ServerMsg::Stdout(b"third".to_vec()),
+        ];
+        let mut relayed = Vec::new();
+        for msg in msgs {
+            if let CommandEffect::Relay(reply) = command.server(msg) {
+                relayed.push(reply);
+            }
+            assert!(command.invariants());
+        }
+        assert!(matches!(relayed.as_slice(), [LocalReply::Stdout(a), LocalReply::Stderr(b), LocalReply::Stdout(c)]
+            if a == b"first" && b == b"second" && c == b"third"));
+        assert!(!command.retry(true));
+        assert!(command.invariants());
+        command.server(ServerMsg::Delivered { id: 1 });
+        assert!(command.invariants());
+        assert!(command.ready_to_fetch());
+        assert!(command.invariants());
+        command.request_fetch(2, vec![[1; 32]]);
+        assert!(command.invariants());
+        assert!(matches!(command.server(ServerMsg::Exit(42)), CommandEffect::ExplainExit(42)));
+        assert!(command.invariants());
+        assert!(command.finish().is_none());
+        assert!(command.invariants());
+        assert!(matches!(command.server(ServerMsg::Fetched { id: 2 }), CommandEffect::VerifyFetch));
+        assert!(command.invariants());
+        assert!(command.verified_fetch(false).is_err());
+        assert!(command.invariants());
+        command.verified_fetch(true).unwrap();
+        assert!(command.invariants());
+        assert!(matches!(command.finish(), Some(LocalReply::Exit(42))));
+        assert!(command.invariants());
+    }
+
+    #[test]
+    fn mounted_output_manifest_paths_are_relative_to_the_mount() {
+        for (path, expected) in [
+            ("/work/target/debug/app", Some("debug/app")),
+            ("/work/target", None),
+            ("/work/target-other/debug/app", None),
+            ("/another/target/debug/app", None),
+        ] {
+            assert_eq!(target_relative(Path::new("/work/target"), Path::new(path)), expected.map(|s| s.as_bytes().to_vec()));
+        }
+    }
+
     use super::*;
 
     #[test]
