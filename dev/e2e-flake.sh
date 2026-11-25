@@ -267,16 +267,25 @@ if tail -n +1 -f --pid="$nw_srv" "$T/state-nw.log" | awk '/serving clients/ { fo
         joined=1
     fi
     cd "$T/nw-proj"
-    out=$(RARGO_SERVER=127.0.0.1:$nw_port RARGO_CACHE_DIR=$T/home-nw/.cache/rargo HOME=$T/home-nw CARGO_HOME=$T/home-nw/.cargo "$R" build 2>&1); rc=$?
-    st=$(RARGO_SERVER=127.0.0.1:$nw_port RARGO_CACHE_DIR=$T/home-nw/.cache/rargo HOME=$T/home-nw "$R" --rargo-status 2>&1 || true)
+    nw() { RARGO_SERVER=127.0.0.1:$nw_port RARGO_CACHE_DIR=$T/home-nw/.cache/rargo HOME=$T/home-nw CARGO_HOME=$T/home-nw/.cargo "$@"; }
+    out=$(nw "$R" build 2>&1); rc=$?
+    st=$(nw "$R" --rargo-status 2>&1 || true)
     nix=$(grep -oE '[0-9.]+ nix store lookups' <<<"$st" | head -1 | cut -d' ' -f1)
     disp=$(grep -oE '[0-9.]+ actions dispatched' <<<"$st" | head -1 | cut -d' ' -f1)
-    if [ "$rc" -eq 0 ] && [ "$joined" = 1 ] && [ "${disp:-0}" -ge 1 ] && [ "${nix:-x}" = 0 ]; then
-        ok "a worker that cannot see /nix/store built the flake ($disp actions, $nix nix store lookups)"
+    if ! grep -q "nix closure:" "$T/state-nw.log" 2>/dev/null; then
+        tail -n +1 -f --pid="$nw_srv" "$T/state-nw.log" | awk '/nix closure:/ { found=1; exit } END { exit found ? 0 : 1 }' || true
+    fi
+    sed -i 's/built with:/built again:/' src/main.rs
+    out2=$(nw "$R" build 2>&1); rc2=$?
+    st2=$(nw "$R" --rargo-status 2>&1 || true)
+    nix2=$(grep -oE '[0-9.]+ nix store lookups' <<<"$st2" | head -1 | cut -d' ' -f1)
+    if [ "$rc" -eq 0 ] && [ "$rc2" -eq 0 ] && [ "$joined" = 1 ] && [ "${disp:-0}" -ge 1 ] && [ "${nix2:-x}" = "${nix:-y}" ]; then
+        ok "a worker that cannot see /nix/store built the flake ($disp actions; nix store lookups $nix then $nix2)"
     else
         bad "a worker that cannot see /nix/store built the flake" "$out
-joined=$joined dispatched=${disp:-} nix=${nix:-}
-$st
+$out2
+joined=$joined dispatched=${disp:-} nix=${nix:-} then ${nix2:-} rc2=$rc2
+$st2
 $(tail -40 "$T/state-nw.log")
 $(tail -40 "$T/worker-nw.log")"
     fi

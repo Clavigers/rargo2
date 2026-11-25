@@ -39,6 +39,15 @@ stop_worker() {
     '
 }
 wait_worker_gone() { stop_worker; }
+wait_hashed() {
+    local srv
+    if grep -q "nix closure:" "$rig/srv.log" 2>/dev/null; then
+        return 0
+    fi
+    srv=$(rargod_pids "$rig/srv" | head -1)
+    [ -n "$srv" ] || return 1
+    tail -n +1 -f --pid="$srv" "$rig/srv.log" | awk '/nix closure:/ { found=1; exit } END { exit found ? 0 : 1 }'
+}
 worker_holds_only() {
     local joined srv wpid
     stop_worker
@@ -139,6 +148,8 @@ out=$(R build 2>&1); check $? "the workspace builds after four crates were added
 settle
 gain=$(( $(store_bytes) - before ))
 [ "$gain" -gt 8388608 ]; check $? "the toolchain is on the worker (+$((gain / 1048576)) MiB)" "$(R --rargo-status)"
+wait_hashed; check $? "the closure hash finished" "$(tail -20 "$rig/srv.log")"
+nix_held=$(stat 'nix store lookups')
 
 for l in $second; do leaf $l 10; done
 app $first $warm $second
@@ -179,7 +190,7 @@ out=$(R run -q 2>&1); [ "$out" = "total 22" ]; check $? "its program shows the l
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
 nix=$(stat 'nix store lookups')
-[ "${nix:-x}" = 0 ]; check $? "the worker asked for nothing under /nix/store ($nix)" "$(R --rargo-status)"
+[ "$nix" = "${nix_held:-}" ]; check $? "once the worker held the closure it asked for nothing more under /nix/store ($nix_held then $nix)" "$(R --rargo-status)"
 grep "nix closure:" "$rig/srv.log" | sed 's/^/        /' || true
 grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 cd /
@@ -209,6 +220,8 @@ out=$(R build 2>&1); check $? "one-core worker: it builds after four crates were
 settle
 gain=$(( $(store_bytes) - before ))
 [ "$gain" -gt 8388608 ]; check $? "one-core worker: the toolchain is on the worker (+$((gain / 1048576)) MiB)" "$(R --rargo-status)"
+wait_hashed; check $? "one-core worker: the closure hash finished" "$(tail -20 "$rig/srv.log")"
+nix_held=$(stat 'nix store lookups')
 for l in $second; do leaf $l 10; done
 app $first $warm $second
 out=$(R build 2>&1); check $? "one-core worker: it builds after six crates were added" "$out"
@@ -234,7 +247,7 @@ out=$(R run -q 2>&1); [ "$out" = "total 46" ]; check $? "its program shows the l
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
 nix=$(stat 'nix store lookups')
-[ "${nix:-x}" = 0 ]; check $? "the worker asked for nothing under /nix/store ($nix)" "$(R --rargo-status)"
+[ "$nix" = "${nix_held:-}" ]; check $? "once the worker held the closure it asked for nothing more under /nix/store ($nix_held then $nix)" "$(R --rargo-status)"
 grep "nix closure:" "$rig/srv.log" | sed 's/^/        /' || true
 grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 

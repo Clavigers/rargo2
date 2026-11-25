@@ -57,7 +57,7 @@ pub struct Daemon {
     pub parser: Parser,
     pub incr: crate::incr::IncrStore,
     pub pool: OnceLock<Arc<crate::remote::Pool>>,
-    pub(crate) nix_attached: Mutex<HashSet<String>>,
+    pub(crate) nix_attached: Arc<Mutex<HashSet<String>>>,
     pub drift_report: Mutex<Option<String>>,
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
     pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
@@ -455,7 +455,7 @@ impl Daemon {
             scratch_seq: AtomicU64::new(0),
             incr,
             pool: OnceLock::new(),
-            nix_attached: Mutex::new(HashSet::new()),
+            nix_attached: Arc::new(Mutex::new(HashSet::new())),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
             deliveries: Mutex::new(HashMap::new()),
@@ -586,6 +586,7 @@ impl Daemon {
 }
 
 pub async fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
+    let _hold = crate::nixmanifest::hold_build();
     d.stats.requests.fetch_add(1, Ordering::Relaxed);
     let c = Arc::new(c);
     if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {

@@ -177,20 +177,7 @@ fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
     for (k, v) in &env.env {
         h.field(k.as_bytes()).field(v.as_bytes());
     }
-    for root in &env.roots {
-        h.field(&root.0);
-    }
     h.finish()
-}
-
-fn log_cost(cost: &crate::nixmanifest::Cost) {
-    if cost.hashed_files == 0 && cost.new_paths == 0 {
-        return;
-    }
-    eprintln!(
-        "nix closure: hashed {} files, {} bytes, {} ms; reused {} paths",
-        cost.hashed_files, cost.hashed_bytes, cost.millis, cost.reused_paths
-    );
 }
 
 pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
@@ -245,19 +232,13 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     let nix = Path::new("/nix/store");
     let hosts = d.pool.get().map(|p| p.host_sources().clone());
     let manifest = |closure: &[String]| {
-        crate::nixmanifest::prepare(
-            store.db(),
-            nix,
-            closure,
-            hosts.as_deref(),
-            &mut d.nix_attached.lock(),
-        )
+        crate::nixmanifest::schedule(store.db(), nix, closure, hosts.as_ref(), &d.nix_attached)
     };
     if let Some(v) = store.db().get(Table::Meta, &k) {
         if let Ok(mut env) = bincode::deserialize::<FlakeEnv>(&v) {
             if env.closure.iter().all(|c| nix.join(c).exists()) {
                 let prepared = manifest(&env.closure)?;
-                log_cost(&prepared.cost);
+                crate::nixmanifest::log_cost(&prepared.cost);
                 env.roots = prepared.roots;
                 let id = action_id(&key, &env);
                 if id != env.id {
@@ -288,7 +269,7 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     let _ = std::fs::remove_dir_all(&scratch);
     let mut env = env?;
     let prepared = manifest(&env.closure)?;
-    log_cost(&prepared.cost);
+    crate::nixmanifest::log_cost(&prepared.cost);
     env.roots = prepared.roots;
     env.id = action_id(&key, &env);
     store.db().put(Table::Meta, &k, &bincode::serialize(&env)?);
