@@ -2693,4 +2693,7 @@ headroom `CLAUDE.md` asks for.
 Before the gate copies its binaries over the ones already in its
 directory, every process still running those copies is gone. A daemon
 exits on SIGTERM. Its unmount-guard exits once the daemon does, and the
-mount goes with it. `e2e-auth` stops every daemon under its own directory.
+mount goes with it. A check that a killed daemon's mount is gone waits
+on that daemon's guard. Another daemon can still be running with a
+guard whose title names the same directory, and that guard stays until
+its own daemon exits. `e2e-auth` stops every daemon under its own directory.

@@ -224,12 +224,18 @@ out=$(R run -q 2>&1); [ "$out" = "value 113" ] && mounted; check $? "rargo build
 # A daemon that is killed outright cannot unmount. What it left watching
 # does, at once and with no rargo command run: target/ is never a dead
 # mount, and stock cargo works in the worktree.
+# Block until each named guard has exited and the path is not a rargo
+# mount. A guard exits when its daemon does, and unmounts if the daemon
+# did not. Only those pids are waited on: an earlier daemon can still be
+# running with a guard whose title names this same path.
 unmounted() {
-    local g
-    for g in $(pgrep -f "^unmount-guard: $1" || true); do
+    local path=$1 g
+    shift
+    for g in "$@"; do
+        [ -n "$g" ] || continue
         tail --pid="$g" -f /dev/null
     done
-    ! grep -q " $1 [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo
+    ! grep -q " $path [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo
 }
 # (The daemon of the TCP part above is still running, with a cache of its
 # own; it is not this one, and its mount here was replaced long ago.)
@@ -237,7 +243,7 @@ mine() { pgrep -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"; }
 guard=$(pgrep -P "$(mine)" -f "^unmount-guard: $proj/target")
 [ -n "$guard" ]; check $? "a process of the daemon's watches the mount, and not under the daemon's name" "$(pgrep -af unmount-guard)"
 pkill -KILL -f "$RARGO_BIN/rargo --rargo-daemon $E/cache/"
-unmounted "$proj/target"; check $? "after the daemon is killed (SIGKILL) target/ is unmounted, with no rargo command run" "$(grep "$proj" /proc/self/mountinfo)"
+unmounted "$proj/target" "$guard"; check $? "after the daemon is killed (SIGKILL) target/ is unmounted, with no rargo command run" "$(grep "$proj" /proc/self/mountinfo)"
 out=$(ls target 2>&1); check $? "and is a plain directory that can be listed" "$out"
 [ -z "$(mine)" ]; check $? "(its daemon is not running)" "$(mine)"
 out=$(cargo build --offline 2>&1); check $? "stock cargo builds in the worktree after the daemon was killed" "$out"
@@ -267,8 +273,9 @@ out=$(asuser "$U/target/debug/app" 2>&1); [ "$out" = "value 113" ]; check $? "th
 out=$(asuser sh -c 'echo x >target/note && cat target/note' 2>&1); [ "$out" = x ]; check $? "the user can write there" "$out"
 # This user's daemon killed: the mount was made by fusermount3, and is
 # unmounted through it.
+ug=$(pgrep -f "^unmount-guard: $U/target$" || true)
 pkill -KILL -f "$U/bin/rargo --rargo-daemon "
-unmounted "$U/target"; check $? "a killed daemon of this user leaves no mount either" "$(grep "$U" /proc/self/mountinfo)"
+unmounted "$U/target" $ug; check $? "a killed daemon of this user leaves no mount either" "$(grep "$U" /proc/self/mountinfo)"
 out=$(asuser cat target/note 2>&1); [ "$out" = x ]; check $? "and what the user wrote is in the plain directory" "$out"
 out=$(asuser "$U/bin/rargo" build 2>&1); check $? "the user's next build starts a daemon again" "$out"
 grep -q " $U/target [^ ]* [^ ]* - fuse.rargo " /proc/self/mountinfo; check $? "which mounts target/ again" "$(tail -3 "$U/cache/daemon.log")"
