@@ -1,0 +1,523 @@
+From 018ac3370c22db7fe6d75d9294f9453793e69214 Mon Sep 17 00:00:00 2001
+From: rargo <noreply@rargo.invalid>
+Date: Wed, 25 Nov 2026 15:26:20 +0100
+Subject: [PATCH] rargo: -Z rargo-fn-ids gives every function instance an
+ identity of its code
+
+---
+ compiler/rustc_codegen_llvm/src/base.rs       |   1 +
+ compiler/rustc_codegen_llvm/src/consts.rs     |  15 +
+ compiler/rustc_codegen_llvm/src/context.rs    |  10 +
+ compiler/rustc_codegen_ssa/src/mir/mod.rs     |   6 +
+ .../rustc_codegen_ssa/src/mir/rargo_id.rs     | 332 ++++++++++++++++++
+ compiler/rustc_codegen_ssa/src/mono_item.rs   |   3 +
+ compiler/rustc_codegen_ssa/src/traits/misc.rs |   1 +
+ compiler/rustc_mir_transform/src/inline.rs    |   2 +-
+ compiler/rustc_session/src/config.rs          |   2 +-
+ compiler/rustc_session/src/options.rs         |   2 +
+ 10 files changed, 372 insertions(+), 2 deletions(-)
+ create mode 100644 compiler/rustc_codegen_ssa/src/mir/rargo_id.rs
+
+diff --git a/compiler/rustc_codegen_llvm/src/base.rs b/compiler/rustc_codegen_llvm/src/base.rs
+index 571d8cda6..a29ad9e3d 100644
+--- a/compiler/rustc_codegen_llvm/src/base.rs
++++ b/compiler/rustc_codegen_llvm/src/base.rs
+@@ -188,6 +188,7 @@ fn module_codegen(
+             }
+ 
+             cx.rargo_finish_slots();
++            cx.rargo_finish_fn_ids();
+ 
+             // Create the llvm.used variable.
+             if !cx.used_statics.is_empty() {
+diff --git a/compiler/rustc_codegen_llvm/src/consts.rs b/compiler/rustc_codegen_llvm/src/consts.rs
+index 1a41e1f8b..fe75b9787 100644
+--- a/compiler/rustc_codegen_llvm/src/consts.rs
++++ b/compiler/rustc_codegen_llvm/src/consts.rs
+@@ -693,6 +693,21 @@ pub(crate) fn rargo_slot_delta(&self) -> &'ll Value {
+         delta
+     }
+ 
++    pub(crate) fn rargo_finish_fn_ids(&mut self) {
++        let rows = self.rargo_fn_ids.take();
++        if rows.is_empty() {
++            return;
++        }
++        let text = self.const_bytes(&rows);
++        let table = self.define_global(&self.generate_local_symbol_name("rargo_fn_ids"), self.val_ty(text)).unwrap();
++        llvm::set_initializer(table, text);
++        llvm::set_linkage(table, llvm::Linkage::InternalLinkage);
++        llvm::LLVMSetGlobalConstant(table, llvm::TRUE);
++        llvm::set_section(table, c".rargo_fn_ids");
++        set_global_alignment(self, table, Align::ONE);
++        self.add_used_global(table);
++    }
++
+     pub(crate) fn rargo_finish_slots(&mut self) {
+         let Some(pending) = self.rargo_slot_array.take() else { return };
+         let names = self.rargo_slots.take();
+diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
+index 795b43f23..321346053 100644
+--- a/compiler/rustc_codegen_llvm/src/context.rs
++++ b/compiler/rustc_codegen_llvm/src/context.rs
+@@ -126,6 +126,7 @@ pub(crate) struct FullCx<'ll, 'tcx> {
+     /// See <https://llvm.org/docs/LangRef.html#the-llvm-compiler-used-global-variable> for details
+     pub compiler_used_statics: RefCell<Vec<&'ll Value>>,
+     pub rargo_slots: RefCell<Vec<String>>,
++    pub rargo_fn_ids: RefCell<Vec<u8>>,
+     pub rargo_slot_array: Cell<Option<&'ll Value>>,
+ 
+     /// Mapping of non-scalar types to llvm types.
+@@ -740,6 +741,7 @@ pub(crate) fn new(
+                 used_statics: Vec::new(),
+                 compiler_used_statics: Default::default(),
+                 rargo_slots: Default::default(),
++                rargo_fn_ids: Default::default(),
+                 rargo_slot_array: Cell::new(None),
+                 type_lowering: Default::default(),
+                 scalar_lltypes: Default::default(),
+@@ -969,6 +971,14 @@ pub(crate) fn get_functions(&self) -> Vec<&'ll Value> {
+ }
+ 
+ impl<'ll, 'tcx> MiscCodegenMethods<'tcx> for CodegenCx<'ll, 'tcx> {
++    fn rargo_record_identity(&self, symbol: &str, identity: Option<[u8; 32]>) {
++        let mut rows = self.rargo_fn_ids.borrow_mut();
++        rows.extend_from_slice(symbol.as_bytes());
++        rows.push(0);
++        rows.extend_from_slice(&identity.unwrap_or([0; 32]));
++        rows.push(identity.is_none() as u8);
++    }
++
+     fn vtables(
+         &self,
+     ) -> &RefCell<FxHashMap<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>), &'ll Value>> {
+diff --git a/compiler/rustc_codegen_ssa/src/mir/mod.rs b/compiler/rustc_codegen_ssa/src/mir/mod.rs
+index 4baf927c5..eb3068b5a 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/mod.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/mod.rs
+@@ -24,6 +24,7 @@
+ pub mod naked_asm;
+ pub mod operand;
+ pub mod place;
++mod rargo_id;
+ mod retag;
+ mod rvalue;
+ mod statement;
+@@ -209,6 +210,11 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+     let tcx = cx.tcx();
+     let llfn = cx.get_fn(instance);
+ 
++    if tcx.sess.opts.unstable_opts.rargo_fn_ids {
++        let identity = rargo_id::identity(tcx, cx.typing_env(), instance);
++        cx.rargo_record_identity(tcx.symbol_name(instance).name, identity);
++    }
++
+     let mut mir = tcx.instance_mir(instance.def);
+     // Note that the ABI logic has deduced facts about the functions' parameters based on the MIR we
+     // got here (`deduce_param_attrs`). That means we can *not* apply arbitrary further MIR
+diff --git a/compiler/rustc_codegen_ssa/src/mir/rargo_id.rs b/compiler/rustc_codegen_ssa/src/mir/rargo_id.rs
+new file mode 100644
+index 000000000..e9a54a7b4
+--- /dev/null
++++ b/compiler/rustc_codegen_ssa/src/mir/rargo_id.rs
+@@ -0,0 +1,332 @@
++use rustc_data_structures::fingerprint::Fingerprint;
++use rustc_data_structures::fx::FxHashMap;
++use rustc_data_structures::stable_hash::{StableHash, StableHasher};
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::DefId;
++use rustc_hir::find_attr;
++use rustc_middle::ich::StableHashState;
++use rustc_middle::mir::interpret::{AllocId, ConstAllocation, GlobalAlloc, Scalar};
++use rustc_middle::mir::visit::MutVisitor;
++use rustc_middle::mir::{self, ConstValue};
++use rustc_middle::ty::layout::{LayoutCx, TyAndLayout};
++use rustc_middle::ty::{self, GenericArgsRef, Instance, InstanceKind, TyCtxt, TypingEnv};
++use rustc_span::{RemapPathScopeComponents, Span};
++
++pub(crate) fn identity<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    typing_env: TypingEnv<'tcx>,
++    instance: Instance<'tcx>,
++) -> Option<[u8; 32]> {
++    let mir = tcx.instance_mir(instance.def);
++    let mut body = instance.instantiate_mir_and_normalize_erasing_regions(
++        tcx,
++        typing_env,
++        ty::EarlyBinder::bind(tcx, mir.clone()),
++    );
++    let def_id = instance.def_id();
++    let test_main = tcx.sess.is_test_crate()
++        && tcx.entry_fn(()).is_some_and(|(entry, _)| entry == def_id);
++    let first_line = line(tcx, tcx.def_span(def_id));
++    let mut locations = Vec::new();
++    for data in body.basic_blocks.iter() {
++        let Some(terminator) = &data.terminator else { continue };
++        let located = match &terminator.kind {
++            mir::TerminatorKind::Assert { .. } => true,
++            mir::TerminatorKind::Call { func, .. } => callee(tcx, typing_env, &func)
++                .is_some_and(|callee| callee.def.requires_caller_location(tcx)),
++            mir::TerminatorKind::InlineAsm { operands, .. } => {
++                if operands.iter().any(|op| {
++                    matches!(
++                        op,
++                        mir::InlineAsmOperand::SymFn { .. } | mir::InlineAsmOperand::SymStatic { .. }
++                    )
++                }) {
++                    return None;
++                }
++                false
++            }
++            _ => false,
++        };
++        if located && !test_main && !instance.def.requires_caller_location(tcx) {
++            locations.push(location(tcx, terminator.source_info.span, first_line));
++        }
++    }
++    body.var_debug_info.clear();
++    for data in body.basic_blocks.as_mut_preserves_cfg().iter_mut() {
++        data.after_last_stmt_debuginfos = Default::default();
++        for statement in &mut data.statements {
++            statement.debuginfos = Default::default();
++        }
++    }
++    let descriptor = test_descriptor(tcx, def_id);
++    tcx.with_stable_hashing_context(|mut hcx| {
++        let mut out = None;
++        hcx.while_hashing_spans(false, |hcx| {
++            let mut hasher = StableHasher::new();
++            let mut consts = Consts {
++                tcx,
++                typing_env,
++                hcx: &mut *hcx,
++                hasher: &mut hasher,
++                allocs: FxHashMap::default(),
++                unknown: false,
++                test_main,
++            };
++            consts.visit_body_preserves_cfg(&mut body);
++            if let Some(descriptor) = descriptor {
++                consts.descriptor(descriptor);
++            }
++            if consts.unknown {
++                return;
++            }
++            drop(consts);
++            instance.args.stable_hash(hcx, &mut hasher);
++            if !test_main {
++                for data in body.basic_blocks.iter() {
++                    data.stable_hash(hcx, &mut hasher);
++                }
++                for decl in body.local_decls.iter() {
++                    decl.mutability.stable_hash(hcx, &mut hasher);
++                    decl.ty.stable_hash(hcx, &mut hasher);
++                }
++                body.arg_count.stable_hash(hcx, &mut hasher);
++                body.spread_arg.stable_hash(hcx, &mut hasher);
++            }
++            for (file, line, column) in &locations {
++                file.as_str().stable_hash(hcx, &mut hasher);
++                line.stable_hash(hcx, &mut hasher);
++                column.stable_hash(hcx, &mut hasher);
++            }
++            let mut second = hasher.clone();
++            0u8.stable_hash(hcx, &mut hasher);
++            1u8.stable_hash(hcx, &mut second);
++            let mut id = [0u8; 32];
++            id[..16].copy_from_slice(&hasher.finish::<Fingerprint>().to_le_bytes());
++            id[16..].copy_from_slice(&second.finish::<Fingerprint>().to_le_bytes());
++            out = Some(id);
++        });
++        out
++    })
++}
++
++fn line(tcx: TyCtxt<'_>, span: Span) -> i64 {
++    tcx.sess.source_map().lookup_char_pos(span.lo()).line as i64
++}
++
++fn location(tcx: TyCtxt<'_>, span: Span, first_line: i64) -> (String, i64, u32) {
++    let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
++    let at = tcx.sess.source_map().lookup_char_pos(topmost.lo());
++    (
++        at.file.name.display(RemapPathScopeComponents::MACRO).to_string_lossy().into_owned(),
++        at.line as i64 - first_line,
++        at.col_display as u32 + 1,
++    )
++}
++
++fn callee<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    typing_env: TypingEnv<'tcx>,
++    func: &mir::Operand<'tcx>,
++) -> Option<Instance<'tcx>> {
++    let mir::Operand::Constant(constant) = func else { return None };
++    let ty::FnDef(def_id, args) = *constant.const_.ty().kind() else { return None };
++    Instance::try_resolve(tcx, typing_env, def_id, args.no_bound_vars()?).ok().flatten()
++}
++
++fn test_descriptor(tcx: TyCtxt<'_>, mut def_id: DefId) -> Option<DefId> {
++    while tcx.is_closure_like(def_id) {
++        def_id = tcx.parent(def_id);
++    }
++    (matches!(tcx.def_kind(def_id), DefKind::Const | DefKind::Static { .. })
++        && find_attr!(tcx, def_id, RustcTestMarker(..)))
++    .then_some(def_id)
++}
++
++struct Consts<'a, 'b, 'tcx> {
++    tcx: TyCtxt<'tcx>,
++    typing_env: TypingEnv<'tcx>,
++    hcx: &'a mut StableHashState<'b>,
++    hasher: &'a mut StableHasher,
++    allocs: FxHashMap<AllocId, usize>,
++    unknown: bool,
++    test_main: bool,
++}
++
++impl<'tcx> MutVisitor<'tcx> for Consts<'_, '_, 'tcx> {
++    fn tcx(&self) -> TyCtxt<'tcx> {
++        self.tcx
++    }
++
++    fn visit_const_operand(&mut self, constant: &mut mir::ConstOperand<'tcx>, _: mir::Location) {
++        let ty = constant.const_.ty();
++        if let ty::FnDef(def_id, args) = *ty.kind() {
++            match args.no_bound_vars() {
++                Some(args) => self.callee(def_id, args),
++                None => ty.stable_hash(self.hcx, self.hasher),
++            }
++        } else if !self.test_main {
++            ty.stable_hash(self.hcx, self.hasher);
++            match constant.const_.eval(self.tcx, self.typing_env, constant.span) {
++                Ok(value) => self.value(value),
++                Err(_) => self.unknown = true,
++            }
++        }
++        constant.const_ = mir::Const::Val(ConstValue::ZeroSized, ty);
++        constant.user_ty = None;
++    }
++}
++
++impl<'tcx> Consts<'_, '_, 'tcx> {
++    fn descriptor(&mut self, def_id: DefId) {
++        let ty = self.tcx.type_of(def_id).instantiate_identity().skip_normalization();
++        let masks = match self.tcx.layout_of(self.typing_env.as_query_input(ty)) {
++            Ok(layout) => line_fields(&LayoutCx::new(self.tcx, self.typing_env), layout, 0),
++            Err(_) => Vec::new(),
++        };
++        if matches!(self.tcx.def_kind(def_id), DefKind::Static { .. }) {
++            match self.tcx.eval_static_initializer(def_id) {
++                Ok(memory) => self.memory_masked(memory, &masks),
++                Err(_) => self.unknown = true,
++            }
++            return;
++        }
++        match self.tcx.const_eval_poly(def_id) {
++            Ok(ConstValue::Indirect { alloc_id, offset }) => {
++                self.allocs.insert(alloc_id, self.allocs.len());
++                match self.tcx.try_get_global_alloc(alloc_id) {
++                    Some(GlobalAlloc::Memory(memory)) => {
++                        let base = offset.bytes() as usize;
++                        let masks: Vec<_> = masks.iter().map(|m| m.start + base..m.end + base).collect();
++                        self.memory_masked(memory, &masks)
++                    }
++                    _ => self.unknown = true,
++                }
++            }
++            Ok(value) => self.value(value),
++            Err(_) => self.unknown = true,
++        }
++    }
++
++    fn callee(&mut self, def_id: DefId, args: GenericArgsRef<'tcx>) {
++        match Instance::try_resolve(self.tcx, self.typing_env, def_id, args) {
++            Ok(Some(instance)) => self.instance(instance),
++            _ => {
++                self.tcx.def_path_hash(def_id).stable_hash(self.hcx, self.hasher);
++                args.stable_hash(self.hcx, self.hasher);
++            }
++        }
++    }
++
++    fn instance(&mut self, instance: Instance<'tcx>) {
++        match instance.def {
++            InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..) => {
++                instance.stable_hash(self.hcx, self.hasher)
++            }
++            _ => self.tcx.symbol_name(instance).name.stable_hash(self.hcx, self.hasher),
++        }
++    }
++
++    fn value(&mut self, value: ConstValue) {
++        match value {
++            ConstValue::Scalar(Scalar::Int(int)) => int.stable_hash(self.hcx, self.hasher),
++            ConstValue::Scalar(Scalar::Ptr(ptr, size)) => {
++                size.stable_hash(self.hcx, self.hasher);
++                let (prov, offset) = ptr.into_raw_parts();
++                offset.bytes().stable_hash(self.hcx, self.hasher);
++                self.alloc(prov.alloc_id());
++            }
++            ConstValue::ZeroSized => {}
++            ConstValue::Slice { alloc_id, meta } => {
++                meta.stable_hash(self.hcx, self.hasher);
++                self.alloc(alloc_id);
++            }
++            ConstValue::Indirect { alloc_id, offset } => {
++                offset.bytes().stable_hash(self.hcx, self.hasher);
++                self.alloc(alloc_id);
++            }
++        }
++    }
++
++    fn alloc(&mut self, id: AllocId) {
++        if let Some(&seen) = self.allocs.get(&id) {
++            (0u8, seen).stable_hash(self.hcx, self.hasher);
++            return;
++        }
++        let next = self.allocs.len();
++        self.allocs.insert(id, next);
++        match self.tcx.try_get_global_alloc(id) {
++            None => self.unknown = true,
++            Some(GlobalAlloc::Function { instance }) => {
++                1u8.stable_hash(self.hcx, self.hasher);
++                self.instance(instance);
++            }
++            Some(GlobalAlloc::VTable(ty, predicates)) => {
++                2u8.stable_hash(self.hcx, self.hasher);
++                ty.stable_hash(self.hcx, self.hasher);
++                predicates.stable_hash(self.hcx, self.hasher);
++            }
++            Some(GlobalAlloc::Static(def_id)) => {
++                3u8.stable_hash(self.hcx, self.hasher);
++                self.tcx.def_path_hash(def_id).stable_hash(self.hcx, self.hasher);
++                if !self.tcx.is_foreign_item(def_id) && !self.tcx.is_thread_local_static(def_id) {
++                    match self.tcx.eval_static_initializer(def_id) {
++                        Ok(memory) => self.memory(memory),
++                        Err(_) => self.unknown = true,
++                    }
++                }
++            }
++            Some(GlobalAlloc::Memory(memory)) => {
++                4u8.stable_hash(self.hcx, self.hasher);
++                self.memory(memory);
++            }
++            Some(GlobalAlloc::TypeId { ty }) => {
++                5u8.stable_hash(self.hcx, self.hasher);
++                ty.stable_hash(self.hcx, self.hasher);
++            }
++        }
++    }
++
++    fn memory(&mut self, memory: ConstAllocation<'tcx>) {
++        self.memory_masked(memory, &[]);
++    }
++
++    fn memory_masked(&mut self, memory: ConstAllocation<'tcx>, masks: &[std::ops::Range<usize>]) {
++        let memory = memory.inner();
++        let mut bytes = memory.inspect_with_uninit_and_ptr_outside_interpreter(0..memory.len()).to_vec();
++        for mask in masks {
++            if let Some(range) = bytes.get_mut(mask.clone()) {
++                range.fill(0);
++            }
++        }
++        bytes.stable_hash(self.hcx, self.hasher);
++        memory.align.bytes().stable_hash(self.hcx, self.hasher);
++        let pointers: Vec<_> =
++            memory.provenance().ptrs().iter().map(|(at, prov)| (at.bytes(), prov.alloc_id())).collect();
++        for (at, id) in pointers {
++            at.stable_hash(self.hcx, self.hasher);
++            self.alloc(id);
++        }
++    }
++}
++
++fn line_fields<'tcx>(
++    cx: &LayoutCx<'tcx>,
++    layout: TyAndLayout<'tcx>,
++    base: usize,
++) -> Vec<std::ops::Range<usize>> {
++    let mut out = Vec::new();
++    let ty::Adt(adt, _) = layout.ty.kind() else { return out };
++    if !adt.is_struct() {
++        return out;
++    }
++    for (i, field) in adt.non_enum_variant().fields.iter().enumerate() {
++        let at = base + layout.fields.offset(i).bytes() as usize;
++        let inner: TyAndLayout<'tcx> = layout.field(cx, i);
++        match field.name.as_str() {
++            "desc" => out.extend(line_fields(cx, inner, at)),
++            "start_line" | "end_line" => out.push(at..at + inner.size.bytes() as usize),
++            _ => {}
++        }
++    }
++    out
++}
+diff --git a/compiler/rustc_codegen_ssa/src/mono_item.rs b/compiler/rustc_codegen_ssa/src/mono_item.rs
+index f2cd9e228..43e226e50 100644
+--- a/compiler/rustc_codegen_ssa/src/mono_item.rs
++++ b/compiler/rustc_codegen_ssa/src/mono_item.rs
+@@ -44,6 +44,9 @@ fn define<Bx: BuilderMethods<'a, 'tcx>>(
+             MonoItem::Fn(instance) => {
+                 let flags = cx.tcx().codegen_instance_attrs(instance.def).flags;
+                 if flags.contains(CodegenFnAttrFlags::NAKED) {
++                    if cx.tcx().sess.opts.unstable_opts.rargo_fn_ids {
++                        cx.rargo_record_identity(cx.tcx().symbol_name(instance).name, None);
++                    }
+                     naked_asm::codegen_naked_asm::<Bx::CodegenCx>(cx, instance, item_data);
+                 } else {
+                     base::codegen_instance::<Bx>(cx, instance);
+diff --git a/compiler/rustc_codegen_ssa/src/traits/misc.rs b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+index add7128a2..5cff14fad 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/misc.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+@@ -19,6 +19,7 @@ fn apply_vcall_visibility_metadata(
+     ) {
+     }
+     fn get_fn(&self, instance: Instance<'tcx>) -> Self::Function;
++    fn rargo_record_identity(&self, _symbol: &str, _identity: Option<[u8; 32]>) {}
+     fn get_fn_addr(
+         &self,
+         instance: Instance<'tcx>,
+diff --git a/compiler/rustc_mir_transform/src/inline.rs b/compiler/rustc_mir_transform/src/inline.rs
+index 492fa54f3..0b632a47c 100644
+--- a/compiler/rustc_mir_transform/src/inline.rs
++++ b/compiler/rustc_mir_transform/src/inline.rs
+@@ -45,7 +45,7 @@ struct CallSite<'tcx> {
+ 
+ impl<'tcx> crate::MirPass<'tcx> for Inline {
+     fn policy(&self, ctx: &crate::PassCtx<'_>) -> PassPolicy {
+-        if ctx.opts.unstable_opts.rargo_fn_slots {
++        if ctx.opts.unstable_opts.rargo_fn_slots || ctx.opts.unstable_opts.rargo_fn_ids {
+             return PassPolicy::optional(false);
+         }
+         match ctx.opts.unstable_opts.inline_mir {
+diff --git a/compiler/rustc_session/src/config.rs b/compiler/rustc_session/src/config.rs
+index ca852b50f..de7433d9e 100644
+--- a/compiler/rustc_session/src/config.rs
++++ b/compiler/rustc_session/src/config.rs
+@@ -3203,7 +3203,7 @@ pub fn check_nightly_options(
+             // rargo: `-Zno-codegen` is how the build system asks for a crate's metadata
+             // without its object code. It has to work without `RUSTC_BOOTSTRAP`, because that
+             // variable changes the crate hash and the metadata must be the full build's.
+-            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| matches!(x.as_str(), "no-codegen" | "rargo-fn-slots" | "rargo-fn-slots=yes")) {
++            if opt.name == "Z" && matches.opt_strs("Z").iter().all(|x| matches!(x.as_str(), "no-codegen" | "rargo-fn-slots" | "rargo-fn-slots=yes" | "rargo-fn-ids" | "rargo-fn-ids=yes")) {
+                 continue;
+             }
+ 
+diff --git a/compiler/rustc_session/src/options.rs b/compiler/rustc_session/src/options.rs
+index c86492fc4..2b9927be9 100644
+--- a/compiler/rustc_session/src/options.rs
++++ b/compiler/rustc_session/src/options.rs
+@@ -2792,6 +2792,8 @@ pub(crate) fn parse_rust_version(slot: &mut Option<RustcVersion>, v: Option<&str
+         "enable queries of the dependency graph for regression testing (default: no)"),
+     randomize_layout: bool = (false, parse_bool, [TRACKED],
+         "randomize the layout of types (default: no)"),
++    rargo_fn_ids: bool = (false, parse_bool, [TRACKED],
++        "give every function instance an identity of its code in `.rargo_fn_ids` (default: no)"),
+     rargo_fn_slots: bool = (false, parse_bool, [TRACKED],
+         "give every function instance a byte in `.rargo_slots` that it sets when it runs, \
+         named in `.rargo_slot_names` (default: no)"),
+-- 
+2.43.0
+

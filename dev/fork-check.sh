@@ -233,5 +233,133 @@ hosted=$(python3 -I marks.py host host.bin)
 [ $rc = 0 ] && [ "$(grep -cE '^\+ _R[A-Za-z0-9_]*_4host12after_plugin$' <<<"$hosted")" = 1 ] && ok "a cdylib with its own std, loaded into a marked process, leaves the process's marks alone" || bad "a cdylib with its own std, loaded into a marked process, leaves the process's marks alone" "exit $rc; $(grep after_plugin <<<"$hosted")"
 cd "$T"
 
+echo "== function identities"
+mkdir -p ids && cd ids
+cat >ids.rs <<'EOF'
+#![allow(dead_code)]
+use std::hint::black_box;
+//ABOVE
+pub static TABLE: [u32; 3] = [1, 2, 3];
+pub const LIMIT: u32 = 10;
+#[inline(never)]
+pub fn reads_table(i: usize) -> u32 { TABLE[i] }
+#[inline(never)]
+pub fn uses_limit(x: u32) -> u32 { x.min(LIMIT) }
+#[inline(never)]
+pub fn plain(x: u32) -> u32 { x + 1 }
+#[inline(never)]
+pub fn callee(x: u32) -> u32 { x * 3 }
+#[inline(never)]
+pub fn caller(x: u32) -> u32 { callee(x) + 1 }
+#[inline(never)]
+pub fn indexes(v: &[u32], i: usize) -> u32 { v[i] }
+#[inline(never)]
+pub fn where_am_i() -> u32 { line!() }
+#[inline(never)]
+pub fn generic<T: Copy + Default>(t: T) -> T { black_box(t); T::default() }
+#[inline(never)]
+pub fn with_asm() { unsafe { std::arch::asm!("/* {} */", sym plain) } }
+#[test]
+fn t_a() {
+    black_box(plain(1));
+    black_box(caller(2));
+    black_box(reads_table(1));
+    black_box(uses_limit(3));
+    black_box(indexes(&[1, 2], 1));
+    black_box(where_am_i());
+    black_box(generic(1u32));
+    black_box(generic(2u64));
+    with_asm();
+}
+#[test]
+fn t_b() { black_box(plain(7)); }
+//NEWTEST
+EOF
+cat >table.py <<'EOF'
+import sys
+d = open(sys.argv[1], 'rb').read()
+u = lambda at, n: int.from_bytes(d[at:at + n], 'little')
+shoff, shentsize, shnum, shstrndx = u(0x28, 8), u(0x3a, 2), u(0x3c, 2), u(0x3e, 2)
+sec = lambda i: d[shoff + i * shentsize: shoff + (i + 1) * shentsize]
+names_at = int.from_bytes(sec(shstrndx)[0x18:0x20], 'little')
+rows = b''
+for i in range(shnum):
+    h = sec(i)
+    n = int.from_bytes(h[0:4], 'little')
+    if d[names_at + n: d.index(b'\0', names_at + n)] == b'.rargo_fn_ids':
+        off, size = int.from_bytes(h[0x18:0x20], 'little'), int.from_bytes(h[0x20:0x28], 'little')
+        rows = d[off:off + size]
+at, out = 0, {}
+while at < len(rows):
+    end = rows.index(b'\0', at)
+    name = rows[at:end].decode()
+    out[name] = rows[end + 1:end + 33].hex() + ' ' + str(rows[end + 33])
+    at = end + 34
+for name in sorted(out):
+    print(out[name], name)
+EOF
+variant() {
+    local dir=$1; shift
+    mkdir -p "$dir"
+    python3 -I -c '
+import sys
+s = open("ids.rs").read()
+for pair in sys.argv[2:]:
+    a, b = pair.split("=>", 1)
+    assert s.count(a) == 1, a
+    s = s.replace(a, b)
+open(sys.argv[1], "w").write(s)' "$dir/ids.rs" "$@"
+}
+build() { (cd "$1" && rustc --edition=2021 --test -O -C symbol-mangling-version=v0 -Zrargo-fn-ids ${2:-} ids.rs -o ids 2>&1 | head -5 && python3 -I ../table.py ids > table); }
+changed() { python3 -I -c '
+import re, sys
+old = set(open(sys.argv[1]).read().splitlines())
+names = set()
+for row in open(sys.argv[2]).read().splitlines():
+    if row in old:
+        continue
+    for m in re.finditer(r"_3ids(?:s[0-9A-Za-z]*_)?(\d+)", row.split(" ", 2)[2]):
+        names.add(row.split(" ", 2)[2][m.end():m.end() + int(m.group(1))])
+print(" ".join(sorted(names)))' "$1/table" "$2/table"; }
+variant v_base
+variant v_body 'x + 1 }=>x + 2 }'
+variant v_callee 'x * 3 }=>x * 5 }'
+variant v_static '[1, 2, 3];=>[1, 2, 4];'
+variant v_const 'LIMIT: u32 = 10;=>LIMIT: u32 = 11;'
+variant v_moved '//ABOVE=>//ABOVE
+
+
+
+'
+variant v_newtest '//NEWTEST=>#[test]
+fn t_c() { black_box(caller(9)); }'
+variant v_ignore '#[test]
+fn t_b=>#[test]
+#[ignore]
+fn t_b'
+cp -r v_base v_cgu && cp -r v_base elsewhere
+for v in v_base v_body v_callee v_static v_const v_moved v_newtest v_ignore elsewhere; do build $v; done
+build v_cgu "-C codegen-units=7"
+rows=$(wc -l <v_base/table)
+[ "$rows" -gt 20 ] && ! grep -q '^0\{64\} 0' v_base/table && ok "every function instance has a row ($rows), none with an empty identity" || bad "every function instance has a row" "$(head -3 v_base/table)"
+[ "$(changed v_base v_body)" = plain ] && ok "an edit to one body changes only that function" || bad "an edit to one body changes only that function" "$(changed v_base v_body)"
+[ "$(changed v_base v_callee)" = callee ] && ok "an edit to a callee changes the callee and not its caller" || bad "an edit to a callee changes the callee and not its caller" "$(changed v_base v_callee)"
+[ "$(changed v_base v_static)" = reads_table ] && ok "a changed static initializer changes exactly the function that reads it" || bad "a changed static initializer changes exactly the function that reads it" "$(changed v_base v_static)"
+[ "$(changed v_base v_const)" = uses_limit ] && ok "a changed const changes exactly the function that uses it" || bad "a changed const changes exactly the function that uses it" "$(changed v_base v_const)"
+[ "$(changed v_base v_moved)" = where_am_i ] && ok "moving the code down three lines changes only the function with line!() (indexes' bounds check and the tests' descriptors keep theirs)" || bad "moving the code down three lines changes only the function with line!()" "$(changed v_base v_moved)"
+added=$(diff <(cut -d' ' -f3 v_base/table | sort) <(cut -d' ' -f3 v_newtest/table | sort) | grep -c '^>')
+[ -z "$(changed v_base v_newtest | tr ' ' '\n' | grep -v '^t_c' | tr -d '\n')" ] && [ "$added" -ge 1 ] && ok "adding a test adds rows for it and changes no other test, nor main" || bad "adding a test adds rows for it and changes no other test, nor main" "$(changed v_base v_newtest)"
+grep -q 'ids4main' v_base/table && [ "$(grep 'ids4main$' v_base/table)" = "$(grep 'ids4main$' v_newtest/table)" ] && ok "main has an identity, the same with the new test" || bad "main has an identity, the same with the new test" "$(grep ids4main v_base/table v_newtest/table)"
+[ "$(changed v_base v_ignore)" = t_b ] && ok "a test's descriptor counts in that test: #[ignore] changes t_b only" || bad "a test's descriptor counts in that test: #[ignore] changes t_b only" "$(changed v_base v_ignore)"
+cmp -s v_base/table v_cgu/table && ok "seven codegen units give the same table" || bad "seven codegen units give the same table" "$(diff v_base/table v_cgu/table | head -4)"
+cmp -s v_base/table elsewhere/table && ok "a build in another directory gives the same table" || bad "a build in another directory gives the same table" "$(diff v_base/table elsewhere/table | head -4)"
+g=$(grep -E '_3ids7generic' v_base/table | cut -d' ' -f1 | sort -u | wc -l)
+[ "$g" = 2 ] && ok "a generic function has a distinct identity per instance" || bad "a generic function has a distinct identity per instance" "$(grep generic v_base/table)"
+[ "$(grep -E '_3ids8with_asm$' v_base/table | cut -d' ' -f1,2)" = "$(printf '0%.0s' $(seq 64)) 1" ] && ok "a function with asm! naming a symbol has the no-identity flag" || bad "a function with asm! naming a symbol has the no-identity flag" "$(grep with_asm v_base/table)"
+[ "$(grep -c ' 1 ' v_base/table)" = 1 ] && ok "and it is the only one" || bad "and it is the only one" "$(grep ' 1 ' v_base/table)"
+out=$(cd v_base && rustc --edition=2021 --test -Zrargo-fn-ids --emit=mir ids.rs -o - 2>/dev/null | sed -n '/^fn caller(/,/^}/p' | grep -c 'callee(')
+[ "$out" = 1 ] && ok "the MIR inliner leaves callees in place under the flag" || bad "the MIR inliner leaves callees in place under the flag" "$out"
+cd "$T"
+
 echo "fork-check: $((checks - fails)) of $checks passed"
 exit $fails
