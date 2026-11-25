@@ -34,8 +34,9 @@ report all pending "Running ${#suites[@]} gate steps"
 for suite in "${suites[@]}"; do report "$suite" pending "Waiting for gate"; done
 passed=0
 step() {
-    local name=$1 status description log=$L/$1.log
+    local name=$1 status description log=$L/$1.log started
     shift
+    started=$(date +%s)
     if "$@" >"$log" 2>&1; then
         status=success
         passed=$((passed + 1))
@@ -46,6 +47,7 @@ step() {
         description=$(summary "$log")
         echo "FAIL  $name (see $log)"
     fi
+    echo $(( $(date +%s) - started )) >"$L/$name.secs"
     report "$name" "$status" "${description:-$status}"
 }
 mkdir -p "$L/work/tmp"
@@ -168,11 +170,12 @@ fi
 result="$passed of ${#suites[@]} gate steps passed"
 elapsed=$(( $(date +%s) - gate_started ))
 echo "gate ${elapsed}s: $result"
-if [ "$passed" -eq "${#suites[@]}" ] && ! dev/gate-budget.sh check "$elapsed" "$L" e2e e2e-copy e2e-flake e2e-auth e2e-components e2e-link e2e-worker; then
+if [ "$passed" -eq "${#suites[@]}" ] && ! dev/gate-budget.sh check "$elapsed" "$L" "${suites[@]}"; then
     report all failure "gate ${elapsed}s is over the budget in dev/gate-budget"
     exit 1
 fi
 if [ "$passed" -eq "${#suites[@]}" ]; then
+    dev/gate-budget.sh record "$L" "${suites[@]}"
     report all success "$result"
 else
     report all failure "$result"

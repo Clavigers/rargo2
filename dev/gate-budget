@@ -1,8 +1,11 @@
 total 150
-e2e 41
-e2e-copy 43
+build 0
+unit 0
+mount-tests 2
+e2e 38
+e2e-copy 38
 e2e-flake 15
 e2e-auth 107
 e2e-components 5
-e2e-link 87
-e2e-worker 25
+e2e-link 88
+e2e-worker 24
