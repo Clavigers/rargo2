@@ -143,7 +143,11 @@ pub(super) async fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                 let a = metadata(d, c, &p, m).await?;
                 if a.code != 0 && !fetched && needs_network(&a.err) {
                     fetched = true;
-                    let Some(snapshot) = fetch(d, c, &p, &a.args, &a.err).await? else {
+                    let (components, offline) = (missing_components(&a.err), offline_args(&a.args));
+                    if offline && components.is_empty() {
+                        return Ok(101);
+                    }
+                    let Some(snapshot) = fetch(d, c, &p, &a.args, components, offline).await? else {
                         return Ok(101);
                     };
                     p = prepare(d, c, snapshot).await?;

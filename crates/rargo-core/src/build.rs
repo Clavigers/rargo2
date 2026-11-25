@@ -18,13 +18,16 @@ use parking_lot::Mutex;
 use rargo_plan as rp;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::watch;
 
 mod nextest;
 mod pure;
+mod request;
+
+use request::{BuildRequest, Effect, End, Go, OnFailure, Unit};
 
 use pure::*;
 
@@ -205,8 +208,7 @@ struct Run {
     times: Mutex<Vec<crate::timings::UnitTime>>,
     early: Mutex<HashMap<usize, Vec<(Vec<u8>, MEntry)>>>,
     ui: Mutex<Ui>,
-    failed: AtomicBool,
-    inconsistent: AtomicBool,
+    req: Arc<Mutex<BuildRequest>>,
     base_env: BTreeMap<String, String>,
     no_cache_tests: bool,
     explain: bool,
@@ -606,10 +608,15 @@ async fn plan_with(
     Ok(PlanOutcome::Ok(Planned { data, stderr }))
 }
 
-async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], failure: &[u8]) -> Result<Option<Arc<Snapshot>>> {
-    let components = missing_components(failure);
+async fn fetch(
+    d: &Arc<Daemon>,
+    c: &Arc<Client>,
+    p: &Prepared,
+    args: &[String],
+    components: Vec<(String, String)>,
+    offline: bool,
+) -> Result<Option<Arc<Snapshot>>> {
     let mut fetch_args = vec!["fetch".to_string()];
-    let mut offline = false;
     let scratch = d.scratch("fetch")?;
     let scratch_s = scratch.to_string_lossy().into_owned();
     let local = |v: &str| -> String {
@@ -629,17 +636,13 @@ async fn fetch(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: &[String], 
                     fetch_args.push(if a == "--config" { v.clone() } else { local(v) });
                 }
             }
-            "--locked" | "--frozen" | "--offline" => offline = true,
+            "--locked" | "--frozen" | "--offline" => {}
             _ if a.starts_with("--manifest-path=") => {
                 fetch_args.push(format!("--manifest-path={}", local(&a["--manifest-path=".len()..])))
             }
             _ if a.starts_with("--config=") => fetch_args.push(a.clone()),
             _ => {}
         }
-    }
-    if offline && components.is_empty() {
-        let _ = std::fs::remove_dir_all(&scratch);
-        return Ok(None);
     }
     let _one_at_a_time = d.fetching.lock().await;
     let planner = d.cfg.planner.clone();
@@ -781,6 +784,38 @@ fn phase(started: Instant, c: &Client, what: &str) {
     }
 }
 
+struct CancelOnDrop(Arc<Mutex<BuildRequest>>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let mut req = self.0.lock();
+        if !matches!(req.phase(), request::Phase::Done(_)) {
+            req.cancel();
+        }
+    }
+}
+
+fn remember_client(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<()> {
+if c.session.is_some() && !c.worktree.is_empty() {
+    d.trees.remember(&c.worktree, &c.snapshot);
+    let mut last = d.last_clients.lock();
+    let dir = c.policy_dir()?;
+    let checked = last.get(&c.worktree).filter(|l| l.dir == dir).and_then(|l| l.checked);
+    last.insert(
+        c.worktree.clone(),
+        crate::drift::LastClient {
+            env: Arc::new(c.env.to_map()),
+            home: c.home.clone(),
+            root: c.root.clone(),
+            dir,
+            at: Instant::now(),
+            checked,
+        },
+    );
+}
+    Ok(())
+}
+
 struct Built {
     layer: Arc<OutputsLayer>,
     units: usize,
@@ -802,59 +837,82 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         let (env, names) = (c.env.clone(), d.engine.traces.every_env_name());
         tokio::spawn(async move { env.ensure(&names).await })
     };
-    let mut p = prepare(d, c, c.snapshot.clone()).await?;
-    phase(started, c, "worktree prepared");
-    if c.session.is_some() && !c.worktree.is_empty() {
-        d.trees.remember(&c.worktree, &c.snapshot);
-        let mut last = d.last_clients.lock();
-        let dir = c.policy_dir()?;
-        let checked = last.get(&c.worktree).filter(|l| l.dir == dir).and_then(|l| l.checked);
-        last.insert(
-            c.worktree.clone(),
-            crate::drift::LastClient {
-                env: Arc::new(c.env.to_map()),
-                home: c.home.clone(),
-                root: c.root.clone(),
-                dir,
-                at: Instant::now(),
-                checked,
-            },
-        );
-    }
     let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
     let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").as_deref() == Some("1"));
     let fork_key = (c.worktree.clone(), c.env.get("RUSTUP_TOOLCHAIN").unwrap_or_default());
-    let mut as_build = check_at.is_some() && d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
-    let mut fetched = false;
-    let mut plan_args;
-    let planned = loop {
-        plan_args = args.clone();
-        if let (Some(i), true) = (check_at, as_build) {
-            plan_args[i] = "build".into();
-        }
-        match plan(d, c, &p, &plan_args).await? {
-            PlanOutcome::Ok(pl) => {
-                if check_at.is_some() && pl.data.plan.rustc_fork != as_build {
-                    as_build = pl.data.plan.rustc_fork;
-                    d.fork_seen.insert(fork_key.clone(), as_build);
-                    continue;
+    let seen_fork = d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
+    let (req, first) = BuildRequest::new(check_at.is_some(), seen_fork, offline_args(&args));
+    let req = Arc::new(Mutex::new(req));
+    let _cancel = CancelOnDrop(req.clone());
+    let mut todo: std::collections::VecDeque<Effect> = first.into();
+    let mut snapshot = c.snapshot.clone();
+    let mut prepared: Option<Prepared> = None;
+    let mut planned: Option<Planned> = None;
+    let mut plan_failure: Option<(Vec<u8>, Vec<u8>)> = None;
+    let mut plan_args = args.clone();
+    while let Some(effect) = todo.pop_front() {
+        let next = match effect {
+            Effect::Prepare => {
+                let first = prepared.is_none();
+                prepared = Some(prepare(d, c, snapshot.clone()).await?);
+                if first {
+                    phase(started, c, "worktree prepared");
+                    remember_client(d, c)?;
                 }
-                break pl;
+                req.lock().prepared()
             }
-            PlanOutcome::Failed { stderr, .. } if !fetched && needs_network(&stderr) => {
-                fetched = true;
-                let Some(snapshot) = fetch(d, c, &p, &args, &stderr).await? else {
-                    return Ok(Finish::Code(101));
-                };
-                p = prepare(d, c, snapshot).await?;
+            Effect::Plan { as_build } => {
+                let p = prepared.as_ref().expect("a plan follows a prepared worktree");
+                plan_args = args.clone();
+                if let (Some(i), true) = (check_at, as_build) {
+                    plan_args[i] = "build".into();
+                }
+                match plan(d, c, p, &plan_args).await? {
+                    PlanOutcome::Ok(pl) => {
+                        let plan = &pl.data.plan;
+                        let fx = req.lock().planned(plan.rustc_fork, plan.units.len(), plan.keep_going);
+                        planned = Some(pl);
+                        fx
+                    }
+                    PlanOutcome::Failed { stderr, stdout, code } => {
+                        let fx = req.lock().plan_failed(&stderr, code);
+                        plan_failure = Some((stdout, stderr));
+                        fx
+                    }
+                }
             }
-            PlanOutcome::Failed { stderr, stdout, code } => {
+            Effect::RememberFork(b) => {
+                d.fork_seen.insert(fork_key.clone(), b);
+                Vec::new()
+            }
+            Effect::Fetch { components, offline } => {
+                let p = prepared.as_ref().expect("a fetch follows a prepared worktree");
+                let got = fetch(d, c, p, &args, components, offline).await?;
+                let ok = got.is_some();
+                if let Some(s) = got {
+                    snapshot = s;
+                }
+                req.lock().fetched(ok)
+            }
+            Effect::ShowPlanFailure => {
+                let p = prepared.as_ref().expect("a plan failure follows a prepared worktree");
+                let (stdout, stderr) = plan_failure.take().expect("a plan failed");
                 c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&stdout)).as_bytes());
                 c.out.err_text(&String::from_utf8_lossy(&stderr));
-                return Ok(Finish::Code(code));
+                Vec::new()
             }
-        }
-    };
+            Effect::End(End::Code(code)) => return Ok(Finish::Code(code)),
+            Effect::End(End::Retry) => return Ok(Finish::Retry),
+            Effect::End(End::Cancelled) => return Ok(Finish::Code(101)),
+            Effect::RunUnits => break,
+            Effect::Deliver => unreachable!("delivery follows the units"),
+        };
+        req.lock().invariants();
+        todo.extend(next);
+    }
+    let p = prepared.expect("units follow a prepared worktree");
+    let planned = planned.expect("units follow a plan");
+    let as_build = req.lock().as_build();
     let pd = planned.data;
     let plan = &pd.plan;
     env_known.await.map_err(|e| anyhow!("asking the client for its environment: {e}"))??;
@@ -911,8 +969,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
         times: Mutex::new(vec![Default::default(); n]),
         early: Mutex::new(HashMap::new()),
         ui: Mutex::new(Ui::default()),
-        failed: AtomicBool::new(false),
-        inconsistent: AtomicBool::new(false),
+        req: req.clone(),
         base_env: env,
         no_cache_tests,
         explain: c.env.contains_key("RARGO_EXPLAIN"),
@@ -953,26 +1010,33 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
                 Ok(st) => st,
                 Err(e) => {
                     r.c.out.error(&format!("{}: {e:#}", r.pd.plan.units[i].desc));
-                    r.failed.store(true, Ordering::SeqCst);
                     UState::Failed
                 }
             };
+            let end = match st {
+                UState::Done => Unit::Done,
+                UState::Failed => Unit::Failed,
+                UState::Skipped => Unit::Skipped,
+                UState::Pending | UState::Meta => unreachable!("a unit's task ends with the unit"),
+            };
+            r.req.lock().unit_ended(i, end);
             r.states[i].send_replace(st);
         }));
     }
     for t in tasks.0.iter_mut() {
         t.await.context("a unit task panicked")?;
     }
-    if run.inconsistent.load(Ordering::SeqCst) {
+    let (ok, after) = req.lock().units_ended();
+    if after == [Effect::End(End::Retry)] {
         return Ok(Finish::Retry);
     }
-    let ok = !run.failed.load(Ordering::SeqCst)
-        && (0..n).all(|i| matches!(*run.states[i].borrow(), UState::Done));
     if matches!(plan.message_format, rp::MessageFormat::Json { .. }) {
         c2.out.raw_out(format!("{{\"reason\":\"build-finished\",\"success\":{ok}}}\n").as_bytes());
     }
-    if !ok {
-        return Ok(Finish::Code(101));
+    match after.as_slice() {
+        [Effect::Deliver] => {}
+        [Effect::End(End::Code(code))] => return Ok(Finish::Code(*code)),
+        other => unreachable!("units end in a delivery or an end: {other:?}"),
     }
 
     if run.verify {
@@ -1074,6 +1138,7 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
     }
     if run.need.is_some() {
         finished();
+        req.lock().delivered(0);
         return Ok(Finish::Code(0));
     }
     run.materialize_roots();
@@ -1083,6 +1148,9 @@ async fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Optio
 
     let done = run.steps().await;
     phase(started, c, "done");
+    if let Ok(Finish::Code(code)) = &done {
+        req.lock().delivered(*code);
+    }
     done
 }
 
@@ -1229,12 +1297,11 @@ impl Run {
         let meta_ok = dep.only_rmeta && (self.plan().units[j].rmeta_early || self.meta_only(j));
         let mut rx = self.states[j].subscribe();
         loop {
-            let st = *rx.borrow_and_update();
-            match st {
-                UState::Done => return true,
-                UState::Meta if meta_ok => return true,
-                UState::Failed | UState::Skipped => return false,
-                _ => {}
+            rx.borrow_and_update();
+            match self.req.lock().dep(j, meta_ok) {
+                Go::Ready => return true,
+                Go::Skip => return false,
+                Go::Wait => {}
             }
             if rx.changed().await.is_err() {
                 return false;
@@ -1334,7 +1401,7 @@ impl Run {
                 }
             }
         }
-        if self.failed.load(Ordering::SeqCst) && !plan.keep_going {
+        if !self.req.lock().may_start(i) {
             return Ok(UState::Skipped);
         }
         let Some(cmd) = &u.cmd else { return Ok(UState::Done) };
@@ -1462,7 +1529,6 @@ impl Run {
             _ => None,
         };
         self.times.lock()[i].start = Some(std::time::Instant::now());
-        let mut components_added = false;
         let outcome = loop {
             if let Some(o) = from_full.take() {
                 break o;
@@ -1512,11 +1578,12 @@ impl Run {
                     continue;
                 }
             }
-            if !r.success() && !components_added {
-                let missing = missing_components(&self.d.store().read(&r.stderr).unwrap_or_default());
-                if !missing.is_empty() {
-                    components_added = true;
-                    if add_components_for(&self.d, &self.c, missing).await? {
+            if !r.success() {
+                let stderr = self.d.store().read(&r.stderr).unwrap_or_default();
+                let on_failure = self.req.lock().unit_failed(i, &stderr);
+                if let OnFailure::Install(missing) = on_failure {
+                    let added = add_components_for(&self.d, &self.c, missing).await?;
+                    if self.req.lock().components_installed(i, added) {
                         self.base.renew();
                         continue;
                     }
@@ -1710,7 +1777,6 @@ impl Run {
         let _ = self.results[i].set((r.clone(), outcome.cached));
 
         if !r.success() {
-            self.failed.store(true, Ordering::SeqCst);
             self.report_failure(i, &cmd, &r);
             return Ok(UState::Failed);
         }
@@ -1718,15 +1784,13 @@ impl Run {
         if let Some(early) = self.early.lock().get(&i) {
             for (path, e) in early {
                 if r.outputs.get(path) != Some(e) {
-                    self.inconsistent.store(true, Ordering::SeqCst);
-                    self.failed.store(true, Ordering::SeqCst);
+                    self.req.lock().unit_inconsistent(i);
                     return Ok(UState::Failed);
                 }
             }
         }
         if u.kind == rp::UnitKind::RunScript {
             if !self.finish_script(i, &r).await? {
-                self.failed.store(true, Ordering::SeqCst);
                 return Ok(UState::Failed);
             }
         }
@@ -2045,6 +2109,7 @@ impl Run {
                         self.layer.add(i as u32, LEVEL_META, &ents);
                         self.early.lock().entry(i).or_default().extend(ents);
                         self.times.lock()[i].meta = Some(std::time::Instant::now());
+                        self.req.lock().unit_meta(i);
                         self.states[i].send_replace(UState::Meta);
                     }
                 }
