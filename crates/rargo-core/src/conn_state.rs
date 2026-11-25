@@ -164,10 +164,8 @@ pub enum Command {
 pub fn protocol_mismatch(client: u32) -> String {
     let server = env!("CARGO_PKG_VERSION");
     let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {server}");
-    let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching client") };
-    format!(
-        "this rargo (protocol {client}) is {age} than the build server (rargod {server}, protocol {PROTO_VERSION}); {verb} with: {install}"
-    )
+    let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching version") };
+    format!("this rargo is {age} than the build server, which runs rargo {server}; {verb} with: {install}")
 }
 
 pub fn command(version: u32, args: &[String], admin: bool, user: &str) -> Command {
@@ -577,9 +575,12 @@ mod tests {
         assert_eq!(command(PROTO_VERSION, &a(&["__gc"]), true, "ann"), Command::Gc);
         let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {}", env!("CARGO_PKG_VERSION"));
         let Command::Fail(old) = command(PROTO_VERSION - 1, &a(&["build"]), false, "bob") else { panic!("an old client") };
-        assert!(old.contains("is older than the build server") && old.ends_with(&format!("update it with: {install}")), "{old}");
+        let server = format!("which runs rargo {}", env!("CARGO_PKG_VERSION"));
+        assert!(old.starts_with("this rargo is older than the build server, ") && old.contains(&server), "{old}");
+        assert!(old.ends_with(&format!("update it with: {install}")) && !old.contains("protocol"), "{old}");
         let Command::Fail(new) = command(PROTO_VERSION + 1, &a(&["build"]), false, "bob") else { panic!("a new client") };
-        assert!(new.contains("is newer than the build server") && new.ends_with(&install), "{new}");
+        assert!(new.starts_with("this rargo is newer than the build server, ") && new.ends_with(&install), "{new}");
+        assert!(new.contains("install the matching version with: ") && !new.contains("protocol"), "{new}");
         assert_eq!(command(PROTO_VERSION, &a(&["__export", "/d"]), true, "ann"), Command::Export("/d".into()));
         assert_eq!(
             command(PROTO_VERSION, &a(&["__import"]), true, "ann"),
