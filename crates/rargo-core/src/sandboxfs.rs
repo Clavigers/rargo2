@@ -1375,7 +1375,7 @@ impl Filesystem for SandboxFs {
 #[cfg(test)]
 mod model_tests {
     use super::*;
-    use crate::view::{CheckObservation, OWN_DIR, merge_listings};
+    use crate::view::{CheckObservation, Owner, merge_listings};
 
     #[test]
     fn merged_views_and_compacted_traces_preserve_observed_results() {
@@ -1407,7 +1407,7 @@ mod model_tests {
                 if let Obs::Listing(want) = obs {
                     return available && *want == listing_hash(&listing);
                 }
-                let looked = if !available { Looked::Absent } else if path == &dir { Looked::Dir(OWN_DIR) } else { Looked::Other };
+                let looked = if !available { Looked::Absent } else if path == &dir { Looked::Dir(Owner::own(0o755)) } else { Looked::Other };
                 matches!(obs.check(looked), CheckObservation::Known(true))
             });
             let compact = compact_obs(observations.clone());
