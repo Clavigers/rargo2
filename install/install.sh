@@ -4,7 +4,8 @@ version=${1:-latest}
 base=${RARGO_DL:-https://rargo.rs/dl}
 case "$(uname -s)-$(uname -m)" in
 Linux-x86_64) asset=rargo-x86_64-unknown-linux-musl ;;
-*) echo "rargo has no prebuilt client for $(uname -s) $(uname -m); try: cargo install rargo" >&2; exit 1 ;;
+Linux-*) echo "rargo has no prebuilt client for Linux $(uname -m); build one with: cargo install rargo" >&2; exit 1 ;;
+*) echo "rargo runs on Linux only, so there is no rargo for $(uname -s); a Linux machine or VM can build with rargo" >&2; exit 1 ;;
 esac
 if [ -n "${RARGO_INSTALL_DIR:-}" ]; then dir=$RARGO_INSTALL_DIR
 elif [ -d "$HOME/.cargo/bin" ]; then dir=$HOME/.cargo/bin
