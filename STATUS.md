@@ -768,6 +768,66 @@ and left 11.8, 2.7, 2.1 and 35.7 GB on the client.
   rest of the 1.5 to 2 s in the swarm, where twenty agents share the
   server, is not measured.
 
+### Chunking rule: RepMaxCDC against the mask rule (issue 117, 2026-11-25)
+
+The question: is RepMaxCDC (`github.com/buildbarn/go-cdc`, as Bonanza uses
+it) a better rule for cutting chunks inside a structural region than
+`chunk.rs`'s gear hash with two masks? The structural boundaries (archive
+members, ELF sections) are the same for both.
+
+**Corpus** (`dev/cdc-corpus.sh`; 48.5 GB of files):
+- Two projects, each built by rargo at 11 successive first-parent commits,
+  oldest first:
+  - rust-analyzer: `aa1982292` to `37721d141`;
+  - rargo: `8daafa142` to `d552e2066`.
+- The builds ran on a private rargod (0.6.4 with #119's change), plain
+  `rargo build`.
+- After each build, one version was kept:
+  - everything the build leaves in `target/debug` (workspace rlibs,
+    binaries, `.d` files);
+  - every crate's newest incremental state, read out of the server's store
+    (`crates/rargo-core/examples/incrdump.rs`).
+- Per version: rust-analyzer 1.41 GB of target and 2.0–2.07 GB of
+  incremental state (52 crates); rargo 0.25 GB and 0.41–0.82 GB (8, then
+  16 crates, because the 0.6.4 version bump at its fourth commit gave every
+  crate a new incremental directory, and the old ones stay in the store).
+- Some rargo commits change only documentation; their builds are the
+  same as the one before.
+
+**Measured** (`crates/rargo-core/examples/cdcbench.rs`):
+- **store:** the bytes of the distinct chunks of the whole corpus, each
+  compressed with zstd level 3, as the cold tier does.
+- **send:** for each version after the first, the bytes of its chunks that
+  the version before it, of the same project, does not have; summed.
+- **cut speed:** finding the cuts (structure and rule, not hashing the
+  chunks) on one core, over 2 GiB of the first versions held in memory;
+  the best of three runs.
+- **Bounds:** RepMaxCDC's minimum was chosen to give the mask rule's mean
+  chunk size, 64 KiB (calibrated on the first versions). Its horizon is
+  eight times that, Bonanza's setting.
+
+**Checked:**
+- The benchmark's copy of the mask rule gave `rargo_core::chunk::chunk`'s
+  cuts on every file of the corpus.
+- RepMaxCDC is cut in one pass, and gave the cuts of the reference
+  algorithm (go-cdc's `simple_rep_max_content_defined_chunker.go`, ported)
+  on every file.
+- No RepMaxCDC chunk reached twice the minimum.
+
+| | mask rule (`chunk.rs`) | RepMaxCDC, min 64 KiB | change | bar to adopt |
+|---|---|---|---|---|
+| mean chunk | 54,409 B (892,086 chunks) | 54,718 B (887,060) | +0.6% | equal |
+| store | 4,021,297,124 B | 4,023,320,960 B | +0.05% | 2% less |
+| send (of 44.4 GB) | 7,528,838,651 B | 7,482,929,506 B | −0.61% | 2% less |
+| send, rust-analyzer | 5,845,381,538 B | 5,822,725,593 B | −0.39% | |
+| send, rargo | 1,683,457,113 B | 1,660,203,913 B | −1.38% | |
+| cut speed | 3,053 MiB/s | 1,930 MiB/s | −36.8% | at most 10% slower |
+
+RepMaxCDC meets none of the three bars, so `chunk.rs` is unchanged. Its
+cuts are slower because it hashes nearly every byte, where the mask rule
+skips the first 16 KiB of every chunk. Unrolling its scan by eight bytes,
+as go-cdc does, did not change the speed.
+
 ### Tracing overhead (`dev/bench-trace.sh`)
 
 The same cold command twice, both capped at 24 cores: stock cargo on the
