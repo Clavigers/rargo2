@@ -437,27 +437,16 @@ impl View for BuildView {
         if let Some(seed) = &self.seed {
             layered.extend(seed.names(dir, &SEED_LEVELS));
         }
-        let mut map: HashMap<Vec<u8>, DType> = match self.base_has_dir(dir) {
-            true => self.base.list(dir)?.into_iter().collect(),
-            false => HashMap::new(),
-        };
-        for (name, e) in layered {
-            match e {
-                LayerEnt::Entry(MEntry::Whiteout) => {
-                    map.remove(&name);
-                }
-                LayerEnt::Entry(MEntry::File { .. }) => {
-                    map.insert(name, DType::File);
-                }
-                LayerEnt::Entry(MEntry::Symlink(_)) => {
-                    map.insert(name, DType::Symlink);
-                }
-                LayerEnt::Entry(MEntry::Dir) | LayerEnt::Implied => {
-                    map.insert(name, DType::Dir);
-                }
-            }
-        }
-        Ok(map.into_iter().collect())
+        let base = if self.base_has_dir(dir) { self.base.list(dir)? } else { Listing::new() };
+        Ok(crate::view::merge_listings(base, layered.into_iter().map(|(name, entry)| {
+            let dtype = match entry {
+                LayerEnt::Entry(MEntry::Whiteout) => None,
+                LayerEnt::Entry(MEntry::File { .. }) => Some(DType::File),
+                LayerEnt::Entry(MEntry::Symlink(_)) => Some(DType::Symlink),
+                LayerEnt::Entry(MEntry::Dir) | LayerEnt::Implied => Some(DType::Dir),
+            };
+            (name, dtype)
+        })))
     }
 
     fn traced(&self, dir: &[u8]) -> bool {

@@ -347,35 +347,55 @@ impl Content {
     }
 }
 
+pub(crate) enum CheckObservation {
+    Known(bool),
+    Hash(FileSrc, Hash),
+}
+
+impl Obs {
+    pub(crate) fn check(&self, looked: Looked) -> CheckObservation {
+        let matches = match (self, looked) {
+            (Obs::Absent, Looked::Absent) | (Obs::Dir, Looked::Dir(_)) | (Obs::Other, Looked::Other) => true,
+            (Obs::Symlink(a), Looked::Symlink(b)) => *a == b,
+            (Obs::Meta { size, exec }, Looked::File(f)) => f.size == *size && f.exec() == *exec,
+            (Obs::IsFile { exec }, Looked::File(f)) => f.exec() == *exec,
+            (Obs::File { hash, exec }, Looked::File(f)) if f.exec() == *exec => {
+                if let Some(sem) = f.sem {
+                    sem == *hash
+                } else {
+                    return CheckObservation::Hash(f.src, *hash);
+                }
+            }
+            _ => false,
+        };
+        CheckObservation::Known(matches)
+    }
+}
+
 pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> bool {
     if let Obs::Listing(want) = obs {
-        return match view.list(path) {
-            Ok(l) => listing_hash(&l) == *want,
-            Err(_) => false,
-        };
+        return view.list(path).is_ok_and(|entries| listing_hash(&entries) == *want);
     }
-    let looked = view.stat(path);
-    match (obs, looked) {
-        (Obs::Absent, Looked::Absent) => true,
-        (Obs::Dir, Looked::Dir(_)) => true,
-        (Obs::Other, Looked::Other) => true,
-        (Obs::Symlink(a), Looked::Symlink(b)) => *a == b,
-        (Obs::Meta { size, exec }, Looked::File(f)) => f.size == *size && f.exec() == *exec,
-        (Obs::IsFile { exec }, Looked::File(f)) => f.exec() == *exec,
-        (Obs::File { hash, exec }, Looked::File(f)) => {
-            if f.exec() != *exec {
-                return false;
-            }
-            if let Some(sem) = f.sem {
-                return sem == *hash;
-            }
-            match content.known_hash(&f.src) {
-                Some(h) => h == *hash,
-                None => content.hash(&f.src).map(|h| h == *hash).unwrap_or(false),
-            }
+    match obs.check(view.stat(path)) {
+        CheckObservation::Known(matches) => matches,
+        CheckObservation::Hash(src, hash) => content.known_hash(&src)
+            .map_or_else(|| content.hash(&src).is_ok_and(|got| got == hash), |got| got == hash),
+    }
+}
+
+pub(crate) fn merge_listings<K: Ord>(
+    base: impl IntoIterator<Item = (K, DType)>,
+    overlay: impl IntoIterator<Item = (K, Option<DType>)>,
+) -> Vec<(K, DType)> {
+    let mut names: std::collections::BTreeMap<_, _> = base.into_iter().collect();
+    for (name, kind) in overlay {
+        if let Some(kind) = kind {
+            names.insert(name, kind);
+        } else {
+            names.remove(&name);
         }
-        _ => false,
     }
+    names.into_iter().collect()
 }
 
 pub struct HostRegion {

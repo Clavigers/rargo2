@@ -86,9 +86,29 @@ enum RawObs {
     Listing(crate::hash::Hash),
 }
 
+#[derive(Default)]
+struct Trace {
+    observed: Vec<(VPath, RawObs)>,
+}
+
+impl Trace {
+    fn record(&mut self, path: VPath, value: RawObs) {
+        self.observed.push((path, value));
+    }
+
+    fn take(&mut self) -> Vec<(VPath, RawObs)> {
+        std::mem::take(&mut self.observed)
+    }
+
+    #[cfg(test)]
+    fn invariants(&self) -> bool {
+        self.observed.iter().all(|(path, _)| path.starts_with(b"/"))
+    }
+}
+
 struct State {
     nodes: Vec<Kind>,
-    obs: Vec<(VPath, RawObs)>,
+    trace: Trace,
     next_upper: u64,
     backing_ids: Vec<i32>,
     finished: bool,
@@ -221,7 +241,7 @@ impl SandboxFs {
             size_blind: cfg.size_blind,
             st: Mutex::new(State {
                 nodes,
-                obs: Vec::new(),
+                trace: Trace::default(),
                 next_upper: 0,
                 backing_ids: Vec::new(),
                 finished: false,
@@ -248,7 +268,7 @@ impl SandboxFs {
         let mut upper = Vec::new();
         walk_upper(&st, &*a.view, ROOT_LOCAL, b"/", false, &mut upper);
 
-        let raw = std::mem::take(&mut st.obs);
+        let raw = st.trace.take();
         let mut out: Vec<(VPath, Obs)> = Vec::with_capacity(raw.len());
         let mut to_hash: Vec<(usize, FileSrc, bool)> = Vec::new();
         for (path, r) in raw {
@@ -599,11 +619,16 @@ impl ActionFs {
         };
         let looked = self.view.lookup(&lower, name);
         let path: VPath = vjoin(&lower, name).into();
+        let child_traced = matches!(looked, Looked::Dir(_)) && self.view.traced(&path);
+        self.apply_lookup(st, parent, name, path, traced, child_traced, looked)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_lookup(&self, st: &mut State, parent: u32, name: &[u8], path: VPath, traced: bool, child_traced: bool, looked: Looked) -> Res<Option<u32>> {
         let (slot, raw) = match looked {
             Looked::Absent => (Slot::Negative, RawObs::Absent),
             Looked::Other => (Slot::Negative, RawObs::Other),
             Looked::Dir(owner) => {
-                let child_traced = self.view.traced(&path);
                 let n = self.push(
                     st,
                     Kind::Dir(Box::new(Dir {
@@ -647,7 +672,7 @@ impl ActionFs {
             }
         };
         if traced {
-            st.obs.push((path, raw));
+            st.trace.record(path, raw);
         }
         let found = match &slot {
             Slot::Lower(n) => Some(*n),
@@ -718,16 +743,15 @@ impl ActionFs {
             }
             (d.lower.clone(), d.traced && !d.lower_listed)
         };
-        let mut names: HashMap<Box<[u8]>, DType> = HashMap::new();
-        if let Some(lower) = &lower {
+        let names = if let Some(lower) = &lower {
             let list = self.view.list(lower).map_err(Errno::from)?;
             if need_obs {
-                st.obs.push((lower.clone(), RawObs::Listing(listing_hash(&list))));
+                st.trace.record(lower.clone(), RawObs::Listing(listing_hash(&list)));
             }
-            for (n, t) in list {
-                names.insert(n.into_boxed_slice(), t);
-            }
-        }
+            list.into_iter().map(|(name, dtype)| (name.into_boxed_slice(), dtype)).collect()
+        } else {
+            Vec::new()
+        };
         let upper: Vec<(Box<[u8]>, Option<DType>)> = {
             let Kind::Dir(d) = &st.nodes[local as usize] else { return Err(Errno::ENOTDIR) };
             d.entries
@@ -747,20 +771,7 @@ impl ActionFs {
                 })
                 .collect()
         };
-        for (name, t) in upper {
-            match t {
-                None => {
-                    names.remove(&name);
-                }
-                Some(t) => {
-                    names.insert(name, t);
-                }
-            }
-        }
-        let mut v: Vec<(Box<[u8]>, DType)> = names.into_iter().collect();
-        v.sort();
-        assert!(v.windows(2).all(|w| w[0].0 < w[1].0), "listing names are unique");
-        let v = Arc::new(v);
+        let v = Arc::new(crate::view::merge_listings(names, upper));
         let d = self.dir_mut(st, local)?;
         d.lower_listed = true;
         d.listing = Some(v.clone());
@@ -878,6 +889,18 @@ impl ActionFs {
             return Ok(Opened { fh: 0, flags: FOPEN_PASSTHROUGH, backing_id: id });
         }
         Ok(Opened { fh: 0, flags: if lower_pt { FOPEN_DIRECT_IO } else { 0 }, backing_id: 0 })
+    }
+}
+
+impl State {
+    fn read_source(&self, node: u32) -> Res<&Arc<File>> {
+        match self.nodes.get(node as usize) {
+            Some(Kind::File(file)) => match &file.src {
+                Src::Upper { file, .. } => Ok(file),
+                Src::Lower(_) => file.file.as_ref().ok_or(Errno::EBADF),
+            },
+            _ => Err(Errno::EBADF),
+        }
     }
 }
 
@@ -1271,16 +1294,7 @@ impl Filesystem for SandboxFs {
     fn read(&self, _ctx: &Ctx, node: u64, _fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
         self.stats.reads.fetch_add(1, Ordering::Relaxed);
         let (a, n) = self.action(node)?;
-        let file = {
-            let st = a.st.lock();
-            match st.nodes.get(n as usize) {
-                Some(Kind::File(f)) => match &f.src {
-                    Src::Upper { file, .. } => file.clone(),
-                    Src::Lower(_) => f.file.clone().ok_or(Errno::EBADF)?,
-                },
-                _ => return Err(Errno::EBADF),
-            }
-        };
+        let file = a.st.lock().read_source(n)?.clone();
         out.resize(size as usize, 0);
         let mut done = 0;
         while done < out.len() {
@@ -1355,5 +1369,52 @@ impl Filesystem for SandboxFs {
             }
         }
         Err(Errno::EBADF)
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+    use crate::view::{CheckObservation, OWN_DIR, merge_listings};
+
+    #[test]
+    fn merged_views_and_compacted_traces_preserve_observed_results() {
+        for seed in 0..48 {
+            let mut trace = Trace::default();
+            let mut observations = Vec::new();
+            let dir: VPath = b"/tree".as_slice().into();
+            trace.record(dir.clone(), RawObs::Dir);
+            assert!(trace.invariants());
+            observations.push((dir.clone(), Obs::Dir));
+            let base = (0..10).map(|i| (format!("file{i}").into_bytes(), DType::File));
+            let changes = (0..10).filter(|i| (i + seed) % 3 == 0)
+                .map(|i| (format!("file{i}").into_bytes(), None));
+            let listing = merge_listings(base, changes);
+            let hash = listing_hash(&listing);
+            trace.record(dir.clone(), RawObs::Listing(hash));
+            assert!(trace.invariants());
+            observations.push((dir.clone(), Obs::Listing(hash)));
+            for (name, _) in &listing {
+                let path: VPath = vjoin(&dir, name).into();
+                trace.record(path.clone(), RawObs::Other);
+                assert!(trace.invariants());
+                observations.push((path, Obs::Other));
+            }
+            let raw = trace.take();
+            assert!(trace.invariants());
+            assert_eq!(raw.iter().map(|(path, _)| path).collect::<Vec<_>>(), observations.iter().map(|(path, _)| path).collect::<Vec<_>>());
+            let holds = |items: &[(VPath, Obs)], available: bool| items.iter().all(|(path, obs)| {
+                if let Obs::Listing(want) = obs {
+                    return available && *want == listing_hash(&listing);
+                }
+                let looked = if !available { Looked::Absent } else if path == &dir { Looked::Dir(OWN_DIR) } else { Looked::Other };
+                matches!(obs.check(looked), CheckObservation::Known(true))
+            });
+            let compact = compact_obs(observations.clone());
+            assert!(compact.iter().all(|(_, obs)| !matches!(obs, Obs::Dir)));
+            for available in [false, true] {
+                assert_eq!(holds(&observations, available), holds(&compact, available));
+            }
+        }
     }
 }
