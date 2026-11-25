@@ -521,6 +521,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_default_toolchain_has_the_standard_library_s_sources_whatever_the_toolchain_file_asks() {
+        let flake = std::str::from_utf8(DEFAULT_FLAKE).unwrap();
+        let rust = flake.lines().find(|l| l.trim_start().starts_with("rust = ")).expect("the default flake defines its toolchain as `rust`");
+        assert!(rust.contains("fromRustupToolchain (toolchain //"), "every toolchain file, and none, goes through one expression: {rust}");
+        let components = flake.lines().find(|l| l.trim_start().starts_with("components = ")).expect("the toolchain names its components");
+        assert!(components.contains("toolchain.components or []"), "the toolchain file's own components are kept: {components}");
+        for wanted in ["\"rust-src\"", "\"clippy\"", "\"rustfmt\""] {
+            assert!(components.contains(wanted), "{wanted} is added to every default toolchain: {components}");
+        }
+    }
+
+    #[test]
     fn files_that_define_a_flake() {
         let none: Vec<String> = Vec::new();
         for f in ["flake.nix", "flake.lock", "shell.nix", "rust-toolchain.toml", "nix/a/b.nix", "nix/dev/flake.lock", "nix/patch.diff", "tools/sub/flake.nix", "tools/sub/flake.lock"] {
