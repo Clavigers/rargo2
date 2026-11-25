@@ -43,8 +43,8 @@ done
 rh rustup default "$DEFAULT_TC" >/dev/null 2>&1
 out=$(rh rustup default 2>&1); grep -q "^$DEFAULT_TC-" <<<"$out"; check $? "the server's default toolchain is $DEFAULT_TC" "$out"
 
-RARGO_STATE=$(mktemp -d "$work/e2e-components-state.XXXXXXXX") || exit 1
-E=$(mktemp -d "$work/e2e-components.XXXXXXXX") || exit 1
+RARGO_STATE=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/e2e-components-state.XXXXXXXX") || exit 1
+E=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/e2e-components.XXXXXXXX") || exit 1
 T=$E/client
 mkdir -p "$T" "$E/store"
 export RARGO_STATE RARGO_HIDE=$T RARGO_CACHE_DIR=$T/.rargo-cache

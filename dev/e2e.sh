@@ -15,7 +15,7 @@ set -u
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 . "$work/env.sh"
-RARGO_STATE=$(mktemp -d "$work/e2e-state.XXXXXXXX") || exit 1
+RARGO_STATE=$(mktemp -d "${RARGO_E2E_ROOT:-$work}/e2e-state.XXXXXXXX") || exit 1
 export RARGO_STATE
 bin=${RARGO_BIN:-$repo/target/release}
 export RARGO_BIN=$bin

@@ -76,15 +76,18 @@ Facts that affect the design:
   there too, remove yours and take a different issue. The label stays
   while the issue is yours, also when the review reopens it. The agents
   share the machine: the limits above are for both together, and each
-  uses rigs, state and build directories of its own for the suites (the
-  second agent: `RIG=codex RIG_STATE=rig-codex`, its own
-  `CARGO_TARGET_DIR` and gate directory), never the other's. `dev/gate.sh`
-  keeps every suite's directory under its gate directory
-  (`RARGO_GATE_DIR`) and picks free ports, so within a gate those are
-  enough. A suite run by hand outside the gate is pointed elsewhere with
+  uses rigs, state and build directories of its own for the suites (its
+  own `CARGO_TARGET_DIR` and gate directory), never the other's.
+  `dev/gate.sh` keeps everything its suites make under its gate directory
+  (`RARGO_GATE_DIR`): each suite's directory, the temporary ones, the
+  mount tests' scratch area, the rig (network namespaces named after the
+  gate directory, the servers' state inside it), and it picks free ports.
+  So within a gate the gate directory is enough. A suite run by hand
+  outside the gate is pointed elsewhere with `RIG` and `RIG_STATE` (the
+  second agent: `RIG=codex RIG_STATE=rig-codex`), `RARGO_E2E_ROOT`,
   `RARGO_E2E_FLAKE`, `RARGO_E2E_AUTH`, `RARGO_E2E_LINK`,
-  `RARGO_E2E_WORKER` and `RARGO_COMPONENTS_RUSTUP` (the second agent:
-  `$RARGO_WORK/<name>-codex`), and with free ports in
+  `RARGO_E2E_WORKER`, `RARGO_COMPONENTS_RUSTUP` and `RARGO_TEST_TMP` (the
+  second agent: `$RARGO_WORK/<name>-codex`), and with free ports in
   `RARGO_E2E_FLAKE_PORT` and `E2E_AUTH_PORT`.
 - Work that closes an issue happens on a branch and lands through a pull
   request whose description says `Closes #N`, what changed, how it was
