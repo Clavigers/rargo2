@@ -454,7 +454,7 @@ fn run_test(
         Some(n) if !q.listing => format!("test {binary} {n}"),
         _ => format!("test list of {binary}"),
     };
-    let spec = ActionSpec {
+    let mut spec = ActionSpec {
         kind: ActionKind::Test,
         argv: q.argv.iter().map(|a| bytes(a)).collect(),
         env,
@@ -465,6 +465,9 @@ fn run_test(
         discard: vec![],
         label: label.clone(),
     };
+    if !q.listing {
+        crate::fn_code::mark(&mut spec);
+    }
     let outcome = d
         .engine
         .obtain(Request {

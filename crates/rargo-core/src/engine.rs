@@ -6,6 +6,7 @@ use crate::sched::{Priority, Scheduler};
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
+use crate::fn_code;
 use crate::io;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -432,6 +433,10 @@ impl Engine {
             return "this command line and environment have not been run before".into();
         };
         match newest.first_mismatch(view, &self.content) {
+            Some((path, Obs::Code { executed, rest })) => {
+                let why = crate::trace::code_verdict(view, &self.content, path, executed, rest).reason();
+                format!("{}: {why} ({} recorded run(s))", show(path), traces.len())
+            }
             Some((path, was)) => {
                 let now = match was {
                     Obs::Listing(_) => match view.list(path) {
@@ -560,6 +565,11 @@ impl Engine {
                     Ran::Keep => break (result, None, side),
                 }
             };
+            let obs = obs.map(|mut obs| {
+                self.select_code(&spec, &result, &mut obs, &side);
+                self.note_code_rest(&spec, &result, &obs);
+                obs
+            });
             let result = Arc::new(result);
             if let Some(obs) = obs {
                 let stored = self.traces.insert(
@@ -593,6 +603,48 @@ impl Engine {
             }
             self.actions.lock().done(id);
             return Ok(Outcome { result, cached: false, side });
+        }
+    }
+
+    fn select_code(&self, spec: &ActionSpec, result: &ActionResult, obs: &mut [(VPath, Obs)], side: &[(Vec<u8>, MEntry)]) {
+        if !matches!(spec.kind, ActionKind::Test | ActionKind::Nextest) || !fn_code::wants_marks(spec) || !result.success() {
+            return;
+        }
+        let Some(marks) = fn_code::marks_file(side) else { return };
+        if !self.store.has(&marks) {
+            match self.remote.get() {
+                Some(r) if r.bring_home(&[marks]).is_ok() => {}
+                _ => return,
+            }
+        }
+        let Ok(marks) = self.store.read(&marks) else { return };
+        let Some(argv0) = spec.argv.first() else { return };
+        let program = fn_code::program(argv0, &spec.cwd);
+        let Some(binary) = fn_code::binary_read(obs, &program) else { return };
+        let (Some(table), Some(rest)) = (self.content.code_table(&binary), self.content.code_rest(&binary)) else { return };
+        let fn_code::Executed::Code(pairs) = fn_code::executed(&table, &marks) else { return };
+        let Ok(executed) = self.store.put_bytes(&fn_code::encode(&pairs)) else { return };
+        fn_code::recode(obs, &program, executed, rest);
+    }
+
+    fn note_code_rest(&self, spec: &ActionSpec, result: &ActionResult, obs: &[(VPath, Obs)]) {
+        if spec.kind != ActionKind::Rustc || !result.success() {
+            return;
+        }
+        let mut rest = None;
+        for (_, e) in &result.outputs.entries {
+            let MEntry::File { hash, exec: true, .. } = e else { continue };
+            if self.content.code_table(hash).is_none() {
+                continue;
+            }
+            let rest = *rest.get_or_insert_with(|| {
+                let mut h = KeyHasher::new("fn-code-command");
+                for a in &spec.argv {
+                    h.field(a);
+                }
+                fn_code::link_rest(&h.finish(), obs, &|rlib| self.content.linked_tracked(rlib))
+            });
+            self.content.record_code_rest(hash, &rest);
         }
     }
 

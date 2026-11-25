@@ -157,18 +157,47 @@ fn observed_hash(content: &Content, src: &FileSrc) -> Option<Hash> {
     content.known_hash(src).or_else(|| content.hash(src).ok())
 }
 
+pub fn code_verdict(view: &dyn View, content: &Content, path: &[u8], executed: &Hash, rest: &Hash) -> crate::fn_code::Verdict {
+    match view.stat(path) {
+        crate::view::Looked::File(f) if f.exec() => match observed_hash(content, &f.src) {
+            Some(binary) => content.code_verdict(&binary, executed, rest),
+            None => crate::fn_code::Verdict::NoTable,
+        },
+        _ => crate::fn_code::Verdict::NotAFile,
+    }
+}
+
+fn holds_one(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> bool {
+    match obs {
+        Obs::Code { executed, rest } => code_verdict(view, content, path, executed, rest) == crate::fn_code::Verdict::Holds,
+        _ => obs_holds(view, &|src| observed_hash(content, src), path, obs),
+    }
+}
+
 impl Trace {
     pub fn holds(&self, view: &dyn View, content: &Content) -> bool {
-        self.obs.iter().all(|(p, o)| obs_holds(view, &|src| observed_hash(content, src), p, o))
+        self.obs.iter().all(|(p, o)| holds_one(view, content, p, o))
     }
 
     pub fn first_mismatch(&self, view: &dyn View, content: &Content) -> Option<&(VPath, Obs)> {
-        self.obs.iter().find(|(p, o)| !obs_holds(view, &|src| observed_hash(content, src), p, o))
+        self.obs.iter().find(|(p, o)| !holds_one(view, content, p, o))
+    }
+
+    fn code_blobs(&self) -> impl Iterator<Item = &Hash> {
+        self.obs.iter().filter_map(|(_, o)| match o {
+            Obs::Code { executed, .. } => Some(executed),
+            _ => None,
+        })
+    }
+
+    pub fn by_code(&self) -> bool {
+        self.code_blobs().next().is_some()
     }
 
     pub fn complete(&self, store: &Store) -> bool {
         store.has(&self.result.stdout)
             && store.has(&self.result.stderr)
+            && self.code_blobs().all(|h| store.has(h))
             && self.result.outputs.entries.iter().all(|(_, e)| match e {
                 MEntry::File { hash, .. } => store.has(hash),
                 _ => true,
@@ -178,6 +207,9 @@ impl Trace {
     pub fn touch(&self, store: &Store) {
         store.touch(&self.result.stdout);
         store.touch(&self.result.stderr);
+        for h in self.code_blobs() {
+            store.touch(h);
+        }
         for (_, e) in &self.result.outputs.entries {
             if let MEntry::File { hash, .. } = e {
                 store.touch(hash);

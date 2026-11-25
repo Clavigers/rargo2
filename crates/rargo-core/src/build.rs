@@ -35,6 +35,9 @@ use pure::*;
 
 const PLAN_PATH: &str = "/.rargo-plan";
 
+pub const VERIFY_TESTS: &str = "RARGO_VERIFY_KEPT_TESTS";
+const DRIFT_SAMPLE: u64 = 4;
+
 pub struct Config {
     pub state_dir: PathBuf,
     pub planner: PathBuf,
@@ -220,6 +223,7 @@ struct Run {
     cargo_override: Option<String>,
     policy: crate::policy::Policy,
     verify: bool,
+    verify_tests: bool,
     verified: AtomicU64,
     verify_mismatches: Mutex<Vec<(String, Vec<Vec<u8>>)>>,
     verify_unreproducible: Mutex<Vec<String>>,
@@ -1041,6 +1045,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         cargo_override: p.flake.which("cargo"),
         policy: p.policy.clone(),
         verify: c.env.contains_key("RARGO_VERIFY"),
+        verify_tests: c.env.contains_key(VERIFY_TESTS),
         verified: AtomicU64::new(0),
         verify_mismatches: Mutex::new(Vec::new()),
         verify_unreproducible: Mutex::new(Vec::new()),
@@ -1103,6 +1108,9 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         other => unreachable!("units end in a delivery or an end: {other:?}"),
     }
 
+    if run.verify_tests {
+        c2.out.note(&format!("verify: {} kept test pass(es) re-run", run.verified.load(Ordering::Relaxed)));
+    }
     if run.verify {
         let all = run.verify_mismatches.lock().clone();
         let read_by_someone = |path: &[u8]| -> bool {
@@ -1485,6 +1493,9 @@ impl Run {
             rp::UnitKind::Doc => (ActionKind::Rustdoc, cmd.args.clone()),
             _ => (ActionKind::BuildScript, cmd.args.clone()),
         };
+        if u.kind == rp::UnitKind::Compile && plan.rustc_fork && crate::fn_code::debug_assertions(&args) {
+            args.extend(crate::fn_code::FLAGS.iter().map(|f| f.to_string()));
+        }
         let mut mkdirs: Vec<Vec<u8>> = Vec::new();
         match u.kind {
             rp::UnitKind::RunScript => {
@@ -2525,6 +2536,49 @@ impl Run {
         self.c.deliver(files, writes);
     }
 
+    fn verify_kept_test(&self, spec: ActionSpec, view: Arc<dyn View>, out: &Output) {
+        let engine = &self.d.engine;
+        let key = engine.effective_key(&spec, &self.c.env);
+        let Some(kept) = engine.traces.lookup(&key, &*view, &engine.content) else { return };
+        if !kept.by_code() || !crate::fn_code::sample(&key, kept.created, DRIFT_SAMPLE) {
+            return;
+        }
+        let label = spec.label.clone();
+        let real = engine.obtain(Request {
+            spec,
+            view,
+            client_env: self.c.env.clone(),
+            uid: self.c.uid,
+            gid: self.c.gid,
+            prio: self.c.prio,
+            no_cache: true,
+            seed_blobs: Default::default(),
+            cacheable: Arc::new(|_| false),
+            declared_env: Arc::new(|_, _| Vec::new()),
+            observer: Arc::new(NullObserver),
+        });
+        self.verified.fetch_add(1, Ordering::Relaxed);
+        let failed = match &real {
+            Ok(o) if o.result.success() => return,
+            Ok(o) => describe_status(o.result.status),
+            Err(e) => format!("{e:#}"),
+        };
+        let mut ran: Vec<String> = Vec::new();
+        for (_, o) in &kept.obs {
+            if let crate::view::Obs::Code { executed, .. } = o {
+                if let Some(pairs) = engine.store.read(executed).ok().as_deref().and_then(crate::fn_code::decode) {
+                    ran.extend(pairs.iter().map(|(s, _)| String::from_utf8_lossy(s).into_owned()));
+                }
+            }
+        }
+        let shown = ran.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+        let more = if ran.len() > 8 { format!(" and {} more", ran.len() - 8) } else { String::new() };
+        out.warn(&format!(
+            "verify: {label}: kept as a pass by the {} function(s) it executed ({shown}{more}), but a real run fails ({failed})",
+            ran.len()
+        ));
+    }
+
     fn steps(self: &Arc<Self>) -> Result<Finish> {
         let plan = self.plan();
         let out = &self.c.out;
@@ -2583,7 +2637,7 @@ impl Run {
                     let mut argv = vec![bytes(&cmd.program)];
                     argv.extend(cmd.args.iter().map(|a| bytes(a)));
                     let akind = if *kind == rp::ExecKind::Doctest { ActionKind::Doctest } else { ActionKind::Test };
-                    let spec = ActionSpec {
+                    let mut spec = ActionSpec {
                         kind: akind,
                         argv,
                         env: self.action_env(&cmd),
@@ -2598,6 +2652,15 @@ impl Run {
                         discard: vec![],
                         label: format!("test {}", plan.units[*unit as usize].desc),
                     };
+                    if akind == ActionKind::Test {
+                        crate::fn_code::mark(&mut spec);
+                    }
+                    if self.verify_tests {
+                        if akind == ActionKind::Test {
+                            self.verify_kept_test(spec, self.view_for(*unit as usize, true, vec![], None), out);
+                        }
+                        continue;
+                    }
                     let outcome = self
                         .d
                         .engine

@@ -61,6 +61,7 @@ pub enum Obs {
     IsFile { exec: bool },
     File { hash: Hash, exec: bool },
     Other,
+    Code { executed: Hash, rest: Hash },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -262,6 +263,65 @@ impl Content {
         })();
         self.meta_ids.insert(*blob, id);
         id
+    }
+
+    fn derived_key(kind: &[u8], blob: &Hash) -> Vec<u8> {
+        let mut k = kind.to_vec();
+        k.extend_from_slice(&blob.0);
+        k
+    }
+
+    pub fn code_table(&self, binary: &Hash) -> Option<crate::fn_code::CodeTable> {
+        let key = Content::derived_key(b"code-table:", binary);
+        match self.db().get(crate::db::Table::Meta, &key) {
+            Some(v) if v.is_empty() => return None,
+            Some(v) => {
+                let kept = Hash(v[..].try_into().ok()?);
+                if let Some(table) = self.store.read(&kept).ok().and_then(|b| bincode::deserialize(&b).ok()) {
+                    return Some(table);
+                }
+            }
+            None => {}
+        }
+        let f = self.store.open_blob(binary).ok()?;
+        let table = crate::fn_code::table_by(&|at, len| {
+            let mut buf = vec![0u8; len];
+            f.read_exact_at(&mut buf, at).ok()?;
+            Some(buf)
+        });
+        let kept = match &table {
+            Some(t) => self.store.put_bytes(&bincode::serialize(t).expect("a table serialises")).ok()?.0.to_vec(),
+            None => Vec::new(),
+        };
+        self.db().put(crate::db::Table::Meta, &key, &kept);
+        table
+    }
+
+    pub fn linked_tracked(&self, input: &Hash) -> bool {
+        let key = Content::derived_key(b"code-tracked:", input);
+        if let Some(v) = self.db().get(crate::db::Table::Meta, &key) {
+            return v.first() == Some(&1);
+        }
+        let Ok(bytes) = self.store.read(input) else { return false };
+        let tracked = crate::fn_code::linked_tracked(&bytes);
+        self.db().put(crate::db::Table::Meta, &key, &[tracked as u8]);
+        tracked
+    }
+
+    pub fn code_rest(&self, binary: &Hash) -> Option<Hash> {
+        let v = self.db().get(crate::db::Table::Meta, &Content::derived_key(b"code-rest:", binary))?;
+        Some(Hash(v[..].try_into().ok()?))
+    }
+
+    pub fn record_code_rest(&self, binary: &Hash, rest: &Hash) {
+        self.db().put(crate::db::Table::Meta, &Content::derived_key(b"code-rest:", binary), &rest.0);
+    }
+
+    pub fn code_verdict(&self, binary: &Hash, executed: &Hash, rest: &Hash) -> crate::fn_code::Verdict {
+        let table = self.code_table(binary);
+        let now = table.as_ref().zip(self.code_rest(binary));
+        let blob = self.store.read(executed).ok();
+        crate::fn_code::verdict(blob.as_deref(), rest, now)
     }
 
     pub fn set_fetcher(&self, f: Fetcher) {
