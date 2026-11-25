@@ -26,6 +26,13 @@ const _: () = assert!(MIN_RTO.as_nanos() < MAX_RTO.as_nanos());
 const _: () = assert!(DATA_HDR == 25);
 const _: () = assert!(SEND_BUFFER >= FRAG);
 
+pub(crate) async fn connect_within(wait: Duration, endpoint: &Arc<Endpoint>, server: SocketAddr) -> io::Result<Arc<Conn>> {
+    match tokio::time::timeout(wait, endpoint.connect(server)).await {
+        Ok(r) => r,
+        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "no answer over UDP")),
+    }
+}
+
 #[derive(Default)]
 pub struct NetStats {
     pub sent_packets: AtomicU64,

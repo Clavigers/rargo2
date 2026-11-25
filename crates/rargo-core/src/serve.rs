@@ -32,6 +32,8 @@ pub async fn connection(
         tokio::time::timeout(std::time::Duration::from_secs(20), session::accept(&mut stream, &keys))
             .await
             .context("handshake timed out")??;
+    let stream = stream.into_std().context("the accepted stream blocks")?;
+    stream.set_nonblocking(false).context("the accepted stream blocks")?;
     link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin, keys).await;
     Ok(())
 }
