@@ -43,6 +43,43 @@ fn a_waiter_cut_short_by_a_timeout_does_not_take_the_next_waiters_wake() {
     });
 }
 
+struct Seen(std::rc::Rc<std::cell::Cell<Option<bool>>>);
+
+impl Drop for Seen {
+    fn drop(&mut self) {
+        self.0.set(Some(on_fiber()));
+    }
+}
+
+#[test]
+fn a_cancelled_fiber_unwinds_outside_every_fiber_so_its_destructors_do_no_ring_io_through_another_s_stack() {
+    drive(1, || {
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let held = Seen(seen.clone());
+        let won = race_biased(vec![
+            Box::new(move || {
+                let _held = held;
+                sleep(Duration::from_secs(3600));
+                "the sleeper"
+            }),
+            Box::new(|| "the quick arm"),
+        ]);
+        assert_eq!(won, "the quick arm");
+        assert_eq!(seen.get(), Some(false), "a race's loser is dropped by the scheduler, where no fiber runs");
+
+        let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+        let held = Seen(seen.clone());
+        let sleeper = spawn(move || {
+            let _held = held;
+            sleep(Duration::from_secs(3600));
+        });
+        yield_now();
+        sleeper.abort();
+        assert_eq!(seen.get(), Some(false), "a fiber that aborts another does not lend it its own context");
+        assert!(on_fiber(), "the aborting fiber gets its context back");
+    });
+}
+
 #[test]
 fn a_datagram_goes_from_one_socket_to_another() {
     drive(1, || {
