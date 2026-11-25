@@ -367,7 +367,7 @@ async fn serve(
         }
         Command::Incr => {
             let d2 = d.clone();
-            return say(&sess, tokio::task::spawn_blocking(move || d2.incr.analyze()).await.unwrap_or_default());
+            return say(&sess, tokio::task::spawn_blocking(move || d2.incr.analyze(&d2.engine.store)).await.unwrap_or_default());
         }
         Command::Gc => {
             let (running, waiting, _, _) = d.engine.sched.snapshot();

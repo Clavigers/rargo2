@@ -34,6 +34,54 @@ impl Table {
     }
 }
 
+pub trait Tables: Send + Sync {
+    fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>>;
+    fn put(&self, table: Table, key: &[u8], val: &[u8]);
+    fn delete(&self, table: Table, key: &[u8]);
+    fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)>;
+}
+
+impl Tables for Db {
+    fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
+        Db::get(self, table, key)
+    }
+
+    fn put(&self, table: Table, key: &[u8], val: &[u8]) {
+        Db::put(self, table, key, val)
+    }
+
+    fn delete(&self, table: Table, key: &[u8]) {
+        Db::delete(self, table, key)
+    }
+
+    fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
+        Db::scan_prefix(self, table, prefix)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct MemTables(Mutex<std::collections::BTreeMap<(Table, Vec<u8>), Arc<[u8]>>>);
+
+#[cfg(test)]
+impl Tables for MemTables {
+    fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
+        self.0.lock().get(&(table, key.to_vec())).cloned()
+    }
+
+    fn put(&self, table: Table, key: &[u8], val: &[u8]) {
+        self.0.lock().insert((table, key.to_vec()), Arc::from(val));
+    }
+
+    fn delete(&self, table: Table, key: &[u8]) {
+        self.0.lock().remove(&(table, key.to_vec()));
+    }
+
+    fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
+        self.0.lock().range((table, prefix.to_vec())..).take_while(|((t, k), _)| *t == table && k.starts_with(prefix)).map(|((_, k), v)| (k.clone(), v.clone())).collect()
+    }
+}
+
 struct Shared {
     db: Database,
     writer: Mutex<DbWriter>,

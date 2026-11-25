@@ -214,6 +214,10 @@ impl Store {
         self.index.lock().has(h)
     }
 
+    pub fn blobs(self: &Arc<Self>) -> Arc<dyn Blobs> {
+        self.clone()
+    }
+
     pub fn size_of(&self, h: &Hash) -> Option<u64> {
         self.index.lock().size_of(h)
     }
@@ -857,5 +861,58 @@ mod tests {
         assert_eq!(h1, h2);
         assert!(!p2.exists());
         assert_eq!(s.blob_count(), 1);
+    }
+}
+
+pub trait Blobs: Send + Sync {
+    fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash>;
+    fn read(&self, h: &Hash) -> io::Result<Vec<u8>>;
+    fn has(&self, h: &Hash) -> bool;
+    fn touch(&self, h: &Hash);
+}
+
+impl Blobs for Store {
+    fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash> {
+        Store::put_bytes(self, bytes)
+    }
+
+    fn read(&self, h: &Hash) -> io::Result<Vec<u8>> {
+        Store::read(self, h)
+    }
+
+    fn has(&self, h: &Hash) -> bool {
+        Store::has(self, h)
+    }
+
+    fn touch(&self, h: &Hash) {
+        Store::touch(self, h)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub struct MemBlobs {
+    pub held: parking_lot::Mutex<std::collections::BTreeMap<Hash, Vec<u8>>>,
+    pub touched: parking_lot::Mutex<Vec<Hash>>,
+}
+
+#[cfg(test)]
+impl Blobs for MemBlobs {
+    fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash> {
+        let h = Hash::of(bytes);
+        self.held.lock().insert(h, bytes.to_vec());
+        Ok(h)
+    }
+
+    fn read(&self, h: &Hash) -> io::Result<Vec<u8>> {
+        self.held.lock().get(h).cloned().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    fn has(&self, h: &Hash) -> bool {
+        self.held.lock().contains_key(h)
+    }
+
+    fn touch(&self, h: &Hash) {
+        self.touched.lock().push(*h);
     }
 }

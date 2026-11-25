@@ -115,7 +115,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         c.output().context("running stock cargo")
     })
     .await??;
-    let stock_secs = time().saturating_duration_since(started).as_secs_f64();
+    let stock_ran = (started, time());
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut env: HashMap<String, String> = (*who.env).clone();
@@ -143,7 +143,7 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
     let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
     let started = time();
     let code = handle(d.clone(), client).await.unwrap_or(0);
-    let rargo_secs = time().saturating_duration_since(started).as_secs_f64();
+    let rargo_ran = (started, time());
     let mut text = String::new();
     while let Ok(m) = rx.try_recv() {
         if let ServerMsg::Stderr(b) = m {
@@ -151,13 +151,26 @@ async fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, s
         }
     }
     let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
-    Ok(compare(snapshot.id.hex(), (stock.status.success(), &String::from_utf8_lossy(&stock.stderr), stock_secs),
-        (code == 0, &text, rargo_secs), verified_units))
+    Ok(compare(snapshot.id.hex(), (stock.status.success(), &String::from_utf8_lossy(&stock.stderr), stock_ran),
+        (code == 0, &text, rargo_ran), verified_units))
 }
 
-fn compare(snapshot: String, stock: (bool, &str, f64), rargo: (bool, &str, f64), verified_units: u64) -> Report {
-    let (stock_ok, stock_stderr, stock_secs) = stock;
-    let (rargo_ok, text, rargo_secs) = rargo;
+trait Since: Copy {
+    fn secs_since(self, earlier: Self) -> f64;
+}
+
+impl Since for Instant {
+    fn secs_since(self, earlier: Instant) -> f64 {
+        self.saturating_duration_since(earlier).as_secs_f64()
+    }
+}
+
+type Ran<'a, T> = (bool, &'a str, (T, T));
+
+fn compare<T: Since>(snapshot: String, stock: Ran<T>, rargo: Ran<T>, verified_units: u64) -> Report {
+    let (stock_ok, stock_stderr, (stock_start, stock_end)) = stock;
+    let (rargo_ok, text, (rargo_start, rargo_end)) = rargo;
+    let (stock_secs, rargo_secs) = (stock_end.secs_since(stock_start), rargo_end.secs_since(rargo_start));
     let mismatches: Vec<String> = text
         .lines()
         .filter_map(|l| l.strip_prefix("warning: verify: ").map(|s| s.to_string()))
@@ -215,16 +228,28 @@ pub async fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn(
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy)]
+    struct Ms(u64);
+
+    impl Since for Ms {
+        fn secs_since(self, earlier: Ms) -> f64 {
+            self.0.saturating_sub(earlier.0) as f64 / 1000.0
+        }
+    }
+
     #[test]
     fn drift_uses_build_results_and_verification_messages() {
-        let same = compare("abcdef".into(), (true, "", 1.5), (true, "note: verify: not compared: bin", 2.0), 3);
+        let same = compare("abcdef".into(), (true, "", (Ms(10_000), Ms(11_500))), (true, "note: verify: not compared: bin", (Ms(11_500), Ms(13_500))), 3);
         assert!(same.agrees());
         assert_eq!(same.unreproducible, 1);
+        assert_eq!((same.stock_secs, same.rargo_secs), (1.5, 2.0));
         assert!(same.render().contains("stock cargo builds (1.5s), rargo builds (2.0s)"));
-        let content = compare("abcdef".into(), (true, "", 0.0), (true, "warning: verify: artifact differs", 0.0), 1);
+        let backwards = compare("abcdef".into(), (true, "", (Ms(5_000), Ms(4_000))), (true, "", (Ms(0), Ms(250))), 0);
+        assert_eq!((backwards.stock_secs, backwards.rargo_secs), (0.0, 0.25), "a clock that steps back counts as no time");
+        let content = compare("abcdef".into(), (true, "", (Ms(0), Ms(0))), (true, "warning: verify: artifact differs", (Ms(0), Ms(0))), 1);
         assert!(!content.agrees());
         assert_eq!(content.mismatches, ["artifact differs"]);
-        let exit = compare("abcdef".into(), (false, "stock failure", 0.0), (true, "rargo success", 0.0), 0);
+        let exit = compare("abcdef".into(), (false, "stock failure", (Ms(0), Ms(0))), (true, "rargo success", (Ms(0), Ms(0))), 0);
         assert!(!exit.agrees());
         assert!(exit.detail.contains("stock failure") && exit.detail.contains("rargo success"));
     }
