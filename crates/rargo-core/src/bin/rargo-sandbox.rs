@@ -1,3 +1,4 @@
+use rargo_core::buildview::{read_host_list, read_host_lookup};
 use rargo_core::sandbox::{HostLayout, NetMode, Place, SetupSpec, Zygote};
 use std::collections::BTreeMap;
 use rargo_core::sandboxfs::{ActionFsConfig, SandboxFs, UpperKind};
@@ -12,10 +13,10 @@ struct HostView {
 
 impl View for HostView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        self.root.lookup(dir, name)
+        read_host_lookup(&self.root.real_path(dir, name))
     }
     fn list(&self, dir: &[u8]) -> std::io::Result<Listing> {
-        self.root.list(dir)
+        read_host_list(&self.root.real_path(dir, b""))
     }
 }
 

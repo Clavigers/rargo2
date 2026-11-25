@@ -214,6 +214,10 @@ pub trait View: Send + Sync {
             Some((dir, name)) => self.lookup(dir, name),
         }
     }
+
+    fn read_bytes(&self, _path: &[u8]) -> Option<&[u8]> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -372,14 +376,13 @@ impl Obs {
     }
 }
 
-pub fn obs_holds(view: &dyn View, content: &Content, path: &[u8], obs: &Obs) -> bool {
+pub fn obs_holds(view: &dyn View, hash_of: &dyn Fn(&FileSrc) -> Option<Hash>, path: &[u8], obs: &Obs) -> bool {
     if let Obs::Listing(want) = obs {
         return view.list(path).is_ok_and(|entries| listing_hash(&entries) == *want);
     }
     match obs.check(view.stat(path)) {
         CheckObservation::Known(matches) => matches,
-        CheckObservation::Hash(src, hash) => content.known_hash(&src)
-            .map_or_else(|| content.hash(&src).is_ok_and(|got| got == hash), |got| got == hash),
+        CheckObservation::Hash(src, hash) => hash_of(&src).is_some_and(|got| got == hash),
     }
 }
 
@@ -407,7 +410,7 @@ impl HostRegion {
         HostRegion { real: real.into() }
     }
 
-    fn real_path(&self, rel_dir: &[u8], name: &[u8]) -> PathBuf {
+    pub fn real_path(&self, rel_dir: &[u8], name: &[u8]) -> PathBuf {
         let mut p = self.real.clone();
         let rel = rel_dir.strip_prefix(b"/").unwrap_or(rel_dir);
         if !rel.is_empty() {
@@ -418,49 +421,101 @@ impl HostRegion {
         }
         p
     }
+}
 
-    pub fn lookup(&self, rel_dir: &[u8], name: &[u8]) -> Looked {
-        let p = self.real_path(rel_dir, name);
-        let Ok(m) = std::fs::symlink_metadata(&p) else { return Looked::Absent };
-        let owner = Owner { uid: m.uid(), gid: m.gid(), mode: m.mode() & 0o777 };
-        let ft = m.file_type();
-        if ft.is_dir() {
-            Looked::Dir(owner)
-        } else if ft.is_file() {
-            Looked::File(FileInfo {
-                size: m.len(),
-                owner,
-                src: FileSrc::Host { path: Arc::from(p), sig: HostSig::of(&m) },
-                sem: None,
-            })
-        } else if ft.is_symlink() {
-            match std::fs::read_link(&p) {
-                Ok(t) => Looked::Symlink(t.as_os_str().as_bytes().to_vec()),
-                Err(_) => Looked::Absent,
-            }
-        } else {
-            Looked::Other
+enum MemNode {
+    Dir(Owner),
+    File { info: FileInfo, bytes: Vec<u8> },
+    Symlink(Vec<u8>),
+    Other,
+}
+
+pub struct MemView {
+    nodes: std::collections::BTreeMap<Vec<u8>, MemNode>,
+}
+
+impl MemView {
+    pub fn new() -> MemView {
+        let mut nodes = std::collections::BTreeMap::new();
+        nodes.insert(b"/".to_vec(), MemNode::Dir(Owner { uid: 0, gid: 0, mode: 0o755 }));
+        MemView { nodes }
+    }
+
+    fn insert(&mut self, path: &[u8], node: MemNode) {
+        let (parent, name) = vsplit(path).expect("an entry has a parent");
+        assert!(!name.is_empty());
+        assert!(self.is_dir(parent), "parent is a directory: {}", show(parent));
+        self.nodes.insert(path.to_vec(), node);
+    }
+
+    pub fn dir(&mut self, path: &[u8]) {
+        self.insert(path, MemNode::Dir(Owner { uid: 0, gid: 0, mode: 0o755 }));
+    }
+
+    pub fn file(&mut self, path: &[u8], bytes: &[u8], exec: bool, sem: Option<Hash>) {
+        let mode = if exec { 0o755 } else { 0o644 };
+        let info = FileInfo {
+            size: bytes.len() as u64,
+            owner: Owner::own(mode),
+            src: FileSrc::Blob(Hash::of(bytes)),
+            sem,
+        };
+        self.insert(path, MemNode::File { info, bytes: bytes.to_vec() });
+    }
+
+    pub fn symlink(&mut self, path: &[u8], target: &[u8]) {
+        self.insert(path, MemNode::Symlink(target.to_vec()));
+    }
+
+    pub fn other(&mut self, path: &[u8]) {
+        self.insert(path, MemNode::Other);
+    }
+
+    fn is_dir(&self, path: &[u8]) -> bool {
+        path == b"/" || matches!(self.nodes.get(path), Some(MemNode::Dir(_)))
+    }
+}
+
+impl View for MemView {
+    fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
+        if !self.is_dir(dir) {
+            return Looked::Absent;
+        }
+        match self.nodes.get(&vjoin(dir, name)) {
+            None => Looked::Absent,
+            Some(MemNode::Dir(owner)) => Looked::Dir(*owner),
+            Some(MemNode::File { info, .. }) => Looked::File(info.clone()),
+            Some(MemNode::Symlink(target)) => Looked::Symlink(target.clone()),
+            Some(MemNode::Other) => Looked::Other,
         }
     }
 
-    pub fn list(&self, rel_dir: &[u8]) -> io::Result<Listing> {
-        let p = self.real_path(rel_dir, b"");
+    fn list(&self, dir: &[u8]) -> io::Result<Listing> {
+        if !self.is_dir(dir) {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
         let mut out = Vec::new();
-        for e in std::fs::read_dir(&p)? {
-            let e = e?;
-            let ft = e.file_type()?;
-            let t = if ft.is_dir() {
-                DType::Dir
-            } else if ft.is_file() {
-                DType::File
-            } else if ft.is_symlink() {
-                DType::Symlink
-            } else {
-                DType::Other
+        for (path, node) in &self.nodes {
+            let Some((parent, name)) = vsplit(path) else { continue };
+            if parent != dir {
+                continue;
+            }
+            let kind = match node {
+                MemNode::Dir(_) => DType::Dir,
+                MemNode::File { .. } => DType::File,
+                MemNode::Symlink(_) => DType::Symlink,
+                MemNode::Other => DType::Other,
             };
-            out.push((e.file_name().as_bytes().to_vec(), t));
+            out.push((name.to_vec(), kind));
         }
         Ok(out)
+    }
+
+    fn read_bytes(&self, path: &[u8]) -> Option<&[u8]> {
+        match self.nodes.get(path) {
+            Some(MemNode::File { bytes, .. }) => Some(bytes.as_slice()),
+            _ => None,
+        }
     }
 }
 
