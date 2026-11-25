@@ -1710,7 +1710,8 @@ The gate also fails when it is slower than the budget in `dev/gate-budget`
 failure message says which suite grew). This ratchet is the one check in
 the gate that depends on how long something took, by the owner's choice.
 `dev/gate-budget.sh` refuses a higher total than `origin/main` has unless
-a commit since says `Gate-budget-raise: <why>`. Not yet run in a full gate.
+a commit since says `Gate-budget-raise: <why>`. The first gate with the
+ratchet (PR #137, while another gate ran) took 128s, 10 of 10, under the budget.
 
 ## Nix store trees (issue 116)
 
