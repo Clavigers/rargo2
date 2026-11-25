@@ -1855,7 +1855,8 @@ mod model_tests {
             items.push((path.clone(), item));
         }
         if matches!(looked, Looked::Dir(_)) {
-            seen.traced.insert(path, view.traced(&path));
+            let child_traced = view.traced(&path);
+            seen.traced.insert(path, child_traced);
         }
     }
 
