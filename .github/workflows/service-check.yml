@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release whose client is used (a tag)
-        default: v0.2.0
+        description: Release whose client is used (a tag; empty for the latest release)
+        default: ""
 permissions:
   contents: read
 jobs:
@@ -22,8 +22,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
         run: |
-          gh release download "$VERSION" --pattern 'rargo-x86_64-unknown-linux-musl' --pattern SHA256SUMS
-          sha256sum -c SHA256SUMS
+          gh release download ${VERSION:+"$VERSION"} --pattern 'rargo-x86_64-unknown-linux-musl' --pattern SHA256SUMS
+          # Only the client was downloaded; it must be there and match.
+          sha256sum -c --ignore-missing --strict SHA256SUMS
+          grep -q ' rargo-x86_64-unknown-linux-musl$' SHA256SUMS
           install -m 755 rargo-x86_64-unknown-linux-musl "$HOME/rargo"
       - name: Build, run and test through the server
         env:
