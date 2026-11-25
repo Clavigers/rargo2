@@ -28,7 +28,8 @@ B=${RARGO_BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release}
 # RIG_STATE its directory under $RARGO_WORK, so that a second rig can run
 # beside one that is in use.
 RIG=${RIG:-rargo}
-T=$work/${RIG_STATE:-nstest}
+# (an absolute RIG_STATE is used as it is).
+case ${RIG_STATE:-nstest} in /*) T=$RIG_STATE ;; *) T=$work/${RIG_STATE:-nstest} ;; esac
 down() {
     # Client daemons started with these binaries (they live in the
     # client's namespace).

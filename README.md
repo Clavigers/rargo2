@@ -127,6 +127,13 @@ else. CI installs the released client, signs in with a token and runs
 `rargo build` and `rargo test`; the tests that mount file systems are
 compiled by the server and run on the runner (`dev/mount-tests.sh`).
 
+The repository's `flake.nix` and `flake.lock` select the native build
+environment and provide the Rust standard library and C linker for
+`x86_64-unknown-linux-musl`. Use `rargo build` or `rargo test` to build
+on the server in that environment. Run `nix develop --command true` on
+a machine that runs the native binaries or mount tests, so their loader
+and libraries are available under `/nix/store`.
+
 ## The build environment is the project's flake
 
 A build sees what the dev shell of the project's `flake.nix` has: the
@@ -134,12 +141,13 @@ compiler, the linker, `pkg-config`, the system libraries. Nothing is
 installed on a server for a project, and the same commit builds the same
 way on every server.
 
-A project without a flake starts from the default one, the build
-essentials (Rust, a C and C++ compiler, `make`, `cmake`, `pkg-config`,
-openssl, zlib, sqlite):
+A project without a flake uses rargo's bundled build shell, with Rust, a
+C and C++ compiler, `make`, `cmake`, `pkg-config`, OpenSSL, zlib and SQLite.
+Its `rust-toolchain.toml` or `rust-toolchain` selects the Rust toolchain.
+A workspace can supply a flake with its own shell:
 
 ```sh
-cp install/flake/flake.nix install/flake/flake.lock YOUR-PROJECT/
+cp nix/default/flake.nix nix/default/flake.lock YOUR-PROJECT/
 cd YOUR-PROJECT && git add flake.nix flake.lock
 ```
 

@@ -32,7 +32,7 @@ check() { local rc=$1 name=$2; shift 2; if [ "$rc" = 0 ]; then ok "$name"; else 
 
 umount -l "$T/proj/target" "$T/proj2/target" 2>/dev/null
 pkill -KILL -f "rargod --state $T/state " 2>/dev/null
-pkill -KILL -f "fake-github.py $((${E2E_AUTH_PORT:-7466} + 1)) " 2>/dev/null
+pkill -KILL -f "fake-github.py [0-9]+ $T/github-who" 2>/dev/null
 rm -rf "$T"; mkdir -p "$T/state" "$T/home" "$T/proj/src"
 export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config RARGO_CACHE_DIR=$T/cache RARGO_NO_BROWSER=1
 R=$B/rargo

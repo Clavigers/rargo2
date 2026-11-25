@@ -14,6 +14,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
 . "$work/env.sh"
 E=${RARGO_E2E_LINK:-$work/e2e-link}
+# The rig's directory (dev/netns.sh): RIG_STATE under $RARGO_WORK, or as it is if absolute.
+case ${RIG_STATE:-nstest} in /*) rig=$RIG_STATE ;; *) rig=$work/${RIG_STATE:-nstest} ;; esac
 proj=$E/ws
 export RARGO_HIDE=$E
 export RARGO_CACHE_DIR=$E/cache
@@ -37,7 +39,7 @@ printf '[package]\nname = "app"\nversion = "0.1.0"\nedition = "2021"\n[dependenc
 echo 'fn main() { println!("value {}", util::value()); }' >crates/app/src/main.rs
 git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one
 "$here/netns.sh" up 4 4 0 >/dev/null 2>&1
-. "$work/${RIG_STATE:-nstest}/client.env"
+. "$rig/client.env"
 
 echo "== one daemon, one link"
 out=$(R run -q 2>&1); [ "$out" = "value 1" ]; check $? "the first command starts a daemon and builds through it" "$out"
@@ -274,11 +276,11 @@ sleep 0.5
 ! mounted && [ -d target ]; check $? "and leaves target/ a plain directory"
 out=$(cargo build --offline 2>&1); check $? "in which stock cargo builds" "$out"
 out=$(./target/debug/app 2>&1); [ "$out" = "value 113" ]; check $? "the same program" "$out"
-grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" "$E"/cache*/daemon.log 2>/dev/null | grep -v ':0$' | { ! grep -q .; }; check $? "nothing panicked"
+grep -c "panicked" "$rig/srv.log" "$E"/cache*/daemon.log 2>/dev/null | grep -v ':0$' | { ! grep -q .; }; check $? "nothing panicked"
 
 cd /
 "$here/netns.sh" down >/dev/null 2>&1
-umount -l "$work/${RIG_STATE:-nstest}/srv/mnt" 2>/dev/null
+umount -l "$rig/srv/mnt" 2>/dev/null
 rm -rf "$E"
 echo
 echo "$pass passed, $fail failed"

@@ -47,7 +47,13 @@ step() {
     fi
     report "$name" "$status" "${description:-$status}"
 }
-# Use the repository's build server and mount tests at their normal paths.
+# Every suite's files are under this gate's directory (the mount tests'
+# scratch area too), so that two gates with different gate directories
+# share nothing.
+mkdir -p "$L/work/tmp"
+export RARGO_TEST_TMP=${RARGO_TEST_TMP:-$L/work/tmp}
+export RARGO_E2E_ROOT=${RARGO_E2E_ROOT:-$L/work/tmp}
+# Use the repository's build server.
 unset CARGO_TARGET_DIR
 step build rargo build --release --locked
 step unit rargo test --release --locked --workspace --lib --bins
@@ -61,7 +67,36 @@ B=$L/bin
 mkdir -p "$B"
 cp target/release/{rargo,rargod,rargo-sandbox} "$B/"
 export RARGO_BIN=$B RARGO_JOBS=$jobs
-export RIG=${RIG:-rargo2} RIG_STATE=${RIG_STATE:-rig2}
+# The rig (dev/netns.sh) too: its network namespaces are named after the
+# gate directory, and its servers' state is in it.
+export RIG=${RIG:-g$(printf '%s' "$L" | sha256sum | cut -c1-6)} RIG_STATE=${RIG_STATE:-$L/work/rig}
+# Each suite's directory is under this gate's directory, and the suites
+# that listen on fixed ports get free ones. What the environment already
+# names stays.
+free_pair() { # a port P such that P and P + 1 are free on loopback
+    python3 -I -c '
+import socket
+for _ in range(200):
+    a = socket.socket(); a.bind(("127.0.0.1", 0)); p = a.getsockname()[1]
+    b = socket.socket()
+    try:
+        b.bind(("127.0.0.1", p + 1))
+    except OSError:
+        continue
+    print(p)
+    break
+'
+}
+export RARGO_E2E_FLAKE=${RARGO_E2E_FLAKE:-$L/work/e2e-flake}
+export RARGO_E2E_FLAKE_PORT=${RARGO_E2E_FLAKE_PORT:-$(free_pair)}
+export RARGO_E2E_AUTH=${RARGO_E2E_AUTH:-$L/work/e2e-auth}
+export E2E_AUTH_PORT=${E2E_AUTH_PORT:-$(free_pair)}
+export RARGO_E2E_LINK=${RARGO_E2E_LINK:-$L/work/e2e-link}
+export RARGO_E2E_WORKER=${RARGO_E2E_WORKER:-$L/work/e2e-worker}
+# The toolchains e2e-components installs components into: kept between
+# runs of this gate.
+export RARGO_COMPONENTS_RUSTUP=${RARGO_COMPONENTS_RUSTUP:-$L/work/rustup-components}
+mkdir -p "$L/work"
 step e2e dev/e2e.sh
 step e2e-copy env RARGO_OUTPUT=copy dev/e2e.sh
 step e2e-flake dev/e2e-flake.sh

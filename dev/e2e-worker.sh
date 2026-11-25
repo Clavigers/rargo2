@@ -7,16 +7,20 @@
 #   dev/e2e-worker.sh
 #
 # A server with one core and a worker with four, then with one, in network
-# namespaces (dev/netns.sh). Needs root.
+# namespaces (dev/netns.sh). Needs root. Its workspace and client cache are
+# in RARGO_E2E_WORKER (default $RARGO_WORK/e2e-worker), which it empties.
 set -u
 work=${RARGO_WORK:-/root/rargo-work}
 here=$(cd "$(dirname "$0")" && pwd)
 export RARGO_BIN=${RARGO_BIN:-$(cd "$here/.." && pwd)/target/release}
-proj=$work/e2e-worker/ws
-export RARGO_HIDE=$work/e2e-worker
+E=${RARGO_E2E_WORKER:-$work/e2e-worker}
+# The rig's directory (dev/netns.sh): RIG_STATE under $RARGO_WORK, or as it is if absolute.
+case ${RIG_STATE:-nstest} in /*) rig=$RIG_STATE ;; *) rig=$work/${RIG_STATE:-nstest} ;; esac
+proj=$E/ws
+export RARGO_HIDE=$E
 # Off unless asked for (D65); the suite checks it.
 export RARGO_STATE_AHEAD=1
-export RARGO_CACHE_DIR=$work/e2e-worker/client-cache
+export RARGO_CACHE_DIR=$E/client-cache
 pass=0; fail=0
 ok() { pass=$((pass + 1)); echo "ok    $1"; }
 bad() { fail=$((fail + 1)); echo "FAIL  $1"; [ -n "${2:-}" ] && echo "$2" | tail -15 | sed 's/^/        /'; }
@@ -31,6 +35,8 @@ leaf() { # name value
     printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$1" >"$proj/$1/Cargo.toml"
     {
         echo "pub fn value() -> u64 { $2 }"
+        echo '// This is set by the selected Nix shell on every compiler action.'
+        echo 'const _: &str = env!("NIX_CC");'
         for i in $(seq 1 1500); do
             echo "pub fn f$i(v: &[u64]) -> String { let mut s = String::new(); for (i, x) in v.iter().enumerate() { s.push_str(&format!(\"{}:{}:{} \", i, x, $i)); } s }"
         done
@@ -59,7 +65,7 @@ app() { # leaf names...
 }
 
 "$here/netns.sh" down >/dev/null 2>&1
-rm -rf "$work/e2e-worker"; mkdir -p "$proj"
+rm -rf "$E"; mkdir -p "$proj"
 first="la lb lc ld"
 warm="lk ll lm ln"
 second="le lf lg lh li lj"
@@ -67,7 +73,7 @@ for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
 "$here/netns.sh" up 1 4 1 1 0 1gbit >/dev/null 2>&1
-. "$work/${RIG_STATE:-nstest}/client.env"
+. "$rig/client.env"
 cd "$proj" || exit 2
 
 # The first build teaches the server what a compile reads; the second has
@@ -132,13 +138,13 @@ for _ in $(seq 1 40); do
     sleep 0.25
 done
 [ "${ahead:-0}" -ge 1 ]; check $? "states made on the server were sent to the worker ahead of need ($ahead)" "$(R --rargo-status)"
-pkill -KILL -f "rargod --state $work/${RIG_STATE:-nstest}/w1" 2>/dev/null
+pkill -KILL -f "rargod --state $rig/w1" 2>/dev/null
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 3 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "the workspace builds after the worker was killed" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 22" ]; check $? "its program shows the last edit (total 22)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
-grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
+grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 
 
 # The same with a worker of one core and states that stay on it (the
@@ -152,7 +158,7 @@ for l in $first; do leaf $l 1; done
 app $first
 (cd "$proj" && git init -q . && git add -A && git -c user.name=t -c user.email=t@example.invalid commit -qm one)
 RARGO_STATE_HOME_AFTER_MS=3600000 "$here/netns.sh" up 1 1 1 1 0 1gbit >/dev/null 2>&1
-. "$work/${RIG_STATE:-nstest}/client.env"
+. "$rig/client.env"
 cd "$proj" || exit 2
 out=$(R build 2>&1); check $? "one-core worker: a workspace builds" "$out"
 for l in $warm; do leaf $l 0; done
@@ -184,19 +190,19 @@ for n in 20 30 40; do
     out=$(R build 2>&1) || break
 done
 [ "${needed:-0}" -ge 1 ]; check $? "a compile on the server fetched the state it started from ($needed files)" "$(R --rargo-status)"
-pkill -KILL -f "rargod --state $work/${RIG_STATE:-nstest}/w1" 2>/dev/null
+pkill -KILL -f "rargod --state $rig/w1" 2>/dev/null
 sleep 3
 for l in $second; do sed -i '1s/.*/pub fn value() -> u64 { 7 }/' "$proj/$l/src/lib.rs"; done
 out=$(R build 2>&1); check $? "it builds after the worker died with states on it" "$out"
 out=$(R run -q 2>&1); [ "$out" = "total 46" ]; check $? "its program shows the last edit (total 46)" "$out"
 R --rargo-status | grep -A12 '^workers' | tr -s ' ' | sed 's/^/        /'
 R --rargo-status | grep '^incremental' | tr -s ' ' | sed 's/^/        /'
-grep -c "panicked" "$work/${RIG_STATE:-nstest}/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
+grep -c "panicked" "$rig/srv.log" | { read n; [ "$n" = 0 ]; check $? "the server did not panic"; }
 
 cd /
 "$here/netns.sh" down >/dev/null 2>&1
-umount -l "$work/${RIG_STATE:-nstest}/srv/mnt" "$work/${RIG_STATE:-nstest}/w1/mnt" 2>/dev/null
-rm -rf "$work/e2e-worker"
+umount -l "$rig/srv/mnt" "$rig/w1/mnt" 2>/dev/null
+rm -rf "$E"
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" = 0 ]
