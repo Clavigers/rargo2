@@ -36,7 +36,7 @@ issues=$(printf '%s\n' "$notes" | { grep -oE '#[0-9]+' || true; } | cut -c2- | s
 
 if [ -z "$remote_tag" ]; then
     step='running the build-machine gate'
-    env -u RARGO_TOKEN -u RARGO_SERVER dev/gate.sh
+    env -u RARGO_TOKEN -u RARGO_SERVER dev/gate.sh 9>&-
     step='checking the gate status'
     dev/release-gate.sh "$commit"
     step='creating and pushing the tag'
