@@ -98,6 +98,9 @@ if [ ! -f "$state/deployed-$commit" ]; then
     touch "$state/deployed-$commit"
 fi
 
+step='waiting for the updated service to answer'
+RARGO_SERVER=rargo.rs "$checkout/deploy/wait-service.sh" "$version"
+
 step='checking the updated service over UDP and TCP'
 RARGO_SERVER=rargo.rs "$checkout/deploy/check-service.sh" /usr/local/bin/rargo
 
