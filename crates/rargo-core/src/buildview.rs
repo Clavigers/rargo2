@@ -4,19 +4,27 @@ use crate::view::*;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub struct HostMemo {
     looked: DashMap<Vec<u8>, (u64, Looked)>,
-    listed: DashMap<Vec<u8>, (u64, Arc<Listing>)>,
+    listed: DashMap<Vec<u8>, (u64, Result<Arc<Listing>, i32>)>,
     generation: AtomicU64,
+    sealed: AtomicBool,
 }
 
 impl Default for HostMemo {
     fn default() -> Self {
-        HostMemo { looked: DashMap::new(), listed: DashMap::new(), generation: AtomicU64::new(1) }
+        HostMemo {
+            looked: DashMap::new(),
+            listed: DashMap::new(),
+            generation: AtomicU64::new(1),
+            sealed: AtomicBool::new(false),
+        }
     }
 }
 
@@ -32,6 +40,18 @@ impl HostMemo {
 
     pub fn current(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    pub fn store_lookup(&self, key: Vec<u8>, looked: Looked) {
+        self.looked.insert(key, (self.current(), looked));
+    }
+
+    pub fn store_list(&self, key: Vec<u8>, listed: Result<Listing, i32>) {
+        self.listed.insert(key, (self.current(), listed.map(Arc::new)));
+    }
+
+    pub fn seal(&self) {
+        self.sealed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -109,44 +129,59 @@ impl BaseView {
         self.mounts.iter().find(|m| m.at == path)
     }
 
-    fn host_lookup(&self, region: &HostRegion, rel_dir: &[u8], name: &[u8]) -> Looked {
-        let mut key = region.real.as_os_str().as_encoded_bytes().to_vec();
-        if rel_dir != b"/" {
-            key.extend_from_slice(rel_dir);
-        }
-        key.push(b'/');
-        key.extend_from_slice(name);
-        if let Some(e) = self.memo.looked.get(&key) {
-            if e.0 >= self.min_gen.load(Ordering::Relaxed) {
-                return e.1.clone();
-            }
-        }
-        let l = region.lookup(rel_dir, name);
-        self.memo.looked.insert(key, (self.memo.current(), l.clone()));
-        l
+    fn cached_lookup(&self, key: &[u8]) -> Option<Looked> {
+        let e = self.memo.looked.get(key)?;
+        (e.0 >= self.min_gen.load(Ordering::Relaxed)).then(|| e.1.clone())
     }
 
-    fn host_list(&self, region: &HostRegion, rel_dir: &[u8]) -> io::Result<Arc<Listing>> {
-        let mut key = region.real.as_os_str().as_encoded_bytes().to_vec();
-        if rel_dir != b"/" {
-            key.extend_from_slice(rel_dir);
-        }
-        if let Some(e) = self.memo.listed.get(&key) {
-            if e.0 >= self.min_gen.load(Ordering::Relaxed) {
-                return Ok(e.1.clone());
-            }
-        }
-        let l = Arc::new(region.list(rel_dir)?);
-        self.memo.listed.insert(key, (self.memo.current(), l.clone()));
-        Ok(l)
+    fn cached_list(&self, key: &[u8]) -> Option<Result<Arc<Listing>, i32>> {
+        let e = self.memo.listed.get(key)?;
+        (e.0 >= self.min_gen.load(Ordering::Relaxed)).then(|| e.1.clone())
     }
 
-    fn is_real_dir(&self, dir: &[u8]) -> bool {
+    fn step_host(&self, region: &HostRegion, rel: &[u8], name: &[u8], infer_at: Option<&[u8]>) -> Step<Looked> {
+        let key = lookup_key(region, rel, name);
+        if let Some(raw) = self.cached_lookup(&key) {
+            return Step::Done(match infer_at {
+                Some(path) => self.infer_mount_parent(path, raw),
+                None => raw,
+            });
+        }
+        Step::Ask(HostReq { kind: HostKind::Lookup, key, path: region.real_path(rel, name) })
+    }
+
+    fn step_host_list(&self, region: &HostRegion, rel: &[u8]) -> Step<io::Result<Arc<Listing>>> {
+        let key = list_key(region, rel);
+        if let Some(listed) = self.cached_list(&key) {
+            return Step::Done(match listed {
+                Ok(list) => Ok(list),
+                Err(err) => Err(io::Error::from_raw_os_error(err)),
+            });
+        }
+        Step::Ask(HostReq { kind: HostKind::List, key, path: region.real_path(rel, b"") })
+    }
+
+    fn step_mounted(&self, real: &Path) -> Step<Looked> {
+        let (Some(parent), Some(name)) = (real.parent(), real.file_name()) else {
+            return Step::Done(Looked::Dir(DIR_OWNER));
+        };
+        let region = HostRegion::new(parent);
+        self.step_host(&region, b"/", name.as_encoded_bytes(), None)
+    }
+
+    fn step_is_real_dir(&self, dir: &[u8]) -> Step<bool> {
         match vsplit(dir) {
-            None => true,
-            Some((parent, name)) => {
-                matches!(self.lookup_unchecked(parent, name), Looked::Dir(_)) && self.is_real_dir(parent)
-            }
+            None => Step::Done(true),
+            Some((parent, name)) => match self.step_lookup(parent, name) {
+                Step::Ask(ask) => Step::Ask(ask),
+                Step::Done(looked) => {
+                    if !matches!(looked, Looked::Dir(_)) {
+                        Step::Done(false)
+                    } else {
+                        self.step_is_real_dir(parent)
+                    }
+                }
+            },
         }
     }
 
@@ -186,20 +221,102 @@ impl BaseView {
         }
     }
 
-    fn lookup_unchecked(&self, dir: &[u8], name: &[u8]) -> Looked {
+    fn step_lookup(&self, dir: &[u8], name: &[u8]) -> Step<Looked> {
         let path = vjoin(dir, name);
-        let observed = match self.plan_lookup(dir, name, &path) {
-            LookupPlan::Known(observed) => observed,
-            LookupPlan::MountedHost(real) => {
-                return match (real.parent(), real.file_name()) {
-                    (Some(parent), Some(name)) => HostRegion::new(parent).lookup(b"/", name.as_encoded_bytes()),
-                    _ => Looked::Dir(DIR_OWNER),
-                };
+        match self.plan_lookup(dir, name, &path) {
+            LookupPlan::Known(observed) => Step::Done(self.infer_mount_parent(&path, observed)),
+            LookupPlan::MountedHost(real) => self.step_mounted(real),
+            LookupPlan::Host(host, rel) => self.step_host(host, rel, name, Some(&path)),
+            LookupPlan::Nix(rel) => {
+                let region = nix_store_region();
+                self.step_host(&region, rel, name, Some(&path))
             }
-            LookupPlan::Host(host, rel) => self.host_lookup(host, rel, name),
-            LookupPlan::Nix(rel) => self.host_lookup(&nix_store_region(), rel, name),
+        }
+    }
+
+    fn step_list(&self, dir: &[u8]) -> Step<io::Result<Listing>> {
+        let (mount, rel) = self.mount_of(dir);
+        let listed: io::Result<Listing> = match &mount.region {
+            Region::Empty | Region::Link(_) => Ok(Vec::new()),
+            Region::Snap(snapshot) => snapshot.list(rel),
+            Region::Host(host) => match self.step_host_list(host, rel) {
+                Step::Ask(ask) => return Step::Ask(ask),
+                Step::Done(result) => result.map(|list| list.as_ref().clone()),
+            },
+            Region::NixStore { names } if rel == b"/" => Ok(names.iter().map(|n| (n.clone(), DType::Dir)).collect()),
+            Region::NixStore { .. } => {
+                let region = nix_store_region();
+                match self.step_host_list(&region, rel) {
+                    Step::Ask(ask) => return Step::Ask(ask),
+                    Step::Done(result) => result.map(|list| list.as_ref().clone()),
+                }
+            }
+            Region::Synth(entries) => Ok(entries
+                .iter()
+                .map(|(n, e)| (n.clone(), if matches!(e, SynthEnt::File { .. }) { DType::File } else { DType::Symlink }))
+                .collect()),
         };
-        self.infer_mount_parent(&path, observed)
+        let mut out = match listed {
+            Ok(list) => list,
+            Err(_) if self.mounts.iter().any(|other| is_strictly_under(&other.at, dir)) => Vec::new(),
+            Err(e) => return Step::Done(Err(e)),
+        };
+        for other in &self.mounts {
+            if !is_strictly_under(&other.at, dir) {
+                continue;
+            }
+            let rest = &other.at[if dir == b"/" { 1 } else { dir.len() + 1 }..];
+            let name = rest.split(|&c| c == b'/').next().unwrap_or(rest);
+            if name.is_empty() || out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let kind = match self.step_lookup(dir, name) {
+                Step::Ask(ask) => return Step::Ask(ask),
+                Step::Done(Looked::File(_)) => DType::File,
+                Step::Done(Looked::Symlink(_)) => DType::Symlink,
+                Step::Done(_) => DType::Dir,
+            };
+            out.push((name.to_vec(), kind));
+        }
+        debug_assert!(
+            out.iter().enumerate().all(|(i, (n, _))| out[i + 1..].iter().all(|(m, _)| m != n)),
+            "listing names are unique"
+        );
+        Step::Done(Ok(out))
+    }
+
+    fn step_stat(&self, path: &[u8]) -> Step<Looked> {
+        match vsplit(path) {
+            None => Step::Done(Looked::Dir(DIR_OWNER)),
+            Some((dir, name)) => {
+                let (mount, _) = self.mount_of(dir);
+                if matches!(mount.region, Region::Host(_) | Region::NixStore { .. }) {
+                    match self.step_is_real_dir(dir) {
+                        Step::Ask(ask) => return Step::Ask(ask),
+                        Step::Done(false) => return Step::Done(Looked::Absent),
+                        Step::Done(true) => {}
+                    }
+                }
+                self.step_lookup(dir, name)
+            }
+        }
+    }
+
+    fn fulfill(&self, req: &HostReq) {
+        assert!(!self.memo.sealed.load(Ordering::SeqCst), "sealed view asked to read {}", req.path.display());
+        let generation = self.memo.current();
+        match req.kind {
+            HostKind::Lookup => {
+                self.memo.looked.insert(req.key.clone(), (generation, read_host_lookup(&req.path)));
+            }
+            HostKind::List => {
+                let listed = match read_host_list(&req.path) {
+                    Ok(list) => Ok(Arc::new(list)),
+                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+                };
+                self.memo.listed.insert(req.key.clone(), (generation, listed));
+            }
+        }
     }
 }
 
@@ -213,49 +330,11 @@ fn is_strictly_under(path: &[u8], dir: &[u8]) -> bool {
 
 impl View for BaseView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        self.lookup_unchecked(dir, name)
+        serve(self, |view| view.step_lookup(dir, name))
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        let (m, rel) = self.mount_of(dir);
-        let listed: io::Result<Listing> = match &m.region {
-            Region::Empty | Region::Link(_) => Ok(Vec::new()),
-            Region::Snap(s) => s.list(rel),
-            Region::Host(h) => self.host_list(h, rel).map(|l| l.as_ref().clone()),
-            Region::NixStore { names } if rel == b"/" => {
-                Ok(names.iter().map(|n| (n.clone(), DType::Dir)).collect())
-            }
-            Region::NixStore { .. } => self.host_list(&nix_store_region(), rel).map(|l| l.as_ref().clone()),
-            Region::Synth(entries) => Ok(entries
-                .iter()
-                .map(|(n, e)| {
-                    (n.clone(), if matches!(e, SynthEnt::File { .. }) { DType::File } else { DType::Symlink })
-                })
-                .collect()),
-        };
-        let mut out = match listed {
-            Ok(l) => l,
-            Err(_) if self.mounts.iter().any(|o| is_strictly_under(&o.at, dir)) => Vec::new(),
-            Err(e) => return Err(e),
-        };
-        for other in &self.mounts {
-            if !is_strictly_under(&other.at, dir) {
-                continue;
-            }
-            let rest = &other.at[if dir == b"/" { 1 } else { dir.len() + 1 }..];
-            let name = rest.split(|&c| c == b'/').next().unwrap_or(rest);
-            if name.is_empty() || out.iter().any(|(n, _)| n == name) {
-                continue;
-            }
-            let t = match self.lookup_unchecked(dir, name) {
-                Looked::File(_) => DType::File,
-                Looked::Symlink(_) => DType::Symlink,
-                _ => DType::Dir,
-            };
-            out.push((name.to_vec(), t));
-        }
-        debug_assert!(out.iter().enumerate().all(|(i, (n, _))| out[i + 1..].iter().all(|(m, _)| m != n)), "listing names are unique");
-        Ok(out)
+        serve(self, |view| view.step_list(dir))
     }
 
     fn traced(&self, dir: &[u8]) -> bool {
@@ -267,17 +346,95 @@ impl View for BaseView {
     }
 
     fn stat(&self, path: &[u8]) -> Looked {
-        match vsplit(path) {
-            None => Looked::Dir(DIR_OWNER),
-            Some((dir, name)) => {
-                let (m, _) = self.mount_of(dir);
-                if matches!(m.region, Region::Host(_) | Region::NixStore { .. }) && !self.is_real_dir(dir) {
-                    return Looked::Absent;
-                }
-                self.lookup_unchecked(dir, name)
-            }
+        serve(self, |view| view.step_stat(path))
+    }
+}
+
+enum HostKind {
+    Lookup,
+    List,
+}
+
+struct HostReq {
+    kind: HostKind,
+    key: Vec<u8>,
+    path: PathBuf,
+}
+
+enum Step<T> {
+    Done(T),
+    Ask(HostReq),
+}
+
+fn serve<T>(view: &BaseView, mut step: impl FnMut(&BaseView) -> Step<T>) -> T {
+    for _ in 0..10_000 {
+        match step(view) {
+            Step::Done(value) => return value,
+            Step::Ask(req) => view.fulfill(&req),
         }
     }
+    panic!("host lookup did not settle");
+}
+
+fn host_key(region: &HostRegion, rel_dir: &[u8]) -> Vec<u8> {
+    let mut key = region.real.as_os_str().as_encoded_bytes().to_vec();
+    if rel_dir != b"/" {
+        key.extend_from_slice(rel_dir);
+    }
+    key
+}
+
+fn lookup_key(region: &HostRegion, rel_dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut key = host_key(region, rel_dir);
+    key.push(b'/');
+    key.extend_from_slice(name);
+    key
+}
+
+fn list_key(region: &HostRegion, rel_dir: &[u8]) -> Vec<u8> {
+    host_key(region, rel_dir)
+}
+
+pub fn read_host_lookup(path: &Path) -> Looked {
+    let Ok(m) = std::fs::symlink_metadata(path) else { return Looked::Absent };
+    let owner = Owner { uid: m.uid(), gid: m.gid(), mode: m.mode() & 0o777 };
+    let ft = m.file_type();
+    if ft.is_dir() {
+        Looked::Dir(owner)
+    } else if ft.is_file() {
+        Looked::File(FileInfo {
+            size: m.len(),
+            owner,
+            src: FileSrc::Host { path: Arc::from(path.to_path_buf()), sig: HostSig::of(&m) },
+            sem: None,
+        })
+    } else if ft.is_symlink() {
+        match std::fs::read_link(path) {
+            Ok(t) => Looked::Symlink(t.as_os_str().as_bytes().to_vec()),
+            Err(_) => Looked::Absent,
+        }
+    } else {
+        Looked::Other
+    }
+}
+
+pub fn read_host_list(path: &Path) -> io::Result<Listing> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(path)? {
+        let e = e?;
+        let ft = e.file_type()?;
+        let kind = if ft.is_dir() {
+            DType::Dir
+        } else if ft.is_file() {
+            DType::File
+        } else if ft.is_symlink() {
+            DType::Symlink
+        } else {
+            DType::Other
+        };
+        out.push((e.file_name().as_bytes().to_vec(), kind));
+    }
+    Ok(out)
 }
 
 pub const LEVEL_NONE: u8 = 0;
@@ -582,6 +739,40 @@ impl ViewParts {
 }
 
 #[cfg(test)]
+fn host_file(path: &Path, size: u64) -> Looked {
+    Looked::File(FileInfo {
+        size,
+        owner: Owner { uid: 0, gid: 0, mode: 0o644 },
+        src: FileSrc::Host {
+            path: Arc::from(path.to_path_buf()),
+            sig: HostSig { dev: 1, ino: 1, size, mtime_ns: 0, ctime_ns: 0 },
+        },
+        sem: None,
+    })
+}
+
+#[cfg(test)]
+fn host_dir() -> Looked {
+    Looked::Dir(Owner { uid: 0, gid: 0, mode: 0o755 })
+}
+
+#[cfg(test)]
+fn rooted(real: &str, seed: impl FnOnce(&HostRegion, &HostMemo)) -> Arc<BaseView> {
+    let region = HostRegion::new(real);
+    let memo = Arc::new(HostMemo::default());
+    seed(&region, &memo);
+    memo.seal();
+    Arc::new(BaseView::new(
+        vec![
+            Mount { at: b"/".to_vec(), region: Region::Host(region), traced: true },
+            Mount { at: b"/t".to_vec(), region: Region::Empty, traced: true },
+        ],
+        memo,
+        0,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -589,29 +780,23 @@ mod tests {
         MEntry::File { hash: crate::hash::Hash([n; 32]), exec: false, size: n as u64 }
     }
 
-    fn base(dir: &std::path::Path) -> Arc<BaseView> {
-        let memo = Arc::new(HostMemo::default());
-        Arc::new(BaseView::new(
-            vec![
-                Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(dir)), traced: true },
-                Mount { at: b"/t".to_vec(), region: Region::Empty, traced: true },
-            ],
-            memo,
-            0,
-        ))
+    fn layer_base() -> Arc<BaseView> {
+        rooted("/view/layer", |region, memo| {
+            let path = region.real.join("hostfile");
+            memo.store_lookup(lookup_key(region, b"/", b"hostfile"), host_file(&path, 1));
+            memo.store_list(list_key(region, b"/"), Ok(vec![(b"hostfile".to_vec(), DType::File)]));
+        })
     }
 
     #[test]
     fn layer_visibility_by_level() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("hostfile"), "x").unwrap();
         let layer = Arc::new(OutputsLayer::new());
         layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
         layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
         layer.add(1, LEVEL_FULL, &[(b"/t/debug/b/libb.rlib".to_vec(), file(3))]);
 
         let view = |levels: Vec<u8>| BuildView {
-            base: base(tmp.path()),
+            base: layer_base(),
             layer: layer.clone(),
             levels: Arc::new(levels),
             untraced: vec![],
@@ -641,7 +826,6 @@ mod tests {
 
     #[test]
     fn explicit_directory_does_not_hide_an_earlier_stage() {
-        let tmp = tempfile::tempdir().unwrap();
         let layer = Arc::new(OutputsLayer::new());
         layer.add(0, LEVEL_META, &[(b"/t/debug/a/out/liba.rmeta".to_vec(), file(1))]);
         layer.add(
@@ -654,7 +838,14 @@ mod tests {
                 (b"/t/debug/a/out/liba.rlib".to_vec(), file(2)),
             ],
         );
-        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_META]), untraced: vec![], seed: None, content: None };
+        let v = BuildView {
+            base: rooted("/view/empty", |_, _| {}),
+            layer,
+            levels: Arc::new(vec![LEVEL_META]),
+            untraced: vec![],
+            seed: None,
+            content: None,
+        };
         assert!(matches!(v.stat(b"/t/debug/a/out"), Looked::Dir(_)));
         assert!(matches!(v.stat(b"/t/debug/a/out/liba.rmeta"), Looked::File(_)));
         assert!(matches!(v.stat(b"/t/debug/a/out/liba.rlib"), Looked::Absent));
@@ -663,11 +854,12 @@ mod tests {
 
     #[test]
     fn symlinked_host_parent_is_not_a_literal_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("real")).unwrap();
-        std::fs::write(tmp.path().join("real/f"), "x").unwrap();
-        std::os::unix::fs::symlink("real", tmp.path().join("link")).unwrap();
-        let b = base(tmp.path());
+        let b = rooted("/view/link", |region, memo| {
+            let file = region.real.join("real/f");
+            memo.store_lookup(lookup_key(region, b"/", b"real"), host_dir());
+            memo.store_lookup(lookup_key(region, b"/real", b"f"), host_file(&file, 1));
+            memo.store_lookup(lookup_key(region, b"/", b"link"), Looked::Symlink(b"real".to_vec()));
+        });
         assert!(matches!(b.stat(b"/real/f"), Looked::File(_)));
         assert!(matches!(b.stat(b"/link/f"), Looked::Absent));
         assert!(matches!(b.stat(b"/link"), Looked::Symlink(_)));
@@ -675,12 +867,17 @@ mod tests {
 
     #[test]
     fn whiteout_hides_base_entry() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("gone"), "x").unwrap();
-        std::fs::write(tmp.path().join("kept"), "x").unwrap();
+        let base = rooted("/view/white", |region, memo| {
+            let kept = region.real.join("kept");
+            memo.store_lookup(lookup_key(region, b"/", b"kept"), host_file(&kept, 1));
+            memo.store_list(
+                list_key(region, b"/"),
+                Ok(vec![(b"gone".to_vec(), DType::File), (b"kept".to_vec(), DType::File)]),
+            );
+        });
         let layer = Arc::new(OutputsLayer::new());
         layer.add(0, LEVEL_FULL, &[(b"/gone".to_vec(), MEntry::Whiteout)]);
-        let v = BuildView { base: base(tmp.path()), layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
+        let v = BuildView { base, layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
         assert!(matches!(v.stat(b"/gone"), Looked::Absent));
         assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
         let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
@@ -694,24 +891,30 @@ mod host_listing_tests {
 
     #[test]
     fn build_view_lists_host_directories() {
-        let host = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(host.path().join("usr/lib")).unwrap();
-        std::fs::create_dir(host.path().join("etc")).unwrap();
-        std::fs::write(host.path().join("usr/lib/sample"), b"library").unwrap();
-        std::fs::write(host.path().join("etc/settings"), b"config").unwrap();
+        let region = HostRegion::new("/view/host");
         let memo = Arc::new(HostMemo::default());
-        let g = memo.advance();
+        memo.store_lookup(lookup_key(&region, b"/", b"usr"), host_dir());
+        memo.store_lookup(lookup_key(&region, b"/", b"etc"), host_dir());
+        memo.store_lookup(lookup_key(&region, b"/usr", b"lib"), host_dir());
+        memo.store_lookup(lookup_key(&region, b"/usr/lib", b"sample"), host_file(&region.real.join("usr/lib/sample"), 7));
+        memo.store_lookup(lookup_key(&region, b"/etc", b"settings"), host_file(&region.real.join("etc/settings"), 6));
+        memo.store_list(list_key(&region, b"/"), Ok(vec![(b"etc".to_vec(), DType::Dir), (b"usr".to_vec(), DType::Dir)]));
+        memo.store_list(list_key(&region, b"/usr/lib"), Ok(vec![(b"sample".to_vec(), DType::File)]));
+        memo.store_list(list_key(&region, b"/etc"), Ok(vec![(b"settings".to_vec(), DType::File)]));
+        memo.seal();
         let base = Arc::new(BaseView::new(
-            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(host.path())), traced: true }],
+            vec![Mount { at: b"/".to_vec(), region: Region::Host(region), traced: true }],
             memo,
-            g,
+            0,
         ));
         let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
-        for dir in ["/usr/lib", "/etc", "/"] {
-            let real = std::fs::read_dir(host.path().join(dir.trim_start_matches('/'))).unwrap().count();
-            let seen = v.list(dir.as_bytes()).unwrap().len();
-            assert_eq!(seen, real, "listing of {dir}");
-            assert!(matches!(v.stat(dir.as_bytes()), Looked::Dir(_)));
+        assert_eq!(v.list(b"/usr/lib").unwrap(), vec![(b"sample".to_vec(), DType::File)]);
+        assert_eq!(v.list(b"/etc").unwrap(), vec![(b"settings".to_vec(), DType::File)]);
+        let mut root: Vec<_> = v.list(b"/").unwrap();
+        root.sort();
+        assert_eq!(root, vec![(b"etc".to_vec(), DType::Dir), (b"usr".to_vec(), DType::Dir)]);
+        for dir in [b"/usr/lib".as_slice(), b"/etc".as_slice(), b"/".as_slice()] {
+            assert!(matches!(v.stat(dir), Looked::Dir(_)));
         }
     }
 }
@@ -722,14 +925,18 @@ mod mount_tests {
 
     #[test]
     fn cargo_home_without_its_programs() {
-        let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join("registry/index")).unwrap();
-        std::fs::create_dir(home.path().join("bin")).unwrap();
-        std::fs::write(home.path().join("bin/cargo-clippy"), "rustup").unwrap();
-        std::fs::write(home.path().join("config.toml"), "").unwrap();
+        let home = PathBuf::from("/mem/cargo");
+        let region = HostRegion::new(&home);
+        let mounted = HostRegion::new("/mem");
+        let memo = Arc::new(HostMemo::default());
+        memo.store_lookup(lookup_key(&mounted, b"/", b"cargo"), host_dir());
+        memo.store_lookup(lookup_key(&region, b"/", b"registry"), host_dir());
+        memo.store_lookup(lookup_key(&region, b"/registry", b"index"), host_dir());
+        memo.store_lookup(lookup_key(&region, b"/", b"config.toml"), host_file(&home.join("config.toml"), 0));
+        memo.seal();
         let mut mounts = vec![Mount { at: b"/".to_vec(), region: Region::Empty, traced: true }];
-        mounts.extend(cargo_home_mounts(home.path()));
-        let v = BaseView::new(mounts, Arc::new(HostMemo::default()), 0);
+        mounts.extend(cargo_home_mounts(&home));
+        let v = BaseView::new(mounts, memo, 0);
         assert!(matches!(v.stat(b"/c/registry/index"), Looked::Dir(_)));
         assert!(matches!(v.stat(b"/c/config.toml"), Looked::File(_)));
         assert!(matches!(v.stat(b"/c/bin"), Looked::Dir(_)));
@@ -739,14 +946,21 @@ mod mount_tests {
 
     #[test]
     fn file_mounted_below_a_directory_that_does_not_exist() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("root")).unwrap();
-        std::fs::write(tmp.path().join("tool"), "binary").unwrap();
+        let root = HostRegion::new("/mem/root");
+        let tool_parent = HostRegion::new("/mem");
         let memo = Arc::new(HostMemo::default());
+        memo.store_lookup(lookup_key(&root, b"/", b"opt"), Looked::Absent);
+        memo.store_lookup(lookup_key(&root, b"/opt", b"x"), Looked::Absent);
+        memo.store_lookup(lookup_key(&root, b"/opt", b"y"), Looked::Absent);
+        memo.store_lookup(lookup_key(&tool_parent, b"/", b"tool"), host_file(&PathBuf::from("/mem/tool"), 6));
+        memo.store_list(list_key(&root, b"/"), Ok(Vec::new()));
+        memo.store_list(list_key(&root, b"/opt"), Err(libc::ENOENT));
+        memo.store_list(list_key(&root, b"/opt/x"), Err(libc::ENOENT));
+        memo.seal();
         let v = BaseView::new(
             vec![
-                Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new(tmp.path().join("root"))), traced: true },
-                Mount { at: b"/opt/x/tool".to_vec(), region: Region::Host(HostRegion::new(tmp.path().join("tool"))), traced: true },
+                Mount { at: b"/".to_vec(), region: Region::Host(root), traced: true },
+                Mount { at: b"/opt/x/tool".to_vec(), region: Region::Host(HostRegion::new("/mem/tool")), traced: true },
             ],
             memo,
             0,

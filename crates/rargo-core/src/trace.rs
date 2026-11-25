@@ -2,7 +2,7 @@ use crate::db::{Db, Table};
 use crate::hash::{Hash, KeyHasher};
 use crate::sandbox::NetMode;
 use crate::store::Store;
-use crate::view::{Content, Obs, VPath, View, obs_holds};
+use crate::view::{Content, FileSrc, Obs, VPath, View, obs_holds};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -153,13 +153,17 @@ pub struct Trace {
     pub created: u64,
 }
 
+fn observed_hash(content: &Content, src: &FileSrc) -> Option<Hash> {
+    content.known_hash(src).or_else(|| content.hash(src).ok())
+}
+
 impl Trace {
     pub fn holds(&self, view: &dyn View, content: &Content) -> bool {
-        self.obs.iter().all(|(p, o)| obs_holds(view, content, p, o))
+        self.obs.iter().all(|(p, o)| obs_holds(view, &|src| observed_hash(content, src), p, o))
     }
 
     pub fn first_mismatch(&self, view: &dyn View, content: &Content) -> Option<&(VPath, Obs)> {
-        self.obs.iter().find(|(p, o)| !obs_holds(view, content, p, o))
+        self.obs.iter().find(|(p, o)| !obs_holds(view, &|src| observed_hash(content, src), p, o))
     }
 
     pub fn complete(&self, store: &Store) -> bool {
