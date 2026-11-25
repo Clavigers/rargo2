@@ -53,6 +53,7 @@ pub struct WorkerPool {
     workers: BTreeMap<u64, Slot>,
     actions: BTreeMap<u64, u64>,
     leased: BTreeMap<u64, usize>,
+    warmed: BTreeSet<u64>,
 }
 
 impl WorkerPool {
@@ -77,6 +78,7 @@ impl WorkerPool {
         }
         self.order.retain(|w| *w != id);
         self.leased.remove(&id);
+        self.warmed.remove(&id);
         let lost: Vec<u64> = self.actions.iter().filter(|(_, w)| **w == id).map(|(a, _)| *a).collect();
         lost.into_iter()
             .map(|action| {
@@ -132,7 +134,12 @@ impl WorkerPool {
         }
     }
 
+    pub fn warm(&mut self, worker: u64, known: bool, own: bool) -> bool {
+        known && !own && self.workers.contains_key(&worker) && self.warmed.insert(worker)
+    }
+
     pub fn invariants(&self) {
+        assert!(self.warmed.iter().all(|w| self.workers.contains_key(w)), "only a worker that is here is warmed");
         assert_eq!(self.order.len(), self.workers.len());
         assert_eq!(self.order.iter().collect::<BTreeSet<_>>().len(), self.order.len(), "a worker is listed once");
         for (id, s) in &self.workers {
@@ -141,6 +148,21 @@ impl WorkerPool {
         }
         assert!(self.leased.keys().all(|id| self.workers.contains_key(id)));
         assert!(self.actions.values().all(|w| self.workers.contains_key(w)), "an action runs on a worker that is here");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placing {
+    Local,
+    LeaseNow,
+    RaceLocal,
+}
+
+pub fn placing(local_free: bool, waiting: bool, away: bool) -> Placing {
+    match (local_free && !waiting, away) {
+        (true, false) => Placing::Local,
+        (true, true) => Placing::LeaseNow,
+        (false, _) => Placing::RaceLocal,
     }
 }
 
@@ -279,6 +301,110 @@ impl Race {
 mod tests {
     use super::*;
 
+    struct Pool(WorkerPool);
+
+    impl std::ops::Deref for Pool {
+        type Target = WorkerPool;
+        fn deref(&self) -> &WorkerPool {
+            &self.0
+        }
+    }
+
+    impl Pool {
+        fn new() -> Pool {
+            let p = WorkerPool::new();
+            p.invariants();
+            Pool(p)
+        }
+
+        fn checked<R>(&self, r: R) -> R {
+            self.0.invariants();
+            r
+        }
+
+        fn joined(&mut self, id: u64, cores: usize) -> Vec<Effect> {
+            let r = self.0.joined(id, cores);
+            self.checked(r)
+        }
+
+        fn left(&mut self, id: u64) -> Vec<Effect> {
+            let r = self.0.left(id);
+            self.checked(r)
+        }
+
+        fn lease(&mut self, among: Option<&[u64]>) -> Option<u64> {
+            let r = self.0.lease(among);
+            self.checked(r)
+        }
+
+        fn give_back(&mut self, id: u64) -> Vec<Effect> {
+            let r = self.0.give_back(id);
+            self.checked(r)
+        }
+
+        fn sent(&mut self, action: u64, worker: u64) -> bool {
+            let r = self.0.sent(action, worker);
+            self.checked(r)
+        }
+
+        fn finished(&mut self, action: u64, answered: bool) -> Vec<Effect> {
+            let r = self.0.finished(action, answered);
+            self.checked(r)
+        }
+
+        fn warm(&mut self, worker: u64, known: bool, own: bool) -> bool {
+            let r = self.0.warm(worker, known, own);
+            self.checked(r)
+        }
+    }
+
+    struct Racing(Race);
+
+    impl std::ops::Deref for Racing {
+        type Target = Race;
+        fn deref(&self) -> &Race {
+            &self.0
+        }
+    }
+
+    impl Racing {
+        fn new() -> Racing {
+            let r = Race::default();
+            r.invariants();
+            Racing(r)
+        }
+
+        fn checked<R>(&self, r: R) -> R {
+            self.0.invariants();
+            r
+        }
+
+        fn claim(&mut self, who: Who) -> bool {
+            let r = self.0.claim(who);
+            self.checked(r)
+        }
+
+        fn hedged(&mut self) {
+            self.0.hedged();
+            self.0.invariants();
+        }
+
+        fn settle(&mut self) -> Option<Settle> {
+            let r = self.0.settle();
+            self.checked(r)
+        }
+
+        fn remote_ended(&mut self, ok: bool) -> Outcome {
+            let r = self.0.remote_ended(ok);
+            self.checked(r)
+        }
+
+        fn local_ended(&mut self) -> Outcome {
+            let r = self.0.local_ended();
+            self.checked(r)
+        }
+    }
+
     struct Rng(u64);
 
     impl Rng {
@@ -292,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_disconnected_worker_s_actions_finish_elsewhere() {
-        let mut p = WorkerPool::new();
+        let mut p = Pool::new();
         assert_eq!(p.joined(1, 2), vec![Effect::Wake, Effect::Wake], "each new core wakes a waiter");
         p.invariants();
         assert_eq!(p.joined(2, 1), vec![Effect::Wake]);
@@ -309,10 +435,10 @@ mod tests {
         assert_eq!(fx, vec![Effect::Lost { action: 10 }, Effect::Lost { action: 11 }]);
         p.invariants();
         assert!(!p.route(1, 10), "nothing from the gone worker reaches its actions");
-        let mut race = Race::default();
+        let mut race = Racing::new();
         assert_eq!(race.remote_ended(false), Outcome::RunElsewhere, "a lost action without a hedge runs here");
         race.invariants();
-        let mut hedged = Race::default();
+        let mut hedged = Racing::new();
         hedged.hedged();
         assert_eq!(hedged.remote_ended(false), Outcome::WaitLocal, "a lost action with a hedge finishes in it");
         assert_eq!(hedged.local_ended(), Outcome::Use { who: Who::Local, stopped_other: false });
@@ -328,14 +454,14 @@ mod tests {
 
     #[test]
     fn a_hedged_action_s_first_result_wins_and_the_other_is_cancelled() {
-        let mut r = Race::default();
+        let mut r = Racing::new();
         assert!(r.may_hedge(false, true));
         assert!(!r.may_hedge(true, true), "an action whose state is away is not hedged");
         r.hedged();
         assert!(!r.may_hedge(false, true), "one hedge");
         assert_eq!(r.local_ended(), Outcome::Use { who: Who::Local, stopped_other: true });
         r.invariants();
-        let mut p = WorkerPool::new();
+        let mut p = Pool::new();
         p.joined(1, 1);
         p.lease(None);
         p.sent(5, 1);
@@ -346,7 +472,7 @@ mod tests {
         );
         p.invariants();
 
-        let mut r = Race::default();
+        let mut r = Racing::new();
         r.hedged();
         assert_eq!(
             r.remote_ended(true),
@@ -355,16 +481,40 @@ mod tests {
         );
         r.invariants();
 
-        let mut r = Race::default();
+        let mut r = Racing::new();
         assert!(r.claim(Who::Remote), "the first to speak owns the output");
         assert!(!r.may_hedge(false, true), "an action that already speaks is not hedged");
         assert!(!r.claim(Who::Local));
-        let mut r = Race::default();
+        let mut r = Racing::new();
         r.hedged();
         assert!(r.claim(Who::Local));
         assert_eq!(r.settle(), Some(Settle::DropRemote), "once the hedge speaks, the remote run is dropped");
         assert_eq!(r.local_ended(), Outcome::Use { who: Who::Local, stopped_other: false });
         r.invariants();
+    }
+
+    #[test]
+    fn where_an_action_goes_and_which_worker_is_warmed_are_decided_here() {
+        assert_eq!(placing(true, false, false), Placing::Local, "a free local slot and nobody waiting: run here");
+        assert_eq!(placing(true, false, true), Placing::LeaseNow, "unless the action's state is on a worker");
+        assert_eq!(
+            placing(false, false, false),
+            Placing::RaceLocal,
+            "a busy server races a lease against a local slot"
+        );
+        assert_eq!(placing(true, true, true), Placing::RaceLocal);
+        let mut p = Pool::new();
+        p.joined(1, 1);
+        assert!(!p.warm(1, false, false), "nothing known, nothing to warm");
+        assert!(!p.warm(1, true, true), "an action's own trace is sent with it");
+        assert!(p.warm(1, true, false), "a profile warms a worker");
+        assert!(!p.warm(1, true, false), "once");
+        assert!(!p.warm(2, true, false), "only a worker that is here");
+        p.left(1);
+        p.joined(1, 1);
+        assert!(p.warm(1, true, false), "a worker that comes back is warmed again");
+        assert!(worth_sending(true, 5, 10, false) && !worth_sending(true, 11, 10, false));
+        assert!(!worth_sending(false, 0, 10, false) && worth_sending(false, 99, 1, true));
     }
 
     #[test]
@@ -413,7 +563,7 @@ mod tests {
     fn generated_pools_lose_each_action_once_and_route_only_to_its_worker() {
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut p = WorkerPool::new();
+            let mut p = Pool::new();
             let mut here: BTreeMap<u64, usize> = BTreeMap::new();
             let mut on: BTreeMap<u64, u64> = BTreeMap::new();
             let mut leases: Vec<u64> = Vec::new();
@@ -501,7 +651,7 @@ mod tests {
     fn generated_races_end_once_with_the_first_result() {
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut r = Race::default();
+            let mut r = Racing::new();
             let mut ended = None;
             for _ in 0..20 {
                 if ended.is_some() {
