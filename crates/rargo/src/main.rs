@@ -1,4 +1,5 @@
 mod daemon;
+mod daemon_state;
 mod git;
 mod known;
 mod mux;

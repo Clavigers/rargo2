@@ -58,6 +58,10 @@ impl KnownDigests {
         }
     }
 
+    pub fn holds(&self, digest: &Digest) -> bool {
+        self.set.contains(&short(digest))
+    }
+
     pub fn len(&self) -> usize {
         self.set.len()
     }
