@@ -105,7 +105,7 @@ def cpu(extra):
         if key not in took:
             problems.append(f"{BUDGETS} gives {key} a budget, but no test of that name ran; remove the line")
         elif took[key] <= default:
-            problems.append(f"{key} used {took[key]:.0f} ms of CPU, within the default {default} ms; remove its line")
+            print(f"note: {key} used {took[key]:.0f} ms of CPU here, within the default {default} ms; its line may go once it does so on every machine")
     if not took:
         problems.append("no tests ran")
     slowest = max(took.items(), key=lambda kv: kv[1], default=("none", 0))
