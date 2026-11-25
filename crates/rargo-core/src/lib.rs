@@ -25,6 +25,7 @@ pub mod sandbox;
 pub mod serve;
 pub mod session;
 pub mod pool_state;
+pub mod send_ahead;
 pub mod session_state;
 pub mod worker_state;
 pub mod snapshot;

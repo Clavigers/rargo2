@@ -7,6 +7,7 @@ use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
 use crate::pool_state::{self, Outcome, Settle, Who};
+use crate::send_ahead::{self, AHEAD_MAX, BATCH_BYTES, inline_indices};
 use crate::worker_state;
 use anyhow::{Context, Result, anyhow, bail};
 use dashmap::DashMap;
@@ -249,25 +250,6 @@ impl BlobSource for StoreSource {
     }
 }
 
-fn inline_indices(recipe: &Recipe, has: &dyn Fn(&Hash) -> bool) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut bytes = 0usize;
-    for (i, c) in recipe.iter().enumerate() {
-        if has(&c.hash) {
-            continue;
-        }
-        if bytes + c.len as usize > BATCH_BYTES && !out.is_empty() {
-            break;
-        }
-        bytes += c.len as usize;
-        out.push(i as u32);
-    }
-    assert!(out.windows(2).all(|w| w[0] < w[1]), "indices ascend");
-    assert!(out.len() <= recipe.len());
-    assert!(out.len() <= 1 || bytes <= BATCH_BYTES);
-    out
-}
-
 pub struct Blobs {
     pub store: Arc<Store>,
     pub index: ChunkIndex,
@@ -283,7 +265,6 @@ pub struct Outline {
     pub lazy: Vec<(u64, u64)>,
 }
 
-const BATCH_BYTES: usize = 1 << 20;
 
 impl Blobs {
     pub fn new(store: Arc<Store>, source: Option<Box<dyn BlobSource>>) -> Blobs {
@@ -403,20 +384,7 @@ impl Blobs {
         }
         assert_eq!(off, recipe.iter().map(|c| c.len as u64).sum::<u64>());
         let missing_count = missing.len();
-        let mut batches: Vec<Vec<(u32, u64, u32)>> = Vec::new();
-        let mut cur: Vec<(u32, u64, u32)> = Vec::new();
-        let mut cur_bytes = 0usize;
-        for m in missing {
-            if cur_bytes + m.2 as usize > BATCH_BYTES && !cur.is_empty() {
-                batches.push(std::mem::take(&mut cur));
-                cur_bytes = 0;
-            }
-            cur_bytes += m.2 as usize;
-            cur.push(m);
-        }
-        if !cur.is_empty() {
-            batches.push(cur);
-        }
+        let batches: Vec<Vec<(u32, u64, u32)>> = send_ahead::batches(missing, |m| m.2 as usize, BATCH_BYTES);
         assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), missing_count);
         assert!(batches.iter().all(|b| !b.is_empty()));
         for group in batches.chunks(8) {
@@ -1271,7 +1239,6 @@ fn state_ahead() -> bool {
     *ON.get_or_init(|| std::env::var("RARGO_STATE_AHEAD").ok().as_deref() == Some("1"))
 }
 
-const AHEAD_MAX: u64 = 256 << 20;
 
 #[derive(Default)]
 pub struct AheadQueue {
@@ -1787,14 +1754,11 @@ impl Pool {
             };
             let workers: Vec<Arc<Worker>> = self.workers.lock().iter().filter(|w| w.alive.load(Ordering::Relaxed)).cloned().collect();
             for w in workers {
-                let missing: Vec<(Hash, u64)> = {
+                let missing = {
                     let has = w.has_blobs.lock();
-                    blobs.iter().filter(|(h, _)| !has.contains(h) && engine.store.has(h)).copied().collect()
+                    send_ahead::state_to_send(&blobs, &|h| has.contains(h), &|h| engine.store.has(h), AHEAD_MAX)
                 };
-                let bytes: u64 = missing.iter().map(|(_, s)| *s).sum();
-                if missing.is_empty() || bytes > AHEAD_MAX {
-                    continue;
-                }
+                let Some(missing) = missing else { continue };
                 for _ in 0..60 {
                     let busy = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
                     if busy.is_zero() {
@@ -1908,12 +1872,12 @@ impl Pool {
             eprintln!("rargod: content {h} was to be sent ahead to worker {:x} but cannot be read here", w.id);
             return 0;
         };
-        let missing: Vec<u32> = {
+        let batches: Vec<Vec<u32>> = {
             let has = w.has_chunks.lock();
-            (0..recipe.len() as u32).filter(|i| !has.contains(&recipe[*i as usize].hash)).collect()
+            send_ahead::push_parts(&recipe, &|c| has.contains(c))
         };
         let total: u64 = recipe.iter().map(|c| c.len as u64).sum();
-        let need: u64 = missing.iter().map(|i| recipe[*i as usize].len as u64).sum();
+        let need: u64 = batches.iter().flatten().map(|i| recipe[*i as usize].len as u64).sum();
         w.pushed_bytes.fetch_add(need, Ordering::Relaxed);
         w.skipped_bytes.fetch_add(total - need, Ordering::Relaxed);
         {
@@ -1926,16 +1890,6 @@ impl Pool {
                 fl.retain(|_, at| *at > now);
             }
             fl.insert(h, *free_at + IN_FLIGHT_SLACK);
-        }
-        let mut batches: Vec<Vec<u32>> = vec![Vec::new()];
-        let mut bytes = 0usize;
-        for i in missing {
-            if bytes + recipe[i as usize].len as usize > BATCH_BYTES && !batches.last().unwrap().is_empty() {
-                batches.push(Vec::new());
-                bytes = 0;
-            }
-            bytes += recipe[i as usize].len as usize;
-            batches.last_mut().unwrap().push(i);
         }
         let of = batches.len() as u32;
         for (part, batch) in batches.iter().enumerate() {
@@ -2004,13 +1958,7 @@ impl Pool {
             None => {
                 let mut obs: Vec<(VPath, Obs)> = engine
                     .profile(spec)
-                    .map(|t| {
-                        t.obs
-                            .iter()
-                            .filter(|(p, _)| !self.profile_exclude.iter().any(|x| vpath_starts_with(p, x)))
-                            .cloned()
-                            .collect()
-                    })
+                    .map(|t| send_ahead::profile_obs(&t.obs, &self.profile_exclude))
                     .unwrap_or_default();
                 obs.extend(view.hints().into_iter().map(|p| (VPath::from(p), Obs::Dir)));
                 obs.extend(
@@ -2095,9 +2043,7 @@ impl Pool {
             let has = w.has_blobs.lock();
             let fl = w.in_flight.lock();
             let now = std::time::Instant::now();
-            incoming = files.into_iter().filter(|h| !has.contains(h) || still_in_flight(&fl, h, now)).collect();
-            incoming.sort();
-            incoming.dedup();
+            incoming = send_ahead::incoming(files, &|h| has.contains(h), &|h| still_in_flight(&fl, h, now));
         }
         closed.retain(|d| listings.iter().any(|(l, _)| l == d));
         Ok((prefill, listings, incoming, closed))
@@ -2451,14 +2397,13 @@ impl RemoteRunner for Pool {
             let missing: u64 = match &known {
                 Some(t) => {
                     let has = w.has_blobs.lock();
-                    t.obs
-                        .iter()
-                        .filter(|(p, _)| own.is_some() || !self.profile_exclude.iter().any(|x| vpath_starts_with(p, x)))
-                        .filter_map(|(_, o)| match o {
-                            Obs::File { hash, .. } if !has.contains(hash) => Some(engine.store.size_of(hash).unwrap_or(256 << 10)),
-                            _ => None,
-                        })
-                        .sum()
+                    send_ahead::trace_bytes(
+                        &t.obs,
+                        own.is_some(),
+                        &self.profile_exclude,
+                        &|h| has.contains(h),
+                        &|h| engine.store.size_of(h),
+                    )
                 }
                 None => 0,
             };
