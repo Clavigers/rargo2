@@ -813,6 +813,7 @@ impl Http {
         tokens::Github::load(self.state.as_deref()?)
     }
 
+    #[cfg(test)]
     fn server_for(&self, host: &str) -> String {
         server_for_host(&self.view_cfg(), host)
     }
