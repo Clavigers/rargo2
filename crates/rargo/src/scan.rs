@@ -965,3 +965,6 @@ mod tests {
         assert!(Index::load(&tmp.path().join("missing")).files.is_empty());
     }
 }
+
+#[cfg(test)]
+mod hegel_pilot;
