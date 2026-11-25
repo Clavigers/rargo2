@@ -238,16 +238,7 @@ pub fn recent_commits(root: &Path, head: &git::Head, wt_cache: &Path) -> Vec<[u8
             return parse(&text);
         }
     }
-    let listed = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["rev-list", "--first-parent", "-n", "64", head])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_else(|| format!("{head}\n"));
+    let listed = git::first_parent_list(root, head, 64).unwrap_or_else(|| format!("{head}\n"));
     let _ = write_atomic(&memo, listed.as_bytes());
     parse(&listed)
 }

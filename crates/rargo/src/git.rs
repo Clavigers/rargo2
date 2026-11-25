@@ -453,6 +453,27 @@ pub fn head(root: &Path) -> Option<Head> {
     Some(Head { text: r.text, branch: r.branch, commit: r.commit, common: r.common, tags })
 }
 
+fn first_parent_text<S: Source>(src: &S, store: &mut Store<S::Data>, common: &Path, head: &str, limit: usize) -> Option<String> {
+    let shallow = shallow(src, common);
+    let mut at = from_hex(head.as_bytes())?;
+    let mut text = String::new();
+    for _ in 0..limit {
+        text.push_str(&to_hex(&at));
+        text.push('\n');
+        match parents(src, store, &shallow, &at)?.first() {
+            Some(p) => at = *p,
+            None => break,
+        }
+    }
+    Some(text)
+}
+
+pub fn first_parent_list(root: &Path, head: &str, limit: usize) -> Option<String> {
+    let r = repo(&Disk, root)?;
+    let mut store = Store::open(&Disk, &r.common.join("objects"));
+    first_parent_text(&Disk, &mut store, &r.common, head, limit)
+}
+
 pub fn ignored(root: &Path) -> Option<Vec<Vec<u8>>> {
     let r = repo(&Disk, root)?;
     let configs = configs(&r.git_dir, &r.common);
@@ -1019,6 +1040,9 @@ mod tests {
         let head = id(&lines(&f.expect["head"])[0]);
         let chain: Vec<String> = first_parents(&f, &mut store, &BTreeSet::new(), head).unwrap().iter().map(to_hex).collect();
         assert_eq!(chain, lines(&f.expect["first-parent"]));
+        let text = first_parent_text(&f, &mut store, &common, &chain[0], 64).unwrap();
+        assert_eq!(text, String::from_utf8_lossy(&f.expect["first-parent"]));
+        assert_eq!(lines(first_parent_text(&f, &mut store, &common, &chain[0], 2).unwrap().as_bytes()), chain[..2]);
         let parent = id(&chain[1]);
         assert_eq!(stand_in_tags(tags_listed(&f, &mut store, &common, parent, false).unwrap().as_bytes()), stand_in_tags(&f.expect["points-at"]));
         assert_eq!(stand_in_tags(tags_listed(&f, &mut store, &common, head, true).unwrap().as_bytes()), stand_in_tags(&f.expect["merged"]));
