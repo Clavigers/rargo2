@@ -6,6 +6,28 @@ may break something (the wire protocol, a file format, an option), a change
 in the third does not. Client and server must be the same protocol; the
 release notes say when a release changes it.
 
+## 0.6.5
+
+Protocol 7 (unchanged).
+
+- `rargo clippy` runs the build's own clippy. Before, cargo found the
+  server's rustup proxy in the cargo home's `bin` and failed with "no
+  default is configured". The sandbox now shows the cargo home without its
+  `bin`. (#119)
+- A sync dropped while it uploads releases its claims, so a later sync of
+  the same files no longer waits forever. (#122)
+- A blob going to the cold tier or coming back from it stays present
+  throughout and does not change the store generation. (#124)
+- rargo's rustc fork keeps dep-graph node numbers across incremental
+  sessions, so successive `dep-graph.bin` files share most of their chunks:
+  about 66% after a one-statement edit, where they shared none. (#114)
+- A delivered file in `target/` is fetched when it is first read, not
+  when it is opened, so a stock `cargo build` after `rargo build` no longer
+  pulls every output it is about to replace. (#127)
+- The planner plans on the channel of the toolchain that builds: a
+  workspace whose flake provides a nightly or local compiler can use
+  nightly Cargo features. (#128)
+
 ## 0.6.4
 
 Protocol 7 (unchanged).
