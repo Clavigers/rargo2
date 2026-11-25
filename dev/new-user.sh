@@ -27,8 +27,11 @@ printf '[package]\nname = "hello"\nversion = "0.1.0"\nedition = "2021"\n\n[depen
 printf 'fn main() {\n    let mut b = itoa::Buffer::new();\n    println!("hello from a remote build: {}", b.format(6 * 7));\n}\n' >src/main.rs
 git add -A && git -c user.name=new -c user.email=new@user.invalid commit -qm one
 step "rargo @$host"
+manifest=$(cat Cargo.toml)
 rargo "@$host"
-grep -A1 'metadata.rargo' Cargo.toml
+cat config.rargo
+[ "$(cat Cargo.toml)" = "$manifest" ] || { echo "rargo @$host changed Cargo.toml"; exit 1; }
+[ -z "$(git status --porcelain)" ] || { git status --short; echo "rargo @$host left git status unclean"; exit 1; }
 step "rargo auth"
 RARGO_NO_BROWSER=1 rargo auth >"$work/auth.out" 2>&1 &
 auth=$!
@@ -51,6 +54,7 @@ rargo build
 out=$(./target/debug/hello)
 echo "$out"
 [ "$out" = "hello from a remote build: 42" ]
+[ -z "$(git status --porcelain)" ] || { git status --short; echo "git status is not clean after the build"; exit 1; }
 step "rargo test, rargo run"
 rargo test 2>&1 | tail -n 2
 rargo run -q

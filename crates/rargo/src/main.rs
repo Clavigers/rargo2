@@ -64,8 +64,7 @@ pub fn load_config() -> Result<Config, String> {
         let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
         return Ok(Config { host: server.clone(), server, user, secret, psk });
     }
-    let cwd = std::env::current_dir().ok();
-    let host = env("RARGO_SERVER").or_else(|| cwd.as_deref().and_then(project::project_host)).unwrap_or_else(|| "127.0.0.1:7459".into());
+    let (host, _) = server_host()?;
     let server = project::resolve(&host)?;
     let (user, secret) = if let Some(token) = env("RARGO_TOKEN") {
         from_token(&token)?
@@ -76,6 +75,22 @@ pub fn load_config() -> Result<Config, String> {
     };
     let psk = secret.as_ref().map_or_else(secure::open_psk, |s| secure::psk_from_secret(s.as_bytes()));
     Ok(Config { host, server, user, secret, psk })
+}
+
+enum HostFrom {
+    Env,
+    File(PathBuf),
+}
+
+fn server_host() -> Result<(String, HostFrom), String> {
+    if let Some(h) = std::env::var("RARGO_SERVER").ok().filter(|v| !v.is_empty()) {
+        return Ok((h, HostFrom::Env));
+    }
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine the current directory: {e}"))?;
+    match project::project_host(&cwd)? {
+        Some((h, path)) => Ok((h, HostFrom::File(path))),
+        None => Err(format!("no rargo server is named here: run `rargo @rargo.rs` (or `rargo @HOST` for a server of your own), which writes {}", project::CONFIG)),
+    }
 }
 
 fn is_loopback(server: &str) -> bool {
@@ -337,7 +352,7 @@ fn at_host(host: &str) -> ! {
     let cwd = std::env::current_dir().unwrap_or_else(|e| die(&format!("cannot determine the current directory: {e}")));
     match project::set_host(&cwd, host) {
         Ok(path) => {
-            eprintln!("{} now names `{host}` as this project's rargo server.", path.display());
+            eprintln!("{} now names `{host}` as this checkout's rargo server.", path.display());
             if host.contains(':') || project::resolve(host).is_ok() {
                 if project::credential(host).is_none() && std::env::var_os("RARGO_TOKEN").is_none() {
                     eprintln!("Next: `rargo auth`, then `rargo build`.");
@@ -369,7 +384,7 @@ fn auth_command(args: &[OsString]) -> ! {
                 println!(
                     "rargo auth [HOST]            get this machine a token for the project's server (or HOST), confirmed in a browser\n\
                      rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
-                     rargo auth status            which server this project builds on, and as whom\n\
+                     rargo auth status            which server this checkout builds on, what named it, and as whom\n\
                      rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here\n\
                      \n\
                      On the project's server, for an administrator (anyone may list and revoke their own tokens):\n\
@@ -388,15 +403,23 @@ fn auth_command(args: &[OsString]) -> ! {
         }
         i += 1;
     }
-    let host = host
-        .or_else(|| std::env::var("RARGO_SERVER").ok().filter(|v| !v.is_empty()))
-        .or_else(|| std::env::current_dir().ok().as_deref().and_then(project::project_host))
-        .unwrap_or_else(|| die("which server? This project names none: run `rargo @host` first, or say `rargo auth HOST`"));
+    let (host, from) = match host {
+        Some(h) => (h, None),
+        None => match server_host() {
+            Ok((h, from)) => (h, Some(from)),
+            Err(e) => die(&format!("{e}; or say `rargo auth HOST`")),
+        },
+    };
     if !project::valid_host(&host) {
         die(&format!("`{host}` is not a host"));
     }
     match what {
         "status" => {
+            match &from {
+                Some(HostFrom::Env) => println!("server named by RARGO_SERVER"),
+                Some(HostFrom::File(path)) => println!("server named by {}", path.display()),
+                None => {}
+            }
             let server = project::resolve(&host).unwrap_or_else(|e| format!("unknown ({e})"));
             match project::credential(&host) {
                 Some(c) if c.name.is_empty() => println!("{host} (server {server}): authenticated (token {})", c.id),
@@ -484,7 +507,7 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
                 passthrough(raw);
             }
             eprintln!("error: cannot reach the rargo server at {}: {why}", cfg.server);
-            eprintln!("       (the server is named by `rargo @host` in the project, or by RARGO_SERVER; RARGO_FALLBACK=cargo uses plain cargo instead)");
+            eprintln!("       (the server is named by `rargo @host`, in {}, or by RARGO_SERVER; RARGO_FALLBACK=cargo uses plain cargo instead)", project::CONFIG);
             std::process::exit(101);
         }
     }

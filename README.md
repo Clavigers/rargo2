@@ -14,7 +14,7 @@ You need Linux.
 ```sh
 cargo install rargo                 # or: curl -fsSL https://rargo.rs/install.sh | sh
 cd my-project
-rargo @build.example                # the name of your server
+rargo @build.example                # the name of your server, kept in config.rargo, which git does not see
 rargo auth                          # enter the invitation your admin gave you
 rargo build
 ```
@@ -37,9 +37,6 @@ A server with no tokens listens on `127.0.0.1` only.
 A project can set rules in `Cargo.toml`:
 
 ```toml
-[workspace.metadata.rargo]
-host = "build.example"
-
 [workspace.metadata.rargo.sync]
 exclude = ["node_modules"]             # never sent to the server
 

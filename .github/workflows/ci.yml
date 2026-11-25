@@ -24,11 +24,12 @@ jobs:
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: Realise the flake closure for binaries from the build server
         run: nix develop --command true
-      - name: rargo, signed in to the server this repository names
+      - name: rargo, signed in to rargo.rs
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
           curl -fsSL https://rargo.rs/install.sh | sh
+          rargo @rargo.rs
           rargo auth --token "$RARGO_TOKEN"
       - name: Build (on the server, on the cache every other build of this commit uses)
         run: rargo build --locked --workspace
@@ -53,11 +54,12 @@ jobs:
         run: nix develop ./nix/default --command true
       - name: Rust toolchain for the no-flake auth fixture
         run: rustup toolchain install stable --profile minimal && rustup default stable
-      - name: rargo, signed in to the server this repository names
+      - name: rargo, signed in to rargo.rs
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
           curl -fsSL https://rargo.rs/install.sh | sh
+          rargo @rargo.rs
           rargo auth --token "$RARGO_TOKEN"
       - run: RARGO_OUTPUT=copy rargo build --locked --release -p rargo -p rargod -p rargo-core
       - name: The planner of the latest release
