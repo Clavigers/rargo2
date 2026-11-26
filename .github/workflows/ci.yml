@@ -61,3 +61,16 @@ jobs:
       - name: The crates that are published
         run: nix develop --command cargo package --locked -p rargo-machine -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh
+  factory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dev/factory
+    steps:
+      - uses: actions/checkout@v4
+      - name: The factory's model, ledger and services
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q 'pydantic>=2.9' pytest simpy
+          /tmp/venv/bin/python -m pytest -q -p no:cacheprovider
