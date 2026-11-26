@@ -8,13 +8,10 @@ use serde::{Deserialize, Serialize};
 use crate::io::file::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-const FICLONE: libc::c_ulong = 0x4004_9409;
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct BlobMeta {
@@ -70,11 +67,11 @@ fn blob_meta(m: HotMeta) -> BlobMeta {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    crate::io::system_now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 pub fn reflink(src: &impl AsRawFd, dst: &impl AsRawFd) -> bool {
-    unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) == 0 }
+    crate::io::file::reflink_fd(src.as_raw_fd(), dst.as_raw_fd())
 }
 
 pub fn clone_or_copy(src: &impl AsRawFd, dst: &impl AsRawFd) -> io::Result<bool> {
@@ -90,7 +87,7 @@ impl Store {
         let blobs = root.join("blobs");
         let tmp = root.join("tmp");
         crate::io::file::create_dir_all(&blobs)?;
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = crate::io::file::remove_dir_all(&tmp);
         crate::io::file::create_dir_all(&tmp)?;
         for i in 0..256 {
             let d = blobs.join(format!("{i:02x}"));
@@ -194,7 +191,7 @@ impl Store {
 
     pub fn tmp_path(&self) -> PathBuf {
         let n = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        self.tmp.join(format!("t{}-{n}", std::process::id()))
+        self.tmp.join(format!("t{}-{n}", crate::io::process::id()))
     }
 
     pub fn tmp_dir(&self, name: &str) -> io::Result<PathBuf> {
@@ -578,7 +575,7 @@ impl Store {
 
     fn install(&self, tmp: &Path, h: Hash, exec: bool, size: u64) -> io::Result<()> {
         let dst = self.path_of(&h, exec);
-        crate::io::file::set_permissions(tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
+        crate::io::file::set_mode(tmp, if exec { 0o555 } else { 0o444 })?;
         crate::io::file::rename(tmp, &dst)?;
         let m = crate::io::file::metadata(&dst)?;
         assert_eq!(m.len(), size, "the installed file is the size the caller hashed");
@@ -599,7 +596,7 @@ impl Store {
             OpenOptions::new().write(true).create_new(true).mode(if exec { 0o555 } else { 0o444 }).open(&tmp)?;
         clone_or_copy(&src, &dst)?;
         drop(dst);
-        crate::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(if exec { 0o555 } else { 0o444 }))?;
+        crate::io::file::set_mode(&tmp, if exec { 0o555 } else { 0o444 })?;
         crate::io::file::rename(&tmp, &want)?;
         Ok(want)
     }
@@ -608,7 +605,7 @@ impl Store {
         self.ensure_whole(h)?;
         let parent = dest.parent().context("destination has no parent")?;
         let tmp =
-            parent.join(format!(".rargo-tmp-{}-{}", std::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
+            parent.join(format!(".rargo-tmp-{}-{}", crate::io::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let src = self.open_blob(h)?;
@@ -640,7 +637,7 @@ impl Store {
         self.touch(h);
         let parent = dest.parent().context("destination has no parent")?;
         let tmp =
-            parent.join(format!(".rargo-tmp-{}-{}", std::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
+            parent.join(format!(".rargo-tmp-{}-{}", crate::io::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let same_fs = crate::io::file::metadata(parent)?.dev() == self.dev;
@@ -749,113 +746,123 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use crate::io::{file, sim};
 
-    fn store() -> (tempfile::TempDir, Store) {
-        let d = tempfile::tempdir().unwrap();
-        let db = Arc::new(Db::open(&d.path().join("db.redb")).unwrap());
-        let s = Store::open(&d.path().join("store"), db).unwrap();
+    fn store() -> (PathBuf, Store) {
+        let d = sim::tempdir();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let s = Store::open(&d.join("store"), db).unwrap();
         (d, s)
     }
 
     #[test]
     fn put_get_materialize() {
-        let (d, s) = store();
-        let h = s.put_bytes(b"hello").unwrap();
-        assert_eq!(s.read(&h).unwrap(), b"hello");
-        assert_eq!(h, Hash::of(b"hello"));
-        let dest = d.path().join("out");
-        let placed = s.materialize(&h, true, &dest).unwrap();
-        assert_ne!(placed, Placed::Copy);
-        assert_eq!(fs::read(&dest).unwrap(), b"hello");
-        assert_eq!(fs::metadata(&dest).unwrap().permissions().mode() & 0o111, 0o111);
-        let h2 = s.put_bytes(b"world").unwrap();
-        s.materialize(&h2, false, &dest).unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"world");
+        sim::test(|| {
+            let (d, s) = store();
+            let h = s.put_bytes(b"hello").unwrap();
+            assert_eq!(s.read(&h).unwrap(), b"hello");
+            assert_eq!(h, Hash::of(b"hello"));
+            let dest = d.join("out");
+            let placed = s.materialize(&h, true, &dest).unwrap();
+            assert_ne!(placed, Placed::Copy);
+            assert_eq!(file::read(&dest).unwrap(), b"hello");
+            assert_eq!(file::metadata(&dest).unwrap().mode() & 0o111, 0o111);
+            let h2 = s.put_bytes(b"world").unwrap();
+            s.materialize(&h2, false, &dest).unwrap();
+            assert_eq!(file::read(&dest).unwrap(), b"world");
+        });
     }
 
     #[test]
     fn detects_write_through_hardlink() {
-        let (d, mut s) = store();
-        s.reflink = false;
-        let dest = d.path().join("linked");
-        // Keep a writable handle while the store moves the inode and makes it
-        // read-only. The materialized hardlink then shares that same inode.
-        let mut f = fs::File::create(&dest).unwrap();
-        f.write_all(b"original content").unwrap();
-        let (h, _) = s.put_file_move(&dest, false).unwrap();
-        let placed = s.materialize(&h, false, &dest).unwrap();
-        assert_eq!(placed, Placed::Hardlink);
-        std::io::Seek::rewind(&mut f).unwrap();
-        f.write_all(b"CORRUPTED").unwrap();
-        drop(f);
-        assert_eq!(s.open_blob(&h).err().unwrap().kind(), io::ErrorKind::InvalidData);
-        assert!(!s.has(&h));
+        sim::test(|| {
+            let (d, mut s) = store();
+            s.reflink = false;
+            let dest = d.join("linked");
+            // Keep a writable handle while the store moves the inode and makes it
+            // read-only. The materialized hardlink then shares that same inode.
+            let mut f = File::create(&dest).unwrap();
+            f.write_all(b"original content").unwrap();
+            let (h, _) = s.put_file_move(&dest, false).unwrap();
+            let placed = s.materialize(&h, false, &dest).unwrap();
+            assert_eq!(placed, Placed::Hardlink);
+            std::io::Seek::rewind(&mut f).unwrap();
+            f.write_all(b"CORRUPTED").unwrap();
+            drop(f);
+            assert_eq!(s.open_blob(&h).err().unwrap().kind(), io::ErrorKind::InvalidData);
+            assert!(!s.has(&h));
+        });
     }
 
     #[test]
     fn cold_blobs_come_back_and_share_chunks() {
-        let (_d, s) = store();
-        let mut a = vec![0u8; 3 << 20];
-        let mut x = 0x1234_5678_9abc_def0u64;
-        for b in a.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *b = x as u8;
-        }
-        let mut b = a.clone();
-        b[1 << 20..(1 << 20) + 16].copy_from_slice(b"sixteen new byte");
-        let (ha, hb) = (s.put_bytes(&a).unwrap(), s.put_bytes(&b).unwrap());
-        let small = s.put_bytes(b"tiny").unwrap();
-        assert_eq!(s.freeze(&small, &|_| {}).unwrap(), None);
-        let whole = s.total_bytes();
-        assert!(s.freeze(&ha, &|_| {}).unwrap().is_some());
-        assert!(s.freeze(&hb, &|_| {}).unwrap().is_some());
-        assert_eq!(s.cold_stats().0, 2);
-        assert!(s.total_bytes() < whole * 6 / 10, "{} vs {}", s.total_bytes(), whole);
-        assert!(s.has(&ha) && s.size_of(&hb) == Some(b.len() as u64));
-        assert_eq!(s.read(&hb).unwrap(), b);
-        assert_eq!(s.cold_stats().0, 1);
-        s.remove(&ha);
-        s.collect_chunks();
-        assert_eq!(s.cold_stats(), (0, 0, 0));
-        assert_eq!(s.read(&hb).unwrap(), b);
-        assert!(s.read(&ha).is_err());
+        sim::test(|| {
+            let (_d, s) = store();
+            let mut a = vec![0u8; 3 << 20];
+            let mut x = 0x1234_5678_9abc_def0u64;
+            for b in a.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *b = x as u8;
+            }
+            let mut b = a.clone();
+            b[1 << 20..(1 << 20) + 16].copy_from_slice(b"sixteen new byte");
+            let (ha, hb) = (s.put_bytes(&a).unwrap(), s.put_bytes(&b).unwrap());
+            let small = s.put_bytes(b"tiny").unwrap();
+            assert_eq!(s.freeze(&small, &|_| {}).unwrap(), None);
+            let whole = s.total_bytes();
+            assert!(s.freeze(&ha, &|_| {}).unwrap().is_some());
+            assert!(s.freeze(&hb, &|_| {}).unwrap().is_some());
+            assert_eq!(s.cold_stats().0, 2);
+            assert!(s.total_bytes() < whole * 6 / 10, "{} vs {}", s.total_bytes(), whole);
+            assert!(s.has(&ha) && s.size_of(&hb) == Some(b.len() as u64));
+            assert_eq!(s.read(&hb).unwrap(), b);
+            assert_eq!(s.cold_stats().0, 1);
+            s.remove(&ha);
+            s.collect_chunks();
+            assert_eq!(s.cold_stats(), (0, 0, 0));
+            assert_eq!(s.read(&hb).unwrap(), b);
+            assert!(s.read(&ha).is_err());
+        });
     }
 
     #[test]
     fn linked_blobs_stay_whole_and_cold_ones_are_evicted() {
-        let (d, s) = store();
-        let data = vec![7u8; 1 << 20];
-        let h = s.put_bytes(&data).unwrap();
-        let out = d.path().join("out");
-        assert_eq!(s.materialize(&h, false, &out).unwrap(), Placed::Hardlink);
-        assert_eq!(s.freeze(&h, &|_| {}).unwrap(), None);
-        std::fs::remove_file(&out).unwrap();
-        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-        s.materialize(&h, true, &out).unwrap();
-        assert_eq!(std::fs::read(&out).unwrap(), data);
-        std::fs::remove_file(&out).unwrap();
-        let _ = std::fs::remove_file(s.path_of(&h, true));
-        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-        s.evict_to(0, &|_| false);
-        assert!(!s.has(&h));
-        assert_eq!(s.cold_stats(), (0, 0, 0));
+        sim::test(|| {
+            let (d, s) = store();
+            let data = vec![7u8; 1 << 20];
+            let h = s.put_bytes(&data).unwrap();
+            let out = d.join("out");
+            assert_eq!(s.materialize(&h, false, &out).unwrap(), Placed::Hardlink);
+            assert_eq!(s.freeze(&h, &|_| {}).unwrap(), None);
+            file::remove_file(&out).unwrap();
+            assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+            s.materialize(&h, true, &out).unwrap();
+            assert_eq!(file::read(&out).unwrap(), data);
+            file::remove_file(&out).unwrap();
+            let _ = file::remove_file(s.path_of(&h, true));
+            assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+            s.evict_to(0, &|_| false);
+            assert!(!s.has(&h));
+            assert_eq!(s.cold_stats(), (0, 0, 0));
+        });
     }
 
     #[test]
     fn move_dedupes() {
-        let (_d, s) = store();
-        let p = s.tmp_path();
-        fs::write(&p, b"same").unwrap();
-        let (h1, _) = s.put_file_move(&p, false).unwrap();
-        let p2 = s.tmp_path();
-        fs::write(&p2, b"same").unwrap();
-        let (h2, _) = s.put_file_move(&p2, false).unwrap();
-        assert_eq!(h1, h2);
-        assert!(!p2.exists());
-        assert_eq!(s.blob_count(), 1);
+        sim::test(|| {
+            let (_d, s) = store();
+            let p = s.tmp_path();
+            file::write(&p, b"same").unwrap();
+            let (h1, _) = s.put_file_move(&p, false).unwrap();
+            let p2 = s.tmp_path();
+            file::write(&p2, b"same").unwrap();
+            let (h2, _) = s.put_file_move(&p2, false).unwrap();
+            assert_eq!(h1, h2);
+            assert!(!p2.ring_exists());
+            assert_eq!(s.blob_count(), 1);
+        });
     }
 }
 
@@ -881,33 +888,5 @@ impl Blobs for Store {
 
     fn touch(&self, h: &Hash) {
         Store::touch(self, h)
-    }
-}
-
-#[cfg(test)]
-#[derive(Default)]
-pub struct MemBlobs {
-    pub held: parking_lot::Mutex<std::collections::BTreeMap<Hash, Vec<u8>>>,
-    pub touched: parking_lot::Mutex<Vec<Hash>>,
-}
-
-#[cfg(test)]
-impl Blobs for MemBlobs {
-    fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash> {
-        let h = Hash::of(bytes);
-        self.held.lock().insert(h, bytes.to_vec());
-        Ok(h)
-    }
-
-    fn read(&self, h: &Hash) -> io::Result<Vec<u8>> {
-        self.held.lock().get(h).cloned().ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-    }
-
-    fn has(&self, h: &Hash) -> bool {
-        self.held.lock().contains_key(h)
-    }
-
-    fn touch(&self, h: &Hash) {
-        self.touched.lock().push(*h);
     }
 }

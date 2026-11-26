@@ -1,7 +1,8 @@
 use crate::sched_state::{Broker, Effects, Job, SchedState};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use crate::io::PipeEnd;
+use std::os::fd::{AsRawFd, RawFd};
 use crate::io::oneshot;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,9 +26,9 @@ pub struct Scheduler {
     inner: Mutex<Inner>,
     wake_broker: std::sync::OnceLock<crate::io::Notify>,
     born: Instant,
-    pipe_r: OwnedFd,
-    pipe_w: OwnedFd,
-    pipe_try: OwnedFd,
+    pipe_r: PipeEnd,
+    pipe_w: PipeEnd,
+    pipe_try: PipeEnd,
 }
 
 pub struct Permit {
@@ -42,29 +43,16 @@ impl Drop for Permit {
 }
 
 fn write_token(fd: RawFd) {
-    loop {
-        let r = unsafe { libc::write(fd, b"|".as_ptr() as *const _, 1) };
-        if r == 1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            return;
-        }
-    }
+    let _ = crate::io::write_now(fd, b"|");
 }
 
 impl Scheduler {
     pub fn new(tokens: usize, mem_budget_kb: u64) -> std::io::Result<Arc<Scheduler>> {
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let (pipe_r, pipe_w) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let (pipe_r, pipe_w) = crate::io::pipe()?;
         for _ in 0..tokens {
             write_token(pipe_w.as_raw_fd());
         }
-        let pipe_try: OwnedFd = crate::io::file::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(format!("/proc/self/fd/{}", pipe_r.as_raw_fd()))?
-            .into();
+        let pipe_try = pipe_r.nonblocking_reader()?;
         let s = Arc::new(Scheduler {
             inner: Mutex::new(Inner {
                 state: SchedState::new(tokens, mem_budget_kb),
@@ -73,7 +61,7 @@ impl Scheduler {
                 shutdown: false,
             }),
             wake_broker: std::sync::OnceLock::new(),
-            born: Instant::now(),
+            born: crate::io::now(),
             pipe_r,
             pipe_w,
             pipe_try,
@@ -201,20 +189,15 @@ impl Scheduler {
     }
 
     fn in_pipe(&self) -> usize {
-        let mut avail: libc::c_int = 0;
-        if unsafe { libc::ioctl(self.pipe_r.as_raw_fd(), libc::FIONREAD, &mut avail) } != 0 {
-            return 0;
-        }
-        avail.max(0) as usize
+        crate::io::queued(self.pipe_r.as_raw_fd()).unwrap_or(0)
     }
 
     fn try_take(&self) -> bool {
-        let mut b = 0u8;
-        unsafe { libc::read(self.pipe_try.as_raw_fd(), &mut b as *mut u8 as *mut _, 1) == 1 }
+        matches!(crate::io::try_read(self.pipe_try.as_raw_fd(), 1), Ok(Some(token)) if token.len() == 1)
     }
 
     fn now_ms(&self) -> u64 {
-        self.born.elapsed().as_millis() as u64
+        crate::io::now().saturating_duration_since(self.born).as_millis() as u64
     }
 
     pub fn shutdown(&self) {
@@ -275,12 +258,11 @@ mod tests {
 
     #[test]
     fn tokens_are_shared_with_jobserver_clients() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
             let s = Scheduler::new(2, u64::MAX).unwrap();
             assert_eq!(s.free_tokens(), 2);
             let [r, w] = s.jobserver_fds();
-            let mut b = 0u8;
-            assert_eq!(unsafe { libc::read(r, &mut b as *mut u8 as *mut _, 1) }, 1);
+            assert_eq!(crate::io::try_read(r, 1).unwrap().map(|token| token.len()), Some(1));
             assert_eq!(s.free_tokens(), 1);
             let _a = s.acquire(Priority::Agent, 0);
             assert_eq!(s.free_tokens(), 0);
@@ -295,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_job_that_must_wait_for_a_slot_is_told_how_many_run_and_wait_and_one_granted_at_once_is_not() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
             let s = Scheduler::new(1, u64::MAX).unwrap();
             let mut said = None;
             let first = s.acquire_saying(Priority::Human, 0, |running, waiting| said = Some((running, waiting)));

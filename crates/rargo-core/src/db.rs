@@ -59,26 +59,46 @@ impl Tables for Db {
     }
 }
 
+/// The tables a test writes to: a database held in memory.
 #[cfg(test)]
-#[derive(Default)]
-pub struct MemTables(Mutex<std::collections::BTreeMap<(Table, Vec<u8>), Arc<[u8]>>>);
+pub struct MemTables(Db);
+
+#[cfg(test)]
+impl Default for MemTables {
+    fn default() -> MemTables {
+        MemTables(Db::open_in_memory().expect("a database in memory opens"))
+    }
+}
+
+#[cfg(test)]
+impl MemTables {
+    /// Empties every table, which costs less than opening another database.
+    pub fn clear(&self) {
+        for table in ALL {
+            for (key, _) in self.0.scan_prefix(table, &[]) {
+                self.0.delete(table, &key);
+            }
+        }
+        self.0.flush();
+    }
+}
 
 #[cfg(test)]
 impl Tables for MemTables {
     fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
-        self.0.lock().get(&(table, key.to_vec())).cloned()
+        self.0.get(table, key)
     }
 
     fn put(&self, table: Table, key: &[u8], val: &[u8]) {
-        self.0.lock().insert((table, key.to_vec()), Arc::from(val));
+        self.0.put(table, key, val)
     }
 
     fn delete(&self, table: Table, key: &[u8]) {
-        self.0.lock().remove(&(table, key.to_vec()));
+        self.0.delete(table, key)
     }
 
     fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
-        self.0.lock().range((table, prefix.to_vec())..).take_while(|((t, k), _)| *t == table && k.starts_with(prefix)).map(|((_, k), v)| (k.clone(), v.clone())).collect()
+        self.0.scan_prefix(table, prefix)
     }
 }
 
@@ -93,7 +113,7 @@ struct Shared {
 
 impl Shared {
     fn now_ms(&self) -> u64 {
-        self.born.elapsed().as_millis() as u64
+        crate::io::now().saturating_duration_since(self.born).as_millis() as u64
     }
 }
 
@@ -104,7 +124,15 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
+        Db::over(Database::create(path).with_context(|| format!("opening {}", path.display()))?)
+    }
+
+    /// A database that lives in memory and is gone when it is dropped.
+    pub fn open_in_memory() -> Result<Db> {
+        Db::over(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?)
+    }
+
+    fn over(db: Database) -> Result<Db> {
         {
             let tx = db.begin_write()?;
             for t in ALL {
@@ -118,7 +146,7 @@ impl Db {
             flushing: Mutex::new(()),
             wake: std::sync::OnceLock::new(),
             stop: Mutex::new(false),
-            born: Instant::now(),
+            born: crate::io::now(),
         });
         Ok(Db { shared, writing: std::sync::Once::new() })
     }

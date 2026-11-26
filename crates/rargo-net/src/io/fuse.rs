@@ -19,7 +19,7 @@ pub struct FuseDrive {
 impl FuseDrive {
     pub fn spawn<F>(session: &Arc<Session>, fs: &Arc<F>) -> io::Result<Self>
     where
-        F: Filesystem + 'static,
+        F: Filesystem + Send + Sync + 'static,
     {
         let queues = possible_queues()?;
         let mut readers = Vec::with_capacity(usize::from(queues) + 1);
@@ -196,7 +196,7 @@ impl RingBuffer {
     }
 }
 
-fn serve_queue<F: Filesystem + 'static>(session: Arc<Session>, fs: Arc<F>, queue: u16) {
+fn serve_queue<F: Filesystem + Send + Sync + 'static>(session: Arc<Session>, fs: Arc<F>, queue: u16) {
     let fd = session.device_fd();
     let mut commit = None;
     let mut buffer = Box::new(RingBuffer::new());
@@ -235,7 +235,7 @@ fn serve_queue<F: Filesystem + 'static>(session: Arc<Session>, fs: Arc<F>, queue
     session.ended();
 }
 
-fn answer<F: Filesystem>(fd: i32, session: &Session, fs: &F, request: &[u8]) {
+fn answer<F: Filesystem + Sync>(fd: i32, session: &Session, fs: &F, request: &[u8]) {
     let replies = super::blocking(|| {
         let mut aligned: Vec<u64> = vec![0; request.len().div_ceil(8)];
         let request = unsafe {

@@ -1,10 +1,12 @@
+use crate::http::{Failure, FailureKind};
+use rargo_net::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DISCOVERY_FRESH: Duration = Duration::from_secs(24 * 3600);
 
 pub fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| crate::home_dir().join(".config")).join("rargo")
+    io::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| crate::home_dir().join(".config")).join("rargo")
 }
 
 pub fn config_path() -> PathBuf {
@@ -12,7 +14,7 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn read_config(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
+    match io::file::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
@@ -44,11 +46,10 @@ pub fn set_host(host: &str) -> Result<PathBuf, String> {
 }
 
 fn set_host_in(path: &Path, host: &str) -> Result<PathBuf, String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     if !valid_host(host) {
         return Err(format!("`{host}` is not a host: write a name (rargo.rs) or a name and a port (build.example:7459)"));
     }
-    let text = match std::fs::read_to_string(path) {
+    let text = match io::file::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
@@ -58,17 +59,17 @@ fn set_host_in(path: &Path, host: &str) -> Result<PathBuf, String> {
         return Ok(path.to_path_buf());
     }
     let dir = path.parent().ok_or_else(|| format!("{} has no directory", path.display()))?;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join(format!(".config.{}", std::process::id()));
+    io::file::DirBuilder::new().recursive(true).mode(0o700).create(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".config.{}", io::process::id()));
     let write = || -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        let mut f = io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
         f.write_all(new.as_bytes())?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        io::file::rename(&tmp, path)
     };
     write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = io::file::remove_file(&tmp);
         format!("{}: {e}", path.display())
     })?;
     Ok(path.to_path_buf())
@@ -80,12 +81,21 @@ fn set_host_text(path: &Path, host: &str, text: &str) -> Result<String, String> 
     Ok(doc.to_string())
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(5)).timeout(Duration::from_secs(15)).build()
+/// How long a request to a server's web endpoint may take to connect.
+const HTTP_CONNECT: Duration = Duration::from_secs(5);
+/// How long such a request may take in all.
+const HTTP_WHOLE: Duration = Duration::from_secs(15);
+
+fn http_get(url: &str) -> Result<String, Failure> {
+    crate::http::get(url, HTTP_CONNECT, HTTP_WHOLE)
+}
+
+fn http_post(url: &str, body: &serde_json::Value) -> Result<String, Failure> {
+    crate::http::post_json(url, &body.to_string(), HTTP_CONNECT, HTTP_WHOLE)
 }
 
 pub fn base_url(host: &str) -> String {
-    if let Ok(b) = std::env::var("RARGO_AUTH_URL") {
+    if let Ok(b) = io::env::var("RARGO_AUTH_URL") {
         return b.trim_end_matches('/').to_string();
     }
     if host.contains(':') { format!("http://{host}") } else { format!("https://{host}") }
@@ -93,8 +103,7 @@ pub fn base_url(host: &str) -> String {
 
 pub fn server_status(host: &str) -> Result<serde_json::Value, String> {
     let url = format!("{}/.well-known/rargo.json", base_url(host));
-    let response = agent().get(&url).call().map_err(|err| err.to_string())?;
-    let body = response.into_string().map_err(|err| err.to_string())?;
+    let body = http_get(&url).map_err(|err| err.text)?;
     let status: serde_json::Value = serde_json::from_str(&body).map_err(|err| err.to_string())?;
     status.get("server").and_then(|s| s.as_str()).ok_or("not a rargo server")?;
     Ok(status)
@@ -106,18 +115,18 @@ pub fn resolve(host: &str) -> Result<String, String> {
     }
     let cached = crate::cache_dir().join("servers").join(format!("{host}.json"));
     let read = |fresh_only: bool| -> Option<String> {
-        let md = std::fs::metadata(&cached).ok()?;
-        if fresh_only && md.modified().ok()?.elapsed().ok()? > DISCOVERY_FRESH {
+        let md = io::file::metadata(&cached).ok()?;
+        if fresh_only && io::system_now().duration_since(md.modified().ok()?).ok()? > DISCOVERY_FRESH {
             return None;
         }
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&cached).ok()?).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&io::file::read(&cached).ok()?).ok()?;
         v.get("server")?.as_str().map(String::from)
     };
     if let Some(server) = read(true) {
         return Ok(server);
     }
     let url = format!("{}/.well-known/rargo.json", base_url(host));
-    let asked = agent().get(&url).call().map_err(|e| unfound(&e)).and_then(|r| r.into_string().map_err(|e| e.to_string()));
+    let asked = http_get(&url).map_err(|e| unfound(&e));
     let found = asked.and_then(|text| {
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("not a rargo answer: {e}"))?;
         let server = v.get("server").and_then(|s| s.as_str()).ok_or("the answer names no server")?.to_string();
@@ -135,14 +144,21 @@ pub fn resolve(host: &str) -> Result<String, String> {
     }
 }
 
-fn unfound(e: &ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, _) => format!("{}{code}", NOT_RARGO),
-        ureq::Error::Transport(t) => match t.kind() {
-            ureq::ErrorKind::Dns => NO_SUCH_HOST.into(),
-            ureq::ErrorKind::ConnectionFailed | ureq::ErrorKind::Io => NO_ANSWER.into(),
-            _ => t.to_string(),
-        },
+fn unfound(e: &Failure) -> String {
+    match &e.kind {
+        FailureKind::Status { code, .. } => format!("{}{code}", NOT_RARGO),
+        FailureKind::Dns => NO_SUCH_HOST.into(),
+        FailureKind::Unreachable => NO_ANSWER.into(),
+        FailureKind::Transport | FailureKind::Body => e.text.clone(),
+    }
+}
+
+/// What a failed request to `url` on `host` says: a body that could not be
+/// read is reported with the URL, anything else as `asked` words it.
+fn refused(host: &str, url: &str, e: &Failure) -> String {
+    match e.kind {
+        FailureKind::Body => format!("{url}: {}", e.text),
+        _ => asked(host, url, &unfound(e), &e.text),
     }
 }
 
@@ -185,7 +201,7 @@ fn credentials_path() -> PathBuf {
 }
 
 fn credentials() -> toml::Table {
-    std::fs::read_to_string(credentials_path()).ok().and_then(|t| t.parse().ok()).unwrap_or_default()
+    io::file::read_to_string(credentials_path()).ok().and_then(|t| t.parse().ok()).unwrap_or_default()
 }
 
 pub fn credential(host: &str) -> Option<Credential> {
@@ -199,17 +215,16 @@ fn credential_in(all: &toml::Table, host: &str) -> Option<Credential> {
 }
 
 fn save_credentials(all: &toml::Table) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let path = credentials_path();
     let dir = config_dir();
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let tmp = dir.join(format!(".credentials.{}", std::process::id()));
+    io::file::DirBuilder::new().recursive(true).mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".credentials.{}", io::process::id()));
     let text = format!("# Tokens for rargo servers, one per host. Written by `rargo auth`; keep it private.\n{all}");
     let write = || -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+        let mut f = io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
         f.write_all(text.as_bytes())?;
-        std::fs::rename(&tmp, &path)
+        io::file::rename(&tmp, &path)
     };
     write().map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -237,13 +252,7 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
     let Some(c) = credential(host) else { return Ok(false) };
     let url = format!("{}/auth/revoke", base_url(host));
     let body = serde_json::json!({ "token": format!("{}.{}", c.id, c.secret) });
-    let text = agent()
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-        .map_err(|e| asked(host, &url, &unfound(&e), &e))?
-        .into_string()
-        .map_err(|e| format!("{url}: {e}"))?;
+    let text = http_post(&url, &body).map_err(|e| refused(host, &url, &e))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
     Ok(v.get("revoked").and_then(|r| r.as_bool()).unwrap_or(false))
 }
@@ -252,13 +261,7 @@ pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
     split_token(token).ok_or_else(|| format!("that is not a token: {TOKEN_FORM}"))?;
     let url = format!("{}/auth/whoami", base_url(host));
     let body = serde_json::json!({ "token": token.trim() });
-    let text = agent()
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-        .map_err(|e| asked(host, &url, &unfound(&e), &e))?
-        .into_string()
-        .map_err(|e| format!("{url}: {e}"))?;
+    let text = http_post(&url, &body).map_err(|e| refused(host, &url, &e))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
     Ok(v.get("user").and_then(|u| u.as_str()).map(String::from))
 }
@@ -273,32 +276,31 @@ pub fn forget(host: &str) -> Result<bool, String> {
 }
 
 fn open_in_browser(url: &str) {
-    if std::env::var_os("RARGO_NO_BROWSER").is_some() {
+    if io::env::var_os("RARGO_NO_BROWSER").is_some() {
         return;
     }
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+    if io::env::var_os("DISPLAY").is_none() && io::env::var_os("WAYLAND_DISPLAY").is_none() {
         return;
     }
-    let _ = std::process::Command::new("xdg-open")
+    let _ = io::process::Command::new("xdg-open")
         .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdin(io::process::Stdio::null())
+        .stdout(io::process::Stdio::null())
+        .stderr(io::process::Stdio::null())
         .spawn();
 }
 
 pub fn auth(host: &str) -> Result<String, String> {
     let base = base_url(host);
     let post = |path: &str, body: serde_json::Value| -> Result<serde_json::Value, String> {
-        let r = agent().post(&format!("{base}{path}")).set("Content-Type", "application/json").send_string(&body.to_string());
-        let text = match r {
-            Ok(r) => r.into_string().map_err(|e| e.to_string())?,
-            Err(ureq::Error::Status(code, r)) => {
-                let text = r.into_string().unwrap_or_default();
-                let said = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("error")?.as_str().map(String::from));
+        let text = match http_post(&format!("{base}{path}"), &body) {
+            Ok(text) => text,
+            Err(Failure { kind: FailureKind::Status { code, body }, .. }) => {
+                let said = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| v.get("error")?.as_str().map(String::from));
                 return Err(said.unwrap_or_else(|| format!("{base}{path} answered {code}")));
             }
-            Err(e) => return Err(asked(host, &format!("{base}{path}"), &unfound(&e), &e)),
+            Err(Failure { kind: FailureKind::Body, text }) => return Err(text),
+            Err(e) => return Err(asked(host, &format!("{base}{path}"), &unfound(&e), &e.text)),
         };
         serde_json::from_str(&text).map_err(|e| format!("{base}{path}: not a rargo answer: {e}"))
     };
@@ -315,11 +317,11 @@ pub fn auth(host: &str) -> Result<String, String> {
     }
     eprintln!("Waiting for that (ten minutes at most; any machine's browser will do) ...");
     let interval = Duration::from_secs(started.get("interval").and_then(|v| v.as_u64()).unwrap_or(2).clamp(1, 30));
-    let deadline = std::time::Instant::now() + Duration::from_secs(started.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(600));
+    let deadline = io::now() + Duration::from_secs(started.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(600));
     let mut failures = 0;
     loop {
-        std::thread::sleep(interval);
-        if std::time::Instant::now() > deadline {
+        io::sleep(interval);
+        if io::now() > deadline {
             return Err("nobody confirmed the code in time; run `rargo auth` again".into());
         }
         let answer = match post("/auth/poll", serde_json::json!({ "device": device })) {
@@ -370,31 +372,32 @@ mod tests {
 
     #[test]
     fn at_host_writes_the_users_config_and_keeps_the_rest_of_it() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("new/rargo/config.toml");
-        let host_in = |path: &Path| -> Result<Option<(String, PathBuf)>, String> {
-            let Some(text) = read_config(path)? else { return Ok(None) };
-            Ok(parse_host(path, &text)?.map(|host| (host, path.to_path_buf())))
-        };
-        assert_eq!(host_in(&path).unwrap(), None);
-        assert_eq!(set_host_in(&path, "rargo.rs").unwrap(), path);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "host = \"rargo.rs\"\n");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(host_in(&path).unwrap(), Some(("rargo.rs".to_string(), path.clone())));
-        std::fs::write(&path, "# mine\nhost = \"rargo.rs\"\nother = 1\n").unwrap();
-        set_host_in(&path, "build.example:7459").unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# mine\nhost = \"build.example:7459\"\nother = 1\n");
-        assert_eq!(host_in(&path).unwrap().unwrap().0, "build.example:7459");
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
-        assert!(set_host_in(&path, "not a host").is_err());
-        assert!(set_host_in(&path, "h:99999").is_err());
-        assert_eq!(host_in(&path).unwrap().unwrap().0, "build.example:7459");
-        std::fs::write(&path, "host = 7\n").unwrap();
-        assert!(host_in(&path).is_err());
-        std::fs::write(&path, "other = 1\n").unwrap();
-        assert_eq!(host_in(&path).unwrap(), None);
+        io::sim::test(|| {
+            let dir = io::sim::tempdir();
+            let path = dir.join("new/rargo/config.toml");
+            let host_in = |path: &Path| -> Result<Option<(String, PathBuf)>, String> {
+                let Some(text) = read_config(path)? else { return Ok(None) };
+                Ok(parse_host(path, &text)?.map(|host| (host, path.to_path_buf())))
+            };
+            assert_eq!(host_in(&path).unwrap(), None);
+            assert_eq!(set_host_in(&path, "rargo.rs").unwrap(), path);
+            assert_eq!(io::file::read_to_string(&path).unwrap(), "host = \"rargo.rs\"\n");
+            assert_eq!(io::file::metadata(&path).unwrap().mode() & 0o777, 0o600);
+            assert_eq!(io::file::metadata(path.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
+            assert_eq!(host_in(&path).unwrap(), Some(("rargo.rs".to_string(), path.clone())));
+            io::file::write(&path, "# mine\nhost = \"rargo.rs\"\nother = 1\n").unwrap();
+            set_host_in(&path, "build.example:7459").unwrap();
+            assert_eq!(io::file::read_to_string(&path).unwrap(), "# mine\nhost = \"build.example:7459\"\nother = 1\n");
+            assert_eq!(host_in(&path).unwrap().unwrap().0, "build.example:7459");
+            assert_eq!(io::file::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+            assert!(set_host_in(&path, "not a host").is_err());
+            assert!(set_host_in(&path, "h:99999").is_err());
+            assert_eq!(host_in(&path).unwrap().unwrap().0, "build.example:7459");
+            io::file::write(&path, "host = 7\n").unwrap();
+            assert!(host_in(&path).is_err());
+            io::file::write(&path, "other = 1\n").unwrap();
+            assert_eq!(host_in(&path).unwrap(), None);
+        });
     }
 
     #[test]

@@ -38,16 +38,7 @@ impl Hash {
         let len = file.metadata()?.len();
         let mut h = blake3::Hasher::new();
         if len >= 4 << 20 {
-            use std::os::fd::AsRawFd;
-            let size = len as usize;
-            unsafe {
-                let p = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
-                if p == libc::MAP_FAILED {
-                    return Err(io::Error::last_os_error());
-                }
-                h.update_rayon(std::slice::from_raw_parts(p as *const u8, size));
-                libc::munmap(p, size);
-            }
+            h.update_rayon(&file.map(len as usize)?);
         } else {
             let mut buf = vec![0u8; len as usize];
             file.read_exact_at(&mut buf, 0)?;
