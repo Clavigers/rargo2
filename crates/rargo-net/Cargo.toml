@@ -8,10 +8,10 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-rargo-proto = { path = "../rargo-proto", version = "0.7.6" }
+rargo-proto = { path = "../rargo-proto", version = "0.7.7" }
 libc.workspace = true
 blake3.workspace = true
 parking_lot.workspace = true
 io-uring.workspace = true
-fusewire = { path = "../fusewire", version = "0.7.6" }
+fusewire = { path = "../fusewire", version = "0.7.7" }
 corosensei.workspace = true
