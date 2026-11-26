@@ -58,7 +58,7 @@ fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
 
 #[test]
 fn dozens_of_client_rounds_overlap_during_eviction() {
-    let report = run(12, None).unwrap_or_else(|failure| panic!("{failure}"));
+    let report = run(180, None).unwrap_or_else(|failure| panic!("{failure}"));
     assert!(report.clients_at_eviction >= 24, "{report:?}");
     assert!(report.cache_hits > 0, "clients reuse action outputs");
 }
