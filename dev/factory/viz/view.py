@@ -97,7 +97,17 @@ def snapshot(w: World, lines: list[dict]) -> dict:
                               children=sorted(i.children),
                               done=sum(not w.open_(c) for c in i.children)))
     inits.sort(key=lambda d: (d["state"] != "open", -d["n"]))
-    return dict(t=iso(now), seq=w.seq, tick=w.tick, config=w.config.version if w.config else None,
+    models = {str(t.type): (t.model, t.plan) for t in w.config.agents} if w.config else {}
+    for d in agents:
+        d["model"], d["plan"] = models.get(d["type"], ("", ""))
+        d["pushes"] = sum(1 for l in lines if l["event"] == "push" and l["actor"] == d["name"])
+        d["gave_up"] = sum(1 for l in lines if l["event"] == "returned" and l["actor"] == d["name"]
+                           and l.get("reason") == "gave_up")
+        d["closed"] = sum(1 for l in lines if l["event"] == "closed" and l["actor"] == d["name"])
+    for g in inits:
+        g["graph"] = [dict(id=c, deps=sorted(d for d in w.issues[c].deps if d in w.issues[g["n"]].children),
+                           state=issues[c]["state"]) for c in g["children"] if c in issues]
+    return dict(t=iso(now), seq=w.seq, foreman=foreman(w, lines), release=release(lines), tick=w.tick, config=w.config.version if w.config else None,
                 reviewers=list(w.config.reviewers) if w.config else [],
                 agents=agents, issues=issues, columns=cols, prs=sorted(prs, key=lambda d: d["pr"]),
                 initiatives=inits[:12], totals=totals(w, lines),
@@ -140,3 +150,25 @@ def totals(w: World, lines: list[dict]) -> list[list]:
         ["median wait in ready", med(wait), "min"],
         ["agent time working", round(100 * sum(work.values()) / (span * n_agents)) if span else None, "%"],
     ]
+
+
+def foreman(w: World, lines: list[dict]) -> dict:
+    starts = [datetime.fromisoformat(l["t"].replace("Z", "+00:00")) for l in lines if l["event"] == "tick_started"]
+    gaps = [mins(a, b) for a, b in zip(starts[-11:], starts[-10:])]
+    every = round(statistics.median(gaps)) if gaps else None
+    since = round(mins(starts[-1], w.t)) if starts and w.t else None
+    back = [l for l in lines if l["event"] == "returned" and l["actor"] == "foreman"]
+    return dict(ticks=len(starts), every=every, since=since,
+                next=max(0, every - since) if every is not None and since is not None else None,
+                took_back=sum(l.get("reason") in ("quota", "stale") for l in back),
+                preempted=sum(l.get("reason") == "preempted" for l in back),
+                planned=len({l.get("parent") for l in lines if l["event"] == "filed" and l["actor"] == "foreman" and l.get("parent")}))
+
+
+def release(lines: list[dict]) -> dict:
+    pub = [l for l in lines if l["event"] == "published"]
+    frozen = [l for l in lines if l["event"] == "frozen"]
+    return dict(latest=pub[-1]["version"] if pub else None, latest_t=pub[-1]["t"] if pub else None,
+                candidate=frozen[-1]["version"] if frozen and (not pub or frozen[-1]["version"] != pub[-1]["version"]) else None,
+                pm_running=any(l["actor"] == "pm" for l in lines),
+                pu_running=any(l["actor"] == "power_user" for l in lines))
