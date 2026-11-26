@@ -36,6 +36,12 @@ pub fn refusal(err: &io::Error) -> Option<&'static str> {
     }
 }
 
+/// Why rargo cannot run on this machine, when the kernel refuses it an io_uring.
+pub fn unavailable() -> Option<String> {
+    let err = ring::probe().err()?;
+    Some(refusal(&err).map(str::to_owned).unwrap_or_else(|| format!("io_uring is unavailable (io_uring_setup failed: {err})")))
+}
+
 pub fn run<R>(workers: usize, main: impl FnOnce() -> R) -> R {
     let mut out = None;
     {

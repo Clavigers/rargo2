@@ -120,6 +120,11 @@ pub fn plain_cause(why: &str) -> String {
     chars.next().map(|c| c.to_lowercase().chain(chars).collect()).unwrap_or_default()
 }
 
+/// The one line a command ends with when the kernel gives rargo no io_uring, and what still works.
+fn ring_refused_text(why: &str) -> String {
+    format!("error: rargo cannot run on this machine: {why}\n       RARGO_FALLBACK=cargo builds with plain cargo meanwhile\n")
+}
+
 fn unreachable_text(server: &str, why: &str) -> String {
     format!(
         "error: cannot reach the rargo server at {server}: {}\n       \
@@ -439,14 +444,17 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
         }
         LocalReply::Exit(code) => std::process::exit(code),
         LocalReply::Exec(e) => exec(e),
-        LocalReply::Unreachable(why) => {
-            if std::env::var_os("RARGO_FALLBACK").is_some_and(|v| v == "cargo") {
-                passthrough(raw);
-            }
-            eprint!("{}", unreachable_text(&cfg.server, &why));
-            std::process::exit(101);
-        }
+        LocalReply::Unreachable(why) => fall_back_or_end(&unreachable_text(&cfg.server, &why), raw),
     }
+}
+
+/// When rargo cannot build here, plain cargo builds instead under RARGO_FALLBACK=cargo; otherwise the command ends with `text`.
+fn fall_back_or_end(text: &str, raw: &[OsString]) -> ! {
+    if std::env::var_os("RARGO_FALLBACK").is_some_and(|v| v == "cargo") {
+        passthrough(raw);
+    }
+    eprint!("{text}");
+    std::process::exit(101);
 }
 
 fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsString]) -> ! {
@@ -548,6 +556,9 @@ fn main() {
     if kind == "stop" {
         stop_daemons(&cfg, &cache, &req);
         std::process::exit(0);
+    }
+    if let Some(why) = rargo_net::io::unavailable() {
+        fall_back_or_end(&ring_refused_text(&why), &raw);
     }
     through_daemon(cfg, cache, req, &raw)
 }
@@ -845,6 +856,18 @@ mod tests {
         let text = super::unreachable_text("build.example:7459", "Connection refused (os error 111)");
         assert!(text.starts_with("error: cannot reach the rargo server at build.example:7459: connection refused\n"), "{text}");
         assert!(text.contains("`rargo @HOST`") && text.contains("RARGO_FALLBACK=cargo") && !text.contains("os error"), "{text}");
+    }
+
+    #[test]
+    fn a_kernel_that_refuses_io_uring_ends_the_command_with_one_error_line_naming_the_fix_and_the_fallback() {
+        let why = rargo_net::io::refusal(&std::io::Error::from_raw_os_error(libc::EPERM)).expect("EPERM is a refusal");
+        let text = super::ring_refused_text(why);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("error: rargo cannot run on this machine: io_uring is unavailable"), "{text}");
+        assert!(lines[0].contains("seccomp=unconfined"), "{text}");
+        assert!(lines[1].trim_start().starts_with("RARGO_FALLBACK=cargo"), "{text}");
+        assert!(!text.contains("No such file") && !text.contains("without its daemon"), "{text}");
     }
 
     #[test]

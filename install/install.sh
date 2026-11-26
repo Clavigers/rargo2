@@ -28,4 +28,5 @@ case ":$PATH:" in
 *) echo "note: $dir is not on your PATH" ;;
 esac
 [ -e /dev/fuse ] || echo "note: no /dev/fuse here; results will be copied into target/ instead of served from it"
+"$dir/rargo" status 2>/dev/null | sed -n 's/^io_uring  unavailable, so rargo cannot build here: /warning: rargo cannot build on this machine yet: /p'
 echo "next, in a cargo project: rargo @HOST (the server, for example rargo.rs), rargo auth, rargo build"
