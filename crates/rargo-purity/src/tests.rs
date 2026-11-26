@@ -55,7 +55,10 @@ fn ambient_io_is_found_through_imports_and_macros_but_not_in_the_shell() {
     );
     assert!(found("crates/a/src/io.rs", text).is_empty());
     assert!(found("crates/a/src/io/disk.rs", text).is_empty());
-    for not_shell in ["crates/a/src/build.rs", "crates/a/build.rs", "crates/a/examples/bench.rs"] {
+    for shell in ["crates/a/build.rs", "crates/a/examples/bench.rs", "crates/a/examples/bench/main.rs"] {
+        assert!(of(Check::AmbientIo, &found(shell, text)).is_empty(), "{shell}");
+    }
+    for not_shell in ["crates/a/src/build.rs", "crates/a/src/examples/bench.rs", "crates/a/src/build/build.rs"] {
         assert_eq!(of(Check::AmbientIo, &found(not_shell, text)).len(), 5, "{not_shell}");
     }
     assert!(found("crates/a/src/lib.rs", "fn f() -> std::time::Duration { let x = libc::EINTR; todo!() }").is_empty());
