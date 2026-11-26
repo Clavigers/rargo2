@@ -73,7 +73,7 @@ pub struct Daemon {
     pub(crate) nix_attached: Arc<Mutex<HashSet<String>>>,
     pub drift_report: Mutex<Option<String>>,
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
+    pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>>,
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
