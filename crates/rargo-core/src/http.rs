@@ -1227,7 +1227,7 @@ mod tests {
         let c = Cfg { access: "open a request at https://example.invalid/<new>".into(), ..cfg(true) };
         assert!(st.begin("deviceone".into(), "ABCD2345".into(), NOW));
         let page_for = |st: &mut AuthState, code: &str, github: Option<GithubIn>, now: u64| {
-            let (outcome, _) = drive(st, parsed(&format!("GET /auth?code={code} HTTP/1.1\r\nHost: build.example\r\n\r\n")), now, &c, &mut Script { github: script_rev(vec![github]), ..Script::default() });
+            let (outcome, _) = drive(st, parsed(&format!("GET /auth?code={code}&protocol={} HTTP/1.1\r\nHost: build.example\r\n\r\n", crate::proto::PROTO_VERSION)), now, &c, &mut Script { github: script_rev(vec![github]), ..Script::default() });
             let (status, _, page) = body_of(&outcome);
             (status, page.to_string())
         };

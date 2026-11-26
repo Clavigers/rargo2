@@ -4,7 +4,7 @@
 # before pushing.
 DATE=$(shell date +%F)
 
-all: site/index.html site/bibliography/index.html site/reference/index.html site/index.css site/src/demo/demo.css
+all: site/index.html site/bibliography/index.html site/reference/index.html site/protocol/index.html site/index.css site/src/demo/demo.css
 
 # The Reference: the Book's template and style sheets, with a table of
 # contents (unnumbered: its headings are looked up, not read in order).
@@ -21,8 +21,28 @@ site/reference/index.html: src/reference/index.md Makefile src/demo/template.htm
 		-i $< \
 		| html-minifier --collapse-whitespace > $@
 
+# The Protocol: what this rargo puts on the wire, for whoever writes another
+# client or server. The protocol number is the source's; the release's
+# version is filled in when the page is served.
+PROTOCOL=$(shell sed -n 's/^pub const PROTO_VERSION: u32 = \([0-9]*\);/\1/p' ../crates/rargo-proto/src/lib.rs)
+site/protocol/index.html: src/protocol/index.md Makefile ../crates/rargo-proto/src/lib.rs src/demo/template.html site/index.css site/src/demo/demo.css site/index.js
+	@mkdir -p site/protocol
+	pandoc \
+		--toc --toc-depth=2 \
+		-s \
+		-M title=Protocol \
+		-M subtitle="rargo {{RARGO_VERSION}} speaks protocol $(PROTOCOL): discovery, the link, frames, content and sign-in" \
+		-M lang=en -M toc-title=Contents \
+		--css "/index.css?v=$$(sha256sum site/index.css | cut -c1-12)" \
+		--css "/src/demo/demo.css?v=$$(sha256sum site/src/demo/demo.css | cut -c1-12)" \
+		-M document-css=false \
+		-V 'header-includes=<script src="/index.js?v='"$$(sha256sum site/index.js | cut -c1-12)"'"></script>' \
+		--template=src/demo/template.html \
+		-i $< \
+		| html-minifier --collapse-whitespace > $@
+
 clean:
-	rm -f site/index.html site/bibliography/index.html site/reference/index.html site/index.css site/src/demo/demo.css
+	rm -f site/index.html site/bibliography/index.html site/reference/index.html site/protocol/index.html site/index.css site/src/demo/demo.css
 
 # Asset URLs carry a content hash so a changed stylesheet can never be served
 # from a stale browser cache. Cloudflare rewrites the origin's `Cache-Control:
