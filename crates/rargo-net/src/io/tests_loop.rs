@@ -80,6 +80,41 @@ fn a_cancelled_fiber_unwinds_outside_every_fiber_so_its_destructors_do_no_ring_i
     });
 }
 
+struct Aborts(Option<JoinHandle<()>>);
+
+impl Drop for Aborts {
+    fn drop(&mut self) {
+        self.0.take().unwrap().abort();
+    }
+}
+
+#[test]
+fn a_cancelled_fiber_whose_destructor_aborts_its_own_task_does_not_stop_the_loop() {
+    drive(1, || {
+        let inner_ended = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = Seen2(inner_ended.clone());
+        let outer = spawn(move || {
+            let _aborts = Aborts(Some(spawn(move || {
+                let _flag = flag;
+                sleep(Duration::from_secs(3600));
+            })));
+            sleep(Duration::from_secs(3600));
+        });
+        yield_now();
+        yield_now();
+        outer.abort();
+        assert!(inner_ended.get(), "the task the destructor aborted is unwound too");
+    });
+}
+
+struct Seen2(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for Seen2 {
+    fn drop(&mut self) {
+        self.0.set(true);
+    }
+}
+
 #[test]
 fn a_datagram_goes_from_one_socket_to_another() {
     drive(1, || {
