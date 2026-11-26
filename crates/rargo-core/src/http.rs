@@ -2,7 +2,7 @@ use rargo_machine::StateMachine;
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use crate::io::http::{self as outbound, Failure};
@@ -271,7 +271,7 @@ impl StateMachine for Phase {
 struct Request {
     method: String,
     path: String,
-    query: HashMap<String, String>,
+    query: BTreeMap<String, String>,
     host: String,
     body: Vec<u8>,
     json: bool,
@@ -366,7 +366,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn form(s: &str) -> HashMap<String, String> {
+fn form(s: &str) -> BTreeMap<String, String> {
     s.split('&').filter(|p| !p.is_empty()).map(|p| {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
         (percent_decode(k), percent_decode(v))
