@@ -59,7 +59,7 @@ fn fixture_with(action_timeout: std::time::Duration) -> Fx {
     std::fs::create_dir_all(&mnt).unwrap();
     let session = Arc::new(
         fusewire::Session::mount_uring(&mnt, &fusewire::MountOptions { fsname: "rargo-test".into(), ..Default::default() })
-            .unwrap(),
+            .expect("engine integration tests require /dev/fuse and an io_uring FUSE mount in the test runner"),
     );
     fs.attach(session.clone());
     let zygote = Zygote::start(&sandbox_helper()).unwrap();
