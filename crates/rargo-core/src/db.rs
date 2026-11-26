@@ -105,6 +105,15 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
+        Db::of(db)
+    }
+
+    #[cfg(test)]
+    fn on(disk: impl redb::StorageBackend) -> Result<Db> {
+        Db::of(redb::Builder::new().create_with_backend(disk)?)
+    }
+
+    fn of(db: Database) -> Result<Db> {
         {
             let tx = db.begin_write()?;
             for t in ALL {
@@ -274,3 +283,6 @@ fn writer_loop(shared: Arc<Shared>) {
         }
     }
 }
+
+#[cfg(test)]
+mod disk_tests;
