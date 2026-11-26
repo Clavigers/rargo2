@@ -778,16 +778,18 @@ mod tests {
     fn detects_write_through_hardlink() {
         let (d, mut s) = store();
         s.reflink = false;
-        let h = s.put_bytes(b"original content").unwrap();
         let dest = d.path().join("linked");
+        // Keep a writable handle while the store moves the inode and makes it
+        // read-only. The materialized hardlink then shares that same inode.
+        let mut f = fs::File::create(&dest).unwrap();
+        f.write_all(b"original content").unwrap();
+        let (h, _) = s.put_file_move(&dest, false).unwrap();
         let placed = s.materialize(&h, false, &dest).unwrap();
         assert_eq!(placed, Placed::Hardlink);
-        // The hardlink shares the read-only blob's permissions.
-        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
-        let mut f = fs::OpenOptions::new().write(true).open(&dest).unwrap();
+        std::io::Seek::rewind(&mut f).unwrap();
         f.write_all(b"CORRUPTED").unwrap();
         drop(f);
-        assert!(s.open_blob(&h).is_err());
+        assert_eq!(s.open_blob(&h).err().unwrap().kind(), io::ErrorKind::InvalidData);
         assert!(!s.has(&h));
     }
 
