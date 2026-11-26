@@ -138,6 +138,7 @@ fn try_remote(world: &Real, install: &Install) -> Result<Vec<(OsString, Vec<u8>)
         LocalReply::Exit(0) => status = Ok(()),
         LocalReply::Exit(code) => status = Err(format!("the remote build exited with status {code}")),
         LocalReply::Unreachable(reason) => status = Err(reason),
+        LocalReply::Refused(text) => status = Err(text.trim_end().trim_start_matches("error: ").to_string()),
         LocalReply::Exec(_) => status = Err("the server returned an unexpected run request".into()),
     })?;
     status?;

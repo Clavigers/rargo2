@@ -24,7 +24,7 @@ Then, inside a cargo project:
 
 `rargo @host` writes the server's name to `~/.config/rargo/config.toml` (under `$XDG_CONFIG_HOME` if you set it), beside the tokens. It is your setting, not the project's: every Rust project on the machine builds there, fresh clones included, and no file in the project changes. `RARGO_SERVER` overrides it for one command.
 
-`rargo auth` prints a short code and opens a page. Check that the page shows the same code, then prove who you are: the page asks for what the server's administrator gave you, an invitation or a sign-in they have allowed. Your terminal receives a token and stores it in `~/.config/rargo/credentials.toml`. That is all the setup there is.
+`rargo auth` prints a short code and opens a page. Check that the page shows the same code, then prove who you are: the page asks for what the server's administrator gave you, an invitation or a sign-in they have allowed. If you have neither, the page and `rargo auth` both say how that server lets people in. Your terminal receives a token and stores it in `~/.config/rargo/credentials.toml`. That is all the setup there is.
 
 The public farm at `rargo.rs` is one machine and admits only people its owner has let in. To ask for access, [open a request on GitHub](https://github.com/sadosystems/rargo/issues/new?title=Request%20access%20to%20the%20Rargo%20Farm) with your GitHub username. You can also use a server of your own: [installing one](#a-server) is one command, it prints an invitation for you, and `rargo @your-server:7459` takes the place of `rargo @rargo.rs`. Everything else on this page is the same.
 
@@ -68,7 +68,7 @@ Each test process is cached by its command line and what it reads. A changed fix
 |---|---|
 | `RARGO_SERVER` | overrides the server `~/.config/rargo/config.toml` names |
 | `RARGO_TOKEN` | a token to use instead of the stored one (for CI) |
-| `RARGO_FALLBACK=cargo` | build with plain cargo when the server cannot be reached |
+| `RARGO_FALLBACK=cargo` | build with plain cargo when rargo cannot build: the server cannot be reached or does not let this machine in, or this machine cannot run rargo |
 | `RARGO_OUTPUT=copy` | copy results into `target/` instead of serving it |
 | `RARGO_TRANSPORT=udp` or `tcp` | force one transport |
 | `RARGO_CACHE_DIR` | where the client keeps its cache (default `~/.cache/rargo`) |
@@ -100,7 +100,7 @@ rargo auth revoke ann            # her next build is refused
 
 The same commands run on the server itself as `rargod token invite|create|list|revoke|allow|disallow --state DIR` (`--state` is `/var/lib/rargo/state` after the installer). That is where the first administrator comes from: the installer's invitation, or `rargod token create --user NAME --admin`. Anyone else may list and revoke their own tokens.
 
-Signing in with GitHub needs a GitHub OAuth application of your own, whose callback is `https://YOUR-NAME/auth/github/callback`, given to the server once with `rargod token github`. Without one, `rargo auth` asks for an invitation.
+Signing in with GitHub needs a GitHub OAuth application of your own, whose callback is `https://YOUR-NAME/auth/github/callback`, given to the server once with `rargod token github`. Without one, `rargo auth` asks for an invitation; with one, it takes either. `rargod token access --state DIR TEXT` sets what the page and `rargo auth` tell someone not let in yet: "To build here, TEXT." Without it they name `rargod token allow` and `rargo auth invite`.
 
 ## A name instead of an address
 
@@ -219,7 +219,7 @@ On your machine, rargo keeps three things: your server in `~/.config/rargo/confi
 
 **"this machine is not authenticated"**, or the server no longer knows its token (it was revoked or has expired). Run `rargo auth`.
 
-**The page asks for an invitation I do not have.** The server you pointed the project at admits only people its administrator has let in. Ask them, or install [a server of your own](#a-server) and point the project at it with `rargo @your-server:7459`.
+**The page will not give me a token.** The server you named admits only people its administrator has let in, and the page and `rargo auth` say how to ask ("To build here, …"). Do that, or install [a server of your own](#a-server) and name it with `rargo @your-server:7459`. Meanwhile `RARGO_FALLBACK=cargo` builds with plain cargo.
 
 **"cannot reach the rargo server".** Check the name with `rargo status`. Then check that the server's port is open for UDP and TCP. `RARGO_TRANSPORT=tcp rargo build` tells you whether only UDP is blocked.
 
