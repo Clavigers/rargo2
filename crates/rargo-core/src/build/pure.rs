@@ -657,7 +657,9 @@ None
 
     #[test]
     fn the_environment_actions_start_from() {
-        let map = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<String, String>>();
+        let map = |kv: &[(&str, &str)]| -> BTreeMap<String, String> {
+            kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
         let server = map(&[
             ("PATH", "/usr/bin"),
             ("HOME", "/home/rargod"),
