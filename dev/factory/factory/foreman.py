@@ -11,6 +11,14 @@ All three are decisions inside one tick. Then, outside the tick, it plans: an
 open initiative with no children gets a planning session (a harness run with
 FOREMAN.md as its prompt) that files sub-issues on GitHub, which the observer
 records as the foreman's. The foreman writes no code.
+
+Every orchestrate_minutes it also orchestrates: a session with ORCHESTRATE.md
+as its prompt looks at the whole factory and decides what the rules above
+cannot: the order of work, duplicates, missing or oversized issues, guidance
+for agents. It runs inside a tick of its own, so what it decides is checked
+and recorded like any other foreman decision, and it keeps notes between
+runs in CHECKOUT/orchestration.md. Both kinds of session run on the config's
+foreman.model.
 """
 from __future__ import annotations
 
@@ -40,11 +48,14 @@ class Foreman:
                  plan_timeout: timedelta = timedelta(minutes=45),
                  replan_after: timedelta = timedelta(hours=24),
                  run: Callable[..., int] | None = None,
-                 say: Callable[[str], None] = print):
+                 say: Callable[[str], None] = print,
+                 orchestrate_prompt: str | None = None, state: Path | None = None):
         self.ledger, self.gh, self.workdir, self.prompt = ledger, gh, Path(workdir), prompt
         self.clock, self.plan_timeout, self.replan_after = clock, plan_timeout, replan_after
         self.run_session = run or self._run_session
         self.say = say
+        self.orchestrate_prompt, self.state = orchestrate_prompt, state
+        self.orchestrated: datetime | None = None  # when the last run began
         self.planned: dict[int, datetime] = {}  # initiative -> when we last tried
         self.told: set[int] = set()  # issues every agent gave up on, owner told
         self.synced: set[int] = set()  # agent closes checked against GitHub
@@ -62,6 +73,7 @@ class Foreman:
         self._stuck()
         self._sync_closed()
         self._plan()
+        self._orchestrate()
 
     def _sync_closed(self) -> None:
         """Close on GitHub, once, what an agent closed in the log (it should
@@ -158,11 +170,34 @@ class Foreman:
                 code = self.run_session(n)
                 self.say(f"foreman: planning #{n} ended with exit {code}")
 
-    def _run_session(self, initiative: int) -> int:
+    def _orchestrate(self) -> None:
+        w = self.ledger.refresh()
+        every = w.config.foreman.orchestrate_minutes
+        now = self.clock()
+        if every is None or self.orchestrate_prompt is None:
+            return
+        if self.orchestrated and now - self.orchestrated < timedelta(minutes=every):
+            return
+        self.orchestrated = now
+        notes = self.workdir / "orchestration.md"
+        prompt = (self.orchestrate_prompt.replace("{notes}", str(notes))
+                  .replace("{state}", str(self.state or self.workdir)))
+        if not self._decide("tick_started", tick=w.tick + 1):
+            return
+        self.say("foreman: orchestrating")
+        try:  # inside a tick: its decisions are the foreman's
+            code = self.run_session("orchestrate", prompt)
+        finally:
+            self._decide("tick_ended", tick=self.ledger.refresh().tick)
+        self.say(f"foreman: orchestrating ended with exit {code}")
+
+    def _run_session(self, initiative: int | str, prompt: str | None = None) -> int:
         w = self.ledger.world
         t = next((a for a in w.config.agents if a.type is m.Harness.claude_code),
                  w.config.agents[0])
-        cmd = harness.command(t, self.prompt.replace("{initiative}", str(initiative)))
+        if w.config.foreman.model is not None:
+            t = t.model_copy(update={"model": w.config.foreman.model})
+        cmd = harness.command(t, prompt or self.prompt.replace("{initiative}", str(initiative)))
         if cmd is None:
             self.say(f"foreman: no {t.type} here to plan with")
             return 127

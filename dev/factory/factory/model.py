@@ -160,6 +160,12 @@ class ForemanRules(Strict):
     # Sessions in a row that end with the holder still holding an issue it
     # did not move; then the foreman takes it back. None: never.
     no_progress_sessions: Annotated[int, Field(ge=1)] | None = None
+    # The model the foreman's own sessions (planning, orchestrating) run on.
+    # None: the first claude-code agent's model.
+    model: Model | None = None
+    # How often the foreman looks at the whole factory and decides what a
+    # queue cannot (ORCHESTRATE.md). None: never.
+    orchestrate_minutes: Annotated[int, Field(ge=1)] | None = None
     # The watchdog ends a session that runs longer than this. None: never.
     session_minutes: Annotated[int, Field(ge=1)] | None = None
 

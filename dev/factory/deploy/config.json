@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "plans": [
     {
       "name": "claude-max",
@@ -17,13 +17,13 @@
   "agents": [
     {
       "type": "claude-code",
-      "count": 1,
+      "count": 3,
       "model": "claude-opus-5-5",
       "plan": "claude-max"
     },
     {
       "type": "codex",
-      "count": 1,
+      "count": 2,
       "model": "gpt-6.2-sol",
       "plan": "chatgpt-pro"
     },
@@ -42,7 +42,9 @@
     "preempt_minutes": 60,
     "affinity_minutes": 120,
     "no_progress_sessions": 3,
-    "session_minutes": 180
+    "session_minutes": 180,
+    "model": "claude-fable-5-2",
+    "orchestrate_minutes": 180
   },
   "release": {
     "freeze_every_days": 7,
@@ -52,6 +54,7 @@
   "guesses": [
     "foreman.affinity_minutes",
     "foreman.no_progress_sessions",
+    "foreman.orchestrate_minutes",
     "foreman.preempt_minutes",
     "foreman.session_minutes",
     "plans.0.hours_per_week",

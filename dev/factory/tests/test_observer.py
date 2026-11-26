@@ -405,3 +405,30 @@ def test_ellipsis_review_of_the_pushed_commit_is_the_verdict():
     assert ellipsis(G([{"user": bot, "commit_id": "aa", "state": "APPROVED"}]), 1, "aa") == (m.ReviewResult.approved, None)
     verdict, note = ellipsis(G([{"user": bot, "commit_id": "aa", "state": "COMMENTED", "html_url": "u"}]), 1, "aa")
     assert verdict is m.ReviewResult.changes and "u" in note
+
+
+def test_the_foreman_orchestrates_inside_a_tick_of_its_own(rig, tmp_path):
+    import copy
+    cfg = copy.deepcopy(CONFIG) | {"version": 2}
+    cfg["foreman"] |= {"orchestrate_minutes": 180, "model": "claude-fable-5-2"}
+    submit(rig, "human", "config_applied", config=cfg)
+    rig.gh.issue(1)
+    rig.gh.issue(2)
+    rig.obs.step()
+    ran = []
+
+    def session(what, prompt=None):  # the session decides, as the foreman
+        ran.append((what, prompt))
+        if len(ran) == 1:
+            submit(rig, "foreman", "depends", issue=2, on=1)
+        return 0
+    fm = Foreman(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=session, say=rig.said.append,
+                 orchestrate_prompt="notes at {notes}, state at {state}", state=tmp_path / "state")
+    fm.tick()
+    assert ran == [("orchestrate", f"notes at {tmp_path / 'orchestration.md'}, state at {tmp_path / 'state'}")]
+    assert 1 in rig.led.world.issues[2].deps and not rig.led.world.is_(M.FOREMAN, "", "ticking")
+    fm.tick()  # not again until orchestrate_minutes have passed
+    assert len(ran) == 1
+    rig.clock.t += timedelta(minutes=181)
+    fm.tick()
+    assert len(ran) == 2

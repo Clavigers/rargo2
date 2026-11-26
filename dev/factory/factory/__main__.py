@@ -132,7 +132,9 @@ def main(argv: list[str]) -> int:
             from .foreman import Foreman
             from .github import GitHub
             Foreman(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
-                    FOREMAN_PROMPT.read_text()).run()
+                    FOREMAN_PROMPT.read_text(),
+                    orchestrate_prompt=(HERE / "ORCHESTRATE.md").read_text(),
+                    state=pathlib.Path(env("FACTORY_LOG")).parent / "state").run()
             return 0
         case ["usage", state, *rest]:
             from . import usage
