@@ -201,7 +201,14 @@ fn a_pipe_holds_its_bytes_in_memory() {
         io::yield_now();
         drop(w);
         assert_eq!(ended.join().unwrap(), b"", "a pipe with no writer left ends");
+        assert_eq!(io::read_at(r_fd, 0, 8).unwrap(), b"", "and a read that starts after the writer closed ends at once");
         drop((r, second));
+
+        let (r, w) = io::pipe().unwrap();
+        io::write_at(w.as_raw_fd(), 0, b"last").unwrap();
+        drop(w);
+        assert_eq!(io::read_at(r.as_raw_fd(), 0, 8).unwrap(), b"last", "what was written before the writer closed is still read");
+        assert_eq!(io::read_at(r.as_raw_fd(), 0, 8).unwrap(), b"", "and then the pipe ends");
     });
 }
 

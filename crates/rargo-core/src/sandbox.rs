@@ -187,8 +187,8 @@ impl Zygote {
         &self,
         plan: Plan,
         stdin: Option<OwnedFd>,
-        stdout: OwnedFd,
-        stderr: OwnedFd,
+        stdout: impl AsRawFd,
+        stderr: impl AsRawFd,
         extra: &[RawFd],
     ) -> Result<Running> {
         self.reading.call_once(|| self.read_exits());
@@ -218,6 +218,26 @@ impl Zygote {
         if let Ok(msg) = bincode::serialize(&ToZygote::Kill { id }) {
             let _ = self.send(&msg, &[]);
         }
+    }
+}
+
+/// What starts the process of an action from its plan and stops it again.
+/// On a kernel that is the zygote; a simulation has no processes and brings its own.
+pub trait Launcher: Send + Sync {
+    /// Starts what `plan` describes with `stdout` and `stderr` as its output and `extra` as further descriptors it inherits.
+    fn launch(&self, plan: Plan, stdout: crate::io::PipeEnd, stderr: crate::io::PipeEnd, extra: &[RawFd]) -> Result<Running>;
+
+    /// Stops the process that `launch` named `id`.
+    fn kill(&self, id: u64);
+}
+
+impl Launcher for Zygote {
+    fn launch(&self, plan: Plan, stdout: crate::io::PipeEnd, stderr: crate::io::PipeEnd, extra: &[RawFd]) -> Result<Running> {
+        self.spawn(plan, None, stdout, stderr, extra)
+    }
+
+    fn kill(&self, id: u64) {
+        Zygote::kill(self, id)
     }
 }
 
@@ -809,6 +829,24 @@ pub fn plan(spec: &SetupSpec, host: &HostLayout) -> io::Result<Plan> {
 impl Plan {
     pub fn cgroup_dir(&self) -> Option<PathBuf> {
         self.cgroup_root.as_ref().map(|root| root.join(format!("action-{}", self.seq)))
+    }
+}
+
+/// What a plan ends in: the program of which action it starts, and how.
+#[cfg(test)]
+pub(crate) struct Exec<'a> {
+    pub(crate) seq: u64,
+    pub(crate) cwd: &'a [u8],
+    pub(crate) argv: &'a [Vec<u8>],
+    pub(crate) env: &'a [(Vec<u8>, Vec<u8>)],
+    pub(crate) candidates: &'a [Vec<u8>],
+}
+
+#[cfg(test)]
+impl Plan {
+    pub(crate) fn exec(&self) -> Exec<'_> {
+        let Some(Op::Exec { argv, env, candidates }) = self.ops.last() else { panic!("a plan ends in its exec") };
+        Exec { seq: self.seq, cwd: &self.cwd, argv, env, candidates }
     }
 }
 

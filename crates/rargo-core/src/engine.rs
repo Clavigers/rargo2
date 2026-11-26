@@ -1,6 +1,6 @@
 use crate::action_table::{ActionTable, Failure, Ran, ReqId, Start, Woken};
 use crate::hash::{Hash, KeyHasher};
-use crate::sandbox::{HostLayout, Place, SetupSpec, Zygote};
+use crate::sandbox::{HostLayout, Launcher, Place, SetupSpec};
 use crate::sandboxfs::{ActionFs, ActionFsConfig, SandboxFs, UpperKind};
 use crate::sched::{Priority, Scheduler};
 use crate::store::Store;
@@ -11,7 +11,7 @@ use crate::io;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -175,7 +175,7 @@ pub struct Engine {
     pub content: Arc<Content>,
     pub fs: Arc<SandboxFs>,
     pub mnt: PathBuf,
-    pub zygote: Arc<Zygote>,
+    pub zygote: Arc<dyn Launcher>,
     pub traces: TraceCache,
     pub sched: Arc<Scheduler>,
     actions: Mutex<ActionTable>,
@@ -221,7 +221,7 @@ impl Drop for Requester<'_> {
 struct Teardown {
     fs: Arc<SandboxFs>,
     sched: Arc<Scheduler>,
-    zygote: Arc<Zygote>,
+    zygote: Arc<dyn Launcher>,
     action: Arc<ActionFs>,
     scratch: PathBuf,
     running: Option<crate::sandbox::Running>,
@@ -289,7 +289,7 @@ fn default_mem_kb(kind: ActionKind) -> u64 {
     }
 }
 
-fn read_pipe(fd: &OwnedFd) -> std::io::Result<Vec<u8>> {
+fn read_pipe(fd: &io::PipeEnd) -> std::io::Result<Vec<u8>> {
     io::read_at(fd.as_raw_fd(), 0, 64 * 1024)
 }
 
@@ -298,7 +298,7 @@ struct ObsPtr(*const dyn Observer);
 
 unsafe impl Send for ObsPtr {}
 
-fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
+fn read_stdout(fd: io::PipeEnd, obs: ObsPtr) -> Vec<u8> {
     let mut all = Vec::new();
     loop {
         let buf = match read_pipe(&fd) {
@@ -311,7 +311,7 @@ fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
     all
 }
 
-fn read_stderr(fd: OwnedFd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
+fn read_stderr(fd: io::PipeEnd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
     let mut all = Vec::new();
     let mut at = 0usize;
     loop {
@@ -343,7 +343,7 @@ impl Engine {
         content: Arc<Content>,
         fs: Arc<SandboxFs>,
         mnt: PathBuf,
-        zygote: Arc<Zygote>,
+        zygote: Arc<dyn Launcher>,
         sched: Arc<Scheduler>,
     ) -> Engine {
         let seed = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
@@ -814,7 +814,6 @@ impl Engine {
         let content = self.content.clone();
         let upper = fin.upper;
         let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
-            use rayon::prelude::*;
             let mut scratch: Vec<(PathBuf, bool)> = upper
                 .iter()
                 .filter_map(|u| match &u.kind {
@@ -824,18 +823,16 @@ impl Engine {
                 .collect();
             scratch.sort();
             scratch.dedup_by(|a, b| a.0 == b.0);
-            let stored: HashMap<PathBuf, (Hash, u64)> = scratch
-                .into_par_iter()
-                .map(|(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
+            let stored: Result<HashMap<PathBuf, (Hash, u64)>> =
+                io::thread::par_map(scratch, |(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
                     let r = store
                         .put_file_move(&path, exec)
                         .with_context(|| format!("storing output file {}", path.display()))?;
                     Ok((path, r))
-                })
-                .collect::<Result<_>>()?;
-            let entries: Vec<(Vec<u8>, MEntry)> = upper
-                .into_par_iter()
-                .map(|u| -> Result<(Vec<u8>, MEntry)> {
+                });
+            let stored = stored?;
+            let entries: Result<Vec<(Vec<u8>, MEntry)>> =
+                io::thread::par_map(upper, |u| -> Result<(Vec<u8>, MEntry)> {
                     let e = match u.kind {
                         UpperKind::Dir => MEntry::Dir,
                         UpperKind::Whiteout => MEntry::Whiteout,
@@ -854,8 +851,8 @@ impl Engine {
                         }
                     };
                     Ok((u.path, e))
-                })
-                .collect::<Result<_>>()?;
+                });
+            let entries = entries?;
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
@@ -895,8 +892,8 @@ impl Engine {
         for d in &spec.mkdirs {
             action.mkdir_p(d).map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
         }
-        let (out_r, out_w) = io::sys::pipe()?;
-        let (err_r, err_w) = io::sys::pipe()?;
+        let (out_r, out_w) = io::pipe()?;
+        let (err_r, err_w) = io::pipe()?;
         let setup = SetupSpec { argv: spec.argv.clone(), env: spec.env.clone(), cwd: spec.cwd.clone(), net: spec.net };
         let host = HostLayout {
             place: self.place,
@@ -913,7 +910,7 @@ impl Engine {
         *group_slot = plan.cgroup_dir().map(crate::cgroup::ActionGroup::open);
         let group = group_slot.as_ref();
         assert!(slot.is_none(), "one process per action");
-        let running = slot.insert(self.zygote.spawn(plan, None, out_w, err_w, &self.sched.jobserver_fds())?);
+        let running = slot.insert(self.zygote.launch(plan, out_w, err_w, &self.sched.jobserver_fds())?);
         let id = running.id;
         let exit = running.done.take().expect("the exit is waited once");
         let obs = ObsPtr(unsafe {

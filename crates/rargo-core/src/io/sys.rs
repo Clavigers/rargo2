@@ -17,12 +17,3 @@ pub fn xattr(path: &Path, name: &CStr, buf: &mut [u8]) -> io::Result<usize> {
     let n = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
     if n < 0 { Err(io::Error::last_os_error()) } else { Ok(n as usize) }
 }
-
-/// A new kernel pipe for handing to a child process, as its read end and its write end, both closed on exec.
-pub fn pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (<std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fds[0]), <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fds[1])) })
-}

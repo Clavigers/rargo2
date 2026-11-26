@@ -8,6 +8,8 @@ pub mod db;
 pub mod db_writer;
 pub mod drift;
 pub mod engine;
+#[cfg(test)]
+mod engine_tests;
 pub mod expand;
 pub mod flake;
 pub mod fn_code;

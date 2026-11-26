@@ -498,10 +498,15 @@ impl SimLoop {
         }
     }
 
+    /// Whether a writing end of a pipe is still open.
+    fn pipe_has_writer(&self, id: u64) -> bool {
+        self.handles.values().any(|h| matches!(h, Handle::Pipe { id: held, writes: true } if *held == id))
+    }
+
     /// Forgets a closed end of a pipe: a read parked on a pipe with no writer left sees its end, and a pipe with no end left is freed.
     fn pipe_closed(&mut self, id: u64) {
         let open = |sim: &SimLoop, writing: bool| sim.handles.values().any(|h| matches!(h, Handle::Pipe { id: held, writes } if *held == id && *writes == writing));
-        let (writers, readers) = (open(self, true), open(self, false));
+        let (writers, readers) = (self.pipe_has_writer(id), open(self, false));
         if !writers {
             if let Some((token, _)) = self.pipes.get_mut(&id).and_then(|pipe| pipe.waiter.take()) {
                 self.done(token, Event::Read { n: 0, buf: Vec::new() });
@@ -691,6 +696,7 @@ impl SimLoop {
                 }
                 match self.pipe_take(id, len) {
                     Some(buf) => Event::Read { n: buf.len(), buf },
+                    None if !self.pipe_has_writer(id) => Event::Read { n: 0, buf: Vec::new() },
                     None => {
                         let pipe = self.pipes.get_mut(&id).expect("an open end keeps its pipe");
                         if pipe.waiter.is_some() {
