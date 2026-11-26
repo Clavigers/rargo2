@@ -1,6 +1,6 @@
 use rargo::known_digests::{KnownDigests, MOST};
 use rargo_proto::Digest;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -25,7 +25,7 @@ impl HeldFile {
     }
 }
 
-pub type Chunks = HashMap<Digest, (Digest, u64, u32)>;
+pub type Chunks = BTreeMap<Digest, (Digest, u64, u32)>;
 
 pub fn chunks_path(cache: &Path) -> PathBuf {
     cache.join("chunks")
@@ -56,6 +56,10 @@ pub fn load_chunks(cache: &Path) -> Chunks {
 }
 
 pub fn save_chunks(cache: &Path, chunks: &Chunks) -> io::Result<()> {
+    crate::write_atomic(&chunks_path(cache), &encode_chunks(chunks))
+}
+
+fn encode_chunks(chunks: &Chunks) -> Vec<u8> {
     let mut b = Vec::with_capacity(CHUNKS_MAGIC.len() + 76 * chunks.len());
     b.extend_from_slice(CHUNKS_MAGIC);
     for (chunk, (blob, off, len)) in chunks {
@@ -65,7 +69,7 @@ pub fn save_chunks(cache: &Path, chunks: &Chunks) -> io::Result<()> {
         b.extend_from_slice(&len.to_le_bytes());
     }
     assert_eq!(b.len(), CHUNKS_MAGIC.len() + 76 * chunks.len());
-    crate::write_atomic(&chunks_path(cache), &b)
+    b
 }
 
 pub const MOST_CHUNKS: usize = MOST;
@@ -97,6 +101,8 @@ mod tests {
         chunks.insert(c, (b, 0, 4096));
         save_chunks(tmp.path(), &chunks).unwrap();
         assert_eq!(load_chunks(tmp.path()), chunks);
+        let reversed: Chunks = [(c, (b, 0, 4096)), (a, (b, 4096, 512))].into_iter().collect();
+        assert_eq!(encode_chunks(&reversed), encode_chunks(&chunks), "the same chunks encode to the same bytes");
         std::fs::write(chunks_path(tmp.path()), b"something else").unwrap();
         assert!(load_chunks(tmp.path()).is_empty());
     }

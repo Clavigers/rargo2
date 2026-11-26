@@ -90,7 +90,6 @@ hash-order	crates/rargo-net/src/lib.rs	2	HashMap or HashSet with the default ran
 hash-order	crates/rargo-proto/src/lib.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo/src/known.rs	1	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 pure-tests	crates/fusewire/Cargo.toml	1	tempfile is a dev-dependency because tests still use real directories
 pure-tests	crates/fusewire/src/lib.rs	5	tests still touch the world instead of memory: shared state (5)
