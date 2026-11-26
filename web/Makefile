@@ -2,7 +2,8 @@
 # esbuild, html-minifier — all provided by `nix develop`). Built artifacts in
 # site/ are committed; deploy.sh serves them as-is, so run `make` and commit
 # before pushing.
-VERSION=$(shell jq -r .version package.json)
+# Pages name the released version as %RARGO_VERSION%, which app.py fills
+# in from the release's dl/VERSION when it serves them.
 DATE=$(shell date +%F)
 
 all: site/index.html site/bibliography/index.html site/reference/index.html site/index.css site/src/demo/demo.css
@@ -20,7 +21,7 @@ site/reference/index.html: src/reference/index.md Makefile src/demo/template.htm
 		-V 'header-includes=<script src="/index.js?v='"$$(sha256sum site/index.js | cut -c1-12)"'"></script>' \
 		--template=src/demo/template.html \
 		-i $< \
-		| html-minifier --collapse-whitespace > $@
+		| html-minifier --collapse-whitespace --remove-comments > $@
 
 clean:
 	rm -f site/index.html site/bibliography/index.html site/reference/index.html site/index.css site/src/demo/demo.css
@@ -40,9 +41,9 @@ site/index.html: src/index.md Makefile src/demo/template.html site/index.css sit
 		-M document-css=false \
 		-V 'header-includes=<script src="/index.js?v='"$$(sha256sum site/index.js | cut -c1-12)"'"></script>' \
 		--template=src/demo/template.html \
-		-Vversion=v$(VERSION) -Vdate=$(DATE) \
+		-Vversion='rargo %RARGO_VERSION%' -Vdate=$(DATE) \
 		-i $< \
-		| html-minifier --collapse-whitespace > $@
+		| html-minifier --collapse-whitespace --remove-comments > $@
 
 site/bibliography/index.html: src/bibliography/index.md Makefile src/demo/template.html site/index.css
 	@mkdir -p site/bibliography
@@ -52,7 +53,7 @@ site/bibliography/index.html: src/bibliography/index.md Makefile src/demo/templa
 		-M document-css=false \
 		--template=src/demo/template.html \
 		-i $< \
-		| html-minifier --collapse-whitespace > $@
+		| html-minifier --collapse-whitespace --remove-comments > $@
 
 site/index.css: src/index.css $(wildcard src/*.css)
 	echo "/* By Oskar Wickström\nLicensed under the MIT License (https://github.com/owickstrom/the-proportional-web/blob/main/LICENSE.md)\n*/" > $@

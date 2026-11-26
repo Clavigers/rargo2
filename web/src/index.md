@@ -19,7 +19,11 @@ It's a worn out trope, but Rargo fixes the "works on my ma&shy;chine" problem. R
 
 # Getting Started
 
-The  <code>rargo CLI</code> is the official Rargo client. All <code>cargo</code> commands work with <code>rargo</code>.
+The  <code>rargo CLI</code> is the official Rargo client. All <code>cargo</code> commands work with <code>rargo</code>. It runs on Linux on x86_64, where the kernel lets it use io_uring (in Docker, start the container with `--security-opt seccomp=unconfined`). This downloads it, and needs only `curl`:
+
+<cmd>curl -fsSL https://rargo.rs/install.sh | sh</cmd>
+
+Or build it with cargo, which needs [Rust](https://rustup.rs) and a C linker (`build-essential` on Ubuntu or Debian):
 
 <cmd>cargo install rargo</cmd>
 
@@ -64,6 +68,8 @@ What the Farm builds links against the Farm's own C library, from the Nix store.
 </aside>
 
 
+<!-- Sections still to be written, left off the page until they are:
+
 # Getting Just a Bit More Started
 TODO: add more of a guide
 
@@ -82,7 +88,7 @@ example of the code block formatting.
 
 # Rargo vs Other Solutions
 TODO: Write the comparison
-<!-- "Why not use X?" if X is in the biblio&shy;graphy I tried it and I walked away still wanting some&shy;thing else. There are many suitable so&shy;lutions to this problem Rargo is the one that works best for Rust work&shy;spaces. -->
+"Why not use X?" if X is in the biblio&shy;graphy I tried it and I walked away still wanting some&shy;thing else. There are many suitable so&shy;lutions to this problem Rargo is the one that works best for Rust work&shy;spaces.
 
 # Tough Topics
 TODO: Write about sharp corners / hermeticity stuff
@@ -92,6 +98,7 @@ TODO: Write about ways to prevent non determinism
 
 # SolidGoldFerris
 TODO: Write about ways to detect and fix non determinism
+-->
 
 # Afterword {.unnumbered}
 <!-- ## Thank You Reader {.unnumbered}

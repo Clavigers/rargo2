@@ -2,6 +2,7 @@ import hashlib
 import os
 
 from flask import Flask, redirect, request, send_from_directory
+from werkzeug.security import safe_join
 
 SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "site")
 
@@ -34,9 +35,33 @@ def cache_policy(response):
     return response
 
 
+RELEASED = "%RARGO_VERSION%"
+
+
+def released_version():
+    """The version the release put on the /data volume, the one install.sh
+    and `cargo install rargo` give; "unreleased" before the first release."""
+    try:
+        with open(os.path.join(DL_DIR, "VERSION")) as f:
+            return f.read().strip() or "unreleased"
+    except OSError:
+        return "unreleased"
+
+
+def page(rel_path):
+    """A built page with the released version filled in, so no page names a
+    version other than the one people install."""
+    path = safe_join(SITE_DIR, rel_path)
+    if path is None or not os.path.isfile(path):
+        return "not found\n", 404, {"Content-Type": "text/plain"}
+    with open(path, encoding="utf-8") as f:
+        html = f.read()
+    return html.replace(RELEASED, released_version()), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.get("/")
 def home():
-    return send_from_directory(SITE_DIR, "index.html")
+    return page("index.html")
 
 
 # The Book is the main page; keep the nav link but send it home.
@@ -47,7 +72,7 @@ def book():
 
 @app.get("/reference")
 def reference():
-    return send_from_directory(SITE_DIR, "reference/index.html")
+    return page("reference/index.html")
 
 
 @app.get("/bibliography")
@@ -155,4 +180,6 @@ def protocol():
 # Static assets last: concrete routes above win over the path converter.
 @app.get("/<path:name>")
 def asset(name):
+    if name.endswith(".html"):
+        return page(name)
     return send_from_directory(SITE_DIR, name)

@@ -1,17 +1,17 @@
 ---
 title: Reference
-subtitle: "rargo 0.7.6: installing the client, installing a server, and what happens in between"
+subtitle: "rargo %RARGO_VERSION%: installing the client, installing a server, and what happens in between"
 lang: en
 toc-title: Contents
 ---
 
 # The Client
 
-Linux on x86_64, where the kernel lets rargo use io_uring. Docker's default seccomp profile does not: start a container with `--security-opt seccomp=unconfined`. Either of these puts one `rargo` binary on your machine; the first builds it, the second downloads it.
+Linux on x86_64, where the kernel lets rargo use io_uring. Docker's default seccomp profile does not: start a container with `--security-opt seccomp=unconfined`. Either of these puts one `rargo` binary on your machine. The first downloads it and needs only `curl`; the second builds it and needs [Rust](https://rustup.rs) and a C linker (`build-essential` on Ubuntu or Debian).
 
 <cmd-list>
-<cmd>cargo install rargo</cmd>
 <cmd>curl -fsSL https://rargo.rs/install.sh | sh</cmd>
+<cmd>cargo install rargo</cmd>
 </cmd-list>
 
 Then, inside a cargo project:
