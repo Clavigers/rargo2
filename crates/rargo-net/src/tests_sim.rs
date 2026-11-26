@@ -96,6 +96,12 @@ fn files_live_in_memory() {
         assert_eq!(names, ["link", "sub"]);
         file::set_mode(dir.join("store/sub/x"), 0o755).unwrap();
         assert!(file::metadata(dir.join("store/sub/x")).unwrap().is_executable());
+        let mut log = file::OpenOptions::new().append(true).create(true).open(dir.join("store/log")).unwrap();
+        std::io::Write::write_all(&mut log, b"one ").unwrap();
+        let mut again = file::OpenOptions::new().append(true).open(dir.join("store/log")).unwrap();
+        std::io::Write::write_all(&mut again, b"two").unwrap();
+        assert_eq!(file::read(dir.join("store/log")).unwrap(), b"one two", "an appending write lands at the end");
+        assert_eq!(file::metadata(dir.join("store/log")).unwrap().mode() & 0o777, 0o644, "a new file gets the usual umask");
         file::remove_dir_all(dir.join("store")).unwrap();
         assert!(!file::exists(dir.join("store")));
     });

@@ -151,6 +151,8 @@ pub struct SimLoop {
     net: Net,
     /// Whether an operation that needs no waiting is answered where it is asked, without the fiber giving way.
     in_place: bool,
+    /// The descriptors opened for appending: each write through one lands at the end of its file.
+    appending: std::collections::BTreeSet<i32>,
     now_ms: u64,
     base: Instant,
     next_token: u64,
@@ -209,6 +211,7 @@ impl SimLoop {
         SimLoop {
             rng: Rng(seed),
             in_place: false,
+            appending: std::collections::BTreeSet::new(),
             net,
             now_ms: 0,
             base: Instant::now(),
@@ -456,7 +459,7 @@ impl SimLoop {
                 let ino = self.next_ino;
                 self.next_ino += 1;
                 let now = self.stamp();
-                self.inodes.insert(ino, Inode { data: Vec::new(), mode: mode & 0o7777, mtime_ns: now, links: 1 });
+                self.inodes.insert(ino, Inode { data: Vec::new(), mode: mode & 0o7777 & !0o022, mtime_ns: now, links: 1 });
                 self.files.insert(path.clone(), Node::File(ino));
                 Ok(self.fd(Handle::File { ino, path }))
             }
@@ -686,7 +689,13 @@ impl SimLoop {
                 }
                 Event::Closed
             }
-            Op::OpenAt { dir, path, flags, mode } => Event::Open { fd: self.open(dir, &path, flags, mode)? },
+            Op::OpenAt { dir, path, flags, mode } => {
+                let fd = self.open(dir, &path, flags, mode)?;
+                if flags & libc::O_APPEND != 0 {
+                    self.appending.insert(fd);
+                }
+                Event::Open { fd }
+            }
             Op::Read { fd, len, .. } if self.pipe_end(fd).is_some() => {
                 let (id, writes) = self.pipe_end(fd).expect("checked above");
                 if writes {
@@ -721,12 +730,14 @@ impl SimLoop {
             }
             Op::Write { fd, off, buf } => {
                 let now = self.stamp();
+                let appending = self.appending.contains(&fd);
                 let inode = self.file(fd)?;
-                let end = off as usize + buf.len();
+                let off = if appending { inode.data.len() } else { off as usize };
+                let end = off + buf.len();
                 if inode.data.len() < end {
                     inode.data.resize(end, 0);
                 }
-                inode.data[off as usize..end].copy_from_slice(&buf);
+                inode.data[off..end].copy_from_slice(&buf);
                 inode.mtime_ns = now;
                 Event::Write { n: buf.len() }
             }
