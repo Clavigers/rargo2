@@ -390,7 +390,9 @@ pub(super) fn call_home<R: Send + 'static>(owner: Arc<Poke>, body: impl FnOnce()
 }
 
 pub(super) fn post(job: impl FnOnce() + Send + 'static) {
-    let poke = poke_global().lock().unwrap_or_else(|e| e.into_inner()).clone().expect("the event loop is running");
+    let poke = home()
+        .or_else(|| poke_global().lock().unwrap_or_else(|e| e.into_inner()).clone())
+        .expect("the event loop is running");
     post_to(&poke, job);
 }
 
