@@ -9,6 +9,7 @@ out=${TSC_OUT:-$work/test-select}
 R=$RARGO_BIN/rargo
 
 server_up() {
+    export RARGOD_ARGS="--store-budget-gb ${TSC_STORE_GB:-40}"
     bench_up "${TSC_JOBS:-16}" 0 0 0 >/dev/null || exit 2
     . "$T/client.env"
     export RARGO_CACHE_DIR=$T/client-cache
