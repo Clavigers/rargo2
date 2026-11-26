@@ -59,12 +59,18 @@ class Foreman:
         self.say = say
         self.orchestrate_prompt, self.state = orchestrate_prompt, state
         self.orchestrated: datetime | None = None  # when the last run began
+        notes = self.workdir / "orchestration.md"
+        if notes.exists():  # a restarted foreman does not orchestrate again at once
+            self.orchestrated = datetime.fromtimestamp(notes.stat().st_mtime, self.clock().tzinfo)
         self.planned: dict[int, datetime] = {}  # initiative -> when we last tried
         self.told: set[int] = set()  # issues every agent gave up on, owner told
         self.synced: set[int] = set()  # agent closes checked against GitHub
 
     def tick(self) -> None:
         w = self.ledger.refresh()
+        if w.is_(M.FOREMAN, "", "ticking"):  # a foreman stopped mid-tick left it open
+            self._decide("tick_ended", tick=w.tick)
+            w = self.ledger.refresh()
         n = w.tick + 1
         self._decide("tick_started", tick=n)
         try:
