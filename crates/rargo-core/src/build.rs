@@ -1389,7 +1389,7 @@ impl UnitObserver {
 }
 
 struct TestObserver {
-    out: Arc<Client>,
+    out: Output,
     explain: bool,
     label: String,
 }
@@ -1399,15 +1399,15 @@ impl Observer for TestObserver {
         self.explain
     }
     fn explain(&self, why: &str) {
-        self.out.out.note(&format!("{} runs because {why}", self.label));
+        self.out.note(&format!("{} runs because {why}", self.label));
     }
     fn stdout(&self, data: &[u8]) {
-        self.out.out.raw_out(self.out.out.tr.text(&String::from_utf8_lossy(data)).as_bytes());
+        self.out.raw_out(data);
     }
     fn stderr_line(&self, line: &[u8], _live: Option<&dyn Live>) {
-        let mut l = self.out.out.tr.text(&String::from_utf8_lossy(line));
-        l.push('\n');
-        self.out.out.raw_err(l.as_bytes());
+        let mut data = line.to_vec();
+        data.push(b'\n');
+        self.out.raw_err(&data);
     }
 }
 
@@ -2762,7 +2762,7 @@ impl Run {
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
                             observer: Arc::new(TestObserver {
-                                out: self.c.clone(),
+                                out: out.derive(out.quiet, out.verbose, out.tr.clone()),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
@@ -2946,6 +2946,33 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_observer_preserves_sandbox_paths_in_output() {
+        use rargo_proto::ServerMsg;
+
+        crate::io::sim::test(|| {
+            let (tx, mut rx) = crate::io::unbounded_channel();
+            let tr = Translator::new(vec![
+                ("/w".into(), "/home/me/project".into()),
+                ("/c".into(), "/home/me/.cargo".into()),
+            ]);
+            let observer = TestObserver {
+                out: Output::new(tx, false, false).derive(false, false, tr),
+                explain: false,
+                label: String::new(),
+            };
+            let output = b"fixture paths: /w/target/debug/app and /c/blobs";
+            observer.stdout(output);
+            observer.stderr_line(output, None);
+            drop(observer);
+            assert!(matches!(rx.recv().unwrap(), ServerMsg::Stdout(data) if data == output));
+            assert!(matches!(
+                rx.recv().unwrap(),
+                ServerMsg::Stderr(data) if data == [output.as_slice(), b"\n"].concat()
+            ));
+        });
+    }
+
     #[test]
     fn a_build_script_that_failed_for_want_of_a_system_library_is_told_where_libraries_come_from() {
         let udev = "  thread 'main' panicked at libudev-sys-0.1.4/build.rs:38:41:\n  pkg-config exited with status code 1\n  > PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs --cflags libudev\n\n  The system library `libudev` required by crate `libudev-sys` was not found.\n  Package libudev was not found in the pkg-config search path.\n  Perhaps you should add the directory containing `libudev.pc'\n";
