@@ -258,7 +258,7 @@ fn ask(
     let base = with_nextest(d, p, nextest);
     let view: Arc<dyn View> = Arc::new(BuildView {
         base,
-        layer: Arc::new(OutputsLayer::new()),
+        layer: Arc::new(OutputsLayer::frozen(OutputState::default())),
         levels: Arc::new(Vec::new()),
         untraced: Vec::new(),
         seed: Some(answer_layer(d, answers, &HashMap::new())?),
@@ -304,7 +304,7 @@ impl Rounds {
         let base = with_nextest(d, p, nextest);
         let (layer, levels) = match built {
             Some(b) => (b.layer.clone(), Arc::new(vec![LEVEL_FULL; b.units])),
-            None => (Arc::new(OutputsLayer::new()), Arc::new(Vec::new())),
+            None => (Arc::new(OutputsLayer::frozen(OutputState::default())), Arc::new(Vec::new())),
         };
         let mut env = match built {
             Some(b) => action_env(&b.env, b.cargo_override.as_deref(), c),
@@ -622,9 +622,9 @@ fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Re
         file(&format!("{what}.err"), &a.err, false)?;
         file(&format!("{what}.code"), format!("{}\n", a.code).as_bytes(), false)?;
     }
-    let layer = OutputsLayer::new();
+    let mut layer = OutputState::default();
     layer.add(0, LEVEL_FULL, &entries);
-    Ok(Arc::new(layer))
+    Ok(Arc::new(OutputsLayer::frozen(layer)))
 }
 
 fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -> Result<Answer> {

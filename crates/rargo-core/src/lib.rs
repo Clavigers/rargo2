@@ -2,6 +2,8 @@ pub mod action_table;
 pub mod ar;
 pub mod build;
 pub mod buildview;
+#[path = "io/buildview.rs"]
+mod buildview_io;
 pub mod chunk;
 pub mod conn_state;
 pub mod db;
