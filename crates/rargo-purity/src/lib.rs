@@ -230,6 +230,10 @@ fn under(full: &str, prefix: &str) -> bool {
 }
 
 fn normalize(full: String) -> String {
+    // core::net contains address values and parsers, but no socket I/O.
+    if under(&full, "core::net") {
+        return full;
+    }
     for root in ["core::", "alloc::"] {
         if let Some(rest) = full.strip_prefix(root) {
             return format!("std::{rest}");
