@@ -20,6 +20,7 @@
                             SLUG (org/name). OWNER is the human's login: their
                             acts on GitHub are the human's. Issues from OWNER
                             and the LOGINs given are the factory's
+  pm SLUG CHECKOUT           run the project manager; it cuts release branches in the clone CHECKOUT
   dictator SLUG CHECKOUT     run the dictator; it plans in the clone CHECKOUT
   doc                       rewrite the generated half of DATA-MODEL.md
   schema                    JSON Schema of an event body
@@ -140,6 +141,14 @@ def main(argv: list[str]) -> int:
                     orchestrate_prompt=(HERE / "ORCHESTRATE.md").read_text(),
                     answer_prompt=(HERE / "ANSWER.md").read_text(),
                     state=pathlib.Path(env("FACTORY_LOG")).parent / "state").run()
+            return 0
+        case ["pm", slug, checkout]:
+            import shlex
+            from .github import GitHub
+            from .pm import Pm
+            cmd = os.environ.get("FACTORY_RELEASE")  # run with the version; unset: publish nothing
+            Pm(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
+               publish=shlex.split(cmd) if cmd else None).run()
             return 0
         case ["usage", state, *rest]:
             from . import usage
