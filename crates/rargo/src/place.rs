@@ -4,7 +4,7 @@ use rargo_net::io::file::PathRing as _;
 use crate::scan::hash_file;
 use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -640,14 +640,14 @@ pub struct Placer {
     pub placed: Placed,
     pub changed: bool,
     waiting: Waiting,
-    parts: HashMap<Digest, Part>,
+    parts: BTreeMap<Digest, Part>,
     pub fetched_bytes: u64,
     pub reused_files: u64,
 }
 
 impl Drop for Placer {
     fn drop(&mut self) {
-        for (_, part) in self.parts.drain() {
+        for (_, part) in std::mem::take(&mut self.parts) {
             let _ = rargo_net::io::file::remove_file(&part.tmp);
         }
     }
@@ -661,7 +661,7 @@ impl Placer {
             placed,
             changed: false,
             waiting: Waiting::default(),
-            parts: HashMap::new(),
+            parts: BTreeMap::new(),
             fetched_bytes: 0,
             reused_files: 0,
         }
