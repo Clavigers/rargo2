@@ -1,6 +1,6 @@
 ---
 title: Reference
-subtitle: "rargo 0.7.6: installing the client, installing a server, and what happens in between"
+subtitle: "rargo {{RARGO_VERSION}}: installing the client, installing a server, and what happens in between"
 lang: en
 toc-title: Contents
 ---
