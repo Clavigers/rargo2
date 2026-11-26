@@ -504,14 +504,6 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     };
     let base = parts.build(d.memo.clone(), generation, false);
     let plan_base: Arc<dyn View> = Arc::new(Hosted::new(parts.build(d.memo.clone(), generation, true)));
-    let tr = Translator::new(vec![
-        (String::from_utf8_lossy(WORKTREE_AT).into_owned(), c.root.clone()),
-        (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), c.cargo_home.clone()),
-    ]);
-    let sandbox_cwd = tr.to_canonical(&c.cwd);
-    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
-        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
-    }
     let client_env = c.env.to_map();
     let mut env = base_env(&d.cfg.server_env, &client_env);
     for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
@@ -525,6 +517,11 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
+    }
+    let tr = build_paths(&c.root, &c.cargo_home, &mut env);
+    let sandbox_cwd = tr.to_canonical(&c.cwd);
+    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
+        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
     }
     let channel = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd)?.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
     Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, channel })
