@@ -98,7 +98,9 @@ def snapshot(w: World, lines: list[dict]) -> dict:
                               done=sum(not w.open_(c) for c in i.children)))
     inits.sort(key=lambda d: (d["state"] != "open", -d["n"]))
     models = {str(t.type): (t.model, t.plan) for t in w.config.agents} if w.config else {}
+    ready = bool(w.ready_queue()) if w.config else False
     for d in agents:
+        d["wake"] = wake(w, d["name"], ready)
         d["model"], d["plan"] = models.get(d["type"], ("", ""))
         d["pushes"] = sum(1 for l in lines if l["event"] == "push" and l["actor"] == d["name"])
         d["gave_up"] = sum(1 for l in lines if l["event"] == "returned" and l["actor"] == d["name"]
@@ -172,3 +174,24 @@ def release(lines: list[dict]) -> dict:
                 candidate=frozen[-1]["version"] if frozen and (not pub or frozen[-1]["version"] != pub[-1]["version"]) else None,
                 pm_running=any(l["actor"] == "pm" for l in lines),
                 pu_running=any(l["actor"] == "power_user" for l in lines))
+
+
+QUOTA_RETRY = 30  # minutes: the watchdog's quota_retry
+WATCHDOG_EVERY = 0.5  # minutes between watchdog steps
+
+
+def wake(w: World, a: str, ready: bool) -> dict | None:
+    """When an agent that is not working will next start: what the watchdog
+    will do, and when. at: a time; None when it waits on an event."""
+    st = w.state(M.AGENT, a) or "off"
+    holds = a in w.holding
+    if w.is_(M.QUOTA, a, "out"):
+        at = w.since(M.QUOTA, a) + timedelta(minutes=QUOTA_RETRY)
+        return dict(why="out of quota: the watchdog tries a session again", at=iso(at))
+    if st == "working":
+        return None
+    if st == "idle":
+        return dict(why="session running; it takes the queue's head itself", at=None)
+    if holds or ready:
+        return dict(why="the watchdog starts a session within 30 s", at=iso(w.t + timedelta(minutes=WATCHDOG_EVERY)) if w.t else None)
+    return dict(why="asleep until an issue is ready", at=None)

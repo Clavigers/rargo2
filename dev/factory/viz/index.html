@@ -71,7 +71,12 @@ body { font-variant-numeric: tabular-nums; }
 .pill { min-width: 13ch; justify-content: center; }
 #clock { min-width: 17ch; }
 #foreman, #pm, #poweruser { height: 118px; overflow: hidden; }
-.agent { height: 92px; overflow: hidden; }
+.agent { min-height: 92px; overflow: hidden; }
+.quota { display: grid; grid-template-columns: 1fr 38px; gap: 1px 6px; margin-top: 5px; font: 10.5px var(--mono); color: var(--dim); }
+.quota .bar { height: 4px; margin-top: 5px; }
+.quota .q { display: flex; justify-content: space-between; gap: 6px; white-space: nowrap; overflow: hidden; }
+.wake { font: 11px var(--mono); color: var(--dim); margin-top: 4px; }
+.wake b { color: var(--text); font-weight: 600; }
 .agent .now { white-space: nowrap; overflow: hidden; }
 .col { height: 252px; overflow: hidden; display: flex; flex-direction: column; }
 .col .chips { flex: 1; overflow: hidden; }
@@ -444,6 +449,7 @@ function render() {
       <div class="ah"><span class="lamp ${st === 'idle' || st === 'out' ? 'blink' : ''}" style="${blink()}"></span>${ic('agent')}<b>${esc(a.name)}</b><span class="cost">${esc(a.model)}</span></div>
       <div class="now">${slot}${now0}</div>
       <div class="meta"><span>${a.pushes} pushes · ${a.closed} closed</span><span>${a.gave_up} given up</span></div>
+      ${wakeLine(a)}${quotaRows(a)}
     </div>`;
   }).join('') || '<div class="box sub">No agents in the config.</div>';
 
@@ -486,6 +492,29 @@ function render() {
   $('metrics').innerHTML = S.totals.map(([l, v, u]) => `<div class="kv"><span>${esc(l)}${u ? ` (${u})` : ''}</span><b>${v == null ? '-' : esc(v)}</b></div>`).join('');
   $('ref').textContent = src === 'real' ? `From ${S.info.lines_total} log lines at ${S.info.path}.` : 'Simulated: the same events through the same checker as the real factory.';
   $('log').innerHTML = ev.filter(l => !l.event.startsWith('tick_')).slice(-11).reverse().map(l => `<div>${when(l.t)} <b>${esc(say(l))}</b></div>`).join('') || 'Nothing yet.';
+}
+
+// When an agent that is not working next starts
+const clockOf = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+const dayOf = t => new Date(t).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false });
+function until(t) {
+  if (!t || !state.t) return '';
+  const m = (Date.parse(t) - (state.source === 'real' && state.info.live ? Date.now() : Date.parse(state.t))) / 60000;
+  return m <= 0 ? 'due now' : 'in ' + dur(m);
+}
+function wakeLine(a) {
+  const w = a.wake; if (!w) return '';
+  return `<div class="wake">${ic('clock')} ${esc(w.why)}${w.at ? `: <b>${clockOf(w.at)}</b> (${until(w.at)})` : ''}</div>`;
+}
+// The plan's quota, from factory usage: each window's use and when it resets
+function quotaRows(a) {
+  const u = state.usage && state.usage.plans && state.usage.plans[a.type]; if (!u) return '';
+  if (!u.windows.length) return `<div class="wake" title="${esc(u.error)}">quota: could not read (${esc(u.error)})</div>`;
+  const age = state.usage.t ? ` · read ${clockOf(state.usage.t)}` : '';
+  return `<div class="quota" title="from /usage${age}">` + u.windows.filter(x => !/credits/i.test(x.name)).map(x => {
+    const c = x.used >= 95 ? css('bug') : x.used >= 75 ? css('fric') : css('ok');
+    return `<div class="q"><span>${esc(x.name.replace(/^Current /, ''))}</span><span>${x.resets ? 'resets ' + dayOf(x.resets) : ''}</span></div><b style="color:${c};text-align:right">${Math.round(x.used)}%</b>${bar(x.used / 100, c)}<span></span>`;
+  }).join('') + '</div>';
 }
 
 // One event as a sentence

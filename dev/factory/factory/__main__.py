@@ -10,6 +10,8 @@
   mine                      what this agent holds, as JSON
   ready                     issues ready to take, best first, as JSON
   init CONFIG               start the log with this config (a JSON file)
+  usage STATE [--every S]   read each plan's quota use and reset times into
+                            STATE/usage.json (once, or every S seconds)
   watchdog REPO STATE       run the watchdog: keep a session per agent, each
                             in a worktree of the clone REPO, under STATE
   observe SLUG OWNER [LOGIN...]
@@ -132,6 +134,9 @@ def main(argv: list[str]) -> int:
             Foreman(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
                     FOREMAN_PROMPT.read_text()).run()
             return 0
+        case ["usage", state, *rest]:
+            from . import usage
+            return usage.main([state, *rest])
         case ["watchdog", repo, state]:
             from .watchdog import Watchdog
             Watchdog(Ledger(env("FACTORY_LOG")), pathlib.Path(repo), pathlib.Path(state),

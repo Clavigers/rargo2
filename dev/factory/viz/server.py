@@ -193,10 +193,20 @@ class Hub:
             self.source.control(msg)
             return dict(ok=True)
 
+    def usage(self):
+        """state/usage.json beside the log, from factory usage, if there is one."""
+        p = pathlib.Path(self.log).parent / "state" / "usage.json"
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            return None
+
     def frame(self):
         with self.lock:
             s = self.source
             out = snapshot(s.w, s.lines)
+            if s is self.real:
+                out["usage"] = self.usage()
             out.update(source=s.kind, playing=self.playing, speed=self.speed[s.kind],
                        info=s.info(), error=getattr(self, "error", None),
                        hours=len(s.history.rows))
