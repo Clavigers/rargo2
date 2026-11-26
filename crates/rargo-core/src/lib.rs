@@ -8,13 +8,15 @@ pub mod db;
 pub mod db_writer;
 pub mod drift;
 pub mod engine;
+#[cfg(test)]
+mod engine_tests;
 pub mod expand;
 pub mod flake;
 pub mod fn_code;
 pub mod hash;
 pub mod nixmanifest;
 pub mod http;
-pub use rargo_net::io;
+pub mod io;
 pub mod incr;
 pub mod cgroup;
 pub use rargo_net as net;

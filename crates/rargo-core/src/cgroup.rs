@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 pub fn setup() -> Option<PathBuf> {
-    if unsafe { libc::geteuid() } != 0 {
+    if crate::io::process::euid() != 0 {
         return None;
     }
     let me = crate::io::file::read_to_string("/proc/self/cgroup").ok()?;
@@ -11,7 +11,11 @@ pub fn setup() -> Option<PathBuf> {
     }
     let procs = crate::io::file::read_to_string(membership_file(&dir)).ok()?;
     for op in delegation_ops(&dir, &procs) {
-        crate::sandbox::apply(&op).ok()?;
+        match op {
+            crate::sandbox::Op::CreateDir { path, .. } => crate::io::file::create_dir_all(path).ok()?,
+            crate::sandbox::Op::Write { path, data } => crate::io::file::write(path, data).ok()?,
+            _ => unreachable!("delegation only creates directories and writes files"),
+        }
     }
     Some(dir)
 }
@@ -39,16 +43,8 @@ pub(crate) fn membership_file(group: &Path) -> PathBuf {
 }
 
 fn delegated(dir: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
     let mut buf = [0u8; 8];
-    for name in [c"trusted.delegate", c"user.delegate"] {
-        let n = unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n >= 1 && buf[0] == b'1' {
-            return true;
-        }
-    }
-    false
+    [c"trusted.delegate", c"user.delegate"].into_iter().any(|name| crate::io::sys::xattr(dir, name, &mut buf).is_ok_and(|n| n >= 1 && buf[0] == b'1'))
 }
 
 pub struct ActionGroup {
@@ -85,7 +81,7 @@ impl ActionGroup {
             if self.stat("cgroup.events", &["frozen"]) == 1 {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            crate::io::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -115,7 +111,7 @@ impl Drop for ActionGroup {
             match crate::io::file::remove_dir(&self.dir) {
                 Ok(()) => return,
                 Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    std::thread::sleep(std::time::Duration::from_millis(2))
+                    crate::io::sleep(std::time::Duration::from_millis(2))
                 }
                 Err(_) => return,
             }

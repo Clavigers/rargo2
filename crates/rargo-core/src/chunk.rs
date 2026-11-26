@@ -203,16 +203,7 @@ pub fn chunk_file(file: &File) -> io::Result<Recipe> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    use std::os::fd::AsRawFd;
-    unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
-        if p == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let r = chunk(std::slice::from_raw_parts(p as *const u8, len));
-        libc::munmap(p, len);
-        Ok(r)
-    }
+    Ok(chunk(&file.map(len)?))
 }
 
 #[derive(Default)]

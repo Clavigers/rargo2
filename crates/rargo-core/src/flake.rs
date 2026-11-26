@@ -10,10 +10,10 @@ use crate::store::Store;
 use rargo_proto::tree::Node;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
+use crate::io::process::Command;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -111,13 +111,18 @@ fn store_names(text: &str, out: &mut BTreeSet<String>) {
     }
 }
 
+/// The directory for temporary files: `TMPDIR`, or `/tmp` without it.
+fn temp_dir() -> std::path::PathBuf {
+    crate::io::env::var_os("TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp".into())
+}
+
 fn run_nix(root: &Path, mut c: Command, uid: u32, gid: u32) -> std::result::Result<Vec<u8>, String> {
     use std::os::unix::process::CommandExt;
-    c.current_dir(root).stdin(std::process::Stdio::null());
-    if uid != unsafe { libc::geteuid() } {
-        c.uid(uid).gid(gid);
+    c.current_dir(root).stdin(crate::io::process::Stdio::null());
+    if uid != crate::io::process::euid() {
+        c.std_mut().uid(uid).gid(gid);
     }
-    let out = crate::io::output(&mut c).map_err(|e| format!("running nix: {e}"))?;
+    let out = c.output().map_err(|e| format!("running nix: {e}"))?;
     if !out.status.success() {
         return Err(format!("nix failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -424,7 +429,7 @@ pub(crate) fn resolve_shell(
 ) -> Result<Arc<FlakeEnv>> {
     static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     if NIX_READY.get().is_none() {
-        let ready = match crate::io::output(nix().arg("--version")) {
+        let ready = match nix().arg("--version").output() {
             Ok(out) if out.status.success() => Ok(()),
             Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
             Err(e) => Err(e.to_string()),
@@ -494,7 +499,7 @@ pub(crate) fn resolve_shell(
                 for r in &roots {
                     c.arg(nix_store.join(r));
                 }
-                let at = scratch.clone().unwrap_or_else(std::env::temp_dir);
+                let at = scratch.clone().unwrap_or_else(temp_dir);
                 resolution.closed(run_nix(&at, c, uid, gid));
             }
             Need::Manifest(closure) => {
@@ -512,7 +517,7 @@ pub(crate) fn resolve_shell(
     };
     if let Some(at) = scratch {
         crate::io::cpu(move || {
-            let _ = std::fs::remove_dir_all(at);
+            let _ = crate::io::file::remove_dir_all(at);
         });
     }
     let (env, save) = done?;
@@ -524,7 +529,7 @@ pub(crate) fn resolve_shell(
 }
 
 impl FlakeEnv {
-    pub fn closure_set(&self) -> Arc<HashSet<Vec<u8>>> {
+    pub fn closure_set(&self) -> Arc<BTreeSet<Vec<u8>>> {
         Arc::new(self.closure.iter().map(|c| c.as_bytes().to_vec()).collect())
     }
 
@@ -532,8 +537,8 @@ impl FlakeEnv {
         self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).ring_is_file())
     }
 
-    pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<HashMap<Vec<u8>, SynthEnt>>> {
-        let mut m = HashMap::new();
+    pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<BTreeMap<Vec<u8>, SynthEnt>>> {
+        let mut m = BTreeMap::new();
         let mut file = |name: &str, content: String| -> Result<()> {
             let hash = store.put_bytes(content.as_bytes())?;
             m.insert(name.as_bytes().to_vec(), SynthEnt::File { hash, size: content.len() as u64 });

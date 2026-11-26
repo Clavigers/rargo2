@@ -28,12 +28,13 @@ pub fn split_env(name: &str, value: &str) -> Vec<(String, String)> {
     }
 }
 
-pub fn joined_env(name: &str) -> String {
-    let mut value = std::env::var(name).unwrap_or_default();
+/// Joins the value `split_env` spread over `name`, `name_1`, `name_2`, ... back together. `var` reads one variable of the caller's environment.
+pub fn joined_env(name: &str, var: impl Fn(&str) -> Option<String>) -> String {
+    let mut value = var(name).unwrap_or_default();
     for i in 1.. {
-        match std::env::var(format!("{name}_{i}")) {
-            Ok(part) => value.push_str(&part),
-            Err(_) => break,
+        match var(&format!("{name}_{i}")) {
+            Some(part) => value.push_str(&part),
+            None => break,
         }
     }
     value
@@ -293,11 +294,9 @@ mod env_tests {
         assert!(parts.len() > 2 && parts.iter().all(|(_, v)| v.len() <= 96 << 10));
         assert_eq!(parts[0].0, "__RARGO_TEST_SPLIT");
         assert_eq!(parts[1].0, "__RARGO_TEST_SPLIT_1");
-        for (k, v) in &parts {
-            unsafe { std::env::set_var(k, v) };
-        }
-        assert_eq!(joined_env("__RARGO_TEST_SPLIT"), value);
+        let var = |name: &str| parts.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
+        assert_eq!(joined_env("__RARGO_TEST_SPLIT", var), value);
         assert_eq!(split_env("X", ""), vec![("X".to_string(), String::new())]);
-        assert_eq!(joined_env("__RARGO_TEST_ABSENT"), "");
+        assert_eq!(joined_env("__RARGO_TEST_ABSENT", var), "");
     }
 }

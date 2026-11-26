@@ -99,12 +99,18 @@ def cpu(extra):
                 sys.stdout.write(f"---- {key} ----\n{run.stdout}{run.stderr}\n")
     problems = [f"{key} failed" for key in failed]
     total = sum(took.values())
+    over = []
     if total > suite:
-        problems.append(f"the suite used {total:.0f} ms of CPU; its budget is {suite} ms")
+        over.append(f"the suite used {total:.0f} ms of CPU; its budget is {suite} ms")
     for key, ms in sorted(took.items()):
         limit = slow.get(key, default)
         if ms > limit:
-            problems.append(f"{key} used {ms:.0f} ms of CPU; its budget is {limit} ms")
+            over.append(f"{key} used {ms:.0f} ms of CPU; its budget is {limit} ms")
+    if os.environ.get("RARGO_CPU_BUDGET") == "report":
+        for line in over:
+            print(f"over budget, reported only: {line}")
+    else:
+        problems += over
     for key, limit in sorted(slow.items()):
         if key not in took:
             problems.append(f"{BUDGETS} gives {key} a budget, but no test of that name ran; remove the line")
