@@ -71,7 +71,8 @@ impl ActionTable {
 
     pub fn begin(&mut self) -> ReqId {
         self.next += 1;
-        self.requests.insert(self.next, State::Deciding { waited: None });
+        let fresh = self.requests.insert(self.next, State::Deciding { waited: None }).is_none();
+        assert!(fresh, "request {} is new", self.next);
         self.next
     }
 
@@ -135,14 +136,20 @@ impl ActionTable {
     }
 
     fn end_flight(&mut self, id: ReqId, slot: Slot, end: End) -> Vec<ReqId> {
+        assert!(
+            !matches!(self.requests.get(&id), Some(State::Joining { .. } | State::Woken { .. })),
+            "request {id} ends a flight only as its runner, not while it waits"
+        );
         let Some(f) = self.flights.get(&slot) else { return Vec::new() };
         if f.runner != id {
             return Vec::new();
         }
         let f = self.flights.remove(&slot).expect("checked above");
         for j in &f.joiners {
-            self.requests.insert(*j, State::Woken { slot, end: end.clone() });
+            let was = self.requests.insert(*j, State::Woken { slot, end: end.clone() });
+            assert_eq!(was, Some(State::Joining { slot }), "{j} was waiting on the flight that ended");
         }
+        assert!(!self.flights.contains_key(&slot), "the flight of {id} ended");
         f.joiners.into_iter().collect()
     }
 
@@ -175,7 +182,7 @@ impl ActionTable {
     }
 
     pub fn cancel(&mut self, id: ReqId) -> Vec<ReqId> {
-        match self.requests.remove(&id) {
+        let woke = match self.requests.remove(&id) {
             None | Some(State::Deciding { .. } | State::Woken { .. }) => Vec::new(),
             Some(State::Joining { slot }) => {
                 if let Some(f) = self.flights.get_mut(&slot) {
@@ -184,7 +191,13 @@ impl ActionTable {
                 Vec::new()
             }
             Some(State::Running { slot, .. } | State::Ran { slot }) => self.end_flight(id, slot, End::Done),
-        }
+        };
+        assert!(!self.requests.contains_key(&id), "a cancelled request {id} is gone");
+        assert!(
+            self.flights.values().all(|f| f.runner != id && !f.joiners.contains(&id)),
+            "a cancelled request {id} neither runs nor joins a flight"
+        );
+        woke
     }
 }
 
@@ -204,7 +217,7 @@ impl StateMachine for ActionTable {
             }
         }
         for (id, st) in &self.requests {
-            assert!(*id <= self.next);
+            assert!((1..=self.next).contains(id), "request {id} was handed out by begin");
             match st {
                 State::Joining { slot } => assert!(
                     self.flights.get(slot).is_some_and(|f| f.joiners.contains(id)),
