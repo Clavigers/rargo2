@@ -173,3 +173,9 @@ fn the_allowlist_format_is_strict() {
     assert!(parse_allow("lock\ta.rs\t2\tno such check\n").is_err());
     assert!(parse_allow("locks\ta.rs\ttwo\tnot a number\n").is_err());
 }
+
+#[test]
+fn an_address_is_a_value_and_a_socket_is_io() {
+    let list = found("crates/a/src/lib.rs", "fn f(a: std::net::SocketAddr, b: std::net::Ipv4Addr) { let _ = std::net::UdpSocket::bind(a); }");
+    assert_eq!(of(Check::AmbientIo, &list), ["std::net::UdpSocket::bind"]);
+}

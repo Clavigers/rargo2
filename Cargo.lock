@@ -412,7 +412,6 @@ dependencies = [
  "expect-test",
  "libc",
  "rargo-machine",
- "tempfile",
 ]
 
 [[package]]
@@ -808,7 +807,6 @@ dependencies = [
  "flate2",
  "fusewire",
  "libc",
- "memmap2",
  "rargo-machine",
  "rargo-net",
  "rargo-proto",
@@ -846,7 +844,6 @@ dependencies = [
  "sha2",
  "shell-escape",
  "tar",
- "tempfile",
  "toml",
  "ureq",
  "zstd",
@@ -862,6 +859,7 @@ version = "0.7.10"
 dependencies = [
  "blake3",
  "corosensei",
+ "expect-test",
  "fusewire",
  "io-uring",
  "libc",
@@ -906,6 +904,7 @@ dependencies = [
  "rargo",
  "rargo-core",
  "rargo-machine",
+ "rargo-plan",
  "rargo-proto",
 ]
 
