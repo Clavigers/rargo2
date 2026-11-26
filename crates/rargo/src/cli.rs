@@ -51,6 +51,7 @@ pub trait World {
     fn nextest_version(&self) -> Option<String>;
     fn cwd(&self) -> PathBuf;
     fn is_file(&self, path: &Path) -> bool;
+    fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String>;
 }
 
 fn var<'a>(w: &'a impl World, name: &str) -> Option<&'a str> {
@@ -82,7 +83,7 @@ pub fn config(w: &impl World) -> Result<Config, String> {
     let (host, _) = host_named(w, daemon)?;
     let server = if daemon { host.clone() } else { w.resolve(&host)? };
     let (user, secret) = if let Some(token) = var(w, "RARGO_TOKEN") {
-        let (id, secret) = project::split_token(token).ok_or("RARGO_TOKEN is not a token (an id, a dot and a secret)")?;
+        let (id, secret) = project::split_token(token).ok_or_else(|| format!("RARGO_TOKEN is not a token: {}", project::TOKEN_FORM))?;
         (id.to_string(), Some(secret.to_string()))
     } else if let Some(c) = (!daemon).then(|| w.credential(&host)).flatten() {
         (c.id, Some(c.secret))
@@ -114,7 +115,7 @@ pub enum Plan {
     Status,
     StopDaemons,
     Fail { text: String, code: i32 },
-    Name(String),
+    Name { host: String, force: bool },
     Auth(Auth),
     Daemon(OsString),
     Remote { config: Config, args: Vec<String>, vars: Vec<(String, String)>, kind: &'static str },
@@ -160,7 +161,11 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
         return Plan::Fail { text: format!("error: unknown option `{option}` (see `rargo --help`)"), code: 2 };
     }
     if let Some(host) = first.and_then(OsStr::to_str).and_then(|a| a.strip_prefix('@')) {
-        return Plan::Name(host.to_string());
+        return match raw[1..].iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
+            [] => Plan::Name { host: host.to_string(), force: false },
+            [Some("--force")] => Plan::Name { host: host.to_string(), force: true },
+            _ => die("usage: rargo @HOST [--force]"),
+        };
     }
     let token_command = first.is_some_and(|a| a == "auth") && second.is_some_and(|a| TOKEN_COMMANDS.contains(&a));
     if token_command && raw[2..].iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h") {
@@ -231,6 +236,19 @@ fn manifest_path_arg(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `host` may be named as the server: it must answer as one,
+/// unless it is an address (`host:port`) or the user said `--force`.
+/// Nothing is written when it may not, so a typo keeps the server set.
+pub fn may_name(w: &impl World, host: &str, force: bool) -> Result<(), String> {
+    if force || host.contains(':') {
+        return Ok(());
+    }
+    w.resolve(host).map(drop).map_err(|e| {
+        let why = e.strip_suffix(project::RENAME).unwrap_or(&e);
+        format!("{why}; nothing was changed (`rargo @{host} --force` names it anyway)")
+    })
 }
 
 pub fn named(w: &impl World, host: &str, path: &Path) -> String {
@@ -310,12 +328,28 @@ pub fn auth_status(w: &impl World, host: &str, from: Option<&HostFrom>) -> Strin
         None => String::new(),
     };
     let server = w.resolve(host).unwrap_or_else(|e| format!("unknown ({e})"));
+    if let Some(token) = var(w, "RARGO_TOKEN") {
+        text.push_str(&format!("{host} (server {server}): {}", env_token_status(w, host, token)));
+        return text;
+    }
     text.push_str(&match w.credential(host) {
         Some(c) if c.name.is_empty() => format!("{host} (server {server}): authenticated (token {})", c.id),
         Some(c) => format!("{host} (server {server}): authenticated as {} (token {})", c.name, c.id),
         None => format!("{host} (server {server}): not authenticated; run `rargo auth`"),
     });
     text
+}
+
+/// Who RARGO_TOKEN signs in as, since it comes before any token stored for the server.
+fn env_token_status(w: &impl World, host: &str, token: &str) -> String {
+    let Some((id, _)) = project::split_token(token) else {
+        return format!("RARGO_TOKEN is not a token: {}", project::TOKEN_FORM);
+    };
+    match w.holder(host, token) {
+        Ok(Some(user)) => format!("authenticated as {user} by RARGO_TOKEN (token {id})"),
+        Ok(None) => format!("the server does not accept RARGO_TOKEN (token {id}): it does not know it, or it was revoked or has expired"),
+        Err(e) => format!("RARGO_TOKEN (token {id}) is used; the server could not say whose it is ({e})"),
+    }
 }
 
 pub fn removed(host: &str, revoked: Result<bool, String>) -> (String, Option<String>) {
@@ -452,6 +486,7 @@ mod tests {
         nextest: Option<String>,
         cwd: PathBuf,
         files: Vec<PathBuf>,
+        holders: Vec<(String, Result<Option<String>, String>)>,
         asked: RefCell<Vec<String>>,
     }
 
@@ -468,6 +503,7 @@ mod tests {
             nextest: Some("0.9.100".into()),
             cwd: "/w/app/src".into(),
             files: vec!["/w/app/Cargo.toml".into()],
+            holders: Vec::new(),
             asked: RefCell::new(Vec::new()),
         }
     }
@@ -518,6 +554,11 @@ mod tests {
         fn credential(&self, host: &str) -> Option<Credential> {
             self.asked.borrow_mut().push(format!("credential {host}"));
             self.creds.iter().find(|(h, _)| h == host).map(|(_, c)| c.clone())
+        }
+
+        fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String> {
+            self.asked.borrow_mut().push(format!("holder {host}"));
+            self.holders.iter().find(|(t, _)| t == token).map_or(Ok(None), |(_, h)| h.clone())
         }
 
         fn nextest_version(&self) -> Option<String> {
@@ -596,8 +637,10 @@ mod tests {
             (None, vec!["--rargo-bogus"], fake(&[]), usage("error: unknown option `--rargo-bogus` (see `rargo --help`)")),
             (None, vec!["auth", "invite", "--help"], fake(&[]), Plan::Print(AUTH_HELP.into())),
             (None, vec!["auth", "tokens", "-h"], fake(&[]), Plan::Print(AUTH_HELP.into())),
-            (None, vec!["@b.example"], fake(&[]), Plan::Name("b.example".into())),
-            (Some("cargo"), vec!["@b.example:1"], fake(&[]), Plan::Name("b.example:1".into())),
+            (None, vec!["@b.example"], fake(&[]), Plan::Name { host: "b.example".into(), force: false }),
+            (None, vec!["@b.example", "--force"], fake(&[]), Plan::Name { host: "b.example".into(), force: true }),
+            (None, vec!["@b.example", "-x"], fake(&[]), fail("usage: rargo @HOST [--force]")),
+            (Some("cargo"), vec!["@b.example:1"], fake(&[]), Plan::Name { host: "b.example:1".into(), force: false }),
             (None, vec!["--rargo-daemon", "/run/s"], fake(&[]), Plan::Daemon("/run/s".into())),
             (None, vec!["--rargo-daemon"], fake(&[]), fail("usage: rargo --rargo-daemon SOCKET")),
             (None, vec!["auth", "-h"], fake(&[]), Plan::Print(AUTH_HELP.into())),
@@ -743,7 +786,7 @@ mod tests {
             ("USER before LOGNAME", fake(&[("USER", "u"), ("LOGNAME", "l")]).no_creds(), Ok(conf("h.example", "srv.example:7459", "u", None)), vec!["config", "resolve h.example", "credential h.example"]),
             ("LOGNAME without USER", fake(&[("USER", ""), ("LOGNAME", "l")]).no_creds(), Ok(conf("h.example", "srv.example:7459", "l", None)), vec!["config", "resolve h.example", "credential h.example"]),
             ("`user` without either", fake(&[]).no_creds(), Ok(conf("h.example", "srv.example:7459", "user", None)), vec!["config", "resolve h.example", "credential h.example"]),
-            ("a bad RARGO_TOKEN", fake(&[("RARGO_TOKEN", "bad")]), Err("RARGO_TOKEN is not a token (an id, a dot and a secret)".into()), vec!["config", "resolve h.example"]),
+            ("a bad RARGO_TOKEN", fake(&[("RARGO_TOKEN", "bad")]), Err(format!("RARGO_TOKEN is not a token: {}", project::TOKEN_FORM)), vec!["config", "resolve h.example"]),
             ("discovery fails before a bad token is read", fake(&[("RARGO_SERVER", "gone.example"), ("RARGO_TOKEN", "bad")]), Err("no answer from gone.example".into()), vec!["resolve gone.example"]),
             ("a file that cannot be read", fake(&[]).config(Err("/x: permission denied")), Err("/x: permission denied".into()), vec!["config"]),
             ("a file that is not TOML", fake(&[]).config(Ok(Some("host = \"a"))), Err(toml_error("host = \"a")), vec!["config"]),
@@ -767,11 +810,38 @@ mod tests {
             format!("{PATH} now names `gone.example` as your rargo server.\nwarning: no rargo server answers for `gone.example` right now (https://gone.example/.well-known/rargo.json)")
         );
 
+        let w = fake(&[]);
+        assert_eq!(may_name(&w, "h.example", false), Ok(()));
+        assert_eq!(may_name(&w, "x.example:1", false), Ok(()));
+        assert_eq!(may_name(&w, "gone.example", true), Ok(()));
+        assert_eq!(may_name(&w, "gone.example", false), Err("no answer from gone.example; nothing was changed (`rargo @gone.example --force` names it anyway)".into()));
+        assert_eq!(w.asked(), ["resolve h.example", "resolve gone.example"]);
+        let mut w = fake(&[]);
+        w.servers.push(("typo.example".into(), Err(project::not_found_text("typo.example", "no such host"))));
+        assert_eq!(
+            may_name(&w, "typo.example", false),
+            Err("cannot find the rargo server `typo.example`: no machine has that name; nothing was changed (`rargo @typo.example --force` names it anyway)".into())
+        );
+
         let mut w = fake(&[]);
         w.creds.push(("named.example:1".into(), cred("t2", "ann")));
         assert_eq!(auth_status(&w, "h.example", Some(&HostFrom::Env)), "server named by RARGO_SERVER\nh.example (server srv.example:7459): authenticated (token stored)");
         assert_eq!(auth_status(&w, "named.example:1", Some(&HostFrom::File(PATH.into()))), format!("server named by {PATH}\nnamed.example:1 (server named.example:1): authenticated as ann (token t2)"));
         assert_eq!(auth_status(&w, "gone.example", None), "gone.example (server unknown (no answer from gone.example)): not authenticated; run `rargo auth`");
+
+        let ann = format!("t9.{SECRET}");
+        let stranger = format!("t8.{SECRET}");
+        let offline = format!("t7.{SECRET}");
+        for (token, said) in [
+            (ann.as_str(), "authenticated as ann by RARGO_TOKEN (token t9)".to_string()),
+            (stranger.as_str(), "the server does not accept RARGO_TOKEN (token t8): it does not know it, or it was revoked or has expired".to_string()),
+            (offline.as_str(), "RARGO_TOKEN (token t7) is used; the server could not say whose it is (no answer)".to_string()),
+            ("bad", format!("RARGO_TOKEN is not a token: {}", project::TOKEN_FORM)),
+        ] {
+            let mut w = fake(&[("RARGO_TOKEN", token)]);
+            w.holders = vec![(ann.clone(), Ok(Some("ann".into()))), (offline.clone(), Err("no answer".into()))];
+            assert_eq!(auth_status(&w, "h.example", None), format!("h.example (server srv.example:7459): {said}"), "{token}");
+        }
 
         assert_eq!(removed("h", Ok(true)), ("revoked the token for h on the server and forgot it here".into(), None));
         assert_eq!(removed("h", Ok(false)), ("forgot the token for h (the server did not know it as a token that still works)".into(), None));

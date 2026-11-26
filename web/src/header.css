@@ -1,0 +1,52 @@
+header {
+  margin: calc(var(--line-height) * 3) 0;
+}
+
+header h1 {
+  font-family: 'Fern Variable', serif;
+  font-variant: normal;
+  text-transform: none;
+  font-size: 3rem;
+  font-weight: normal;
+  font-optical-sizing: none;
+  font-variation-settings: "opsz" 20;
+  letter-spacing: 0.05ch;
+  line-height: calc(1.9 * var(--line-height));
+  margin: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+header .subtitle,
+header .subtitle-small {
+  font-size: 1.25rem;
+  line-height: calc(2 * var(--line-height));
+  margin: calc(var(--line-height) * .5) 0;
+}
+
+/* Show the compact subtitle by default (narrow / mobile window); swap to the
+ * full one at the same 768px boundary the topbar uses to go desktop. */
+header .subtitle {
+  display: none;
+}
+
+@media (min-width: 768px) {
+  header .subtitle {
+    display: block;
+  }
+  header .subtitle-small {
+    display: none;
+  }
+}
+
+header .subtitle-small code {
+  font-size: 1.23em;
+  font-weight: 150;
+  letter-spacing: normal;
+  vertical-align: -0.12em;
+}
+
+header p {
+  text-indent: 0;
+  text-align: left;
+}

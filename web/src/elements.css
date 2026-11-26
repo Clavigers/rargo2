@@ -1,0 +1,193 @@
+hr {
+  position: relative;
+  display: block;
+  height: var(--line-height);
+  margin: var(--line-height) 0;
+  border: none;
+  color: var(--text-color);
+}
+
+hr:before {
+  display: block;
+  content: "";
+  position: absolute;
+  top: calc(var(--line-height) / 2);
+  left: 0;
+  width: 100%;
+  border-top: var(--border-thickness) solid var(--light-color);
+  height: 0;
+}
+a {
+  text-decoration-thickness: var(--border-thickness);
+}
+
+a:link {
+  color: #3366cc;
+}
+
+a:visited {
+  color: #6a60b0;
+}
+
+a:link:hover {
+  color: #3056a9;
+}
+
+a:visited:hover {
+  color: #534fa3;
+}
+
+p {
+  margin: var(--line-height) 0 0;
+  text-align: justify;
+  word-break: break-all;
+}
+
+p + p {
+  margin-top: 0;
+  text-indent: 3ch;
+}
+
+h1 + p,
+h2 + p,
+h3 + p,
+h4 + p,
+hr + p {
+  text-indent: 0;
+}
+
+strong {
+  font-weight: var(--font-weight-bold);
+}
+
+em {
+  font-style: italic;
+}
+
+abbr {
+  font-size: 1.0625em;
+  font-variant: all-small-caps;
+  font-weight: 515;
+  letter-spacing: 0.05em;
+}
+
+sub {
+  position: relative;
+  display: inline-block;
+  margin: 0;
+  vertical-align: sub;
+  line-height: 0;
+  width: calc(1ch / 0.75);
+  font-size: .75rem;
+}
+
+p {
+  word-break: break-word;
+  text-wrap: pretty;
+  hyphens: auto;
+  hyphenate-limit-chars: 3;
+}
+
+img, video {
+  display: block;
+  width: 100%;
+  object-fit: contain;
+  overflow: hidden;
+}
+
+img {
+  font-style: italic;
+  color: var(--text-color);
+}
+
+pre {
+  white-space: pre;
+  margin: var(--line-height) 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+pre, code {
+  font-family: var(--font-family-code);
+  font-weight: 450;
+}
+
+code {
+  font-size: .88em;
+  letter-spacing: -0.025em;
+}
+
+pre.sourceCode > code {
+  display: flex;
+  flex-direction: column;
+  overflow-x: auto;
+  overflow-y: clip;
+  counter-reset: line;
+  line-height: 1.2;
+  /* collapse the newline text nodes between line spans, which would
+     otherwise become empty line-tall anonymous flex items */
+  white-space: normal;
+}
+
+pre.sourceCode > code > span {
+  counter-increment: line;
+  margin-top: 0;
+  white-space: pre-wrap;
+}
+
+pre.sourceCode > code > span::before {
+  content: counter(line);
+  display: inline-block;
+  width: 3ch;
+  padding-right: 0.5ch;
+  margin-right: 1ch;
+  text-align: right;
+  opacity: .35;
+  border-right: 1px solid black;
+}
+
+ul, ol {
+  padding: 0;
+  margin: 0 0 var(--line-height);
+}
+
+ul {
+  list-style-type: none;
+  padding: 0;
+}
+
+ul li:before {
+  content: "•";
+  margin-right: 1ch;
+}
+
+ol {
+  list-style-type: none;
+  counter-reset: item;
+  padding: 0;
+}
+
+ol ul,
+ol ol,
+ul ol,
+ul ul {
+  padding: 0 0 0 2ch;
+  margin: 0;
+}
+
+ol li:before { 
+  font-size: .875rem;
+  font-weight: 500;
+  content: counters(item, ".") ". ";
+  counter-increment: item;
+}
+
+li {
+  margin: 0;
+  padding: 0;
+}
+
+li::marker {
+  line-height: 0;
+}
+

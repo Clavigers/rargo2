@@ -1,0 +1,7 @@
+{
+  "name": "rargo-hq",
+  "version": "0.1.0",
+  "description": "rargo.rs site, built from markdown with the-proportional-web's toolchain",
+  "license": "MIT",
+  "private": true
+}

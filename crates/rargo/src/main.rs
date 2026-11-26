@@ -91,6 +91,11 @@ impl cli::World for Real {
         project::resolve(host)
     }
 
+    fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String> {
+        self.handle_signals();
+        project::holder(host, token)
+    }
+
     fn credential(&self, host: &str) -> Option<project::Credential> {
         project::credential(host)
     }
@@ -344,7 +349,10 @@ pub fn mount_ns() -> String {
     std::fs::read_link("/proc/self/ns/mnt").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-fn name_server(world: &Real, host: &str) -> ! {
+fn name_server(world: &Real, host: &str, force: bool) -> ! {
+    if let Err(e) = cli::may_name(world, host, force) {
+        die(&e);
+    }
     match project::set_host(host) {
         Ok(path) => {
             eprintln!("{}", cli::named(world, host, &path));
@@ -503,7 +511,7 @@ fn main() {
             eprintln!("{text}");
             std::process::exit(code)
         }
-        cli::Plan::Name(host) => name_server(&world, &host),
+        cli::Plan::Name { host, force } => name_server(&world, &host, force),
         cli::Plan::Auth(auth) => auth_command(&world, auth),
         cli::Plan::Daemon(socket) => daemon::serve(Path::new(&socket)),
         cli::Plan::Remote { config, args, vars, kind } => (config, args, vars, kind),

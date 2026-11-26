@@ -150,6 +150,13 @@ const NO_SUCH_HOST: &str = "no such host";
 const NO_ANSWER: &str = "no answer";
 const NOT_RARGO: &str = "not rargo: ";
 
+/// What a failed request to `host`'s web endpoint says: in the words
+/// `rargo build` uses when the machine cannot be reached, else the URL and why.
+/// `why` is what `unfound` made of the error `e`.
+fn asked(host: &str, url: &str, why: &str, e: impl std::fmt::Display) -> String {
+    if why == NO_SUCH_HOST || why == NO_ANSWER { not_found_text(host, why) } else { format!("{url}: {e}") }
+}
+
 pub fn not_found_text(host: &str, why: &str) -> String {
     let what = if why == NO_SUCH_HOST {
         "no machine has that name".to_string()
@@ -160,8 +167,11 @@ pub fn not_found_text(host: &str, why: &str) -> String {
     } else {
         why.to_string()
     };
-    format!("cannot find the rargo server `{host}`: {what}. Check the name, then name the server again with `rargo @HOST`")
+    format!("cannot find the rargo server `{host}`: {what}{RENAME}")
 }
+
+/// The advice `not_found_text` ends with.
+pub const RENAME: &str = ". Check the name, then name the server again with `rargo @HOST`";
 
 #[derive(Clone)]
 pub struct Credential {
@@ -204,13 +214,16 @@ fn save_credentials(all: &toml::Table) -> Result<(), String> {
     write().map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// What a token looks like, for the message that says a string is not one.
+pub const TOKEN_FORM: &str = "a token is an id, a dot and a secret of at least 16 characters, as `rargo auth` stores it and `rargod token create` prints it";
+
 pub fn split_token(token: &str) -> Option<(&str, &str)> {
     let (id, secret) = token.trim().split_once('.')?;
     (!id.is_empty() && secret.len() >= 16).then_some((id, secret))
 }
 
 pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
-    let (id, secret) = split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
+    let (id, secret) = split_token(token).ok_or_else(|| format!("that is not a token: {TOKEN_FORM}"))?;
     let mut all = credentials();
     let mut c = toml::Table::new();
     c.insert("id".into(), id.into());
@@ -228,7 +241,7 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
         .post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| format!("{url}: {e}"))?
+        .map_err(|e| asked(host, &url, &unfound(&e), &e))?
         .into_string()
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
@@ -236,14 +249,14 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
 }
 
 pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
-    split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
+    split_token(token).ok_or_else(|| format!("that is not a token: {TOKEN_FORM}"))?;
     let url = format!("{}/auth/whoami", base_url(host));
     let body = serde_json::json!({ "token": token.trim() });
     let text = agent()
         .post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| format!("{url}: {e}"))?
+        .map_err(|e| asked(host, &url, &unfound(&e), &e))?
         .into_string()
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
@@ -285,7 +298,7 @@ pub fn auth(host: &str) -> Result<String, String> {
                 let said = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("error")?.as_str().map(String::from));
                 return Err(said.unwrap_or_else(|| format!("{base}{path} answered {code}")));
             }
-            Err(e) => return Err(format!("{base}{path}: {e}")),
+            Err(e) => return Err(asked(host, &format!("{base}{path}"), &unfound(&e), &e)),
         };
         serde_json::from_str(&text).map_err(|e| format!("{base}{path}: not a rargo answer: {e}"))
     };
