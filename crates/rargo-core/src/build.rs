@@ -73,13 +73,21 @@ pub struct Daemon {
     pub(crate) nix_attached: Arc<crate::nixmanifest::Attached>,
     pub drift_report: Mutex<Option<String>>,
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    pub deliveries: Mutex<std::collections::BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>>,
+    pub deliveries: Mutex<Deliveries>,
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
     fetching: crate::io::Mutex<()>,
     scratch_seq: AtomicU64,
     pub stats: Arc<DaemonStats>,
+}
+
+/// What each worktree was last delivered, under the token that names it.
+pub struct Deliveries {
+    /// Every random value the server hands out (delivery tokens) is drawn here,
+    /// from the seed `Daemon::new` was given.
+    pub random: crate::rng::Rng,
+    pub by_worktree: BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>,
 }
 
 pub struct Home {
@@ -239,10 +247,12 @@ fn bytes(s: &str) -> Vec<u8> {
 }
 
 impl Daemon {
-    pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
+    /// `seed` seeds the server's random values: the shell draws it from the OS,
+    /// tests and the simulator pass their own.
+    pub fn new(cfg: Config, engine: Arc<Engine>, seed: u64) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
-        let seed = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
-        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), seed);
+        let incr_seed = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), incr_seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
@@ -257,7 +267,7 @@ impl Daemon {
             nix_attached: Arc::default(),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
-            deliveries: Mutex::new(std::collections::BTreeMap::new()),
+            deliveries: Mutex::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
             client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
             cfg,
             engine,
