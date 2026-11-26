@@ -716,6 +716,33 @@ mod tests {
     }
 
     #[test]
+    fn a_held_snapshot_pins_its_whole_worktree_until_it_is_dropped() {
+        crate::io::drive(1, || {
+            let (_d, trees, fake) = setup();
+            let v = fake.dir(vec![
+                ("src", fake.dir(vec![("a", fake.file(b"a")), ("deep", fake.dir(vec![("b", fake.file(b"b"))]))])),
+                ("top", fake.file(b"top")),
+            ]);
+            let root = root_of(&v);
+            let s = trees.sync(root, &fake).unwrap();
+            let held = worktree_hashes(root, |d| trees.get(d)).unwrap();
+            assert_eq!(held.len(), 6, "three manifests and three files");
+            assert!(held.iter().all(|h| trees.store.is_pinned(h)));
+
+            let output = trees.store.put_bytes(b"an output nobody holds").unwrap();
+            trees.store.evict_to(0, &|_| false);
+            assert!(!trees.store.has(&output));
+            assert!(held.iter().all(|h| trees.store.has(h)));
+            assert_eq!(s.read(b"src/deep/b").unwrap(), b"b");
+
+            drop(s);
+            assert!(held.iter().all(|h| !trees.store.is_pinned(h)));
+            trees.store.evict_to(0, &|_| false);
+            assert!(held.iter().all(|h| !trees.store.has(h)));
+        });
+    }
+
+    #[test]
     fn a_client_that_withholds_content_fails_the_sync() {
         crate::io::drive(1, || {
         let (_d, trees, fake) = setup();
