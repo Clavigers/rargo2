@@ -155,6 +155,8 @@ pub enum Link {
 }
 
 const UDP_WAIT: Duration = Duration::from_millis(2500);
+/// How long connecting over TCP and the handshake after it may take: a stopped server's kernel still accepts the connection.
+const CONNECT_WITHIN: Duration = Duration::from_secs(5);
 
 impl Link {
     pub fn tcp(stream: TcpStream, sealer: Sealer, opener: Opener) -> Link {
@@ -190,25 +192,31 @@ impl Link {
                 return Err(udp_error.unwrap());
             }
         }
-        let mut stream = match TcpStream::connect(server) {
-            Ok(s) => s,
-            Err(e) => return Err(if e.kind() == io::ErrorKind::ConnectionRefused { e } else { udp_error.unwrap_or(e) }),
+        let tcp = move || -> io::Result<Link> {
+            let mut stream = match TcpStream::connect(server) {
+                Ok(s) => s,
+                Err(e) => return Err(if e.kind() == io::ErrorKind::ConnectionRefused { e } else { udp_error.unwrap_or(e) }),
+            };
+            let _ = stream.set_nodelay(true);
+            let (hs, first) = secure::client_start(user, psk, &[])?;
+            stream.write_all(&first)?;
+            let mut head = [0u8; 3];
+            stream.read_exact(&mut head)?;
+            let mut body = vec![0u8; u16::from_le_bytes([head[1], head[2]]) as usize];
+            stream.read_exact(&mut body)?;
+            if head[0] != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("the server refused the connection: {}", String::from_utf8_lossy(&body).trim()),
+                ));
+            }
+            let (sealer, opener) = secure::client_finish(hs, &body)?;
+            Ok(Link::tcp(stream, sealer, opener))
         };
-        let _ = stream.set_nodelay(true);
-        let (hs, first) = secure::client_start(user, psk, &[])?;
-        stream.write_all(&first)?;
-        let mut head = [0u8; 3];
-        stream.read_exact(&mut head)?;
-        let mut body = vec![0u8; u16::from_le_bytes([head[1], head[2]]) as usize];
-        stream.read_exact(&mut body)?;
-        if head[0] != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("the server refused the connection: {}", String::from_utf8_lossy(&body).trim()),
-            ));
+        match shell::timeout(CONNECT_WITHIN, tcp) {
+            Ok(tcp) => tcp,
+            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer over TCP within {} s", CONNECT_WITHIN.as_secs()))),
         }
-        let (sealer, opener) = secure::client_finish(hs, &body)?;
-        Ok(Link::tcp(stream, sealer, opener))
     }
 
     pub fn kind(&self) -> &'static str {

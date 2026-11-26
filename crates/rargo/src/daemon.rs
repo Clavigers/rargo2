@@ -1277,6 +1277,13 @@ impl Daemon {
         let _ = out.send(reply);
     }
 
+    /// Ends a command whose server went silent, with one line naming the server and what rargo waited for.
+    fn silent(&self, out: &UnboundedSender<LocalReply>, quiet: Duration, waiting_for: &str) -> LocalReply {
+        let text = rargo::link_watch::silent_text(&self.cfg.server, quiet, waiting_for);
+        let _ = out.send(LocalReply::Stderr(text.into_bytes()));
+        LocalReply::Exit(101)
+    }
+
     fn fail(out: &UnboundedSender<LocalReply>, text: String) -> LocalReply {
         let _ = out.send(LocalReply::Stderr(format!("error: {text}\n").into_bytes()));
         LocalReply::Exit(101)
@@ -1347,7 +1354,10 @@ impl Daemon {
                         match self.converse(&mux, run, None, None, None, req, out, &mut command, None) {
                             Ok(Some(reply)) => return Ok(reply),
                             Ok(None) => command.again(),
-                            Err(_) if mux.is_dead() => command.link_lost(),
+                            Err(_) if mux.is_dead() => match mux.silent() {
+                                Some(quiet) => return Ok(self.silent(out, quiet, "its answer")),
+                                None => command.link_lost(),
+                            },
                             Err(e) => return Err(e),
                         }
                     }
@@ -1388,11 +1398,16 @@ impl Daemon {
         let mut snap: Option<Arc<Snap>> = None;
         let mut bet = None;
         let mut failure = None;
+        let mut silence = None;
         let mut started = Instant::now();
         loop {
             step = match step {
                 Step::Link => {
-                    link = Some(self.mux()?);
+                    link = Some(match (self.mux(), silence) {
+                        (Ok(mux), _) => mux,
+                        (Err(_), Some((quiet, waiting_for))) => return Ok(self.silent(out, quiet, waiting_for)),
+                        (Err(e), None) => return Err(e),
+                    });
                     phase("link to the server ready");
                     started = Instant::now();
                     command.linked()
@@ -1442,6 +1457,7 @@ impl Daemon {
                         Ok(Offered::Changed) => command.offered(Sent::Changed),
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
+                            silence = mux.silent().map(|quiet| (quiet, "its answer to the worktree offer"));
                             command.link_lost()
                         }
                         Err(e) => return Err(e),
@@ -1483,6 +1499,7 @@ impl Daemon {
                         }
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
+                            silence = mux.silent().map(|quiet| (quiet, "the build's progress"));
                             command.link_lost()
                         }
                         Err(e) => return Err(e),
@@ -1495,7 +1512,10 @@ impl Daemon {
                 Step::Exit(code) => return Ok(LocalReply::Exit(code)),
                 Step::Fail(text) => return Ok(Self::fail(out, text.into())),
                 Step::Error(text) => return Err(std::io::Error::other(text)),
-                Step::GiveUp => return Err(failure.take().unwrap_or_else(lost)),
+                Step::GiveUp => match silence {
+                    Some((quiet, waiting_for)) => return Ok(self.silent(out, quiet, waiting_for)),
+                    None => return Err(failure.take().unwrap_or_else(lost)),
+                },
             };
         }
     }

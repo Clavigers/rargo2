@@ -2,6 +2,7 @@ use crate::model::{self, Project};
 use crate::rng::Rng;
 use rargo::daemon_state::{DaemonState, Link, Need};
 use rargo::known_digests::KnownDigests;
+use rargo::link_watch::{self, Tick, Watch};
 use rargo_core::hash::Hash;
 use rargo_core::pool_state::{self, WorkerPool};
 use rargo_core::sched::Priority;
@@ -12,10 +13,12 @@ use rargo_core::worker_state::{self, Carried, FromServer, Worker};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use rargo_proto::{Blob, ClientMsg, Delivery, Digest, ServerMsg};
 use std::fmt;
+use std::time::Duration;
 
 pub const LIVENESS_MS: u64 = 120_000;
 const SERVER_TOKENS: usize = 6;
 const SERVER_MEM_KB: u64 = 16 * 1024;
+const WATCH_STEP_MS: u64 = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bug {
@@ -24,10 +27,12 @@ pub enum Bug {
     NeverAnswer,
     EvictClaimed,
     StaleKnowledge,
+    DeafToSilence,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 5] = [Bug::EvictPinned, Bug::StaleDelivery, Bug::NeverAnswer, Bug::EvictClaimed, Bug::StaleKnowledge];
+    pub const ALL: [Bug; 6] =
+        [Bug::EvictPinned, Bug::StaleDelivery, Bug::NeverAnswer, Bug::EvictClaimed, Bug::StaleKnowledge, Bug::DeafToSilence];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -36,6 +41,7 @@ impl Bug {
             Bug::NeverAnswer => "never-answer",
             Bug::EvictClaimed => "evict-claimed",
             Bug::StaleKnowledge => "stale-knowledge",
+            Bug::DeafToSilence => "deaf-to-silence",
         }
     }
 
@@ -52,6 +58,7 @@ pub enum Kind {
     Liveness(String),
     Deadlock(String),
     StartedWithoutInputs(String),
+    Silence(String),
 }
 
 impl Kind {
@@ -63,6 +70,7 @@ impl Kind {
             Kind::Liveness(_) => "liveness once faults stop",
             Kind::Deadlock(_) => "no deadlock",
             Kind::StartedWithoutInputs(_) => "a run starts with its inputs",
+            Kind::Silence(_) => "a silent server ends the command, and only a silent one",
         }
     }
 
@@ -73,7 +81,8 @@ impl Kind {
             | Kind::Drift(d)
             | Kind::Liveness(d)
             | Kind::Deadlock(d)
-            | Kind::StartedWithoutInputs(d) => d,
+            | Kind::StartedWithoutInputs(d)
+            | Kind::Silence(d) => d,
         }
     }
 }
@@ -121,6 +130,7 @@ pub struct Report {
     pub uploads: u64,
     pub wants: u64,
     pub client_cuts: u64,
+    pub silences: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -183,12 +193,14 @@ enum Up {
     Offer { round: u64, root: Digest, contents: Vec<Digest>, sending: Vec<Digest> },
     Session(ClientMsg),
     Request { round: u64, action: usize, inputs: Vec<Hash> },
+    Ping,
 }
 
 #[derive(Debug)]
 enum Down {
     Session(ServerMsg),
     Synced { round: u64, root: Digest },
+    Pong,
 }
 
 #[derive(Debug)]
@@ -208,6 +220,7 @@ enum Ev {
     Round { client: u64 },
     Sync { client: u64 },
     ClientCut { client: u64 },
+    Watch { client: u64 },
 }
 
 struct WorkerNode {
@@ -274,6 +287,8 @@ struct Client {
     pending: BTreeMap<u64, Vec<Delivery>>,
     contents: Vec<Digest>,
     synced_round: u64,
+    watch: Watch,
+    up_since: u64,
 }
 
 pub struct World {
@@ -292,6 +307,7 @@ pub struct World {
     clients: BTreeMap<u64, Client>,
     report: Report,
     trace: Vec<u8>,
+    silence: Option<(u64, u64)>,
 }
 
 type Step = Result<(), Kind>;
@@ -337,8 +353,10 @@ impl World {
                 uploads: 0,
                 wants: 0,
                 client_cuts: 0,
+                silences: 0,
             },
             trace: Vec::new(),
+            silence: None,
             project,
             cfg,
         };
@@ -374,10 +392,13 @@ impl World {
                     pending: BTreeMap::new(),
                     contents: Vec::new(),
                     synced_round: 0,
+                    watch: Watch::new(Duration::ZERO, link_watch::SILENT_AFTER),
+                    up_since: 0,
                 },
             );
             let at = w.rng.range(0, 500);
             w.schedule(at, Ev::Round { client: id });
+            w.schedule_housekeeping(WATCH_STEP_MS, Ev::Watch { client: id });
         }
         if w.cfg.fault_end_ms > 0 {
             for id in 1..=w.cfg.workers {
@@ -388,6 +409,10 @@ impl World {
                 let client = w.rng.range(1, w.cfg.clients);
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
                 w.schedule(at, Ev::ClientCut { client });
+            }
+            if w.rng.chance(300) {
+                let start = w.rng.range(0, w.cfg.fault_end_ms);
+                w.silence = Some((start, start + w.rng.range(5_000, 100_000)));
             }
         }
         let at = w.rng.range(50, 400);
@@ -443,7 +468,7 @@ impl World {
                     .collect();
                 return Err(fail(&self, Kind::Deadlock(format!("nothing left to happen: {}", open.join("; ")))));
             }
-            if self.now > self.cfg.fault_end_ms + LIVENESS_MS {
+            if self.now > self.faults_end() + LIVENESS_MS {
                 let open: Vec<String> = self
                     .clients
                     .iter()
@@ -454,13 +479,13 @@ impl World {
                     &self,
                     Kind::Liveness(format!(
                         "faults stopped at {} ms and {}",
-                        self.cfg.fault_end_ms,
+                        self.faults_end(),
                         open.join("; ")
                     )),
                 ));
             }
             let ((at, _), ev) = self.queue.pop_first().expect("busy events are queued");
-            if !matches!(ev, Ev::Evict) {
+            if !matches!(ev, Ev::Evict | Ev::Watch { .. }) {
                 self.busy -= 1;
             }
             self.now = at;
@@ -484,6 +509,14 @@ impl World {
                 }
             }
         }
+    }
+
+    fn faults_end(&self) -> u64 {
+        self.silence.map_or(self.cfg.fault_end_ms, |(_, end)| end.max(self.cfg.fault_end_ms))
+    }
+
+    fn silent_at(&self, at: u64) -> Option<(u64, u64)> {
+        self.silence.filter(|(start, end)| (*start..*end).contains(&at))
     }
 
     fn waiting(&self, c: &Client) -> Vec<u64> {
@@ -541,6 +574,7 @@ impl World {
                 self.client_cut(client);
                 Ok(())
             }
+            Ev::Watch { client } => self.watch(client),
         }
     }
 
@@ -563,6 +597,14 @@ impl World {
             let client = &self.clients[&c];
             if !client.up || client.epoch != epoch {
                 return Ok(());
+            }
+            if let Some((_, end)) = self.silent_at(self.now) {
+                self.schedule(end - self.now, Ev::Deliver { from, to, epoch, msg });
+                return Ok(());
+            }
+            if to == Node::Client(c) {
+                let now = Duration::from_millis(self.now);
+                self.clients.get_mut(&c).expect("known").watch.heard(now);
             }
         }
         match (from, msg) {
@@ -728,6 +770,7 @@ impl World {
 
     fn server_from_client(&mut self, client: u64, u: Up) -> Step {
         match u {
+            Up::Ping => self.send(Node::Server, Node::Client(client), Msg::Down(Down::Pong)),
             Up::Join => {
                 self.drop_session(client);
                 let mut sess = Sess { state: SessionState::new(), has: ClientSet::default(), offer: None };
@@ -917,7 +960,7 @@ impl World {
                 self.server.cache.insert(j.key, out);
                 self.deliver_output(j.client, j.round, j.action, out, output)?;
             }
-            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } => unreachable!("only clients say this"),
+            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Ping => unreachable!("only clients say this"),
         }
         Ok(())
     }
@@ -1029,6 +1072,8 @@ impl World {
                 c.daemon.connected();
                 c.up = true;
                 c.epoch += 1;
+                c.watch = Watch::new(Duration::from_millis(now), link_watch::SILENT_AFTER);
+                c.up_since = now;
                 let outputs = &c.outputs;
                 c.requested.retain(|a| outputs.contains_key(a));
                 c.pending.clear();
@@ -1076,6 +1121,53 @@ impl World {
         }
     }
 
+    fn watch(&mut self, client: u64) -> Step {
+        let now = self.now;
+        let max_latency = self.cfg.max_latency_ms;
+        let silence = self.silence;
+        let bug = self.bug;
+        if self.clients[&client].finished {
+            return Ok(());
+        }
+        self.schedule_housekeeping(WATCH_STEP_MS, Ev::Watch { client });
+        let c = self.clients.get_mut(&client).expect("known");
+        if !c.up {
+            return Ok(());
+        }
+        match c.watch.tick(Duration::from_millis(now)) {
+            Tick::Wait => {}
+            Tick::Ping(_) => self.send(Node::Client(client), Node::Server, Msg::Up(Up::Ping)),
+            Tick::Silent(_) if bug == Some(Bug::DeafToSilence) => {}
+            Tick::Silent(quiet) => {
+                let heard = now - quiet.as_millis() as u64;
+                let slack = link_watch::PING_EVERY.as_millis() as u64 + 2 * max_latency + 2 * WATCH_STEP_MS;
+                let silent_for = silence.map_or(0, |(start, end)| end.min(now).saturating_sub(start.max(heard)));
+                if silent_for + slack < link_watch::SILENT_AFTER.as_millis() as u64 {
+                    return Err(Kind::Silence(format!(
+                        "client {client} gave up on its server at {now} ms after {} ms without a word, but the server was silent for only {silent_for} ms of it",
+                        quiet.as_millis()
+                    )));
+                }
+                c.up = false;
+                self.report.silences += 1;
+                self.drop_session(client);
+                self.schedule(1_000, Ev::Sync { client });
+                return Ok(());
+            }
+        }
+        let c = &self.clients[&client];
+        if let Some((start, end)) = silence {
+            let from = start.max(c.up_since);
+            let bound = from + link_watch::SILENT_AFTER.as_millis() as u64 + max_latency + 2 * WATCH_STEP_MS;
+            if c.up && now < end && now > bound {
+                return Err(Kind::Silence(format!(
+                    "client {client} still waits at {now} ms on a server silent since {start} ms, past its bound of {bound} ms"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn request_ready(&mut self, client: u64) {
         let c = &self.clients[&client];
         if c.synced_round != c.round {
@@ -1105,6 +1197,7 @@ impl World {
                 return Ok(());
             }
             Down::Session(m) => m,
+            Down::Pong => return Ok(()),
         };
         let c = self.clients.get_mut(&client).expect("known");
         match m {
@@ -1203,9 +1296,11 @@ fn label(ev: &Ev) -> String {
                 Msg::Up(Up::Offer { .. }) => "offer",
                 Msg::Up(Up::Session(_)) => "upload",
                 Msg::Up(Up::Request { .. }) => "request",
+                Msg::Up(Up::Ping) => "ping",
                 Msg::Work(_) => "work",
                 Msg::Down(Down::Synced { .. }) => "synced",
                 Msg::Down(Down::Session(_)) => "deliver",
+                Msg::Down(Down::Pong) => "pong",
             };
             format!("{from:?}>{to:?}@{epoch}:{what};")
         }
@@ -1216,6 +1311,7 @@ fn label(ev: &Ev) -> String {
         Ev::Round { client } => format!("round {client};"),
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
+        Ev::Watch { client } => format!("watch {client};"),
     }
 }
 
