@@ -180,7 +180,8 @@ impl Session {
     fn send_bulk(&self, m: ServerMsg) -> Result<()> {
         let bytes = bulk_size(&m);
         loop {
-            match self.state.lock().take_bulk(bytes) {
+            let took = self.state.lock().take_bulk(bytes);
+            match took {
                 Err(_) => return Err(self.gone()),
                 Ok(true) => break,
                 Ok(false) => {}
@@ -404,7 +405,8 @@ impl Uploader for Session {
         let wanting = Wanting(self);
         self.send(ask);
         loop {
-            match self.state.lock().progress(&|d| self.store.has(&Hash(*d))) {
+            let progress = self.state.lock().progress(&|d| self.store.has(&Hash(*d)));
+            match progress {
                 Progress::Done => break,
                 Progress::Gone => return Err(self.gone()),
                 Progress::Wait => {}
@@ -480,5 +482,19 @@ mod tests {
         assert_eq!(k.name_of(&bob.id), "bob");
         store.revoke(&bob.id).unwrap();
         assert!(!k.still_valid(&bob.id));
+    }
+
+    #[test]
+    fn an_upload_that_finds_the_session_gone_says_so_and_does_not_lock_the_state_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::db::Db::open(&dir.path().join("db.redb")).unwrap());
+        let store = Arc::new(Store::open(&dir.path().join("store"), db).unwrap());
+        crate::io::drive(1, move || {
+            let (session, _rx) = Session::new(store);
+            session.close();
+            let lacking = Hash([7; 32]);
+            assert!(Uploader::blobs(&*session, vec![lacking]).is_err(), "a closed session's upload ends");
+            assert!(session.send_bulk(ServerMsg::Blobs(Vec::new())).is_err(), "a closed session sends no bulk");
+        });
     }
 }
