@@ -113,7 +113,7 @@ pub(super) fn backend() -> Option<&'static mut Backend> {
 }
 
 pub fn loop_running() -> bool {
-    poke_global().lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    on_loop() || poke_global().lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 pub fn on_fiber() -> bool {
