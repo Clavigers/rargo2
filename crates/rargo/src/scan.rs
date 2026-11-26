@@ -43,8 +43,9 @@ impl Index {
         index_from_bytes(rargo_net::io::file::read(path).ok().as_deref())
     }
 
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        crate::write_atomic(path, &index_bytes(self)?)
+    /// What `save` writes; the caller writes it to disk atomically.
+    pub fn to_bytes(&self) -> io::Result<Vec<u8>> {
+        index_bytes(self)
     }
 }
 
@@ -152,12 +153,8 @@ enum Take {
 }
 
 impl Ignored {
-    pub fn from_git(root: &Path, include: &[String]) -> Option<Ignored> {
-        let listed = crate::git::ignored(root)?;
-        Some(Ignored::new(listed.iter().map(|p| p.as_slice()), include))
-    }
-
-    fn new<'p>(listed: impl Iterator<Item = &'p [u8]>, include: &[String]) -> Ignored {
+    /// The ignore rules of a worktree whose ignored paths git listed as `listed`.
+    pub fn new<'p>(listed: impl Iterator<Item = &'p [u8]>, include: &[String]) -> Ignored {
         let mut me = Ignored { include: include.to_vec(), ..Ignored::default() };
         for p in listed {
             me.paths.insert(p.strip_suffix(b"/").unwrap_or(p).to_vec());
@@ -352,25 +349,56 @@ impl ScanState {
 }
 
 pub fn scan(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
-    drive(ScanCore::whole(root, Some(old), exclude, ignored))
+    drive(ScanCore::whole(root, Some(old), exclude, ignored), |asks| read_host(root, asks))
 }
 
 pub fn rescan(root: &Path, prev: Scan, changed: &BTreeSet<PathBuf>, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
-    drive(ScanCore::rescan(root, prev, changed, exclude, ignored))
+    drive(ScanCore::rescan(root, prev, changed, exclude, ignored), |asks| read_host(root, asks))
 }
 
 pub fn scan_store(dir: &Path, old: &Index) -> io::Result<Scan> {
-    drive(ScanCore::whole(dir, Some(old), &[], None))
+    drive(ScanCore::whole(dir, Some(old), &[], None), |asks| read_host(dir, asks))
 }
 
-pub fn graft_git(scan: &mut Scan, root: &Path, git: &Path, history: Option<Scan>) -> io::Result<()> {
+/// `scan`, with `answer` answering the scan core's questions in place of the host: one answer per
+/// ask, in order. A simulation answers them from a worktree in memory.
+pub fn scan_answered(
+    root: &Path,
+    old: &Index,
+    exclude: &[String],
+    ignored: Option<&Ignored>,
+    answer: impl FnMut(&[Ask]) -> Vec<Answer>,
+) -> io::Result<Scan> {
+    drive(ScanCore::whole(root, Some(old), exclude, ignored), answer)
+}
+
+/// `rescan`, answered by `answer` as in `scan_answered`.
+pub fn rescan_answered(
+    root: &Path,
+    prev: Scan,
+    changed: &BTreeSet<PathBuf>,
+    exclude: &[String],
+    ignored: Option<&Ignored>,
+    answer: impl FnMut(&[Ask]) -> Vec<Answer>,
+) -> io::Result<Scan> {
+    drive(ScanCore::rescan(root, prev, changed, exclude, ignored), answer)
+}
+
+/// `write_atomic` writes the stand-in's gitfile when it changed.
+pub fn graft_git(
+    scan: &mut Scan,
+    root: &Path,
+    git: &Path,
+    history: Option<Scan>,
+    write_atomic: impl FnOnce(&Path, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
     let fresh = Index::default();
-    let sub = drive(ScanCore::whole(git, Some(&fresh), &[], None))?;
+    let sub = drive(ScanCore::whole(git, Some(&fresh), &[], None), |asks| read_host(git, asks))?;
     let gitfile = if root.join(".git").ring_is_file() {
         let text = format!("gitdir: {}\n", rargo_proto::GIT_SIDE);
         let path = git.parent().unwrap_or(git).join("gitfile-v1");
         if rargo_net::io::file::read(&path).ok().as_deref() != Some(text.as_bytes()) {
-            crate::write_atomic(&path, text.as_bytes())?;
+            write_atomic(&path, text.as_bytes())?;
         }
         Some((path, text))
     } else {
@@ -503,7 +531,8 @@ fn finish_scan(root: &Path, old: Option<&Index>, previous: Option<Scan>, observe
     })
 }
 
-enum Ask {
+/// A question the scan core asks of the worktree. `rel` is relative to the root, empty for the root.
+pub enum Ask {
     List { rel: Vec<u8> },
     Meta { rel: Vec<u8> },
     Cache { rel: Vec<u8> },
@@ -511,7 +540,10 @@ enum Ask {
     Content { rel: Vec<u8>, size: u64 },
 }
 
-enum Answer {
+/// The answer to an `Ask` of the same kind: a directory's names, in any order; an entry's metadata,
+/// without following a symlink; the head of a directory's CACHEDIR.TAG; a symlink's target; a
+/// file's hash, with the time it was read.
+pub enum Answer {
     List(io::Result<Vec<Vec<u8>>>),
     Meta(io::Result<Meta>),
     Cache(Option<Vec<u8>>),
@@ -519,16 +551,16 @@ enum Answer {
     Content { at_ns: i64, hash: io::Result<Digest> },
 }
 
-struct Meta {
-    kind: Kind,
-    size: u64,
-    mtime_ns: i64,
-    ctime_ns: i64,
-    ino: u64,
-    exec: bool,
+pub struct Meta {
+    pub kind: Kind,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub ctime_ns: i64,
+    pub ino: u64,
+    pub exec: bool,
 }
 
-enum Kind {
+pub enum Kind {
     Dir,
     Symlink,
     File,
@@ -916,13 +948,13 @@ fn changed_directories(root: &Path, changed: &BTreeSet<PathBuf>) -> BTreeSet<Vec
     on_path
 }
 
-fn drive(mut core: ScanCore) -> io::Result<Scan> {
+fn drive(mut core: ScanCore, mut answer: impl FnMut(&[Ask]) -> Vec<Answer>) -> io::Result<Scan> {
     let mut answers = Vec::new();
     loop {
         match core.advance(std::mem::take(&mut answers))? {
             Step::Ask(asks) => {
                 core.invariants();
-                answers = read_host(core.root_path, &asks);
+                answers = answer(&asks);
             }
             Step::Done => {
                 core.invariants();

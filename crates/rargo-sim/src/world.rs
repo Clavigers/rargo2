@@ -1,6 +1,9 @@
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::workspace::Workspace;
+use crate::worktree::{self, Worktree};
+use rargo::out_tree::{Edit, OutputTree, VFile};
+use rargo::scan::{Index, Scan};
 use crate::rng::Rng;
 use crate::nextest::{Outcome, TestRun};
 use rargo_core::build::nextest_run::Phase;
@@ -48,10 +51,14 @@ pub enum Bug {
     StaleKnowledge,
     DeafToSilence,
     TrustAfterCrash,
+    /// The daemon's watch misses the writes in the worktree, so a rescan reads none of them.
+    DeafToEdits,
+    /// The daemon brings the outputs back without showing them in `target/`.
+    UnshownOutputs,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 7] = [
+    pub const ALL: [Bug; 9] = [
         Bug::EvictPinned,
         Bug::StaleDelivery,
         Bug::NeverAnswer,
@@ -59,6 +66,8 @@ impl Bug {
         Bug::StaleKnowledge,
         Bug::DeafToSilence,
         Bug::TrustAfterCrash,
+        Bug::DeafToEdits,
+        Bug::UnshownOutputs,
     ];
 
     pub fn name(self) -> &'static str {
@@ -70,6 +79,8 @@ impl Bug {
             Bug::StaleKnowledge => "stale-knowledge",
             Bug::DeafToSilence => "deaf-to-silence",
             Bug::TrustAfterCrash => "trust-after-crash",
+            Bug::DeafToEdits => "deaf-to-edits",
+            Bug::UnshownOutputs => "unshown-outputs",
         }
     }
 
@@ -430,6 +441,15 @@ struct Client {
     edits: Rng,
     edit_scheduled: bool,
     checkout_seed: Option<u64>,
+    /// The files `tree` names, which the daemon's scan reads.
+    worktree: Worktree,
+    /// The daemon's last scan, which it keeps in memory to rescan only what changed.
+    last_scan: Option<Scan>,
+    /// The scan's index as the daemon last saved it, which outlives a crash.
+    index: Index,
+    scan_root: Digest,
+    /// The output filesystem's table of what the client's `target/` holds.
+    target: OutputTree,
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
@@ -450,7 +470,7 @@ struct Client {
 }
 
 impl Client {
-    fn edit(&mut self) {
+    fn edit(&mut self, now_ns: i64) {
         let index = self.edits.below(self.tree.len() as u64) as usize;
         let slot = &mut self.tree[index];
         if slot.is_some() && self.edits.chance(500) {
@@ -461,7 +481,20 @@ impl Client {
             let version = slot.as_ref().map_or_else(|| self.edits.below(2), |bytes| u64::from(*bytes == original));
             *slot = Some(if version == 0 { original } else { model::source(index, version) });
         }
+        self.put(index, now_ns);
     }
+
+    /// Writes source `index` as `tree` has it into the worktree.
+    fn put(&mut self, index: usize, now_ns: i64) {
+        match &self.tree[index] {
+            Some(bytes) => self.worktree.write(&worktree::path(index), bytes.clone(), now_ns),
+            None => self.worktree.remove(&worktree::path(index)),
+        }
+    }
+}
+
+fn ns(ms: u64) -> i64 {
+    ms as i64 * 1_000_000
 }
 
 pub struct World {
@@ -575,6 +608,11 @@ impl World {
                     edits: Rng::new(seed ^ id.wrapping_mul(0x912a_e043_5b7d_68f1)),
                     edit_scheduled: false,
                     checkout_seed: Some(seed ^ id.wrapping_mul(0x5cab_f0e9_d1b2_7431)),
+                    worktree: Worktree::default(),
+                    last_scan: None,
+                    index: Index::default(),
+                    scan_root: [0; 32],
+                    target: OutputTree::new(BTreeMap::new()),
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
@@ -594,6 +632,10 @@ impl World {
                     saved: Vec::new(),
                 },
             );
+            let c = w.clients.get_mut(&id).expect("just made");
+            for index in 0..c.tree.len() {
+                c.put(index, 0);
+            }
             let at = w.rng.range(0, 500);
             w.schedule(at, Ev::Round { client: id });
             w.schedule_housekeeping(WATCH_STEP_MS, Ev::Watch { client: id });
@@ -772,6 +814,7 @@ impl World {
         all.extend(self.server.sessions.values().map(|s| &s.state as &dyn StateMachine));
         all.extend(self.workers.values().map(|w| &w.sm as &dyn StateMachine));
         all.extend(self.clients.values().map(|c| &c.daemon as &dyn StateMachine));
+        all.extend(self.clients.values().map(|c| &c.target as &dyn StateMachine));
         all.extend(self.clients.values().filter_map(|c| c.test.as_ref()).map(|t| &t.machine as &dyn StateMachine));
         all
     }
@@ -819,7 +862,7 @@ impl World {
             }
             Ev::Round { client } => self.round(client),
             Ev::Edit { client } => {
-                self.clients.get_mut(&client).expect("known").edit();
+                self.clients.get_mut(&client).expect("known").edit(ns(self.now));
                 Ok(())
             }
             Ev::Checkout { client, round } => self.checkout(client, round),
@@ -1384,6 +1427,9 @@ impl World {
         // Versions 0 and 1 are used by single-file edits on the original branch.
         let mut rng = Rng::new(c.checkout_seed.take().expect("checkout scheduled once"));
         c.tree = (0..c.tree.len()).map(|index| Some(model::source(index, rng.range(2, 16)))).collect();
+        for index in 0..c.tree.len() {
+            c.put(index, ns(self.now));
+        }
         self.build_snapshot(client)
     }
 
@@ -1391,8 +1437,36 @@ impl World {
         let c = self.clients.get_mut(&client).expect("known");
         // Old jobs keep their round ID even if they finish after the checkout.
         c.round += 1;
-        c.snapshot.clone_from(&c.tree);
-        c.reference = self.project.clean_build(&c.snapshot);
+        if self.bug == Some(Bug::DeafToEdits) {
+            c.worktree.forget_changes();
+        }
+        let scan = c
+            .worktree
+            .scan(&c.target, c.last_scan.take(), &c.index, ns(self.now))
+            .map_err(|e| Kind::StateMachine(format!("client {client} could not scan its worktree: {e}")))?;
+        if scan.index_changed {
+            c.index = scan.index.clone();
+        }
+        // The build reads what the scan saw, and must come out as a clean build of the tree.
+        let present = c.tree.iter().flatten().count() as u64;
+        if scan.file_count != present + worktree::OTHER_FILES {
+            return Err(Kind::Drift(format!(
+                "client {client}'s scan saw {} files where its worktree has {present} sources and {} other files",
+                scan.file_count,
+                worktree::OTHER_FILES
+            )));
+        }
+        let snapshot: Vec<Option<Vec<u8>>> = (0..c.tree.len())
+            .map(|index| {
+                let entry = scan.index.files.get(&worktree::path(index))?;
+                let bytes = c.worktree.read(&worktree::path(index)).filter(|b| Hash::of(b).0 == entry.hash);
+                Some(bytes.map_or_else(|| format!("stale {}", Hash(entry.hash).hex()).into_bytes(), <[u8]>::to_vec))
+            })
+            .collect();
+        c.snapshot = snapshot;
+        c.scan_root = scan.root;
+        c.last_scan = Some(scan);
+        c.reference = self.project.clean_build(&c.tree);
         c.edit_scheduled = false;
         c.synced_round = 0;
         c.outputs.clear();
@@ -1437,7 +1511,7 @@ impl World {
         for (d, b) in contents.iter().zip(blobs) {
             c.cache.insert(*d, b.clone());
         }
-        let root = Hash::of(&contents.concat()).0;
+        let root = c.scan_root;
         let (_, lacking) = c.daemon.offer(Some(1), &root, std::iter::empty(), contents.iter().map(|d| (d, ())));
         let sending: Vec<Digest> = lacking.into_iter().map(|(d, ())| d).collect();
         let upload: Vec<Blob> = sending.iter().map(|d| Blob::pack(*d, &c.cache[d])).collect();
@@ -1475,6 +1549,8 @@ impl World {
             return;
         }
         c.dead = true;
+        // The new daemon scans all of the worktree again, with the index the old one saved.
+        c.last_scan = None;
         self.report.crashes += 1;
         if self.bug != Some(Bug::TrustAfterCrash) {
             c.up = false;
@@ -1671,8 +1747,16 @@ impl World {
             )));
         }
         let c = self.clients.get_mut(&client).expect("known");
+        // The daemon shows each delivery in `target/` as one edit of the output filesystem's table.
+        let file = VFile { hash: Hash::of(&output).0, size: output.len() as u64, exec: false, mtime_ns: ns(self.now) };
+        let path = worktree::target_path(self.project.actions[action].id);
+        if self.bug != Some(Bug::UnshownOutputs) {
+            c.target.apply(c.target.generation + 1, vec![Edit::Put { path, file, replaced_real: false }]);
+        }
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
+            self.check_target(client)?;
+            let c = self.clients.get_mut(&client).expect("known");
             if let Some(test) = &mut c.test {
                 let scheduled = test.built();
                 self.schedule_tests(client, scheduled);
@@ -1682,6 +1766,27 @@ impl World {
             return Ok(());
         }
         self.request_ready(client);
+        Ok(())
+    }
+
+    /// What the round left in the client's `target/` is a clean build of its tree, and nothing else.
+    fn check_target(&self, client: u64) -> Step {
+        let c = &self.clients[&client];
+        let want: BTreeMap<Vec<u8>, Digest> = self
+            .project
+            .actions
+            .iter()
+            .zip(&c.reference)
+            .map(|(a, out)| (worktree::target_path(a.id), Hash::of(out).0))
+            .collect();
+        let got: BTreeMap<Vec<u8>, Digest> = c.target.files.iter().map(|(p, f)| (p.clone(), f.hash)).collect();
+        if got != want {
+            let wrong = want.iter().filter(|(p, h)| got.get(*p) != Some(h)).count() + got.keys().filter(|p| !want.contains_key(*p)).count();
+            return Err(Kind::Drift(format!(
+                "client {client} round {}: {wrong} files in target/ differ from a clean build of its tree",
+                c.round
+            )));
+        }
         Ok(())
     }
 
@@ -1822,6 +1927,38 @@ mod edit_tests {
         assert!(world.clients[&1].outputs.is_empty());
         world.client_done(1, new_round, action, new_output.clone()).unwrap();
         assert_eq!(world.clients[&1].outputs[&action], new_output);
+    }
+
+    #[test]
+    fn a_round_scans_only_what_changed_and_a_new_daemon_reuses_the_saved_index() {
+        let mut world = World::new(12, None, Off::none());
+        world.clients.get_mut(&1).unwrap().rounds_left = 3;
+        world.now = 1_000;
+        world.round(1).unwrap();
+        let first = world.clients[&1].last_scan.clone().unwrap();
+        let files = first.file_count;
+        assert_eq!(first.hashed_files, files, "a first scan hashes every file");
+
+        world.now = 2_000;
+        world.step(Ev::Edit { client: 1 }).unwrap();
+        world.now = 3_000;
+        world.round(1).unwrap();
+        let client = &world.clients[&1];
+        let second = client.last_scan.clone().unwrap();
+        assert!(second.hashed_files <= 1, "only the edited file is read again, not {}", second.hashed_files);
+        assert!(second.listed_dirs < second.dirs.len() as u64, "a rescan lists only the directories written in");
+        assert_eq!(client.snapshot, client.tree);
+        assert_ne!(second.root, first.root);
+
+        world.client_crash(1);
+        world.now = 4_000;
+        world.round(1).unwrap();
+        let client = &world.clients[&1];
+        let third = client.last_scan.as_ref().unwrap();
+        assert_eq!(third.listed_dirs, third.dirs.len() as u64, "a new daemon lists all of the worktree");
+        assert_eq!(third.hashed_files, 0, "but reads no file its saved index vouches for");
+        assert_eq!(third.root, second.root);
+        assert_eq!(client.snapshot, client.tree);
     }
 
     #[test]

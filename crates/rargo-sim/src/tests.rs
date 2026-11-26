@@ -177,3 +177,13 @@ fn a_client_that_never_gives_up_on_a_silent_server_is_caught() {
 fn a_restarted_daemon_trusting_the_dead_one_is_caught() {
     caught(Bug::TrustAfterCrash, |k| matches!(k, Kind::StateMachine(_) | Kind::Liveness(_) | Kind::Deadlock(_)));
 }
+
+#[test]
+fn a_rescan_that_misses_the_edits_is_caught() {
+    caught(Bug::DeafToEdits, |k| matches!(k, Kind::Drift(_)));
+}
+
+#[test]
+fn outputs_that_never_reach_target_are_caught() {
+    caught(Bug::UnshownOutputs, |k| matches!(k, Kind::Drift(d) if d.contains("target/")));
+}

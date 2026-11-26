@@ -693,7 +693,7 @@ impl Daemon {
             if let Ok(inside) = cache.ring_canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
                 policy.exclude.push(format!("/{}", inside.to_string_lossy()));
             }
-            let left_out = if policy.gitignored { None } else { scan::Ignored::from_git(&root, &policy.include) };
+            let left_out = if policy.gitignored { None } else { git::ignored(&root).map(|listed| scan::Ignored::new(listed.iter().map(|p| p.as_slice()), &policy.include)) };
             let reusable = previous.as_ref().is_some_and(|p| {
                 !everything
                     && p.policy.exclude == policy.exclude
@@ -713,7 +713,7 @@ impl Daemon {
             };
             let mut scan = scanned.map_err(|e| std::io::Error::new(e.kind(), format!("scanning {}: {e}", root.display())))?;
             if scan.index_changed {
-                let _ = scan.index.save(&wt_cache.join("index"));
+                let _ = scan.index.to_bytes().and_then(|b| crate::write_atomic(&wt_cache.join("index"), &b));
             }
             if let Some(h) = &head {
                 let history = match policy.git {
@@ -730,13 +730,13 @@ impl Daemon {
                             let at = dir.parent().and_then(Path::parent).unwrap_or(dir).join("index");
                             let s = scan::scan_store(dir, &scan::Index::load(&at))?;
                             if s.index_changed {
-                                let _ = s.index.save(&at);
+                                let _ = s.index.to_bytes().and_then(|b| crate::write_atomic(&at, &b));
                             }
                             Some(s)
                         }
                         None => None,
                     };
-                    scan::graft_git(&mut scan, &root, &thin, stored)?;
+                    scan::graft_git(&mut scan, &root, &thin, stored, crate::write_atomic)?;
                 }
             }
             Ok(Snap { scan, policy, head, left_out })
@@ -2741,7 +2741,7 @@ mod left_out_tests {
     #[test]
     fn a_failure_naming_left_out_files_gets_one_note_for_at_most_three() {
         let root = Path::new("/home/ann/proj");
-        let ignored = scan::Ignored::for_test(&["junk/", "crates/util/local-note.txt", "a.bin", "b.bin", "c.bin", "d.bin"], &[]);
+        let ignored = scan::Ignored::new(["junk/", "crates/util/local-note.txt", "a.bin", "b.bin", "c.bin", "d.bin"].iter().map(|p| p.as_bytes()), &[]);
         let one = |p: &str| format!("note: `{p}` is not on the build server: git ignores it");
         let rows: &[(&str, Option<String>)] = &[
             ("error: couldn't read `/home/ann/proj/crates/util/src/../local-note.txt`\n", Some(one("crates/util/local-note.txt"))),
