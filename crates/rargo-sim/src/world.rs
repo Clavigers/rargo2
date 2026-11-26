@@ -125,6 +125,11 @@ pub struct Report {
     pub end_ms: u64,
     pub trace: Hash,
     pub runs: u64,
+    pub long_runs: u64,
+    pub failed_builds: u64,
+    pub cancelled_builds: u64,
+    pub cancelled_with_outputs: u64,
+    pub aborted_runs: u64,
     pub cache_hits: u64,
     pub cuts: u64,
     pub evictions: u64,
@@ -189,11 +194,12 @@ enum Node {
 #[derive(Debug)]
 enum Up {
     Hello { cores: usize },
-    Result { job: u64, output: Vec<u8> },
+    Result { job: u64, output: Result<Vec<u8>, Vec<u8>> },
     Join,
     Offer { round: u64, root: Digest, contents: Vec<Digest>, sending: Vec<Digest> },
     Session(ClientMsg),
     Request { round: u64, action: usize, inputs: Vec<Hash> },
+    Cancel { round: u64 },
     Ping,
 }
 
@@ -217,6 +223,7 @@ enum Ev {
     Connect { worker: u64 },
     Finish { worker: u64, token: u64 },
     Cut { worker: u64 },
+    Cancel { worker: u64, token: u64 },
     Evict,
     Round { client: u64 },
     Sync { client: u64 },
@@ -255,6 +262,7 @@ struct Sess {
     state: SessionState,
     has: ClientSet,
     offer: Option<Offer>,
+    ended: Option<u64>,
 }
 
 struct Server {
@@ -276,7 +284,11 @@ struct Client {
     round: u64,
     rounds_left: u64,
     versions: Vec<u64>,
+    // Dependency outputs are staged for this command until it succeeds.
     outputs: BTreeMap<usize, Vec<u8>>,
+    artifacts: BTreeMap<usize, Vec<u8>>,
+    round_ended: bool,
+    diagnostic: Option<Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
     daemon: DaemonState,
@@ -348,6 +360,11 @@ impl World {
                 end_ms: 0,
                 trace: Hash::of(b""),
                 runs: 0,
+                long_runs: 0,
+                failed_builds: 0,
+                cancelled_builds: 0,
+                cancelled_with_outputs: 0,
+                aborted_runs: 0,
                 cache_hits: 0,
                 cuts: 0,
                 evictions: 0,
@@ -382,6 +399,9 @@ impl World {
                     rounds_left: w.cfg.rounds,
                     versions,
                     outputs: BTreeMap::new(),
+                    artifacts: BTreeMap::new(),
+                    round_ended: false,
+                    diagnostic: None,
                     requested: BTreeSet::new(),
                     finished: false,
                     daemon,
@@ -454,7 +474,7 @@ impl World {
         let seed = self.seed;
         let bug = self.bug;
         loop {
-            if self.finished() {
+            if self.finished() && self.busy == 0 {
                 self.report.end_ms = self.now;
                 self.report.trace = Hash::of(&self.trace);
                 return Ok(self.report);
@@ -536,6 +556,12 @@ impl World {
 
     fn check(&self) -> Step {
         rargo_machine::check_all(self.machines());
+        for client in self.clients.values() {
+            assert!(client.artifacts.is_empty() || client.artifacts.len() == self.project.actions.len());
+            if client.round_ended {
+                assert!(client.outputs.is_empty() && client.pending.is_empty() && client.parts.is_empty());
+            }
+        }
         for (client, sess) in &self.server.sessions {
             let Some(o) = &sess.offer else { continue };
             for h in &o.arrived {
@@ -567,6 +593,17 @@ impl World {
             Ev::Connect { worker } => self.connect(worker),
             Ev::Finish { worker, token } => self.finish(worker, token),
             Ev::Cut { worker } => self.cut(worker),
+            Ev::Cancel { worker, token } => {
+                if let Some((job, _)) = self.workers[&worker].running.get(&token)
+                    && let Some(j) = self.server.jobs.get(job)
+                    && j.round == self.clients[&j.client].round
+                    && self.clients[&j.client].up
+                    && !self.clients[&j.client].round_ended
+                {
+                    self.send(Node::Client(j.client), Node::Server, Msg::Up(Up::Cancel { round: j.round }));
+                }
+                Ok(())
+            }
             Ev::Evict => {
                 self.evict();
                 Ok(())
@@ -616,7 +653,11 @@ impl World {
                 let now = self.now;
                 let node = self.workers.get_mut(&w).expect("known");
                 let store = &node.store;
+                let cancel = matches!(m, FromServer::Cancel { .. });
                 let fx = node.sm.server(m, &|h| store.contains_key(h), now);
+                if cancel && fx.iter().any(|e| matches!(e, worker_state::Effect::Abort { .. })) {
+                    self.report.aborted_runs += 1;
+                }
                 self.worker_effects(w, fx)
             }
             (_, Msg::Down(d)) => {
@@ -700,6 +741,12 @@ impl World {
                     let ms = run.ms;
                     node.running.insert(token, (action, run));
                     self.schedule(ms, Ev::Finish { worker, token });
+                    if ms >= model::LONG_RUN_MS {
+                        self.report.long_runs += 1;
+                        if self.seed.is_multiple_of(3) {
+                            self.schedule(ms / 2, Ev::Cancel { worker, token });
+                        }
+                    }
                 }
                 worker_state::Effect::Abort { token } => {
                     self.workers.get_mut(&worker).expect("known").running.remove(&token);
@@ -714,7 +761,7 @@ impl World {
         let node = self.workers.get_mut(&worker).expect("known");
         let Some((job, run)) = node.running.remove(&token) else { return Ok(()) };
         let inputs: Vec<&[u8]> = run.inputs.iter().map(|h| node.store[h].as_slice()).collect();
-        let output = model::compile(self.project.actions[run.action].id, &inputs);
+        let output = model::compile(self.seed, self.project.actions[run.action].id, &inputs);
         let fx = node.sm.ended(token);
         self.report.runs += 1;
         for e in fx {
@@ -736,12 +783,20 @@ impl World {
         }
         let ignore_pins = self.bug == Some(Bug::EvictPinned);
         let ignore_claims = self.bug == Some(Bug::EvictClaimed);
+        // An offer can already have some of its inputs in the store while
+        // waiting on uploads for the rest. Keep those inputs until it commits.
+        let offered: BTreeSet<_> = self.server.sessions.values()
+            .filter_map(|s| s.offer.as_ref())
+            .flat_map(|o| o.contents.iter().copied())
+            .collect();
         let candidates: Vec<Hash> = self
             .server
             .store
             .keys()
             .filter(|h| ignore_pins || self.server.pins.get(h).copied().unwrap_or(0) == 0)
-            .filter(|h| ignore_claims || self.server.trees.holder(h).is_none())
+            .filter(|h| {
+                if self.server.trees.holder(h).is_some() { ignore_claims } else { !offered.contains(h) }
+            })
             .copied()
             .collect();
         if candidates.is_empty() {
@@ -751,7 +806,7 @@ impl World {
         self.server.store.remove(&h);
         self.report.evictions += 1;
         let worker = self.rng.range(1, self.cfg.workers);
-        let busy: BTreeSet<Hash> = self
+        let mut busy: BTreeSet<Hash> = self
             .server
             .jobs
             .values()
@@ -759,6 +814,7 @@ impl World {
             .flat_map(|j| j.inputs.iter().copied())
             .collect();
         let node = self.workers.get_mut(&worker).expect("known");
+        busy.extend(node.running.values().flat_map(|(_, run)| run.inputs.iter().copied()));
         if let Some(h) = node.store.keys().find(|h| !busy.contains(h)).copied() {
             node.store.remove(&h);
         }
@@ -776,7 +832,7 @@ impl World {
             Up::Ping => self.send(Node::Server, Node::Client(client), Msg::Down(Down::Pong)),
             Up::Join => {
                 self.drop_session(client);
-                let mut sess = Sess { state: SessionState::new(), has: ClientSet::default(), offer: None };
+                let mut sess = Sess { state: SessionState::new(), has: ClientSet::default(), offer: None, ended: None };
                 sess.state.knows(&mut sess.has, std::iter::empty());
                 self.server.sessions.insert(client, sess);
             }
@@ -798,6 +854,11 @@ impl World {
                     self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::WantBlobs(want))));
                 }
                 self.try_finish_offer(client);
+            }
+            Up::Cancel { round } => {
+                if self.server.held.get(&client).is_some_and(|(held, _)| *held == round) {
+                    self.end_server_round(client, round, model::CANCELLED, None);
+                }
             }
             Up::Session(m) => {
                 let server = &mut self.server;
@@ -829,6 +890,9 @@ impl World {
                 }
             }
             Up::Request { round, action, inputs } => {
+                if self.server.sessions[&client].ended == Some(round) {
+                    return Ok(());
+                }
                 if self.bug == Some(Bug::NeverAnswer) && self.rng.chance(40) {
                     return Ok(());
                 }
@@ -861,12 +925,52 @@ impl World {
 
     fn drop_session(&mut self, client: u64) {
         let Some(sess) = self.server.sessions.remove(&client) else { return };
+        self.cancel_jobs(client, None);
         let Some(o) = sess.offer else { return };
         self.server.trees.release(o.up);
         let others: Vec<u64> = self.server.sessions.iter().filter(|(_, s)| s.offer.is_some()).map(|(c, _)| *c).collect();
         for other in others {
             self.rewant(other);
         }
+    }
+
+    fn cancel_jobs(&mut self, client: u64, round: Option<u64>) {
+        let jobs: Vec<_> = self
+            .server
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.client == client && round.is_none_or(|round| j.round == round))
+            .map(|(&job, _)| job)
+            .collect();
+        for job in jobs {
+            self.server.ready.retain(|&ready| ready != job);
+            let j = self.server.jobs.remove(&job).expect("selected job");
+            let fx = self.server.pool.finished(job, false);
+            self.pool_effects(fx);
+            if let Some(worker) = j.worker {
+                let fx = self.server.pool.give_back(worker);
+                self.pool_effects(fx);
+            }
+            let fx = if self.server.sched.is_running(job) {
+                self.server.sched.release(job)
+            } else {
+                self.server.sched.cancel(job)
+            };
+            self.sched_effects(fx);
+        }
+    }
+
+    fn end_server_round(&mut self, client: u64, round: u64, code: i32, diagnostic: Option<Vec<u8>>) {
+        let Some(sess) = self.server.sessions.get_mut(&client) else { return };
+        if sess.ended == Some(round) {
+            return;
+        }
+        sess.ended = Some(round);
+        self.cancel_jobs(client, Some(round));
+        if let Some(bytes) = diagnostic {
+            self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::Stderr(bytes))));
+        }
+        self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::Exit(code))));
     }
 
     fn rewant(&mut self, client: u64) {
@@ -958,12 +1062,19 @@ impl World {
                 let j = self.server.jobs.remove(&job).expect("a routed job is known");
                 let fx = self.server.sched.release(job);
                 self.sched_effects(fx);
+                let output = match output {
+                    Ok(output) => output,
+                    Err(diagnostic) => {
+                        self.end_server_round(j.client, j.round, model::FAILED, Some(diagnostic));
+                        return Ok(());
+                    }
+                };
                 let out = Hash::of(&output);
                 self.server.store.insert(out, output.clone());
                 self.server.cache.insert(j.key, out);
                 self.deliver_output(j.client, j.round, j.action, out, output)?;
             }
-            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Ping => unreachable!("only clients say this"),
+            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Cancel { .. } | Up::Ping => unreachable!("only clients say this"),
         }
         Ok(())
     }
@@ -982,7 +1093,9 @@ impl World {
                     let fx = self.server.sched.request(job, Priority::Agent, mem_kb);
                     self.sched_effects(fx);
                 }
-                pool_state::Effect::Cancel { .. } => {}
+                pool_state::Effect::Cancel { worker, action } => {
+                    self.send(Node::Server, Node::Worker(worker), Msg::Work(FromServer::Cancel { action }));
+                }
             }
         }
         if wake {
@@ -1016,7 +1129,9 @@ impl World {
             assert!(self.server.pool.sent(job, worker), "a leased worker is here");
             let j = self.server.jobs.get_mut(&job).expect("a granted job is known");
             j.worker = Some(worker);
-            let run = SimRun { action: j.action, inputs: j.inputs.clone(), ms: self.project.actions[j.action].ms };
+            let a = &self.project.actions[j.action];
+            let ms = model::duration(self.seed, model::key(a.id, &j.inputs), a.ms);
+            let run = SimRun { action: j.action, inputs: j.inputs.clone(), ms };
             let pushes: Vec<(Hash, Vec<u8>)> = j.inputs.iter().map(|h| (*h, self.server.store[h].clone())).collect();
             let msg = FromServer::Run(worker_state::Run {
                 action: job,
@@ -1051,9 +1166,9 @@ impl World {
                 c.versions[s] = self.rng.range(0, 2);
             }
         }
-        c.outputs.clear();
+        c.round_ended = false;
+        c.diagnostic = None;
         c.requested.clear();
-        c.pending.clear();
         c.daemon.changed(1, false);
         self.sync(client)
     }
@@ -1061,7 +1176,7 @@ impl World {
     fn sync(&mut self, client: u64) -> Step {
         let now = self.now;
         let c = self.clients.get_mut(&client).expect("known");
-        if c.finished {
+        if c.round_ended {
             return Ok(());
         }
         match c.daemon.link(c.up, Need::Must) {
@@ -1173,7 +1288,7 @@ impl World {
 
     fn request_ready(&mut self, client: u64) {
         let c = &self.clients[&client];
-        if c.synced_round != c.round {
+        if c.round_ended || c.synced_round != c.round {
             return;
         }
         let ready = self.project.ready(&|a| c.outputs.contains_key(&a), &|a| c.requested.contains(&a));
@@ -1203,7 +1318,30 @@ impl World {
             Down::Pong => return Ok(()),
         };
         let c = self.clients.get_mut(&client).expect("known");
+        if c.round_ended {
+            return Ok(());
+        }
         match m {
+            ServerMsg::Stderr(bytes) => c.diagnostic = Some(bytes),
+            ServerMsg::Exit(code @ (model::FAILED | model::CANCELLED)) => {
+                if code == model::FAILED {
+                    let c = &self.clients[&client];
+                    let expected = c
+                        .requested
+                        .iter()
+                        .filter(|a| !c.outputs.contains_key(a))
+                        .filter_map(|&a| self.reference(c, a).err())
+                        .any(|diagnostic| c.diagnostic.as_ref() == Some(&diagnostic));
+                    if !expected {
+                        return Err(Kind::Drift(format!("client {client} received an unexpected compiler diagnostic")));
+                    }
+                    self.report.failed_builds += 1;
+                } else {
+                    self.report.cancelled_builds += 1;
+                    self.report.cancelled_with_outputs += u64::from(!c.outputs.is_empty());
+                }
+                self.end_client_round(client, code);
+            }
             ServerMsg::WantBlobs(want) => {
                 if self.bug == Some(Bug::StaleKnowledge) {
                     return Ok(());
@@ -1262,30 +1400,47 @@ impl World {
         if round != c.round || c.outputs.contains_key(&action) {
             return Ok(());
         }
-        let inputs = self.inputs_of(c, action);
-        let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
-        let want = model::compile(self.project.actions[action].id, &refs);
-        if output != want {
+        let want = self.reference(c, action);
+        if want.as_ref() != Ok(&output) {
             return Err(Kind::Drift(format!(
                 "client {client} round {round} got {:?} for action {} where its tree gives {:?}",
                 String::from_utf8_lossy(&output[..output.len().min(40)]),
                 self.project.actions[action].id,
-                String::from_utf8_lossy(&want[..want.len().min(40)])
+                want.map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(40)]).into_owned())
             )));
         }
         let c = self.clients.get_mut(&client).expect("known");
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
-            if c.rounds_left == 0 {
-                c.finished = true;
-            } else {
-                let at = self.rng.range(0, 1_000);
-                self.schedule(at, Ev::Round { client });
-            }
-            return Ok(());
+            self.end_client_round(client, 0);
+        } else {
+            self.request_ready(client);
         }
-        self.request_ready(client);
         Ok(())
+    }
+
+    fn reference(&self, client: &Client, action: usize) -> Result<Vec<u8>, Vec<u8>> {
+        let inputs = self.inputs_of(client, action);
+        let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
+        model::compile(self.seed, self.project.actions[action].id, &refs)
+    }
+
+    fn end_client_round(&mut self, client: u64, code: i32) {
+        let c = self.clients.get_mut(&client).expect("known");
+        c.round_ended = true;
+        c.pending.clear();
+        c.parts.clear();
+        if code == 0 {
+            c.artifacts = std::mem::take(&mut c.outputs);
+        } else {
+            c.outputs.clear();
+        }
+        if c.rounds_left == 0 {
+            c.finished = true;
+        } else {
+            let at = self.rng.range(0, 1_000);
+            self.schedule(at, Ev::Round { client });
+        }
     }
 }
 
@@ -1300,6 +1455,7 @@ fn label(ev: &Ev) -> String {
                 Msg::Up(Up::Session(_)) => "upload",
                 Msg::Up(Up::Request { .. }) => "request",
                 Msg::Up(Up::Ping) => "ping",
+                Msg::Up(Up::Cancel { .. }) => "cancel",
                 Msg::Work(_) => "work",
                 Msg::Down(Down::Synced { .. }) => "synced",
                 Msg::Down(Down::Session(_)) => "deliver",
@@ -1310,6 +1466,7 @@ fn label(ev: &Ev) -> String {
         Ev::Connect { worker } => format!("connect {worker};"),
         Ev::Finish { worker, token } => format!("finish {worker}/{token};"),
         Ev::Cut { worker } => format!("cut {worker};"),
+        Ev::Cancel { worker, token } => format!("cancel {worker}/{token};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
         Ev::Sync { client } => format!("sync {client};"),

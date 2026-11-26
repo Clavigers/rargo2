@@ -23,11 +23,12 @@ fn main() -> Result<(), String> {
     }
     let count = seeds.end - seeds.start;
     let mut failures = Vec::new();
-    let mut totals = [0u64; 5];
+    let mut totals = [0u64; 8];
     for seed in seeds {
         match run(seed, bug) {
             Ok(r) => {
-                for (t, n) in totals.iter_mut().zip([r.events, r.runs, r.cache_hits, r.cuts, r.evictions]) {
+                let counts = [r.events, r.runs, r.cache_hits, r.cuts, r.evictions, r.long_runs, r.failed_builds, r.cancelled_builds];
+                for (t, n) in totals.iter_mut().zip(counts) {
                     *t += n;
                 }
             }
@@ -37,8 +38,9 @@ fn main() -> Result<(), String> {
             }
         }
     }
-    let [events, runs, hits, cuts, evictions] = totals;
+    let [events, runs, hits, cuts, evictions, long, failed, cancelled] = totals;
     println!("passing seeds: {events} events, {runs} runs, {hits} cache hits, {cuts} cut links, {evictions} evictions");
+    println!("model workload: {long} long runs, {failed} compiler failures, {cancelled} cancelled builds");
     println!("{} of {count} seeds failed", failures.len());
     if failures.is_empty() { Ok(()) } else { Err(format!("{} seeds failed", failures.len())) }
 }

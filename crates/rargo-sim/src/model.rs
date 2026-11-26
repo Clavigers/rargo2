@@ -45,13 +45,31 @@ pub fn source(index: usize, version: u64) -> Vec<u8> {
     format!("source {index} at version {version}\n").into_bytes()
 }
 
-pub fn compile(action: u64, inputs: &[&[u8]]) -> Vec<u8> {
+pub(crate) const LONG_RUN_MS: u64 = 1_000;
+pub(crate) const FAILED: i32 = 101;
+pub(crate) const CANCELLED: i32 = 130;
+
+pub fn compile(seed: u64, action: u64, inputs: &[&[u8]]) -> Result<Vec<u8>, Vec<u8>> {
+    let hashes: Vec<_> = inputs.iter().map(|input| Hash::of(input)).collect();
+    if profile(seed, key(action, &hashes)).is_multiple_of(23) {
+        return Err(format!("error: model compiler failed for action {action}\n").into_bytes());
+    }
     let mut text = format!("output of {action}:").into_bytes();
-    for input in inputs {
-        text.extend_from_slice(Hash::of(input).hex().as_bytes());
+    for hash in hashes {
+        text.extend_from_slice(hash.hex().as_bytes());
         text.push(b' ');
     }
-    text
+    Ok(text)
+}
+
+pub(crate) fn duration(seed: u64, key: Hash, base_ms: u64) -> u64 {
+    if profile(seed, key).is_multiple_of(5) { base_ms + LONG_RUN_MS } else { base_ms }
+}
+
+fn profile(seed: u64, key: Hash) -> u64 {
+    let mut bytes = seed.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&key.0);
+    u64::from_le_bytes(Hash::of(&bytes).0[..8].try_into().expect("eight bytes"))
 }
 
 pub fn key(action: u64, inputs: &[Hash]) -> Hash {

@@ -78,3 +78,25 @@ fn a_client_trusting_what_the_server_no_longer_holds_is_caught() {
 fn a_client_that_never_gives_up_on_a_silent_server_is_caught() {
     caught(Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
 }
+
+#[test]
+fn compiler_failures_are_repeatable_for_the_same_inputs() {
+    use crate::model::compile;
+
+    let errors: Vec<_> = (0..100)
+        .filter_map(|seed| compile(seed, 1000, &[b"source"]).err().map(|error| (seed, error)))
+        .collect();
+    assert!(!errors.is_empty());
+    for (seed, error) in errors {
+        assert_eq!(compile(seed, 1000, &[b"source"]), Err(error));
+        assert!((0..100).any(|version| compile(seed, 1000, &[&[version]]).is_ok()));
+    }
+}
+
+#[test]
+fn builds_exercise_compiler_exits_and_discard_staged_artifacts_on_cancel() {
+    let reports: Vec<_> = (0..24).map(|seed| run(seed, None).expect("passes")).collect();
+    assert!(reports.iter().any(|r| r.failed_builds > 0));
+    assert!(reports.iter().any(|r| r.long_runs > 0 && r.cancelled_builds > 0 && r.aborted_runs > 0));
+    assert!(reports.iter().any(|r| r.cancelled_with_outputs > 0));
+}
