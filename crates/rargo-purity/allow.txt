@@ -86,7 +86,6 @@ locks	crates/rargo/src/tmp.rs	6	shares state between threads outside a shell or 
 locks	crates/rargo/src/watch.rs	2	shares state between threads outside a shell or worker pool: std locks (2)
 hash-order	crates/rargo-core/examples/cdcbench.rs	3	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: HashMap or HashSet with the default random hasher
 hash-order	crates/rargo-core/examples/chunkshare.rs	1	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: HashMap or HashSet with the default random hasher
-hash-order	crates/rargo-core/src/ar.rs	1	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/build.rs	31	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/build/pure.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/buildview.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
