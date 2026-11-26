@@ -776,13 +776,14 @@ mod tests {
 
     #[test]
     fn detects_write_through_hardlink() {
-        let (d, s) = store();
+        let (d, mut s) = store();
+        s.reflink = false;
         let h = s.put_bytes(b"original content").unwrap();
         let dest = d.path().join("linked");
         let placed = s.materialize(&h, false, &dest).unwrap();
-        if placed != Placed::Hardlink {
-            return;
-        }
+        assert_eq!(placed, Placed::Hardlink);
+        // The hardlink shares the read-only blob's permissions.
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o644)).unwrap();
         let mut f = fs::OpenOptions::new().write(true).open(&dest).unwrap();
         f.write_all(b"CORRUPTED").unwrap();
         drop(f);
