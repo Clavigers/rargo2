@@ -29,6 +29,7 @@ struct State {
     unsynced: Vec<Change>,
     changes: usize,
     cut_after: Option<usize>,
+    full: bool,
 }
 
 thread_local! {
@@ -54,6 +55,9 @@ impl FakeDisk {
         self.with(|s| {
             if s.cut_after.is_some_and(|n| s.changes >= n) {
                 return Err(io::Error::other("the power is off"));
+            }
+            if s.full {
+                return Err(io::ErrorKind::StorageFull.into());
             }
             s.changes += 1;
             change.apply(&mut s.live);
@@ -160,4 +164,17 @@ fn a_power_cut_keeps_every_finished_batch_and_tears_none() {
         cut += 1;
     }
     assert!(cut > 0, "the cut fell inside a commit at least once");
+}
+
+#[test]
+fn a_full_disk_loses_nothing_once_there_is_room_again() {
+    let disk = FakeDisk::holding(Vec::new());
+    let db = Db::on(disk).unwrap();
+    write_batch(&db, 1);
+    disk.with(|s| s.full = true);
+    write_batch(&db, 2);
+    assert_eq!(db.get(Table::Meta, b"first").as_deref(), Some(&[2u8][..]), "an unwritten record is still read");
+    disk.with(|s| s.full = false);
+    write_batch(&db, 3);
+    assert_eq!(batch_on(disk.with(|s| s.safe.clone())), 3, "the record written after the disk had room again is on disk");
 }

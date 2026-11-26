@@ -82,16 +82,44 @@ impl Tables for MemTables {
     }
 }
 
+type Opener = Box<dyn Fn() -> Result<Database> + Send + Sync>;
+
+struct Slot {
+    db: Option<Arc<Database>>,
+    broken: bool,
+    stop: bool,
+}
+
 struct Shared {
-    db: Database,
+    open: Opener,
     writer: Mutex<DbWriter>,
     flushing: Mutex<()>,
     wake: std::sync::OnceLock<crate::io::Notify>,
-    stop: Mutex<bool>,
+    slot: Mutex<Slot>,
     born: Instant,
 }
 
 impl Shared {
+    fn reader(&self) -> Option<Arc<Database>> {
+        self.slot.lock().db.clone()
+    }
+
+    fn writable(&self) -> Result<Arc<Database>> {
+        let old = {
+            let mut slot = self.slot.lock();
+            match &slot.db {
+                Some(db) if !slot.broken => return Ok(db.clone()),
+                _ => slot.db.take(),
+            }
+        };
+        drop(old);
+        let db = Arc::new((self.open)().context("reopening the database")?);
+        let mut slot = self.slot.lock();
+        slot.db = Some(db.clone());
+        slot.broken = false;
+        Ok(db)
+    }
+
     fn now_ms(&self) -> u64 {
         self.born.elapsed().as_millis() as u64
     }
@@ -104,18 +132,19 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
-        Db::of(db)
+        let path = path.to_path_buf();
+        Db::of(Box::new(move || Database::create(&path).with_context(|| format!("opening {}", path.display()))))
     }
 
     #[cfg(test)]
-    fn on(disk: impl redb::StorageBackend) -> Result<Db> {
-        let db = Db::of(redb::Builder::new().create_with_backend(disk)?)?;
+    fn on(disk: impl redb::StorageBackend + Copy) -> Result<Db> {
+        let db = Db::of(Box::new(move || Ok(redb::Builder::new().create_with_backend(disk)?)))?;
         db.writing.call_once(|| ());
         Ok(db)
     }
 
-    fn of(db: Database) -> Result<Db> {
+    fn of(open: Opener) -> Result<Db> {
+        let db = open()?;
         {
             let tx = db.begin_write()?;
             for t in ALL {
@@ -124,11 +153,11 @@ impl Db {
             tx.commit()?;
         }
         let shared = Arc::new(Shared {
-            db,
+            open,
             writer: Mutex::new(DbWriter::new()),
             flushing: Mutex::new(()),
             wake: std::sync::OnceLock::new(),
-            stop: Mutex::new(false),
+            slot: Mutex::new(Slot { db: Some(Arc::new(db)), broken: false, stop: false }),
             born: Instant::now(),
         });
         Ok(Db { shared, writing: std::sync::Once::new() })
@@ -155,7 +184,7 @@ impl Db {
         if let Some(v) = self.shared.writer.lock().get(table, key) {
             return v;
         }
-        let tx = self.shared.db.begin_read().ok()?;
+        let tx = self.shared.reader()?.begin_read().ok()?;
         let t = tx.open_table(table.def()).ok()?;
         let v = t.get(key).ok()??;
         Some(Arc::from(v.value()))
@@ -175,7 +204,7 @@ impl Db {
 
     pub fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
         let mut out: std::collections::BTreeMap<Vec<u8>, Option<Arc<[u8]>>> = Default::default();
-        if let Ok(tx) = self.shared.db.begin_read() {
+        if let Some(Ok(tx)) = self.shared.reader().map(|db| db.begin_read()) {
             if let Ok(t) = tx.open_table(table.def()) {
                 if let Ok(range) = t.range::<&[u8]>(prefix..) {
                     for item in range {
@@ -207,7 +236,7 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        *self.shared.stop.lock() = true;
+        self.shared.slot.lock().stop = true;
         if let Some(wake) = self.shared.wake.get() {
             wake.notify_one();
         }
@@ -243,12 +272,13 @@ fn flush_once(shared: &Shared) {
     if batch.is_empty() {
         return;
     }
-    let done = commit(&shared.db, &batch);
+    let done = shared.writable().and_then(|db| commit(&db, &batch));
     let now = shared.now_ms();
     match done {
         Ok(()) => shared.writer.lock().flushed(&batch, now),
         Err(e) => {
             eprintln!("rargod: db commit failed: {e:#}");
+            shared.slot.lock().broken = true;
             shared.writer.lock().failed(now);
         }
     }
@@ -265,7 +295,7 @@ fn flush_off_the_loop(shared: &Shared) {
 fn writer_loop(shared: Arc<Shared>) {
     let wake = shared.wake.get().expect("the writer starts with its wake");
     loop {
-        if *shared.stop.lock() {
+        if shared.slot.lock().stop {
             return;
         }
         let wait = {
