@@ -843,7 +843,6 @@ dependencies = [
  "sha2",
  "shell-escape",
  "tar",
- "tempfile",
  "toml",
  "ureq",
  "zstd",

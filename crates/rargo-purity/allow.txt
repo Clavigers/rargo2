@@ -47,8 +47,6 @@ hash-order	crates/rargo-proto/src/lib.rs	2	HashMap or HashSet with the default r
 hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-pure-tests	crates/rargo-core/Cargo.toml	1	tempfile is a dev-dependency because tests still use real directories
-pure-tests	crates/rargo-core/tests/engine.rs	20	tests still touch the world instead of memory: the filesystem (17), tempdirs (2), the environment (1)
 self-check	crates/rargo-core/src/action_table.rs	3	3 step methods of ActionTable assert nothing
 self-check	crates/rargo-core/src/build/nextest_run.rs	1	1 step method of NextestRun asserts nothing
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
