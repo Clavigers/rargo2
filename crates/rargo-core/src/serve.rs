@@ -437,7 +437,7 @@ fn serve(
     }
 
     let worktree = req.worktree.clone();
-    let before: Option<Arc<std::collections::HashSet<crate::proto::Digest>>> = {
+    let before: Option<Arc<std::collections::BTreeSet<crate::proto::Digest>>> = {
         let known = d.deliveries.lock();
         known
             .get(&worktree)

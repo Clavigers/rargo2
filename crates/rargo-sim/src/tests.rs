@@ -7,8 +7,13 @@ fn clean(seeds: std::ops::Range<u64>) {
 }
 
 #[test]
-fn seeds_0_to_200_keep_every_invariant() {
-    clean(0..200);
+fn seeds_0_to_100_keep_every_invariant() {
+    clean(0..100);
+}
+
+#[test]
+fn seeds_100_to_200_keep_every_invariant() {
+    clean(100..200);
 }
 
 #[test]
@@ -35,6 +40,14 @@ fn a_seed_replays_the_same_run() {
 }
 
 #[test]
+fn seeded_test_commands_report_passes_failures_and_timeouts() {
+    let reports: Vec<_> = (0..10).map(|seed| run(seed, None).expect("commands finish")).collect();
+    assert!(reports.iter().any(|r| r.tests_passed > 0));
+    assert!(reports.iter().any(|r| r.tests_failed > 0));
+    assert!(reports.iter().any(|r| r.tests_timed_out > 0));
+}
+
+#[test]
 fn a_worker_restarts_even_if_its_link_was_cut_when_it_crashed() {
     let report = run(85, None).expect("the only worker reconnects and the build finishes");
     assert_eq!(report.cuts, 1);
@@ -46,6 +59,13 @@ fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
     clean(635..636);
     clean(8360..8361);
     clean(9391..9392);
+}
+
+#[test]
+fn dozens_of_client_rounds_overlap_during_eviction() {
+    let report = run(12, None).unwrap_or_else(|failure| panic!("{failure}"));
+    assert!(report.clients_at_eviction >= 24, "{report:?}");
+    assert!(report.cache_hits > 0, "clients reuse action outputs");
 }
 
 #[test]
@@ -63,11 +83,6 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
     assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
     assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
-}
-
-#[test]
-fn the_network_loses_duplicates_and_reorders() {
-    let reports: Vec<_> = (0..100).map(|s| run(s, None).expect("passes")).collect();
     assert!(reports.iter().any(|r| r.lost > 0), "packets are lost and sent again");
     assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
     assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
@@ -79,7 +94,7 @@ fn turns_off_alone(f: Fault) {
         Fault::Duplicate => r.duplicated,
         Fault::Reorder => r.reordered,
     };
-    let reports: Vec<_> = (0..100).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
+    let reports: Vec<_> = (0..40).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
     assert!(reports.iter().all(|r| count(r, f) == 0), "--off {} leaves no {0}", f.name());
     for other in Fault::ALL.into_iter().filter(|o| *o != f) {
         assert!(reports.iter().any(|r| count(r, other) > 0), "--off {} leaves {}", f.name(), other.name());

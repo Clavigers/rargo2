@@ -1,5 +1,6 @@
 pub mod model;
 pub mod rng;
+mod nextest;
 pub mod workspace;
 pub mod world;
 
