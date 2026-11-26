@@ -883,6 +883,7 @@ version = "0.7.10"
 dependencies = [
  "bincode",
  "blake3",
+ "expect-test",
  "serde",
  "snow",
  "toml",
