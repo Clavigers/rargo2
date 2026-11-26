@@ -1,5 +1,6 @@
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
+use crate::workspace::Workspace;
 use crate::rng::Rng;
 use rargo::daemon_state::{DaemonState, Link, Need};
 use rargo::known_digests::KnownDigests;
@@ -22,6 +23,7 @@ const SERVER_MEM_KB: u64 = 16 * 1024;
 const WATCH_STEP_MS: u64 = 200;
 /// Seeds the network faults' streams, apart from the one that drives the rest of the world.
 const NET_STREAM: u64 = 0x6e65_7477_6f72_6b21;
+const WORKSPACE_STREAM: u64 = 0x776f_726b_7370_6163;
 /// The first retransmission timeout of a lost packet, as Linux's TCP_RTO_MIN; it doubles on each loss.
 const RTO_MS: u64 = 200;
 /// Losses in a row before a packet gets through; at the rates a seed picks, more never happens.
@@ -205,7 +207,6 @@ pub struct Config {
     pub workers: u64,
     pub clients: u64,
     pub sources: usize,
-    pub actions: usize,
     pub rounds: u64,
     pub fault_end_ms: u64,
     pub cut_per_mille: u64,
@@ -234,12 +235,11 @@ impl Net {
 }
 
 impl Config {
-    pub fn of(rng: &mut Rng, net: Net) -> Config {
+    pub fn of(rng: &mut Rng, net: Net, sources: usize) -> Config {
         Config {
             workers: rng.range(1, 4),
             clients: rng.range(1, 3),
-            sources: rng.range(3, 10) as usize,
-            actions: rng.range(4, 24) as usize,
+            sources,
             rounds: rng.range(1, 3),
             fault_end_ms: rng.range(0, 8_000),
             cut_per_mille: rng.range(0, 30),
@@ -436,8 +436,9 @@ impl World {
     pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
         let mut rng = Rng::new(seed);
         let mut net = Fault::ALL.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
-        let cfg = Config::of(&mut rng, Net::of(&mut net, &off));
-        let project = Project::generate(&mut rng, cfg.sources, cfg.actions);
+        let mut plan_rng = Rng::new(seed ^ WORKSPACE_STREAM);
+        let project = Project::plan(&mut plan_rng, &Workspace::generate(&mut plan_rng));
+        let cfg = Config::of(&mut rng, Net::of(&mut net, &off), project.sources);
         let mut w = World {
             seed,
             bug,
