@@ -26,12 +26,14 @@ fn a_waiter_cut_short_by_a_timeout_does_not_take_the_next_waiters_wake() {
 
         let lock = Arc::new(Mutex::new(()));
         let held = lock.lock();
+        assert!(lock.try_lock().is_none(), "a held lock is not taken without waiting");
         assert!(timeout(short, || drop(lock.lock())).is_err());
         let waiting = Arc::clone(&lock);
         let mut next = spawn(move || drop(waiting.lock()));
         yield_now();
         drop(held);
         assert!(timeout(long, || next.join()).is_ok(), "an unlock reaches the live waiter");
+        assert!(lock.try_lock().is_some(), "a free lock is taken without waiting");
 
         let sem = Arc::new(Semaphore::new(0));
         assert!(timeout(short, || drop(sem.acquire_many(1))).is_err());

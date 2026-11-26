@@ -240,6 +240,13 @@ pub enum Need {
     Failed(String),
 }
 
+impl Need {
+    /// Whether this step runs Nix to evaluate or build the toolchain, which the client is told it waits for.
+    pub fn prepares_toolchain(&self) -> bool {
+        matches!(self, Need::Evaluate | Need::Closure(_))
+    }
+}
+
 #[derive(Clone, Debug)]
 enum Stage {
     Cached(FlakeEnv),
@@ -388,7 +395,7 @@ fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
     h.finish()
 }
 
-pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
+pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32, preparing: &dyn Fn()) -> Result<Arc<FlakeEnv>> {
     static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     if NIX_READY.get().is_none() {
         let ready = match crate::io::output(nix().arg("--version")) {
@@ -411,8 +418,14 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     let cached = crate::io::cpu(|| store.db().get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
     let mut resolution = Resolution::new(src.key, cached, host_ca_bundle().is_some());
     let mut scratch: Option<std::path::PathBuf> = None;
+    let mut said = false;
     let done = loop {
-        match resolution.need() {
+        let need = resolution.need();
+        if need.prepares_toolchain() && !said {
+            said = true;
+            preparing();
+        }
+        match need {
             Need::Exists(names) => {
                 let present = crate::io::cpu(|| names.into_iter().filter(|n| nix_store.join(n).ring_exists()).collect());
                 resolution.exists(&present);
@@ -621,6 +634,37 @@ mod tests {
         let mut cached = Resolution::new(key, Some(env.clone()), true);
         cached.exists(&gone);
         assert_eq!(cached.need(), Need::Evaluate, "a cached closure missing a path is evaluated again");
+    }
+
+    #[test]
+    fn only_a_flake_that_must_be_evaluated_or_built_prepares_the_toolchain() {
+        let key = Hash::of(b"source");
+        let closure = lines(CLOSURE);
+        let prepares = |r: &mut Resolution, present: &BTreeSet<String>| {
+            let mut steps = Vec::new();
+            for _ in 0..8 {
+                let need = r.need();
+                steps.push(need.prepares_toolchain());
+                match need {
+                    Need::Exists(names) => r.exists(&names.into_iter().filter(|n| present.contains(n)).collect()),
+                    Need::Evaluate => r.evaluated(Ok(DEV_ENV.to_vec())),
+                    Need::Closure(_) => r.closed(Ok(CLOSURE.to_vec())),
+                    Need::Manifest(c) => r.manifested(c.iter().map(|n| Hash::of(n.as_bytes())).collect()),
+                    Need::Done { env, .. } => return (steps, Some(env)),
+                    Need::Failed(_) => return (steps, None),
+                }
+            }
+            panic!("the resolution did not finish");
+        };
+        let (fresh, env) = prepares(&mut Resolution::new(key, None, true), &closure);
+        assert_eq!(fresh, [true, false, true, false, false]);
+        let env = env.expect("resolves");
+        let (cached, _) = prepares(&mut Resolution::new(key, Some(env.clone()), true), &closure);
+        assert!(!cached.contains(&true), "a cached flake whose paths are present prepares nothing: {cached:?}");
+        let mut gone = closure.clone();
+        gone.remove(&env.closure[7]);
+        let (missing, _) = prepares(&mut Resolution::new(key, Some(env), true), &gone);
+        assert!(missing.contains(&true), "a cached closure missing a path prepares the toolchain again");
     }
 
     #[test]

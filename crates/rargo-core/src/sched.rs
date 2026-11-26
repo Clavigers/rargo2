@@ -116,19 +116,29 @@ impl Scheduler {
     }
 
     pub fn acquire(self: &Arc<Self>, prio: Priority, mem_kb: u64) -> Permit {
+        self.acquire_saying(prio, mem_kb, |_, _| {})
+    }
+
+    /// Like `acquire`; when no slot is free as the job asks, `queued` is told how many jobs run and how many wait.
+    pub fn acquire_saying(self: &Arc<Self>, prio: Priority, mem_kb: u64, queued: impl FnOnce(usize, usize)) -> Permit {
         self.start_broker();
-        let rx = {
+        let (rx, waits) = {
             let mut i = self.inner.lock();
             self.prune(&mut i);
             let (tx, rx) = oneshot::channel();
             let job = i.next_job;
             i.next_job += 1;
             i.senders.insert(job, tx);
+            let free = i.state.spare() + self.in_pipe();
             let fx = i.state.request(job, prio, mem_kb);
             self.apply(&mut i, fx);
             self.kick();
-            rx
+            let (running, waiting, _, _) = i.state.snapshot();
+            (rx, (free == 0).then_some((running, waiting)))
         };
+        if let Some((running, waiting)) = waits {
+            queued(running, waiting);
+        }
         match rx.recv() {
             Some(permit) => permit,
             None => {
@@ -280,6 +290,26 @@ mod tests {
             assert!(!second.is_finished());
             write_token(w);
             crate::io::timeout(std::time::Duration::from_secs(5), || second.join()).unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn a_job_that_must_wait_for_a_slot_is_told_how_many_run_and_wait_and_one_granted_at_once_is_not() {
+        crate::io::drive(1, || {
+            let s = Scheduler::new(1, u64::MAX).unwrap();
+            let mut said = None;
+            let first = s.acquire_saying(Priority::Human, 0, |running, waiting| said = Some((running, waiting)));
+            assert_eq!(said, None);
+            let s2 = s.clone();
+            let mut second = crate::io::spawn(move || {
+                let mut said = None;
+                drop(s2.acquire_saying(Priority::Human, 0, |running, waiting| said = Some((running, waiting))));
+                said
+            });
+            crate::io::yield_now();
+            drop(first);
+            let said = crate::io::timeout(std::time::Duration::from_secs(5), || second.join()).unwrap().unwrap();
+            assert_eq!(said, Some((1, 1)));
         });
     }
 }

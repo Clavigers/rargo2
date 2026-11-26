@@ -5,6 +5,7 @@ use crate::expand::{self, EnvRule, Scripts};
 use crate::hash::Hash;
 use crate::io::watch;
 use crate::parse::Parser;
+use rargo_proto::waits::{self, Wait};
 use crate::present::*;
 use crate::proto::{Delivery, ExecRequest, Write};
 use crate::session::Session;
@@ -431,6 +432,12 @@ struct PlanObserver {
     client: Arc<Client>,
 }
 impl Observer for PlanObserver {
+    fn miss(&self) {
+        say(&self.client, Wait::Planning);
+    }
+    fn queued(&self, running: usize, waiting: usize) {
+        say(&self.client, Wait::Queued { running, waiting });
+    }
     fn wants_explanation(&self) -> bool {
         self.client.env.contains_key("RARGO_EXPLAIN")
     }
@@ -466,7 +473,7 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
         }
     }
     let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
-    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid)
+    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid, &|| say(c, Wait::Toolchain))
         .context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")?;
     let mut links = Vec::new();
     for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
@@ -842,6 +849,13 @@ fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, Stri
             false
         }
     })
+}
+
+/// Tells the client what the server waits for, unless the command is quiet.
+fn say(c: &Client, wait: Wait) {
+    if waits::shown(&c.args, c.env.get("RARGO_SYNC_STATS").as_deref()) {
+        c.out.send(rargo_proto::ServerMsg::Stderr(waits::line(&wait).into_bytes()));
+    }
 }
 
 fn phase(started: Instant, c: &Client, what: &str) {

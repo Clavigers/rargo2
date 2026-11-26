@@ -1,4 +1,5 @@
 use rargo_net::io::file::PathRing as _;
+use rargo_proto::waits::{self, Wait};
 use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
@@ -434,8 +435,7 @@ fn lost() -> std::io::Error {
 }
 
 fn sync_stats(vars: &[(String, String)], args: &[String]) -> bool {
-    let quiet = args.iter().take_while(|a| *a != "--").any(|a| a == "-q" || a == "--quiet");
-    !quiet && var(vars, "RARGO_SYNC_STATS") != Some("0")
+    waits::shown(args, var(vars, "RARGO_SYNC_STATS"))
 }
 
 fn var<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -587,6 +587,11 @@ impl Daemon {
         *g = Some(m.clone());
         self.knowledge.lock().unwrap().connected();
         Ok(m)
+    }
+
+    /// Whether a live link to the server is already open, so a command need not connect.
+    fn link_up(&self) -> bool {
+        self.mux.lock().as_ref().is_some_and(|mux| !mux.is_dead())
     }
 
     fn mux_if_up(&self) -> Option<Arc<Mux>> {
@@ -1395,7 +1400,19 @@ impl Daemon {
             return Ok(Self::fail(out, "the manifest must be inside the synced worktree".into()));
         };
         let wt = self.worktree(&root);
-        let _running = wt.running.lock();
+        let stats = sync_stats(&req.vars, &req.args);
+        let say = |wait: Wait| {
+            if stats {
+                let _ = out.send(LocalReply::Stderr(waits::line(&wait).into_bytes()));
+            }
+        };
+        let _running = match wt.running.try_lock() {
+            Some(running) => running,
+            None => {
+                say(Wait::Worktree);
+                wt.running.lock()
+            }
+        };
         let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
@@ -1404,7 +1421,6 @@ impl Daemon {
                 _ => {}
             }
         }
-        let stats = sync_stats(&req.vars, &req.args);
         let taken_up = Instant::now();
         let phase = |what: &str| {
             if stats {
@@ -1419,15 +1435,20 @@ impl Daemon {
         let mut started = Instant::now();
         loop {
             step = match step {
-                Step::Link => match self.mux() {
-                    Ok(mux) => {
-                        link = Some(mux);
-                        phase("link to the server ready");
-                        started = Instant::now();
-                        command.linked()
+                Step::Link => {
+                    if !self.link_up() {
+                        say(Wait::Connecting(self.cfg.server.clone()));
                     }
-                    Err(e) => command.connect_failed().ok_or(e)?,
-                },
+                    match self.mux() {
+                        Ok(mux) => {
+                            link = Some(mux);
+                            phase("link to the server ready");
+                            started = Instant::now();
+                            command.linked()
+                        }
+                        Err(e) => command.connect_failed().ok_or(e)?,
+                    }
+                }
                 Step::Scan => {
                     let mut st = wt.state.lock();
                     if st.policy_dir != policy_dir {

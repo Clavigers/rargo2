@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub trait Observer: Send + Sync {
     fn miss(&self) {}
+    fn queued(&self, _running: usize, _waiting: usize) {}
     fn wants_explanation(&self) -> bool {
         false
     }
@@ -707,7 +708,9 @@ impl Engine {
             }
         }
         self.seed_home(req)?;
-        let permit = self.sched.acquire(req.prio, self.estimate_mem_kb(&key, spec.kind));
+        let permit = self.sched.acquire_saying(req.prio, self.estimate_mem_kb(&key, spec.kind), |running, waiting| {
+            req.observer.queued(running, waiting)
+        });
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
         self.stats.runs_by_kind[spec.kind as usize].fetch_add(1, Ordering::Relaxed);
         let started = std::time::Instant::now();

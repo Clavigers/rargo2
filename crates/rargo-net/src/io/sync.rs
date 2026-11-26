@@ -179,6 +179,12 @@ impl<T> Mutex<T> {
         }
     }
 
+    /// The lock if no one holds it, without waiting.
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
+        use std::sync::atomic::Ordering::{Acquire, AcqRel};
+        self.held.compare_exchange(false, true, AcqRel, Acquire).is_ok().then(|| MutexGuard { lock: self })
+    }
+
     fn wake_next(&self) {
         let next = self.waiters.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         if let Some(id) = next {
