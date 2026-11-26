@@ -231,7 +231,7 @@ fn mount<'a>(fake: &'a Fake, at: &str, auto_unmount: bool) -> Session<&'a Fake> 
     Session::mount_on(fake, Path::new(at), &opts(auto_unmount), false).expect("mount")
 }
 
-fn failure<'a>(mounted: std::io::Result<Session<&'a Fake>>) -> std::io::Error {
+fn failure(mounted: std::io::Result<Session<&Fake>>) -> std::io::Error {
     match mounted {
         Ok(_) => panic!("the mount succeeded"),
         Err(e) => e,
