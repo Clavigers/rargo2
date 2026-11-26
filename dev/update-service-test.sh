@@ -17,7 +17,7 @@ refused 'a commit' "$(git -C "$here" rev-parse HEAD)"
 refused 'a version without v' 0.6.5
 refused 'an unpublished tag' v999.0.0
 RARGO_RELEASE_REPO=cli/cli refused 'a release without the client' v2.0.0
-latest=$(gh release view --repo sadosystems/rargo2 --json tagName --jq .tagName)
+latest=$(gh release view --repo Clavigers/rargo2 --json tagName --jq .tagName)
 run "$latest"
 if grep -q 'env.sh' "$tmp/out" && ! grep -q 'dev/release.sh X.Y.Z' "$tmp/out"; then
     echo "ok   the published release $latest is accepted"

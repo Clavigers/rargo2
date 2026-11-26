@@ -2942,7 +2942,7 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
     (!missing.is_empty()).then(|| {
         let names = missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
         format!(
-            "the build script of `{package}` asked pkg-config for {names}, which the build's flake does not provide; rargo builds in the dev shell of the project's flake.nix, or in its default flake when there is none: add the library to that shell's buildInputs (see https://github.com/sadosystems/rargo2#toolchain-and-system-libraries)"
+            "the build script of `{package}` asked pkg-config for {names}, which the build's flake does not provide; rargo builds in the dev shell of the project's flake.nix, or in its default flake when there is none: add the library to that shell's buildInputs (see https://github.com/Clavigers/rargo2#toolchain-and-system-libraries)"
         )
     })
 }
