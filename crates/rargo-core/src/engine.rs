@@ -10,7 +10,7 @@ use crate::fn_code;
 use crate::io;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,13 +50,17 @@ impl Live for LiveCtl<'_> {
 pub type EnvAsker = Arc<dyn Fn(Vec<String>) -> Result<Vec<(String, Option<String>)>> + Send + Sync>;
 
 pub struct ClientEnv {
-    vars: parking_lot::RwLock<HashMap<String, String>>,
-    checked: parking_lot::RwLock<std::collections::HashSet<String>>,
+    vars: parking_lot::RwLock<BTreeMap<String, String>>,
+    checked: parking_lot::RwLock<BTreeSet<String>>,
     asker: Option<EnvAsker>,
 }
 
 impl ClientEnv {
-    pub fn new(vars: HashMap<String, String>, checked: Vec<String>, asker: Option<EnvAsker>) -> ClientEnv {
+    pub fn new(
+        vars: BTreeMap<String, String>,
+        checked: Vec<String>,
+        asker: Option<EnvAsker>,
+    ) -> ClientEnv {
         ClientEnv {
             vars: parking_lot::RwLock::new(vars),
             checked: parking_lot::RwLock::new(checked.into_iter().collect()),
@@ -72,7 +76,7 @@ impl ClientEnv {
         self.vars.read().contains_key(name)
     }
 
-    pub fn to_map(&self) -> HashMap<String, String> {
+    pub fn to_map(&self) -> BTreeMap<String, String> {
         self.vars.read().clone()
     }
 
@@ -823,7 +827,7 @@ impl Engine {
                 .collect();
             scratch.sort();
             scratch.dedup_by(|a, b| a.0 == b.0);
-            let stored: Result<HashMap<PathBuf, (Hash, u64)>> =
+            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> =
                 io::thread::par_map(scratch, |(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
                     let r = store
                         .put_file_move(&path, exec)
@@ -982,5 +986,23 @@ impl Engine {
             bail!("could not start `{}`: {}", spec.label, String::from_utf8_lossy(&stderr).trim());
         }
         Ok((info, stdout, stderr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientEnv;
+
+    #[test]
+    fn client_env_snapshot_is_sorted_by_name() {
+        let env = ClientEnv::new(
+            [("Z".into(), "last".into()), ("A".into(), "first".into())].into(),
+            Vec::new(),
+            None,
+        );
+
+        let snapshot = env.to_map();
+        let entries: Vec<_> = snapshot.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_eq!(entries, [("A", "first"), ("Z", "last")]);
     }
 }

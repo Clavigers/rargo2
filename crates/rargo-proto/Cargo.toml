@@ -14,3 +14,6 @@ blake3.workspace = true
 zstd.workspace = true
 toml = "0.8"
 snow = "0.10"
+
+[dev-dependencies]
+expect-test = "1.5"
