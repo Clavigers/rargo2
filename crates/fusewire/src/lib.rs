@@ -335,15 +335,6 @@ fn require_uring(offered: bool) -> io::Result<()> {
     ))
 }
 
-#[cfg(test)]
-#[test]
-fn missing_uring_offer_explains_how_to_enable_it() {
-    assert!(require_uring(true).is_ok());
-    let err = require_uring(false).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
-    assert!(err.to_string().contains("fuse.enable_uring=Y"));
-}
-
 const MAX_WRITE: u32 = 1 << 20;
 pub const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
 const _: () = assert!(MAX_WRITE % 4096 == 0);
@@ -1307,6 +1298,8 @@ fn dispatch<F: Filesystem>(fs: &F, ctx: &Ctx, call: &mut Call, hdr: &fuse_in_hea
 #[cfg(test)]
 mod request_tests {
     use super::*;
+    use expect_test::{Expect, expect};
+    use std::fmt::Write as _;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
@@ -1567,131 +1560,294 @@ mod request_tests {
         out
     }
 
+    fn record_frame(out: &mut String, bytes: &[u8]) {
+        let hdr = read_struct::<fuse_out_header>(bytes).unwrap();
+        assert_eq!(hdr.len as usize, bytes.len());
+        write!(out, "unique={} code={} payload=", hdr.unique, hdr.error).unwrap();
+        for byte in &bytes[OUT..] {
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out.push('\n');
+    }
+
+    fn record(out: &mut String, label: &str, result: Handled<'_>) {
+        writeln!(out, "{label}").unwrap();
+        if result.bytes.is_empty() {
+            writeln!(out, "  no reply").unwrap();
+        } else {
+            write!(out, "  reply ").unwrap();
+            record_frame(out, result.bytes);
+        }
+        for effect in result.effects {
+            match effect {
+                Effect::Notify(bytes) => {
+                    write!(out, "  notify ").unwrap();
+                    record_frame(out, &bytes);
+                }
+                effect => writeln!(out, "  {effect:?}").unwrap(),
+            }
+        }
+        if result.destroyed {
+            writeln!(out, "  destroyed").unwrap();
+        }
+    }
+
+    enum Event {
+        Request(Vec<u8>),
+        Registered(u64, Res<i32>),
+    }
+
+    fn replay(
+        handler: &mut RequestHandler,
+        fs: &Memory,
+        out: &mut String,
+        events: impl IntoIterator<Item = (&'static str, Event)>,
+    ) {
+        for (label, event) in events {
+            let result = match event {
+                Event::Request(bytes) => handler.handle(fs, &bytes),
+                Event::Registered(token, id) => handler.registered(fs, token, id),
+            };
+            record(out, label, result);
+            handler.invariants();
+            if handler.pending() {
+                writeln!(out, "  awaiting registration").unwrap();
+            }
+        }
+    }
+
     #[test]
     fn recorded_kernel_requests_get_the_expected_replies() {
         let fs = Memory::default();
         let mut h = RequestHandler::new(MAX_WRITE);
-        h.invariants();
-        let mut model = Model { flips: 0, forgotten: Vec::new(), released: Vec::new() };
-        let mut seen = std::collections::BTreeSet::new();
-        for (name, hex) in RECORDED {
-            let request = unhex(hex);
-            let hdr = read_struct::<fuse_in_header>(&request).unwrap();
-            let body = &request[HEADER..];
-            let (u, node) = (hdr.unique, hdr.nodeid);
-            let (bytes, effects) = checked(&mut h, &fs, &request);
-            assert!(effects.is_empty(), "{name}: the recorded requests ask for no device effects");
-            let want = match *name {
-                "LOOKUP" => model.lookup(u, node, abi::name_arg(body).unwrap().0),
-                "GETATTR" => {
-                    let a = fuse_attr_out { attr_valid: 0, attr_valid_nsec: 0, dummy: 0, attr: attr(node) };
-                    answer(u, 0, &[as_bytes(&a)])
-                }
-                "OPEN" => opened_reply(u, 17, 0, 0),
-                "READ" => {
-                    let r = read_struct::<fuse_read_in>(body).unwrap();
-                    data(u, r.offset, r.size, MAX_WRITE)
-                }
-                "READDIR" => {
-                    let r = read_struct::<fuse_read_in>(body).unwrap();
-                    dirents(u, r.offset, r.size)
-                }
-                "RELEASE" => {
-                    model.released.push(read_struct::<fuse_release_in>(body).unwrap().fh);
-                    answer(u, 0, &[])
-                }
-                "BATCH_FORGET" => {
-                    model.forgotten.extend([(6, 1), (5, 1)]);
-                    Vec::new()
-                }
-                "INTERRUPT" => Vec::new(),
-                "STATFS" => {
-                    let ctx = Ctx { uid: 0, gid: 0, pid: 0, effects: &Effects::default() };
-                    answer(u, 0, &[as_bytes(&fuse_statfs_out { st: fs.statfs(&ctx, 1).unwrap() })])
-                }
-                "INIT" | "STATX" | "OPENDIR" | "FLUSH" => answer(u, -libc::ENOSYS, &[]),
-                other => panic!("no expectation for the recorded {other}"),
-            };
-            assert_eq!(bytes, want, "{name} (unique {u})");
-            seen.insert(*name);
-        }
-        for listed in ["LOOKUP", "GETATTR", "OPEN", "READ", "READDIR", "RELEASE", "BATCH_FORGET", "INTERRUPT"] {
-            assert!(seen.contains(listed), "the recording has a {listed}");
-        }
-        assert_eq!(*fs.forgotten.lock().unwrap(), model.forgotten);
-        assert_eq!(*fs.released.lock().unwrap(), model.released);
+        let mut out = String::new();
+        replay(&mut h, &fs, &mut out, RECORDED.iter().map(|&(name, hex)| (name, Event::Request(unhex(hex)))));
+        writeln!(out, "forgotten {:?}", fs.forgotten.lock().unwrap()).unwrap();
+        writeln!(out, "released {:?}", fs.released.lock().unwrap()).unwrap();
+        expect![[r#"
+            INIT
+              reply unique=2 code=-38 payload=
+            LOOKUP
+              reply unique=4 code=0 payload=02000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            STATX
+              reply unique=6 code=-38 payload=
+            GETATTR
+              reply unique=8 code=0 payload=00000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            GETATTR
+              reply unique=10 code=0 payload=00000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ed410000010000000000000000000000000000000010000000000000
+            OPENDIR
+              reply unique=12 code=-38 payload=
+            GETATTR
+              reply unique=14 code=0 payload=00000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000ed410000010000000000000000000000000000000010000000000000
+            READDIR
+              reply unique=16 code=0 payload=02000000000000000100000000000000040000000800000066696c6500000000
+            READDIR
+              reply unique=18 code=0 payload=
+            LOOKUP
+              reply unique=20 code=0 payload=02000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            OPEN
+              reply unique=22 code=0 payload=11000000000000000000000000000000
+            GETATTR
+              reply unique=24 code=0 payload=00000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            GETATTR
+              reply unique=26 code=0 payload=00000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            READ
+              reply unique=28 code=0 payload=61626364
+            GETATTR
+              reply unique=30 code=0 payload=00000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            FLUSH
+              reply unique=32 code=-38 payload=
+            RELEASE
+              reply unique=34 code=0 payload=
+            LOOKUP
+              reply unique=36 code=-2 payload=
+            LOOKUP
+              reply unique=38 code=0 payload=03000000000000000000000000000000000000000000000000000000000000000000000000000000030000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            OPEN
+              reply unique=40 code=0 payload=11000000000000000000000000000000
+            GETATTR
+              reply unique=42 code=0 payload=00000000000000000000000000000000030000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            READ
+              reply unique=44 code=0 payload=61626364
+            RELEASE
+              reply unique=46 code=0 payload=
+            LOOKUP
+              reply unique=48 code=0 payload=04000000000000000000000000000000000000000000000000000000000000000000000000000000040000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000000000000000000000000000000000000010000000000000
+            GETATTR
+              reply unique=50 code=0 payload=00000000000000000000000000000000040000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000000000000000000000000000000000000010000000000000
+            LOOKUP
+              reply unique=52 code=-2 payload=
+            INTERRUPT
+              no reply
+            LOOKUP
+              reply unique=54 code=0 payload=05000000000000000000000000000000000000000000000000000000000000000000000000000000050000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000000000000000000000000000000000000010000000000000
+            GETATTR
+              reply unique=56 code=0 payload=00000000000000000000000000000000050000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000000000000000000000000000000000000010000000000000
+            LOOKUP
+              reply unique=58 code=0 payload=06000000000000000000000000000000000000000000000000000000000000000000000000000000060000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            LOOKUP
+              reply unique=60 code=0 payload=06000000000000000000000000000000000000000000000000000000000000000000000000000000060000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            BATCH_FORGET
+              no reply
+            GETATTR
+              reply unique=64 code=0 payload=00000000000000000000000000000000060000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+            STATFS
+              reply unique=66 code=0 payload=0000004000000000000000200000000000000020000000000000004000000000000000200000000000100000ff0000000010000000000000000000000000000000000000000000000000000000000000
+            forgotten [(6, 1), (5, 1)]
+            released [17, 17]
+        "#]].assert_eq(&out);
     }
 
     #[test]
     fn forgets_and_interrupts_get_no_reply_and_an_interrupted_request_still_answers() {
+        use Event::{Registered, Request};
+
         let fs = Memory::default();
         let mut h = RequestHandler::new(MAX_WRITE);
-        h.invariants();
-        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_FORGET, 5, 2, as_bytes(&fuse_forget_in { nlookup: 3 })));
-        assert!(bytes.is_empty());
+        let mut waiting = RequestHandler::new(MAX_WRITE);
+        let mut out = String::new();
+
         let mut batch = as_bytes(&fuse_batch_forget_in { count: 3, dummy: 0 }).to_vec();
         batch.extend_from_slice(as_bytes(&fuse_forget_one { nodeid: 6, nlookup: 1 }));
         batch.extend_from_slice(as_bytes(&fuse_forget_one { nodeid: 5, nlookup: 2 }));
-        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_BATCH_FORGET, 6, 0, &batch));
-        assert!(bytes.is_empty(), "a batch that claims more entries than it carries forgets those it carries");
-        assert_eq!(*fs.forgotten.lock().unwrap(), [(2, 3), (6, 1), (5, 2)]);
+        replay(&mut h, &fs, &mut out, [
+            ("FORGET", Request(frame(FUSE_FORGET, 5, 2, as_bytes(&fuse_forget_in { nlookup: 3 })))),
+            ("BATCH_FORGET with fewer entries than advertised", Request(frame(FUSE_BATCH_FORGET, 6, 0, &batch))),
+        ]);
+        writeln!(out, "forgotten {:?}", fs.forgotten.lock().unwrap()).unwrap();
 
-        let mut waiting = RequestHandler::new(MAX_WRITE);
-        let open = frame(FUSE_OPEN, 52, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
-        let (bytes, effects) = checked(&mut waiting, &fs, &open);
-        assert!(bytes.is_empty() && waiting.pending(), "the open waits for its registration");
-        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 70 }]);
-        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_INTERRUPT, 53, 0, &52u64.to_ne_bytes()));
-        assert!(bytes.is_empty() && effects.is_empty(), "an interrupt of a request in flight on another worker");
-        let (bytes, _) = after_registration(&mut waiting, &fs, 70, Ok(4));
-        assert_eq!(bytes, opened_reply(52, 70, FOPEN_PASSTHROUGH, 4), "the interrupted request is still answered");
-        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_INTERRUPT, 54, 0, &999u64.to_ne_bytes()));
-        assert!(bytes.is_empty(), "an interrupt of an unknown request");
-        let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_LOOKUP, 55, 1, b"file\0"));
-        assert_eq!(bytes, entry_reply(55, 2), "and the next request is answered");
+        let open = fuse_open_in { flags: 0, open_flags: 0 };
+        replay(&mut waiting, &fs, &mut out, [
+            ("OPEN on another worker", Request(frame(FUSE_OPEN, 52, 7, as_bytes(&open)))),
+        ]);
+        replay(&mut h, &fs, &mut out, [
+            ("INTERRUPT the in-flight OPEN", Request(frame(FUSE_INTERRUPT, 53, 0, &52u64.to_ne_bytes()))),
+        ]);
+        replay(&mut waiting, &fs, &mut out, [("OPEN registration completes", Registered(70, Ok(4)))]);
+        replay(&mut h, &fs, &mut out, [
+            ("INTERRUPT an unknown request", Request(frame(FUSE_INTERRUPT, 54, 0, &999u64.to_ne_bytes()))),
+            ("LOOKUP after the interrupts", Request(frame(FUSE_LOOKUP, 55, 1, b"file\0"))),
+        ]);
+        expect![[r#"
+            FORGET
+              no reply
+            BATCH_FORGET with fewer entries than advertised
+              no reply
+            forgotten [(2, 3), (6, 1), (5, 2)]
+            OPEN on another worker
+              no reply
+              Register { fd: 99, token: 70 }
+              awaiting registration
+            INTERRUPT the in-flight OPEN
+              no reply
+            OPEN registration completes
+              reply unique=52 code=0 payload=46000000000000008000000004000000
+            INTERRUPT an unknown request
+              no reply
+            LOOKUP after the interrupts
+              reply unique=55 code=0 payload=02000000000000000000000000000000000000000000000000000000000000000000000000000000020000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a4810000010000000000000000000000000000000010000000000000
+        "#]].assert_eq(&out);
     }
 
     #[test]
     fn registrations_and_notifications_are_effects_in_the_result() {
+        use Event::{Registered, Request};
+
         let fs = Memory::default();
         let mut h = RequestHandler::new(MAX_WRITE);
-        h.invariants();
-        let open = |u| frame(FUSE_OPEN, u, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
-        let (bytes, effects) = checked(&mut h, &fs, &open(10));
-        assert!(bytes.is_empty() && h.pending());
-        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 70 }]);
-        let (bytes, effects) = after_registration(&mut h, &fs, 70, Ok(5));
-        assert_eq!((bytes, effects), (opened_reply(10, 70, FOPEN_PASSTHROUGH, 5), Vec::new()));
+        let mut out = String::new();
+        let open = |unique, node| Request(frame(FUSE_OPEN, unique, node, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 })));
         let release = fuse_release_in { fh: 70, flags: 0, release_flags: 0, lock_owner: 0 };
-        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_RELEASE, 11, 7, as_bytes(&release)));
-        assert_eq!((bytes, effects), (answer(11, 0, &[]), vec![Effect::Unregister(5)]));
-
-        let (_, effects) = checked(&mut h, &fs, &open(12));
-        assert_eq!(effects, [Effect::Register { fd: BACKING_FD, token: 71 }]);
-        let (bytes, _) = after_registration(&mut h, &fs, 71, Err(Errno::EPERM));
-        assert_eq!(bytes, opened_reply(12, 71, FOPEN_KEEP_CACHE, 0), "a refused registration falls back to the cache");
-
         let mut create = as_bytes(&fuse_create_in { flags: 0, mode: 0o644, umask: 0, open_flags: 0 }).to_vec();
         create.extend_from_slice(b"made\0");
-        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_CREATE, 13, 1, &create));
-        assert!(bytes.is_empty() && effects == [Effect::Register { fd: BACKING_FD, token: 72 }]);
-        let (bytes, _) = after_registration(&mut h, &fs, 72, Ok(6));
-        let e = &entry_reply(13, 8)[OUT..];
-        let o = fuse_open_out { fh: 72, open_flags: FOPEN_PASSTHROUGH, backing_id: 6 };
-        assert_eq!(bytes, answer(13, 0, &[e, as_bytes(&o)]), "a create answers with its entry and the open");
 
-        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_OPEN, 14, 9, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 })));
-        assert_eq!(bytes, answer(14, -libc::EACCES, &[]));
-        assert!(effects.is_empty() && !h.pending(), "a failed open's registration is dropped");
+        replay(&mut h, &fs, &mut out, [
+            ("OPEN for passthrough", open(10, 7)),
+            ("OPEN registration succeeds", Registered(70, Ok(5))),
+            ("RELEASE the registered handle", Request(frame(FUSE_RELEASE, 11, 7, as_bytes(&release)))),
+            ("OPEN for passthrough again", open(12, 7)),
+            ("OPEN registration fails", Registered(71, Err(Errno::EPERM))),
+            ("CREATE for passthrough", Request(frame(FUSE_CREATE, 13, 1, &create))),
+            ("CREATE registration succeeds", Registered(72, Ok(6))),
+            ("OPEN fails before registration", open(14, 9)),
+            ("UNLINK invalidates the entry", Request(frame(FUSE_UNLINK, 15, 1, b"file\0"))),
+            ("DESTROY", Request(frame(FUSE_DESTROY, 16, 0, &[]))),
+        ]);
+        expect![[r#"
+            OPEN for passthrough
+              no reply
+              Register { fd: 99, token: 70 }
+              awaiting registration
+            OPEN registration succeeds
+              reply unique=10 code=0 payload=46000000000000008000000005000000
+            RELEASE the registered handle
+              reply unique=11 code=0 payload=
+              Unregister(5)
+            OPEN for passthrough again
+              no reply
+              Register { fd: 99, token: 71 }
+              awaiting registration
+            OPEN registration fails
+              reply unique=12 code=0 payload=47000000000000000200000000000000
+            CREATE for passthrough
+              no reply
+              Register { fd: 99, token: 72 }
+              awaiting registration
+            CREATE registration succeeds
+              reply unique=13 code=0 payload=08000000000000000000000000000000000000000000000000000000000000000000000000000000080000000000000004000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000a481000001000000000000000000000000000000001000000000000048000000000000008000000006000000
+            OPEN fails before registration
+              reply unique=14 code=-13 payload=
+            UNLINK invalidates the entry
+              reply unique=15 code=0 payload=
+              notify unique=0 code=3 payload=0100000000000000040000000000000066696c6500
+            DESTROY
+              reply unique=16 code=0 payload=
+              destroyed
+        "#]].assert_eq(&out);
+    }
 
-        let (bytes, effects) = checked(&mut h, &fs, &frame(FUSE_UNLINK, 15, 1, b"file\0"));
-        assert_eq!(bytes, answer(15, 0, &[]));
-        let [Effect::Notify(note)] = effects.as_slice() else { panic!("one notification: {effects:?}") };
-        let header = read_struct::<fuse_out_header>(note).unwrap();
-        assert_eq!((header.len as usize, header.unique, header.error), (note.len(), 0, FUSE_NOTIFY_INVAL_ENTRY));
-        let inval = read_struct::<fuse_notify_inval_entry_out>(&note[OUT..]).unwrap();
-        assert_eq!((inval.parent, inval.namelen), (1, 4));
-        assert!(note.ends_with(b"file\0"));
+    fn check_uring_init(flags2: u32, expected: Expect) {
+        let (device, kernel) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        kernel.set_nonblocking(true).unwrap();
+        let mut session = Session {
+            dev: device.into(),
+            mountpoint: PathBuf::new(),
+            caps: Caps::default(),
+            unmounted: AtomicBool::new(true),
+            helper: false,
+            guard: Mutex::new(None),
+            mount_id: None,
+            connected: AtomicBool::new(false),
+        };
+        let init = fuse_init_in {
+            major: FUSE_KERNEL_VERSION,
+            minor: FUSE_KERNEL_MINOR_VERSION,
+            flags: FUSE_INIT_EXT as u32,
+            flags2,
+            max_readahead: 0,
+            unused: [0; 11],
+        };
+        kernel.send(&frame(FUSE_INIT, 1, 0, as_bytes(&init))).unwrap();
+        let mut out = String::new();
+        match session.handshake(&MountOptions::default(), true) {
+            Ok(()) => {
+                let mut reply = [0; 256];
+                let len = kernel.recv(&mut reply).unwrap();
+                record_frame(&mut out, &reply[..len]);
+            }
+            Err(error) => writeln!(out, "{:?}: {error}", error.kind()).unwrap(),
+        }
+        expected.assert_eq(&out);
+    }
+
+    #[test]
+    fn uring_init_negotiates_the_offer_or_explains_how_to_enable_it() {
+        check_uring_init((FUSE_OVER_IO_URING >> 32) as u32, expect![[r#"
+            unique=1 code=0 payload=070000002d00000000000000000000400001c0000000100001000000000100000002000000000000000000000000000000000000000000000000000000000000
+        "#]]);
+        check_uring_init(0, expect![[r#"
+            Unsupported: FUSE-over-io_uring is unavailable. Use Linux 6.14 or newer with CONFIG_FUSE_IO_URING and set fuse.enable_uring=Y.
+        "#]]);
     }
 
     #[test]
