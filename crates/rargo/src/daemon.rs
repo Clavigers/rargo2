@@ -681,7 +681,7 @@ impl Daemon {
             (ScanPlan::Reuse, None) => true,
             (ScanPlan::Scan { everything }, _) => everything,
         };
-        let mut changed: HashSet<PathBuf> = std::mem::take(&mut *wt.events.lock().unwrap());
+        let mut changed: std::collections::BTreeSet<PathBuf> = std::mem::take(&mut *wt.events.lock().unwrap()).into_iter().collect();
         changed.extend(st.unwatched.iter().cloned());
         if let Some(w) = &self.watcher {
             changed.extend(st.watched.iter().filter(|(d, wd)| !w.watches(**wd, d)).map(|(d, _)| d.clone()));
@@ -2012,7 +2012,7 @@ struct UploadPlan {
 }
 
 impl UploadPlan {
-    fn new(want: Vec<Digest>, files: &HashMap<Digest, (PathBuf, u64)>, budget: usize) -> Option<Self> {
+    fn new(want: Vec<Digest>, files: &std::collections::BTreeMap<Digest, (PathBuf, u64)>, budget: usize) -> Option<Self> {
         let part_size = rargo_proto::PART_SIZE.min(budget.checked_sub(UPLOAD_OVERHEAD)?);
         if part_size == 0 {
             return None;
@@ -2172,7 +2172,7 @@ mod upload_tests {
     fn upload_plans_keep_first_occurrence_order_within_both_frame_types() {
         for budget in [128usize, 232, 4096] {
             let mut want = Vec::new();
-            let mut files = HashMap::new();
+            let mut files = std::collections::BTreeMap::new();
             let mut small = Vec::new();
             let mut large = Vec::new();
             for i in 0..96u8 {
