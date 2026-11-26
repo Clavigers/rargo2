@@ -234,11 +234,11 @@ pub struct Part {
 
 impl Part {
     pub fn pack(bytes: Vec<u8>) -> Part {
-        if let Ok(z) = zstd::bulk::compress(&bytes, 1) {
-            if z.len() + bytes.len() / 10 < bytes.len() {
-                assert!(z.len() < bytes.len());
-                return Part { data: z, packed: true };
-            }
+        if let Ok(z) = zstd::bulk::compress(&bytes, 1)
+            && z.len() + bytes.len() / 10 < bytes.len()
+        {
+            assert!(z.len() < bytes.len());
+            return Part { data: z, packed: true };
         }
         Part { data: bytes, packed: false }
     }
@@ -275,13 +275,12 @@ const _: () = assert!(CHUNKED_FROM as usize >= PART_SIZE);
 
 impl Blob {
     pub fn pack(hash: Digest, bytes: &[u8]) -> Blob {
-        if bytes.len() >= 256 {
-            if let Ok(z) = zstd::bulk::compress(bytes, 1) {
-                if z.len() + 16 < bytes.len() {
-                    assert!(z.len() < bytes.len());
-                    return Blob { hash, data: z, packed: true };
-                }
-            }
+        if bytes.len() >= 256
+            && let Ok(z) = zstd::bulk::compress(bytes, 1)
+            && z.len() + 16 < bytes.len()
+        {
+            assert!(z.len() < bytes.len());
+            return Blob { hash, data: z, packed: true };
         }
         Blob { hash, data: bytes.to_vec(), packed: false }
     }
