@@ -145,6 +145,8 @@ impl StateMachine for DbWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use rargo_machine::Checked;
 
     struct Writer(Checked<DbWriter>);
@@ -184,60 +186,91 @@ mod tests {
 
     #[test]
     fn a_flush_is_due_a_delay_after_the_first_write_or_when_full() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
-        assert_eq!(w.due(1000), Due::Idle);
-        w.put(Table::Meta, b"a", b"1", 1000);
-        assert_eq!(w.due(1000), Due::At(1000 + DELAY_MS));
-        w.put(Table::Meta, b"b", b"2", 1050);
-        assert_eq!(w.due(1050), Due::At(1000 + DELAY_MS), "later writes do not push the flush back");
-        assert_eq!(w.due(1000 + DELAY_MS - 1), Due::At(1000 + DELAY_MS));
-        assert_eq!(w.due(1000 + DELAY_MS), Due::Now);
+        outcomes.record("empty at 1000", w.due(1000));
+        for (at, key, value) in [(1000, b"a", b"1"), (1050, b"b", b"2")] {
+            w.put(Table::Meta, key, value, at);
+            outcomes.record(&format!("after put at {at}"), w.due(at));
+        }
+        for at in [1000 + DELAY_MS - 1, 1000 + DELAY_MS] {
+            outcomes.record(&format!("tick at {at}"), w.due(at));
+        }
         let b = w.take();
-        assert_eq!(w.due(1200), Due::At(1300), "nothing more is due while a flush runs");
+        outcomes.record("flush in flight", w.due(1200));
         w.flushed(&b, 1200);
-        assert_eq!(w.due(1200), Due::Idle);
+        outcomes.record("due", w.due(1200));
         w.put(Table::Blobs, b"big", &vec![0u8; FULL_BYTES], 2000);
-        assert_eq!(w.due(2000), Due::Now, "a full queue is flushed at once");
+        outcomes.record("full queue", w.due(2000));
         w.invariants();
+        expect![[r#"
+            empty at 1000: Idle
+            after put at 1000: At(1100)
+            after put at 1050: At(1100)
+            tick at 1099: At(1100)
+            tick at 1100: Now
+            flush in flight: At(1300)
+            due: Idle
+            full queue: Now
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_write_made_during_a_flush_stays_for_the_next() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
         w.put(Table::Meta, b"k", b"old", 0);
         w.put(Table::Meta, b"j", b"x", 0);
         let b = w.take();
-        assert_eq!(b.writes.len(), 2);
+        outcomes.record("batch size", b.writes.len());
         w.put(Table::Meta, b"k", b"new", 50);
         w.flushed(&b, 60);
-        assert_eq!(w.get(Table::Meta, b"k"), Some(Some(Arc::from(&b"new"[..]))));
-        assert_eq!(w.get(Table::Meta, b"j"), None);
-        assert_eq!(w.due(60), Due::At(60 + DELAY_MS));
+        outcomes.record("get k", w.get(Table::Meta, b"k").flatten().as_deref().map(String::from_utf8_lossy));
+        outcomes.record("get j", w.get(Table::Meta, b"j"));
+        outcomes.record("due", w.due(60));
         w.invariants();
+        expect![[r#"
+            batch size: 2
+            get k: Some("new")
+            get j: None
+            due: At(160)
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_failed_flush_keeps_every_write_and_tries_again_later() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
         w.put(Table::Traces, b"t", b"v", 0);
         w.delete(Table::Traces, b"u", 0);
         let _ = w.take();
         w.failed(500);
-        assert_eq!(w.due(500), Due::At(500 + DELAY_MS));
-        assert_eq!(w.take().writes.len(), 2);
+        outcomes.record("due", w.due(500));
+        outcomes.record("retry batch size", w.take().writes.len());
+        expect![[r#"
+            due: At(600)
+            retry batch size: 2
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn pending_writes_are_found_by_prefix_and_deletes_show() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
         w.put(Table::Incr, b"ab1", b"1", 0);
         w.put(Table::Incr, b"ab2", b"2", 0);
         w.put(Table::Incr, b"ac", b"3", 0);
         w.put(Table::Meta, b"ab9", b"4", 0);
         w.delete(Table::Incr, b"ab3", 0);
-        let found: Vec<(Vec<u8>, bool)> =
-            w.pending_with_prefix(Table::Incr, b"ab").into_iter().map(|(k, v)| (k, v.is_some())).collect();
-        assert_eq!(found, vec![(b"ab1".to_vec(), true), (b"ab2".to_vec(), true), (b"ab3".to_vec(), false)]);
+        let found: Vec<_> =
+            w.pending_with_prefix(Table::Incr, b"ab")
+                .into_iter()
+                .map(|(k, v)| (String::from_utf8(k).unwrap(), v.is_some()))
+                .collect();
+        outcomes.record("pending prefix entries", found);
+        expect![[r#"
+            pending prefix entries: [("ab1", true), ("ab2", true), ("ab3", false)]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

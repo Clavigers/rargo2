@@ -465,6 +465,7 @@ fn looks_like_transport(pkt: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     fn eph(b: u8) -> [u8; 32] {
         [b; 32]
@@ -703,48 +704,42 @@ mod tests {
 
     #[test]
     fn a_truncated_packet_is_refused() {
-        let mut responder = Handshake::shared_responder([1; 32], eph(1));
-        assert!(matches!(responder.start().unwrap(), Action::Wait));
-        for pkt in [vec![], vec![0u8; 10], vec![9u8; NOISE_LEN - 1]] {
-            let err = responder.recv(&pkt).unwrap_err();
+        let cases: [(Handshake, &[u8]); 6] = [
+            (Handshake::shared_responder([1; 32], eph(1)), &[]),
+            (Handshake::shared_responder([1; 32], eph(1)), &[0; 10]),
+            (Handshake::shared_responder([1; 32], eph(1)), &[9; NOISE_LEN - 1]),
+            (Handshake::user_responder(eph(3)), &[]),
+            (Handshake::user_responder(eph(4)), &[5, b'a', b'b']),
+            (Handshake::user_responder(eph(5)), &[2, b'a', b'n']),
+        ];
+        let mut trace = Vec::new();
+        for (mut responder, packet) in cases {
+            let start = responder.start().unwrap();
+            let error = responder.recv(packet).unwrap_err();
             responder.invariants();
-            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{}", err);
-            assert_eq!(err.to_string(), "truncated handshake packet");
-            responder = Handshake::shared_responder([1; 32], eph(1));
-            assert!(matches!(responder.start().unwrap(), Action::Wait));
+            trace.push(format!("{start:?} -> {:?}: {error}", error.kind()));
         }
 
-        let mut initiator = Handshake::shared_initiator([1; 32], eph(2));
-        let _ = outbound(initiator.start().unwrap());
-        assert!(matches!(initiator.sent().unwrap(), Action::Wait));
-        let err = initiator.recv(&[0u8; 8]).unwrap_err();
-        initiator.invariants();
-        assert_eq!(err.to_string(), "truncated handshake packet");
+        let mut shared = Handshake::shared_initiator([1; 32], eph(2));
+        let mut user = Handshake::user_initiator("ann", [7; 32], eph(6), true);
+        for (initiator, packet) in [(&mut shared, &[0; 8][..]), (&mut user, &[0])] {
+            let start = initiator.start().unwrap();
+            let sent = initiator.sent().unwrap();
+            let error = initiator.recv(packet).unwrap_err();
+            initiator.invariants();
+            trace.push(format!("{start:?} -> {sent:?} -> {:?}: {error}", error.kind()));
+        }
 
-        let mut server = Handshake::user_responder(eph(3));
-        assert!(matches!(server.start().unwrap(), Action::Wait));
-        let err = server.recv(&[]).unwrap_err();
-        server.invariants();
-        assert_eq!(err.to_string(), "empty key agreement");
-
-        let mut server = Handshake::user_responder(eph(4));
-        assert!(matches!(server.start().unwrap(), Action::Wait));
-        let err = server.recv(&[5, b'a', b'b']).unwrap_err();
-        server.invariants();
-        assert_eq!(err.to_string(), "malformed key agreement");
-
-        let mut server = Handshake::user_responder(eph(5));
-        assert!(matches!(server.start().unwrap(), Action::Wait));
-        let err = server.recv(&[2, b'a', b'n']).unwrap_err();
-        server.invariants();
-        assert_eq!(err.to_string(), "truncated handshake packet");
-
-        let mut client = Handshake::user_initiator("ann", [7; 32], eph(6), true);
-        let _ = outbound(client.start().unwrap());
-        assert!(matches!(client.sent().unwrap(), Action::Wait));
-        let err = client.recv(&[0]).unwrap_err();
-        client.invariants();
-        assert_eq!(err.to_string(), "truncated handshake packet");
+        expect![[r#"
+            Wait -> UnexpectedEof: truncated handshake packet
+            Wait -> UnexpectedEof: truncated handshake packet
+            Wait -> UnexpectedEof: truncated handshake packet
+            Wait -> Other: empty key agreement
+            Wait -> Other: malformed key agreement
+            Wait -> UnexpectedEof: truncated handshake packet
+            Send(48) -> Wait -> UnexpectedEof: truncated handshake packet
+            Send(60) -> Wait -> UnexpectedEof: truncated handshake packet"#]]
+            .assert_eq(&trace.join("\n"));
     }
 
     #[test]

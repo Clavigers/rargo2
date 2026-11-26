@@ -55,12 +55,15 @@ mod tests {
 
     #[test]
     fn reports_are_numbered_kept_and_not_repeated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let p = tmp.path().join("target/.future-incompat-report.json");
+        rargo_net::io::sim::test(numbered_kept_and_not_repeated);
+    }
+
+    fn numbered_kept_and_not_repeated() {
+        let p = rargo_net::io::sim::tempdir().join("target/.future-incompat-report.json");
         assert_eq!(save(&report(&p, "a")).unwrap(), 1);
         assert_eq!(save(&report(&p, "b")).unwrap(), 2);
         assert_eq!(save(&report(&p, "a")).unwrap(), 1);
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rargo_net::io::file::read(&p).unwrap()).unwrap();
         assert_eq!(v["version"], 0);
         assert_eq!(v["next_id"], 3);
         assert_eq!(v["reports"][1]["id"], 2);
@@ -72,10 +75,10 @@ mod tests {
         for t in ["c", "d", "e", "f"] {
             save(&report(&p, t)).unwrap();
         }
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&rargo_net::io::file::read(&p).unwrap()).unwrap();
         let ids: Vec<u64> = v["reports"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
         assert_eq!(ids, vec![2, 3, 4, 5, 6]);
-        std::fs::write(&p, br#"{"version":9,"next_id":40,"reports":[]}"#).unwrap();
+        rargo_net::io::file::write(&p, br#"{"version":9,"next_id":40,"reports":[]}"#).unwrap();
         assert_eq!(save(&report(&p, "a")).unwrap(), 1);
     }
 }

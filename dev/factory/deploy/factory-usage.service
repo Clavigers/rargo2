@@ -1,0 +1,16 @@
+[Unit]
+Description=rargo2 factory: reads each agent plan's quota use and reset times into state/usage.json, every 10 minutes
+After=network-online.target
+
+[Service]
+WorkingDirectory=/root/factory
+Environment=HOME=/root
+Environment=PYTHONPATH=/root/factory/src
+Environment=FACTORY_LOG=/root/factory/log.jsonl
+Environment=PATH=/root/.local/bin:/root/.grok/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/root/factory/venv/bin/python -m factory usage /root/factory/state --every 600
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
