@@ -234,7 +234,7 @@ enum Ev {
     Sync { client: u64 },
     ClientCut { client: u64 },
     Watch { client: u64 },
-    Crash { client: u64 },
+    ClientCrash { client: u64 },
     Restart { client: u64 },
 }
 
@@ -430,7 +430,7 @@ impl World {
             for _ in 0..w.cfg.crashes {
                 let client = w.rng.range(1, w.cfg.clients);
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
-                w.schedule(at, Ev::Crash { client });
+                w.schedule(at, Ev::ClientCrash { client });
             }
             if w.rng.chance(300) {
                 let start = w.rng.range(0, w.cfg.fault_end_ms);
@@ -599,7 +599,7 @@ impl World {
                 Ok(())
             }
             Ev::Watch { client } => self.watch(client),
-            Ev::Crash { client } => {
+            Ev::ClientCrash { client } => {
                 self.crash(client);
                 Ok(())
             }
@@ -1402,7 +1402,7 @@ fn label(ev: &Ev) -> String {
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
         Ev::Watch { client } => format!("watch {client};"),
-        Ev::Crash { client } => format!("crash {client};"),
+        Ev::ClientCrash { client } => format!("crash {client};"),
         Ev::Restart { client } => format!("restart {client};"),
     }
 }
