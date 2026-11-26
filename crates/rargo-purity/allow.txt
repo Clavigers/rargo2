@@ -112,7 +112,6 @@ pure-tests	crates/rargo/src/project.rs	9	tests still touch the world instead of 
 pure-tests	crates/rargo/src/report.rs	4	tests still touch the world instead of memory: the filesystem (3), tempdirs (1)
 pure-tests	crates/rargo/src/tmp.rs	18	tests still touch the world instead of memory: the filesystem (9), processes (4), libc calls (3), tempdirs (2)
 self-check	crates/rargo-core/src/action_table.rs	3	3 step methods of ActionTable assert nothing
-self-check	crates/rargo-core/src/build/nextest_run.rs	1	1 step method of NextestRun asserts nothing
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
 self-check	crates/rargo-core/src/conn_state.rs	6	6 step methods of ConnectionState assert nothing
 self-check	crates/rargo-core/src/db_writer.rs	5	5 step methods of DbWriter assert nothing

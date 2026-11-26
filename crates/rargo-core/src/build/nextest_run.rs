@@ -73,6 +73,8 @@ impl NextestRun {
     }
 
     fn end(&mut self, code: i32) -> Vec<Effect> {
+        assert_ne!(self.phase, Phase::Done, "a run ends once");
+        assert!(self.running.is_empty(), "a run ends between rounds");
         self.phase = Phase::Done;
         vec![Effect::End(code)]
     }
@@ -182,6 +184,11 @@ impl StateMachine for NextestRun {
         assert!(self.running.keys().all(|k| !self.ran.contains(k)), "a test runs once");
         if self.phase != Phase::Tests {
             assert!(self.running.is_empty(), "tests run only in their round");
+        } else {
+            assert!(!self.running.is_empty(), "a round of tests has a test left to run");
+        }
+        if self.phase == Phase::Fetch {
+            assert!(self.fetched, "the network is fetched from once");
         }
         if matches!(self.phase, Phase::Round | Phase::Tests) {
             assert!(self.round >= 1);
