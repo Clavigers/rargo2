@@ -11,9 +11,9 @@ categories = ["development-tools::build-utils", "command-line-utilities"]
 exclude = ["src/git/fixture.bin"]
 
 [dependencies]
-rargo-proto = { path = "../rargo-proto", version = "0.7.6" }
-rargo-net = { path = "../rargo-net", version = "0.7.6" }
-fusewire = { path = "../fusewire", version = "0.7.6" }
+rargo-proto = { path = "../rargo-proto", version = "0.7.7" }
+rargo-net = { path = "../rargo-net", version = "0.7.7" }
+fusewire = { path = "../fusewire", version = "0.7.7" }
 libc.workspace = true
 blake3.workspace = true
 rayon.workspace = true
