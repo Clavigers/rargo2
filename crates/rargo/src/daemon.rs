@@ -154,6 +154,7 @@ enum Step {
     Fail(&'static str),
     Error(&'static str),
     GiveUp,
+    Silent { quiet: Duration, waiting_for: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +194,7 @@ struct CommandState {
     delivery_ready: bool,
     last: Option<LocalReply>,
     token: Option<u64>,
+    silence: Option<(Duration, &'static str)>,
 }
 
 impl CommandState {
@@ -200,6 +202,7 @@ impl CommandState {
         Self {
             kind, phase: CommandPhase::Link, bet: false, after: None, retry_used: false, changes: 0, probe, visible: false,
             capture_errors: false, heard: Vec::new(), fetching: None, delivery_ready: false, last: None, token: None,
+            silence: None,
         }
     }
 
@@ -252,18 +255,32 @@ impl CommandState {
         }
     }
 
-    fn link_lost(&mut self) -> Step {
+    /// The link closed; `silent` is how long the server had said nothing, and what was awaited, when that is why.
+    fn link_lost(&mut self, silent: Option<(Duration, &'static str)>) -> Step {
         self.bet = false;
         self.after = None;
         self.fetching = None;
         self.delivery_ready = false;
+        if silent.is_some() {
+            self.silence = silent;
+        }
         if self.visible || self.retry_used || self.phase == CommandPhase::Finished {
             self.phase = CommandPhase::Finished;
-            return Step::GiveUp;
+            return match self.silence {
+                Some((quiet, waiting_for)) => Step::Silent { quiet, waiting_for },
+                None => Step::GiveUp,
+            };
         }
         self.retry_used = true;
         self.phase = CommandPhase::Link;
         Step::Link
+    }
+
+    /// Connecting failed: after a server went silent, the command ends with that silence, not a new error.
+    fn connect_failed(&mut self) -> Option<Step> {
+        let (quiet, waiting_for) = self.silence?;
+        self.phase = CommandPhase::Finished;
+        Some(Step::Silent { quiet, waiting_for })
     }
 
     fn again(&mut self) -> Step {
@@ -1343,10 +1360,13 @@ impl Daemon {
             let mut link = None;
             loop {
                 step = match step {
-                    Step::Link => {
-                        link = Some(self.mux()?);
-                        command.linked()
-                    }
+                    Step::Link => match self.mux() {
+                        Ok(mux) => {
+                            link = Some(mux);
+                            command.linked()
+                        }
+                        Err(e) => command.connect_failed().ok_or(e)?,
+                    },
                     Step::Request => {
                         let mux = link.clone().expect("a link before a request");
                         let (env, env_checked) = env_for(&Policy::default());
@@ -1354,15 +1374,13 @@ impl Daemon {
                         match self.converse(&mux, run, None, None, None, req, out, &mut command, None) {
                             Ok(Some(reply)) => return Ok(reply),
                             Ok(None) => command.again(),
-                            Err(_) if mux.is_dead() => match mux.silent() {
-                                Some(quiet) => return Ok(self.silent(out, quiet, "its answer")),
-                                None => command.link_lost(),
-                            },
+                            Err(_) if mux.is_dead() => command.link_lost(mux.silent().map(|quiet| (quiet, "its answer"))),
                             Err(e) => return Err(e),
                         }
                     }
                     Step::Error(text) => return Err(std::io::Error::other(text)),
                     Step::GiveUp => return Err(lost()),
+                    Step::Silent { quiet, waiting_for } => return Ok(self.silent(out, quiet, waiting_for)),
                     other => unreachable!("an admin command does not {other:?}"),
                 };
             }
@@ -1398,20 +1416,18 @@ impl Daemon {
         let mut snap: Option<Arc<Snap>> = None;
         let mut bet = None;
         let mut failure = None;
-        let mut silence = None;
         let mut started = Instant::now();
         loop {
             step = match step {
-                Step::Link => {
-                    link = Some(match (self.mux(), silence) {
-                        (Ok(mux), _) => mux,
-                        (Err(_), Some((quiet, waiting_for))) => return Ok(self.silent(out, quiet, waiting_for)),
-                        (Err(e), None) => return Err(e),
-                    });
-                    phase("link to the server ready");
-                    started = Instant::now();
-                    command.linked()
-                }
+                Step::Link => match self.mux() {
+                    Ok(mux) => {
+                        link = Some(mux);
+                        phase("link to the server ready");
+                        started = Instant::now();
+                        command.linked()
+                    }
+                    Err(e) => command.connect_failed().ok_or(e)?,
+                },
                 Step::Scan => {
                     let mut st = wt.state.lock();
                     if st.policy_dir != policy_dir {
@@ -1457,8 +1473,7 @@ impl Daemon {
                         Ok(Offered::Changed) => command.offered(Sent::Changed),
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
-                            silence = mux.silent().map(|quiet| (quiet, "its answer to the worktree offer"));
-                            command.link_lost()
+                            command.link_lost(mux.silent().map(|quiet| (quiet, "its answer to the worktree offer")))
                         }
                         Err(e) => return Err(e),
                     }
@@ -1499,8 +1514,7 @@ impl Daemon {
                         }
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
-                            silence = mux.silent().map(|quiet| (quiet, "the build's progress"));
-                            command.link_lost()
+                            command.link_lost(mux.silent().map(|quiet| (quiet, "the build's progress")))
                         }
                         Err(e) => return Err(e),
                     }
@@ -1512,10 +1526,8 @@ impl Daemon {
                 Step::Exit(code) => return Ok(LocalReply::Exit(code)),
                 Step::Fail(text) => return Ok(Self::fail(out, text.into())),
                 Step::Error(text) => return Err(std::io::Error::other(text)),
-                Step::GiveUp => match silence {
-                    Some((quiet, waiting_for)) => return Ok(self.silent(out, quiet, waiting_for)),
-                    None => return Err(failure.take().unwrap_or_else(lost)),
-                },
+                Step::GiveUp => return Err(failure.take().unwrap_or_else(lost)),
+                Step::Silent { quiet, waiting_for } => return Ok(self.silent(out, quiet, waiting_for)),
             };
         }
     }
@@ -2507,6 +2519,51 @@ mod left_out_tests {
     }
 
     #[test]
+    fn a_server_gone_silent_ends_the_command_with_that_silence_once_its_retry_cannot_connect_or_is_spent() {
+        let to_request = |c: &mut CommandState| {
+            assert_eq!(c.begin(), Step::Link);
+            assert_eq!(c.connect_failed(), None, "a first connect that fails is its own error");
+            assert_eq!(c.linked(), Step::Scan);
+            assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
+            assert_eq!(c.offered(Sent::All), Step::Request);
+        };
+        let quiet = Duration::from_secs(45);
+        let silent = Step::Silent { quiet, waiting_for: "the build's progress" };
+
+        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
+        to_request(&mut c);
+        assert_eq!(c.link_lost(Some((quiet, "the build's progress"))), Step::Link, "a silent link is retried once");
+        c.invariants();
+        assert_eq!(c.connect_failed(), Some(silent), "a retry that cannot connect ends with the silence");
+        c.invariants();
+
+        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
+        to_request(&mut c);
+        assert_eq!(c.link_lost(Some((quiet, "the build's progress"))), Step::Link);
+        assert_eq!(c.linked(), Step::Scan);
+        assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
+        assert_eq!(c.offered(Sent::All), Step::Request);
+        assert_eq!(c.link_lost(None), silent, "a spent retry ends with the earlier silence");
+
+        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
+        to_request(&mut c);
+        assert_eq!(c.link_lost(None), Step::Link);
+        assert_eq!(c.connect_failed(), None, "after a plain drop a failed connect is its own error");
+        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
+        to_request(&mut c);
+        assert_eq!(c.link_lost(None), Step::Link);
+        assert_eq!(c.linked(), Step::Scan);
+        assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
+        assert_eq!(c.offered(Sent::All), Step::Request);
+        assert_eq!(c.link_lost(None), Step::GiveUp);
+
+        let mut c = CommandState::new(CommandKind::Admin, Probe::Wait);
+        assert_eq!(c.linked(), Step::Request);
+        assert_eq!(c.link_lost(Some((quiet, "its answer"))), Step::Link);
+        assert_eq!(c.connect_failed(), Some(Step::Silent { quiet, waiting_for: "its answer" }));
+    }
+
+    #[test]
     fn generated_commands_relay_in_order_exit_with_the_builds_code_and_retry_a_lost_link_once() {
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
@@ -2521,7 +2578,7 @@ mod left_out_tests {
             let mut ended = false;
             for _ in 0..200 {
                 let lost = |c: &mut CommandState, m: &mut Model, visible: bool| {
-                    let next = c.link_lost();
+                    let next = c.link_lost(None);
                     c.invariants();
                     if visible || m.retried {
                         assert_eq!(next, Step::GiveUp, "seed {seed}: a lost link fails clearly after output or a retry");
@@ -2593,7 +2650,7 @@ mod left_out_tests {
                         ended = true;
                         break;
                     }
-                    Step::Fail(_) | Step::Error(_) | Step::GiveUp => {
+                    Step::Fail(_) | Step::Error(_) | Step::GiveUp | Step::Silent { .. } => {
                         ended = true;
                         break;
                     }
