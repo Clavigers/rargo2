@@ -70,6 +70,15 @@ class GitHub:
     def check_runs(self, sha: str) -> list[dict]:
         return self._api(f"commits/{sha}/check-runs?per_page=100")["check_runs"]
 
+    def rerun_failed(self, sha: str) -> int:
+        """Run again the failed jobs of the workflow runs on this commit."""
+        runs = self._api(f"actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]
+        failed = [r["id"] for r in runs if r["status"] == "completed" and r["conclusion"] in
+                  ("failure", "timed_out", "cancelled", "startup_failure")]
+        for run in failed:
+            self._gh("run", "rerun", str(run), "-R", self.repo, "--failed")
+        return len(failed)
+
     def merge(self, pr: int, sha: str) -> None:
         self._gh("pr", "merge", str(pr), "-R", self.repo, "--squash", "--delete-branch",
                  "--match-head-commit", sha)
