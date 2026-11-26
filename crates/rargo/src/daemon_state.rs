@@ -202,6 +202,7 @@ impl StateMachine for DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
     use std::collections::{BTreeMap, BTreeSet};
 
     struct Rng(u64);
@@ -388,28 +389,127 @@ mod tests {
         }
     }
 
+    enum Ev {
+        Added(u64),
+        Link(bool, Need),
+        Connected,
+        Changed(u64, bool),
+        Watched(u64, bool),
+        PlanScan(u64, u64, bool),
+        Scanned(u64, u64),
+        Offer(u64, Digest, &'static [Digest], &'static [(Digest, u64)]),
+        Synced(u64, Digest, &'static [Digest]),
+        Missing(&'static [Digest]),
+        Expired(u64),
+    }
+
+    /// Steps a daemon's state through the events, checking its invariants after each, and lists what each
+    /// step decided. Digests are named by their first byte.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
+        let mut core = DaemonState::new(KnownDigests::default());
+        core.invariants();
+        let name = |d: &Digest| d[0];
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Added(wt) => {
+                    core.added(wt);
+                    format!("added {wt}")
+                }
+                Ev::Link(alive, need) => format!("link alive={alive} {need:?} => {:?}", core.link(alive, need)),
+                Ev::Connected => {
+                    core.connected();
+                    format!("connected, {} connections", core.connections())
+                }
+                Ev::Changed(wt, everything) => {
+                    core.changed(wt, everything);
+                    format!("changed {wt} everything={everything}")
+                }
+                Ev::Watched(wt, all) => {
+                    core.watched(wt, all);
+                    format!("watched {wt} all={all} => {} wholly watched", core.all_watched())
+                }
+                Ev::PlanScan(wt, h, watching) => {
+                    format!("plan scan {wt} head {h} watching={watching} => {:?}", core.plan_scan(wt, head(h).as_ref(), watching))
+                }
+                Ev::Scanned(wt, h) => {
+                    core.scanned(wt, head(h));
+                    format!("scanned {wt} head {h}")
+                }
+                Ev::Offer(wt, root, trees, files) => {
+                    let (trees, files) = core.offer(Some(wt), &root, trees.iter(), files.iter().map(|(d, s)| (d, *s)));
+                    let trees: Vec<u8> = trees.iter().map(name).collect();
+                    let files: Vec<(u8, u64)> = files.iter().map(|(d, s)| (name(d), *s)).collect();
+                    format!("offer {wt} root {} => trees {trees:?} files {files:?}", name(&root))
+                }
+                Ev::Synced(wt, root, contents) => {
+                    core.synced(Some(wt), root, contents.iter());
+                    format!("synced {wt} root {}", name(&root))
+                }
+                Ev::Missing(lost) => {
+                    core.missing(lost.iter());
+                    format!("missing {:?}", lost.iter().map(name).collect::<Vec<_>>())
+                }
+                Ev::Expired(wt) => {
+                    core.expired(wt);
+                    format!("expired {wt}")
+                }
+            };
+            core.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
+    const D1: Digest = [1; 32];
+    const D2: Digest = [2; 32];
+    const D9: Digest = [9; 32];
+    const FILES: &[(Digest, u64)] = &[(D1, 3), (D2, 4)];
+
     #[test]
     fn a_dropped_session_keeps_what_the_server_holds_and_forgets_what_is_synced() {
-        let mut core = DaemonState::new(KnownDigests::default());
-        core.added(1);
-        assert_eq!(core.link(false, Need::IfUp), Link::Skip);
-        assert_eq!(core.link(false, Need::Must), Link::Connect);
-        core.connected();
-        core.invariants();
-        let files = [(d(1), 3u64), (d(2), 4)];
-        core.synced(Some(1), d(9), [d(9), d(1), d(2)].iter());
-        core.invariants();
-        assert_eq!(core.offer(Some(1), &d(9), [d(9)].iter(), files.iter().map(|(d, s)| (d, *s))), (vec![], vec![]));
-        assert_eq!(core.link(false, Need::IfUp), Link::Skip, "the link died");
-        core.invariants();
-        assert_eq!(core.link(false, Need::Must), Link::Connect);
-        core.connected();
-        assert_eq!(core.connections(), 2);
-        let (trees, blobs) = core.offer(Some(1), &d(9), [d(9)].iter(), files.iter().map(|(d, s)| (d, *s)));
-        assert!(trees.is_empty() && blobs.is_empty(), "after a reconnect nothing the server holds is sent again");
-        core.missing([d(2)].iter());
-        core.invariants();
-        let (trees, blobs) = core.offer(Some(1), &d(9), [d(9)].iter(), files.iter().map(|(d, s)| (d, *s)));
-        assert_eq!((trees, blobs), (vec![], vec![(d(2), 4)]), "what the server said it lost is sent again");
+        let events = [
+            Ev::Added(1),
+            Ev::Link(false, Need::IfUp),
+            Ev::Link(false, Need::Must),
+            Ev::Connected,
+            Ev::Offer(1, D9, &[D9], FILES),
+            Ev::Synced(1, D9, &[D9, D1, D2]),
+            Ev::Offer(1, D9, &[D9], FILES),
+            Ev::Link(false, Need::IfUp),
+            Ev::Link(false, Need::Must),
+            Ev::Connected,
+            Ev::Offer(1, D9, &[D9], FILES),
+            Ev::Missing(&[D2]),
+            Ev::Offer(1, D9, &[D9], FILES),
+        ];
+        expect![[r#""#]].assert_eq(&run(events));
+    }
+
+    #[test]
+    fn an_unchanged_wholly_watched_worktree_is_not_scanned_again_until_it_changes() {
+        let events = [
+            Ev::Added(1),
+            Ev::PlanScan(1, 1, true),
+            Ev::Scanned(1, 1),
+            Ev::Watched(1, true),
+            Ev::PlanScan(1, 1, true),
+            Ev::PlanScan(1, 2, true),
+            Ev::Scanned(1, 2),
+            Ev::Changed(1, false),
+            Ev::PlanScan(1, 2, true),
+            Ev::Scanned(1, 2),
+            Ev::PlanScan(1, 2, false),
+            Ev::Scanned(1, 2),
+            Ev::Changed(1, true),
+            Ev::PlanScan(1, 2, true),
+            Ev::Watched(1, false),
+            Ev::Scanned(1, 2),
+            Ev::PlanScan(1, 2, true),
+            Ev::Expired(1),
+            Ev::PlanScan(1, 2, true),
+        ];
+        expect![[r#""#]].assert_eq(&run(events));
     }
 }

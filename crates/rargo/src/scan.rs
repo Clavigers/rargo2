@@ -1054,6 +1054,7 @@ fn scan_holds(scan: &Scan, root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
     use std::collections::BTreeSet;
     use std::io::ErrorKind;
 
@@ -1267,6 +1268,63 @@ mod tests {
             assert_eq!(b.files.get(hash), Some(&(path.clone(), *size)));
         }
         assert!(a.dir_trees.values().all(|digest| a.trees.contains_key(digest)));
+    }
+
+    /// Runs a scan to its end, answering from the model, and lists what it asked at each step and what it found.
+    fn transcript(core: &mut ScanCore, model: &Model) -> String {
+        let text = |b: &[u8]| format!("{:?}", String::from_utf8_lossy(b));
+        let mut out = String::new();
+        let mut answers = Vec::new();
+        for step in 1.. {
+            let next = core.advance(std::mem::take(&mut answers)).unwrap();
+            rargo_machine::check(&core, format_args!("invariants after step {step}"));
+            let Step::Ask(asks) = next else { break };
+            let asked: Vec<String> = asks
+                .iter()
+                .map(|ask| match ask {
+                    Ask::List { rel } => format!("list {}", text(rel)),
+                    Ask::Meta { rel } => format!("meta {}", text(rel)),
+                    Ask::Cache { rel } => format!("cache tag {}", text(rel)),
+                    Ask::Link { rel } => format!("link {}", text(rel)),
+                    Ask::Content { rel, size } => format!("content {} ({size} bytes)", text(rel)),
+                })
+                .collect();
+            out += &format!("step {step}: {}\n", asked.join(", "));
+            answers = model.answer(&asks);
+        }
+        let scan = core.outcome.take().expect("a finished scan");
+        let mut files: Vec<String> =
+            scan.index.files.iter().map(|(path, entry)| format!("{}:{}", text(path), entry.size)).collect();
+        files.sort();
+        out += &format!(
+            "listed {} directories, hashed {} files, index changed: {}; files {}\n",
+            scan.listed_dirs,
+            scan.hashed_files,
+            scan.index_changed,
+            files.join(" ")
+        );
+        core.outcome = Some(scan);
+        out
+    }
+
+    #[test]
+    fn a_scan_asks_for_each_directory_then_its_entries_and_a_rescan_only_for_what_it_is_told() {
+        let root = Path::new("/mem");
+        let mut tree = dir();
+        put(&mut tree, "Cargo.toml", file("[package]", 1));
+        put(&mut tree, "src/lib.rs", file("pub fn a() {}", 2));
+        put(&mut tree, "src/bin/b.rs", file("fn main() {}", 3));
+        put(&mut tree, "target/debug/out", file("o", 4));
+        put(&mut tree, "link", Mem::Link(b"src".to_vec()));
+        let mut model = Model { root: tree, at_ns: SETTLED };
+        let mut whole = ScanCore::whole(root, Some(&Index::default()), &[], None);
+        expect![[r#""#]].assert_eq(&transcript(&mut whole, &model));
+
+        let first = whole.outcome.take().unwrap();
+        put(&mut model.root, "src/lib.rs", Mem::File { bytes: b"pub fn b() {}".to_vec(), mtime_ns: SETTLED, ctime_ns: SETTLED, ino: 2, exec: false });
+        let told: BTreeSet<PathBuf> = [root.join("src")].into_iter().collect();
+        let mut rescan = ScanCore::rescan(root, first, &told, &[], None);
+        expect![[r#""#]].assert_eq(&transcript(&mut rescan, &model));
     }
 
     #[test]

@@ -1444,6 +1444,7 @@ impl Filesystem for OutFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     #[test]
     fn listing_cookies_are_stable_and_ordered() {
@@ -1655,22 +1656,52 @@ mod tests {
         assert!(reads > 1000 && refused > 100 && stale > 100, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
     }
 
-    #[test]
-    fn replacing_output_detaches_the_name_without_reusing_its_inode() {
+    enum Ev {
+        Lookup(u64, &'static str),
+        Changed(&'static str),
+        Path(u64),
+        Forget(u64, u64),
+    }
+
+    /// Steps an inode table holding only the root through the events, checking it after each, and lists what
+    /// each step gave back.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
         let mut state = Inodes { nodes, children: HashMap::new(), next: 2 };
-        let old = state.lookup(ROOT, b"app");
         state.invariants();
-        assert_eq!(state.changed(b"app"), (ROOT, b"app".to_vec()));
-        state.invariants();
-        let new = state.lookup(ROOT, b"app");
-        state.invariants();
-        assert_ne!(old, new);
-        assert_eq!(state.path(new).ok().unwrap(), b"app");
-        assert_eq!(state.forget(old, 1), [old]);
-        state.invariants();
-        assert_eq!(state.lookup(ROOT, b"app"), new);
-        state.invariants();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Lookup(parent, name) => format!("lookup {parent} {name} => {}", state.lookup(parent, name.as_bytes())),
+                Ev::Changed(path) => {
+                    let (parent, name) = state.changed(path.as_bytes());
+                    format!("changed {path} => detached {} from {parent}", text(&name))
+                }
+                Ev::Path(node) => format!("path {node} => {:?}", state.path(node).map(|p| text(&p)).map_err(|e| e.0)),
+                Ev::Forget(node, n) => format!("forget {node} {n} => {:?}", state.forget(node, n)),
+            };
+            state.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn replacing_output_detaches_the_name_without_reusing_its_inode() {
+        let events = [
+            Ev::Lookup(ROOT, "app"),
+            Ev::Changed("app"),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Path(3),
+            Ev::Path(2),
+            Ev::Forget(2, 1),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Forget(3, 2),
+            Ev::Lookup(ROOT, "app"),
+        ];
+        expect![[r#""#]].assert_eq(&run(events));
     }
 }

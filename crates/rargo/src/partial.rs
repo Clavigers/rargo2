@@ -25,6 +25,7 @@ enum Group {
     Bad,
 }
 
+#[derive(Debug)]
 enum Read {
     Ready,
     BadHash,
@@ -392,6 +393,7 @@ pub fn hex(h: &Digest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     fn recipe(data: &[u8]) -> Vec<(Digest, u32)> {
         data.chunks(30_000).map(|c| (*blake3::hash(c).as_bytes(), c.len() as u32)).collect()
@@ -401,66 +403,82 @@ mod tests {
         (0..size).map(|i| (i / 11 + i / 29) as u8).collect()
     }
 
-    fn state(data: &[u8], lazy: &[(u64, u64)]) -> RangeState {
-        let state = RangeState::new(blake3::hash(data).as_bytes(), data.len() as u64, recipe(data), outline::outline(data), lazy).unwrap();
-        state.invariants();
-        state
+    enum Ev {
+        /// A read of bytes `start..end`, `waited` once it has waited for a change.
+        Read(u64, u64, bool),
+        /// The chunks the last fetch asked for, needed then prefetched, arrive as `sent` holds them.
+        DeliverFetched,
+        /// The source could not fetch the chunks the last fetch needed.
+        FailNeeded,
     }
 
-    fn requested(state: &RangeState, read: Read) -> (Vec<u32>, Vec<u32>) {
+    /// Steps a file's range state through the events with `sent` as the bytes the server sends, checks its
+    /// invariants after each step, and lists what each step decided and what the file holds at the end.
+    fn run(original: &[u8], sent: &[u8], lazy: &[(u64, u64)], events: impl IntoIterator<Item = Ev>) -> String {
+        let hash = blake3::hash(original);
+        let mut state =
+            RangeState::new(hash.as_bytes(), original.len() as u64, recipe(sent), outline::outline(original), lazy).unwrap();
         state.invariants();
-        let Read::Fetch { needed, prefetch } = read else { panic!("expected a fetch") };
-        (needed, prefetch)
-    }
-
-    fn deliver(state: &mut RangeState, chunks: impl IntoIterator<Item = u32>, data: &[u8], file: &mut [u8]) {
-        for chunk in chunks {
-            assert!(state.needs_chunk(chunk));
-            let i = chunk as usize;
-            let start = state.offsets[i] as usize;
-            let end = start + state.recipe[i].1 as usize;
-            assert!(RangeState::valid_chunk(&state.recipe[i], &data[start..end]));
-            file[start..end].copy_from_slice(&data[start..end]);
-            let proofs = state.stored(chunk);
-            state.invariants();
-            for proof in proofs {
-                state.proved(proof.group, proof.verify(&file[proof.start as usize..proof.end as usize]));
-                state.invariants();
+        let mut file = vec![0; original.len()];
+        let mut fetched = (Vec::new(), Vec::new());
+        let mut out = String::new();
+        for ev in events {
+            match ev {
+                Ev::Read(start, end, waited) => {
+                    let read = state.read(start, end, waited);
+                    out += &format!("read {start}..{end} waited={waited} => {read:?}\n");
+                    if let Read::Fetch { needed, prefetch } = read {
+                        fetched = (needed, prefetch);
+                    }
+                }
+                Ev::FailNeeded => {
+                    state.failed(&fetched.0);
+                    out += &format!("failed {:?}\n", fetched.0);
+                }
+                Ev::DeliverFetched => {
+                    for chunk in fetched.0.iter().chain(&fetched.1).copied() {
+                        assert!(state.needs_chunk(chunk));
+                        let i = chunk as usize;
+                        let start = state.offsets[i] as usize;
+                        let end = start + state.recipe[i].1 as usize;
+                        file[start..end].copy_from_slice(&sent[start..end]);
+                        let proofs = state.stored(chunk);
+                        state.invariants();
+                        for proof in proofs {
+                            let valid = proof.verify(&file[proof.start as usize..proof.end as usize]);
+                            out += &format!("chunk {chunk} proves group {} => {:?}\n", proof.group, state.proved(proof.group, valid));
+                            state.invariants();
+                        }
+                    }
+                }
             }
+            state.invariants();
         }
+        let groups: Vec<bool> = (0..outline::groups(original.len() as u64))
+            .map(|g| {
+                let (start, end) = outline::group_range(g, original.len() as u64);
+                file[start as usize..end as usize] == original[start as usize..end as usize]
+            })
+            .collect();
+        out + &format!("can place: {}; groups holding the original bytes: {groups:?}\n", state.can_place())
     }
 
     #[test]
     fn overlapping_reads_share_fetches_and_failed_chunks_are_retried() {
         let data = content(GROUP as usize * 4);
-        let mut state = state(&data, &[(GROUP * 2, GROUP * 4)]);
-        let mut file = vec![0; data.len()];
-        let read = state.read(0, 1, false);
-        let (needed, prefetch) = requested(&state, read);
-        assert!(matches!(state.read(1, 3, false), Read::Wait));
-        state.invariants();
-
-        state.failed(&needed);
-        state.invariants();
-        assert!(matches!(state.read(0, 1, true), Read::Failed));
-        state.invariants();
-        let read = state.read(0, 1, false);
-        let (retry, extra) = requested(&state, read);
-        assert_eq!(retry, needed);
-        assert!(extra.is_empty());
-        deliver(&mut state, retry.into_iter().chain(prefetch), &data, &mut file);
-        assert!(matches!(state.read(1, 3, true), Read::Ready));
-        state.invariants();
-        assert_eq!(&file[..3], &data[..3]);
-        assert!(!state.can_place());
-
-        let read = state.read(0, data.len() as u64, false);
-        let (needed, prefetch) = requested(&state, read);
-        deliver(&mut state, needed.into_iter().chain(prefetch), &data, &mut file);
-        assert!(matches!(state.read(0, data.len() as u64, false), Read::Ready));
-        state.invariants();
-        assert!(state.can_place());
-        assert_eq!(file, data);
+        let events = [
+            Ev::Read(0, 1, false),
+            Ev::Read(1, 3, false),
+            Ev::FailNeeded,
+            Ev::Read(0, 1, true),
+            Ev::Read(0, 1, false),
+            Ev::DeliverFetched,
+            Ev::Read(1, 3, true),
+            Ev::Read(0, data.len() as u64, false),
+            Ev::DeliverFetched,
+            Ev::Read(0, data.len() as u64, false),
+        ];
+        expect![[r#""#]].assert_eq(&run(&data, &data, &[(GROUP * 2, GROUP * 4)], events));
     }
 
     #[test]
@@ -468,26 +486,36 @@ mod tests {
         let original = content(GROUP as usize * 3);
         let mut wrong = original.clone();
         wrong[GROUP as usize + 17] ^= 1;
-        let correct_recipe = recipe(&original);
+        let events = [
+            Ev::Read(0, original.len() as u64, false),
+            Ev::DeliverFetched,
+            Ev::Read(GROUP, GROUP + 1, false),
+            Ev::Read(0, GROUP, false),
+        ];
+        expect![[r#""#]].assert_eq(&run(&original, &wrong, &[], events));
+    }
+
+    #[test]
+    fn a_chunk_that_does_not_match_its_recipe_or_an_outline_that_does_not_give_the_hash_is_refused() {
+        let original = content(GROUP as usize * 3);
+        let mut wrong = original.clone();
+        wrong[GROUP as usize + 17] ^= 1;
+        let correct = recipe(&original);
         let i = (GROUP as usize + 17) / 30_000;
-        assert!(!RangeState::valid_chunk(&correct_recipe[i], &wrong[i * 30_000..(i + 1) * 30_000]));
-
+        let chunk_ok = |bytes: &[u8]| RangeState::valid_chunk(&correct[i], &bytes[i * 30_000..(i + 1) * 30_000]);
         let hash = blake3::hash(&original);
-        let mut state = RangeState::new(hash.as_bytes(), original.len() as u64, recipe(&wrong), outline::outline(&original), &[]).unwrap();
-        state.invariants();
-        let read = state.read(0, original.len() as u64, false);
-        let (needed, prefetch) = requested(&state, read);
-        let mut file = vec![0; original.len()];
-        deliver(&mut state, needed.into_iter().chain(prefetch), &wrong, &mut file);
-        assert!(matches!(state.read(GROUP, GROUP + 1, false), Read::BadHash));
-        state.invariants();
-        assert!(matches!(state.read(0, GROUP, false), Read::Ready));
-        state.invariants();
-        assert_eq!(file[..GROUP as usize], original[..GROUP as usize]);
-        assert!(!state.can_place());
-
         let mut bad_outline = outline::outline(&original);
         bad_outline[0][0] ^= 1;
-        assert!(RangeState::new(hash.as_bytes(), original.len() as u64, correct_recipe, bad_outline, &[]).is_err());
+        let mut short = correct.clone();
+        short.pop();
+        let new = |recipe, outline| RangeState::new(hash.as_bytes(), original.len() as u64, recipe, outline, &[]).err();
+        let found = format!(
+            "original chunk valid: {}\nwrong chunk valid: {}\nbad outline: {:?}\nshort recipe: {:?}\n",
+            chunk_ok(&original),
+            chunk_ok(&wrong),
+            new(correct.clone(), bad_outline),
+            new(short, outline::outline(&original)),
+        );
+        expect![[r#""#]].assert_eq(&found);
     }
 }

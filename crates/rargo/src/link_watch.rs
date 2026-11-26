@@ -74,6 +74,7 @@ pub fn silent_text(server: &str, quiet: Duration, waiting_for: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -96,38 +97,51 @@ mod tests {
         assert_eq!(pings, 3_600_000 / PING_EVERY.as_millis() as u64 - 1);
     }
 
+    enum Ev {
+        Heard(u64),
+        Tick(u64),
+    }
+
+    /// Feeds the events to a watch made at 0 ms with `limit`, and lists what each tick decided.
+    fn run(limit: Duration, events: impl IntoIterator<Item = Ev>) -> String {
+        let mut w = Watch::new(ms(0), limit);
+        let mut out = String::new();
+        for ev in events {
+            match ev {
+                Ev::Heard(t) => {
+                    w.heard(ms(t));
+                    out += &format!("heard {t} ms\n");
+                }
+                Ev::Tick(t) => match w.tick(ms(t)) {
+                    Tick::Wait => {}
+                    tick => out += &format!("tick {t} ms => {tick:?}\n"),
+                },
+            }
+        }
+        out + &format!("silent: {:?}\n", w.silent())
+    }
+
     #[test]
     fn a_server_that_stops_answering_is_silent_once_the_limit_passes_and_stays_so() {
-        let mut w = Watch::new(ms(0), SILENT_AFTER);
-        w.heard(ms(1_000));
-        let gone = (1..).map(|n| n * 200).find(|t| matches!(w.tick(ms(*t)), Tick::Silent(_))).unwrap();
-        assert_eq!(gone, 1_000 + SILENT_AFTER.as_millis() as u64 + 200);
-        w.heard(ms(gone + 1));
-        assert_eq!(w.tick(ms(gone + 200)), Tick::Silent(SILENT_AFTER + ms(200)));
-        assert_eq!(w.silent(), Some(SILENT_AFTER + ms(200)));
+        let ticks = (1..=240).map(|n| Ev::Tick(n * 200));
+        let events = std::iter::once(Ev::Heard(1_000)).chain(ticks.take_while(|e| !matches!(e, Ev::Tick(t) if *t > 46_400)));
+        let events = events.chain([Ev::Heard(46_401), Ev::Tick(46_600)]);
+        expect![[r#""#]].assert_eq(&run(SILENT_AFTER, events));
     }
 
     #[test]
     fn hearing_an_older_time_does_not_move_the_last_heard_back() {
-        let mut w = Watch::new(ms(0), ms(3_000));
-        w.heard(ms(2_000));
-        w.heard(ms(500));
-        assert_eq!(w.tick(ms(5_000)), Tick::Ping(1));
-        assert_eq!(w.tick(ms(5_001)), Tick::Silent(ms(3_001)));
+        let events = [Ev::Heard(2_000), Ev::Heard(500), Ev::Tick(5_000), Ev::Tick(5_001)];
+        expect![[r#""#]].assert_eq(&run(ms(3_000), events));
     }
 
     #[test]
     fn a_short_limit_pings_three_times_within_it() {
-        let mut w = Watch::new(ms(0), ms(3_000));
-        let pings: Vec<u64> = (1..=15).map(|n| n * 200).filter(|t| matches!(w.tick(ms(*t)), Tick::Ping(_))).collect();
-        assert_eq!(pings, [1_000, 2_000, 3_000]);
+        expect![[r#""#]].assert_eq(&run(ms(3_000), (1..=15).map(|n| Ev::Tick(n * 200))));
     }
 
     #[test]
     fn the_silent_line_names_the_server_the_time_and_what_was_awaited() {
-        assert_eq!(
-            silent_text("rargo.rs:7459", ms(45_200), "the build's output"),
-            "error: the rargo server at rargo.rs:7459 sent nothing for 45 s while rargo waited for the build's output; it may be stopped or overloaded\n"
-        );
+        expect![[r#""#]].assert_eq(&silent_text("rargo.rs:7459", ms(45_200), "the build's output"));
     }
 }

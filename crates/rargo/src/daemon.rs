@@ -2175,9 +2175,38 @@ fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> s
 #[cfg(test)]
 mod upload_tests {
     use super::*;
+    use expect_test::expect;
+
+    /// Plans the upload of `want`, each file named by its first byte and `size` bytes long, and lists the plan.
+    fn plan(want: &[u8], sizes: &[(u8, u64)], budget: usize) -> String {
+        let files = sizes.iter().map(|&(i, size)| ([i; 32], (PathBuf::from(i.to_string()), size))).collect();
+        let Some(plan) = UploadPlan::new(want.iter().map(|&i| [i; 32]).collect(), &files, budget) else {
+            return "no plan\n".to_string();
+        };
+        plan.invariants();
+        let name = |file: &UploadFile| format!("{}:{}", file.hash[0], file.size);
+        let mut out = format!("part size {}\n", plan.part_size);
+        for batch in &plan.batches {
+            out += &format!("batch {}\n", batch.iter().map(name).collect::<Vec<_>>().join(" "));
+        }
+        for file in &plan.multipart {
+            out += &format!("multipart {}\n", name(file));
+        }
+        out
+    }
 
     #[test]
     fn upload_plans_keep_first_occurrence_order_within_both_frame_types() {
+        let sizes = [(1, 0), (2, 100), (3, 168), (4, 169), (5, 40), (6, 1_000), (7, 60), (8, 104)];
+        let want = [3, 1, 4, 1, 5, 2, 6, 5, 7, 8, 3];
+        let found = [128, 232, 4096].map(|budget| format!("budget {budget}\n{}", plan(&want, &sizes, budget))).concat();
+        expect![[r#""#]].assert_eq(&found);
+        expect![[r#""#]].assert_eq(&plan(&[1, 9], &sizes, 4096));
+        expect![[r#""#]].assert_eq(&plan(&[1], &sizes, UPLOAD_OVERHEAD));
+    }
+
+    #[test]
+    fn generated_upload_plans_keep_first_occurrence_order_within_both_frame_types() {
         for budget in [128usize, 232, 4096] {
             let mut want = Vec::new();
             let mut files = std::collections::BTreeMap::new();
@@ -2194,38 +2223,48 @@ mod upload_tests {
                 assert_eq!(plan.batches.iter().flatten().map(|entry| entry.hash).collect::<Vec<_>>(), small);
                 assert_eq!(plan.multipart.iter().map(|entry| entry.hash).collect::<Vec<_>>(), large);
             }
-            assert!(UploadPlan::new(vec![[255; 32]], &files, budget).is_none());
         }
+    }
+
+    #[test]
+    fn a_target_relative_directory_is_named_by_its_dot_entry() {
         assert_eq!(join_rel(b"debug"), b"debug/.");
+    }
+
+    /// Feeds `input` to a multipart upload of `content` in reads of `part_size` bytes, checking it after each,
+    /// and lists the frames it sends.
+    fn multipart(content: &[u8], input: &[u8], part_size: usize) -> String {
+        let hash = *blake3::hash(content).as_bytes();
+        let mut upload =
+            Multipart { hash, size: content.len() as u64, part_size, bytes: 0, hasher: blake3::Hasher::new(), held: None };
+        upload.invariants();
+        let frame = |(msg, bytes): (ClientMsg, usize)| match msg {
+            ClientMsg::BlobPart { hash: got, part, last } => {
+                assert_eq!(got, hash, "a part names its content");
+                let data = part.unpack().unwrap();
+                format!("part {:?} last={last} ({bytes} bytes on the wire)", String::from_utf8_lossy(&data))
+            }
+            other => format!("unexpected {other:?}"),
+        };
+        let mut out = String::new();
+        for (i, chunk) in input.chunks(part_size).enumerate() {
+            let sent = match upload.read(chunk.to_vec()) {
+                Ok(Some(sent)) => frame(sent),
+                Ok(None) => "nothing yet".to_string(),
+                Err(()) => "refused".to_string(),
+            };
+            upload.invariants();
+            out += &format!("read {i} {:?} => {sent}\n", String::from_utf8_lossy(chunk));
+        }
+        out + &format!("finish => {}\n", upload.finish().map_or("nothing".to_string(), frame))
     }
 
     #[test]
     fn only_verified_multipart_content_gets_a_terminal_frame() {
-        let input = b"one two three";
-        let hash = *blake3::hash(input).as_bytes();
-        let fresh = || Multipart { hash, size: input.len() as u64, part_size: 4, bytes: 0, hasher: blake3::Hasher::new(), held: None };
-        let mut content = fresh();
-        let mut transferred = Vec::new();
-        for chunk in input.chunks(4) {
-            if let Some((ClientMsg::BlobPart { hash: got, part, last: false }, bytes)) = content.read(chunk.to_vec()).ok().unwrap() {
-                assert_eq!(got, hash);
-                assert!(bytes <= 4);
-                transferred.extend(part.unpack().unwrap());
-            }
-            content.invariants();
-        }
-        let (ClientMsg::BlobPart { hash: got, part, last: true }, bytes) = content.finish().unwrap() else { panic!("expected final part") };
-        assert_eq!(got, hash);
-        assert!(bytes <= 4);
-        transferred.extend(part.unpack().unwrap());
-        assert_eq!(transferred, input);
-
-        let mut corrupt = fresh();
-        for chunk in b"one TWO three".chunks(4) {
-            let _ = corrupt.read(chunk.to_vec()).unwrap();
-            corrupt.invariants();
-        }
-        assert!(corrupt.finish().is_none());
+        expect![[r#""#]].assert_eq(&multipart(b"one two three", b"one two three", 4));
+        expect![[r#""#]].assert_eq(&multipart(b"one two three", b"one TWO three", 4));
+        expect![[r#""#]].assert_eq(&multipart(b"one two", b"one two three", 4));
+        expect![[r#""#]].assert_eq(&multipart(b"one two three", b"one two", 4));
     }
 }
 
@@ -2461,6 +2500,7 @@ fn paths_in<'t>(text: &'t str, root: &'t str) -> impl Iterator<Item = String> + 
 
 #[cfg(test)]
 mod left_out_tests {
+    use expect_test::expect;
     struct Rng(u64);
 
     impl Rng {
@@ -2565,49 +2605,59 @@ mod left_out_tests {
         Ended::Reply
     }
 
+    #[derive(Clone, Copy)]
+    enum Ev {
+        Begin,
+        Linked,
+        ConnectFailed,
+        Scanned,
+        Offered(Sent),
+        Lost,
+        LostSilent(&'static str),
+    }
+
+    use Ev::*;
+
+    /// Steps a command of `kind` through the events, checking it after each, and lists the step each one gave.
+    fn run(kind: CommandKind, events: &[Ev]) -> String {
+        let mut c = CommandState::new(kind, Probe::Wait);
+        c.invariants();
+        let mut out = String::new();
+        for &ev in events {
+            let (name, step) = match ev {
+                Begin => ("begin".to_string(), Some(c.begin())),
+                Linked => ("linked".to_string(), Some(c.linked())),
+                ConnectFailed => ("connect failed".to_string(), c.connect_failed()),
+                Scanned => ("scanned".to_string(), Some(c.scanned())),
+                Offered(sent) => (format!("offered {sent:?}"), Some(c.offered(sent))),
+                Lost => ("link lost".to_string(), Some(c.link_lost(None))),
+                LostSilent(awaited) => {
+                    (format!("link silent 45 s awaiting {awaited}"), Some(c.link_lost(Some((Duration::from_secs(45), awaited)))))
+                }
+            };
+            c.invariants();
+            out += &format!("{name} => {step:?}\n");
+        }
+        out
+    }
+
+    const TO_REQUEST: [Ev; 5] = [Begin, ConnectFailed, Linked, Scanned, Offered(Sent::All)];
+    const RELINK: [Ev; 3] = [Linked, Scanned, Offered(Sent::All)];
+
     #[test]
     fn a_server_gone_silent_ends_the_command_with_that_silence_once_its_retry_cannot_connect_or_is_spent() {
-        let to_request = |c: &mut CommandState| {
-            assert_eq!(c.begin(), Step::Link);
-            assert_eq!(c.connect_failed(), None, "a first connect that fails is its own error");
-            assert_eq!(c.linked(), Step::Scan);
-            assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
-            assert_eq!(c.offered(Sent::All), Step::Request);
-        };
-        let quiet = Duration::from_secs(45);
-        let silent = Step::Silent { quiet, waiting_for: "the build's progress" };
+        let progress = "the build's progress";
+        let retry_cannot_connect = [&TO_REQUEST[..], &[LostSilent(progress), ConnectFailed]].concat();
+        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &retry_cannot_connect));
+        let retry_spent = [&TO_REQUEST[..], &[LostSilent(progress)], &RELINK, &[Lost]].concat();
+        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &retry_spent));
+        expect![[r#""#]].assert_eq(&run(CommandKind::Admin, &[Linked, LostSilent("its answer"), ConnectFailed]));
+    }
 
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(Some((quiet, "the build's progress"))), Step::Link, "a silent link is retried once");
-        c.invariants();
-        assert_eq!(c.connect_failed(), Some(silent), "a retry that cannot connect ends with the silence");
-        c.invariants();
-
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(Some((quiet, "the build's progress"))), Step::Link);
-        assert_eq!(c.linked(), Step::Scan);
-        assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
-        assert_eq!(c.offered(Sent::All), Step::Request);
-        assert_eq!(c.link_lost(None), silent, "a spent retry ends with the earlier silence");
-
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(None), Step::Link);
-        assert_eq!(c.connect_failed(), None, "after a plain drop a failed connect is its own error");
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(None), Step::Link);
-        assert_eq!(c.linked(), Step::Scan);
-        assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
-        assert_eq!(c.offered(Sent::All), Step::Request);
-        assert_eq!(c.link_lost(None), Step::GiveUp);
-
-        let mut c = CommandState::new(CommandKind::Admin, Probe::Wait);
-        assert_eq!(c.linked(), Step::Request);
-        assert_eq!(c.link_lost(Some((quiet, "its answer"))), Step::Link);
-        assert_eq!(c.connect_failed(), Some(Step::Silent { quiet, waiting_for: "its answer" }));
+    #[test]
+    fn a_plain_drop_is_retried_once_and_a_failed_connect_after_it_is_its_own_error() {
+        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost, ConnectFailed]].concat()));
+        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost], &RELINK, &[Lost]].concat()));
     }
 
     #[test]
