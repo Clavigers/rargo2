@@ -57,21 +57,21 @@ struct RecvState {
     pending: BTreeMap<u64, Vec<u8>>,
 }
 
-pub(crate) enum Admit {
+pub enum Admit {
     Queued,
     Full,
     Closed,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Packet {
+pub struct Packet {
     pub msg: u64,
     pub bytes: Vec<u8>,
     pub dropped: bool,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Output {
+pub struct Output {
     pub datagrams: Vec<Packet>,
     pub messages: Vec<Vec<u8>>,
     pub acks: Vec<(u64, u32)>,
@@ -101,7 +101,7 @@ pub struct ConnState {
     closed: bool,
 }
 
-pub(crate) fn data_packet(id: u64, msg: u64, frag: u32, nfrags: u32, data: &[u8]) -> Vec<u8> {
+pub fn data_packet(id: u64, msg: u64, frag: u32, nfrags: u32, data: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(DATA_HDR + data.len());
     pkt.push(T_DATA);
     pkt.extend_from_slice(&id.to_le_bytes());
@@ -112,7 +112,7 @@ pub(crate) fn data_packet(id: u64, msg: u64, frag: u32, nfrags: u32, data: &[u8]
     pkt
 }
 
-pub(crate) fn ack_packet(id: u64, entries: &[(u64, u32)]) -> Vec<u8> {
+pub fn ack_packet(id: u64, entries: &[(u64, u32)]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(9 + entries.len() * 12);
     pkt.push(T_ACK);
     pkt.extend_from_slice(&id.to_le_bytes());

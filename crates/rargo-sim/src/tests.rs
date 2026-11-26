@@ -76,7 +76,7 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
 #[test]
 fn the_network_loses_duplicates_and_reorders() {
     let reports: Vec<_> = (0..100).map(|s| run(s, None).expect("passes")).collect();
-    assert!(reports.iter().any(|r| r.lost > 0), "packets are lost and sent again");
+    assert!(reports.iter().any(|r| r.lost > 0 && r.retransmits > 0), "rargo-net retransmits after datagram loss");
     assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
     assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
 }
@@ -127,8 +127,8 @@ fn a_failure_replays_with_the_faults_it_ran_without() {
 }
 
 fn caught(bug: Bug, kind: fn(&Kind) -> bool) {
-    let failures = search(0..60, Some(bug));
-    let first = failures.first().unwrap_or_else(|| panic!("no seed of 0..60 catches {}", bug.name()));
+    let failures = search(0..64, Some(bug));
+    let first = failures.first().unwrap_or_else(|| panic!("no seed of 0..64 catches {}", bug.name()));
     assert!(kind(&first.kind), "{} is caught as {}, not {first}", bug.name(), first.kind.name());
     let again = run(first.seed, Some(bug)).expect_err("a failing seed fails again");
     assert_eq!(&again, first, "{} replays exactly", first.replay());

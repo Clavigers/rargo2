@@ -15,7 +15,11 @@ pub trait Carried {
     type Serve: Debug;
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+    serialize = "C::Run: serde::Serialize, C::Part: serde::Serialize, C::Serve: serde::Serialize",
+    deserialize = "C::Run: serde::Deserialize<'de>, C::Part: serde::Deserialize<'de>, C::Serve: serde::Deserialize<'de>"
+))]
 pub enum FromServer<C: Carried> {
     Welcome,
     Ask { rid: u64, serve: Option<C::Serve> },
@@ -25,7 +29,8 @@ pub enum FromServer<C: Carried> {
     Other,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(serialize = "C::Run: serde::Serialize", deserialize = "C::Run: serde::Deserialize<'de>"))]
 pub struct Run<C: Carried> {
     pub action: u64,
     pub incoming: Vec<Hash>,

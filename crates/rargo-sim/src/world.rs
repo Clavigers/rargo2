@@ -1,3 +1,7 @@
+use crate::transport::{self, Side};
+use rargo_net::sans_io::{EndpointState, LinkKey, RouteEvent};
+use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::rng::Rng;
@@ -24,19 +28,6 @@ const SERVER_MEM_KB: u64 = 16 * 1024;
 const WATCH_STEP_MS: u64 = 200;
 /// Seeds the network faults' streams, apart from the one that drives the rest of the world.
 const NET_STREAM: u64 = 0x6e65_7477_6f72_6b21;
-/// The first retransmission timeout of a lost packet, as Linux's TCP_RTO_MIN; it doubles on each loss.
-const RTO_MS: u64 = 200;
-/// Losses in a row before a packet gets through; at the rates a seed picks, more never happens.
-const MAX_RETRIES: u32 = 5;
-
-/// The receiving end of one connection: what TCP does under the messages, so that the network may lose,
-/// duplicate and reorder packets while each connection still hands its messages over once and in order.
-#[derive(Default)]
-struct Rx {
-    next: u64,
-    held: BTreeMap<u64, Msg>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bug {
     EvictPinned,
@@ -203,6 +194,7 @@ pub struct Report {
     pub lost: u64,
     pub duplicated: u64,
     pub reordered: u64,
+    pub retransmits: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -219,7 +211,7 @@ pub struct Config {
     pub net: Net,
 }
 
-/// How often, per mille of messages, the network loses, duplicates and reorders until `fault_end_ms`.
+/// How often, per mille of datagrams, the network loses, duplicates and reorders until `fault_end_ms`.
 #[derive(Clone, Debug)]
 pub struct Net {
     pub loss_per_mille: u64,
@@ -258,7 +250,7 @@ impl Config {
 #[derive(Debug)]
 pub struct Sim;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimRun {
     action: usize,
     inputs: Vec<Hash>,
@@ -278,7 +270,7 @@ enum Node {
     Client(u64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Up {
     Hello { cores: usize },
     Result { job: u64, output: Vec<u8> },
@@ -289,50 +281,40 @@ enum Up {
     Ping,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Down {
     Session(ServerMsg),
     Synced { round: u64, root: Digest },
     Pong,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Msg {
     Up(Up),
     Work(FromServer<Sim>),
     Down(Down),
 }
 
-impl Msg {
-    /// The copy a duplicating network delivers; the worker's messages are not `Clone` in `rargo-core`.
-    fn copy(&self) -> Msg {
-        match self {
-            Msg::Up(u) => Msg::Up(u.clone()),
-            Msg::Down(d) => Msg::Down(d.clone()),
-            Msg::Work(w) => Msg::Work(match w {
-                FromServer::Welcome => FromServer::Welcome,
-                FromServer::Ask { rid, serve } => FromServer::Ask { rid: *rid, serve: *serve },
-                FromServer::Push { blob, first, of, part } => {
-                    FromServer::Push { blob: *blob, first: *first, of: *of, part: part.clone() }
-                }
-                FromServer::Run(r) => FromServer::Run(worker_state::Run {
-                    action: r.action,
-                    incoming: r.incoming.clone(),
-                    prefill: r.prefill.clone(),
-                    listings: r.listings.clone(),
-                    closed: r.closed.clone(),
-                    run: r.run.clone(),
-                }),
-                FromServer::Cancel { action } => FromServer::Cancel { action: *action },
-                FromServer::Other => FromServer::Other,
-            }),
-        }
-    }
+struct Connection {
+    id: u64,
+    endpoint: EndpointState,
+    sides: [Option<Side>; 2],
+    wakes: [Option<u64>; 2],
+}
+
+fn addr(node: Node) -> SocketAddr {
+    let (kind, id) = match node {
+        Node::Server => (0, 0),
+        Node::Worker(id) => (1, id),
+        Node::Client(id) => (2, id),
+    };
+    SocketAddr::from((std::net::Ipv6Addr::from((kind << 64) | u128::from(id)), 1))
 }
 
 #[derive(Debug)]
 enum Ev {
-    Deliver { from: Node, to: Node, epoch: u64, n: u64, msg: Msg },
+    Datagram { peer: Node, to_server: bool, id: u64, bytes: Vec<u8> },
+    LinkTimer { peer: Node, server: bool, id: u64 },
     Connect { worker: u64, epoch: u64 },
     Finish { worker: u64, epoch: u64, token: u64 },
     Crash { worker: u64 },
@@ -421,13 +403,15 @@ pub struct World {
     cfg: Config,
     rng: Rng,
     net: [Rng; 3],
-    tx: BTreeMap<(Node, Node, u64), u64>,
-    rx: BTreeMap<(Node, Node, u64), Rx>,
+    connections: BTreeMap<Node, Connection>,
+    server_endpoint: EndpointState,
+    link_key: LinkKey,
+    next_conn: u64,
     now: u64,
     seq: u64,
     queue: BTreeMap<(u64, u64), Ev>,
     busy: usize,
-    last: BTreeMap<(Node, Node), u64>,
+    last: BTreeMap<(Node, bool), u64>,
     project: Project,
     server: Server,
     workers: BTreeMap<u64, WorkerNode>,
@@ -439,20 +423,27 @@ pub struct World {
 
 type Step = Result<(), Kind>;
 
+fn link_error(error: std::io::Error) -> Kind {
+    Kind::StateMachine(format!("UDP link: {error}"))
+}
+
 impl World {
     pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
         let mut rng = Rng::new(seed);
         let mut net = Fault::ALL.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
         let cfg = Config::of(&mut rng, Net::of(&mut net, &off));
         let project = Project::generate(&mut rng, cfg.sources, cfg.actions);
+        let link_key = transport::key();
         let mut w = World {
             seed,
             bug,
             off,
             rng,
             net,
-            tx: BTreeMap::new(),
-            rx: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            server_endpoint: EndpointState::new(true, false, link_key.clone()),
+            link_key,
+            next_conn: 1,
             now: 0,
             seq: 0,
             queue: BTreeMap::new(),
@@ -494,6 +485,7 @@ impl World {
                 lost: 0,
                 duplicated: 0,
                 reordered: 0,
+                retransmits: 0,
             },
             trace: Vec::new(),
             silence: None,
@@ -574,54 +566,93 @@ impl World {
         self.queue.insert((self.now + after_ms, self.seq), ev);
     }
 
-    fn send(&mut self, from: Node, to: Node, msg: Msg) {
-        let epoch = match (from, to) {
-            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].epoch,
-            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].epoch,
-            _ => 0,
-        };
-        let latency = self.rng.range(1, self.cfg.max_latency_ms);
-        let in_order = (self.now + latency).max(self.last.get(&(from, to)).copied().unwrap_or(0));
-        let seq = self.tx.entry((from, to, epoch)).or_default();
-        let n = *seq;
-        *seq += 1;
-        let net = self.cfg.net.clone();
-        let faulty = self.now < self.cfg.fault_end_ms;
-        let max_latency = self.cfg.max_latency_ms;
-        let [loss, dup, reorder] = &mut self.net;
-        let mut stall = 0;
-        let mut rto = RTO_MS;
-        for _ in 0..MAX_RETRIES {
-            if !(loss.chance(net.loss_per_mille) && faulty) {
-                break;
-            }
-            self.report.lost += 1;
-            stall += rto;
-            rto *= 2;
+    fn open_link(&mut self, peer: Node) -> Step {
+        let id = self.next_conn;
+        self.next_conn += 1;
+        let mut endpoint = EndpointState::new(false, false, self.link_key.clone());
+        assert!(endpoint.connect(id, addr(Node::Server), self.now));
+        let initiator = Side::new(id, true, self.now).map_err(link_error)?;
+        let connection = Connection { id, endpoint, sides: [Some(initiator), None], wakes: [None; 2] };
+        assert!(self.connections.insert(peer, connection).is_none());
+        self.wake_link(peer, false, self.now);
+        Ok(())
+    }
+
+    fn close_link(&mut self, peer: Node) {
+        if let Some(link) = self.connections.remove(&peer) {
+            self.server_endpoint.forget(link.id);
         }
+        self.last.remove(&(peer, false));
+        self.last.remove(&(peer, true));
+    }
+
+    fn wake_link(&mut self, peer: Node, server: bool, at: u64) {
+        let link = self.connections.get_mut(&peer).expect("a live link");
+        let wake = &mut link.wakes[usize::from(server)];
+        if wake.is_some_and(|current| current <= at) {
+            return;
+        }
+        *wake = Some(at);
+        let id = link.id;
+        self.schedule(at - self.now, Ev::LinkTimer { peer, server, id });
+    }
+
+    fn send(&mut self, from: Node, to: Node, msg: Msg) {
+        let server = from == Node::Server;
+        let peer = if server { to } else { from };
+        let link = self.connections.get_mut(&peer).expect("a live link");
+        link.sides[usize::from(server)].as_mut().expect("a local link side").send(rargo_proto::encode(&msg));
+        self.wake_link(peer, server, self.now);
+    }
+
+    fn transmit(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) {
+        let latency = self.rng.range(1, self.cfg.max_latency_ms);
+        let max_latency = self.cfg.max_latency_ms;
+        let net = &self.cfg.net;
+        let faulty = self.now < self.cfg.fault_end_ms;
+        let [loss, dup, reorder] = &mut self.net;
+        let lost = loss.chance(net.loss_per_mille) && faulty;
         let copy_after = dup.range(1, 4 * max_latency);
         let duplicate = dup.chance(net.duplicate_per_mille) && faulty;
         let early = reorder.range(1, max_latency);
         let reordered = reorder.chance(net.reorder_per_mille) && faulty;
-        let at = if reordered {
+        if lost {
+            self.report.lost += 1;
+            return;
+        }
+        let after = if reordered {
             self.report.reordered += 1;
-            self.now + early + stall
-        } else if stall > 0 {
-            in_order + stall
+            early
         } else {
-            self.last.insert((from, to), in_order);
-            in_order
+            let last = self.last.entry((peer, to_server)).or_default();
+            *last = (*last).max(self.now + latency);
+            *last - self.now
         };
         if duplicate {
             self.report.duplicated += 1;
-            let copy = msg.copy();
-            self.busy += 1;
-            self.seq += 1;
-            self.queue.insert((at + copy_after, self.seq), Ev::Deliver { from, to, epoch, n, msg: copy });
+            self.schedule(after + copy_after, Ev::Datagram { peer, to_server, id, bytes: bytes.clone() });
         }
-        self.busy += 1;
-        self.seq += 1;
-        self.queue.insert((at, self.seq), Ev::Deliver { from, to, epoch, n, msg });
+        self.schedule(after, Ev::Datagram { peer, to_server, id, bytes });
+    }
+
+    fn link_timer(&mut self, peer: Node, server: bool, id: u64) -> Step {
+        let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        let side = usize::from(server);
+        if link.wakes[side] != Some(self.now) {
+            return Ok(());
+        }
+        link.wakes[side] = None;
+        let mut effects = transport::Effects::default();
+        link.sides[side].as_mut().expect("a local link side")
+            .drive(&self.link_key, self.now, &mut effects).map_err(link_error)?;
+        self.report.retransmits += effects.retransmits;
+        for packet in effects.packets {
+            self.transmit(peer, !server, id, packet);
+        }
+        if let Some(at) = effects.wake {
+            self.wake_link(peer, server, at);
+        }
+        Ok(())
     }
 
     fn finished(&self) -> bool {
@@ -746,7 +777,8 @@ impl World {
 
     fn step(&mut self, ev: Ev) -> Step {
         match ev {
-            Ev::Deliver { from, to, epoch, n, msg } => self.arrive(from, to, epoch, n, msg),
+            Ev::Datagram { peer, to_server, id, bytes } => self.arrive(peer, to_server, id, bytes),
+            Ev::LinkTimer { peer, server, id } => self.link_timer(peer, server, id),
             Ev::Connect { worker, epoch } => self.connect(worker, epoch),
             Ev::Finish { worker, epoch, token } => self.finish(worker, epoch, token),
             Ev::Crash { worker } => self.crash(worker),
@@ -769,39 +801,44 @@ impl World {
         }
     }
 
-    fn arrive(&mut self, from: Node, to: Node, epoch: u64, n: u64, msg: Msg) -> Step {
-        if !self.open(from, to, epoch) {
-            self.rx.remove(&(from, to, epoch));
+    fn arrive(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) -> Step {
+        let silence = self.silent_at(self.now);
+        let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        // The silence fault stalls an established client session. Let agreement run so that
+        // the application-level watch can still observe silence on newly connected sessions.
+        if let Some((_, end)) = silence
+            && matches!(peer, Node::Client(_))
+            && link.sides.iter().all(|side| side.as_ref().is_some_and(Side::agreed))
+        {
+            self.schedule(end - self.now, Ev::Datagram { peer, to_server, id, bytes });
             return Ok(());
         }
-        if self.silent_at(self.now).is_some() && matches!((from, to), (Node::Client(_), _) | (_, Node::Client(_))) {
-            let (_, end) = self.silent_at(self.now).expect("checked");
-            self.schedule(end - self.now, Ev::Deliver { from, to, epoch, n, msg });
-            return Ok(());
-        }
-        let rx = self.rx.entry((from, to, epoch)).or_default();
-        if n < rx.next || rx.held.contains_key(&n) {
-            return Ok(());
-        }
-        rx.held.insert(n, msg);
-        loop {
-            let rx = self.rx.entry((from, to, epoch)).or_default();
-            let next = rx.next;
-            let Some(msg) = rx.held.remove(&next) else { return Ok(()) };
-            rx.next += 1;
-            if !self.open(from, to, epoch) {
-                return Ok(());
+        let (from, to) = if to_server { (peer, Node::Server) } else { (Node::Server, peer) };
+        let from_addr = addr(from);
+        let endpoint = if to_server { &mut self.server_endpoint } else { &mut link.endpoint };
+        let side = &mut link.sides[usize::from(to_server)];
+        let mut effects = transport::Effects::default();
+        for event in endpoint.recv(from_addr, &bytes, self.now).events {
+            if matches!(event, RouteEvent::Open { .. }) {
+                assert!(to_server && side.is_none());
+                *side = Some(Side::new(id, false, self.now).map_err(link_error)?);
             }
+            side.as_mut().expect("the endpoint opened the link")
+                .route(endpoint, event, from_addr, self.now, &mut effects).map_err(link_error)?;
+        }
+        let acks = endpoint.take_datagrams();
+        for (dest, ack) in acks {
+            assert_eq!(dest, from_addr);
+            self.transmit(peer, !to_server, id, ack);
+        }
+        if self.connections[&peer].sides[usize::from(to_server)].is_some() {
+            self.wake_link(peer, to_server, self.now);
+        }
+        for bytes in effects.messages {
+            let msg = rargo_proto::decode(&bytes).map_err(link_error)?;
             self.deliver(from, to, msg)?;
         }
-    }
-
-    fn open(&self, from: Node, to: Node, epoch: u64) -> bool {
-        match (from, to) {
-            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].up && self.workers[&w].epoch == epoch,
-            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].up && self.clients[&c].epoch == epoch,
-            _ => true,
-        }
+        Ok(())
     }
 
     fn deliver(&mut self, from: Node, to: Node, msg: Msg) -> Step {
@@ -843,7 +880,9 @@ impl World {
         } else {
             node.up = true;
             node.epoch += 1;
-            node.sm.connected()
+            let fx = node.sm.connected();
+            self.open_link(Node::Worker(worker))?;
+            fx
         };
         self.worker_effects(worker, fx)
     }
@@ -864,6 +903,7 @@ impl World {
         node.up = false;
         node.epoch += 1;
         let fx = node.sm.link_lost();
+        self.close_link(Node::Worker(worker));
         self.worker_effects(worker, fx)?;
         let lost = self.server.pool.left(worker);
         self.pool_effects(lost);
@@ -885,6 +925,7 @@ impl World {
         node.up = false;
         node.epoch += 1;
         self.report.worker_crashes += 1;
+        self.close_link(Node::Worker(worker));
 
         let lost = self.server.pool.left(worker);
         self.report.jobs_lost_to_crashes += lost
@@ -1336,6 +1377,7 @@ impl World {
                 c.requested.retain(|a| outputs.contains_key(a));
                 c.pending.clear();
                 c.parts.clear();
+                self.open_link(Node::Client(client))?;
                 self.send(Node::Client(client), Node::Server, Msg::Up(Up::Join));
             }
             Link::Skip => unreachable!("a sync needs the link"),
@@ -1373,6 +1415,7 @@ impl World {
         c.cut_until = until;
         let finished = c.finished;
         self.report.client_cuts += 1;
+        self.close_link(Node::Client(client));
         self.drop_session(client);
         if !finished {
             self.schedule(until - now, Ev::Sync { client });
@@ -1408,6 +1451,7 @@ impl World {
                 }
                 c.up = false;
                 self.report.silences += 1;
+                self.close_link(Node::Client(client));
                 self.drop_session(client);
                 self.schedule(1_000, Ev::Sync { client });
                 return Ok(());
@@ -1578,22 +1622,10 @@ impl World {
 
 fn label(ev: &Ev) -> String {
     match ev {
-        Ev::Deliver { from, to, epoch, n, msg } => {
-            let what = match msg {
-                Msg::Up(Up::Hello { .. }) => "hello",
-                Msg::Up(Up::Result { .. }) => "result",
-                Msg::Up(Up::Join) => "join",
-                Msg::Up(Up::Offer { .. }) => "offer",
-                Msg::Up(Up::Session(_)) => "upload",
-                Msg::Up(Up::Request { .. }) => "request",
-                Msg::Up(Up::Ping) => "ping",
-                Msg::Work(_) => "work",
-                Msg::Down(Down::Synced { .. }) => "synced",
-                Msg::Down(Down::Session(_)) => "deliver",
-                Msg::Down(Down::Pong) => "pong",
-            };
-            format!("{from:?}>{to:?}@{epoch}#{n}:{what};")
+        Ev::Datagram { peer, to_server, id, bytes } => {
+            format!("datagram {peer:?}/{to_server}@{id} [{}];", bytes.len())
         }
+        Ev::LinkTimer { peer, server, id } => format!("link timer {peer:?}/{server}@{id};"),
         Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
         Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
         Ev::Crash { worker } => format!("crash {worker};"),
@@ -1613,4 +1645,20 @@ pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
 
 pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure> {
     World::new(seed, bug, off).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lost_initial_handshake_is_retransmitted_on_the_simulated_clock() {
+        let mut world = World::new(85, None, Off::none());
+        world.cfg.fault_end_ms = 100;
+        world.cfg.net = Net { loss_per_mille: 1_000, duplicate_per_mille: 0, reorder_per_mille: 0 };
+        let report = world.run().expect("the build finishes after the initial handshake is lost");
+        assert!(report.lost > 0);
+        assert!(report.retransmits > 0);
+        assert!(report.runs > 0);
+    }
 }

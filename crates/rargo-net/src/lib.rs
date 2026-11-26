@@ -3,6 +3,14 @@ mod conn;
 mod endpoint;
 mod handshake;
 
+/// The UDP link's state machines and packet adapters for shells with their own clock and I/O.
+pub mod sans_io {
+    pub use crate::conn::{Admit, ConnState, Output, Packet, ack_packet, data_packet};
+    pub use crate::endpoint::{EndpointState, RouteEvent, Routed};
+    pub use crate::handshake::{Action, Agreed, Handshake};
+    pub use crate::{HANDSHAKE_WAIT, LinkKey, seal};
+}
+
 use rargo_machine::StateMachine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -70,12 +78,12 @@ const AGREEMENT: u64 = 1;
 fn handshake_key(key: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("rargo worker link handshake v2", key)
 }
-const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
+pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 const TAG: usize = 16;
 const _: () = assert!(DATA_HDR + FRAG + 2 * TAG <= 1500 - 20 - 8);
 const _: () = assert!(AGREEMENT >= 1, "message ids start at 1");
 
-fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
+pub fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
     if let Some(k) = key {
         let before = pkt.len();
         let tag = blake3::keyed_hash(k, pkt);
