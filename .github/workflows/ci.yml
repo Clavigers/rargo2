@@ -42,8 +42,6 @@ jobs:
           sudo modprobe fuse
           echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
       - name: Every test of the workspace (built on the server, run here, as root, one process each), each within its CPU budget
-        env:
-          RARGO_CPU_BUDGET: ${{ github.event.pull_request.number == 616 && 'report' || 'enforce' }}
         run: python3 -I dev/purity.py cpu
       - name: The purity allowlists and the time budgets only shrink
         # Not on a release branch: it holds only commits that passed this on
