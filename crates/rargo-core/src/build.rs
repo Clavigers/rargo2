@@ -75,6 +75,8 @@ pub struct Daemon {
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
     pub deliveries: Mutex<std::collections::BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>>,
     pub client_blobs: Arc<crate::remote::Blobs>,
+    /// Every random value the server hands out (delivery tokens) is drawn here.
+    pub random: Mutex<crate::rng::Rng>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
     fetching: crate::io::Mutex<()>,
@@ -239,10 +241,12 @@ fn bytes(s: &str) -> Vec<u8> {
 }
 
 impl Daemon {
-    pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
+    /// `seed` seeds the server's random values: the shell draws it from the OS,
+    /// tests and the simulator pass their own.
+    pub fn new(cfg: Config, engine: Arc<Engine>, seed: u64) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
-        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), seed);
+        let incr_seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), incr_seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
@@ -259,6 +263,7 @@ impl Daemon {
             last_clients: Mutex::new(HashMap::new()),
             deliveries: Mutex::new(std::collections::BTreeMap::new()),
             client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
+            random: Mutex::new(crate::rng::Rng::new(seed)),
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),
