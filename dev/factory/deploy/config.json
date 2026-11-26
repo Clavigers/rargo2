@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "plans": [
     {
       "name": "claude-max",
@@ -35,7 +35,7 @@
     }
   ],
   "reviewers": [
-    "placeholder"
+    "ellipsis"
   ],
   "foreman": {
     "tick_minutes": 20,

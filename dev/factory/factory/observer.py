@@ -67,7 +67,29 @@ class ReviewerStuck(Exception):
     """A reviewer that cannot give a verdict without the owner."""
 
 
-REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder}
+ELLIPSIS = "ellipsis-dev[bot]"
+ELLIPSIS_WAIT = timedelta(minutes=30)
+_first_seen: dict[tuple[int, str], datetime] = {}  # when a push was first found unreviewed
+
+
+def ellipsis(gh: GitHub, pr: int, sha: str):
+    """Ellipsis reviews every push on its own. Its review of this commit is
+    the verdict: an approval approves; anything else it says asks for
+    changes. No review after ELLIPSIS_WAIT needs the owner."""
+    mine = [r for r in gh.reviews(pr) if r["user"]["login"] == ELLIPSIS and r.get("commit_id") == sha]
+    if not mine:
+        seen = _first_seen.setdefault((pr, sha), datetime.now(timezone.utc))
+        if datetime.now(timezone.utc) - seen > ELLIPSIS_WAIT:
+            raise ReviewerStuck(f"Ellipsis has not reviewed {sha[:8]} in {ELLIPSIS_WAIT.seconds // 60} minutes")
+        return None
+    _first_seen.pop((pr, sha), None)
+    last = mine[-1]
+    if last["state"] == "APPROVED":
+        return m.ReviewResult.approved, None
+    return m.ReviewResult.changes, f"Ellipsis: {last.get('html_url', 'see its review on the pull request')}"
+
+
+REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder, "ellipsis": ellipsis}
 
 
 class Observer:

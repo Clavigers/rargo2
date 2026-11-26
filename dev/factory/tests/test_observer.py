@@ -386,3 +386,22 @@ def test_a_stuck_review_waits_and_says_so_once(rig):
     rig.obs.step()
     assert rig.led.world.is_(M.REVIEW, "10/1/review-mux", "pending")
     assert sum("could not review" in x for x in rig.said) == 1
+
+
+def test_ellipsis_review_of_the_pushed_commit_is_the_verdict():
+    from factory.observer import ellipsis
+    from factory import model as m
+
+    class G:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def reviews(self, pr):
+            return self.rows
+    bot = {"login": "ellipsis-dev[bot]"}
+    assert ellipsis(G([]), 1, "aa") is None
+    assert ellipsis(G([{"user": bot, "commit_id": "old", "state": "APPROVED"}]), 1, "aa") is None
+    assert ellipsis(G([{"user": {"login": "x"}, "commit_id": "aa", "state": "APPROVED"}]), 1, "aa") is None
+    assert ellipsis(G([{"user": bot, "commit_id": "aa", "state": "APPROVED"}]), 1, "aa") == (m.ReviewResult.approved, None)
+    verdict, note = ellipsis(G([{"user": bot, "commit_id": "aa", "state": "COMMENTED", "html_url": "u"}]), 1, "aa")
+    assert verdict is m.ReviewResult.changes and "u" in note
