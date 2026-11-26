@@ -6,6 +6,7 @@ pub use rargo_net::io::*;
 
 pub(crate) mod db;
 pub mod http;
+pub mod nix;
 pub mod sandbox;
 pub mod sys;
 pub mod thread;
