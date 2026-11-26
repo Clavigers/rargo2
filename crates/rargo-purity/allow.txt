@@ -1,4 +1,3 @@
-locks	crates/fusewire/src/lib.rs	6	shares state between threads outside a shell or worker pool: atomics (4), std locks (2)
 locks	crates/rargo-core/src/build.rs	60	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/buildview.rs	12	shares state between threads outside a shell or worker pool: dashmap (6), atomics (6)
 locks	crates/rargo-core/src/chunk.rs	2	shares state between threads outside a shell or worker pool: dashmap (2)

@@ -17,8 +17,13 @@ fn seeds_200_to_400_keep_every_invariant() {
 }
 
 #[test]
-fn seeds_400_to_600_keep_every_invariant() {
-    clean(400..600);
+fn seeds_400_to_500_keep_every_invariant() {
+    clean(400..500);
+}
+
+#[test]
+fn seeds_500_to_600_keep_every_invariant() {
+    clean(500..600);
 }
 
 #[test]

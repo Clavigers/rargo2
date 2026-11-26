@@ -363,6 +363,7 @@ enum Ev {
     Evict,
     Round { client: u64 },
     Edit { client: u64 },
+    Checkout { client: u64, round: u64 },
     TestComplete { client: u64, key: String, started_ms: u64 },
     Sync { client: u64 },
     ClientCut { client: u64 },
@@ -428,6 +429,7 @@ struct Client {
     reference: Vec<Vec<u8>>,
     edits: Rng,
     edit_scheduled: bool,
+    checkout_seed: Option<u64>,
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
@@ -572,6 +574,7 @@ impl World {
                     reference: Vec::new(),
                     edits: Rng::new(seed ^ id.wrapping_mul(0x912a_e043_5b7d_68f1)),
                     edit_scheduled: false,
+                    checkout_seed: Some(seed ^ id.wrapping_mul(0x5cab_f0e9_d1b2_7431)),
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
@@ -819,6 +822,7 @@ impl World {
                 self.clients.get_mut(&client).expect("known").edit();
                 Ok(())
             }
+            Ev::Checkout { client, round } => self.checkout(client, round),
             Ev::TestComplete { client, key, started_ms } => {
                 self.test_complete(client, &key, started_ms);
                 Ok(())
@@ -1367,12 +1371,30 @@ impl World {
 
     fn round(&mut self, client: u64) -> Step {
         let c = self.clients.get_mut(&client).expect("known");
-        c.round += 1;
         c.rounds_left -= 1;
-        c.test = TestRun::generate(self.seed, client, c.round);
+        c.test = TestRun::generate(self.seed, client, self.cfg.rounds - c.rounds_left);
+        self.build_snapshot(client)
+    }
+
+    fn checkout(&mut self, client: u64, round: u64) -> Step {
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.round != round || c.outputs.len() == self.project.actions.len() {
+            return Ok(());
+        }
+        // Versions 0 and 1 are used by single-file edits on the original branch.
+        let mut rng = Rng::new(c.checkout_seed.take().expect("checkout scheduled once"));
+        c.tree = (0..c.tree.len()).map(|index| Some(model::source(index, rng.range(2, 16)))).collect();
+        self.build_snapshot(client)
+    }
+
+    fn build_snapshot(&mut self, client: u64) -> Step {
+        let c = self.clients.get_mut(&client).expect("known");
+        // Old jobs keep their round ID even if they finish after the checkout.
+        c.round += 1;
         c.snapshot.clone_from(&c.tree);
         c.reference = self.project.clean_build(&c.snapshot);
         c.edit_scheduled = false;
+        c.synced_round = 0;
         c.outputs.clear();
         c.requested.clear();
         c.pending.clear();
@@ -1541,8 +1563,13 @@ impl World {
         }
         let ready = self.project.ready(&|a| c.outputs.contains_key(&a), &|a| c.requested.contains(&a));
         if !ready.is_empty() && !c.edit_scheduled {
+            let round = c.round;
+            let checkout = c.checkout_seed.is_some();
             self.clients.get_mut(&client).expect("known").edit_scheduled = true;
             self.schedule(1, Ev::Edit { client });
+            if checkout {
+                self.schedule(1, Ev::Checkout { client, round });
+            }
         }
         for action in ready {
             let c = &self.clients[&client];
@@ -1734,6 +1761,7 @@ fn label(ev: &Ev) -> String {
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
         Ev::Edit { client } => format!("edit {client};"),
+        Ev::Checkout { client, round } => format!("checkout {client} round {round};"),
         Ev::TestComplete { client, key, .. } => format!("test result {client}/{key};"),
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
@@ -1754,6 +1782,47 @@ pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure>
 #[cfg(test)]
 mod edit_tests {
     use super::*;
+
+    #[test]
+    fn checkout_replaces_the_build_snapshot_and_ignores_old_results() {
+        let mut world = World::new(12, None, Off::none());
+        world.round(1).unwrap();
+        let old_round = world.clients[&1].round;
+        let old_tree = world.clients[&1].snapshot.clone();
+        let action = world.project.ready(&|_| false, &|_| false)[0];
+        let old_output = world.clients[&1].reference[action].clone();
+
+        world.clients.get_mut(&1).unwrap().synced_round = old_round;
+        world.request_ready(1);
+        assert!(world.clients[&1].requested.contains(&action));
+        assert!(world.queue.values().any(|event| matches!(
+            event,
+            Ev::Checkout { client: 1, round } if *round == old_round
+        )));
+
+        let rounds_left = world.clients[&1].rounds_left;
+        world.step(Ev::Checkout { client: 1, round: old_round }).unwrap();
+        let client = &world.clients[&1];
+        assert_eq!(client.rounds_left, rounds_left);
+        assert_eq!(client.snapshot, client.tree);
+        assert!(client.snapshot.iter().zip(old_tree).all(|(new, old)| *new != old));
+        assert!(client.requested.is_empty());
+        let new_round = client.round;
+        let clean = world.project.clean_build(&client.tree);
+        assert_eq!(client.reference, clean);
+        let new_output = clean[action].clone();
+        assert_ne!(new_output, old_output);
+
+        let root = Hash::of(&client.contents.concat()).0;
+        world.client_hears(1, Down::Synced { round: old_round, root }).unwrap();
+        assert!(world.clients[&1].requested.is_empty());
+        world.client_hears(1, Down::Synced { round: new_round, root }).unwrap();
+        assert!(world.clients[&1].requested.contains(&action));
+        world.client_done(1, old_round, action, old_output).unwrap();
+        assert!(world.clients[&1].outputs.is_empty());
+        world.client_done(1, new_round, action, new_output.clone()).unwrap();
+        assert_eq!(world.clients[&1].outputs[&action], new_output);
+    }
 
     #[test]
     fn live_edits_leave_the_current_build_on_its_snapshot() {

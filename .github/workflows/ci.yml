@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
 permissions:
   contents: read
@@ -46,6 +46,9 @@ jobs:
           RARGO_CPU_BUDGET: ${{ github.event.pull_request.number == 616 && 'report' || 'enforce' }}
         run: python3 -I dev/purity.py cpu
       - name: The purity allowlists and the time budgets only shrink
+        # Not on a release branch: it holds only commits that passed this on
+        # main, and main moves on past it.
+        if: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
         run: git fetch -q --depth=1 origin main && python3 -I dev/purity.py ratchet FETCH_HEAD
       - name: The shipped client
         run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'

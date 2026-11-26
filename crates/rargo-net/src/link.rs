@@ -475,27 +475,16 @@ fn tcp_read(mut stream: ReadHalf, mut opener: Opener, shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
     use rargo_proto::secure::{client_finish, client_start, psk_from_secret, server_accept};
 
-    fn round_trip(limit: usize, payloads: &[Vec<u8>]) -> Vec<Vec<u8>> {
-        let mut wire = Vec::new();
-        for p in payloads {
-            wire.extend(encode_frame(p, limit).unwrap());
-        }
-        let mut d = FrameDecoder::new(limit);
-        let got = d.push(&wire).unwrap();
-        d.invariants();
-        assert_eq!(d.end(), Ok(()));
-        assert_eq!(d.missing(), 0);
-        got
-    }
-
     #[test]
-    fn frames_round_trip_and_an_empty_frame_is_a_frame() {
-        let payloads = [vec![], vec![1, 2, 3], vec![9; 20]];
-        assert_eq!(round_trip(FRAME_LIMIT, &payloads), payloads);
-        let exact = vec![7u8; 4];
-        assert_eq!(round_trip(4, &[exact.clone()]), vec![exact]);
+    fn an_empty_frame_and_a_frame_at_the_limit_are_delivered() {
+        let mut decoder = FrameDecoder::new(4);
+        let frames = decoder.push(&[0, 0, 0, 0, 4, 0, 0, 0, 7, 7, 7, 7]);
+        expect!["Ok([[], [7, 7, 7, 7]])"].assert_eq(&format!("{frames:?}"));
+        expect!["Ok(())"].assert_eq(&format!("{:?}", decoder.end()));
+        decoder.invariants();
     }
 
     #[test]
@@ -544,19 +533,21 @@ mod tests {
     #[test]
     fn an_oversize_frame_is_refused() {
         assert_eq!(encode_frame(&[1, 2, 3], 2), Err(FrameError::Oversize { len: 3, limit: 2 }));
-        let mut raw = 5u32.to_le_bytes().to_vec();
-        raw.extend_from_slice(&[9; 5]);
-        let mut d = FrameDecoder::new(4);
-        assert!(d.push(&raw[..2]).unwrap().is_empty());
-        d.invariants();
-        assert_eq!(d.missing(), 2);
-        assert_eq!(d.push(&raw[2..6]), Err(FrameError::Oversize { len: 5, limit: 4 }));
-        d.invariants();
-        assert_eq!(d.push(&[0]), Err(FrameError::Oversize { len: 5, limit: 4 }));
-        let huge = (FRAME_LIMIT as u32 + 1).to_le_bytes().to_vec();
-        let mut d = FrameDecoder::new(FRAME_LIMIT);
-        assert_eq!(d.push(&huge), Err(FrameError::Oversize { len: FRAME_LIMIT + 1, limit: FRAME_LIMIT }));
-        d.invariants();
+        let mut decoder = FrameDecoder::new(4);
+        let mut trace = Vec::new();
+        for chunk in [&[5, 0][..], &[0, 0, 9, 9], &[0]] {
+            trace.push(format!("{:?}, missing={}", decoder.push(chunk), decoder.missing()));
+            decoder.invariants();
+        }
+        expect![[r#"
+            Ok([]), missing=2
+            Err(Oversize { len: 5, limit: 4 }), missing=0
+            Err(Oversize { len: 5, limit: 4 }), missing=0"#]].assert_eq(&trace.join("\n"));
+        let mut decoder = FrameDecoder::new(FRAME_LIMIT);
+        let huge = (FRAME_LIMIT as u32 + 1).to_le_bytes();
+        expect!["Err(Oversize { len: 65536, limit: 65535 })"]
+            .assert_eq(&format!("{:?}", decoder.push(&huge)));
+        decoder.invariants();
     }
 
     #[test]
