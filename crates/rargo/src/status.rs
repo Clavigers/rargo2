@@ -31,7 +31,7 @@ pub fn run() {
                 return "unavailable";
             };
             match (rargo_mount(&info, target), daemon) {
-                (false, _) => "no rargo mount",
+                (false, _) => crate::daemon_control::unmounted_reason(),
                 (true, Some(false)) => "mounted without its daemon; run `rargo build` to recover",
                 (true, _) => {
                     let target = target.to_path_buf();

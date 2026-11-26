@@ -112,6 +112,7 @@ pub enum Plan {
     Cargo { release: bool, banner: Option<String> },
     Print(String),
     Status,
+    StopDaemons,
     Fail { text: String, code: i32 },
     Name(String),
     Auth(Auth),
@@ -167,6 +168,9 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
     }
     if first.is_some_and(|a| a == "auth") && !token_command {
         return auth(w, &raw[1..]);
+    }
+    if first.is_some_and(|a| a == "--rargo-daemon-stop") {
+        return Plan::StopDaemons;
     }
     if first.is_some_and(|a| a == "--rargo-daemon") {
         return match raw.get(1) {
@@ -355,7 +359,6 @@ fn route(raw: &[OsString], mut vars: Vec<(String, String)>, token_command: bool)
     let drift = args.first().map(|s| s.as_str()) == Some("--rargo-drift-check");
     let daemon_cmd = match args.first().map(|s| s.as_str()) {
         Some("--rargo-daemon-status") => Some("status"),
-        Some("--rargo-daemon-stop") => Some("stop"),
         Some("--rargo-daemon-sync") => Some("sync"),
         _ => None,
     };
@@ -627,7 +630,7 @@ mod tests {
             (None, vec!["--rargo-export"], fake(&[]), usage("usage: rargo --rargo-export DIRECTORY-ON-THE-SERVER")),
             (None, vec!["--rargo-import"], fake(&[]), usage("usage: rargo --rargo-import DIRECTORY-ON-THE-SERVER")),
             (None, vec!["--rargo-daemon-status", "x"], fake(&[]), remote(&[], &[], "status")),
-            (None, vec!["--rargo-daemon-stop"], fake(&[]), remote(&[], &[], "stop")),
+            (None, vec!["--rargo-daemon-stop"], fake(&[]), Plan::StopDaemons),
             (None, vec!["--rargo-daemon-sync"], fake(&[]), remote(&[], &[], "sync")),
             (None, vec!["--rargo-drift-check", "x"], fake(&[]), remote(&["__drift"], &[], "drift")),
             (None, vec!["clean"], fake(&[]), Plan::Cargo { release: true, banner: None }),
@@ -651,7 +654,7 @@ mod tests {
             (None, vec!["build"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`")),
             (None, vec!["--rargo-gc"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`")),
             (None, vec!["--rargo-drift-check"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`")),
-            (None, vec!["--rargo-daemon-stop"], fake(&[("USER", "u")]).no_creds(), Plan::Remote { config: conf("h.example", "srv.example:7459", "u", None), args: vec![], vars: vec![("USER".into(), "u".into())], kind: "stop" }),
+            (None, vec!["--rargo-daemon-stop"], fake(&[("USER", "u")]).no_creds(), Plan::StopDaemons),
             (None, vec!["build"], fake(&[("RARGO_SERVER", "local.example"), ("USER", "u")]).no_creds(), Plan::Remote { config: conf("local.example", "127.0.0.1:7459", "u", None), args: strings(&["build"]), vars: vec![("RARGO_SERVER".into(), "local.example".into()), ("USER".into(), "u".into())], kind: "build" }),
             (None, vec!["build"], fake(&[]).config(Ok(Some("host ="))), fail(&toml_error("host ="))),
             (None, vec!["build"], fake(&[]).config(Ok(Some("x = 1"))), fail(&not_named)),
