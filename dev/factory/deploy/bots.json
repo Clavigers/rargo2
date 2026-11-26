@@ -27,7 +27,8 @@
     },
     "trigger_as": "sadosystems",
     "repos": [
-      "Clavigers/review_mux"
+      "Clavigers/review_mux",
+      "Clavigers/rargo2"
     ],
     "done": {
       "comment": "(?s).+"
