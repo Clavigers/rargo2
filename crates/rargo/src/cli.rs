@@ -33,6 +33,8 @@ pub trait World {
     fn resolve(&self, host: &str) -> Result<String, String>;
     fn credential(&self, host: &str) -> Option<Credential>;
     fn nextest_version(&self) -> Option<String>;
+    fn cwd(&self) -> PathBuf;
+    fn is_file(&self, path: &Path) -> bool;
 }
 
 fn var<'a>(w: &'a impl World, name: &str) -> Option<&'a str> {
@@ -140,6 +142,11 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
         Route::Usage(text) => return Plan::Fail { text, code: 2 },
         Route::Remote { args, vars, kind } => (args, vars, kind),
     };
+    if kind == "build"
+        && let Err(e) = find_manifest(w, &args)
+    {
+        return die(e);
+    }
     if subcommand(&args) == Some("nextest")
         && !vars.iter().any(|(k, _)| k == "RARGO_NEXTEST_VERSION")
         && let Some(v) = w.nextest_version()
@@ -154,6 +161,35 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
         return die(format!("this machine is not authenticated to {}: run `rargo auth`", config.host));
     }
     Plan::Remote { config, args, vars, kind }
+}
+
+/// The manifest the command would use: `--manifest-path` if given, else
+/// the first Cargo.toml walking up from the current directory. Cargo's own
+/// error when there is none, so a command fails before anything is sent.
+fn find_manifest(w: &impl World, args: &[String]) -> Result<PathBuf, String> {
+    let cwd = w.cwd();
+    if let Some(given) = manifest_path_arg(args) {
+        let path = cwd.join(&given);
+        return if w.is_file(&path) { Ok(path) } else { Err(format!("manifest path `{given}` does not exist")) };
+    }
+    cwd.ancestors()
+        .map(|dir| dir.join("Cargo.toml"))
+        .find(|candidate| w.is_file(candidate))
+        .ok_or_else(|| format!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display()))
+}
+
+/// The value of `--manifest-path`, in either spelling, before any `--`.
+fn manifest_path_arg(args: &[String]) -> Option<String> {
+    let mut it = args.iter().take_while(|a| *a != "--");
+    while let Some(a) = it.next() {
+        if a == "--manifest-path" {
+            return it.next().cloned();
+        }
+        if let Some(v) = a.strip_prefix("--manifest-path=") {
+            return Some(v.to_string());
+        }
+    }
+    None
 }
 
 pub fn named(w: &impl World, host: &str, path: &Path) -> String {
@@ -374,6 +410,8 @@ mod tests {
         servers: Vec<(String, Result<String, String>)>,
         creds: Vec<(String, Credential)>,
         nextest: Option<String>,
+        cwd: PathBuf,
+        files: Vec<PathBuf>,
         asked: RefCell<Vec<String>>,
     }
 
@@ -388,6 +426,8 @@ mod tests {
             servers: vec![("h.example".into(), Ok("srv.example:7459".into())), ("local.example".into(), Ok("127.0.0.1:7459".into()))],
             creds: vec![("h.example".into(), cred("stored", ""))],
             nextest: Some("0.9.100".into()),
+            cwd: "/w/app/src".into(),
+            files: vec!["/w/app/Cargo.toml".into()],
             asked: RefCell::new(Vec::new()),
         }
     }
@@ -400,6 +440,11 @@ mod tests {
 
         fn no_creds(mut self) -> Self {
             self.creds.clear();
+            self
+        }
+
+        fn files(mut self, files: &[&str]) -> Self {
+            self.files = files.iter().map(PathBuf::from).collect();
             self
         }
 
@@ -438,6 +483,14 @@ mod tests {
         fn nextest_version(&self) -> Option<String> {
             self.asked.borrow_mut().push("nextest".into());
             self.nextest.clone()
+        }
+
+        fn cwd(&self) -> PathBuf {
+            self.cwd.clone()
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            self.files.iter().any(|f| f == path)
         }
     }
 
@@ -577,6 +630,35 @@ mod tests {
         let w = fake(&[]);
         plan(&w, None, &os(&["auth", "remove", "x.example"]));
         assert_eq!(w.asked(), ["credential x.example"]);
+    }
+
+    #[test]
+    fn a_routed_command_with_no_manifest_fails_at_once_without_asking_for_a_server_a_credential_or_a_daemon() {
+        let none = |text: &str| Plan::Fail { text: format!("error: {text}"), code: 101 };
+        let not_found = none("could not find `Cargo.toml` in `/w/app/src` or any parent directory");
+        let cases: Vec<(Vec<&str>, Fake, Option<Plan>)> = vec![
+            (vec!["build"], fake(&[]).files(&[]), Some(not_found.clone())),
+            (vec!["+nightly", "test", "-p", "x"], fake(&[]).files(&[]), Some(not_found.clone())),
+            (vec!["nextest", "run"], fake(&[]).files(&[]), Some(not_found.clone())),
+            (vec!["build"], fake(&[]).files(&["/w/Cargo.toml"]), None),
+            (vec!["build"], fake(&[]).files(&["/w/app/src/Cargo.toml"]), None),
+            (vec!["build", "--manifest-path", "../other/Cargo.toml"], fake(&[]), Some(none("manifest path `../other/Cargo.toml` does not exist"))),
+            (vec!["build", "--manifest-path=../other/Cargo.toml"], fake(&[]), Some(none("manifest path `../other/Cargo.toml` does not exist"))),
+            (vec!["build", "--manifest-path", "../other/Cargo.toml"], fake(&[]).files(&["/w/app/src/../other/Cargo.toml"]), None),
+            (vec!["run", "--", "--manifest-path", "missing"], fake(&[]), None),
+            (vec!["--rargo-status"], fake(&[]).files(&[]), None),
+            (vec!["--rargo-daemon-status"], fake(&[]).files(&[]), None),
+        ];
+        for (words, w, failure) in cases {
+            let got = plan(&w, None, &os(&words));
+            match failure {
+                Some(expected) => {
+                    assert_eq!(got, expected, "{words:?}");
+                    assert_eq!(w.asked(), Vec::<String>::new(), "{words:?} asked the world");
+                }
+                None => assert!(matches!(got, Plan::Remote { .. }), "{words:?}: {got:?}"),
+            }
+        }
     }
 
     #[test]

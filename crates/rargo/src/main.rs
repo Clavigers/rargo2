@@ -95,6 +95,14 @@ impl cli::World for Real {
         self.handle_signals();
         own_nextest_version()
     }
+
+    fn cwd(&self) -> PathBuf {
+        std::env::current_dir().unwrap_or_default()
+    }
+
+    fn is_file(&self, path: &Path) -> bool {
+        path.is_file()
+    }
 }
 
 pub fn load_config() -> Result<Config, String> {
