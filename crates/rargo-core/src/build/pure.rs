@@ -1,6 +1,6 @@
 use crate::buildview::{CARGO_HOME_AT, LEVEL_FULL, LEVEL_META, LEVEL_NONE};
 use rargo_plan as rp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub struct PlanFacts {
@@ -230,7 +230,10 @@ pub fn offline_args(args: &[String]) -> bool {
     false
 }
 
-pub fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) -> BTreeMap<String, String> {
+pub fn base_env<'a>(
+    server: impl IntoIterator<Item = (&'a String, &'a String)>,
+    client: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> BTreeMap<String, String> {
     const SERVER: &[&str] =
         &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"];
     const NOT_FOR_ACTIONS: &[&str] = &["TERM", "NO_COLOR", "BROWSER", "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM"];
@@ -654,7 +657,9 @@ None
 
     #[test]
     fn the_environment_actions_start_from() {
-        let map = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map = |kv: &[(&str, &str)]| -> BTreeMap<String, String> {
+            kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
         let server = map(&[
             ("PATH", "/usr/bin"),
             ("HOME", "/home/rargod"),
