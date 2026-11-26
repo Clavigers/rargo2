@@ -6,7 +6,7 @@ set -euo pipefail
 F=/root/factory
 cd $F
 [ -d venv ] || python3 -m venv venv
-venv/bin/pip install -q 'pydantic>=2.9' pytest
+venv/bin/pip install -q 'pydantic>=2.9' pytest simpy
 [ -d repo ] || git clone -q https://github.com/Clavigers/rargo2.git repo
 [ -d plan ] || git clone -q https://github.com/Clavigers/rargo2.git plan
 mkdir -p state
@@ -16,4 +16,4 @@ if [ ! -s log.jsonl ]; then
 fi
 cp src/deploy/factory-*.service /etc/systemd/system/
 systemctl daemon-reload
-echo "installed; start with: systemctl enable --now factory-observer factory-foreman factory-watchdog"
+echo "installed; start with: systemctl enable --now factory-observer factory-foreman factory-watchdog factory-viz"

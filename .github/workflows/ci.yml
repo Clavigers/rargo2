@@ -66,5 +66,5 @@ jobs:
       - name: The factory's model, ledger and services
         run: |
           python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install -q 'pydantic>=2.9' pytest
+          /tmp/venv/bin/pip install -q 'pydantic>=2.9' pytest simpy
           /tmp/venv/bin/python -m pytest -q -p no:cacheprovider

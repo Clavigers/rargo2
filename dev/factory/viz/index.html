@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rargo2 factory</title>
+<style>
+:root {
+  --bg: #0b0e13; --panel: #141922; --panel2: #10141b; --line: #252d39; --line2: #313b4a;
+  --text: #e4e9f0; --dim: #8693a4; --faint: #586374;
+  --enh: #56c7da; --bug: #f0525c; --fric: #e8a23a; --init: #a782f2; --rework: #f07f3c;
+  --ok: #3fbf6f; --wait: #7d8fb0; --idle: #e8a23a; --out: #f0525c;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); font-variant-numeric: tabular-nums; }
+button, select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line2); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--dim); }
+button.on { border-color: var(--enh); color: var(--enh); }
+button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--enh); outline-offset: 1px; }
+input[type=number] { width: 7ch; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line2); border-radius: 6px; padding: 3px 6px; }
+input[type=range] { accent-color: var(--enh); width: 100%; }
+
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 20px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 10; }
+.brand { font-weight: 600; font-size: 15px; }
+.brand span { color: var(--dim); font-weight: 400; }
+.seg { display: inline-flex; border: 1px solid var(--line2); border-radius: 7px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; background: var(--panel2); }
+.seg button.on { background: var(--panel); color: var(--enh); }
+#clock { font: 600 14px var(--mono); min-width: 19ch; }
+.ctl { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+.pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line2); font: 12px var(--mono); color: var(--dim); }
+.pill i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+#err { color: var(--bug); font: 12px var(--mono); }
+
+main { padding: 18px 20px 30px; display: flex; flex-direction: column; gap: 18px; }
+.grid { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 18px; }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.box h2, .box h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.box h2 small, .box h3 small { margin-left: auto; font: 11px var(--mono); color: var(--dim); font-weight: 400; }
+.sub { color: var(--dim); font-size: 12px; }
+.stack { display: flex; flex-direction: column; gap: 10px; }
+.stat { font: 12px var(--mono); color: var(--dim); }
+.stat b { color: var(--text); }
+
+.agent { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; }
+.agent .name { font: 600 12px var(--mono); }
+.agent .st { font: 11px var(--mono); justify-self: end; }
+.st.working { color: var(--ok); } .st.idle { color: var(--idle); } .st.off { color: var(--faint); }
+.agent .now { grid-column: 1 / -1; font: 11px var(--mono); color: var(--dim); display: flex; gap: 6px; align-items: center; min-height: 20px; }
+.quota { color: var(--out); }
+
+.cols { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+.col { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; height: 270px; overflow: hidden; display: flex; flex-direction: column; }
+.col > div:first-child { display: flex; font-size: 12px; font-weight: 600; color: var(--dim); margin-bottom: 6px; }
+.col > div:first-child b { margin-left: auto; font: 600 12px var(--mono); color: var(--text); }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start; overflow: hidden; }
+.chip { display: inline-flex; align-items: center; gap: 4px; height: 20px; padding: 0 7px; border-radius: 999px; font: 11px var(--mono); border: 1px solid; background: var(--panel2); white-space: nowrap; }
+.chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.chip.enhancement { color: var(--enh); border-color: color-mix(in srgb, var(--enh) 45%, transparent); }
+.chip.bug { color: var(--bug); border-color: color-mix(in srgb, var(--bug) 45%, transparent); }
+.chip.friction { color: var(--fric); border-color: color-mix(in srgb, var(--fric) 45%, transparent); }
+.chip.initiative { color: var(--init); border-color: color-mix(in srgb, var(--init) 45%, transparent); }
+.chip.rw { box-shadow: inset 0 0 0 1px var(--rework); }
+.chip .who { color: var(--dim); }
+.chip.moved { animation: moved 1.2s ease-out; }
+@keyframes moved { from { background: color-mix(in srgb, currentColor 40%, var(--panel2)); } to { background: var(--panel2); } }
+.more { font: 11px var(--mono); color: var(--dim); }
+
+.prrow { display: grid; grid-template-columns: 120px 90px 90px 1fr 110px; gap: 8px; align-items: center; height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); font: 11px var(--mono); color: var(--dim); margin-bottom: 5px; }
+.prrow.empty { grid-template-columns: 1fr; border-style: dashed; background: none; }
+.ok { color: var(--ok); } .bad { color: var(--bug); } .run { color: var(--idle); }
+
+.dags { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.dag { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.dag .hd { display: flex; font: 11px var(--mono); color: var(--init); gap: 6px; }
+.dag .hd small { margin-left: auto; color: var(--dim); }
+.dag canvas { width: 100%; height: 110px; display: block; }
+
+.bottom { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 18px; }
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.chart canvas { width: 100%; height: 150px; display: block; }
+.legend { display: flex; gap: 10px; flex-wrap: wrap; font: 11px var(--mono); color: var(--dim); }
+.legend i { display: inline-block; width: 9px; height: 3px; border-radius: 2px; margin-right: 4px; vertical-align: middle; }
+table { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+td { padding: 3px 0; border-bottom: 1px solid var(--line); }
+td:last-child { text-align: right; color: var(--text); }
+td:first-child { color: var(--dim); }
+#log { font: 11px var(--mono); height: 330px; overflow: hidden; }
+#log div { display: grid; grid-template-columns: 92px 110px 1fr; gap: 8px; white-space: nowrap; overflow: hidden; }
+#log .t { color: var(--faint); } #log .a { color: var(--dim); }
+
+#drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 340px; background: var(--panel); border-left: 1px solid var(--line2); padding: 14px 16px; overflow: auto; z-index: 20; transform: translateX(100%); transition: transform .2s; }
+#drawer.open { transform: none; }
+#drawer h4 { margin: 14px 0 6px; font-size: 12px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+.param { margin-bottom: 8px; font-size: 12px; }
+.param div { display: flex; justify-content: space-between; color: var(--dim); }
+.param b { font: 12px var(--mono); color: var(--text); }
+.simonly, .realonly { display: contents; }
+body.real .simonly, body.sim .realonly { display: none; }
+</style>
+</head>
+<body class="real">
+<header>
+  <div class="brand">rargo2 factory <span>Factory2</span></div>
+  <div class="seg" role="group" aria-label="Source">
+    <button id="srcReal" class="on">Real</button><button id="srcSim">Simulated</button>
+  </div>
+  <div id="clock">—</div>
+  <span class="realonly"><button id="live" title="Show the log as it is now, and follow it">Live</button>
+    <button id="replay" title="Play the real log again from its first line">Replay</button></span>
+  <span class="simonly"><span class="ctl">seed <input id="seed" type="number" value="1" min="1"></span>
+    <button id="reset">Restart</button><button id="gear" aria-label="Parameters">Parameters</button></span>
+  <button id="play">Pause</button>
+  <span class="ctl">speed <select id="speed">
+    <option value="1">1 min/s</option><option value="10">10 min/s</option><option value="60" selected>1 h/s</option>
+    <option value="360">6 h/s</option><option value="1440">1 day/s</option><option value="10080">1 week/s</option></select></span>
+  <span id="where" class="pill"></span>
+  <span id="err"></span>
+</header>
+
+<main>
+  <div class="grid">
+    <div class="stack" id="actors"></div>
+    <div class="stack">
+      <div class="box"><h2>Issues <small id="qsum"></small></h2><div class="cols" id="cols"></div></div>
+      <div class="box"><h2>Pull requests in checks <small id="revs"></small></h2><div id="prs"></div></div>
+      <div class="box"><h2>Initiatives</h2><div class="dags" id="dags"></div></div>
+    </div>
+  </div>
+  <div class="bottom">
+    <div class="box"><h2>History, hourly</h2><div class="charts" id="charts"></div></div>
+    <div class="stack">
+      <div class="box"><h2>Totals</h2><table id="totals"></table></div>
+      <div class="box"><h2>Events <small id="seq"></small></h2><div id="log"></div></div>
+    </div>
+  </div>
+</main>
+
+<aside id="drawer" aria-label="Simulation parameters">
+  <div style="display:flex;align-items:center"><b>Parameters</b><button id="close" style="margin-left:auto">Close</button></div>
+  <p class="sub">Every default is a guess until calibrated against the real log. Changes apply at once; agent counts and the reviewer apply as a new config.</p>
+  <div id="params"></div>
+</aside>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let S = null, prevState = {}, series = [];
+
+function post(body) { return fetch('/api/control', { method: 'POST', body: JSON.stringify(body) }); }
+
+$('#srcReal').onclick = () => post({ source: 'real' });
+$('#srcSim').onclick = () => post({ source: 'sim' });
+$('#play').onclick = () => post({ action: S && S.playing ? 'pause' : 'play' });
+$('#speed').onchange = e => post({ speed: +e.target.value });
+$('#live').onclick = () => post({ action: 'live' });
+$('#replay').onclick = () => { prevState = {}; post({ action: 'reset' }); };
+$('#reset').onclick = () => { prevState = {}; post({ action: 'reset', seed: +$('#seed').value }); };
+$('#gear').onclick = () => $('#drawer').classList.add('open');
+$('#close').onclick = () => $('#drawer').classList.remove('open');
+
+const COLS = { parked: 'Held by people', blocked: 'Blocked', ready: 'Ready (queue order)', held: 'Being worked', checking: 'In checks', closed: 'Closed' };
+
+function chip(n, moved) {
+  const i = S.issues[n]; if (!i) return '';
+  const who = i.holder ? ` <span class="who">${esc(i.holder.replace(/-1$/, ''))}</span>` : '';
+  return `<span class="chip ${i.kind}${i.rework ? ' rw' : ''}${moved ? ' moved' : ''}" title="#${n} ${i.kind}, ${i.state}${i.age != null ? ', ' + i.age + ' min in state' : ''}${i.deps.length ? ', depends on ' + i.deps.map(d => '#' + d).join(' ') : ''}">#${n}${who}</span>`;
+}
+
+function fmtMin(m) { if (m == null) return ''; if (m < 60) return m + 'm'; if (m < 1440) return (m / 60).toFixed(1) + 'h'; return (m / 1440).toFixed(1) + 'd'; }
+
+function render() {
+  document.body.className = S.source;
+  $('#srcReal').classList.toggle('on', S.source === 'real');
+  $('#srcSim').classList.toggle('on', S.source === 'sim');
+  $('#play').textContent = S.playing ? 'Pause' : 'Play';
+  $('#speed').value = String(S.speed);
+  $('#clock').textContent = S.t ? S.t.replace('T', ' ').replace('Z', ' UTC') : 'no log yet';
+  $('#err').textContent = S.error || '';
+  if (S.source === 'real') {
+    $('#live').classList.toggle('on', S.info.live); $('#replay').classList.toggle('on', !S.info.live);
+    $('#where').innerHTML = S.info.live ? `<i style="background:var(--ok)"></i>live · ${S.info.lines_total} lines`
+      : `<i style="background:var(--idle)"></i>replay · ${S.info.behind} lines to go`;
+  } else {
+    $('#where').innerHTML = `<i style="background:var(--init)"></i>simulated · seed ${S.info.seed}`;
+  }
+  $('#seq').textContent = `line ${S.seq} · config ${S.config ?? '—'}`;
+  $('#revs').textContent = 'reviewers: ' + S.reviewers.join(', ');
+
+  // actors
+  const last = e => [...S.events].reverse().find(l => l.event === e);
+  const tk = last('tick_ended');
+  let html = `<div class="box"><h3>Human <small>owner</small></h3><div class="stat">files work, holds it with <b>guard</b>, closes and merges on GitHub</div></div>
+    <div class="box"><h3>Foreman <small>tick ${S.tick}</small></h3><div class="stat">last tick ${tk ? esc(tk.t.slice(11, 16)) : '—'} · takes back stale and out-of-quota work, preempts for bugs, plans initiatives</div></div>
+    <div class="box"><h3>Watchdog</h3><div class="stat">a session per agent with work</div></div>
+    <div class="box"><h3>Observer</h3><div class="stat">GitHub into the log; CI, ${esc(S.reviewers.join(', '))}, merges</div></div>`;
+  for (const a of S.agents) {
+    const st = a.quota === 'out' ? '<span class="quota">out of quota</span>' : `<span class="st ${a.state}">${a.state}${a.since != null ? ' ' + fmtMin(a.since) : ''}</span>`;
+    html += `<div class="box agent"><span class="name">${esc(a.name)}</span>${st}
+      <div class="now">${a.holding ? 'holds ' + chip(a.holding) : '<span>holds nothing</span>'}</div></div>`;
+  }
+  $('#actors').innerHTML = html;
+
+  // columns
+  let cols = '';
+  for (const [k, label] of Object.entries(COLS)) {
+    const ns = S.columns[k] || [];
+    const show = ns.slice(0, 60);
+    cols += `<div class="col"><div>${label}<b>${ns.length}</b></div><div class="chips">${show.map(n => {
+      const moved = prevState[n] !== undefined && prevState[n] !== k; return chip(n, moved);
+    }).join('')}${ns.length > show.length ? `<span class="more">+${ns.length - show.length}</span>` : ''}</div></div>`;
+  }
+  $('#cols').innerHTML = cols;
+  prevState = {};
+  for (const [k, ns] of Object.entries(S.columns)) for (const n of ns) prevState[n] = k;
+  $('#qsum').textContent = `${(S.columns.ready || []).length} ready · ${S.agents.filter(a => a.state !== 'off').length} of ${S.agents.length} agents live`;
+
+  // pull requests
+  const mark = s => s === 'pass' || s === 'approved' ? `<span class="ok">${s}</span>` : s === 'fail' || s === 'changes' ? `<span class="bad">${s}</span>` : `<span class="run">${s ?? '—'}</span>`;
+  $('#prs').innerHTML = S.prs.length ? S.prs.map(p => `<div class="prrow"><span>pr ${p.pr} · push ${p.push}</span>${chip(p.issue)}
+      <span>CI ${mark(p.ci)}</span><span>${Object.entries(p.reviews).map(([r, s]) => esc(r) + ' ' + mark(s)).join(' · ')}</span>
+      <span>${p.issue_state === 'checking' ? 'awaiting merge' : esc(p.issue_state)}</span></div>`).join('')
+    : '<div class="prrow empty">nothing in checks</div>';
+
+  // initiatives
+  $('#dags').innerHTML = S.initiatives.length ? S.initiatives.map(g => `<div class="dag"><div class="hd">#${g.n} ${g.state}${g.parked ? ' · held' : ''}<small>${g.done}/${g.children.length}</small></div><canvas id="dag_${g.n}"></canvas></div>`).join('')
+    : '<div class="sub">no initiatives</div>';
+  for (const g of S.initiatives) drawDag(g);
+
+  // totals and events
+  $('#totals').innerHTML = S.totals.map(([l, v, u]) => `<tr><td>${esc(l)}</td><td>${v == null ? '—' : esc(v) + (u ? ' ' + u : '')}</td></tr>`).join('');
+  $('#log').innerHTML = [...S.events].reverse().filter(l => !l.event.startsWith('tick_')).slice(0, 40).map(l => {
+    const rest = Object.entries(l).filter(([k]) => !['schema', 'seq', 't', 'actor', 'event', 'config'].includes(k)).map(([k, v]) => `${k}=${typeof v === 'object' ? JSON.stringify(v) : v}`).join(' ');
+    return `<div><span class="t">${esc(l.t.slice(5, 16).replace('T', ' '))}</span><span class="a">${esc(l.actor)}</span><span>${esc(l.event)} ${esc(rest)}</span></div>`;
+  }).join('');
+}
+
+const STATE_COLOR = { closed: '--ok', checking: '--enh', held: '--idle', ready: '--wait', blocked: '--faint', parked: '--fric' };
+function drawDag(g) {
+  const c = document.getElementById('dag_' + g.n); if (!c) return;
+  const r = devicePixelRatio || 1, W = c.clientWidth, H = c.clientHeight;
+  c.width = W * r; c.height = H * r;
+  const x = c.getContext('2d'); x.scale(r, r);
+  const kids = g.children.filter(n => S.issues[n]);
+  if (!kids.length) { x.fillStyle = css('--dim'); x.font = '11px ' + css('--mono'); x.fillText(g.state === 'open' ? 'not planned yet' : 'closed', 6, 20); return; }
+  const depth = {}, d = n => depth[n] ?? (depth[n] = 1 + Math.max(-1, ...S.issues[n].deps.filter(k => kids.includes(k)).map(d)));
+  kids.forEach(d);
+  const levels = {}; kids.forEach(n => (levels[depth[n]] ||= []).push(n));
+  const L = Object.keys(levels).length, pos = {};
+  Object.entries(levels).forEach(([lv, ns]) => ns.forEach((n, i) => pos[n] = [14 + (W - 28) * (L > 1 ? lv / (L - 1) : 0.5), (H / (ns.length + 1)) * (i + 1)]));
+  x.strokeStyle = css('--line2'); x.lineWidth = 1;
+  for (const n of kids) for (const k of S.issues[n].deps) if (pos[k]) { x.beginPath(); x.moveTo(...pos[k]); x.lineTo(...pos[n]); x.stroke(); }
+  for (const n of kids) {
+    x.fillStyle = css(STATE_COLOR[S.issues[n].state] || '--dim');
+    x.beginPath(); x.arc(...pos[n], 5, 0, 7); x.fill();
+  }
+}
+
+const CHARTS = [
+  ['Queue', [['ready', '--wait'], ['blocked', '--faint'], ['parked', '--fric']]],
+  ['In flight', [['held', '--idle'], ['checking', '--enh']]],
+  ['Done (cumulative)', [['merged', '--ok'], ['closed', '--init']]],
+  ['Agents', [['working', '--ok'], ['quota_out', '--out']]],
+];
+function drawCharts() {
+  $('#charts').innerHTML = CHARTS.map(([t, ks], i) => `<div class="chart"><div class="legend"><b style="color:var(--text)">${t}</b>${ks.map(([k, c]) => `<span><i style="background:var(${c})"></i>${k.replace('_', ' ')}</span>`).join('')}</div><canvas id="ch${i}"></canvas></div>`).join('');
+  CHARTS.forEach(([, ks], i) => {
+    const c = $('#ch' + i), r = devicePixelRatio || 1, W = c.clientWidth, H = c.clientHeight;
+    c.width = W * r; c.height = H * r; const x = c.getContext('2d'); x.scale(r, r);
+    const rows = series; if (rows.length < 2) { x.fillStyle = css('--faint'); x.font = '11px ' + css('--mono'); x.fillText('an hour of data is needed', 6, 20); return; }
+    const max = Math.max(1, ...rows.flatMap(row => ks.map(([k]) => row[k])));
+    x.strokeStyle = css('--line'); x.beginPath(); x.moveTo(0, H - 14.5); x.lineTo(W, H - 14.5); x.stroke();
+    x.fillStyle = css('--faint'); x.font = '10px ' + css('--mono'); x.fillText(max, 2, 10);
+    x.fillText(rows[0].t.slice(5, 13).replace('T', ' '), 2, H - 2); const e = rows.at(-1).t.slice(5, 13).replace('T', ' '); x.fillText(e, W - x.measureText(e).width - 2, H - 2);
+    for (const [k, col] of ks) {
+      x.strokeStyle = css(col); x.lineWidth = 1.5; x.beginPath();
+      rows.forEach((row, j) => { const px = (W - 4) * j / (rows.length - 1) + 2, py = (H - 18) * (1 - row[k] / max) + 2; j ? x.lineTo(px, py) : x.moveTo(px, py); });
+      x.stroke();
+    }
+  });
+}
+
+async function params() {
+  const ps = await (await fetch('/api/params')).json();
+  let g = '', html = '';
+  for (const p of ps) {
+    if (p.group !== g) { g = p.group; html += `<h4>${esc(g)}</h4>`; }
+    html += `<div class="param"><div><label for="p_${p.key}">${esc(p.label)}</label><b id="v_${p.key}">${p.default}</b></div>
+      <input type="range" id="p_${p.key}" min="${p.min}" max="${p.max}" step="${p.step}" value="${p.default}"></div>`;
+  }
+  $('#params').innerHTML = html;
+  for (const p of ps) $('#p_' + p.key).oninput = e => { $('#v_' + p.key).textContent = e.target.value; post({ params: { [p.key]: +e.target.value } }); };
+}
+
+let lastHours = -1, lastSource = '';
+new EventSource('/api/stream').onmessage = async ev => {
+  S = JSON.parse(ev.data);
+  if (S.source === 'sim' && S.info.params) for (const [k, v] of Object.entries(S.info.params)) { const el = $('#p_' + k); if (el && document.activeElement !== el) { el.value = v; $('#v_' + k).textContent = v; } }
+  render();
+  if (S.hours !== lastHours || S.source !== lastSource) {
+    lastHours = S.hours; lastSource = S.source;
+    series = await (await fetch('/api/series')).json(); drawCharts();
+  }
+};
+params();
+addEventListener('resize', () => { if (S) { render(); drawCharts(); } });
+</script>
+</body>
+</html>
