@@ -205,6 +205,8 @@ impl Walk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     struct World {
         trees: BTreeMap<Hash, Arc<Tree>>,
@@ -283,6 +285,7 @@ mod tests {
 
     #[test]
     fn concurrent_uploads_of_overlapping_trees_each_finish() {
+        let mut outcomes = Transcript::default();
         let mut st = TreesState::new();
         let (a, b, c) = (Hash([1; 32]), Hash([2; 32]), Hash([3; 32]));
         let mut store = BTreeSet::new();
@@ -290,27 +293,35 @@ mod tests {
         let two = st.begin_upload();
         let first = st.claim(one, &[a, b], &|h| store.contains(h));
         let second = st.claim(two, &[b, c], &|h| store.contains(h));
-        assert_eq!(first.mine, vec![a, b]);
-        assert_eq!(second, Claimed { mine: vec![c], theirs: vec![(b, one)] });
+        outcomes.record("first claims", &first.mine);
+        outcomes.record("second claims", &second);
         store.extend(first.mine);
-        assert_eq!(st.release(one), vec![a, b]);
+        outcomes.record("release", st.release(one));
         store.extend(second.mine);
-        assert_eq!(st.holder(&b), None);
+        outcomes.record("holder", st.holder(&b));
         assert!(store.contains(&b), "the second upload's share arrived through the first");
-        assert_eq!(st.release(two), vec![c]);
+        outcomes.record("release", st.release(two));
         st.invariants();
+        expect![[r#"
+            first claims: [0101010101010101, 0202020202020202]
+            second claims: Claimed { mine: [0303030303030303], theirs: [(0202020202020202, 0)] }
+            release: [0101010101010101, 0202020202020202]
+            holder: None
+            release: [0303030303030303]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_cancelled_upload_releases_exactly_its_claims() {
+        let mut outcomes = Transcript::default();
         let mut st = TreesState::new();
         let hs: Vec<Hash> = (0..6u8).map(|i| Hash([i; 32])).collect();
         let one = st.begin_upload();
         let two = st.begin_upload();
         st.claim(one, &hs[..4], &|_| false);
         let second = st.claim(two, &hs[2..], &|_| false);
-        assert_eq!(second.mine, hs[4..].to_vec());
-        assert_eq!(st.release(one), hs[..4].to_vec());
+        outcomes.record("second claims", second.mine);
+        outcomes.record("release", st.release(one));
         for h in &hs[..4] {
             assert_eq!(st.holder(h), None);
         }
@@ -318,12 +329,19 @@ mod tests {
             assert_eq!(st.holder(h), Some(two), "the other upload's claims stay");
         }
         let again = st.claim(two, &hs[2..4], &|_| false);
-        assert_eq!(again.mine, hs[2..4].to_vec(), "what the cancelled upload held is claimed again");
+        // what the cancelled upload held is claimed again.
+        outcomes.record("reclaimed", again.mine);
         st.invariants();
+        expect![[r#"
+            second claims: [0404040404040404, 0505050505050505]
+            release: [0000000000000000, 0101010101010101, 0202020202020202, 0303030303030303]
+            reclaimed: [0202020202020202, 0303030303030303]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn evicted_content_is_asked_for_again() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new();
         let mut st = TreesState::new();
         let (root, _) = w.dir(vec![World::file(1), World::file(2)]);
@@ -334,16 +352,20 @@ mod tests {
         assert!(!st.is_complete(&root, w.generation), "eviction ends what was complete");
         let (trees, blobs, _) =
             missing(root, &|d| st.is_complete(d, w.generation), &|d| w.tree(d), &|h| w.blobs.contains(h));
-        assert_eq!((trees, blobs), (vec![], vec![gone]));
+        outcomes.record("missing trees and blobs", (trees, blobs));
         assert!(w.sync(&mut st, root));
         assert!(w.blobs.contains(&gone));
+        expect![[r#"
+            missing trees and blobs: ([], [0100000000000000])
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_walk_asks_for_each_level_of_trees_once() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new();
-        let (inner, n) = w.dir(vec![World::file(3)]);
-        let (mid, m) = w.dir(vec![(b"in".to_vec(), n), World::file(2)]);
+        let (_, n) = w.dir(vec![World::file(3)]);
+        let (_, m) = w.dir(vec![(b"in".to_vec(), n), World::file(2)]);
         let (root, _) = w.dir(vec![(b"mid".to_vec(), m), World::file(1)]);
         let mut walk = Walk::new(root);
         let mut asked = Vec::new();
@@ -351,9 +373,14 @@ mod tests {
             asked.push(lacking.clone());
             w.stored_trees.extend(lacking);
         }
-        assert_eq!(asked, vec![vec![root], vec![mid], vec![inner]]);
-        assert_eq!(walk.missing.len(), 3);
-        assert_eq!(walk.walked, vec![root, mid, inner]);
+        outcomes.record("asked", asked);
+        outcomes.record("missing blob count", walk.missing.len());
+        outcomes.record("walked trees", walk.walked);
+        expect![[r#"
+            asked: [[01fe4dbab6c59572], [49cc3835d611e385], [9e03b5377206a02b]]
+            missing blob count: 3
+            walked trees: [01fe4dbab6c59572, 49cc3835d611e385, 9e03b5377206a02b]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
