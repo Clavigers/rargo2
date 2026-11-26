@@ -1,0 +1,48 @@
+@font-face {
+  font-family: "Fern Variable";
+  font-style: normal;
+  font-weight: 400 800;
+  src: local("Fern Variable Roman"), local("FernVariable-Roman");
+}
+
+@font-face {
+  font-family: "Fern Variable";
+  font-style: italic;
+  font-weight: 400 800;
+  src: local("Fern Variable Italic"), local("FernVariable-Italic");
+}
+
+:root {
+  --font-family: "Fern Variable", serif;
+  --font-family-code: "JetBrains Mono", monospace;
+  --line-height: 1.20rem;
+  --border-thickness: 1.25px;
+  --text-color: #000;
+  --light-color: #a2a9b1;
+  --background-color: #fff;
+  --horizontal-margin: 3ch;
+  --body-inner-width: 58ch;
+  --body-max-width: calc(var(--body-inner-width) + var(--horizontal-margin) * 2);
+
+  --font-weight-normal: 480;
+  --font-weight-medium: 600;
+  --font-weight-bold: 800;
+
+  font-family: var(--font-family);
+  font-synthesis: weight small-caps;
+  font-optical-sizing: auto;
+  font-variation-settings: "opsz" 10;
+  font-weight: var(--font-weight-normal);
+  font-style: normal;
+  font-variant-numeric: oldstyle-nums;
+  font-feature-settings: "onum"; 
+  font-size: 15px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+* + * {
+  margin-top: var(--line-height);
+}
