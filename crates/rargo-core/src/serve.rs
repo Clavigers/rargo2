@@ -440,6 +440,7 @@ fn serve(
     let before: Option<Arc<std::collections::BTreeSet<crate::proto::Digest>>> = {
         let known = d.deliveries.lock();
         known
+            .by_worktree
             .get(&worktree)
             .filter(|(token, _)| req.delivered != 0 && *token == req.delivered)
             .map(|(_, set)| set.clone())
@@ -520,8 +521,10 @@ fn serve(
                 delivered.extend(set.iter().copied());
             }
         }
-        let token = delivery_token(&mut d.random.lock());
-        d.deliveries.lock().insert(worktree, (token, Arc::new(delivered)));
+        let mut known = d.deliveries.lock();
+        let token = delivery_token(&mut known.random);
+        known.by_worktree.insert(worktree, (token, Arc::new(delivered)));
+        drop(known);
         sess.send(ServerMsg::DeliveryToken(token));
     }
     match outcome {
