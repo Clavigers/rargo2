@@ -15,7 +15,7 @@ use crate::snapshot::{Snapshot, Trees};
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use rargo_plan as rp;
@@ -473,7 +473,8 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
         }
     }
     let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
-    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid, &|| say(c, Wait::Toolchain))
+    let shell = if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "install") { "install" } else { "default" };
+    let flake = crate::flake::resolve_shell(&dd, &snap, &dir, &files, (uid, gid), shell, &|| say(c, Wait::Toolchain))
         .context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")?;
     let mut links = Vec::new();
     for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
@@ -617,6 +618,10 @@ fn plan_with(
     }
     env.insert(bytes("CARGO_NET_OFFLINE"), bytes("true"));
     env.insert(bytes("CARGO_CACHE_RUSTC_INFO"), bytes("0"));
+    if subcommand_pos(args).is_some_and(|i| args[i] == "install") {
+        env.insert(bytes("CARGO_TARGET_DIR"), bytes("/w/target/install-build"));
+        env.insert(bytes("CARGO_BUILD_BUILD_DIR"), bytes("/w/target/install-build"));
+    }
     let mut argv = vec![PLANNER_AT.to_vec()];
     for a in args {
         let a = match a.split_once('=') {
@@ -684,6 +689,33 @@ fn plan_with(
     Ok(PlanOutcome::Ok(Planned { data, stderr }))
 }
 
+/// Keep the registry and selection flags from an install request without passing client config to the host planner.
+fn install_fetch_args(args: &[String], local: &impl Fn(&str) -> String) -> Result<Vec<String>> {
+    let index = subcommand_pos(args).context("install request has no subcommand")?;
+    let mut fetch = vec!["install".into(), "--rargo-fetch-only".into(), "--no-track".into(), "--target=x86_64-unknown-linux-musl".into()];
+    let mut args = args[index + 1..].iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        let (flag, value) = arg.split_once('=').map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        match flag {
+            "--version" | "--vers" | "--path" | "--features" | "-F" | "--bin" | "--example" => {
+                let value = value.or_else(|| args.next()).with_context(|| format!("{flag} requires a value"))?;
+                let value = if flag == "--path" { local(value) } else { value.into() };
+                fetch.push(format!("{flag}={value}"));
+            }
+            "--locked" | "--all-features" | "--no-default-features" | "--ignore-rust-version" | "--bins" | "--examples" if value.is_none() => {
+                fetch.push(flag.into());
+            }
+            "--target" | "--root" => {
+                value.or_else(|| args.next()).with_context(|| format!("{flag} requires a value"))?;
+            }
+            "--force" | "-f" | "--no-track" | "--offline" | "--frozen" if value.is_none() => {}
+            _ if !arg.starts_with('-') => fetch.push(arg.into()),
+            _ => bail!("unsupported remote install argument {arg}"),
+        }
+    }
+    Ok(fetch)
+}
+
 fn fetch(
     d: &Arc<Daemon>,
     c: &Arc<Client>,
@@ -692,6 +724,7 @@ fn fetch(
     components: Vec<(String, String)>,
     offline: bool,
 ) -> Result<Option<Arc<Snapshot>>> {
+    let install = subcommand_pos(args).is_some_and(|i| args[i] == "install");
     let mut fetch_args = vec!["fetch".to_string()];
     let scratch = d.scratch("fetch")?;
     let scratch_s = scratch.to_string_lossy().into_owned();
@@ -702,8 +735,12 @@ fn fetch(
             _ => v.to_string(),
         }
     };
+    if install {
+        fetch_args = install_fetch_args(args, &local)?;
+        fetch_args.extend(["--root".into(), format!("{scratch_s}/target/install-fetch")]);
+    }
     let mut it = args.iter();
-    while let Some(a) = it.next() {
+    while let Some(a) = it.next().filter(|_| !install) {
         match a.as_str() {
             "--" => break,
             "--manifest-path" | "--config" | "--lockfile-path" => {
@@ -728,11 +765,28 @@ fn fetch(
         env.insert(k, v);
     }
     env.insert("CARGO_HOME".into(), c.home.dir.to_string_lossy().into_owned());
+    if install {
+        for key in ["RUSTUP_TOOLCHAIN", "RUSTC", "RUSTDOC"] {
+            env.remove(key);
+        }
+        if let Some(rustc) = p.flake.which("rustc") {
+            env.insert("RUSTC".into(), rustc);
+        }
+    }
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
     let out = (|| -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
         crate::io::cpu(|| snap.materialize(&scratch2, uid, gid, &|_, _| true))?;
+        if install {
+            for path in fetch_args.iter().filter_map(|a| a.strip_prefix("--path=")) {
+                let path = Path::new(path);
+                ensure!(
+                    path.is_absolute() && path.canonicalize()?.starts_with(scratch2.canonicalize()?),
+                    "install path lies outside the synced worktree"
+                );
+            }
+        }
         let run = |program: &Path, args: &[String]| {
             let mut cmd = std::process::Command::new(program);
             cmd.args(args).current_dir(&cwd).env_clear().envs(&env);
@@ -931,15 +985,24 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
     let mut planned: Option<Planned> = None;
     let mut plan_failure: Option<(Vec<u8>, Vec<u8>)> = None;
     let mut plan_args = args.clone();
+    let refresh_install = subcommand_pos(&args).is_some_and(|i| args[i] == "install")
+        && !offline_args(&args)
+        && !args.iter().any(|arg| arg == "--path" || arg.starts_with("--path=") || arg == "--version" || arg.starts_with("--version=")
+            || arg == "--vers" || arg.starts_with("--vers=") || (!arg.starts_with('-') && arg.contains('@')));
     while let Some(effect) = todo.pop_front() {
         let next = match effect {
             Effect::Prepare => {
                 let first = prepared.is_none();
-                prepared = Some(prepare(d, c, snapshot.clone())?);
+                let ready = prepare(d, c, snapshot.clone())?;
                 if first {
                     phase(started, c, "worktree prepared");
                     remember_client(d, c)?;
+                    // Resolve an unpinned registry install against the online index before planning from the cache.
+                    if refresh_install && fetch(d, c, &ready, &args, Vec::new(), false)?.is_none() {
+                        return Ok(Finish::Code(101));
+                    }
                 }
+                prepared = Some(ready);
                 req.lock().prepared()
             }
             Effect::Plan { as_build } => {
@@ -1227,8 +1290,12 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         req.lock().delivered(0);
         return Ok(Finish::Code(0));
     }
-    run.materialize_roots();
-    run.write_depinfo();
+    if subcommand_pos(&args).is_some_and(|i| args[i] == "install") {
+        run.deliver_install()?;
+    } else {
+        run.materialize_roots();
+        run.write_depinfo();
+    }
     phase(started, c, "results listed for the client");
     finished();
 
@@ -2485,6 +2552,30 @@ impl Run {
             .map(|(dest, text)| Write::Text { path: dest.to_string_lossy().into_owned(), text })
             .collect();
         self.c.deliver(Vec::new(), writes);
+    }
+
+    /// Return just the executable roots to the client's private staging directory.
+    fn deliver_install(&self) -> Result<()> {
+        let stage = self.c.env.get("RARGO_INSTALL_STAGE").context("install request has no staging directory")?;
+        ensure!(stage.len() == 32 && stage.bytes().all(|b| b.is_ascii_alphanumeric()), "invalid install staging directory");
+        let mut files = BTreeMap::new();
+        let plan = self.plan();
+        for &root in &plan.roots {
+            let unit = &plan.units[root as usize];
+            let Some(executable) = &unit.executable else { continue };
+            let target: serde_json::Value = serde_json::from_str(&unit.target_json)?;
+            let name = target["name"].as_str().context("executable target has no name")?;
+            ensure!(!name.is_empty() && !name.contains('/') && !matches!(name, "." | ".."), "invalid executable target name");
+            let Some((result, _)) = self.results[root as usize].get() else { continue };
+            let Some(output) = unit.outputs.iter().find(|out| out.path == *executable || out.hardlink.as_ref() == Some(executable)) else { continue };
+            let Some(MEntry::File { hash, size, exec: true }) = result.outputs.get(output.path.as_bytes()) else { continue };
+            let path = format!("{}/.rargo-install-{stage}/{name}", self.c.root);
+            let previous = files.insert(path.clone(), Delivery { path, hash: hash.0, size: *size, exec: true, own: false });
+            ensure!(previous.is_none(), "multiple install targets are named {name}");
+        }
+        ensure!(!files.is_empty(), "the install did not produce any executables");
+        self.c.deliver(files.into_values().collect(), Vec::new());
+        Ok(())
     }
 
     fn materialize_roots(&self) {

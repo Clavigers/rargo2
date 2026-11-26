@@ -1,0 +1,106 @@
+From: rargo <noreply@rargo.invalid>
+Subject: [PATCH] Plan install without placing binaries
+
+diff --git a/src/ops/cargo_install.rs b/src/ops/cargo_install.rs
+--- a/src/ops/cargo_install.rs
++++ b/src/ops/cargo_install.rs
+@@ -2,10 +2,9 @@
+ use std::collections::BTreeMap;
+ use std::collections::BTreeSet;
+ use std::path::{Path, PathBuf};
+-use std::sync::Arc;
+ use std::{env, fmt, fs};
+
+-use crate::compiler::{CompileKind, DefaultExecutor, Executor, UnitOutput};
++use crate::compiler::{CompileKind, UnitOutput};
+ use crate::context::FeatureUnification;
+ use crate::ops::{CompileFilter, Packages};
+ use crate::ops::{FilterRule, common_for_install_and_uninstall::*};
+@@ -334,7 +334,7 @@
+         Ok(duplicates)
+     }
+
+-    fn install_one(mut self, dry_run: bool) -> CargoResult<bool> {
++    fn install_one(mut self, dry_run: bool, fetch_only: bool) -> CargoResult<bool> {
+         self.gctx.shell().status("Installing", &self.pkg)?;
+
+         if let Some(source) = get_rustup_toolchain_source()
+@@ -388,11 +387,19 @@
+             self.ws.set_target_dir(target_dir);
+         }
+
++        if fetch_only {
++            let options = ops::FetchOptions {
++                gctx: self.gctx,
++                targets: vec!["x86_64-unknown-linux-musl".to_owned()],
++            };
++            ops::fetch(&self.ws, &options)?;
++            return Ok(false);
++        }
++
+         self.check_yanked_install()?;
+
+-        let exec: Arc<dyn Executor> = Arc::new(DefaultExecutor);
+         self.opts.build_config.dry_run = dry_run;
+-        let compile = ops::compile_with_exec(&self.ws, &self.opts, &exec).with_context(|| {
++        let compile = ops::compile(&self.ws, &self.opts).with_context(|| {
+             if let Some(td) = td_opt.take() {
+                 // preserve the temporary directory, so the user can inspect it
+                 drop(td.keep());
+@@ -464,6 +471,11 @@
+
+             return Ok(false);
+         }
++        // The build server will execute the plan and the client owns the install root.
++        if crate::compiler::rargo::active() {
++            return Ok(false);
++        }
++
+         // This is primarily to make testing easier.
+         binaries.sort_unstable();
+
+@@ -715,6 +715,7 @@
+     force: bool,
+     no_track: bool,
+     dry_run: bool,
++    fetch_only: bool,
+ ) -> CargoResult<()> {
+     let root = resolve_root(root, gctx)?;
+     // Normalize to absolute path for consistency throughout.
+@@ -757,7 +758,7 @@
+         )?;
+         let mut installed_anything = true;
+         if let Some(installable_pkg) = installable_pkg {
+-            installed_anything = installable_pkg.install_one(dry_run)?;
++            installed_anything = installable_pkg.install_one(dry_run, fetch_only)?;
+         }
+         (installed_anything, false)
+     } else {
+@@ -808,7 +809,7 @@
+
+         let install_results: Vec<_> = pkgs_to_install
+             .into_iter()
+-            .map(|(krate, installable_pkg)| (krate, installable_pkg.install_one(dry_run)))
++            .map(|(krate, installable_pkg)| (krate, installable_pkg.install_one(dry_run, fetch_only)))
+             .collect();
+
+         for (krate, result) in install_results {
+diff --git a/src/bin/cargo/commands/install.rs b/src/bin/cargo/commands/install.rs
+--- a/src/bin/cargo/commands/install.rs
++++ b/src/bin/cargo/commands/install.rs
+@@ -75,6 +75,7 @@
+         )
+         .arg(opt("root", "Directory to install packages into").value_name("DIR"))
+         .arg(flag("force", "Force overwriting existing crates or binaries").short('f'))
++        .arg(flag("rargo-fetch-only", "Prefetch registry sources for rargo").hide(true))
+         .arg_dry_run("Perform all checks without installing (unstable)")
+         .arg(flag("no-track", "Do not save tracking information"))
+         .arg(flag(
+@@ -255,6 +256,7 @@
+             args.flag("force"),
+             args.flag("no-track"),
+             args.dry_run(),
++            args.flag("rargo-fetch-only"),
+         )?;
+     }
+     Ok(())

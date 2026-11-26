@@ -1,6 +1,8 @@
 mod cli;
 mod daemon;
 mod git;
+#[path = "io/install.rs"]
+mod install;
 mod known;
 mod loader;
 mod mux;
@@ -460,22 +462,32 @@ fn through_daemon(cfg: Config, cache: PathBuf, req: LocalRequest, raw: &[OsStrin
             die("the command ended without a result");
         }
     };
-    let bytes = rargo_proto::encode(&req);
+    match daemon_replies(&mut stream, &req, |reply| relay(reply, &cfg, raw)) {
+        Ok(()) => die("the command ended without a result"),
+        Err(error) => die(error),
+    }
+}
+
+/// Send a command to the daemon and relay its messages up to the terminal reply.
+fn daemon_replies(stream: &mut (impl Read + Write), req: &LocalRequest, mut each: impl FnMut(LocalReply)) -> Result<(), &'static str> {
+    let bytes = rargo_proto::encode(req);
     if stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes)).is_err() {
-        die("the rargo daemon closed the connection");
+        return Err("the rargo daemon closed the connection");
     }
     loop {
         let mut len = [0u8; 4];
         if stream.read_exact(&mut len).is_err() {
-            die("the rargo daemon went away while the command was running");
+            return Err("the rargo daemon went away while the command was running");
         }
         let mut buf = vec![0u8; u32::from_le_bytes(len) as usize];
         if stream.read_exact(&mut buf).is_err() {
-            die("the rargo daemon went away while the command was running");
+            return Err("the rargo daemon went away while the command was running");
         }
-        match rargo_proto::decode::<LocalReply>(&buf) {
-            Ok(reply) => relay(reply, &cfg, raw),
-            Err(_) => die("the rargo daemon said something this program does not understand"),
+        let reply = rargo_proto::decode::<LocalReply>(&buf).map_err(|_| "the rargo daemon said something this program does not understand")?;
+        let last = matches!(reply, LocalReply::Exit(_) | LocalReply::Exec(_) | LocalReply::Unreachable(_));
+        each(reply);
+        if last {
+            return Ok(());
         }
     }
 }
@@ -484,6 +496,10 @@ fn main() {
     let argv0 = std::env::args_os().next();
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     let world = Real::read();
+    if raw.first().is_some_and(|arg| arg == "install") && !world.vars.iter().any(|(name, _)| name == "RARGO_BYPASS") {
+        install::run(&world, &raw);
+        return;
+    }
     let (cfg, args, vars, kind) = match cli::plan(&world, argv0.as_deref(), &raw) {
         cli::Plan::Cargo { release, banner } => {
             if banner {

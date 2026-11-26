@@ -78,6 +78,43 @@ pub fn interpreter(elf: &[u8]) -> Option<&[u8]> {
     Some(interp.strip_suffix(b"\0").unwrap_or(interp))
 }
 
+/// Check that an install artifact is an x86-64 ELF executable with no dynamic loader or shared dependencies.
+pub fn static_executable(bytes: &[u8]) -> bool {
+    let Some(elf) = Elf::parse(bytes) else { return false };
+    if !matches!(elf.u16(16), Some(2 | 3)) || elf.u16(18) != Some(62) || elf.u64(24) == Some(0) || elf.u16(54) != Some(56) {
+        return false;
+    }
+    let mut loads = false;
+    for &(kind, offset, _, size) in &elf.headers {
+        let Some(data) = usize::try_from(offset).ok().zip(usize::try_from(size).ok()).and_then(|(offset, size)| elf.get(offset, size)) else {
+            return false;
+        };
+        match kind {
+            1 => loads = true,
+            2 if !static_dynamic_entries(data) => return false,
+            3 => return false,
+            _ => {}
+        }
+    }
+    loads
+}
+
+/// A static PIE can have a dynamic table for relocations, but cannot name shared libraries.
+fn static_dynamic_entries(bytes: &[u8]) -> bool {
+    let (entries, remainder) = bytes.as_chunks::<16>();
+    if !remainder.is_empty() {
+        return false;
+    }
+    for entry in entries {
+        match u64::from_le_bytes(entry[..8].try_into().unwrap()) {
+            0 => return true,
+            1 | 0x7fff_fffd | 0x7fff_ffff | 0x6fff_fefb | 0x6fff_fefc => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 pub fn store_path(path: &[u8]) -> Option<String> {
     let name = std::str::from_utf8(path).ok()?.strip_prefix(STORE)?.split('/').next()?;
     (name.len() > 33 && name.as_bytes()[32] == b'-').then(|| format!("{STORE}{name}"))
@@ -176,6 +213,26 @@ mod tests {
             f[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
         }
         f
+    }
+
+    #[test]
+    fn install_accepts_static_pie_and_rejects_dynamic_or_truncated_elf() {
+        let mut program = elf(None, None, None);
+        program[16..18].copy_from_slice(&3u16.to_le_bytes());
+        program[18..20].copy_from_slice(&62u16.to_le_bytes());
+        program[24..32].copy_from_slice(&0x40_0100u64.to_le_bytes());
+        assert!(!static_executable(&program), "DT_NEEDED requires a shared library");
+        program[0x600..0x608].copy_from_slice(&7u64.to_le_bytes());
+        assert!(static_executable(&program), "DT_RELA is valid in a static PIE");
+        assert!(!static_executable(&program[..0x610]));
+        program[18..20].copy_from_slice(&183u16.to_le_bytes());
+        assert!(!static_executable(&program), "AArch64 is unsupported");
+
+        let mut with_interp = elf(Some("/lib64/ld-linux-x86-64.so.2"), None, None);
+        with_interp[16..32].copy_from_slice(&program[16..32]);
+        with_interp[18..20].copy_from_slice(&62u16.to_le_bytes());
+        with_interp[0x600..0x608].copy_from_slice(&7u64.to_le_bytes());
+        assert!(!static_executable(&with_interp), "PT_INTERP requires a loader");
     }
 
     #[test]

@@ -29,6 +29,11 @@
       rust = pkgs.rust-bin.fromRustupToolchain (toolchain // {
         components = pkgs.lib.unique ((toolchain.components or []) ++ [ "clippy" "rustfmt" "rust-src" ]);
       });
+      muslTarget = "x86_64-unknown-linux-musl";
+      muslRust = pkgs.rust-bin.fromRustupToolchain (toolchain // {
+        targets = [ muslTarget ];
+      });
+      muslCc = pkgs.pkgsCross.musl64.stdenv.cc;
       tools = with pkgs; [ gcc binutils pkg-config cmake gnumake perl python3 git ];
       libs = with pkgs; [
         openssl zlib sqlite
@@ -44,6 +49,11 @@
         default = pkgs.mkShell {
           nativeBuildInputs = [ rust ] ++ tools;
           buildInputs = libs;
+        };
+        install = pkgs.mkShell {
+          nativeBuildInputs = [ muslRust muslCc ] ++ tools;
+          CC_x86_64_unknown_linux_musl = "${muslCc}/bin/${muslCc.targetPrefix}cc";
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${muslCc}/bin/${muslCc.targetPrefix}cc";
         };
       };
     };
