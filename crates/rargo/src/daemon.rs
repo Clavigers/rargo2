@@ -460,8 +460,8 @@ impl std::error::Error for NoLink {
 fn refused_text(server: &str, had_token: bool) -> String {
     if had_token {
         format!(
-            "error: the rargo server at {server} no longer accepts this machine's token: it was revoked or has expired. \
-             Run `rargo auth` to get a new one\n"
+            "error: the rargo server at {server} does not accept this machine's token: it does not know it, or it was revoked \
+             or has expired. Run `rargo auth` to get a new one\n"
         )
     } else {
         format!("error: this machine is not authenticated to the rargo server at {server}: run `rargo auth`\n")
@@ -2773,7 +2773,7 @@ mod tests {
         let none = refused_text("build.example:7459", false);
         let revoked = refused_text("build.example:7459", true);
         assert_eq!(none, "error: this machine is not authenticated to the rargo server at build.example:7459: run `rargo auth`\n");
-        assert!(revoked.starts_with("error: the rargo server at build.example:7459 no longer accepts this machine's token: it was revoked or has expired. Run `rargo auth`"), "{revoked}");
+        assert!(revoked.starts_with("error: the rargo server at build.example:7459 does not accept this machine's token: it does not know it, or it was revoked or has expired. Run `rargo auth`"), "{revoked}");
         for text in [none, revoked] {
             assert!(!text.contains(rargo_proto::REFUSED), "{text}");
         }

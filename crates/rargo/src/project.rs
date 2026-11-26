@@ -204,13 +204,16 @@ fn save_credentials(all: &toml::Table) -> Result<(), String> {
     write().map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// What a token looks like, for the message that says a string is not one.
+pub const TOKEN_FORM: &str = "a token is an id, a dot and a secret of at least 16 characters, as `rargo auth` stores it and `rargod token create` prints it";
+
 pub fn split_token(token: &str) -> Option<(&str, &str)> {
     let (id, secret) = token.trim().split_once('.')?;
     (!id.is_empty() && secret.len() >= 16).then_some((id, secret))
 }
 
 pub fn store_token(host: &str, token: &str, name: &str) -> Result<(), String> {
-    let (id, secret) = split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
+    let (id, secret) = split_token(token).ok_or_else(|| format!("that is not a token: {TOKEN_FORM}"))?;
     let mut all = credentials();
     let mut c = toml::Table::new();
     c.insert("id".into(), id.into());
@@ -236,7 +239,7 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
 }
 
 pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
-    split_token(token).ok_or("that is not a token (a token is an id, a dot and a secret)")?;
+    split_token(token).ok_or_else(|| format!("that is not a token: {TOKEN_FORM}"))?;
     let url = format!("{}/auth/whoami", base_url(host));
     let body = serde_json::json!({ "token": token.trim() });
     let text = agent()

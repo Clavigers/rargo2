@@ -89,6 +89,11 @@ impl cli::World for Real {
         project::resolve(host)
     }
 
+    fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String> {
+        self.handle_signals();
+        project::holder(host, token)
+    }
+
     fn credential(&self, host: &str) -> Option<project::Credential> {
         project::credential(host)
     }

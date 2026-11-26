@@ -78,7 +78,7 @@ pub fn run() {
                 (Some(secret), Ok(_)) => {
                     match project::holder(&cfg.host, &format!("{}.{secret}", cfg.user)) {
                         Ok(Some(account)) => account,
-                        Ok(None) => "sign-in expired or revoked; run `rargo auth`".into(),
+                        Ok(None) => "the server does not accept this token: it does not know it, or it was revoked or has expired; run `rargo auth`".into(),
                         Err(_) => "unavailable (could not verify sign-in)".into(),
                     }
                 }
