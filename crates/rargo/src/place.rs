@@ -126,18 +126,22 @@ impl OutputMounts {
                 return None;
             }
             let (major, minor) = mount.split_whitespace().nth(2)?.split_once(':')?;
-            Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
+            Some(makedev(major.parse().ok()?, minor.parse().ok()?))
         }).collect())
     }
 
     pub(crate) fn check(&self, path: &Path) -> io::Result<()> {
+        // Follow symlinks so aliases of another worktree's target are caught too.
+        self.check_by(path, |p| rargo_net::io::file::metadata(p).map(|md| md.dev()))
+    }
+
+    fn check_by(&self, path: &Path, dev_of: impl Fn(&Path) -> io::Result<u64>) -> io::Result<()> {
         if self.0.is_empty() {
             return Ok(());
         }
         // Missing outputs inherit the filesystem of their closest existing ancestor.
-        // Follow symlinks so aliases of another worktree's target are caught too.
-        let check_device = |candidate: &Path| match rargo_net::io::file::metadata(candidate) {
-            Ok(md) if self.0.contains(&md.dev()) => Err(io::Error::other(format!(
+        let check_device = |candidate: &Path| match dev_of(candidate) {
+            Ok(dev) if self.0.contains(&dev) => Err(io::Error::other(format!(
                 "cannot copy build output to `{}` on a rargo FUSE mount; choose an output directory outside that mount",
                 path.display()
             ))),
@@ -155,6 +159,12 @@ impl OutputMounts {
         }
         Ok(())
     }
+}
+
+/// Linux's `makedev`, as `stat` reports `st_dev`.
+fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (u64::from(major), u64::from(minor));
+    ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
 }
 
 fn mode(exec: bool, writable: bool) -> u32 {
@@ -870,20 +880,28 @@ mod tests {
 
     #[test]
     fn copied_outputs_reject_rargo_mounts_including_missing_paths_and_aliases() {
-        let tmp = tempfile::tempdir().unwrap();
-        let proc = Path::new("/proc");
-        let dev = rargo_net::io::file::metadata(proc).unwrap().dev();
-        let info = format!("42 1 {}:{} / /proc rw - fuse.rargo rargo rw\n", libc::major(dev), libc::minor(dev));
-        let mounts = OutputMounts::from_mountinfo(&info);
-        let alias = tmp.path().join("other-target");
-        std::os::unix::fs::symlink(proc, &alias).unwrap();
-
-        for path in [proc.to_path_buf(), proc.join("other/debug/app"), alias.join("other/debug/app")] {
-            let error = mounts.check(&path).unwrap_err();
-            assert!(error.to_string().contains("on a rargo FUSE mount"));
+        let info = "42 1 0:61 / /w/a/target rw - fuse.rargo rargo rw\n43 1 259:3 / / rw - ext4 /dev/x rw\n";
+        let mounts = OutputMounts::from_mountinfo(info);
+        let fuse = makedev(0, 61);
+        assert_eq!(mounts.0, BTreeSet::from([fuse]));
+        assert_eq!(makedev(259, 3), (259 << 8) | 3);
+        assert_eq!(makedev(0x1234, 0x5678), 0x1000_0562_3478);
+        // What a stat that follows symlinks reports: `/w/alias` points into the mount.
+        let dev_of = |p: &Path| -> io::Result<u64> {
+            match p.to_str().unwrap() {
+                "/w/a/target" | "/w/alias" => Ok(fuse),
+                "/" | "/w" | "/w/a" | "/w/b" => Ok(makedev(259, 3)),
+                _ => Err(io::ErrorKind::NotFound.into()),
+            }
+        };
+        for path in ["/w/a/target", "/w/a/target/debug/app", "/w/alias/debug/app"] {
+            let error = mounts.check_by(Path::new(path), dev_of).unwrap_err();
+            assert!(error.to_string().contains("on a rargo FUSE mount"), "{path}: {error}");
         }
-        mounts.check(&tmp.path().join("other-target-sibling/debug/app")).unwrap();
-        OutputMounts::from_mountinfo(&info.replace("fuse.rargo", "proc")).check(proc).unwrap();
+        for path in ["/w/b/target/debug/app", "/w/a/other"] {
+            mounts.check_by(Path::new(path), dev_of).unwrap();
+        }
+        OutputMounts::from_mountinfo(&info.replace("fuse.rargo", "proc")).check_by(Path::new("/w/a/target"), dev_of).unwrap();
     }
 
     struct Rng(u64);

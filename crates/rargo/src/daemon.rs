@@ -961,7 +961,7 @@ impl Daemon {
         }
     }
 
-    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
+    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest, cwd: &Path) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
         let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
             || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
@@ -973,6 +973,11 @@ impl Daemon {
             if let Some(m) = g.take() {
                 m.fs.save();
                 io::blocking(|| m.session.unmount());
+            }
+            // Checked only now: an explicit target dir may name this
+            // worktree's own `target`, whose mount was just released.
+            if let Some(dir) = explicit_target_dir(req) {
+                OutputMounts::current()?.check(&cwd.join(dir))?;
             }
             return Ok(None);
         }
@@ -1425,14 +1430,7 @@ impl Daemon {
         let shown = if req.kind == "sync" {
             None
         } else {
-            if let Some(dir) = explicit_target_dir(req) {
-                let path = cwd.join(dir);
-                let _mounting = self.mounting.lock();
-                if let Err(error) = OutputMounts::current().and_then(|mounts| mounts.check(&path)) {
-                    return Ok(Self::fail(out, error.to_string()));
-                }
-            }
-            match self.out_for(&wt, req) {
+            match self.out_for(&wt, req, &cwd) {
                 Ok(shown) => shown,
                 Err(err) => return Ok(Self::fail(out, err.to_string())),
             }
