@@ -468,11 +468,15 @@ pub fn bulk_of(m: &ServerMsg) -> usize {
 mod tests {
     use super::*;
 
+    fn dir() -> impl AsRef<std::path::Path> {
+        tempfile::tempdir().unwrap()
+    }
+
     #[test]
     fn an_open_server_admits_anyone_and_one_with_tokens_their_holders() {
         assert!(Keys::open().lookup("anyone").unwrap().1);
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::tokens::TokenStore::new(dir.path().join("tokens.json")));
+        let dir = dir();
+        let store = Arc::new(crate::tokens::TokenStore::new(dir.as_ref().join("tokens.json")));
         let (ann, secret) = store.create("ann", true, None, "test").unwrap();
         let (bob, _) = store.create("bob", false, None, "test").unwrap();
         let k = Keys::with_tokens(store.clone());
@@ -486,9 +490,9 @@ mod tests {
 
     #[test]
     fn an_upload_that_finds_the_session_gone_says_so_and_does_not_lock_the_state_twice() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(crate::db::Db::open(&dir.path().join("db.redb")).unwrap());
-        let store = Arc::new(Store::open(&dir.path().join("store"), db).unwrap());
+        let dir = dir();
+        let db = Arc::new(crate::db::Db::open(&dir.as_ref().join("db.redb")).unwrap());
+        let store = Arc::new(Store::open(&dir.as_ref().join("store"), db).unwrap());
         crate::io::drive(1, move || {
             let (session, _rx) = Session::new(store);
             session.close();
