@@ -4,6 +4,7 @@
 
 pub use rargo_net::io::*;
 
+pub(crate) mod db;
 pub mod http;
 pub mod sandbox;
 pub mod sys;
