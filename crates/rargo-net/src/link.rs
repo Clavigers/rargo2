@@ -158,6 +158,72 @@ const UDP_WAIT: Duration = Duration::from_millis(2500);
 /// How long connecting over TCP and the handshake after it may take: a stopped server's kernel still accepts the connection.
 const CONNECT_WITHIN: Duration = Duration::from_secs(5);
 
+/// A byte stream a TCP dial speaks its handshake over.
+trait Wire {
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()>;
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()>;
+}
+
+impl Wire for TcpStream {
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        TcpStream::write_all(self, buf)
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        TcpStream::read_exact(self, buf)
+    }
+}
+
+/// What a TCP dial needs from the world: a connection to the server, and the clock that bounds the whole dial.
+trait Dial {
+    type Wire: Wire + 'static;
+    fn connect(&self) -> io::Result<Self::Wire>;
+    fn within<T: 'static>(&self, limit: Duration, body: impl FnOnce() -> T) -> Option<T>;
+}
+
+/// The real dial: the event loop's TCP and its timers.
+struct Tcp<F>(F);
+
+impl<F: Fn() -> io::Result<TcpStream>> Dial for Tcp<F> {
+    type Wire = TcpStream;
+
+    fn connect(&self) -> io::Result<TcpStream> {
+        (self.0)()
+    }
+
+    fn within<T: 'static>(&self, limit: Duration, body: impl FnOnce() -> T) -> Option<T> {
+        shell::timeout(limit, body).ok()
+    }
+}
+
+/// Connects over TCP and finishes the handshake, all within `CONNECT_WITHIN` on the dial's clock.
+fn dial<D: Dial>(d: &D, user: &str, psk: &[u8; 32], udp_error: Option<io::Error>) -> io::Result<(D::Wire, Sealer, Opener)> {
+    let handshake = || -> io::Result<(D::Wire, Sealer, Opener)> {
+        let mut wire = match d.connect() {
+            Ok(w) => w,
+            Err(e) => return Err(if e.kind() == io::ErrorKind::ConnectionRefused { e } else { udp_error.unwrap_or(e) }),
+        };
+        let (hs, first) = secure::client_start(user, psk, &[])?;
+        wire.write_all(&first)?;
+        let mut head = [0u8; 3];
+        wire.read_exact(&mut head)?;
+        let mut body = vec![0u8; u16::from_le_bytes([head[1], head[2]]) as usize];
+        wire.read_exact(&mut body)?;
+        if head[0] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("the server refused the connection: {}", String::from_utf8_lossy(&body).trim()),
+            ));
+        }
+        let (sealer, opener) = secure::client_finish(hs, &body)?;
+        Ok((wire, sealer, opener))
+    };
+    match d.within(CONNECT_WITHIN, handshake) {
+        Some(dialled) => dialled,
+        None => Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer over TCP within {} s", CONNECT_WITHIN.as_secs()))),
+    }
+}
+
 impl Link {
     pub fn tcp(stream: TcpStream, sealer: Sealer, opener: Opener) -> Link {
         let _ = stream.set_nodelay(true);
@@ -192,31 +258,13 @@ impl Link {
                 return Err(udp_error.unwrap());
             }
         }
-        let tcp = move || -> io::Result<Link> {
-            let mut stream = match TcpStream::connect(server) {
-                Ok(s) => s,
-                Err(e) => return Err(if e.kind() == io::ErrorKind::ConnectionRefused { e } else { udp_error.unwrap_or(e) }),
-            };
+        let tcp = Tcp(move || {
+            let stream = TcpStream::connect(server)?;
             let _ = stream.set_nodelay(true);
-            let (hs, first) = secure::client_start(user, psk, &[])?;
-            stream.write_all(&first)?;
-            let mut head = [0u8; 3];
-            stream.read_exact(&mut head)?;
-            let mut body = vec![0u8; u16::from_le_bytes([head[1], head[2]]) as usize];
-            stream.read_exact(&mut body)?;
-            if head[0] != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("the server refused the connection: {}", String::from_utf8_lossy(&body).trim()),
-                ));
-            }
-            let (sealer, opener) = secure::client_finish(hs, &body)?;
-            Ok(Link::tcp(stream, sealer, opener))
-        };
-        match shell::timeout(CONNECT_WITHIN, tcp) {
-            Ok(tcp) => tcp,
-            Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer over TCP within {} s", CONNECT_WITHIN.as_secs()))),
-        }
+            Ok(stream)
+        });
+        let (stream, sealer, opener) = dial(&tcp, user, psk, udp_error)?;
+        Ok(Link::tcp(stream, sealer, opener))
     }
 
     pub fn kind(&self) -> &'static str {
@@ -532,6 +580,107 @@ mod tests {
         d.invariants();
         assert_eq!(d.missing(), 2);
         assert_eq!(d.end(), Err(FrameError::Truncated { missing: 2 }));
+    }
+
+    struct Clock {
+        now: std::cell::Cell<Duration>,
+        deadline: std::cell::Cell<Option<Duration>>,
+    }
+
+    struct Peer {
+        clock: std::rc::Rc<Clock>,
+        psk: [u8; 32],
+        answer_after: Option<Duration>,
+        refuse: Option<io::ErrorKind>,
+    }
+
+    struct PeerWire {
+        clock: std::rc::Rc<Clock>,
+        psk: [u8; 32],
+        answer_after: Option<Duration>,
+        arrived: bool,
+        reply: Vec<u8>,
+    }
+
+    impl Wire for PeerWire {
+        fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+            let ulen = buf[8] as usize;
+            let mlen = u16::from_le_bytes([buf[9 + ulen], buf[10 + ulen]]) as usize;
+            let (msg2, ..) = server_accept(&self.psk, &buf[11 + ulen..11 + ulen + mlen])?;
+            self.reply = [vec![0], (msg2.len() as u16).to_le_bytes().to_vec(), msg2].concat();
+            Ok(())
+        }
+
+        fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+            let deadline = self.clock.deadline.get().expect("a dial reads within its bound");
+            match self.answer_after {
+                None => self.clock.now.set(deadline),
+                Some(after) if !self.arrived => {
+                    self.arrived = true;
+                    self.clock.now.set(self.clock.now.get() + after);
+                }
+                Some(_) => {}
+            }
+            if self.clock.now.get() >= deadline {
+                self.clock.now.set(deadline);
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "the clock reached the dial's deadline"));
+            }
+            let rest = self.reply.split_off(buf.len());
+            buf.copy_from_slice(&self.reply);
+            self.reply = rest;
+            Ok(())
+        }
+    }
+
+    impl Dial for Peer {
+        type Wire = PeerWire;
+
+        fn connect(&self) -> io::Result<PeerWire> {
+            if let Some(kind) = self.refuse {
+                return Err(io::Error::new(kind, "the peer's port is closed"));
+            }
+            Ok(PeerWire { clock: self.clock.clone(), psk: self.psk, answer_after: self.answer_after, arrived: false, reply: Vec::new() })
+        }
+
+        fn within<T: 'static>(&self, limit: Duration, body: impl FnOnce() -> T) -> Option<T> {
+            self.clock.deadline.set(Some(self.clock.now.get() + limit));
+            let got = body();
+            (self.clock.now.get() < self.clock.deadline.get().unwrap()).then_some(got)
+        }
+    }
+
+    fn peer(answer_after: Option<Duration>, refuse: Option<io::ErrorKind>) -> Peer {
+        let clock = Clock { now: std::cell::Cell::new(Duration::ZERO), deadline: std::cell::Cell::new(None) };
+        Peer { clock: std::rc::Rc::new(clock), psk: psk_from_secret(b"dial"), answer_after, refuse }
+    }
+
+    #[test]
+    fn a_peer_that_accepts_and_never_answers_ends_the_dial_once_its_bound_passes_on_the_clock() {
+        let silent = peer(None, None);
+        let Err(e) = dial(&silent, "ann", &silent.psk, None) else { panic!("a silent peer is not dialled") };
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(e.to_string(), "no answer over TCP within 5 s");
+        assert_eq!(silent.clock.now.get(), CONNECT_WITHIN, "the dial gives up exactly at its bound");
+
+        let late = peer(Some(CONNECT_WITHIN + Duration::from_secs(1)), None);
+        let Err(e) = dial(&late, "ann", &late.psk, None) else { panic!("an answer after the bound is too late") };
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+
+        let prompt = peer(Some(CONNECT_WITHIN - Duration::from_secs(1)), None);
+        assert!(dial(&prompt, "ann", &prompt.psk, None).is_ok(), "an answer inside the bound finishes the handshake");
+        assert_eq!(prompt.clock.now.get(), CONNECT_WITHIN - Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_closed_port_is_said_at_once_and_another_connect_failure_keeps_the_udp_error() {
+        let closed = peer(None, Some(io::ErrorKind::ConnectionRefused));
+        let udp = || Some(io::Error::new(io::ErrorKind::TimedOut, "no answer over UDP"));
+        let Err(e) = dial(&closed, "ann", &closed.psk, udp()) else { panic!() };
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(closed.clock.now.get(), Duration::ZERO);
+        let unreachable = peer(None, Some(io::ErrorKind::HostUnreachable));
+        let Err(e) = dial(&unreachable, "ann", &unreachable.psk, udp()) else { panic!() };
+        assert_eq!(e.to_string(), "no answer over UDP");
     }
 
     fn handshake() -> (Sealer, Opener, Sealer, Opener) {
