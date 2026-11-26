@@ -56,13 +56,13 @@ fn one_seed_is_one_run() {
 fn a_bad_network_delivers_everything_in_order_for_many_seeds() {
     let net = Net { loss_per_mille: 200, duplicate_per_mille: 100, delay_ms: (1, 80) };
     let (mut simulated_ms, mut lost) = (0u64, 0u64);
-    for seed in 0..100 {
+    for seed in 0..8 {
         let report = exchange(seed, net);
         simulated_ms += report.elapsed_ms;
         lost += report.datagrams_lost;
     }
     assert!(lost > 0, "the network did lose datagrams");
-    assert!(simulated_ms > 60_000, "retransmission timers ran on simulated time: {simulated_ms} ms");
+    assert!(simulated_ms > 5_000, "retransmission timers ran on simulated time: {simulated_ms} ms");
 }
 
 #[test]

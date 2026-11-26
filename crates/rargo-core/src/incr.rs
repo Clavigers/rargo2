@@ -526,12 +526,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_saves_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        sim::test(|| {
+    fn generated_saves(seeds: std::ops::RangeInclusive<u64>) {
+        sim::test(move || {
             let worktrees: Vec<String> = (0..KEEP_WORKTREES as u64 + 4).map(|i| format!("/wt/{i}")).collect();
             let (db, s) = store();
-            for seed in 1..=300u64 {
+            for seed in seeds {
                 let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
                 db.clear();
                 let start = 1000 + rng.below(1000);
@@ -580,6 +579,36 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn generated_saves_1_to_50_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(1..=50);
+    }
+
+    #[test]
+    fn generated_saves_51_to_100_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(51..=100);
+    }
+
+    #[test]
+    fn generated_saves_101_to_150_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(101..=150);
+    }
+
+    #[test]
+    fn generated_saves_151_to_200_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(151..=200);
+    }
+
+    #[test]
+    fn generated_saves_201_to_250_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(201..=250);
+    }
+
+    #[test]
+    fn generated_saves_251_to_300_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(251..=300);
     }
 
     #[test]
