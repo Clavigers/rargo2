@@ -511,3 +511,14 @@ def test_status_reads_well():
     assert "claude-code-1" in text and "closed" in text
     text = initiative_to_release().w.status()
     assert "issues" in text
+
+
+def test_a_given_up_issue_waits_for_the_owner():
+    g = one_held()
+    g(C1, "returned", issue=1, reason="gave_up", note="needs a deploy")
+    with pytest.raises(Illegal, match="gave up on #1"):
+        g(C1, "taken", issue=1)
+    assert g.w.ready_queue(C1) == [] and g.w.ready_queue(C2) == [1]
+    g("human", "parked", issue=1)
+    g("human", "unparked", issue=1)
+    g(C1, "taken", issue=1)

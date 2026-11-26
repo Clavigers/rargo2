@@ -1,4 +1,3 @@
-import json
 
 from factory import harness
 from factory.model import Config, SessionEnd

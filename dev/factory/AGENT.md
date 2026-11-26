@@ -62,4 +62,7 @@ back to the queue, and whoever takes it next fixes it.
 ## Rules
 
 - Write events only as yourself, only the ones above.
+- Never add or remove `wip-` labels, and never assign issues: the log is the
+  lock here. `wip-` labels and the label `guard` belong to people outside the
+  factory.
 - Touch only your branch. Never merge, never close issues.

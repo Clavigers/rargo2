@@ -29,6 +29,7 @@ from . import model as m
 from .github import GitHub, GitHubError
 from .ledger import Ledger, Refused, utc_now
 from .machines import AgentS, IssueS
+from .notify import notify
 from .model import Kind, Role
 from .watchdog import BIN
 
@@ -45,6 +46,7 @@ class Foreman:
         self.run_session = run or self._run_session
         self.say = say
         self.planned: dict[int, datetime] = {}  # initiative -> when we last tried
+        self.told: set[int] = set()  # issues every agent gave up on, owner told
 
     def tick(self) -> None:
         w = self.ledger.refresh()
@@ -56,7 +58,20 @@ class Foreman:
             self._close_initiatives()
         finally:
             self._decide("tick_ended", tick=n)
+        self._stuck()
         self._plan()
+
+    def _stuck(self) -> None:
+        """Tell the owner, once, about work no agent will do."""
+        w = self.ledger.world
+        agents = set(w.config.names())
+        for n, i in w.issues.items():
+            if w.waiting(n) and agents <= i.given_up and n not in self.told:
+                self.told.add(n)
+                notify(f"#{n}: every agent gave up on it. Put it on hold and release it "
+                       f"(label guard, then remove it) to let them try again.",
+                       "rargo factory: needs the owner")
+                self.say(f"foreman: #{n} needs the owner; every agent gave up on it")
 
     def run(self) -> None:
         while True:

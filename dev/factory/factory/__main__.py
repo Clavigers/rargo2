@@ -96,7 +96,7 @@ def main(argv: list[str]) -> int:
         case ["ready"]:
             w = Ledger(env("FACTORY_LOG")).world
             print(json.dumps([{"issue": n, "kind": str(w.issues[n].kind), "pr": w.issues[n].pr}
-                              for n in w.ready_queue()]))
+                              for n in w.ready_queue(os.environ.get("FACTORY_ACTOR"))]))
             return 0
         case ["init", config]:
             body = json.dumps({"event": "config_applied",

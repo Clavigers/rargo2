@@ -34,8 +34,8 @@ the ntfy topic in the service files.
   `friction` or `initiative`. Without one the factory asks and waits.
 - **Place it** with lines in the body: `Part of #N` for its initiative,
   `Depends on #N` for each issue it waits for.
-- **Hold it**: label `guard`. A guarded issue is not taken and a guarded
-  initiative is not planned until the label goes.
+- **Hold it**: label `guard`, or assign it to the owner. A held issue is not
+  taken and a held initiative is not planned until that is undone.
 - **Lock it** for yourself or another agent outside the factory: a label
   `wip-NAME`. The factory leaves it alone while any `wip-` label is on it.
 - **Close or merge** anything on GitHub whenever you like; the factory

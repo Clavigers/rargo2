@@ -47,6 +47,7 @@ class Issue:
     pr: int | None = None
     holder: str | None = None
     parked: bool = False
+    given_up: set[str] = field(default_factory=set)  # agents that gave up on it
 
 
 @dataclass
@@ -184,10 +185,12 @@ class World:
             self.fail(f"push {push} is not pr {pr}'s latest ({p.pushes})")
         return p
 
-    def ready_queue(self) -> list[int]:
+    def ready_queue(self, agent: str | None = None) -> list[int]:
         """Ready issues best first: needing work, then bugs, then the rest,
-        oldest first. Policy, not legality: taking any ready issue is legal."""
-        ready = [n for n in self.issues if self.is_(M.ISSUE, n, IssueS.ready)]
+        oldest first; with agent, only those it may take (not ones it gave up
+        on). The order is policy, not legality."""
+        ready = [n for n in self.issues if self.is_(M.ISSUE, n, IssueS.ready)
+                 and agent not in self.issues[n].given_up]
         return sorted(ready, key=lambda n: (self.issues[n].pr is None,
                                             self.issues[n].kind is not Kind.bug,
                                             self.issues[n].filed, n))
@@ -438,6 +441,7 @@ def _(w: World, e: m.Unparked, a):
     if not i.parked:
         w.fail(f"#{e.issue} is not parked")
     i.parked = False
+    i.given_up.clear()  # the owner looked at it: everyone may try again
 
 
 @on(m.Undepends)
@@ -512,6 +516,8 @@ def _(w: World, e: m.Taken, a):
     w.issue(e.issue, work=True)
     if not w.is_(M.ISSUE, e.issue, IssueS.ready):
         w.fail(f"#{e.issue} is {w.state(M.ISSUE, e.issue)}, not ready")
+    if a in w.issues[e.issue].given_up:
+        w.fail(f"{a} gave up on #{e.issue}; the owner holding and releasing it lets it try again")
     w.enter(M.ISSUE, e.issue, IssueS.held)
     w.enter(M.AGENT, a, AgentS.working)
     w.holding[a] = e.issue
@@ -529,6 +535,8 @@ def _(w: World, e: m.Returned, a):
             w.fail(f"only {holder} returns #{e.issue} as {e.reason}")
         if e.reason is R.blocked and not any(w.open_(d) for d in i.deps):
             w.fail(f"#{e.issue} has no open dependency")
+        if e.reason is R.gave_up:
+            i.given_up.add(holder)
     else:
         if a != Role.foreman:
             w.fail(f"only the foreman returns an issue as {e.reason}")

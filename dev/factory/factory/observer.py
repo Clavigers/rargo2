@@ -206,10 +206,12 @@ class Observer:
         self._record(actor, "filed", **fields)
 
     def _park(self, i: dict) -> None:
-        """The owner's hold and outside locks follow the labels."""
+        """The owner's hold (the label guard, or the issue assigned to the
+    owner) and outside locks (wip- labels) follow GitHub."""
         n = i["number"]
         labels = {l["name"] for l in i["labels"]}
-        owner, locked = PARK in labels, any(x.startswith(LOCK) for x in labels)
+        mine = self.owner in {u["login"] for u in i.get("assignees") or []}
+        owner, locked = PARK in labels or mine, any(x.startswith(LOCK) for x in labels)
         parked = self.ledger.world.issues[n].parked
         if (owner or locked) and not parked:
             self._record(Role.human if owner else Role.outside, "parked", issue=n,

@@ -372,7 +372,8 @@ class Parked(Event):
 
 @event({H, Role.outside}, O)
 class Unparked(Event):
-    """The hold on a parked issue was lifted."""
+    """The hold on a parked issue was lifted. Agents that gave up on it may
+    take it again."""
     event: Literal["unparked"]
     issue: Number
 
@@ -436,7 +437,8 @@ class QuotaBack(Event):
 
 @event({AGENT}, D)
 class Taken(Event):
-    """An idle agent with quota takes a ready issue. This append is the lock."""
+    """An idle agent with quota takes a ready issue it has not given up on.
+    This append is the lock."""
     event: Literal["taken"]
     issue: Number
 

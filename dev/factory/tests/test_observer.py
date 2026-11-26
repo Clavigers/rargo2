@@ -33,8 +33,9 @@ class FakeGitHub:
         self.merge_error: str | None = None
 
     def issue(self, n, labels=("enhancement",), body="", by=OWNER, state="open",
-              closed_by=None, state_reason=None):
+              closed_by=None, state_reason=None, assignees=()):
         self.issue_list[n] = {"number": n, "labels": [{"name": x} for x in labels],
+                              "assignees": [{"login": a} for a in assignees],
                               "body": body, "user": {"login": by}, "state": state,
                               "closed_by": {"login": closed_by} if closed_by else None,
                               "state_reason": state_reason}
@@ -277,3 +278,11 @@ def test_since_is_utc_whatever_the_machine_zone(monkeypatch):
     cet = timezone(timedelta(hours=1))
     gh.issues(datetime(2026, 11, 26, 7, 30, tzinfo=cet))
     assert "since=2026-11-26T06:30:00Z" in asked[0]
+
+
+def test_assigned_to_the_owner_is_the_owners(rig):
+    rig.gh.issue(1, assignees=[OWNER])
+    rig.gh.issue(2, assignees=["someone"])
+    rig.obs.step()
+    w = rig.led.world
+    assert w.state(M.ISSUE, 1) == IssueS.parked and w.state(M.ISSUE, 2) == IssueS.ready

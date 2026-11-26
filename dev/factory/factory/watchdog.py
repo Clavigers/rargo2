@@ -102,7 +102,7 @@ class Watchdog:
         w = self.ledger.world
         for agent in w.config.names():
             crashes, not_before = self.backoff.get(agent, (0, now))
-            work = agent in w.holding or w.ready_queue()  # else a session would only end
+            work = agent in w.holding or w.ready_queue(agent)  # else a session would only end
             if (work and w.is_(M.AGENT, agent, AgentS.off) and w.is_(M.QUOTA, agent, "ok")
                     and agent not in self.sessions and now >= not_before):
                 self._start(agent)

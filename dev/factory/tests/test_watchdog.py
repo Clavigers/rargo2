@@ -199,3 +199,16 @@ def test_no_work_no_session(rig):
     led.submit("human", json.dumps({"event": "filed", "issue": 2, "kind": "enhancement"}))
     wd.step()
     assert A in wd.sessions
+
+
+def test_no_session_for_work_the_agent_gave_up_on(rig):
+    rig.monkeypatch.setenv("FAKE_MODE", "sleep")
+    led = Ledger(rig.log, rig.clock)
+    led.submit("watchdog", json.dumps({"event": "session_started", "agent": A}))
+    led.submit(A, json.dumps({"event": "taken", "issue": 1}))
+    led.submit(A, json.dumps({"event": "returned", "issue": 1, "reason": "gave_up"}))
+    led.submit("watchdog", json.dumps({"event": "session_ended", "agent": A,
+                                       "reason": "finished"}))
+    wd = rig.watchdog()
+    wd.step()
+    assert A not in wd.sessions
