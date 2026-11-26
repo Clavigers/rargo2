@@ -43,3 +43,17 @@ pub mod tokens;
 pub mod trace;
 pub mod trees_state;
 pub mod view;
+
+#[cfg(test)]
+mod test_support {
+    use std::fmt::{Debug, Write};
+
+    #[derive(Default)]
+    pub struct Transcript(pub String);
+
+    impl Transcript {
+        pub fn record(&mut self, event: &str, effect: impl Debug) {
+            writeln!(self.0, "{event}: {effect:?}").unwrap();
+        }
+    }
+}

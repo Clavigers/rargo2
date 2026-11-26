@@ -902,6 +902,7 @@ dependencies = [
  "rargo",
  "rargo-core",
  "rargo-machine",
+ "rargo-plan",
  "rargo-proto",
 ]
 

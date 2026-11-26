@@ -48,7 +48,6 @@ hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default ran
 hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 self-check	crates/rargo-core/src/action_table.rs	3	3 step methods of ActionTable assert nothing
-self-check	crates/rargo-core/src/build/nextest_run.rs	1	1 step method of NextestRun asserts nothing
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
 self-check	crates/rargo-core/src/conn_state.rs	6	6 step methods of ConnectionState assert nothing
 self-check	crates/rargo-core/src/db_writer.rs	5	5 step methods of DbWriter assert nothing

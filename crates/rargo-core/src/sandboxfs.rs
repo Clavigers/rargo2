@@ -1580,6 +1580,8 @@ impl Filesystem for SandboxFs {
 
 #[cfg(test)]
 mod model_tests {
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2183,7 +2185,14 @@ mod model_tests {
         st.trace.fail_hash(index);
         st.invariants();
         let (obs, tainted) = st.trace.outcome();
-        assert!(tainted);
-        assert!(matches!(obs.as_slice(), [(path, Obs::File { hash, exec: false })] if path.as_ref() == b"/f" && *hash == crate::hash::Hash::ZERO));
+        let mut outcomes = Transcript::default();
+        outcomes.record("tainted", tainted);
+        for (path, observation) in obs {
+            outcomes.record(&String::from_utf8_lossy(path.as_ref()), observation);
+        }
+        expect![[r#"
+            tainted: true
+            /f: File { hash: 0000000000000000, exec: false }
+        "#]].assert_eq(&outcomes.0);
     }
 }

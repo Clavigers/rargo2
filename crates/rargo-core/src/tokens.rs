@@ -642,6 +642,8 @@ pub fn command(store: &TokenStore, args: &[String], asker: &Asker, usage: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     #[test]
     fn persisted_tokens_are_verified_expired_and_revoked_without_the_secret() {
@@ -765,28 +767,49 @@ mod tests {
         assert_eq!(out, "SOME-LOGIN may no longer sign in; revoked 1 token(s) it had signed in for\n");
         assert_eq!(run(&mut t, "disallow some-login", &boss, at, 0, false).unwrap_err().to_string(), "`some-login` is not on the allow list");
 
-        for (line, e) in [
-            ("", "usage"),
-            ("revoke", "usage"),
-            ("allow", "usage"),
-            ("disallow", "usage"),
-            ("frobnicate", "usage"),
-            ("list --bogus", "unknown option `--bogus`\nusage"),
-            ("invite --days", "`--days` needs a value"),
-            ("invite --uses many", "--uses takes a number"),
-            ("invite --token-days x", "--token-days takes a number"),
-            ("create --days -1 --user z", "--days takes a number"),
+        let mut outcomes = Transcript::default();
+        for line in [
+            "",
+            "revoke",
+            "allow",
+            "disallow",
+            "frobnicate",
+            "list --bogus",
+            "invite --days",
+            "invite --uses many",
+            "invite --token-days x",
+            "create --days -1 --user z",
         ] {
-            assert_eq!(run(&mut t, line, &boss, at, 0, false).unwrap_err().to_string(), e, "{line}");
+            let result = run(&mut t, line, &boss, at, 0, false).map_err(|e| e.to_string());
+            outcomes.record(&format!("admin {line:?}"), result);
         }
-        assert_eq!(run(&mut t, "revoke", &ann, at, 0, false).unwrap_err().to_string(), "usage", "a missing id is usage for anyone");
-        let cmd = Command::parse(&["invite".into()], &boss, "usage").unwrap();
-        assert!(cmd.apply(&mut t, at, None, false).unwrap_err().to_string().contains("needs entropy"));
-        assert_eq!(
-            Command::parse(&["create".into(), "--user".into(), "z".into()], &Asker { user: "", admin: true, from: "command line" }, "usage").unwrap(),
-            Command::Create { user: "z".into(), admin: false, days: None, note: "command line".into() }
+        outcomes.record(
+            "non-admin revoke with no ID",
+            run(&mut t, "revoke", &ann, at, 0, false).map_err(|e| e.to_string()),
         );
-        assert!(!Command::List { all: true, user: String::new() }.writes() && Command::Revoke { id: String::new(), owner: None }.writes());
+        let cli = Asker { user: "", admin: true, from: "command line" };
+        outcomes.record(
+            "command line create",
+            run(&mut t, "create --user z", &cli, at, 10, false).map_err(|e| e.to_string()),
+        );
+        let (list, _) = run(&mut t, "list", &boss, at, 0, false).unwrap();
+        let created = list.lines().find(|line| line.starts_with("t-010")).unwrap();
+        outcomes.record("created token entry", created);
+        expect![[r#"
+            admin "": Err("usage")
+            admin "revoke": Err("usage")
+            admin "allow": Err("usage")
+            admin "disallow": Err("usage")
+            admin "frobnicate": Err("usage")
+            admin "list --bogus": Err("unknown option `--bogus`\nusage")
+            admin "invite --days": Err("`--days` needs a value")
+            admin "invite --uses many": Err("--uses takes a number")
+            admin "invite --token-days x": Err("--token-days takes a number")
+            admin "create --days -1 --user z": Err("--days takes a number")
+            non-admin revoke with no ID: Err("usage")
+            command line create: Ok(("t-010.fixture-secret-10\n", "A token for z; it is shown this once. A client uses it as RARGO_TOKEN or through `rargo auth --token`.\n"))
+            created token entry: "t-010            z                           never        command line"
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]

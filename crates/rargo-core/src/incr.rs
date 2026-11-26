@@ -381,6 +381,8 @@ pub fn apply_changes(dir: &[u8], seed: Option<&Manifest>, changes: &[(Vec<u8>, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     use crate::db::MemTables;
     use crate::io::sim;
@@ -410,6 +412,7 @@ mod tests {
     #[test]
     fn seed_preference_order() {
         sim::test(|| {
+            let mut outcomes = Transcript::default();
             let (db, s) = store();
             let incr = IncrStore::new(db.clone(), s.clone(), 1);
             let k = Hash::of(b"crate");
@@ -426,36 +429,45 @@ mod tests {
             };
             let s1 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
             incr.invariants();
-            assert_eq!((content(&s1.manifest).as_str(), s1.kind), ("main state", SeedKind::Ancestor));
-            assert_eq!(s1.blobs.len(), 1);
+            outcomes.record("nearest ancestor seed", (content(&s1.manifest).as_str(), s1.kind));
+            outcomes.record("seed blob count", s1.blobs.len());
             let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
             incr.invariants();
-            assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
+            outcomes.record("recent fallback seed", (content(&s2.manifest).as_str(), s2.kind));
             incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]), 100);
             incr.invariants();
             let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
             let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
             incr.invariants();
-            assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
+            outcomes.record("same commit seed", (content(&s3.manifest).as_str(), s3.kind));
             incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]), 100);
             incr.invariants();
             let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
             let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
             incr.invariants();
-            assert_eq!((content(&s5.manifest).as_str(), s5.kind), ("one commit back", SeedKind::Ancestor));
+            outcomes.record("closer ancestor seed", (content(&s5.manifest).as_str(), s5.kind));
             incr.forget(&k, s5.id);
             incr.invariants();
             incr.discard(&k, s3.id);
             incr.invariants();
             let s4 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
             incr.invariants();
-            assert_eq!(content(&s4.manifest), "main state");
+            outcomes.record("content", content(&s4.manifest));
+            expect![[r#"
+                nearest ancestor seed: ("main state", Ancestor)
+                seed blob count: 1
+                recent fallback seed: ("side state", Other)
+                same commit seed: ("own state", SameWorktree)
+                closer ancestor seed: ("one commit back", Ancestor)
+                content: "main state"
+            "#]].assert_eq(&outcomes.0);
         });
     }
 
     #[test]
     fn evicted_state_is_skipped() {
         sim::test(|| {
+            let mut outcomes = Transcript::default();
             let (db, s) = store();
             let incr = IncrStore::new(db.clone(), s.clone(), 1);
             let k = Hash::of(b"crate");
@@ -466,13 +478,17 @@ mod tests {
                 s.remove(hash);
             }
             assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-            assert_eq!(incr.state_count(&k), 0);
+            outcomes.record("state count", incr.state_count(&k));
+            expect![[r#"
+                state count: 0
+            "#]].assert_eq(&outcomes.0);
         });
     }
 
     #[test]
     fn state_with_files_on_a_worker_is_usable_while_the_worker_holds_them() {
         sim::test(|| {
+            let mut outcomes = Transcript::default();
             let (db, s) = store();
             let incr = IncrStore::new(db.clone(), s.clone(), 1);
             let k = Hash::of(b"crate");
@@ -487,15 +503,20 @@ mod tests {
             let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
             incr.invariants();
             assert!(seed.blobs.contains(&(away, 33)));
-            assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
+            outcomes.record("blobs absent locally", seed.blobs.iter().filter(|(h, _)| !s.has(h)).count());
             worker.remove(&away);
             assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-            assert_eq!(incr.state_count(&k), 0);
+            outcomes.record("state count", incr.state_count(&k));
+            expect![[r#"
+                blobs absent locally: 1
+                state count: 0
+            "#]].assert_eq(&outcomes.0);
         });
     }
 
     #[test]
     fn changes_apply_over_seed() {
+        let mut outcomes = Transcript::default();
         let f = |n: u8| MEntry::File { hash: Hash([n; 32]), exec: false, size: 1 };
         let seed = Manifest {
             entries: vec![
@@ -512,7 +533,10 @@ mod tests {
         ];
         let m = apply_changes(b"/i", Some(&seed), &changes);
         let paths: Vec<&[u8]> = m.entries.iter().map(|(p, _)| p.as_slice()).collect();
-        assert_eq!(paths, vec![&b"/i/c/s-new"[..], b"/i/c/s-new/a.o", b"/i/c/s-new/dep-graph.bin"]);
+        outcomes.record("paths", paths);
+        expect![[r#"
+            paths: [[47, 105, 47, 99, 47, 115, 45, 110, 101, 119], [47, 105, 47, 99, 47, 115, 45, 110, 101, 119, 47, 97, 46, 111], [47, 105, 47, 99, 47, 115, 45, 110, 101, 119, 47, 100, 101, 112, 45, 103, 114, 97, 112, 104, 46, 98, 105, 110]]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
