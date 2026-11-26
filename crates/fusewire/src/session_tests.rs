@@ -515,6 +515,25 @@ fn a_guard_that_cannot_start_leaves_the_mount_unguarded() {
 }
 
 #[test]
+fn ending_the_connection_leaves_the_guard_for_unmount() {
+    let fake = Fake::new();
+    let session = mount(&fake, "/mnt/a", true);
+    fake.took_log();
+
+    session.ended();
+    session.ended();
+    assert!(!session.shown());
+    assert!(session.auto_unmount_active());
+    assert!(fake.took_log().is_empty());
+
+    session.unmount();
+    session.ended();
+    assert!(!session.shown());
+    assert!(!session.auto_unmount_active());
+    assert_eq!(fake.took_log(), ["stand down 1", "detach \"/mnt/a\""]);
+}
+
+#[test]
 fn unmounting_stands_the_guard_down() {
     let fake = Fake::new();
     let first = mount(&fake, "/mnt/a", true);
