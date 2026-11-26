@@ -45,11 +45,19 @@ pub enum Bug {
     EvictClaimed,
     StaleKnowledge,
     DeafToSilence,
+    TrustAfterCrash,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 6] =
-        [Bug::EvictPinned, Bug::StaleDelivery, Bug::NeverAnswer, Bug::EvictClaimed, Bug::StaleKnowledge, Bug::DeafToSilence];
+    pub const ALL: [Bug; 7] = [
+        Bug::EvictPinned,
+        Bug::StaleDelivery,
+        Bug::NeverAnswer,
+        Bug::EvictClaimed,
+        Bug::StaleKnowledge,
+        Bug::DeafToSilence,
+        Bug::TrustAfterCrash,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -59,6 +67,7 @@ impl Bug {
             Bug::EvictClaimed => "evict-claimed",
             Bug::StaleKnowledge => "stale-knowledge",
             Bug::DeafToSilence => "deaf-to-silence",
+            Bug::TrustAfterCrash => "trust-after-crash",
         }
     }
 
@@ -202,6 +211,7 @@ pub struct Report {
     pub wants: u64,
     pub client_cuts: u64,
     pub silences: u64,
+    pub crashes: u64,
     pub lost: u64,
     pub duplicated: u64,
     pub reordered: u64,
@@ -218,6 +228,7 @@ pub struct Config {
     pub cut_per_mille: u64,
     pub max_latency_ms: u64,
     pub client_cuts: u64,
+    pub crashes: u64,
     pub net: Net,
 }
 
@@ -261,6 +272,7 @@ impl Config {
             cut_per_mille: rng.range(0, 30),
             max_latency_ms: rng.range(1, 60),
             client_cuts: rng.range(0, 3),
+            crashes: rng.range(0, 2),
             net,
         }
     }
@@ -354,6 +366,8 @@ enum Ev {
     Sync { client: u64 },
     ClientCut { client: u64 },
     Watch { client: u64 },
+    ClientCrash { client: u64 },
+    Restart { client: u64 },
 }
 
 struct WorkerNode {
@@ -423,6 +437,8 @@ struct Client {
     synced_round: u64,
     watch: Watch,
     up_since: u64,
+    dead: bool,
+    saved: Vec<u8>,
 }
 
 pub struct World {
@@ -503,6 +519,7 @@ impl World {
                 wants: 0,
                 client_cuts: 0,
                 silences: 0,
+                crashes: 0,
                 lost: 0,
                 duplicated: 0,
                 reordered: 0,
@@ -523,9 +540,6 @@ impl World {
         }
         for id in 1..=w.cfg.clients {
             let versions = vec![0; w.cfg.sources];
-            let mut daemon = DaemonState::new(KnownDigests::default());
-            daemon.added(1);
-            daemon.watched(1, true);
             w.clients.insert(
                 id,
                 Client {
@@ -536,7 +550,7 @@ impl World {
                     requested: BTreeSet::new(),
                     finished: false,
                     test: None,
-                    daemon,
+                    daemon: new_daemon(KnownDigests::default()),
                     up: false,
                     epoch: 0,
                     cut_until: 0,
@@ -547,6 +561,8 @@ impl World {
                     synced_round: 0,
                     watch: Watch::new(Duration::ZERO, link_watch::SILENT_AFTER),
                     up_since: 0,
+                    dead: false,
+                    saved: Vec::new(),
                 },
             );
             let at = w.rng.range(0, 500);
@@ -564,6 +580,11 @@ impl World {
                 let client = w.rng.range(1, w.cfg.clients);
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
                 w.schedule(at, Ev::ClientCut { client });
+            }
+            for _ in 0..w.cfg.crashes {
+                let client = w.rng.range(1, w.cfg.clients);
+                let at = w.rng.range(0, w.cfg.fault_end_ms);
+                w.schedule(at, Ev::ClientCrash { client });
             }
             if w.rng.chance(300) {
                 let start = w.rng.range(0, w.cfg.fault_end_ms);
@@ -778,6 +799,11 @@ impl World {
                 Ok(())
             }
             Ev::Watch { client } => self.watch(client),
+            Ev::ClientCrash { client } => {
+                self.client_crash(client);
+                Ok(())
+            }
+            Ev::Restart { client } => self.restart(client),
         }
     }
 
@@ -822,6 +848,9 @@ impl World {
             _ => None,
         };
         if let Node::Client(c) = to {
+            if self.clients[&c].dead {
+                return Ok(());
+            }
             let now = Duration::from_millis(self.now);
             self.clients.get_mut(&c).expect("known").watch.heard(now);
         }
@@ -1334,7 +1363,7 @@ impl World {
     fn sync(&mut self, client: u64) -> Step {
         let now = self.now;
         let c = self.clients.get_mut(&client).expect("known");
-        if c.finished {
+        if c.finished || c.dead {
             return Ok(());
         }
         match c.daemon.link(c.up, Need::Must) {
@@ -1397,6 +1426,48 @@ impl World {
         }
     }
 
+    /// The client's daemon dies: its link closes, and everything it held in
+    /// memory is gone. Only what it last saved of its knowledge survives.
+    fn client_crash(&mut self, client: u64) {
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.finished || c.dead {
+            return;
+        }
+        c.dead = true;
+        self.report.crashes += 1;
+        if self.bug != Some(Bug::TrustAfterCrash) {
+            c.up = false;
+        }
+        self.drop_session(client);
+        let at = self.rng.range(10, 1_500);
+        self.schedule(at, Ev::Restart { client });
+    }
+
+    /// The client side finds its daemon gone, starts a new one and runs the
+    /// command it was running again from the start. The new daemon rebuilds
+    /// what it knows of the server: it reads the knowledge last saved, which
+    /// the server may have evicted since, and makes a new link and session.
+    fn restart(&mut self, client: u64) -> Step {
+        let lost_save = self.rng.chance(300);
+        let c = self.clients.get_mut(&client).expect("known");
+        c.dead = false;
+        if self.bug != Some(Bug::TrustAfterCrash) {
+            let held = if lost_save { None } else { KnownDigests::decode(&c.saved) };
+            c.daemon = new_daemon(held.unwrap_or_default());
+            c.cache.clear();
+        }
+        if c.outputs.len() == self.project.actions.len() {
+            // It died between commands: the next one starts the new daemon's link.
+            return Ok(());
+        }
+        c.outputs.clear();
+        c.requested.clear();
+        c.pending.clear();
+        c.parts.clear();
+        c.synced_round = 0;
+        self.sync(client)
+    }
+
     fn watch(&mut self, client: u64) -> Step {
         let now = self.now;
         let max_latency = self.cfg.max_latency_ms;
@@ -1407,7 +1478,7 @@ impl World {
         }
         self.schedule_housekeeping(WATCH_STEP_MS, Ev::Watch { client });
         let c = self.clients.get_mut(&client).expect("known");
-        if !c.up {
+        if !c.up || c.dead {
             return Ok(());
         }
         match c.watch.tick(Duration::from_millis(now)) {
@@ -1468,6 +1539,7 @@ impl World {
                 }
                 let contents = c.contents.clone();
                 c.daemon.synced(Some(1), root, contents.iter());
+                c.save();
                 c.synced_round = round;
                 self.request_ready(client);
                 return Ok(());
@@ -1482,6 +1554,7 @@ impl World {
                     return Ok(());
                 }
                 c.daemon.missing(want.iter());
+                c.save();
                 let upload: Vec<Blob> = want.iter().filter_map(|d| c.cache.get(d).map(|b| Blob::pack(*d, b))).collect();
                 if upload.len() != want.len() {
                     return Err(Kind::StateMachine(format!("the server wants content client {client} never had")));
@@ -1532,7 +1605,7 @@ impl World {
 
     fn client_done(&mut self, client: u64, round: u64, action: usize, output: Vec<u8>) -> Step {
         let c = &self.clients[&client];
-        if round != c.round || c.outputs.contains_key(&action) {
+        if round != c.round || c.outputs.contains_key(&action) || !c.requested.contains(&action) {
             return Ok(());
         }
         let inputs = self.inputs_of(c, action);
@@ -1594,6 +1667,23 @@ impl World {
     }
 }
 
+impl Client {
+    /// The daemon writes its knowledge of the server to disk, as the real one
+    /// does, so a daemon started after a crash reads it back.
+    fn save(&mut self) {
+        if let Some(bytes) = self.daemon.held.take_changes() {
+            self.saved = bytes;
+        }
+    }
+}
+
+fn new_daemon(held: KnownDigests) -> DaemonState {
+    let mut daemon = DaemonState::new(held);
+    daemon.added(1);
+    daemon.watched(1, true);
+    daemon
+}
+
 fn label(ev: &Ev) -> String {
     match ev {
         Ev::Deliver { from, to, epoch, n, msg } => {
@@ -1622,6 +1712,8 @@ fn label(ev: &Ev) -> String {
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
         Ev::Watch { client } => format!("watch {client};"),
+        Ev::ClientCrash { client } => format!("crash {client};"),
+        Ev::Restart { client } => format!("restart {client};"),
     }
 }
 
