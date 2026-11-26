@@ -5,8 +5,8 @@ use rargo::link_watch::{self, Tick, Watch};
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const WINDOW: usize = 32 << 20;
@@ -149,32 +149,32 @@ enum DeadWait {
 }
 
 pub struct Mux {
-    link: Arc<Link>,
-    out: Mutex<Out>,
-    window: Arc<io::Semaphore>,
-    state: Mutex<WireState>,
+    link: Rc<Link>,
+    out: RefCell<Out>,
+    window: io::Semaphore,
+    state: RefCell<WireState>,
     pub gone: io::Notify,
     started: Instant,
-    watch: Mutex<Watch>,
-    pub bytes_out: AtomicU64,
-    pub bytes_in: AtomicU64,
+    watch: RefCell<Watch>,
+    pub bytes_out: Cell<u64>,
+    pub bytes_in: Cell<u64>,
 }
 
 impl Mux {
-    pub fn new(link: Link) -> Arc<Mux> {
-        let link = Arc::new(link);
+    pub fn new(link: Link) -> Rc<Mux> {
+        let link = Rc::new(link);
         let (tx, mut rx) = unbounded_channel::<(Vec<u8>, usize)>();
         let (urgent, mut urgent_rx) = unbounded_channel::<Vec<u8>>();
-        let mux = Arc::new(Mux {
+        let mux = Rc::new(Mux {
             link: link.clone(),
-            out: Mutex::new(Out { seq: 0, tx, urgent }),
-            window: Arc::new(io::Semaphore::new(WINDOW as u32)),
-            state: Mutex::new(MuxState::new()),
+            out: RefCell::new(Out { seq: 0, tx, urgent }),
+            window: io::Semaphore::new(WINDOW as u32),
+            state: RefCell::new(MuxState::new()),
             gone: io::Notify::new(),
             started: io::now(),
-            watch: Mutex::new(Watch::new(Duration::ZERO, dead_limit(link.kind()))),
-            bytes_out: AtomicU64::new(0),
-            bytes_in: AtomicU64::new(0),
+            watch: RefCell::new(Watch::new(Duration::ZERO, dead_limit(link.kind()))),
+            bytes_out: Cell::new(0),
+            bytes_in: Cell::new(0),
         });
         let m = mux.clone();
         io::spawn(move || {
@@ -188,7 +188,7 @@ impl Mux {
                     Outgoing::Bulk(Some(frame)) => frame,
                     Outgoing::Urgent(None) | Outgoing::Bulk(None) => break,
                 };
-                m.bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                m.bytes_out.set(m.bytes_out.get() + frame.len() as u64);
                 let sent = m.link.send(&frame);
                 if bulk > 0 {
                     m.window.add_permits(bulk as u32);
@@ -202,11 +202,11 @@ impl Mux {
         let m = mux.clone();
         io::spawn(move || {
             while let Some(raw) = m.link.recv() {
-                m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
+                m.bytes_in.set(m.bytes_in.get() + raw.len() as u64);
                 let now = io::now().saturating_duration_since(m.started);
-                m.watch.lock().unwrap().heard(now);
+                m.watch.borrow_mut().heard(now);
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
-                let ordered = m.state.lock().unwrap().incoming(frame);
+                let ordered = m.state.borrow_mut().incoming(frame);
                 for (stream, msg) in ordered {
                     let msg = match msg {
                         ServerMsg::Packed(z) => match rargo_proto::unpack(&z).and_then(|b| rargo_proto::decode(&b)) {
@@ -215,7 +215,7 @@ impl Mux {
                         },
                         m => m,
                     };
-                    let action = m.state.lock().unwrap().route(stream, msg);
+                    let action = m.state.borrow_mut().route(stream, msg);
                     match action {
                         Route::Stream(dest, msg) => { let _ = dest.send(msg); }
                         Route::Missing(dest, missing) => { let _ = dest.send(missing); }
@@ -233,10 +233,11 @@ impl Mux {
                     break;
                 }
                 let now = io::now().saturating_duration_since(m.started);
+                let idle = (m.link.kind() == "udp").then(|| m.link.idle());
                 let tick = {
-                    let mut watch = m.watch.lock().unwrap();
-                    if m.link.kind() == "udp" {
-                        watch.heard(now.saturating_sub(m.link.idle()));
+                    let mut watch = m.watch.borrow_mut();
+                    if let Some(idle) = idle {
+                        watch.heard(now.saturating_sub(idle));
                     }
                     watch.tick(now)
                 };
@@ -244,7 +245,8 @@ impl Mux {
                     Tick::Wait => {}
                     Tick::Ping(n) => {
                         let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
-                        let _ = m.out.lock().unwrap().urgent.send(ping);
+                        let urgent = m.out.borrow().urgent.clone();
+                        let _ = urgent.send(ping);
                     }
                     Tick::Silent(_) => {
                         m.die();
@@ -262,11 +264,12 @@ impl Mux {
 
     /// How long the server had been silent when this link gave up on it, if that is why it closed.
     pub fn silent(&self) -> Option<Duration> {
-        self.watch.lock().unwrap().silent()
+        self.watch.borrow().silent()
     }
 
     pub fn is_dead(&self) -> bool {
-        self.state.lock().unwrap().dead || self.link.is_closed()
+        let dead = self.state.borrow().dead;
+        dead || self.link.is_closed()
     }
 
     /// Resolves when the link is closed. A missed wake is caught on the next check.
@@ -286,7 +289,7 @@ impl Mux {
     }
 
     pub fn die(&self) {
-        let drained = self.state.lock().unwrap().fail();
+        let drained = self.state.borrow_mut().fail();
         let Some(endpoints) = drained else { return };
         self.link.close();
         drop(endpoints);
@@ -301,7 +304,7 @@ impl Mux {
                 encoded_msg = Some(ClientMsg::Packed(z));
             }
         }
-        let mut out = self.out.lock().unwrap();
+        let mut out = self.out.borrow_mut();
         let frame = match &encoded_msg {
             Some(packed) => rargo_proto::encode(&Frame { stream, seq: out.seq, msg: packed }),
             None => rargo_proto::encode(&Frame { stream, seq: out.seq, msg }),
@@ -326,25 +329,25 @@ impl Mux {
 
     pub fn open(&self) -> (u32, UnboundedSender<ServerMsg>, UnboundedReceiver<ServerMsg>) {
         let (tx, rx) = unbounded_channel();
-        let (id, rejected) = self.state.lock().unwrap().open(tx.clone());
+        let (id, rejected) = self.state.borrow_mut().open(tx.clone());
         drop(rejected);
         (id, tx, rx)
     }
 
     pub fn cancel(&self, stream: u32) {
-        let closed = self.state.lock().unwrap().close(stream);
+        let closed = self.state.borrow_mut().close(stream);
         if closed.is_some() {
             self.post(stream, &ClientMsg::Cancel);
         }
     }
 
     pub fn next_id(&self) -> u64 {
-        self.state.lock().unwrap().next_id()
+        self.state.borrow_mut().next_id()
     }
 
     pub fn expect_missing(&self, id: u64) -> io::oneshot::Receiver<Missing> {
         let (tx, rx) = io::oneshot::channel();
-        let rejected = self.state.lock().unwrap().expect_missing(id, tx);
+        let rejected = self.state.borrow_mut().expect_missing(id, tx);
         drop(rejected);
         rx
     }
@@ -354,7 +357,7 @@ impl Mux {
     }
 
     pub fn ask(&self, to: &UnboundedSender<ServerMsg>, question: impl FnOnce(u64) -> ClientMsg) -> u64 {
-        let (stream, rejected) = self.state.lock().unwrap().open(to.clone());
+        let (stream, rejected) = self.state.borrow_mut().open(to.clone());
         drop(rejected);
         let id = stream as u64;
         self.post(stream, &question(id));
