@@ -42,6 +42,10 @@ class GitHub:
     def pull(self, n: int) -> dict:
         return self._api(f"pulls/{n}")
 
+    def statuses(self, sha: str) -> list[dict]:
+        """Commit statuses on sha, newest first."""
+        return self._api(f"commits/{sha}/statuses?per_page=100")
+
     def check_runs(self, sha: str) -> list[dict]:
         return self._api(f"commits/{sha}/check-runs?per_page=100")["check_runs"]
 

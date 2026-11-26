@@ -56,7 +56,28 @@ def placeholder(gh: GitHub, pr: int, sha: str):
     return m.ReviewResult.approved, None
 
 
-REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder}
+def review_mux(gh: GitHub, pr: int, sha: str):
+    """review_mux's merged verdict: its commit status on exactly this commit.
+    failure carries the link to its findings. error (no bot could review)
+    is no verdict: the push waits, and the owner is told once."""
+    for s in gh.statuses(sha):  # newest first
+        if s["context"] != "review_mux":
+            continue
+        if s["state"] == "success":
+            return m.ReviewResult.approved, None
+        if s["state"] == "failure":
+            return m.ReviewResult.changes, f"{s['description']}: {s.get('target_url') or ''}".strip()[:500]
+        if s["state"] == "error":
+            raise ReviewerStuck(f"review_mux could not review {sha[:9]}: {s['description']}")
+        return None  # pending
+    return None
+
+
+class ReviewerStuck(Exception):
+    pass
+
+
+REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder, "review-mux": review_mux}
 
 
 class Observer:
@@ -107,7 +128,16 @@ class Observer:
                 self._record(Role.ci, "ci_done", pr=pr, push=p.pushes, result=result)
         for r in p.reviewers:
             if self.ledger.world.is_(M.REVIEW, f"{key}/{r}", ReviewS.pending):
-                verdict = REVIEWERS[r](self.gh, pr, p.sha) if r in REVIEWERS else None
+                try:
+                    verdict = REVIEWERS[r](self.gh, pr, p.sha) if r in REVIEWERS else None
+                except ReviewerStuck as err:
+                    verdict = None
+                    if ("stuck", pr, p.sha) not in self.noted:
+                        notify(f"pr {pr}: {err}", "rargo factory: review stuck")
+                    self._once(("stuck", pr, p.sha), str(err))
+                except GitHubError as err:
+                    verdict = None
+                    self.say(f"pr {pr}: reviewer {r}: {err}")
                 if r not in REVIEWERS:
                     self._once(("reviewer", r), f"no reviewer called {r} is wired up")
                 if verdict:
