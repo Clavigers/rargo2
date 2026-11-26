@@ -1029,6 +1029,8 @@ pub fn list_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use crate::db::MemTables;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1226,21 +1228,27 @@ mod tests {
         fs.put("/s/d/sub/x", Ent::File(b"x".to_vec(), false));
         fs.broken.insert(PathBuf::from("/s/d/sub"));
         let mut rng = Rng(7);
-        let f = walk_shuffled(&fs, Path::new("/s/f"), &mut rng).unwrap();
-        assert!(matches!(f.kind, StoredKind::File { size: 9, exec: true, .. }) && (f.files, f.bytes) == (1, 9));
-        let l = walk_shuffled(&fs, Path::new("/s/l"), &mut rng).unwrap();
-        assert!(matches!(&l.kind, StoredKind::Link(t) if t == b"f") && (l.files, l.bytes) == (0, 0));
-        let p = walk_shuffled(&fs, Path::new("/s/p"), &mut rng).err().unwrap();
-        assert_eq!(p.to_string(), "/s/p is not a file, directory or symlink");
-        let d = walk_shuffled(&fs, Path::new("/s/d"), &mut rng).err().unwrap();
-        assert_eq!(d.to_string(), "/s/d/sub: permission denied");
-        let gone = walk_shuffled(&fs, Path::new("/s/none"), &mut rng).err().unwrap();
-        assert_eq!(gone.to_string(), "/s/none: /s/none is missing");
+        let mut outcomes = Transcript::default();
+        for path in ["/s/f", "/s/l", "/s/p", "/s/d", "/s/none"] {
+            match walk_shuffled(&fs, Path::new(path), &mut rng) {
+                Ok(fresh) => outcomes.record(path, (fresh.kind, fresh.files, fresh.bytes)),
+                Err(err) => outcomes.record(path, err.to_string()),
+            }
+        }
         let mut walk = Walk::new(Path::new("/s/f"));
         walk.saw(Ask::Stat("/s/f".into()), Ok(Answer::Hash(Hash::ZERO, 0)));
         walk.invariants();
-        assert!(walk.finish().is_err(), "an answer of the wrong shape fails the walk");
-        assert!(Walk::new(Path::new("/s/f")).finish().is_err(), "an unfinished walk has no manifest");
+        outcomes.record("wrong answer shape", walk.finish().err().expect("the walk failed").to_string());
+        outcomes.record("unfinished walk", Walk::new(Path::new("/s/f")).finish().err().expect("the walk failed").to_string());
+        expect![[r#"
+            /s/f: (File { hash: a42be855d08d82d7, size: 9, exec: true }, 1, 9)
+            /s/l: (Link([102]), 0, 0)
+            /s/p: "/s/p is not a file, directory or symlink"
+            /s/d: "/s/d/sub: permission denied"
+            /s/none: "/s/none: /s/none is missing"
+            wrong answer shape: "/s/f: Hash(0000000000000000, 0) does not answer Stat(\"/s/f\")"
+            unfinished walk: "/s/f is not walked yet"
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]

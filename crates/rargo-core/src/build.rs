@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 mod nextest;
-mod pure;
+pub mod pure;
 mod request;
 pub mod nextest_run;
 
