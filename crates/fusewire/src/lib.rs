@@ -6,7 +6,6 @@ use abi::*;
 use std::ffi::{CStr, CString, OsString};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -456,16 +455,64 @@ fn mount_with_helper<K: Kernel>(kernel: &K, mountpoint: &Path, opts: &MountOptio
         .ok_or_else(|| std::io::Error::other("fusermount3 did not hand over the connection"))
 }
 
+enum LifecycleEvent {
+    GuardActive,
+    MayBeShown,
+    Ended,
+    Unmount,
+}
+
+enum LifecycleReply<G> {
+    Status(bool),
+    Ended,
+    Unmount { guard: Option<G> },
+    AlreadyUnmounted,
+}
+
+struct Lifecycle<G> {
+    connected: bool,
+    unmounted: bool,
+    guard: Option<G>,
+}
+
+impl<G> Lifecycle<G> {
+    fn new(guard: Option<G>) -> Self {
+        Self { connected: true, unmounted: false, guard }
+    }
+
+    fn step(&mut self, event: LifecycleEvent) -> LifecycleReply<G> {
+        let reply = match event {
+            LifecycleEvent::GuardActive => LifecycleReply::Status(self.guard.is_some()),
+            LifecycleEvent::MayBeShown => LifecycleReply::Status(self.connected && !self.unmounted),
+            LifecycleEvent::Ended => {
+                self.connected = false;
+                LifecycleReply::Ended
+            }
+            LifecycleEvent::Unmount if self.unmounted => LifecycleReply::AlreadyUnmounted,
+            LifecycleEvent::Unmount => {
+                self.unmounted = true;
+                LifecycleReply::Unmount { guard: self.guard.take() }
+            }
+        };
+        self.invariants();
+        reply
+    }
+}
+
+impl<G> StateMachine for Lifecycle<G> {
+    fn invariants(&self) {
+        assert!(!self.unmounted || self.guard.is_none(), "unmount takes ownership of the guard");
+    }
+}
+
 pub struct Session<K: Kernel = io::Real> {
     kernel: K,
     dev: K::Device,
     mountpoint: PathBuf,
     caps: Caps,
-    unmounted: AtomicBool,
     helper: bool,
-    guard: std::sync::Mutex<Option<K::Guard>>,
     mount_id: Option<u64>,
-    connected: AtomicBool,
+    lifecycle: io::LifecycleDriver<K::Guard>,
 }
 
 #[derive(Clone, Debug)]
@@ -631,11 +678,9 @@ impl<K: Kernel> Session<K> {
             dev,
             mountpoint: mountpoint.to_path_buf(),
             caps: Caps::default(),
-            unmounted: AtomicBool::new(false),
             helper,
-            guard: std::sync::Mutex::new(guard),
             mount_id,
-            connected: AtomicBool::new(true),
+            lifecycle: io::LifecycleDriver::new(Lifecycle::new(guard)),
         };
         if let Err(e) = sess.handshake(opts, uring) {
             sess.unmount();
@@ -698,11 +743,11 @@ impl<K: Kernel> Session<K> {
     }
 
     pub fn auto_unmount_active(&self) -> bool {
-        self.guard.lock().unwrap().is_some()
+        matches!(self.lifecycle.dispatch(LifecycleEvent::GuardActive), LifecycleReply::Status(true))
     }
 
     pub fn shown(&self) -> bool {
-        if self.unmounted.load(Ordering::SeqCst) || !self.connected.load(Ordering::SeqCst) {
+        if !matches!(self.lifecycle.dispatch(LifecycleEvent::MayBeShown), LifecycleReply::Status(true)) {
             return false;
         }
         let Ok(tgt) = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()) else { return false };
@@ -714,11 +759,9 @@ impl<K: Kernel> Session<K> {
     }
 
     pub fn unmount(&self) {
-        if self.unmounted.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let LifecycleReply::Unmount { guard } = self.lifecycle.dispatch(LifecycleEvent::Unmount) else { return };
         let tgt = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()).ok();
-        if let Some(guard) = self.guard.lock().unwrap().take() {
+        if let Some(guard) = guard {
             self.kernel.stand_down(guard);
         }
         let there = tgt.as_deref().and_then(|tgt| mount_id(&self.kernel, tgt));
@@ -808,7 +851,7 @@ impl<K: Kernel> Session<K> {
     }
 
     pub fn ended(&self) {
-        self.connected.store(false, Ordering::SeqCst);
+        self.lifecycle.dispatch(LifecycleEvent::Ended);
     }
 
     pub fn respond<F, W>(&self, handler: &mut RequestHandler, fs: &F, request: &[u8], mut write: W) -> bool
