@@ -130,7 +130,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             root: "/w".into(),
             cwd: std::path::Path::new("/w").join(&who.dir).to_string_lossy().into_owned(),
             cargo_home: "/c".into(),
-            env: Arc::new(ClientEnv::new(env.into_iter().collect(), Vec::new(), None)),
+            env: Arc::new(ClientEnv::new(env, Vec::new(), None)),
             uid,
             gid,
             prio: Priority::Background,
