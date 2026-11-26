@@ -502,8 +502,8 @@ fn main() {
     }
     let (cfg, args, vars, kind) = match cli::plan(&world, argv0.as_deref(), &raw) {
         cli::Plan::Cargo { release, banner } => {
-            if banner {
-                println!("{}", cli::BANNER);
+            if let Some(banner) = banner {
+                println!("{banner}");
             }
             if release {
                 world.handle_signals();
