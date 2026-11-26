@@ -100,6 +100,7 @@ class World:
     issues: dict[int, Issue] = field(default_factory=dict)
     prs: dict[int, Pr] = field(default_factory=dict)
     holding: dict[str, int] = field(default_factory=dict)
+    quota_seen: dict[str, tuple] = field(default_factory=dict)  # harness -> (when, windows)
     moved: dict[str, bool] = field(default_factory=dict)  # agent -> moved its work this session
     versions: dict[str, Version] = field(default_factory=dict)
     uses: dict[int, Use] = field(default_factory=dict)
@@ -587,6 +588,11 @@ def _(w: World, e: m.SessionEnded, a):
 @on(m.QuotaOut)
 def _(w: World, e: m.QuotaOut, a):
     w.enter(M.QUOTA, w.agent(e.agent), "out")
+
+
+@on(m.QuotaSeen)
+def _(w: World, e: m.QuotaSeen, a):
+    w.quota_seen[e.harness.value] = (w.t, e.windows)
 
 
 @on(m.QuotaBack)

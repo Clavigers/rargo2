@@ -213,7 +213,7 @@ class Hub:
             s = self.source
             out = snapshot(s.w, s.lines)
             if s is self.real:
-                out["usage"] = self.usage()
+                out["usage"] = out.get("usage") or self.usage()  # the log's readings first
                 out["watchdog"] = self.beat()
             out.update(source=s.kind, playing=self.playing, speed=self.speed[s.kind],
                        info=s.info(), error=getattr(self, "error", None),

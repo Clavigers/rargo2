@@ -114,3 +114,20 @@ def test_the_foreman_answers_a_question_and_tunes_the_factory():
     for change in ({"reviewers": ["other"]}, {"agents": [dict(more["agents"][0], count=5), more["agents"][1]]}):
         with pytest.raises(Illegal, match="the foreman"):
             g("foreman", "config_applied", config=more | {"version": 3} | change)
+
+
+def test_quota_readings_are_in_the_log(tmp_path):
+    import json
+    from factory import usage
+    from factory.ledger import Ledger
+    path = str(tmp_path / "log.jsonl")
+    Ledger(path).submit("human", json.dumps({"event": "config_applied", "config": RULES}))
+    reading = {"plans": {"codex": {"windows": [{"name": "Week", "used": 19.0, "resets": "2026-12-03T03:45:23Z"}]},
+                         "grok": {"windows": [], "error": "nothing read"}}}
+    usage.record(reading, path)
+    usage.record(reading, path)  # unchanged: not written again
+    reading["plans"]["codex"]["windows"][0]["used"] = 21.0
+    usage.record(reading, path)
+    rows = [json.loads(x) for x in open(path).read().splitlines()][1:]
+    assert [(r["event"], r["harness"], r["windows"][0]["used"]) for r in rows] == \
+        [("quota_seen", "codex", 19.0), ("quota_seen", "codex", 21.0)]

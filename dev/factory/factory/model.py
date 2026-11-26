@@ -460,6 +460,23 @@ class QuotaBack(Event):
     agent: AgentName
 
 
+class QuotaWindow(Strict):
+    """One limit of a plan, as the harness reports it."""
+    name: Annotated[str, StringConstraints(min_length=1, max_length=80)]  # "Current week", "5-hour window"
+    used: Annotated[float, Field(ge=0, le=100)]  # percent
+    resets: Time | None  # when it goes back to 0; None if the harness does not say
+
+
+@event({W}, O)
+class QuotaSeen(Event):
+    """What a harness says about its plan's quota: each limit's use and
+    reset. A reading, written when it differs from the last one; nothing in
+    the factory decides from it."""
+    event: Literal["quota_seen"]
+    harness: Harness
+    windows: Annotated[tuple[QuotaWindow, ...], Field(min_length=1)]
+
+
 @event({AGENT}, D)
 class Taken(Event):
     """An idle agent with quota takes a ready issue it has not given up on.

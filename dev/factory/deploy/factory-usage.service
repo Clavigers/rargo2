@@ -6,6 +6,7 @@ After=network-online.target
 WorkingDirectory=/root/factory
 Environment=HOME=/root
 Environment=PYTHONPATH=/root/factory/src
+Environment=FACTORY_LOG=/root/factory/log.jsonl
 Environment=PATH=/root/.local/bin:/root/.grok/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/root/factory/venv/bin/python -m factory usage /root/factory/state --every 600
 Restart=always

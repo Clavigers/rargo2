@@ -2,9 +2,10 @@
 
     python -m factory usage STATE [--every SECONDS]
 
-Writes STATE/usage.json: {"t": ..., "plans": {harness: {"windows": [{"name",
-"used", "resets"}], "error"}}}. It is a reading for people (the visualizer),
-not part of the log: nothing in the factory decides from it.
+Each reading that differs from the last goes into the log as quota_seen, so
+the history of every plan's quota is there with everything else. The last
+reading, with any reader's error, is also in STATE/usage.json. Nothing in
+the factory decides from it.
 
 How each is read, none of them a documented interface:
 - claude-code: the interactive `/usage` screen, in a hidden tmux window.
@@ -180,11 +181,31 @@ def probe(state: Path) -> dict:
     return dict(t=iso(now), plans=plans)
 
 
+def record(out: dict, log: str, say=print) -> None:
+    """Write each plan's reading into the log, if it changed."""
+    from .ledger import Alarm, Ledger, Refused
+    from .model import Role
+    led = Ledger(log)
+    for harness, plan in out["plans"].items():
+        if not plan["windows"]:
+            continue
+        last = led.refresh().quota_seen.get(harness)
+        if last and [w.model_dump(mode="json") for w in last[1]] == plan["windows"]:
+            continue
+        try:
+            led.submit(Role.watchdog, json.dumps(
+                {"event": "quota_seen", "harness": harness, "windows": plan["windows"]}))
+        except (Alarm, Refused, ValueError) as err:
+            say(f"usage: {harness}: {err}")
+
+
 def main(argv: list[str]) -> int:
     state = Path(argv[0])
     every = float(argv[argv.index("--every") + 1]) if "--every" in argv else 0
     while True:
         out = probe(state)
+        if os.environ.get("FACTORY_LOG"):
+            record(out, os.environ["FACTORY_LOG"])
         tmp = state / "usage.json.tmp"
         tmp.write_text(json.dumps(out, indent=1))
         tmp.replace(state / "usage.json")

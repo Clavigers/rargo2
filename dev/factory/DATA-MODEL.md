@@ -191,6 +191,7 @@ Starts in `open`.
 | `session_ended` | observation | watchdog | `agent`: text<br>`reason`: `finished` \| `crashed` \| `quota` \| `killed` | A live agent stops. Its issue stays held until the foreman returns it. |
 | `quota_out` | observation | watchdog | `agent`: text |  |
 | `quota_back` | observation | watchdog | `agent`: text |  |
+| `quota_seen` | observation | watchdog | `harness`: `claude-code` \| `codex` \| `grok`<br>`windows`: set of QuotaWindow | What a harness says about its plan's quota: each limit's use and reset. A reading, written when it differs from the last one; nothing in the factory decides from it. |
 | `taken` | decision | agent | `issue`: int | An idle agent with quota takes a ready issue it has not given up on. This append is the lock. |
 | `returned` | decision | agent, foreman | `issue`: int<br>`reason`: `blocked` \| `gave_up` \| `quota` \| `stale` \| `preempted` \| `asked` \| `no_progress`<br>`note?`: text | A held issue goes back to waiting. The reason says who may return it. |
 | `push` | observation | agent | `issue`: int<br>`pr`: int<br>`push`: int<br>`sha`: text | The holder pushed; this ends its hold. The first push opens a new pull request number; pushes go 1, 2, 3. Open checks of the push before end. |

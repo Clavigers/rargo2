@@ -111,7 +111,10 @@ def snapshot(w: World, lines: list[dict]) -> dict:
     for g in inits:
         g["graph"] = [dict(id=c, deps=sorted(d for d in w.issues[c].deps if d in w.issues[g["n"]].children),
                            state=issues[c]["state"]) for c in g["children"] if c in issues]
-    return dict(t=iso(now), seq=w.seq, foreman=foreman(w, lines), release=release(lines), tick=w.tick, config=w.config.version if w.config else None,
+    usage = dict(t=iso(max((t for t, _ in w.quota_seen.values()), default=None)), plans={
+        h: dict(windows=[x.model_dump(mode="json") for x in ws], error=None, t=iso(t))
+        for h, (t, ws) in w.quota_seen.items()}) if w.quota_seen else None
+    return dict(t=iso(now), seq=w.seq, foreman=foreman(w, lines), release=release(lines), usage=usage, tick=w.tick, config=w.config.version if w.config else None,
                 reviewers=list(w.config.reviewers) if w.config else [],
                 agents=agents, issues=issues, columns=cols, prs=sorted(prs, key=lambda d: d["pr"]),
                 initiatives=inits[:12], totals=totals(w, lines),
