@@ -302,7 +302,7 @@ pub fn auth(host: &str) -> Result<String, String> {
         };
         serde_json::from_str(&text).map_err(|e| format!("{base}{path}: not a rargo answer: {e}"))
     };
-    let started = post("/auth/start", serde_json::json!({ "machine": crate::hostname() }))?;
+    let started = post("/auth/start", serde_json::json!({ "machine": crate::hostname(), "protocol": rargo_proto::PROTO_VERSION }))?;
     let field = |k: &str| started.get(k).and_then(|v| v.as_str()).map(String::from);
     let (Some(device), Some(code), Some(path)) = (field("device"), field("code"), field("path")) else {
         return Err(format!("{base}/auth/start: an answer without a code"));

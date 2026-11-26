@@ -247,10 +247,19 @@ impl Link {
         let mut udp_error = None;
         if transport != "tcp" {
             let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
-            let endpoint = Endpoint::bind_auth(bind, false, Auth::User { name: user.to_string(), psk: *psk })?;
             let wait = if transport == "udp" { Duration::from_secs(20) } else { UDP_WAIT };
-            match crate::connect_within(wait, &endpoint, server) {
-                Ok(conn) => return Ok(Link::Udp(conn, endpoint)),
+            let connect = |marked| {
+                let (name, psk) = (user.to_string(), *psk);
+                let auth = if marked { Auth::User { name, psk } } else { Auth::UnmarkedUser { name, psk } };
+                let endpoint = Endpoint::bind_auth(bind, false, auth)?;
+                crate::connect_within(wait, &endpoint, server).map(|conn| Link::Udp(conn, endpoint))
+            };
+            // Use a fresh socket for an old server. Its failed handshake may still own the first peer address.
+            let result = connect(true).or_else(|error| {
+                if error.kind() == io::ErrorKind::Unsupported { connect(false) } else { Err(error) }
+            });
+            match result {
+                Ok(link) => return Ok(link),
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(e),
                 Err(e) => udp_error = Some(e),
             }

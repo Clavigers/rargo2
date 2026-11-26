@@ -8,6 +8,28 @@ pub mod workspace;
 
 pub const PROTO_VERSION: u32 = 9;
 
+const SERVER_IN_CARGO_TOML_UNTIL: u32 = 7;
+
+pub fn protocol_mismatch(client: u32) -> String {
+    let server = env!("CARGO_PKG_VERSION");
+    let install = format!("cargo install rargo --version {server}");
+    let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching version") };
+    let rename = if client <= SERVER_IN_CARGO_TOML_UNTIL {
+        "; then name the server once more with `rargo @HOST`, as you did before: the new rargo keeps it in your own \
+         configuration, not in Cargo.toml"
+    } else {
+        ""
+    };
+    format!("this rargo is {age} than the build server, which runs rargo {server}; {verb} with: {install}{rename}")
+}
+
+/// An older hello can omit the version entirely.
+pub fn protocol_unmarked() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    format!("this client did not name its protocol; the build server runs rargo {version}; install the matching client with: cargo install rargo --version {version}")
+}
+
+
 pub const REFUSED: &str = "the server does not know this token, or it was revoked or has expired";
 
 pub const GIT_SIDE: &str = ".rargo-git";

@@ -57,6 +57,7 @@ pub enum Auth {
     Shared(Arc<[u8; 32]>),
     Users(UserKeys),
     User { name: String, psk: [u8; 32] },
+    UnmarkedUser { name: String, psk: [u8; 32] },
 }
 
 fn user_handshake_key(psk: &[u8; 32]) -> [u8; 32] {
@@ -343,8 +344,8 @@ impl Conn {
         Ok(())
     }
 
-    fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> sio::Result<()> {
-        let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral());
+    fn agree_as_user(&self, name: &str, psk: &[u8; 32], marked: bool) -> sio::Result<()> {
+        let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral(), marked);
         self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
@@ -497,7 +498,7 @@ impl Endpoint {
         let sock = Arc::new(UdpSocket::bind(addr)?);
         sock.set_buffers(16 << 20);
         let (tx, rx) = io::unbounded_channel();
-        let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. });
+        let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. } | Auth::UnmarkedUser { .. });
         let ep = Arc::new(Endpoint {
             sock,
             conns: Mutex::new(HashMap::new()),
@@ -530,7 +531,8 @@ impl Endpoint {
         let agreed = match &self.auth {
             Auth::None => Ok(()),
             Auth::Shared(key) => c.agree_as_initiator(key),
-            Auth::User { name, psk } => c.agree_as_user(name, psk),
+            Auth::User { name, psk } => c.agree_as_user(name, psk, true),
+            Auth::UnmarkedUser { name, psk } => c.agree_as_user(name, psk, false),
             Auth::Users(_) => Err(sio::Error::other("an accepting endpoint does not connect")),
         };
         if let Err(e) = agreed {
@@ -545,7 +547,7 @@ impl Endpoint {
     }
 
     fn per_conn(&self) -> bool {
-        matches!(self.auth, Auth::Users(_) | Auth::User { .. })
+        matches!(self.auth, Auth::Users(_) | Auth::User { .. } | Auth::UnmarkedUser { .. })
     }
 
     pub fn forget(&self, id: u64) {
