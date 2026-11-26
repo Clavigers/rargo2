@@ -11,7 +11,7 @@ use crate::io;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -258,7 +258,7 @@ impl Drop for Teardown {
             io::cpu(move || {
                 let _ = fs.finish_action(&action);
                 drop(group);
-                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = io::file::remove_dir_all(&scratch);
             });
         }));
     }
@@ -287,14 +287,6 @@ fn default_mem_kb(kind: ActionKind) -> u64 {
         ActionKind::Plan => 300 * 1024,
         ActionKind::Other => 300 * 1024,
     }
-}
-
-fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn read_pipe(fd: &OwnedFd) -> std::io::Result<Vec<u8>> {
@@ -354,7 +346,7 @@ impl Engine {
         zygote: Arc<Zygote>,
         sched: Arc<Scheduler>,
     ) -> Engine {
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let seed = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
         let traces = TraceCache::new(store.db().clone(), seed);
         Engine {
             store,
@@ -586,7 +578,7 @@ impl Engine {
                     Trace {
                         obs,
                         result: (*result).clone(),
-                        created: std::time::SystemTime::now()
+                        created: io::system_now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
@@ -713,12 +705,12 @@ impl Engine {
         });
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
         self.stats.runs_by_kind[spec.kind as usize].fetch_add(1, Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        let started = io::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer);
         drop(permit);
-        self.note_action_wall(started.elapsed());
+        self.note_action_wall(io::now().saturating_duration_since(started));
         static LOG_ACTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *LOG_ACTIONS.get_or_init(|| std::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
+        if *LOG_ACTIONS.get_or_init(|| io::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
             let outcome = match &r {
                 Ok((result, _, tainted, _)) => format!("exit={:?} tainted={tainted}", result.code()),
                 Err(e) => format!("error={e:#}"),
@@ -764,9 +756,9 @@ impl Engine {
         observer: &dyn Observer,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        let started = io::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, observer);
-        self.note_action_wall(started.elapsed());
+        self.note_action_wall(io::now().saturating_duration_since(started));
         r
     }
 
@@ -783,7 +775,7 @@ impl Engine {
         observer: &dyn Observer,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let scratch = self.store.tmp_dir(&format!("act-{}-{n}", std::process::id()))?;
+        let scratch = self.store.tmp_dir(&format!("act-{}-{n}", io::process::id()))?;
         let action = self.fs.create_action(ActionFsConfig {
             view,
             uid,
@@ -813,7 +805,7 @@ impl Engine {
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = io::file::remove_dir_all(&scratch);
                 return Err(e);
             }
         };
@@ -868,7 +860,7 @@ impl Engine {
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
         })?;
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = io::file::remove_dir_all(&scratch);
 
         let mut entries = entries;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -903,8 +895,8 @@ impl Engine {
         for d in &spec.mkdirs {
             action.mkdir_p(d).map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
         }
-        let (out_r, out_w) = pipe()?;
-        let (err_r, err_w) = pipe()?;
+        let (out_r, out_w) = io::pipe::pipe()?;
+        let (err_r, err_w) = io::pipe::pipe()?;
         let setup = SetupSpec { argv: spec.argv.clone(), env: spec.env.clone(), cwd: spec.cwd.clone(), net: spec.net };
         let host = HostLayout {
             place: self.place,
@@ -913,7 +905,7 @@ impl Engine {
             cgroup_root: self.cgroup_root.clone(),
             uid,
             gid,
-            caller: unsafe { (libc::getuid(), libc::getgid()) },
+            caller: (io::process::uid(), io::process::gid()),
             flake: false,
             binds: vec![],
         };
