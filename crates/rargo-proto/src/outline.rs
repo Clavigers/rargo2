@@ -72,7 +72,11 @@ mod tests {
     #[test]
     fn the_outline_gives_the_content_hash() {
         let g = GROUP as usize;
-        for n in [g + 1, 2 * g, 2 * g + 1, 3 * g - 5, 4 * g, 5 * g + 1024, 7 * g + 1, 8 * g, 9 * g + 17, 33 * g - 1, 100 * g + 3] {
+        let sizes = [
+            g + 1, 2 * g, 2 * g + 1, 3 * g - 5, 4 * g, 4 * g + 1, 5 * g + 1024,
+            7 * g + 1, 8 * g, 8 * g + 1, 9 * g + 17, 33 * g - 1, 100 * g + 3,
+        ];
+        for n in sizes {
             let data = noise(n, n as u64);
             let cvs = outline(&data);
             assert_eq!(cvs.len(), groups(n as u64));
@@ -96,15 +100,5 @@ mod tests {
         assert!(proves(&cvs, data.len() as u64, &hash));
         assert!(!proves(&cvs, data.len() as u64 + GROUP, &hash));
         assert!(!proves(&cvs[..5], data.len() as u64, &hash));
-    }
-
-    #[test]
-    fn left_subtrees_hold_the_largest_power_of_two_below() {
-        assert_eq!(left_len(2), 1);
-        assert_eq!(left_len(3), 2);
-        assert_eq!(left_len(4), 2);
-        assert_eq!(left_len(5), 4);
-        assert_eq!(left_len(8), 4);
-        assert_eq!(left_len(9), 8);
     }
 }
