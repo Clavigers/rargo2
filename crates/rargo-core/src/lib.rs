@@ -23,6 +23,7 @@ pub use rargo_net as net;
 pub mod parse;
 pub mod policy;
 pub mod remote;
+pub mod rng;
 pub mod present;
 pub use rargo_proto as proto;
 pub mod sandbox;

@@ -225,7 +225,7 @@ fn main() -> Result<()> {
         }
         io::background(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
-            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key) {
+            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key, &mut rargo_core::rng::Rng::from_shell()) {
                 Ok(pool) => {
                     let _ = daemon.engine.remote.set(pool.clone());
                     let _ = daemon.pool.set(pool);

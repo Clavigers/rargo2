@@ -3,6 +3,7 @@ use crate::engine::{Engine, Live, Observer, RemoteRunner, Request};
 use crate::hash::Hash;
 use crate::net::{Conn, Endpoint};
 use crate::sandbox::NetMode;
+use crate::rng::Rng;
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
@@ -1399,13 +1400,29 @@ pub struct PoolStats {
     pub nix_lookups: AtomicU64,
 }
 
+/// Numbers the actions a pool sends out. The first is drawn from the
+/// generator the pool was given, so a daemon restarted against the same
+/// workers does not reuse the numbers of its last life, and a seeded run
+/// numbers its actions the same way every time.
+struct ActionIds(AtomicU64);
+
+impl ActionIds {
+    fn new(rng: &mut Rng) -> ActionIds {
+        ActionIds(AtomicU64::new(rng.next_u64() >> 1))
+    }
+
+    fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
 pub struct Pool {
     workers: Mutex<Vec<Arc<Worker>>>,
     core: Mutex<pool_state::WorkerPool>,
     blobs: Arc<Blobs>,
     host_srcs: Arc<DashMap<Hash, FileSrc>>,
     content: Arc<Content>,
-    next_action: AtomicU64,
+    next_action: ActionIds,
     pub profile_exclude: Vec<Vec<u8>>,
     pub bandwidth: AtomicU64,
     pub stats: PoolStats,
@@ -1437,7 +1454,8 @@ fn to_wire(l: &Looked, content: &Content) -> WLooked {
 }
 
 impl Pool {
-    pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey) -> Result<Arc<Pool>> {
+    /// `rng` is the pool's only source of randomness: action IDs come from it.
+    pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey, rng: &mut Rng) -> Result<Arc<Pool>> {
         let endpoint = Endpoint::bind_keyed(addr, true, key).with_context(|| format!("binding {addr}"))?;
         let host_srcs: Arc<DashMap<Hash, FileSrc>> = Arc::new(DashMap::new());
         let blobs = Arc::new(Blobs::new(
@@ -1454,11 +1472,7 @@ impl Pool {
             blobs,
             host_srcs,
             content: engine.content.clone(),
-            next_action: AtomicU64::new({
-                let mut b = [0u8; 8];
-                crate::io::random(&mut b);
-                u64::from_le_bytes(b) >> 1
-            }),
+            next_action: ActionIds::new(rng),
             profile_exclude: vec![
                 crate::buildview::WORKTREE_AT.to_vec(),
                 crate::buildview::CARGO_HOME_AT.to_vec(),
@@ -2116,7 +2130,7 @@ impl Pool {
         req: &Request,
         voice: &Voice,
     ) -> RunResult {
-        let action = self.next_action.fetch_add(1, Ordering::Relaxed);
+        let action = self.next_action.next();
         let (tx, mut rx) = crate::io::unbounded_channel();
         let t0 = crate::io::now();
         let view: Arc<dyn View> = req.view.clone();
@@ -2639,6 +2653,21 @@ impl Drop for Scope<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_seed_numbers_actions_the_same_way() {
+        use super::ActionIds;
+        use crate::rng::Rng;
+        let ids = |seed| {
+            let a = ActionIds::new(&mut Rng::seeded(seed));
+            (0..5).map(|_| a.next()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(42), ids(42));
+        assert_ne!(ids(42), ids(43));
+        let first = ids(42)[0];
+        assert_eq!(ids(42), (first..first + 5).collect::<Vec<_>>(), "actions are numbered in a row");
+        assert!(first < 1 << 63, "the numbers have room to count up");
+    }
+
     #[test]
     fn contents_go_behind_questions_and_actions() {
         use super::{is_bulk, Msg, Req, Resp};
