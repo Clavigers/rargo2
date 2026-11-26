@@ -1,0 +1,6 @@
+# Qodo: nothing runs on its own when a pull request opens or is pushed to.
+# The factory's review-mux reviewer asks for a review with /agentic_review.
+[github_app]
+pr_commands = []
+handle_push_trigger = false
+push_commands = []
