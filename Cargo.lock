@@ -905,8 +905,10 @@ dependencies = [
  "rargo",
  "rargo-core",
  "rargo-machine",
+ "rargo-net",
  "rargo-plan",
  "rargo-proto",
+ "serde",
 ]
 
 [[package]]
