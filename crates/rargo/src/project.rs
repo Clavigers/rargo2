@@ -150,6 +150,15 @@ const NO_SUCH_HOST: &str = "no such host";
 const NO_ANSWER: &str = "no answer";
 const NOT_RARGO: &str = "not rargo: ";
 
+/// What a failed request to `host`'s web endpoint says: in the words
+/// `rargo build` uses when the machine cannot be reached, else the URL and why.
+fn asked(host: &str, url: &str, e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Transport(_) => not_found_text(host, &unfound(&e)),
+        e => format!("{url}: {e}"),
+    }
+}
+
 pub fn not_found_text(host: &str, why: &str) -> String {
     let what = if why == NO_SUCH_HOST {
         "no machine has that name".to_string()
@@ -160,8 +169,11 @@ pub fn not_found_text(host: &str, why: &str) -> String {
     } else {
         why.to_string()
     };
-    format!("cannot find the rargo server `{host}`: {what}. Check the name, then name the server again with `rargo @HOST`")
+    format!("cannot find the rargo server `{host}`: {what}{RENAME}")
 }
+
+/// The advice `not_found_text` ends with.
+pub const RENAME: &str = ". Check the name, then name the server again with `rargo @HOST`";
 
 #[derive(Clone)]
 pub struct Credential {
@@ -231,7 +243,7 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
         .post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| format!("{url}: {e}"))?
+        .map_err(|e| asked(host, &url, e))?
         .into_string()
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
@@ -246,7 +258,7 @@ pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
         .post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| format!("{url}: {e}"))?
+        .map_err(|e| asked(host, &url, e))?
         .into_string()
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
@@ -288,7 +300,7 @@ pub fn auth(host: &str) -> Result<String, String> {
                 let said = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("error")?.as_str().map(String::from));
                 return Err(said.unwrap_or_else(|| format!("{base}{path} answered {code}")));
             }
-            Err(e) => return Err(format!("{base}{path}: {e}")),
+            Err(e) => return Err(asked(host, &format!("{base}{path}"), e)),
         };
         serde_json::from_str(&text).map_err(|e| format!("{base}{path}: not a rargo answer: {e}"))
     };

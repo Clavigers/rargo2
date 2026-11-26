@@ -115,7 +115,7 @@ pub enum Plan {
     Status,
     StopDaemons,
     Fail { text: String, code: i32 },
-    Name(String),
+    Name { host: String, force: bool },
     Auth(Auth),
     Daemon(OsString),
     Remote { config: Config, args: Vec<String>, vars: Vec<(String, String)>, kind: &'static str },
@@ -161,7 +161,11 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
         return Plan::Fail { text: format!("error: unknown option `{option}` (see `rargo --help`)"), code: 2 };
     }
     if let Some(host) = first.and_then(OsStr::to_str).and_then(|a| a.strip_prefix('@')) {
-        return Plan::Name(host.to_string());
+        return match raw[1..].iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
+            [] => Plan::Name { host: host.to_string(), force: false },
+            [Some("--force")] => Plan::Name { host: host.to_string(), force: true },
+            _ => die("usage: rargo @HOST [--force]"),
+        };
     }
     let token_command = first.is_some_and(|a| a == "auth") && second.is_some_and(|a| TOKEN_COMMANDS.contains(&a));
     if token_command && raw[2..].iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h") {
@@ -232,6 +236,19 @@ fn manifest_path_arg(args: &[String]) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `host` may be named as the server: it must answer as one,
+/// unless it is an address (`host:port`) or the user said `--force`.
+/// Nothing is written when it may not, so a typo keeps the server set.
+pub fn may_name(w: &impl World, host: &str, force: bool) -> Result<(), String> {
+    if force || host.contains(':') {
+        return Ok(());
+    }
+    w.resolve(host).map(drop).map_err(|e| {
+        let why = e.strip_suffix(project::RENAME).unwrap_or(&e);
+        format!("{why}; nothing was changed (`rargo @{host} --force` names it anyway)")
+    })
 }
 
 pub fn named(w: &impl World, host: &str, path: &Path) -> String {
@@ -620,8 +637,10 @@ mod tests {
             (None, vec!["--rargo-bogus"], fake(&[]), usage("error: unknown option `--rargo-bogus` (see `rargo --help`)")),
             (None, vec!["auth", "invite", "--help"], fake(&[]), Plan::Print(AUTH_HELP.into())),
             (None, vec!["auth", "tokens", "-h"], fake(&[]), Plan::Print(AUTH_HELP.into())),
-            (None, vec!["@b.example"], fake(&[]), Plan::Name("b.example".into())),
-            (Some("cargo"), vec!["@b.example:1"], fake(&[]), Plan::Name("b.example:1".into())),
+            (None, vec!["@b.example"], fake(&[]), Plan::Name { host: "b.example".into(), force: false }),
+            (None, vec!["@b.example", "--force"], fake(&[]), Plan::Name { host: "b.example".into(), force: true }),
+            (None, vec!["@b.example", "-x"], fake(&[]), fail("usage: rargo @HOST [--force]")),
+            (Some("cargo"), vec!["@b.example:1"], fake(&[]), Plan::Name { host: "b.example:1".into(), force: false }),
             (None, vec!["--rargo-daemon", "/run/s"], fake(&[]), Plan::Daemon("/run/s".into())),
             (None, vec!["--rargo-daemon"], fake(&[]), fail("usage: rargo --rargo-daemon SOCKET")),
             (None, vec!["auth", "-h"], fake(&[]), Plan::Print(AUTH_HELP.into())),
@@ -789,6 +808,19 @@ mod tests {
         assert_eq!(
             named(&fake(&[]), "gone.example", path),
             format!("{PATH} now names `gone.example` as your rargo server.\nwarning: no rargo server answers for `gone.example` right now (https://gone.example/.well-known/rargo.json)")
+        );
+
+        let w = fake(&[]);
+        assert_eq!(may_name(&w, "h.example", false), Ok(()));
+        assert_eq!(may_name(&w, "x.example:1", false), Ok(()));
+        assert_eq!(may_name(&w, "gone.example", true), Ok(()));
+        assert_eq!(may_name(&w, "gone.example", false), Err("no answer from gone.example; nothing was changed (`rargo @gone.example --force` names it anyway)".into()));
+        assert_eq!(w.asked(), ["resolve h.example", "resolve gone.example"]);
+        let mut w = fake(&[]);
+        w.servers.push(("typo.example".into(), Err(project::not_found_text("typo.example", "no such host"))));
+        assert_eq!(
+            may_name(&w, "typo.example", false),
+            Err("cannot find the rargo server `typo.example`: no machine has that name; nothing was changed (`rargo @typo.example --force` names it anyway)".into())
         );
 
         let mut w = fake(&[]);
