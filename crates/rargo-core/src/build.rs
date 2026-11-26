@@ -940,7 +940,7 @@ if c.session.is_some() && !c.worktree.is_empty() {
     last.insert(
         c.worktree.clone(),
         crate::drift::LastClient {
-            env: Arc::new(c.env.to_map()),
+            env: Arc::new(c.env.to_map().into_iter().collect()),
             home: c.home.clone(),
             root: c.root.clone(),
             dir,

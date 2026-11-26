@@ -477,7 +477,7 @@ fn serve(
             return fail(&sess, "the current directory must be inside the synced worktree".into());
         };
         let who = crate::drift::LastClient {
-            env: Arc::new(env),
+            env: Arc::new(env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             home,
             root: req.root.clone(),
             dir,

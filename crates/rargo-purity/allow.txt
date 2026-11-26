@@ -76,13 +76,11 @@ locks	crates/rargo/src/watch.rs	2	shares state between threads outside a shell o
 hash-order	crates/rargo-core/src/build.rs	31	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/buildview.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/conn_state.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/drift.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/engine.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/flake.rs	3	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/http.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/incr.rs	7	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/nixmanifest.rs	8	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/policy.rs	1	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/sandbox.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/sandboxfs.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
