@@ -1,0 +1,24 @@
+name: factory CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: factory-ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  factory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dev/factory
+    steps:
+      - uses: actions/checkout@v4
+      - name: The factory's model, ledger and services
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q 'pydantic>=2.9' pytest simpy
+          /tmp/venv/bin/python -m pytest -q -p no:cacheprovider
