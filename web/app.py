@@ -157,9 +157,11 @@ def download(name):
     return send_from_directory(DL_DIR, name, mimetype=kind)
 
 
+# Built from src/protocol/index.md with the rest of the site, which a release
+# deploys, so it describes the released protocol.
 @app.get("/protocol")
 def protocol():
-    return send_from_directory(os.path.join(DL_DIR, "latest"), "protocol.html")
+    return _page("protocol/index.html")
 
 
 # Static assets last: concrete routes above win over the path converter.
