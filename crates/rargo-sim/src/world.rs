@@ -187,6 +187,8 @@ pub struct Report {
     pub worker_crashes: u64,
     pub jobs_lost_to_crashes: u64,
     pub evictions: u64,
+    /// Most client rounds in progress when the server evicted a blob.
+    pub clients_at_eviction: usize,
     pub uploads: u64,
     pub wants: u64,
     pub client_cuts: u64,
@@ -232,9 +234,18 @@ impl Net {
 
 impl Config {
     pub fn of(rng: &mut Rng, net: Net) -> Config {
+        let workers = rng.range(1, 4);
+        let client_roll = rng.next_u64();
+        // One seed in 128 exercises a crowd. Use the same draw for small worlds
+        // so their remaining configuration and workload still replay.
+        let clients = if client_roll >> 57 == 0 {
+            20 + client_roll % 13
+        } else {
+            1 + client_roll % 3
+        };
         Config {
-            workers: rng.range(1, 4),
-            clients: rng.range(1, 3),
+            workers,
+            clients,
             sources: rng.range(3, 10) as usize,
             actions: rng.range(4, 24) as usize,
             rounds: rng.range(1, 3),
@@ -478,6 +489,7 @@ impl World {
                 worker_crashes: 0,
                 jobs_lost_to_crashes: 0,
                 evictions: 0,
+                clients_at_eviction: 0,
                 uploads: 0,
                 wants: 0,
                 client_cuts: 0,
@@ -1040,6 +1052,12 @@ impl World {
         let h = candidates[self.rng.below(candidates.len() as u64) as usize];
         self.server.store.remove(&h);
         self.report.evictions += 1;
+        let active_clients = self
+            .clients
+            .values()
+            .filter(|c| c.round > 0 && c.outputs.len() < self.project.actions.len())
+            .count();
+        self.report.clients_at_eviction = self.report.clients_at_eviction.max(active_clients);
         let worker = self.rng.range(1, self.cfg.workers);
         let busy: BTreeSet<Hash> = self
             .server
