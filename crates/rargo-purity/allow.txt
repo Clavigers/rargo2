@@ -81,7 +81,6 @@ hash-order	crates/rargo-core/src/http.rs	2	HashMap or HashSet with the default r
 hash-order	crates/rargo-core/src/incr.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/nixmanifest.rs	8	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/sandbox.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/sandboxfs.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/serve.rs	3	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/session.rs	1	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
