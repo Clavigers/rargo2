@@ -19,7 +19,7 @@ import tempfile
 from datetime import datetime
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--repo", default="sadosystems/rargo2")
+ap.add_argument("--repo", default="Clavigers/rargo2")
 ap.add_argument("--ssh", default="hetzner")
 ap.add_argument("--cache")
 args = ap.parse_args()

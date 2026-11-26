@@ -12,7 +12,7 @@ fail() {
 }
 want=${1:-}
 [[ "$want" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || refuse "'$want' is not a release tag (vX.Y.Z)"
-assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-sadosystems/rargo2}" --json isDraft,assets \
+assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-Clavigers/rargo2}" --json isDraft,assets \
     --jq 'select(.isDraft | not) | .assets[].name' 2>/dev/null) || refuse "$want has no published release"
 grep -qx rargo-x86_64-unknown-linux-musl <<<"$assets" || refuse "the release $want does not have the client (rargo-x86_64-unknown-linux-musl)"
 S=${RARGO_SERVICE:-/root/rargo-work/service}

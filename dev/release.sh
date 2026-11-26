@@ -8,7 +8,7 @@ version=${1:-}
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
     || die 'usage: dev/release.sh X.Y.Z'
 tag=v$version
-project=sadosystems/rargo2
+project=Clavigers/rargo2
 work=${RARGO_WORK:-/root/rargo-work}
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
