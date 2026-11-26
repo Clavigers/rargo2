@@ -1,4 +1,5 @@
 use rargo_net::io::{self, UnboundedReceiver, UnboundedSender, unbounded_channel};
+use rargo::link_watch::{self, Tick, Watch};
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
 use std::collections::BTreeMap;
@@ -7,20 +8,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WINDOW: usize = 32 << 20;
-const PING_EVERY: Duration = Duration::from_secs(10);
-const DEAD_AFTER: Duration = Duration::from_secs(45);
+const WATCH_STEP: Duration = Duration::from_millis(200);
 
 const _: () = assert!(WINDOW <= u32::MAX as usize, "a window's permits fit acquire_many");
-const _: () = assert!(DEAD_AFTER.as_secs() > 2 * PING_EVERY.as_secs());
 
 fn dead_limit(kind: &str) -> Duration {
-    let base = std::env::var("RARGO_LINK_DEAD_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|n| *n >= 1)
-        .map(Duration::from_secs)
-        .unwrap_or(DEAD_AFTER);
-    if kind == "udp" { base } else { base * 8 }
+    let set = std::env::var("RARGO_LINK_DEAD_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|n| *n >= 1).map(Duration::from_secs);
+    match (set, kind) {
+        (Some(base), "udp") => base,
+        (Some(base), _) => base * 8,
+        (None, "udp") => link_watch::SILENT_AFTER,
+        (None, _) => link_watch::SILENT_AFTER_TCP,
+    }
 }
 
 struct Out {
@@ -145,7 +144,8 @@ pub struct Mux {
     window: Arc<io::Semaphore>,
     state: Mutex<WireState>,
     pub gone: io::Notify,
-    last_heard: Mutex<Instant>,
+    started: Instant,
+    watch: Mutex<Watch>,
     pub bytes_out: AtomicU64,
     pub bytes_in: AtomicU64,
 }
@@ -161,7 +161,8 @@ impl Mux {
             window: Arc::new(io::Semaphore::new(WINDOW as u32)),
             state: Mutex::new(MuxState::new()),
             gone: io::Notify::new(),
-            last_heard: Mutex::new(Instant::now()),
+            started: Instant::now(),
+            watch: Mutex::new(Watch::new(Duration::ZERO, dead_limit(link.kind()))),
             bytes_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
         });
@@ -192,7 +193,8 @@ impl Mux {
         io::spawn(move || {
             while let Some(raw) = m.link.recv() {
                 m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                *m.last_heard.lock().unwrap() = Instant::now();
+                let now = m.started.elapsed();
+                m.watch.lock().unwrap().heard(now);
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
                 let ordered = m.state.lock().unwrap().incoming(frame);
                 for (stream, msg) in ordered {
@@ -215,29 +217,29 @@ impl Mux {
         });
         let m = mux.clone();
         io::spawn(move || {
-            let limit = dead_limit(m.link.kind());
-            // A live server answers a ping well inside the dead limit, so silence means it is gone.
-            let ping_every = PING_EVERY.min(limit / 3).max(Duration::from_millis(500));
-            let step = Duration::from_millis(200);
-            let mut since_ping = Duration::ZERO;
-            let mut n = 0u64;
             loop {
-                io::sleep(step);
+                io::sleep(WATCH_STEP);
                 if m.is_dead() {
                     break;
                 }
-                let frames = m.last_heard.lock().unwrap().elapsed();
-                let quiet = if m.link.kind() == "udp" { frames.min(m.link.idle()) } else { frames };
-                if quiet > limit {
-                    m.die();
-                    break;
-                }
-                since_ping += step;
-                if since_ping >= ping_every {
-                    since_ping = Duration::ZERO;
-                    n += 1;
-                    let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
-                    let _ = m.out.lock().unwrap().urgent.send(ping);
+                let now = m.started.elapsed();
+                let tick = {
+                    let mut watch = m.watch.lock().unwrap();
+                    if m.link.kind() == "udp" {
+                        watch.heard(now.saturating_sub(m.link.idle()));
+                    }
+                    watch.tick(now)
+                };
+                match tick {
+                    Tick::Wait => {}
+                    Tick::Ping(n) => {
+                        let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
+                        let _ = m.out.lock().unwrap().urgent.send(ping);
+                    }
+                    Tick::Silent(_) => {
+                        m.die();
+                        break;
+                    }
                 }
             }
         });
@@ -246,6 +248,11 @@ impl Mux {
 
     pub fn kind(&self) -> &'static str {
         self.link.kind()
+    }
+
+    /// How long the server had been silent when this link gave up on it, if that is why it closed.
+    pub fn silent(&self) -> Option<Duration> {
+        self.watch.lock().unwrap().silent()
     }
 
     pub fn is_dead(&self) -> bool {

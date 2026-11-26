@@ -39,7 +39,7 @@ ambient-io	crates/rargo/src/daemon.rs	23	logic and I/O are not yet split, the I/
 ambient-io	crates/rargo/src/git.rs	15	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (36), the environment (3), processes (3), the clock (1)
 ambient-io	crates/rargo/src/known.rs	3	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (3)
 ambient-io	crates/rargo/src/main.rs	85	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (30), processes (21), the environment (14), libc calls (13), the network (5), the clock (1), threads and sleeps (1)
-ambient-io	crates/rargo/src/mux.rs	3	logic and I/O are not yet split, the I/O is not in an io module: the clock (2), the environment (1)
+ambient-io	crates/rargo/src/mux.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the clock (1), the environment (1)
 ambient-io	crates/rargo/src/outfs.rs	13	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (25), libc calls (5), the clock (3), processes (1)
 ambient-io	crates/rargo/src/partial.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (7), processes (1)
 ambient-io	crates/rargo/src/place.rs	5	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (14), processes (2), libc calls (1)
