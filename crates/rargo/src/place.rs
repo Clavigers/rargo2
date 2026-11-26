@@ -104,13 +104,67 @@ pub(crate) enum Op {
 }
 
 impl Op {
-    #[cfg(test)]
     fn path(&self) -> &Path {
         match self {
             Op::Remove(p) | Op::Unlink(p) | Op::Dir(p) | Op::Symlink(p, _) | Op::Text(p, _) | Op::Record(p, _) => p,
             Op::Install { to, .. } => to,
         }
     }
+}
+
+pub(crate) struct OutputMounts(BTreeSet<u64>);
+
+impl OutputMounts {
+    pub(crate) fn current() -> io::Result<Self> {
+        rargo_net::io::file::read_to_string("/proc/self/mountinfo").map(|info| Self::from_mountinfo(&info))
+    }
+
+    fn from_mountinfo(info: &str) -> Self {
+        Self(info.lines().filter_map(|line| {
+            let (mount, fs) = line.split_once(" - ")?;
+            if fs.split_whitespace().next()? != "fuse.rargo" {
+                return None;
+            }
+            let (major, minor) = mount.split_whitespace().nth(2)?.split_once(':')?;
+            Some(makedev(major.parse().ok()?, minor.parse().ok()?))
+        }).collect())
+    }
+
+    pub(crate) fn check(&self, path: &Path) -> io::Result<()> {
+        // Follow symlinks so aliases of another worktree's target are caught too.
+        self.check_by(path, |p| rargo_net::io::file::metadata(p).map(|md| md.dev()))
+    }
+
+    fn check_by(&self, path: &Path, dev_of: impl Fn(&Path) -> io::Result<u64>) -> io::Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        // Missing outputs inherit the filesystem of their closest existing ancestor.
+        let check_device = |candidate: &Path| match dev_of(candidate) {
+            Ok(dev) if self.0.contains(&dev) => Err(io::Error::other(format!(
+                "cannot copy build output to `{}` on a rargo FUSE mount; choose an output directory outside that mount",
+                path.display()
+            ))),
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(false),
+            Err(e) => Err(e),
+        };
+        check_device(path)?;
+        // An install writes a temporary file beside the destination, even when
+        // the destination itself is a symlink pointing off the mount.
+        for parent in path.ancestors().skip(1) {
+            if check_device(parent)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Linux's `makedev`, as `stat` reports `st_dev`.
+fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (u64::from(major), u64::from(minor));
+    ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
 }
 
 fn mode(exec: bool, writable: bool) -> u32 {
@@ -666,7 +720,12 @@ impl Placer {
     }
 
     fn run(&mut self, ops: Vec<Op>) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mounts = OutputMounts::current()?;
         for op in ops {
+            mounts.check(op.path())?;
             match op {
                 Op::Remove(path) => {
                     if let Ok(md) = rargo_net::io::file::symlink_metadata(&path) {
@@ -753,6 +812,12 @@ impl Placer {
 
     pub fn deliver(&mut self, root: &Path, targets: &[String], files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
         let bound = Bound::new(root, targets);
+        let mounts = OutputMounts::current()?;
+        for path in files.iter().map(|f| f.path.as_str()).chain(writes.iter().map(write_path)).map(Path::new) {
+            if bound.holds(path) {
+                mounts.check(path)?;
+            }
+        }
         let mut placement = Placement::new(&bound, &self.cache, &self.placed, files, writes)
             .map_err(|path| io::Error::other(format!("the server asked to place `{}`, which is not inside {bound}", path.display())))?;
         loop {
@@ -812,6 +877,32 @@ impl Placer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copied_outputs_reject_rargo_mounts_including_missing_paths_and_aliases() {
+        let info = "42 1 0:61 / /w/a/target rw - fuse.rargo rargo rw\n43 1 259:3 / / rw - ext4 /dev/x rw\n";
+        let mounts = OutputMounts::from_mountinfo(info);
+        let fuse = makedev(0, 61);
+        assert_eq!(mounts.0, BTreeSet::from([fuse]));
+        assert_eq!(makedev(259, 3), (259 << 8) | 3);
+        assert_eq!(makedev(0x1234, 0x5678), 0x1000_0562_3478);
+        // What a stat that follows symlinks reports: `/w/alias` points into the mount.
+        let dev_of = |p: &Path| -> io::Result<u64> {
+            match p.to_str().unwrap() {
+                "/w/a/target" | "/w/alias" => Ok(fuse),
+                "/" | "/w" | "/w/a" | "/w/b" => Ok(makedev(259, 3)),
+                _ => Err(io::ErrorKind::NotFound.into()),
+            }
+        };
+        for path in ["/w/a/target", "/w/a/target/debug/app", "/w/alias/debug/app"] {
+            let error = mounts.check_by(Path::new(path), dev_of).unwrap_err();
+            assert!(error.to_string().contains("on a rargo FUSE mount"), "{path}: {error}");
+        }
+        for path in ["/w/b/target/debug/app", "/w/a/other"] {
+            mounts.check_by(Path::new(path), dev_of).unwrap();
+        }
+        OutputMounts::from_mountinfo(&info.replace("fuse.rargo", "proc")).check_by(Path::new("/w/a/target"), dev_of).unwrap();
+    }
 
     struct Rng(u64);
 
@@ -1312,9 +1403,17 @@ mod tests {
         assert!(ways.iter().all(|w| w.from == tmp && w.how != How::Link && w.mode == Some(0o755)), "an own output is a writable copy: {ways:?}");
     }
 
+    fn placement_test(body: impl FnOnce() + 'static) {
+        rargo_net::io::sim::test(move || {
+            rargo_net::io::file::create_dir_all("/proc/self").unwrap();
+            rargo_net::io::file::write("/proc/self/mountinfo", b"").unwrap();
+            body();
+        });
+    }
+
     #[test]
     fn large_content_arrives_in_parts() {
-        rargo_net::io::sim::test(|| {
+        placement_test(|| {
             let tmp = rargo_net::io::sim::tempdir();
             let dest = tmp.join("t/big");
             let content: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
@@ -1332,7 +1431,7 @@ mod tests {
 
     #[test]
     fn writes() {
-        rargo_net::io::sim::test(|| {
+        placement_test(|| {
             let tmp = rargo_net::io::sim::tempdir();
             let s = |n: &str| tmp.join(n).to_string_lossy().into_owned();
             let mut p = Placer::new(&tmp.join("cache"), Placed::default());
@@ -1367,7 +1466,7 @@ mod tests {
 
     #[test]
     fn a_target_directory_outside_the_worktree_is_placed_when_the_server_names_it() {
-        rargo_net::io::sim::test(|| {
+        placement_test(|| {
             let tmp = rargo_net::io::sim::tempdir();
             let (root, outside) = (tmp.join("proj"), tmp.join("outside"));
             rargo_net::io::file::create_dir_all(&root).unwrap();
