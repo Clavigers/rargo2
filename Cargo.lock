@@ -858,6 +858,7 @@ version = "0.7.10"
 dependencies = [
  "blake3",
  "corosensei",
+ "expect-test",
  "fusewire",
  "io-uring",
  "libc",
