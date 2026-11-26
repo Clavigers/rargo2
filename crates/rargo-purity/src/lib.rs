@@ -105,8 +105,28 @@ pub fn compare(check: Check, findings: &[Finding], allow: &[Entry]) -> Result<()
     if report.is_empty() { Ok(()) } else { Err(format!("check {}:\n{report}", check.name())) }
 }
 
+/// Whether `file` is shell: code that meets the real world, which the
+/// checks for ambient I/O, locks, hash order and state machines leave alone.
+///
+/// The shell is an `io` module (`io.rs` or anything under `io/`), and two
+/// kinds of file that are not rargo's logic at all:
+///
+/// - a crate's examples (`crates/<crate>/examples/`): benchmarks and
+///   inspection tools run by hand against real files, sockets and clocks.
+///   Nothing in rargo calls them, so there is no logic in them to keep pure.
+/// - a crate's build script (`crates/<crate>/build.rs`): Cargo runs it at
+///   build time, and its whole job is to read the environment, the files and
+///   the tools of the machine building rargo. It has no io module to move
+///   that into, being one file that Cargo runs on its own.
+///
+/// A module that happens to be called `build` or `examples` inside `src/` is
+/// not shell; only the paths Cargo itself gives these roles are.
 pub fn is_shell(file: &str) -> bool {
-    file.ends_with("/io.rs") || file.contains("/io/")
+    if file.ends_with("/io.rs") || file.contains("/io/") {
+        return true;
+    }
+    let in_crate = file.strip_prefix("crates/").and_then(|rest| rest.split_once('/')).map(|(_, path)| path);
+    in_crate.is_some_and(|path| path == "build.rs" || path.starts_with("examples/"))
 }
 
 const AMBIENT: &[&str] = &[
