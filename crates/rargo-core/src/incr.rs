@@ -219,7 +219,7 @@ impl IncrStore {
     }
 
     pub fn analyze(&self, store: &Store) -> String {
-        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::collections::{BTreeMap, BTreeSet};
         fn kind(path: &[u8]) -> &'static str {
             let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
             match name {
@@ -237,13 +237,13 @@ impl IncrStore {
         struct Row {
             files: u64,
             logical: u64,
-            blobs: HashSet<Hash>,
+            blobs: BTreeSet<Hash>,
             unique: u64,
-            chunks: HashSet<Hash>,
+            chunks: BTreeSet<Hash>,
             chunk_unique: u64,
         }
         let mut states = 0u64;
-        let mut crates: HashSet<[u8; 32]> = HashSet::new();
+        let mut crates: BTreeSet<[u8; 32]> = BTreeSet::new();
         let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
         let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
         for (k, v) in self.db.scan_prefix(Table::Incr, &[]) {
@@ -251,7 +251,6 @@ impl IncrStore {
                 entries.push((k, m));
             }
         }
-        let mut sizes: HashMap<Hash, u64> = HashMap::new();
         for (k, meta) in &entries {
             let Ok(raw) = self.store.read(&meta.manifest) else { continue };
             let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
@@ -266,7 +265,6 @@ impl IncrStore {
                 row.logical += size;
                 if row.blobs.insert(*hash) {
                     row.unique += size;
-                    sizes.insert(*hash, *size);
                 }
             }
         }
