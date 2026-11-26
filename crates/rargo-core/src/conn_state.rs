@@ -165,7 +165,7 @@ const SERVER_IN_CARGO_TOML_UNTIL: u32 = 7;
 
 pub fn protocol_mismatch(client: u32) -> String {
     let server = env!("CARGO_PKG_VERSION");
-    let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {server}");
+    let install = format!("cargo install rargo --version {server}");
     let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching version") };
     let rename = if client <= SERVER_IN_CARGO_TOML_UNTIL {
         "; then name the server once more with `rargo @HOST`, as you did before: the new rargo keeps it in your own \
@@ -581,7 +581,7 @@ mod tests {
             );
         }
         assert_eq!(command(PROTO_VERSION, &a(&["__gc"]), true, "ann"), Command::Gc);
-        let install = format!("curl -fsSL https://rargo.rs/install.sh | sh -s -- {}", env!("CARGO_PKG_VERSION"));
+        let install = format!("cargo install rargo --version {}", env!("CARGO_PKG_VERSION"));
         let Command::Fail(old) = command(PROTO_VERSION - 1, &a(&["build"]), false, "bob") else { panic!("an old client") };
         let server = format!("which runs rargo {}", env!("CARGO_PKG_VERSION"));
         assert!(old.starts_with("this rargo is older than the build server, ") && old.contains(&server), "{old}");
