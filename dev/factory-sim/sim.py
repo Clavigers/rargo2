@@ -110,7 +110,7 @@ NODES = [
     # id, label, what it is
     ("human", "Human", "You, the only user. You file issues and initiatives straight into the tracker, and use the stable release in sessions while awake. A session can hit hidden bugs; you file those too."),
     ("tracker", "Issues", "The GitHub issue tracker. Everything is an issue: initiatives, enhancements, bugs and friction reports."),
-    ("foreman", "Foreman", "Acts only on its tick. Splits initiatives into chains of partly serial sub-issues, takes locks back from agents that stopped, and pulls an agent off lower-priority work when a bug has waited too long."),
+    ("foreman", "Foreman", "Acts only on its tick. Splits initiatives into chains of partly serial sub-issues, each labelled with a t-shirt size, takes locks back from agents that stopped, and pulls an agent off lower-priority work when a bug has waited too long."),
     ("workers", "Agents", "Coding agents. Each locks one issue, writes the change and opens a pull request."),
     ("checks", "Checks running", "A push starts CI and review together on that commit. Green and approved merges; anything red moves the pull request to Needs work."),
     ("needswork", "Needs work", "Open pull requests whose last push failed CI or got changes requested. Agents take these before new issues; the next push restarts both checks."),
