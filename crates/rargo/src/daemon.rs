@@ -416,6 +416,11 @@ fn lost() -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, "the server went away")
 }
 
+fn sync_stats(vars: &[(String, String)], args: &[String]) -> bool {
+    let quiet = args.iter().take_while(|a| *a != "--").any(|a| a == "-q" || a == "--quiet");
+    !quiet && var(vars, "RARGO_SYNC_STATS") != Some("0")
+}
+
 fn var<'a>(vars: &'a [(String, String)], name: &str) -> Option<&'a str> {
     vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
 }
@@ -1371,7 +1376,7 @@ impl Daemon {
                 _ => {}
             }
         }
-        let stats = var(&req.vars, "RARGO_SYNC_STATS").is_some();
+        let stats = sync_stats(&req.vars, &req.args);
         let taken_up = Instant::now();
         let phase = |what: &str| {
             if stats {
