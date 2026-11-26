@@ -22,6 +22,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: dev/update-service-test.sh
+      - name: The deploy brings the planner checkout up to a release's fork patches and builds it without changing it
+        run: dev/planner-test.sh
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: Realise the flake closure for binaries from the build server
         run: nix develop --command true
