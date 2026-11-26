@@ -1,0 +1,17 @@
+[project]
+name = "factory"
+version = "0.1.0"
+description = "rargo2 factory2: the event log's data model and its checker"
+requires-python = ">=3.12"
+dependencies = ["pydantic>=2.9"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
