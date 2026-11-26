@@ -106,8 +106,10 @@ impl BuildRequest {
     }
 
     fn end(&mut self, end: End) -> Vec<Effect> {
+        assert!(!matches!(self.phase, Phase::Done(_)), "a request ends once");
         self.phase = Phase::Done(end);
         self.installing.clear();
+        assert!(self.installing.is_empty(), "nothing is installed after the end");
         vec![Effect::End(end)]
     }
 
@@ -119,7 +121,9 @@ impl BuildRequest {
         if !self.in_phase(Phase::Snapshot) {
             return Vec::new();
         }
+        assert!(self.units.is_empty(), "a request is prepared before it is planned");
         self.phase = Phase::Plan;
+        assert!(self.check || !self.as_build, "only a check is planned as a build");
         vec![Effect::Plan { as_build: self.as_build }]
     }
 
@@ -129,11 +133,14 @@ impl BuildRequest {
         }
         if self.check && rustc_fork != self.as_build {
             self.as_build = rustc_fork;
+            assert_eq!(self.phase, Phase::Plan, "a fork is planned again");
             return vec![Effect::RememberFork(rustc_fork), Effect::Plan { as_build: rustc_fork }];
         }
+        assert!(self.units.is_empty() && !self.any_failed && !self.inconsistent, "a request is planned once");
         self.phase = Phase::Units;
         self.keep_going = keep_going;
         self.units = vec![Unit::Pending; units];
+        assert_eq!(self.units.len(), units, "every planned unit is pending");
         vec![Effect::RunUnits]
     }
 
@@ -156,6 +163,8 @@ impl BuildRequest {
         }
         self.installed.extend(components.iter().cloned());
         self.phase = Phase::Fetch;
+        assert!(self.fetched, "a fetch happens once");
+        assert!(components.iter().all(|c| self.installed.contains(c)), "a fetched component is remembered");
         vec![Effect::Fetch { components, offline: self.offline }]
     }
 
@@ -163,10 +172,12 @@ impl BuildRequest {
         if !self.in_phase(Phase::Fetch) {
             return Vec::new();
         }
+        assert!(self.fetched, "only a fetch ends in fetched");
         if !ok {
             return self.end(End::Code(101));
         }
         self.phase = Phase::Snapshot;
+        assert!(self.units.is_empty(), "a fetch comes before any unit");
         vec![Effect::Prepare]
     }
 
@@ -192,15 +203,21 @@ impl BuildRequest {
     }
 
     pub fn unit_meta(&mut self, i: usize) {
-        if self.in_phase(Phase::Units) && self.units[i] == Unit::Running {
+        if !self.in_phase(Phase::Units) {
+            return;
+        }
+        assert!(i < self.units.len(), "unit {i} was planned");
+        if self.units[i] == Unit::Running {
             self.units[i] = Unit::Meta;
         }
+        assert_ne!(self.units[i], Unit::Running, "a unit with metadata is no longer just running");
     }
 
     pub fn unit_failed(&mut self, i: usize, stderr: &[u8]) -> OnFailure {
         if !self.in_phase(Phase::Units) || self.retried.contains(&i) {
             return OnFailure::Report;
         }
+        assert!(!self.units[i].ended(), "only a unit not yet ended fails");
         let missing = missing_components(stderr);
         if missing.is_empty() {
             return OnFailure::Report;
@@ -209,11 +226,14 @@ impl BuildRequest {
         self.installing.insert(i);
         let new: Vec<Component> = missing.into_iter().filter(|c| !self.installed.contains(c)).collect();
         self.installed.extend(new.iter().cloned());
+        assert!(self.retried.contains(&i) && self.installing.contains(&i), "unit {i} installs on its one retry");
         OnFailure::Install(new)
     }
 
     pub fn components_installed(&mut self, i: usize, ok: bool) -> bool {
         let was = self.installing.remove(&i);
+        assert!(!was || self.retried.contains(&i), "only a retried unit was installing");
+        assert!(!self.installing.contains(&i), "unit {i} installs no more");
         was && ok && self.in_phase(Phase::Units)
     }
 
@@ -257,14 +277,19 @@ impl BuildRequest {
         if !self.in_phase(Phase::Deliver) {
             return Vec::new();
         }
-        self.end(End::Code(code))
+        assert!(self.units.iter().all(|u| *u == Unit::Done), "only a whole build is delivered");
+        let fx = self.end(End::Code(code));
+        assert_eq!(self.phase, Phase::Done(End::Code(code)));
+        fx
     }
 
     pub fn cancel(&mut self) -> Vec<Effect> {
         if matches!(self.phase, Phase::Done(_)) {
             return Vec::new();
         }
-        self.end(End::Cancelled)
+        let fx = self.end(End::Cancelled);
+        assert_eq!(self.phase, Phase::Done(End::Cancelled), "a cancel ends any phase");
+        fx
     }
 }
 
