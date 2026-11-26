@@ -293,13 +293,7 @@ impl Blobs {
         if len == 0 {
             return Some(Arc::new(Outline { cvs: Vec::new(), lazy: Vec::new() }));
         }
-        use std::os::fd::AsRawFd;
-        let o = unsafe {
-            let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, f.as_raw_fd(), 0);
-            if p == libc::MAP_FAILED {
-                return None;
-            }
-            let data = std::slice::from_raw_parts(p as *const u8, len);
+        let o = crate::io::map::mapped(&f, len, |data| {
             let cvs = if len as u64 <= crate::proto::outline::GROUP {
                 Vec::new()
             } else {
@@ -309,10 +303,9 @@ impl Blobs {
                     .map(|(i, g)| crate::proto::outline::group_cv(i, g))
                     .collect()
             };
-            let o = Outline { cvs, lazy: chunk::debug_ranges(data) };
-            libc::munmap(p, len);
-            o
-        };
+            Outline { cvs, lazy: chunk::debug_ranges(data) }
+        })
+        .ok()?;
         assert!(o.cvs.is_empty() || o.cvs.len() == crate::proto::outline::groups(len as u64));
         let o = Arc::new(o);
         self.outlines.insert(*h, o.clone());
@@ -512,7 +505,7 @@ impl WorkerState {
     }
 
     fn now_ms(&self) -> u64 {
-        self.born.elapsed().as_millis() as u64
+        crate::io::now().saturating_duration_since(self.born).as_millis() as u64
     }
 
     fn ensure_blob(self: &Arc<Self>, h: &Hash) -> io::Result<()> {
@@ -970,7 +963,7 @@ pub fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: cra
         core: Mutex::new(core),
         woken: crate::io::watch::channel(()).0,
         tasks: Mutex::new(HashMap::new()),
-        born: std::time::Instant::now(),
+        born: crate::io::now(),
         lookups_local: AtomicU64::new(0),
         lookups_remote: AtomicU64::new(0),
         starved: AtomicU64::new(0),
@@ -1260,29 +1253,29 @@ fn unframe(raw: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
 
 fn eager_dispatch() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_DISPATCH").ok().as_deref() == Some("eager"))
+    *ON.get_or_init(|| crate::io::env::var("RARGO_DISPATCH").ok().as_deref() == Some("eager"))
 }
 
 fn remote_incr() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_REMOTE_INCR").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| crate::io::env::var("RARGO_REMOTE_INCR").ok().as_deref() != Some("0"))
 }
 
 fn state_home_after() -> Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("RARGO_STATE_HOME_AFTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+        crate::io::env::var("RARGO_STATE_HOME_AFTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
     }))
 }
 
 fn hedge() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_HEDGE").ok().as_deref() != Some("0"))
+    *ON.get_or_init(|| crate::io::env::var("RARGO_HEDGE").ok().as_deref() != Some("0"))
 }
 
 fn state_ahead() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RARGO_STATE_AHEAD").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| crate::io::env::var("RARGO_STATE_AHEAD").ok().as_deref() == Some("1"))
 }
 
 
@@ -1327,7 +1320,7 @@ const SEED_GAP: u64 = 4 << 20;
 
 fn trace_remote() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("RARGO_TRACE_REMOTE").is_some())
+    *ON.get_or_init(|| crate::io::env::var_os("RARGO_TRACE_REMOTE").is_some())
 }
 
 pub struct Worker {
@@ -1462,7 +1455,7 @@ impl Pool {
             content: engine.content.clone(),
             next_action: AtomicU64::new({
                 let mut b = [0u8; 8];
-                unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
+                crate::io::random(&mut b);
                 u64::from_le_bytes(b) >> 1
             }),
             profile_exclude: vec![
@@ -1561,7 +1554,7 @@ impl Pool {
                         skipped_bytes: AtomicU64::new(0),
                         overhead_us: AtomicU64::new(0),
                         overhead_samples: AtomicU64::new(0),
-                        link_free_at: Mutex::new(std::time::Instant::now()),
+                        link_free_at: Mutex::new(crate::io::now()),
                         in_flight: Mutex::new(HashMap::new()),
                         store_paths: Mutex::new(HashSet::new()),
                     });
@@ -1825,7 +1818,7 @@ impl Pool {
                 };
                 let Some(missing) = missing else { continue };
                 for _ in 0..60 {
-                    let busy = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
+                    let busy = w.link_free_at.lock().saturating_duration_since(crate::io::now());
                     if busy.is_zero() {
                         break;
                     }
@@ -1850,7 +1843,7 @@ impl Pool {
             let due = {
                 let mut q = self.home_queue.lock();
                 match q.front() {
-                    Some((_, _, _, since)) => match state_home_after().checked_sub(since.elapsed()) {
+                    Some((_, _, _, since)) => match state_home_after().checked_sub(crate::io::now().saturating_duration_since(*since)) {
                         Some(wait) if !wait.is_zero() => Err(wait),
                         _ => {
                             self.home_fetching.store(true, Ordering::SeqCst);
@@ -1917,7 +1910,7 @@ impl Pool {
                 return false;
             }
             let after = state_home_after();
-            if q.iter().any(|(_, _, _, since)| since.elapsed() >= after) {
+            if q.iter().any(|(_, _, _, since)| crate::io::now().saturating_duration_since(*since) >= after) {
                 return false;
             }
         }
@@ -1950,9 +1943,9 @@ impl Pool {
         {
             let secs = need as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64;
             let mut free_at = w.link_free_at.lock();
-            *free_at = (*free_at).max(std::time::Instant::now()) + Duration::from_secs_f64(secs);
+            *free_at = (*free_at).max(crate::io::now()) + Duration::from_secs_f64(secs);
             let mut fl = w.in_flight.lock();
-            let now = std::time::Instant::now();
+            let now = crate::io::now();
             if fl.len() > 4096 {
                 fl.retain(|_, at| *at > now);
             }
@@ -2106,7 +2099,7 @@ impl Pool {
             listings = l;
             let has = w.has_blobs.lock();
             let fl = w.in_flight.lock();
-            let now = std::time::Instant::now();
+            let now = crate::io::now();
             incoming = send_ahead::incoming(files, &|h| has.contains(h), &|h| still_in_flight(&fl, h, now));
         }
         closed.retain(|d| listings.iter().any(|(l, _)| l == d));
@@ -2124,7 +2117,7 @@ impl Pool {
     ) -> RunResult {
         let action = self.next_action.fetch_add(1, Ordering::Relaxed);
         let (tx, mut rx) = crate::io::unbounded_channel();
-        let t0 = std::time::Instant::now();
+        let t0 = crate::io::now();
         let view: Arc<dyn View> = req.view.clone();
         let ra = Arc::new(RemoteAction {
             view: view.clone(),
@@ -2220,7 +2213,7 @@ impl Pool {
         let early: Mutex<HashMap<Vec<u8>, MEntry>> = Mutex::new(HashMap::new());
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
-        let t_sent = t0.elapsed();
+        let t_sent = crate::io::now().saturating_duration_since(t0);
         let done = loop {
             let Some(ev) = rx.recv() else { bail!("worker connection lost") };
             if !matches!(ev, Event::Done(_)) && !voice.claim(Who::Remote) {
@@ -2250,7 +2243,7 @@ impl Pool {
             }
         };
 
-        let t_done = t0.elapsed();
+        let t_done = crate::io::now().saturating_duration_since(t0);
         let mut wanted: Vec<Hash> = Vec::new();
         let mut wanted_bytes = 0u64;
         for (p, e) in &done.entries {
@@ -2287,7 +2280,7 @@ impl Pool {
                 }
                 self.stats.state_left_blobs.fetch_add(left.len() as u64, Ordering::Relaxed);
                 self.stats.state_left_bytes.fetch_add(left.iter().map(|(_, s)| s).sum::<u64>(), Ordering::Relaxed);
-                let now = std::time::Instant::now();
+                let now = crate::io::now();
                 self.home_queue.lock().extend(left.into_iter().map(|(h, s)| (w.clone(), h, s, now)));
                 let _ = self.home_wake.send_replace(());
                 let _ = self.settle_wake.send_replace(());
@@ -2315,10 +2308,10 @@ impl Pool {
             outputs: Arc::new(Manifest { entries }),
             stats: done.stats,
         };
-        w.note_overhead(t0.elapsed().saturating_sub(Duration::from_micros(result.stats.wall_us)));
+        w.note_overhead(crate::io::now().saturating_duration_since(t0).saturating_sub(Duration::from_micros(result.stats.wall_us)));
         {
             let bytes: u64 = wanted_bytes;
-            let secs = (t0.elapsed() - t_done).as_secs_f64();
+            let secs = (crate::io::now().saturating_duration_since(t0) - t_done).as_secs_f64();
             if bytes > (4 << 20) && secs > 0.01 {
                 let seen = (bytes as f64 / secs) as u64;
                 let old = self.bandwidth.load(Ordering::Relaxed);
@@ -2330,12 +2323,12 @@ impl Pool {
                 "rargod: remote {:x} `{}`: {:.2}s total = {:.2}s to send, {:.2}s until done (worker ran it {:.2}s, {} questions), {:.2}s fetching outputs",
                 w.id,
                 spec.label,
-                t0.elapsed().as_secs_f64(),
+                crate::io::now().saturating_duration_since(t0).as_secs_f64(),
                 t_sent.as_secs_f64(),
                 (t_done - t_sent).as_secs_f64(),
                 result.stats.wall_us as f64 / 1e6,
                 ra.asked.load(Ordering::Relaxed),
-                (t0.elapsed() - t_done).as_secs_f64(),
+                (crate::io::now().saturating_duration_since(t0) - t_done).as_secs_f64(),
             );
         }
         Ok((result, done.obs, tainted, side))
@@ -2465,7 +2458,7 @@ impl RemoteRunner for Pool {
                 }
                 None => 0,
             };
-            let queued = w.link_free_at.lock().saturating_duration_since(std::time::Instant::now());
+            let queued = w.link_free_at.lock().saturating_duration_since(crate::io::now());
             let bytes_time = queued + Duration::from_secs_f64(missing as f64 / self.bandwidth.load(Ordering::Relaxed).max(1) as f64);
             if trace_remote() && bytes_time > engine.avg_action_wall() {
                 eprintln!(
@@ -2665,14 +2658,16 @@ mod tests {
     #[test]
     fn a_blob_is_in_flight_until_the_link_has_carried_it() {
         use crate::hash::Hash;
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let mut fl = std::collections::HashMap::new();
-        fl.insert(Hash([1; 32]), now + Duration::from_secs(1));
-        fl.insert(Hash([2; 32]), now);
-        assert!(super::still_in_flight(&fl, &Hash([1; 32]), now));
-        assert!(!super::still_in_flight(&fl, &Hash([2; 32]), now));
-        assert!(!super::still_in_flight(&fl, &Hash([3; 32]), now));
+        use std::time::Duration;
+        crate::io::sim::test(|| {
+            let now = crate::io::now();
+            let mut fl = std::collections::HashMap::new();
+            fl.insert(Hash([1; 32]), now + Duration::from_secs(1));
+            fl.insert(Hash([2; 32]), now);
+            assert!(super::still_in_flight(&fl, &Hash([1; 32]), now));
+            assert!(!super::still_in_flight(&fl, &Hash([2; 32]), now));
+            assert!(!super::still_in_flight(&fl, &Hash([3; 32]), now));
+        });
     }
 
     #[test]

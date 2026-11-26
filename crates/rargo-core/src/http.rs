@@ -5,7 +5,8 @@ use anyhow::{Context, Result, anyhow};
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::io::http::{self as outbound, Failure};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const PENDING_FOR_MS: u64 = 600_000;
 const MAX_PENDING: usize = 1000;
@@ -806,7 +807,7 @@ fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
 }
 
 fn next_item(stream: &mut rargo_net::io::TcpStream, deadline: Instant) -> ReadItem {
-    let remain = deadline.saturating_duration_since(Instant::now());
+    let remain = deadline.saturating_duration_since(crate::io::now());
     if remain.is_zero() {
         return ReadItem::Socket(ErrorKind::TimedOut, "timed out".into());
     }
@@ -851,7 +852,7 @@ fn write_outcome(stream: &mut rargo_net::io::TcpStream, outcome: &Outcome) -> Re
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    crate::io::system_now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 pub struct Http {
@@ -892,7 +893,7 @@ impl Http {
 
     pub fn serve(&self, mut stream: rargo_net::io::TcpStream) -> Result<()> {
         let mut buf = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = crate::io::now() + Duration::from_secs(20);
         let req = loop {
             match intake(&mut buf, next_item(&mut stream, deadline)) {
                 Intake::More => {}
@@ -964,32 +965,60 @@ impl Http {
 }
 
 fn github_url() -> String {
-    std::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
+    crate::io::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
 }
 
 fn github_api() -> String {
-    std::env::var("RARGO_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').to_string()
+    crate::io::env::var("RARGO_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').to_string()
 }
 
-fn agent(timeout_secs: u64) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs)).build()
+/// The most bytes of an answer that are read as its text.
+const TEXT_LIMIT: usize = 10 * 1024 * 1024;
+
+/// The text of GitHub's answer to `request`, or what went wrong, which `asking` introduces.
+fn answer_text(request: &outbound::Request, asking: &str) -> Result<String, String> {
+    let answer = match outbound::fetch(request) {
+        Ok(answer) => answer,
+        Err(Failure::Send(e)) => return Err(format!("{asking}: {e}")),
+        Err(Failure::Body(e)) => return Err(format!("{:#}", anyhow!(e).context("reading GitHub's answer"))),
+    };
+    if let Some(said) = answer.refused {
+        return Err(format!("{asking}: {said}"));
+    }
+    if answer.body.len() > TEXT_LIMIT {
+        return Err("reading GitHub's answer: response too big for into_string".into());
+    }
+    Ok(String::from_utf8_lossy(&answer.body).to_string())
 }
 
 fn post_form(url: &str, accept: &str, fields: &[(&'static str, String)], timeout_secs: u64) -> Result<String, String> {
     let owned: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    agent(timeout_secs).post(url).set("Accept", accept).send_form(&owned).map_err(|e| anyhow!("asking GitHub: {e}")).and_then(|r| r.into_string().context("reading GitHub's answer")).map_err(|e| format!("{e:#}"))
+    let request = outbound::Request {
+        method: "POST",
+        url,
+        headers: &[("Accept", accept)],
+        form: Some(&owned),
+        redirects: None,
+        user_agent: None,
+        timeout: Duration::from_secs(timeout_secs),
+        body_limit: TEXT_LIMIT as u64 + 1,
+    };
+    answer_text(&request, "asking GitHub")
 }
 
 fn get_bearer(url: &str, accept: &str, user_agent: &str, bearer: &str, timeout_secs: u64) -> Result<String, String> {
-    agent(timeout_secs)
-        .get(url)
-        .set("Authorization", &format!("Bearer {bearer}"))
-        .set("Accept", accept)
-        .set("User-Agent", user_agent)
-        .call()
-        .map_err(|e| anyhow!("asking GitHub who signed in: {e}"))
-        .and_then(|r| r.into_string().context("reading GitHub's answer"))
-        .map_err(|e| format!("{e:#}"))
+    let authorization = format!("Bearer {bearer}");
+    let request = outbound::Request {
+        method: "GET",
+        url,
+        headers: &[("Authorization", &authorization), ("Accept", accept), ("User-Agent", user_agent)],
+        form: None,
+        redirects: None,
+        user_agent: None,
+        timeout: Duration::from_secs(timeout_secs),
+        body_limit: TEXT_LIMIT as u64 + 1,
+    };
+    answer_text(&request, "asking GitHub who signed in")
 }
 
 #[cfg(test)]
