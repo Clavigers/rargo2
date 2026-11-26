@@ -325,6 +325,25 @@ impl Default for MountOptions {
     }
 }
 
+fn require_uring(offered: bool) -> io::Result<()> {
+    if offered {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "FUSE-over-io_uring is unavailable. Use Linux 6.14 or newer with CONFIG_FUSE_IO_URING and set fuse.enable_uring=Y.",
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn missing_uring_offer_explains_how_to_enable_it() {
+    assert!(require_uring(true).is_ok());
+    let err = require_uring(false).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert!(err.to_string().contains("fuse.enable_uring=Y"));
+}
+
 const MAX_WRITE: u32 = 1 << 20;
 pub const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
 const _: () = assert!(MAX_WRITE % 4096 == 0);
@@ -337,6 +356,14 @@ const _: () = assert!(
 
 impl Session {
     pub fn mount(mountpoint: &Path, opts: &MountOptions) -> io::Result<Session> {
+        Self::mount_with_transport(mountpoint, opts, false)
+    }
+
+    pub fn mount_uring(mountpoint: &Path, opts: &MountOptions) -> io::Result<Self> {
+        Self::mount_with_transport(mountpoint, opts, true)
+    }
+
+    fn mount_with_transport(mountpoint: &Path, opts: &MountOptions, uring: bool) -> io::Result<Self> {
         let dev = open_dev()?;
         let meta = std::fs::metadata(mountpoint)?;
         if !meta.is_dir() {
@@ -395,7 +422,7 @@ impl Session {
             mount_id,
             connected: AtomicBool::new(true),
         };
-        if let Err(e) = sess.handshake(opts) {
+        if let Err(e) = sess.handshake(opts, uring) {
             sess.unmount();
             return Err(e);
         }
@@ -404,7 +431,7 @@ impl Session {
         Ok(sess)
     }
 
-    fn handshake(&mut self, opts: &MountOptions) -> io::Result<()> {
+    fn handshake(&mut self, opts: &MountOptions, uring: bool) -> io::Result<()> {
         let mut buf = vec![0u8; BUF_SIZE];
         let n = loop {
             let n = unsafe {
@@ -424,8 +451,15 @@ impl Session {
         if hdr.opcode != FUSE_INIT {
             return Err(io::Error::other("first FUSE request was not INIT"));
         }
-        let init: fuse_init_in = read_struct(&buf[std::mem::size_of::<fuse_in_header>()..n])
-            .ok_or_else(|| io::Error::other("short INIT body"))?;
+        let init: Option<fuse_init_in> = read_struct(&buf[std::mem::size_of::<fuse_in_header>()..n]);
+        if uring {
+            require_uring(init.as_ref().is_some_and(|init| {
+                init.major == FUSE_KERNEL_VERSION
+                    && init.flags & FUSE_INIT_EXT as u32 != 0
+                    && (u64::from(init.flags2) << 32) & FUSE_OVER_IO_URING != 0
+            }))?;
+        }
+        let init = init.ok_or_else(|| io::Error::other("short INIT body"))?;
         if init.major != FUSE_KERNEL_VERSION || init.minor < 31 {
             return Err(io::Error::other(format!(
                 "unsupported FUSE protocol {}.{}",
@@ -443,6 +477,9 @@ impl Session {
             | FUSE_ASYNC_DIO
             | FUSE_DIRECT_IO_ALLOW_MMAP
             | FUSE_INIT_EXT;
+        if uring {
+            want |= FUSE_OVER_IO_URING;
+        }
         let passthrough = opts.passthrough && kflags & FUSE_PASSTHROUGH != 0;
         if passthrough {
             want |= FUSE_PASSTHROUGH;
