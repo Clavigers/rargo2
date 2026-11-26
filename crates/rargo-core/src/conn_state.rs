@@ -71,6 +71,15 @@ impl ConnectionState {
 
     pub fn message(&mut self, stream: u32, msg: ClientMsg, key_valid: bool) -> Vec<Route> {
         assert_ne!(stream, KEEPALIVE, "keepalives are answered by the link");
+        self.invariants();
+        let was_closed = self.closed;
+        let routes = self.route_message(stream, msg, key_valid);
+        assert!(!was_closed || (self.closed && routes.is_empty()), "a closed connection routes nothing");
+        self.invariants();
+        routes
+    }
+
+    fn route_message(&mut self, stream: u32, msg: ClientMsg, key_valid: bool) -> Vec<Route> {
         if self.closed {
             return Vec::new();
         }
@@ -99,43 +108,67 @@ impl ConnectionState {
                 if !self.running.insert(stream) {
                     return unknown(stream, &ClientMsg::Run(req));
                 }
+                assert!(self.is_running(stream));
                 vec![Route::Run { stream, req }]
             }
-            ClientMsg::Cancel => self.end(stream),
+            ClientMsg::Cancel => self.stream_failed(stream),
             m if for_a_session(&m) && self.running.contains(&stream) => vec![Route::Stream { stream, msg: m }],
             m => unknown(stream, &m),
         }
     }
 
-    fn end(&mut self, stream: u32) -> Vec<Route> {
-        if self.running.remove(&stream) { vec![Route::Cancel { stream }] } else { Vec::new() }
-    }
-
     pub fn stream_failed(&mut self, stream: u32) -> Vec<Route> {
-        self.end(stream)
+        self.invariants();
+        let routes = if self.running.remove(&stream) {
+            vec![Route::Cancel { stream }]
+        } else {
+            Vec::new()
+        };
+        assert!(!self.is_running(stream));
+        self.invariants();
+        routes
     }
 
     pub fn finished(&mut self, stream: u32) {
+        self.invariants();
         self.running.remove(&stream);
+        assert!(!self.is_running(stream));
+        self.invariants();
     }
 
     pub fn key_checked(&mut self, valid: bool) -> Vec<Route> {
-        if valid { Vec::new() } else { self.close() }
+        self.invariants();
+        let was_closed = self.closed;
+        let routes = if valid { Vec::new() } else { self.close() };
+        assert_eq!(self.closed, was_closed || !valid);
+        self.invariants();
+        routes
     }
 
     pub fn control_failed(&mut self) -> Vec<Route> {
-        self.close()
+        self.invariants();
+        let routes = self.close();
+        assert!(self.closed);
+        self.invariants();
+        routes
     }
 
     pub fn close(&mut self) -> Vec<Route> {
-        if self.closed {
-            return Vec::new();
-        }
-        self.closed = true;
-        let mut out: Vec<Route> =
-            std::mem::take(&mut self.running).into_iter().map(|stream| Route::Cancel { stream }).collect();
-        out.push(Route::Close);
-        out
+        self.invariants();
+        let routes = if self.closed {
+            Vec::new()
+        } else {
+            self.closed = true;
+            let count = self.running.len();
+            let mut out: Vec<Route> =
+                std::mem::take(&mut self.running).into_iter().map(|stream| Route::Cancel { stream }).collect();
+            assert_eq!(out.len(), count);
+            out.push(Route::Close);
+            out
+        };
+        assert!(self.closed);
+        self.invariants();
+        routes
     }
 }
 
