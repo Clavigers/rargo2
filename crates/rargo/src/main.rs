@@ -427,6 +427,7 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
         LocalReply::Exit(code) => std::process::exit(code),
         LocalReply::Exec(e) => exec(e),
         LocalReply::Unreachable(why) => fall_back_or_end(&unreachable_text(&cfg.server, &why), raw),
+        LocalReply::Refused(text) => fall_back_or_end(&text, raw),
     }
 }
 
@@ -474,7 +475,7 @@ fn daemon_replies(stream: &mut (impl Read + Write), req: &LocalRequest, mut each
             return Err("the rargo daemon went away while the command was running");
         }
         let reply = rargo_proto::decode::<LocalReply>(&buf).map_err(|_| "the rargo daemon said something this program does not understand")?;
-        let last = matches!(reply, LocalReply::Exit(_) | LocalReply::Exec(_) | LocalReply::Unreachable(_));
+        let last = matches!(reply, LocalReply::Exit(_) | LocalReply::Exec(_) | LocalReply::Unreachable(_) | LocalReply::Refused(_));
         each(reply);
         if last {
             return Ok(());

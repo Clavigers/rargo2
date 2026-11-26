@@ -85,6 +85,8 @@ pub enum LocalReply {
     Exit(i32),
     Exec(ExecRequest),
     Unreachable(String),
+    /// The server refused this machine's token or its lack of one; the text says what to do.
+    Refused(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

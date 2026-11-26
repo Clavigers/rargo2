@@ -61,6 +61,10 @@ impl AuthState {
         serde_json::json!({ "status": "pending" })
     }
 
+    fn waiting(&self, code: &str, now: u64) -> bool {
+        self.pending.values().any(|p| p.code == code && p.granted.is_none() && now.saturating_sub(p.made) < PENDING_FOR_MS)
+    }
+
     fn authorize(&mut self, code: &str, now: u64) -> Result<&mut Pending> {
         let found = self.pending.values_mut().find(|p| p.code == code && now.saturating_sub(p.made) < PENDING_FOR_MS);
         let pending = found.context("no terminal is waiting with this code (it is good for ten minutes): run `rargo auth` again")?;
@@ -146,6 +150,16 @@ struct Cfg {
     public: Option<String>,
     port: u16,
     has_tokens: bool,
+    access: String,
+}
+
+/// How to be let in when an administrator has said nothing more: an allowed GitHub account where GitHub signs people in, an invitation everywhere.
+fn default_access(github: bool) -> &'static str {
+    if github {
+        "ask this server's administrator to allow your GitHub account (`rargod token allow YOUR-LOGIN`) or for an invitation (`rargo auth invite`)"
+    } else {
+        "ask this server's administrator for an invitation (`rargo auth invite`)"
+    }
 }
 
 enum ReadItem {
@@ -375,11 +389,24 @@ fn page(title: &str, body: &str) -> String {
     )
 }
 
-fn auth_page(code: &str, error: Option<&str>, auth: bool, github: bool) -> String {
-    if !auth {
+fn invite_form(code: &str, autofocus: bool) -> String {
+    format!(
+        "<form method=\"post\" action=\"/auth/approve\">\
+         <label>Code shown in the terminal<input name=\"code\" value=\"{}\" autocomplete=\"off\" required></label>\
+         <label>Invitation (from the server's administrator)<input name=\"invite\" autocomplete=\"off\" required{}></label>\
+         <label>Your name, if the invitation does not carry one<input name=\"name\" autocomplete=\"username\"></label>\
+         <button type=\"submit\">Give that terminal a token</button></form>",
+        escape(&shown(code)),
+        if autofocus { " autofocus" } else { "" }
+    )
+}
+
+fn auth_page(code: &str, error: Option<&str>, cfg: &Cfg, github: bool) -> String {
+    if !cfg.has_tokens {
         return page("rargo auth", "<p>This server does not issue tokens.</p>");
     }
     let err = error.map(|e| format!("<p class=\"err\">{}</p>", escape(e))).unwrap_or_default();
+    let access = format!("<p>Not let in yet? To build here, {}.</p>", escape(&cfg.access));
     if github {
         return page(
             "rargo auth",
@@ -390,8 +417,11 @@ fn auth_page(code: &str, error: Option<&str>, auth: bool, github: bool) -> Strin
                  <form method=\"get\" action=\"/auth/github\">\
                  <label>Code shown in the terminal<input name=\"code\" value=\"{}\" autocomplete=\"off\" required></label>\
                  <button type=\"submit\">Sign in with GitHub and give that terminal a token</button></form>\
-                 <p>The server learns your GitHub user name and nothing else, and gives a token only to accounts its administrator has allowed.</p>",
-                escape(&shown(code))
+                 <p>The server learns your GitHub user name and nothing else, and gives a token only to accounts its administrator has allowed.</p>\
+                 {access}\
+                 <h2>Or with an invitation</h2>{}",
+                escape(&shown(code)),
+                invite_form(code, false)
             ),
         );
     }
@@ -400,13 +430,8 @@ fn auth_page(code: &str, error: Option<&str>, auth: bool, github: bool) -> Strin
         &format!(
             "<p>A terminal is asking for a token to build on this server. Go on only if the code below is the one \
              <code>rargo auth</code> is showing you.</p>\
-             {err}\
-             <form method=\"post\" action=\"/auth/approve\">\
-             <label>Code shown in the terminal<input name=\"code\" value=\"{}\" autocomplete=\"off\" required></label>\
-             <label>Invitation (from the server's administrator)<input name=\"invite\" autocomplete=\"off\" required autofocus></label>\
-             <label>Your name, if the invitation does not carry one<input name=\"name\" autocomplete=\"username\"></label>\
-             <button type=\"submit\">Give that terminal a token</button></form>",
-            escape(&shown(code))
+             {err}{}{access}",
+            invite_form(code, true)
         ),
     )
 }
@@ -527,9 +552,13 @@ fn step(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: 
         (None, Event::Request(req)) => begin_request(state, phase, req, cfg, now),
         (Some(Wait::Github(need)), Event::Github(app)) => match need {
             NeedGh::Discovery { host } => done(phase, discovery(cfg, &host, app.is_some()), Vec::new()),
-            NeedGh::Page { code } => done(phase, html(200, auth_page(&code, None, cfg.has_tokens, app.is_some())), Vec::new()),
+            NeedGh::Page { code } if !code.is_empty() && cfg.has_tokens && !state.waiting(&normal_code(&code), now) => {
+                let error = "no terminal is waiting with this code: it is good for ten minutes and once. Run `rargo auth` again and open the address it prints";
+                done(phase, html(404, auth_page(&code, Some(error), cfg, app.is_some())), Vec::new())
+            }
+            NeedGh::Page { code } => done(phase, html(200, auth_page(&code, None, cfg, app.is_some())), Vec::new()),
             NeedGh::Redirect { code } => match app {
-                None => done(phase, html(403, auth_page(&code, Some("this server does not sign people in with GitHub"), cfg.has_tokens, false)), Vec::new()),
+                None => done(phase, html(403, auth_page(&code, Some("this server does not sign people in with GitHub"), cfg, false)), Vec::new()),
                 Some(gh) => ask(phase, Wait::Draw(DrawNext::Oauth { code, gh }), Effect::Random { n: 32, alphabet: DEVICE_ALPHABET }),
             },
             NeedGh::Callback { state: oauth, code } => callback_open(state, phase, cfg, now, oauth, code, app),
@@ -539,14 +568,14 @@ fn step(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: 
             (DrawNext::Device, Ok(device)) => ask(phase, Wait::Draw(DrawNext::Code { device }), Effect::Random { n: 8, alphabet: CODE_ALPHABET }),
             (DrawNext::Code { device }, Ok(code)) => {
                 if state.begin(device.clone(), code.clone(), now) {
-                    done(phase, started(&device, &code), Vec::new())
+                    done(phase, started(&device, &code, &cfg.access), Vec::new())
                 } else {
                     ask(phase, Wait::Draw(DrawNext::Device), Effect::Random { n: 40, alphabet: DEVICE_ALPHABET })
                 }
             }
-            (DrawNext::Oauth { code, .. }, Err(e)) => done(phase, html(403, auth_page(&code, Some(&e), cfg.has_tokens, true)), Vec::new()),
+            (DrawNext::Oauth { code, .. }, Err(e)) => done(phase, html(403, auth_page(&code, Some(&e), cfg, true)), Vec::new()),
             (DrawNext::Oauth { code, gh }, Ok(oauth)) => match state.authorize(&normal_code(&code), now) {
-                Err(e) => done(phase, html(403, auth_page(&code, Some(&format!("{e:#}")), cfg.has_tokens, true)), Vec::new()),
+                Err(e) => done(phase, html(403, auth_page(&code, Some(&format!("{e:#}")), cfg, true)), Vec::new()),
                 Ok(p) => {
                     p.state = Some(oauth.clone());
                     done(phase, Outcome::Redirect(authorize_url(&gh, &oauth)), Vec::new())
@@ -600,7 +629,7 @@ fn step(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: 
                 ask(phase, Wait::AuthPage { code: page_code, error: msg.to_string() }, Effect::LoadGithub)
             }
         }
-        (Some(Wait::AuthPage { code, error }), Event::Github(app)) => done(phase, html(403, auth_page(&code, Some(&error), cfg.has_tokens, app.is_some())), Vec::new()),
+        (Some(Wait::AuthPage { code, error }), Event::Github(app)) => done(phase, html(403, auth_page(&code, Some(&error), cfg, app.is_some())), Vec::new()),
         (Some(Wait::RevokeSelf), Event::RevokedSelf(done_it)) => {
             let notes = done_it.then(|| "rargod: a token was revoked by its holder (`rargo auth remove`)".to_string()).into_iter().collect();
             done(phase, json_ok(serde_json::json!({ "revoked": done_it })), notes)
@@ -641,9 +670,10 @@ fn discovery(cfg: &Cfg, host: &str, github: bool) -> Outcome {
     }))
 }
 
-fn started(device: &str, code: &str) -> Outcome {
+fn started(device: &str, code: &str, access: &str) -> Outcome {
     json_ok(serde_json::json!({
         "device": device,
+        "access": access,
         "code": shown(code),
         "path": format!("/auth?code={}", shown(code)),
         "interval": 2,
@@ -664,7 +694,7 @@ fn start(state: &mut AuthState, phase: &mut Phase, cfg: &Cfg, now: u64) -> Act {
 
 fn approve(state: &mut AuthState, phase: &mut Phase, cfg: &Cfg, now: u64, code: String, invite: String, name: String) -> Act {
     if !cfg.has_tokens {
-        return done(phase, html(403, auth_page(&code, None, false, false)), Vec::new());
+        return done(phase, html(403, auth_page(&code, None, cfg, false)), Vec::new());
     }
     let normalized = normal_code(&code);
     if let Err(e) = state.invite_attempt(&normalized, now) {
@@ -808,7 +838,12 @@ impl Http {
     }
 
     fn view_cfg(&self) -> Cfg {
-        Cfg { public: self.public.clone(), port: self.port, has_tokens: self.keys.tokens().is_some() }
+        let github = self.github();
+        let access = match &github {
+            Some(g) if !g.access.is_empty() => g.access.clone(),
+            _ => default_access(github.is_some()).to_string(),
+        };
+        Cfg { public: self.public.clone(), port: self.port, has_tokens: self.keys.tokens().is_some(), access }
     }
 
     fn github(&self) -> Option<tokens::Github> {
@@ -928,7 +963,7 @@ mod tests {
     const NOW: u64 = 1_700_000_000_000;
 
     fn cfg(tokens: bool) -> Cfg {
-        Cfg { public: None, port: 7459, has_tokens: tokens }
+        Cfg { public: None, port: 7459, has_tokens: tokens, access: "ask for it.".into() }
     }
 
     fn gh() -> GithubIn {
@@ -1075,14 +1110,14 @@ mod tests {
             let request = post(route, r#"{"token":"fixture"}"#, "application/json");
             assert!(matches!(request.goal(), Goal::Revoke(Some(token)) | Goal::Who(Some(token)) if token == "fixture"));
         }
-        assert!(auth_page("abc", None, false, false).contains("does not issue tokens"));
-        assert!(auth_page("abc", Some("<error>"), true, false).contains("&lt;error&gt;"));
-        assert!(auth_page("abc", None, true, true).contains("Sign in with GitHub"));
+        assert!(auth_page("abc", None, &cfg(false), false).contains("does not issue tokens"));
+        assert!(auth_page("abc", Some("<error>"), &cfg(true), false).contains("&lt;error&gt;"));
+        assert!(auth_page("abc", None, &cfg(true), true).contains("Sign in with GitHub"));
         assert_eq!(form("code=AB%2DCD&name=a+b")["code"], "AB-CD");
         assert_eq!(form("code=AB%2DCD&name=a+b")["name"], "a b");
         assert_eq!(percent_decode("100%"), "100%");
-        assert_eq!(server_for_host(&Cfg { public: None, port: 7459, has_tokens: false }, "build.example:8080"), "build.example:7459");
-        assert_eq!(server_for_host(&Cfg { public: Some("b.example:1".into()), port: 7459, has_tokens: false }, "rargo.rs"), "b.example:1");
+        assert_eq!(server_for_host(&Cfg { public: None, port: 7459, has_tokens: false, access: String::new() }, "build.example:8080"), "build.example:7459");
+        assert_eq!(server_for_host(&Cfg { public: Some("b.example:1".into()), port: 7459, has_tokens: false, access: String::new() }, "rargo.rs"), "b.example:1");
         assert_eq!(Http::new(Arc::new(Keys::open()), None, 7459).server_for("build.example"), "build.example:7459");
     }
 
@@ -1115,6 +1150,7 @@ mod tests {
         assert_eq!(body["path"], "/auth?code=ABCD-2345");
         assert_eq!(body["interval"], 2);
         assert_eq!(body["expires_in"], 600);
+        assert_eq!(body["access"], "ask for it.");
         assert!(st.begin("other".into(), "ABCD2345".into(), NOW) == false);
         let (outcome, _) = drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"deviceone"}"#), NOW, &c, &mut Script::default());
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["status"], "pending");
@@ -1144,6 +1180,36 @@ mod tests {
         assert!(body_of(&outcome).2.contains("does not issue tokens"));
         let (outcome, _) = drive(&mut st, parsed("GET /nope HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &c, &mut Script::default());
         assert_eq!(body_of(&outcome), (404, "text/plain", "this is a rargo build server; see https://rargo.rs\n"));
+    }
+
+    #[test]
+    fn the_page_says_how_to_get_access_takes_an_invitation_beside_github_and_names_a_code_no_terminal_waits_with() {
+        let mut st = AuthState::default();
+        let c = Cfg { access: "open a request at https://example.invalid/<new>".into(), ..cfg(true) };
+        assert!(st.begin("deviceone".into(), "ABCD2345".into(), NOW));
+        let page_for = |st: &mut AuthState, code: &str, github: Option<GithubIn>, now: u64| {
+            let (outcome, _) = drive(st, parsed(&format!("GET /auth?code={code} HTTP/1.1\r\nHost: build.example\r\n\r\n")), now, &c, &mut Script { github: script_rev(vec![github]), ..Script::default() });
+            let (status, _, page) = body_of(&outcome);
+            (status, page.to_string())
+        };
+        for github in [Some(gh()), None] {
+            let (status, page) = page_for(&mut st, "ABCD-2345", github.clone(), NOW);
+            assert_eq!(status, 200);
+            assert!(page.contains("Not let in yet? To build here, open a request at https://example.invalid/&lt;new&gt;."), "{page}");
+            assert!(page.contains("action=\"/auth/approve\"") && page.contains("name=\"invite\""), "{page}");
+            assert_eq!(page.contains("Sign in with GitHub"), github.is_some());
+            assert!(!page.contains("class=\"err\""), "{page}");
+        }
+        for (code, now) in [("ZZZZ-9999", NOW), ("zzz", NOW), ("ABCD-2345", NOW + PENDING_FOR_MS)] {
+            let (status, page) = page_for(&mut st, code, Some(gh()), now);
+            assert_eq!(status, 404, "{code}");
+            assert!(page.contains("no terminal is waiting with this code") && page.contains("Run `rargo auth` again"), "{page}");
+        }
+        let (status, page) = page_for(&mut st, "", None, NOW);
+        assert_eq!(status, 200);
+        assert!(!page.contains("class=\"err\""), "{page}");
+        assert!(default_access(true).contains("rargod token allow") && default_access(true).contains("rargo auth invite"));
+        assert!(default_access(false).contains("rargo auth invite") && !default_access(false).contains("GitHub"));
     }
 
     #[test]

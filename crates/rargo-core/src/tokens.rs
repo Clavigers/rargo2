@@ -58,6 +58,9 @@ pub struct Github {
     pub client_id: String,
     pub client_secret: String,
     pub url: String,
+    /// How someone the server has not let in yet gets access, completing "To build here, …"; empty for the default.
+    #[serde(default)]
+    pub access: String,
 }
 
 impl Github {

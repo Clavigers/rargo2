@@ -464,7 +464,10 @@ fn refused_text(server: &str, had_token: bool) -> String {
              or has expired. Run `rargo auth` to get a new one\n"
         )
     } else {
-        format!("error: this machine is not authenticated to the rargo server at {server}: run `rargo auth`\n")
+        format!(
+            "error: this machine is not authenticated to the rargo server at {server}: run `rargo auth`, which also says how to get \
+             access if the server has not let you in yet\n"
+        )
     }
 }
 
@@ -1285,12 +1288,10 @@ impl Daemon {
             Err(e) => {
                 if is_no_link(&e) {
                     LocalReply::Unreachable(e.to_string())
+                } else if e.to_string().contains(rargo_proto::REFUSED) {
+                    LocalReply::Refused(refused_text(&self.cfg.server, self.cfg.secret.is_some()))
                 } else {
-                    let text = if e.to_string().contains(rargo_proto::REFUSED) {
-                        refused_text(&self.cfg.server, self.cfg.secret.is_some())
-                    } else {
-                        format!("error: talking to the rargo server at {}: {}\n", self.cfg.server, crate::plain_cause(&e.to_string()))
-                    };
+                    let text = format!("error: talking to the rargo server at {}: {}\n", self.cfg.server, crate::plain_cause(&e.to_string()));
                     let _ = out.send(LocalReply::Stderr(text.into_bytes()));
                     LocalReply::Exit(101)
                 }
@@ -2250,7 +2251,7 @@ fn serve_command(d: Arc<Daemon>, stream: io::UnixStream, socket: PathBuf) {
             }),
         ]) {
             ClientWait::Reply(Some(reply)) => {
-                let last = matches!(reply, LocalReply::Exit(_) | LocalReply::Exec(_) | LocalReply::Unreachable(_));
+                let last = matches!(reply, LocalReply::Exit(_) | LocalReply::Exec(_) | LocalReply::Unreachable(_) | LocalReply::Refused(_));
                 let bytes = rargo_proto::encode(&reply);
                 if wr.write_all(&(bytes.len() as u32).to_le_bytes()).is_err() || wr.write_all(&bytes).is_err() {
                     break;
@@ -2772,7 +2773,7 @@ mod tests {
     fn a_refused_token_says_whether_there_was_one_and_names_rargo_auth() {
         let none = refused_text("build.example:7459", false);
         let revoked = refused_text("build.example:7459", true);
-        assert_eq!(none, "error: this machine is not authenticated to the rargo server at build.example:7459: run `rargo auth`\n");
+        assert_eq!(none, "error: this machine is not authenticated to the rargo server at build.example:7459: run `rargo auth`, which also says how to get access if the server has not let you in yet\n");
         assert!(revoked.starts_with("error: the rargo server at build.example:7459 does not accept this machine's token: it does not know it, or it was revoked or has expired. Run `rargo auth`"), "{revoked}");
         for text in [none, revoked] {
             assert!(!text.contains(rargo_proto::REFUSED), "{text}");

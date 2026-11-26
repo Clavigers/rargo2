@@ -204,7 +204,13 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
         Err(e) => return die(e),
     };
     if config.secret.is_none() && !is_loopback(&config.server) && matches!(kind, "admin" | "drift" | "build") {
-        return die(format!("this machine is not authenticated to {}: run `rargo auth`", config.host));
+        if kind == "build" && var(w, "RARGO_FALLBACK") == Some("cargo") {
+            return Plan::Cargo { release: false, banner: None };
+        }
+        return die(format!(
+            "this machine is not authenticated to {}: run `rargo auth`, which also says how to get access if the server has not let you in yet",
+            config.host
+        ));
     }
     Plan::Remote { config, args, vars, kind }
 }
@@ -694,9 +700,11 @@ mod tests {
                 fake(&[("RUSTUP_TOOLCHAIN", "stable"), ("RUSTFLAGS", "-W")]),
                 remote(&["check", "--", "-h"], &[("RUSTFLAGS", "-W"), ("RUSTUP_TOOLCHAIN", "nightly")], "build"),
             ),
-            (None, vec!["build"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`")),
-            (None, vec!["--rargo-gc"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`")),
-            (None, vec!["--rargo-drift-check"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`")),
+            (None, vec!["build"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
+            (None, vec!["--rargo-gc"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
+            (None, vec!["build"], fake(&[("RARGO_FALLBACK", "cargo")]).no_creds(), Plan::Cargo { release: false, banner: None }),
+            (None, vec!["--rargo-gc"], fake(&[("RARGO_FALLBACK", "cargo")]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
+            (None, vec!["--rargo-drift-check"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["--rargo-daemon-stop"], fake(&[("USER", "u")]).no_creds(), Plan::StopDaemons),
             (None, vec!["build"], fake(&[("RARGO_SERVER", "local.example"), ("USER", "u")]).no_creds(), Plan::Remote { config: conf("local.example", "127.0.0.1:7459", "u", None), args: strings(&["build"]), vars: vec![("RARGO_SERVER".into(), "local.example".into()), ("USER".into(), "u".into())], kind: "build" }),
             (None, vec!["build"], fake(&[]).config(Ok(Some("host ="))), fail(&toml_error("host ="))),

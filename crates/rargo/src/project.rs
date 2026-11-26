@@ -310,6 +310,9 @@ pub fn auth(host: &str) -> Result<String, String> {
     let url = format!("{base}{path}");
     eprintln!("To let this machine build on {host}, open\n\n    {url}\n\nand confirm there that it shows this code:\n\n    {code}\n");
     open_in_browser(&url);
+    if let Some(access) = field("access").filter(|a| !a.is_empty()) {
+        eprintln!("If {host} has not let you in yet, the page will not give a token. To build here, {access}.\n");
+    }
     eprintln!("Waiting for that (ten minutes at most; any machine's browser will do) ...");
     let interval = Duration::from_secs(started.get("interval").and_then(|v| v.as_u64()).unwrap_or(2).clamp(1, 30));
     let deadline = std::time::Instant::now() + Duration::from_secs(started.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(600));

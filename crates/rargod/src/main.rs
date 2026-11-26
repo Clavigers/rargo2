@@ -283,7 +283,8 @@ fn token_command(args: &[String]) -> Result<()> {
                  rargod token revoke --state DIR ID-OR-USER\n       \
                  rargod token allow --state DIR GITHUB-LOGIN [--admin]      (may sign in with GitHub through `rargo auth`)\n       \
                  rargod token disallow --state DIR GITHUB-LOGIN             (and revokes the tokens it signed in for)\n       \
-                 rargod token github --state DIR --client-id ID --client-secret-file FILE --url https://NAME";
+                 rargod token github --state DIR --client-id ID --client-secret-file FILE --url https://NAME\n       \
+                 rargod token access --state DIR TEXT                     (how to get access, for the auth page and `rargo auth`)";
     let mut state: Option<PathBuf> = None;
     let (mut client_id, mut secret_file, mut url) = (None::<String>, None::<PathBuf>, None::<String>);
     let mut rest: Vec<String> = Vec::new();
@@ -310,8 +311,21 @@ fn token_command(args: &[String]) -> Result<()> {
         if client_id.is_empty() || client_secret.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
             bail!("a client id, a secret and an address starting with https:// are needed");
         }
-        rargo_core::tokens::Github { client_id, client_secret, url: url.clone() }.save(&state)?;
+        let access = rargo_core::tokens::Github::load(&state).map(|g| g.access).unwrap_or_default();
+        rargo_core::tokens::Github { client_id, client_secret, url: url.clone(), access }.save(&state)?;
         println!("`rargo auth` now signs people in with GitHub. The application's callback address must be {url}/auth/github/callback");
+        return Ok(());
+    }
+    if rest.first().map(String::as_str) == Some("access") {
+        let Some(mut github) = rargo_core::tokens::Github::load(&state) else {
+            bail!("the access text is shown on the GitHub sign-in page: set GitHub sign-in up first with `rargod token github`");
+        };
+        github.access = rest[1..].join(" ").trim().trim_end_matches('.').to_string();
+        github.save(&state)?;
+        match github.access.as_str() {
+            "" => println!("`rargo auth` and its page now give the default way to get access"),
+            text => println!("`rargo auth` and its page now say: To build here, {text}."),
+        }
         return Ok(());
     }
     let store = rargo_core::tokens::TokenStore::new(state.join("tokens.json"));
