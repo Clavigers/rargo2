@@ -36,7 +36,7 @@ CONFIG = {
     "plans": [{"name": "max", "hours_per_week": 168.0}],
     "agents": [{"type": "claude-code", "count": 1, "model": "claude-opus-5-5", "plan": "max"}],
     "reviewers": ["placeholder"],
-    "foreman": {"tick_minutes": 20, "preempt_minutes": None},
+    "dictator": {"tick_minutes": 20, "preempt_minutes": None},
     "release": {"freeze_every_days": 7, "uses_required": 1, "soak_minutes": 120},
 }
 A = "claude-code-1"
@@ -240,7 +240,7 @@ def test_the_next_session_on_an_issue_resumes_its_conversation(rig, tmp_path):
 
 def test_a_session_that_runs_too_long_is_killed(rig):
     cfg = json.loads(json.dumps(CONFIG)) | {"version": 2}
-    cfg["foreman"]["session_minutes"] = 90
+    cfg["dictator"]["session_minutes"] = 90
     rig.monkeypatch.setenv("FAKE_MODE", "sleep")
     wd = rig.watchdog()
     wd.ledger.submit("human", json.dumps({"event": "config_applied", "config": cfg}))

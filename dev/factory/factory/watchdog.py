@@ -112,7 +112,7 @@ class Watchdog:
             if code is not None:
                 self._ended(agent, s, code)
         w = self.ledger.world
-        limit = w.config.foreman.session_minutes
+        limit = w.config.dictator.session_minutes
         for agent, s in self.sessions.items():
             if (limit and s.started and not s.killed
                     and self.clock() - s.started > timedelta(minutes=limit)):

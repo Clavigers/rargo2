@@ -70,7 +70,7 @@ def version_key(v: str) -> tuple[int, ...]:
 
 class Role(enum.StrEnum):
     human = "human"
-    foreman = "foreman"
+    dictator = "dictator"
     watchdog = "watchdog"
     ci = "ci"
     reviewer = "reviewer"
@@ -149,7 +149,7 @@ class AgentType(Strict):
         return [f"{self.type}-{i}" for i in range(1, self.count + 1)]
 
 
-class ForemanRules(Strict):
+class DictatorRules(Strict):
     tick_minutes: Annotated[int, Field(ge=1)]
     # A bug ready this long pulls an agent off other work. None: never.
     preempt_minutes: Annotated[int, Field(ge=1)] | None
@@ -158,12 +158,12 @@ class ForemanRules(Strict):
     # conversation, before any agent may take it. None: no waiting.
     affinity_minutes: Annotated[int, Field(ge=1)] | None = None
     # Sessions in a row that end with the holder still holding an issue it
-    # did not move; then the foreman takes it back. None: never.
+    # did not move; then the dictator takes it back. None: never.
     no_progress_sessions: Annotated[int, Field(ge=1)] | None = None
-    # The model the foreman's own sessions (planning, orchestrating) run on.
+    # The model the dictator's own sessions (planning, orchestrating) run on.
     # None: the first claude-code agent's model.
     model: Model | None = None
-    # How often the foreman looks at the whole factory and decides what a
+    # How often the dictator looks at the whole factory and decides what a
     # queue cannot (ORCHESTRATE.md). None: never.
     orchestrate_minutes: Annotated[int, Field(ge=1)] | None = None
     # The watchdog ends a session that runs longer than this. None: never.
@@ -185,7 +185,7 @@ class Config(Strict):
     # Every push needs an approval from each of these on that push to merge.
     # "placeholder" approves every push at once, until a real one is set up.
     reviewers: Annotated[tuple[Slug, ...], Field(min_length=1)]
-    foreman: ForemanRules
+    dictator: DictatorRules
     release: ReleaseRules
     guesses: Set(str) = frozenset()  # dotted paths no measurement backs yet
 
@@ -239,11 +239,11 @@ class Kind(enum.StrEnum):
 class ReturnReason(enum.StrEnum):
     blocked = "blocked"  # the holder: it added a dependency that is open
     gave_up = "gave_up"  # the holder: it cannot do the issue as written
-    quota = "quota"  # the foreman: the holder is out of quota
-    stale = "stale"  # the foreman: the holder's session ended
-    preempted = "preempted"  # the foreman: a bug has waited too long
+    quota = "quota"  # the dictator: the holder is out of quota
+    stale = "stale"  # the dictator: the holder's session ended
+    preempted = "preempted"  # the dictator: a bug has waited too long
     asked = "asked"  # the holder: it asked the owner on the issue; held until they answer
-    no_progress = "no_progress"  # the foreman: the holder's sessions keep ending without moving it
+    no_progress = "no_progress"  # the dictator: the holder's sessions keep ending without moving it
 
 
 class CiResult(enum.StrEnum):
@@ -320,7 +320,7 @@ class Event(Strict):
 
 
 D, O = Nature.decision, Nature.observation
-H, F, W, PM, PU = Role.human, Role.foreman, Role.watchdog, Role.pm, Role.power_user
+H, F, W, PM, PU = Role.human, Role.dictator, Role.watchdog, Role.pm, Role.power_user
 
 
 def event(actors, nature):
@@ -351,7 +351,7 @@ class Filed(Event):
     Bugs and friction are filed by whoever found them, where they found them:
     an agent in the issue it holds, the power user in its open use session,
     the human in a use session or as a plain report whenever it likes. The world records which.
-    Initiatives and enhancements come from the human and the foreman; an agent
+    Initiatives and enhancements come from the human and the dictator; an agent
     may file follow-up enhancements under the initiative of the issue it holds.
     """
     event: Literal["filed"]
@@ -380,7 +380,7 @@ class Depends(Event):
 class ParkReason(enum.StrEnum):
     owner = "owner"  # the owner's hold (on GitHub, the label guard)
     lock = "lock"  # a lock by someone outside the factory (a label wip-NAME)
-    foreman = "foreman"  # the foreman's hold: it is rethinking the issue
+    dictator = "dictator"  # the dictator's hold: it is rethinking the issue
 
 
 @event({H, F, Role.outside}, O)
@@ -412,7 +412,7 @@ class Undepends(Event):
 
 @event({H, F, Role.outside, AGENT}, D)
 class Closed(Event):
-    """Closes an issue without a merge. The foreman closes waiting work and
+    """Closes an issue without a merge. The dictator closes waiting work and
     initiatives whose children are closed. An agent closes an issue it holds
     and has no open pull request for as completed, when it found nothing left
     to change, with the evidence in the note. The human and outsiders close
@@ -442,7 +442,7 @@ class SessionStarted(Event):
 
 @event({W}, O)
 class SessionEnded(Event):
-    """A live agent stops. Its issue stays held until the foreman returns it."""
+    """A live agent stops. Its issue stays held until the dictator returns it."""
     event: Literal["session_ended"]
     agent: AgentName
     reason: SessionEnd

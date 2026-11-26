@@ -20,7 +20,7 @@
                             SLUG (org/name). OWNER is the human's login: their
                             acts on GitHub are the human's. Issues from OWNER
                             and the LOGINs given are the factory's
-  foreman SLUG CHECKOUT     run the foreman; it plans in the clone CHECKOUT
+  dictator SLUG CHECKOUT     run the dictator; it plans in the clone CHECKOUT
   doc                       rewrite the generated half of DATA-MODEL.md
   schema                    JSON Schema of an event body
 
@@ -41,7 +41,7 @@ from .world import Illegal, World
 HERE = pathlib.Path(__file__).parent.parent
 DOC = HERE / "DATA-MODEL.md"
 PROMPT = HERE / "AGENT.md"
-FOREMAN_PROMPT = HERE / "FOREMAN.md"
+DICTATOR_PROMPT = HERE / "DICTATOR.md"
 
 
 def env(name: str) -> str:
@@ -132,11 +132,11 @@ def main(argv: list[str]) -> int:
             while True:
                 obs.step()
                 time.sleep(60)
-        case ["foreman", slug, checkout]:
-            from .foreman import Foreman
+        case ["dictator", slug, checkout]:
+            from .dictator import Dictator
             from .github import GitHub
-            Foreman(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
-                    FOREMAN_PROMPT.read_text(),
+            Dictator(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
+                    DICTATOR_PROMPT.read_text(),
                     orchestrate_prompt=(HERE / "ORCHESTRATE.md").read_text(),
                     answer_prompt=(HERE / "ANSWER.md").read_text(),
                     state=pathlib.Path(env("FACTORY_LOG")).parent / "state").run()

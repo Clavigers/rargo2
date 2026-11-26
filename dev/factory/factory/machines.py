@@ -75,7 +75,7 @@ class PrS(enum.StrEnum):
     abandoned = "abandoned"  # its issue closed without it
 
 
-class ForemanS(enum.StrEnum):
+class DictatorS(enum.StrEnum):
     resting = "resting"
     ticking = "ticking"
 
@@ -124,10 +124,10 @@ REVIEW = machine(
 PR = machine(
     "pr", "pr", PrS, ["open"], [("open", "merged"), ("open", "abandoned")],
     "The one pull request of an issue.")
-FOREMAN = machine(
-    "foreman", "", ForemanS, ["resting"],
+DICTATOR = machine(
+    "dictator", "", DictatorS, ["resting"],
     [("resting", "ticking"), ("ticking", "resting")],
-    "The foreman acts only while ticking.")
+    "The dictator acts only while ticking.")
 VERSION = machine(
     "version", "version", VersionS, ["candidate"], [("candidate", "published")],
     "A release branch and its candidate builds.")
@@ -135,4 +135,4 @@ USE = machine(
     "use", "use", UseS, ["open"], [("open", "ended")],
     "The human or the power user using one build.")
 
-MACHINES = (ISSUE, INITIATIVE, AGENT, QUOTA, CI, REVIEW, PR, FOREMAN, VERSION, USE)
+MACHINES = (ISSUE, INITIATIVE, AGENT, QUOTA, CI, REVIEW, PR, DICTATOR, VERSION, USE)

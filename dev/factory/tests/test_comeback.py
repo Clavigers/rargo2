@@ -10,7 +10,7 @@ from factory.world import Illegal
 from test_world import C1, C2, CONFIG, SHA, X1, Log
 
 RULES = copy.deepcopy(CONFIG)
-RULES["foreman"] |= {"affinity_minutes": 120, "no_progress_sessions": 2, "session_minutes": 90}
+RULES["dictator"] |= {"affinity_minutes": 120, "no_progress_sessions": 2, "session_minutes": 90}
 
 
 def log():
@@ -77,12 +77,12 @@ def test_sessions_that_end_without_moving_the_issue_lose_it():
     g(C1, "taken", issue=1)
     g("watchdog", "session_ended", agent=C1, reason="finished")
     assert g.w.issues[1].stuck == {C1: 1}
-    g("foreman", "tick_started", tick=1)
+    g("dictator", "tick_started", tick=1)
     with pytest.raises(Illegal, match="ended 1 sessions"):
-        g("foreman", "returned", issue=1, reason="no_progress")
-    g("foreman", "tick_ended", tick=1)
+        g("dictator", "returned", issue=1, reason="no_progress")
+    g("dictator", "tick_ended", tick=1)
     g("watchdog", "session_started", agent=C1)("watchdog", "session_ended", agent=C1, reason="finished")
-    g("foreman", "tick_started", tick=2)("foreman", "returned", issue=1, reason="no_progress")
+    g("dictator", "tick_started", tick=2)("dictator", "returned", issue=1, reason="no_progress")
     assert C1 in g.w.issues[1].given_up and g.w.reserved_for(1) is None
     g(C2, "taken", issue=1)  # another agent starts fresh
 
@@ -96,24 +96,24 @@ def test_a_session_that_pushed_is_not_stuck():
     assert g.w.issues[1].stuck == {}
 
 
-def test_the_foreman_answers_a_question_and_tunes_the_factory():
+def test_the_dictator_answers_a_question_and_tunes_the_factory():
     g = log()
     g(C1, "taken", issue=1)(C1, "returned", issue=1, reason="asked", note="tabs or spaces?")
     g("human", "filed", issue=2, kind="enhancement")
     with pytest.raises(Illegal, match="held by owner"):
-        g("human", "parked", issue=2)("foreman", "unparked", issue=2)
-    g("foreman", "unparked", issue=1)  # its answer is on the issue
+        g("human", "parked", issue=2)("dictator", "unparked", issue=2)
+    g("dictator", "unparked", issue=1)  # its answer is on the issue
     assert g.w.reserved_for(1) == C1
     g("human", "filed", issue=3, kind="enhancement")
-    g("foreman", "parked", issue=3, reason="foreman")("foreman", "unparked", issue=3)
+    g("dictator", "parked", issue=3, reason="dictator")("dictator", "unparked", issue=3)
     more = copy.deepcopy(RULES) | {"version": 2}
     more["agents"][1]["count"] = 3
-    more["foreman"]["orchestrate_minutes"] = 60
-    g("foreman", "tick_started", tick=1)("foreman", "config_applied", config=more)
+    more["dictator"]["orchestrate_minutes"] = 60
+    g("dictator", "tick_started", tick=1)("dictator", "config_applied", config=more)
     assert "codex-3" in g.w.config.names()
     for change in ({"reviewers": ["other"]}, {"agents": [dict(more["agents"][0], count=5), more["agents"][1]]}):
-        with pytest.raises(Illegal, match="the foreman"):
-            g("foreman", "config_applied", config=more | {"version": 3} | change)
+        with pytest.raises(Illegal, match="the dictator"):
+            g("dictator", "config_applied", config=more | {"version": 3} | change)
 
 
 def test_quota_readings_are_in_the_log(tmp_path):

@@ -1,7 +1,7 @@
 """A SimPy model of Factory2 that writes the same log the real factory does.
 
 Every role of the real factory is a SimPy process here, doing what its
-service does: the human files work, the foreman ticks, the watchdog keeps
+service does: the human files work, the dictator ticks, the watchdog keeps
 sessions, agents do one issue per session, CI and the reviewers judge
 pushes, and the merger merges. Each act is an event of factory.model,
 applied to a factory.world.World, so the simulation can only make moves the
@@ -37,8 +37,8 @@ PARAMS = [
     ("friction_share", "Human", "Share that are friction (%)", 0, 100, 5, 15),
     ("initiatives_per_week", "Human", "Initiatives per week", 0, 7, 0.5, 1),
     ("hold_odds", "Human", "Issues the owner holds a while (%)", 0, 50, 1, 5),
-    ("children", "Foreman", "Issues per planned initiative", 1, 20, 1, 6),
-    ("plan_minutes", "Foreman", "Planning session (min)", 5, 240, 5, 40),
+    ("children", "Dictator", "Issues per planned initiative", 1, 20, 1, 6),
+    ("plan_minutes", "Dictator", "Planning session (min)", 5, 240, 5, 40),
     ("claude-code", "Agents", "Claude Code agents", 0, 8, 1, 1),
     ("codex", "Agents", "Codex agents", 0, 8, 1, 1),
     ("grok", "Agents", "Grok agents", 0, 8, 1, 1),
@@ -78,7 +78,7 @@ class Sim:
         self.planned: set[int] = set()
         self.pending = False  # a config waiting for departing agents
         self._config()
-        for proc in (self.human(), self.foreman(), self.watchdog(), self.initiatives()):
+        for proc in (self.human(), self.dictator(), self.watchdog(), self.initiatives()):
             self.env.process(proc)
 
     # ------------------------------------------------------------ the log
@@ -183,24 +183,24 @@ class Sim:
             yield self._wait(7 * DAY / rate)
             self.emit("human", event="filed", issue=self._next(), kind="initiative")
 
-    # ------------------------------------------------------------ the foreman
+    # ------------------------------------------------------------ the dictator
 
-    def foreman(self):
+    def dictator(self):
         while True:
-            yield self.env.timeout(self.w.config.foreman.tick_minutes)
+            yield self.env.timeout(self.w.config.dictator.tick_minutes)
             w = self.w
-            self.emit("foreman", event="tick_started", tick=w.tick + 1)
+            self.emit("dictator", event="tick_started", tick=w.tick + 1)
             for agent, issue in list(w.holding.items()):
                 if w.is_(M.AGENT, agent, AgentS.off):
-                    self.emit("foreman", event="returned", issue=issue, reason="stale")
+                    self.emit("dictator", event="returned", issue=issue, reason="stale")
                 elif w.is_(M.QUOTA, agent, "out"):
-                    self.emit("foreman", event="returned", issue=issue, reason="quota")
+                    self.emit("dictator", event="returned", issue=issue, reason="quota")
             self._preempt()
             for n, i in list(w.issues.items()):
                 if (i.kind is m.Kind.initiative and w.open_(n) and i.children
                         and not any(w.open_(c) for c in i.children)):
-                    self.emit("foreman", event="closed", issue=n, reason="done")
-            self.emit("foreman", event="tick_ended", tick=w.tick)
+                    self.emit("dictator", event="closed", issue=n, reason="done")
+            self.emit("dictator", event="tick_ended", tick=w.tick)
             for n, i in list(w.issues.items()):
                 if (i.kind is m.Kind.initiative and w.open_(n) and not i.children
                         and not i.parked and n not in self.planned):
@@ -209,7 +209,7 @@ class Sim:
 
     def _preempt(self):
         w = self.w
-        limit = w.config.foreman.preempt_minutes
+        limit = w.config.dictator.preempt_minutes
         if limit is None or w.free_agents():
             return
         cutoff = w.t - timedelta(minutes=limit)
@@ -219,7 +219,7 @@ class Sim:
         held = [n for n in w.holding.values() if w.issues[n].kind is not m.Kind.bug]
         if held:
             n = max(held, key=lambda n: w.since(M.ISSUE, n))
-            self.emit("foreman", event="returned", issue=n, reason="preempted",
+            self.emit("dictator", event="returned", issue=n, reason="preempted",
                       note="a bug has waited longer than the preemption limit")
 
     def plan(self, initiative: int):
@@ -231,7 +231,7 @@ class Sim:
         for _ in range(max(1, int(self.p["children"]))):
             n = self._next()
             deps = [self.rng.choice(made)] if made and self.rng.random() < 0.4 else []
-            self.emit("foreman", event="filed", issue=n, kind="enhancement",
+            self.emit("dictator", event="filed", issue=n, kind="enhancement",
                       parent=initiative, deps=deps)
             made.append(n)
             yield self.env.timeout(0.5)

@@ -1,4 +1,4 @@
-"""The foreman. Every tick_minutes it:
+"""The dictator. Every tick_minutes it:
 
 1. takes back issues whose holder's session ended (stale) or whose holder is
    out of quota;
@@ -9,16 +9,16 @@
 
 All three are decisions inside one tick. Then, outside the tick, it plans: an
 open initiative with no children gets a planning session (a harness run with
-FOREMAN.md as its prompt) that files sub-issues on GitHub, which the observer
-records as the foreman's. The foreman writes no code.
+DICTATOR.md as its prompt) that files sub-issues on GitHub, which the observer
+records as the dictator's. The dictator writes no code.
 
 Every orchestrate_minutes it also orchestrates: a session with ORCHESTRATE.md
 as its prompt looks at the whole factory and decides what the rules above
 cannot: the order of work, duplicates, missing or oversized issues, guidance
 for agents. It runs inside a tick of its own, so what it decides is checked
-and recorded like any other foreman decision, and it keeps notes between
+and recorded like any other dictator decision, and it keeps notes between
 runs in CHECKOUT/orchestration.md. Both kinds of session run on the config's
-foreman.model.
+dictator.model.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ from .model import Kind, Role
 from .watchdog import BIN
 
 
-class Foreman:
+class Dictator:
     def __init__(self, ledger: Ledger, gh: GitHub, workdir: Path, prompt: str,
                  clock: Callable[[], datetime] = utc_now,
                  plan_timeout: timedelta = timedelta(minutes=45),
@@ -60,7 +60,7 @@ class Foreman:
         self.orchestrate_prompt, self.state = orchestrate_prompt, state
         self.orchestrated: datetime | None = None  # when the last run began
         notes = self.workdir / "orchestration.md"
-        if notes.exists():  # a restarted foreman does not orchestrate again at once
+        if notes.exists():  # a restarted dictator does not orchestrate again at once
             self.orchestrated = datetime.fromtimestamp(notes.stat().st_mtime, self.clock().tzinfo)
         self.planned: dict[int, datetime] = {}  # initiative -> when we last tried
         self.told: set[int] = set()  # issues every agent gave up on, owner told
@@ -68,7 +68,7 @@ class Foreman:
 
     def tick(self) -> None:
         w = self.ledger.refresh()
-        if w.is_(M.FOREMAN, "", "ticking"):  # a foreman stopped mid-tick left it open
+        if w.is_(M.DICTATOR, "", "ticking"):  # a dictator stopped mid-tick left it open
             self._decide("tick_ended", tick=w.tick)
             w = self.ledger.refresh()
         n = w.tick + 1
@@ -98,29 +98,29 @@ class Foreman:
             for n in still:
                 self.gh.close(n, "completed", f"Closed by {w.issues[n].closer}: see the factory log.")
         except GitHubError as err:
-            self.say(f"foreman: closing on GitHub: {err}")
+            self.say(f"dictator: closing on GitHub: {err}")
             return
         self.synced |= mine
 
     def _stuck(self) -> None:
-        """Work no agent will do is the foreman's to rethink: orchestrate at
+        """Work no agent will do is the dictator's to rethink: orchestrate at
         once. Without an orchestrator, tell the owner, once."""
         w = self.ledger.world
         agents = set(w.config.names())
         for n, i in w.issues.items():
             if w.waiting(n) and agents <= i.given_up and n not in self.told:
                 self.told.add(n)
-                if w.config.foreman.orchestrate_minutes and self.orchestrate_prompt:
+                if w.config.dictator.orchestrate_minutes and self.orchestrate_prompt:
                     self.orchestrated = None
-                    self.say(f"foreman: every agent gave up on #{n}; orchestrating now")
+                    self.say(f"dictator: every agent gave up on #{n}; orchestrating now")
                     continue
                 notify(f"#{n}: every agent gave up on it. Put it on hold and release it "
                        f"(label guard, then remove it) to let them try again.",
                        "rargo factory: needs the owner")
-                self.say(f"foreman: #{n} needs the owner; every agent gave up on it")
+                self.say(f"dictator: #{n} needs the owner; every agent gave up on it")
 
     def _answer(self) -> None:
-        """An agent that asked gets its answer from the foreman: a session per
+        """An agent that asked gets its answer from the dictator: a session per
         question, inside a tick, that decides, comments, and releases the
         issue. Two tries; then the owner is told."""
         if self.answer_prompt is None:
@@ -130,31 +130,33 @@ class Foreman:
             if tries >= 2:
                 if tries == 2:
                     self.answering[n] = 3
-                    notify(f"#{n}: an agent asked a question and the foreman did not settle it.",
+                    notify(f"#{n}: an agent asked a question and the dictator did not settle it.",
                            "rargo factory: unanswered question")
                 continue
             self.answering[n] = tries + 1
             if not self._decide("tick_started", tick=self.ledger.world.tick + 1):
                 return
-            self.say(f"foreman: answering the question on #{n}")
+            self.say(f"dictator: answering the question on #{n}")
             try:
                 code = self.run_session(n, self.answer_prompt.replace("{issue}", str(n)))
             finally:
                 self._decide("tick_ended", tick=self.ledger.refresh().tick)
-            self.say(f"foreman: answering #{n} ended with exit {code}")
+            self.say(f"dictator: answering #{n} ended with exit {code}")
             if not self.ledger.world.issues[n].asked:
                 self.answering.pop(n, None)
 
     def run(self) -> None:
         while True:
-            self.tick()
-            time.sleep(self.ledger.world.config.foreman.tick_minutes * 60)
+            began = time.monotonic()
+            self.tick()  # a tick every tick_minutes, however long this one took
+            time.sleep(max(10.0, self.ledger.world.config.dictator.tick_minutes * 60
+                           - (time.monotonic() - began)))
 
     # ------------------------------------------------------------ decisions
 
     def _take_back(self) -> None:
         w = self.ledger.world
-        stuck = w.config.foreman.no_progress_sessions
+        stuck = w.config.dictator.no_progress_sessions
         for agent, issue in list(w.holding.items()):
             if (stuck and w.is_(M.AGENT, agent, AgentS.off)
                     and w.issues[issue].stuck.get(agent, 0) >= stuck):
@@ -166,7 +168,7 @@ class Foreman:
 
     def _preempt(self) -> None:
         w = self.ledger.world
-        limit = w.config.foreman.preempt_minutes
+        limit = w.config.dictator.preempt_minutes
         if limit is None or w.free_agents():
             return
         cutoff = w.t - timedelta(minutes=limit)
@@ -192,10 +194,10 @@ class Foreman:
 
     def _decide(self, event: str, **fields) -> bool:
         try:
-            self.ledger.submit(Role.foreman, json.dumps({"event": event, **fields}))
+            self.ledger.submit(Role.dictator, json.dumps({"event": event, **fields}))
             return True
         except Refused as err:
-            self.say(f"foreman: {err}")
+            self.say(f"dictator: {err}")
             return False
 
     # ------------------------------------------------------------ planning
@@ -207,17 +209,17 @@ class Foreman:
             if (i.kind is Kind.initiative and w.open_(n) and not i.children and not i.parked
                     and now - self.planned.get(n, now - self.replan_after) >= self.replan_after):
                 self.planned[n] = now
-                self.say(f"foreman: planning initiative #{n}")
+                self.say(f"dictator: planning initiative #{n}")
                 code = self.run_session(n)
-                self.say(f"foreman: planning #{n} ended with exit {code}")
+                self.say(f"dictator: planning #{n} ended with exit {code}")
 
     def _orchestrate(self) -> None:
         w = self.ledger.refresh()
-        every = w.config.foreman.orchestrate_minutes
+        every = w.config.dictator.orchestrate_minutes
         now = self.clock()
         if every is None or self.orchestrate_prompt is None:
             return
-        if self.orchestrated and now - self.orchestrated < timedelta(minutes=every):
+        if self.orchestrated and now - self.orchestrated < timedelta(minutes=every, seconds=-30):
             return
         self.orchestrated = now
         notes = self.workdir / "orchestration.md"
@@ -225,22 +227,22 @@ class Foreman:
                   .replace("{state}", str(self.state or self.workdir)))
         if not self._decide("tick_started", tick=w.tick + 1):
             return
-        self.say("foreman: orchestrating")
-        try:  # inside a tick: its decisions are the foreman's
+        self.say("dictator: orchestrating")
+        try:  # inside a tick: its decisions are the dictator's
             code = self.run_session("orchestrate", prompt)
         finally:
             self._decide("tick_ended", tick=self.ledger.refresh().tick)
-        self.say(f"foreman: orchestrating ended with exit {code}")
+        self.say(f"dictator: orchestrating ended with exit {code}")
 
     def _run_session(self, initiative: int | str, prompt: str | None = None) -> int:
         w = self.ledger.world
         t = next((a for a in w.config.agents if a.type is m.Harness.claude_code),
                  w.config.agents[0])
-        if w.config.foreman.model is not None:
-            t = t.model_copy(update={"model": w.config.foreman.model})
+        if w.config.dictator.model is not None:
+            t = t.model_copy(update={"model": w.config.dictator.model})
         cmd = harness.command(t, prompt or self.prompt.replace("{initiative}", str(initiative)))
         if cmd is None:
-            self.say(f"foreman: no {t.type} here to plan with")
+            self.say(f"dictator: no {t.type} here to plan with")
             return 127
         argv, extra = cmd
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -249,7 +251,7 @@ class Foreman:
                            capture_output=True)
         log = self.workdir / f"plan-{initiative}-{self.clock():%Y%m%dT%H%M%S}.log"
         env = os.environ | extra | {
-            "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.foreman,
+            "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.dictator,
             "FACTORY_PYTHON": sys.executable,
             "PATH": f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}"}
         with open(log, "wb") as out:

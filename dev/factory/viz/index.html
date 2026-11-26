@@ -70,7 +70,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; pa
 body { font-variant-numeric: tabular-nums; }
 .pill { min-width: 13ch; justify-content: center; }
 #clock { min-width: 17ch; }
-#foreman, #pm, #poweruser { height: 118px; overflow: hidden; }
+#dictator, #pm, #poweruser { height: 118px; overflow: hidden; }
 #watchdog { height: 76px; overflow: hidden; }
 .agent { min-height: 92px; overflow: hidden; }
 .quota { display: grid; grid-template-columns: 1fr 38px; gap: 1px 6px; margin-top: 5px; font: 10.5px var(--mono); color: var(--dim); }
@@ -281,7 +281,7 @@ button.on { border-color: var(--enh); color: var(--enh); }
     <div class="tag"><svg class="i"><use href="#i-agent"/></svg>The factory</div>
     <div id="factory">
       <div id="actors">
-        <div class="box actor" data-anchor="foreman" id="foreman"></div>
+        <div class="box actor" data-anchor="dictator" id="dictator"></div>
         <div class="box actor" data-anchor="watchdog" id="watchdog"></div>
         <div id="agentcol" data-anchor="workers" style="display:flex;flex-direction:column;gap:8px"></div>
         <div class="box actor" data-anchor="pm" id="pm"></div>
@@ -354,7 +354,7 @@ const asChip = n => { const i = state.issues[n]; return i ? { n, t: i.kind, rw: 
 function chip(c, cls = '', extra = '') {
   if (c.for_) extra += `<span class="who">${ic('arrow')}${esc(c.for_.replace(/-\d+$/, ''))}</span>`;
   if (c.asked) extra += `<span class="who">asked</span>`;
-  return `<span class="chip ${c.t}${c.rw ? ' rw' : ''} ${cls}" data-n="${c.n}" title="#${c.n} ${c.t}${c.rw ? ', sent back for changes' : ''}${c.for_ ? ', waits for ' + c.for_ + ', which held it last' : ''}${c.asked ? ', its agent asked a question on the issue; the foreman answers at its next tick' : ''}">${ic(ICON[c.t] || 'issue')}${c.n}${extra}</span>`;
+  return `<span class="chip ${c.t}${c.rw ? ' rw' : ''} ${cls}" data-n="${c.n}" title="#${c.n} ${c.t}${c.rw ? ', sent back for changes' : ''}${c.for_ ? ', waits for ' + c.for_ + ', which held it last' : ''}${c.asked ? ', its agent asked a question on the issue; the dictator answers at its next tick' : ''}">${ic(ICON[c.t] || 'issue')}${c.n}${extra}</span>`;
 }
 function heap(n, color, label = 'more') {
   if (n <= 0) return '';
@@ -422,21 +422,21 @@ function render() {
   const C = S.columns, inits = S.initiatives.filter(g => g.state === 'open');
   const open = C.ready.length + C.blocked.length + C.held.length + C.checking.length + C.parked.length;
   $('tracker').innerHTML = `<h3>${ic('issue')}Issues <small class="counts"><span>${ic('issue')}${open} open</span><span>${ic('closed')}${C.closed.length} closed</span></small></h3>
-    <div class="sub">Everything is an issue. You file them; the foreman splits initiatives; each agent takes one at a time into its slot, the queue's head first.</div>
+    <div class="sub">Everything is an issue. You file them; the dictator splits initiatives; each agent takes one at a time into its slot, the queue's head first.</div>
     <div class="cols">
       <div class="col"><div>${ic('initiative')}Initiatives<b>${inits.length}</b></div>
         ${inits.slice(0, 8).map(g => g.children.length
           ? `<div class="init" title="#${g.n}: ${g.done} of ${g.children.length} sub-issues closed${g.parked ? ', held' : ''}">${ic(g.parked ? 'lock' : 'initiative')}#${g.n}${bar(g.done / g.children.length)}<span>${g.done}/${g.children.length}</span></div>`
-          : `<div class="init plan" title="#${g.n}: waiting for the foreman to plan it">${ic(g.parked ? 'lock' : 'initiative')}#${g.n}${bar(0)}<span>${g.parked ? 'held' : 'to plan'}</span></div>`).join('')}
+          : `<div class="init plan" title="#${g.n}: waiting for the dictator to plan it">${ic(g.parked ? 'lock' : 'initiative')}#${g.n}${bar(0)}<span>${g.parked ? 'held' : 'to plan'}</span></div>`).join('')}
         <div style="margin-top:auto">${inits.length > 8 ? heap(inits.length - 8, css('init'), 'more initiatives') : ''}</div></div>
       <div class="col" data-zone="ready"><div>${ic('issue')}Ready<b>${C.ready.length}</b></div><div class="chips">${chips(C.ready.map(asChip), 30)}</div></div>
       <div class="col" data-zone="blocked"><div>${ic('blocked')}Blocked<b>${C.blocked.length}</b></div><div class="chips">${chips(C.blocked.map(asChip), 22, c => chip(c, 'blocked'))}</div></div>
       <div class="col" data-zone="parked"><div>${ic('lock')}On hold<b>${C.parked.length}</b></div><div class="chips">${chips(C.parked.map(asChip), 14, c => chip(c, 'blocked'))}</div></div>
     </div>`;
 
-  // the foreman
-  const f = S.foreman, frac = f.every ? Math.min(1, (f.next ?? 0) / f.every) : 0, RC = 2 * Math.PI * 10;
-  $('foreman').innerHTML = `<div class="row"><div class="ic">${ic('clock')}</div><div><b>Foreman</b><div class="sub" style="margin:0">${f.every ? `acts every ${f.every} min` : 'no ticks yet'} · tick ${S.tick}</div></div>
+  // the dictator
+  const f = S.dictator, frac = f.every ? Math.min(1, (f.next ?? 0) / f.every) : 0, RC = 2 * Math.PI * 10;
+  $('dictator').innerHTML = `<div class="row"><div class="ic">${ic('clock')}</div><div><b>Dictator</b><div class="sub" style="margin:0">${f.every ? `acts every ${f.every} min` : 'no ticks yet'} · tick ${S.tick}</div></div>
       <svg width="26" height="26" class="ring" style="margin-left:auto"><circle cx="13" cy="13" r="10" fill="none" stroke="${css('line2')}" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="${css('init')}" stroke-width="3" stroke-dasharray="${RC * (1 - frac)} ${RC}"/></svg></div>
     <div class="stat" style="margin-top:6px">next tick in <b>${f.next == null ? '-' : Math.ceil(f.next) + ' min'}</b></div>
     <div class="stat">split <b>${f.planned}</b> initiatives</div>
@@ -577,7 +577,7 @@ function moves(a, b) {
   for (const [n, i] of Object.entries(b.issues)) {
     const was = a.issues[n], dst = placeOf(i);
     if (!dst) continue;
-    if (!was) { out.push([i.parent ? 'foreman' : 'human', 'tracker', i.kind]); continue; }
+    if (!was) { out.push([i.parent ? 'dictator' : 'human', 'tracker', i.kind]); continue; }
     const src = placeOf(was);
     if (src && src !== dst) out.push([src, dst, src === 'checks' ? 'pr' : i.kind]);
   }
@@ -787,8 +787,8 @@ async function loadSeries() {
 }
 
 graph = { edges: [
-  { src: 'human', dst: 'tracker', kind: 'flow' }, { src: 'foreman', dst: 'tracker', kind: 'plan' },
-  { src: 'tracker', dst: 'workers', kind: 'flow' }, { src: 'foreman', dst: 'workers', kind: 'plan' },
+  { src: 'human', dst: 'tracker', kind: 'flow' }, { src: 'dictator', dst: 'tracker', kind: 'plan' },
+  { src: 'tracker', dst: 'workers', kind: 'flow' }, { src: 'dictator', dst: 'workers', kind: 'plan' },
   { src: 'workers', dst: 'checks', kind: 'flow' }, { src: 'checks', dst: 'main', kind: 'flow' },
   { src: 'checks', dst: 'needswork', kind: 'rework' }, { src: 'needswork', dst: 'workers', kind: 'rework' },
   { src: 'workers', dst: 'tracker', kind: 'rework' }, { src: 'main', dst: 'rc', kind: 'flow' },

@@ -51,7 +51,7 @@ class Issue:
     closer: str | None = None  # who closed it, in the log
     owner: str | None = None  # the agent that held it last: work coming back waits for it
     asked: bool = False  # parked on a question its holder asked
-    hold: str | None = None  # why it is parked: owner, lock, foreman; None when asked
+    hold: str | None = None  # why it is parked: owner, lock, dictator; None when asked
     stuck: dict[str, int] = field(default_factory=dict)  # agent -> sessions ended without moving it
 
 
@@ -197,11 +197,11 @@ class World:
         it has quota and for affinity_minutes after the issue came back."""
         i = self.issues[n]
         a = i.owner
-        if (a is None or not self.config or self.config.foreman.affinity_minutes is None
+        if (a is None or not self.config or self.config.dictator.affinity_minutes is None
                 or not self.is_(M.ISSUE, n, IssueS.ready) or a in i.given_up
                 or self.config.type_of(a) is None or not self.is_(M.QUOTA, a, "ok")):
             return None
-        if self.t - self.since(M.ISSUE, n) >= timedelta(minutes=self.config.foreman.affinity_minutes):
+        if self.t - self.since(M.ISSUE, n) >= timedelta(minutes=self.config.dictator.affinity_minutes):
             return None
         return a
 
@@ -332,9 +332,9 @@ class World:
             self.fail(f"{a} may not write {e.event}")
         if is_agent and self.is_(M.AGENT, a, AgentS.off):
             self.fail(f"{a} is off; an agent writes only from a live session")
-        if a == Role.foreman and e.nature is m.Nature.decision \
-                and not isinstance(e, m.TickStarted) and not self.is_(M.FOREMAN, "", "ticking"):
-            self.fail("the foreman decides only inside a tick")
+        if a == Role.dictator and e.nature is m.Nature.decision \
+                and not isinstance(e, m.TickStarted) and not self.is_(M.DICTATOR, "", "ticking"):
+            self.fail("the dictator decides only inside a tick")
         self.t = line.t
         held = self.holding.get(a) if is_agent else None
         HANDLERS[type(e)](self, e, a)
@@ -373,8 +373,8 @@ def _(w: World, e: m.ConfigApplied, a):
         w.fail(f"config version {e.config.version} after {w.config.version}")
     if not w.config and e.config.version != 1:
         w.fail("the first config is version 1")
-    if a == Role.foreman:
-        _foreman_may(w, e.config)
+    if a == Role.dictator:
+        _dictator_may(w, e.config)
     new = set(e.config.names())
     for name in (w.config.names() if w.config else []):
         if name not in new and (not w.is_(M.AGENT, name, AgentS.off) or name in w.holding):
@@ -384,17 +384,17 @@ def _(w: World, e: m.ConfigApplied, a):
         if w.state(M.AGENT, name) is None:
             w.enter(M.AGENT, name, AgentS.off)
             w.enter(M.QUOTA, name, "ok")
-    if w.state(M.FOREMAN, "") is None:
-        w.enter(M.FOREMAN, "", "resting")
+    if w.state(M.DICTATOR, "") is None:
+        w.enter(M.DICTATOR, "", "resting")
 
 
-FOREMAN_TUNES = ("preempt_minutes", "affinity_minutes", "no_progress_sessions",
+DICTATOR_TUNES = ("preempt_minutes", "affinity_minutes", "no_progress_sessions",
                  "session_minutes", "orchestrate_minutes")
-MAX_AGENTS = 4  # of one type, when the foreman sets the count
+MAX_AGENTS = 4  # of one type, when the dictator sets the count
 
 
-def _foreman_may(w: World, new: m.Config) -> None:
-    """The foreman changes only how many agents of each type run, and its own
+def _dictator_may(w: World, new: m.Config) -> None:
+    """The dictator changes only how many agents of each type run, and its own
     timing rules. Who reviews, on which plans and models, and how releases
     go stay the human's."""
     if w.config is None:
@@ -404,15 +404,15 @@ def _foreman_may(w: World, new: m.Config) -> None:
     for d in (old, want):
         d.pop("version")
         d.pop("guesses")
-        for k in FOREMAN_TUNES:
-            d["foreman"].pop(k)
+        for k in DICTATOR_TUNES:
+            d["dictator"].pop(k)
     counts = [x.pop("count") for x in want["agents"]]
     for x in old["agents"]:
         x.pop("count")
     if old != want:
-        w.fail("the foreman changes only agent counts and its own timing rules")
+        w.fail("the dictator changes only agent counts and its own timing rules")
     if any(c > MAX_AGENTS for c in counts):
-        w.fail(f"the foreman runs at most {MAX_AGENTS} agents of a type")
+        w.fail(f"the dictator runs at most {MAX_AGENTS} agents of a type")
 
 
 @on(m.ScopeFrozen)
@@ -445,7 +445,7 @@ def _(w: World, e: m.Filed, a):
     else:
         if w.scope_frozen:
             w.fail(f"scope is frozen; no new {e.kind}")
-        planners = {Role.human, Role.foreman} | ({m.AGENT} if e.kind is Kind.enhancement else set())
+        planners = {Role.human, Role.dictator} | ({m.AGENT} if e.kind is Kind.enhancement else set())
         if (a if a in m.ROLES else m.AGENT) not in planners:
             w.fail(f"{a} does not file {e.kind}s")
         if a not in m.ROLES:
@@ -493,9 +493,9 @@ def _(w: World, e: m.Depends, a):
 @on(m.Parked)
 def _(w: World, e: m.Parked, a):
     whose = {m.ParkReason.owner: Role.human, m.ParkReason.lock: Role.outside,
-             m.ParkReason.foreman: Role.foreman}[e.reason]
+             m.ParkReason.dictator: Role.dictator}[e.reason]
     if a != whose:
-        w.fail("the owner's hold is the human's; a lock is an outsider's; the foreman's is its own")
+        w.fail("the owner's hold is the human's; a lock is an outsider's; the dictator's is its own")
     i = w.issue(e.issue)
     if not w.open_(e.issue):
         w.fail(f"#{e.issue} is closed")
@@ -509,8 +509,8 @@ def _(w: World, e: m.Unparked, a):
     i = w.issue(e.issue)
     if not i.parked:
         w.fail(f"#{e.issue} is not parked")
-    if a == Role.foreman and not (i.asked or i.hold == m.ParkReason.foreman):
-        w.fail(f"#{e.issue} is held by {i.hold}; the foreman lifts only its own hold or answers a question")
+    if a == Role.dictator and not (i.asked or i.hold == m.ParkReason.dictator):
+        w.fail(f"#{e.issue} is held by {i.hold}; the dictator lifts only its own hold or answers a question")
     i.parked = i.asked = False
     i.hold = None
     i.given_up.clear()  # the owner looked at it: everyone may try again
@@ -538,7 +538,7 @@ def _let_go(w: World, i: Issue) -> None:
 @on(m.Closed)
 def _(w: World, e: m.Closed, a):
     i = w.issue(e.issue)
-    inside = a == Role.foreman
+    inside = a == Role.dictator
     if a not in m.ROLES:  # an agent
         if i.holder != a:
             w.fail(f"{a} does not hold #{e.issue}")
@@ -558,7 +558,7 @@ def _(w: World, e: m.Closed, a):
     if e.reason is m.CloseReason.done:
         w.fail("work closes as done only by merging")
     if inside and not w.waiting(e.issue):
-        w.fail(f"#{e.issue} is {w.state(M.ISSUE, e.issue)}; the foreman closes only waiting work")
+        w.fail(f"#{e.issue} is {w.state(M.ISSUE, e.issue)}; the dictator closes only waiting work")
     _let_go(w, i)
     i.closer = a
     w.enter(M.ISSUE, e.issue, IssueS.closed)
@@ -639,18 +639,18 @@ def _(w: World, e: m.Returned, a):
             w.fail("an agent that asks says what in the note")
         i.parked = i.asked = True
     elif e.reason is R.no_progress:
-        if a != Role.foreman:
-            w.fail("only the foreman returns an issue as no_progress")
+        if a != Role.dictator:
+            w.fail("only the dictator returns an issue as no_progress")
         assert w.config
-        limit = w.config.foreman.no_progress_sessions
+        limit = w.config.dictator.no_progress_sessions
         if limit is None or i.stuck.get(holder, 0) < limit:
             w.fail(f"{holder} has ended {i.stuck.get(holder, 0)} sessions on #{e.issue} without moving it")
         if not w.is_(M.AGENT, holder, AgentS.off):
             w.fail(f"{holder}'s session is live")
         i.given_up.add(holder)
     else:
-        if a != Role.foreman:
-            w.fail(f"only the foreman returns an issue as {e.reason}")
+        if a != Role.dictator:
+            w.fail(f"only the dictator returns an issue as {e.reason}")
         if e.reason is R.quota and not w.is_(M.QUOTA, holder, "out"):
             w.fail(f"{holder} has quota")
         if e.reason is R.stale and not w.is_(M.AGENT, holder, AgentS.off):
@@ -668,7 +668,7 @@ def _(w: World, e: m.Returned, a):
 
 def _check_preempt(w: World, n: int) -> None:
     assert w.config and w.t
-    limit = w.config.foreman.preempt_minutes
+    limit = w.config.dictator.preempt_minutes
     if limit is None:
         w.fail("preemption is off in this config")
     if w.issues[n].kind is Kind.bug:
@@ -814,7 +814,7 @@ def _(w: World, e: m.Attributed, a):
 def _(w: World, e: m.TickStarted, a):
     if e.tick != w.tick + 1:
         w.fail(f"tick {e.tick} after {w.tick}")
-    w.enter(M.FOREMAN, "", "ticking")
+    w.enter(M.DICTATOR, "", "ticking")
     w.tick = e.tick
 
 
@@ -822,7 +822,7 @@ def _(w: World, e: m.TickStarted, a):
 def _(w: World, e: m.TickEnded, a):
     if e.tick != w.tick:
         w.fail(f"tick {w.tick} is open, not {e.tick}")
-    w.enter(M.FOREMAN, "", "resting")
+    w.enter(M.DICTATOR, "", "resting")
 
 
 def _candidate(w: World, v: str) -> Version:

@@ -10,7 +10,7 @@ On the factory machine, under `/root/factory`, three systemd services:
 | Service | Does |
 |---|---|
 | `factory-observer` | Every minute: records what happened on GitHub into the log, and merges pull requests whose latest push passed CI and every reviewer. |
-| `factory-foreman` | Every 20 minutes: takes back work from agents that stopped or ran out of quota, preempts for bugs that waited too long, closes finished initiatives, and plans unparked initiatives into issues. |
+| `factory-dictator` | Every 20 minutes: takes back work from agents that stopped or ran out of quota, preempts for bugs that waited too long, closes finished initiatives, and plans unparked initiatives into issues. |
 | `factory-watchdog` | Keeps one headless session (Claude Code, Codex, Grok) running per agent that has work, each in its own worktree under `state/worktrees`. A session does one issue (`AGENT.md`) and ends. |
 
 ### Review
@@ -45,7 +45,7 @@ else is the factory's state: not labels, not the services' memory.
     cd /root/factory
     PYTHONPATH=src FACTORY_LOG=log.jsonl venv/bin/python -m factory status
     PYTHONPATH=src venv/bin/python -m factory check log.jsonl
-    journalctl -u factory-observer -u factory-foreman -u factory-watchdog -f
+    journalctl -u factory-observer -u factory-dictator -u factory-watchdog -f
     ls -t state/logs | head          # each agent session's full output
 
 Alarms (GitHub showing something the model says cannot happen) also go to

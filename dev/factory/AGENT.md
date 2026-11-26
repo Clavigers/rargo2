@@ -56,7 +56,7 @@ left, end the session.
   as you can make it, with what you have found so far; push what you have
   to the branch `issue-N` so it is not lost; then `factory submit
   '{"event":"returned","issue":N,"reason":"asked","note":"the question"}'`
-  and end. The foreman answers on the issue, within its next tick. The answer
+  and end. The dictator answers on the issue, within its next tick. The answer
   wakes you again in this same conversation, with what you know.
 - If it cannot be done as written: `factory submit
   '{"event":"returned","issue":N,"reason":"gave_up","note":"why"}'`,

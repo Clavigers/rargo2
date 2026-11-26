@@ -21,7 +21,7 @@ CONFIG = {
     "agents": [{"type": "claude-code", "count": N, "model": "claude-opus-5-5",
                 "plan": "max"}],
     "reviewers": ["placeholder"],
-    "foreman": {"tick_minutes": 20, "preempt_minutes": None},
+    "dictator": {"tick_minutes": 20, "preempt_minutes": None},
     "release": {"freeze_every_days": 7, "uses_required": 1, "soak_minutes": 120},
 }
 AGENTS = [f"claude-code-{i}" for i in range(1, N + 1)]

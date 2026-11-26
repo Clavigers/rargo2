@@ -1,5 +1,5 @@
 {
-  "version": 4,
+  "version": 6,
   "plans": [
     {
       "name": "claude-max",
@@ -37,14 +37,14 @@
   "reviewers": [
     "ellipsis"
   ],
-  "foreman": {
+  "dictator": {
     "tick_minutes": 20,
     "preempt_minutes": 60,
     "affinity_minutes": 120,
     "no_progress_sessions": 3,
     "session_minutes": 180,
     "model": "claude-fable-5-2",
-    "orchestrate_minutes": 180
+    "orchestrate_minutes": 20
   },
   "release": {
     "freeze_every_days": 7,
@@ -52,11 +52,11 @@
     "soak_minutes": 120
   },
   "guesses": [
-    "foreman.affinity_minutes",
-    "foreman.no_progress_sessions",
-    "foreman.orchestrate_minutes",
-    "foreman.preempt_minutes",
-    "foreman.session_minutes",
+    "dictator.affinity_minutes",
+    "dictator.no_progress_sessions",
+    "dictator.orchestrate_minutes",
+    "dictator.preempt_minutes",
+    "dictator.session_minutes",
     "plans.0.hours_per_week",
     "plans.1.hours_per_week",
     "plans.2.hours_per_week",

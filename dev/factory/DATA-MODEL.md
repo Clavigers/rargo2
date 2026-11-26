@@ -66,7 +66,7 @@ moves, the checker refuses the others, and measurement reads the intervals.
 ```
 
 The envelope is `schema`, `seq` (1, 2, 3 with no gaps), `t` (UTC to the
-second, never before the line above) and `actor`: a role (`human`, `foreman`,
+second, never before the line above) and `actor`: a role (`human`, `dictator`,
 `watchdog`, `ci`, `reviewer`, `merger`, `pm`, `power_user`) or an agent of the
 config in force. The rest is the event. The first line is `config_applied`.
 Issues and pull requests share GitHub's numbers, so no number is used twice.
@@ -148,9 +148,9 @@ Starts in `open`.
 - `merged` → (final)
 - `abandoned` → (final)
 
-### foreman (one)
+### dictator (one)
 
-The foreman acts only while ticking.
+The dictator acts only while ticking.
 
 Starts in `resting`.
 
@@ -179,30 +179,30 @@ Starts in `open`.
 
 | Event | Nature | Written by | Fields | Must be true |
 |---|---|---|---|---|
-| `config_applied` | decision | foreman, human | `config`: Config | The first line, and any change of policy after. Versions go up by one. It may not drop an agent that is live or holds an issue. |
+| `config_applied` | decision | dictator, human | `config`: Config | The first line, and any change of policy after. Versions go up by one. It may not drop an agent that is live or holds an issue. |
 | `scope_frozen` | decision | human | — | Once. No enhancement or initiative is filed after it. |
-| `filed` | observation | agent, foreman, human, power_user | `issue`: int<br>`kind`: `initiative` \| `enhancement` \| `bug` \| `friction`<br>`parent?`: int<br>`deps?`: set of int | The issue exists on GitHub, which gave it a new number. parent: an open initiative. deps: open work. Bugs and friction are filed by whoever found them, where they found them: an agent in the issue it holds, the power user in its open use session, the human in a use session or as a plain report whenever it likes. The world records which. Initiatives and enhancements come from the human and the foreman; an agent may file follow-up enhancements under the initiative of the issue it holds. |
-| `depends` | decision | agent, foreman, human | `issue`: int<br>`on`: int | issue waits for on. Both open work issues; no cycle. |
-| `parked` | observation | foreman, human, outside | `issue`: int<br>`reason?`: `owner` \| `lock` \| `foreman` | An open issue went on hold. Waiting work is not taken while parked, and an initiative is not planned. The owner's hold is the human's; an outside lock is an outsider's. |
-| `unparked` | observation | foreman, human, outside | `issue`: int | The hold on a parked issue was lifted. Agents that gave up on it may take it again. |
-| `undepends` | decision | agent, foreman, human | `issue`: int<br>`on`: int<br>`note`: text | Removes an edge that exists. |
-| `closed` | decision | agent, foreman, human, outside | `issue`: int<br>`reason`: `done` \| `duplicate` \| `wontfix` \| `invalid` \| `completed`<br>`duplicate_of?`: int<br>`note?`: text | Closes an issue without a merge. The foreman closes waiting work and initiatives whose children are closed. An agent closes an issue it holds and has no open pull request for as completed, when it found nothing left to change, with the evidence in the note. The human and outsiders close whatever is open (on GitHub): an agent holding it loses it, and its open pull request is abandoned. |
+| `filed` | observation | agent, dictator, human, power_user | `issue`: int<br>`kind`: `initiative` \| `enhancement` \| `bug` \| `friction`<br>`parent?`: int<br>`deps?`: set of int | The issue exists on GitHub, which gave it a new number. parent: an open initiative. deps: open work. Bugs and friction are filed by whoever found them, where they found them: an agent in the issue it holds, the power user in its open use session, the human in a use session or as a plain report whenever it likes. The world records which. Initiatives and enhancements come from the human and the dictator; an agent may file follow-up enhancements under the initiative of the issue it holds. |
+| `depends` | decision | agent, dictator, human | `issue`: int<br>`on`: int | issue waits for on. Both open work issues; no cycle. |
+| `parked` | observation | dictator, human, outside | `issue`: int<br>`reason?`: `owner` \| `lock` \| `dictator` | An open issue went on hold. Waiting work is not taken while parked, and an initiative is not planned. The owner's hold is the human's; an outside lock is an outsider's. |
+| `unparked` | observation | dictator, human, outside | `issue`: int | The hold on a parked issue was lifted. Agents that gave up on it may take it again. |
+| `undepends` | decision | agent, dictator, human | `issue`: int<br>`on`: int<br>`note`: text | Removes an edge that exists. |
+| `closed` | decision | agent, dictator, human, outside | `issue`: int<br>`reason`: `done` \| `duplicate` \| `wontfix` \| `invalid` \| `completed`<br>`duplicate_of?`: int<br>`note?`: text | Closes an issue without a merge. The dictator closes waiting work and initiatives whose children are closed. An agent closes an issue it holds and has no open pull request for as completed, when it found nothing left to change, with the evidence in the note. The human and outsiders close whatever is open (on GitHub): an agent holding it loses it, and its open pull request is abandoned. |
 | `session_started` | observation | watchdog | `agent`: text | An off agent with quota starts; it resumes the issue it still holds. |
-| `session_ended` | observation | watchdog | `agent`: text<br>`reason`: `finished` \| `crashed` \| `quota` \| `killed` | A live agent stops. Its issue stays held until the foreman returns it. |
+| `session_ended` | observation | watchdog | `agent`: text<br>`reason`: `finished` \| `crashed` \| `quota` \| `killed` | A live agent stops. Its issue stays held until the dictator returns it. |
 | `quota_out` | observation | watchdog | `agent`: text |  |
 | `quota_back` | observation | watchdog | `agent`: text |  |
 | `quota_seen` | observation | watchdog | `harness`: `claude-code` \| `codex` \| `grok`<br>`windows`: set of QuotaWindow | What a harness says about its plan's quota: each limit's use and reset. A reading, written when it differs from the last one; nothing in the factory decides from it. |
 | `taken` | decision | agent | `issue`: int | An idle agent with quota takes a ready issue it has not given up on. This append is the lock. |
-| `returned` | decision | agent, foreman | `issue`: int<br>`reason`: `blocked` \| `gave_up` \| `quota` \| `stale` \| `preempted` \| `asked` \| `no_progress`<br>`note?`: text | A held issue goes back to waiting. The reason says who may return it. |
+| `returned` | decision | agent, dictator | `issue`: int<br>`reason`: `blocked` \| `gave_up` \| `quota` \| `stale` \| `preempted` \| `asked` \| `no_progress`<br>`note?`: text | A held issue goes back to waiting. The reason says who may return it. |
 | `push` | observation | agent | `issue`: int<br>`pr`: int<br>`push`: int<br>`sha`: text | The holder pushed; this ends its hold. The first push opens a new pull request number; pushes go 1, 2, 3. Open checks of the push before end. |
 | `ci_done` | observation | ci | `pr`: int<br>`push`: int<br>`result`: `pass` \| `fail` | On the latest push, while pending. fail voids the review and the issue needs work. |
 | `review_done` | observation | reviewer | `by`: text<br>`pr`: int<br>`push`: int<br>`result`: `approved` \| `changes`<br>`reasons?`: set of `incomplete` \| `wrong` \| `bug` \| `tests` \| `scope` \| `other`<br>`note?`: text | One reviewer of the config on the latest push, while pending. changes need reasons, and the issue needs work. |
 | `diverged` | observation | merger | `pr`: int<br>`push`: int<br>`reason`: `foreign_push` \| `closed` | The pull request changed on GitHub outside the factory, while its issue was in checks or its pull request open: the latest push's pending checks void, and an issue in checks waits again. foreign_push: someone pushed to its branch, so the next agent starts from their commit. closed: the pull request is abandoned; the next push opens a new one. |
 | `merge_failed` | observation | merger | `pr`: int<br>`push`: int<br>`reason`: `conflict` \| `stale_base` | The latest push is green and approved but did not merge: needs work. |
 | `merged` | observation | human, merger, outside | `pr`: int<br>`push`: int<br>`sha`: text | The pull request merged and its issue closes. By the merger: the latest push is green and approved by every reviewer. By the human or an outsider on GitHub: whatever its checks say, and an agent holding the issue loses it. |
-| `attributed` | decision | agent, foreman, human, reviewer | `bug`: int<br>`pr`: int<br>`replaces?`: int | bug came in with merged pr. A second attribution of the same bug must name the first in replaces. |
-| `tick_started` | decision | foreman | `tick`: int |  |
-| `tick_ended` | decision | foreman | `tick`: int |  |
+| `attributed` | decision | agent, dictator, human, reviewer | `bug`: int<br>`pr`: int<br>`replaces?`: int | bug came in with merged pr. A second attribution of the same bug must name the first in replaces. |
+| `tick_started` | decision | dictator | `tick`: int |  |
+| `tick_ended` | decision | dictator | `tick`: int |  |
 | `frozen` | decision | pm | `version`: text<br>`sha`: text | A release branch for a version above every earlier one. |
 | `built` | observation | pm | `version`: text<br>`build`: int<br>`sha`: text | Candidate build n of a candidate version; n goes 1, 2, 3. |
 | `backported` | decision | pm | `version`: text<br>`pr`: int | A bug fix merged after the freeze enters the version's branch. |

@@ -1,5 +1,5 @@
 [Unit]
-Description=rargo2 factory foreman: takes back stale work, preempts, plans initiatives
+Description=rargo2 factory dictator: takes back stale work, preempts, plans initiatives
 After=network-online.target
 Wants=network-online.target
 
@@ -13,7 +13,7 @@ Environment=FACTORY_CLAUDE_CODE=/root/.local/bin/claude
 Environment=PYTHONPATH=/root/factory/src
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/root/factory
-ExecStart=/root/factory/venv/bin/python -m factory foreman Clavigers/rargo2 /root/factory/plan
+ExecStart=/root/factory/venv/bin/python -m factory dictator Clavigers/rargo2 /root/factory/plan
 Restart=always
 RestartSec=10
 # Stopping the watchdog leaves running agent sessions alone; a new watchdog adopts them.

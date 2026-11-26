@@ -114,7 +114,7 @@ def snapshot(w: World, lines: list[dict]) -> dict:
     usage = dict(t=iso(max((t for t, _ in w.quota_seen.values()), default=None)), plans={
         h: dict(windows=[x.model_dump(mode="json") for x in ws], error=None, t=iso(t))
         for h, (t, ws) in w.quota_seen.items()}) if w.quota_seen else None
-    return dict(t=iso(now), seq=w.seq, foreman=foreman(w, lines), release=release(lines), usage=usage, tick=w.tick, config=w.config.version if w.config else None,
+    return dict(t=iso(now), seq=w.seq, dictator=dictator(w, lines), release=release(lines), usage=usage, tick=w.tick, config=w.config.version if w.config else None,
                 reviewers=list(w.config.reviewers) if w.config else [],
                 agents=agents, issues=issues, columns=cols, prs=sorted(prs, key=lambda d: d["pr"]),
                 initiatives=inits[:12], totals=totals(w, lines),
@@ -159,17 +159,17 @@ def totals(w: World, lines: list[dict]) -> list[list]:
     ]
 
 
-def foreman(w: World, lines: list[dict]) -> dict:
+def dictator(w: World, lines: list[dict]) -> dict:
     starts = [datetime.fromisoformat(l["t"].replace("Z", "+00:00")) for l in lines if l["event"] == "tick_started"]
     gaps = [mins(a, b) for a, b in zip(starts[-11:], starts[-10:])]
     every = round(statistics.median(gaps)) if gaps else None
     since = round(mins(starts[-1], w.t)) if starts and w.t else None
-    back = [l for l in lines if l["event"] == "returned" and l["actor"] == "foreman"]
+    back = [l for l in lines if l["event"] == "returned" and l["actor"] == "dictator"]
     return dict(ticks=len(starts), every=every, since=since,
                 next=max(0, every - since) if every is not None and since is not None else None,
                 took_back=sum(l.get("reason") in ("quota", "stale") for l in back),
                 preempted=sum(l.get("reason") == "preempted" for l in back),
-                planned=len({l.get("parent") for l in lines if l["event"] == "filed" and l["actor"] == "foreman" and l.get("parent")}))
+                planned=len({l.get("parent") for l in lines if l["event"] == "filed" and l["actor"] == "dictator" and l.get("parent")}))
 
 
 def release(lines: list[dict]) -> dict:

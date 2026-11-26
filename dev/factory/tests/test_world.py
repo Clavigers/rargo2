@@ -20,7 +20,7 @@ CONFIG = {
         {"type": "codex", "count": 1, "model": "gpt-6.2-sol", "plan": "max"},
     ],
     "reviewers": ["placeholder"],
-    "foreman": {"tick_minutes": 20, "preempt_minutes": 60},
+    "dictator": {"tick_minutes": 20, "preempt_minutes": 60},
     "release": {"freeze_every_days": 7, "uses_required": 1, "soak_minutes": 120},
     "guesses": ["release.soak_minutes"],
 }
@@ -64,10 +64,10 @@ class Log:
 
     def tick(self, *lines):
         n = self.w.tick + 1
-        self("foreman", "tick_started", tick=n)
+        self("dictator", "tick_started", tick=n)
         for line in lines:
-            self("foreman", *line[:1], **line[1])
-        return self("foreman", "tick_ended", tick=n)
+            self("dictator", *line[:1], **line[1])
+        return self("dictator", "tick_ended", tick=n)
 
 
 # ---------------------------------------------------------------- scenarios
@@ -244,12 +244,12 @@ def one_held():
     (C2, "taken", dict(issue=1), "held, not ready"),
     ("human", "taken", dict(issue=1), "may not write"),
     ("grok-1", "taken", dict(issue=1), "no role and no agent"),
-    ("foreman", "returned", dict(issue=1, reason="stale"), "decides only inside a tick"),
+    ("dictator", "returned", dict(issue=1, reason="stale"), "decides only inside a tick"),
     (C1, "returned", dict(issue=1, reason="blocked"), "no open dependency"),
     (C2, "returned", dict(issue=1, reason="gave_up"), "only claude-code-1"),
     ("human", "closed", dict(issue=1, reason="done"), "only by merging"),
     ("power_user", "filed", dict(issue=2, kind="bug"), "open use session"),
-    ("foreman", "tick_ended", dict(tick=1), "decides only inside a tick"),
+    ("dictator", "tick_ended", dict(tick=1), "decides only inside a tick"),
     ("pm", "built", dict(version="0.1.0", build=1, sha=SHA), "not frozen"),
     ("ci", "ci_done", dict(pr=5, push=1, result="pass"), "no pr 5"),
     ("human", "config_applied", dict(config=CONFIG), "version 1 after 1"),
@@ -287,17 +287,17 @@ def test_preemption():
     g(C2, "taken", issue=2)
     g(C1, "filed", issue=4, kind="bug")
     assert g.w.issues[4].found == ("work", 1)
-    g("foreman", "tick_started", tick=1)
+    g("dictator", "tick_started", tick=1)
     with pytest.raises(Illegal, match="codex-1 is free"):
-        g("foreman", "returned", issue=1, reason="preempted")
-    g("foreman", "tick_ended", tick=1)
+        g("dictator", "returned", issue=1, reason="preempted")
+    g("dictator", "tick_ended", tick=1)
     g(X1, "taken", issue=3)
-    g("foreman", "tick_started", tick=2)
+    g("dictator", "tick_started", tick=2)
     with pytest.raises(Illegal, match="no bug has been ready 60"):
-        g("foreman", "returned", issue=1, reason="preempted")
-    g("foreman", "tick_ended", tick=2)
-    g("foreman", "tick_started", tick=3, after=60)
-    g("foreman", "returned", issue=1, reason="preempted")
+        g("dictator", "returned", issue=1, reason="preempted")
+    g("dictator", "tick_ended", tick=2)
+    g("dictator", "tick_started", tick=3, after=60)
+    g("dictator", "returned", issue=1, reason="preempted")
 
 
 def test_config_cannot_drop_a_live_agent():
@@ -464,13 +464,13 @@ def test_ready_queue_puts_needs_work_then_bugs_first():
                                                "reviews": {"placeholder": "void"}}
 
 
-def test_the_foreman_closes_only_waiting_work():
+def test_the_dictator_closes_only_waiting_work():
     g = one_held()
-    g("foreman", "tick_started", tick=1)
+    g("dictator", "tick_started", tick=1)
     with pytest.raises(Illegal, match="only waiting work"):
-        g("foreman", "closed", issue=1, reason="wontfix")
+        g("dictator", "closed", issue=1, reason="wontfix")
     with pytest.raises(Illegal, match="completed"):
-        g("foreman", "closed", issue=1, reason="completed")
+        g("dictator", "closed", issue=1, reason="completed")
 
 
 def test_every_reviewer_must_approve():

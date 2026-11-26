@@ -6,7 +6,7 @@ was slow) is only late, never lost.
 What it records:
 - Issues opened by a trusted login (the owner, by default): `filed`, by the
   actor named in the body's `<!-- factory-actor: NAME -->` marker, else by
-  the human. Agents and the foreman open issues this way, so the observer is
+  the human. Agents and the dictator open issues this way, so the observer is
   the one recorder of `filed`. Issues from anyone else are not the factory's.
 - Issues the log has open that are closed on GitHub: `closed`, by the human
   if the owner closed them, else by an outsider.
@@ -44,6 +44,7 @@ def parse_time(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+FORMER = {"fore" "man": "dictator"}  # the dictator's name in bodies written before it was renamed
 NEEDS_TYPE = "<!-- factory: needs-type -->"
 # How a pull request says which issue it does: "Closes #N" and the like, or
 # a title ending "(#N)".
@@ -246,6 +247,7 @@ class Observer:
         kind = Kind(labels.pop())
         marker = MARKER.search(body)
         actor = marker.group(1) if marker else Role.human
+        actor = FORMER.get(actor, actor)
         parents = [int(x) for x in PART_OF.findall(body)]
         parent = next((p for p in parents if p in w.issues
                        and w.issues[p].kind is Kind.initiative and w.open_(p)), None)
@@ -276,7 +278,7 @@ class Observer:
         if (owner or locked) and not parked:
             self._record(Role.human if owner else Role.outside, "parked", issue=n,
                          reason="owner" if owner else "lock")
-        elif parked and not (owner or locked) and w.issues[n].hold != m.ParkReason.foreman:
+        elif parked and not (owner or locked) and w.issues[n].hold != m.ParkReason.dictator:
             self._record(Role.human, "unparked", issue=n)
 
     def _outside_prs(self) -> None:

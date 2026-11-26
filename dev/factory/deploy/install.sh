@@ -16,4 +16,4 @@ if [ ! -s log.jsonl ]; then
 fi
 cp src/deploy/factory-*.service /etc/systemd/system/
 systemctl daemon-reload
-echo "installed; start with: systemctl enable --now factory-observer factory-foreman factory-watchdog factory-viz factory-usage"
+echo "installed; start with: systemctl enable --now factory-observer factory-dictator factory-watchdog factory-viz factory-usage"

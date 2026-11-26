@@ -5,7 +5,7 @@ import pytest
 
 from factory import machines as M
 from factory import model as m
-from factory.foreman import Foreman
+from factory.dictator import Dictator
 from factory.github import GitHubError
 from factory.ledger import Ledger
 from factory.machines import IssueS
@@ -18,7 +18,7 @@ CONFIG = {
     "plans": [{"name": "max", "hours_per_week": 168.0}],
     "agents": [{"type": "claude-code", "count": 2, "model": "claude-opus-5-5", "plan": "max"}],
     "reviewers": ["placeholder"],
-    "foreman": {"tick_minutes": 20, "preempt_minutes": 60},
+    "dictator": {"tick_minutes": 20, "preempt_minutes": 60},
     "release": {"freeze_every_days": 7, "uses_required": 1, "soak_minutes": 120},
 }
 A1, A2 = "claude-code-1", "claude-code-2"
@@ -234,10 +234,10 @@ def test_merges_and_closes_on_github_are_followed(rig):
     assert lines(rig)[-1]["actor"] == "human" and lines(rig)[-1]["reason"] == "wontfix"
 
 
-# ---------------------------------------------------------------- foreman
+# ---------------------------------------------------------------- dictator
 
 
-def test_the_foreman_takes_back_closes_and_plans(rig, tmp_path):
+def test_the_dictator_takes_back_closes_and_plans(rig, tmp_path):
     rig.gh.issue(1, labels=["initiative"])
     rig.gh.issue(2, body="Part of #1")
     rig.gh.issue(3, labels=["initiative"])
@@ -246,7 +246,7 @@ def test_the_foreman_takes_back_closes_and_plans(rig, tmp_path):
     submit(rig, A1, "taken", issue=4)
     submit(rig, "watchdog", "session_ended", agent=A1, reason="crashed")
     planned = []
-    fm = Foreman(rig.led, rig.gh, tmp_path, "plan {initiative}", clock=rig.clock,
+    fm = Dictator(rig.led, rig.gh, tmp_path, "plan {initiative}", clock=rig.clock,
                  run=lambda n: planned.append(n) or 0, say=rig.said.append)
     fm.tick()
     assert rig.led.world.is_(M.ISSUE, 4, IssueS.ready)  # stale, taken back
@@ -258,7 +258,7 @@ def test_the_foreman_takes_back_closes_and_plans(rig, tmp_path):
     assert planned == [3]  # not again within a day
 
 
-def test_the_foreman_preempts_for_a_waiting_bug(rig, tmp_path):
+def test_the_dictator_preempts_for_a_waiting_bug(rig, tmp_path):
     rig.gh.issue(1)
     rig.gh.issue(2)
     rig.obs.step()
@@ -266,7 +266,7 @@ def test_the_foreman_preempts_for_a_waiting_bug(rig, tmp_path):
     submit(rig, A2, "taken", issue=2)
     rig.gh.issue(3, labels=["bug"], body=f"<!-- factory-actor: {A1} -->")
     rig.obs.step()
-    fm = Foreman(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=lambda n: 0,
+    fm = Dictator(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=lambda n: 0,
                  say=rig.said.append)
     fm.tick()
     assert set(rig.led.world.holding) == {A1, A2}  # the bug has not waited long
@@ -282,7 +282,7 @@ def test_the_guard_label_parks(rig, tmp_path):
     w = rig.led.world
     assert w.issues[1].parked and w.state(M.ISSUE, 2) == IssueS.parked
     planned = []
-    Foreman(rig.led, rig.gh, tmp_path, "", clock=rig.clock,
+    Dictator(rig.led, rig.gh, tmp_path, "", clock=rig.clock,
             run=lambda n: planned.append(n) or 0, say=rig.said.append).tick()
     assert planned == []  # a parked initiative is not planned
     rig.gh.issue(2, labels=["enhancement"])  # the owner lifts the hold
@@ -319,7 +319,7 @@ def test_assigned_to_the_owner_is_the_owners(rig):
     assert w.state(M.ISSUE, 1) == IssueS.parked and w.state(M.ISSUE, 2) == IssueS.ready
 
 
-def test_the_foreman_closes_on_github_what_an_agent_closed(rig, tmp_path):
+def test_the_dictator_closes_on_github_what_an_agent_closed(rig, tmp_path):
     rig.gh.issue(1)
     rig.gh.issue(2)
     rig.obs.step()
@@ -328,7 +328,7 @@ def test_the_foreman_closes_on_github_what_an_agent_closed(rig, tmp_path):
     submit(rig, A2, "taken", issue=2)
     submit(rig, A2, "closed", issue=2, reason="completed", note="it holds")
     rig.gh.issue(2, state="closed", closed_by={"login": "kevkev"}, state_reason="completed")
-    fm = Foreman(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=lambda n: 0,
+    fm = Dictator(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=lambda n: 0,
                  say=rig.said.append)
     fm.tick()
     fm.tick()
@@ -407,26 +407,26 @@ def test_ellipsis_review_of_the_pushed_commit_is_the_verdict():
     assert verdict is m.ReviewResult.changes and "u" in note
 
 
-def test_the_foreman_orchestrates_inside_a_tick_of_its_own(rig, tmp_path):
+def test_the_dictator_orchestrates_inside_a_tick_of_its_own(rig, tmp_path):
     import copy
     cfg = copy.deepcopy(CONFIG) | {"version": 2}
-    cfg["foreman"] |= {"orchestrate_minutes": 180, "model": "claude-fable-5-2"}
+    cfg["dictator"] |= {"orchestrate_minutes": 180, "model": "claude-fable-5-2"}
     submit(rig, "human", "config_applied", config=cfg)
     rig.gh.issue(1)
     rig.gh.issue(2)
     rig.obs.step()
     ran = []
 
-    def session(what, prompt=None):  # the session decides, as the foreman
+    def session(what, prompt=None):  # the session decides, as the dictator
         ran.append((what, prompt))
         if len(ran) == 1:
-            submit(rig, "foreman", "depends", issue=2, on=1)
+            submit(rig, "dictator", "depends", issue=2, on=1)
         return 0
-    fm = Foreman(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=session, say=rig.said.append,
+    fm = Dictator(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=session, say=rig.said.append,
                  orchestrate_prompt="notes at {notes}, state at {state}", state=tmp_path / "state")
     fm.tick()
     assert ran == [("orchestrate", f"notes at {tmp_path / 'orchestration.md'}, state at {tmp_path / 'state'}")]
-    assert 1 in rig.led.world.issues[2].deps and not rig.led.world.is_(M.FOREMAN, "", "ticking")
+    assert 1 in rig.led.world.issues[2].deps and not rig.led.world.is_(M.DICTATOR, "", "ticking")
     fm.tick()  # not again until orchestrate_minutes have passed
     assert len(ran) == 1
     rig.clock.t += timedelta(minutes=181)
