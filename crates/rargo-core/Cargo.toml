@@ -33,4 +33,5 @@ zstd.workspace = true
 redb.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 expect-test = "1.5"
