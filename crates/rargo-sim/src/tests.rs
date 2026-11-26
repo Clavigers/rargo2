@@ -1,4 +1,4 @@
-use crate::{Bug, Kind, run, search};
+use crate::{Bug, Fault, Kind, Off, run, run_off, search};
 
 fn clean(seeds: std::ops::Range<u64>) {
     let failures = search(seeds, None);
@@ -7,13 +7,18 @@ fn clean(seeds: std::ops::Range<u64>) {
 }
 
 #[test]
-fn seeds_0_to_300_keep_every_invariant() {
-    clean(0..300);
+fn seeds_0_to_200_keep_every_invariant() {
+    clean(0..200);
 }
 
 #[test]
-fn seeds_300_to_600_keep_every_invariant() {
-    clean(300..600);
+fn seeds_200_to_400_keep_every_invariant() {
+    clean(200..400);
+}
+
+#[test]
+fn seeds_400_to_600_keep_every_invariant() {
+    clean(400..600);
 }
 
 #[test]
@@ -58,6 +63,59 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
     assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
     assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
+}
+
+#[test]
+fn the_network_loses_duplicates_and_reorders() {
+    let reports: Vec<_> = (0..100).map(|s| run(s, None).expect("passes")).collect();
+    assert!(reports.iter().any(|r| r.lost > 0), "packets are lost and sent again");
+    assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
+    assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
+}
+
+fn turns_off_alone(f: Fault) {
+    let count = |r: &crate::Report, f: Fault| match f {
+        Fault::Loss => r.lost,
+        Fault::Duplicate => r.duplicated,
+        Fault::Reorder => r.reordered,
+    };
+    let reports: Vec<_> = (0..100).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
+    assert!(reports.iter().all(|r| count(r, f) == 0), "--off {} leaves no {0}", f.name());
+    for other in Fault::ALL.into_iter().filter(|o| *o != f) {
+        assert!(reports.iter().any(|r| count(r, other) > 0), "--off {} leaves {}", f.name(), other.name());
+    }
+}
+
+#[test]
+fn loss_turns_off_alone() {
+    turns_off_alone(Fault::Loss);
+}
+
+#[test]
+fn duplication_turns_off_alone() {
+    turns_off_alone(Fault::Duplicate);
+}
+
+#[test]
+fn reordering_turns_off_alone() {
+    turns_off_alone(Fault::Reorder);
+}
+
+#[test]
+fn a_seed_with_every_fault_off_replays_the_same_run() {
+    let all = Fault::ALL.into_iter().fold(Off::none(), Off::with);
+    let a = run_off(9, None, all.clone()).expect("passes");
+    assert_eq!((a.lost, a.duplicated, a.reordered), (0, 0, 0));
+    assert_eq!(a, run_off(9, None, all).expect("passes"), "a seed with faults off replays the same run");
+}
+
+#[test]
+fn a_failure_replays_with_the_faults_it_ran_without() {
+    let off = Off::none().with(Fault::Reorder).with(Fault::Loss);
+    let failure = (0..60).find_map(|s| run_off(s, Some(Bug::EvictPinned), off.clone()).err()).expect("the bug is caught");
+    let replay = failure.replay();
+    assert!(replay.ends_with("--bug evict-pinned --off loss --off reorder"), "{replay}");
+    assert_eq!(run_off(failure.seed, Some(Bug::EvictPinned), off).expect_err("fails again"), failure);
 }
 
 fn caught(bug: Bug, kind: fn(&Kind) -> bool) {
