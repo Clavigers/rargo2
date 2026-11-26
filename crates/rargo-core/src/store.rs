@@ -266,6 +266,7 @@ impl Store {
     }
 
     pub fn freeze(&self, h: &Hash, before: &dyn Fn(&Hash)) -> io::Result<Option<u64>> {
+        assert!(!crate::io::on_fiber(), "freezing holds the cold lock, so it runs off the event loop");
         let _g = self.cold_lock.read().unwrap();
         let Some(start) = self.index.lock().begin_freeze(h) else {
             return Ok(None);
@@ -355,7 +356,15 @@ impl Store {
         (n, freed)
     }
 
+    // `cold_lock` is a blocking lock held across file I/O. A fiber that holds it parks
+    // on that I/O, and the next fiber to take it then blocks the event-loop thread, so
+    // the parked holder never resumes. Every holder runs off the loop: `blocking` runs
+    // the body in place when it is already off a fiber.
     fn thaw(&self, h: &Hash) -> io::Result<()> {
+        crate::io::blocking(|| self.thaw_off_loop(h))
+    }
+
+    fn thaw_off_loop(&self, h: &Hash) -> io::Result<()> {
         let _g = self.cold_lock.read().unwrap();
         let (_, started) = self.index.lock().begin_thaw(h);
         let Some((size, recipe)) = started else {
@@ -409,6 +418,10 @@ impl Store {
     }
 
     pub fn collect_chunks(&self) -> (usize, u64) {
+        crate::io::blocking(|| self.collect_chunks_off_loop())
+    }
+
+    fn collect_chunks_off_loop(&self) -> (usize, u64) {
         let _g = self.cold_lock.write().unwrap();
         let live = self.index.lock().live_chunks();
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
@@ -791,6 +804,45 @@ mod tests {
         drop(f);
         assert_eq!(s.open_blob(&h).err().unwrap().kind(), io::ErrorKind::InvalidData);
         assert!(!s.has(&h));
+    }
+
+    #[test]
+    fn a_thaw_waiting_on_the_cold_lock_leaves_the_event_loop_running() {
+        let (_d, s) = store();
+        let s = Arc::new(s);
+        let data = vec![9u8; 1 << 20];
+        let h = s.put_bytes(&data).unwrap();
+        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer = {
+            let (s, alive) = (s.clone(), alive.clone());
+            std::thread::spawn(move || {
+                let _w = s.cold_lock.write().unwrap();
+                held_tx.send(()).unwrap();
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !alive.load(Ordering::SeqCst) {
+                    if std::time::Instant::now() > until {
+                        return false;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                true
+            })
+        };
+        let read = crate::io::run(2, move || {
+            crate::io::blocking(move || held_rx.recv().unwrap());
+            let mut reader = {
+                let s = s.clone();
+                crate::io::spawn(move || s.read(&h))
+            };
+            crate::io::yield_now();
+            crate::io::sleep(std::time::Duration::from_millis(20));
+            alive.store(true, Ordering::SeqCst);
+            reader.join().unwrap()
+        });
+        assert!(writer.join().unwrap(), "the event loop stalled while a fiber waited on the cold lock");
+        assert_eq!(read.unwrap(), data);
     }
 
     #[test]
