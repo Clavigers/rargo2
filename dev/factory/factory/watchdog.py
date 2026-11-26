@@ -110,7 +110,16 @@ class Watchdog:
     def run(self, every: float = 30.0) -> None:
         while True:
             self.step()
+            self._beat(every)
             time.sleep(every)
+
+    def _beat(self, every: float) -> None:
+        """STATE/watchdog.json: when it last checked and how often, for people
+        to see when it next acts. Not the log: a check that did nothing is not
+        an event."""
+        tmp = self.state / "watchdog.json.tmp"
+        tmp.write_text(json.dumps({"t": self.clock().strftime("%Y-%m-%dT%H:%M:%SZ"), "every": every}))
+        tmp.replace(self.state / "watchdog.json")
 
     # ------------------------------------------------------------ sessions
 

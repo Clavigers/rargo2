@@ -71,6 +71,7 @@ body { font-variant-numeric: tabular-nums; }
 .pill { min-width: 13ch; justify-content: center; }
 #clock { min-width: 17ch; }
 #foreman, #pm, #poweruser { height: 118px; overflow: hidden; }
+#watchdog { height: 76px; overflow: hidden; }
 .agent { min-height: 92px; overflow: hidden; }
 .quota { display: grid; grid-template-columns: 1fr 38px; gap: 1px 6px; margin-top: 5px; font: 10.5px var(--mono); color: var(--dim); }
 .quota .bar { height: 4px; margin-top: 5px; }
@@ -439,12 +440,7 @@ function render() {
     <div class="stat">split <b>${f.planned}</b> initiatives</div>
     <div class="stat">took back <b>${f.took_back}</b> · <b>${f.preempted}</b> preempted</div>`;
 
-  // the watchdog: no tick in the log, only what it did
-  const wd = ev.filter(l => l.actor === 'watchdog'), wl = wd.at(-1);
-  const started = wd.filter(l => l.event === 'session_started').length, crashed = wd.filter(l => l.event === 'session_ended' && l.reason === 'crashed').length;
-  $('watchdog').innerHTML = `<div class="row"><div class="ic">${ic('eye')}</div><div><b>Watchdog</b><div class="sub" style="margin:0">checks every 30 s; starts a session for each agent with work</div></div></div>
-    <div class="stat" style="margin-top:6px">last did <b>${wl ? esc(say(wl)) : 'nothing in view'}</b>${wl ? ' ' + when(wl.t).slice(6) : ''}</div>
-    <div class="stat">recent: <b>${started}</b> started · <b>${crashed}</b> crashed</div>`;
+  renderWatchdog();
 
   // agents, each with one slot
   $('agentcol').innerHTML = S.agents.map(a => {
@@ -501,6 +497,18 @@ function render() {
   $('ref').textContent = src === 'real' ? `From ${S.info.lines_total} log lines at ${S.info.path}.` : 'Simulated: the same events through the same checker as the real factory.';
   $('log').innerHTML = ev.filter(l => !l.event.startsWith('tick_')).slice(-11).reverse().map(l => `<div>${when(l.t)} <b>${esc(say(l))}</b></div>`).join('') || 'Nothing yet.';
 }
+
+// The watchdog's ring runs down to its next check, between frames too
+function renderWatchdog() {
+  const b = state.watchdog, live = state.source === 'real' && state.info.live && b;
+  let left = null, every = 30;
+  if (live) { every = b.every; left = Math.max(0, every - (Date.now() - Date.parse(b.t)) / 1000); }
+  const frac = left == null ? 0 : left / every, RC = 2 * Math.PI * 10;
+  $('watchdog').innerHTML = `<div class="row"><div class="ic">${ic('eye')}</div><div><b>Watchdog</b><div class="sub" style="margin:0">every ${Math.round(every)} s: starts a session for each agent with work</div></div>
+    <svg width="26" height="26" class="ring" style="margin-left:auto"><circle cx="13" cy="13" r="10" fill="none" stroke="${css('line2')}" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="${css('ok')}" stroke-width="3" stroke-dasharray="${RC * frac} ${RC}"/></svg></div>
+    <div class="stat" style="margin-top:6px">next check in <b>${left == null ? '-' : Math.ceil(left) + ' s'}</b></div>`;
+}
+setInterval(() => { if (state) renderWatchdog(); }, 250);
 
 // When an agent that is not working next starts
 const clockOf = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });

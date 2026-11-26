@@ -153,6 +153,15 @@ class ForemanRules(Strict):
     tick_minutes: Annotated[int, Field(ge=1)]
     # A bug ready this long pulls an agent off other work. None: never.
     preempt_minutes: Annotated[int, Field(ge=1)] | None
+    # Work that comes back (red checks, a conflict, the owner's answer) waits
+    # this long for the agent that last held it, which resumes its own
+    # conversation, before any agent may take it. None: no waiting.
+    affinity_minutes: Annotated[int, Field(ge=1)] | None = None
+    # Sessions in a row that end with the holder still holding an issue it
+    # did not move; then the foreman takes it back. None: never.
+    no_progress_sessions: Annotated[int, Field(ge=1)] | None = None
+    # The watchdog ends a session that runs longer than this. None: never.
+    session_minutes: Annotated[int, Field(ge=1)] | None = None
 
 
 class ReleaseRules(Strict):
@@ -227,6 +236,8 @@ class ReturnReason(enum.StrEnum):
     quota = "quota"  # the foreman: the holder is out of quota
     stale = "stale"  # the foreman: the holder's session ended
     preempted = "preempted"  # the foreman: a bug has waited too long
+    asked = "asked"  # the holder: it asked the owner on the issue; held until they answer
+    no_progress = "no_progress"  # the foreman: the holder's sessions keep ending without moving it
 
 
 class CiResult(enum.StrEnum):

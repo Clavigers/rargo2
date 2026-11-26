@@ -201,12 +201,20 @@ class Hub:
         except (OSError, ValueError):
             return None
 
+    def beat(self):
+        p = pathlib.Path(self.log).parent / "state" / "watchdog.json"
+        try:
+            return json.loads(p.read_text())
+        except (OSError, ValueError):
+            return None
+
     def frame(self):
         with self.lock:
             s = self.source
             out = snapshot(s.w, s.lines)
             if s is self.real:
                 out["usage"] = self.usage()
+                out["watchdog"] = self.beat()
             out.update(source=s.kind, playing=self.playing, speed=self.speed[s.kind],
                        info=s.info(), error=getattr(self, "error", None),
                        hours=len(s.history.rows))

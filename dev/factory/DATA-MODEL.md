@@ -192,7 +192,7 @@ Starts in `open`.
 | `quota_out` | observation | watchdog | `agent`: text |  |
 | `quota_back` | observation | watchdog | `agent`: text |  |
 | `taken` | decision | agent | `issue`: int | An idle agent with quota takes a ready issue it has not given up on. This append is the lock. |
-| `returned` | decision | agent, foreman | `issue`: int<br>`reason`: `blocked` \| `gave_up` \| `quota` \| `stale` \| `preempted`<br>`note?`: text | A held issue goes back to waiting. The reason says who may return it. |
+| `returned` | decision | agent, foreman | `issue`: int<br>`reason`: `blocked` \| `gave_up` \| `quota` \| `stale` \| `preempted` \| `asked` \| `no_progress`<br>`note?`: text | A held issue goes back to waiting. The reason says who may return it. |
 | `push` | observation | agent | `issue`: int<br>`pr`: int<br>`push`: int<br>`sha`: text | The holder pushed; this ends its hold. The first push opens a new pull request number; pushes go 1, 2, 3. Open checks of the push before end. |
 | `ci_done` | observation | ci | `pr`: int<br>`push`: int<br>`result`: `pass` \| `fail` | On the latest push, while pending. fail voids the review and the issue needs work. |
 | `review_done` | observation | reviewer | `by`: text<br>`pr`: int<br>`push`: int<br>`result`: `approved` \| `changes`<br>`reasons?`: set of `incomplete` \| `wrong` \| `bug` \| `tests` \| `scope` \| `other`<br>`note?`: text | One reviewer of the config on the latest push, while pending. changes need reasons, and the issue needs work. |

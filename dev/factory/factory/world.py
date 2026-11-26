@@ -49,6 +49,9 @@ class Issue:
     parked: bool = False
     given_up: set[str] = field(default_factory=set)  # agents that gave up on it
     closer: str | None = None  # who closed it, in the log
+    owner: str | None = None  # the agent that held it last: work coming back waits for it
+    asked: bool = False  # parked on a question its holder asked the owner
+    stuck: dict[str, int] = field(default_factory=dict)  # agent -> sessions ended without moving it
 
 
 @dataclass
@@ -96,6 +99,7 @@ class World:
     issues: dict[int, Issue] = field(default_factory=dict)
     prs: dict[int, Pr] = field(default_factory=dict)
     holding: dict[str, int] = field(default_factory=dict)
+    moved: dict[str, bool] = field(default_factory=dict)  # agent -> moved its work this session
     versions: dict[str, Version] = field(default_factory=dict)
     uses: dict[int, Use] = field(default_factory=dict)
     attribution: dict[int, int] = field(default_factory=dict)  # bug -> seq of latest
@@ -186,13 +190,29 @@ class World:
             self.fail(f"push {push} is not pr {pr}'s latest ({p.pushes})")
         return p
 
+    def reserved_for(self, n: int) -> str | None:
+        """The agent a ready issue waits for: the one that held it last, while
+        it has quota and for affinity_minutes after the issue came back."""
+        i = self.issues[n]
+        a = i.owner
+        if (a is None or not self.config or self.config.foreman.affinity_minutes is None
+                or not self.is_(M.ISSUE, n, IssueS.ready) or a in i.given_up
+                or self.config.type_of(a) is None or not self.is_(M.QUOTA, a, "ok")):
+            return None
+        if self.t - self.since(M.ISSUE, n) >= timedelta(minutes=self.config.foreman.affinity_minutes):
+            return None
+        return a
+
     def ready_queue(self, agent: str | None = None) -> list[int]:
-        """Ready issues best first: needing work, then bugs, then the rest,
-        oldest first; with agent, only those it may take (not ones it gave up
-        on). The order is policy, not legality."""
+        """Ready issues best first: its own come-back work first, then needing
+        work, then bugs, then the rest, oldest first; with agent, only those
+        it may take (not ones it gave up on, nor ones waiting for another
+        agent). The order is policy; taking a reserved issue is refused."""
         ready = [n for n in self.issues if self.is_(M.ISSUE, n, IssueS.ready)
-                 and agent not in self.issues[n].given_up]
-        return sorted(ready, key=lambda n: (self.issues[n].pr is None,
+                 and agent not in self.issues[n].given_up
+                 and (agent is None or self.reserved_for(n) in (None, agent))]
+        return sorted(ready, key=lambda n: (agent is None or self.reserved_for(n) != agent,
+                                            self.issues[n].pr is None,
                                             self.issues[n].kind is not Kind.bug,
                                             self.issues[n].filed, n))
 
@@ -307,7 +327,12 @@ class World:
                 and not isinstance(e, m.TickStarted) and not self.is_(M.FOREMAN, "", "ticking"):
             self.fail("the foreman decides only inside a tick")
         self.t = line.t
+        held = self.holding.get(a) if is_agent else None
         HANDLERS[type(e)](self, e, a)
+        if is_agent and isinstance(e, MOVES):  # progress on its work: not stuck
+            self.moved[a] = True
+            for n in {held, getattr(e, "issue", None)} - {None}:
+                self.issues[n].stuck.pop(a, None)
         self._settle()
         self.seq = line.seq
 
@@ -328,6 +353,9 @@ class World:
 
 
 # ---------------------------------------------------------------- handlers
+
+# What an agent writes that moves its work (taking alone does not).
+MOVES = (m.Push, m.Returned, m.Closed, m.Depends, m.Undepends, m.Filed)
 
 
 @on(m.ConfigApplied)
@@ -441,7 +469,7 @@ def _(w: World, e: m.Unparked, a):
     i = w.issue(e.issue)
     if not i.parked:
         w.fail(f"#{e.issue} is not parked")
-    i.parked = False
+    i.parked = i.asked = False
     i.given_up.clear()  # the owner looked at it: everyone may try again
 
 
@@ -501,11 +529,17 @@ def _(w: World, e: m.SessionStarted, a):
     if not w.is_(M.QUOTA, n, "ok"):
         w.fail(f"{n} is out of quota")
     w.enter(M.AGENT, n, AgentS.working if n in w.holding else AgentS.idle)
+    w.moved[n] = False
 
 
 @on(m.SessionEnded)
 def _(w: World, e: m.SessionEnded, a):
-    w.enter(M.AGENT, w.agent(e.agent), AgentS.off)
+    n = w.agent(e.agent)
+    held = w.holding.get(n)
+    if held is not None and not w.moved.get(n, False):
+        st = w.issues[held].stuck
+        st[n] = st.get(n, 0) + 1
+    w.enter(M.AGENT, n, AgentS.off)
 
 
 @on(m.QuotaOut)
@@ -527,6 +561,10 @@ def _(w: World, e: m.Taken, a):
         w.fail(f"#{e.issue} is {w.state(M.ISSUE, e.issue)}, not ready")
     if a in w.issues[e.issue].given_up:
         w.fail(f"{a} gave up on #{e.issue}; the owner holding and releasing it lets it try again")
+    r = w.reserved_for(e.issue)
+    if r not in (None, a):
+        w.fail(f"#{e.issue} waits for {r}, which held it last")
+    w.issues[e.issue].owner = a
     w.enter(M.ISSUE, e.issue, IssueS.held)
     w.enter(M.AGENT, a, AgentS.working)
     w.holding[a] = e.issue
@@ -546,6 +584,22 @@ def _(w: World, e: m.Returned, a):
             w.fail(f"#{e.issue} has no open dependency")
         if e.reason is R.gave_up:
             i.given_up.add(holder)
+    elif e.reason is R.asked:
+        if a != holder:
+            w.fail(f"only {holder} returns #{e.issue} as asked")
+        if not e.note:
+            w.fail("an agent that asks says what in the note")
+        i.parked = i.asked = True
+    elif e.reason is R.no_progress:
+        if a != Role.foreman:
+            w.fail("only the foreman returns an issue as no_progress")
+        assert w.config
+        limit = w.config.foreman.no_progress_sessions
+        if limit is None or i.stuck.get(holder, 0) < limit:
+            w.fail(f"{holder} has ended {i.stuck.get(holder, 0)} sessions on #{e.issue} without moving it")
+        if not w.is_(M.AGENT, holder, AgentS.off):
+            w.fail(f"{holder}'s session is live")
+        i.given_up.add(holder)
     else:
         if a != Role.foreman:
             w.fail(f"only the foreman returns an issue as {e.reason}")
@@ -555,6 +609,7 @@ def _(w: World, e: m.Returned, a):
             w.fail(f"{holder}'s session is live")
         if e.reason is R.preempted:
             _check_preempt(w, e.issue)
+    i.stuck.pop(holder, None)
     w.wait(e.issue)
     if w.is_(M.AGENT, holder, AgentS.working):
         w.enter(M.AGENT, holder, AgentS.idle)
