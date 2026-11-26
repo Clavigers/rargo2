@@ -152,11 +152,9 @@ const NOT_RARGO: &str = "not rargo: ";
 
 /// What a failed request to `host`'s web endpoint says: in the words
 /// `rargo build` uses when the machine cannot be reached, else the URL and why.
-fn asked(host: &str, url: &str, e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Transport(_) => not_found_text(host, &unfound(&e)),
-        e => format!("{url}: {e}"),
-    }
+/// `why` is what `unfound` made of the error `e`.
+fn asked(host: &str, url: &str, why: &str, e: impl std::fmt::Display) -> String {
+    if why == NO_SUCH_HOST || why == NO_ANSWER { not_found_text(host, why) } else { format!("{url}: {e}") }
 }
 
 pub fn not_found_text(host: &str, why: &str) -> String {
@@ -243,7 +241,7 @@ pub fn revoke_on_server(host: &str) -> Result<bool, String> {
         .post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| asked(host, &url, e))?
+        .map_err(|e| asked(host, &url, &unfound(&e), &e))?
         .into_string()
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
@@ -258,7 +256,7 @@ pub fn holder(host: &str, token: &str) -> Result<Option<String>, String> {
         .post(&url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string())
-        .map_err(|e| asked(host, &url, e))?
+        .map_err(|e| asked(host, &url, &unfound(&e), &e))?
         .into_string()
         .map_err(|e| format!("{url}: {e}"))?;
     let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{url}: not a rargo answer: {e}"))?;
@@ -300,7 +298,7 @@ pub fn auth(host: &str) -> Result<String, String> {
                 let said = serde_json::from_str::<serde_json::Value>(&text).ok().and_then(|v| v.get("error")?.as_str().map(String::from));
                 return Err(said.unwrap_or_else(|| format!("{base}{path} answered {code}")));
             }
-            Err(e) => return Err(asked(host, &format!("{base}{path}"), e)),
+            Err(e) => return Err(asked(host, &format!("{base}{path}"), &unfound(&e), &e)),
         };
         serde_json::from_str(&text).map_err(|e| format!("{base}{path}: not a rargo answer: {e}"))
     };
