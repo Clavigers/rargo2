@@ -50,7 +50,8 @@ class Issue:
     given_up: set[str] = field(default_factory=set)  # agents that gave up on it
     closer: str | None = None  # who closed it, in the log
     owner: str | None = None  # the agent that held it last: work coming back waits for it
-    asked: bool = False  # parked on a question its holder asked the owner
+    asked: bool = False  # parked on a question its holder asked
+    hold: str | None = None  # why it is parked: owner, lock, foreman; None when asked
     stuck: dict[str, int] = field(default_factory=dict)  # agent -> sessions ended without moving it
 
 
@@ -263,6 +264,13 @@ class World:
                            f" ({sum(self.open_(c) for c in self.issues[n].children)}"
                            f"/{len(self.issues[n].children)} open)")
                 for n in sorted(inits)))
+        names = set(self.config.names()) if self.config else set()
+        gave = [f"#{n}" for n, i in self.issues.items() if self.waiting(n) and names and names <= i.given_up]
+        if gave:
+            out.append("  every agent gave up on  " + " ".join(gave))
+        asked = [f"#{n}" for n, i in self.issues.items() if i.asked]
+        if asked:
+            out.append("  asked, waiting for an answer  " + " ".join(asked))
         closed = [n for n in self.issues if self.is_(M.ISSUE, n, "closed")]
         out.append(f"  closed    {len(closed)}   (* bug)")
         checking = [n for n in self.issues if self.is_(M.ISSUE, n, "checking")]
@@ -364,6 +372,8 @@ def _(w: World, e: m.ConfigApplied, a):
         w.fail(f"config version {e.config.version} after {w.config.version}")
     if not w.config and e.config.version != 1:
         w.fail("the first config is version 1")
+    if a == Role.foreman:
+        _foreman_may(w, e.config)
     new = set(e.config.names())
     for name in (w.config.names() if w.config else []):
         if name not in new and (not w.is_(M.AGENT, name, AgentS.off) or name in w.holding):
@@ -375,6 +385,33 @@ def _(w: World, e: m.ConfigApplied, a):
             w.enter(M.QUOTA, name, "ok")
     if w.state(M.FOREMAN, "") is None:
         w.enter(M.FOREMAN, "", "resting")
+
+
+FOREMAN_TUNES = ("preempt_minutes", "affinity_minutes", "no_progress_sessions",
+                 "session_minutes", "orchestrate_minutes")
+MAX_AGENTS = 4  # of one type, when the foreman sets the count
+
+
+def _foreman_may(w: World, new: m.Config) -> None:
+    """The foreman changes only how many agents of each type run, and its own
+    timing rules. Who reviews, on which plans and models, and how releases
+    go stay the human's."""
+    if w.config is None:
+        w.fail("the first config is the human's")
+    old = w.config.model_dump(mode="json")
+    want = new.model_dump(mode="json")
+    for d in (old, want):
+        d.pop("version")
+        d.pop("guesses")
+        for k in FOREMAN_TUNES:
+            d["foreman"].pop(k)
+    counts = [x.pop("count") for x in want["agents"]]
+    for x in old["agents"]:
+        x.pop("count")
+    if old != want:
+        w.fail("the foreman changes only agent counts and its own timing rules")
+    if any(c > MAX_AGENTS for c in counts):
+        w.fail(f"the foreman runs at most {MAX_AGENTS} agents of a type")
 
 
 @on(m.ScopeFrozen)
@@ -454,14 +491,16 @@ def _(w: World, e: m.Depends, a):
 
 @on(m.Parked)
 def _(w: World, e: m.Parked, a):
-    if (e.reason is m.ParkReason.owner) != (a == Role.human):
-        w.fail("the owner's hold is the human's; a lock is an outsider's")
+    whose = {m.ParkReason.owner: Role.human, m.ParkReason.lock: Role.outside,
+             m.ParkReason.foreman: Role.foreman}[e.reason]
+    if a != whose:
+        w.fail("the owner's hold is the human's; a lock is an outsider's; the foreman's is its own")
     i = w.issue(e.issue)
     if not w.open_(e.issue):
         w.fail(f"#{e.issue} is closed")
     if i.parked:
         w.fail(f"#{e.issue} is already parked")
-    i.parked = True
+    i.parked, i.hold = True, e.reason.value
 
 
 @on(m.Unparked)
@@ -469,7 +508,10 @@ def _(w: World, e: m.Unparked, a):
     i = w.issue(e.issue)
     if not i.parked:
         w.fail(f"#{e.issue} is not parked")
+    if a == Role.foreman and not (i.asked or i.hold == m.ParkReason.foreman):
+        w.fail(f"#{e.issue} is held by {i.hold}; the foreman lifts only its own hold or answers a question")
     i.parked = i.asked = False
+    i.hold = None
     i.given_up.clear()  # the owner looked at it: everyone may try again
 
 

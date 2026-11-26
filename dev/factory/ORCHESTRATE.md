@@ -23,7 +23,9 @@ back and is really two issues, or is missing a prerequisite; duplicates; a
 dependency that is no longer true; agents failing the same way for one
 cause; an issue whose text misleads the agents working it; quota that will
 run out before the work that only that agent does well; an initiative whose
-plan no longer fits what was learned. Prefer one decision that changes the
+plan no longer fits what was learned; an issue every agent gave up on
+(`factory status` lists them), which needs its text fixed, a prerequisite
+filed, or to be split or closed. Prefer one decision that changes the
 outcome to ten that tidy.
 
 ## Act
@@ -44,8 +46,21 @@ Only through these, each recorded and checked by the factory:
   `wontfix` with a note naming the parts.
 - Guide: comment on an issue with what its next agent needs to know (what
   was tried, what the real problem is). Keep it short and concrete.
-- Tell the owner what only they can decide (agent counts, plans, a hold, a
-  change of direction): put it under "For the owner" in your notes.
+- Change how many agents of each type run (at most 4 of a type), or your
+  own timing rules (preempt, affinity, no_progress, session, orchestrate
+  minutes): `factory config > c.json`, edit it, raise `version` by one, and
+  `factory submit "{\"event\":\"config_applied\",\"config\":$(cat c.json)}"`.
+  Match the agents to the quota that is left and to the work that is ready.
+- Hold an issue while you rethink it, so no agent takes it:
+  `factory submit '{"event":"parked","issue":N,"reason":"foreman"}'`, and
+  release it with `{"event":"unparked","issue":N}`. Releasing also lets the
+  agents that gave up on it try again: do that after you have fixed what
+  made them give up (the issue's text, a missing prerequisite, your
+  guidance), never before.
+
+There is no person in the loop. Nothing waits for the owner: if a decision
+is yours to make with these tools, make it; if it is not (who reviews, which
+models and plans, releases), work within it.
 
 A refused submit (exit 2) means the factory's rules forbid it: do not work
 around it. Do not take, hold, push, merge, label, assign or edit issues, and
@@ -54,5 +69,4 @@ do not touch pull requests. If nothing needs deciding, decide nothing.
 ## Record
 
 Before you end, rewrite `{notes}` (keep it under 80 lines): the date; what
-you saw; each decision and its reason; what you are watching for next time;
-and "For the owner", if anything. Then end.
+you saw; each decision and its reason; and what you are watching for next time. Then end.

@@ -330,7 +330,7 @@ def event(actors, nature):
     return mark
 
 
-@event({H}, D)
+@event({H, F}, D)
 class ConfigApplied(Event):
     """The first line, and any change of policy after. Versions go up by one.
     It may not drop an agent that is live or holds an issue."""
@@ -380,9 +380,10 @@ class Depends(Event):
 class ParkReason(enum.StrEnum):
     owner = "owner"  # the owner's hold (on GitHub, the label guard)
     lock = "lock"  # a lock by someone outside the factory (a label wip-NAME)
+    foreman = "foreman"  # the foreman's hold: it is rethinking the issue
 
 
-@event({H, Role.outside}, O)
+@event({H, F, Role.outside}, O)
 class Parked(Event):
     """An open issue went on hold. Waiting work is not taken while parked,
     and an initiative is not planned. The owner's hold is the human's; an
@@ -392,7 +393,7 @@ class Parked(Event):
     reason: ParkReason = ParkReason.owner  # lines from before locks have none
 
 
-@event({H, Role.outside}, O)
+@event({H, F, Role.outside}, O)
 class Unparked(Event):
     """The hold on a parked issue was lifted. Agents that gave up on it may
     take it again."""

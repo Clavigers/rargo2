@@ -94,3 +94,23 @@ def test_a_session_that_pushed_is_not_stuck():
     g("watchdog", "session_started", agent=C1)
     g(C1, "push", issue=1, pr=10, push=1, sha=SHA)
     assert g.w.issues[1].stuck == {}
+
+
+def test_the_foreman_answers_a_question_and_tunes_the_factory():
+    g = log()
+    g(C1, "taken", issue=1)(C1, "returned", issue=1, reason="asked", note="tabs or spaces?")
+    g("human", "filed", issue=2, kind="enhancement")
+    with pytest.raises(Illegal, match="held by owner"):
+        g("human", "parked", issue=2)("foreman", "unparked", issue=2)
+    g("foreman", "unparked", issue=1)  # its answer is on the issue
+    assert g.w.reserved_for(1) == C1
+    g("human", "filed", issue=3, kind="enhancement")
+    g("foreman", "parked", issue=3, reason="foreman")("foreman", "unparked", issue=3)
+    more = copy.deepcopy(RULES) | {"version": 2}
+    more["agents"][1]["count"] = 3
+    more["foreman"]["orchestrate_minutes"] = 60
+    g("foreman", "tick_started", tick=1)("foreman", "config_applied", config=more)
+    assert "codex-3" in g.w.config.names()
+    for change in ({"reviewers": ["other"]}, {"agents": [dict(more["agents"][0], count=5), more["agents"][1]]}):
+        with pytest.raises(Illegal, match="the foreman"):
+            g("foreman", "config_applied", config=more | {"version": 3} | change)

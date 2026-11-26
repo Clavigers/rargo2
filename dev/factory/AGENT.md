@@ -50,14 +50,14 @@ left, end the session.
   left to change, show it: comment the evidence on the issue, then
   `factory submit '{"event":"closed","issue":N,"reason":"completed","note":"evidence, briefly"}'`,
   then `gh issue close N --reason completed`, and end.
-- If only the owner can decide something you need (a choice the issue
+- If you need a decision that is not yours to make (a choice the issue
   leaves open, a conflict between two instructions): do not guess, and do
   not wait. Comment the question on the issue, as short and as answerable
   as you can make it, with what you have found so far; push what you have
   to the branch `issue-N` so it is not lost; then `factory submit
   '{"event":"returned","issue":N,"reason":"asked","note":"the question"}'`
-  and end. The issue waits for the owner. Their answer wakes you again in
-  this same conversation, with what you know.
+  and end. The foreman answers on the issue, within its next tick. The answer
+  wakes you again in this same conversation, with what you know.
 - If it cannot be done as written: `factory submit
   '{"event":"returned","issue":N,"reason":"gave_up","note":"why"}'`,
   comment on the issue saying why, and end.

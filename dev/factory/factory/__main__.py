@@ -7,6 +7,7 @@
                             2 refused (a decision that did not happen),
                             3 alarm (an observation the model says cannot be)
   status                    the factory at a glance
+  config                    the config in force, as JSON
   mine                      what this agent holds, as JSON
   ready                     issues ready to take, best first, as JSON
   init CONFIG               start the log with this config (a JSON file)
@@ -93,6 +94,9 @@ def main(argv: list[str]) -> int:
         case ["status"]:
             print(Ledger(env("FACTORY_LOG")).world.status())
             return 0
+        case ["config"]:
+            print(Ledger(env("FACTORY_LOG")).world.config.model_dump_json(indent=1))
+            return 0
         case ["mine"]:
             w = Ledger(env("FACTORY_LOG")).world
             print(json.dumps(w.agent_view(env("FACTORY_ACTOR"))))
@@ -134,6 +138,7 @@ def main(argv: list[str]) -> int:
             Foreman(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
                     FOREMAN_PROMPT.read_text(),
                     orchestrate_prompt=(HERE / "ORCHESTRATE.md").read_text(),
+                    answer_prompt=(HERE / "ANSWER.md").read_text(),
                     state=pathlib.Path(env("FACTORY_LOG")).parent / "state").run()
             return 0
         case ["usage", state, *rest]:

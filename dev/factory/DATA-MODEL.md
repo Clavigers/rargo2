@@ -179,12 +179,12 @@ Starts in `open`.
 
 | Event | Nature | Written by | Fields | Must be true |
 |---|---|---|---|---|
-| `config_applied` | decision | human | `config`: Config | The first line, and any change of policy after. Versions go up by one. It may not drop an agent that is live or holds an issue. |
+| `config_applied` | decision | foreman, human | `config`: Config | The first line, and any change of policy after. Versions go up by one. It may not drop an agent that is live or holds an issue. |
 | `scope_frozen` | decision | human | — | Once. No enhancement or initiative is filed after it. |
 | `filed` | observation | agent, foreman, human, power_user | `issue`: int<br>`kind`: `initiative` \| `enhancement` \| `bug` \| `friction`<br>`parent?`: int<br>`deps?`: set of int | The issue exists on GitHub, which gave it a new number. parent: an open initiative. deps: open work. Bugs and friction are filed by whoever found them, where they found them: an agent in the issue it holds, the power user in its open use session, the human in a use session or as a plain report whenever it likes. The world records which. Initiatives and enhancements come from the human and the foreman; an agent may file follow-up enhancements under the initiative of the issue it holds. |
 | `depends` | decision | agent, foreman, human | `issue`: int<br>`on`: int | issue waits for on. Both open work issues; no cycle. |
-| `parked` | observation | human, outside | `issue`: int<br>`reason?`: `owner` \| `lock` | An open issue went on hold. Waiting work is not taken while parked, and an initiative is not planned. The owner's hold is the human's; an outside lock is an outsider's. |
-| `unparked` | observation | human, outside | `issue`: int | The hold on a parked issue was lifted. Agents that gave up on it may take it again. |
+| `parked` | observation | foreman, human, outside | `issue`: int<br>`reason?`: `owner` \| `lock` \| `foreman` | An open issue went on hold. Waiting work is not taken while parked, and an initiative is not planned. The owner's hold is the human's; an outside lock is an outsider's. |
+| `unparked` | observation | foreman, human, outside | `issue`: int | The hold on a parked issue was lifted. Agents that gave up on it may take it again. |
 | `undepends` | decision | agent, foreman, human | `issue`: int<br>`on`: int<br>`note`: text | Removes an edge that exists. |
 | `closed` | decision | agent, foreman, human, outside | `issue`: int<br>`reason`: `done` \| `duplicate` \| `wontfix` \| `invalid` \| `completed`<br>`duplicate_of?`: int<br>`note?`: text | Closes an issue without a merge. The foreman closes waiting work and initiatives whose children are closed. An agent closes an issue it holds and has no open pull request for as completed, when it found nothing left to change, with the evidence in the note. The human and outsiders close whatever is open (on GitHub): an agent holding it loses it, and its open pull request is abandoned. |
 | `session_started` | observation | watchdog | `agent`: text | An off agent with quota starts; it resumes the issue it still holds. |

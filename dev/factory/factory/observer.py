@@ -276,7 +276,7 @@ class Observer:
         if (owner or locked) and not parked:
             self._record(Role.human if owner else Role.outside, "parked", issue=n,
                          reason="owner" if owner else "lock")
-        elif parked and not (owner or locked):
+        elif parked and not (owner or locked) and w.issues[n].hold != m.ParkReason.foreman:
             self._record(Role.human, "unparked", issue=n)
 
     def _outside_prs(self) -> None:

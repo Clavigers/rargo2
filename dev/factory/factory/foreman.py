@@ -49,7 +49,10 @@ class Foreman:
                  replan_after: timedelta = timedelta(hours=24),
                  run: Callable[..., int] | None = None,
                  say: Callable[[str], None] = print,
-                 orchestrate_prompt: str | None = None, state: Path | None = None):
+                 orchestrate_prompt: str | None = None, state: Path | None = None,
+                 answer_prompt: str | None = None):
+        self.answer_prompt = answer_prompt
+        self.answering: dict[int, int] = {}  # asked issue -> sessions tried
         self.ledger, self.gh, self.workdir, self.prompt = ledger, gh, Path(workdir), prompt
         self.clock, self.plan_timeout, self.replan_after = clock, plan_timeout, replan_after
         self.run_session = run or self._run_session
@@ -73,6 +76,7 @@ class Foreman:
         self._stuck()
         self._sync_closed()
         self._plan()
+        self._answer()
         self._orchestrate()
 
     def _sync_closed(self) -> None:
@@ -93,16 +97,47 @@ class Foreman:
         self.synced |= mine
 
     def _stuck(self) -> None:
-        """Tell the owner, once, about work no agent will do."""
+        """Work no agent will do is the foreman's to rethink: orchestrate at
+        once. Without an orchestrator, tell the owner, once."""
         w = self.ledger.world
         agents = set(w.config.names())
         for n, i in w.issues.items():
             if w.waiting(n) and agents <= i.given_up and n not in self.told:
                 self.told.add(n)
+                if w.config.foreman.orchestrate_minutes and self.orchestrate_prompt:
+                    self.orchestrated = None
+                    self.say(f"foreman: every agent gave up on #{n}; orchestrating now")
+                    continue
                 notify(f"#{n}: every agent gave up on it. Put it on hold and release it "
                        f"(label guard, then remove it) to let them try again.",
                        "rargo factory: needs the owner")
                 self.say(f"foreman: #{n} needs the owner; every agent gave up on it")
+
+    def _answer(self) -> None:
+        """An agent that asked gets its answer from the foreman: a session per
+        question, inside a tick, that decides, comments, and releases the
+        issue. Two tries; then the owner is told."""
+        if self.answer_prompt is None:
+            return
+        for n in [n for n, i in self.ledger.refresh().issues.items() if i.asked]:
+            tries = self.answering.get(n, 0)
+            if tries >= 2:
+                if tries == 2:
+                    self.answering[n] = 3
+                    notify(f"#{n}: an agent asked a question and the foreman did not settle it.",
+                           "rargo factory: unanswered question")
+                continue
+            self.answering[n] = tries + 1
+            if not self._decide("tick_started", tick=self.ledger.world.tick + 1):
+                return
+            self.say(f"foreman: answering the question on #{n}")
+            try:
+                code = self.run_session(n, self.answer_prompt.replace("{issue}", str(n)))
+            finally:
+                self._decide("tick_ended", tick=self.ledger.refresh().tick)
+            self.say(f"foreman: answering #{n} ended with exit {code}")
+            if not self.ledger.world.issues[n].asked:
+                self.answering.pop(n, None)
 
     def run(self) -> None:
         while True:
