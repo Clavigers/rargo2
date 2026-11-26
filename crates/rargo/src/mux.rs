@@ -15,7 +15,7 @@ const WATCH_STEP: Duration = Duration::from_millis(200);
 const _: () = assert!(WINDOW <= u32::MAX as usize, "a window's permits fit acquire_many");
 
 fn dead_limit(kind: &str) -> Duration {
-    let set = std::env::var("RARGO_LINK_DEAD_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|n| *n >= 1).map(Duration::from_secs);
+    let set = io::env::var("RARGO_LINK_DEAD_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|n| *n >= 1).map(Duration::from_secs);
     match (set, kind) {
         (Some(base), "udp") => base,
         (Some(base), _) => base * 8,
@@ -171,7 +171,7 @@ impl Mux {
             window: Arc::new(io::Semaphore::new(WINDOW as u32)),
             state: Mutex::new(MuxState::new()),
             gone: io::Notify::new(),
-            started: Instant::now(),
+            started: io::now(),
             watch: Mutex::new(Watch::new(Duration::ZERO, dead_limit(link.kind()))),
             bytes_out: AtomicU64::new(0),
             bytes_in: AtomicU64::new(0),
@@ -203,7 +203,7 @@ impl Mux {
         io::spawn(move || {
             while let Some(raw) = m.link.recv() {
                 m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                let now = m.started.elapsed();
+                let now = io::now().saturating_duration_since(m.started);
                 m.watch.lock().unwrap().heard(now);
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
                 let ordered = m.state.lock().unwrap().incoming(frame);
@@ -232,7 +232,7 @@ impl Mux {
                 if m.is_dead() {
                     break;
                 }
-                let now = m.started.elapsed();
+                let now = io::now().saturating_duration_since(m.started);
                 let tick = {
                     let mut watch = m.watch.lock().unwrap();
                     if m.link.kind() == "udp" {

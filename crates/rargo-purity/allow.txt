@@ -1,46 +1,5 @@
-ambient-io	crates/fusewire/src/lib.rs	48	logic and I/O are not yet split, the I/O is not in an io module: libc calls (43), processes (6), the filesystem (2), threads and sleeps (1)
-ambient-io	crates/rargo-core/src/bin/rargo-sandbox.rs	10	logic and I/O are not yet split, the I/O is not in an io module: libc calls (4), the filesystem (3), the environment (1), the clock (1), processes (1)
-ambient-io	crates/rargo-core/src/build.rs	23	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (21), the clock (7), processes (7), libc calls (2), the environment (1)
-ambient-io	crates/rargo-core/src/build/nextest.rs	8	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (13), other (3), processes (2)
-ambient-io	crates/rargo-core/src/cgroup.rs	4	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (8), libc calls (2), threads and sleeps (2)
-ambient-io	crates/rargo-core/src/chunk.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (2), libc calls (2)
-ambient-io	crates/rargo-core/src/db.rs	1	logic and I/O are not yet split, the I/O is not in an io module: the clock (1)
-ambient-io	crates/rargo-core/src/drift.rs	5	logic and I/O are not yet split, the I/O is not in an io module: processes (3), the filesystem (1), libc calls (1)
-ambient-io	crates/rargo-core/src/engine.rs	12	logic and I/O are not yet split, the I/O is not in an io module: libc calls (5), the filesystem (3), the clock (3), the environment (1), processes (1)
-ambient-io	crates/rargo-core/src/flake.rs	7	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (6), processes (5), libc calls (1)
-ambient-io	crates/rargo-core/src/hash.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (4)
-ambient-io	crates/rargo-core/src/http.rs	7	logic and I/O are not yet split, the I/O is not in an io module: the network (5), the clock (3), the environment (2), other (2)
-ambient-io	crates/rargo-core/src/nixmanifest.rs	11	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (9), the clock (3), libc calls (2), threads and sleeps (1)
-ambient-io	crates/rargo-core/src/parse.rs	6	logic and I/O are not yet split, the I/O is not in an io module: processes (4), libc calls (2)
-ambient-io	crates/rargo-core/src/remote.rs	20	logic and I/O are not yet split, the I/O is not in an io module: the clock (9), the filesystem (7), the environment (6), libc calls (3), the network (2)
-ambient-io	crates/rargo-core/src/sandbox.rs	54	logic and I/O are not yet split, the I/O is not in an io module: libc calls (41), the filesystem (7), processes (3), the network (2), the clock (1)
-ambient-io	crates/rargo-core/src/sandboxfs.rs	5	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (8), the clock (3), libc calls (2)
-ambient-io	crates/rargo-core/src/sched.rs	5	logic and I/O are not yet split, the I/O is not in an io module: libc calls (4), the filesystem (1), the clock (1)
-ambient-io	crates/rargo-core/src/serve.rs	5	logic and I/O are not yet split, the I/O is not in an io module: the clock (4), libc calls (1)
-ambient-io	crates/rargo-core/src/snapshot.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (3), libc calls (2)
-ambient-io	crates/rargo-core/src/store.rs	8	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (27), processes (3), the clock (1), libc calls (1)
-ambient-io	crates/rargo-core/src/tokens.rs	4	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (11), processes (2), the clock (1), libc calls (1)
-ambient-io	crates/rargo-net/src/endpoint.rs	9	logic and I/O are not yet split, the I/O is not in an io module: the network (9)
-ambient-io	crates/rargo-net/src/lib.rs	19	logic and I/O are not yet split, the I/O is not in an io module: the network (11), the clock (6), libc calls (3)
-ambient-io	crates/rargo-net/src/link.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the network (8), threads and sleeps (1)
-ambient-io	crates/rargo-plan/src/lib.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the environment (2)
-ambient-io	crates/rargo/src/cli.rs	1	logic and I/O are not yet split, the I/O is not in an io module: the network (1)
-ambient-io	crates/rargo/src/daemon.rs	23	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (11), the clock (9), libc calls (5), processes (5), the environment (3)
-ambient-io	crates/rargo/src/git.rs	15	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (36), the environment (3), processes (3), the clock (1)
-ambient-io	crates/rargo/src/known.rs	3	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (3)
-ambient-io	crates/rargo/src/main.rs	80	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (29), processes (20), the environment (13), libc calls (12), the network (4), the clock (1), threads and sleeps (1)
-ambient-io	crates/rargo/src/mux.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the clock (1), the environment (1)
-ambient-io	crates/rargo/src/outfs.rs	13	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (25), libc calls (5), the clock (3), processes (1)
-ambient-io	crates/rargo/src/partial.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (7), processes (1)
-ambient-io	crates/rargo/src/place.rs	5	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (14), processes (2), libc calls (1)
-ambient-io	crates/rargo/src/project.rs	35	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (12), other (9), processes (6), the environment (5), the clock (2), threads and sleeps (1)
-ambient-io	crates/rargo/src/scan.rs	1	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (8), the clock (1)
-ambient-io	crates/rargo/src/status.rs	2	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (2), the network (1), threads and sleeps (1)
-ambient-io	crates/rargo/src/tmp.rs	8	logic and I/O are not yet split, the I/O is not in an io module: libc calls (7), the filesystem (4), processes (1)
-ambient-io	crates/rargo/src/watch.rs	4	logic and I/O are not yet split, the I/O is not in an io module: libc calls (5), the filesystem (1)
-ambient-io	crates/rargod/src/main.rs	11	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (7), the network (4), libc calls (3), the environment (2), the clock (1)
 locks	crates/fusewire/src/lib.rs	6	shares state between threads outside a shell or worker pool: atomics (4), std locks (2)
-locks	crates/rargo-core/src/build.rs	62	shares state between threads outside a shell or worker pool: parking_lot locks (30), once cells (14), atomics (12), dashmap (6)
+locks	crates/rargo-core/src/build.rs	60	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/buildview.rs	12	shares state between threads outside a shell or worker pool: dashmap (6), atomics (6)
 locks	crates/rargo-core/src/chunk.rs	4	shares state between threads outside a shell or worker pool: once cells (2), dashmap (2)
 locks	crates/rargo-core/src/db.rs	10	shares state between threads outside a shell or worker pool: parking_lot locks (10)
@@ -48,7 +7,7 @@ locks	crates/rargo-core/src/engine.rs	27	shares state between threads outside a 
 locks	crates/rargo-core/src/flake.rs	2	shares state between threads outside a shell or worker pool: once cells (2)
 locks	crates/rargo-core/src/http.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
 locks	crates/rargo-core/src/incr.rs	10	shares state between threads outside a shell or worker pool: atomics (8), once cells (2)
-locks	crates/rargo-core/src/nixmanifest.rs	21	shares state between threads outside a shell or worker pool: parking_lot locks (9), dashmap (6), once cells (4), atomics (2)
+locks	crates/rargo-core/src/nixmanifest.rs	17	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/parse.rs	2	shares state between threads outside a shell or worker pool: dashmap (2)
 locks	crates/rargo-core/src/present.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
 locks	crates/rargo-core/src/remote.rs	114	shares state between threads outside a shell or worker pool: atomics (55), parking_lot locks (35), dashmap (13), once cells (12)
@@ -70,16 +29,13 @@ locks	crates/rargo/src/main.rs	2	shares state between threads outside a shell or
 locks	crates/rargo/src/mux.rs	10	shares state between threads outside a shell or worker pool: std locks (6), atomics (4)
 locks	crates/rargo/src/outfs.rs	30	shares state between threads outside a shell or worker pool: std locks (16), atomics (12), once cells (2)
 locks	crates/rargo/src/partial.rs	6	shares state between threads outside a shell or worker pool: std locks (4), atomics (2)
-locks	crates/rargo/src/status.rs	1	shares state between threads outside a shell or worker pool: channels (1)
 locks	crates/rargo/src/tmp.rs	6	shares state between threads outside a shell or worker pool: atomics (6)
 locks	crates/rargo/src/watch.rs	2	shares state between threads outside a shell or worker pool: std locks (2)
-hash-order	crates/rargo-core/src/build.rs	27	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/buildview.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
+hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/engine.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/flake.rs	3	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/http.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/incr.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/nixmanifest.rs	8	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
+hash-order	crates/rargo-core/src/nixmanifest.rs	7	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/sandboxfs.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/serve.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
@@ -89,32 +45,8 @@ hash-order	crates/rargo-proto/src/lib.rs	2	HashMap or HashSet with the default r
 hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-pure-tests	crates/fusewire/Cargo.toml	1	tempfile is a dev-dependency because tests still use real directories
-pure-tests	crates/fusewire/src/lib.rs	5	tests still touch the world instead of memory: shared state (5)
-pure-tests	crates/fusewire/tests/auto_unmount.rs	26	tests still touch the world instead of memory: the filesystem (8), threads and sleeps (5), tempdirs (4), processes (4), libc calls (2), the environment (2), the clock (1)
-pure-tests	crates/rargo-core/Cargo.toml	1	tempfile is a dev-dependency because tests still use real directories
-pure-tests	crates/rargo-core/src/build/nextest.rs	4	tests still touch the world instead of memory: the filesystem (3), tempdirs (1)
-pure-tests	crates/rargo-core/src/db.rs	1	tests still touch the world instead of memory: shared state (1)
-pure-tests	crates/rargo-core/src/incr.rs	1	tests still touch the world instead of memory: shared state (1)
-pure-tests	crates/rargo-core/src/nixmanifest.rs	10	tests still touch the world instead of memory: shared state (10)
-pure-tests	crates/rargo-core/src/remote.rs	1	tests still touch the world instead of memory: the clock (1)
-pure-tests	crates/rargo-core/src/sched.rs	1	tests still touch the world instead of memory: libc calls (1)
-pure-tests	crates/rargo-core/src/session.rs	1	tests still touch the world instead of memory: tempdirs (1)
-pure-tests	crates/rargo-core/src/snapshot.rs	8	tests still touch the world instead of memory: shared state (4), tempdirs (2), the filesystem (2)
-pure-tests	crates/rargo-core/src/store.rs	14	tests still touch the world instead of memory: the filesystem (10), tempdirs (2), shared state (2)
-pure-tests	crates/rargo-core/tests/engine.rs	20	tests still touch the world instead of memory: the filesystem (17), tempdirs (2), the environment (1)
-pure-tests	crates/rargo-net/src/endpoint.rs	4	tests still touch the world instead of memory: the network (4)
-pure-tests	crates/rargo/src/git.rs	24	tests still touch the world instead of memory: the filesystem (18), processes (4), tempdirs (2)
-pure-tests	crates/rargo/src/known.rs	4	tests still touch the world instead of memory: the filesystem (3), tempdirs (1)
-pure-tests	crates/rargo/src/main.rs	4	tests still touch the world instead of memory: the filesystem (2), tempdirs (1), threads and sleeps (1)
-pure-tests	crates/rargo/src/place.rs	9	tests still touch the world instead of memory: the filesystem (6), tempdirs (3)
-pure-tests	crates/rargo/src/project.rs	9	tests still touch the world instead of memory: the filesystem (8), tempdirs (1)
-pure-tests	crates/rargo/src/report.rs	4	tests still touch the world instead of memory: the filesystem (3), tempdirs (1)
-pure-tests	crates/rargo/src/tmp.rs	18	tests still touch the world instead of memory: the filesystem (9), processes (4), libc calls (3), tempdirs (2)
 self-check	crates/rargo-core/src/action_table.rs	3	3 step methods of ActionTable assert nothing
-self-check	crates/rargo-core/src/build/nextest_run.rs	1	1 step method of NextestRun asserts nothing
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
-self-check	crates/rargo-core/src/conn_state.rs	6	6 step methods of ConnectionState assert nothing
 self-check	crates/rargo-core/src/db_writer.rs	5	5 step methods of DbWriter assert nothing
 self-check	crates/rargo-core/src/http.rs	8	8 step methods of AuthState assert nothing
 self-check	crates/rargo-core/src/pool_state.rs	9	9 step methods of Calls, Race, WorkerPool assert nothing

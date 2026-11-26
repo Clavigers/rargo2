@@ -7,11 +7,6 @@ fn clean(seeds: std::ops::Range<u64>) {
 }
 
 #[test]
-fn seeds_0_to_100_keep_every_invariant() {
-    clean(0..100);
-}
-
-#[test]
 fn seeds_100_to_200_keep_every_invariant() {
     clean(100..200);
 }
@@ -22,8 +17,13 @@ fn seeds_200_to_400_keep_every_invariant() {
 }
 
 #[test]
-fn seeds_400_to_600_keep_every_invariant() {
-    clean(400..600);
+fn seeds_400_to_500_keep_every_invariant() {
+    clean(400..500);
+}
+
+#[test]
+fn seeds_500_to_600_keep_every_invariant() {
+    clean(500..600);
 }
 
 #[test]
@@ -63,13 +63,14 @@ fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
 
 #[test]
 fn dozens_of_client_rounds_overlap_during_eviction() {
-    let report = run(12, None).unwrap_or_else(|failure| panic!("{failure}"));
+    let report = run(180, None).unwrap_or_else(|failure| panic!("{failure}"));
     assert!(report.clients_at_eviction >= 24, "{report:?}");
     assert!(report.cache_hits > 0, "clients reuse action outputs");
 }
 
 #[test]
 fn the_seeds_exercise_faults_the_cache_and_eviction() {
+    // These runs also check every invariant for seeds 0 through 99.
     let reports: Vec<_> = (0..100).map(|s| run(s, None).expect("passes")).collect();
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
     assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
@@ -83,6 +84,7 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
     assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
     assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
+    assert!(reports.iter().any(|r| r.crashes > 0), "client daemons crash and restart");
     assert!(reports.iter().any(|r| r.lost > 0), "packets are lost and sent again");
     assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
     assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
@@ -169,4 +171,9 @@ fn a_client_trusting_what_the_server_no_longer_holds_is_caught() {
 #[test]
 fn a_client_that_never_gives_up_on_a_silent_server_is_caught() {
     caught(Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
+}
+
+#[test]
+fn a_restarted_daemon_trusting_the_dead_one_is_caught() {
+    caught(Bug::TrustAfterCrash, |k| matches!(k, Kind::StateMachine(_) | Kind::Liveness(_) | Kind::Deadlock(_)));
 }

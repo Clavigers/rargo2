@@ -130,7 +130,7 @@ impl Conn {
             user: std::sync::OnceLock::new(),
             sock,
             peer: Mutex::new(peer),
-            epoch: Instant::now(),
+            epoch: io::now(),
             state: Mutex::new(conn::ConnState::new(id)),
             wake_sender: Notify::new(),
             send_settled: Notify::new(),
@@ -139,7 +139,7 @@ impl Conn {
             inbound_rx: FiberMutex::new(rx),
             stats: NetStats::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
-            last_heard: Mutex::new(Instant::now()),
+            last_heard: Mutex::new(io::now()),
             rng: AtomicU64::new(id | 1),
             handshake_in: Mutex::new(Vec::new()),
         });
@@ -165,7 +165,7 @@ impl Conn {
     }
 
     pub fn idle(&self) -> Duration {
-        self.last_heard.lock().elapsed()
+        io::now().saturating_duration_since(*self.last_heard.lock())
     }
 
     pub fn close(&self) {
@@ -261,7 +261,7 @@ impl Conn {
 
     fn ephemeral() -> [u8; 32] {
         let mut b = [0u8; 32];
-        unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 32, 0) };
+        io::random(&mut b);
         b
     }
 
@@ -288,7 +288,7 @@ impl Conn {
     }
 
     fn drive(&self, hs: &mut handshake::Handshake, keys: Option<&UserKeys>) -> sio::Result<handshake::Agreed> {
-        let deadline = Instant::now() + HANDSHAKE_WAIT;
+        let deadline = io::now() + HANDSHAKE_WAIT;
         let mut action = hs.start()?;
         loop {
             hs.invariants();
@@ -298,7 +298,7 @@ impl Conn {
                     action = hs.sent()?;
                 }
                 handshake::Action::Wait => {
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let left = deadline.saturating_duration_since(io::now());
                     if left.is_zero() {
                         return Err(hs.timeout_error());
                     }
@@ -358,7 +358,7 @@ impl Conn {
     }
 
     fn now(&self) -> Duration {
-        self.epoch.elapsed()
+        io::now().saturating_duration_since(self.epoch)
     }
 
     fn jitter(rng: &AtomicU64) -> u64 {
@@ -504,7 +504,7 @@ impl Endpoint {
             sock,
             conns: Mutex::new(HashMap::new()),
             state: Mutex::new(endpoint::EndpointState::new(accepting, per_conn, key.clone())),
-            t0: Instant::now(),
+            t0: io::now(),
             accept_tx: tx,
             accept_rx: FiberMutex::new(rx),
             key,
@@ -522,11 +522,11 @@ impl Endpoint {
     pub fn connect(&self, peer: SocketAddr) -> sio::Result<Arc<Conn>> {
         let id = {
             let mut b = [0u8; 8];
-            unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
+            io::random(&mut b);
             u64::from_le_bytes(b) | 1
         };
         let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn());
-        let now = self.t0.elapsed().as_millis() as u64;
+        let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
         assert!(self.state.lock().connect(id, peer, now), "connection ids are unique");
         assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
         let agreed = match &self.auth {
@@ -606,14 +606,14 @@ impl Endpoint {
 
     fn ingest(&self, from: SocketAddr, bytes: &[u8]) {
         self.sync_tag(bytes);
-        let now = self.t0.elapsed().as_millis() as u64;
+        let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
         let routed = self.state.lock().recv(from, bytes, now);
         for ev in routed.events {
             match ev {
                 endpoint::RouteEvent::Open { id, from } => self.open_conn(id, from),
                 endpoint::RouteEvent::Peer { id, from } => {
                     if let Some(c) = self.conns.lock().get(&id) {
-                        *c.last_heard.lock() = Instant::now();
+                        *c.last_heard.lock() = io::now();
                         *c.peer.lock() = from;
                     }
                 }
@@ -659,4 +659,5 @@ impl Endpoint {
     }
 }
 
-
+#[cfg(test)]
+mod tests_sim;

@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use rargo_plan::{PARSE_ENV, ParseReq, ParseResp, Script};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use crate::io::process::{Command, Stdio};
 use std::sync::Arc;
 
 struct Proc {
@@ -15,7 +15,7 @@ struct Proc {
 
 impl Proc {
     fn end(self) {
-        unsafe { libc::kill(self.pid, libc::SIGKILL) };
+        let _ = io::sys::kill(self.pid);
         drop((self.stdin, self.stdout));
         let _ = io::wait_exit(self.pid);
     }
@@ -127,7 +127,7 @@ impl Drop for Parser {
         if io::on_fiber() {
             p.end();
         } else {
-            unsafe { libc::kill(p.pid, libc::SIGKILL) };
+            let _ = io::sys::kill(p.pid);
         }
     }
 }

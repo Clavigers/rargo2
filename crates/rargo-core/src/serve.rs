@@ -112,7 +112,7 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
 
 pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
     let user = keys.name_of(&presented);
-    let mut checked = std::time::Instant::now();
+    let mut checked = crate::io::now();
     let has = Arc::new(ClientHas::default());
     let (control, control_rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
     {
@@ -243,13 +243,13 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
                 Route::Report { stream, text } => eprintln!("rargod: {user}: stream {stream}: {text}"),
             }
         }
-        if checked.elapsed() > std::time::Duration::from_secs(2) {
+        if crate::io::now().saturating_duration_since(checked) > std::time::Duration::from_secs(2) {
             let valid = keys.still_valid(&presented);
             if !valid {
                 eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
             }
             todo.extend(conn.lock().key_checked(valid));
-            checked = std::time::Instant::now();
+            checked = crate::io::now();
             continue;
         }
         let waited = crate::io::race_biased(vec![
@@ -481,10 +481,10 @@ fn serve(
             home,
             root: req.root.clone(),
             dir,
-            at: std::time::Instant::now(),
+            at: crate::io::now(),
             checked: None,
         };
-        return match crate::drift::check(&d, &snapshot, &who, std::time::Instant::now) {
+        return match crate::drift::check(&d, &snapshot, &who, crate::io::now) {
             Ok(r) => {
                 let text = r.render();
                 *d.drift_report.lock() = Some(format!("{}: {text}", req.root));
@@ -521,7 +521,7 @@ fn serve(
             }
         }
         let mut b = [0u8; 8];
-        unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
+        crate::io::random(&mut b);
         let token = u64::from_le_bytes(b) | 1;
         assert_ne!(token, 0);
         d.deliveries.lock().insert(worktree, (token, Arc::new(delivered)));

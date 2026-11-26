@@ -9,7 +9,6 @@ use std::collections::{BTreeMap, HashMap};
 use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -35,7 +34,7 @@ struct Timed<'a>(&'a OutFs, usize, std::time::Instant);
 impl Drop for Timed<'_> {
     fn drop(&mut self) {
         self.0.op_count[self.1].fetch_add(1, Ordering::Relaxed);
-        self.0.op_nanos[self.1].fetch_add(self.2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.0.op_nanos[self.1].fetch_add(rargo_net::io::now().saturating_duration_since(self.2).as_nanos() as u64, Ordering::Relaxed);
     }
 }
 const LISTING_KEPT: Duration = Duration::from_secs(30);
@@ -276,7 +275,7 @@ impl Delivery<'_> {
         let real = self.fs.real(rel);
         match rargo_net::io::file::symlink_metadata(&real) {
             Ok(md) if md.is_dir() => {
-                let _ = std::fs::remove_dir_all(&real);
+                let _ = rargo_net::io::file::remove_dir_all(&real);
             }
             Ok(_) => {
                 let _ = rargo_net::io::file::remove_file(&real);
@@ -486,7 +485,7 @@ impl OutFs {
             .unwrap_or_default();
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (uid, gid) = (rargo_net::io::process::euid(), rargo_net::io::process::egid());
         Ok(Arc::new(OutFs {
             under,
             _under_fd: fd,
@@ -513,7 +512,7 @@ impl OutFs {
     }
 
     fn timed(&self, op: &str) -> Timed<'_> {
-        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), std::time::Instant::now())
+        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), rargo_net::io::now())
     }
 
     pub fn op_report(&self) -> String {
@@ -654,9 +653,9 @@ impl OutFs {
         let mode = if v.exec { 0o755 } else { 0o644 };
         if with_content && v.size > 0 {
             let src = self.source.whole(&v.hash, v.size).map_err(errno)?;
-            let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", std::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
+            let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", rargo_net::io::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
             rargo_net::io::file::copy(&src, &tmp).map_err(errno)?;
-            rargo_net::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
+            rargo_net::io::file::set_mode(&tmp, mode).map_err(errno)?;
             rargo_net::io::file::rename(&tmp, &dst).map_err(|e| {
                 let _ = rargo_net::io::file::remove_file(&tmp);
                 errno(e)
@@ -861,7 +860,7 @@ impl OutFs {
             let Some(pid) = text.strip_prefix(crate::tmp::BESIDE).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<i32>().ok()) else {
                 continue;
             };
-            let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let alive = crate::kernel::kill(pid, 0).map_or_else(|e| e.raw_os_error() == Some(libc::EPERM), |()| true);
             if !alive && rargo_net::io::file::remove_file(e.path()).is_ok() {
                 self.changed(&join(&dir, name.as_bytes()));
             }
@@ -919,7 +918,7 @@ impl Filesystem for OutFs {
                 match set.mtime {
                     Some(TimeSet::At(s, ns)) => v.mtime_ns = s * 1_000_000_000 + ns as i64,
                     Some(TimeSet::Now) => {
-                        v.mtime_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+                        v.mtime_ns = rargo_net::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
                     }
                     None => {}
                 }
@@ -937,7 +936,7 @@ impl Filesystem for OutFs {
             f.set_len(size).map_err(errno)?;
         }
         if let Some(mode) = set.mode {
-            rargo_net::io::file::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777)).map_err(errno)?;
+            rargo_net::io::file::set_mode(&path, mode & 0o7777).map_err(errno)?;
         }
         if set.atime.is_some() || set.mtime.is_some() {
             let spec = |t: Option<TimeSet>| match t {
@@ -947,9 +946,7 @@ impl Filesystem for OutFs {
             };
             let times = [spec(set.atime), spec(set.mtime)];
             let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-            if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-                return Err(Errno::last());
-            }
+            crate::kernel::set_times(&c, &times, libc::AT_SYMLINK_NOFOLLOW).map_err(errno)?;
         }
         self.getattr(ctx, nodeid, None)
     }
@@ -995,7 +992,7 @@ impl Filesystem for OutFs {
         if self.touches_virtual(&rel) {
             return Err(Errno(libc::EEXIST));
         }
-        let make = || std::fs::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
+        let make = || rargo_net::io::file::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
         match make() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.make_parents(&rel)?;
@@ -1371,7 +1368,7 @@ impl Filesystem for OutFs {
                 return Ok(());
             }
         }
-        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| at.elapsed() < LISTING_KEPT).map(|(_, l)| l.clone()) };
+        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| rargo_net::io::now().saturating_duration_since(*at) < LISTING_KEPT).map(|(_, l)| l.clone()) };
         let listing = match cached {
             Some(l) => l,
             None => {
@@ -1405,9 +1402,9 @@ impl Filesystem for OutFs {
                 }
                 let mut all = self.listings.lock().unwrap();
                 if all.len() > 256 {
-                    all.retain(|_, (at, _)| at.elapsed() < LISTING_KEPT);
+                    all.retain(|_, (at, _)| rargo_net::io::now().saturating_duration_since(*at) < LISTING_KEPT);
                 }
-                all.insert(nodeid, (std::time::Instant::now(), l.clone()));
+                all.insert(nodeid, (rargo_net::io::now(), l.clone()));
                 l
             }
         };
@@ -1423,10 +1420,7 @@ impl Filesystem for OutFs {
     fn statfs(&self, _ctx: &Ctx, _nodeid: u64) -> Res<fuse_kstatfs> {
         let _t = self.timed("statfs");
         let c = std::ffi::CString::new(self.under.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-            return Err(Errno::last());
-        }
+        let s = crate::kernel::statvfs(&c).map_err(errno)?;
         Ok(fuse_kstatfs {
             blocks: s.f_blocks as u64,
             bfree: s.f_bfree as u64,

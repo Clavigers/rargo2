@@ -260,7 +260,7 @@ impl Partial {
         rargo_net::io::file::create_dir_all(dir)?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = slot.with_file_name(format!(".partial-{}-{n}", std::process::id()));
+        let tmp = slot.with_file_name(format!(".partial-{}-{n}", rargo_net::io::process::id()));
         let file = rargo_net::io::file::OpenOptions::new().read(true).write(true).create_new(true).open(&tmp)?;
         file.set_len(size)?;
         Ok(Arc::new(Partial {
@@ -358,8 +358,7 @@ impl Partial {
             }
         }
         if st.can_place() {
-            use std::os::unix::fs::PermissionsExt;
-            let placed = rargo_net::io::file::set_permissions(&self.tmp, std::fs::Permissions::from_mode(0o444))
+            let placed = rargo_net::io::file::set_mode(&self.tmp, 0o444)
                 .and_then(|_| rargo_net::io::file::rename(&self.tmp, &self.slot));
             match placed {
                 Ok(()) => st.done = true,

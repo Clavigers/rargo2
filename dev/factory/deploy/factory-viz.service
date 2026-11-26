@@ -1,0 +1,14 @@
+[Unit]
+Description=rargo2 factory visualizer: the log, live, on localhost:8377 (reach it with ssh -L 8377:localhost:8377)
+After=network-online.target
+
+[Service]
+WorkingDirectory=/root/factory/src
+Environment=HOME=/root
+Environment=PYTHONPATH=/root/factory/src
+ExecStart=/root/factory/venv/bin/python -m viz.server --log /root/factory/log.jsonl --host 127.0.0.1 --port 8377
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

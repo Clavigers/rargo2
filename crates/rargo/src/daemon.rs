@@ -490,8 +490,7 @@ fn low_space_text(cache: &Path, free: u64) -> Option<String> {
 
 fn free_bytes(dir: &Path) -> Option<u64> {
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+    crate::kernel::statvfs(&c).ok().map(|s| s.f_bavail as u64 * s.f_frsize as u64)
 }
 
 fn no_link(e: std::io::Error) -> std::io::Error {
@@ -527,13 +526,13 @@ impl Daemon {
             cfg,
             cache,
             host: crate::hostname(),
-            transport: std::env::var("RARGO_TRANSPORT").unwrap_or_default(),
+            transport: io::env::var("RARGO_TRANSPORT").unwrap_or_default(),
             mux: io::Mutex::new(None),
             worktrees: Mutex::new(HashMap::new()),
             watcher,
             next_wt: AtomicU64::new(1),
             active: AtomicUsize::new(0),
-            last_active: Mutex::new(Instant::now()),
+            last_active: Mutex::new(io::now()),
             counters: Counters::default(),
             big_sync: io::Mutex::new(()),
             fetching: Mutex::new(HashMap::new()),
@@ -612,7 +611,7 @@ impl Daemon {
     fn worktree(self: &Arc<Self>, root: &Path) -> Arc<Worktree> {
         let mut all = self.worktrees.lock().unwrap();
         if let Some(wt) = all.get(root) {
-            *wt.last_used.lock().unwrap() = Instant::now();
+            *wt.last_used.lock().unwrap() = io::now();
             return wt.clone();
         }
         let wt_id = {
@@ -640,7 +639,7 @@ impl Daemon {
             events: Mutex::new(HashSet::new()),
             changed: io::Notify::new(),
             running: io::Mutex::new(()),
-            last_used: Mutex::new(Instant::now()),
+            last_used: Mutex::new(io::now()),
             out: Mutex::new(None),
             out_failed: AtomicBool::new(false),
         });
@@ -840,7 +839,7 @@ impl Daemon {
             None
         };
         self.counters.offers.fetch_add(1, Ordering::Relaxed);
-        if std::env::var_os("RARGO_DAEMON_TRACE").is_some() {
+        if io::env::var_os("RARGO_DAEMON_TRACE").is_some() {
             let new: HashSet<&Digest> = trees.iter().collect();
             let mut paths: Vec<String> = Vec::new();
             let mut todo: Vec<(String, Digest)> = vec![(String::new(), snap.scan.root)];
@@ -1014,7 +1013,7 @@ impl Daemon {
         }
         let source = Box::new(Contents { d: Arc::downgrade(self) });
         let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
-        let root = unsafe { libc::geteuid() } == 0;
+        let root = io::process::euid() == 0;
         let opts = fusewire::MountOptions {
             fsname: "rargo".into(),
             allow_other: root,
@@ -1172,7 +1171,7 @@ impl Daemon {
             }
             if !recipe.is_empty() {
                 let slot = crate::place::cache_slot(&self.cache, &hash);
-                let tmp = slot.with_file_name(format!(".incoming-{}-{}", std::process::id(), mux.next_id()));
+                let tmp = slot.with_file_name(format!(".incoming-{}-{}", io::process::id(), mux.next_id()));
                 if let Some(parent) = slot.parent() {
                     rargo_net::io::file::create_dir_all(parent)?;
                 }
@@ -1226,7 +1225,7 @@ impl Daemon {
                     let _ = rargo_net::io::file::remove_file(&tmp);
                     return Err(std::io::Error::other("the server sent content that does not match its hash"));
                 }
-                let _ = rargo_net::io::file::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
+                let _ = rargo_net::io::file::set_mode(&tmp, 0o444);
                 rargo_net::io::file::rename(&tmp, &slot)?;
                 let mut index = self.chunks.lock().unwrap();
                 if index.len() > crate::known::MOST_CHUNKS {
@@ -1266,7 +1265,7 @@ impl Daemon {
     }
 
     fn touch(&self) {
-        *self.last_active.lock().unwrap() = Instant::now();
+        *self.last_active.lock().unwrap() = io::now();
     }
 
     fn close_down(&self, socket: &Path) {
@@ -1433,10 +1432,10 @@ impl Daemon {
                 _ => {}
             }
         }
-        let taken_up = Instant::now();
+        let taken_up = io::now();
         let phase = |what: &str| {
             if stats {
-                let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
+                let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", io::now().saturating_duration_since(taken_up).as_secs_f64()).into_bytes()));
             }
         };
         let mut step = command.begin();
@@ -1444,7 +1443,7 @@ impl Daemon {
         let mut snap: Option<Arc<Snap>> = None;
         let mut bet = None;
         let mut failure = None;
-        let mut started = Instant::now();
+        let mut started = io::now();
         loop {
             step = match step {
                 Step::Link => {
@@ -1455,7 +1454,7 @@ impl Daemon {
                         Ok(mux) => {
                             link = Some(mux);
                             phase("link to the server ready");
-                            started = Instant::now();
+                            started = io::now();
                             command.linked()
                         }
                         Err(e) => command.connect_failed().ok_or(e)?,
@@ -1476,7 +1475,7 @@ impl Daemon {
                             format!(
                                 "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB), looking at {} of {} directories\n",
                                 fresh.scan.file_count,
-                                started.elapsed().as_secs_f64() * 1e3,
+                                io::now().saturating_duration_since(started).as_secs_f64() * 1e3,
                                 fresh.scan.hashed_files,
                                 fresh.scan.hashed_bytes as f64 / 1048576.0,
                                 fresh.scan.listed_dirs,
@@ -1923,7 +1922,13 @@ fn mounts_at<'a>(info: &'a str, dir: &Path) -> impl Iterator<Item = &'a str> {
 
 fn dev_at(info: &str, dir: &Path) -> Option<u64> {
     let (major, minor) = mounts_at(info, dir).last()?.split(' ').nth(2)?.split_once(':')?;
-    Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
+    Some(device_number(major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The device number Linux makes of a major and a minor number.
+fn device_number(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (u64::from(major), u64::from(minor));
+    ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
 }
 
 fn release_mounts(dir: &Path) {
@@ -1931,7 +1936,7 @@ fn release_mounts(dir: &Path) {
     let mounts = mounts_at(&info, dir).count();
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
     for _ in 0..mounts {
-        if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } != 0 {
+        if crate::kernel::unmount(&c, libc::MNT_DETACH).is_err() {
             fusewire::unmount_with_helper(dir);
         }
     }
@@ -1945,7 +1950,7 @@ fn show(
 ) -> std::io::Result<(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>)> {
     use rargo_proto::Write;
     let inside = |path: &str| target_relative(dir, Path::new(path));
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
+    let now = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
     let mut delivery = fs.begin_delivery();
     let mut rest_writes = Vec::new();
     for w in writes {
@@ -2297,7 +2302,7 @@ fn serve_command(d: Arc<Daemon>, stream: io::UnixStream, socket: PathBuf) {
         let _ = wr.write_all(&(done.len() as u32).to_le_bytes());
         let _ = wr.write_all(&done);
         let _ = wr.shutdown();
-        std::process::exit(0);
+        io::process::exit(0);
     }
     let (tx, mut rx) = unbounded_channel::<LocalReply>();
     let work = io::spawn(move || d.command(req, tx));
@@ -2346,10 +2351,10 @@ pub fn serve(socket: &Path) -> ! {
         };
         {
             use std::os::fd::AsRawFd;
-            let started = Instant::now();
-            while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                if started.elapsed() > Duration::from_secs(3) {
-                    std::process::exit(0);
+            let started = io::now();
+            while crate::kernel::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB).is_err() {
+                if io::now().saturating_duration_since(started) > Duration::from_secs(3) {
+                    io::process::exit(0);
                 }
                 io::sleep(Duration::from_millis(20));
             }
@@ -2361,9 +2366,9 @@ pub fn serve(socket: &Path) -> ! {
         };
         let d = Daemon::new(cfg, cache, true);
         let idle = Duration::from_secs(
-            std::env::var("RARGO_DAEMON_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800),
+            io::env::var("RARGO_DAEMON_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800),
         );
-        eprintln!("rargo daemon: {} serving {} on {}", std::process::id(), d.cfg.server, socket.display());
+        eprintln!("rargo daemon: {} serving {} on {}", io::process::id(), d.cfg.server, socket.display());
         let mut term = io::signal(io::SignalKind::terminate()).expect("signal handler");
         let mut int = io::signal(io::SignalKind::interrupt()).expect("signal handler");
         enum Gate {
@@ -2400,13 +2405,13 @@ pub fn serve(socket: &Path) -> ! {
                 Gate::Conn(Err(_)) => {}
                 Gate::Idle => {
                     let showing = d.worktrees.lock().unwrap().values().any(|w| w.out.lock().unwrap().is_some());
-                    let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
+                    let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && io::now().saturating_duration_since(*d.last_active.lock().unwrap()) > idle;
                     d.save_known();
                     if quiet {
                         d.close_down(&socket);
                         break;
                     }
-                    if !socket.exists() {
+                    if !socket.ring_exists() {
                         d.unmount_all();
                         break;
                     }
@@ -2414,7 +2419,7 @@ pub fn serve(socket: &Path) -> ! {
                         let mut all = d.worktrees.lock().unwrap();
                         let old: Vec<PathBuf> = all
                             .iter()
-                            .filter(|(_, w)| w.out.lock().unwrap().is_none() && w.last_used.lock().unwrap().elapsed() > Duration::from_secs(4 * 3600))
+                            .filter(|(_, w)| w.out.lock().unwrap().is_none() && io::now().saturating_duration_since(*w.last_used.lock().unwrap()) > Duration::from_secs(4 * 3600))
                             .map(|(p, _)| p.clone())
                             .collect();
                         old.iter().filter_map(|p| all.remove(p)).collect()
@@ -2430,7 +2435,7 @@ pub fn serve(socket: &Path) -> ! {
             }
         }
         drop(lock);
-        std::process::exit(0);
+        io::process::exit(0);
     });
     unreachable!("the daemon leaves through exit")
 }
