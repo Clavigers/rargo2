@@ -199,7 +199,7 @@ impl IncrStore {
         self.db.delete(Table::Incr, &key(crate_key, id));
     }
 
-    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
+    pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
         let mut metas: Vec<StateMeta> = Vec::new();
         for (_, v) in self.db.scan_prefix(Table::Incr, &[]) {
             if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {

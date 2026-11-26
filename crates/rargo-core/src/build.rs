@@ -375,7 +375,7 @@ impl Daemon {
     }
 
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
-        let mut live = HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         self.engine.traces.mark(&mut live);
         self.incr.mark(&mut live);
         self.trees.mark(&mut live);

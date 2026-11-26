@@ -377,7 +377,7 @@ impl TraceCache {
             .collect()
     }
 
-    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
+    pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
         for (_, v) in self.db.scan_prefix(Table::Traces, &[]) {
             let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
             let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
@@ -475,9 +475,9 @@ mod tests {
         let created: Vec<u64> = again.traces(&b).iter().map(|(_, t)| t.created).collect();
         assert_eq!(created, (0..30u64).filter(|n| n % 3 == 0).rev().map(|n| 1000 + n).collect::<Vec<u64>>());
         assert_eq!(again.all().len(), MAX_TRACES_PER_KEY - 1 + 10);
-        let mut live = std::collections::HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         again.mark(&mut live);
-        let expected: std::collections::HashSet<Hash> = again
+        let expected: std::collections::BTreeSet<Hash> = again
             .all()
             .iter()
             .flat_map(|(_, t)| {
