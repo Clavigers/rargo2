@@ -36,6 +36,17 @@ impl Project {
         Project { sources, actions }
     }
 
+    pub fn clean_build(&self, tree: &[Option<Vec<u8>>]) -> Vec<Vec<u8>> {
+        let mut outputs: Vec<Vec<u8>> = Vec::with_capacity(self.actions.len());
+        for action in &self.actions {
+            let sources = action.sources.iter().filter_map(|&s| tree[s].as_deref());
+            let deps = action.deps.iter().map(|&d| outputs[d].as_slice());
+            let inputs: Vec<_> = sources.chain(deps).collect();
+            outputs.push(compile(action.id, &inputs));
+        }
+        outputs
+    }
+
     pub fn ready(&self, done: &dyn Fn(usize) -> bool, requested: &dyn Fn(usize) -> bool) -> Vec<usize> {
         (0..self.actions.len()).filter(|&i| !requested(i) && self.actions[i].deps.iter().all(|&d| done(d))).collect()
     }

@@ -350,6 +350,7 @@ enum Ev {
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
+    Edit { client: u64 },
     TestComplete { client: u64, key: String, started_ms: u64 },
     Sync { client: u64 },
     ClientCut { client: u64 },
@@ -407,7 +408,12 @@ struct Server {
 struct Client {
     round: u64,
     rounds_left: u64,
-    versions: Vec<u64>,
+    tree: Vec<Option<Vec<u8>>>,
+    // Reconnects and later actions in this round still read the original tree.
+    snapshot: Vec<Option<Vec<u8>>>,
+    reference: Vec<Vec<u8>>,
+    edits: Rng,
+    edit_scheduled: bool,
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
@@ -423,6 +429,21 @@ struct Client {
     synced_round: u64,
     watch: Watch,
     up_since: u64,
+}
+
+impl Client {
+    fn edit(&mut self) {
+        let index = self.edits.below(self.tree.len() as u64) as usize;
+        let slot = &mut self.tree[index];
+        if slot.is_some() && self.edits.chance(500) {
+            *slot = None;
+        } else {
+            // Revisiting earlier contents exercises cache hits and re-uploads after eviction.
+            let original = model::source(index, 0);
+            let version = slot.as_ref().map_or_else(|| self.edits.below(2), |bytes| u64::from(*bytes == original));
+            *slot = Some(if version == 0 { original } else { model::source(index, version) });
+        }
+    }
 }
 
 pub struct World {
@@ -522,7 +543,6 @@ impl World {
             w.worker_effects(id, fx).expect("a new worker only connects");
         }
         for id in 1..=w.cfg.clients {
-            let versions = vec![0; w.cfg.sources];
             let mut daemon = DaemonState::new(KnownDigests::default());
             daemon.added(1);
             daemon.watched(1, true);
@@ -531,7 +551,11 @@ impl World {
                 Client {
                     round: 0,
                     rounds_left: w.cfg.rounds,
-                    versions,
+                    tree: (0..w.cfg.sources).map(|s| Some(model::source(s, 0))).collect(),
+                    snapshot: Vec::new(),
+                    reference: Vec::new(),
+                    edits: Rng::new(seed ^ id.wrapping_mul(0x912a_e043_5b7d_68f1)),
+                    edit_scheduled: false,
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
@@ -768,6 +792,10 @@ impl World {
                 Ok(())
             }
             Ev::Round { client } => self.round(client),
+            Ev::Edit { client } => {
+                self.clients.get_mut(&client).expect("known").edit();
+                Ok(())
+            }
             Ev::TestComplete { client, key, started_ms } => {
                 self.test_complete(client, &key, started_ms);
                 Ok(())
@@ -1306,24 +1334,14 @@ impl World {
         }
     }
 
-    fn inputs_of(&self, client: &Client, action: usize) -> Vec<Vec<u8>> {
-        let a = &self.project.actions[action];
-        let mut inputs: Vec<Vec<u8>> = a.sources.iter().map(|&s| model::source(s, client.versions[s])).collect();
-        inputs.extend(a.deps.iter().map(|d| client.outputs[d].clone()));
-        inputs
-    }
-
     fn round(&mut self, client: u64) -> Step {
         let c = self.clients.get_mut(&client).expect("known");
         c.round += 1;
         c.rounds_left -= 1;
         c.test = TestRun::generate(self.seed, client, c.round);
-        if c.round > 1 {
-            for _ in 0..self.rng.range(1, 3) {
-                let s = self.rng.below(self.cfg.sources as u64) as usize;
-                c.versions[s] = self.rng.range(0, 2);
-            }
-        }
+        c.snapshot.clone_from(&c.tree);
+        c.reference = self.project.clean_build(&c.snapshot);
+        c.edit_scheduled = false;
         c.outputs.clear();
         c.requested.clear();
         c.pending.clear();
@@ -1358,14 +1376,13 @@ impl World {
             }
             Link::Skip => unreachable!("a sync needs the link"),
         }
-        let sources = self.cfg.sources;
         let c = self.clients.get_mut(&client).expect("known");
         let _ = c.daemon.plan_scan(1, None, true);
         c.daemon.scanned(1, None);
-        let blobs: Vec<Vec<u8>> = (0..sources).map(|s| model::source(s, c.versions[s])).collect();
-        let contents: Vec<Digest> = blobs.iter().map(|b| Hash::of(b).0).collect();
+        let blobs = c.snapshot.iter().flatten();
+        let contents: Vec<Digest> = blobs.clone().map(|b| Hash::of(b).0).collect();
         for (d, b) in contents.iter().zip(blobs) {
-            c.cache.insert(*d, b);
+            c.cache.insert(*d, b.clone());
         }
         let root = Hash::of(&contents.concat()).0;
         let (_, lacking) = c.daemon.offer(Some(1), &root, std::iter::empty(), contents.iter().map(|d| (d, ())));
@@ -1450,9 +1467,16 @@ impl World {
             return;
         }
         let ready = self.project.ready(&|a| c.outputs.contains_key(&a), &|a| c.requested.contains(&a));
+        if !ready.is_empty() && !c.edit_scheduled {
+            self.clients.get_mut(&client).expect("known").edit_scheduled = true;
+            self.schedule(1, Ev::Edit { client });
+        }
         for action in ready {
             let c = &self.clients[&client];
-            let inputs = self.inputs_of(c, action).iter().map(|b| Hash::of(b)).collect();
+            let spec = &self.project.actions[action];
+            let sources = spec.sources.iter().filter_map(|&s| c.snapshot[s].as_deref());
+            let deps = spec.deps.iter().map(|d| c.outputs[d].as_slice());
+            let inputs = sources.chain(deps).map(Hash::of).collect();
             let round = c.round;
             self.clients.get_mut(&client).expect("known").requested.insert(action);
             self.send(Node::Client(client), Node::Server, Msg::Up(Up::Request { round, action, inputs }));
@@ -1535,10 +1559,8 @@ impl World {
         if round != c.round || c.outputs.contains_key(&action) {
             return Ok(());
         }
-        let inputs = self.inputs_of(c, action);
-        let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
-        let want = model::compile(self.project.actions[action].id, &refs);
-        if output != want {
+        let want = &c.reference[action];
+        if &output != want {
             return Err(Kind::Drift(format!(
                 "client {client} round {round} got {:?} for action {} where its tree gives {:?}",
                 String::from_utf8_lossy(&output[..output.len().min(40)]),
@@ -1588,6 +1610,7 @@ impl World {
         if c.rounds_left == 0 {
             c.finished = true;
         } else {
+            self.schedule(0, Ev::Edit { client });
             let at = self.rng.range(0, 1_000);
             self.schedule(at, Ev::Round { client });
         }
@@ -1618,6 +1641,7 @@ fn label(ev: &Ev) -> String {
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
+        Ev::Edit { client } => format!("edit {client};"),
         Ev::TestComplete { client, key, .. } => format!("test result {client}/{key};"),
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
@@ -1631,4 +1655,45 @@ pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
 
 pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure> {
     World::new(seed, bug, off).run()
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    #[test]
+    fn live_edits_leave_the_current_build_on_its_snapshot() {
+        let mut world = World::new(12, None, Off::none());
+        world.clients.get_mut(&1).unwrap().rounds_left = 2;
+        world.round(1).unwrap();
+        let original = world.clients[&1].snapshot.clone();
+        let original_contents = world.clients[&1].contents.clone();
+        let mut edited = false;
+        let mut deleted = false;
+        let mut added = false;
+        for _ in 0..32 {
+            let before = world.clients[&1].tree.clone();
+            world.step(Ev::Edit { client: 1 }).unwrap();
+            let client = &world.clients[&1];
+            for (old, new) in before.iter().zip(&client.tree) {
+                edited |= old.is_some() && new.is_some() && old != new;
+                deleted |= old.is_some() && new.is_none();
+                added |= old.is_none() && new.is_some();
+            }
+        }
+        assert!(edited && deleted && added);
+
+        world.sync(1).unwrap();
+        let client = &world.clients[&1];
+        assert_eq!(client.contents, original_contents);
+        assert_eq!(client.snapshot, original);
+        assert_eq!(client.reference, world.project.clean_build(&original));
+
+        world.round(1).unwrap();
+        let client = &world.clients[&1];
+        assert_eq!(client.snapshot, client.tree);
+        assert_ne!(client.snapshot, original);
+        assert_eq!(client.reference, world.project.clean_build(&client.tree));
+        assert_ne!(client.reference, world.project.clean_build(&original));
+    }
 }
