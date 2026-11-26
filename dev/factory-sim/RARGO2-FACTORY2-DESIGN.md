@@ -55,7 +55,10 @@ The foreman acts on a fixed tick, every 20 minutes. On each tick it, in order:
    returns that issue to the queue.
 3. Splits new initiatives into sub-issues with explicit dependencies, keeping
    independent work parallel and dependent work serial, until the ready queue
-   holds enough work for every agent.
+   holds enough work for every agent. Each sub-issue gets a t-shirt size label
+   (`size:XS`, `size:S`, `size:M`, `size:L`, `size:XL`, `size:XXL`) on the same
+   scale the size check puts on pull requests by lines changed, so every
+   estimate can be compared with the pull request that closed it.
 
 The foreman does not write code.
 

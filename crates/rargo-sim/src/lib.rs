@@ -1,5 +1,6 @@
 pub mod model;
 pub mod rng;
+mod nextest;
 pub mod world;
 
 pub use world::{Bug, Failure, Fault, Kind, Off, Report, run, run_off};
