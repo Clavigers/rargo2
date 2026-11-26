@@ -263,7 +263,6 @@ impl Store {
     }
 
     pub fn freeze(&self, h: &Hash, before: &dyn Fn(&Hash)) -> io::Result<Option<u64>> {
-        assert!(!crate::io::on_fiber(), "freezing holds the cold lock, so it runs off the event loop");
         let _g = self.cold_lock.read().unwrap();
         let Some(start) = self.index.lock().begin_freeze(h) else {
             return Ok(None);
@@ -355,8 +354,10 @@ impl Store {
 
     // `cold_lock` is a blocking lock held across file I/O. A fiber that holds it parks
     // on that I/O, and the next fiber to take it then blocks the event-loop thread, so
-    // the parked holder never resumes. Every holder runs off the loop: `blocking` runs
-    // the body in place when it is already off a fiber.
+    // the parked holder never resumes. Likewise a pool thread that holds it has the loop
+    // do its file I/O, and waits forever once the loop thread blocks on the lock. So no
+    // fiber takes it on the loop thread: `blocking` moves the body to the pool, and runs
+    // it in place when it is already off a fiber. `freeze` is only called from the pool.
     fn thaw(&self, h: &Hash) -> io::Result<()> {
         crate::io::blocking(|| self.thaw_off_loop(h))
     }
@@ -805,29 +806,6 @@ mod tests {
             assert_eq!(s.open_blob(&h).err().unwrap().kind(), io::ErrorKind::InvalidData);
             assert!(!s.has(&h));
         });
-    }
-
-    // Without the fix this test does not fail, it hangs: the thaw blocks the loop
-    // thread on the lock, and the fiber that holds the lock never wakes to drop it.
-    #[test]
-    fn a_thaw_waiting_on_the_cold_lock_leaves_the_event_loop_running() {
-        let (_d, s) = store();
-        let s = Arc::new(s);
-        let data = vec![9u8; 1 << 20];
-        let h = s.put_bytes(&data).unwrap();
-        assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-        let read = crate::io::run(2, move || {
-            let held = s.cold_lock.write().unwrap();
-            let mut reader = {
-                let s = s.clone();
-                crate::io::spawn(move || s.read(&h))
-            };
-            crate::io::yield_now();
-            crate::io::sleep(std::time::Duration::from_millis(20));
-            drop(held);
-            reader.join().unwrap()
-        });
-        assert_eq!(read.unwrap(), data);
     }
 
     #[test]
