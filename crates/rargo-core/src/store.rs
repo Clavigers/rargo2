@@ -806,6 +806,8 @@ mod tests {
         assert!(!s.has(&h));
     }
 
+    // Without the fix this test does not fail, it hangs: the thaw blocks the loop
+    // thread on the lock, and the fiber that holds the lock never wakes to drop it.
     #[test]
     fn a_thaw_waiting_on_the_cold_lock_leaves_the_event_loop_running() {
         let (_d, s) = store();
@@ -813,35 +815,17 @@ mod tests {
         let data = vec![9u8; 1 << 20];
         let h = s.put_bytes(&data).unwrap();
         assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (held_tx, held_rx) = std::sync::mpsc::channel();
-        let writer = {
-            let (s, alive) = (s.clone(), alive.clone());
-            std::thread::spawn(move || {
-                let _w = s.cold_lock.write().unwrap();
-                held_tx.send(()).unwrap();
-                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while !alive.load(Ordering::SeqCst) {
-                    if std::time::Instant::now() > until {
-                        return false;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                true
-            })
-        };
         let read = crate::io::run(2, move || {
-            crate::io::blocking(move || held_rx.recv().unwrap());
+            let held = s.cold_lock.write().unwrap();
             let mut reader = {
                 let s = s.clone();
                 crate::io::spawn(move || s.read(&h))
             };
             crate::io::yield_now();
             crate::io::sleep(std::time::Duration::from_millis(20));
-            alive.store(true, Ordering::SeqCst);
+            drop(held);
             reader.join().unwrap()
         });
-        assert!(writer.join().unwrap(), "the event loop stalled while a fiber waited on the cold lock");
         assert_eq!(read.unwrap(), data);
     }
 
