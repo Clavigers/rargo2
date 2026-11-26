@@ -104,7 +104,8 @@ struct Inode {
 }
 
 enum Node {
-    Dir { mode: u32 },
+    /// A directory, with when it was made in nanoseconds since the Unix epoch.
+    Dir { mode: u32, mtime_ns: i64 },
     File(u64),
     Link(PathBuf),
 }
@@ -188,7 +189,7 @@ fn path_of(c: &CString) -> PathBuf {
 impl SimLoop {
     pub fn new(seed: u64, net: Net) -> SimLoop {
         let mut files = BTreeMap::new();
-        files.insert(PathBuf::from("/"), Node::Dir { mode: 0o755 });
+        files.insert(PathBuf::from("/"), Node::Dir { mode: 0o755, mtime_ns: (EPOCH_S * 1_000_000_000) as i64 });
         SimLoop {
             rng: Rng(seed),
             net,
@@ -442,9 +443,13 @@ impl SimLoop {
         st.stx_gid = UID;
         match self.files.get(path) {
             None => return Err(errno(libc::ENOENT)),
-            Some(Node::Dir { mode }) => {
+            Some(Node::Dir { mode, mtime_ns }) => {
                 st.stx_mode = (libc::S_IFDIR | *mode) as u16;
                 st.stx_ino = 1;
+                st.stx_mtime.tv_sec = mtime_ns.div_euclid(1_000_000_000);
+                st.stx_mtime.tv_nsec = mtime_ns.rem_euclid(1_000_000_000) as u32;
+                st.stx_ctime = st.stx_mtime;
+                st.stx_atime = st.stx_mtime;
             }
             Some(Node::Link(target)) => {
                 st.stx_mode = (libc::S_IFLNK | 0o777) as u16;
@@ -636,7 +641,8 @@ impl SimLoop {
                     return Err(errno(libc::EEXIST));
                 }
                 self.parent_is_dir(&path)?;
-                self.files.insert(path, Node::Dir { mode: mode & 0o7777 & !0o022 });
+                let mtime_ns = self.wall_ns();
+                self.files.insert(path, Node::Dir { mode: mode & 0o7777 & !0o022, mtime_ns });
                 Event::Done
             }
             Op::UnlinkAt { dir, path, flags } => {
@@ -863,7 +869,7 @@ pub(super) fn set_mode(path: &Path, mode: u32) -> Option<io::Result<()>> {
     with(|sim| {
         let path = sim.real(path)?;
         match sim.files.get_mut(&path) {
-            Some(Node::Dir { mode: held }) => *held = mode & 0o7777,
+            Some(Node::Dir { mode: held, .. }) => *held = mode & 0o7777,
             Some(Node::File(ino)) => {
                 let ino = *ino;
                 sim.inodes.get_mut(&ino).expect("a named file has its inode").mode = mode & 0o7777;
@@ -977,8 +983,9 @@ pub fn tempdir() -> PathBuf {
     .expect("a simulation is running");
     let dir = PathBuf::from(format!("/tmp/sim-{n}"));
     with(|sim| {
-        sim.files.entry(PathBuf::from("/tmp")).or_insert(Node::Dir { mode: 0o777 });
-        sim.files.insert(dir.clone(), Node::Dir { mode: 0o755 });
+        let mtime_ns = sim.wall_ns();
+        sim.files.entry(PathBuf::from("/tmp")).or_insert(Node::Dir { mode: 0o777, mtime_ns });
+        sim.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns });
     });
     dir
 }

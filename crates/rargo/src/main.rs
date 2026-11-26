@@ -3,8 +3,12 @@ mod daemon;
 #[path = "io/daemon_control.rs"]
 mod daemon_control;
 mod git;
+#[path = "io/http.rs"]
+mod http;
 #[path = "io/install.rs"]
 mod install;
+#[path = "io/kernel.rs"]
+mod kernel;
 mod known;
 mod loader;
 mod mux;
@@ -27,14 +31,14 @@ use std::path::{Path, PathBuf};
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        rargo_net::io::file::create_dir_all(parent)?;
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!("{}{}-{}-{name}", tmp::BESIDE, std::process::id(), tmp::seq()));
+    let tmp = path.with_file_name(format!("{}{}-{}-{name}", tmp::BESIDE, rargo_net::io::process::id(), tmp::seq()));
     let _watched = tmp::watch(&tmp);
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
+    rargo_net::io::file::write(&tmp, bytes)?;
+    rargo_net::io::file::rename(&tmp, path).inspect_err(|_| {
+        let _ = rargo_net::io::file::remove_file(&tmp);
     })
 }
 

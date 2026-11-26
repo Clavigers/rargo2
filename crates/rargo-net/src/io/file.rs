@@ -225,11 +225,11 @@ pub fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
     route(move || path_op(Op::MkdirAt { dir: CWD, path: c_path(&at)?, mode: 0o777 }), || std::fs::create_dir(&path))
 }
 
-fn ring_create_dir_all(path: &Path) -> io::Result<()> {
+fn ring_create_dir_all(path: &Path, mode: u32) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    let mkdir = |p: &Path| path_op(Op::MkdirAt { dir: CWD, path: c_path(p)?, mode: 0o777 });
+    let mkdir = |p: &Path| path_op(Op::MkdirAt { dir: CWD, path: c_path(p)?, mode });
     let is_dir = |p: &Path| stat_with(CWD, p, 0).is_ok_and(|st| st.is_dir());
     match mkdir(path) {
         Ok(()) => return Ok(()),
@@ -238,7 +238,7 @@ fn ring_create_dir_all(path: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     if let Some(parent) = path.parent() {
-        ring_create_dir_all(parent)?;
+        ring_create_dir_all(parent, mode)?;
     }
     match mkdir(path) {
         Ok(()) => Ok(()),
@@ -248,9 +248,46 @@ fn ring_create_dir_all(path: &Path) -> io::Result<()> {
 }
 
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    let path = path.as_ref().to_path_buf();
-    let at = path.clone();
-    route(move || ring_create_dir_all(&at), || std::fs::create_dir_all(&path))
+    DirBuilder::new().recursive(true).create(path)
+}
+
+/// Makes a directory with chosen permission bits, and its missing parents when asked.
+#[derive(Clone, Debug)]
+pub struct DirBuilder {
+    recursive: bool,
+    mode: u32,
+}
+
+impl Default for DirBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirBuilder {
+    pub fn new() -> Self {
+        Self { recursive: false, mode: 0o777 }
+    }
+
+    pub fn recursive(&mut self, on: bool) -> &mut Self {
+        self.recursive = on;
+        self
+    }
+
+    pub fn mode(&mut self, mode: u32) -> &mut Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn create(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let (recursive, mode) = (self.recursive, self.mode);
+        let path = path.as_ref().to_path_buf();
+        let at = path.clone();
+        route(
+            move || if recursive { ring_create_dir_all(&at, mode) } else { path_op(Op::MkdirAt { dir: CWD, path: c_path(&at)?, mode }) },
+            || std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(recursive), mode).create(&path),
+        )
+    }
 }
 
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
