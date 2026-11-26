@@ -6,7 +6,7 @@ pub mod tree;
 pub mod waits;
 pub mod workspace;
 
-pub const PROTO_VERSION: u32 = 9;
+pub const PROTO_VERSION: u32 = 10;
 
 const SERVER_IN_CARGO_TOML_UNTIL: u32 = 7;
 

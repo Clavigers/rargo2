@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn immediately_older_tcp_hellos_are_read_in_full_before_refusal() {
         use rargo_proto::secure::MAGIC;
-        for version in [7, 8] {
+        for version in [7, 8, 9] {
             let mut bytes = a_hello("ann", &[42; 48]);
             bytes[5] = version;
             let (mut handshake, step) = Handshake::new(MAGIC);

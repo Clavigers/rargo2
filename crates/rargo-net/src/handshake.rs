@@ -562,7 +562,7 @@ mod tests {
         assert_eq!(&unmarked[4..], &marked[4 + MAGIC.len()..]);
 
         // Protocols 7, 8 and the original protocol 9 had the same unmarked layout.
-        for version in [None, Some(7), Some(8)] {
+        for version in [None, Some(7), Some(8), Some(9)] {
             let bytes = match version {
                 None => unmarked.clone(),
                 Some(version) => {

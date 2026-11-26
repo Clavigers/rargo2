@@ -1029,7 +1029,9 @@ mod tests {
             ("POST", "/auth/start", r#"{"machine":"old-host"}"#),
             ("POST", "/auth/start", r#"{"protocol":7}"#),
             ("POST", "/auth/start", r#"{"protocol":8}"#),
+            ("POST", "/auth/start", r#"{"protocol":9}"#),
             ("GET", "/auth?code=ABCD-2345", ""),
+            ("GET", "/auth?code=ABCD-2345&protocol=9", ""),
         ] {
             let req = call(method, path, Some("application/json"), body);
             let (outcome, _) = drive(&mut state, req, NOW, &cfg(true), &mut Script::default());
