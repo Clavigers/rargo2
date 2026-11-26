@@ -2312,7 +2312,10 @@ mod upload_tests {
             read 3 "e" => part "thre" last=false (4 bytes on the wire)
             finish => nothing
         "#]].assert_eq(&multipart(b"one two three", b"one TWO three", 4));
-        expect![[r#""#]].assert_eq(&multipart(b"one two", b"one two three", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "two " => refused, and the upload stops
+        "#]].assert_eq(&multipart(b"one two", b"one two three", 4));
         expect![[r#"
             read 0 "one " => nothing yet
             read 1 "two" => part "one " last=false (4 bytes on the wire)

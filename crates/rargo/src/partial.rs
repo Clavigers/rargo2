@@ -482,7 +482,21 @@ mod tests {
             Ev::DeliverFetched,
             Ev::Read(0, data.len() as u64, false),
         ];
-        expect![[r#""#]].assert_eq(&run(&data, &data, &[(GROUP * 2, GROUP * 4)], events));
+        expect![[r#"
+            read 0..1 waited=false => Fetch { needed: [0, 1, 2], prefetch: [3, 4] }
+            read 1..3 waited=false => Wait
+            failed [0, 1, 2]
+            read 0..1 waited=true => Failed
+            read 0..1 waited=false => Fetch { needed: [0, 1, 2], prefetch: [] }
+            chunk 2 proves group 0 => Some(Good)
+            chunk 4 proves group 1 => Some(Good)
+            read 1..3 waited=true => Ready
+            read 0..262144 waited=false => Fetch { needed: [5, 6, 7, 8], prefetch: [] }
+            chunk 6 proves group 2 => Some(Good)
+            chunk 8 proves group 3 => Some(Good)
+            read 0..262144 waited=false => Ready
+            can place: true; groups holding the original bytes: [true, true, true, true]
+        "#]].assert_eq(&run(&data, &data, &[(GROUP * 2, GROUP * 4)], events));
     }
 
     #[test]
