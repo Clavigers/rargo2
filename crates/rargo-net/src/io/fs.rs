@@ -64,6 +64,9 @@ pub fn close_fd(fd: i32) -> io::Result<()> {
 }
 
 pub fn try_read(fd: i32, len: usize) -> io::Result<Option<Vec<u8>>> {
+    if let Some(got) = super::sim::pipe_try_read(fd, len) {
+        return got;
+    }
     let mut buf = vec![0u8; len];
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, len) };

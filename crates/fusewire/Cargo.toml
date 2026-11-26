@@ -10,6 +10,3 @@ homepage.workspace = true
 [dependencies]
 rargo-machine = { path = "../rargo-machine", version = "0.7.10" }
 libc.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
