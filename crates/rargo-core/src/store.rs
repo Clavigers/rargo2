@@ -726,7 +726,7 @@ impl Store {
 
     pub fn sweep(
         &self,
-        live: &std::collections::HashSet<Hash>,
+        live: &std::collections::BTreeSet<Hash>,
         min_age_secs: u64,
         on_evict: &dyn Fn(&Hash),
     ) -> (usize, u64) {
