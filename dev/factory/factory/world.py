@@ -209,6 +209,49 @@ class World:
                                                   for r in pr.reviewers}}}
         return out
 
+    def status(self) -> str:
+        """The factory at a glance, for a person."""
+        assert self.config and self.t
+        def ago(t):
+            mins = int((self.t - t).total_seconds() // 60)
+            return f"{mins // 60}h{mins % 60:02d}m" if mins >= 60 else f"{mins}m"
+        out = [f"log line {self.seq}, {self.t:%Y-%m-%d %H:%M}Z, config {self.config.version}", "",
+               "agents"]
+        for a in self.config.names():
+            what = self.state(M.AGENT, a)
+            if a in self.holding:
+                what += f" on #{self.holding[a]}"
+            if self.is_(M.QUOTA, a, "out"):
+                what += f", out of quota {ago(self.since(M.QUOTA, a))}"
+            out.append(f"  {a:16} {what}")
+        out += ["", "issues"]
+        for st in ("ready", "blocked", "parked", "held", "checking"):
+            ns = [n for n in self.issues if self.is_(M.ISSUE, n, st)]
+            if ns:
+                out.append(f"  {st:9} " + " ".join(
+                    f"#{n}" + ("*" if self.issues[n].kind is Kind.bug else "")
+                    + (f"(pr {self.issues[n].pr})" if self.issues[n].pr else "")
+                    for n in sorted(ns)))
+        inits = [n for n, i in self.issues.items() if i.kind is Kind.initiative and self.open_(n)]
+        if inits:
+            out.append("  initiatives " + " ".join(
+                f"#{n}" + (" (parked)" if self.issues[n].parked else
+                           f" ({sum(self.open_(c) for c in self.issues[n].children)}"
+                           f"/{len(self.issues[n].children)} open)")
+                for n in sorted(inits)))
+        closed = [n for n in self.issues if self.is_(M.ISSUE, n, "closed")]
+        out.append(f"  closed    {len(closed)}   (* bug)")
+        checking = [n for n in self.issues if self.is_(M.ISSUE, n, "checking")]
+        if checking:
+            out += ["", "in checks"]
+            for n in sorted(checking):
+                pr = self.prs[self.issues[n].pr]
+                key = f"{self.issues[n].pr}/{pr.pushes}"
+                revs = ", ".join(f"{r} {self.state(M.REVIEW, f'{key}/{r}')}" for r in pr.reviewers)
+                out.append(f"  #{n} pr {self.issues[n].pr} push {pr.pushes}: "
+                           f"ci {self.state(M.CI, key)}, {revs}")
+        return "\n".join(out)
+
     def hold_reasons(self, version: str) -> set[m.HoldReason]:
         assert self.config and self.t
         v, rules, R = self.versions[version], self.config.release, m.HoldReason

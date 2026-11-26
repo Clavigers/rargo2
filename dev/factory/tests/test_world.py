@@ -504,3 +504,10 @@ def test_logs_already_written_still_check():
     for text in (pathlib.Path(__file__).parent / "golden.jsonl").read_text().splitlines():
         w.apply(parse(text))
     assert w.seq >= 24
+
+
+def test_status_reads_well():
+    text = checks_race().w.status()
+    assert "claude-code-1" in text and "closed" in text
+    text = initiative_to_release().w.status()
+    assert "issues" in text

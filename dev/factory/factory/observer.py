@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from . import machines as M
 from . import model as m
 from .github import GitHub, GitHubError
 from .ledger import Alarm, Ledger, Refused
+from .notify import notify
 from .machines import CiS, IssueS, ReviewS
 from .model import Kind, Role
 from .world import green
@@ -70,7 +71,7 @@ class Observer:
         self.noted: set[tuple] = set()  # things said once
 
     def step(self) -> None:
-        start = datetime.now().astimezone()
+        start = datetime.now(timezone.utc)
         w = self.ledger.refresh()
         for pr in [n for n in w.prs if w.is_(M.PR, n, "open")]:
             try:
@@ -236,8 +237,10 @@ class Observer:
             self.ledger.submit(actor, json.dumps({"event": event, **fields}))
             return True
         except (Refused, Alarm, ValueError) as err:
-            self._once(("refused", event, json.dumps(fields, sort_keys=True)),
-                       f"{actor} {event} {fields}: {err}")
+            key = ("refused", event, json.dumps(fields, sort_keys=True))
+            if isinstance(err, Alarm) and key not in self.noted:
+                notify(f"{actor} {event} {fields}: {err}", "rargo factory alarm")
+            self._once(key, f"{actor} {event} {fields}: {err}")
             return False
 
     def _once(self, key: tuple, msg: str) -> None:

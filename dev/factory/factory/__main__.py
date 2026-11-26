@@ -6,6 +6,7 @@
                             exit 0 written (or would be), 1 malformed,
                             2 refused (a decision that did not happen),
                             3 alarm (an observation the model says cannot be)
+  status                    the factory at a glance
   mine                      what this agent holds, as JSON
   ready                     issues ready to take, best first, as JSON
   init CONFIG               start the log with this config (a JSON file)
@@ -85,6 +86,9 @@ def main(argv: list[str]) -> int:
             return submit(body, dry=False)
         case ["submit", "--dry", body]:
             return submit(body, dry=True)
+        case ["status"]:
+            print(Ledger(env("FACTORY_LOG")).world.status())
+            return 0
         case ["mine"]:
             w = Ledger(env("FACTORY_LOG")).world
             print(json.dumps(w.agent_view(env("FACTORY_ACTOR"))))

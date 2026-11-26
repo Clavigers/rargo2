@@ -63,7 +63,7 @@ def session_end(t: m.AgentType, returncode: int, output: str) -> m.SessionEnd:
     limits in a session that finished is not mistaken for one that hit one."""
     if returncode == 0:
         return m.SessionEnd.finished
-    if returncode < 0:
+    if returncode < 0 or returncode >= 128:  # a signal, directly or through a shell
         return m.SessionEnd.killed
     if KINDS[t.type].quota.search(output[-4000:]):
         return m.SessionEnd.quota

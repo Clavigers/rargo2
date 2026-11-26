@@ -5,6 +5,7 @@ Wants=network-online.target
 
 [Service]
 Environment=HOME=/root
+Environment=FACTORY_NOTIFY=https://ntfy.sh/wd-c3eaf0b48fad13b9e7a68532
 Environment=FACTORY_LOG=/root/factory/log.jsonl
 Environment=FACTORY_CODEX=/root/.codex/packages/app-server-daemon/releases/0.172.0-x86_64-unknown-linux-musl/bin/codex
 Environment=FACTORY_GROK=/root/.grok/bin/grok

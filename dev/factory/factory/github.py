@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class GitHubError(Exception):
@@ -32,7 +32,10 @@ class GitHub:
     def issues(self, since: datetime | None) -> list[dict]:
         """Issues (not pull requests): every open one, or with since, every one
         updated since then, open or closed."""
-        q = f"state=all&since={since:%Y-%m-%dT%H:%M:%SZ}" if since else "state=open"
+        if since and since.tzinfo is None:
+            raise ValueError("since must be an aware time")
+        q = (f"state=all&since={since.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
+             if since else "state=open")
         return [i for i in self._api(f"issues?{q}&per_page=100", paginate=True)
                 if "pull_request" not in i]
 

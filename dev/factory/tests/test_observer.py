@@ -266,3 +266,14 @@ def test_wip_labels_are_outside_locks(rig):
     rig.gh.issue(1, labels=["bug"])
     rig.obs.step()
     assert rig.led.world.state(M.ISSUE, 1) == IssueS.ready
+
+
+def test_since_is_utc_whatever_the_machine_zone(monkeypatch):
+    """The factory machine runs on CET; GitHub's since is UTC."""
+    from factory.github import GitHub
+    asked = []
+    gh = GitHub("o/r")
+    monkeypatch.setattr(gh, "_api", lambda path, paginate=False: asked.append(path) or [])
+    cet = timezone(timedelta(hours=1))
+    gh.issues(datetime(2026, 11, 26, 7, 30, tzinfo=cet))
+    assert "since=2026-11-26T06:30:00Z" in asked[0]

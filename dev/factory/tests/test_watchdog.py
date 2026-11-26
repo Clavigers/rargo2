@@ -150,10 +150,20 @@ def test_a_restarted_watchdog_adopts_running_sessions(rig):
     second.step()
     assert second.sessions[A].pid == pid
     assert events(rig.log) == [("session_started", None)]
-    os.kill(pid, 9)
+    os.kill(pid, 9)  # the wrapper itself: no exit code is left
     first.sessions[A].proc.wait()  # reap it, as init would
     second.step()
     assert events(rig.log)[1] == ("session_ended", "crashed")
+
+
+def test_an_adopted_session_reports_how_it_ended(rig):
+    rig.monkeypatch.setenv("FAKE_MODE", "quota")
+    first = rig.watchdog()
+    first.step()
+    first.sessions[A].proc.wait()  # it ended while no watchdog watched
+    second = rig.watchdog()
+    second.step()
+    assert events(rig.log)[1:] == [("session_ended", "quota"), ("quota_out", None)]
 
 
 def test_a_lost_session_is_recorded(rig):

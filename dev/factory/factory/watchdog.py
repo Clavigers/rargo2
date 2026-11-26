@@ -35,14 +35,22 @@ from . import machines as M
 from . import model as m
 from .ledger import Alarm, Ledger, utc_now
 from .machines import AgentS
+from .notify import notify
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
+
+
+# Runs the harness and leaves its exit code in $FACTORY_EXIT, so a watchdog
+# that adopted the session (and so cannot wait for it) still learns how it
+# ended. A signal shows as 128 + its number.
+WRAP = '"$@"; c=$?; echo $c > "$FACTORY_EXIT.tmp" && mv "$FACTORY_EXIT.tmp" "$FACTORY_EXIT"; exit $c'
 
 
 @dataclass
 class Session:
     pid: int
     log: Path
+    exit: Path  # where the wrapper writes the exit code
     proc: subprocess.Popen | None  # None when adopted from an earlier watchdog
 
     def exit_code(self) -> int | None:
@@ -52,7 +60,10 @@ class Session:
             os.kill(self.pid, 0)
             return None
         except ProcessLookupError:
-            return 1  # adopted and gone; its real exit code went with its parent
+            try:
+                return int(self.exit.read_text())
+            except (OSError, ValueError):
+                return 1  # gone without a word: killed with its wrapper
 
 
 class Watchdog:
@@ -66,7 +77,7 @@ class Watchdog:
         self.clock, self.say = clock, say
         self.sessions: dict[str, Session] = {}
         self.backoff: dict[str, tuple[int, datetime]] = {}  # agent -> (crashes, not before)
-        for d in ("pids", "logs", "worktrees"):
+        for d in ("pids", "logs", "worktrees", "exits"):
             (self.state / d).mkdir(parents=True, exist_ok=True)
         self._adopt()
 
@@ -114,13 +125,17 @@ class Watchdog:
         if not self._record("session_started", agent=agent):
             return
         log = self.state / "logs" / f"{agent}-{self.clock():%Y%m%dT%H%M%S}.log"
+        exit_file = self.state / "exits" / agent
+        exit_file.unlink(missing_ok=True)
         env = os.environ | extra | {
+            "FACTORY_EXIT": str(exit_file),
             "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": agent,
             "FACTORY_PYTHON": sys.executable,
             "PATH": f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}"}
         try:
             with open(log, "wb") as out:
-                proc = subprocess.Popen(argv, cwd=wt, env=env, stdin=subprocess.DEVNULL,
+                proc = subprocess.Popen(["sh", "-c", WRAP, "sh", *argv], cwd=wt, env=env,
+                                        stdin=subprocess.DEVNULL,
                                         stdout=out, stderr=subprocess.STDOUT,
                                         start_new_session=True)
         except OSError as err:
@@ -128,8 +143,9 @@ class Watchdog:
             self._record("session_ended", agent=agent, reason="crashed")
             self._crashed(agent)
             return
-        self.sessions[agent] = Session(proc.pid, log, proc)
-        (self.state / "pids" / agent).write_text(json.dumps({"pid": proc.pid, "log": str(log)}))
+        self.sessions[agent] = Session(proc.pid, log, exit_file, proc)
+        (self.state / "pids" / agent).write_text(
+            json.dumps({"pid": proc.pid, "log": str(log), "exit": str(exit_file)}))
         self.say(f"{agent}: started, pid {proc.pid}")
 
     def _ended(self, agent: str, s: Session, code: int) -> None:
@@ -157,7 +173,8 @@ class Watchdog:
     def _adopt(self) -> None:
         for f in (self.state / "pids").iterdir():
             d = json.loads(f.read_text())
-            self.sessions[f.name] = Session(d["pid"], Path(d["log"]), None)
+            exit_file = Path(d.get("exit", self.state / "exits" / f.name))
+            self.sessions[f.name] = Session(d["pid"], Path(d["log"]), exit_file, None)
 
     def _worktree(self, agent: str) -> Path:
         wt = self.state / "worktrees" / agent
@@ -174,4 +191,5 @@ class Watchdog:
             return True
         except Alarm as err:
             self.say(f"ALARM {err}")
+            notify(f"watchdog: {err}", "rargo factory alarm")
             return False
