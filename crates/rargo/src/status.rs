@@ -1,6 +1,6 @@
 use crate::{cache_dir, daemon_socket, find_root, load_config, project};
+use rargo_net::io::UnixStream;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 pub fn run() {
@@ -9,7 +9,7 @@ pub fn run() {
     let daemon = config
         .as_ref()
         .ok()
-        .map(|cfg| UnixStream::connect(daemon_socket(cfg, &cache_dir())).is_ok());
+        .map(|cfg| UnixStream::connect(&daemon_socket(cfg, &cache_dir())).is_ok());
     println!(
         "Daemon    {}",
         match daemon {
@@ -35,16 +35,13 @@ pub fn run() {
                 (true, Some(false)) => "mounted without its daemon; run `rargo build` to recover",
                 (true, _) => {
                     let target = target.to_path_buf();
-                    let (send, recv) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let _ = send.send(
-                            rargo_net::io::file::read_dir(target)
-                                .and_then(|mut entries| entries.next().transpose())
-                                .map(|_| ()),
-                        );
+                    let listed = rargo_net::io::within(std::time::Duration::from_millis(500), move || {
+                        rargo_net::io::file::read_dir(target)
+                            .and_then(|mut entries| entries.next().transpose())
+                            .map(|_| ())
                     });
-                    match recv.recv_timeout(std::time::Duration::from_millis(500)) {
-                        Ok(Ok(())) => "mounted and responding",
+                    match listed {
+                        Some(Ok(())) => "mounted and responding",
                         _ => "mount is unresponsive; run `rargo build` to recover",
                     }
                 }

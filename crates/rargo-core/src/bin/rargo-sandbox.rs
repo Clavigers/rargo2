@@ -62,36 +62,37 @@ fn main() -> anyhow::Result<()> {
 fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
     let Options { state, passthrough, quiet, cmd } = options(&args)?;
     let zygote = Zygote::start(&std::env::current_exe()?)?;
-    std::fs::create_dir_all(&state)?;
+    rargo_core::io::file::create_dir_all(&state)?;
     let db = Arc::new(rargo_core::db::Db::open(&state.join("db.redb"))?);
     let store = Arc::new(rargo_core::store::Store::open(&state.join("store"), db)?);
     let content = Arc::new(Content::new(store.clone()));
     let fs = Arc::new(SandboxFs::new(content));
     let mnt = state.join("mnt");
-    std::fs::create_dir_all(&mnt)?;
-    let session = Arc::new(fusewire::Session::mount(
+    rargo_core::io::file::create_dir_all(&mnt)?;
+    let session = Arc::new(fusewire::Session::mount_uring(
         &mnt,
         &fusewire::MountOptions { fsname: "rargo".into(), passthrough, ..Default::default() },
     )?);
     fs.attach(session.clone());
-    let _fuse = rargo_core::io::FuseDrive::spawn(&session, &fs);
+    let _fuse = rargo_core::io::FuseDrive::spawn(&session, &fs)?;
     eprintln!("[rargo-sandbox] passthrough: {}", session.caps().passthrough);
 
     let scratch = store.tmp_dir("tool-action")?;
     let action = fs.create_action(ActionFsConfig {
         view: Arc::new(HostView { root: HostRegion::new("/") }),
-        uid: unsafe { libc::getuid() },
-        gid: unsafe { libc::getgid() },
+        uid: rargo_core::io::process::uid(),
+        gid: rargo_core::io::process::gid(),
         scratch,
         mountpoints: vec![b"proc".to_vec(), b"dev".to_vec(), b"sys".to_vec(), b"tmp".to_vec()],
         size_blind: false,
     });
-    let env: BTreeMap<Vec<u8>, Vec<u8>> = std::env::vars_os()
+    let env: BTreeMap<Vec<u8>, Vec<u8>> = rargo_core::io::env::vars_os()
+        .into_iter()
         .map(|(k, v)| (k.into_encoded_bytes(), v.into_encoded_bytes()))
         .collect();
     let cwd = std::env::current_dir()?.into_os_string().into_encoded_bytes();
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
+    let uid = rargo_core::io::process::uid();
+    let gid = rargo_core::io::process::gid();
     let spec = SetupSpec { argv: cmd, env, cwd, net: NetMode::Loopback };
     let host = HostLayout {
         place: Place::Server,
@@ -108,11 +109,11 @@ fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
     let out: OwnedFd = std::io::stdout().as_fd().try_clone_to_owned()?;
     let err: OwnedFd = std::io::stderr().as_fd().try_clone_to_owned()?;
     use std::os::fd::AsFd;
-    let start = std::time::Instant::now();
+    let start = rargo_core::io::now();
     let running = zygote.spawn(plan, None, out, err, &[])?;
     let info = rargo_net::io::call(|| running.done.expect("the exit is waited once").recv())
         .ok_or_else(|| anyhow::anyhow!("the sandbox helper process died"))?;
-    let wall = start.elapsed();
+    let wall = rargo_core::io::now().saturating_duration_since(start);
     let fin = fs.finish_action(&action);
     eprintln!(
         "[rargo-sandbox] status={:?} signal={:?} wall={:.3}s user={:.3}s sys={:.3}s maxrss={}MB",
@@ -143,7 +144,7 @@ fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
             let k = match &u.kind {
                 UpperKind::Dir => "dir".to_string(),
                 UpperKind::File { path, exec } => {
-                    format!("file {} bytes exec={exec}", std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+                    format!("file {} bytes exec={exec}", rargo_core::io::file::metadata(path).map(|m| m.len()).unwrap_or(0))
                 }
                 UpperKind::LowerFile { .. } => "lower-file".into(),
                 UpperKind::Symlink(t) => format!("symlink -> {}", show(t)),
@@ -153,5 +154,5 @@ fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
         }
     }
     session.unmount();
-    std::process::exit(info.code().unwrap_or(1));
+    rargo_core::io::process::exit(info.code().unwrap_or(1));
 }

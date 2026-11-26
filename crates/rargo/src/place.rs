@@ -4,9 +4,8 @@ use rargo_net::io::file::PathRing as _;
 use crate::scan::hash_file;
 use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 fn hex(d: &Digest) -> String {
@@ -113,7 +112,7 @@ impl Op {
     }
 }
 
-pub(crate) struct OutputMounts(HashSet<u64>);
+pub(crate) struct OutputMounts(BTreeSet<u64>);
 
 impl OutputMounts {
     pub(crate) fn current() -> io::Result<Self> {
@@ -597,12 +596,11 @@ fn look_at(look: &Look) -> Sight {
 #[cfg(target_os = "linux")]
 fn reflink(src: &Path, dst: &Path) -> bool {
     use std::os::fd::AsRawFd;
-    const FICLONE: libc::c_ulong = 0x4004_9409;
     let (Ok(s), Ok(d)) = (rargo_net::io::file::File::open(src), rargo_net::io::file::OpenOptions::new().write(true).create_new(true).open(dst))
     else {
         return false;
     };
-    let ok = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as libc::Ioctl, s.as_raw_fd()) } == 0;
+    let ok = crate::kernel::share_blocks(s.as_raw_fd(), d.as_raw_fd()).is_ok();
     if !ok {
         let _ = rargo_net::io::file::remove_file(dst);
     }
@@ -616,7 +614,7 @@ fn reflink(_src: &Path, _dst: &Path) -> bool {
 
 fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
     let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = to.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), crate::tmp::seq()));
+    let tmp = to.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, rargo_net::io::process::id(), crate::tmp::seq()));
     assert_eq!(tmp.parent(), to.parent());
     assert_ne!(tmp, to);
     let _watched = crate::tmp::watch(&tmp);
@@ -634,7 +632,7 @@ fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
             How::Move => unreachable!("a move renames its source"),
         }
         if let Some(m) = way.mode {
-            rargo_net::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(m))?;
+            rargo_net::io::file::set_mode(&tmp, m)?;
         }
         rargo_net::io::file::rename(&tmp, to)
     })();
@@ -650,7 +648,7 @@ fn install(to: &Path, ways: &[Way]) -> io::Result<()> {
         let done = match way.how {
             How::Move => way
                 .mode
-                .map_or(Ok(()), |m| rargo_net::io::file::set_permissions(&way.from, std::fs::Permissions::from_mode(m)))
+                .map_or(Ok(()), |m| rargo_net::io::file::set_mode(&way.from, m))
                 .and_then(|()| rargo_net::io::file::rename(&way.from, to)),
             _ => place_beside(to, way),
         };
@@ -684,14 +682,14 @@ pub struct Placer {
     pub placed: Placed,
     pub changed: bool,
     waiting: Waiting,
-    parts: HashMap<Digest, Part>,
+    parts: BTreeMap<Digest, Part>,
     pub fetched_bytes: u64,
     pub reused_files: u64,
 }
 
 impl Drop for Placer {
     fn drop(&mut self) {
-        for (_, part) in self.parts.drain() {
+        for (_, part) in std::mem::take(&mut self.parts) {
             let _ = rargo_net::io::file::remove_file(&part.tmp);
         }
     }
@@ -705,7 +703,7 @@ impl Placer {
             placed,
             changed: false,
             waiting: Waiting::default(),
-            parts: HashMap::new(),
+            parts: BTreeMap::new(),
             fetched_bytes: 0,
             reused_files: 0,
         }
@@ -764,7 +762,7 @@ impl Placer {
 
     fn scratch(&mut self) -> io::Result<PathBuf> {
         rargo_net::io::file::create_dir_all(&self.cache)?;
-        Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), crate::tmp::seq())))
+        Ok(self.cache.join(format!(".incoming-{}-{}", rargo_net::io::process::id(), crate::tmp::seq())))
     }
 
     pub fn blob(&mut self, hash: Digest, bytes: &[u8]) -> io::Result<()> {
@@ -842,7 +840,7 @@ impl Placer {
 
     pub fn prune(&self) {
         let marker = self.cache.join(".pruned");
-        let age = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        let age = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| rargo_net::io::system_now().duration_since(t).ok());
         if age(&marker).is_some_and(|a| a.as_secs() < 3600) || !self.cache.ring_is_dir() {
             return;
         }
@@ -869,13 +867,12 @@ impl Placer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn copied_outputs_reject_rargo_mounts_including_missing_paths_and_aliases() {
         let tmp = tempfile::tempdir().unwrap();
         let proc = Path::new("/proc");
-        let dev = std::fs::metadata(proc).unwrap().dev();
+        let dev = rargo_net::io::file::metadata(proc).unwrap().dev();
         let info = format!("42 1 {}:{} / /proc rw - fuse.rargo rargo rw\n", libc::major(dev), libc::minor(dev));
         let mounts = OutputMounts::from_mountinfo(&info);
         let alias = tmp.path().join("other-target");
@@ -1388,83 +1385,97 @@ mod tests {
         assert!(ways.iter().all(|w| w.from == tmp && w.how != How::Link && w.mode == Some(0o755)), "an own output is a writable copy: {ways:?}");
     }
 
+    fn placement_test(body: impl FnOnce() + 'static) {
+        rargo_net::io::sim::test(move || {
+            rargo_net::io::file::create_dir_all("/proc/self").unwrap();
+            rargo_net::io::file::write("/proc/self/mountinfo", b"").unwrap();
+            body();
+        });
+    }
+
     #[test]
     fn large_content_arrives_in_parts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("t/big");
-        let content: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let h = *blake3::hash(&content).as_bytes();
-        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
-        let d = delivery(dest.to_str().unwrap(), &content, false, true);
-        assert_eq!(p.deliver(tmp.path(), &[], vec![d], vec![]).unwrap(), vec![h]);
-        let (x, y) = content.split_at(700_000);
-        p.part(h, x, false).unwrap();
-        p.part(h, y, true).unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), content);
-        assert!(p.settled());
+        placement_test(|| {
+            let tmp = rargo_net::io::sim::tempdir();
+            let dest = tmp.join("t/big");
+            let content: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
+            let h = *blake3::hash(&content).as_bytes();
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let d = delivery(dest.to_str().unwrap(), &content, false, true);
+            assert_eq!(p.deliver(&tmp, &[], vec![d], vec![]).unwrap(), vec![h]);
+            let (x, y) = content.split_at(700_000);
+            p.part(h, x, false).unwrap();
+            p.part(h, y, true).unwrap();
+            assert_eq!(rargo_net::io::file::read(&dest).unwrap(), content);
+            assert!(p.settled());
+        });
     }
 
     #[test]
     fn writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = |n: &str| tmp.path().join(n).to_string_lossy().into_owned();
-        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
-        let src = b"fn generated() {}";
-        let h = *blake3::hash(src).as_bytes();
-        let need = p
-            .deliver(
-                tmp.path(),
-                &[],
-                vec![],
-                vec![
-                    Write::Dir { path: s("gen/deep") },
-                    Write::Text { path: s("target/debug/app.d"), text: Some("app: src/main.rs\n".into()) },
-                    Write::Symlink { path: s("gen/link"), target: b"deep".to_vec() },
-                    Write::File { path: s("src/generated.rs"), hash: h, size: src.len() as u64, exec: false },
-                ],
-            )
-            .unwrap();
-        assert_eq!(need, vec![h]);
-        assert!(p.blob(h, b"forged").is_err(), "content that does not match its hash is refused");
-        p.blob(h, src).unwrap();
-        assert!(tmp.path().join("gen/deep").is_dir());
-        assert_eq!(std::fs::read_link(tmp.path().join("gen/link")).unwrap(), Path::new("deep"));
-        assert_eq!(std::fs::read(tmp.path().join("src/generated.rs")).unwrap(), src);
-        let md = std::fs::metadata(tmp.path().join("src/generated.rs")).unwrap();
-        assert!(md.mode() & 0o200 != 0 && md.nlink() == 1, "a source file is an ordinary writable file");
-        p.deliver(tmp.path(), &[], vec![], vec![Write::Remove { path: s("gen") }, Write::Text { path: s("target/debug/app.d"), text: None }]).unwrap();
-        assert!(!tmp.path().join("gen").exists() && !tmp.path().join("target/debug/app.d").exists());
-        assert!(p.deliver(tmp.path(), &[], vec![], vec![Write::Remove { path: "/etc".into() }]).is_err());
+        placement_test(|| {
+            let tmp = rargo_net::io::sim::tempdir();
+            let s = |n: &str| tmp.join(n).to_string_lossy().into_owned();
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let src = b"fn generated() {}";
+            let h = *blake3::hash(src).as_bytes();
+            let need = p
+                .deliver(
+                    &tmp,
+                    &[],
+                    vec![],
+                    vec![
+                        Write::Dir { path: s("gen/deep") },
+                        Write::Text { path: s("target/debug/app.d"), text: Some("app: src/main.rs\n".into()) },
+                        Write::Symlink { path: s("gen/link"), target: b"deep".to_vec() },
+                        Write::File { path: s("src/generated.rs"), hash: h, size: src.len() as u64, exec: false },
+                    ],
+                )
+                .unwrap();
+            assert_eq!(need, vec![h]);
+            assert!(p.blob(h, b"forged").is_err(), "content that does not match its hash is refused");
+            p.blob(h, src).unwrap();
+            assert!(tmp.join("gen/deep").ring_is_dir());
+            assert_eq!(rargo_net::io::file::read_link(tmp.join("gen/link")).unwrap(), Path::new("deep"));
+            assert_eq!(rargo_net::io::file::read(tmp.join("src/generated.rs")).unwrap(), src);
+            let md = rargo_net::io::file::metadata(tmp.join("src/generated.rs")).unwrap();
+            assert!(md.mode() & 0o200 != 0 && md.nlink() == 1, "a source file is an ordinary writable file");
+            p.deliver(&tmp, &[], vec![], vec![Write::Remove { path: s("gen") }, Write::Text { path: s("target/debug/app.d"), text: None }]).unwrap();
+            assert!(!tmp.join("gen").ring_exists() && !tmp.join("target/debug/app.d").ring_exists());
+            assert!(p.deliver(&tmp, &[], vec![], vec![Write::Remove { path: "/etc".into() }]).is_err());
+        });
     }
 
     #[test]
     fn a_target_directory_outside_the_worktree_is_placed_when_the_server_names_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (root, outside) = (tmp.path().join("proj"), tmp.path().join("outside"));
-        std::fs::create_dir_all(&root).unwrap();
-        let named = [outside.to_string_lossy().into_owned(), root.join("target").to_string_lossy().into_owned()];
-        let content = b"\x7fELF hi";
-        let h = *blake3::hash(content).as_bytes();
-        let app = outside.join("debug/p");
-        let tag = Write::Text { path: outside.join("CACHEDIR.TAG").to_string_lossy().into_owned(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) };
-        let files = vec![delivery(app.to_str().unwrap(), content, true, false)];
-        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
-        let refused = p.deliver(&root, &named[1..], files.clone(), vec![tag.clone()]).unwrap_err().to_string();
-        assert_eq!(
-            refused,
-            format!(
-                "the server asked to place `{}`, which is not inside the worktree `{}` or the target directory `{}`",
-                outside.join("CACHEDIR.TAG").display(),
-                root.display(),
-                root.join("target").display()
-            )
-        );
-        assert!(!outside.exists(), "nothing is placed when the delivery is refused");
-        assert_eq!(p.deliver(&root, &named, files, vec![Write::Dir { path: named[0].clone() }, tag]).unwrap(), vec![h]);
-        p.blob(h, content).unwrap();
-        assert_eq!(std::fs::read(&app).unwrap(), content);
-        assert!(outside.join("CACHEDIR.TAG").is_file());
-        let passwd = vec![delivery("/etc/passwd", b"x", false, true)];
-        assert!(p.deliver(&root, &named, passwd, vec![]).is_err(), "and nothing else outside is");
+        placement_test(|| {
+            let tmp = rargo_net::io::sim::tempdir();
+            let (root, outside) = (tmp.join("proj"), tmp.join("outside"));
+            rargo_net::io::file::create_dir_all(&root).unwrap();
+            let named = [outside.to_string_lossy().into_owned(), root.join("target").to_string_lossy().into_owned()];
+            let content = b"\x7fELF hi";
+            let h = *blake3::hash(content).as_bytes();
+            let app = outside.join("debug/p");
+            let tag = Write::Text { path: outside.join("CACHEDIR.TAG").to_string_lossy().into_owned(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) };
+            let files = vec![delivery(app.to_str().unwrap(), content, true, false)];
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let refused = p.deliver(&root, &named[1..], files.clone(), vec![tag.clone()]).unwrap_err().to_string();
+            assert_eq!(
+                refused,
+                format!(
+                    "the server asked to place `{}`, which is not inside the worktree `{}` or the target directory `{}`",
+                    outside.join("CACHEDIR.TAG").display(),
+                    root.display(),
+                    root.join("target").display()
+                )
+            );
+            assert!(!outside.ring_exists(), "nothing is placed when the delivery is refused");
+            assert_eq!(p.deliver(&root, &named, files, vec![Write::Dir { path: named[0].clone() }, tag]).unwrap(), vec![h]);
+            p.blob(h, content).unwrap();
+            assert_eq!(rargo_net::io::file::read(&app).unwrap(), content);
+            assert!(outside.join("CACHEDIR.TAG").ring_is_file());
+            let passwd = vec![delivery("/etc/passwd", b"x", false, true)];
+            assert!(p.deliver(&root, &named, passwd, vec![]).is_err(), "and nothing else outside is");
+        });
     }
 }

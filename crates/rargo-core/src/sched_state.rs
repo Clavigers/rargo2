@@ -258,6 +258,8 @@ impl StateMachine for SchedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     struct World {
         s: SchedState,
@@ -306,22 +308,31 @@ mod tests {
 
     #[test]
     fn limits_concurrency_to_tokens() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new(3, u64::MAX);
         for j in 0..4 {
             w.request(j, Priority::Agent, 0);
         }
-        assert_eq!(w.order, vec![0, 1, 2]);
-        assert_eq!(w.s.running(), 3);
+        outcomes.record("granted jobs", &w.order);
+        outcomes.record("running", w.s.running());
         w.release(1);
-        assert_eq!(w.order, vec![0, 1, 2, 3], "released capacity is reused at once");
+        // released capacity is reused at once.
+        outcomes.record("granted jobs", &w.order);
         for j in [0, 2, 3] {
             w.release(j);
         }
-        assert_eq!((w.s.running(), w.pipe), (0, 3));
+        outcomes.record("running jobs and pipe tokens", (w.s.running(), w.pipe));
+        expect![[r#"
+            granted jobs: [0, 1, 2]
+            running: 3
+            granted jobs: [0, 1, 2, 3]
+            running jobs and pipe tokens: (0, 3)
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn humans_go_first() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new(1, u64::MAX);
         w.request(0, Priority::Agent, 0);
         w.request(1, Priority::Agent, 0);
@@ -331,22 +342,33 @@ mod tests {
         for j in [0, 3, 1, 2] {
             w.release(j);
         }
-        assert_eq!(w.order, vec![0, 3, 1, 2, 4]);
+        outcomes.record("granted jobs", &w.order);
+        expect![[r#"
+            granted jobs: [0, 3, 1, 2, 4]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn memory_admission_holds_back_big_actions() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new(8, 1000);
         w.request(0, Priority::Agent, 600);
         w.request(1, Priority::Agent, 600);
         w.request(2, Priority::Agent, 300);
-        assert_eq!(w.order, vec![0, 2], "600 + 600 exceeds the 1000 budget");
+        // 600 + 600 exceeds the 1000 budget.
+        outcomes.record("granted jobs", &w.order);
         w.release(0);
-        assert_eq!(w.order, vec![0, 2, 1]);
+        outcomes.record("granted jobs", &w.order);
         w.release(1);
         w.release(2);
         w.request(3, Priority::Agent, 5000);
-        assert_eq!(w.order, vec![0, 2, 1, 3], "a job bigger than the budget runs alone");
+        // a job bigger than the budget runs alone.
+        outcomes.record("granted jobs", &w.order);
+        expect![[r#"
+            granted jobs: [0, 2]
+            granted jobs: [0, 2, 1]
+            granted jobs: [0, 2, 1, 3]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
@@ -383,32 +405,49 @@ mod tests {
 
     #[test]
     fn idle_requests_wait_for_a_token_to_lie_unclaimed() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new(1, u64::MAX);
         w.request(0, Priority::Agent, 0);
         w.request(1, Priority::Idle, 0);
-        assert_eq!(w.order, vec![0]);
-        assert_eq!(w.s.snapshot().1, 0, "an idle request is not waiting work");
+        outcomes.record("granted jobs", &w.order);
+        // an idle request is not waiting work.
+        outcomes.record("waiting jobs", w.s.snapshot().1);
         w.release(0);
-        assert_eq!(w.order, vec![0], "an idle request leaves the freed token in the pipe");
-        assert_eq!(w.pipe, 1);
+        // an idle request leaves the freed token in the pipe.
+        outcomes.record("granted jobs", &w.order);
+        outcomes.record("pipe tokens", w.pipe);
         w.pipe -= 1;
         w.outside += 1;
-        assert_eq!(w.s.tick(1000, w.pipe), Broker::Wait(IDLE_DWELL_MS), "a helper holds the token");
+        // a helper holds the token.
+        outcomes.record("tick", w.s.tick(1000, w.pipe));
         w.pipe += 1;
         w.outside -= 1;
-        assert_eq!(w.s.tick(1001, w.pipe), Broker::Wait(IDLE_DWELL_MS));
-        assert_eq!(w.s.tick(1001 + IDLE_DWELL_MS - 1, w.pipe), Broker::Wait(1));
-        assert_eq!(w.s.tick(1001 + IDLE_DWELL_MS, w.pipe), Broker::TakeForIdle);
+        outcomes.record("tick", w.s.tick(1001, w.pipe));
+        outcomes.record("tick", w.s.tick(1001 + IDLE_DWELL_MS - 1, w.pipe));
+        outcomes.record("tick", w.s.tick(1001 + IDLE_DWELL_MS, w.pipe));
         w.pipe -= 1;
         let fx = w.s.idle_token();
         w.apply(fx);
-        assert_eq!(w.order, vec![0, 1]);
+        outcomes.record("granted jobs", &w.order);
         w.release(1);
-        assert_eq!(w.pipe, 1);
+        outcomes.record("pipe tokens", w.pipe);
+        expect![[r#"
+            granted jobs: [0]
+            waiting jobs: 0
+            granted jobs: [0]
+            pipe tokens: 1
+            tick: Wait(40)
+            tick: Wait(40)
+            tick: Wait(1)
+            tick: TakeForIdle
+            granted jobs: [0, 1]
+            pipe tokens: 1
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_cancelled_waiter_is_never_granted() {
+        let mut outcomes = Transcript::default();
         let mut w = World::new(1, u64::MAX);
         w.request(0, Priority::Agent, 0);
         w.request(1, Priority::Human, 0);
@@ -416,14 +455,28 @@ mod tests {
         let fx = w.s.cancel(1);
         w.apply(fx);
         w.release(0);
-        assert_eq!(w.order, vec![0, 2]);
+        outcomes.record("granted jobs", &w.order);
+        expect![[r#"
+            granted jobs: [0, 2]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn reconcile_restores_the_token_count() {
-        let s = SchedState::new(4, 0);
-        assert_eq!(s.reconcile(1), Reconcile { put: 3, take: 0 });
-        assert_eq!(s.reconcile(6), Reconcile { put: 0, take: 2 });
+        let mut outcomes = Transcript::default();
+        for in_pipe in [1, 6] {
+            let mut w = World::new(4, u64::MAX);
+            w.request(0, Priority::Agent, 0);
+            let fx = w.s.release(0);
+            // The shell has returned the job's token and counted what is in the pipe.
+            assert!(fx.reconcile);
+            outcomes.record(&format!("{in_pipe} in pipe"), w.s.reconcile(in_pipe));
+            w.s.invariants();
+        }
+        expect![[r#"
+            1 in pipe: Reconcile { put: 3, take: 0 }
+            6 in pipe: Reconcile { put: 0, take: 2 }
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

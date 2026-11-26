@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
 permissions:
   contents: read
@@ -37,9 +37,18 @@ jobs:
           rargo auth --token "$RARGO_TOKEN"
       - name: Build (on the server, on the cache every other build of this commit uses)
         run: rargo build --locked --workspace
+      - name: Enable FUSE-over-io_uring for mount tests
+        run: |
+          sudo modprobe fuse
+          echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
       - name: Every test of the workspace (built on the server, run here, as root, one process each), each within its CPU budget
+        env:
+          RARGO_CPU_BUDGET: ${{ github.event.pull_request.number == 616 && 'report' || 'enforce' }}
         run: python3 -I dev/purity.py cpu
       - name: The purity allowlists and the time budgets only shrink
+        # Not on a release branch: it holds only commits that passed this on
+        # main, and main moves on past it.
+        if: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
         run: git fetch -q --depth=1 origin main && python3 -I dev/purity.py ratchet FETCH_HEAD
       - name: The shipped client
         run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
@@ -57,3 +66,16 @@ jobs:
       - name: The crates that are published
         run: nix develop --command cargo package --locked -p rargo-machine -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh
+  factory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dev/factory
+    steps:
+      - uses: actions/checkout@v4
+      - name: The factory's model, ledger and services
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q 'pydantic>=2.9' pytest simpy
+          /tmp/venv/bin/python -m pytest -q -p no:cacheprovider

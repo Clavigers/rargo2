@@ -1,9 +1,7 @@
 #[cfg(test)]
 use rargo_machine::StateMachine;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -137,26 +135,16 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn new() -> std::io::Result<Watcher> {
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = crate::inotify::open(libc::IN_CLOEXEC | libc::IN_NONBLOCK)?;
         Ok(Watcher { fd, state: Mutex::new(WatchState::default()) })
     }
 
     pub fn add(&self, dir: &Path, owner: u64) -> std::io::Result<Registration> {
-        let c = CString::new(dir.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
         let mut state = self.state.lock().unwrap();
-        let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), c.as_ptr(), MASK) };
-        let result = if wd >= 0 {
-            WatchResult::Added(wd)
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOSPC) {
-                return Err(error);
-            }
-            WatchResult::TooManyDirectories
+        let result = match crate::inotify::add(&self.fd, dir, MASK) {
+            Ok(wd) => WatchResult::Added(wd),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => WatchResult::TooManyDirectories,
+            Err(error) => return Err(error),
         };
         Ok(state.register(owner, dir.to_path_buf(), result))
     }
@@ -168,7 +156,7 @@ impl Watcher {
     pub fn remove(&self, wd: i32, dir: &Path) {
         let mut state = self.state.lock().unwrap();
         if state.remove(wd, dir) {
-            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
+            crate::inotify::remove(&self.fd, wd);
         }
     }
 
@@ -181,7 +169,7 @@ impl Watcher {
     pub fn forget(&self, owner: u64) {
         let mut state = self.state.lock().unwrap();
         for wd in state.forget(owner) {
-            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
+            crate::inotify::remove(&self.fd, wd);
         }
     }
 

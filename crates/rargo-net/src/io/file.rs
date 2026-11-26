@@ -44,6 +44,10 @@ impl Stat {
         }
     }
 
+    fn of_mode(kind: u32) -> Self {
+        Self { mode: kind, size: 0, blocks: 0, nlink: 1, ino: 0, dev: 0, rdev: 0, uid: 0, gid: 0, atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
+    }
+
     pub fn of(md: &std::fs::Metadata) -> Self {
         Self {
             mode: md.mode(),
@@ -221,11 +225,11 @@ pub fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
     route(move || path_op(Op::MkdirAt { dir: CWD, path: c_path(&at)?, mode: 0o777 }), || std::fs::create_dir(&path))
 }
 
-fn ring_create_dir_all(path: &Path) -> io::Result<()> {
+fn ring_create_dir_all(path: &Path, mode: u32) -> io::Result<()> {
     if path.as_os_str().is_empty() {
         return Ok(());
     }
-    let mkdir = |p: &Path| path_op(Op::MkdirAt { dir: CWD, path: c_path(p)?, mode: 0o777 });
+    let mkdir = |p: &Path| path_op(Op::MkdirAt { dir: CWD, path: c_path(p)?, mode });
     let is_dir = |p: &Path| stat_with(CWD, p, 0).is_ok_and(|st| st.is_dir());
     match mkdir(path) {
         Ok(()) => return Ok(()),
@@ -234,7 +238,7 @@ fn ring_create_dir_all(path: &Path) -> io::Result<()> {
         Err(e) => return Err(e),
     }
     if let Some(parent) = path.parent() {
-        ring_create_dir_all(parent)?;
+        ring_create_dir_all(parent, mode)?;
     }
     match mkdir(path) {
         Ok(()) => Ok(()),
@@ -244,9 +248,51 @@ fn ring_create_dir_all(path: &Path) -> io::Result<()> {
 }
 
 pub fn create_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
-    let path = path.as_ref().to_path_buf();
-    let at = path.clone();
-    route(move || ring_create_dir_all(&at), || std::fs::create_dir_all(&path))
+    DirBuilder::new().recursive(true).create(path)
+}
+
+/// Makes a directory with chosen permission bits, and its missing parents when asked.
+#[derive(Clone, Debug)]
+pub struct DirBuilder {
+    recursive: bool,
+    mode: u32,
+}
+
+impl Default for DirBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirBuilder {
+    pub fn new() -> Self {
+        Self { recursive: false, mode: 0o777 }
+    }
+
+    pub fn recursive(&mut self, on: bool) -> &mut Self {
+        self.recursive = on;
+        self
+    }
+
+    pub fn mode(&mut self, mode: u32) -> &mut Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn create(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let (recursive, mode) = (self.recursive, self.mode);
+        let path = path.as_ref().to_path_buf();
+        let at = path.clone();
+        route(
+            move || if recursive { ring_create_dir_all(&at, mode) } else { path_op(Op::MkdirAt { dir: CWD, path: c_path(&at)?, mode }) },
+            || std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(recursive), mode).create(&path),
+        )
+    }
+}
+
+/// Creates a directory and its missing parents, each with these permission bits (less the umask).
+pub fn create_dir_all_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(mode).create(path)
 }
 
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
@@ -303,34 +349,116 @@ pub fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
     Ok(copied)
 }
 
-pub fn read_dir(path: impl AsRef<Path>) -> io::Result<std::vec::IntoIter<io::Result<std::fs::DirEntry>>> {
+/// One name in a directory.
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    path: std::path::PathBuf,
+    kind: char,
+}
+
+impl DirEntry {
+    pub fn path(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+
+    pub fn file_name(&self) -> std::ffi::OsString {
+        self.path.file_name().unwrap_or_default().to_os_string()
+    }
+
+    /// What the name is, without following a link.
+    pub fn file_type(&self) -> io::Result<Stat> {
+        match self.kind {
+            'd' => Ok(Stat::of_mode(libc::S_IFDIR)),
+            'f' => Ok(Stat::of_mode(libc::S_IFREG)),
+            'l' => Ok(Stat::of_mode(libc::S_IFLNK)),
+            _ => symlink_metadata(&self.path),
+        }
+    }
+
+    /// The entry's metadata, without following a link.
+    pub fn metadata(&self) -> io::Result<Stat> {
+        symlink_metadata(&self.path)
+    }
+}
+
+pub fn read_dir(path: impl AsRef<Path>) -> io::Result<std::vec::IntoIter<io::Result<DirEntry>>> {
     let path = path.as_ref();
-    offload(|| std::fs::read_dir(path).map(|d| d.collect::<Vec<_>>().into_iter()))
+    if let Some(names) = super::sim::read_dir(path) {
+        let entries: Vec<_> = names?.into_iter().map(|(name, kind)| Ok(DirEntry { path: path.join(name), kind })).collect();
+        return Ok(entries.into_iter());
+    }
+    offload(|| {
+        std::fs::read_dir(path).map(|d| {
+            d.map(|e| {
+                e.map(|e| {
+                    let kind = match e.file_type() {
+                        Ok(t) if t.is_dir() => 'd',
+                        Ok(t) if t.is_file() => 'f',
+                        Ok(t) if t.is_symlink() => 'l',
+                        _ => '?',
+                    };
+                    DirEntry { path: e.path(), kind }
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+        })
+    })
 }
 
 pub fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::remove_dir_all(path) {
+        return done;
+    }
     offload(|| std::fs::remove_dir_all(path))
 }
 
 pub fn set_permissions(path: impl AsRef<Path>, mode: std::fs::Permissions) -> io::Result<()> {
+    set_mode(path, std::os::unix::fs::PermissionsExt::mode(&mode))
+}
+
+/// Sets a path's permission bits.
+pub fn set_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
     let path = path.as_ref();
-    offload(|| std::fs::set_permissions(path, mode))
+    if let Some(done) = super::sim::set_mode(path, mode) {
+        return done;
+    }
+    offload(|| std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)))
 }
 
 pub fn read_link(path: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::read_link(path) {
+        return done;
+    }
     offload(|| std::fs::read_link(path))
 }
 
 pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::canonicalize(path) {
+        return done;
+    }
     offload(|| std::fs::canonicalize(path))
 }
 
 pub fn set_modified(path: impl AsRef<Path>, at: SystemTime) -> io::Result<()> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::set_modified(path, at) {
+        return done;
+    }
     offload(|| std::fs::File::options().append(true).open(path).and_then(|f| f.set_modified(at)))
+}
+
+/// Changes who owns a path, without following a link.
+pub fn lchown(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(done) = super::sim::lchown(path, uid, gid) {
+        return done;
+    }
+    let c = c_path(path)?;
+    direct(unsafe { libc::lchown(c.as_ptr(), uid, gid) } as isize, |_| ())
 }
 
 pub trait PathRing {
@@ -544,6 +672,9 @@ impl File {
     }
 
     pub fn try_clone(&self) -> io::Result<File> {
+        if let Some(fd) = super::sim::dup(self.fd) {
+            return Ok(File { fd: fd?, pos: self.pos });
+        }
         let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -557,7 +688,87 @@ impl File {
     }
 
     pub fn set_mode(&self, mode: u32) -> io::Result<()> {
+        if let Some(done) = super::sim::set_fd_mode(self.fd, mode) {
+            return done;
+        }
         direct(unsafe { libc::fchmod(self.fd, mode) } as isize, |_| ())
+    }
+
+    /// Sets the access and modification times as `futimens` does, so a time may be `UTIME_NOW` or `UTIME_OMIT`. A simulated file keeps only its modification time.
+    pub fn set_times(&self, atime: libc::timespec, mtime: libc::timespec) -> io::Result<()> {
+        if super::sim::active() {
+            let mtime_ns = match mtime.tv_nsec {
+                libc::UTIME_OMIT => None,
+                libc::UTIME_NOW => Some(super::sim::system_now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64)),
+                nsec => Some(mtime.tv_sec * 1_000_000_000 + nsec),
+            };
+            if let Some(done) = super::sim::set_fd_modified(self.fd, mtime_ns) {
+                return done;
+            }
+        }
+        let times = [atime, mtime];
+        direct(unsafe { libc::futimens(self.fd, times.as_ptr()) } as isize, |_| ())
+    }
+
+    /// Reserves or releases a range of the file as `fallocate` does.
+    pub fn allocate(&self, mode: i32, offset: u64, len: u64) -> io::Result<()> {
+        if let Some(done) = super::sim::allocate(self.fd, mode, offset, len) {
+            return done;
+        }
+        direct(unsafe { libc::fallocate(self.fd, mode, offset as libc::off_t, len as libc::off_t) } as isize, |_| ())
+    }
+
+    /// Takes the exclusive advisory lock on the file, waiting for whoever
+    /// holds it. Closing the file gives the lock up.
+    pub fn lock_exclusive(&self) -> io::Result<()> {
+        while let Some(taken) = super::sim::try_lock(self.fd) {
+            if taken? {
+                return Ok(());
+            }
+            super::sleep(Duration::from_millis(1));
+        }
+        direct(unsafe { libc::flock(self.fd, libc::LOCK_EX) } as isize, |_| ())
+    }
+
+    /// The first `len` bytes of the file as memory, without reading them up front.
+    pub fn map(&self, len: usize) -> io::Result<Mapped> {
+        if let Some(held) = super::sim::contents(self.fd, len) {
+            return Ok(Mapped::Held(held?));
+        }
+        let at = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, self.fd, 0) };
+        if at == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Mapped::Kernel { at: at.cast(), len })
+    }
+}
+
+/// A file's bytes as memory: the kernel's mapping, or in a simulation a copy.
+pub enum Mapped {
+    Kernel { at: *const u8, len: usize },
+    Held(Vec<u8>),
+}
+
+// The mapping is private and read-only, and nothing but this value points into it.
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
+
+impl std::ops::Deref for Mapped {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Mapped::Kernel { at, len } => unsafe { std::slice::from_raw_parts(*at, *len) },
+            Mapped::Held(bytes) => bytes,
+        }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        if let Mapped::Kernel { at, len } = self {
+            unsafe { libc::munmap(at.cast_mut().cast(), *len) };
+        }
     }
 }
 
@@ -622,6 +833,16 @@ impl Drop for File {
         let fd = self.fd;
         let _ = route(move || close_fd(fd), || direct(unsafe { libc::close(fd) } as isize, |_| ()));
     }
+}
+
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
+/// Makes `dst` share `src`'s blocks, and says whether the filesystem did it. The simulated filesystem never does.
+pub fn reflink_fd(src: i32, dst: i32) -> bool {
+    if super::sim::owns(src) || super::sim::owns(dst) {
+        return false;
+    }
+    unsafe { libc::ioctl(dst, FICLONE as libc::Ioctl, src) == 0 }
 }
 
 pub fn copy_fd(src: i32, dst: i32) -> io::Result<u64> {
