@@ -61,3 +61,4 @@ If a build script needs another library, add a `flake.nix` that puts it in the s
 ## Docs
 
 Read the docs at [rargo.rs](https://rargo.rs/).
+Their source is `web/`: the Book is `web/src/index.md`, the Reference `web/src/reference/index.md`. `cd web && nix develop -c make` rebuilds `web/site/`; commit both. A release deploys the site with `deploy/update-site.sh`.

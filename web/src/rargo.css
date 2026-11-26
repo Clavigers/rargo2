@@ -1,0 +1,168 @@
+/* rargo.rs overrides, imported last from index.css so they win the cascade. */
+
+/* The stock sheet declares Fern via local() only, which renders for nobody
+ * but the author. These later @font-face rules add self-hosted woff2
+ * sources (the same files the consulting site serves), so visitors get the
+ * real typography. */
+@font-face {
+  font-family: "Fern Variable";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: local("Fern Variable Roman"), local("FernVariable-Roman"),
+       url("/Fern-Roman-VF.woff2") format("woff2-variations"),
+       url("/Fern-Roman-VF.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Fern Variable";
+  font-style: italic;
+  font-weight: 400 800;
+  font-display: swap;
+  src: local("Fern Variable Italic"), local("FernVariable-Italic"),
+       url("/Fern-Italic-VF.woff2") format("woff2-variations"),
+       url("/Fern-Italic-VF.woff2") format("woff2");
+}
+
+/* Title 10% larger than the stock 3rem. */
+header h1 {
+  font-size: 3.3rem;
+}
+
+/* Topbar larger than the stock .75rem. */
+.topbar {
+  font-size: .9rem;
+}
+
+/* Bibliography: a hanging annotation set under its entry, annotated-
+ * bibliography style. Entries without one just stay a single line. */
+li .note {
+  display: block;
+  margin-top: 0;
+  padding-left: 3ch;
+  font-size: .875rem;
+  font-style: italic;
+}
+
+/* Inline code inside a note (e.g. an f-string) stays upright JetBrains Mono,
+ * not italic like the surrounding annotation. */
+li .note code {
+  font-style: normal;
+}
+
+/* Copy-pasteable command chip: <cmd>cargo install rargo</cmd>. Rendered as a
+ * centered JetBrains Mono box; index.js appends the .copy-cmd button. */
+cmd {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  max-width: 100%;
+  margin: var(--line-height) auto;
+  font-family: var(--font-family-code);
+  font-size: .88em;
+}
+
+/* A group of related commands: <cmd-list><cmd>a</cmd><cmd>b</cmd></cmd-list>.
+ * Loose <cmd>s are each centered on their own line a full line-height apart;
+ * the members of a list instead share one left edge and sit a quarter of that
+ * apart, so the group reads as one block. The group itself stays centered. */
+cmd-list {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: calc(var(--line-height) / 4);
+  width: fit-content;
+  max-width: 100%;
+  margin: var(--line-height) auto;
+}
+
+/* Inside a list the chip no longer centers or spaces itself — cmd-list owns
+ * the alignment and the gap. */
+cmd-list cmd {
+  justify-content: flex-start;
+  margin: 0;
+}
+
+/* Grey shell prompt. It's a ::before pseudo-element, so it is not part of
+ * cmd.textContent and the copy button never grabs it. */
+cmd::before {
+  content: "$:";
+  text-indent: 0;
+  color: var(--light-color);
+}
+
+/* The command string itself (the #text node), wrapped by index.js in a span
+ * so it can be styled apart from the $: prompt and the copy button. */
+.cmd-text {
+  text-indent: 0.25ch;
+  color: var(--text-color);
+}
+
+.copy-cmd {
+  flex: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--light-color);
+  cursor: pointer;
+  line-height: 0;
+}
+
+.copy-cmd:hover,
+.copy-cmd:focus-visible {
+  color: var(--text-color);
+}
+
+.copy-cmd svg {
+  display: block;
+  width: 1.15em;
+  height: 1.15em;
+  margin: 0 0 0 1.25ch;
+}
+
+.copy-cmd .check {
+  display: none;
+}
+
+.copy-cmd.copied .copy {
+  display: none;
+}
+
+.copy-cmd.copied .check {
+  display: block;
+  color: var(--text-color);
+}
+
+/* The stock sheet sets small-caps headings, section numbers and author
+ * lines in "Fern Text" and top-level headings in "Fern Titling Caps".
+ * Neither family is defined anywhere, so those fell back to the generic
+ * serif of the browser with its own (or faked) small caps. Both names now
+ * point at the self-hosted Fern, which carries real small caps (smcp, c2sc). */
+@font-face {
+  font-family: "Fern Text";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/Fern-Roman-VF.woff2") format("woff2-variations"),
+       url("/Fern-Roman-VF.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Fern Text";
+  font-style: italic;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/Fern-Italic-VF.woff2") format("woff2-variations"),
+       url("/Fern-Italic-VF.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Fern Titling Caps";
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  src: url("/Fern-Roman-VF.woff2") format("woff2-variations"),
+       url("/Fern-Roman-VF.woff2") format("woff2");
+}
