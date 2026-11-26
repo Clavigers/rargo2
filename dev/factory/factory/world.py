@@ -48,6 +48,7 @@ class Issue:
     holder: str | None = None
     parked: bool = False
     given_up: set[str] = field(default_factory=set)  # agents that gave up on it
+    closer: str | None = None  # who closed it, in the log
 
 
 @dataclass
@@ -467,6 +468,13 @@ def _let_go(w: World, i: Issue) -> None:
 def _(w: World, e: m.Closed, a):
     i = w.issue(e.issue)
     inside = a == Role.foreman
+    if a not in m.ROLES:  # an agent
+        if i.holder != a:
+            w.fail(f"{a} does not hold #{e.issue}")
+        if e.reason is not m.CloseReason.completed or not e.note:
+            w.fail("an agent closes only as completed, with its evidence in the note")
+        if i.pr is not None and w.is_(M.PR, i.pr, "open"):
+            w.fail(f"#{e.issue} has open pull request {i.pr}; it closes by merging")
     if e.duplicate_of is not None:
         w.issue(e.duplicate_of)
     if e.reason is m.CloseReason.completed and inside:
@@ -481,6 +489,7 @@ def _(w: World, e: m.Closed, a):
     if inside and not w.waiting(e.issue):
         w.fail(f"#{e.issue} is {w.state(M.ISSUE, e.issue)}; the foreman closes only waiting work")
     _let_go(w, i)
+    i.closer = a
     w.enter(M.ISSUE, e.issue, IssueS.closed)
     if i.pr is not None and w.is_(M.PR, i.pr, "open"):
         w.enter(M.PR, i.pr, "abandoned")

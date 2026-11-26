@@ -51,7 +51,7 @@ class FakeGitHub:
 
     # the interface the observer uses
     def issues(self, since):
-        return list(self.issue_list.values())
+        return [i for i in self.issue_list.values() if since or i["state"] == "open"]
 
     def pull(self, n):
         return self.pulls[n]
@@ -286,3 +286,21 @@ def test_assigned_to_the_owner_is_the_owners(rig):
     rig.obs.step()
     w = rig.led.world
     assert w.state(M.ISSUE, 1) == IssueS.parked and w.state(M.ISSUE, 2) == IssueS.ready
+
+
+def test_the_foreman_closes_on_github_what_an_agent_closed(rig, tmp_path):
+    rig.gh.issue(1)
+    rig.gh.issue(2)
+    rig.obs.step()
+    submit(rig, A1, "taken", issue=1)
+    submit(rig, A1, "closed", issue=1, reason="completed", note="it holds")
+    submit(rig, A2, "taken", issue=2)
+    submit(rig, A2, "closed", issue=2, reason="completed", note="it holds")
+    rig.gh.issue(2, state="closed", closed_by={"login": "kevkev"}, state_reason="completed")
+    fm = Foreman(rig.led, rig.gh, tmp_path, "", clock=rig.clock, run=lambda n: 0,
+                 say=rig.said.append)
+    fm.tick()
+    fm.tick()
+    assert rig.gh.closed == [1]  # #2 the agent closed itself; each once
+    rig.obs.step()
+    assert rig.led.world.issues[2].closer == A2  # the observer does not record it again

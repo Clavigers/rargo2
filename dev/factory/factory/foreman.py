@@ -47,6 +47,7 @@ class Foreman:
         self.say = say
         self.planned: dict[int, datetime] = {}  # initiative -> when we last tried
         self.told: set[int] = set()  # issues every agent gave up on, owner told
+        self.synced: set[int] = set()  # agent closes checked against GitHub
 
     def tick(self) -> None:
         w = self.ledger.refresh()
@@ -59,7 +60,25 @@ class Foreman:
         finally:
             self._decide("tick_ended", tick=n)
         self._stuck()
+        self._sync_closed()
         self._plan()
+
+    def _sync_closed(self) -> None:
+        """Close on GitHub, once, what an agent closed in the log (it should
+        have closed it there itself)."""
+        w = self.ledger.world
+        mine = {n for n, i in w.issues.items() if i.closer in w.config.names()
+                and not w.open_(n) and n not in self.synced}
+        if not mine:
+            return
+        try:
+            still = {i["number"] for i in self.gh.issues(None)} & mine
+            for n in still:
+                self.gh.close(n, "completed", f"Closed by {w.issues[n].closer}: see the factory log.")
+        except GitHubError as err:
+            self.say(f"foreman: closing on GitHub: {err}")
+            return
+        self.synced |= mine
 
     def _stuck(self) -> None:
         """Tell the owner, once, about work no agent will do."""

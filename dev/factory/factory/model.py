@@ -387,10 +387,12 @@ class Undepends(Event):
     note: Note
 
 
-@event({H, F, Role.outside}, D)
+@event({H, F, Role.outside, AGENT}, D)
 class Closed(Event):
     """Closes an issue without a merge. The foreman closes waiting work and
-    initiatives whose children are closed. The human and outsiders close
+    initiatives whose children are closed. An agent closes an issue it holds
+    and has no open pull request for as completed, when it found nothing left
+    to change, with the evidence in the note. The human and outsiders close
     whatever is open (on GitHub): an agent holding it loses it, and its open
     pull request is abandoned."""
     event: Literal["closed"]

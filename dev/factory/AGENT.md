@@ -45,6 +45,10 @@ left, end the session.
   `factory submit --dry '{"event":"depends","issue":N,"on":OTHER}'` exits 0,
   then submit it for real, then
   `factory submit '{"event":"returned","issue":N,"reason":"blocked"}'` and end.
+- If the issue asks only for something to be checked, or you find nothing
+  left to change, show it: comment the evidence on the issue, then
+  `factory submit '{"event":"closed","issue":N,"reason":"completed","note":"evidence, briefly"}'`,
+  then `gh issue close N --reason completed`, and end.
 - If it cannot be done as written: `factory submit
   '{"event":"returned","issue":N,"reason":"gave_up","note":"why"}'`,
   comment on the issue saying why, and end.
@@ -65,4 +69,4 @@ back to the queue, and whoever takes it next fixes it.
 - Never add or remove `wip-` labels, and never assign issues: the log is the
   lock here. `wip-` labels and the label `guard` belong to people outside the
   factory.
-- Touch only your branch. Never merge, never close issues.
+- Touch only your branch. Never merge. Close only an issue you hold, as above.
