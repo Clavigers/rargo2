@@ -31,7 +31,9 @@ jobs:
         id: planner
         with:
           path: planner/target/release/cargo
-          key: planner-${{ hashFiles('forks/cargo/**') }}
+          # Everything the step below builds from: the fork's base and patches, the
+          # rargo-plan it is pointed at, and this workflow (the build commands).
+          key: planner-${{ hashFiles('forks/cargo/**', 'crates/rargo-plan/**', '.github/workflows/release.yml') }}
       - name: Planner (the cargo fork)
         if: steps.planner.outputs.cache-hit != 'true'
         run: |
