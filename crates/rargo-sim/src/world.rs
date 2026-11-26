@@ -1,7 +1,7 @@
 use crate::transport::{self, Side};
 use rargo_net::sans_io::{EndpointState, LinkKey, RouteEvent};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::rng::Rng;
@@ -319,7 +319,7 @@ fn addr(node: Node) -> SocketAddr {
         Node::Worker(id) => (1, id),
         Node::Client(id) => (2, id),
     };
-    SocketAddr::from((std::net::Ipv6Addr::from((kind << 64) | u128::from(id)), 1))
+    SocketAddr::from((core::net::Ipv6Addr::from((kind << 64) | u128::from(id)), 1))
 }
 
 #[derive(Debug)]

@@ -5,7 +5,7 @@ use rargo_net::sans_io::{
 use rargo_proto::secure::LinkCipher;
 use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use core::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
