@@ -21,10 +21,10 @@ bench_gone() {
 bench_stop() {
     pids=$(bench_pids | tr '\n' ' ')
     [ -n "$pids" ] || return 0
-    kill -TERM $pids 2>&1 | grep -v 'No such process' >&2
+    kill -TERM $pids 2>&1 | grep -v 'No such process' >&2 || true
     bench_gone $pids
     pids=$(bench_pids | tr '\n' ' ')
-    [ -n "$pids" ] && kill -KILL $pids 2>&1 | grep -v 'No such process' >&2
+    [ -n "$pids" ] && { kill -KILL $pids 2>&1 | grep -v 'No such process' >&2 || true; }
     bench_gone $pids
     return 0
 }

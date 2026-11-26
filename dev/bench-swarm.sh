@@ -25,7 +25,8 @@ if [ "${SWARM_SKIP_RARGO:-}" != 1 ]; then
         echo "$v" >"$RARGO_STATE/nextest/newest-release"
     fi
     python3 "$repo/dev/swarm.py" --repo "$name" --mode rargo --agents "$agents" --out "$out" \
-        --tests "$tests" --label "remote client, ${CLIENT_RTT_MS:-2} ms round trip"
+        --tests "$tests" --selection "${SWARM_SELECTION:-files}" ${SWARM_KEEP:+--keep} ${SWARM_FORK_FLAKE:+--fork-flake "$SWARM_FORK_FLAKE"} \
+        --label "remote client, ${CLIENT_RTT_MS:-2} ms round trip"
     bench_down
 fi
 if [ "${SWARM_SKIP_STOCK:-}" != 1 ]; then

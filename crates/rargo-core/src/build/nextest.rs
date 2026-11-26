@@ -481,9 +481,16 @@ fn run_test(
             seed_blobs: Default::default(),
             cacheable: Arc::new(|r| r.success()),
             declared_env: Arc::new(|_, _| Vec::new()),
-            observer: Arc::new(Explaining { c: c.clone(), label }),
+            observer: Arc::new(Explaining { c: c.clone(), label: label.clone() }),
         })?;
+    if c.env.contains_key("RARGO_EXPLAIN") && !outcome.cached {
+        c.out.note(&ran_note(&label, &outcome.result.stats));
+    }
     Ok((outcome.result, outcome.cached))
+}
+
+pub fn ran_note(label: &str, stats: &crate::trace::Stats) -> String {
+    format!("{label} ran: {} ms of CPU, {} ms on the server", stats.cpu_us / 1000, stats.wall_us / 1000)
 }
 
 struct Explaining {
@@ -893,6 +900,12 @@ fn install(dir: &Path, version: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_process_that_ran_names_its_server_cpu_and_wall_time_in_milliseconds() {
+        let stats = crate::trace::Stats { wall_us: 2_345_678, cpu_us: 1_999, max_rss_kb: 7 };
+        assert_eq!(ran_note("test app::a a", &stats), "test app::a a ran: 1 ms of CPU, 2345 ms on the server");
+    }
 
     #[test]
     fn the_stand_in_s_question_is_read_back() {

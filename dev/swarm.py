@@ -60,6 +60,15 @@ def du(path):
     real = subprocess.run(["du", "-sB1", path], capture_output=True, text=True).stdout.split()
     return (int(out[0]) if out else 0, int(real[0]) if real else 0)
 
+RAN = re.compile(r"^(?:note: )?test (list of )?.*? ran: (\d+) ms of CPU, \d+ ms on the server$", re.M)
+
+
+def test_work(text):
+    ran = RAN.findall(re.sub(r"\x1b\[[0-9;]*m", "", text))
+    return dict(processes=sum(1 for listing, _ in ran if not listing), lists=sum(1 for listing, _ in ran if listing),
+                cpu_ms=sum(int(cpu) for _, cpu in ran))
+
+
 def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", tests="test"):
     def run(args):
         if tests == "nextest" and args[0] == "test":
@@ -73,12 +82,11 @@ def agent(i, wt, cfg, mode, env, log, results, edit_kind="api", tests="test"):
         p = subprocess.run(cmd, cwd=wt, env=env, stdout=log, stderr=subprocess.STDOUT)
         log.write(f"### agent {i} {' '.join(args)} -> {p.returncode} in {time.time()-t:.2f}s\n".encode())
         log.flush()
-        out = ""
-        if p.returncode != 0:
-            with open(log.name, "rb") as f:
-                f.seek(at)
-                out = f.read().decode(errors="replace")[-3000:]
-        return (" ".join(args), p.returncode, time.time() - t, out)
+        with open(log.name, "rb") as f:
+            f.seek(at)
+            text = f.read().decode(errors="replace")
+        work = test_work(text) if args[0] in ("test", "nextest") else None
+        return (" ".join(args), p.returncode, time.time() - t, text[-3000:] if p.returncode != 0 else "", work)
 
     def edit(n):
         f = cfg["edits"][(i + (0 if edit_kind == "body" else n)) % len(cfg["edits"])]
@@ -124,9 +132,15 @@ def main():
                          "until the end); for a stock swarm that does not fit in memory at once")
     ap.add_argument("--tests", default="test", choices=["test", "nextest"],
                     help="what the agents test with: `test`, or `nextest run` (on PATH for stock cargo)")
+    ap.add_argument("--selection", default="files", choices=["files", "functions"],
+                    help="files: a kept test result holds while the files it read are unchanged; functions: while the code it "
+                         "executed is, with the fork toolchain of --fork-flake committed into every worktree")
+    ap.add_argument("--fork-flake", default=None, help="a directory with the flake.nix and flake.lock of the fork toolchain")
     ap.add_argument("--edit", default="api", choices=["api", "body"],
                     help="api: both edits add a public function; body: the second edit changes only a function body")
     a = ap.parse_args()
+    if a.selection == "functions" and not a.fork_flake:
+        sys.exit("--selection functions needs --fork-flake")
     cfg = REPOS[a.repo]
     base = os.path.join(WORK, "bench", cfg["dir"])
     root = os.path.join(WORK, "swarm", f"{a.repo}-{a.mode}")
@@ -140,9 +154,17 @@ def main():
     for i in range(a.agents):
         wt = os.path.join(root, f"agent{i:02d}")
         subprocess.run(["git", "-C", base, "worktree", "add", "-q", "--detach", wt], check=True)
+        if a.selection == "functions":
+            for name in ("flake.nix", "flake.lock"):
+                shutil.copy(os.path.join(a.fork_flake, name), os.path.join(wt, name))
+            subprocess.run(["git", "-C", wt, "add", "flake.nix", "flake.lock"], check=True)
+            subprocess.run(["git", "-C", wt, "-c", "user.name=swarm", "-c", "user.email=swarm@example.invalid",
+                            "commit", "-qm", "the fork toolchain"], check=True)
         wts.append(wt)
 
     env = dict(os.environ)
+    if a.mode == "rargo":
+        env["RARGO_EXPLAIN"] = "1"
     if a.toolchain:
         env["RUSTUP_TOOLCHAIN"] = a.toolchain
     daemon_pid = None
@@ -221,10 +243,26 @@ def main():
         store_after_gc = du(store_dir)
     per_step = {}
     for steps in results.values():
-        for n, (name, rc, dt, _) in enumerate(steps):
+        for n, (name, rc, dt, _, _) in enumerate(steps):
             per_step.setdefault(n, []).append(dt)
+    by_step = {}
+    for steps in results.values():
+        for n, (name, rc, dt, _, work) in enumerate(steps):
+            if work is None:
+                continue
+            row = by_step.setdefault(n, dict(step=n, commands=0, wall_s=0.0, processes=0, lists=0, cpu_ms=0))
+            row["commands"] += 1
+            row["wall_s"] = round(row["wall_s"] + dt, 2)
+            for k in ("processes", "lists", "cpu_ms"):
+                row[k] += work[k]
+    test_steps = [by_step[n] for n in sorted(by_step)]
+    test_total = dict(commands=sum(r["commands"] for r in test_steps), wall_s=round(sum(r["wall_s"] for r in test_steps), 2),
+                      processes=sum(r["processes"] for r in test_steps), lists=sum(r["lists"] for r in test_steps),
+                      cpu_s=round(sum(r["cpu_ms"] for r in test_steps) / 1000, 1))
     summary = dict(
         repo=a.repo, mode=a.mode, agents=a.agents, label=a.label, toolchain=a.toolchain, edit=a.edit, tests=a.tests,
+        selection=a.selection if a.mode == "rargo" else None,
+        test_steps=test_steps if a.mode == "rargo" else None, test_total=test_total if a.mode == "rargo" else None,
         wall_s=round(wall, 1), cpu_s=round((cpu1 - cpu0) / 1e6, 1),
         client_cpu_s=round(client_cpu, 1) if a.mode == "rargo" else 0,
         client_bytes=real, worktree_target_apparent_bytes=apparent,
