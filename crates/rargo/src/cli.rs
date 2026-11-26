@@ -9,12 +9,12 @@ pub const ROUTED: &[&str] =
 
 pub const TOKEN_COMMANDS: &[&str] = &["invite", "create", "tokens", "revoke", "allow", "disallow"];
 
-pub const AUTH_HELP: &str = "rargo auth [HOST]            get this machine a token for the project's server (or HOST), confirmed in a browser\n\
+pub const AUTH_HELP: &str = "rargo auth [HOST]            get this machine a token for your server (or HOST), confirmed in a browser\n\
      rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
      rargo auth status            which server you build on, what named it, and as whom\n\
-     rargo auth remove [HOST]     revoke the token for the project's server (or HOST) there and forget it here\n\
+     rargo auth remove [HOST]     revoke the token for your server (or HOST) there and forget it here\n\
      \n\
-     On the project's server, for an administrator (anyone may list and revoke their own tokens):\n\
+     On your server, for an administrator (anyone may list and revoke their own tokens):\n\
      rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n\
      rargo auth create --user NAME [--admin] [--days N]\n\
      rargo auth tokens\n\
@@ -24,7 +24,23 @@ pub const AUTH_HELP: &str = "rargo auth [HOST]            get this machine a tok
 
 pub const STATUS_HELP: &str = "Usage: rargo status\n\nShow your server, account, daemon, mount and versions.";
 
-pub const BANNER: &str = "rargo status    Show your server, account, daemon, mount and versions.\n";
+pub const BANNER: &str = "Usage: rargo [CARGO COMMAND...]\n\n\
+     rargo runs cargo, with build, check, clippy, test, run, doc, bench and nextest done on your rargo server.\n\n\
+     rargo's own commands:\n    \
+     @HOST            Name HOST as your rargo server (e.g. `rargo @rargo.rs`)\n    \
+     auth             Get, show or remove this machine's token for your server (`rargo help auth`)\n    \
+     status           Show your server, account, daemon, mount and versions\n    \
+     --rargo-version  Print rargo's version and protocol\n\n\
+     Cargo's help follows.\n";
+
+pub fn version() -> String {
+    format!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION)
+}
+
+const RARGO_OPTIONS: &[&str] = &[
+    "--rargo-version", "--rargo-daemon", "--rargo-status", "--rargo-settle", "--rargo-gc", "--rargo-incr-stats", "--rargo-compact",
+    "--rargo-export", "--rargo-import", "--rargo-drift-check", "--rargo-daemon-status", "--rargo-daemon-stop", "--rargo-daemon-sync",
+];
 
 pub trait World {
     fn vars(&self) -> &[(String, String)];
@@ -92,7 +108,8 @@ pub enum Auth {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Plan {
-    Cargo { release: bool, banner: bool },
+    /// Run cargo, first printing `banner` if there is one.
+    Cargo { release: bool, banner: Option<String> },
     Print(String),
     Status,
     Fail { text: String, code: i32 },
@@ -108,7 +125,7 @@ fn die(msg: impl std::fmt::Display) -> Plan {
 
 pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
     if w.vars().iter().any(|(k, _)| k == "RARGO_BYPASS") {
-        return Plan::Cargo { release: false, banner: false };
+        return Plan::Cargo { release: false, banner: None };
     }
     let first = raw.first().map(OsString::as_os_str);
     let second = raw.get(1).and_then(|a| a.to_str());
@@ -120,14 +137,34 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
             _ => die("usage: rargo status"),
         };
     }
-    let banner = !cargo_link && raw.len() == 1 && first.is_some_and(|a| a == "--help" || a == "-h");
+    if !cargo_link && first.is_some_and(|a| a == "help") {
+        match (second, raw.len()) {
+            (Some("auth"), 2) => return Plan::Print(AUTH_HELP.into()),
+            (Some("status"), 2) => return Plan::Print(STATUS_HELP.into()),
+            _ => {}
+        }
+    }
+    let alone = |names: &[&str]| !cargo_link && raw.len() == 1 && first.and_then(OsStr::to_str).is_some_and(|a| names.contains(&a));
+    let banner = if alone(&["--help", "-h", "help"]) {
+        Some(BANNER.to_string())
+    } else if alone(&["--version", "-V"]) {
+        Some(version())
+    } else {
+        None
+    };
     if first.is_some_and(|a| a == "--rargo-version") {
-        return Plan::Print(format!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION));
+        return Plan::Print(version());
+    }
+    if let Some(option) = first.and_then(OsStr::to_str).filter(|a| a.starts_with("--rargo-") && !RARGO_OPTIONS.contains(a)) {
+        return Plan::Fail { text: format!("error: unknown option `{option}` (see `rargo --help`)"), code: 2 };
     }
     if let Some(host) = first.and_then(OsStr::to_str).and_then(|a| a.strip_prefix('@')) {
         return Plan::Name(host.to_string());
     }
     let token_command = first.is_some_and(|a| a == "auth") && second.is_some_and(|a| TOKEN_COMMANDS.contains(&a));
+    if token_command && raw[2..].iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h") {
+        return Plan::Print(AUTH_HELP.into());
+    }
     if first.is_some_and(|a| a == "auth") && !token_command {
         return auth(w, &raw[1..]);
     }
@@ -530,7 +567,7 @@ mod tests {
     #[test]
     fn every_command_line_is_planned_without_io() {
         let not_named = format!("no rargo server is named: run `rargo @rargo.rs` (or `rargo @HOST` for a server of your own), which writes {PATH}");
-        let cargo = Plan::Cargo { release: false, banner: false };
+        let cargo = Plan::Cargo { release: false, banner: None };
         let cases: Vec<(Option<&str>, Vec<&str>, Fake, Plan)> = vec![
             (None, vec!["build"], fake(&[("RARGO_BYPASS", "1")]), cargo.clone()),
             (None, vec!["build"], fake(&[("RARGO_BYPASS", "")]), cargo.clone()),
@@ -540,11 +577,22 @@ mod tests {
             (None, vec!["status", "x"], fake(&[]), fail("usage: rargo status")),
             (None, vec!["status", "-h", "x"], fake(&[]), fail("usage: rargo status")),
             (Some("/usr/bin/cargo"), vec!["status"], fake(&[]), cargo.clone()),
-            (Some("rargo"), vec!["-h"], fake(&[]), Plan::Cargo { release: false, banner: true }),
-            (None, vec!["--help"], fake(&[]), Plan::Cargo { release: false, banner: true }),
+            (Some("rargo"), vec!["-h"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
+            (None, vec!["--help"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
             (Some("/bin/cargo"), vec!["-h"], fake(&[]), cargo.clone()),
             (None, vec!["-h", "build"], fake(&[]), cargo.clone()),
             (None, vec!["--rargo-version"], fake(&[]), Plan::Print(format!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION))),
+            (None, vec!["help"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
+            (None, vec!["help", "auth"], fake(&[]), Plan::Print(AUTH_HELP.into())),
+            (None, vec!["help", "status"], fake(&[]), Plan::Print(STATUS_HELP.into())),
+            (None, vec!["help", "build"], fake(&[]), cargo.clone()),
+            (Some("cargo"), vec!["help", "auth"], fake(&[]), cargo.clone()),
+            (None, vec!["--version"], fake(&[]), Plan::Cargo { release: false, banner: Some(version()) }),
+            (None, vec!["-V"], fake(&[]), Plan::Cargo { release: false, banner: Some(version()) }),
+            (Some("cargo"), vec!["--version"], fake(&[]), cargo.clone()),
+            (None, vec!["--rargo-bogus"], fake(&[]), usage("error: unknown option `--rargo-bogus` (see `rargo --help`)")),
+            (None, vec!["auth", "invite", "--help"], fake(&[]), Plan::Print(AUTH_HELP.into())),
+            (None, vec!["auth", "tokens", "-h"], fake(&[]), Plan::Print(AUTH_HELP.into())),
             (None, vec!["@b.example"], fake(&[]), Plan::Name("b.example".into())),
             (Some("cargo"), vec!["@b.example:1"], fake(&[]), Plan::Name("b.example:1".into())),
             (None, vec!["--rargo-daemon", "/run/s"], fake(&[]), Plan::Daemon("/run/s".into())),
@@ -582,8 +630,8 @@ mod tests {
             (None, vec!["--rargo-daemon-stop"], fake(&[]), remote(&[], &[], "stop")),
             (None, vec!["--rargo-daemon-sync"], fake(&[]), remote(&[], &[], "sync")),
             (None, vec!["--rargo-drift-check", "x"], fake(&[]), remote(&["__drift"], &[], "drift")),
-            (None, vec!["clean"], fake(&[]), Plan::Cargo { release: true, banner: false }),
-            (None, vec!["clean", "-p", "x"], fake(&[]), Plan::Cargo { release: true, banner: false }),
+            (None, vec!["clean"], fake(&[]), Plan::Cargo { release: true, banner: None }),
+            (None, vec!["clean", "-p", "x"], fake(&[]), Plan::Cargo { release: true, banner: None }),
             (None, vec!["clean", "-vn"], fake(&[]), cargo.clone()),
             (None, vec!["clean", "--dry-run"], fake(&[]), cargo.clone()),
             (None, vec!["clean", "--help"], fake(&[]), cargo.clone()),
@@ -614,12 +662,12 @@ mod tests {
         }
         use std::os::unix::ffi::OsStringExt;
         let not_utf8 = vec![OsString::from("build"), OsString::from_vec(vec![0xff])];
-        assert_eq!(plan(&fake(&[]), None, &not_utf8), Plan::Cargo { release: false, banner: false });
+        assert_eq!(plan(&fake(&[]), None, &not_utf8), Plan::Cargo { release: false, banner: None });
     }
 
     #[test]
     fn local_answers_ask_nothing_and_remote_ones_ask_only_what_they_need() {
-        for words in [vec!["status"], vec!["--rargo-version"], vec!["@x"], vec!["metadata"], vec!["auth", "-h"], vec!["auth", "x.example"], vec!["--rargo-daemon", "s"]] {
+        for words in [vec!["status"], vec!["--rargo-version"], vec!["@x"], vec!["metadata"], vec!["auth", "-h"], vec!["auth", "invite", "--help"], vec!["help", "auth"], vec!["--rargo-bogus"], vec!["auth", "x.example"], vec!["--rargo-daemon", "s"]] {
             let w = fake(&[]);
             plan(&w, None, &os(&words));
             assert_eq!(w.asked(), Vec::<String>::new(), "{words:?}");
@@ -728,6 +776,25 @@ mod tests {
             removed("h", Err("offline".into())),
             ("forgot the token for h on this machine".into(), Some("warning: the server could not be told to revoke it (offline); it keeps working for whoever has a copy until an administrator runs `rargod token revoke`".into()))
         );
+    }
+
+    #[test]
+    fn no_help_calls_the_server_the_projects_and_the_banner_names_rargos_commands() {
+        for text in [AUTH_HELP, STATUS_HELP, BANNER] {
+            assert!(!text.contains("project's"), "{text}");
+        }
+        for command in ["@HOST", "auth", "status", "--rargo-version"] {
+            assert!(BANNER.contains(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn every_rargo_option_is_planned_as_rargos_own() {
+        for option in RARGO_OPTIONS {
+            let got = plan(&fake(&[]), None, &os(&[option, "x"]));
+            assert!(!matches!(got, Plan::Cargo { .. }), "{option}: {got:?}");
+            assert!(!matches!(&got, Plan::Fail { text, .. } if text.contains("unknown option")), "{option}: {got:?}");
+        }
     }
 
     #[test]
