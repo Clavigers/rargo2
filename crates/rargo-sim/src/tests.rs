@@ -63,6 +63,7 @@ fn dozens_of_client_rounds_overlap_during_eviction() {
     let report = run(12, None).unwrap_or_else(|failure| panic!("{failure}"));
     assert!(report.clients_at_eviction >= 24, "{report:?}");
     assert!(report.cache_hits > 0, "clients reuse action outputs");
+    assert!(report.silences > 0, "clients give up on a silent server");
 }
 
 #[test]
@@ -80,7 +81,6 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.uploads > 0), "clients upload sources");
     assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
     assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
-    assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
     assert!(reports.iter().any(|r| r.lost > 0 && r.retransmits > 0), "rargo-net retransmits after datagram loss");
     assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
     assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
