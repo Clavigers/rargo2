@@ -461,7 +461,7 @@ fn serve(
         Ok(h) => h,
         Err(e) => return fail(&sess, failure("setting up the cargo configuration", &e)),
     };
-    let env: HashMap<String, String> = req.env.iter().cloned().collect();
+    let env: std::collections::BTreeMap<String, String> = req.env.iter().cloned().collect();
     let prio = crate::conn_state::priority(&env, req.stderr_tty);
     let out = Output::new(
         sess.sender(),
@@ -499,7 +499,7 @@ fn serve(
         root: req.root,
         cwd: req.cwd,
         cargo_home: req.cargo_home,
-        env: Arc::new(ClientEnv::new(env, req.env_checked, Some(asker))),
+        env: Arc::new(ClientEnv::new(env.into_iter().collect(), req.env_checked, Some(asker))),
         uid: d.cfg.uid,
         gid: d.cfg.gid,
         prio,
