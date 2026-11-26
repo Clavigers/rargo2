@@ -1,6 +1,6 @@
 use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use redb::{Database, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
@@ -82,8 +82,11 @@ impl Tables for MemTables {
     }
 }
 
+type Open = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>;
+
 struct Shared {
-    db: Database,
+    db: RwLock<Option<Database>>,
+    open: Open,
     writer: Mutex<DbWriter>,
     flushing: Mutex<()>,
     wake: std::sync::OnceLock<crate::io::Notify>,
@@ -104,18 +107,19 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        let db = Database::create(path).with_context(|| format!("opening {}", path.display()))?;
-        Db::of(db)
+        let owned = path.to_path_buf();
+        Db::of(Box::new(move || Database::create(&owned))).with_context(|| format!("opening {}", path.display()))
     }
 
     #[cfg(test)]
-    fn on(disk: impl redb::StorageBackend) -> Result<Db> {
-        let db = Db::of(redb::Builder::new().create_with_backend(disk)?)?;
+    fn on(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
+        let db = Db::of(Box::new(move || redb::Builder::new().create_with_backend(disk.clone())))?;
         db.writing.call_once(|| ());
         Ok(db)
     }
 
-    fn of(db: Database) -> Result<Db> {
+    fn of(open: Open) -> Result<Db> {
+        let db = open()?;
         {
             let tx = db.begin_write()?;
             for t in ALL {
@@ -124,7 +128,8 @@ impl Db {
             tx.commit()?;
         }
         let shared = Arc::new(Shared {
-            db,
+            db: RwLock::new(Some(db)),
+            open,
             writer: Mutex::new(DbWriter::new()),
             flushing: Mutex::new(()),
             wake: std::sync::OnceLock::new(),
@@ -155,7 +160,8 @@ impl Db {
         if let Some(v) = self.shared.writer.lock().get(table, key) {
             return v;
         }
-        let tx = self.shared.db.begin_read().ok()?;
+        let db = self.shared.db.read();
+        let tx = db.as_ref()?.begin_read().ok()?;
         let t = tx.open_table(table.def()).ok()?;
         let v = t.get(key).ok()??;
         Some(Arc::from(v.value()))
@@ -175,7 +181,7 @@ impl Db {
 
     pub fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
         let mut out: std::collections::BTreeMap<Vec<u8>, Option<Arc<[u8]>>> = Default::default();
-        if let Ok(tx) = self.shared.db.begin_read() {
+        if let Some(Ok(tx)) = self.shared.db.read().as_ref().map(Database::begin_read) {
             if let Ok(t) = tx.open_table(table.def()) {
                 if let Ok(range) = t.range::<&[u8]>(prefix..) {
                     for item in range {
@@ -215,8 +221,8 @@ impl Drop for Db {
     }
 }
 
-fn commit(db: &Database, batch: &Batch) -> Result<()> {
-    let tx = db.begin_write()?;
+fn commit(db: Option<&Database>, batch: &Batch) -> Result<()> {
+    let tx = db.context("the database could not be opened again")?.begin_write()?;
     for t in ALL {
         let mut table = tx.open_table(t.def())?;
         for (bt, k, v) in &batch.writes {
@@ -243,14 +249,28 @@ fn flush_once(shared: &Shared) {
     if batch.is_empty() {
         return;
     }
-    let done = commit(&shared.db, &batch);
+    if shared.db.read().is_none() {
+        reopen(shared);
+    }
+    let done = commit(shared.db.read().as_ref(), &batch);
     let now = shared.now_ms();
     match done {
         Ok(()) => shared.writer.lock().flushed(&batch, now),
         Err(e) => {
             eprintln!("rargod: db commit failed: {e:#}");
             shared.writer.lock().failed(now);
+            reopen(shared);
         }
+    }
+}
+
+// After an I/O error redb refuses every later transaction until the database is opened again.
+fn reopen(shared: &Shared) {
+    let mut db = shared.db.write();
+    drop(db.take());
+    match (shared.open)() {
+        Ok(fresh) => *db = Some(fresh),
+        Err(e) => eprintln!("rargod: db reopen failed: {e:#}"),
     }
 }
 
