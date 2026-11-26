@@ -1,5 +1,7 @@
 mod cli;
 mod daemon;
+#[path = "io/daemon_control.rs"]
+mod daemon_control;
 mod git;
 #[path = "io/install.rs"]
 mod install;
@@ -262,36 +264,7 @@ fn daemon_socket(cfg: &Config, cache: &Path) -> PathBuf {
     if in_cache.as_os_str().len() < 100 {
         return in_cache;
     }
-    let uid = unsafe { libc::getuid() };
-    let dir = match std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) {
-        Some(d) => PathBuf::from(d).join("rargo"),
-        None => PathBuf::from(format!("/tmp/rargo-{uid}")),
-    };
-    dir.join(name)
-}
-
-fn stop_daemons(cfg: &Config, cache: &Path, req: &LocalRequest) {
-    use std::os::unix::net::UnixStream;
-    let mut sockets = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(cache.join("run")) {
-        for ent in rd.flatten() {
-            let path = ent.path();
-            if path.extension().is_some_and(|ext| ext == "sock") {
-                sockets.push(path);
-            }
-        }
-    }
-    let primary = daemon_socket(cfg, cache);
-    if !sockets.iter().any(|path| path == &primary) {
-        sockets.push(primary);
-    }
-    let bytes = rargo_proto::encode(req);
-    for socket in sockets {
-        let Ok(mut stream) = UnixStream::connect(&socket) else { continue };
-        let _ = stream.write_all(&(bytes.len() as u32).to_le_bytes()).and_then(|_| stream.write_all(&bytes));
-        let mut rest = Vec::new();
-        let _ = stream.read_to_end(&mut rest);
-    }
+    daemon_control::runtime_dir().join(name)
 }
 
 fn private_dir(dir: &Path) -> std::io::Result<()> {
@@ -349,6 +322,7 @@ fn connect_daemon(cfg: &Config, cache: &Path) -> std::io::Result<std::os::unix::
     if let Ok(s) = UnixStream::connect(&socket) {
         return Ok(s);
     }
+    daemon_control::retire(&socket, cache);
     if let Some(dir) = socket.parent() {
         private_dir(dir)?;
     }
@@ -524,6 +498,7 @@ fn main() {
             return;
         }
         cli::Plan::Status => return status::run(),
+        cli::Plan::StopDaemons => return daemon_control::stop_all(&cache_dir()),
         cli::Plan::Fail { text, code } => {
             eprintln!("{text}");
             std::process::exit(code)
@@ -553,10 +528,6 @@ fn main() {
         mount_ns: mount_ns(),
     };
     let cache = cache_dir();
-    if kind == "stop" {
-        stop_daemons(&cfg, &cache, &req);
-        std::process::exit(0);
-    }
     if let Some(why) = rargo_net::io::unavailable() {
         fall_back_or_end(&ring_refused_text(&why), &raw);
     }
