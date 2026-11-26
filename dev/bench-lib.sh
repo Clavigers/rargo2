@@ -46,7 +46,7 @@ bench_start() {
         unshare -m --propagation private sh -c "$hide exec \"\$@\"" sh \
         "$B/rargod" --state "$T/srv" --planner "${RARGO_PLANNER:-$work/cargo/target/release/cargo}" \
         --listen "127.0.0.1:$bench_port" --cargo-home "$work/cargo-home" \
-        --jobs "$bench_sj" --workers-listen "127.0.0.1:$bench_wport" --worker-key "$T/link.key" --drift-interval-min 0 >"$T/srv.log" 2>&1 &
+        --jobs "$bench_sj" --workers-listen "127.0.0.1:$bench_wport" --worker-key "$T/link.key" --drift-interval-min 0 ${RARGOD_ARGS:-} >"$T/srv.log" 2>&1 &
     srvpid=$!
     if ! bench_wait_line "$T/srv.log" "serving clients" "$srvpid"; then
         echo "rargod did not start" >&2
