@@ -429,3 +429,37 @@ pub fn background(body: impl FnOnce() + Send + 'static) {
         spawn_raw(Spec { parent: None, race: None, task: None, background: true }, body);
     });
 }
+
+/// Runs `body`, which may block for good, on a thread of its own and gives up
+/// on it after `limit`: for code off the loop that probes something that can
+/// hang. A simulation has one thread and nothing in it hangs, so `body` runs
+/// where it is asked for.
+pub fn within<T: Send + 'static>(limit: Duration, body: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    if super::sim::active() {
+        return Some(body());
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(body());
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+/// Runs `body` with every `io` call in it made as a plain blocking system call
+/// by this thread, as it is off the loop. The ring's workers do not follow a
+/// thread into a namespace it enters, so work that changes the thread's own
+/// kernel state and then touches files runs here. A simulation has no such
+/// state, so `body` runs unchanged.
+pub fn on_this_thread<R>(body: impl FnOnce() -> R) -> R {
+    if super::sim::active() {
+        return body();
+    }
+    struct Back(u64);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            CURRENT.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(CURRENT.with(|c| c.replace(0)));
+    body()
+}

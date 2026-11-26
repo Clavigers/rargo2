@@ -290,6 +290,11 @@ impl DirBuilder {
     }
 }
 
+/// Creates a directory and its missing parents, each with these permission bits (less the umask).
+pub fn create_dir_all_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(mode).create(path)
+}
+
 pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()> {
     let (from, to) = (from.as_ref().to_path_buf(), to.as_ref().to_path_buf());
     let (old, new) = (from.clone(), to.clone());

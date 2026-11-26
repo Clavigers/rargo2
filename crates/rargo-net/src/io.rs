@@ -25,7 +25,7 @@ pub use net::{lookup_host, recv_fds, send_fds, ReadHalf, TcpListener, TcpStream,
 pub use sim::{now, random, system_now};
 pub use signal::{signal, Signal, SignalKind};
 pub use sync::{oneshot, unbounded_channel, watch, Mutex, MutexGuard, Notify, Permit, RecvError, Semaphore, UnboundedReceiver, UnboundedSender};
-pub use task::{background, blocking, call, spawn_off, cpu, interval, race_biased, sleep, spawn, timeout, yield_now, AbortHandle, Elapsed, Interval, JoinError, JoinHandle};
+pub use task::{background, blocking, call, spawn_off, cpu, interval, on_this_thread, race_biased, sleep, spawn, timeout, within, yield_now, AbortHandle, Elapsed, Interval, JoinError, JoinHandle};
 
 use std::io;
 

@@ -67,6 +67,15 @@ pub fn exit(code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// Whether a process with this id exists. In a simulation the only processes are init and the simulated one.
+pub fn alive(pid: u32) -> bool {
+    if let Some(simulated) = super::sim::alive(pid) {
+        return simulated;
+    }
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 pub fn uid() -> u32 {
     super::sim::uid().unwrap_or_else(|| unsafe { libc::getuid() })
 }
@@ -183,6 +192,14 @@ impl Command {
         let pid = child.id() as i32;
         drop(child);
         Ok(ExitStatus::from_raw(wait_exit(pid)?))
+    }
+
+    /// Replaces this process with the command and returns only the reason it could not. A simulation has no process to replace.
+    pub fn exec(&mut self) -> io::Error {
+        if super::sim::active() {
+            return io::Error::new(io::ErrorKind::Unsupported, "a simulation cannot replace its process with a command");
+        }
+        std::os::unix::process::CommandExt::exec(&mut self.real)
     }
 
     /// Starts the command and returns at once. A simulation has no processes to hand back.
