@@ -57,6 +57,12 @@ class FakeGitHub:
     def pull(self, n):
         return self.pulls[n]
 
+    def get_issue(self, n):
+        return self.issue_list[n]
+
+    def open_pulls(self):
+        return [p for p in self.pulls.values() if p["state"] == "open"]
+
     def check_runs(self, sha):
         return self.runs.get(sha, [])
 
@@ -169,13 +175,37 @@ def test_red_ci_sends_it_back(rig):
     assert w.is_(M.CI, "10/1", "fail") and w.needs_work(1)
 
 
-def test_a_foreign_commit_stops_everything_for_that_pr(rig):
+def test_a_foreign_push_sends_the_issue_back_to_an_agent(rig):
     pushed(rig)
-    rig.gh.pulls[10]["head"]["sha"] = SHA2  # someone pushed to the branch
+    rig.gh.pulls[10]["head"]["sha"] = SHA2  # someone outside pushed to the branch
     rig.gh.ci(SHA2, "success")
     rig.obs.step()
-    assert rig.led.world.is_(M.CI, "10/1", "pending")
-    assert any("not the recorded push" in s for s in rig.said)
+    w = rig.led.world
+    assert lines(rig)[-1]["event"] == "diverged" and lines(rig)[-1]["reason"] == "foreign_push"
+    assert w.is_(M.CI, "10/1", "void") and w.needs_work(1)  # never merged unchecked
+    rig.obs.step()  # said once, not again
+    assert sum(d["event"] == "diverged" for d in lines(rig)) == 1
+
+
+def test_a_pr_closed_outside_the_factory_is_abandoned(rig):
+    pushed(rig)
+    rig.gh.pulls[10]["state"] = "closed"
+    rig.obs.step()
+    w = rig.led.world
+    assert w.is_(M.PR, 10, "abandoned") and w.issues[1].pr is None and w.waiting(1)
+
+
+def test_an_outside_pr_that_closes_an_issue_locks_it(rig):
+    rig.gh.issue(1)
+    rig.obs.step()
+    rig.gh.pulls[50] = {"number": 50, "state": "open", "user": {"login": "stranger-bot"},
+                        "title": "Fix the thing", "body": "Closes #1", "head": {"sha": SHA2}}
+    rig.obs.step()
+    assert rig.led.world.issues[1].parked
+    assert lines(rig)[-1] == {**lines(rig)[-1], "event": "parked", "actor": "outside", "reason": "lock"}
+    rig.gh.pulls[50]["state"] = "closed"  # they gave up: the issue is free again
+    rig.obs.step()
+    assert not rig.led.world.issues[1].parked
 
 
 def test_a_merge_conflict_is_recorded(rig):

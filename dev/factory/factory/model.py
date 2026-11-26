@@ -248,6 +248,11 @@ class ReviewReason(enum.StrEnum):
     other = "other"  # a reviewer whose findings are not coded; see its note
 
 
+class DivergeReason(enum.StrEnum):
+    foreign_push = "foreign_push"  # its head is a commit the factory did not record
+    closed = "closed"  # closed on GitHub without a merge
+
+
 class MergeFailure(enum.StrEnum):
     conflict = "conflict"
     stale_base = "stale_base"
@@ -492,6 +497,19 @@ class ReviewDone(Event):
         if (self.result is ReviewResult.changes) != bool(self.reasons):
             raise ValueError("changes need reasons; an approval has none")
         return self
+
+
+@event({Role.merger}, O)
+class Diverged(Event):
+    """The pull request changed on GitHub outside the factory, while its
+    issue was in checks or its pull request open: the latest push's pending
+    checks void, and an issue in checks waits again. foreign_push: someone
+    pushed to its branch, so the next agent starts from their commit. closed:
+    the pull request is abandoned; the next push opens a new one."""
+    event: Literal["diverged"]
+    pr: Number
+    push: PushNo
+    reason: DivergeReason
 
 
 @event({Role.merger}, O)

@@ -58,6 +58,12 @@ class GitHub:
         return [i for i in self._api(f"issues?{q}&per_page=100", paginate=True)
                 if "pull_request" not in i]
 
+    def open_pulls(self) -> list[dict]:
+        return self._api("pulls?state=open&per_page=100", paginate=True)
+
+    def get_issue(self, n: int) -> dict:
+        return self._api(f"issues/{n}")
+
     def pull(self, n: int) -> dict:
         return self._api(f"pulls/{n}")
 

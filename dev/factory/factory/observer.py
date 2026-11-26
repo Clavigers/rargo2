@@ -41,6 +41,9 @@ MARKER = re.compile(r"<!--\s*factory-actor:\s*([a-z][a-z0-9_-]*)\s*-->")
 PART_OF = re.compile(r"^\s*Part of #(\d+)\s*$", re.M | re.I)
 DEPENDS = re.compile(r"^\s*Depends on #(\d+)\s*$", re.M | re.I)
 NEEDS_TYPE = "<!-- factory: needs-type -->"
+# How a pull request says which issue it does: "Closes #N" and the like, or
+# a title ending "(#N)".
+CLOSES = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)|\(#(\d+)\)\s*$", re.M)
 PARK = "guard"  # the label by which the owner puts an issue on hold
 LOCK = "wip-"  # labels by which others outside the factory lock an issue
 FAILED = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
@@ -75,6 +78,7 @@ class Observer:
         self.since: datetime | None = None
         self.asked: set[int] = set()  # issues we asked for a type label
         self.noted: set[tuple] = set()  # things said once
+        self.pr_locks: set[int] = set()  # issues outside pull requests are working on
 
     def step(self) -> None:
         start = datetime.now(timezone.utc)
@@ -85,6 +89,10 @@ class Observer:
             except GitHubError as err:
                 self.say(f"pr {pr}: {err}")
         self._issues()
+        try:
+            self._outside_prs()
+        except GitHubError as err:
+            self.say(f"outside pull requests: {err}")
         self.since = start - timedelta(minutes=5)  # overlap: GitHub's since is not exact
 
     # ------------------------------------------------------------ pull requests
@@ -98,10 +106,12 @@ class Observer:
             self._record(self._who(by), "merged", pr=pr, push=p.pushes, sha=g["merge_commit_sha"])
             return
         if g["state"] == "closed":
-            self._once(("closed-pr", pr), f"pr {pr} was closed on GitHub without a merge; "
-                                          f"its issue #{p.issue} stays open")
+            self._record(Role.merger, "diverged", pr=pr, push=p.pushes, reason="closed")
             return
         if g["head"]["sha"] != p.sha:
+            if w.is_(M.ISSUE, p.issue, IssueS.checking):  # not an agent's push in flight
+                self._record(Role.merger, "diverged", pr=pr, push=p.pushes, reason="foreign_push")
+                return
             self._once(("head", pr, g["head"]["sha"]),
                        f"pr {pr}: its head {g['head']['sha'][:8]} is not the recorded push "
                        f"{p.pushes} ({p.sha[:8]}); waiting for a recorded push")
@@ -222,17 +232,38 @@ class Observer:
 
     def _park(self, i: dict) -> None:
         """The owner's hold (the label guard, or the issue assigned to the
-    owner) and outside locks (wip- labels) follow GitHub."""
+    owner) and outside locks (wip- labels, or an open pull request from
+    outside the factory that says it closes the issue) follow GitHub."""
         n = i["number"]
         labels = {l["name"] for l in i["labels"]}
         mine = self.owner in {u["login"] for u in i.get("assignees") or []}
-        owner, locked = PARK in labels or mine, any(x.startswith(LOCK) for x in labels)
+        owner = PARK in labels or mine
+        locked = any(x.startswith(LOCK) for x in labels) or n in self.pr_locks
         parked = self.ledger.world.issues[n].parked
         if (owner or locked) and not parked:
             self._record(Role.human if owner else Role.outside, "parked", issue=n,
                          reason="owner" if owner else "lock")
         elif parked and not (owner or locked):
             self._record(Role.human, "unparked", issue=n)
+
+    def _outside_prs(self) -> None:
+        """An open pull request from anyone but the factory's own accounts that
+        names an issue it closes is someone else working on it: an outside
+        lock, as long as the pull request is open."""
+        w = self.ledger.world
+        ours = self.trusted - {self.owner}  # the factory's own GitHub accounts
+        locks = set()
+        for g in self.gh.open_pulls():
+            if g["number"] in w.prs or g["user"]["login"] in ours:
+                continue
+            for x, y in CLOSES.findall(f"{g.get('title') or ''}\n{g.get('body') or ''}"):
+                n = int(x or y)
+                if n in w.issues and w.open_(n) and w.issues[n].kind is not Kind.initiative:
+                    locks.add(n)
+        changed, self.pr_locks = locks ^ self.pr_locks, locks
+        for n in sorted(changed):
+            if w.open_(n):
+                self._park(self.gh.get_issue(n))
 
     def _closed(self, i: dict) -> None:
         n = i["number"]

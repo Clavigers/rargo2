@@ -652,6 +652,22 @@ def _green(w: World, e) -> Pr:
     return p
 
 
+@on(m.Diverged)
+def _(w: World, e: m.Diverged, a):
+    p = w.latest_push(e.pr, e.push)
+    if not w.is_(M.PR, e.pr, "open"):
+        w.fail(f"pr {e.pr} is {w.state(M.PR, e.pr)}")
+    i = w.issues[p.issue]
+    if e.reason is m.DivergeReason.foreign_push and not w.is_(M.ISSUE, p.issue, IssueS.checking):
+        w.fail(f"#{p.issue} is not in checks; a foreign push matters only there")
+    _void(w, e.pr, e.push, ci=True)
+    if e.reason is m.DivergeReason.closed:
+        w.enter(M.PR, e.pr, "abandoned")
+        i.pr = None
+    if w.is_(M.ISSUE, p.issue, IssueS.checking):
+        w.wait(p.issue)
+
+
 @on(m.MergeFailed)
 def _(w: World, e: m.MergeFailed, a):
     w.wait(_green(w, e).issue)
