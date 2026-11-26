@@ -76,6 +76,8 @@ def snapshot(w: World, lines: list[dict]) -> dict:
         d = dict(n=n, kind=str(i.kind), state=s, holder=i.holder, pr=i.pr, parent=i.parent,
                  deps=sorted(i.deps), parked=i.parked, rework=w.needs_work(n) if s == "ready" else False,
                  age=round(mins(w.since(M.ISSUE, n), now)) if now and i.kind is not Kind.initiative else None)
+        d["waits_for"] = w.reserved_for(n) if s == "ready" else None
+        d["asked"] = i.asked
         issues[n] = d
         if i.kind is not Kind.initiative and s in cols:
             cols[s].append(n)
@@ -192,6 +194,11 @@ def wake(w: World, a: str, ready: bool) -> dict | None:
         return None
     if st == "idle":
         return dict(why="session running; it takes the queue's head itself", at=None)
+    mine = [n for n in w.ready_queue(a) if w.reserved_for(n) == a]
+    if mine or (holds and w.issues[w.holding[a]].pr is not None):
+        n = w.holding[a] if holds else mine[0]
+        return dict(why=f"the watchdog wakes it for #{n}, in the conversation it had",
+                    at=iso(w.t + timedelta(minutes=WATCHDOG_EVERY)) if w.t else None)
     if holds or ready:
         return dict(why="the watchdog starts a session within 30 s", at=iso(w.t + timedelta(minutes=WATCHDOG_EVERY)) if w.t else None)
     return dict(why="asleep until an issue is ready", at=None)

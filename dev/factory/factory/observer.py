@@ -40,6 +40,10 @@ from .world import green
 MARKER = re.compile(r"<!--\s*factory-actor:\s*([a-z][a-z0-9_-]*)\s*-->")
 PART_OF = re.compile(r"^\s*Part of #(\d+)\s*$", re.M | re.I)
 DEPENDS = re.compile(r"^\s*Depends on #(\d+)\s*$", re.M | re.I)
+def parse_time(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
 NEEDS_TYPE = "<!-- factory: needs-type -->"
 # How a pull request says which issue it does: "Closes #N" and the like, or
 # a title ending "(#N)".
@@ -239,7 +243,14 @@ class Observer:
         mine = self.owner in {u["login"] for u in i.get("assignees") or []}
         owner = PARK in labels or mine
         locked = any(x.startswith(LOCK) for x in labels) or n in self.pr_locks
-        parked = self.ledger.world.issues[n].parked
+        w = self.ledger.world
+        parked = w.issues[n].parked
+        if w.issues[n].asked:  # its agent asked the owner: their answer lifts it
+            asked_at = w.since(M.ISSUE, n)
+            if any(c["user"]["login"] == self.owner and parse_time(c["created_at"]) > asked_at
+                   for c in self.gh.issue_comments(n)):
+                self._record(Role.human, "unparked", issue=n)
+            return
         if (owner or locked) and not parked:
             self._record(Role.human if owner else Role.outside, "parked", issue=n,
                          reason="owner" if owner else "lock")

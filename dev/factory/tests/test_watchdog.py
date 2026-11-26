@@ -3,6 +3,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -16,6 +17,7 @@ ROOT = pathlib.Path(__file__).parent.parent
 FAKE = f"""#!{sys.executable}
 import json, os, subprocess, sys, time
 mode = os.environ["FAKE_MODE"]
+open(os.environ.get("FAKE_ARGS", os.devnull), "a").write(json.dumps(sys.argv[1:]) + "\\n")
 f = [sys.executable, "-m", "factory"]
 if mode == "work":
     ready = json.loads(subprocess.check_output(f + ["ready"]))
@@ -212,3 +214,39 @@ def test_no_session_for_work_the_agent_gave_up_on(rig):
     wd = rig.watchdog()
     wd.step()
     assert A not in wd.sessions
+
+
+def test_the_next_session_on_an_issue_resumes_its_conversation(rig, tmp_path):
+    args = tmp_path / "args"
+    rig.monkeypatch.setenv("FAKE_ARGS", str(args))
+    rig.monkeypatch.setenv("FAKE_MODE", "work")
+    wd = rig.watchdog()
+    wd.step()
+    finish(wd)
+    rig.monkeypatch.setenv("FAKE_MODE", "sleep")
+    wd.step()  # the first ended holding #1; the second goes on with it
+    for _ in range(50):  # the second process writes its arguments as it starts
+        rows = [json.loads(x) for x in args.read_text().splitlines()]
+        if len(rows) == 2:
+            break
+        time.sleep(0.1)
+    first, second = rows
+    conv = first[first.index("--session-id") + 1]
+    assert second[second.index("--resume") + 1] == conv and "--session-id" not in second
+    assert "awake again" in second[1] and "issue #1" in second[1] and "You still hold it" in second[1]
+    assert json.loads((tmp_path / "state" / "conversations.json").read_text()) == {A: {"1": conv}}
+    assert any("resuming its conversation on #1" in x for x in rig.said)
+
+
+def test_a_session_that_runs_too_long_is_killed(rig):
+    cfg = json.loads(json.dumps(CONFIG)) | {"version": 2}
+    cfg["foreman"]["session_minutes"] = 90
+    rig.monkeypatch.setenv("FAKE_MODE", "sleep")
+    wd = rig.watchdog()
+    wd.ledger.submit("human", json.dumps({"event": "config_applied", "config": cfg}))
+    wd.step()
+    rig.clock.advance(minutes=91)
+    wd.step()
+    finish(wd)
+    wd.step()
+    assert ("session_ended", "killed") in events(rig.log)

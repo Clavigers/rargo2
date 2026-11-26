@@ -609,7 +609,8 @@ def _(w: World, e: m.Returned, a):
             w.fail(f"{holder}'s session is live")
         if e.reason is R.preempted:
             _check_preempt(w, e.issue)
-    i.stuck.pop(holder, None)
+    if e.reason is R.no_progress:
+        i.stuck.pop(holder, None)
     w.wait(e.issue)
     if w.is_(M.AGENT, holder, AgentS.working):
         w.enter(M.AGENT, holder, AgentS.idle)

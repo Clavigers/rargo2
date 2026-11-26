@@ -101,8 +101,12 @@ class Foreman:
 
     def _take_back(self) -> None:
         w = self.ledger.world
+        stuck = w.config.foreman.no_progress_sessions
         for agent, issue in list(w.holding.items()):
-            if w.is_(M.AGENT, agent, AgentS.off):
+            if (stuck and w.is_(M.AGENT, agent, AgentS.off)
+                    and w.issues[issue].stuck.get(agent, 0) >= stuck):
+                self._decide("returned", issue=issue, reason="no_progress")
+            elif w.is_(M.AGENT, agent, AgentS.off):
                 self._decide("returned", issue=issue, reason="stale")
             elif w.is_(M.QUOTA, agent, "out"):
                 self._decide("returned", issue=issue, reason="quota")

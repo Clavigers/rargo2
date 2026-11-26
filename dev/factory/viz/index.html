@@ -350,9 +350,11 @@ const fmtSpeed = s => s < 60 ? `1 s = ${s} min` : s < 1440 ? `1 s = ${(s / 60).t
 const dur = m => m == null ? '-' : m < 60 ? `${Math.round(m)} min` : m < 2880 ? `${(m / 60).toFixed(1)} h` : `${(m / 1440).toFixed(1)} d`;
 const when = t => t ? t.slice(5, 16).replace('T', ' ') : '';
 
-const asChip = n => { const i = state.issues[n]; return i ? { n, t: i.kind, rw: i.rework } : null; };
+const asChip = n => { const i = state.issues[n]; return i ? { n, t: i.kind, rw: i.rework, for_: i.waits_for, asked: i.asked } : null; };
 function chip(c, cls = '', extra = '') {
-  return `<span class="chip ${c.t}${c.rw ? ' rw' : ''} ${cls}" data-n="${c.n}" title="#${c.n} ${c.t}${c.rw ? ', sent back for changes' : ''}">${ic(ICON[c.t] || 'issue')}${c.n}${extra}</span>`;
+  if (c.for_) extra += `<span class="who">${ic('arrow')}${esc(c.for_.replace(/-\d+$/, ''))}</span>`;
+  if (c.asked) extra += `<span class="who">asked you</span>`;
+  return `<span class="chip ${c.t}${c.rw ? ' rw' : ''} ${cls}" data-n="${c.n}" title="#${c.n} ${c.t}${c.rw ? ', sent back for changes' : ''}${c.for_ ? ', waits for ' + c.for_ + ', which held it last' : ''}${c.asked ? ', its agent asked you a question on the issue: answer there to wake it' : ''}">${ic(ICON[c.t] || 'issue')}${c.n}${extra}</span>`;
 }
 function heap(n, color, label = 'more') {
   if (n <= 0) return '';

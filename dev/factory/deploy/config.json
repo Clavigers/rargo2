@@ -1,20 +1,63 @@
 {
-  "version": 1,
+  "version": 2,
   "plans": [
-    {"name": "claude-max", "hours_per_week": 168.0},
-    {"name": "chatgpt-pro", "hours_per_week": 168.0},
-    {"name": "supergrok", "hours_per_week": 168.0}
+    {
+      "name": "claude-max",
+      "hours_per_week": 168.0
+    },
+    {
+      "name": "chatgpt-pro",
+      "hours_per_week": 168.0
+    },
+    {
+      "name": "supergrok",
+      "hours_per_week": 168.0
+    }
   ],
   "agents": [
-    {"type": "claude-code", "count": 1, "model": "claude-opus-5-5", "plan": "claude-max"},
-    {"type": "codex", "count": 1, "model": "gpt-6.2-sol", "plan": "chatgpt-pro"},
-    {"type": "grok", "count": 1, "model": "grok-4.7", "plan": "supergrok"}
+    {
+      "type": "claude-code",
+      "count": 1,
+      "model": "claude-opus-5-5",
+      "plan": "claude-max"
+    },
+    {
+      "type": "codex",
+      "count": 1,
+      "model": "gpt-6.2-sol",
+      "plan": "chatgpt-pro"
+    },
+    {
+      "type": "grok",
+      "count": 1,
+      "model": "grok-4.7",
+      "plan": "supergrok"
+    }
   ],
-  "reviewers": ["placeholder"],
-  "foreman": {"tick_minutes": 20, "preempt_minutes": 60},
-  "release": {"freeze_every_days": 7, "uses_required": 1, "soak_minutes": 120},
+  "reviewers": [
+    "placeholder"
+  ],
+  "foreman": {
+    "tick_minutes": 20,
+    "preempt_minutes": 60,
+    "affinity_minutes": 120,
+    "no_progress_sessions": 3,
+    "session_minutes": 180
+  },
+  "release": {
+    "freeze_every_days": 7,
+    "uses_required": 1,
+    "soak_minutes": 120
+  },
   "guesses": [
-    "plans.0.hours_per_week", "plans.1.hours_per_week", "plans.2.hours_per_week",
-    "foreman.preempt_minutes", "release.freeze_every_days", "release.soak_minutes"
+    "foreman.affinity_minutes",
+    "foreman.no_progress_sessions",
+    "foreman.preempt_minutes",
+    "foreman.session_minutes",
+    "plans.0.hours_per_week",
+    "plans.1.hours_per_week",
+    "plans.2.hours_per_week",
+    "release.freeze_every_days",
+    "release.soak_minutes"
   ]
 }

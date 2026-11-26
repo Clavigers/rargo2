@@ -50,6 +50,14 @@ left, end the session.
   left to change, show it: comment the evidence on the issue, then
   `factory submit '{"event":"closed","issue":N,"reason":"completed","note":"evidence, briefly"}'`,
   then `gh issue close N --reason completed`, and end.
+- If only the owner can decide something you need (a choice the issue
+  leaves open, a conflict between two instructions): do not guess, and do
+  not wait. Comment the question on the issue, as short and as answerable
+  as you can make it, with what you have found so far; push what you have
+  to the branch `issue-N` so it is not lost; then `factory submit
+  '{"event":"returned","issue":N,"reason":"asked","note":"the question"}'`
+  and end. The issue waits for the owner. Their answer wakes you again in
+  this same conversation, with what you know.
 - If it cannot be done as written: `factory submit
   '{"event":"returned","issue":N,"reason":"gave_up","note":"why"}'`,
   comment on the issue saying why, and end.
@@ -61,8 +69,11 @@ left, end the session.
     factory submit '{"event":"push","issue":N,"pr":P,"push":K,"sha":"<git rev-parse HEAD>"}'
 
 K is `next_push` from `factory mine`. The push ends your hold on the issue.
-Do not wait for CI or review: end the session. If they fail, the issue comes
-back to the queue, and whoever takes it next fixes it.
+Do not wait for CI, for review, or for a person: end the session. Never
+sleep or poll. If the checks fail, the issue comes back to you first: you
+are woken in this same conversation, told what failed, and go on from what
+you know. If you have no quota then, or do not take it in time, another
+agent takes it.
 
 ## Rules
 

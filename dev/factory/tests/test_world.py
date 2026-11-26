@@ -535,3 +535,4 @@ def test_an_agent_closes_what_needs_no_change():
     g(C1, "closed", issue=1, reason="completed", note="every item holds on the site")
     assert g.w.state(M.ISSUE, 1) == IssueS.closed and C1 not in g.w.holding
     assert g.w.issues[1].closer == C1
+
