@@ -959,7 +959,7 @@ impl Daemon {
         }
     }
 
-    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> Option<(Arc<OutFs>, PathBuf)> {
+    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
         let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
             || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
@@ -971,11 +971,11 @@ impl Daemon {
                 m.fs.save();
                 io::blocking(|| m.session.unmount());
             }
-            return None;
+            return Ok(None);
         }
         if let Some(m) = &*g {
             if m.session.shown() && dev_at(&mountinfo(), &m.dir) == Some(m.dev) {
-                return Some((m.fs.clone(), m.dir.clone()));
+                return Ok(Some((m.fs.clone(), m.dir.clone())));
             }
             if let Some(m) = g.take() {
                 m.fs.save();
@@ -983,19 +983,20 @@ impl Daemon {
             }
         }
         if wt.out_failed.load(Ordering::SeqCst) && var(&req.vars, "RARGO_OUTPUT") != Some("fuse") {
-            return None;
+            return Ok(None);
         }
         match self.mount_out(wt) {
             Ok(m) => {
                 let r = (m.fs.clone(), m.dir.clone());
                 *g = Some(m);
-                Some(r)
+                Ok(Some(r))
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Err(e),
             Err(e) => {
                 if !wt.out_failed.swap(true, Ordering::SeqCst) {
                     eprintln!("rargo daemon: {}: no virtual output directory ({e}); results are copied into it", wt.root.display());
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -1021,9 +1022,9 @@ impl Daemon {
             passthrough: true,
             auto_unmount: true,
         };
-        let session = Arc::new(io::blocking(|| fusewire::Session::mount(&dir, &opts))?);
+        let session = Arc::new(io::blocking(|| fusewire::Session::mount_uring(&dir, &opts))?);
         fs.attach(session.clone());
-        rargo_net::io::FuseDrive::spawn(&session, &fs).detach();
+        rargo_net::io::FuseDrive::spawn(&session, &fs)?.detach();
         let dev = dev_at(&mountinfo(), &dir).ok_or_else(|| std::io::Error::other("the mount does not show in /proc/self/mountinfo"))?;
         Ok(Mounted { fs, session, dir, dev })
     }
@@ -1417,7 +1418,14 @@ impl Daemon {
                 wt.running.lock()
             }
         };
-        let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
+        let shown = if req.kind == "sync" {
+            None
+        } else {
+            match self.out_for(&wt, req) {
+                Ok(shown) => shown,
+                Err(err) => return Ok(Self::fail(out, err.to_string())),
+            }
+        };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
             match rargo_net::io::file::read(cargo_home.join(name)) {

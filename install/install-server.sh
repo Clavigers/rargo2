@@ -7,7 +7,12 @@ listen=${RARGO_LISTEN:-0.0.0.0:7459}
 admin=${RARGO_ADMIN:-admin}
 [ "$(id -u)" = 0 ] || { echo "run this as root: rargod mounts a FUSE file system and creates namespaces" >&2; exit 1; }
 [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || { echo "the prebuilt server is for Linux x86_64 only" >&2; exit 1; }
+fuse_uring=/sys/module/fuse/parameters/enable_uring
+if [ -z "$P" ] && [ ! -e "$fuse_uring" ]; then
+    modprobe fuse 2>/dev/null || true
+fi
 [ -e /dev/fuse ] || { echo "/dev/fuse is missing: load the fuse module (modprobe fuse)" >&2; exit 1; }
+[ -e "$fuse_uring" ] || { echo "FUSE-over-io_uring is unavailable: use Linux 6.14 or newer with CONFIG_FUSE_IO_URING" >&2; exit 1; }
 for tool in curl tar sha256sum git cc; do
     command -v "$tool" >/dev/null || { echo "missing: $tool (builds also need a C compiler and linker; on Debian/Ubuntu: apt install build-essential git curl)" >&2; exit 1; }
 done
@@ -38,6 +43,12 @@ install -m 755 "$tmp/rargo-server/rargod" "$tmp/rargo-server/rargo-sandbox" "$tm
 install -d "$lib/$real/default-flake"
 install -m 644 "$tmp/rargo-server/default-flake/flake.nix" "$tmp/rargo-server/default-flake/flake.lock" "$lib/$real/default-flake/"
 ln -sfn "$lib/$real" "$lib/current"
+mkdir -p "$P/etc/modprobe.d" "$P/etc/tmpfiles.d"
+printf '%s\n' 'options fuse enable_uring=Y' >"$P/etc/modprobe.d/rargo-fuse-uring.conf"
+printf 'w %s - - - - Y\n' "$fuse_uring" >"$P/etc/tmpfiles.d/rargo-fuse-uring.conf"
+if [ -z "$P" ] && [ "$(cat "$fuse_uring")" != Y ]; then
+    printf '%s\n' Y >"$fuse_uring"
+fi
 export RUSTUP_HOME=$home/rustup CARGO_HOME=$home/cargo-home
 if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
     echo "installing rustup into $home"

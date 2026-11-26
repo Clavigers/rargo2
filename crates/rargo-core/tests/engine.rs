@@ -58,7 +58,7 @@ fn fixture_with(action_timeout: std::time::Duration) -> Fx {
     let mnt = tmp.path().join("mnt");
     std::fs::create_dir_all(&mnt).unwrap();
     let session = Arc::new(
-        fusewire::Session::mount(&mnt, &fusewire::MountOptions { fsname: "rargo-test".into(), ..Default::default() })
+        fusewire::Session::mount_uring(&mnt, &fusewire::MountOptions { fsname: "rargo-test".into(), ..Default::default() })
             .unwrap(),
     );
     fs.attach(session.clone());
@@ -142,7 +142,7 @@ fn replays_until_an_observed_input_changes() {
     std::fs::write(fx.work.join("other.txt"), "x\n").unwrap();
     let script = "cat in.txt > out.txt; echo printed; echo warned >&2; test -e missing.txt || true";
     io::drive(1, move || {
-        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
         let a = fx.engine.obtain(fx.req(script, &[], &[], &[])).unwrap();
         assert!(!a.cached && a.result.success());
         assert_eq!(fx.text(&a.result.stdout), "printed\n");
@@ -188,7 +188,7 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
     std::fs::write(other.join("in.txt"), "second\n").unwrap();
     let script = "sleep 0.5; cat in.txt";
     io::drive(1, move || {
-        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
         let e = fx.engine.clone();
         let r1 = fx.req(script, &[], &[], &[]);
         let mut first = io::spawn(move || e.obtain(r1).unwrap());
@@ -225,7 +225,7 @@ fn declared_environment_variables_become_part_of_the_key() {
     let fx = fixture();
     let script = "echo value=$FOO";
     io::drive(1, move || {
-        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
         let a = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).unwrap();
         assert_eq!(fx.text(&a.result.stdout), "value=bar\n");
         assert_eq!(fx.runs(), 2);
@@ -247,7 +247,7 @@ fn declared_environment_variables_become_part_of_the_key() {
 fn failures_are_not_cached_unless_allowed() {
     let fx = fixture();
     io::drive(1, move || {
-        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
         let a = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).unwrap();
         assert_eq!(a.result.code(), Some(3));
         let b = fx.engine.obtain(fx.req("echo oops >&2; exit 3", &[], &[], &[])).unwrap();
@@ -269,7 +269,7 @@ fn large_directories_list_completely_through_a_build_view() {
         std::fs::write(big.join(format!("libsomething-with-a-long-name-{i:04}-5cc9b44b3cc93987.rmeta")), "x").unwrap();
     }
     io::drive(1, move || {
-        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
         let mut r = fx.req("ls /w/big | wc -l; ls -la /w/big | grep -c rmeta; ls /w/big | sort | uniq -d | wc -l", &[], &[], &[]);
         let base = {
             let g = fx.memo.advance();
@@ -300,7 +300,7 @@ fn large_directories_list_completely_through_a_build_view() {
 fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
     let fx = fixture_with(std::time::Duration::from_secs(1));
     io::drive(1, move || {
-        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+        let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
         let mut tasks = Vec::new();
         for _ in 0..3 {
             let e = fx.engine.clone();
@@ -464,7 +464,7 @@ mod fn_code_selection {
     fn table(nextest: bool) {
         let fx = fixture();
         io::drive(1, move || {
-            let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+            let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
             let abc = ["a", "b", "c"];
             let run = |app: App, tests: &[&str], no_cache: bool| {
                 let (view, bins) = link(&fx, &app, tests);
@@ -533,7 +533,7 @@ mod fn_code_selection {
     fn a_kept_pass_that_fails_for_real_with_no_identity_changed_is_reported_as_drift() {
         let fx = fixture();
         io::drive(1, move || {
-            let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs);
+            let _fuse = rargo_core::io::FuseDrive::spawn(&fx.session, &fx.fs).unwrap();
             let (view, _) = link(&fx, &BASE, &["c"]);
             assert_eq!(round(&fx, &view, &["c"], false, false).ran, ["c"]);
             assert_eq!(fx.engine.recheck_kept(test_req(&view, "c", false, false), 1), Kept::Holds);

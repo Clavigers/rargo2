@@ -69,12 +69,12 @@ fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
     let fs = Arc::new(SandboxFs::new(content));
     let mnt = state.join("mnt");
     std::fs::create_dir_all(&mnt)?;
-    let session = Arc::new(fusewire::Session::mount(
+    let session = Arc::new(fusewire::Session::mount_uring(
         &mnt,
         &fusewire::MountOptions { fsname: "rargo".into(), passthrough, ..Default::default() },
     )?);
     fs.attach(session.clone());
-    let _fuse = rargo_core::io::FuseDrive::spawn(&session, &fs);
+    let _fuse = rargo_core::io::FuseDrive::spawn(&session, &fs)?;
     eprintln!("[rargo-sandbox] passthrough: {}", session.caps().passthrough);
 
     let scratch = store.tmp_dir("tool-action")?;
