@@ -10,7 +10,7 @@ use crate::store::Store;
 use rargo_proto::tree::Node;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use crate::io::process::Command;
@@ -529,7 +529,7 @@ pub(crate) fn resolve_shell(
 }
 
 impl FlakeEnv {
-    pub fn closure_set(&self) -> Arc<HashSet<Vec<u8>>> {
+    pub fn closure_set(&self) -> Arc<BTreeSet<Vec<u8>>> {
         Arc::new(self.closure.iter().map(|c| c.as_bytes().to_vec()).collect())
     }
 
@@ -537,8 +537,8 @@ impl FlakeEnv {
         self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).ring_is_file())
     }
 
-    pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<HashMap<Vec<u8>, SynthEnt>>> {
-        let mut m = HashMap::new();
+    pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<BTreeMap<Vec<u8>, SynthEnt>>> {
+        let mut m = BTreeMap::new();
         let mut file = |name: &str, content: String| -> Result<()> {
             let hash = store.put_bytes(content.as_bytes())?;
             m.insert(name.as_bytes().to_vec(), SynthEnt::File { hash, size: content.len() as u64 });

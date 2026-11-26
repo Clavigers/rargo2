@@ -3,7 +3,7 @@ use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -65,8 +65,8 @@ pub enum Region {
     Host(HostRegion),
     Snap(Arc<Snapshot>),
     Empty,
-    NixStore { names: Arc<std::collections::HashSet<Vec<u8>>> },
-    Synth(Arc<HashMap<Vec<u8>, SynthEnt>>),
+    NixStore { names: Arc<BTreeSet<Vec<u8>>> },
+    Synth(Arc<BTreeMap<Vec<u8>, SynthEnt>>),
     Link(Vec<u8>),
 }
 
@@ -523,7 +523,7 @@ enum LayerEnt {
 
 #[derive(Default)]
 struct LayerDir {
-    children: HashMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
+    children: BTreeMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
 }
 
 #[derive(Default)]
@@ -751,9 +751,9 @@ pub struct ViewParts {
 
 #[derive(Clone)]
 pub struct Restricted {
-    pub store_names: Arc<std::collections::HashSet<Vec<u8>>>,
+    pub store_names: Arc<BTreeSet<Vec<u8>>>,
     pub store_paths: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
-    pub etc: Arc<HashMap<Vec<u8>, SynthEnt>>,
+    pub etc: Arc<BTreeMap<Vec<u8>, SynthEnt>>,
     pub links: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
