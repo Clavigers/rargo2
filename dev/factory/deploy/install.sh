@@ -7,8 +7,8 @@ F=/root/factory
 cd $F
 [ -d venv ] || python3 -m venv venv
 venv/bin/pip install -q 'pydantic>=2.9' pytest
-[ -d repo ] || git clone -q https://github.com/sadosystems/rargo2.git repo
-[ -d plan ] || git clone -q https://github.com/sadosystems/rargo2.git plan
+[ -d repo ] || git clone -q https://github.com/Clavigers/rargo2.git repo
+[ -d plan ] || git clone -q https://github.com/Clavigers/rargo2.git plan
 mkdir -p state
 (cd src && ../venv/bin/python -m pytest -q -p no:cacheprovider)
 if [ ! -s log.jsonl ]; then

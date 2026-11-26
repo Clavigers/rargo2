@@ -13,7 +13,7 @@ Environment=FACTORY_CLAUDE_CODE=/root/.local/bin/claude
 Environment=PYTHONPATH=/root/factory/src
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/root/factory
-ExecStart=/root/factory/venv/bin/python -m factory observe sadosystems/rargo2 kevkevmurrayfalcon-stack
+ExecStart=/root/factory/venv/bin/python -m factory observe Clavigers/rargo2 sadosystems kevkevmurrayfalcon-stack
 Restart=always
 RestartSec=10
 # Stopping the watchdog leaves running agent sessions alone; a new watchdog adopts them.

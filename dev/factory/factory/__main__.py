@@ -12,9 +12,11 @@
   init CONFIG               start the log with this config (a JSON file)
   watchdog REPO STATE       run the watchdog: keep a session per agent, each
                             in a worktree of the clone REPO, under STATE
-  observe SLUG [LOGIN...]   run the observer and merger on GitHub repository
-                            SLUG (owner/name); issues from the owner and the
-                            LOGINs given are the factory's
+  observe SLUG OWNER [LOGIN...]
+                            run the observer and merger on GitHub repository
+                            SLUG (org/name). OWNER is the human's login: their
+                            acts on GitHub are the human's. Issues from OWNER
+                            and the LOGINs given are the factory's
   foreman SLUG CHECKOUT     run the foreman; it plans in the clone CHECKOUT
   doc                       rewrite the generated half of DATA-MODEL.md
   schema                    JSON Schema of an event body
@@ -106,11 +108,10 @@ def main(argv: list[str]) -> int:
                 sys.exit("factory: the log is not empty; apply a new config with submit")
             print(led.submit("human", body).dump())
             return 0
-        case ["observe", slug, *trusted]:
+        case ["observe", slug, owner, *trusted]:
             import time
             from .github import GitHub
             from .observer import Observer
-            owner = slug.split("/")[0]
             gh = GitHub(slug)
             reviewers = {}
             if os.environ.get("FACTORY_BOTS"):  # the review bots, through review-mux
