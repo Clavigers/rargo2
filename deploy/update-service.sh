@@ -6,9 +6,13 @@ refuse() {
     echo "The service runs released versions only: dev/release.sh X.Y.Z releases and deploys one; deploy/update-service.sh vX.Y.Z deploys a published release again." >&2
     exit 1
 }
+fail() {
+    echo "deploy/update-service.sh: $1" >&2
+    exit 1
+}
 want=${1:-}
 [[ "$want" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || refuse "'$want' is not a release tag (vX.Y.Z)"
-assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-sadosystems/rargo2}" --json isDraft,assets \
+assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-Clavigers/rargo2}" --json isDraft,assets \
     --jq 'select(.isDraft | not) | .assets[].name' 2>/dev/null) || refuse "$want has no published release"
 grep -qx rargo-x86_64-unknown-linux-musl <<<"$assets" || refuse "the release $want does not have the client (rargo-x86_64-unknown-linux-musl)"
 S=${RARGO_SERVICE:-/root/rargo-work/service}
@@ -35,17 +39,26 @@ if [ ! -x "$rel/rargod" ]; then
     cp "$S/build/release/rargod" "$S/build/release/rargo-sandbox" "$rel.tmp/"
     cp "$S/build/x86_64-unknown-linux-musl/release/rargo" "$rel.tmp/"
     strip "$rel.tmp/rargo"
-    planner=$work/cargo
-    [ -z "$(git -C "$planner" status --porcelain)" ] || { echo "the planner checkout is not clean" >&2; exit 1; }
-    n=$(ls "$S/src/forks/cargo/"*.patch | wc -l)
-    [ "$(git -C "$planner" rev-parse --short=9 "HEAD~$n")" = "$(cat "$S/src/forks/cargo/BASE")" ] || { echo "the planner checkout is not BASE + $n patches" >&2; exit 1; }
-    last=$(ls "$S/src/forks/cargo/"*.patch | tail -n 1)
-    subject=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$last" | head -n 1)
-    case "$(git -C "$planner" log -1 --format=%s)" in
-    "$subject"*) ;;
-    *) echo "the planner's last commit is not the last patch" >&2; exit 1 ;;
-    esac
-    cp "$planner/target/release/cargo" "$rel.tmp/planner-cargo"
+    planner=$S/planner
+    plan_src=$S/src/crates/rargo-plan
+    base=$(cat "$S/src/forks/cargo/BASE")
+    [ -d "$planner/.git" ] || git clone -q https://github.com/rust-lang/cargo.git "$planner" || fail "cannot clone cargo into $planner"
+    git -C "$planner" cat-file -e "$base^{commit}" 2>/dev/null || git -C "$planner" fetch -q origin || fail "cannot fetch cargo into $planner"
+    git -C "$planner" am --abort 2>/dev/null || true
+    git -C "$planner" checkout -q -f --detach "$base" || fail "cargo has no commit $base (forks/cargo/BASE at $want)"
+    git -C "$planner" clean -qfdx
+    git -C "$planner" -c user.name=rargo -c user.email=noreply@rargo.invalid am -q "$S/src/forks/cargo/"*.patch \
+        || fail "the patches in forks/cargo at $want do not apply to cargo $base"
+    grep -qF 'rargo-plan = { path = "/root/rargo/crates/rargo-plan" }' "$planner/Cargo.toml" \
+        || fail "the planner's Cargo.toml does not name rargo-plan as forks/cargo/0001 does, so it cannot be pointed at $plan_src"
+    sed -i "s|/root/rargo/crates/rargo-plan|$plan_src|" "$planner/Cargo.toml"
+    (cd "$planner" && CARGO_TARGET_DIR=$S/planner-build CFG_RELEASE_CHANNEL=stable cap cargo build --release --bin cargo) \
+        || fail "cannot build the planner against $plan_src at $want"
+    plan_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$plan_src/Cargo.toml" | head -n 1)
+    used=$(cd "$planner" && cargo tree --offline -e normal -i rargo-plan --depth 0) || fail "cannot read which rargo-plan the planner was built against"
+    [ "$used" = "rargo-plan v$plan_version ($plan_src)" ] \
+        || fail "the planner was built against '$used', not rargo-plan v$plan_version ($plan_src) at $want"
+    cp "$S/planner-build/release/cargo" "$rel.tmp/planner-cargo"
     cp -R "$S/src/nix/default" "$rel.tmp/default-flake"
     mv "$rel.tmp" "$rel"
 fi

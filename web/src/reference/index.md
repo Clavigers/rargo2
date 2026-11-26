@@ -111,9 +111,11 @@ A bare name like `rargo.rs` is asked over HTTPS where its server is. To use one,
 ## What builds can see
 
 A project without a `flake.nix` builds in rargo's pinned default Nix
-shell. It provides Rust with Cargo, Clippy and rustfmt, GCC for C and
-C++, binutils, Make, CMake, pkg-config, Perl, Python 3, Git, OpenSSL,
-zlib and SQLite. The project's `rust-toolchain.toml` or
+shell. It provides Rust with Cargo, Clippy, rustfmt and the standard
+library's source, GCC for C and C++, binutils, Make, CMake, pkg-config,
+Perl, Python 3 and Git, and the libraries OpenSSL, zlib, SQLite, udev,
+ALSA, Wayland, xkbcommon, the Vulkan loader, fontconfig, FreeType and
+the X11 libraries. The project's `rust-toolchain.toml` or
 `rust-toolchain` selects Rust. The sandbox exposes the selected closure and keeps
 the server's system libraries outside the build. The server needs Nix with flakes.
 
@@ -195,6 +197,7 @@ pass = ["DATABASE_URL", "PROTOC*"]   # reach every build step
 tests = false                          # true: every test may use the network
 test-packages = ["integration-tests"]  # these tests may use the network
 build-scripts = ["some-sys"]           # so may these build scripts
+git-build-scripts-offline = false      # true: git dependencies' build scripts lose it too
 
 [workspace.metadata.rargo.sync]
 exclude = ["node_modules"]           # never sent to the server
@@ -225,9 +228,9 @@ On your machine, rargo keeps three things: your server in `~/.config/rargo/confi
 
 **A library is missing** (`pkg-config`, `cannot find -lfoo`). Add it to the workspace flake and commit `flake.nix` and `flake.lock`. See [What builds can see](#what-builds-can-see).
 
-**A build script cannot download something.** Build scripts have no network unless the project allows it under `network` in its manifest (see *Configuration*).
+**A build script cannot download something.** Build scripts of crates.io dependencies and of the workspace have no network unless the project allows it under `network` in its manifest (see *Configuration*). Build scripts of git dependencies have it, unless the project sets `git-build-scripts-offline = true`.
 
-**Client and server do not match.** They must be the same release line. The error names the server's version and the command that installs a client that matches it. `rargo --rargo-version` and `rargod --version` print both versions.
+**Client and server do not match.** They must be the same release line. The error names the server's version and the command that installs a client that matches it, `cargo install rargo --version X.Y.Z`. `rargo --rargo-version` and `rargod --version` print both versions.
 
 **`cargo clean` fails with "Device or resource busy".** `target/` is mounted. Use `rargo clean`.
 

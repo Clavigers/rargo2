@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use rargo_net::io::{self, UnboundedReceiver, UnboundedSender, unbounded_channel};
 use rargo::link_watch::{self, Tick, Watch};
 use rargo_net::link::Link;
@@ -117,11 +119,19 @@ impl<S: Clone, M> MuxState<S, M> {
         self.order = Reorder::new(true);
         Some((std::mem::take(&mut self.streams), std::mem::take(&mut self.missing)))
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.streams.keys().all(|&id| id > CONTROL && id < self.next_stream && id != rargo_proto::KEEPALIVE)
-            && (!self.dead || (self.streams.is_empty() && self.missing.is_empty()))
+#[cfg(test)]
+impl<S: Clone, M> StateMachine for MuxState<S, M> {
+    fn invariants(&self) {
+        for &id in self.streams.keys() {
+            assert!(id > CONTROL && id != rargo_proto::KEEPALIVE, "stream {id} is not a reserved id");
+            assert!(id < self.next_stream, "stream {id} was handed out, below {}", self.next_stream);
+        }
+        if self.dead {
+            assert!(self.streams.is_empty(), "a dead mux has no streams");
+            assert!(self.missing.is_empty(), "a dead mux waits for nothing");
+        }
     }
 }
 
@@ -361,56 +371,56 @@ mod tests {
     fn reorder_and_terminal_frames_stay_with_their_own_stream() {
         let mut state = MuxState::<_, ()>::new();
         let (first, _) = state.open("first");
-        assert!(state.invariants());
+        state.invariants();
         let (second, _) = state.open("second");
-        assert!(state.invariants());
+        state.invariants();
 
         let stdout = |byte| ServerMsg::Stdout(vec![byte]);
         assert!(state.incoming(Frame { stream: first, seq: 1, msg: ServerMsg::Exit(0) }).is_empty());
-        assert!(state.invariants());
+        state.invariants();
         let msgs = state.incoming(Frame { stream: second, seq: 0, msg: stdout(2) });
-        assert!(state.invariants());
+        state.invariants();
         let [(stream, msg)] = msgs.try_into().ok().unwrap();
         assert!(matches!(state.route(stream, msg), Route::Stream("second", ServerMsg::Stdout(bytes)) if bytes == [2]));
-        assert!(state.invariants());
+        state.invariants();
 
         let msgs = state.incoming(Frame { stream: first, seq: 0, msg: stdout(1) });
-        assert!(state.invariants());
+        state.invariants();
         let [(stream, msg), (last_stream, last)] = msgs.try_into().ok().unwrap();
         assert!(matches!(state.route(stream, msg), Route::Stream("first", ServerMsg::Stdout(bytes)) if bytes == [1]));
-        assert!(state.invariants());
+        state.invariants();
         assert!(matches!(state.route(last_stream, last), Route::Stream("first", ServerMsg::Exit(0))));
-        assert!(state.invariants());
+        state.invariants();
         assert!(state.incoming(Frame { stream: first, seq: 2, msg: stdout(9) }).is_empty());
-        assert!(state.invariants());
+        state.invariants();
         assert!(matches!(state.route(first, stdout(9)), Route::Drop));
-        assert!(state.invariants());
+        state.invariants();
     }
 
     #[test]
     fn failure_drains_every_open_registration_once() {
         let mut state = MuxState::new();
         let (closed, _) = state.open("cancelled");
-        assert!(state.invariants());
+        state.invariants();
         let (a, _) = state.open("first");
-        assert!(state.invariants());
+        state.invariants();
         let (b, _) = state.open("second");
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(state.close(closed), Some("cancelled"));
-        assert!(state.invariants());
+        state.invariants();
         let id = state.next_id();
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(state.expect_missing(id, "offer"), None);
-        assert!(state.invariants());
+        state.invariants();
         let (streams, offers) = state.fail().unwrap();
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(streams, BTreeMap::from([(a, "first"), (b, "second")]));
         assert_eq!(offers, BTreeMap::from([(id, "offer")]));
         assert!(state.fail().is_none());
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(state.open("late").1, Some("late"));
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(state.expect_missing(id, "late offer"), Some("late offer"));
-        assert!(state.invariants());
+        state.invariants();
     }
 }

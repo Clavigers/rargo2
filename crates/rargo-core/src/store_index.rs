@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::chunk::ChunkRef;
 use crate::hash::Hash;
 use std::collections::{BTreeMap, BTreeSet};
@@ -402,8 +403,10 @@ impl StoreIndex {
         out.sort_by_key(|e| e.cold);
         out
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for StoreIndex {
+    fn invariants(&self) {
         let whole: u64 = self.blobs.values().filter(|b| b.is_whole()).map(|b| b.size).sum();
         assert_eq!(whole, self.whole_bytes, "whole bytes are the sum of the whole blobs");
         assert!(self.generation >= 1);
@@ -427,6 +430,8 @@ impl StoreIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     fn h(i: u8) -> Hash {
         Hash([i; 32])
@@ -447,16 +452,22 @@ mod tests {
 
     #[test]
     fn eviction_is_lru_and_respects_pins() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         for (i, used) in [(1, 10), (2, 20), (3, 30)] {
             ix.put(h(i), 1000, 0, used);
         }
         let gone = ix.evict(1500, 0, 100, &|x| *x == h(1));
-        assert_eq!(gone.iter().map(|e| e.hash).collect::<Vec<_>>(), vec![h(2), h(3)]);
-        assert_eq!(gone.iter().map(|e| e.freed).sum::<u64>(), 2000);
+        outcomes.record("evictions", &gone);
+        outcomes.record("bytes freed", gone.iter().map(|e| e.freed).sum::<u64>());
         assert!(ix.has(&h(1)) && !ix.has(&h(2)) && !ix.has(&h(3)));
-        assert_eq!(ix.generation(), 3);
+        outcomes.record("generation", ix.generation());
         ix.invariants();
+        expect![[r#"
+            evictions: [Evicted { hash: 0202020202020202, cold: false, freed: 1000 }, Evicted { hash: 0303030303030303, cold: false, freed: 1000 }]
+            bytes freed: 2000
+            generation: 3
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
@@ -487,55 +498,76 @@ mod tests {
 
     #[test]
     fn a_blob_used_while_going_cold_stays_whole() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 1 << 20, 0, 5);
         ix.begin_freeze(&h(1)).unwrap();
-        assert_eq!(ix.touch(&h(1), 9), Touch::Quiet);
-        assert_eq!(ix.finish_freeze(&h(1), recipe(1 << 20), 10), None);
+        outcomes.record("touch", ix.touch(&h(1), 9));
+        outcomes.record("finish freeze", ix.finish_freeze(&h(1), recipe(1 << 20), 10));
         assert!(ix.is_whole(&h(1)));
         assert!(ix.begin_freeze(&h(2)).is_none());
         ix.put(h(3), 100, 0, 1);
         assert!(ix.begin_freeze(&h(3)).is_none(), "a small blob stays whole");
         ix.invariants();
+        expect![[r#"
+            touch: Quiet
+            finish freeze: None
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_failed_thaw_drops_the_blob() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 1 << 20, 0, 5);
         ix.begin_freeze(&h(1)).unwrap();
         ix.finish_freeze(&h(1), recipe(1 << 20), 10).unwrap();
         ix.begin_thaw(&h(1));
-        let g = ix.generation();
+        outcomes.record("generation before failed thaw", ix.generation());
         assert!(ix.fail_thaw(&h(1)));
         assert!(!ix.has(&h(1)));
-        assert_eq!(ix.generation(), g + 1);
+        outcomes.record("generation", ix.generation());
         ix.invariants();
+        expect![[r#"
+            generation before failed thaw: 1
+            generation: 2
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn touch_persists_only_after_ten_minutes() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 10, 3, 100);
-        assert_eq!(ix.touch(&h(1), 200), Touch::Quiet);
-        assert_eq!(ix.touch(&h(1), 801), Touch::Persist(HotMeta { size: 10, mtime_ns: 3, last_used: 801 }));
-        assert_eq!(ix.touch(&h(2), 801), Touch::Absent);
+        outcomes.record("touch", ix.touch(&h(1), 200));
+        outcomes.record("touch", ix.touch(&h(1), 801));
+        outcomes.record("touch", ix.touch(&h(2), 801));
+        expect![[r#"
+            touch: Quiet
+            touch: Persist(HotMeta { size: 10, mtime_ns: 3, last_used: 801 })
+            touch: Absent
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn sweep_drops_what_is_not_live_and_not_pinned() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 10, 0, 1);
         ix.put(h(2), 20, 0, 1);
         ix.put(h(3), 30, 0, 1000);
         assert!(ix.pin_all(&[h(2)]));
         let gone = ix.sweep(&|x| *x == h(4), 100, 1050);
-        assert_eq!(gone, vec![Evicted { hash: h(1), cold: false, freed: 10 }]);
+        outcomes.record("gone", gone);
         ix.unpin_all(&[h(2)]);
         let gone = ix.sweep(&|_| false, 0, 1050);
-        assert_eq!(gone.len(), 2);
+        outcomes.record("sweep after unpin", gone);
         assert!(!ix.pin_all(&[h(1)]));
         ix.invariants();
+        expect![[r#"
+            gone: [Evicted { hash: 0101010101010101, cold: false, freed: 10 }]
+            sweep after unpin: [Evicted { hash: 0202020202020202, cold: false, freed: 20 }, Evicted { hash: 0303030303030303, cold: false, freed: 30 }]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

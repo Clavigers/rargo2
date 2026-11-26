@@ -1,9 +1,10 @@
+use rargo_machine::StateMachine;
 use rargo_net::io::file::PathRing as _;
 use rargo_proto::Digest;
 use rargo_proto::tree::{Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::{self, ErrorKind, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -23,7 +24,7 @@ const RACY_NS: i64 = 50_000_000;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Index {
-    pub files: HashMap<Vec<u8>, Entry>,
+    pub files: BTreeMap<Vec<u8>, Entry>,
 }
 
 fn index_from_bytes(raw: Option<&[u8]>) -> Index {
@@ -50,12 +51,12 @@ impl Index {
 #[derive(Clone)]
 pub struct Scan {
     pub root: Digest,
-    pub trees: HashMap<Digest, Vec<u8>>,
-    pub files: HashMap<Digest, (PathBuf, u64)>,
-    refs: HashMap<Digest, u32>,
+    pub trees: BTreeMap<Digest, Vec<u8>>,
+    pub files: BTreeMap<Digest, (PathBuf, u64)>,
+    refs: BTreeMap<Digest, u32>,
     grafted: Vec<Digest>,
     pub dirs: Vec<PathBuf>,
-    pub dir_trees: HashMap<Vec<u8>, Digest>,
+    pub dir_trees: BTreeMap<Vec<u8>, Digest>,
     worktree_root: Vec<u8>,
     pub listed_dirs: u64,
     pub index: Index,
@@ -67,12 +68,12 @@ pub struct Scan {
 
 #[derive(Default)]
 struct ScanState {
-    trees: HashMap<Digest, Vec<u8>>,
-    files: HashMap<Digest, (PathBuf, u64)>,
-    refs: HashMap<Digest, u32>,
-    dir_trees: HashMap<Vec<u8>, Digest>,
-    index: HashMap<Vec<u8>, Entry>,
-    relink: HashSet<Digest>,
+    trees: BTreeMap<Digest, Vec<u8>>,
+    files: BTreeMap<Digest, (PathBuf, u64)>,
+    refs: BTreeMap<Digest, u32>,
+    dir_trees: BTreeMap<Vec<u8>, Digest>,
+    index: BTreeMap<Vec<u8>, Entry>,
+    relink: BTreeSet<Digest>,
     listed_dirs: u64,
     removed: u64,
     hashed_files: u64,
@@ -138,9 +139,9 @@ fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Ignored {
-    paths: HashSet<Vec<u8>>,
+    paths: BTreeSet<Vec<u8>>,
     include: Vec<String>,
-    on_way: HashSet<Vec<u8>>,
+    on_way: BTreeSet<Vec<u8>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -226,7 +227,7 @@ enum Observed {
 struct ScanPlan<'a> {
     old: Option<&'a Index>,
     previous: Option<&'a Scan>,
-    on_path: Option<&'a HashSet<Vec<u8>>>,
+    on_path: Option<&'a BTreeSet<Vec<u8>>>,
     exclude: &'a [String],
     ignored: Option<&'a Ignored>,
 }
@@ -354,7 +355,7 @@ pub fn scan(root: &Path, old: &Index, exclude: &[String], ignored: Option<&Ignor
     drive(ScanCore::whole(root, Some(old), exclude, ignored))
 }
 
-pub fn rescan(root: &Path, prev: Scan, changed: &HashSet<PathBuf>, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
+pub fn rescan(root: &Path, prev: Scan, changed: &BTreeSet<PathBuf>, exclude: &[String], ignored: Option<&Ignored>) -> io::Result<Scan> {
     drive(ScanCore::rescan(root, prev, changed, exclude, ignored))
 }
 
@@ -421,7 +422,7 @@ fn graft_into(scan: &mut Scan, mut sub: Scan, history: Option<Scan>, gitfile: Op
     Ok(())
 }
 
-fn merge(trees: &mut HashMap<Digest, Vec<u8>>, a: Digest, b: Digest) -> io::Result<Digest> {
+fn merge(trees: &mut BTreeMap<Digest, Vec<u8>>, a: Digest, b: Digest) -> io::Result<Digest> {
     let mut out = Tree::decode(&trees[&a])?;
     for (name, node) in Tree::decode(&trees[&b])?.entries {
         let node = match (out.get(&name).cloned(), node) {
@@ -478,7 +479,7 @@ fn finish_scan(root: &Path, old: Option<&Index>, previous: Option<Scan>, observe
     }
     let worktree_root = state.trees.get(&root_digest).cloned().unwrap_or_default();
     if state.trees.len() > 2 * state.dir_trees.len() + 256 {
-        let live: HashSet<_> = state.dir_trees.values().collect();
+        let live: BTreeSet<_> = state.dir_trees.values().collect();
         state.trees.retain(|d, _| live.contains(d));
     }
     let mut dirs: Vec<_> = state.dir_trees.keys().map(|rel| if rel.is_empty() { root.to_path_buf() } else { root.join(OsStr::from_bytes(rel)) }).collect();
@@ -576,7 +577,7 @@ struct ScanCore<'a> {
     root_path: &'a Path,
     old: Option<&'a Index>,
     previous: Option<Scan>,
-    on_path: Option<HashSet<Vec<u8>>>,
+    on_path: Option<BTreeSet<Vec<u8>>>,
     exclude: &'a [String],
     ignored: Option<&'a Ignored>,
     dirs: BTreeMap<Vec<u8>, DirBuild>,
@@ -589,7 +590,7 @@ impl<'a> ScanCore<'a> {
         Self::open(root_path, old, None, None, exclude, ignored)
     }
 
-    fn rescan(root_path: &'a Path, previous: Scan, changed: &HashSet<PathBuf>, exclude: &'a [String], ignored: Option<&'a Ignored>) -> Self {
+    fn rescan(root_path: &'a Path, previous: Scan, changed: &BTreeSet<PathBuf>, exclude: &'a [String], ignored: Option<&'a Ignored>) -> Self {
         let on_path = Some(changed_directories(root_path, changed));
         Self::open(root_path, None, Some(previous), on_path, exclude, ignored)
     }
@@ -598,7 +599,7 @@ impl<'a> ScanCore<'a> {
         root_path: &'a Path,
         old: Option<&'a Index>,
         previous: Option<Scan>,
-        on_path: Option<HashSet<Vec<u8>>>,
+        on_path: Option<BTreeSet<Vec<u8>>>,
         exclude: &'a [String],
         ignored: Option<&'a Ignored>,
     ) -> Self {
@@ -855,42 +856,6 @@ impl<'a> ScanCore<'a> {
         asks
     }
 
-    fn invariants(&self) -> bool {
-        if self.on_path.as_ref().is_some_and(|paths| !paths.contains(b"".as_slice())) {
-            return false;
-        }
-        if self.pending.iter().any(|pend| !self.pending_ok(pend)) {
-            return false;
-        }
-        for (rel, dir) in &self.dirs {
-            if !rel_well_formed(rel) {
-                return false;
-            }
-            match &dir.phase {
-                Phase::Listing(rows) => {
-                    if !rows_ok(rel, rows, &self.dirs) {
-                        return false;
-                    }
-                }
-                Phase::Done(Directory::Listing(listing)) => {
-                    if !names_increase(listing.iter().map(|(name, _)| name.as_slice())) {
-                        return false;
-                    }
-                }
-                Phase::Done(Directory::Reuse(_)) | Phase::NeedList | Phase::Folded | Phase::Gone => {}
-            }
-        }
-        if self.outcome.is_none() && self.dirs.values().any(|dir| matches!(dir.phase, Phase::Done(_))) && !self.root_done() {
-            return false;
-        }
-        if let Some(prev) = &self.previous {
-            if prev.dir_trees.iter().any(|(rel, hash)| !rel.is_empty() && !prev.trees.contains_key(hash)) {
-                return false;
-            }
-        }
-        self.outcome.as_ref().is_none_or(|scan| scan_holds(scan, self.root_path))
-    }
-
     fn pending_ok(&self, pend: &Pending) -> bool {
         let Some(dir) = self.dirs.get(&pend.rel) else { return false };
         match pend.kind {
@@ -905,8 +870,39 @@ impl<'a> ScanCore<'a> {
     }
 }
 
-fn changed_directories(root: &Path, changed: &HashSet<PathBuf>) -> HashSet<Vec<u8>> {
-    let mut on_path = HashSet::from([Vec::new()]);
+impl<'a> StateMachine for ScanCore<'a> {
+    fn invariants(&self) {
+        assert!(
+            self.on_path.as_ref().is_none_or(|paths| paths.contains(b"".as_slice())),
+            "the directories on the path include the root"
+        );
+        assert!(self.pending.iter().all(|pend| self.pending_ok(pend)), "every pending look is one the scan can still use");
+        for (rel, dir) in &self.dirs {
+            let at = String::from_utf8_lossy(rel);
+            assert!(rel_well_formed(rel), "{at:?} is a well-formed relative path");
+            match &dir.phase {
+                Phase::Listing(rows) => assert!(rows_ok(rel, rows, &self.dirs), "the rows listed for {at:?} agree with the directories"),
+                Phase::Done(Directory::Listing(listing)) => {
+                    assert!(names_increase(listing.iter().map(|(name, _)| name.as_slice())), "the listing of {at:?} is sorted")
+                }
+                Phase::Done(Directory::Reuse(_)) | Phase::NeedList | Phase::Folded | Phase::Gone => {}
+            }
+        }
+        if self.outcome.is_none() && self.dirs.values().any(|dir| matches!(dir.phase, Phase::Done(_))) {
+            assert!(self.root_done(), "once a directory is done the root is done, until the scan finishes");
+        }
+        if let Some(prev) = &self.previous {
+            assert!(
+                prev.dir_trees.iter().all(|(rel, hash)| rel.is_empty() || prev.trees.contains_key(hash)),
+                "every directory tree of the previous scan is one of its trees"
+            );
+        }
+        assert!(self.outcome.as_ref().is_none_or(|scan| scan_holds(scan, self.root_path)), "the finished scan holds");
+    }
+}
+
+fn changed_directories(root: &Path, changed: &BTreeSet<PathBuf>) -> BTreeSet<Vec<u8>> {
+    let mut on_path = BTreeSet::from([Vec::new()]);
     for dir in changed {
         let Ok(rel) = dir.strip_prefix(root) else { continue };
         let mut rel = rel.as_os_str().as_bytes();
@@ -925,11 +921,11 @@ fn drive(mut core: ScanCore) -> io::Result<Scan> {
     loop {
         match core.advance(std::mem::take(&mut answers))? {
             Step::Ask(asks) => {
-                assert!(core.invariants());
+                core.invariants();
                 answers = read_host(core.root_path, &asks);
             }
             Step::Done => {
-                assert!(core.invariants());
+                core.invariants();
                 return Ok(core.outcome.take().expect("a finished scan is present"));
             }
         }
@@ -1207,13 +1203,13 @@ mod tests {
     }
 
     fn run(core: &mut ScanCore, model: &Model) -> io::Result<Scan> {
-        assert!(core.invariants(), "invariants before the first step");
+        rargo_machine::check(&core, "invariants before the first step");
         let mut answers = Vec::new();
         let mut steps = 0u32;
         loop {
             let step = core.advance(std::mem::take(&mut answers))?;
             steps += 1;
-            assert!(core.invariants(), "invariants after step {steps}");
+            rargo_machine::check(&core, format_args!("invariants after step {steps}"));
             match step {
                 Step::Ask(asks) => answers = model.answer(&asks),
                 Step::Done => return Ok(core.outcome.take().expect("a finished scan")),
@@ -1225,7 +1221,7 @@ mod tests {
         run(&mut ScanCore::whole(root, Some(old), exclude, ignored), model).unwrap()
     }
 
-    fn rescan_of(root: &Path, model: &Model, prev: Scan, changed: &HashSet<PathBuf>, exclude: &[String], ignored: Option<&Ignored>) -> Scan {
+    fn rescan_of(root: &Path, model: &Model, prev: Scan, changed: &BTreeSet<PathBuf>, exclude: &[String], ignored: Option<&Ignored>) -> Scan {
         run(&mut ScanCore::rescan(root, prev, changed, exclude, ignored), model).unwrap()
     }
 
@@ -1298,7 +1294,7 @@ mod tests {
         put(&mut model.root, "src/deep/x.rs", Mem::File { bytes: b"changed".to_vec(), mtime_ns: SETTLED, ctime_ns: SETTLED, ino: 3, exec: false });
         put(&mut model.root, "src/deep/new/y.rs", file("y", 10));
         drop_at(&mut model.root, "docs/old");
-        let told: HashSet<PathBuf> = [root.join("src/deep"), root.join("docs"), root.join("docs/old")].into_iter().collect();
+        let told: BTreeSet<PathBuf> = [root.join("src/deep"), root.join("docs"), root.join("docs/old")].into_iter().collect();
         let s1 = rescan_of(root, &model, s0, &told, &exclude, None);
         same(&s1, &whole(&model), root, &model.root);
         assert_eq!(s1.listed_dirs, 5);
@@ -1328,10 +1324,10 @@ mod tests {
         same(&s5, &whole(&model), root, &model.root);
         assert!(!s5.files.contains_key(&shared));
 
-        let s6 = rescan_of(root, &model, s5.clone(), &HashSet::new(), &exclude, None);
+        let s6 = rescan_of(root, &model, s5.clone(), &BTreeSet::new(), &exclude, None);
         same(&s6, &s5, root, &model.root);
         assert_eq!(s6.listed_dirs, 1);
-        let outside: HashSet<PathBuf> = [PathBuf::from("/elsewhere")].into_iter().collect();
+        let outside: BTreeSet<PathBuf> = [PathBuf::from("/elsewhere")].into_iter().collect();
         let skipped = rescan_of(root, &model, s6.clone(), &outside, &exclude, None);
         assert_eq!(skipped.root, s6.root);
         assert_eq!(skipped.listed_dirs, 1);
@@ -1342,7 +1338,7 @@ mod tests {
         let mut grafted = s6.clone();
         graft_into(&mut grafted, git_scan, None, None).unwrap();
         assert_ne!(grafted.root, s6.root);
-        same(&rescan_of(root, &model, grafted, &HashSet::new(), &exclude, None), &s6, root, &model.root);
+        same(&rescan_of(root, &model, grafted, &BTreeSet::new(), &exclude, None), &s6, root, &model.root);
     }
 
     #[test]
@@ -1570,16 +1566,16 @@ mod tests {
     fn a_missing_root_is_an_error_and_an_unreadable_file_names_its_path() {
         let empty = Index::default();
         let mut core = ScanCore::whole(Path::new("/missing"), Some(&empty), &[], None);
-        assert!(core.invariants());
+        core.invariants();
         let Step::Ask(asks) = core.advance(Vec::new()).unwrap() else { panic!("the root is listed") };
-        assert!(core.invariants());
+        core.invariants();
         assert!(matches!(asks.as_slice(), [Ask::List { rel }] if rel.is_empty()));
         let err = match core.advance(vec![Answer::List(Err(io::Error::new(ErrorKind::NotFound, "gone")))]) {
             Err(err) => err,
             Ok(_) => panic!("a missing root is an error"),
         };
         assert_eq!(err.kind(), ErrorKind::NotFound);
-        assert!(core.invariants());
+        core.invariants();
 
         let root = Path::new("/mem");
         let mut tree = dir();

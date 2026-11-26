@@ -147,7 +147,7 @@ fn main() -> Result<()> {
     }
     rargo_core::io::file::create_dir_all(&mnt).with_context(|| format!("making the mountpoint {}", mnt.display()))?;
     let session = Arc::new(
-        fusewire::Session::mount(
+        fusewire::Session::mount_uring(
             &mnt,
             &fusewire::MountOptions { fsname: "rargo".into(), passthrough: opts.passthrough, ..Default::default() },
         )
@@ -171,7 +171,10 @@ fn main() -> Result<()> {
         let jobs = opts.jobs as u32;
         let (engine, session, fuse_fs) = (engine.clone(), session.clone(), fuse_fs.clone());
         io::drive(4, move || {
-            rargo_core::io::FuseDrive::spawn(&session, &fuse_fs).detach();
+            match rargo_core::io::FuseDrive::spawn(&session, &fuse_fs) {
+                Ok(drive) => drive.detach(),
+                Err(err) => stop(&session, Err(err.into())),
+            }
             let result = rargo_core::remote::worker_main(engine, server, jobs, key);
             stop(&session, result);
         });
@@ -217,7 +220,10 @@ fn main() -> Result<()> {
     let http_state = state.clone();
     let keys = Arc::new(keys);
     io::drive(4, move || {
-        rargo_core::io::FuseDrive::spawn(&session, &fuse_fs).detach();
+        match rargo_core::io::FuseDrive::spawn(&session, &fuse_fs) {
+            Ok(drive) => drive.detach(),
+            Err(err) => stop(&session, Err(err.into())),
+        }
         io::background(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
             match rargo_core::remote::Pool::listen(&daemon.engine, addr, key) {

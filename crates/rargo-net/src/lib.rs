@@ -3,6 +3,7 @@ mod conn;
 mod endpoint;
 mod handshake;
 
+use rargo_machine::StateMachine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 pub mod io;

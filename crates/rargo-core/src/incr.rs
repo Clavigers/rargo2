@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use crate::db::{Table, Tables};
 use crate::hash::Hash;
 use crate::store::{Blobs, Store};
@@ -188,21 +190,6 @@ impl IncrStore {
         }
     }
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let mut by_crate: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
-        for (k, _) in self.db.scan_prefix(Table::Incr, &[]) {
-            if let (Some(c), Some(id)) = (k.get(..32), k.get(32..40)) {
-                by_crate.entry(c.try_into().unwrap()).or_default().push(u64::from_be_bytes(id.try_into().unwrap()));
-            }
-        }
-        let next = self.next.load(Ordering::Relaxed);
-        by_crate.iter().all(|(c, ids)| {
-            let listed = self.list(&Hash(*c));
-            ids.iter().all(|id| *id < next) && listed.len() == ids.len() && doomed(&listed).is_empty()
-        })
-    }
-
     pub fn discard(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
         self.stats.discarded_after_crash.fetch_add(1, Ordering::Relaxed);
@@ -212,7 +199,7 @@ impl IncrStore {
         self.db.delete(Table::Incr, &key(crate_key, id));
     }
 
-    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
+    pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
         let mut metas: Vec<StateMeta> = Vec::new();
         for (_, v) in self.db.scan_prefix(Table::Incr, &[]) {
             if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
@@ -327,6 +314,25 @@ impl IncrStore {
     }
 }
 
+#[cfg(test)]
+impl StateMachine for IncrStore {
+    fn invariants(&self) {
+        let mut by_crate: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
+        for (k, _) in self.db.scan_prefix(Table::Incr, &[]) {
+            if let (Some(c), Some(id)) = (k.get(..32), k.get(32..40)) {
+                by_crate.entry(c.try_into().unwrap()).or_default().push(u64::from_be_bytes(id.try_into().unwrap()));
+            }
+        }
+        let next = self.next.load(Ordering::Relaxed);
+        for (c, ids) in &by_crate {
+            let listed = self.list(&Hash(*c));
+            assert!(ids.iter().all(|id| *id < next), "every stored id {ids:?} was handed out, below {next}");
+            assert_eq!(listed.len(), ids.len(), "the list of a crate is every entry stored for it");
+            assert!(doomed(&listed).is_empty(), "nothing kept for a crate is due to be evicted");
+        }
+    }
+}
+
 fn doomed(newest_first: &[(u64, StateMeta)]) -> Vec<u64> {
     let mut seen_worktrees: Vec<&str> = Vec::new();
     let mut extra = 0;
@@ -375,6 +381,8 @@ pub fn apply_changes(dir: &[u8], seed: Option<&Manifest>, changes: &[(Vec<u8>, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     use crate::db::MemTables;
     use crate::store::MemBlobs;
@@ -397,6 +405,7 @@ mod tests {
 
     #[test]
     fn seed_preference_order() {
+        let mut outcomes = Transcript::default();
         let (db, s) = store();
         let incr = IncrStore::new(db.clone(), s.clone(), 1);
         let k = Hash::of(b"crate");
@@ -404,58 +413,71 @@ mod tests {
         let side = [2u8; 20];
         assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
         incr.save(&k, "/wt/main", Some(main), &manifest(&s, &[("/i/x", "main state")]), 100);
-        assert!(incr.invariants());
+        incr.invariants();
         incr.save(&k, "/wt/side", Some(side), &manifest(&s, &[("/i/x", "side state")]), 100);
-        assert!(incr.invariants());
+        incr.invariants();
         let content = |m: &Manifest| match &m.entries[0].1 {
             MEntry::File { hash, .. } => String::from_utf8(s.read(hash).unwrap()).unwrap(),
             _ => unreachable!(),
         };
         let s1 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s1.manifest).as_str(), s1.kind), ("main state", SeedKind::Ancestor));
-        assert_eq!(s1.blobs.len(), 1);
+        incr.invariants();
+        outcomes.record("nearest ancestor seed", (content(&s1.manifest).as_str(), s1.kind));
+        outcomes.record("seed blob count", s1.blobs.len());
         let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
+        incr.invariants();
+        outcomes.record("recent fallback seed", (content(&s2.manifest).as_str(), s2.kind));
         incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]), 100);
-        assert!(incr.invariants());
+        incr.invariants();
         let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
         let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
+        incr.invariants();
+        outcomes.record("same commit seed", (content(&s3.manifest).as_str(), s3.kind));
         incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]), 100);
-        assert!(incr.invariants());
+        incr.invariants();
         let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
         let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s5.manifest).as_str(), s5.kind), ("one commit back", SeedKind::Ancestor));
+        incr.invariants();
+        outcomes.record("closer ancestor seed", (content(&s5.manifest).as_str(), s5.kind));
         incr.forget(&k, s5.id);
-        assert!(incr.invariants());
+        incr.invariants();
         incr.discard(&k, s3.id);
-        assert!(incr.invariants());
+        incr.invariants();
         let s4 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
-        assert!(incr.invariants());
-        assert_eq!(content(&s4.manifest), "main state");
+        incr.invariants();
+        outcomes.record("content", content(&s4.manifest));
+        expect![[r#"
+            nearest ancestor seed: ("main state", Ancestor)
+            seed blob count: 1
+            recent fallback seed: ("side state", Other)
+            same commit seed: ("own state", SameWorktree)
+            closer ancestor seed: ("one commit back", Ancestor)
+            content: "main state"
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn evicted_state_is_skipped() {
+        let mut outcomes = Transcript::default();
         let (db, s) = store();
         let incr = IncrStore::new(db.clone(), s.clone(), 1);
         let k = Hash::of(b"crate");
         let m = manifest(&s, &[("/i/x", "will be evicted")]);
         incr.save(&k, "/wt/a", None, &m, 100);
-        assert!(incr.invariants());
+        incr.invariants();
         if let MEntry::File { hash, .. } = &m.entries[0].1 {
             s.held.lock().remove(hash);
         }
         assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-        assert_eq!(incr.state_count(&k), 0);
+        outcomes.record("state count", incr.state_count(&k));
+        expect![[r#"
+            state count: 0
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn state_with_files_on_a_worker_is_usable_while_the_worker_holds_them() {
+        let mut outcomes = Transcript::default();
         let (db, s) = store();
         let incr = IncrStore::new(db.clone(), s.clone(), 1);
         let k = Hash::of(b"crate");
@@ -466,18 +488,23 @@ mod tests {
         let mut m = manifest(&s, &[("/i/here", "at home")]);
         m.entries.push((b"/i/there".to_vec(), MEntry::File { hash: away, exec: false, size: 33 }));
         incr.save(&k, "/wt/a", None, &m, 100);
-        assert!(incr.invariants());
+        incr.invariants();
         let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
-        assert!(incr.invariants());
+        incr.invariants();
         assert!(seed.blobs.contains(&(away, 33)));
-        assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
+        outcomes.record("blobs absent locally", seed.blobs.iter().filter(|(h, _)| !s.has(h)).count());
         connected.store(false, Ordering::Relaxed);
         assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-        assert_eq!(incr.state_count(&k), 0);
+        outcomes.record("state count", incr.state_count(&k));
+        expect![[r#"
+            blobs absent locally: 1
+            state count: 0
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn changes_apply_over_seed() {
+        let mut outcomes = Transcript::default();
         let f = |n: u8| MEntry::File { hash: Hash([n; 32]), exec: false, size: 1 };
         let seed = Manifest {
             entries: vec![
@@ -494,7 +521,10 @@ mod tests {
         ];
         let m = apply_changes(b"/i", Some(&seed), &changes);
         let paths: Vec<&[u8]> = m.entries.iter().map(|(p, _)| p.as_slice()).collect();
-        assert_eq!(paths, vec![&b"/i/c/s-new"[..], b"/i/c/s-new/a.o", b"/i/c/s-new/dep-graph.bin"]);
+        outcomes.record("paths", paths);
+        expect![[r#"
+            paths: [[47, 105, 47, 99, 47, 115, 45, 110, 101, 119], [47, 105, 47, 99, 47, 115, 45, 110, 101, 119, 47, 97, 46, 111], [47, 105, 47, 99, 47, 115, 45, 110, 101, 119, 47, 100, 101, 112, 45, 103, 114, 97, 112, 104, 46, 98, 105, 110]]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
@@ -539,7 +569,7 @@ mod tests {
                         newest.insert((c, wt), id);
                     }
                 }
-                assert!(incr.invariants(), "seed {seed} step {step}");
+                rargo_machine::check(&incr, format_args!("seed {seed} step {step}"));
                 for (c, k) in crates.iter().enumerate() {
                     let listed = incr.list(k);
                     let distinct: std::collections::BTreeSet<&str> = listed.iter().map(|(_, m)| m.worktree.as_str()).collect();
@@ -569,7 +599,7 @@ mod tests {
         for round in 0..6 {
             for wt in ["/wt/a", "/wt/b"] {
                 incr.save(&k, wt, None, &manifest(&s, &[("/i/x", &format!("{wt} {round}"))]), 100);
-                assert!(incr.invariants());
+                incr.invariants();
             }
         }
         assert_eq!(incr.state_count(&k), 2 + KEEP_EXTRA);

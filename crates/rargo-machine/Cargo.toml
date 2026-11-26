@@ -1,0 +1,10 @@
+[package]
+name = "rargo-machine"
+description = "The state-machine trait every rargo state machine implements"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use rargo_proto::outline::{self, Cv, GROUP};
 use rargo_proto::Digest;
 use rargo_net::io::file::File;
@@ -220,18 +222,25 @@ impl RangeState {
             }
         }
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.offsets.len() == self.recipe.len() && self.chunks.len() == self.recipe.len()
-            && self.region.len() == self.chunks.len()
-            && self.region.iter().all(|&r| (r as usize) < self.started.len())
-            && self.good == self.groups.iter().filter(|&&g| g == Group::Good).count()
-            && (!self.done || self.good == self.groups.len())
-            && self.groups.iter().enumerate().all(|(g, group)| {
-                let (start, end) = outline::group_range(g, self.size);
-                *group == Group::Unproven || self.chunks_of(start, end).all(|c| self.chunks[c] == Chunk::Here)
-            })
+#[cfg(test)]
+impl StateMachine for RangeState {
+    fn invariants(&self) {
+        assert_eq!(self.offsets.len(), self.recipe.len(), "every chunk of the recipe has an offset");
+        assert_eq!(self.chunks.len(), self.recipe.len(), "every chunk of the recipe has a state");
+        assert_eq!(self.region.len(), self.chunks.len(), "every chunk has a region");
+        assert!(self.region.iter().all(|&r| (r as usize) < self.started.len()), "every chunk's region is a started region");
+        let good = self.groups.iter().filter(|&&g| g == Group::Good).count();
+        assert_eq!(self.good, good, "the count of good groups is the number of good groups");
+        assert!(!self.done || self.good == self.groups.len(), "a done file has only good groups");
+        for (g, group) in self.groups.iter().enumerate() {
+            let (start, end) = outline::group_range(g, self.size);
+            assert!(
+                *group == Group::Unproven || self.chunks_of(start, end).all(|c| self.chunks[c] == Chunk::Here),
+                "group {g} is proven only once every chunk of it is here"
+            );
+        }
     }
 }
 
@@ -394,12 +403,12 @@ mod tests {
 
     fn state(data: &[u8], lazy: &[(u64, u64)]) -> RangeState {
         let state = RangeState::new(blake3::hash(data).as_bytes(), data.len() as u64, recipe(data), outline::outline(data), lazy).unwrap();
-        assert!(state.invariants());
+        state.invariants();
         state
     }
 
     fn requested(state: &RangeState, read: Read) -> (Vec<u32>, Vec<u32>) {
-        assert!(state.invariants());
+        state.invariants();
         let Read::Fetch { needed, prefetch } = read else { panic!("expected a fetch") };
         (needed, prefetch)
     }
@@ -413,10 +422,10 @@ mod tests {
             assert!(RangeState::valid_chunk(&state.recipe[i], &data[start..end]));
             file[start..end].copy_from_slice(&data[start..end]);
             let proofs = state.stored(chunk);
-            assert!(state.invariants());
+            state.invariants();
             for proof in proofs {
                 state.proved(proof.group, proof.verify(&file[proof.start as usize..proof.end as usize]));
-                assert!(state.invariants());
+                state.invariants();
             }
         }
     }
@@ -429,19 +438,19 @@ mod tests {
         let read = state.read(0, 1, false);
         let (needed, prefetch) = requested(&state, read);
         assert!(matches!(state.read(1, 3, false), Read::Wait));
-        assert!(state.invariants());
+        state.invariants();
 
         state.failed(&needed);
-        assert!(state.invariants());
+        state.invariants();
         assert!(matches!(state.read(0, 1, true), Read::Failed));
-        assert!(state.invariants());
+        state.invariants();
         let read = state.read(0, 1, false);
         let (retry, extra) = requested(&state, read);
         assert_eq!(retry, needed);
         assert!(extra.is_empty());
         deliver(&mut state, retry.into_iter().chain(prefetch), &data, &mut file);
         assert!(matches!(state.read(1, 3, true), Read::Ready));
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(&file[..3], &data[..3]);
         assert!(!state.can_place());
 
@@ -449,7 +458,7 @@ mod tests {
         let (needed, prefetch) = requested(&state, read);
         deliver(&mut state, needed.into_iter().chain(prefetch), &data, &mut file);
         assert!(matches!(state.read(0, data.len() as u64, false), Read::Ready));
-        assert!(state.invariants());
+        state.invariants();
         assert!(state.can_place());
         assert_eq!(file, data);
     }
@@ -465,15 +474,15 @@ mod tests {
 
         let hash = blake3::hash(&original);
         let mut state = RangeState::new(hash.as_bytes(), original.len() as u64, recipe(&wrong), outline::outline(&original), &[]).unwrap();
-        assert!(state.invariants());
+        state.invariants();
         let read = state.read(0, original.len() as u64, false);
         let (needed, prefetch) = requested(&state, read);
         let mut file = vec![0; original.len()];
         deliver(&mut state, needed.into_iter().chain(prefetch), &wrong, &mut file);
         assert!(matches!(state.read(GROUP, GROUP + 1, false), Read::BadHash));
-        assert!(state.invariants());
+        state.invariants();
         assert!(matches!(state.read(0, GROUP, false), Read::Ready));
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(file[..GROUP as usize], original[..GROUP as usize]);
         assert!(!state.can_place());
 

@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::io::file::PathRing as _;
 use crate::buildview::*;
 use crate::engine::*;
@@ -28,7 +29,7 @@ use std::time::Instant;
 mod nextest;
 mod pure;
 mod request;
-mod nextest_run;
+pub mod nextest_run;
 
 use request::{BuildRequest, Effect, End, Go, OnFailure, Unit};
 
@@ -72,7 +73,7 @@ pub struct Daemon {
     pub(crate) nix_attached: Arc<Mutex<HashSet<String>>>,
     pub drift_report: Mutex<Option<String>>,
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
+    pub deliveries: Mutex<std::collections::BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>>,
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
@@ -256,7 +257,7 @@ impl Daemon {
             nix_attached: Arc::new(Mutex::new(HashSet::new())),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
-            deliveries: Mutex::new(HashMap::new()),
+            deliveries: Mutex::new(std::collections::BTreeMap::new()),
             client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
             cfg,
             engine,
@@ -374,7 +375,7 @@ impl Daemon {
     }
 
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
-        let mut live = HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         self.engine.traces.mark(&mut live);
         self.incr.mark(&mut live);
         self.trees.mark(&mut live);
@@ -503,14 +504,6 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     };
     let base = parts.build(d.memo.clone(), generation, false);
     let plan_base: Arc<dyn View> = Arc::new(Hosted::new(parts.build(d.memo.clone(), generation, true)));
-    let tr = Translator::new(vec![
-        (String::from_utf8_lossy(WORKTREE_AT).into_owned(), c.root.clone()),
-        (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), c.cargo_home.clone()),
-    ]);
-    let sandbox_cwd = tr.to_canonical(&c.cwd);
-    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
-        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
-    }
     let client_env = c.env.to_map();
     let mut env = base_env(&d.cfg.server_env, &client_env);
     for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
@@ -524,6 +517,11 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
+    }
+    let tr = build_paths(&c.root, &c.cargo_home, &mut env);
+    let sandbox_cwd = tr.to_canonical(&c.cwd);
+    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
+        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
     }
     let channel = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd)?.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
     Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, channel })
@@ -939,7 +937,7 @@ if c.session.is_some() && !c.worktree.is_empty() {
     last.insert(
         c.worktree.clone(),
         crate::drift::LastClient {
-            env: Arc::new(c.env.to_map()),
+            env: Arc::new(c.env.to_map().into_iter().collect()),
             home: c.home.clone(),
             root: c.root.clone(),
             dir,
@@ -2942,7 +2940,7 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
     (!missing.is_empty()).then(|| {
         let names = missing.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ");
         format!(
-            "the build script of `{package}` asked pkg-config for {names}, which the build's flake does not provide; rargo builds in the dev shell of the project's flake.nix, or in its default flake when there is none: add the library to that shell's buildInputs (see https://github.com/sadosystems/rargo2#toolchain-and-system-libraries)"
+            "the build script of `{package}` asked pkg-config for {names}, which the build's flake does not provide; rargo builds in the dev shell of the project's flake.nix, or in its default flake when there is none: add the library to that shell's buildInputs (see https://github.com/Clavigers/rargo2#toolchain-and-system-libraries)"
         )
     })
 }

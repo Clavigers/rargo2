@@ -256,7 +256,7 @@ impl Trees {
         self.recent.lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
-    pub fn mark(&self, live: &mut HashSet<Hash>) {
+    pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
         let roots: Vec<Hash> = self.recent.lock().values().map(|s| s.id).collect();
         let mut stack = roots;
         while let Some(d) = stack.pop() {
@@ -462,6 +462,7 @@ pub fn chown(path: &Path, uid: u32, gid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rargo_machine::StateMachine;
     use crate::db::Db;
 
     #[derive(Default)]
@@ -707,7 +708,7 @@ mod tests {
         assert!(!out.join("src").exists());
         std::fs::write(out.join("Cargo.toml"), b"changed").unwrap();
         assert_eq!(s2.read(b"Cargo.toml").unwrap(), b"[package]");
-        let mut live = HashSet::new();
+        let mut live = std::collections::BTreeSet::new();
         trees.remember("wt", &s2);
         trees.mark(&mut live);
         assert!(live.contains(&lock) && live.contains(&s2.id));

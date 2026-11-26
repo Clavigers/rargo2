@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow, bail};
 use parking_lot::Mutex;
 use rargo_proto::secure::{self, Opener, Sealer};
 use rargo_proto::{ClientMsg, Delivery, Digest, ServerMsg, Write};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -147,7 +147,7 @@ impl Session {
         }
     }
 
-    pub fn delivered(&self) -> HashSet<Digest> {
+    pub fn delivered(&self) -> BTreeSet<Digest> {
         self.state.lock().delivered().iter().copied().collect()
     }
 

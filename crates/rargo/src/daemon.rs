@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use rargo_net::io::file::PathRing as _;
 use rargo_proto::waits::{self, Wait};
 use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
@@ -416,8 +417,10 @@ impl CommandState {
         self.phase = CommandPhase::Finished;
         Some(reply)
     }
+}
 
-    #[cfg(test)]
+#[cfg(test)]
+impl StateMachine for CommandState {
     fn invariants(&self) {
         assert!(self.changes <= 5 && self.heard.len() <= HEARD_MAX);
         assert!(self.fetching.as_ref().is_none_or(|(_, hashes)| !hashes.is_empty()), "a fetch asks for something");
@@ -678,7 +681,7 @@ impl Daemon {
             (ScanPlan::Reuse, None) => true,
             (ScanPlan::Scan { everything }, _) => everything,
         };
-        let mut changed: HashSet<PathBuf> = std::mem::take(&mut *wt.events.lock().unwrap());
+        let mut changed: std::collections::BTreeSet<PathBuf> = std::mem::take(&mut *wt.events.lock().unwrap()).into_iter().collect();
         changed.extend(st.unwatched.iter().cloned());
         if let Some(w) = &self.watcher {
             changed.extend(st.watched.iter().filter(|(d, wd)| !w.watches(**wd, d)).map(|(d, _)| d.clone()));
@@ -956,7 +959,7 @@ impl Daemon {
         }
     }
 
-    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> Option<(Arc<OutFs>, PathBuf)> {
+    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
         let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
             || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
@@ -968,11 +971,11 @@ impl Daemon {
                 m.fs.save();
                 io::blocking(|| m.session.unmount());
             }
-            return None;
+            return Ok(None);
         }
         if let Some(m) = &*g {
             if m.session.shown() && dev_at(&mountinfo(), &m.dir) == Some(m.dev) {
-                return Some((m.fs.clone(), m.dir.clone()));
+                return Ok(Some((m.fs.clone(), m.dir.clone())));
             }
             if let Some(m) = g.take() {
                 m.fs.save();
@@ -980,19 +983,20 @@ impl Daemon {
             }
         }
         if wt.out_failed.load(Ordering::SeqCst) && var(&req.vars, "RARGO_OUTPUT") != Some("fuse") {
-            return None;
+            return Ok(None);
         }
         match self.mount_out(wt) {
             Ok(m) => {
                 let r = (m.fs.clone(), m.dir.clone());
                 *g = Some(m);
-                Some(r)
+                Ok(Some(r))
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Err(e),
             Err(e) => {
                 if !wt.out_failed.swap(true, Ordering::SeqCst) {
                     eprintln!("rargo daemon: {}: no virtual output directory ({e}); results are copied into it", wt.root.display());
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -1018,9 +1022,9 @@ impl Daemon {
             passthrough: true,
             auto_unmount: true,
         };
-        let session = Arc::new(io::blocking(|| fusewire::Session::mount(&dir, &opts))?);
+        let session = Arc::new(io::blocking(|| fusewire::Session::mount_uring(&dir, &opts))?);
         fs.attach(session.clone());
-        rargo_net::io::FuseDrive::spawn(&session, &fs).detach();
+        rargo_net::io::FuseDrive::spawn(&session, &fs)?.detach();
         let dev = dev_at(&mountinfo(), &dir).ok_or_else(|| std::io::Error::other("the mount does not show in /proc/self/mountinfo"))?;
         Ok(Mounted { fs, session, dir, dev })
     }
@@ -1414,7 +1418,14 @@ impl Daemon {
                 wt.running.lock()
             }
         };
-        let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
+        let shown = if req.kind == "sync" {
+            None
+        } else {
+            match self.out_for(&wt, req) {
+                Ok(shown) => shown,
+                Err(err) => return Ok(Self::fail(out, err.to_string())),
+            }
+        };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
             match rargo_net::io::file::read(cargo_home.join(name)) {
@@ -2005,15 +2016,16 @@ struct UploadPlan {
     batches: Vec<Vec<UploadFile>>,
     multipart: Vec<UploadFile>,
     part_size: usize,
+    budget: usize,
 }
 
 impl UploadPlan {
-    fn new(want: Vec<Digest>, files: &HashMap<Digest, (PathBuf, u64)>, budget: usize) -> Option<Self> {
+    fn new(want: Vec<Digest>, files: &std::collections::BTreeMap<Digest, (PathBuf, u64)>, budget: usize) -> Option<Self> {
         let part_size = rargo_proto::PART_SIZE.min(budget.checked_sub(UPLOAD_OVERHEAD)?);
         if part_size == 0 {
             return None;
         }
-        let mut plan = Self { batches: Vec::new(), multipart: Vec::new(), part_size };
+        let mut plan = Self { batches: Vec::new(), multipart: Vec::new(), part_size, budget };
         let mut batch = Vec::new();
         let mut used = 0;
         let mut seen = std::collections::BTreeSet::new();
@@ -2040,14 +2052,24 @@ impl UploadPlan {
         }
         Some(plan)
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self, budget: usize) -> bool {
+impl StateMachine for UploadPlan {
+    fn invariants(&self) {
         let mut seen = std::collections::BTreeSet::new();
-        self.batches.iter().all(|batch| {
-            !batch.is_empty() && batch.iter().map(|file| file.size as usize + UPLOAD_OVERHEAD).sum::<usize>() <= budget
-                && batch.iter().all(|file| file.size <= self.part_size as u64 && seen.insert(file.hash))
-        }) && self.multipart.iter().all(|file| file.size > self.part_size as u64 && seen.insert(file.hash))
+        for batch in &self.batches {
+            assert!(!batch.is_empty(), "no batch is empty");
+            let cost: usize = batch.iter().map(|file| file.size as usize + UPLOAD_OVERHEAD).sum();
+            assert!(cost <= self.budget, "a batch costs {cost}, over the budget of {}", self.budget);
+            for file in batch {
+                assert!(file.size <= self.part_size as u64, "a batched file of {} bytes fits in one part", file.size);
+                assert!(seen.insert(file.hash), "a file is planned once");
+            }
+        }
+        for file in &self.multipart {
+            assert!(file.size > self.part_size as u64, "a multipart file of {} bytes is over one part", file.size);
+            assert!(seen.insert(file.hash), "a file is planned once");
+        }
     }
 }
 
@@ -2084,16 +2106,19 @@ impl Multipart {
         let last = self.held.take()?;
         Some(self.frame(last, true))
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.bytes <= self.size && self.held.as_ref().is_none_or(|buf| buf.len() <= self.part_size)
+#[cfg(test)]
+impl StateMachine for Multipart {
+    fn invariants(&self) {
+        assert!(self.bytes <= self.size, "{} bytes of a {}-byte file are sent", self.bytes, self.size);
+        assert!(self.held.as_ref().is_none_or(|buf| buf.len() <= self.part_size), "a held buffer fits in one part");
     }
 }
 
 fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
     let Some(plan) = UploadPlan::new(want, &snap.scan.files, rargo_proto::BATCH_SIZE) else { return Ok(false) };
-    let UploadPlan { batches, multipart, part_size } = plan;
+    let UploadPlan { batches, multipart, part_size, .. } = plan;
     for window in batches.chunks(8) {
         let window = window.to_vec();
         let packed: Vec<Option<Vec<Blob>>> = io::cpu(move || {
@@ -2155,7 +2180,7 @@ mod upload_tests {
     fn upload_plans_keep_first_occurrence_order_within_both_frame_types() {
         for budget in [128usize, 232, 4096] {
             let mut want = Vec::new();
-            let mut files = HashMap::new();
+            let mut files = std::collections::BTreeMap::new();
             let mut small = Vec::new();
             let mut large = Vec::new();
             for i in 0..96u8 {
@@ -2165,7 +2190,7 @@ mod upload_tests {
                 want.extend([hash, hash]);
                 if size <= (budget - UPLOAD_OVERHEAD) as u64 { small.push(hash) } else { large.push(hash) }
                 let plan = UploadPlan::new(want.clone(), &files, budget).unwrap();
-                assert!(plan.invariants(budget));
+                plan.invariants();
                 assert_eq!(plan.batches.iter().flatten().map(|entry| entry.hash).collect::<Vec<_>>(), small);
                 assert_eq!(plan.multipart.iter().map(|entry| entry.hash).collect::<Vec<_>>(), large);
             }
@@ -2187,7 +2212,7 @@ mod upload_tests {
                 assert!(bytes <= 4);
                 transferred.extend(part.unpack().unwrap());
             }
-            assert!(content.invariants());
+            content.invariants();
         }
         let (ClientMsg::BlobPart { hash: got, part, last: true }, bytes) = content.finish().unwrap() else { panic!("expected final part") };
         assert_eq!(got, hash);
@@ -2198,7 +2223,7 @@ mod upload_tests {
         let mut corrupt = fresh();
         for chunk in b"one TWO three".chunks(4) {
             let _ = corrupt.read(chunk.to_vec()).unwrap();
-            assert!(corrupt.invariants());
+            corrupt.invariants();
         }
         assert!(corrupt.finish().is_none());
     }

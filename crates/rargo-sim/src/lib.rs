@@ -1,8 +1,9 @@
 pub mod model;
 pub mod rng;
+mod nextest;
 pub mod world;
 
-pub use world::{Bug, Failure, Kind, Report, run};
+pub use world::{Bug, Failure, Fault, Kind, Off, Report, run, run_off};
 
 pub fn search(seeds: std::ops::Range<u64>, bug: Option<Bug>) -> Vec<Failure> {
     seeds.filter_map(|seed| run(seed, bug).err()).collect()

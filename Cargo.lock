@@ -407,9 +407,10 @@ dependencies = [
 
 [[package]]
 name = "fusewire"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "libc",
+ "rargo-machine",
  "tempfile",
 ]
 
@@ -798,7 +799,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rargo"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "bincode",
  "blake3",
@@ -807,6 +808,7 @@ dependencies = [
  "fusewire",
  "libc",
  "memmap2",
+ "rargo-machine",
  "rargo-net",
  "rargo-proto",
  "rayon",
@@ -821,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "rargo-core"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "anyhow",
  "bincode",
@@ -832,6 +834,7 @@ dependencies = [
  "fusewire",
  "libc",
  "parking_lot",
+ "rargo-machine",
  "rargo-net",
  "rargo-plan",
  "rargo-proto",
@@ -849,8 +852,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "rargo-machine"
+version = "0.7.10"
+
+[[package]]
 name = "rargo-net"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "blake3",
  "corosensei",
@@ -858,12 +865,13 @@ dependencies = [
  "io-uring",
  "libc",
  "parking_lot",
+ "rargo-machine",
  "rargo-proto",
 ]
 
 [[package]]
 name = "rargo-plan"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "bincode",
  "serde",
@@ -871,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "rargo-proto"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "bincode",
  "blake3",
@@ -883,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "rargo-purity"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -892,16 +900,17 @@ dependencies = [
 
 [[package]]
 name = "rargo-sim"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "rargo",
  "rargo-core",
+ "rargo-machine",
  "rargo-proto",
 ]
 
 [[package]]
 name = "rargod"
-version = "0.7.9"
+version = "0.7.10"
 dependencies = [
  "anyhow",
  "bincode",

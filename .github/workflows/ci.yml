@@ -22,6 +22,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: dev/update-service-test.sh
+      - name: install.sh installs a release only once the build server runs it
+        run: dev/release-local-test.sh
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: Realise the flake closure for binaries from the build server
         run: nix develop --command true
@@ -35,6 +37,10 @@ jobs:
           rargo auth --token "$RARGO_TOKEN"
       - name: Build (on the server, on the cache every other build of this commit uses)
         run: rargo build --locked --workspace
+      - name: Enable FUSE-over-io_uring for mount tests
+        run: |
+          sudo modprobe fuse
+          echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
       - name: Every test of the workspace (built on the server, run here, as root, one process each), each within its CPU budget
         run: python3 -I dev/purity.py cpu
       - name: The purity allowlists and the time budgets only shrink
@@ -53,7 +59,7 @@ jobs:
           echo "$out"
           grep -q '^io_uring  unavailable, so rargo cannot build here: io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out"
       - name: The crates that are published
-        run: nix develop --command cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
+        run: nix develop --command cargo package --locked -p rargo-machine -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh
   factory:
     runs-on: ubuntu-24.04

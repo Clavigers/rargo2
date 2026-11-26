@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -107,15 +109,19 @@ impl WatchState {
         descriptors
     }
 
-    #[cfg(test)]
-    fn invariants(&self, changes: &Changes) -> bool {
-        self.owners.iter().all(|(descriptor, (owner, dir))| {
-            *descriptor >= 0 && !dir.as_os_str().is_empty() && self.registered.contains(owner)
-        }) && self.moved.iter().all(|descriptor| self.owners.contains_key(descriptor))
-            && changes.dirty.iter().all(|(owner, paths)| {
-                self.registered.contains(owner) && !paths.is_empty() && paths.iter().all(|path| !path.as_os_str().is_empty())
-            })
-            && changes.rescan.iter().all(|owner| self.registered.contains(owner))
+}
+
+#[cfg(test)]
+impl StateMachine for WatchState {
+    fn invariants(&self) {
+        for (descriptor, (owner, dir)) in &self.owners {
+            assert!(*descriptor >= 0, "watch descriptor {descriptor} is not negative");
+            assert!(!dir.as_os_str().is_empty(), "watch descriptor {descriptor} watches a named directory");
+            assert!(self.registered.contains(owner), "watch descriptor {descriptor} belongs to registered worktree {owner}");
+        }
+        for descriptor in &self.moved {
+            assert!(self.owners.contains_key(descriptor), "moved descriptor {descriptor} is watched");
+        }
     }
 }
 
@@ -275,10 +281,22 @@ mod tests {
         }
     }
 
+    fn checked(state: &WatchState, changes: &Changes) {
+        state.invariants();
+        for (owner, paths) in &changes.dirty {
+            assert!(state.registered.contains(owner), "dirty worktree {owner} is registered");
+            assert!(!paths.is_empty(), "dirty worktree {owner} names a directory");
+            assert!(paths.iter().all(|path| !path.as_os_str().is_empty()), "dirty worktree {owner} names directories by path");
+        }
+        for owner in &changes.rescan {
+            assert!(state.registered.contains(owner), "rescanned worktree {owner} is registered");
+        }
+    }
+
     fn apply(state: &mut WatchState, changes: &mut Changes, descriptor: Option<i32>, mask: u32) {
         if let Some(descriptor) = descriptor {
             state.apply(Event { descriptor, mask }, changes);
-            assert!(state.invariants(changes));
+            checked(state, changes);
         }
     }
 
@@ -296,7 +314,7 @@ mod tests {
                 let wd = m.next_wd;
                 m.next_wd += 1;
                 assert!(matches!(state.register(owner, path.clone(), WatchResult::Added(wd)), Registration::Watched(w) if w == wd));
-                assert!(state.invariants(&changes));
+                checked(&state, &changes);
                 m.slots.push(Slot { owner, path, wd: Some(wd), moved: false, alive: true });
             }
             for step in 0..300 {
@@ -331,7 +349,7 @@ mod tests {
                             assert!(matches!(state.register(s.owner, s.path.clone(), WatchResult::Added(wd)), Registration::Watched(_)));
                         } else {
                             assert!(state.remove(wd, &state.owners[&wd].1.clone()));
-                            assert!(state.invariants(&changes));
+                            checked(&state, &changes);
                             apply(&mut state, &mut changes, Some(wd), libc::IN_IGNORED);
                             assert!(!state.owners.contains_key(&wd), "seed {seed}: an ignored watch is gone");
                             let fresh = m.next_wd;
@@ -340,7 +358,7 @@ mod tests {
                             s.wd = Some(fresh);
                         }
                         s.moved = false;
-                        assert!(state.invariants(&changes));
+                        checked(&state, &changes);
                     }
                     7 if x != a && m.slots[x].alive && m.slots[a].alive => {
                         let parent = m.touch(a);
@@ -371,7 +389,7 @@ mod tests {
                             state.register(s.owner, s.path.clone(), WatchResult::Added(wd));
                             s.wd = Some(wd);
                         }
-                        assert!(state.invariants(&changes));
+                        checked(&state, &changes);
                     }
                     9 => {
                         apply(&mut state, &mut changes, Some(-1), libc::IN_Q_OVERFLOW);
@@ -387,7 +405,7 @@ mod tests {
                     11 if rng.below(8) == 0 => {
                         let owner = m.slots[x].owner;
                         let mut gone = state.forget(owner);
-                        assert!(state.invariants(&changes));
+                        checked(&state, &changes);
                         let mut want: Vec<i32> = m.slots.iter().filter(|s| s.owner == owner).filter_map(|s| s.wd).collect();
                         gone.sort();
                         want.sort();
@@ -399,7 +417,7 @@ mod tests {
                     }
                     _ => {}
                 }
-                assert!(state.invariants(&changes));
+                checked(&state, &changes);
                 m.check(&changes, seed, step);
             }
         }
@@ -411,15 +429,15 @@ mod tests {
         let mut changes = Changes::default();
         for (descriptor, owner, dir) in [(1, 10, "first"), (2, 10, "first/src"), (3, 20, "second")] {
             state.register(owner, dir.into(), WatchResult::Added(descriptor));
-            assert!(state.invariants(&changes));
+            checked(&state, &changes);
         }
         assert!(!state.remove(2, Path::new("different")));
-        assert!(state.invariants(&changes));
+        checked(&state, &changes);
         assert_eq!(state.forget(10), [1, 2]);
-        assert!(state.invariants(&changes));
+        checked(&state, &changes);
         for descriptor in [1, 2, 3] {
             state.apply(Event { descriptor, mask: libc::IN_CREATE }, &mut changes);
-            assert!(state.invariants(&changes));
+            checked(&state, &changes);
         }
         assert_eq!(changes.dirty, BTreeMap::from([(20, BTreeSet::from(["second".into()]))]));
     }
@@ -429,22 +447,22 @@ mod tests {
         let mut state = WatchState::default();
         let mut changes = Changes::default();
         state.register(10, "from".into(), WatchResult::Added(1));
-        assert!(state.invariants(&changes));
+        checked(&state, &changes);
         state.register(20, "to".into(), WatchResult::Added(2));
-        assert!(state.invariants(&changes));
+        checked(&state, &changes);
         for (descriptor, mask) in [(1, libc::IN_MOVED_FROM), (2, libc::IN_MOVED_TO)] {
             state.apply(Event { descriptor, mask }, &mut changes);
-            assert!(state.invariants(&changes));
+            checked(&state, &changes);
         }
         assert_eq!(changes.dirty, BTreeMap::from([(10, BTreeSet::from(["from".into()])), (20, BTreeSet::from(["to".into()]))]));
         assert!(changes.rescan.is_empty());
 
         state.register(10, "from/sub".into(), WatchResult::Added(3));
         state.apply(Event { descriptor: 3, mask: libc::IN_MOVE_SELF }, &mut changes);
-        assert!(state.invariants(&changes));
+        checked(&state, &changes);
         let mut after = Changes::default();
         state.apply(Event { descriptor: 3, mask: libc::IN_MODIFY }, &mut after);
-        assert!(state.invariants(&after));
+        checked(&state, &after);
         assert_eq!(after.rescan, BTreeSet::from([10]), "a moved directory's old path is not trusted until it is watched again");
         state.register(10, "to/sub".into(), WatchResult::Added(3));
         let mut rewatched = Changes::default();
@@ -455,12 +473,12 @@ mod tests {
         for (descriptor, mask) in [(1, libc::IN_ISDIR | libc::IN_MOVED_FROM), (2, libc::IN_ISDIR | libc::IN_MOVED_TO),
             (1, libc::IN_MOVE_SELF), (1, libc::IN_IGNORED)] {
             state.apply(Event { descriptor, mask }, &mut changes);
-            assert!(state.invariants(&changes));
+            checked(&state, &changes);
         }
         assert_eq!(changes.rescan, BTreeSet::from([10, 20]));
         assert!(!state.owners.contains_key(&1));
         let decision = state.register(20, "to/new".into(), WatchResult::TooManyDirectories);
-        assert!(state.invariants(&changes));
+        checked(&state, &changes);
         assert!(matches!(decision, Registration::Poll(path) if path == Path::new("to/new")));
     }
 }

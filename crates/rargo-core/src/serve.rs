@@ -437,7 +437,7 @@ fn serve(
     }
 
     let worktree = req.worktree.clone();
-    let before: Option<Arc<std::collections::HashSet<crate::proto::Digest>>> = {
+    let before: Option<Arc<std::collections::BTreeSet<crate::proto::Digest>>> = {
         let known = d.deliveries.lock();
         known
             .get(&worktree)
@@ -461,7 +461,7 @@ fn serve(
         Ok(h) => h,
         Err(e) => return fail(&sess, failure("setting up the cargo configuration", &e)),
     };
-    let env: HashMap<String, String> = req.env.iter().cloned().collect();
+    let env: std::collections::BTreeMap<String, String> = req.env.iter().cloned().collect();
     let prio = crate::conn_state::priority(&env, req.stderr_tty);
     let out = Output::new(
         sess.sender(),
@@ -477,7 +477,7 @@ fn serve(
             return fail(&sess, "the current directory must be inside the synced worktree".into());
         };
         let who = crate::drift::LastClient {
-            env: Arc::new(env),
+            env: Arc::new(env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
             home,
             root: req.root.clone(),
             dir,
@@ -499,7 +499,7 @@ fn serve(
         root: req.root,
         cwd: req.cwd,
         cargo_home: req.cargo_home,
-        env: Arc::new(ClientEnv::new(env, req.env_checked, Some(asker))),
+        env: Arc::new(ClientEnv::new(env.into_iter().collect(), req.env_checked, Some(asker))),
         uid: d.cfg.uid,
         gid: d.cfg.gid,
         prio,

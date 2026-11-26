@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
 use crate::partial::Partial;
@@ -62,25 +64,6 @@ struct Inodes {
 }
 
 impl Inodes {
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let mut kids: BTreeMap<u64, u64> = BTreeMap::new();
-        for (id, node) in &self.nodes {
-            if *id != ROOT {
-                *kids.entry(node.parent).or_default() += 1;
-            }
-        }
-        self.nodes.contains_key(&ROOT)
-            && self.children.iter().all(|((parent, name), id)| {
-                self.nodes.get(id).is_some_and(|node| node.parent == *parent && node.name == *name)
-            })
-            && self.nodes.iter().all(|(id, node)| {
-                *id < self.next
-                    && node.kids == kids.get(id).copied().unwrap_or(0)
-                    && (*id == ROOT || (self.nodes.contains_key(&node.parent) && !node.name.is_empty()))
-            })
-    }
-
     fn path(&self, mut id: u64) -> Res<Vec<u8>> {
         let mut parts: Vec<&[u8]> = Vec::new();
         while id != ROOT {
@@ -156,6 +139,34 @@ impl Inodes {
             }
         }
         unreachable!("a path has a component")
+    }
+}
+
+#[cfg(test)]
+impl StateMachine for Inodes {
+    fn invariants(&self) {
+        let mut kids: BTreeMap<u64, u64> = BTreeMap::new();
+        for (id, node) in &self.nodes {
+            if *id != ROOT {
+                *kids.entry(node.parent).or_default() += 1;
+            }
+        }
+        assert!(self.nodes.contains_key(&ROOT), "the root inode is there");
+        for ((parent, name), id) in &self.children {
+            assert!(
+                self.nodes.get(id).is_some_and(|node| node.parent == *parent && node.name == *name),
+                "child {:?} of inode {parent} is inode {id}, which has that parent and name",
+                String::from_utf8_lossy(name)
+            );
+        }
+        for (id, node) in &self.nodes {
+            assert!(*id < self.next, "inode {id} was handed out, below {}", self.next);
+            assert_eq!(node.kids, kids.get(id).copied().unwrap_or(0), "inode {id} counts its children");
+            if *id != ROOT {
+                assert!(self.nodes.contains_key(&node.parent), "inode {id}'s parent {} is there", node.parent);
+                assert!(!node.name.is_empty(), "inode {id} has a name");
+            }
+        }
     }
 }
 
@@ -239,16 +250,17 @@ impl OutputTree {
             self.files.remove(&key);
         }
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.files.keys().all(|path| {
-            !path.is_empty()
-                && !path.starts_with(b"/")
-                && !path.ends_with(b"/")
-                && !path.split(|&b| b == b'/').any(|part| part.is_empty())
-                && !self.has_below(path)
-        })
+#[cfg(test)]
+impl StateMachine for OutputTree {
+    fn invariants(&self) {
+        for path in self.files.keys() {
+            let at = String::from_utf8_lossy(path);
+            assert!(!path.is_empty(), "no file has an empty path");
+            assert!(!path.split(|&b| b == b'/').any(|part| part.is_empty()), "{at:?} is relative and has no empty parts");
+            assert!(!self.has_below(path), "file {at:?} has nothing below it");
+        }
     }
 }
 
@@ -351,12 +363,14 @@ impl<F, R> Content<F, R> {
         }
         Ok(())
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        match self {
-            Self::Unfetched(fetch) => !fetch.rel.is_empty() && fetch.size > 0,
-            Self::Open(_) | Self::Ranged(_) => true,
+#[cfg(test)]
+impl<F, R> StateMachine for Content<F, R> {
+    fn invariants(&self) {
+        if let Self::Unfetched(fetch) = self {
+            assert!(!fetch.rel.is_empty(), "an unfetched file has a path");
+            assert!(fetch.size > 0, "an unfetched file has bytes to fetch");
         }
     }
 }
@@ -1536,7 +1550,7 @@ mod tests {
                             })
                             .collect();
                         let changed = tree.apply(generation, as_edits);
-                        assert!(tree.invariants(), "seed {seed} step {step}");
+                        rargo_machine::check(&tree, format_args!("seed {seed} step {step}"));
                         if generation > applied {
                             applied = generation;
                             model_apply(&mut model, &edits);
@@ -1547,26 +1561,26 @@ mod tests {
                         assert_eq!(tree.generation, applied, "seed {seed} step {step}");
                         for path in &changed {
                             inodes.changed(path);
-                            assert!(inodes.invariants(), "seed {seed} step {step}");
+                            rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                             if let Some(before) = seen.remove(path) {
                                 let now = *walk(&mut inodes, path).last().unwrap();
-                                assert!(inodes.invariants());
+                                inodes.invariants();
                                 assert_ne!(now, before, "seed {seed} step {step}: a changed name gets a new inode");
                                 inodes.forget(now, 1);
-                                assert!(inodes.invariants());
+                                inodes.invariants();
                             }
                         }
                     }
                     4 => {
                         let path = PATHS[rng.below(PATHS.len())].as_bytes();
                         let ids = walk(&mut inodes, path);
-                        assert!(inodes.invariants(), "seed {seed} step {step}");
+                        rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                         assert_eq!(inodes.path(*ids.last().unwrap()).ok().unwrap(), path);
                         seen.insert(path.to_vec(), *ids.last().unwrap());
                         if rng.below(2) == 0 {
                             for id in ids.iter().rev() {
                                 inodes.forget(*id, 1);
-                                assert!(inodes.invariants(), "seed {seed} step {step}");
+                                rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                             }
                             seen.remove(path);
                         }
@@ -1576,7 +1590,7 @@ mod tests {
                         if let Ok(VirtualOpen::Read(file)) = tree.open(path, false, false) {
                             assert_eq!(model.get(path).map(|f| f.hash), Some(file.hash), "seed {seed} step {step}: an open sees the newest tree");
                             let content = Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel: path.to_vec() });
-                            assert!(content.invariants());
+                            content.invariants();
                             handles.push((file.hash, content));
                         }
                     }
@@ -1600,7 +1614,7 @@ mod tests {
                         let proven = *blake3::hash(&served).as_bytes();
                         let content = if ranged { Content::Ranged(served) } else { Content::Open(served) };
                         let result = handles[h].1.fetched(&request, &proven, content);
-                        assert!(handles[h].1.invariants(), "seed {seed} step {step}");
+                        rargo_machine::check(&handles[h].1, format_args!("seed {seed} step {step}"));
                         assert_eq!(result.is_err(), proven != request.hash, "seed {seed} step {step}: a completion is refused exactly when its bytes are not the content asked for");
                         refused += usize::from(result.is_err());
                     }
@@ -1619,7 +1633,8 @@ mod tests {
                     }
                     _ => {}
                 }
-                assert!(tree.invariants() && inodes.invariants(), "seed {seed} step {step}");
+                rargo_machine::check(&tree, format_args!("seed {seed} step {step}"));
+                rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                 assert_eq!(tree.files.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "seed {seed} step {step}: the tree is the newest delivery's");
                 for path in PATHS {
                     let path = path.as_bytes();
@@ -1646,16 +1661,16 @@ mod tests {
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
         let mut state = Inodes { nodes, children: HashMap::new(), next: 2 };
         let old = state.lookup(ROOT, b"app");
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(state.changed(b"app"), (ROOT, b"app".to_vec()));
-        assert!(state.invariants());
+        state.invariants();
         let new = state.lookup(ROOT, b"app");
-        assert!(state.invariants());
+        state.invariants();
         assert_ne!(old, new);
         assert_eq!(state.path(new).ok().unwrap(), b"app");
         assert_eq!(state.forget(old, 1), [old]);
-        assert!(state.invariants());
+        state.invariants();
         assert_eq!(state.lookup(ROOT, b"app"), new);
-        assert!(state.invariants());
+        state.invariants();
     }
 }
