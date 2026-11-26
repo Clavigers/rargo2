@@ -1,7 +1,7 @@
 locks	crates/rargo-core/src/build.rs	60	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/buildview.rs	12	shares state between threads outside a shell or worker pool: dashmap (6), atomics (6)
 locks	crates/rargo-core/src/chunk.rs	4	shares state between threads outside a shell or worker pool: once cells (2), dashmap (2)
-locks	crates/rargo-core/src/db.rs	10	shares state between threads outside a shell or worker pool: parking_lot locks (10)
+locks	crates/rargo-core/src/db.rs	4	shares the write buffer and commit serialization between threads: parking_lot locks (4)
 locks	crates/rargo-core/src/engine.rs	27	shares state between threads outside a shell or worker pool: atomics (15), parking_lot locks (6), once cells (4), dashmap (2)
 locks	crates/rargo-core/src/flake.rs	2	shares state between threads outside a shell or worker pool: once cells (2)
 locks	crates/rargo-core/src/http.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
