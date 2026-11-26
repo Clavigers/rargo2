@@ -110,7 +110,9 @@ impl Db {
 
     #[cfg(test)]
     fn on(disk: impl redb::StorageBackend) -> Result<Db> {
-        Db::of(redb::Builder::new().create_with_backend(disk)?)
+        let db = Db::of(redb::Builder::new().create_with_backend(disk)?)?;
+        db.writing.call_once(|| ());
+        Ok(db)
     }
 
     fn of(db: Database) -> Result<Db> {
