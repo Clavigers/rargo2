@@ -128,39 +128,16 @@ impl Trees {
     }
 
     fn hold(self: &Arc<Self>, root: Hash) -> Option<Arc<Snapshot>> {
-        let mut all: Vec<Hash> = Vec::new();
-        let mut seen: HashSet<Hash> = HashSet::new();
-        let mut todo = vec![root];
-        seen.insert(root);
-        while let Some(d) = todo.pop() {
-            let tree = self.get(&d)?;
-            if !self.store.has(&d) {
+        let all = worktree_hashes(root, |d| {
+            let tree = self.get(d)?;
+            if !self.store.has(d) {
                 match self.store.put_bytes(&tree.encode()) {
-                    Ok(stored) if stored == d => {}
+                    Ok(stored) if stored == *d => {}
                     _ => return None,
                 }
             }
-            all.push(d);
-            for (_, node) in &tree.entries {
-                match node {
-                    Node::File { hash, .. } => {
-                        let h = Hash(*hash);
-                        if seen.insert(h) {
-                            all.push(h);
-                        }
-                    }
-                    Node::Dir(sub) => {
-                        let sub = Hash(*sub);
-                        if seen.insert(sub) {
-                            todo.push(sub);
-                        }
-                    }
-                    Node::Symlink(_) => {}
-                }
-            }
-        }
-        assert_eq!(all.first(), Some(&root));
-        debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+            Some(tree)
+        })?;
         if !self.store.pin_all(&all) {
             return None;
         }
@@ -226,6 +203,37 @@ impl Trees {
         }
         Ok(())
     }
+}
+
+fn worktree_hashes(root: Hash, tree: impl Fn(&Hash) -> Option<Arc<Tree>>) -> Option<Vec<Hash>> {
+    let mut all: Vec<Hash> = Vec::new();
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut todo = vec![root];
+    seen.insert(root);
+    while let Some(d) = todo.pop() {
+        let tree = tree(&d)?;
+        all.push(d);
+        for (_, node) in &tree.entries {
+            match node {
+                Node::File { hash, .. } => {
+                    let h = Hash(*hash);
+                    if seen.insert(h) {
+                        all.push(h);
+                    }
+                }
+                Node::Dir(sub) => {
+                    let sub = Hash(*sub);
+                    if seen.insert(sub) {
+                        todo.push(sub);
+                    }
+                }
+                Node::Symlink(_) => {}
+            }
+        }
+    }
+    assert_eq!(all.first(), Some(&root));
+    debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+    Some(all)
 }
 
 struct Claims<'a> {
@@ -644,37 +652,67 @@ mod tests {
 
     #[test]
     fn a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held() {
-        crate::io::drive(1, || {
-            let (_d, trees, fake) = setup();
-            let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
-            let mut last = None;
-            for round in 0..3 {
-                let files: Vec<(&str, Node)> =
-                    names.iter().map(|n| (n.as_str(), fake.file(format!("{n} in round {round}").as_bytes()))).collect();
-                let v = fake.dir(vec![("src", fake.dir(files)), ("top", fake.file(format!("top {round}").as_bytes()))]);
-                let s = trees.sync(root_of(&v), &fake).unwrap_or_else(|e| panic!("sync {round} failed: {e:#}"));
-                let mut outputs = Vec::new();
-                for i in 0..32 {
-                    outputs.push(trees.store.put_bytes(format!("output {round}/{i} {}", "x".repeat(4000)).as_bytes()).unwrap());
+        use crate::store_index::StoreIndex;
+
+        let mut store = StoreIndex::new();
+        let mut state = TreesState::new();
+        let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
+        let mut last = None;
+        for round in 0..3 {
+            let source = Fake::default();
+            let files = names.iter().map(|n| (n.as_str(), source.file(format!("{n} in round {round}").as_bytes())));
+            let sub = source.dir(files.collect());
+            let top = source.file(format!("top {round}").as_bytes());
+            let root = root_of(&source.dir(vec![("src", sub), ("top", top)]));
+
+            let manifests = source.trees.lock();
+            let blobs = source.blobs.lock();
+            let load_tree = |d: &Hash| Some(Arc::new(Tree::decode(manifests.get(d)?).unwrap()));
+            let generation = store.generation();
+            let mut walk = Walk::new(root);
+            while let Some(wanted) = walk.advance(
+                &|d| state.is_complete(d, generation),
+                &|d| if store.has(d) { load_tree(d) } else { None },
+                &|h| store.has(h),
+            ) {
+                for d in wanted {
+                    store.put(d, manifests[&d].len() as u64, 0, round);
                 }
-                assert!(trees.store.evict_to(1000, &|_| false) > 100_000);
-                assert!(outputs.iter().all(|h| !trees.store.has(h)));
-                for n in &names {
-                    let path = format!("src/{n}");
-                    assert_eq!(
-                        s.read(path.as_bytes())
-                            .unwrap_or_else(|| panic!("round {round}: {path} was evicted while its snapshot was held")),
-                        format!("{n} in round {round}").as_bytes()
-                    );
-                }
-                assert_eq!(trees.lacking(s.id), (Vec::new(), Vec::new()));
-                last = Some((s.id, Hash::of(format!("f000 in round {round}").as_bytes())));
             }
-            let (root, a_file) = last.unwrap();
-            trees.store.evict_to(0, &|_| false);
-            assert!(!trees.store.has(&a_file) && !trees.store.has(&root));
-            assert!(!trees.store.is_pinned(&a_file));
-        });
+            for h in walk.missing {
+                store.put(h, blobs[&h].len() as u64, 0, round);
+            }
+            assert!(state.completed(&walk.walked, generation, store.generation()));
+            let held = worktree_hashes(root, load_tree).unwrap();
+            assert!(store.pin_all(&held));
+
+            let outputs: Vec<_> = (0..32)
+                .map(|i| {
+                    let h = Hash::of(format!("output {round}/{i}").as_bytes());
+                    store.put(h, 4000, 0, round);
+                    h
+                })
+                .collect();
+            let evicted = store.evict(1000, 0, round, &|_| false);
+            assert!(evicted.iter().map(|e| e.freed).sum::<u64>() > 100_000);
+            assert!(outputs.iter().all(|h| !store.has(h)));
+            for (h, bytes) in manifests.iter().chain(blobs.iter()) {
+                assert_eq!(store.size_of(h), Some(bytes.len() as u64), "round {round}: held content {h}");
+            }
+            let (trees, blobs, _) = crate::trees_state::missing(
+                root,
+                &|d| state.is_complete(d, store.generation()),
+                &|d| if store.has(d) { load_tree(d) } else { None },
+                &|h| store.has(h),
+            );
+            assert!(trees.is_empty() && blobs.is_empty());
+            store.unpin_all(&held);
+            last = Some((root, Hash::of(format!("f000 in round {round}").as_bytes())));
+        }
+        let (root, a_file) = last.unwrap();
+        store.evict(0, 0, 3, &|_| false);
+        assert!(!store.has(&a_file) && !store.has(&root));
+        assert!(!store.is_pinned(&a_file));
     }
 
     #[test]
