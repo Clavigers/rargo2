@@ -427,16 +427,12 @@ pub(crate) fn resolve_shell(
     shell: &str,
     preparing: &dyn Fn(),
 ) -> Result<Arc<FlakeEnv>> {
-    static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    if NIX_READY.get().is_none() {
-        let ready = match nix().arg("--version").output() {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
-            Err(e) => Err(e.to_string()),
-        };
-        let _ = NIX_READY.set(ready);
-    }
-    NIX_READY.get().expect("set above").as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
+    crate::io::nix::ready(|| match nix().arg("--version").output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+        Err(e) => Err(e.to_string()),
+    })
+    .map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
 
     let src = source(snap, dir, extra);
     let shell_key = if shell == "default" {
