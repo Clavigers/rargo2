@@ -411,7 +411,6 @@ version = "0.7.10"
 dependencies = [
  "libc",
  "rargo-machine",
- "tempfile",
 ]
 
 [[package]]
