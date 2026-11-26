@@ -8,13 +8,15 @@ pub mod db;
 pub mod db_writer;
 pub mod drift;
 pub mod engine;
+#[cfg(test)]
+mod engine_tests;
 pub mod expand;
 pub mod flake;
 pub mod fn_code;
 pub mod hash;
 pub mod nixmanifest;
 pub mod http;
-pub use rargo_net::io;
+pub mod io;
 pub mod incr;
 pub mod cgroup;
 pub use rargo_net as net;
@@ -41,3 +43,17 @@ pub mod tokens;
 pub mod trace;
 pub mod trees_state;
 pub mod view;
+
+#[cfg(test)]
+mod test_support {
+    use std::fmt::{Debug, Write};
+
+    #[derive(Default)]
+    pub struct Transcript(pub String);
+
+    impl Transcript {
+        pub fn record(&mut self, event: &str, effect: impl Debug) {
+            writeln!(self.0, "{event}: {effect:?}").unwrap();
+        }
+    }
+}

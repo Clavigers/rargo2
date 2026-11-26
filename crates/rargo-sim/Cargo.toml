@@ -12,3 +12,4 @@ rargo-core = { path = "../rargo-core" }
 rargo-proto = { path = "../rargo-proto" }
 rargo-net = { path = "../rargo-net" }
 serde.workspace = true
+rargo-plan = { path = "../rargo-plan" }

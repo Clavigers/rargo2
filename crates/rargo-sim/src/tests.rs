@@ -60,7 +60,7 @@ fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
 
 #[test]
 fn dozens_of_client_rounds_overlap_during_eviction() {
-    let report = run(12, None).unwrap_or_else(|failure| panic!("{failure}"));
+    let report = run(257, None).unwrap_or_else(|failure| panic!("{failure}"));
     assert!(report.clients_at_eviction >= 24, "{report:?}");
     assert!(report.cache_hits > 0, "clients reuse action outputs");
     assert!(report.silences > 0, "clients give up on a silent server");
@@ -68,8 +68,8 @@ fn dozens_of_client_rounds_overlap_during_eviction() {
 
 #[test]
 fn the_seeds_exercise_faults_the_cache_and_eviction() {
-    // The dedicated concurrency test covers the crowd at seed 12.
-    let reports: Vec<_> = (0..12).chain(13..24).map(|s| run(s, None).expect("passes")).collect();
+    // The dedicated concurrency test covers the crowd at seed 257.
+    let reports: Vec<_> = (0..24).map(|s| run(s, None).expect("passes")).collect();
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
     assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
     assert!(
@@ -81,6 +81,8 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.uploads > 0), "clients upload sources");
     assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
     assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
+    assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
+    assert!(reports.iter().any(|r| r.crashes > 0), "client daemons crash and restart");
     assert!(reports.iter().any(|r| r.lost > 0 && r.retransmits > 0), "rargo-net retransmits after datagram loss");
     assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
     assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
@@ -145,7 +147,7 @@ fn evicting_a_pinned_blob_is_caught() {
 
 #[test]
 fn delivering_a_stale_output_is_caught() {
-    caught(1, Bug::StaleDelivery, |k| matches!(k, Kind::Drift(_)));
+    caught(2, Bug::StaleDelivery, |k| matches!(k, Kind::Drift(_)));
 }
 
 #[test]
@@ -155,7 +157,7 @@ fn never_answering_a_request_is_caught() {
 
 #[test]
 fn evicting_content_an_upload_claimed_is_caught() {
-    caught(61, Bug::EvictClaimed, |k| matches!(k, Kind::LostPinned(_)));
+    caught(11, Bug::EvictClaimed, |k| matches!(k, Kind::LostPinned(_)));
 }
 
 #[test]
@@ -165,5 +167,11 @@ fn a_client_trusting_what_the_server_no_longer_holds_is_caught() {
 
 #[test]
 fn a_client_that_never_gives_up_on_a_silent_server_is_caught() {
-    caught(12, Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
+    caught(0, Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
 }
+
+#[test]
+fn a_restarted_daemon_trusting_the_dead_one_is_caught() {
+    caught(0, Bug::TrustAfterCrash, |k| matches!(k, Kind::StateMachine(_) | Kind::Liveness(_) | Kind::Deadlock(_)));
+}
+
