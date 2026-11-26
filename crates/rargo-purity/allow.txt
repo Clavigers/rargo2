@@ -51,7 +51,7 @@ ambient-io	crates/rargo/src/watch.rs	4	logic and I/O are not yet split, the I/O 
 ambient-io	crates/rargod/src/main.rs	11	logic and I/O are not yet split, the I/O is not in an io module: the filesystem (7), the network (4), libc calls (3), the environment (2), the clock (1)
 locks	crates/fusewire/src/lib.rs	6	shares state between threads outside a shell or worker pool: atomics (4), std locks (2)
 locks	crates/rargo-core/examples/cdcbench.rs	10	a benchmark or inspection tool run by hand on real files and sockets, not part of rargo: atomics (6), once cells (2), dashmap (2)
-locks	crates/rargo-core/src/build.rs	64	shares state between threads outside a shell or worker pool: parking_lot locks (32), once cells (14), atomics (12), dashmap (6)
+locks	crates/rargo-core/src/build.rs	62	shares state between threads outside a shell or worker pool: parking_lot locks (30), once cells (14), atomics (12), dashmap (6)
 locks	crates/rargo-core/src/buildview.rs	12	shares state between threads outside a shell or worker pool: dashmap (6), atomics (6)
 locks	crates/rargo-core/src/chunk.rs	4	shares state between threads outside a shell or worker pool: once cells (2), dashmap (2)
 locks	crates/rargo-core/src/db.rs	10	shares state between threads outside a shell or worker pool: parking_lot locks (10)

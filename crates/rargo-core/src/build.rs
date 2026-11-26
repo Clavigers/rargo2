@@ -284,7 +284,7 @@ impl Daemon {
         }
         let dir = self.cfg.state_dir.join("homes").join(h.finish().hex());
         let names: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
-        static MAKING: Mutex<()> = Mutex::new(());
+        static MAKING: crate::io::Mutex<()> = crate::io::Mutex::new(());
         let _one = MAKING.lock();
         if !dir.join(".complete").ring_exists() {
             use std::os::unix::fs::PermissionsExt;
