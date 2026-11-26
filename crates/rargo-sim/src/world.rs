@@ -1,6 +1,8 @@
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::rng::Rng;
+use crate::nextest::{Outcome, TestRun};
+use rargo_core::build::nextest_run::Phase;
 use rargo::daemon_state::{DaemonState, Link, Need};
 use rargo::known_digests::KnownDigests;
 use rargo::link_watch::{self, Tick, Watch};
@@ -187,6 +189,9 @@ pub struct Report {
     pub trace: Hash,
     pub runs: u64,
     pub cache_hits: u64,
+    pub tests_passed: u64,
+    pub tests_failed: u64,
+    pub tests_timed_out: u64,
     pub cuts: u64,
     pub worker_crashes: u64,
     pub jobs_lost_to_crashes: u64,
@@ -334,6 +339,7 @@ enum Ev {
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
+    TestComplete { client: u64, key: String, started_ms: u64 },
     Sync { client: u64 },
     ClientCut { client: u64 },
     Watch { client: u64 },
@@ -394,6 +400,7 @@ struct Client {
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
+    test: Option<TestRun>,
     daemon: DaemonState,
     up: bool,
     epoch: u64,
@@ -473,6 +480,9 @@ impl World {
                 trace: Hash::of(b""),
                 runs: 0,
                 cache_hits: 0,
+                tests_passed: 0,
+                tests_failed: 0,
+                tests_timed_out: 0,
                 cuts: 0,
                 worker_crashes: 0,
                 jobs_lost_to_crashes: 0,
@@ -513,6 +523,7 @@ impl World {
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
+                    test: None,
                     daemon,
                     up: false,
                     epoch: 0,
@@ -699,6 +710,7 @@ impl World {
         all.extend(self.server.sessions.values().map(|s| &s.state as &dyn StateMachine));
         all.extend(self.workers.values().map(|w| &w.sm as &dyn StateMachine));
         all.extend(self.clients.values().map(|c| &c.daemon as &dyn StateMachine));
+        all.extend(self.clients.values().filter_map(|c| c.test.as_ref()).map(|t| &t.machine as &dyn StateMachine));
         all
     }
 
@@ -744,6 +756,10 @@ impl World {
                 Ok(())
             }
             Ev::Round { client } => self.round(client),
+            Ev::TestComplete { client, key, started_ms } => {
+                self.test_complete(client, &key, started_ms);
+                Ok(())
+            }
             Ev::Sync { client } => self.sync(client),
             Ev::ClientCut { client } => {
                 self.client_cut(client);
@@ -1283,6 +1299,7 @@ impl World {
         let c = self.clients.get_mut(&client).expect("known");
         c.round += 1;
         c.rounds_left -= 1;
+        c.test = TestRun::generate(self.seed, client, c.round);
         if c.round > 1 {
             for _ in 0..self.rng.range(1, 3) {
                 let s = self.rng.below(self.cfg.sources as u64) as usize;
@@ -1514,16 +1531,48 @@ impl World {
         let c = self.clients.get_mut(&client).expect("known");
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
-            if c.rounds_left == 0 {
-                c.finished = true;
+            if let Some(test) = &mut c.test {
+                let scheduled = test.built();
+                self.schedule_tests(client, scheduled);
             } else {
-                let at = self.rng.range(0, 1_000);
-                self.schedule(at, Ev::Round { client });
+                self.complete_round(client);
             }
             return Ok(());
         }
         self.request_ready(client);
         Ok(())
+    }
+
+    fn schedule_tests(&mut self, client: u64, scheduled: Vec<(String, u64)>) {
+        for (key, delay) in scheduled {
+            self.schedule(delay, Ev::TestComplete { client, key, started_ms: self.now });
+        }
+    }
+
+    fn test_complete(&mut self, client: u64, key: &str, started_ms: u64) {
+        let test = self.clients.get_mut(&client).expect("known").test.as_mut().expect("a test command");
+        let (outcome, scheduled) = test.completed(key, self.now - started_ms);
+        match outcome {
+            Some(Outcome::Passed) => self.report.tests_passed += 1,
+            Some(Outcome::Failed) => self.report.tests_failed += 1,
+            Some(Outcome::TimedOut) => self.report.tests_timed_out += 1,
+            None => {}
+        }
+        if test.machine.phase() == Phase::Done {
+            self.complete_round(client);
+        } else {
+            self.schedule_tests(client, scheduled);
+        }
+    }
+
+    fn complete_round(&mut self, client: u64) {
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.rounds_left == 0 {
+            c.finished = true;
+        } else {
+            let at = self.rng.range(0, 1_000);
+            self.schedule(at, Ev::Round { client });
+        }
     }
 }
 
@@ -1551,6 +1600,7 @@ fn label(ev: &Ev) -> String {
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
+        Ev::TestComplete { client, key, .. } => format!("test result {client}/{key};"),
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
         Ev::Watch { client } => format!("watch {client};"),

@@ -35,6 +35,14 @@ fn a_seed_replays_the_same_run() {
 }
 
 #[test]
+fn seeded_test_commands_report_passes_failures_and_timeouts() {
+    let reports: Vec<_> = (0..10).map(|seed| run(seed, None).expect("commands finish")).collect();
+    assert!(reports.iter().any(|r| r.tests_passed > 0));
+    assert!(reports.iter().any(|r| r.tests_failed > 0));
+    assert!(reports.iter().any(|r| r.tests_timed_out > 0));
+}
+
+#[test]
 fn a_worker_restarts_even_if_its_link_was_cut_when_it_crashed() {
     let report = run(85, None).expect("the only worker reconnects and the build finishes");
     assert_eq!(report.cuts, 1);

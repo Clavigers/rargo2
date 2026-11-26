@@ -29,7 +29,7 @@ use std::time::Instant;
 mod nextest;
 mod pure;
 mod request;
-mod nextest_run;
+pub mod nextest_run;
 
 use request::{BuildRequest, Effect, End, Go, OnFailure, Unit};
 
