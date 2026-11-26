@@ -1,6 +1,7 @@
 mod cli;
 mod daemon;
 mod git;
+#[path = "io/install.rs"]
 mod install;
 mod known;
 mod loader;
@@ -495,7 +496,7 @@ fn main() {
     let argv0 = std::env::args_os().next();
     let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
     let world = Real::read();
-    if raw.first().is_some_and(|arg| arg == "install") && std::env::var_os("RARGO_BYPASS").is_none() {
+    if raw.first().is_some_and(|arg| arg == "install") && !world.vars.iter().any(|(name, _)| name == "RARGO_BYPASS") {
         install::run(&world, &raw);
         return;
     }

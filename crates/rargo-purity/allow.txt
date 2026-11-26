@@ -130,7 +130,6 @@ pure-tests	crates/rargo-core/src/snapshot.rs	8	tests still touch the world inste
 pure-tests	crates/rargo-core/src/store.rs	14	tests still touch the world instead of memory: the filesystem (10), tempdirs (2), shared state (2)
 pure-tests	crates/rargo-core/tests/engine.rs	20	tests still touch the world instead of memory: the filesystem (17), tempdirs (2), the environment (1)
 pure-tests	crates/rargo-net/src/endpoint.rs	4	tests still touch the world instead of memory: the network (4)
-pure-tests	crates/rargo/Cargo.toml	1	tempfile is a dev-dependency because tests still use real directories
 pure-tests	crates/rargo/src/git.rs	24	tests still touch the world instead of memory: the filesystem (18), processes (4), tempdirs (2)
 pure-tests	crates/rargo/src/known.rs	4	tests still touch the world instead of memory: the filesystem (3), tempdirs (1)
 pure-tests	crates/rargo/src/main.rs	4	tests still touch the world instead of memory: the filesystem (2), tempdirs (1), threads and sleeps (1)

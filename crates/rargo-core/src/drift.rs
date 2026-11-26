@@ -78,7 +78,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     }
     let policy = crate::policy::snapshot_policy(snapshot, &who.dir).map_err(|e| anyhow::anyhow!(e))?;
     let (dd, snap, dir, files) = (d.clone(), snapshot.clone(), who.dir.clone(), policy.flake.files.clone());
-    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid)
+    let flake = crate::flake::resolve(&dd, &snap, &dir, &files, uid, gid, &|| {})
         .context("evaluating the build flake for the drift check")?;
     for k in ["RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         env.remove(k);

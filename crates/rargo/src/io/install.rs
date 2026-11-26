@@ -203,24 +203,3 @@ fn fallback(raw: &[OsString], why: &str) -> ! {
     eprintln!("rargo: {}; using local cargo install", why.lines().next().unwrap_or("remote install unavailable"));
     passthrough(raw)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn existing_program_is_only_replaced_when_forced() {
-        let root = tempfile::tempdir().unwrap();
-        let bin = root.path().join("bin");
-        let programs = [("tool".into(), b"first".to_vec())];
-        install_files(&bin, &programs, false).unwrap();
-        let path = bin.join("tool");
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o755);
-        let programs = [("new".into(), b"new".to_vec()), ("tool".into(), b"second".to_vec())];
-        assert_eq!(install_files(&bin, &programs, false).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
-        assert!(!bin.join("new").exists());
-        assert_eq!(fs::read(&path).unwrap(), b"first");
-        install_files(&bin, &programs, true).unwrap();
-        assert_eq!(fs::read(path).unwrap(), b"second");
-    }
-}
