@@ -125,10 +125,10 @@ pub(super) fn boot(workers: usize) -> Loop {
         Ok(ring) => ring,
         Err(err) => {
             match super::refusal(&err) {
-                Some(msg) => eprintln!("{msg}"),
-                None => eprintln!("io_uring_setup failed: {err}"),
+                Some(msg) => eprintln!("error: {msg}"),
+                None => eprintln!("error: io_uring_setup failed: {err}"),
             }
-            std::process::exit(1);
+            std::process::exit(101);
         }
     }
 }

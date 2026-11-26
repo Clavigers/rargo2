@@ -51,6 +51,10 @@ pub fn run() {
             }
         });
     println!("Mount     {mount}");
+    match rargo_net::io::unavailable() {
+        None => println!("io_uring  available"),
+        Some(why) => println!("io_uring  unavailable, so rargo cannot build here: {why}"),
+    }
 
     match config {
         Ok(cfg) => {

@@ -62,6 +62,11 @@ pub struct Loop {
     pub(super) blocking: Pool,
 }
 
+/// Whether this process may create an io_uring at all; a container's seccomp profile or a sysctl can forbid it.
+pub(super) fn probe() -> io::Result<()> {
+    IoUring::new(2).map(drop)
+}
+
 impl Loop {
     pub fn new(workers: usize) -> io::Result<Self> {
         assert!(workers >= 1, "the worker pool has at least one thread");
