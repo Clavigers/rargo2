@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::hash::Hash;
 use rargo_proto::tree::{Node, Tree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -81,8 +82,10 @@ impl TreesState {
         }
         mine.into_iter().collect()
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for TreesState {
+    fn invariants(&self) {
         let mut n = 0;
         for (up, hs) in &self.uploads {
             assert!(*up < self.next_upload, "upload {up} was begun");

@@ -1,5 +1,6 @@
 pub mod abi;
 
+use rargo_machine::StateMachine;
 use abi::*;
 use std::ffi::CString;
 use std::io;
@@ -975,8 +976,10 @@ impl RequestHandler {
     pub fn pending(&self) -> bool {
         self.pending.is_some()
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for RequestHandler {
+    fn invariants(&self) {
         if self.pending.is_some() {
             assert!(self.reply.is_empty(), "an open that awaits its registration has not been answered");
         }

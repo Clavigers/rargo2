@@ -1,6 +1,7 @@
 //! Packet routing for one UDP socket. The shell reads and writes that socket.
 //! This type decides which connection a datagram belongs to, and which datagrams to send back.
 
+use rargo_machine::StateMachine;
 use super::{AGREEMENT, DATA_HDR, LinkKey, T_ACK, T_DATA, TAG, open, seal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -126,19 +127,6 @@ impl EndpointState {
         out
     }
 
-    pub fn invariants(&self) {
-        for id in &self.forgotten {
-            assert!(!self.conns.contains_key(id), "a forgotten connection is not routed");
-            assert!(!self.acks.contains_key(id), "a forgotten connection has no acknowledgement waiting");
-        }
-        for (id, ack) in &self.acks {
-            assert!(self.conns.contains_key(id), "an acknowledgement names a live connection");
-            assert_eq!(ack.body.first().copied(), Some(T_ACK), "an acknowledgement starts with its type");
-            assert!(ack.body.len() >= 9, "an acknowledgement carries its connection id");
-            assert_eq!(ack.body.len() % 12, 9, "an acknowledgement is a header plus whole entries");
-        }
-    }
-
     fn route(&mut self, from: SocketAddr, bytes: &[u8], now: u64) -> Routed {
         let Some((pkt, proven)) = self.admit(bytes) else {
             return Routed { id: None, len: 0, events: Vec::new() };
@@ -208,6 +196,21 @@ impl EndpointState {
             }
         }
         Some((pkt, false))
+    }
+}
+
+impl StateMachine for EndpointState {
+    fn invariants(&self) {
+        for id in &self.forgotten {
+            assert!(!self.conns.contains_key(id), "a forgotten connection is not routed");
+            assert!(!self.acks.contains_key(id), "a forgotten connection has no acknowledgement waiting");
+        }
+        for (id, ack) in &self.acks {
+            assert!(self.conns.contains_key(id), "an acknowledgement names a live connection");
+            assert_eq!(ack.body.first().copied(), Some(T_ACK), "an acknowledgement starts with its type");
+            assert!(ack.body.len() >= 9, "an acknowledgement carries its connection id");
+            assert_eq!(ack.body.len() % 12, 9, "an acknowledgement is a header plus whole entries");
+        }
     }
 }
 

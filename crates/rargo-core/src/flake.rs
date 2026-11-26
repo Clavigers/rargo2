@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use crate::io::file::PathRing as _;
 use crate::buildview::SynthEnt;
 use crate::db::Table;
@@ -323,18 +325,29 @@ impl Resolution {
         let save = *was != Some(env.id);
         self.stage = Stage::Done { env, save };
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let sorted = |c: &[String]| c.windows(2).all(|w| w[0] < w[1]);
+#[cfg(test)]
+impl StateMachine for Resolution {
+    fn invariants(&self) {
+        let sorted = |c: &[String]| assert!(c.windows(2).all(|w| w[0] < w[1]), "the closure is sorted and has no repeats");
         match &self.stage {
-            Stage::Cached(env) => sorted(&env.closure),
-            Stage::Evaluating => true,
-            Stage::Rooting { env, names } => !names.is_empty() && env.contains_key("PATH"),
-            Stage::Closing { env, roots } => env.contains_key("PATH") && roots.iter().all(|r| r.as_bytes().get(32) == Some(&b'-')),
-            Stage::Manifesting { env, .. } => sorted(&env.closure),
-            Stage::Done { env, .. } => sorted(&env.closure) && env.id == action_id(&self.key, env) && env.roots.len() == env.closure.len(),
-            Stage::Failed(e) => !e.is_empty(),
+            Stage::Cached(env) | Stage::Manifesting { env, .. } => sorted(&env.closure),
+            Stage::Evaluating => {}
+            Stage::Rooting { env, names } => {
+                assert!(!names.is_empty(), "rooting has names to root");
+                assert!(env.contains_key("PATH"), "an evaluated environment has a PATH");
+            }
+            Stage::Closing { env, roots } => {
+                assert!(env.contains_key("PATH"), "an evaluated environment has a PATH");
+                assert!(roots.iter().all(|r| r.as_bytes().get(32) == Some(&b'-')), "every root is a store path name");
+            }
+            Stage::Done { env, .. } => {
+                sorted(&env.closure);
+                assert!(env.id == action_id(&self.key, env), "a done environment's id is the action id of its key and contents");
+                assert_eq!(env.roots.len(), env.closure.len(), "every closure path has a root");
+            }
+            Stage::Failed(e) => assert!(!e.is_empty(), "a failure says why"),
         }
     }
 }
@@ -594,7 +607,7 @@ mod tests {
 
     fn drive(r: &mut Resolution, present: &BTreeSet<String>, dev_env: &[u8], closure: &[u8]) -> Need {
         for _ in 0..8 {
-            assert!(r.invariants());
+            r.invariants();
             match r.need() {
                 Need::Exists(names) => r.exists(&names.into_iter().filter(|n| present.contains(n)).collect()),
                 Need::Evaluate => r.evaluated(Ok(dev_env.to_vec())),
@@ -613,7 +626,7 @@ mod tests {
         let mut r = Resolution::new(key, None, true);
         assert_eq!(r.need(), Need::Evaluate);
         r.evaluated(Ok(DEV_ENV.to_vec()));
-        assert!(r.invariants());
+        r.invariants();
         let Need::Exists(asked) = r.need() else { panic!("the roots are checked against the store") };
         assert!(asked.iter().all(|n| n.as_bytes().get(32) == Some(&b'-')));
         r.exists(&closure);
@@ -626,7 +639,7 @@ mod tests {
         assert_eq!(manifest.len(), 163);
         assert_eq!(manifest, closure.iter().cloned().collect::<Vec<_>>());
         r.manifested(manifest.iter().map(|n| Hash::of(n.as_bytes())).collect());
-        assert!(r.invariants());
+        r.invariants();
         let Need::Done { env, save: true } = r.need() else { panic!("a fresh evaluation is saved") };
         assert!(env.env["PATH"].split(':').all(|p| p.starts_with("/nix/store/")));
         assert_eq!(env.env["SSL_CERT_FILE"], CA_AT);
@@ -707,7 +720,7 @@ mod tests {
         r.evaluated(Err("late".into()));
         r.exists(&lines(CLOSURE));
         r.closed(Err("nix failed: no store".into()));
-        assert!(r.invariants());
+        r.invariants();
         assert_eq!(r.need(), Need::Failed("nix failed: no store".into()));
     }
 
@@ -778,7 +791,7 @@ mod tests {
             let fail_close = rng.below(10) == 0;
             let mut steps = 0;
             let end = loop {
-                assert!(r.invariants(), "seed {seed}");
+                rargo_machine::check(&r, format_args!("seed {seed}"));
                 steps += 1;
                 assert!(steps < 10, "seed {seed}");
                 let before = r.need();

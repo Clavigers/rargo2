@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::db::Table;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -128,8 +129,10 @@ impl DbWriter {
         self.flushing = false;
         self.since = if self.pending.is_empty() { None } else { Some(now_ms) };
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for DbWriter {
+    fn invariants(&self) {
         let bytes: usize = self.pending.iter().map(|((_, k), e)| size(k, &e.value)).sum();
         assert_eq!(bytes, self.bytes, "pending bytes are the sum of the pending writes");
         assert_eq!(self.since.is_some(), !self.pending.is_empty(), "the clock runs exactly while writes wait");
@@ -142,53 +145,46 @@ impl DbWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rargo_machine::Checked;
 
-    struct Checked(DbWriter);
+    struct Writer(Checked<DbWriter>);
 
-    impl std::ops::Deref for Checked {
+    impl std::ops::Deref for Writer {
         type Target = DbWriter;
         fn deref(&self) -> &DbWriter {
             &self.0
         }
     }
 
-    impl Checked {
-        fn new() -> Checked {
-            let w = DbWriter::new();
-            w.invariants();
-            Checked(w)
+    impl Writer {
+        fn new() -> Writer {
+            Writer(Checked::new(DbWriter::new()))
         }
 
         fn put(&mut self, table: Table, key: &[u8], value: &[u8], now_ms: u64) {
-            self.0.put(table, key, value, now_ms);
-            self.0.invariants();
+            self.0.step(|w| w.put(table, key, value, now_ms))
         }
 
         fn delete(&mut self, table: Table, key: &[u8], now_ms: u64) {
-            self.0.delete(table, key, now_ms);
-            self.0.invariants();
+            self.0.step(|w| w.delete(table, key, now_ms))
         }
 
         fn take(&mut self) -> Batch {
-            let b = self.0.take();
-            self.0.invariants();
-            b
+            self.0.step(|w| w.take())
         }
 
         fn flushed(&mut self, batch: &Batch, now_ms: u64) {
-            self.0.flushed(batch, now_ms);
-            self.0.invariants();
+            self.0.step(|w| w.flushed(batch, now_ms))
         }
 
         fn failed(&mut self, now_ms: u64) {
-            self.0.failed(now_ms);
-            self.0.invariants();
+            self.0.step(|w| w.failed(now_ms))
         }
     }
 
     #[test]
     fn a_flush_is_due_a_delay_after_the_first_write_or_when_full() {
-        let mut w = Checked::new();
+        let mut w = Writer::new();
         assert_eq!(w.due(1000), Due::Idle);
         w.put(Table::Meta, b"a", b"1", 1000);
         assert_eq!(w.due(1000), Due::At(1000 + DELAY_MS));
@@ -207,7 +203,7 @@ mod tests {
 
     #[test]
     fn a_write_made_during_a_flush_stays_for_the_next() {
-        let mut w = Checked::new();
+        let mut w = Writer::new();
         w.put(Table::Meta, b"k", b"old", 0);
         w.put(Table::Meta, b"j", b"x", 0);
         let b = w.take();
@@ -222,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_failed_flush_keeps_every_write_and_tries_again_later() {
-        let mut w = Checked::new();
+        let mut w = Writer::new();
         w.put(Table::Traces, b"t", b"v", 0);
         w.delete(Table::Traces, b"u", 0);
         let _ = w.take();
@@ -233,7 +229,7 @@ mod tests {
 
     #[test]
     fn pending_writes_are_found_by_prefix_and_deletes_show() {
-        let mut w = Checked::new();
+        let mut w = Writer::new();
         w.put(Table::Incr, b"ab1", b"1", 0);
         w.put(Table::Incr, b"ab2", b"2", 0);
         w.put(Table::Incr, b"ac", b"3", 0);
@@ -260,7 +256,7 @@ mod tests {
         let tables = [Table::Blobs, Table::Meta, Table::Cold];
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
-            let mut w = Checked::new();
+            let mut w = Writer::new();
             let mut disk: BTreeMap<(Table, Vec<u8>), Vec<u8>> = BTreeMap::new();
             let mut last: BTreeMap<(Table, Vec<u8>), Option<Vec<u8>>> = BTreeMap::new();
             let mut flushed_seqs = std::collections::BTreeSet::new();

@@ -4,6 +4,7 @@
 //! reports a lost one, and returns a packet to send, the agreed cipher and the
 //! proven user, or a refusal.
 
+use rargo_machine::StateMachine;
 use super::{handshake_key, user_handshake_key, DATA_HDR, T_ACK, T_DATA};
 use rargo_proto::secure::{LinkCipher, LinkPending, MAGIC, link_accept_with, link_start_with};
 use std::io;
@@ -368,8 +369,10 @@ impl Handshake {
         self.invariants();
         Err(io::Error::new(kind, msg))
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for Handshake {
+    fn invariants(&self) {
         assert!(self.resends_left <= RESENDS, "a handshake repeats its datagram once");
         if self.last_sent.is_none() {
             assert_eq!(self.resends_left, RESENDS, "an unsent handshake has its resend");

@@ -5,6 +5,7 @@
 //! timer, and returns datagrams to transmit, messages in send order, and the
 //! next deadline.
 
+use rargo_machine::StateMachine;
 use super::{
     DATA_HDR, FRAG, INIT_CWND, MAX_CWND, MAX_RTO, MIN_CWND, MIN_RTO, SEND_BUFFER, T_ACK, T_DATA,
 };
@@ -401,65 +402,6 @@ impl ConnState {
         out
     }
 
-    pub fn invariants(&self) {
-        let s = &self.send;
-        assert!(
-            s.cwnd >= MIN_CWND && s.cwnd <= MAX_CWND,
-            "the window stays inside its bounds"
-        );
-        assert!(
-            s.ssthresh >= MIN_CWND && s.ssthresh <= MAX_CWND,
-            "the slow-start threshold stays inside its bounds"
-        );
-        assert!(s.next_msg >= 1, "message ids start at 1");
-        assert!(
-            s.next_seq > s.high_acked,
-            "an acknowledgement names a sequence that was handed out"
-        );
-        let queued: usize = s.queue.iter().map(|(_, _, _, data)| data.len()).sum();
-        assert_eq!(
-            s.queued_bytes, queued,
-            "queued_bytes counts every queued fragment"
-        );
-        if s.queue.is_empty() {
-            assert_eq!(s.queued_bytes, 0);
-        }
-        for (&(msg, frag), inf) in &s.inflight {
-            assert!(msg >= 1);
-            assert!(frag < inf.nfrags);
-            assert!(inf.data.len() <= FRAG);
-            assert!(inf.seq < s.next_seq, "an in-flight sequence was handed out");
-        }
-        let rto = Self::rto(s);
-        assert!(rto >= MIN_RTO && rto <= MAX_RTO);
-        assert!(self.recv.done_below >= 1);
-        for (&msg, part) in &self.recv.partial {
-            assert!(
-                msg >= self.recv.done_below,
-                "a partial message is still due"
-            );
-            assert!(
-                !self.recv.pending.contains_key(&msg),
-                "a partial message is not waiting to be delivered"
-            );
-            assert_eq!(
-                part.have as usize,
-                part.frags.iter().filter(|f| f.is_some()).count()
-            );
-            assert!(part.have as usize <= part.frags.len());
-            assert!(
-                part.have as usize != part.frags.len(),
-                "a complete message leaves the partial map"
-            );
-        }
-        for &msg in self.recv.pending.keys() {
-            assert!(
-                msg > self.recv.done_below,
-                "a complete message is delivered as soon as every earlier one is"
-            );
-        }
-    }
-
     fn rto(s: &SendState) -> Duration {
         let rto = match s.srtt {
             Some(srtt) => (srtt + (4 * s.rttvar).max(srtt / 2).max(Duration::from_millis(5)))
@@ -578,6 +520,67 @@ impl ConnState {
         while let Some(whole) = self.recv.pending.remove(&self.recv.done_below) {
             out.messages.push(whole);
             self.recv.done_below += 1;
+        }
+    }
+}
+
+impl StateMachine for ConnState {
+    fn invariants(&self) {
+        let s = &self.send;
+        assert!(
+            s.cwnd >= MIN_CWND && s.cwnd <= MAX_CWND,
+            "the window stays inside its bounds"
+        );
+        assert!(
+            s.ssthresh >= MIN_CWND && s.ssthresh <= MAX_CWND,
+            "the slow-start threshold stays inside its bounds"
+        );
+        assert!(s.next_msg >= 1, "message ids start at 1");
+        assert!(
+            s.next_seq > s.high_acked,
+            "an acknowledgement names a sequence that was handed out"
+        );
+        let queued: usize = s.queue.iter().map(|(_, _, _, data)| data.len()).sum();
+        assert_eq!(
+            s.queued_bytes, queued,
+            "queued_bytes counts every queued fragment"
+        );
+        if s.queue.is_empty() {
+            assert_eq!(s.queued_bytes, 0);
+        }
+        for (&(msg, frag), inf) in &s.inflight {
+            assert!(msg >= 1);
+            assert!(frag < inf.nfrags);
+            assert!(inf.data.len() <= FRAG);
+            assert!(inf.seq < s.next_seq, "an in-flight sequence was handed out");
+        }
+        let rto = Self::rto(s);
+        assert!(rto >= MIN_RTO && rto <= MAX_RTO);
+        assert!(self.recv.done_below >= 1);
+        for (&msg, part) in &self.recv.partial {
+            assert!(
+                msg >= self.recv.done_below,
+                "a partial message is still due"
+            );
+            assert!(
+                !self.recv.pending.contains_key(&msg),
+                "a partial message is not waiting to be delivered"
+            );
+            assert_eq!(
+                part.have as usize,
+                part.frags.iter().filter(|f| f.is_some()).count()
+            );
+            assert!(part.have as usize <= part.frags.len());
+            assert!(
+                part.have as usize != part.frags.len(),
+                "a complete message leaves the partial map"
+            );
+        }
+        for &msg in self.recv.pending.keys() {
+            assert!(
+                msg > self.recv.done_below,
+                "a complete message is delivered as soon as every earlier one is"
+            );
         }
     }
 }

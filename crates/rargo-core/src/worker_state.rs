@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::hash::Hash;
 use crate::remote::WLooked;
 use std::collections::{BTreeMap, BTreeSet};
@@ -367,8 +368,10 @@ impl<C: Carried> Worker<C> {
     pub fn fetched(&mut self, h: Hash) {
         self.fetching.remove(&h);
     }
+}
 
-    pub fn invariants(&self) {
+impl<C: Carried> StateMachine for Worker<C> {
+    fn invariants(&self) {
         if self.link == Link::Down {
             assert!(self.acts.is_empty() && self.asks.is_empty(), "no run outlives its link");
             assert!(self.fetching.is_empty() && self.partial.is_empty());

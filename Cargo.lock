@@ -410,6 +410,7 @@ name = "fusewire"
 version = "0.7.10"
 dependencies = [
  "libc",
+ "rargo-machine",
  "tempfile",
 ]
 
@@ -807,6 +808,7 @@ dependencies = [
  "fusewire",
  "libc",
  "memmap2",
+ "rargo-machine",
  "rargo-net",
  "rargo-proto",
  "rayon",
@@ -832,6 +834,7 @@ dependencies = [
  "fusewire",
  "libc",
  "parking_lot",
+ "rargo-machine",
  "rargo-net",
  "rargo-plan",
  "rargo-proto",
@@ -849,6 +852,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rargo-machine"
+version = "0.7.10"
+
+[[package]]
 name = "rargo-net"
 version = "0.7.10"
 dependencies = [
@@ -858,6 +865,7 @@ dependencies = [
  "io-uring",
  "libc",
  "parking_lot",
+ "rargo-machine",
  "rargo-proto",
 ]
 
@@ -896,6 +904,7 @@ version = "0.7.10"
 dependencies = [
  "rargo",
  "rargo-core",
+ "rargo-machine",
  "rargo-proto",
 ]
 

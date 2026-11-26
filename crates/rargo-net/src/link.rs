@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::io::{self as shell, JoinHandle, Mutex as FiberMutex, Notify, ReadHalf, TcpStream, WriteHalf};
 use crate::{Auth, Conn, Endpoint};
 use rargo_proto::secure::{self, Opener, Sealer};
@@ -103,8 +104,10 @@ impl FrameDecoder {
         self.invariants();
         Ok(out)
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for FrameDecoder {
+    fn invariants(&self) {
         if self.failed.is_some() {
             assert!(self.buf.is_empty() && self.body.is_none(), "a refused frame leaves the decoder idle");
             return;

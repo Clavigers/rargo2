@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use rargo_net::io::file::PathRing as _;
 use rargo_proto::Digest;
 use rargo_proto::tree::{Node, Tree};
@@ -855,42 +856,6 @@ impl<'a> ScanCore<'a> {
         asks
     }
 
-    fn invariants(&self) -> bool {
-        if self.on_path.as_ref().is_some_and(|paths| !paths.contains(b"".as_slice())) {
-            return false;
-        }
-        if self.pending.iter().any(|pend| !self.pending_ok(pend)) {
-            return false;
-        }
-        for (rel, dir) in &self.dirs {
-            if !rel_well_formed(rel) {
-                return false;
-            }
-            match &dir.phase {
-                Phase::Listing(rows) => {
-                    if !rows_ok(rel, rows, &self.dirs) {
-                        return false;
-                    }
-                }
-                Phase::Done(Directory::Listing(listing)) => {
-                    if !names_increase(listing.iter().map(|(name, _)| name.as_slice())) {
-                        return false;
-                    }
-                }
-                Phase::Done(Directory::Reuse(_)) | Phase::NeedList | Phase::Folded | Phase::Gone => {}
-            }
-        }
-        if self.outcome.is_none() && self.dirs.values().any(|dir| matches!(dir.phase, Phase::Done(_))) && !self.root_done() {
-            return false;
-        }
-        if let Some(prev) = &self.previous {
-            if prev.dir_trees.iter().any(|(rel, hash)| !rel.is_empty() && !prev.trees.contains_key(hash)) {
-                return false;
-            }
-        }
-        self.outcome.as_ref().is_none_or(|scan| scan_holds(scan, self.root_path))
-    }
-
     fn pending_ok(&self, pend: &Pending) -> bool {
         let Some(dir) = self.dirs.get(&pend.rel) else { return false };
         match pend.kind {
@@ -902,6 +867,37 @@ impl<'a> ScanCore<'a> {
                 _ => false,
             },
         }
+    }
+}
+
+impl<'a> StateMachine for ScanCore<'a> {
+    fn invariants(&self) {
+        assert!(
+            self.on_path.as_ref().is_none_or(|paths| paths.contains(b"".as_slice())),
+            "the directories on the path include the root"
+        );
+        assert!(self.pending.iter().all(|pend| self.pending_ok(pend)), "every pending look is one the scan can still use");
+        for (rel, dir) in &self.dirs {
+            let at = String::from_utf8_lossy(rel);
+            assert!(rel_well_formed(rel), "{at:?} is a well-formed relative path");
+            match &dir.phase {
+                Phase::Listing(rows) => assert!(rows_ok(rel, rows, &self.dirs), "the rows listed for {at:?} agree with the directories"),
+                Phase::Done(Directory::Listing(listing)) => {
+                    assert!(names_increase(listing.iter().map(|(name, _)| name.as_slice())), "the listing of {at:?} is sorted")
+                }
+                Phase::Done(Directory::Reuse(_)) | Phase::NeedList | Phase::Folded | Phase::Gone => {}
+            }
+        }
+        if self.outcome.is_none() && self.dirs.values().any(|dir| matches!(dir.phase, Phase::Done(_))) {
+            assert!(self.root_done(), "once a directory is done the root is done, until the scan finishes");
+        }
+        if let Some(prev) = &self.previous {
+            assert!(
+                prev.dir_trees.iter().all(|(rel, hash)| rel.is_empty() || prev.trees.contains_key(hash)),
+                "every directory tree of the previous scan is one of its trees"
+            );
+        }
+        assert!(self.outcome.as_ref().is_none_or(|scan| scan_holds(scan, self.root_path)), "the finished scan holds");
     }
 }
 
@@ -925,11 +921,11 @@ fn drive(mut core: ScanCore) -> io::Result<Scan> {
     loop {
         match core.advance(std::mem::take(&mut answers))? {
             Step::Ask(asks) => {
-                assert!(core.invariants());
+                core.invariants();
                 answers = read_host(core.root_path, &asks);
             }
             Step::Done => {
-                assert!(core.invariants());
+                core.invariants();
                 return Ok(core.outcome.take().expect("a finished scan is present"));
             }
         }
@@ -1207,13 +1203,13 @@ mod tests {
     }
 
     fn run(core: &mut ScanCore, model: &Model) -> io::Result<Scan> {
-        assert!(core.invariants(), "invariants before the first step");
+        rargo_machine::check(&core, "invariants before the first step");
         let mut answers = Vec::new();
         let mut steps = 0u32;
         loop {
             let step = core.advance(std::mem::take(&mut answers))?;
             steps += 1;
-            assert!(core.invariants(), "invariants after step {steps}");
+            rargo_machine::check(&core, format_args!("invariants after step {steps}"));
             match step {
                 Step::Ask(asks) => answers = model.answer(&asks),
                 Step::Done => return Ok(core.outcome.take().expect("a finished scan")),
@@ -1570,16 +1566,16 @@ mod tests {
     fn a_missing_root_is_an_error_and_an_unreadable_file_names_its_path() {
         let empty = Index::default();
         let mut core = ScanCore::whole(Path::new("/missing"), Some(&empty), &[], None);
-        assert!(core.invariants());
+        core.invariants();
         let Step::Ask(asks) = core.advance(Vec::new()).unwrap() else { panic!("the root is listed") };
-        assert!(core.invariants());
+        core.invariants();
         assert!(matches!(asks.as_slice(), [Ask::List { rel }] if rel.is_empty()));
         let err = match core.advance(vec![Answer::List(Err(io::Error::new(ErrorKind::NotFound, "gone")))]) {
             Err(err) => err,
             Ok(_) => panic!("a missing root is an error"),
         };
         assert_eq!(err.kind(), ErrorKind::NotFound);
-        assert!(core.invariants());
+        core.invariants();
 
         let root = Path::new("/mem");
         let mut tree = dir();

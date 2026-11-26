@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::sched::Priority;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -233,8 +234,10 @@ impl SchedState {
             fx.put_tokens += 1;
         }
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for SchedState {
+    fn invariants(&self) {
         assert_eq!(self.running.values().sum::<u64>(), self.mem_kb, "memory is the sum of what runs");
         assert!(
             self.mem_kb <= self.mem_budget_kb || self.running.len() == 1,

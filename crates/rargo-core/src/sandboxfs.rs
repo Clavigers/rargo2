@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use crate::view::*;
 use dashmap::DashMap;
 use fusewire::abi::*;
@@ -208,25 +210,25 @@ impl ObsCore {
         }
         (out, tainted)
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.items.iter().all(|(path, rec)| {
-            if !path_ok(path) {
-                return false;
+#[cfg(test)]
+impl StateMachine for ObsCore {
+    fn invariants(&self) {
+        for (path, rec) in &self.items {
+            let at = String::from_utf8_lossy(path);
+            assert!(path_ok(path), "{at:?} is a well-formed path");
+            if let Rec::File(file) = rec {
+                if file.hashed.is_some() {
+                    assert!(!file.failed, "{at}: a hashed file has not failed");
+                    assert!(file.sem.is_none(), "{at}: a hashed file holds no hashing slot");
+                    assert!(file.read, "{at}: a hashed file was read");
+                } else if file.failed {
+                    assert!(file.sem.is_none(), "{at}: a failed file holds no hashing slot");
+                    assert!(file.read, "{at}: a failed file was read");
+                }
             }
-            match rec {
-                Rec::Settled(_) => true,
-                Rec::File(file) => match (file.hashed.is_some(), file.failed, file.sem.is_some(), file.read) {
-                    (true, true, _, _) => false,
-                    (true, _, true, _) => false,
-                    (true, _, _, false) => false,
-                    (false, true, true, _) => false,
-                    (false, true, _, false) => false,
-                    _ => true,
-                },
-            }
-        })
+        }
     }
 }
 
@@ -1075,43 +1077,6 @@ fn mark_file_read(st: &mut State, node: u32) {
 }
 
 impl State {
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        if !self.trace.invariants() || self.nodes.is_empty() {
-            return false;
-        }
-        for node in &self.nodes {
-            match node {
-                Kind::Dir(dir) => {
-                    if dir.parent as usize >= self.nodes.len() {
-                        return false;
-                    }
-                    for slot in dir.entries.values() {
-                        let id = match slot {
-                            Slot::Lower(n) | Slot::Upper(n, _) => *n as usize,
-                            Slot::Negative | Slot::Whiteout => continue,
-                        };
-                        if id == 0 || id >= self.nodes.len() {
-                            return false;
-                        }
-                    }
-                }
-                Kind::File(file) => {
-                    if file.parent as usize >= self.nodes.len() {
-                        return false;
-                    }
-                    if let Some(index) = file.obs {
-                        if !self.trace.file_is(index, file.read_src.is_some()) {
-                            return false;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        true
-    }
-
     fn read_source(&self, node: u32) -> Res<&Arc<File>> {
         match self.nodes.get(node as usize) {
             Some(Kind::File(file)) => match &file.src {
@@ -1119,6 +1084,36 @@ impl State {
                 Src::Lower(_) => file.file.as_ref().ok_or(Errno::EBADF),
             },
             _ => Err(Errno::EBADF),
+        }
+    }
+}
+
+#[cfg(test)]
+impl StateMachine for State {
+    fn invariants(&self) {
+        self.trace.invariants();
+        assert!(!self.nodes.is_empty(), "the root node is there");
+        let n = self.nodes.len();
+        for (i, node) in self.nodes.iter().enumerate() {
+            match node {
+                Kind::Dir(dir) => {
+                    assert!((dir.parent as usize) < n, "directory {i}'s parent {} is a node", dir.parent);
+                    for slot in dir.entries.values() {
+                        let id = match slot {
+                            Slot::Lower(n) | Slot::Upper(n, _) => *n as usize,
+                            Slot::Negative | Slot::Whiteout => continue,
+                        };
+                        assert!(id != 0 && id < n, "directory {i} names node {id}, which is not a child node");
+                    }
+                }
+                Kind::File(file) => {
+                    assert!((file.parent as usize) < n, "file {i}'s parent {} is a node", file.parent);
+                    if let Some(index) = file.obs {
+                        assert!(self.trace.file_is(index, file.read_src.is_some()), "file {i} is traced as read exactly when it was read");
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -1972,7 +1967,7 @@ mod model_tests {
         let (parent, name) = vsplit(path).expect("a path has a parent");
         let parent_id = ensure_dir(fs, st, ids, parent).unwrap_or_else(|| panic!("parent {}", show(parent)));
         let id = fs.resolve(st, parent_id, name, true).expect("resolve").unwrap_or_else(|| panic!("present {}", show(path)));
-        assert!(st.invariants());
+        st.invariants();
         if matches!(st.nodes[id as usize], Kind::Dir(_)) {
             ids.insert(path.to_vec(), id);
         }
@@ -1996,7 +1991,7 @@ mod model_tests {
     fn drive(view: Arc<dyn View>, blind: bool, accesses: &[Access]) -> (Vec<(VPath, Obs)>, bool, Vec<Vec<(Vec<u8>, DType)>>) {
         let fs = ActionFs::in_memory(view.clone(), blind);
         let mut st = fs.st.lock();
-        assert!(st.invariants());
+        st.invariants();
         let mut ids = BTreeMap::new();
         let mut listings = Vec::new();
         for access in accesses {
@@ -2004,7 +1999,7 @@ mod model_tests {
                 Access::Lookup { dir, name } => {
                     let parent = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("lookup parent {}", show(dir)));
                     let id = fs.resolve(&mut st, parent, name, true).expect("resolve");
-                    assert!(st.invariants());
+                    st.invariants();
                     if let Some(id) = id {
                         if matches!(st.nodes[id as usize], Kind::Dir(_)) {
                             ids.insert(vjoin(dir, name), id);
@@ -2014,7 +2009,7 @@ mod model_tests {
                 Access::ReadDir(dir) => {
                     let id = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("readdir {}", show(dir)));
                     let list = fs.merged_listing(&mut st, id).expect("list");
-                    assert!(st.invariants());
+                    st.invariants();
                     listings.push(list.iter().map(|(name, kind)| (name.to_vec(), *kind)).collect());
                 }
                 Access::Open { path } => {
@@ -2022,25 +2017,25 @@ mod model_tests {
                     let (parent, name) = vsplit(path).unwrap();
                     let Looked::File(info) = view.lookup(parent, name) else { panic!("open expects a file {}", show(path)) };
                     accept_read(&mut st, id, info.src);
-                    assert!(st.invariants());
+                    st.invariants();
                 }
                 Access::Read { path } => {
                     let id = resolve_file(&fs, &mut st, &mut ids, path);
                     assert!(st.read_source(id).is_err(), "an in-memory file has no content handle");
                     note_read(&mut st, id);
-                    assert!(st.invariants());
+                    st.invariants();
                 }
                 Access::Unlink { dir, name } => {
                     let parent = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("unlink parent {}", show(dir)));
                     fs.conceal(&mut st, parent, name).expect("unlink");
-                    assert!(st.invariants());
+                    st.invariants();
                 }
                 Access::Mkdir { dir, name } => {
                     let parent = ensure_dir(&fs, &mut st, &mut ids, dir).unwrap_or_else(|| panic!("mkdir parent {}", show(dir)));
                     assert!(fs.resolve(&mut st, parent, name, true).expect("resolve").is_none(), "mkdir names a new entry");
-                    assert!(st.invariants());
+                    st.invariants();
                     fs.do_mkdir(&mut st, parent, name, 0o755).expect("mkdir");
-                    assert!(st.invariants());
+                    st.invariants();
                 }
             }
         }
@@ -2048,10 +2043,10 @@ mod model_tests {
             let path = st.trace.path_of(index).to_vec();
             let bytes = view.read_bytes(&path).expect("a read file has bytes");
             st.trace.supply_hash(index, crate::hash::Hash::of(bytes));
-            assert!(st.invariants());
+            st.invariants();
         }
         let (obs, tainted) = st.trace.outcome();
-        assert!(st.invariants());
+        st.invariants();
         (obs, tainted, listings)
     }
 
@@ -2180,18 +2175,18 @@ mod model_tests {
         let view: Arc<dyn View> = Arc::new(mem);
         let fs = ActionFs::in_memory(view.clone(), false);
         let mut st = fs.st.lock();
-        assert!(st.invariants());
+        st.invariants();
         let id = fs.resolve(&mut st, ROOT_LOCAL, b"f", true).expect("resolve").expect("file");
-        assert!(st.invariants());
+        st.invariants();
         let Looked::File(info) = view.lookup(b"/", b"f") else { panic!("file") };
         accept_read(&mut st, id, info.src);
-        assert!(st.invariants());
+        st.invariants();
         assert!(st.read_source(id).is_err());
         note_read(&mut st, id);
-        assert!(st.invariants());
+        st.invariants();
         let index = st.trace.pending_hashes()[0];
         st.trace.fail_hash(index);
-        assert!(st.invariants());
+        st.invariants();
         let (obs, tainted) = st.trace.outcome();
         assert!(tainted);
         assert!(matches!(obs.as_slice(), [(path, Obs::File { hash, exec: false })] if path.as_ref() == b"/f" && *hash == crate::hash::Hash::ZERO));

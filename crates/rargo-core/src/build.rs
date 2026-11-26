@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::io::file::PathRing as _;
 use crate::buildview::*;
 use crate::engine::*;

@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use super::pure::{missing_components, needs_network};
 use std::collections::BTreeSet;
 
@@ -265,8 +266,10 @@ impl BuildRequest {
         }
         self.end(End::Cancelled)
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for BuildRequest {
+    fn invariants(&self) {
         assert!(self.check || !self.as_build, "only a check is planned as a build");
         assert!(self.installing.is_subset(&self.retried), "a unit installs components only on its one retry");
         match self.phase {

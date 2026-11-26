@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use crate::db::{Table, Tables};
 use crate::hash::Hash;
 use crate::view::{DType, FileInfo, FileSrc, HostSig, Listing, Looked, Owner};
@@ -281,9 +283,11 @@ impl Walk {
             _ => Err(io::Error::other(format!("{} was not looked at", self.root.display()))),
         }
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
+#[cfg(test)]
+impl StateMachine for Walk {
+    fn invariants(&self) {
         let inside = |a: &Ask| a.path().starts_with(&self.root);
         let from_listing = |a: &Ask| {
             let p = a.path();
@@ -302,13 +306,16 @@ impl Walk {
                 })
             })
         };
-        self.want.iter().chain(&self.asked).all(|a| inside(a) && from_listing(a))
-            && self.want.is_disjoint(&self.asked)
-            && self.listed.keys().all(|d| self.asked.contains(&Ask::List(d.clone())))
-            && self.hashed.keys().all(|f| self.asked.contains(&Ask::Hash(f.clone())))
-            && self.listed.values().flatten().all(|(n, _)| plain_name(n))
-            && (self.failed.is_none() || self.want.is_empty())
-            && (self.top.is_some() || self.asked.is_empty() || self.failed.is_some())
+        for a in self.want.iter().chain(&self.asked) {
+            assert!(inside(a), "{a:?} is inside the root");
+            assert!(from_listing(a), "{a:?} is the root or named by a listing as what it asks");
+        }
+        assert!(self.want.is_disjoint(&self.asked), "nothing wanted has been asked already");
+        assert!(self.listed.keys().all(|d| self.asked.contains(&Ask::List(d.clone()))), "every listing was asked for");
+        assert!(self.hashed.keys().all(|f| self.asked.contains(&Ask::Hash(f.clone()))), "every hash was asked for");
+        assert!(self.listed.values().flatten().all(|(n, _)| plain_name(n)), "every listed name is a plain name");
+        assert!(self.failed.is_none() || self.want.is_empty(), "a failed walk wants nothing more");
+        assert!(self.top.is_some() || self.asked.is_empty() || self.failed.is_some(), "a walk that asked has a top or a failure");
     }
 }
 
@@ -570,11 +577,13 @@ impl<T> Queue<T> {
         self.handed += 1;
         Some(item)
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.handed + self.waiting.len() as u64 == self.pushed
-            && self.waiting.iter().zip(self.handed..).all(|((n, _), want)| *n == want)
+#[cfg(test)]
+impl<T> StateMachine for Queue<T> {
+    fn invariants(&self) {
+        assert_eq!(self.handed + self.waiting.len() as u64, self.pushed, "everything pushed is handed out or waiting");
+        assert!(self.waiting.iter().zip(self.handed..).all(|((n, _), want)| *n == want), "the waiting entries are the next ones in order");
     }
 }
 
@@ -1144,7 +1153,7 @@ mod tests {
 
     fn walk_shuffled(fs: &FakeStore, root: &Path, rng: &mut Rng) -> io::Result<Fresh> {
         let mut walk = Walk::new(root);
-        assert!(walk.invariants());
+        walk.invariants();
         let mut rounds = 0;
         loop {
             let mut wants = walk.wants();
@@ -1158,9 +1167,9 @@ mod tests {
                 let ask = wants.remove(rng.below(wants.len() as u64) as usize);
                 let got = answer(fs, &ask);
                 walk.saw(ask.clone(), got);
-                assert!(walk.invariants(), "after {ask:?}");
+                rargo_machine::check(&walk, format_args!("after {ask:?}"));
                 walk.saw(ask, Ok(Answer::Stat(Kind::Dir)));
-                assert!(walk.invariants(), "an answer to nothing asked is ignored");
+                rargo_machine::check(&walk, "an answer to nothing asked is ignored");
             }
         }
         walk.finish()
@@ -1229,7 +1238,7 @@ mod tests {
         assert_eq!(gone.to_string(), "/s/none: /s/none is missing");
         let mut walk = Walk::new(Path::new("/s/f"));
         walk.saw(Ask::Stat("/s/f".into()), Ok(Answer::Hash(Hash::ZERO, 0)));
-        assert!(walk.invariants());
+        walk.invariants();
         assert!(walk.finish().is_err(), "an answer of the wrong shape fails the walk");
         assert!(Walk::new(Path::new("/s/f")).finish().is_err(), "an unfinished walk has no manifest");
     }
@@ -1381,7 +1390,7 @@ mod tests {
                         None => assert!((one_core && builds > 0) || next_out == next_in, "seed {seed}: the queue is idle only when empty or held"),
                     },
                 }
-                assert!(q.invariants(), "seed {seed}");
+                rargo_machine::check(&q, format_args!("seed {seed}"));
             }
         }
         assert!(quota_is_one_core("100000 100000\n") && quota_is_one_core("50000 100000"));
