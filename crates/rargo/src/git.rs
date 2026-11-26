@@ -367,7 +367,7 @@ fn ignored_in<S: Source>(src: &S, root: &Path, global: Option<&[u8]>) -> Option<
 
 pub enum Bytes {
     Owned(Vec<u8>),
-    Mapped(memmap2::Mmap),
+    Mapped(rargo_net::io::file::Mapped),
 }
 
 impl AsRef<[u8]> for Bytes {
@@ -392,7 +392,7 @@ impl Source for Disk {
             return None;
         }
         if md.len() >= 1 << 20 {
-            return unsafe { memmap2::Mmap::map(&f) }.ok().map(Bytes::Mapped);
+            return f.map(md.len() as usize).ok().map(Bytes::Mapped);
         }
         let mut v = Vec::with_capacity(md.len() as usize);
         f.read_to_end(&mut v).ok()?;

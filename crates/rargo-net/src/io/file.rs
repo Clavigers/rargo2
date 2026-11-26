@@ -749,6 +749,10 @@ pub enum Mapped {
     Held(Vec<u8>),
 }
 
+// The mapping is private and read-only, and nothing but this value points into it.
+unsafe impl Send for Mapped {}
+unsafe impl Sync for Mapped {}
+
 impl std::ops::Deref for Mapped {
     type Target = [u8];
 

@@ -293,7 +293,8 @@ impl Blobs {
         if len == 0 {
             return Some(Arc::new(Outline { cvs: Vec::new(), lazy: Vec::new() }));
         }
-        let o = crate::io::map::mapped(&f, len, |data| {
+        let o = f.map(len).map(|data| {
+            let data: &[u8] = &data;
             let cvs = if len as u64 <= crate::proto::outline::GROUP {
                 Vec::new()
             } else {
