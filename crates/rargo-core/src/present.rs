@@ -83,17 +83,14 @@ impl Translator {
     }
 
     pub fn to_canonical(&self, p: &str) -> String {
-        for (canon, real) in &self.pairs {
-            if p == real {
-                return canon.clone();
-            }
-            if let Some(rest) = p.strip_prefix(real.as_str()) {
-                if rest.starts_with('/') {
-                    return format!("{canon}{rest}");
-                }
-            }
-        }
-        p.to_string()
+        self.pairs
+            .iter()
+            .filter_map(|(canon, real)| {
+                let rest = p.strip_prefix(real.as_str())?;
+                (rest.is_empty() || rest.starts_with('/')).then_some((real.len(), canon, rest))
+            })
+            .max_by_key(|(len, _, _)| *len)
+            .map_or_else(|| p.to_string(), |(_, canon, rest)| format!("{canon}{rest}"))
     }
 }
 
