@@ -468,32 +468,29 @@ pub fn bulk_of(m: &ServerMsg) -> usize {
 mod tests {
     use super::*;
 
-    fn dir() -> impl AsRef<std::path::Path> {
-        tempfile::tempdir().unwrap()
-    }
-
     #[test]
     fn an_open_server_admits_anyone_and_one_with_tokens_their_holders() {
-        assert!(Keys::open().lookup("anyone").unwrap().1);
-        let dir = dir();
-        let store = Arc::new(crate::tokens::TokenStore::new(dir.as_ref().join("tokens.json")));
-        let (ann, secret) = store.create("ann", true, None, "test").unwrap();
-        let (bob, _) = store.create("bob", false, None, "test").unwrap();
-        let k = Keys::with_tokens(store.clone());
-        assert_eq!(k.lookup(&ann.id).unwrap(), (secure::psk_from_secret(secret.as_bytes()), true));
-        assert!(!k.lookup(&bob.id).unwrap().1);
-        assert!(k.lookup("ann").is_none(), "a name is not a token");
-        assert_eq!(k.name_of(&bob.id), "bob");
-        store.revoke(&bob.id).unwrap();
-        assert!(!k.still_valid(&bob.id));
+        crate::io::sim::test(|| {
+            assert!(Keys::open().lookup("anyone").unwrap().1);
+            let dir = crate::io::sim::tempdir();
+            let store = Arc::new(crate::tokens::TokenStore::new(dir.join("tokens.json")));
+            let (ann, secret) = store.create("ann", true, None, "test").unwrap();
+            let (bob, _) = store.create("bob", false, None, "test").unwrap();
+            let k = Keys::with_tokens(store.clone());
+            assert_eq!(k.lookup(&ann.id).unwrap(), (secure::psk_from_secret(secret.as_bytes()), true));
+            assert!(!k.lookup(&bob.id).unwrap().1);
+            assert!(k.lookup("ann").is_none(), "a name is not a token");
+            assert_eq!(k.name_of(&bob.id), "bob");
+            store.revoke(&bob.id).unwrap();
+            assert!(!k.still_valid(&bob.id));
+        });
     }
 
     #[test]
     fn an_upload_that_finds_the_session_gone_says_so_and_does_not_lock_the_state_twice() {
-        let dir = dir();
-        let db = Arc::new(crate::db::Db::open(&dir.as_ref().join("db.redb")).unwrap());
-        let store = Arc::new(Store::open(&dir.as_ref().join("store"), db).unwrap());
-        crate::io::drive(1, move || {
+        crate::io::sim::test(|| {
+            let db = Arc::new(crate::db::Db::open_in_memory().unwrap());
+            let store = Arc::new(Store::open(&crate::io::sim::tempdir().join("store"), db).unwrap());
             let (session, _rx) = Session::new(store);
             session.close();
             let lacking = Hash([7; 32]);

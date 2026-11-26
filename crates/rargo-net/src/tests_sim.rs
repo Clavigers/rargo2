@@ -102,6 +102,51 @@ fn files_live_in_memory() {
 }
 
 #[test]
+fn a_simulated_file_keeps_what_a_content_store_relies_on() {
+    sim::test(|| {
+        use crate::io::file;
+        use std::os::fd::AsRawFd;
+        let dir = sim::tempdir();
+        let path = dir.join("blob");
+        let held = file::File::create(&path).unwrap();
+        held.write_all_at(b"first", 0).unwrap();
+        let before = file::metadata(&path).unwrap().mtime_ns();
+        held.write_all_at(b"again", 0).unwrap();
+        let after = file::metadata(&path).unwrap();
+        assert!(after.mtime_ns() > before, "a second write at the same instant still moves the modification time");
+        assert_eq!(after.len(), 5);
+
+        file::set_mode(&path, 0o444).unwrap();
+        let refused = file::OpenOptions::new().write(true).open(&path).unwrap_err();
+        assert_eq!(refused.raw_os_error(), Some(libc::EACCES), "a read-only file does not open for writing");
+        held.write_all_at(b"still", 0).unwrap();
+        let read = file::File::open(&path).unwrap();
+        assert_eq!(&*read.map(5).unwrap(), b"still", "a descriptor opened before the mode changed keeps writing");
+        assert!(read.map(6).is_err(), "a mapping is no longer than its file");
+
+        let copy = file::File::create(dir.join("copy")).unwrap();
+        assert!(!file::reflink_fd(read.as_raw_fd(), copy.as_raw_fd()), "the simulated filesystem shares no blocks");
+        assert_eq!(file::lchown(&path, 0, 0).unwrap_err().raw_os_error(), Some(libc::EPERM));
+        file::lchown(&path, io::process::uid(), io::process::gid()).unwrap();
+
+        let first = file::File::create(dir.join("lock")).unwrap();
+        first.lock_exclusive().unwrap();
+        let other = dir.join("lock");
+        let mut waiter = io::spawn(move || {
+            let second = file::File::open(other).unwrap();
+            second.lock_exclusive().unwrap();
+            io::now()
+        });
+        let start = io::now();
+        io::sleep(std::time::Duration::from_secs(1));
+        assert!(!waiter.is_finished(), "a second descriptor waits for the lock");
+        drop(first);
+        let got = waiter.join().unwrap();
+        assert!(got >= start + std::time::Duration::from_secs(1), "and gets it once the first is closed");
+    });
+}
+
+#[test]
 fn the_clock_the_environment_and_commands_are_the_simulations() {
     sim::test(|| {
         let (start, wall) = (io::now(), io::system_now());

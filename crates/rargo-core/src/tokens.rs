@@ -78,7 +78,7 @@ impl Github {
     pub fn save(&self, state: &Path) -> Result<()> {
         use std::io::Write;
         let path = Self::path(state);
-        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = path.with_extension(format!("tmp{}", crate::io::process::id()));
         let mut w = crate::io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
         w.write_all(&serde_json::to_vec_pretty(self)?)?;
         crate::io::file::rename(&tmp, &path)?;
@@ -96,13 +96,12 @@ pub struct TokenStore {
 }
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    crate::io::system_now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn random(n: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
     let mut b = vec![0u8; n];
-    crate::io::file::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).context("reading /dev/urandom")?;
+    crate::io::random(&mut b);
     Ok(b)
 }
 
@@ -178,7 +177,6 @@ impl TokenStore {
     }
 
     fn change<T>(&self, f: impl FnOnce(&mut Tokens) -> Result<T>) -> Result<T> {
-        use std::os::fd::AsRawFd;
         if let Some(dir) = self.path.parent() {
             crate::io::file::create_dir_all(dir)?;
         }
@@ -189,8 +187,8 @@ impl TokenStore {
             .mode(0o600)
             .open(self.path.with_extension("lock"))
             .context("opening the token lock file")?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!("locking the token file: {}", std::io::Error::last_os_error());
+        if let Err(e) = lock.lock_exclusive() {
+            bail!("locking the token file: {e}");
         }
         let mut file: Tokens = match crate::io::file::read(&self.path) {
             Ok(bytes) => Tokens::decode(&bytes).with_context(|| format!("{}", self.path.display()))?,
@@ -198,7 +196,7 @@ impl TokenStore {
             Err(e) => return Err(e).with_context(|| format!("{}", self.path.display())),
         };
         let out = f(&mut file)?;
-        let tmp = self.path.with_extension(format!("tmp{}", std::process::id()));
+        let tmp = self.path.with_extension(format!("tmp{}", crate::io::process::id()));
         {
             use std::io::Write;
             let mut w = crate::io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;

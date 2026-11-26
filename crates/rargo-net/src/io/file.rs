@@ -451,6 +451,16 @@ pub fn set_modified(path: impl AsRef<Path>, at: SystemTime) -> io::Result<()> {
     offload(|| std::fs::File::options().append(true).open(path).and_then(|f| f.set_modified(at)))
 }
 
+/// Changes who owns a path, without following a link.
+pub fn lchown(path: impl AsRef<Path>, uid: u32, gid: u32) -> io::Result<()> {
+    let path = path.as_ref();
+    if let Some(done) = super::sim::lchown(path, uid, gid) {
+        return done;
+    }
+    let c = c_path(path)?;
+    direct(unsafe { libc::lchown(c.as_ptr(), uid, gid) } as isize, |_| ())
+}
+
 pub trait PathRing {
     fn ring_exists(&self) -> bool;
     fn ring_is_file(&self) -> bool;
@@ -707,6 +717,55 @@ impl File {
         }
         direct(unsafe { libc::fallocate(self.fd, mode, offset as libc::off_t, len as libc::off_t) } as isize, |_| ())
     }
+
+    /// Takes the exclusive advisory lock on the file, waiting for whoever
+    /// holds it. Closing the file gives the lock up.
+    pub fn lock_exclusive(&self) -> io::Result<()> {
+        while let Some(taken) = super::sim::try_lock(self.fd) {
+            if taken? {
+                return Ok(());
+            }
+            super::sleep(Duration::from_millis(1));
+        }
+        direct(unsafe { libc::flock(self.fd, libc::LOCK_EX) } as isize, |_| ())
+    }
+
+    /// The first `len` bytes of the file as memory, without reading them up front.
+    pub fn map(&self, len: usize) -> io::Result<Mapped> {
+        if let Some(held) = super::sim::contents(self.fd, len) {
+            return Ok(Mapped::Held(held?));
+        }
+        let at = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, self.fd, 0) };
+        if at == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Mapped::Kernel { at: at.cast(), len })
+    }
+}
+
+/// A file's bytes as memory: the kernel's mapping, or in a simulation a copy.
+pub enum Mapped {
+    Kernel { at: *const u8, len: usize },
+    Held(Vec<u8>),
+}
+
+impl std::ops::Deref for Mapped {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Mapped::Kernel { at, len } => unsafe { std::slice::from_raw_parts(*at, *len) },
+            Mapped::Held(bytes) => bytes,
+        }
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        if let Mapped::Kernel { at, len } = self {
+            unsafe { libc::munmap(at.cast_mut().cast(), *len) };
+        }
+    }
 }
 
 impl std::io::Read for File {
@@ -770,6 +829,16 @@ impl Drop for File {
         let fd = self.fd;
         let _ = route(move || close_fd(fd), || direct(unsafe { libc::close(fd) } as isize, |_| ()));
     }
+}
+
+const FICLONE: libc::c_ulong = 0x4004_9409;
+
+/// Makes `dst` share `src`'s blocks, and says whether the filesystem did it. The simulated filesystem never does.
+pub fn reflink_fd(src: i32, dst: i32) -> bool {
+    if super::sim::owns(src) || super::sim::owns(dst) {
+        return false;
+    }
+    unsafe { libc::ioctl(dst, FICLONE, src) == 0 }
 }
 
 pub fn copy_fd(src: i32, dst: i32) -> io::Result<u64> {

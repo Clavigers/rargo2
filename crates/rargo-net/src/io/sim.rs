@@ -164,6 +164,10 @@ pub struct SimLoop {
     pipes: BTreeMap<u64, Pipe>,
     env: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     commands: Option<Commands>,
+    /// The latest modification time handed out, so that each change to a file is later than the one before.
+    last_stamp: i64,
+    /// The descriptor that holds the exclusive lock on each locked inode.
+    locks: BTreeMap<u64, i32>,
     report: Report,
 }
 
@@ -218,6 +222,8 @@ impl SimLoop {
             pipes: BTreeMap::new(),
             env: BTreeMap::new(),
             commands: None,
+            last_stamp: 0,
+            locks: BTreeMap::new(),
             report: Report { elapsed_ms: 0, ops: 0, datagrams_sent: 0, datagrams_lost: 0, datagrams_duplicated: 0, trace: 0xcbf2_9ce4_8422_2325 },
         }
     }
@@ -364,6 +370,14 @@ impl SimLoop {
         (EPOCH_S * 1_000_000_000 + self.now_ms * 1_000_000) as i64
     }
 
+    /// The time a change to a file is stamped with: the wall clock, moved on
+    /// by a nanosecond when the clock has not moved since the last change, so
+    /// a file that was written again never keeps its modification time.
+    fn stamp(&mut self) -> i64 {
+        self.last_stamp = self.wall_ns().max(self.last_stamp + 1);
+        self.last_stamp
+    }
+
     /// Follows symbolic links in every component, as the kernel does when it opens a path.
     fn real(&self, path: &Path) -> io::Result<PathBuf> {
         let mut out = PathBuf::from("/");
@@ -414,8 +428,17 @@ impl SimLoop {
                 if flags & libc::O_DIRECTORY != 0 {
                     return Err(errno(libc::ENOTDIR));
                 }
+                let held = self.inodes[&ino].mode;
+                let (reads, writes) = match flags & libc::O_ACCMODE {
+                    libc::O_RDONLY => (true, flags & libc::O_TRUNC != 0),
+                    libc::O_WRONLY => (false, true),
+                    _ => (true, true),
+                };
+                if (reads && held & 0o400 == 0) || (writes && held & 0o200 == 0) {
+                    return Err(errno(libc::EACCES));
+                }
                 if flags & libc::O_TRUNC != 0 {
-                    let now = self.wall_ns();
+                    let now = self.stamp();
                     let inode = self.inodes.get_mut(&ino).expect("a named file has its inode");
                     inode.data.clear();
                     inode.mtime_ns = now;
@@ -429,7 +452,8 @@ impl SimLoop {
                 self.parent_is_dir(&path)?;
                 let ino = self.next_ino;
                 self.next_ino += 1;
-                self.inodes.insert(ino, Inode { data: Vec::new(), mode: mode & 0o7777, mtime_ns: self.wall_ns(), links: 1 });
+                let now = self.stamp();
+                self.inodes.insert(ino, Inode { data: Vec::new(), mode: mode & 0o7777, mtime_ns: now, links: 1 });
                 self.files.insert(path.clone(), Node::File(ino));
                 Ok(self.fd(Handle::File { ino, path }))
             }
@@ -649,7 +673,10 @@ impl SimLoop {
                             self.fail(waiter, errno(libc::EBADF));
                         }
                     }
-                    Some(Handle::File { ino, .. }) => self.reap(ino),
+                    Some(Handle::File { ino, .. }) => {
+                        self.locks.retain(|_, holder| *holder != fd);
+                        self.reap(ino)
+                    }
                     Some(Handle::Dir { .. }) => {}
                     Some(Handle::Pipe { id, .. }) => self.pipe_closed(id),
                     None => return Err(errno(libc::EBADF)),
@@ -690,7 +717,7 @@ impl SimLoop {
                 Event::Read { n: buf.len(), buf }
             }
             Op::Write { fd, off, buf } => {
-                let now = self.wall_ns();
+                let now = self.stamp();
                 let inode = self.file(fd)?;
                 let end = off as usize + buf.len();
                 if inode.data.len() < end {
@@ -701,7 +728,7 @@ impl SimLoop {
                 Event::Write { n: buf.len() }
             }
             Op::Ftruncate { fd, len } => {
-                let now = self.wall_ns();
+                let now = self.stamp();
                 let inode = self.file(fd)?;
                 inode.data.resize(len as usize, 0);
                 inode.mtime_ns = now;
@@ -898,7 +925,10 @@ pub(super) fn close_now(fd: i32) -> bool {
                 sim.fail(waiter, errno(libc::EBADF));
             }
         }
-        Some(Handle::File { ino, .. }) => sim.reap(ino),
+        Some(Handle::File { ino, .. }) => {
+            sim.locks.retain(|_, holder| *holder != fd);
+            sim.reap(ino)
+        }
         Some(Handle::Pipe { id, .. }) => sim.pipe_closed(id),
         Some(Handle::Dir { .. }) | None => {}
     })
@@ -1087,6 +1117,52 @@ pub(super) fn canonicalize(path: &Path) -> Option<io::Result<PathBuf>> {
     with(|sim| {
         let real = sim.real(path)?;
         if sim.files.contains_key(&real) { Ok(real) } else { Err(errno(libc::ENOENT)) }
+    })
+}
+
+/// Whether `fd` is a descriptor of this thread's simulation.
+pub(super) fn owns(fd: i32) -> bool {
+    fd >= FIRST_FD && active()
+}
+
+/// The first `len` bytes of a simulated open file, which is what mapping it shows.
+pub(super) fn contents(fd: i32, len: usize) -> Option<io::Result<Vec<u8>>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| {
+        let data = &sim.file(fd)?.data;
+        if len == 0 || len > data.len() {
+            return Err(errno(libc::EINVAL));
+        }
+        Ok(data[..len].to_vec())
+    })
+}
+
+/// Takes the exclusive lock on a simulated open file for `fd`, or says that another descriptor holds it.
+pub(super) fn try_lock(fd: i32) -> Option<io::Result<bool>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| {
+        let ino = match sim.handles.get(&fd) {
+            Some(Handle::File { ino, .. }) => *ino,
+            Some(_) => return Err(errno(libc::EINVAL)),
+            None => return Err(errno(libc::EBADF)),
+        };
+        let holder = *sim.locks.entry(ino).or_insert(fd);
+        Ok(holder == fd)
+    })
+}
+
+/// Changes who owns a simulated path. Every path belongs to the simulated
+/// user, who is not root, so only a change to that same owner is allowed.
+pub(super) fn lchown(path: &Path, uid: u32, gid: u32) -> Option<io::Result<()>> {
+    with(|sim| {
+        if !sim.files.contains_key(&normal(path)) {
+            return Err(errno(libc::ENOENT));
+        }
+        if uid == UID && gid == UID { Ok(()) } else { Err(errno(libc::EPERM)) }
     })
 }
 
