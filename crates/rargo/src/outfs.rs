@@ -1696,6 +1696,16 @@ mod tests {
             Ev::Forget(3, 2),
             Ev::Lookup(ROOT, "app"),
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            lookup 1 app => 2
+            changed app => detached app from 1
+            lookup 1 app => 3
+            path 3 => Ok("app")
+            path 2 => Ok("app")
+            forget 2 1 => [2]
+            lookup 1 app => 3
+            forget 3 2 => [3]
+            lookup 1 app => 4
+        "#]].assert_eq(&run(events));
     }
 }

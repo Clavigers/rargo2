@@ -1317,14 +1317,34 @@ mod tests {
         put(&mut tree, "target/debug/out", file("o", 4));
         put(&mut tree, "link", Mem::Link(b"src".to_vec()));
         let mut model = Model { root: tree, at_ns: SETTLED };
-        let mut whole = ScanCore::whole(root, Some(&Index::default()), &[], None);
-        expect![[r#""#]].assert_eq(&transcript(&mut whole, &model));
+        let empty = Index::default();
+        let mut whole = ScanCore::whole(root, Some(&empty), &[], None);
+        expect![[r#"
+            step 1: list ""
+            step 2: meta "Cargo.toml", meta "link", meta "src"
+            step 3: content "Cargo.toml" (9 bytes), link "link", cache tag "src"
+            step 4: list "src"
+            step 5: meta "src/bin", meta "src/lib.rs"
+            step 6: cache tag "src/bin", content "src/lib.rs" (13 bytes)
+            step 7: list "src/bin"
+            step 8: meta "src/bin/b.rs"
+            step 9: content "src/bin/b.rs" (12 bytes)
+            listed 3 directories, hashed 3 files, index changed: true; files "Cargo.toml":9 "src/bin/b.rs":12 "src/lib.rs":13
+        "#]].assert_eq(&transcript(&mut whole, &model));
 
         let first = whole.outcome.take().unwrap();
         put(&mut model.root, "src/lib.rs", Mem::File { bytes: b"pub fn b() {}".to_vec(), mtime_ns: SETTLED, ctime_ns: SETTLED, ino: 2, exec: false });
         let told: BTreeSet<PathBuf> = [root.join("src")].into_iter().collect();
         let mut rescan = ScanCore::rescan(root, first, &told, &[], None);
-        expect![[r#""#]].assert_eq(&transcript(&mut rescan, &model));
+        expect![[r#"
+            step 1: list ""
+            step 2: meta "Cargo.toml", meta "link", meta "src"
+            step 3: link "link", cache tag "src"
+            step 4: list "src"
+            step 5: meta "src/bin", meta "src/lib.rs"
+            step 6: cache tag "src/bin", content "src/lib.rs" (13 bytes)
+            listed 2 directories, hashed 1 files, index changed: true; files "Cargo.toml":9 "src/bin/b.rs":12 "src/lib.rs":13
+        "#]].assert_eq(&transcript(&mut rescan, &model));
     }
 
     #[test]

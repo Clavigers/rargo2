@@ -1279,7 +1279,28 @@ mod tests {
             found.push('\n');
         }
         found += &format!("a relative root holds w/a: {}\n", yes(within(Path::new("w"), Path::new("w/a"))));
-        expect![[r#""#]].assert_eq(&found);
+        expect![[r#"
+            targets ["/srv/out", "/w/target"]
+            bound: the worktree `/w` or the target directory `/srv/out` or the target directory `/w/target`
+            path: within the worktree; worktree alone: holds, file, write; with the targets: holds, file, write
+            "/w/target/debug/app": y; yyy; yyy
+            "/w/Cargo.lock": y; yyy; yyy
+            "/w": -; ---; ---
+            "/srv/out": -; ---; yyy
+            "/srv/out/CACHEDIR.TAG": -; ---; yyy
+            "/srv/out/debug/app": -; ---; yyy
+            "/srv/out/../../etc/passwd": -; ---; ---
+            "/srv/outer/app": -; ---; ---
+            "/srv": -; ---; ---
+            "/etc/passwd": -; ---; ---
+            "/x/../etc/passwd": -; ---; ---
+            "/w/../etc/passwd": -; ---; ---
+            "/w/target/../../etc/passwd": -; ---; ---
+            "/wx/target/app": -; ---; ---
+            "target/debug/app": -; ---; ---
+            "": -; ---; ---
+            a relative root holds w/a: -
+        "#]].assert_eq(&found);
     }
 
     /// Lists the operations, with the content's hash shown as `<h>` in its cache paths.
@@ -1327,7 +1348,32 @@ mod tests {
         waiting.invariants();
         found += &format!("waiting for nothing: {}\n", waiting.is_empty());
         found += &format!("arrived unasked =>\n{}", ops_text(&waiting.arrived(blobs, hash, tmp), &hash));
-        expect![[r#""#]].assert_eq(&found);
+        expect![[r#"
+            matches: true; forged matches: false
+            add /w/target/debug/app => fetch true
+            add /v/target/debug/app => fetch false
+            add /w/target/debug/app.txt => fetch false
+            add /w/target/debug/dir-was-here => fetch false
+            arrived =>
+              dir /c/blobs/a4
+              install /c/blobs/<h>.x required=false: Reflink /c/blobs/.incoming-1-1 555, Link /c/blobs/.incoming-1-1 555, Copy /c/blobs/.incoming-1-1 555
+              install /c/blobs/<h> required=false: Reflink /c/blobs/.incoming-1-1 444, Copy /c/blobs/.incoming-1-1 444
+              dir /w/target/debug
+              install /w/target/debug/app required=true: Reflink /c/blobs/<h>.x 755, Link /c/blobs/<h>.x, Copy /c/blobs/<h>.x 755, Reflink /c/blobs/.incoming-1-1 755, Copy /c/blobs/.incoming-1-1 755
+              record /w/target/debug/app <h>
+              dir /v/target/debug
+              install /v/target/debug/app required=true: Reflink /c/blobs/.incoming-1-1 755, Copy /c/blobs/.incoming-1-1 755
+              record /v/target/debug/app <h>
+              install /w/target/debug/app.txt required=true: Reflink /c/blobs/<h> 644, Link /c/blobs/<h>, Copy /c/blobs/<h> 644, Reflink /c/blobs/.incoming-1-1 644, Copy /c/blobs/.incoming-1-1 644
+              record /w/target/debug/app.txt <h>
+              remove /w/target/debug/dir-was-here
+              install /w/target/debug/dir-was-here required=true: Reflink /c/blobs/<h> 644, Link /c/blobs/<h>, Copy /c/blobs/<h> 644, Reflink /c/blobs/.incoming-1-1 644, Copy /c/blobs/.incoming-1-1 644
+              record /w/target/debug/dir-was-here <h>
+            waiting for nothing: true
+            arrived unasked =>
+              dir /c/blobs/a4
+              install /c/blobs/<h> required=true: Move /c/blobs/.incoming-1-1 444
+        "#]].assert_eq(&found);
     }
 
     #[test]

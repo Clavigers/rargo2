@@ -2205,9 +2205,36 @@ mod upload_tests {
         let sizes = [(1, 0), (2, 100), (3, 168), (4, 169), (5, 40), (6, 1_000), (7, 60), (8, 104)];
         let want = [3, 1, 4, 1, 5, 2, 6, 5, 7, 8, 3];
         let found = [128, 232, 4096].map(|budget| format!("budget {budget}\n{}", plan(&want, &sizes, budget))).concat();
-        expect![[r#""#]].assert_eq(&found);
-        expect![[r#""#]].assert_eq(&plan(&[1, 9], &sizes, 4096));
-        expect![[r#""#]].assert_eq(&plan(&[1], &sizes, UPLOAD_OVERHEAD));
+        expect![[r#"
+            budget 128
+            part size 64
+            batch 1:0
+            batch 5:40
+            batch 7:60
+            multipart 3:168
+            multipart 4:169
+            multipart 2:100
+            multipart 6:1000
+            multipart 8:104
+            budget 232
+            part size 168
+            batch 3:168
+            batch 1:0 5:40
+            batch 2:100
+            batch 7:60
+            batch 8:104
+            multipart 4:169
+            multipart 6:1000
+            budget 4096
+            part size 4032
+            batch 3:168 1:0 4:169 5:40 2:100 6:1000 7:60 8:104
+        "#]].assert_eq(&found);
+        expect![[r#"
+            no plan
+        "#]].assert_eq(&plan(&[1, 9], &sizes, 4096));
+        expect![[r#"
+            no plan
+        "#]].assert_eq(&plan(&[1], &sizes, UPLOAD_OVERHEAD));
     }
 
     #[test]
@@ -2237,7 +2264,7 @@ mod upload_tests {
     }
 
     /// Feeds `input` to a multipart upload of `content` in reads of `part_size` bytes, checking it after each,
-    /// and lists the frames it sends.
+    /// and lists the frames it sends; like the upload, it stops at the first read the machine refuses.
     fn multipart(content: &[u8], input: &[u8], part_size: usize) -> String {
         let hash = *blake3::hash(content).as_bytes();
         let mut upload =
@@ -2253,23 +2280,44 @@ mod upload_tests {
         };
         let mut out = String::new();
         for (i, chunk) in input.chunks(part_size).enumerate() {
-            let sent = match upload.read(chunk.to_vec()) {
+            let read = upload.read(chunk.to_vec());
+            upload.invariants();
+            let refused = read.is_err();
+            let sent = match read {
                 Ok(Some(sent)) => frame(sent),
                 Ok(None) => "nothing yet".to_string(),
-                Err(()) => "refused".to_string(),
+                Err(()) => "refused, and the upload stops".to_string(),
             };
-            upload.invariants();
             out += &format!("read {i} {:?} => {sent}\n", String::from_utf8_lossy(chunk));
+            if refused {
+                return out;
+            }
         }
         out + &format!("finish => {}\n", upload.finish().map_or("nothing".to_string(), frame))
     }
 
     #[test]
     fn only_verified_multipart_content_gets_a_terminal_frame() {
-        expect![[r#""#]].assert_eq(&multipart(b"one two three", b"one two three", 4));
-        expect![[r#""#]].assert_eq(&multipart(b"one two three", b"one TWO three", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "two " => part "one " last=false (4 bytes on the wire)
+            read 2 "thre" => part "two " last=false (4 bytes on the wire)
+            read 3 "e" => part "thre" last=false (4 bytes on the wire)
+            finish => part "e" last=true (1 bytes on the wire)
+        "#]].assert_eq(&multipart(b"one two three", b"one two three", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "TWO " => part "one " last=false (4 bytes on the wire)
+            read 2 "thre" => part "TWO " last=false (4 bytes on the wire)
+            read 3 "e" => part "thre" last=false (4 bytes on the wire)
+            finish => nothing
+        "#]].assert_eq(&multipart(b"one two three", b"one TWO three", 4));
         expect![[r#""#]].assert_eq(&multipart(b"one two", b"one two three", 4));
-        expect![[r#""#]].assert_eq(&multipart(b"one two three", b"one two", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "two" => part "one " last=false (4 bytes on the wire)
+            finish => nothing
+        "#]].assert_eq(&multipart(b"one two three", b"one two", 4));
     }
 }
 
@@ -2653,16 +2701,58 @@ mod left_out_tests {
     fn a_server_gone_silent_ends_the_command_with_that_silence_once_its_retry_cannot_connect_or_is_spent() {
         let progress = "the build's progress";
         let retry_cannot_connect = [&TO_REQUEST[..], &[LostSilent(progress), ConnectFailed]].concat();
-        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &retry_cannot_connect));
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link silent 45 s awaiting the build's progress => Some(Link)
+            connect failed => Some(Silent { quiet: 45s, waiting_for: "the build's progress" })
+        "#]].assert_eq(&run(CommandKind::Run, &retry_cannot_connect));
         let retry_spent = [&TO_REQUEST[..], &[LostSilent(progress)], &RELINK, &[Lost]].concat();
-        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &retry_spent));
-        expect![[r#""#]].assert_eq(&run(CommandKind::Admin, &[Linked, LostSilent("its answer"), ConnectFailed]));
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link silent 45 s awaiting the build's progress => Some(Link)
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(Silent { quiet: 45s, waiting_for: "the build's progress" })
+        "#]].assert_eq(&run(CommandKind::Run, &retry_spent));
+        expect![[r#"
+            linked => Some(Request)
+            link silent 45 s awaiting its answer => Some(Link)
+            connect failed => Some(Silent { quiet: 45s, waiting_for: "its answer" })
+        "#]].assert_eq(&run(CommandKind::Admin, &[Linked, LostSilent("its answer"), ConnectFailed]));
     }
 
     #[test]
     fn a_plain_drop_is_retried_once_and_a_failed_connect_after_it_is_its_own_error() {
-        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost, ConnectFailed]].concat()));
-        expect![[r#""#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost], &RELINK, &[Lost]].concat()));
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(Link)
+            connect failed => None
+        "#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost, ConnectFailed]].concat()));
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(Link)
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(GiveUp)
+        "#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost], &RELINK, &[Lost]].concat()));
     }
 
     #[test]

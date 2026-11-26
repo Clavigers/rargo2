@@ -405,7 +405,7 @@ mod tests {
     enum Ev {
         /// A read of bytes `start..end`, `waited` once it has waited for a change.
         Read(u64, u64, bool),
-        /// The chunks the last fetch asked for, needed then prefetched, arrive as `sent` holds them.
+        /// Every chunk asked for and not yet delivered or failed arrives, in order, as `sent` holds it.
         DeliverFetched,
         /// The source could not fetch the chunks the last fetch needed.
         FailNeeded,
@@ -419,23 +419,28 @@ mod tests {
             RangeState::new(hash.as_bytes(), original.len() as u64, recipe(sent), outline::outline(original), lazy).unwrap();
         state.invariants();
         let mut file = vec![0; original.len()];
-        let mut fetched = (Vec::new(), Vec::new());
+        let mut needed = Vec::new();
+        let mut asked = std::collections::BTreeSet::new();
         let mut out = String::new();
         for ev in events {
             match ev {
                 Ev::Read(start, end, waited) => {
                     let read = state.read(start, end, waited);
                     out += &format!("read {start}..{end} waited={waited} => {read:?}\n");
-                    if let Read::Fetch { needed, prefetch } = read {
-                        fetched = (needed, prefetch);
+                    if let Read::Fetch { needed: now, prefetch } = read {
+                        asked.extend(now.iter().chain(&prefetch).copied());
+                        needed = now;
                     }
                 }
                 Ev::FailNeeded => {
-                    state.failed(&fetched.0);
-                    out += &format!("failed {:?}\n", fetched.0);
+                    state.failed(&needed);
+                    for chunk in &needed {
+                        asked.remove(chunk);
+                    }
+                    out += &format!("failed {needed:?}\n");
                 }
                 Ev::DeliverFetched => {
-                    for chunk in fetched.0.iter().chain(&fetched.1).copied() {
+                    for chunk in std::mem::take(&mut asked) {
                         assert!(state.needs_chunk(chunk));
                         let i = chunk as usize;
                         let start = state.offsets[i] as usize;
@@ -491,7 +496,15 @@ mod tests {
             Ev::Read(GROUP, GROUP + 1, false),
             Ev::Read(0, GROUP, false),
         ];
-        expect![[r#""#]].assert_eq(&run(&original, &wrong, &[], events));
+        expect![[r#"
+            read 0..196608 waited=false => Fetch { needed: [0, 1, 2, 3, 4, 5, 6], prefetch: [] }
+            chunk 2 proves group 0 => Some(Good)
+            chunk 4 proves group 1 => Some(Bad)
+            chunk 6 proves group 2 => Some(Good)
+            read 65536..65537 waited=false => BadHash
+            read 0..65536 waited=false => Ready
+            can place: false; groups holding the original bytes: [true, false, true]
+        "#]].assert_eq(&run(&original, &wrong, &[], events));
     }
 
     #[test]
@@ -515,6 +528,11 @@ mod tests {
             new(correct.clone(), bad_outline),
             new(short, outline::outline(&original)),
         );
-        expect![[r#""#]].assert_eq(&found);
+        expect![[r#"
+            original chunk valid: true
+            wrong chunk valid: false
+            bad outline: Some("the server's outline of the content does not give its hash")
+            short recipe: Some("the server's recipe of the content does not cover it")
+        "#]].assert_eq(&found);
     }
 }

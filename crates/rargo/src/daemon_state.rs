@@ -484,7 +484,21 @@ mod tests {
             Ev::Missing(&[D2]),
             Ev::Offer(1, D9, &[D9], FILES),
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            added 1
+            link alive=false IfUp => Skip
+            link alive=false Must => Connect
+            connected, 1 connections
+            offer 1 root 9 => trees [9] files [(1, 3), (2, 4)]
+            synced 1 root 9
+            offer 1 root 9 => trees [] files []
+            link alive=false IfUp => Skip
+            link alive=false Must => Connect
+            connected, 2 connections
+            offer 1 root 9 => trees [] files []
+            missing [2]
+            offer 1 root 9 => trees [] files [(2, 4)]
+        "#]].assert_eq(&run(events));
     }
 
     #[test]
@@ -510,6 +524,26 @@ mod tests {
             Ev::Expired(1),
             Ev::PlanScan(1, 2, true),
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            added 1
+            plan scan 1 head 1 watching=true => Scan { everything: true }
+            scanned 1 head 1
+            watched 1 all=true => 1 wholly watched
+            plan scan 1 head 1 watching=true => Reuse
+            plan scan 1 head 2 watching=true => Scan { everything: false }
+            scanned 1 head 2
+            changed 1 everything=false
+            plan scan 1 head 2 watching=true => Scan { everything: false }
+            scanned 1 head 2
+            plan scan 1 head 2 watching=false => Scan { everything: true }
+            scanned 1 head 2
+            changed 1 everything=true
+            plan scan 1 head 2 watching=true => Scan { everything: true }
+            watched 1 all=false => 0 wholly watched
+            scanned 1 head 2
+            plan scan 1 head 2 watching=true => Scan { everything: false }
+            expired 1
+            plan scan 1 head 2 watching=true => Scan { everything: true }
+        "#]].assert_eq(&run(events));
     }
 }

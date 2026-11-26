@@ -126,22 +126,46 @@ mod tests {
         let ticks = (1..=240).map(|n| Ev::Tick(n * 200));
         let events = std::iter::once(Ev::Heard(1_000)).chain(ticks.take_while(|e| !matches!(e, Ev::Tick(t) if *t > 46_400)));
         let events = events.chain([Ev::Heard(46_401), Ev::Tick(46_600)]);
-        expect![[r#""#]].assert_eq(&run(SILENT_AFTER, events));
+        expect![[r#"
+            heard 1000 ms
+            tick 10000 ms => Ping(1)
+            tick 20000 ms => Ping(2)
+            tick 30000 ms => Ping(3)
+            tick 40000 ms => Ping(4)
+            tick 46200 ms => Silent(45.2s)
+            tick 46400 ms => Silent(45.2s)
+            heard 46401 ms
+            tick 46600 ms => Silent(45.2s)
+            silent: Some(45.2s)
+        "#]].assert_eq(&run(SILENT_AFTER, events));
     }
 
     #[test]
     fn hearing_an_older_time_does_not_move_the_last_heard_back() {
         let events = [Ev::Heard(2_000), Ev::Heard(500), Ev::Tick(5_000), Ev::Tick(5_001)];
-        expect![[r#""#]].assert_eq(&run(ms(3_000), events));
+        expect![[r#"
+            heard 2000 ms
+            heard 500 ms
+            tick 5000 ms => Ping(1)
+            tick 5001 ms => Silent(3.001s)
+            silent: Some(3.001s)
+        "#]].assert_eq(&run(ms(3_000), events));
     }
 
     #[test]
     fn a_short_limit_pings_three_times_within_it() {
-        expect![[r#""#]].assert_eq(&run(ms(3_000), (1..=15).map(|n| Ev::Tick(n * 200))));
+        expect![[r#"
+            tick 1000 ms => Ping(1)
+            tick 2000 ms => Ping(2)
+            tick 3000 ms => Ping(3)
+            silent: None
+        "#]].assert_eq(&run(ms(3_000), (1..=15).map(|n| Ev::Tick(n * 200))));
     }
 
     #[test]
     fn the_silent_line_names_the_server_the_time_and_what_was_awaited() {
-        expect![[r#""#]].assert_eq(&silent_text("rargo.rs:7459", ms(45_200), "the build's output"));
+        expect![[r#"
+            error: the rargo server at rargo.rs:7459 sent nothing for 45 s while rargo waited for the build's output; it may be stopped or overloaded
+        "#]].assert_eq(&silent_text("rargo.rs:7459", ms(45_200), "the build's output"));
     }
 }

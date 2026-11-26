@@ -483,7 +483,20 @@ mod tests {
             Ev::Apply(3, libc::IN_CREATE),
             Ev::Collect,
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            register 10 first => watched 1
+            register 10 first/src => watched 2
+            register 20 second => watched 3
+            remove 2 different => false
+            forget 10 => [1, 2]
+            event 1 CREATE
+            event 2 CREATE
+            event 3 CREATE
+            collect => Changes { dirty: {20: {"second"}}, rescan: {}, rescan_all: false }
+            remove 3 second => true
+            event 3 CREATE
+            collect => Changes { dirty: {}, rescan: {}, rescan_all: false }
+        "#]].assert_eq(&run(events));
     }
 
     #[test]
@@ -512,6 +525,29 @@ mod tests {
             Ev::Apply(-1, libc::IN_Q_OVERFLOW),
             Ev::Collect,
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            register 10 from => watched 1
+            register 20 to => watched 2
+            event 1 MOVED_FROM
+            event 2 MOVED_TO
+            collect => Changes { dirty: {10: {"from"}, 20: {"to"}}, rescan: {}, rescan_all: false }
+            register 10 from/sub => watched 3
+            event 3 MOVE_SELF
+            collect => Changes { dirty: {}, rescan: {10}, rescan_all: false }
+            event 3 MODIFY
+            collect => Changes { dirty: {}, rescan: {10}, rescan_all: false }
+            register 10 to/sub => watched 3
+            event 3 MODIFY
+            collect => Changes { dirty: {10: {"to/sub"}}, rescan: {}, rescan_all: false }
+            event 1 MOVED_FROM|ISDIR
+            event 2 MOVED_TO|ISDIR
+            event 1 MOVE_SELF
+            event 1 IGNORED
+            event 1 MODIFY
+            collect => Changes { dirty: {}, rescan: {10, 20}, rescan_all: false }
+            register 20 to/new (too many) => poll to/new
+            event -1 Q_OVERFLOW
+            collect => Changes { dirty: {}, rescan: {}, rescan_all: true }
+        "#]].assert_eq(&run(events));
     }
 }

@@ -429,7 +429,15 @@ mod tests {
             Ev::Frame(1, 2, stdout(9)),
             Ev::Route(1, stdout(9)),
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            open first => (1, None)
+            open second => (2, None)
+            frame 1#1 => []
+            frame 2#0 => ["second <- Stdout([2])"]
+            frame 1#0 => ["first <- Stdout([1])", "first <- Exit(0)"]
+            frame 1#2 => []
+            route 1 => dropped
+        "#]].assert_eq(&run(events));
     }
 
     #[test]
@@ -446,6 +454,17 @@ mod tests {
             Ev::Open("late"),
             Ev::ExpectMissing(1, "late offer"),
         ];
-        expect![[r#""#]].assert_eq(&run(events));
+        expect![[r#"
+            open cancelled => (1, None)
+            open first => (2, None)
+            open second => (3, None)
+            close 1 => Some("cancelled")
+            next id => 1
+            expect missing 1 for offer => None
+            fail => Some(({2: "first", 3: "second"}, {1: "offer"}))
+            fail => None
+            open late => (4, Some("late"))
+            expect missing 1 for late offer => Some("late offer")
+        "#]].assert_eq(&run(events));
     }
 }
