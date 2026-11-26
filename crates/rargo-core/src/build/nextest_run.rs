@@ -200,56 +200,76 @@ pub fn exit_code(code: Option<i32>, status: &str) -> (i32, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     #[test]
     fn metadata_needing_the_network_is_fetched_once() {
+        let mut outcomes = Transcript::default();
         let (mut r, fx) = NextestRun::new();
-        assert_eq!(fx, [Effect::RunNextest]);
+        outcomes.record("effects", fx);
         let args = vec!["metadata".to_string()];
-        assert_eq!(r.asked(Asked::Metadata(args.clone()), None), [Effect::Metadata(args.clone())]);
+        outcomes.record("asked", r.asked(Asked::Metadata(args.clone()), None));
         let offline = b"note: offline mode (via `--offline`) can sometimes cause surprising resolution failures\n";
-        assert_eq!(
-            r.metadata_answered(&args, 101, offline),
-            [Effect::Fetch { args: args.clone(), components: vec![], offline: false }]
-        );
-        assert_eq!(r.fetched(true), [Effect::Prepare, Effect::RunNextest]);
+        outcomes.record("metadata answered", r.metadata_answered(&args, 101, offline));
+        outcomes.record("fetched", r.fetched(true));
         r.asked(Asked::Metadata(args.clone()), None);
-        assert_eq!(
-            r.metadata_answered(&args, 101, offline),
-            [Effect::RunNextest],
-            "nextest then reports cargo's failure"
-        );
+        // nextest then reports cargo's failure.
+        outcomes.record("metadata answered", r.metadata_answered(&args, 101, offline));
         let (mut r, _) = NextestRun::new();
         let locked = vec!["metadata".to_string(), "--locked".to_string()];
         r.asked(Asked::Metadata(locked.clone()), None);
-        assert_eq!(r.metadata_answered(&locked, 101, offline), [Effect::End(101)]);
+        outcomes.record("metadata answered", r.metadata_answered(&locked, 101, offline));
         r.invariants();
+        expect![[r#"
+            effects: [RunNextest]
+            asked: [Metadata(["metadata"])]
+            metadata answered: [Fetch { args: ["metadata"], components: [], offline: false }]
+            fetched: [Prepare, RunNextest]
+            metadata answered: [RunNextest]
+            metadata answered: [End(101)]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn nextest_that_asks_nothing_ends_with_its_own_code() {
-        let (mut r, _) = NextestRun::new();
-        assert_eq!(r.asked(Asked::Nothing, Some(4)), [Effect::ShowNextest, Effect::End(4)]);
-        assert_eq!(exit_code(None, "signal 9"), (101, Some("nextest did not exit normally (signal 9)".into())));
+        let mut outcomes = Transcript::default();
+        for code in [Some(4), None] {
+            let (mut r, _) = NextestRun::new();
+            outcomes.record(&format!("exit {code:?}"), r.asked(Asked::Nothing, code));
+            r.invariants();
+        }
+        expect![[r#"
+            exit Some(4): [ShowNextest, End(4)]
+            exit None: [ShowNextest, End(101)]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn rounds_run_each_new_question_once_and_count_what_was_replayed() {
+        let mut outcomes = Transcript::default();
         let (mut r, _) = NextestRun::new();
         r.asked(Asked::Build(vec!["test".into()]), None);
-        assert_eq!(r.built(), [Effect::RunNextest]);
+        outcomes.record("built", r.built());
         let q = |k: &str, listing| TestAsked { key: k.into(), listing };
-        assert_eq!(r.round_ended(vec![q("list", true), q("list", true)]), [Effect::RunTests(vec!["list".into()])]);
-        assert_eq!(r.test_ran("list", false), [Effect::RunNextest]);
-        assert_eq!(r.round_ended(vec![q("a", false), q("b", false)]), [Effect::RunTests(vec!["a".into(), "b".into()])]);
-        assert_eq!(r.test_ran("a", true), []);
-        assert_eq!(r.test_ran("b", false), [Effect::RunNextest]);
-        assert_eq!(r.round_ended(vec![q("a", false)]), [Effect::ShowNextest, Effect::Finish]);
-        assert_eq!(
-            r.summary().as_deref(),
-            Some("1 of 2 test runs from rargo's cache (1 run on the server; `--no-cache` runs every test)")
-        );
+        outcomes.record("round ended", r.round_ended(vec![q("list", true), q("list", true)]));
+        outcomes.record("test ran", r.test_ran("list", false));
+        outcomes.record("round ended", r.round_ended(vec![q("a", false), q("b", false)]));
+        outcomes.record("test ran", r.test_ran("a", true));
+        outcomes.record("test ran", r.test_ran("b", false));
+        outcomes.record("round ended", r.round_ended(vec![q("a", false)]));
+        outcomes.record("summary", r.summary().as_deref());
         r.invariants();
+        expect![[r#"
+            built: [RunNextest]
+            round ended: [RunTests(["list"])]
+            test ran: [RunNextest]
+            round ended: [RunTests(["a", "b"])]
+            test ran: []
+            test ran: [RunNextest]
+            round ended: [ShowNextest, Finish]
+            summary: Some("1 of 2 test runs from rargo's cache (1 run on the server; `--no-cache` runs every test)")
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
