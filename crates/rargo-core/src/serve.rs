@@ -500,7 +500,7 @@ fn serve(
         root: req.root,
         cwd: req.cwd,
         cargo_home: req.cargo_home,
-        env: Arc::new(ClientEnv::new(env.into_iter().collect(), req.env_checked, Some(asker))),
+        env: Arc::new(ClientEnv::new(env, req.env_checked, Some(asker))),
         uid: d.cfg.uid,
         gid: d.cfg.gid,
         prio,

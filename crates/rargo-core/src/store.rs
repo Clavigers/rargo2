@@ -352,7 +352,17 @@ impl Store {
         (n, freed)
     }
 
+    // `cold_lock` is a blocking lock held across file I/O. A fiber that holds it parks
+    // on that I/O, and the next fiber to take it then blocks the event-loop thread, so
+    // the parked holder never resumes. Likewise a pool thread that holds it has the loop
+    // do its file I/O, and waits forever once the loop thread blocks on the lock. So no
+    // fiber takes it on the loop thread: `blocking` moves the body to the pool, and runs
+    // it in place when it is already off a fiber. `freeze` is only called from the pool.
     fn thaw(&self, h: &Hash) -> io::Result<()> {
+        crate::io::blocking(|| self.thaw_off_loop(h))
+    }
+
+    fn thaw_off_loop(&self, h: &Hash) -> io::Result<()> {
         let _g = self.cold_lock.read().unwrap();
         let (_, started) = self.index.lock().begin_thaw(h);
         let Some((size, recipe)) = started else {
@@ -406,6 +416,10 @@ impl Store {
     }
 
     pub fn collect_chunks(&self) -> (usize, u64) {
+        crate::io::blocking(|| self.collect_chunks_off_loop())
+    }
+
+    fn collect_chunks_off_loop(&self) -> (usize, u64) {
         let _g = self.cold_lock.write().unwrap();
         let live = self.index.lock().live_chunks();
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);

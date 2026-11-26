@@ -9,7 +9,7 @@ Every few minutes it does the next thing that is due, and records it:
 2. Backport. A bug fix merged to main after the freeze is cherry-picked onto
    the branch.
 3. Build. The branch's head, once CI passed on it, is the next candidate
-   build.
+   build. CI that failed there is run again, three times at most.
 4. Hold or publish. The world says which reasons hold the latest build
    (known bugs, too few power user sessions, too little soak, a backport in
    no build). When the reasons change it records them; when there are none
@@ -39,6 +39,8 @@ from .model import Kind, Role
 from .notify import notify
 from .observer import FAILED, PASSED
 
+RERUNS = 3  # times a failed CI on a release branch is run again
+RERUN_AFTER = timedelta(minutes=20)  # between them, so a broken service can recover
 SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -70,6 +72,7 @@ class Pm:
         self.ledger, self.gh, self.checkout = ledger, gh, Path(checkout)
         self.clock, self.publish, self.ci_apps, self.say = clock, publish, ci_apps, say
         self.told: set[str] = set()  # things said once
+        self.reruns: dict[str, list[datetime]] = {}  # commit -> when its CI was run again
 
     def run(self, every: float = 300.0) -> None:
         while True:
@@ -164,8 +167,22 @@ class Pm:
         if ci == "pass":
             self._record("built", version=version, build=len(w.versions[version].builds) + 1, sha=head)
         elif ci == "fail":
-            self._once(f"CI failed on {branch(version)} at {head[:7]}; no build until it passes",
-                       tell=True)
+            self._failed(version, head)
+
+    def _failed(self, version: str, head: str) -> None:
+        """CI failed on the branch's head. A release branch holds only what
+        passed on main, so the cause is most often not the code: run it
+        again, a few times, before saying that it needs someone."""
+        tries = self.reruns.setdefault(head, [])
+        now = self.clock()
+        if len(tries) >= RERUNS:
+            self._once(f"CI failed on {branch(version)} at {head[:7]} {RERUNS + 1} times; "
+                       f"no build until it passes", tell=True)
+        elif not tries or now - tries[-1] >= RERUN_AFTER:
+            tries.append(now)
+            n = self.gh.rerun_failed(head)
+            self.say(f"pm: CI failed on {branch(version)} at {head[:7]}; ran {n} run(s) again "
+                     f"(try {len(tries)} of {RERUNS})")
 
     def _ci(self, sha: str) -> str | None:
         runs = [r for r in self.gh.check_runs(sha) if r["app"]["slug"] in self.ci_apps]
