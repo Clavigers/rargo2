@@ -2,7 +2,7 @@ use rargo_machine::StateMachine;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -90,7 +90,7 @@ enum FromZygote {
 pub struct Zygote {
     sock: OwnedFd,
     sending: crate::io::Mutex<()>,
-    pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
+    pending: Arc<Mutex<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
     next: AtomicU64,
     pid: i32,
     reading: std::sync::Once,
@@ -154,7 +154,7 @@ impl Zygote {
         let pid = child.id() as i32;
         drop(child);
         let sock = OwnedFd::from(ours);
-        let pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
+        let pending: Arc<Mutex<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
         Ok(Arc::new(Zygote {
             sock,
             sending: crate::io::Mutex::new(()),

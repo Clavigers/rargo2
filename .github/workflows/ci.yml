@@ -37,6 +37,10 @@ jobs:
           rargo auth --token "$RARGO_TOKEN"
       - name: Build (on the server, on the cache every other build of this commit uses)
         run: rargo build --locked --workspace
+      - name: Enable FUSE-over-io_uring for mount tests
+        run: |
+          sudo modprobe fuse
+          echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
       - name: Every test of the workspace (built on the server, run here, as root, one process each), each within its CPU budget
         run: python3 -I dev/purity.py cpu
       - name: The purity allowlists and the time budgets only shrink

@@ -1,6 +1,8 @@
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::rng::Rng;
+use crate::nextest::{Outcome, TestRun};
+use rargo_core::build::nextest_run::Phase;
 use rargo::daemon_state::{DaemonState, Link, Need};
 use rargo::known_digests::KnownDigests;
 use rargo::link_watch::{self, Tick, Watch};
@@ -20,6 +22,20 @@ pub const LIVENESS_MS: u64 = 120_000;
 const SERVER_TOKENS: usize = 6;
 const SERVER_MEM_KB: u64 = 16 * 1024;
 const WATCH_STEP_MS: u64 = 200;
+/// Seeds the network faults' streams, apart from the one that drives the rest of the world.
+const NET_STREAM: u64 = 0x6e65_7477_6f72_6b21;
+/// The first retransmission timeout of a lost packet, as Linux's TCP_RTO_MIN; it doubles on each loss.
+const RTO_MS: u64 = 200;
+/// Losses in a row before a packet gets through; at the rates a seed picks, more never happens.
+const MAX_RETRIES: u32 = 5;
+
+/// The receiving end of one connection: what TCP does under the messages, so that the network may lose,
+/// duplicate and reorder packets while each connection still hands its messages over once and in order.
+#[derive(Default)]
+struct Rx {
+    next: u64,
+    held: BTreeMap<u64, Msg>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bug {
@@ -57,6 +73,54 @@ impl Bug {
 
     pub fn parse(s: &str) -> Option<Bug> {
         Bug::ALL.into_iter().find(|b| b.name() == s)
+    }
+}
+
+/// A fault the simulated network makes on its own, which `rargo-sim --off` turns off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Fault {
+    Loss,
+    Duplicate,
+    Reorder,
+}
+
+impl Fault {
+    pub const ALL: [Fault; 3] = [Fault::Loss, Fault::Duplicate, Fault::Reorder];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Fault::Loss => "loss",
+            Fault::Duplicate => "duplicate",
+            Fault::Reorder => "reorder",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Fault> {
+        Fault::ALL.into_iter().find(|f| f.name() == s)
+    }
+}
+
+/// Which network faults a run leaves out. Each fault draws from its own stream, so turning one off
+/// leaves the others' rates and draws as the seed picked them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Off(BTreeSet<Fault>);
+
+impl Off {
+    pub fn none() -> Off {
+        Off::default()
+    }
+
+    pub fn with(mut self, f: Fault) -> Off {
+        self.0.insert(f);
+        self
+    }
+
+    pub fn has(&self, f: Fault) -> bool {
+        self.0.contains(&f)
+    }
+
+    fn flags(&self) -> String {
+        self.0.iter().map(|f| format!(" --off {}", f.name())).collect()
     }
 }
 
@@ -101,16 +165,15 @@ impl Kind {
 pub struct Failure {
     pub seed: u64,
     pub bug: Option<Bug>,
+    pub off: Off,
     pub at_ms: u64,
     pub kind: Kind,
 }
 
 impl Failure {
     pub fn replay(&self) -> String {
-        match self.bug {
-            Some(b) => format!("rargo-sim --seed {} --bug {}", self.seed, b.name()),
-            None => format!("rargo-sim --seed {}", self.seed),
-        }
+        let bug = self.bug.map(|b| format!(" --bug {}", b.name())).unwrap_or_default();
+        format!("rargo-sim --seed {}{bug}{}", self.seed, self.off.flags())
     }
 }
 
@@ -135,13 +198,23 @@ pub struct Report {
     pub trace: Hash,
     pub runs: u64,
     pub cache_hits: u64,
+    pub tests_passed: u64,
+    pub tests_failed: u64,
+    pub tests_timed_out: u64,
     pub cuts: u64,
+    pub worker_crashes: u64,
+    pub jobs_lost_to_crashes: u64,
     pub evictions: u64,
+    /// Most client rounds in progress when the server evicted a blob.
+    pub clients_at_eviction: usize,
     pub uploads: u64,
     pub wants: u64,
     pub client_cuts: u64,
     pub silences: u64,
     pub crashes: u64,
+    pub lost: u64,
+    pub duplicated: u64,
+    pub reordered: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -156,13 +229,42 @@ pub struct Config {
     pub max_latency_ms: u64,
     pub client_cuts: u64,
     pub crashes: u64,
+    pub net: Net,
+}
+
+/// How often, per mille of messages, the network loses, duplicates and reorders until `fault_end_ms`.
+#[derive(Clone, Debug)]
+pub struct Net {
+    pub loss_per_mille: u64,
+    pub duplicate_per_mille: u64,
+    pub reorder_per_mille: u64,
+}
+
+impl Net {
+    fn of(rngs: &mut [Rng; 3], off: &Off) -> Net {
+        let mut rate = |f: Fault| {
+            let rng = &mut rngs[f as usize];
+            let r = if rng.chance(500) { rng.range(1, 40) } else { 0 };
+            if off.has(f) { 0 } else { r }
+        };
+        Net { loss_per_mille: rate(Fault::Loss), duplicate_per_mille: rate(Fault::Duplicate), reorder_per_mille: rate(Fault::Reorder) }
+    }
 }
 
 impl Config {
-    pub fn of(rng: &mut Rng) -> Config {
+    pub fn of(rng: &mut Rng, net: Net) -> Config {
+        let workers = rng.range(1, 4);
+        let client_roll = rng.next_u64();
+        // One seed in 128 exercises a crowd. Use the same draw for small worlds
+        // so their remaining configuration and workload still replay.
+        let clients = if client_roll >> 57 == 0 {
+            20 + client_roll % 13
+        } else {
+            1 + client_roll % 3
+        };
         Config {
-            workers: rng.range(1, 4),
-            clients: rng.range(1, 3),
+            workers,
+            clients,
             sources: rng.range(3, 10) as usize,
             actions: rng.range(4, 24) as usize,
             rounds: rng.range(1, 3),
@@ -171,6 +273,7 @@ impl Config {
             max_latency_ms: rng.range(1, 60),
             client_cuts: rng.range(0, 3),
             crashes: rng.range(0, 2),
+            net,
         }
     }
 }
@@ -198,7 +301,7 @@ enum Node {
     Client(u64),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Up {
     Hello { cores: usize },
     Result { job: u64, output: Vec<u8> },
@@ -209,7 +312,7 @@ enum Up {
     Ping,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Down {
     Session(ServerMsg),
     Synced { round: u64, root: Digest },
@@ -223,14 +326,43 @@ enum Msg {
     Down(Down),
 }
 
+impl Msg {
+    /// The copy a duplicating network delivers; the worker's messages are not `Clone` in `rargo-core`.
+    fn copy(&self) -> Msg {
+        match self {
+            Msg::Up(u) => Msg::Up(u.clone()),
+            Msg::Down(d) => Msg::Down(d.clone()),
+            Msg::Work(w) => Msg::Work(match w {
+                FromServer::Welcome => FromServer::Welcome,
+                FromServer::Ask { rid, serve } => FromServer::Ask { rid: *rid, serve: *serve },
+                FromServer::Push { blob, first, of, part } => {
+                    FromServer::Push { blob: *blob, first: *first, of: *of, part: part.clone() }
+                }
+                FromServer::Run(r) => FromServer::Run(worker_state::Run {
+                    action: r.action,
+                    incoming: r.incoming.clone(),
+                    prefill: r.prefill.clone(),
+                    listings: r.listings.clone(),
+                    closed: r.closed.clone(),
+                    run: r.run.clone(),
+                }),
+                FromServer::Cancel { action } => FromServer::Cancel { action: *action },
+                FromServer::Other => FromServer::Other,
+            }),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum Ev {
-    Deliver { from: Node, to: Node, epoch: u64, msg: Msg },
-    Connect { worker: u64 },
-    Finish { worker: u64, token: u64 },
+    Deliver { from: Node, to: Node, epoch: u64, n: u64, msg: Msg },
+    Connect { worker: u64, epoch: u64 },
+    Finish { worker: u64, epoch: u64, token: u64 },
+    Crash { worker: u64 },
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
+    TestComplete { client: u64, key: String, started_ms: u64 },
     Sync { client: u64 },
     ClientCut { client: u64 },
     Watch { client: u64 },
@@ -293,6 +425,7 @@ struct Client {
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
+    test: Option<TestRun>,
     daemon: DaemonState,
     up: bool,
     epoch: u64,
@@ -311,8 +444,12 @@ struct Client {
 pub struct World {
     seed: u64,
     bug: Option<Bug>,
+    off: Off,
     cfg: Config,
     rng: Rng,
+    net: [Rng; 3],
+    tx: BTreeMap<(Node, Node, u64), u64>,
+    rx: BTreeMap<(Node, Node, u64), Rx>,
     now: u64,
     seq: u64,
     queue: BTreeMap<(u64, u64), Ev>,
@@ -330,14 +467,19 @@ pub struct World {
 type Step = Result<(), Kind>;
 
 impl World {
-    pub fn new(seed: u64, bug: Option<Bug>) -> World {
+    pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
         let mut rng = Rng::new(seed);
-        let cfg = Config::of(&mut rng);
+        let mut net = Fault::ALL.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
+        let cfg = Config::of(&mut rng, Net::of(&mut net, &off));
         let project = Project::generate(&mut rng, cfg.sources, cfg.actions);
         let mut w = World {
             seed,
             bug,
+            off,
             rng,
+            net,
+            tx: BTreeMap::new(),
+            rx: BTreeMap::new(),
             now: 0,
             seq: 0,
             queue: BTreeMap::new(),
@@ -365,13 +507,22 @@ impl World {
                 trace: Hash::of(b""),
                 runs: 0,
                 cache_hits: 0,
+                tests_passed: 0,
+                tests_failed: 0,
+                tests_timed_out: 0,
                 cuts: 0,
+                worker_crashes: 0,
+                jobs_lost_to_crashes: 0,
                 evictions: 0,
+                clients_at_eviction: 0,
                 uploads: 0,
                 wants: 0,
                 client_cuts: 0,
                 silences: 0,
                 crashes: 0,
+                lost: 0,
+                duplicated: 0,
+                reordered: 0,
             },
             trace: Vec::new(),
             silence: None,
@@ -398,6 +549,7 @@ impl World {
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
+                    test: None,
                     daemon: new_daemon(KnownDigests::default()),
                     up: false,
                     epoch: 0,
@@ -421,6 +573,8 @@ impl World {
             for id in 1..=w.cfg.workers {
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
                 w.schedule(at, Ev::Cut { worker: id });
+                let at = w.rng.range(0, w.cfg.fault_end_ms);
+                w.schedule(at, Ev::Crash { worker: id });
             }
             for _ in 0..w.cfg.client_cuts {
                 let client = w.rng.range(1, w.cfg.clients);
@@ -460,11 +614,47 @@ impl World {
             _ => 0,
         };
         let latency = self.rng.range(1, self.cfg.max_latency_ms);
-        let at = (self.now + latency).max(self.last.get(&(from, to)).copied().unwrap_or(0));
-        self.last.insert((from, to), at);
+        let in_order = (self.now + latency).max(self.last.get(&(from, to)).copied().unwrap_or(0));
+        let seq = self.tx.entry((from, to, epoch)).or_default();
+        let n = *seq;
+        *seq += 1;
+        let net = self.cfg.net.clone();
+        let faulty = self.now < self.cfg.fault_end_ms;
+        let max_latency = self.cfg.max_latency_ms;
+        let [loss, dup, reorder] = &mut self.net;
+        let mut stall = 0;
+        let mut rto = RTO_MS;
+        for _ in 0..MAX_RETRIES {
+            if !(loss.chance(net.loss_per_mille) && faulty) {
+                break;
+            }
+            self.report.lost += 1;
+            stall += rto;
+            rto *= 2;
+        }
+        let copy_after = dup.range(1, 4 * max_latency);
+        let duplicate = dup.chance(net.duplicate_per_mille) && faulty;
+        let early = reorder.range(1, max_latency);
+        let reordered = reorder.chance(net.reorder_per_mille) && faulty;
+        let at = if reordered {
+            self.report.reordered += 1;
+            self.now + early + stall
+        } else if stall > 0 {
+            in_order + stall
+        } else {
+            self.last.insert((from, to), in_order);
+            in_order
+        };
+        if duplicate {
+            self.report.duplicated += 1;
+            let copy = msg.copy();
+            self.busy += 1;
+            self.seq += 1;
+            self.queue.insert((at + copy_after, self.seq), Ev::Deliver { from, to, epoch, n, msg: copy });
+        }
         self.busy += 1;
         self.seq += 1;
-        self.queue.insert((at, self.seq), Ev::Deliver { from, to, epoch, msg });
+        self.queue.insert((at, self.seq), Ev::Deliver { from, to, epoch, n, msg });
     }
 
     fn finished(&self) -> bool {
@@ -474,13 +664,14 @@ impl World {
     pub fn run(mut self) -> Result<Report, Failure> {
         let seed = self.seed;
         let bug = self.bug;
+        let off = self.off.clone();
         loop {
             if self.finished() {
                 self.report.end_ms = self.now;
                 self.report.trace = Hash::of(&self.trace);
                 return Ok(self.report);
             }
-            let fail = |w: &World, kind: Kind| Failure { seed, bug, at_ms: w.now, kind };
+            let fail = |w: &World, kind: Kind| Failure { seed, bug, off: off.clone(), at_ms: w.now, kind };
             if self.busy == 0 {
                 let open: Vec<String> = self
                     .clients
@@ -552,6 +743,7 @@ impl World {
         all.extend(self.server.sessions.values().map(|s| &s.state as &dyn StateMachine));
         all.extend(self.workers.values().map(|w| &w.sm as &dyn StateMachine));
         all.extend(self.clients.values().map(|c| &c.daemon as &dyn StateMachine));
+        all.extend(self.clients.values().filter_map(|c| c.test.as_ref()).map(|t| &t.machine as &dyn StateMachine));
         all
     }
 
@@ -575,6 +767,9 @@ impl World {
             }
         }
         for (job, j) in &self.server.jobs {
+            if let Some(h) = j.inputs.iter().find(|h| !self.server.store.contains_key(h)) {
+                return Err(Kind::LostPinned(format!("input {} of unfinished job {job} is gone", h.hex())));
+            }
             if let Some(w) = j.worker {
                 assert!(self.server.pool.route(w, *job), "job {job} sent to worker {w} is routed there");
             }
@@ -584,15 +779,20 @@ impl World {
 
     fn step(&mut self, ev: Ev) -> Step {
         match ev {
-            Ev::Deliver { from, to, epoch, msg } => self.deliver(from, to, epoch, msg),
-            Ev::Connect { worker } => self.connect(worker),
-            Ev::Finish { worker, token } => self.finish(worker, token),
+            Ev::Deliver { from, to, epoch, n, msg } => self.arrive(from, to, epoch, n, msg),
+            Ev::Connect { worker, epoch } => self.connect(worker, epoch),
+            Ev::Finish { worker, epoch, token } => self.finish(worker, epoch, token),
+            Ev::Crash { worker } => self.crash(worker),
             Ev::Cut { worker } => self.cut(worker),
             Ev::Evict => {
                 self.evict();
                 Ok(())
             }
             Ev::Round { client } => self.round(client),
+            Ev::TestComplete { client, key, started_ms } => {
+                self.test_complete(client, &key, started_ms);
+                Ok(())
+            }
             Ev::Sync { client } => self.sync(client),
             Ev::ClientCut { client } => {
                 self.client_cut(client);
@@ -600,41 +800,59 @@ impl World {
             }
             Ev::Watch { client } => self.watch(client),
             Ev::ClientCrash { client } => {
-                self.crash(client);
+                self.client_crash(client);
                 Ok(())
             }
             Ev::Restart { client } => self.restart(client),
         }
     }
 
-    fn deliver(&mut self, from: Node, to: Node, epoch: u64, msg: Msg) -> Step {
+    fn arrive(&mut self, from: Node, to: Node, epoch: u64, n: u64, msg: Msg) -> Step {
+        if !self.open(from, to, epoch) {
+            self.rx.remove(&(from, to, epoch));
+            return Ok(());
+        }
+        if self.silent_at(self.now).is_some() && matches!((from, to), (Node::Client(_), _) | (_, Node::Client(_))) {
+            let (_, end) = self.silent_at(self.now).expect("checked");
+            self.schedule(end - self.now, Ev::Deliver { from, to, epoch, n, msg });
+            return Ok(());
+        }
+        let rx = self.rx.entry((from, to, epoch)).or_default();
+        if n < rx.next || rx.held.contains_key(&n) {
+            return Ok(());
+        }
+        rx.held.insert(n, msg);
+        loop {
+            let rx = self.rx.entry((from, to, epoch)).or_default();
+            let next = rx.next;
+            let Some(msg) = rx.held.remove(&next) else { return Ok(()) };
+            rx.next += 1;
+            if !self.open(from, to, epoch) {
+                return Ok(());
+            }
+            self.deliver(from, to, msg)?;
+        }
+    }
+
+    fn open(&self, from: Node, to: Node, epoch: u64) -> bool {
+        match (from, to) {
+            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].up && self.workers[&w].epoch == epoch,
+            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].up && self.clients[&c].epoch == epoch,
+            _ => true,
+        }
+    }
+
+    fn deliver(&mut self, from: Node, to: Node, msg: Msg) -> Step {
         let w = match (from, to) {
             (Node::Worker(w), _) | (_, Node::Worker(w)) => Some(w),
             _ => None,
         };
-        if let Some(w) = w {
-            let node = &self.workers[&w];
-            if !node.up || node.epoch != epoch {
+        if let Node::Client(c) = to {
+            if self.clients[&c].dead {
                 return Ok(());
             }
-        }
-        let c = match (from, to) {
-            (Node::Client(c), _) | (_, Node::Client(c)) => Some(c),
-            _ => None,
-        };
-        if let Some(c) = c {
-            let client = &self.clients[&c];
-            if !client.up || client.epoch != epoch || (client.dead && to == Node::Client(c)) {
-                return Ok(());
-            }
-            if let Some((_, end)) = self.silent_at(self.now) {
-                self.schedule(end - self.now, Ev::Deliver { from, to, epoch, msg });
-                return Ok(());
-            }
-            if to == Node::Client(c) {
-                let now = Duration::from_millis(self.now);
-                self.clients.get_mut(&c).expect("known").watch.heard(now);
-            }
+            let now = Duration::from_millis(self.now);
+            self.clients.get_mut(&c).expect("known").watch.heard(now);
         }
         match (from, msg) {
             (_, Msg::Work(m)) => {
@@ -655,10 +873,10 @@ impl World {
         }
     }
 
-    fn connect(&mut self, worker: u64) -> Step {
+    fn connect(&mut self, worker: u64, epoch: u64) -> Step {
         let now = self.now;
         let node = self.workers.get_mut(&worker).expect("known");
-        if node.up {
+        if node.up || node.epoch != epoch {
             return Ok(());
         }
         let fx = if now < node.cut_until {
@@ -693,13 +911,39 @@ impl World {
         Ok(())
     }
 
+    fn crash(&mut self, worker: u64) -> Step {
+        let downtime = self.rng.range(1, 1_000);
+        let node = self.workers.get_mut(&worker).expect("known");
+        let (sm, mut fx) = Worker::new();
+        let [worker_state::Effect::Connect { after_ms }] = fx.as_mut_slice() else {
+            unreachable!("a new worker only connects");
+        };
+        // A fresh worker quits if its first connection fails. Wait out any link cut.
+        *after_ms = downtime.max(node.cut_until.saturating_sub(self.now));
+        node.sm = sm;
+        node.running.clear();
+        // A process crash drops in-flight work. The simulated worker disk survives.
+        node.up = false;
+        node.epoch += 1;
+        self.report.worker_crashes += 1;
+
+        let lost = self.server.pool.left(worker);
+        self.report.jobs_lost_to_crashes += lost
+            .iter()
+            .filter(|effect| matches!(effect, pool_state::Effect::Lost { .. }))
+            .count() as u64;
+        self.pool_effects(lost);
+        self.worker_effects(worker, fx)
+    }
+
     fn worker_effects(&mut self, worker: u64, fx: Vec<worker_state::Effect<Sim>>) -> Step {
         let mut queue: VecDeque<worker_state::Effect<Sim>> = fx.into();
         while let Some(e) = queue.pop_front() {
             match e {
                 worker_state::Effect::Connect { after_ms } => {
                     let jitter = self.rng.range(0, 50);
-                    self.schedule(after_ms + jitter, Ev::Connect { worker });
+                    let epoch = self.workers[&worker].epoch;
+                    self.schedule(after_ms + jitter, Ev::Connect { worker, epoch });
                 }
                 worker_state::Effect::Quit => {}
                 worker_state::Effect::Hello => {
@@ -725,7 +969,8 @@ impl World {
                     }
                     let ms = run.ms;
                     node.running.insert(token, (action, run));
-                    self.schedule(ms, Ev::Finish { worker, token });
+                    let epoch = node.epoch;
+                    self.schedule(ms, Ev::Finish { worker, epoch, token });
                 }
                 worker_state::Effect::Abort { token } => {
                     self.workers.get_mut(&worker).expect("known").running.remove(&token);
@@ -736,8 +981,11 @@ impl World {
         Ok(())
     }
 
-    fn finish(&mut self, worker: u64, token: u64) -> Step {
+    fn finish(&mut self, worker: u64, epoch: u64, token: u64) -> Step {
         let node = self.workers.get_mut(&worker).expect("known");
+        if node.epoch != epoch {
+            return Ok(());
+        }
         let Some((job, run)) = node.running.remove(&token) else { return Ok(()) };
         let inputs: Vec<&[u8]> = run.inputs.iter().map(|h| node.store[h].as_slice()).collect();
         let output = model::compile(self.project.actions[run.action].id, &inputs);
@@ -762,12 +1010,28 @@ impl World {
         }
         let ignore_pins = self.bug == Some(Bug::EvictPinned);
         let ignore_claims = self.bug == Some(Bug::EvictClaimed);
+        // Jobs can outlive the client round that pinned their inputs.
+        let job_inputs: BTreeSet<Hash> = self.server.jobs.values().flat_map(|j| j.inputs.iter().copied()).collect();
+        // An offer may rely on blobs already in the store without claiming them.
+        let offered: BTreeSet<Hash> = self
+            .server
+            .sessions
+            .values()
+            .filter_map(|s| s.offer.as_ref())
+            .flat_map(|o| o.contents.iter().copied())
+            .collect();
         let candidates: Vec<Hash> = self
             .server
             .store
             .keys()
-            .filter(|h| ignore_pins || self.server.pins.get(h).copied().unwrap_or(0) == 0)
-            .filter(|h| ignore_claims || self.server.trees.holder(h).is_none())
+            .filter(|h| ignore_pins || (!self.server.pins.contains_key(h) && !job_inputs.contains(h)))
+            .filter(|h| {
+                if self.server.trees.holder(h).is_some() {
+                    ignore_claims
+                } else {
+                    !offered.contains(h)
+                }
+            })
             .copied()
             .collect();
         if candidates.is_empty() {
@@ -776,6 +1040,12 @@ impl World {
         let h = candidates[self.rng.below(candidates.len() as u64) as usize];
         self.server.store.remove(&h);
         self.report.evictions += 1;
+        let active_clients = self
+            .clients
+            .values()
+            .filter(|c| c.round > 0 && c.outputs.len() < self.project.actions.len())
+            .count();
+        self.report.clients_at_eviction = self.report.clients_at_eviction.max(active_clients);
         let worker = self.rng.range(1, self.cfg.workers);
         let busy: BTreeSet<Hash> = self
             .server
@@ -851,7 +1121,9 @@ impl World {
                     }
                 }
                 if wake {
-                    self.try_finish_offer(client);
+                    for client in self.pending_offers() {
+                        self.try_finish_offer(client);
+                    }
                 }
             }
             Up::Request { round, action, inputs } => {
@@ -889,10 +1161,13 @@ impl World {
         let Some(sess) = self.server.sessions.remove(&client) else { return };
         let Some(o) = sess.offer else { return };
         self.server.trees.release(o.up);
-        let others: Vec<u64> = self.server.sessions.iter().filter(|(_, s)| s.offer.is_some()).map(|(c, _)| *c).collect();
-        for other in others {
+        for other in self.pending_offers() {
             self.rewant(other);
         }
+    }
+
+    fn pending_offers(&self) -> Vec<u64> {
+        self.server.sessions.iter().filter(|(_, s)| s.offer.is_some()).map(|(c, _)| *c).collect()
     }
 
     fn rewant(&mut self, client: u64) {
@@ -1071,6 +1346,7 @@ impl World {
         let c = self.clients.get_mut(&client).expect("known");
         c.round += 1;
         c.rounds_left -= 1;
+        c.test = TestRun::generate(self.seed, client, c.round);
         if c.round > 1 {
             for _ in 0..self.rng.range(1, 3) {
                 let s = self.rng.below(self.cfg.sources as u64) as usize;
@@ -1152,7 +1428,7 @@ impl World {
 
     /// The client's daemon dies: its link closes, and everything it held in
     /// memory is gone. Only what it last saved of its knowledge survives.
-    fn crash(&mut self, client: u64) {
+    fn client_crash(&mut self, client: u64) {
         let c = self.clients.get_mut(&client).expect("known");
         if c.finished || c.dead {
             return;
@@ -1346,16 +1622,48 @@ impl World {
         let c = self.clients.get_mut(&client).expect("known");
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
-            if c.rounds_left == 0 {
-                c.finished = true;
+            if let Some(test) = &mut c.test {
+                let scheduled = test.built();
+                self.schedule_tests(client, scheduled);
             } else {
-                let at = self.rng.range(0, 1_000);
-                self.schedule(at, Ev::Round { client });
+                self.complete_round(client);
             }
             return Ok(());
         }
         self.request_ready(client);
         Ok(())
+    }
+
+    fn schedule_tests(&mut self, client: u64, scheduled: Vec<(String, u64)>) {
+        for (key, delay) in scheduled {
+            self.schedule(delay, Ev::TestComplete { client, key, started_ms: self.now });
+        }
+    }
+
+    fn test_complete(&mut self, client: u64, key: &str, started_ms: u64) {
+        let test = self.clients.get_mut(&client).expect("known").test.as_mut().expect("a test command");
+        let (outcome, scheduled) = test.completed(key, self.now - started_ms);
+        match outcome {
+            Some(Outcome::Passed) => self.report.tests_passed += 1,
+            Some(Outcome::Failed) => self.report.tests_failed += 1,
+            Some(Outcome::TimedOut) => self.report.tests_timed_out += 1,
+            None => {}
+        }
+        if test.machine.phase() == Phase::Done {
+            self.complete_round(client);
+        } else {
+            self.schedule_tests(client, scheduled);
+        }
+    }
+
+    fn complete_round(&mut self, client: u64) {
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.rounds_left == 0 {
+            c.finished = true;
+        } else {
+            let at = self.rng.range(0, 1_000);
+            self.schedule(at, Ev::Round { client });
+        }
     }
 }
 
@@ -1378,7 +1686,7 @@ fn new_daemon(held: KnownDigests) -> DaemonState {
 
 fn label(ev: &Ev) -> String {
     match ev {
-        Ev::Deliver { from, to, epoch, msg } => {
+        Ev::Deliver { from, to, epoch, n, msg } => {
             let what = match msg {
                 Msg::Up(Up::Hello { .. }) => "hello",
                 Msg::Up(Up::Result { .. }) => "result",
@@ -1392,13 +1700,15 @@ fn label(ev: &Ev) -> String {
                 Msg::Down(Down::Session(_)) => "deliver",
                 Msg::Down(Down::Pong) => "pong",
             };
-            format!("{from:?}>{to:?}@{epoch}:{what};")
+            format!("{from:?}>{to:?}@{epoch}#{n}:{what};")
         }
-        Ev::Connect { worker } => format!("connect {worker};"),
-        Ev::Finish { worker, token } => format!("finish {worker}/{token};"),
+        Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
+        Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
+        Ev::Crash { worker } => format!("crash {worker};"),
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
+        Ev::TestComplete { client, key, .. } => format!("test result {client}/{key};"),
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
         Ev::Watch { client } => format!("watch {client};"),
@@ -1408,5 +1718,9 @@ fn label(ev: &Ev) -> String {
 }
 
 pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
-    World::new(seed, bug).run()
+    run_off(seed, bug, Off::none())
+}
+
+pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure> {
+    World::new(seed, bug, off).run()
 }

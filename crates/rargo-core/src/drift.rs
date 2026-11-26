@@ -6,13 +6,13 @@ use crate::proto::ServerMsg;
 use crate::sched::Priority;
 use crate::snapshot::Snapshot;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone)]
 pub struct LastClient {
-    pub env: Arc<HashMap<String, String>>,
+    pub env: Arc<BTreeMap<String, String>>,
     pub home: Arc<Home>,
     pub root: String,
     pub dir: std::path::PathBuf,
@@ -70,7 +70,7 @@ pub fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, time: 
 
 fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path, time: fn() -> Instant) -> Result<Report> {
     let (uid, gid) = (d.cfg.uid, d.cfg.gid);
-    let mut env: HashMap<String, String> = d.cfg.server_env.clone();
+    let mut env: BTreeMap<String, String> = d.cfg.server_env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (k, v) in who.env.iter() {
         if rargo_proto::env_allowed(k) && !k.starts_with("RARGO_") && k != "CARGO_TARGET_DIR" && k != "CARGO_BUILD_TARGET_DIR" {
             env.insert(k.clone(), v.clone());
@@ -86,7 +86,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     env.retain(|k, _| !k.starts_with("NIX_"));
     env.extend(flake.env.clone());
     let cargo = flake.which("cargo").context("the build flake does not provide Cargo")?;
-    let client_env: HashMap<String, String> = (*who.env).clone();
+    let client_env: BTreeMap<String, String> = (*who.env).clone();
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
@@ -121,7 +121,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
 
     let run = |args: &[&str], flag: &str| -> (i32, String) {
         let (tx, mut rx) = crate::io::unbounded_channel();
-        let mut env: HashMap<String, String> = (*who.env).clone();
+        let mut env: BTreeMap<String, String> = (*who.env).clone();
         env.insert(flag.into(), "1".into());
         env.remove("CARGO_TARGET_DIR");
         env.remove("CARGO_BUILD_TARGET_DIR");
@@ -130,7 +130,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             root: "/w".into(),
             cwd: std::path::Path::new("/w").join(&who.dir).to_string_lossy().into_owned(),
             cargo_home: "/c".into(),
-            env: Arc::new(ClientEnv::new(env, Vec::new(), None)),
+            env: Arc::new(ClientEnv::new(env.into_iter().collect(), Vec::new(), None)),
             uid,
             gid,
             prio: Priority::Background,

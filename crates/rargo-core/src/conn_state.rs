@@ -1,7 +1,7 @@
 use rargo_machine::StateMachine;
 use crate::proto::{CONTROL, ClientMsg, Digest, KEEPALIVE, Offer, PROTO_VERSION, RunRequest, ServerMsg, protocol_mismatch};
 use crate::sched::Priority;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub enum Route {
@@ -189,7 +189,7 @@ pub fn command(version: u32, args: &[String], admin: bool, user: &str) -> Comman
     }
 }
 
-pub fn priority(env: &HashMap<String, String>, stderr_tty: bool) -> Priority {
+pub fn priority(env: &BTreeMap<String, String>, stderr_tty: bool) -> Priority {
     match env.get("RARGO_PRIORITY").map(|s| s.as_str()) {
         Some("human") => Priority::Human,
         Some("agent") => Priority::Agent,
@@ -199,7 +199,7 @@ pub fn priority(env: &HashMap<String, String>, stderr_tty: bool) -> Priority {
     }
 }
 
-pub fn wants_color(args: &[String], env: &HashMap<String, String>, tty: bool) -> bool {
+pub fn wants_color(args: &[String], env: &BTreeMap<String, String>, tty: bool) -> bool {
     let mut choice: Option<&str> = None;
     let mut it = args.iter().take_while(|a| *a != "--");
     while let Some(a) = it.next() {
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn color_and_priority_follow_the_request() {
         let env =
-            |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+            |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let term = env(&[("TERM", "xterm")]);
         assert!(wants_color(&a(&["build"]), &term, true));
