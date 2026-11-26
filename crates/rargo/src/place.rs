@@ -4,7 +4,7 @@ use rargo_net::io::file::PathRing as _;
 use crate::scan::hash_file;
 use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -105,12 +105,56 @@ pub(crate) enum Op {
 }
 
 impl Op {
-    #[cfg(test)]
     fn path(&self) -> &Path {
         match self {
             Op::Remove(p) | Op::Unlink(p) | Op::Dir(p) | Op::Symlink(p, _) | Op::Text(p, _) | Op::Record(p, _) => p,
             Op::Install { to, .. } => to,
         }
+    }
+}
+
+pub(crate) struct OutputMounts(HashSet<u64>);
+
+impl OutputMounts {
+    pub(crate) fn current() -> io::Result<Self> {
+        rargo_net::io::file::read_to_string("/proc/self/mountinfo").map(|info| Self::from_mountinfo(&info))
+    }
+
+    fn from_mountinfo(info: &str) -> Self {
+        Self(info.lines().filter_map(|line| {
+            let (mount, fs) = line.split_once(" - ")?;
+            if fs.split_whitespace().next()? != "fuse.rargo" {
+                return None;
+            }
+            let (major, minor) = mount.split_whitespace().nth(2)?.split_once(':')?;
+            Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
+        }).collect())
+    }
+
+    pub(crate) fn check(&self, path: &Path) -> io::Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        // Missing outputs inherit the filesystem of their closest existing ancestor.
+        // Follow symlinks so aliases of another worktree's target are caught too.
+        let check_device = |candidate: &Path| match rargo_net::io::file::metadata(candidate) {
+            Ok(md) if self.0.contains(&md.dev()) => Err(io::Error::other(format!(
+                "cannot copy build output to `{}` on a rargo FUSE mount; choose an output directory outside that mount",
+                path.display()
+            ))),
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(false),
+            Err(e) => Err(e),
+        };
+        check_device(path)?;
+        // An install writes a temporary file beside the destination, even when
+        // the destination itself is a symlink pointing off the mount.
+        for parent in path.ancestors().skip(1) {
+            if check_device(parent)? {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -668,7 +712,12 @@ impl Placer {
     }
 
     fn run(&mut self, ops: Vec<Op>) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mounts = OutputMounts::current()?;
         for op in ops {
+            mounts.check(op.path())?;
             match op {
                 Op::Remove(path) => {
                     if let Ok(md) = rargo_net::io::file::symlink_metadata(&path) {
@@ -755,6 +804,12 @@ impl Placer {
 
     pub fn deliver(&mut self, root: &Path, targets: &[String], files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
         let bound = Bound::new(root, targets);
+        let mounts = OutputMounts::current()?;
+        for path in files.iter().map(|f| f.path.as_str()).chain(writes.iter().map(write_path)).map(Path::new) {
+            if bound.holds(path) {
+                mounts.check(path)?;
+            }
+        }
         let mut placement = Placement::new(&bound, &self.cache, &self.placed, files, writes)
             .map_err(|path| io::Error::other(format!("the server asked to place `{}`, which is not inside {bound}", path.display())))?;
         loop {
@@ -815,6 +870,24 @@ impl Placer {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn copied_outputs_reject_rargo_mounts_including_missing_paths_and_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc = Path::new("/proc");
+        let dev = std::fs::metadata(proc).unwrap().dev();
+        let info = format!("42 1 {}:{} / /proc rw - fuse.rargo rargo rw\n", libc::major(dev), libc::minor(dev));
+        let mounts = OutputMounts::from_mountinfo(&info);
+        let alias = tmp.path().join("other-target");
+        std::os::unix::fs::symlink(proc, &alias).unwrap();
+
+        for path in [proc.to_path_buf(), proc.join("other/debug/app"), alias.join("other/debug/app")] {
+            let error = mounts.check(&path).unwrap_err();
+            assert!(error.to_string().contains("on a rargo FUSE mount"));
+        }
+        mounts.check(&tmp.path().join("other-target-sibling/debug/app")).unwrap();
+        OutputMounts::from_mountinfo(&info.replace("fuse.rargo", "proc")).check(proc).unwrap();
+    }
 
     struct Rng(u64);
 

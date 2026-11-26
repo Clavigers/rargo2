@@ -5,7 +5,7 @@ use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
 use crate::partial::Partial;
-use crate::place::{Placed, Placer};
+use crate::place::{OutputMounts, Placed, Placer};
 use crate::watch::{Registration, Watcher};
 use crate::{Config, Policy, git, report, scan};
 use rargo_net::link::Link;
@@ -85,6 +85,8 @@ pub struct Daemon {
     transport: String,
     mux: io::Mutex<Option<Arc<Mux>>>,
     worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
+    // Keep mount creation from racing a checked copy to the same path.
+    mounting: io::Mutex<()>,
     watcher: Option<Arc<Watcher>>,
     next_wt: AtomicU64,
     asked: Mutex<Vec<String>>,
@@ -530,6 +532,7 @@ impl Daemon {
             transport: std::env::var("RARGO_TRANSPORT").unwrap_or_default(),
             mux: io::Mutex::new(None),
             worktrees: Mutex::new(HashMap::new()),
+            mounting: io::Mutex::new(()),
             watcher,
             next_wt: AtomicU64::new(1),
             active: AtomicUsize::new(0),
@@ -965,6 +968,7 @@ impl Daemon {
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
         let same_ns = req.mount_ns == crate::mount_ns();
         let want = self.watcher.is_some() && var(&req.vars, "RARGO_OUTPUT") != Some("copy") && !elsewhere && same_ns;
+        let _mounting = self.mounting.lock();
         let mut g = wt.out.lock().unwrap();
         if !want {
             if let Some(m) = g.take() {
@@ -1002,6 +1006,7 @@ impl Daemon {
 
     fn mount_out(self: &Arc<Self>, wt: &Arc<Worktree>) -> std::io::Result<Mounted> {
         let dir = wt.root.join("target");
+        OutputMounts::current()?.check(&wt.root)?;
         release_mounts(&dir);
         if rargo_net::io::file::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
             return Err(std::io::Error::other("`target` is a symbolic link"));
@@ -1417,7 +1422,18 @@ impl Daemon {
                 wt.running.lock()
             }
         };
-        let shown = if req.kind == "sync" { None } else { self.out_for(&wt, req) };
+        let shown = if req.kind == "sync" {
+            None
+        } else {
+            let shown = self.out_for(&wt, req);
+            if let Some(dir) = explicit_target_dir(req) {
+                let path = cwd.join(dir);
+                if let Err(error) = io::blocking(|| OutputMounts::current()?.check(&path)) {
+                    return Ok(Self::fail(out, error.to_string()));
+                }
+            }
+            shown
+        };
         let mut home_files = Vec::new();
         for name in ["config.toml", "config", "credentials.toml", "credentials"] {
             match rargo_net::io::file::read(cargo_home.join(name)) {
@@ -1679,6 +1695,7 @@ impl Daemon {
                     }
                 }
                 CommandEffect::Deliver(files, writes, targets) => {
+                    let _mounting = self.mounting.lock();
                     io::cpu(|| -> std::io::Result<()> {
                         let (files, writes) = match shown {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
@@ -1689,15 +1706,19 @@ impl Daemon {
                         Ok(())
                     })?;
                 }
-                CommandEffect::Blobs(blobs) => io::cpu(|| -> std::io::Result<()> {
-                    for b in blobs {
-                        let hash = b.hash;
-                        placer.blob(hash, &b.unpack()?)?;
-                    }
-                    Ok(())
-                })?,
+                CommandEffect::Blobs(blobs) => {
+                    let _mounting = self.mounting.lock();
+                    io::cpu(|| -> std::io::Result<()> {
+                        for b in blobs {
+                            let hash = b.hash;
+                            placer.blob(hash, &b.unpack()?)?;
+                        }
+                        Ok(())
+                    })?;
+                }
                 CommandEffect::Part(hash, part, last) => {
-                    io::cpu(|| -> std::io::Result<()> { placer.part(hash, &part.unpack()?, last) })?
+                    let _mounting = self.mounting.lock();
+                    io::cpu(|| placer.part(hash, &part.unpack()?, last))?;
                 }
                 CommandEffect::VerifyFetch => {
                     let complete = command.fetching.as_ref().is_some_and(|(_, hashes)| hashes.iter().all(|hash| !placer.pending(hash)));
@@ -1902,6 +1923,19 @@ fn next_msg(mux: &Arc<Mux>, rx: &mut UnboundedReceiver<ServerMsg>) -> std::io::R
             LinkWait::Msg(None) | LinkWait::Dead => return Err(lost()),
         }
     }
+}
+
+fn explicit_target_dir(req: &LocalRequest) -> Option<&str> {
+    let mut args = req.args.iter().take_while(|arg| *arg != "--");
+    while let Some(arg) = args.next() {
+        if arg == "--target-dir" {
+            return args.next().map(String::as_str);
+        }
+        if let Some(dir) = arg.strip_prefix("--target-dir=") {
+            return Some(dir);
+        }
+    }
+    var(&req.vars, "CARGO_TARGET_DIR").or_else(|| var(&req.vars, "CARGO_BUILD_TARGET_DIR"))
 }
 
 fn mountinfo() -> String {
