@@ -44,6 +44,10 @@ impl Stat {
         }
     }
 
+    fn of_mode(kind: u32) -> Self {
+        Self { mode: kind, size: 0, blocks: 0, nlink: 1, ino: 0, dev: 0, rdev: 0, uid: 0, gid: 0, atime: (0, 0), mtime: (0, 0), ctime: (0, 0) }
+    }
+
     pub fn of(md: &std::fs::Metadata) -> Self {
         Self {
             mode: md.mode(),
@@ -303,33 +307,105 @@ pub fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
     Ok(copied)
 }
 
-pub fn read_dir(path: impl AsRef<Path>) -> io::Result<std::vec::IntoIter<io::Result<std::fs::DirEntry>>> {
+/// One name in a directory.
+#[derive(Clone, Debug)]
+pub struct DirEntry {
+    path: std::path::PathBuf,
+    kind: char,
+}
+
+impl DirEntry {
+    pub fn path(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+
+    pub fn file_name(&self) -> std::ffi::OsString {
+        self.path.file_name().unwrap_or_default().to_os_string()
+    }
+
+    /// What the name is, without following a link.
+    pub fn file_type(&self) -> io::Result<Stat> {
+        match self.kind {
+            'd' => Ok(Stat::of_mode(libc::S_IFDIR)),
+            'f' => Ok(Stat::of_mode(libc::S_IFREG)),
+            'l' => Ok(Stat::of_mode(libc::S_IFLNK)),
+            _ => symlink_metadata(&self.path),
+        }
+    }
+
+    /// The entry's metadata, without following a link.
+    pub fn metadata(&self) -> io::Result<Stat> {
+        symlink_metadata(&self.path)
+    }
+}
+
+pub fn read_dir(path: impl AsRef<Path>) -> io::Result<std::vec::IntoIter<io::Result<DirEntry>>> {
     let path = path.as_ref();
-    offload(|| std::fs::read_dir(path).map(|d| d.collect::<Vec<_>>().into_iter()))
+    if let Some(names) = super::sim::read_dir(path) {
+        let entries: Vec<_> = names?.into_iter().map(|(name, kind)| Ok(DirEntry { path: path.join(name), kind })).collect();
+        return Ok(entries.into_iter());
+    }
+    offload(|| {
+        std::fs::read_dir(path).map(|d| {
+            d.map(|e| {
+                e.map(|e| {
+                    let kind = match e.file_type() {
+                        Ok(t) if t.is_dir() => 'd',
+                        Ok(t) if t.is_file() => 'f',
+                        Ok(t) if t.is_symlink() => 'l',
+                        _ => '?',
+                    };
+                    DirEntry { path: e.path(), kind }
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+        })
+    })
 }
 
 pub fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::remove_dir_all(path) {
+        return done;
+    }
     offload(|| std::fs::remove_dir_all(path))
 }
 
 pub fn set_permissions(path: impl AsRef<Path>, mode: std::fs::Permissions) -> io::Result<()> {
+    set_mode(path, std::os::unix::fs::PermissionsExt::mode(&mode))
+}
+
+/// Sets a path's permission bits.
+pub fn set_mode(path: impl AsRef<Path>, mode: u32) -> io::Result<()> {
     let path = path.as_ref();
-    offload(|| std::fs::set_permissions(path, mode))
+    if let Some(done) = super::sim::set_mode(path, mode) {
+        return done;
+    }
+    offload(|| std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode)))
 }
 
 pub fn read_link(path: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::read_link(path) {
+        return done;
+    }
     offload(|| std::fs::read_link(path))
 }
 
 pub fn canonicalize(path: impl AsRef<Path>) -> io::Result<std::path::PathBuf> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::canonicalize(path) {
+        return done;
+    }
     offload(|| std::fs::canonicalize(path))
 }
 
 pub fn set_modified(path: impl AsRef<Path>, at: SystemTime) -> io::Result<()> {
     let path = path.as_ref();
+    if let Some(done) = super::sim::set_modified(path, at) {
+        return done;
+    }
     offload(|| std::fs::File::options().append(true).open(path).and_then(|f| f.set_modified(at)))
 }
 
@@ -544,6 +620,9 @@ impl File {
     }
 
     pub fn try_clone(&self) -> io::Result<File> {
+        if let Some(fd) = super::sim::dup(self.fd) {
+            return Ok(File { fd: fd?, pos: self.pos });
+        }
         let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -557,6 +636,9 @@ impl File {
     }
 
     pub fn set_mode(&self, mode: u32) -> io::Result<()> {
+        if let Some(done) = super::sim::set_fd_mode(self.fd, mode) {
+            return done;
+        }
         direct(unsafe { libc::fchmod(self.fd, mode) } as isize, |_| ())
     }
 }

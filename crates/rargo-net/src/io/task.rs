@@ -248,6 +248,10 @@ pub fn blocking<R: Send>(body: impl FnOnce() -> R + Send) -> R {
 }
 
 fn on_pool<R: Send>(blocking: bool, body: impl FnOnce() -> R + Send) -> R {
+    if super::sim::active() {
+        // A simulation has one thread: pool work runs where it is asked for.
+        return body();
+    }
     struct Pack<F, R> {
         body: Option<F>,
         out: Option<Result<R, Box<dyn Any + Send>>>,
@@ -289,6 +293,10 @@ fn on_pool<R: Send>(blocking: bool, body: impl FnOnce() -> R + Send) -> R {
 }
 
 pub fn sleep(duration: Duration) {
+    if !on_fiber() {
+        std::thread::sleep(duration);
+        return;
+    }
     let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
     if ms == 0 {
         yield_now();

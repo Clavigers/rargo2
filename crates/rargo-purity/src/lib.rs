@@ -129,6 +129,17 @@ pub fn is_shell(file: &str) -> bool {
     in_crate.is_some_and(|path| path == "build.rs" || path.starts_with("examples/"))
 }
 
+/// Types under a denied module that are plain values: naming an address
+/// opens no socket, so they are not I/O.
+const VALUES: &[&str] = &[
+    "std::net::SocketAddr",
+    "std::net::SocketAddrV4",
+    "std::net::SocketAddrV6",
+    "std::net::IpAddr",
+    "std::net::Ipv4Addr",
+    "std::net::Ipv6Addr",
+];
+
 const AMBIENT: &[&str] = &[
     "std::fs",
     "std::net",
@@ -414,7 +425,7 @@ impl Scan<'_> {
     }
 
     fn denied(&mut self, full: &str, line: usize) {
-        if under(full, "std::sync::atomic::Ordering") {
+        if under(full, "std::sync::atomic::Ordering") || VALUES.iter().any(|v| under(full, v)) {
             return;
         }
         let testing = self.testing();

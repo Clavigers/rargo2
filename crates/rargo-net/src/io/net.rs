@@ -39,6 +39,9 @@ pub(super) fn reuseaddr(fd: i32) {
 }
 
 pub(super) fn local_of(fd: i32) -> io::Result<SocketAddr> {
+    if let Some(local) = super::sim::local_addr(fd) {
+        return local;
+    }
     unsafe {
         let mut storage = mem::zeroed::<libc::sockaddr_storage>();
         let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -90,7 +93,9 @@ pub(super) struct OwnedFd {
 impl Drop for OwnedFd {
     fn drop(&mut self) {
         if self.fd >= 0 {
-            unsafe { libc::close(self.fd) };
+            if !super::sim::close_now(self.fd) {
+                unsafe { libc::close(self.fd) };
+            }
             self.fd = -1;
         }
     }
@@ -385,6 +390,11 @@ impl UdpSocket {
     }
 
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        if let Some(got) = super::sim::try_recv_from(self.fd.fd, buf.len()) {
+            let (bytes, from) = got?;
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            return Ok((bytes.len(), from));
+        }
         unsafe {
             let mut storage = mem::zeroed::<libc::sockaddr_storage>();
             let mut len = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;

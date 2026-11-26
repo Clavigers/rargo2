@@ -664,7 +664,6 @@ fn sweep_history(store: &Path) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
-    use std::os::unix::fs::MetadataExt;
     for e in rargo_net::io::file::read_dir(store.join("pieces")).into_iter().flatten().flatten() {
         if e.metadata().is_ok_and(|m| m.nlink() == 1) && stale(&e.path()) {
             let _ = rargo_net::io::file::remove_file(e.path());

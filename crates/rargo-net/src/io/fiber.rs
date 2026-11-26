@@ -12,6 +12,7 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
 
 use super::ops::{Event, Op};
 use super::ring::Loop;
+use super::sim::{Report, SimLoop};
 
 pub(super) const STACK: usize = 8 << 20;
 
@@ -56,13 +57,59 @@ pub(super) struct Fiber {
 }
 
 pub(super) struct Sched {
-    pub(super) ring: Loop,
+    pub(super) ring: Backend,
     pub(super) poke: Arc<Poke>,
     pub(super) next_id: u64,
     pub(super) fibers: BTreeMap<u64, Fiber>,
     pub(super) ready: VecDeque<u64>,
     pub(super) inbox: BTreeMap<u64, Resume>,
     pub(super) waiting: BTreeMap<u64, u64>,
+}
+
+/// What answers the scheduler's operations: the kernel's io_uring, or a simulation.
+pub(super) enum Backend {
+    Real(Loop),
+    Sim(SimLoop),
+}
+
+impl Backend {
+    fn submit(&mut self, op: Op) -> io::Result<u64> {
+        match self {
+            Backend::Real(ring) => ring.submit(op),
+            Backend::Sim(sim) => sim.submit(op),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<Vec<(u64, Event)>> {
+        match self {
+            Backend::Real(ring) => ring.wait(),
+            Backend::Sim(sim) => sim.wait(),
+        }
+    }
+
+    fn cancel(&mut self, token: u64) {
+        match self {
+            Backend::Real(ring) => ring.cancel(token),
+            Backend::Sim(sim) => sim.cancel(token),
+        }
+    }
+}
+
+/// Every fiber but the caller becomes a background fiber, so the loop ends them when the caller returns.
+pub(super) fn rest_in_background() {
+    let me = current_id();
+    let s = unsafe { &mut *sched_ptr() };
+    for (id, fiber) in s.fibers.iter_mut() {
+        if *id != me {
+            fiber.background = true;
+        }
+    }
+}
+
+/// The backend of the loop this thread is driving, if it is driving one.
+pub(super) fn backend() -> Option<&'static mut Backend> {
+    let p = SCHED.with(|c| c.get());
+    if p.is_null() { None } else { Some(unsafe { &mut (*p).ring }) }
 }
 
 pub fn loop_running() -> bool {
@@ -262,10 +309,23 @@ pub(super) fn op_event(op: Op) -> io::Result<Event> {
 }
 
 pub fn drive(workers: usize, main: impl FnOnce() + 'static) {
-    assert!(!on_loop(), "the event loop is already running");
     let ring = boot(workers);
+    let efd = ring.wake_fd();
+    drive_on(Backend::Real(ring), efd, main);
+}
+
+/// Drives `main` on a simulated backend, on this thread alone, and reports the run.
+pub(super) fn drive_sim(sim: SimLoop, main: impl FnOnce() + 'static) -> Report {
+    match drive_on(Backend::Sim(sim), -1, main) {
+        Backend::Sim(sim) => sim.report(),
+        Backend::Real(_) => unreachable!("the loop returns the backend it was given"),
+    }
+}
+
+fn drive_on(ring: Backend, efd: i32, main: impl FnOnce() + 'static) -> Backend {
+    assert!(!on_loop(), "the event loop is already running");
     let poke = Arc::new(Poke {
-        efd: ring.wake_fd(),
+        efd,
         q: StdMutex::new(Vec::new()),
         spawn: StdMutex::new(Vec::new()),
     });
@@ -290,9 +350,11 @@ pub fn drive(workers: usize, main: impl FnOnce() + 'static) {
             *poke_global().lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
-    let _clear = Clear;
+    let clear = Clear;
     spawn_raw(Spec { parent: None, race: None, task: None, background: false }, main);
     run(ptr);
+    drop(clear);
+    sched.ring
 }
 
 pub(super) fn run(sched: *mut Sched) {
