@@ -314,6 +314,7 @@ pub fn needs_network(stderr: &[u8]) -> bool {
     ["--offline", "offline mode", "is not installed", "could not download", "syncing channel updates"]
         .iter()
         .any(|m| s.contains(m))
+        || s.lines().any(|line| line.starts_with("error: could not find `") && line.contains(" in registry `"))
 }
 
 pub fn script_warning_message(line: &str) -> Option<&str> {
@@ -550,12 +551,13 @@ error: could not compile `app` (bin \"app\") due to 1 previous error\n";
 
     #[test]
     fn what_a_failure_s_stderr_asks_for() {
-        let cases: [(&str, &[u8]); 7] = [
+        let cases: [(&str, &[u8]); 8] = [
             ("rustup, miri on nightly", RUSTUP_MISSING_MIRI),
             ("rustup, clippy and rustfmt", &[RUSTUP_MISSING_CLIPPY, RUSTUP_MISSING_MIRI].concat()),
             ("rustup, no such component", RUSTUP_NO_SUCH_COMPONENT),
             ("rustup, unknown binary", RUSTUP_UNKNOWN_BINARY),
             ("cargo, offline resolution", CARGO_OFFLINE_RESOLUTION),
+            ("cargo, an uncached install", b"error: could not find `ripgrep` in registry `crates-io` with version `=14.1.1`\n"),
             ("rustc, a compile error", RUSTC_ERROR),
             ("a toolchain name that is not a name", SHADY_RUSTUP),
         ];
@@ -569,6 +571,7 @@ rustup, clippy and rustfmt: components [(\"clippy\", \"stable-x86_64-unknown-lin
 rustup, no such component: components [], network false
 rustup, unknown binary: components [], network false
 cargo, offline resolution: components [], network true
+cargo, an uncached install: components [], network true
 rustc, a compile error: components [], network false
 a toolchain name that is not a name: components [], network true
 ");

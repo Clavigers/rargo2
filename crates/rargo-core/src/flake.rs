@@ -389,6 +389,18 @@ fn action_id(source: &Hash, env: &FlakeEnv) -> Hash {
 }
 
 pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u32, gid: u32) -> Result<Arc<FlakeEnv>> {
+    resolve_shell(d, snap, dir, extra, (uid, gid), "default")
+}
+
+/// Resolve a development shell and keep its store closure separate from the other shells.
+pub(crate) fn resolve_shell(
+    d: &Daemon,
+    snap: &Snapshot,
+    dir: &Path,
+    extra: &[String],
+    (uid, gid): (u32, u32),
+    shell: &str,
+) -> Result<Arc<FlakeEnv>> {
     static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
     if NIX_READY.get().is_none() {
         let ready = match crate::io::output(nix().arg("--version")) {
@@ -401,15 +413,22 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
     NIX_READY.get().expect("set above").as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
 
     let src = source(snap, dir, extra);
+    let shell_key = if shell == "default" {
+        src.key
+    } else {
+        let mut hash = KeyHasher::new("flake-shell-v1");
+        hash.field(&src.key.0).field(shell.as_bytes());
+        hash.finish()
+    };
     let store = &d.engine.store;
     let mut k = b"flake:".to_vec();
-    k.extend_from_slice(&src.key.0);
+    k.extend_from_slice(&shell_key.0);
     let nix_store = Path::new("/nix/store");
     let hosts = d.pool.get().map(|p| p.host_sources().clone());
     let tables: Arc<dyn crate::db::Tables> = store.db().clone();
     let disk: Arc<dyn crate::nixmanifest::StoreFs> = Arc::new(crate::nixmanifest::Disk);
     let cached = crate::io::cpu(|| store.db().get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
-    let mut resolution = Resolution::new(src.key, cached, host_ca_bundle().is_some());
+    let mut resolution = Resolution::new(shell_key, cached, host_ca_bundle().is_some());
     let mut scratch: Option<std::path::PathBuf> = None;
     let done = loop {
         match resolution.need() {
@@ -437,7 +456,7 @@ pub fn resolve(d: &Daemon, snap: &Snapshot, dir: &Path, extra: &[String], uid: u
                         }
                     }) })?;
                     let mut c = nix();
-                    c.args(["print-dev-env", "--json", "--no-write-lock-file", ".#default"]);
+                    c.args(["print-dev-env", "--json", "--no-write-lock-file"]).arg(format!(".#{shell}"));
                     run_nix(&dir, c, uid, gid).map_err(anyhow::Error::msg)
                 })();
                 resolution.evaluated(out.map_err(|e| format!("{e:#}")));
