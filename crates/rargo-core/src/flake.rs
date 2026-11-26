@@ -565,6 +565,8 @@ impl FlakeEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     #[test]
     fn the_default_toolchain_has_the_standard_library_s_sources_whatever_the_toolchain_file_asks() {
@@ -621,31 +623,32 @@ mod tests {
 
     #[test]
     fn the_real_dev_environment_resolves_to_its_closure() {
+        let mut outcomes = Transcript::default();
         let key = Hash::of(b"source");
         let closure = lines(CLOSURE);
         let mut r = Resolution::new(key, None, true);
-        assert_eq!(r.need(), Need::Evaluate);
+        outcomes.record("need", r.need());
         r.evaluated(Ok(DEV_ENV.to_vec()));
         r.invariants();
         let Need::Exists(asked) = r.need() else { panic!("the roots are checked against the store") };
         assert!(asked.iter().all(|n| n.as_bytes().get(32) == Some(&b'-')));
         r.exists(&closure);
         let Need::Closure(roots) = r.need() else { panic!("the closure of the roots is asked for") };
-        assert_eq!(roots.len(), 39);
+        outcomes.record("closure root count", roots.len());
         assert!(roots.iter().all(|root| closure.contains(root)));
         assert!(roots.iter().any(|root| root.contains("-rust")), "{roots:?}");
         r.closed(Ok(CLOSURE.to_vec()));
         let Need::Manifest(manifest) = r.need() else { panic!("the closure is manifested") };
-        assert_eq!(manifest.len(), 163);
+        outcomes.record("manifest path count", manifest.len());
         assert_eq!(manifest, closure.iter().cloned().collect::<Vec<_>>());
         r.manifested(manifest.iter().map(|n| Hash::of(n.as_bytes())).collect());
         r.invariants();
         let Need::Done { env, save: true } = r.need() else { panic!("a fresh evaluation is saved") };
         assert!(env.env["PATH"].split(':').all(|p| p.starts_with("/nix/store/")));
-        assert_eq!(env.env["SSL_CERT_FILE"], CA_AT);
+        outcomes.record("SSL_CERT_FILE", &env.env["SSL_CERT_FILE"]);
         assert!(!env.env.keys().any(|k| k.starts_with("BASH") || k.starts_with("__") || (DROP.contains(&k.as_str()) && env.env[k] != CA_AT)));
         assert!(!env.env.contains_key("HOME") && !env.env.contains_key("NIX_BUILD_TOP") && !env.env.contains_key("shellHook"));
-        assert_eq!(env.id, action_id(&key, &env));
+        outcomes.record("environment id", env.id);
         let without_ca = drive(&mut Resolution::new(key, None, false), &closure, DEV_ENV, CLOSURE);
         let Need::Done { env: plain, .. } = without_ca else { panic!("{without_ca:?}") };
         assert!(!plain.env.contains_key("SSL_CERT_FILE") || plain.env["SSL_CERT_FILE"] != CA_AT);
@@ -654,7 +657,7 @@ mod tests {
         reversed.reverse();
         let reversed = reversed.join(&b'\n');
         let Need::Done { env: again, .. } = drive(&mut Resolution::new(key, None, true), &closure, DEV_ENV, &reversed) else { panic!() };
-        assert_eq!(again, env, "the closure's order does not matter");
+        assert_eq!(again, env, "the closure order does not matter");
 
         let mut cached = Resolution::new(key, Some(env.clone()), true);
         assert_eq!(cached.need(), Need::Exists(env.closure.clone()));
@@ -666,11 +669,21 @@ mod tests {
         gone.remove(&env.closure[7]);
         let mut cached = Resolution::new(key, Some(env.clone()), true);
         cached.exists(&gone);
-        assert_eq!(cached.need(), Need::Evaluate, "a cached closure missing a path is evaluated again");
+        // a cached closure missing a path is evaluated again.
+        outcomes.record("need", cached.need());
+        expect![[r#"
+            need: Evaluate
+            closure root count: 39
+            manifest path count: 163
+            SSL_CERT_FILE: "/etc/ca-certificates.crt"
+            environment id: 0ba5d1d686b3f387
+            need: Evaluate
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn only_a_flake_that_must_be_evaluated_or_built_prepares_the_toolchain() {
+        let mut outcomes = Transcript::default();
         let key = Hash::of(b"source");
         let closure = lines(CLOSURE);
         let prepares = |r: &mut Resolution, present: &BTreeSet<String>| {
@@ -690,38 +703,52 @@ mod tests {
             panic!("the resolution did not finish");
         };
         let (fresh, env) = prepares(&mut Resolution::new(key, None, true), &closure);
-        assert_eq!(fresh, [true, false, true, false, false]);
+        outcomes.record("fresh", fresh);
         let env = env.expect("resolves");
         let (cached, _) = prepares(&mut Resolution::new(key, Some(env.clone()), true), &closure);
-        assert!(!cached.contains(&true), "a cached flake whose paths are present prepares nothing: {cached:?}");
+        outcomes.record("cached", cached);
         let mut gone = closure.clone();
         gone.remove(&env.closure[7]);
         let (missing, _) = prepares(&mut Resolution::new(key, Some(env), true), &gone);
-        assert!(missing.contains(&true), "a cached closure missing a path prepares the toolchain again");
+        outcomes.record("stale", missing);
+        expect![[r#"
+            fresh: [true, false, true, false, false]
+            cached: [false, false, false]
+            stale: [false, true, false, true, false, false]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn failures_and_answers_out_of_turn() {
+        let mut outcomes = Transcript::default();
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.closed(Ok(CLOSURE.to_vec()));
         r.manifested(Vec::new());
         r.exists(&BTreeSet::new());
-        assert_eq!(r.need(), Need::Evaluate, "answers to what was not asked change nothing");
+        // answers to what was not asked change nothing.
+        outcomes.record("need", r.need());
         r.evaluated(Err("nix failed: boom".into()));
-        assert_eq!(r.need(), Need::Failed("nix failed: boom".into()));
+        outcomes.record("need", r.need());
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.evaluated(Ok(br#"{"variables":{"PATH":{"type":"exported","value":"/usr/bin"}}}"#.to_vec()));
-        assert!(matches!(r.need(), Need::Failed(e) if e.contains("exports no tools")));
+        outcomes.record("no tools", r.need());
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.evaluated(Ok(b"not json".to_vec()));
-        assert!(matches!(r.need(), Need::Failed(e) if e.contains("parsing `nix print-dev-env`")));
+        outcomes.record("malformed environment", r.need());
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.evaluated(Ok(DEV_ENV.to_vec()));
         r.evaluated(Err("late".into()));
         r.exists(&lines(CLOSURE));
         r.closed(Err("nix failed: no store".into()));
         r.invariants();
-        assert_eq!(r.need(), Need::Failed("nix failed: no store".into()));
+        outcomes.record("need", r.need());
+        expect![[r#"
+            need: Evaluate
+            need: Failed("nix failed: boom")
+            no tools: Failed("the flake's devShell exports no tools (no store paths, or no PATH)")
+            malformed environment: Failed("parsing `nix print-dev-env`: expected ident at line 1 column 2")
+            need: Failed("nix failed: no store")
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
