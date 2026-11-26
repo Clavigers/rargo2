@@ -814,7 +814,6 @@ impl World {
         all.extend(self.server.sessions.values().map(|s| &s.state as &dyn StateMachine));
         all.extend(self.workers.values().map(|w| &w.sm as &dyn StateMachine));
         all.extend(self.clients.values().map(|c| &c.daemon as &dyn StateMachine));
-        all.extend(self.clients.values().map(|c| &c.target as &dyn StateMachine));
         all.extend(self.clients.values().filter_map(|c| c.test.as_ref()).map(|t| &t.machine as &dyn StateMachine));
         all
     }
@@ -1752,6 +1751,8 @@ impl World {
         let path = worktree::target_path(self.project.actions[action].id);
         if self.bug != Some(Bug::UnshownOutputs) {
             c.target.apply(c.target.generation + 1, vec![Edit::Put { path, file, replaced_real: false }]);
+            // The table changes only here, so its invariants are checked here and not after every event.
+            c.target.invariants();
         }
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
