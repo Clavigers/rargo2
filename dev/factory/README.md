@@ -13,6 +13,29 @@ On the factory machine, under `/root/factory`, three systemd services:
 | `factory-foreman` | Every 20 minutes: takes back work from agents that stopped or ran out of quota, preempts for bugs that waited too long, closes finished initiatives, and plans unparked initiatives into issues. |
 | `factory-watchdog` | Keeps one headless session (Claude Code, Codex, Grok) running per agent that has work, each in its own worktree under `state/worktrees`. A session does one issue (`AGENT.md`) and ends. |
 
+### Review
+
+Each push is reviewed by the reviewers in the config. `placeholder` approves
+everything. `review-mux` (`factory/review/`) asks AI review bots, defined in
+`deploy/bots.json`, and runs inside the observer: for each pushed commit it
+picks the bots worth asking (free ones and expiring credits first, the best
+paid one for 300+ line changes or the label `review:deep`), triggers each as
+the account that installed it, waits for their answers, and posts one PR
+comment with their findings merged. No findings approves; any finding asks for
+changes, and the next agent reads that comment. If no bot could review, the
+push waits and the owner is told. Bot approvals never count. What it asked and
+spent is in its own record beside the log.
+
+To turn it on, add to the observer's service
+
+    Environment=FACTORY_BOTS=/root/factory/src/deploy/bots.json
+    Environment=FACTORY_REVIEW_RECORD=/root/factory/review.jsonl
+    Environment=FACTORY_REPORT_AS=sadosystems
+    Environment=GH_TOKEN_SADOSYSTEMS=...    # each bot's trigger_as account
+
+and apply a config with `"reviewers": ["review-mux"]`. The bots must be
+installed on the repository (see review_mux's docs/setup.md).
+
 Everything they do goes through one log, `/root/factory/log.jsonl`. Nothing
 else is the factory's state: not labels, not the services' memory.
 

@@ -111,8 +111,17 @@ def main(argv: list[str]) -> int:
             from .github import GitHub
             from .observer import Observer
             owner = slug.split("/")[0]
-            obs = Observer(Ledger(env("FACTORY_LOG")), GitHub(slug), owner,
-                           trusted=frozenset(trusted))
+            gh = GitHub(slug)
+            reviewers = {}
+            if os.environ.get("FACTORY_BOTS"):  # the review bots, through review-mux
+                from .review.bots import load
+                from .review.mux import Mux
+                from .review.record import Record
+                mux = Mux(gh, Record(env("FACTORY_REVIEW_RECORD")), load(env("FACTORY_BOTS")),
+                          report_as=os.environ.get("FACTORY_REPORT_AS") or None)
+                reviewers["review-mux"] = mux.verdict
+            obs = Observer(Ledger(env("FACTORY_LOG")), gh, owner,
+                           trusted=frozenset(trusted), reviewers=reviewers)
             while True:
                 obs.step()
                 time.sleep(60)

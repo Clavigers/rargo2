@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from factory import machines as M
+from factory import model as m
 from factory.foreman import Foreman
 from factory.github import GitHubError
 from factory.ledger import Ledger
@@ -28,7 +29,6 @@ class FakeGitHub:
         self.issue_list: dict[int, dict] = {}
         self.pulls: dict[int, dict] = {}
         self.runs: dict[str, list] = {}
-        self.status_list: dict[str, list] = {}
         self.posted: list[tuple[int, str]] = []
         self.closed: list[int] = []
         self.merge_error: str | None = None
@@ -56,13 +56,6 @@ class FakeGitHub:
 
     def pull(self, n):
         return self.pulls[n]
-
-    def statuses(self, sha):
-        return list(reversed(self.status_list.get(sha, [])))  # newest first
-
-    def status(self, sha, state, description="", url=""):
-        self.status_list.setdefault(sha, []).append(
-            {"context": "review_mux", "state": state, "description": description, "target_url": url})
 
     def check_runs(self, sha):
         return self.runs.get(sha, [])
@@ -314,18 +307,30 @@ def test_the_foreman_closes_on_github_what_an_agent_closed(rig, tmp_path):
     assert rig.led.world.issues[2].closer == A2  # the observer does not record it again
 
 
-def with_review_mux(rig):
+
+def with_review_mux(rig, verdicts):
+    """The observer with a review-mux reviewer that answers from verdicts."""
+    from factory.observer import ReviewerStuck
+
+    def reviewer(gh, pr, sha):
+        v = verdicts.get(sha)
+        if isinstance(v, Exception):
+            raise v
+        return v
     submit(rig, "human", "config_applied", config=dict(CONFIG, version=2, reviewers=["review-mux"]))
+    rig.obs = Observer(rig.led, rig.gh, OWNER, say=rig.said.append,
+                       reviewers={"review-mux": reviewer})
+    return ReviewerStuck
 
 
 def test_review_mux_findings_send_it_back_with_the_link(rig):
-    with_review_mux(rig)
+    verdicts = {}
+    with_review_mux(rig, verdicts)
     pushed(rig)
     rig.gh.ci(SHA, "success")
-    rig.gh.status(SHA, "pending", "asking coderabbit, greptile")
     rig.obs.step()
     assert rig.led.world.is_(M.REVIEW, "10/1/review-mux", "pending")
-    rig.gh.status(SHA, "failure", "1 finding from coderabbit", "https://x/10#c1")
+    verdicts[SHA] = (m.ReviewResult.changes, "1 finding from coderabbit: https://x/10#c1")
     rig.obs.step()
     last = lines(rig)[-1]
     assert (last["event"], last["result"], last["note"]) == (
@@ -333,20 +338,20 @@ def test_review_mux_findings_send_it_back_with_the_link(rig):
     assert rig.led.world.needs_work(1)
 
 
-def test_review_mux_success_merges(rig):
-    with_review_mux(rig)
+def test_review_mux_approval_merges(rig):
+    with_review_mux(rig, {SHA: (m.ReviewResult.approved, None)})
     pushed(rig)
     rig.gh.ci(SHA, "success")
-    rig.gh.status(SHA, "success", "no findings from coderabbit, greptile")
     rig.obs.step()
     assert rig.led.world.is_(M.PR, 10, "merged")
 
 
-def test_review_mux_unable_to_review_waits_and_says_so_once(rig):
-    with_review_mux(rig)
+def test_a_stuck_review_waits_and_says_so_once(rig):
+    verdicts = {}
+    stuck = with_review_mux(rig, verdicts)
+    verdicts[SHA] = stuck("review-mux could not review aaaa: no bot gave a review")
     pushed(rig)
     rig.gh.ci(SHA, "success")
-    rig.gh.status(SHA, "error", "no bot gave a review: coderabbit timeout")
     rig.obs.step()
     rig.obs.step()
     assert rig.led.world.is_(M.REVIEW, "10/1/review-mux", "pending")

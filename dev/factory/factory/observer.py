@@ -56,37 +56,22 @@ def placeholder(gh: GitHub, pr: int, sha: str):
     return m.ReviewResult.approved, None
 
 
-def review_mux(gh: GitHub, pr: int, sha: str):
-    """review_mux's merged verdict: its commit status on exactly this commit.
-    failure carries the link to its findings. error (no bot could review)
-    is no verdict: the push waits, and the owner is told once."""
-    for s in gh.statuses(sha):  # newest first
-        if s["context"] != "review_mux":
-            continue
-        if s["state"] == "success":
-            return m.ReviewResult.approved, None
-        if s["state"] == "failure":
-            return m.ReviewResult.changes, f"{s['description']}: {s.get('target_url') or ''}".strip()[:500]
-        if s["state"] == "error":
-            raise ReviewerStuck(f"review_mux could not review {sha[:9]}: {s['description']}")
-        return None  # pending
-    return None
-
-
 class ReviewerStuck(Exception):
-    pass
+    """A reviewer that cannot give a verdict without the owner."""
 
 
-REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder, "review-mux": review_mux}
+REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder}
 
 
 class Observer:
     def __init__(self, ledger: Ledger, gh: GitHub, owner: str,
                  trusted: frozenset[str] = frozenset(), ci_apps=frozenset({"github-actions"}),
-                 merge: bool = True, say: Callable[[str], None] = print):
+                 merge: bool = True, say: Callable[[str], None] = print,
+                 reviewers: dict[str, Reviewer] | None = None):
         self.ledger, self.gh, self.owner = ledger, gh, owner
         self.trusted = trusted | {owner}
         self.ci_apps, self.merging, self.say = ci_apps, merge, say
+        self.reviewers = {**REVIEWERS, **(reviewers or {})}
         self.since: datetime | None = None
         self.asked: set[int] = set()  # issues we asked for a type label
         self.noted: set[tuple] = set()  # things said once
@@ -129,7 +114,7 @@ class Observer:
         for r in p.reviewers:
             if self.ledger.world.is_(M.REVIEW, f"{key}/{r}", ReviewS.pending):
                 try:
-                    verdict = REVIEWERS[r](self.gh, pr, p.sha) if r in REVIEWERS else None
+                    verdict = self.reviewers[r](self.gh, pr, p.sha) if r in self.reviewers else None
                 except ReviewerStuck as err:
                     verdict = None
                     if ("stuck", pr, p.sha) not in self.noted:
@@ -138,7 +123,7 @@ class Observer:
                 except GitHubError as err:
                     verdict = None
                     self.say(f"pr {pr}: reviewer {r}: {err}")
-                if r not in REVIEWERS:
+                if r not in self.reviewers:
                     self._once(("reviewer", r), f"no reviewer called {r} is wired up")
                 if verdict:
                     result, note = verdict

@@ -3,6 +3,7 @@ with the same methods."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 
@@ -11,12 +12,30 @@ class GitHubError(Exception):
     pass
 
 
+def token_var(account: str) -> str:
+    return "GH_TOKEN_" + account.upper().replace("-", "_")
+
+
+def token_for(account: str) -> str | None:
+    """A token to act as account: GH_TOKEN_<ACCOUNT>, else gh's stored one."""
+    if os.environ.get(token_var(account)):
+        return os.environ[token_var(account)]
+    r = subprocess.run(["gh", "auth", "token", "--user", account], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
 class GitHub:
     def __init__(self, repo: str):
         self.repo = repo  # owner/name
 
-    def _gh(self, *args: str, input: str | None = None) -> str:
-        r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input)
+    def _gh(self, *args: str, input: str | None = None, as_: str | None = None) -> str:
+        env = None
+        if as_:
+            tok = token_for(as_)
+            if not tok:
+                raise GitHubError(f"no token for {as_}: set {token_var(as_)} or gh auth login as {as_}")
+            env = dict(os.environ, GH_TOKEN=tok)
+        r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input, env=env)
         if r.returncode != 0:
             raise GitHubError(f"gh {' '.join(args[:3])}: {r.stderr.strip()[:500]}")
         return r.stdout
@@ -42,10 +61,6 @@ class GitHub:
     def pull(self, n: int) -> dict:
         return self._api(f"pulls/{n}")
 
-    def statuses(self, sha: str) -> list[dict]:
-        """Commit statuses on sha, newest first."""
-        return self._api(f"commits/{sha}/statuses?per_page=100")
-
     def check_runs(self, sha: str) -> list[dict]:
         return self._api(f"commits/{sha}/check-runs?per_page=100")["check_runs"]
 
@@ -64,3 +79,28 @@ class GitHub:
         """reason: completed or not planned."""
         self._gh("issue", "close", str(issue), "-R", self.repo, "--reason", reason,
                  "--comment", body)
+
+    # what the review-mux reviewer uses
+
+    def issue_comments(self, pr: int) -> list[dict]:
+        return self._api(f"issues/{pr}/comments?per_page=100", paginate=True)
+
+    def review_comments(self, pr: int) -> list[dict]:
+        return self._api(f"pulls/{pr}/comments?per_page=100", paginate=True)
+
+    def reviews(self, pr: int) -> list[dict]:
+        return self._api(f"pulls/{pr}/reviews?per_page=100", paginate=True)
+
+    def post(self, pr: int, body: str, as_: str | None = None) -> int:
+        """A comment on pr, as the account as_; returns its id."""
+        out = self._gh("api", f"repos/{self.repo}/issues/{pr}/comments", "-X", "POST",
+                       "-F", "body=@-", input=body, as_=as_)
+        return json.loads(out)["id"]
+
+    def edit_comment(self, comment_id: int, body: str, as_: str | None = None) -> None:
+        self._gh("api", f"repos/{self.repo}/issues/comments/{comment_id}", "-X", "PATCH",
+                 "-F", "body=@-", input=body, as_=as_)
+
+    def set_body(self, pr: int, body: str, as_: str | None = None) -> None:
+        self._gh("api", f"repos/{self.repo}/pulls/{pr}", "-X", "PATCH",
+                 "-F", "body=@-", input=body, as_=as_)
