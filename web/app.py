@@ -34,9 +34,19 @@ def cache_policy(response):
     return response
 
 
+def _page(rel):
+    try:
+        with open(os.path.join(DL_DIR, "VERSION")) as f:
+            version = f.read().strip()
+    except OSError:
+        version = "unreleased"
+    with open(os.path.join(SITE_DIR, rel)) as f:
+        return f.read().replace("{{RARGO_VERSION}}", version), 200, {"Content-Type": "text/html; charset=utf-8"}
+
+
 @app.get("/")
 def home():
-    return send_from_directory(SITE_DIR, "index.html")
+    return _page("index.html")
 
 
 # The Book is the main page; keep the nav link but send it home.
@@ -47,7 +57,7 @@ def book():
 
 @app.get("/reference")
 def reference():
-    return send_from_directory(SITE_DIR, "reference/index.html")
+    return _page("reference/index.html")
 
 
 @app.get("/bibliography")

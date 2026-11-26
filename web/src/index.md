@@ -19,7 +19,13 @@ It's a worn out trope, but Rargo fixes the "works on my ma&shy;chine" problem. R
 
 # Getting Started
 
-The  <code>rargo CLI</code> is the official Rargo client. All <code>cargo</code> commands work with <code>rargo</code>.
+The  <code>rargo CLI</code> is the official Rargo client. All <code>cargo</code> commands work with <code>rargo</code>. On Linux x86_64, install it with:
+
+<cmd>curl -fsSL https://rargo.rs/install.sh | sh</cmd>
+
+That needs only `curl`. It puts `rargo` in `~/.cargo/bin` if you have one, else `~/.local/bin`, and says what to do next.
+
+Or build it from crates.io, which needs [Rust](https://rustup.rs/) and a C linker (`build-essential` on Debian and Ubuntu):
 
 <cmd>cargo install rargo</cmd>
 
@@ -63,35 +69,6 @@ Once you are authenti&shy;cated with the server, you can run any cargo command w
 What the Farm builds links against the Farm's own C library, from the Nix store. To run it on your machine, with `rargo run` or straight from `target/`, you need [Nix](https://nixos.org/download/) installed. The first `rargo run` fetches the library into your store; after that the program runs either way.
 </aside>
 
-
-# Getting Just a Bit More Started
-TODO: add more of a guide
-
-example of the code block formatting.
-<figure class="example">
-```css
-:root {
-  --font-family: "Alegreya", serif;
-  --line-height: 1.2;
-  --border-thickness: 1.5px;
-  --text-color: #000;
-  --background-color: #fff;
-}
-```
-</figure>
-
-# Rargo vs Other Solutions
-TODO: Write the comparison
-<!-- "Why not use X?" if X is in the biblio&shy;graphy I tried it and I walked away still wanting some&shy;thing else. There are many suitable so&shy;lutions to this problem Rargo is the one that works best for Rust work&shy;spaces. -->
-
-# Tough Topics
-TODO: Write about sharp corners / hermeticity stuff
-
-# Things are Gonna Get Easier
-TODO: Write about ways to prevent non determinism
-
-# SolidGoldFerris
-TODO: Write about ways to detect and fix non determinism
 
 # Afterword {.unnumbered}
 <!-- ## Thank You Reader {.unnumbered}

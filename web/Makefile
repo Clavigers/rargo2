@@ -2,7 +2,6 @@
 # esbuild, html-minifier — all provided by `nix develop`). Built artifacts in
 # site/ are committed; deploy.sh serves them as-is, so run `make` and commit
 # before pushing.
-VERSION=$(shell jq -r .version package.json)
 DATE=$(shell date +%F)
 
 all: site/index.html site/bibliography/index.html site/reference/index.html site/index.css site/src/demo/demo.css
@@ -40,7 +39,7 @@ site/index.html: src/index.md Makefile src/demo/template.html site/index.css sit
 		-M document-css=false \
 		-V 'header-includes=<script src="/index.js?v='"$$(sha256sum site/index.js | cut -c1-12)"'"></script>' \
 		--template=src/demo/template.html \
-		-Vversion=v$(VERSION) -Vdate=$(DATE) \
+		-Vversion=v{{RARGO_VERSION}} -Vdate=$(DATE) \
 		-i $< \
 		| html-minifier --collapse-whitespace > $@
 
