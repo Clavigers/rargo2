@@ -851,6 +851,8 @@ fn rooted(real: &str, seed: impl FnOnce(&HostRegion, &HostMemo)) -> Arc<BaseView
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     fn file(n: u8) -> MEntry {
         MEntry::File { hash: crate::hash::Hash([n; 32]), exec: false, size: n as u64 }
@@ -962,6 +964,7 @@ mod tests {
 
     #[test]
     fn a_base_view_is_given_its_contents() {
+        let mut outcomes = Transcript::default();
         let memo = Arc::new(HostMemo::default());
         let view = BaseView::new(
             vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/no/such/host-view")), traced: true }],
@@ -977,8 +980,14 @@ mod tests {
         assert!(refused.is_err(), "the view does not read the host");
         view.deposit(&req, HostAnswer::Lookup(host_dir()));
         view.invariants();
-        assert!(matches!(View::lookup(&view, b"/", b"missing"), Looked::Dir(_)));
+        let Step::Done(found) = view.step_lookup(b"/", b"missing") else {
+            panic!("the deposit answers the lookup");
+        };
+        outcomes.record("retry lookup", found);
         view.invariants();
+        expect![[r#"
+            retry lookup: Dir(Owner { uid: 0, gid: 0, mode: 493 })
+        "#]].assert_eq(&outcomes.0);
     }
 }
 
