@@ -272,3 +272,16 @@ fn blocking_work_runs_beside_a_busy_cpu_pool() {
         assert_eq!(cpu(|| call(|| blocking(|| 41 + 1))), 42);
     });
 }
+
+#[test]
+fn a_pool_thread_calls_back_into_the_loop_that_gave_it_work_even_while_another_loop_stops() {
+    drive(1, || {
+        let answer = cpu(|| {
+            let other = super::fiber::poke_global().lock().unwrap_or_else(|e| e.into_inner()).take();
+            let answer = call(|| 41 + 1);
+            *super::fiber::poke_global().lock().unwrap_or_else(|e| e.into_inner()) = other;
+            answer
+        });
+        assert_eq!(answer, 42);
+    });
+}
