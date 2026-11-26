@@ -1,0 +1,89 @@
+{
+ "repo": "sadosystems/rargo2",
+ "window_days": 1.88,
+ "merged_prs": 213,
+ "reference": {
+  "prs_per_day": 113.2,
+  "prs_per_issue": 1.72,
+  "first_review_reopen_rate": 0.415,
+  "peak_prs_in_a_day": 151
+ },
+ "params": {
+  "ci_time": {
+   "value": 3.483,
+   "source": "median of 327 CI runs"
+  },
+  "ci_flake": {
+   "value": 0.067,
+   "source": "22 of 327 CI runs failed"
+  },
+  "gate_time": {
+   "value": 1.97,
+   "source": "mean of 179 reviews in watch.log"
+  },
+  "p_incomplete": {
+   "value": 0.428,
+   "source": "51 of 123 first reviews reopened the issue; solved for the PR rate assuming the review catches 85% of gaps and 40% of bugs"
+  },
+  "rework_defect": {
+   "value": 0.643,
+   "source": "12 of 45 second reviews failed, against 51 of 123 first reviews"
+  },
+  "work_time": {
+   "value": 9.021,
+   "source": "claude held 84 of 115 locked issues, so about 156 of 213 merged PRs in 38 active hours: 14.7 min per PR, less the 5.6 min median from PR open to merge"
+  },
+  "claude_quota": {
+   "value": 168,
+   "source": "ran the whole window without a usage stop"
+  },
+  "codex_quota": {
+   "value": 8.391,
+   "source": "locked 20 issues before its weekly limit stopped it; at 1.72 PRs per issue and 14.7 min per PR"
+  },
+  "grok_quota": {
+   "value": 17.162,
+   "source": "locked 11 issues in 1.9 days between usage stops, scaled to a week"
+  },
+  "self_find": {
+   "value": 0.099,
+   "source": "agents filed 21 bug issues over 213 merged PRs"
+  },
+  "requests_per_day": {
+   "value": 20.187,
+   "source": "11 initiatives and 27 single issues from the owner in 1.9 days"
+  },
+  "init_share": {
+   "value": 0.289,
+   "source": "11 of 38 owner requests were initiatives"
+  },
+  "init_median": {
+   "value": 4,
+   "source": "initiative sizes, by issues that mention them: [2, 3, 3, 3, 3, 4, 4, 5, 6, 9, 39]"
+  },
+  "init_sigma": {
+   "value": 0.772,
+   "source": "spread of the log of those sizes"
+  },
+  "p_followup": {
+   "value": 0.075,
+   "source": "13 issues filed by agents outside any initiative, and 3 initiative children filed over an hour after the rest, over 213 merged PRs"
+  },
+  "foreman_tick": {
+   "value": 20.0,
+   "source": "median gap between 63 ticks in the foreman log"
+  }
+ },
+ "presets": {
+  "Today": {
+   "freeze_days": {
+    "value": 0.065,
+    "source": "29 releases in 1.9 days"
+   },
+   "restart_delay": {
+    "value": 7.5,
+    "source": "watch.sh polls every 5 min and nudges on the second idle check"
+   }
+  }
+ }
+}

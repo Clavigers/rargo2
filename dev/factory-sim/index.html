@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rargo2 factory sim</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Mona+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: the human stands outside the factory; inside it, actors (left) work on two
+   artifacts (right): the repository and the releases. */
+:root {
+  --bg: #0b0e13; --panel: #141922; --panel2: #10141b; --line: #252d39; --line2: #313b4a;
+  --text: #e4e9f0; --dim: #8693a4; --faint: #586374;
+  --enh: #56c7da; --bug: #f0525c; --fric: #e8a23a; --init: #a782f2; --rework: #f07f3c;
+  --ok: #3fbf6f; --wait: #7d8fb0; --idle: #e8a23a; --out: #f0525c; --rel: #3fbf6f; --pre: #d99a2b;
+  --sans: "Mona Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); font: 13px/1.45 var(--sans); }
+svg.i { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; vertical-align: -2px; }
+svg.i.lg { width: 18px; height: 18px; }
+button, select { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line2); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--dim); }
+button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--enh); outline-offset: 1px; }
+input[type=range] { accent-color: var(--enh); }
+input[type=number] { width: 6ch; font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line2); border-radius: 6px; padding: 3px 6px; }
+
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; padding: 10px 20px; border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 15px; }
+.brand span { color: var(--dim); font-weight: 400; }
+#clock { display: flex; align-items: center; gap: 6px; font: 600 14px var(--mono); min-width: 15ch; font-variant-numeric: tabular-nums; }
+.ctl { display: flex; align-items: center; gap: 6px; color: var(--dim); }
+#crew { display: flex; gap: 6px; margin-left: auto; flex-wrap: wrap; }
+.pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line2); font: 12px var(--mono); color: var(--dim); }
+.pill i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+
+#stage { position: relative; padding: 22px 20px 26px; display: grid; grid-template-columns: minmax(0, 1fr) 190px; gap: 30px; align-items: center; }
+#edges, #tokens { position: absolute; inset: 0; pointer-events: none; }
+#tokens { z-index: 5; }
+.frame { position: relative; z-index: 1; border: 1px dashed var(--line2); border-radius: 14px; padding: 26px 18px 18px; }
+.frame > .tag { position: absolute; top: -10px; left: 16px; background: var(--bg); padding: 0 8px; font: 600 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--dim); display: flex; gap: 6px; align-items: center; }
+#factory { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 22px 40px; }
+#actors { display: flex; flex-direction: column; gap: 14px; }
+#artifacts { display: flex; flex-direction: column; gap: 26px; min-width: 0; }
+.box { position: relative; z-index: 1; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; min-width: 0; }
+.box h3 { margin: 0; display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; flex-wrap: wrap; }
+.box h3 small { font: 11px var(--mono); color: var(--dim); font-weight: 400; margin-left: auto; }
+.sub { color: var(--dim); font-size: 12px; margin: 2px 0 8px; }
+.row { display: flex; align-items: center; gap: 8px; }
+.stat { font: 12px var(--mono); color: var(--dim); }
+.stat b { color: var(--text); font-weight: 600; }
+
+/* Issue chips, GitHub style: a symbol per issue type, then the number */
+.chip { display: inline-flex; align-items: center; gap: 3px; height: 20px; padding: 0 6px 0 4px; border-radius: 999px; font: 11px var(--mono); border: 1px solid; background: var(--panel2); white-space: nowrap; }
+.chip.enhancement { color: var(--enh); border-color: color-mix(in srgb, var(--enh) 45%, transparent); }
+.chip.bug { color: var(--bug); border-color: color-mix(in srgb, var(--bug) 45%, transparent); }
+.chip.friction { color: var(--fric); border-color: color-mix(in srgb, var(--fric) 45%, transparent); }
+.chip.rw { box-shadow: inset 0 0 0 1px var(--rework); }
+.chip.blocked { opacity: .55; border-style: dashed; }
+.chip svg.i { width: 12px; height: 12px; }
+.chip .who { color: var(--dim); margin-left: 2px; display: inline-flex; align-items: center; gap: 2px; }
+.ghost { position: fixed; z-index: 30; pointer-events: none; margin: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start; }
+.more { font: 11px var(--mono); color: var(--dim); align-self: center; }
+
+/* Fixed sizes: nothing on the board changes size as the simulation runs */
+body { font-variant-numeric: tabular-nums; }
+.pill { min-width: 13ch; justify-content: center; }
+#clock { min-width: 17ch; }
+#foreman, #pm, #poweruser { height: 118px; overflow: hidden; }
+.agent { height: 92px; overflow: hidden; }
+.agent .now { white-space: nowrap; overflow: hidden; }
+.col { height: 252px; overflow: hidden; display: flex; flex-direction: column; }
+.col .chips { flex: 1; overflow: hidden; }
+.stagebox { height: 148px; overflow: hidden; display: flex; flex-direction: column; }
+.stagebox .waiting { margin-top: auto; height: 44px; overflow: hidden; align-content: flex-start; }
+#rc, #stable { height: 126px; overflow: hidden; }
+#human .stat { height: 18px; }
+#log { height: 300px; overflow: hidden; }
+#dags { height: 230px; overflow: hidden; align-content: flex-start; }
+#charts { min-height: 300px; }
+
+/* A heap: past a bin's capacity, items pile up. The pile grows with the log of the count. */
+.heap { position: relative; display: inline-flex; align-items: flex-end; height: 28px; vertical-align: bottom; margin-left: 2px; }
+.heap .pile { position: relative; height: 100%; }
+.heap .pile i { position: absolute; bottom: 0; height: 12px; border-radius: 4px; border: 1px solid currentColor; background: color-mix(in srgb, currentColor 22%, var(--panel2)); }
+.heap b { font: 600 11px var(--mono); margin-left: 4px; color: currentColor; align-self: center; }
+
+/* Tracker */
+#tracker .cols { display: grid; grid-template-columns: 1.2fr 1.4fr 1fr; gap: 10px; }
+.col { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; min-height: 92px; min-width: 0; }
+.col > div:first-child { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; margin-bottom: 6px; color: var(--dim); }
+.col > div:first-child b { margin-left: auto; font: 600 12px var(--mono); color: var(--text); }
+.init { display: grid; grid-template-columns: auto auto 1fr auto; gap: 6px; align-items: center; font: 11px var(--mono); color: var(--init); margin-bottom: 5px; }
+.init .bar { height: 6px; }
+.init.plan { color: var(--dim); }
+.init.plan .bar { background: repeating-linear-gradient(90deg, var(--line2) 0 4px, transparent 4px 7px); }
+.bar { height: 5px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.bar > i { display: block; height: 100%; background: currentColor; border-radius: 3px; }
+.counts { display: flex; gap: 14px; }
+.counts span { display: flex; align-items: center; gap: 5px; }
+
+/* Pull requests */
+#prs .lane { display: grid; grid-template-columns: 1fr auto 1fr auto 150px; gap: 10px; align-items: stretch; }
+.arrow { align-self: center; color: var(--faint); }
+.stagebox { position: relative; z-index: 1; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: 7px 8px; min-width: 0; }
+.stagebox > div:first-child { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.stagebox > div:first-child small { margin-left: auto; font: 11px var(--mono); color: var(--dim); font-weight: 400; }
+.runners { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 4px; margin-bottom: 6px; }
+.runner { height: 28px; border: 1px dashed var(--line2); border-radius: 6px; display: flex; flex-direction: column; justify-content: center; padding: 0 4px; gap: 2px; }
+.runner.on { border: 1px solid var(--line2); }
+.runner .bar { height: 3px; }
+.waiting { font: 11px var(--mono); color: var(--dim); display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+.off { opacity: .45; }
+#main .big { font: 600 24px var(--mono); }
+.bugs { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 4px; min-height: 16px; }
+.bugs svg.i { width: 13px; height: 13px; color: var(--bug); }
+.bugs svg.hid { opacity: .4; }
+
+.flow3 { display: grid; grid-template-columns: minmax(0,1.4fr) auto 170px; grid-template-rows: auto auto; gap: 12px 10px; align-items: stretch; }
+.flow3 .arrow { align-self: center; }
+#needswork { grid-column: 1 / 2; }
+.pcol { height: 136px; }
+.prow { display: flex; align-items: center; gap: 6px; height: 24px; font: 11px var(--mono); color: var(--dim); }
+.mini { display: inline-flex; align-items: center; gap: 2px; }
+.mini svg.i { width: 12px; height: 12px; }
+.prgrid { display: grid; grid-template-columns: minmax(0, 1fr) 170px; gap: 12px; }
+#prlist { display: flex; flex-direction: column; gap: 5px; }
+.prrow { height: 34px; display: grid; grid-template-columns: 82px 74px 58px 1fr 1fr; gap: 8px; align-items: center; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel2); font: 11px var(--mono); color: var(--dim); }
+.prrow.empty { border-style: dashed; background: none; grid-template-columns: 1fr; }
+.prrow .who { display: flex; align-items: center; gap: 4px; color: var(--text); }
+.check { display: flex; align-items: center; gap: 5px; min-width: 0; white-space: nowrap; }
+.check .bar { flex: 1; min-width: 20px; height: 3px; color: var(--idle); }
+.check.pass { color: var(--ok); } .check.fail { color: var(--bug); } .check.run { color: var(--idle); } .check.wait, .check.none { color: var(--faint); }
+.check.stale { opacity: .55; }
+#main { height: auto; }
+#runners { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font: 11px var(--mono); color: var(--dim); }
+#runners span { display: inline-flex; align-items: center; gap: 5px; }
+.slots { display: inline-flex; gap: 2px; }
+.slots i { width: 7px; height: 10px; border-radius: 2px; border: 1px solid var(--line2); }
+.slots i.on { background: var(--idle); border-color: var(--idle); }
+
+/* Releases */
+#releases .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.badge { font: 600 10px var(--sans); padding: 1px 7px; border-radius: 999px; border: 1px solid; }
+.badge.latest { color: var(--rel); border-color: var(--rel); }
+.badge.pre { color: var(--pre); border-color: var(--pre); }
+.ver { font: 600 18px var(--mono); }
+.dots { display: inline-flex; gap: 3px; vertical-align: middle; }
+.dots i { width: 8px; height: 8px; border-radius: 50%; border: 1px solid var(--rel); display: inline-block; }
+.dots i.on { background: var(--rel); }
+
+/* Actors */
+.actor .ic { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; background: var(--panel2); border: 1px solid var(--line2); color: var(--dim); }
+.agent { border-left: 3px solid var(--st); }
+.agent .ah { display: flex; align-items: center; gap: 7px; }
+.agent .ah b { font-weight: 600; }
+.agent .ah small { color: var(--dim); font-size: 11px; }
+.agent .ah .cost { margin-left: auto; font: 11px var(--mono); color: var(--dim); }
+.lamp { width: 9px; height: 9px; border-radius: 50%; background: var(--st); flex: none; }
+.lamp.blink { animation: blink 1.1s steps(2, jump-none) infinite; }
+@keyframes blink { 50% { opacity: .2; } }
+.agent .now { display: flex; align-items: center; gap: 8px; margin: 6px 0 4px; min-height: 20px; font-size: 12px; color: var(--st); }
+.slot { flex: none; width: 66px; height: 24px; border: 1px dashed var(--line2); border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; }
+.slot.full { border-style: solid; border-color: var(--st); }
+.agent .now .bar { flex: 1; color: var(--st); }
+.agent .meta { font: 11px var(--mono); color: var(--dim); display: flex; justify-content: space-between; gap: 8px; }
+.share { display: flex; height: 3px; border-radius: 2px; overflow: hidden; margin-top: 5px; background: var(--line); }
+.ring { transform: rotate(-90deg); }
+#human { position: relative; z-index: 1; border: 1px solid var(--line2); background: var(--panel); border-radius: 12px; padding: 14px; text-align: center; align-self: stretch; display: flex; flex-direction: column; justify-content: space-between; gap: 14px; }
+.port { display: flex; align-items: center; gap: 6px; font: 11px var(--mono); color: var(--dim); border: 1px solid var(--line2); border-radius: 8px; padding: 6px 8px; text-align: left; }
+.port svg.i { color: var(--text); }
+#human .face { width: 54px; height: 54px; margin: 0 auto 6px; border-radius: 50%; border: 2px solid var(--line2); display: grid; place-items: center; }
+#human .face.on { border-color: var(--rel); }
+#human .face svg.i { width: 28px; height: 28px; }
+#human .stat { display: flex; align-items: center; justify-content: center; gap: 5px; }
+
+/* Below the board */
+#below { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; padding: 0 20px 30px; }
+#below h2 { margin: 0 0 8px; font: 600 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+table { width: 100%; border-collapse: collapse; }
+td, th { padding: 3px 0; }
+td.v { text-align: right; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+#metrics { columns: 3 260px; column-gap: 36px; }
+.kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; border-bottom: 1px solid var(--line); break-inside: avoid; font-size: 12.5px; }
+.kv b { font: 600 12px var(--mono); font-variant-numeric: tabular-nums; }
+.kv .warn { color: var(--fric); } .kv .bad { color: var(--bug); } .kv .good { color: var(--ok); }
+#agents th { text-align: right; font: 600 10px var(--mono); color: var(--dim); padding-left: 8px; white-space: nowrap; }
+#agents th:first-child, #agents td:first-child { text-align: left; padding-left: 0; }
+#agents td { text-align: right; font: 12px var(--mono); padding-left: 8px; white-space: nowrap; }
+#agents small { display: block; color: var(--dim); font: 11px var(--sans); }
+#ref { color: var(--dim); font-size: 12px; margin: 8px 0 0; }
+.spark { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; margin-bottom: 8px; font-size: 12px; color: var(--dim); }
+.spark b { font: 12px var(--mono); color: var(--text); }
+.spark canvas { grid-column: 1 / -1; width: 100%; height: 32px; }
+#log { font: 12px var(--mono); color: var(--dim); display: flex; flex-direction: column; gap: 4px; }
+#log b { color: var(--text); font-weight: 400; }
+#dags { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-start; }
+.dag { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--panel2); }
+.dag span { display: flex; align-items: center; gap: 4px; font: 11px var(--mono); color: var(--init); margin-bottom: 4px; }
+.key { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--dim); font-size: 12px; margin-bottom: 8px; }
+.key i { display: inline-block; width: 9px; height: 9px; margin-right: 4px; vertical-align: -1px; }
+.wide { grid-column: 1 / -1; }
+
+/* Settings drawer */
+#settings { position: fixed; top: 0; right: 0; bottom: 0; width: min(380px, 100vw); background: var(--panel); border-left: 1px solid var(--line2); z-index: 20; overflow-y: auto; padding: 14px 16px 40px; box-shadow: -20px 0 40px rgba(0,0,0,.4); }
+#settings details { border-bottom: 1px solid var(--line); padding: 8px 0; }
+#settings summary { cursor: pointer; font: 600 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--dim); }
+.prm { display: grid; grid-template-columns: 1fr auto; gap: 0 8px; margin: 8px 0; font-size: 12px; }
+.prm output { font: 12px var(--mono); color: var(--enh); }
+.prm input, .prm select { grid-column: 1 / -1; width: 100%; }
+.src { grid-column: 1 / -1; color: var(--dim); font-size: 11px; }
+.tg { font: 10px var(--mono); padding: 0 4px; border-radius: 3px; margin-left: 5px; border: 1px solid var(--line2); color: var(--dim); }
+.tg.real { color: var(--ok); border-color: var(--ok); }
+@media (max-width: 1100px) { #stage { grid-template-columns: 1fr; } #factory { grid-template-columns: 1fr; } #tracker .cols { grid-template-columns: 1fr 1fr; } #prs .lane { grid-template-columns: 1fr; } .arrow { display: none; } }
+@media (prefers-reduced-motion: reduce) { .lamp.blink { animation: none; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-issue" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><circle cx="8" cy="8" r="1.4" fill="currentColor"/></symbol>
+  <symbol id="i-closed" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><path d="M5.3 8.2l1.9 1.9 3.6-3.8"/></symbol>
+  <symbol id="i-bug" viewBox="0 0 16 16"><path d="M5.2 6.2a2.8 2.8 0 0 1 5.6 0v3.6a2.8 2.8 0 0 1-5.6 0z"/><path d="M8 7v5.4M2.2 7.6h3M10.8 7.6h3M2.6 12l2.7-1.3M13.4 12l-2.7-1.3M6 3.6L4.8 2.2M10 3.6l1.2-1.4"/></symbol>
+  <symbol id="i-friction" viewBox="0 0 16 16"><path d="M2.2 3.2h11.6v7.6H7.4L4.6 13.4v-2.6H2.2z"/><path d="M5.2 6.2h5.6M5.2 8.2h3.4"/></symbol>
+  <symbol id="i-initiative" viewBox="0 0 16 16"><path d="M7.6 1.8v12.4"/><path d="M7.6 2.6h5.2l-1.4 2.3 1.4 2.3H7.6"/><path d="M4.6 14.2h6"/></symbol>
+  <symbol id="i-pr" viewBox="0 0 16 16"><circle cx="4" cy="3.6" r="1.7"/><circle cx="4" cy="12.4" r="1.7"/><circle cx="12" cy="12.4" r="1.7"/><path d="M4 5.3v5.4M12 10.7V6.4a2 2 0 0 0-2-2H7.6"/><path d="M9.2 2.8L7.6 4.4l1.6 1.6"/></symbol>
+  <symbol id="i-branch" viewBox="0 0 16 16"><circle cx="4" cy="12.4" r="1.7"/><circle cx="4" cy="3.6" r="1.7"/><circle cx="12" cy="4.4" r="1.7"/><path d="M4 5.3v5.4M12 6.1c0 3.2-8 1.8-8 4.6"/></symbol>
+  <symbol id="i-tag" viewBox="0 0 16 16"><path d="M2 2.2h5.6l6.2 6.2-5.4 5.4L2.2 7.6z"/><circle cx="5.2" cy="5.3" r="1" fill="currentColor"/></symbol>
+  <symbol id="i-package" viewBox="0 0 16 16"><path d="M8 1.6l6 3v6.8l-6 3-6-3V4.6z"/><path d="M2 4.6l6 3 6-3M8 7.6v6.8"/></symbol>
+  <symbol id="i-agent" viewBox="0 0 16 16"><rect x="2.6" y="5" width="10.8" height="8.4" rx="2.2"/><path d="M8 5V2.8"/><circle cx="8" cy="2.2" r=".9" fill="currentColor"/><circle cx="5.8" cy="9" r=".9" fill="currentColor"/><circle cx="10.2" cy="9" r=".9" fill="currentColor"/></symbol>
+  <symbol id="i-person" viewBox="0 0 16 16"><circle cx="8" cy="5" r="2.7"/><path d="M2.6 14.2c.5-3 2.6-4.6 5.4-4.6s4.9 1.6 5.4 4.6"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 16 16"><path d="M1.4 8S3.8 3.4 8 3.4 14.6 8 14.6 8 12.2 12.6 8 12.6 1.4 8 1.4 8z"/><circle cx="8" cy="8" r="2"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><path d="M6.6 5.6v4.8L10.4 8z" fill="currentColor"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.4" y="7" width="9.2" height="7" rx="1.5"/><path d="M5.4 7V5a2.6 2.6 0 0 1 5.2 0v2"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><path d="M8 4.4V8l2.4 1.5"/></symbol>
+  <symbol id="i-blocked" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><path d="M3.6 12.4l8.8-8.8"/></symbol>
+  <symbol id="i-repo" viewBox="0 0 16 16"><path d="M3 2.4h9.6v10.2H4.6a1.6 1.6 0 0 0 0 3.2H6"/><path d="M3 2.4v11.8M9 13.4v2.4l1.2-.8 1.2.8v-2.4"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 16 16"><path d="M12.8 10.4A5.6 5.6 0 0 1 5.6 3.2a5.6 5.6 0 1 0 7.2 7.2z"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.2 8.4l3 3 6.6-7"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-dot" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.4"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M2.5 8h11M9.5 4l4 4-4 4"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.8M8 12.4v1.8M1.8 8h1.8M12.4 8h1.8M3.6 3.6l1.3 1.3M11.1 11.1l1.3 1.3M3.6 12.4l1.3-1.3M11.1 4.9l1.3-1.3"/></symbol>
+</svg>
+
+<header>
+  <div class="brand"><svg class="i lg"><use href="#i-repo"/></svg>sadosystems/rargo2 <span>factory sim</span></div>
+  <div id="clock"></div>
+  <button id="play">Pause</button>
+  <label class="ctl">Speed <input id="speed" type="range" min="0" max="100" value="40"> <span id="speedv" class="stat"></span></label>
+  <label class="ctl">Seed <input id="seed" type="number" min="1" value="1"></label>
+  <button id="reset">Restart</button>
+  <span id="presets"></span>
+  <button id="gear"><svg class="i"><use href="#i-gear"/></svg> Settings</button>
+  <div id="crew"></div>
+</header>
+
+<div id="stage">
+  <canvas id="edges"></canvas>
+  <div class="frame">
+    <div class="tag"><svg class="i"><use href="#i-agent"/></svg>The factory</div>
+    <div id="factory">
+      <div id="actors">
+        <div class="box actor" data-anchor="foreman" id="foreman"></div>
+        <div id="agentcol" data-anchor="workers" style="display:flex;flex-direction:column;gap:8px"></div>
+        <div class="box actor" data-anchor="pm" id="pm"></div>
+        <div class="box actor" data-anchor="poweruser" id="poweruser"></div>
+      </div>
+      <div id="artifacts">
+        <div class="frame">
+          <div class="tag"><svg class="i"><use href="#i-repo"/></svg>Repository</div>
+          <div style="display:flex;flex-direction:column;gap:14px">
+            <div class="box" id="tracker" data-anchor="tracker"></div>
+            <div class="box" id="prs" data-anchor="prs">
+              <h3><svg class="i"><use href="#i-pr"/></svg>Pull requests <small id="prstats"></small></h3>
+              <div class="sub">An agent pushes and moves on. CI and review run together on each push. Red goes to Needs work, which agents take before new issues; the next push restarts both checks.</div>
+              <div class="flow3">
+                <div class="col pcol" id="checks" data-anchor="checks" data-zone="checks"></div>
+                <svg class="i arrow"><use href="#i-arrow"/></svg>
+                <div class="stagebox" id="main" data-anchor="main"></div>
+                <div class="col pcol" id="needswork" data-anchor="needswork" data-zone="needswork"></div>
+              </div>
+              <div id="runners"></div>
+            </div>
+          </div>
+        </div>
+        <div class="frame" id="releases">
+          <div class="tag"><svg class="i"><use href="#i-tag"/></svg>Releases</div>
+          <div class="two">
+            <div class="box" id="rc" data-anchor="rc"></div>
+            <div class="box" id="stable" data-anchor="stable"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="human" data-anchor="human"></div>
+  <canvas id="tokens"></canvas>
+</div>
+
+<div id="below">
+  <section class="box wide"><h2>Initiatives as issue graphs</h2><div class="key" id="dagkey"></div><div id="dags"></div></section>
+  <section class="box"><h2>Agents: cost and quality</h2><div style="overflow-x:auto"><table id="agents"></table></div></section>
+  <section class="box wide"><h2>Totals</h2><div id="metrics"></div><p id="ref"></p></section>
+  <section class="box"><h2>History, hourly</h2><div id="charts"></div></section>
+  <section class="box"><h2>Events</h2><div id="log"></div></section>
+</div>
+
+<aside id="settings" hidden>
+  <div class="row" style="justify-content:space-between;margin-bottom:6px"><b>Settings</b><button id="close">Close</button></div>
+  <p class="sub">Changes apply to the running simulation. <span class="tg real">measured</span> values come from the real repository and logs; the rest are guesses.</p>
+  <div id="params"></div>
+</aside>
+
+<script>
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue('--' + n).trim();
+const COL = { pr: css('enh'), enhancement: css('enh'), bug: css('bug'), friction: css('fric'), initiative: css('init'), rework: css('rework'), release: css('rel'), review: css('dim') };
+const ST = { work: css('ok'), wait: css('wait'), idle: css('idle'), out: css('out') };
+const ICON = { enhancement: 'issue', bug: 'bug', friction: 'friction' };
+const ic = (name, cls = '') => `<svg class="i ${cls}"><use href="#i-${name}"/></svg>`;
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+let graph, state, tokens = [], hot = {};
+
+const post = body => fetch('/api/control', { method: 'POST', body: JSON.stringify(body) });
+const speedOf = v => Math.round(Math.pow(10, v / 100 * 3.7) * 10) / 10;
+const fmtSpeed = s => s < 60 ? `1 s = ${s} min` : s < 1440 ? `1 s = ${(s / 60).toFixed(1)} h` : `1 s = ${(s / 1440).toFixed(1)} d`;
+const hm = t => { const m = Math.floor(t % 1440); return `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`; };
+const clock = t => `day ${Math.floor(t / 1440)}, ${hm(t)}`;
+const dur = m => m < 60 ? `${Math.round(m)} min` : m < 2880 ? `${(m / 60).toFixed(1)} h` : `${(m / 1440).toFixed(1)} d`;
+
+function chip(c, cls = '', extra = '') {
+  return `<span class="chip ${c.t}${c.rw ? ' rw' : ''} ${cls}" data-n="${c.n}" title="#${c.n} ${c.t}${c.rw ? ', sent back for changes' : ''}">${ic(ICON[c.t])}${c.n}${extra}</span>`;
+}
+// A pile of n items: a few slabs that grow slowly, like a heap of goods on a belt.
+function heap(n, color, label = 'more') {
+  if (n <= 0) return '';
+  const layers = Math.min(7, 1 + Math.floor(Math.log2(n))), wide = 18 + 4 * layers;
+  let slabs = '';
+  for (let k = 0; k < layers; k++) {
+    const w = wide - k * 3 - (k % 2) * 2, x = (k * 7) % 5 - 2 + k * 1.5;
+    slabs += `<i style="width:${w}px;left:${x}px;bottom:${k * 3.2}px;transform:rotate(${((k * 37) % 9) - 4}deg)"></i>`;
+  }
+  return `<span class="heap" style="color:${color}" title="${n} ${label}"><span class="pile" style="width:${wide + 6}px">${slabs}</span><b>+${n}</b></span>`;
+}
+function majority(list) {
+  const c = {}; for (const x of list) c[x.t] = (c[x.t] || 0) + 1;
+  return COL[Object.keys(c).sort((a, b) => c[b] - c[a])[0]] || css('dim');
+}
+function chips(list, cap, f = c => chip(c)) {
+  if (list.length <= cap) return list.map(f).join('');
+  return list.slice(0, cap - 1).map(f).join('') + heap(list.length - cap + 1, majority(list.slice(cap - 1)));
+}
+const bar = (p, color = '') => `<div class="bar" ${color ? `style="color:${color}"` : ''}><i style="width:${Math.round(100 * Math.min(1, p))}%"></i></div>`;
+const bugs = (hidden, known) => `<div class="bugs" title="${known} known bugs, ${hidden} hidden bugs">`
+  + (known ? `${ic('bug').repeat(Math.min(known, 3))}${known > 3 ? heap(known - 3, css('bug'), 'known bugs') : ''}<span class="stat" style="margin:0 8px 0 3px">${known} known</span>` : '')
+  + `<span style="opacity:.45;display:inline-flex;align-items:center">${ic('bug').repeat(Math.min(hidden, 3))}${hidden > 3 ? heap(hidden - 3, css('bug'), 'hidden bugs') : ''}</span><span class="stat" style="margin-left:3px">${hidden} hidden</span></div>`;
+const blink = () => `animation-delay:-${Date.now() % 1100}ms`;
+
+// ---------- the board ----------
+function render() {
+  const b = state.board, t = b.tracker;
+  $('clock').innerHTML = ic(b.human.awake ? 'sun' : 'moon') + clock(state.t);
+  $('play').textContent = state.playing ? 'Pause' : 'Play';
+  $('speedv').textContent = fmtSpeed(state.speed);
+  const w = state.workers, names = { work: 'working', wait: 'waiting', idle: 'idle', out: 'out of quota' };
+  $('crew').innerHTML = Object.keys(names).map(k => `<span class="pill" style="${w[k] ? `color:${ST[k]};border-color:${ST[k]}` : ''}"><i style="background:${ST[k]}"></i>${w[k] || 0} ${names[k]}</span>`).join('');
+
+  const h = b.human;
+  $('human').innerHTML = `<div class="port">${ic('arrow')}<span style="transform:scaleX(-1);display:none"></span>files issues and initiatives into the repository</div>
+    <div><div class="face ${h.state !== 'sleep' ? 'on' : ''}" style="border-color:${{ use: css('rel'), write: css('enh'), sleep: css('line2') }[h.state]}">${ic(h.state === 'sleep' ? 'moon' : h.state === 'write' ? 'issue' : 'person')}</div>
+    <div style="font-weight:600">Human</div>
+    <div class="sub" style="margin:2px 0 8px">${{ use: `using ${h.uses || 'a dev build'}`, write: 'writing issues', sleep: 'asleep' }[h.state]}</div>
+    <div style="color:${{ use: css('rel'), write: css('enh'), sleep: css('faint') }[h.state]}">${bar(h.progress)}</div>
+    <div class="stat" style="margin-top:8px">${ic('issue')} filed <b>${h.filed}</b></div>
+    <div class="stat">${ic('bug')} found <b>${h.found}</b> bugs</div></div>
+    <div class="port">${ic('tag')}uses <b style="color:${css('rel')}">${h.uses || 'no release yet'}</b></div>`;
+
+  const open = t.ready.length + t.blocked.length + t.progress.length + t.initiatives.length + t.planning.length;
+  const stageIcon = { work: 'agent', coding: 'agent', checks: 'play', stalled: 'lock' };
+  const nInit = t.initiatives.length + t.planning.length;
+  $('tracker').innerHTML = `<h3>${ic('issue')}Issues <small class="counts"><span>${ic('issue')}${open} open</span><span>${ic('closed')}${t.closed} closed</span></small></h3>
+    <div class="sub">Everything is an issue. You and the power user file them; the foreman splits initiatives; each agent takes one at a time into its slot.</div>
+    <div class="cols">
+      <div class="col"><div>${ic('initiative')}Initiatives<b>${nInit}</b></div>
+        ${t.planning.slice(0, Math.min(t.planning.length, t.initiatives.length ? 3 : 8)).map(p => `<div class="init plan" title="#${p.n}: waiting for the foreman's next tick">${ic('initiative')}#${p.n}${bar(0)}<span>${p.size} to plan</span></div>`).join('')}
+        ${t.initiatives.slice(0, 8 - Math.min(t.planning.length, t.initiatives.length ? 3 : 8)).map(i => `<div class="init" title="#${i.n}: ${i.done} of ${i.total} sub-issues closed${i.late ? `, ${i.late} added during work` : ''}">${ic('initiative')}#${i.n}${bar(i.done / i.total)}<span>${i.done}/${i.total}</span></div>`).join('')}
+        <div style="margin-top:auto">${nInit > 8 ? heap(nInit - 8, css('init'), 'more initiatives') : ''}</div></div>
+      <div class="col" data-zone="ready"><div>${ic('issue')}Ready<b>${t.ready.length}</b></div><div class="chips">${chips(t.ready, 27)}</div></div>
+      <div class="col" data-zone="blocked"><div>${ic('blocked')}Blocked<b>${t.blocked.length}</b></div><div class="chips">${chips(t.blocked, 18, c => chip(c, 'blocked'))}</div></div>
+    </div>`;
+
+  const f = b.foreman, frac = f.tick ? f.next / f.tick : 0, C = 2 * Math.PI * 10;
+  $('foreman').innerHTML = `<div class="row"><div class="ic">${ic('clock')}</div><div><b>Foreman</b><div class="sub" style="margin:0">acts every ${f.tick} min</div></div>
+      <svg width="26" height="26" class="ring" style="margin-left:auto"><circle cx="13" cy="13" r="10" fill="none" stroke="${css('line2')}" stroke-width="3"/><circle cx="13" cy="13" r="10" fill="none" stroke="${css('init')}" stroke-width="3" stroke-dasharray="${C * (1 - frac)} ${C}"/></svg></div>
+    <div class="stat" style="margin-top:6px">next tick in <b>${Math.ceil(f.next)} min</b></div>
+    <div class="stat">split <b>${f.planned}</b> initiatives</div>
+    <div class="stat">took back <b>${f.unlocked}</b> locks · <b>${f.preempted}</b> preempted</div>`;
+
+  $('agentcol').innerHTML = b.agents.map(a => {
+    const i = a.issue;
+    const slot = `<span class="slot ${i ? 'full' : ''}" title="each agent holds one issue at a time">${i ? chip(i) : ''}</span>`;
+    const now0 = a.state === 'work' ? bar(a.progress) :
+      a.state === 'wait' ? 'waiting on CI and review' :
+      a.state === 'out' ? (i ? `${ic('lock')} out of quota, holds the lock` : 'out of quota') : esc(a.why || 'idle');
+    return `<div class="box actor agent" data-zone="agent:${esc(a.name)}" data-anchor="agent:${esc(a.name)}" style="--st:${ST[a.state]}">
+      <div class="ah"><span class="lamp ${a.state === 'idle' || a.state === 'out' ? 'blink' : ''}" style="${blink()}"></span>${ic('agent')}<b>${esc(a.name)}</b><small>${esc(a.model)}</small><span class="cost">$${a.monthly}/mo</span></div>
+      <div class="now">${slot}${now0}</div>
+      <div class="meta"><span title="hours of quota used this week">${Math.round(a.used)} of ${a.quota} h used</span><span title="PRs with a bug or missing work">${a.defects === null ? '-' : Math.round(a.defects) + '%'} defective</span></div>
+    </div>`;
+  }).join('') || '<div class="box sub">No agents. Add some in Settings.</div>';
+
+  const P = b.prs, byAgent = Object.fromEntries(P.open.map(x => [x.agent, x]));
+  const check = (label, st, p, coding) => {
+    const map = { pass: ['pass', 'check', label === 'CI' ? 'passed' : 'approved'], approved: ['pass', 'check', 'approved'],
+      fail: ['fail', 'x', 'failed'], changes: ['fail', 'x', 'changes requested'], running: ['run', 'dot', 'running'],
+      queued: ['wait', 'dot', 'queued'], cancelled: ['wait', 'x', 'cancelled'], off: ['none', 'dot', 'off'] };
+    const [cls, icon, text] = map[st] || ['none', 'dot', 'not run'];
+    return `<span class="check ${cls} ${coding ? 'stale' : ''}" title="${label} on the latest push: ${text}">${ic(icon)}${label} ${st === 'running' ? bar(p) : esc(text)}</span>`;
+  };
+  const mini = (label, st, p) => {
+    const c = { pass: 'ok', approved: 'ok', fail: 'bug', changes: 'bug', running: 'idle', queued: 'faint', cancelled: 'faint', off: 'faint' }[st] || 'faint';
+    const icon = { pass: 'check', approved: 'check', fail: 'x', changes: 'x', cancelled: 'x' }[st] || 'dot';
+    return `<span class="mini" style="color:${css(c)}" title="${label}: ${st || 'not run'}">${ic(icon)}${label}${st === 'running' ? `<span style="width:30px;display:inline-block">${bar(p)}</span>` : ''}</span>`;
+  };
+  const running = P.open.filter(x => x.phase === 'checks'), red = P.open.filter(x => x.phase === 'needs work');
+  const list = (xs, f) => xs.slice(0, 4).map(f).join('') + (xs.length > 4 ? heap(xs.length - 4, css('enh'), 'more pull requests') : '');
+  $('checks').innerHTML = `<div>${ic('play')}Checks running<b>${running.length}</b></div>` + list(running, x =>
+    `<div class="prow">${chip(x)}<span>push ${x.pushes}</span>${mini('CI', x.ci, x.ci_p)}${mini('Review', x.review, x.review_p)}</div>`);
+  $('needswork').innerHTML = `<div>${ic('x')}Needs work<b>${red.length}</b><span style="font-weight:400;margin-left:6px">back to an agent</span></div>` + list(red, x =>
+    `<div class="prow">${chip(x)}<span>push ${x.pushes}</span>${x.ci === 'fail' ? mini('CI', 'fail') : mini('Review', 'changes')}</div>`);
+  const slots = (busy, n) => `<span class="slots">${Array.from({ length: Math.min(n, 12) }, (_, k) => `<i class="${k < busy ? 'on' : ''}"></i>`).join('')}</span>`;
+  $('runners').innerHTML = `<span>${ic('play')}CI runners ${slots(P.ci.busy, P.ci.slots)} ${P.ci.busy}/${P.ci.slots} busy · ${P.ci.queued} waiting · ${P.ci.fails} failed</span>
+    <span>${ic('eye')}Reviewers ${P.review.slots ? `${slots(P.review.busy, P.review.slots)} ${P.review.busy}/${P.review.slots} busy · ${P.review.queued} waiting · ` : ''}${P.review.mode} · ${P.review.changes} changes requested${P.review.reopens ? ` · ${P.review.reopens} reopened` : ''}</span>`;
+  $('prstats').textContent = `${P.open.length} open · ${P.pushes} pushes`;
+  const m = b.main;
+  $('main').innerHTML = `<div>${ic('branch')}main</div><div class="big">${m.merged}</div><div class="stat">merged PRs</div><div class="stat"><b>${m.since}</b> since freeze</div>${bugs(m.hidden, m.known)}`;
+
+  const s = b.stable, rc = b.rc, pm = b.pm;
+  $('stable').innerHTML = `<h3>${ic('tag')}Latest release ${s ? '<span class="badge latest">Latest</span>' : ''}</h3>
+    ${s ? `<div class="ver">${s.ver}</div><div class="stat">${s.changes} changes · released ${dur(s.age)} ago</div>${bugs(s.hidden, 0)}<div class="sub" style="margin:2px 0 0">${s.hidden} hidden bugs shipped in it</div>`
+        : '<div class="sub">Nothing released yet.</div>'}`;
+  $('rc').innerHTML = `<h3>${ic('branch')}Release candidate ${rc ? '<span class="badge pre">Pre-release</span>' : ''}</h3>
+    ${rc ? `<div class="ver">${rc.ver}-rc.${rc.build}</div><div class="stat">${rc.changes} changes · tested <span class="dots">${Array.from({ length: rc.need }, (_, k) => `<i class="${k < rc.sessions ? 'on' : ''}"></i>`).join('')}</span> ${rc.sessions}/${rc.need}</div>
+         ${bugs(rc.hidden, rc.known)}<div class="sub" style="margin:2px 0 0">${rc.known} known bugs block it, ${rc.hidden} hidden</div>`
+       : `<div class="sub">No release branch. Next freeze in ${dur(pm.freeze ?? 0)}.</div>`}`;
+  $('pm').innerHTML = `<div class="row"><div class="ic">${ic('package')}</div><div><b>Product manager</b><div class="sub" style="margin:0">${pm.releases} releases tagged</div></div></div>
+    <div class="stat" style="margin-top:6px">${rc ? (rc.known ? `holding ${rc.ver}: ${rc.known} known bugs` : rc.sessions < rc.need ? `holding ${rc.ver}: needs ${rc.need - rc.sessions} more test sessions` : pm.soak > 0 ? `holding ${rc.ver}: quiet for ${dur(pm.soak)} more` : `releasing ${rc.ver}`) : `next feature freeze in <b>${dur(pm.freeze ?? 0)}</b>`}</div>`;
+  const pu = b.poweruser, busy = pu.slots.filter(x => x.state === 'work');
+  $('poweruser').innerHTML = `<div class="row"><div class="ic">${ic('agent')}</div><div><b>Power user</b><div class="sub" style="margin:0">tries the release candidate, docs only</div></div></div>
+    <div style="margin-top:6px;color:${css('rel')}">${busy.length ? busy.map(x => bar(x.progress)).join('') : `<span class="stat">${pu.slots.length ? (rc ? 'between sessions' : 'waiting for a release candidate') : 'off'}</span>`}</div>
+    <div class="stat" style="margin-top:4px">filed <b>${pu.found}</b> ${ic('bug')} bugs · <b>${pu.friction}</b> ${ic('friction')} friction</div>`;
+
+  const n = v => v === null || v === undefined ? '-' : v;
+  $('agents').innerHTML = '<tr><th>Agent</th><th>$/mo</th><th>Spent $</th><th>Hours</th><th>Issues</th><th>Defects/100</th><th>$/issue</th></tr>'
+    + state.agents.map(a => `<tr><td>${a.name}<small>${a.model}</small></td><td>${a.monthly}</td><td>${a.spent}</td><td>${a.hours}</td><td>${a.issues}</td><td>${n(a.defects)}</td><td>${n(a.per_issue)}</td></tr>`).join('');
+  $('metrics').innerHTML = state.metrics.map(([l, v, tone]) => `<div class="kv"><span>${l}</span><b class="${tone}">${v}</b></div>`).join('');
+  $('log').innerHTML = state.log.slice(-11).reverse().map(([t, s]) => `<div>${clock(t)} <b>${esc(s)}</b></div>`).join('') || 'Nothing yet.';
+}
+
+// ---------- issue chips glide between places instead of popping ----------
+// Every chip is keyed by issue number and the place it sits in. After each render, a key that
+// is new in one place and gone from another flies from the old spot; a brand new issue pops in;
+// an issue that left the board entirely shrinks away where it was.
+let lastRects = new Map(), lastEls = new Map(), flying = new Map();
+const FLY = 380, POP = 240, GONE = 300;
+function chipKeys() {
+  const out = new Map();
+  for (const el of document.querySelectorAll('#stage .chip[data-n]')) {
+    const key = el.dataset.n + '@' + (el.closest('[data-zone]')?.dataset.zone || 'other');
+    if (!out.has(key)) out.set(key, el);
+  }
+  return out;
+}
+// Flights run in an overlay above everything, so no column clips them; the real chip
+// stays invisible until its flight lands.
+function ghost(el, r) {
+  const g = el.cloneNode(true); g.classList.add('ghost'); g.style.transform = ''; g.style.opacity = '';
+  g.style.left = r.left + 'px'; g.style.top = r.top + 'px'; document.body.append(g); return g;
+}
+function animateChips() {
+  const now = performance.now(), cur = chipKeys(), rects = new Map();
+  for (const [k, el] of cur) rects.set(k, el.getBoundingClientRect());
+  const gone = new Map();
+  for (const [k, r] of lastRects) if (!cur.has(k)) { const n = k.split('@')[0]; if (!gone.has(n)) gone.set(n, [k, r]); }
+  const present = new Set([...cur.keys()].map(k => k.split('@')[0]));
+  if (lastRects.size) for (const [k, el] of cur) {
+    if (lastRects.has(k) || flying.has(k)) continue;
+    const r = rects.get(k), from = gone.get(k.split('@')[0]);
+    if (from) {
+      const g = ghost(el, r), dx = from[1].left - r.left, dy = from[1].top - r.top;
+      flying.set(k, now + FLY);
+      g.animate([{ transform: `translate(${dx}px,${dy}px) scale(1.1)` }, { transform: 'translate(0,0) scale(1)' }],
+        { duration: FLY, easing: 'cubic-bezier(.2,.8,.3,1)' }).onfinish = () => g.remove();
+    } else {
+      const g = ghost(el, r); flying.set(k, now + POP);
+      g.animate([{ transform: 'scale(.4)', opacity: 0 }, { transform: 'scale(1)', opacity: 1 }], { duration: POP, easing: 'ease-out' }).onfinish = () => g.remove();
+    }
+  }
+  for (const [n, [k, r]] of gone) {
+    if (present.has(n) || !lastEls.has(k)) continue;
+    const g = ghost(lastEls.get(k), r);
+    g.animate([{ transform: 'scale(1)', opacity: 1 }, { transform: 'scale(.3)', opacity: 0 }], { duration: GONE, easing: 'ease-in' }).onfinish = () => g.remove();
+  }
+  lastRects = rects; lastEls = new Map([...cur].map(([k, el]) => [k, el.cloneNode(true)]));
+  stepChips(now);
+}
+function stepChips(now) {
+  if (!flying.size) return;
+  const cur = chipKeys();
+  for (const [k, end] of flying) {
+    const el = cur.get(k);
+    if (now >= end) { flying.delete(k); if (el) el.style.visibility = ''; }
+    else if (el) el.style.visibility = 'hidden';
+  }
+}
+if (matchMedia('(prefers-reduced-motion: reduce)').matches) { window.animateChips = () => {}; }
+
+// ---------- flows between boxes; items travel as their GitHub symbol ----------
+function anchorEl(id) {
+  return document.querySelector(`[data-anchor="${CSS.escape(id)}"]`) || (id.startsWith('agent:') ? $('agentcol') : null);
+}
+function rectOf(id) {
+  const el = anchorEl(id); if (!el) return null;
+  const r = el.getBoundingClientRect(), s = $('stage').getBoundingClientRect();
+  return { x: r.left - s.left + r.width / 2, y: r.top - s.top + r.height / 2, w: r.width / 2, h: r.height / 2 };
+}
+function exitPoint(r, dx, dy) {
+  const k = Math.min(dx ? r.w / Math.abs(dx) : 1e9, dy ? r.h / Math.abs(dy) : 1e9);
+  return [r.x + dx * k, r.y + dy * k];
+}
+function segment(src, dst, off = 0) {
+  const a = rectOf(src), b = rectOf(dst); if (!a || !b) return null;
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy) || 1, nx = -dy / len * off, ny = dx / len * off;
+  const p = exitPoint({ ...a, x: a.x + nx, y: a.y + ny }, dx, dy), q = exitPoint({ ...b, x: b.x + nx, y: b.y + ny }, -dx, -dy);
+  return [p, q, [(p[0] + q[0]) / 2 + nx * 2.5, (p[1] + q[1]) / 2 + ny * 2.5]];
+}
+const bez = ([p, q, c], t) => { const u = 1 - t; return [u * u * p[0] + 2 * u * t * c[0] + t * t * q[0], u * u * p[1] + 2 * u * t * c[1] + t * t * q[1]]; };
+const norm = id => id.startsWith('agent:') ? 'workers' : id;
+const PATH = Object.fromEntries(Object.entries({
+  issue: 'M1.75 8a6.25 6.25 0 1 0 12.5 0a6.25 6.25 0 1 0 -12.5 0M6.6 8a1.4 1.4 0 1 0 2.8 0a1.4 1.4 0 1 0 -2.8 0',
+  bug: 'M5.2 6.2a2.8 2.8 0 0 1 5.6 0v3.6a2.8 2.8 0 0 1-5.6 0zM8 7v5.4M2.2 7.6h3M10.8 7.6h3M2.6 12l2.7-1.3M13.4 12l-2.7-1.3M6 3.6L4.8 2.2M10 3.6l1.2-1.4',
+  friction: 'M2.2 3.2h11.6v7.6H7.4L4.6 13.4v-2.6H2.2zM5.2 6.2h5.6M5.2 8.2h3.4',
+  initiative: 'M7.6 1.8v12.4M7.6 2.6h5.2l-1.4 2.3 1.4 2.3H7.6M4.6 14.2h6',
+  pr: 'M2.3 3.6a1.7 1.7 0 1 0 3.4 0a1.7 1.7 0 1 0 -3.4 0M2.3 12.4a1.7 1.7 0 1 0 3.4 0a1.7 1.7 0 1 0 -3.4 0M10.3 12.4a1.7 1.7 0 1 0 3.4 0a1.7 1.7 0 1 0 -3.4 0M4 5.3v5.4M12 10.7V6.4a2 2 0 0 0-2-2H7.6M9.2 2.8L7.6 4.4l1.6 1.6',
+  tag: 'M2 2.2h5.6l6.2 6.2-5.4 5.4L2.2 7.6zM4.6 5.3a.6.6 0 1 0 1.2 0a.6.6 0 1 0 -1.2 0',
+  eye: 'M1.4 8S3.8 3.4 8 3.4 14.6 8 14.6 8 12.2 12.6 8 12.6 1.4 8 1.4 8zM6 8a2 2 0 1 0 4 0a2 2 0 1 0 -4 0',
+}).map(([k, d]) => [k, new Path2D(d)]));
+// What a moving item is: an issue (by type) on its way to an agent or back to the tracker,
+// a pull request once an agent has opened it, a release when it leaves the release branch.
+function tokenIcon(t) {
+  if (t.kind === 'release') return 'tag';
+  if (t.kind === 'review') return 'eye';
+  if (t.kind === 'initiative') return 'initiative';
+  if (t.kind === 'pr' || ['checks', 'needswork'].includes(t.src) || ['checks', 'needswork'].includes(t.dst)) return 'pr';
+  return ICON[t.kind] || 'issue';
+}
+
+function sizeCanvas(cv) {
+  const s = $('stage'), dpr = devicePixelRatio || 1;
+  if (cv.width !== Math.round(s.clientWidth * dpr) || cv.height !== Math.round(s.clientHeight * dpr)) {
+    cv.width = Math.round(s.clientWidth * dpr); cv.height = Math.round(s.clientHeight * dpr);
+    cv.style.width = s.clientWidth + 'px'; cv.style.height = s.clientHeight + 'px';
+  }
+  const g = cv.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, s.clientWidth, s.clientHeight); return g;
+}
+const EDGE_COL = { flow: css('dim'), plan: css('init'), rework: css('rework'), report: css('fric'), review: css('dim') };
+function draw(now) {
+  requestAnimationFrame(draw);
+  if (!graph || !state) return;
+  stepChips(now);
+  const g = sizeCanvas($('edges'));
+  const pairs = new Set(graph.edges.map(e => e.src + '>' + e.dst));
+  for (const e of graph.edges) {
+    const seg = segment(e.src, e.dst, pairs.has(e.dst + '>' + e.src) ? 6 : 0); if (!seg) continue;
+    const age = now - (hot[e.src + '>' + e.dst] || -1e9), fade = Math.max(0, 1 - age / 2500);
+    g.beginPath(); g.moveTo(...seg[0]); g.quadraticCurveTo(...seg[2], ...seg[1]);
+    g.strokeStyle = EDGE_COL[e.kind] || css('dim'); g.globalAlpha = .22 + .6 * fade; g.lineWidth = 1.2 + .5 * fade;
+    g.setLineDash([4, 6]); g.lineDashOffset = fade ? -now / 35 : 0; g.stroke(); g.setLineDash([]);
+    const [mx, my] = bez(seg, .55), [nx, ny] = bez(seg, .6);
+    g.save(); g.translate(mx, my); g.rotate(Math.atan2(ny - my, nx - mx)); g.beginPath(); g.moveTo(5, 0); g.lineTo(-4, -4); g.lineTo(-4, 4); g.closePath();
+    g.fillStyle = g.strokeStyle; g.fill(); g.restore(); g.globalAlpha = 1;
+  }
+  const k = sizeCanvas($('tokens'));
+  tokens = tokens.filter(t => now - t.t0 < 1000);
+  for (const t of tokens) {
+    const f = (now - t.t0) / 1000; if (f < 0) continue;
+    const seg = segment(t.src, t.dst); if (!seg) continue;
+    const [x, y] = bez(seg, f), col = COL[t.kind] || css('dim');
+    k.beginPath(); k.arc(x, y, 10, 0, 7); k.fillStyle = css('panel'); k.fill(); k.lineWidth = 1; k.strokeStyle = col; k.stroke();
+    k.save(); k.translate(x - 6.5, y - 6.5); k.scale(13 / 16, 13 / 16);
+    k.strokeStyle = col; k.lineWidth = 1.7; k.lineCap = k.lineJoin = 'round'; k.stroke(PATH[tokenIcon(t)]); k.restore();
+  }
+}
+
+// ---------- issue graphs, settings, history ----------
+const DAG = { done: css('ok'), work: css('enh'), ready: css('text'), blocked: css('init'), stalled: css('bug') };
+let lastDag = -1e9;
+function paintDags() {
+  const box = $('dags'), gs = state.graphs;
+  if (!gs.length) { box.innerHTML = '<span class="sub">No initiative with more than one sub-issue is open.</span>'; return; }
+  box.innerHTML = gs.map(g => `<div class="dag" style="${g.done ? 'opacity:.45' : ''}"><span>${ic('initiative')} #${g.id} · ${g.issues.length} sub-issues${g.late ? ` · ${g.late} added during work` : ''}${g.done ? ' · done' : ''}</span><canvas id="dag_${g.id}"></canvas></div>`).join('');
+  const dpr = devicePixelRatio || 1, CW = 24, CH = 18;
+  for (const g of gs) {
+    const cols = {}, at = {};
+    for (const i of g.issues) { const col = cols[i.depth] ||= []; at[i.id] = [11 + i.depth * CW, 10 + col.length * CH]; col.push(i); }
+    const w = 22 + Math.max(...g.issues.map(i => i.depth)) * CW, h = 20 + (Math.max(...Object.values(cols).map(c => c.length)) - 1) * CH;
+    const cv = $('dag_' + g.id); cv.width = w * dpr; cv.height = h * dpr; cv.style.width = w + 'px'; cv.style.height = h + 'px';
+    const c = cv.getContext('2d'); c.scale(dpr, dpr);
+    c.strokeStyle = css('dim'); c.lineWidth = 1; c.globalAlpha = .45;
+    for (const i of g.issues) for (const d of i.deps) if (at[d]) { c.beginPath(); c.moveTo(...at[d]); c.lineTo(...at[i.id]); c.stroke(); }
+    c.globalAlpha = 1;
+    for (const i of g.issues) {
+      const [x, y] = at[i.id];
+      c.fillStyle = css('panel2'); c.beginPath(); c.arc(x, y, 7, 0, 7); c.fill();
+      c.save(); c.translate(x - 6, y - 6); c.scale(.75, .75); c.strokeStyle = DAG[i.state]; c.lineWidth = 2; c.lineCap = 'round';
+      c.stroke(PATH[i.state === 'done' ? 'issue' : 'issue']); c.restore();
+      if (i.late) { c.strokeStyle = css('rework'); c.lineWidth = 1.4; c.beginPath(); c.arc(x, y, 8.5, 0, 7); c.stroke(); }
+    }
+  }
+}
+
+function buildParams() {
+  const groups = {};
+  for (const p of graph.params) (groups[p.group] ||= []).push(p);
+  $('params').innerHTML = Object.entries(groups).map(([g, ps], k) => `<details ${k < 2 ? 'open' : ''}><summary>${g}</summary>` + ps.map(p =>
+    `<label class="prm"><span>${p.label}<span class="tg ${p.source ? 'real' : ''}">${p.source ? 'measured' : 'guess'}</span></span><output id="o_${p.key}"></output>` + (p.choices
+      ? `<select id="p_${p.key}">${p.choices.map((c, i) => `<option value="${i}">${c}</option>`).join('')}</select>`
+      : `<input id="p_${p.key}" type="range" min="${p.min}" max="${p.max}" step="${p.step}">`) + (p.source ? `<span class="src">${esc(p.source)}</span>` : '') + `</label>`).join('') + '</details>').join('');
+  for (const p of graph.params) $('p_' + p.key).oninput = ev => { p.touched = Date.now(); post({ params: { [p.key]: +ev.target.value } }); showParam(p, +ev.target.value); };
+}
+function showParam(p, v) { $('o_' + p.key).textContent = p.choices ? '' : (p.max <= 1 && p.step < 1 ? Math.round(v * 100) + '%' : Math.round(v * 100) / 100); }
+function syncParams() {
+  if ($('settings').hidden) return;
+  for (const p of graph.params) {
+    if (Date.now() - (p.touched || 0) < 800) continue;
+    const el = $('p_' + p.key);
+    if (+el.value !== state.params[p.key]) el.value = state.params[p.key];
+    showParam(p, state.params[p.key]);
+  }
+}
+
+const SERIES = [['ready', 'Issues ready to start', 'enh'], ['blocked', 'Issues blocked on another issue', 'init'], ['idle', 'Idle agents', 'fric'], ['rate', 'Merged in the last 24 h', 'ok'], ['hidden', 'Hidden bugs in main', 'rework'], ['shipped', 'Hidden bugs in the latest release', 'bug']];
+async function loadSeries() {
+  const s = await (await fetch('/api/series')).json();
+  if (!$('charts').children.length) $('charts').innerHTML = SERIES.map(([k, l]) => `<div class="spark"><span>${l}</span><b id="sv_${k}"></b><canvas id="sc_${k}"></canvas></div>`).join('');
+  for (const [k, , col] of SERIES) {
+    const data = s[k], cv = $('sc_' + k), dpr = devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+    cv.width = w * dpr; cv.height = h * dpr;
+    const g = cv.getContext('2d'); g.scale(dpr, dpr);
+    $('sv_' + k).textContent = data.length ? data[data.length - 1] : 0;
+    if (data.length < 2) continue;
+    const max = Math.max(1, ...data), X = i => i / (data.length - 1) * w, Y = v => h - 2 - v / max * (h - 5);
+    g.beginPath(); data.forEach((v, i) => i ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)));
+    g.strokeStyle = css(col); g.lineWidth = 1.5; g.stroke();
+    g.lineTo(w, h); g.lineTo(0, h); g.closePath(); g.globalAlpha = .14; g.fillStyle = css(col); g.fill();
+  }
+}
+
+async function init() {
+  graph = await (await fetch('/api/graph')).json();
+  for (const n of graph.nodes) { const el = document.querySelector(`[data-anchor="${n.id}"]`); if (el) el.title = n.about; }
+  buildParams();
+  const ref = graph.reference;
+  if (ref.prs_per_day) $('ref').textContent = `Real factory over the measured window: ${ref.prs_per_day} merged PRs per day (peak ${ref.peak_prs_in_a_day}), ${ref.prs_per_issue} PRs per issue, ${Math.round(ref.first_review_reopen_rate * 100)}% of first reviews sent work back.`;
+  $('dagkey').innerHTML = [['done', 'closed'], ['work', 'in progress'], ['ready', 'ready'], ['blocked', 'blocked']].map(([k, v]) => `<span style="color:${DAG[k]}">${ic('issue')} <span style="color:${css('dim')}">${v}</span></span>`).join('')
+    + `<span><i style="border:1.5px solid ${css('rework')};border-radius:50%"></i>added during work, not planned</span><span>A line joins a sub-issue to the one it waits for; left to right is the order work can happen in.</span>`;
+  for (const name of Object.keys(graph.presets)) {
+    const b = document.createElement('button'); b.textContent = name;
+    b.title = `Load the ${name} preset and restart`;
+    b.onclick = () => post({ params: graph.presets[name], action: 'reset' });
+    $('presets').append(b, ' ');
+  }
+  const es = new EventSource('/api/stream');
+  es.onmessage = ev => {
+    state = JSON.parse(ev.data);
+    const now = performance.now();
+    for (const [src, dst, kind] of state.moves) {
+      hot[norm(src) + '>' + norm(dst)] = now;
+      if (tokens.length < 300) tokens.push({ src, dst, kind: kind === 'feature' ? 'enhancement' : kind, t0: now + Math.random() * 150 });
+    }
+    render(); syncParams();
+    if (!matchMedia('(prefers-reduced-motion: reduce)').matches) animateChips();
+    if (now - lastDag > 500) { lastDag = now; paintDags(); }
+  };
+  loadSeries(); setInterval(loadSeries, 1500);
+  requestAnimationFrame(draw);
+}
+
+$('play').onclick = () => post({ action: state && state.playing ? 'pause' : 'play' });
+$('reset').onclick = () => post({ action: 'reset', seed: +$('seed').value || 1 });
+$('speed').oninput = ev => post({ speed: speedOf(+ev.target.value) });
+$('gear').onclick = () => { $('settings').hidden = false; };
+$('close').onclick = () => { $('settings').hidden = true; };
+post({ speed: speedOf(+$('speed').value) });
+init();
+</script>
+</body>
+</html>
