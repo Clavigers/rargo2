@@ -296,6 +296,7 @@ impl Handshake {
     }
 
     fn reject_protocol(&mut self, why: String) -> io::Result<Action> {
+        assert!(self.notify.is_none(), "the first hello gets only one refusal");
         self.notify = Some(refusal(&why));
         self.fail(io::ErrorKind::InvalidData, why)
     }

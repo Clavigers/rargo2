@@ -249,7 +249,9 @@ impl Link {
             let bind: SocketAddr = if server.is_ipv4() { "0.0.0.0:0".parse().unwrap() } else { "[::]:0".parse().unwrap() };
             let wait = if transport == "udp" { Duration::from_secs(20) } else { UDP_WAIT };
             let connect = |marked| {
-                let endpoint = Endpoint::bind_with_hello(bind, false, Auth::User { name: user.to_string(), psk: *psk }, marked)?;
+                let (name, psk) = (user.to_string(), *psk);
+                let auth = if marked { Auth::User { name, psk } } else { Auth::UnmarkedUser { name, psk } };
+                let endpoint = Endpoint::bind_auth(bind, false, auth)?;
                 crate::connect_within(wait, &endpoint, server).map(|conn| Link::Udp(conn, endpoint))
             };
             // Use a fresh socket for an old server. Its failed handshake may still own the first peer address.

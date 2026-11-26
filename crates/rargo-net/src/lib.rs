@@ -57,6 +57,7 @@ pub enum Auth {
     Shared(Arc<[u8; 32]>),
     Users(UserKeys),
     User { name: String, psk: [u8; 32] },
+    UnmarkedUser { name: String, psk: [u8; 32] },
 }
 
 fn user_handshake_key(psk: &[u8; 32]) -> [u8; 32] {
@@ -474,7 +475,6 @@ pub struct Endpoint {
     accept_rx: FiberMutex<UnboundedReceiver<Arc<Conn>>>,
     key: LinkKey,
     auth: Auth,
-    marked: bool,
 }
 
 impl Endpoint {
@@ -491,10 +491,6 @@ impl Endpoint {
     }
 
     pub fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> sio::Result<Arc<Endpoint>> {
-        Self::bind_with_hello(addr, accepting, auth, true)
-    }
-
-    fn bind_with_hello(addr: SocketAddr, accepting: bool, auth: Auth, marked: bool) -> sio::Result<Arc<Endpoint>> {
         let key: LinkKey = match &auth {
             Auth::Shared(k) => Some(k.clone()),
             _ => None,
@@ -502,7 +498,7 @@ impl Endpoint {
         let sock = Arc::new(UdpSocket::bind(addr)?);
         sock.set_buffers(16 << 20);
         let (tx, rx) = io::unbounded_channel();
-        let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. });
+        let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. } | Auth::UnmarkedUser { .. });
         let ep = Arc::new(Endpoint {
             sock,
             conns: Mutex::new(HashMap::new()),
@@ -512,7 +508,6 @@ impl Endpoint {
             accept_rx: FiberMutex::new(rx),
             key,
             auth,
-            marked,
         });
         let ep2 = ep.clone();
         io::spawn(move || ep2.recv_loop());
@@ -536,7 +531,8 @@ impl Endpoint {
         let agreed = match &self.auth {
             Auth::None => Ok(()),
             Auth::Shared(key) => c.agree_as_initiator(key),
-            Auth::User { name, psk } => c.agree_as_user(name, psk, self.marked),
+            Auth::User { name, psk } => c.agree_as_user(name, psk, true),
+            Auth::UnmarkedUser { name, psk } => c.agree_as_user(name, psk, false),
             Auth::Users(_) => Err(sio::Error::other("an accepting endpoint does not connect")),
         };
         if let Err(e) = agreed {
@@ -551,7 +547,7 @@ impl Endpoint {
     }
 
     fn per_conn(&self) -> bool {
-        matches!(self.auth, Auth::Users(_) | Auth::User { .. })
+        matches!(self.auth, Auth::Users(_) | Auth::User { .. } | Auth::UnmarkedUser { .. })
     }
 
     pub fn forget(&self, id: u64) {
