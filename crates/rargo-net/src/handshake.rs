@@ -5,7 +5,7 @@
 //! proven user, or a refusal.
 
 use super::{handshake_key, user_handshake_key, DATA_HDR, T_ACK, T_DATA};
-use rargo_proto::secure::{LinkCipher, LinkPending, link_accept_with, link_start_with};
+use rargo_proto::secure::{LinkCipher, LinkPending, MAGIC, link_accept_with, link_start_with};
 use std::io;
 
 /// Noise_NNpsk0 writes the ephemeral public key and a tag, and nothing else.
@@ -55,7 +55,7 @@ enum Phase {
 enum Role {
     SharedInit { psk: [u8; 32] },
     SharedResp { psk: [u8; 32] },
-    UserInit { name: String, psk: [u8; 32] },
+    UserInit { name: String, psk: [u8; 32], marked: bool },
     UserResp,
 }
 
@@ -84,8 +84,8 @@ impl Handshake {
         Handshake::new(Role::SharedResp { psk: key }, ephemeral, "no key agreement")
     }
 
-    pub fn user_initiator(name: &str, psk: [u8; 32], ephemeral: [u8; 32]) -> Handshake {
-        Handshake::new(Role::UserInit { name: name.to_string(), psk }, ephemeral, "no answer from the server")
+    pub fn user_initiator(name: &str, psk: [u8; 32], ephemeral: [u8; 32], marked: bool) -> Handshake {
+        Handshake::new(Role::UserInit { name: name.to_string(), psk, marked }, ephemeral, "no answer from the server")
     }
 
     pub fn user_responder(ephemeral: [u8; 32]) -> Handshake {
@@ -141,11 +141,14 @@ impl Handshake {
         };
         assert_eq!(noise.len(), NOISE_LEN, "a handshake message has a fixed length");
         let pkt = match &self.role {
-            Role::UserInit { name, .. } => {
+            Role::UserInit { name, marked, .. } => {
                 let n = name.len().min(255);
-                let mut first = Vec::with_capacity(1 + n + noise.len());
+                let mut first = Vec::with_capacity(1 + n + MAGIC.len() + noise.len());
                 first.push(n as u8);
                 first.extend_from_slice(&name.as_bytes()[..n]);
+                if *marked {
+                    first.extend_from_slice(MAGIC);
+                }
                 first.extend_from_slice(&noise);
                 first
             }
@@ -210,6 +213,11 @@ impl Handshake {
         let noise = if user {
             match pkt.first() {
                 Some(1) => {
+                    if &pkt[1..] == rargo_proto::REFUSED.as_bytes()
+                        && matches!(self.role, Role::UserInit { marked: true, .. })
+                    {
+                        return self.fail(io::ErrorKind::Unsupported, "the server uses unmarked UDP hellos");
+                    }
                     let why = String::from_utf8_lossy(&pkt[1..]).trim().to_string();
                     return self.fail(io::ErrorKind::PermissionDenied, format!("the server refused the connection: {why}"));
                 }
@@ -268,15 +276,28 @@ impl Handshake {
         let Ok(name) = std::str::from_utf8(body) else {
             return self.fail(io::ErrorKind::Other, "malformed key agreement");
         };
-        let noise = &pkt[1 + n..];
-        if noise.len() < NOISE_LEN {
-            return self.fail(io::ErrorKind::UnexpectedEof, "truncated handshake packet");
-        }
+        let body = &pkt[1 + n..];
+        let noise = match body.len() {
+            len if len < NOISE_LEN => return self.fail(io::ErrorKind::UnexpectedEof, "truncated handshake packet"),
+            NOISE_LEN => return self.reject_protocol(rargo_proto::protocol_unmarked()),
+            len if len == MAGIC.len() + NOISE_LEN && body[..5] == MAGIC[..5] && body[6..8] == MAGIC[6..8] => {
+                if &body[..MAGIC.len()] != MAGIC {
+                    return self.reject_protocol(rargo_proto::protocol_mismatch(u32::from(body[5])));
+                }
+                &body[MAGIC.len()..]
+            }
+            _ => return self.fail(io::ErrorKind::InvalidData, "malformed key agreement"),
+        };
         self.seen.push(pkt.to_vec());
         self.name = Some(name.to_string());
         self.noise = Some(noise.to_vec());
         self.phase = Phase::NeedKey;
         Ok(Action::NeedKey(name.to_string()))
+    }
+
+    fn reject_protocol(&mut self, why: String) -> io::Result<Action> {
+        self.notify = Some(refusal(&why));
+        self.fail(io::ErrorKind::InvalidData, why)
     }
 
     pub fn provide_key(&mut self, psk: Option<[u8; 32]>) -> io::Result<Action> {
@@ -286,7 +307,7 @@ impl Handshake {
         let name = self.name.clone().expect("a user hello names its user");
         let noise = self.noise.take().expect("a user hello carries its key agreement");
         let Some(psk) = psk else {
-            self.notify = Some(refusal());
+            self.notify = Some(refusal(&format!("{}\n", rargo_proto::REFUSED)));
             return self.fail(io::ErrorKind::PermissionDenied, refused(&name));
         };
         match link_accept_with(&user_handshake_key(&psk), &noise, &self.ephemeral) {
@@ -301,7 +322,7 @@ impl Handshake {
                 Ok(Action::Send(reply))
             }
             Err(_) => {
-                self.notify = Some(refusal());
+                self.notify = Some(refusal(&format!("{}\n", rargo_proto::REFUSED)));
                 self.fail(io::ErrorKind::PermissionDenied, refused(&name))
             }
         }
@@ -415,9 +436,9 @@ impl Handshake {
     }
 }
 
-fn refusal() -> Vec<u8> {
+fn refusal(text: &str) -> Vec<u8> {
     let mut pkt = vec![1u8];
-    pkt.extend_from_slice(rargo_proto::REFUSED.as_bytes());
+    pkt.extend_from_slice(text.as_bytes());
     pkt
 }
 
@@ -526,8 +547,41 @@ mod tests {
         assert_eq!(&hello[1..4], b"ann");
     }
 
+    #[test]
+    fn the_first_udp_datagram_gets_an_upgrade_notice_when_its_protocol_is_old_or_unmarked() {
+        let mut client = Handshake::user_initiator("ann", [7; 32], eph(1), true);
+        let marked = outbound(client.start().unwrap());
+        let mut old_server_refusal = vec![1];
+        old_server_refusal.extend_from_slice(rargo_proto::REFUSED.as_bytes());
+        client.sent().unwrap();
+        assert_eq!(client.recv(&old_server_refusal).unwrap_err().kind(), io::ErrorKind::Unsupported);
+        let mut legacy_client = Handshake::user_initiator("ann", [7; 32], eph(1), false);
+        let unmarked = outbound(legacy_client.start().unwrap());
+        assert_eq!(unmarked.len(), 4 + NOISE_LEN);
+        assert_eq!(&unmarked[4..], &marked[4 + MAGIC.len()..]);
+
+        // Protocols 7, 8 and the original protocol 9 had the same unmarked layout.
+        for version in [None, Some(7), Some(8)] {
+            let bytes = match version {
+                None => unmarked.clone(),
+                Some(version) => {
+                    let mut bytes = marked.clone();
+                    bytes[4 + 5] = version;
+                    bytes
+                }
+            };
+            let mut server = Handshake::user_responder(eph(2));
+            server.start().unwrap();
+            assert!(server.recv(&bytes).is_err());
+            let response = server.take_notify().unwrap();
+            assert_eq!(response[0], 1);
+            let why = std::str::from_utf8(&response[1..]).unwrap();
+            assert!(why.contains(&format!("cargo install rargo --version {}", env!("CARGO_PKG_VERSION"))));
+        }
+    }
+
     fn agree_user(name: &str, psk: [u8; 32], known: Option<[u8; 32]>) -> (Result<Agreed, io::Error>, Result<Agreed, io::Error>, Vec<u8>, Option<Vec<u8>>) {
-        let mut client = Handshake::user_initiator(name, psk, eph(1));
+        let mut client = Handshake::user_initiator(name, psk, eph(1), true);
         let mut server = Handshake::user_responder(eph(2));
         client.invariants();
         server.invariants();
@@ -559,7 +613,7 @@ mod tests {
                 let notify = server.take_notify().expect("a refusal is sent");
                 server.invariants();
                 assert_eq!(notify[0], 1);
-                assert_eq!(&notify[1..], rargo_proto::REFUSED.as_bytes());
+                assert_eq!(String::from_utf8_lossy(&notify[1..]).trim(), rargo_proto::REFUSED);
                 let client_err = client.recv(&notify).unwrap_err();
                 client.invariants();
                 (Err(client_err), Err(e), hello, Some(notify))
@@ -631,7 +685,7 @@ mod tests {
         assert_eq!(err.to_string(), "replayed handshake packet");
         let _ = server;
 
-        let mut client = Handshake::user_initiator("ann", [7; 32], eph(3));
+        let mut client = Handshake::user_initiator("ann", [7; 32], eph(3), true);
         let mut server = Handshake::user_responder(eph(4));
         let hello = outbound(client.start().unwrap());
         assert!(matches!(client.sent().unwrap(), Action::Wait));
@@ -681,7 +735,7 @@ mod tests {
         server.invariants();
         assert_eq!(err.to_string(), "truncated handshake packet");
 
-        let mut client = Handshake::user_initiator("ann", [7; 32], eph(6));
+        let mut client = Handshake::user_initiator("ann", [7; 32], eph(6), true);
         let _ = outbound(client.start().unwrap());
         assert!(matches!(client.sent().unwrap(), Action::Wait));
         let err = client.recv(&[0]).unwrap_err();
@@ -728,8 +782,8 @@ mod tests {
         a_r.invariants();
         assert_eq!(err.to_string(), "packet from another connection");
 
-        let mut ann = Handshake::user_initiator("ann", [7; 32], eph(6));
-        let mut eve = Handshake::user_initiator("eve", [7; 32], eph(7));
+        let mut ann = Handshake::user_initiator("ann", [7; 32], eph(6), true);
+        let mut eve = Handshake::user_initiator("eve", [7; 32], eph(7), true);
         let mut server = Handshake::user_responder(eph(8));
         let hello = outbound(ann.start().unwrap());
         assert!(matches!(ann.sent().unwrap(), Action::Wait));
@@ -773,7 +827,7 @@ mod tests {
         roundtrip(&client.cipher, &server.cipher, b"after a loss");
         roundtrip(&server.cipher, &client.cipher, b"back");
 
-        let mut user = Handshake::user_initiator("ann", [7; 32], eph(3));
+        let mut user = Handshake::user_initiator("ann", [7; 32], eph(3), true);
         let mut server = Handshake::user_responder(eph(4));
         let hello = outbound(user.start().unwrap());
         assert!(matches!(user.sent().unwrap(), Action::Wait));

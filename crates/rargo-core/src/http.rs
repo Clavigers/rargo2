@@ -433,6 +433,10 @@ fn bad_request(msg: impl std::fmt::Display) -> Outcome {
     Outcome::Body { status: 400, kind: "text/plain", body: format!("bad request: {msg}\n") }
 }
 
+fn upgrade_required(msg: &str) -> Outcome {
+    Outcome::Body { status: 409, kind: "application/json", body: serde_json::json!({ "error": msg }).to_string() }
+}
+
 fn service_error(msg: &str) -> Outcome {
     Outcome::Body { status: 503, kind: "application/json", body: serde_json::json!({ "error": msg }).to_string() }
 }
@@ -613,7 +617,15 @@ fn step(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: 
 fn begin_request(state: &mut AuthState, phase: &mut Phase, req: Request, cfg: &Cfg, now: u64) -> Act {
     match req.goal() {
         Goal::Discovery(host) => ask(phase, Wait::Github(NeedGh::Discovery { host }), Effect::LoadGithub),
-        Goal::Start => start(state, phase, cfg, now),
+        Goal::Start => {
+            let protocol = serde_json::from_slice::<serde_json::Value>(&req.body)
+                .ok().and_then(|body| u32::try_from(body.get("protocol")?.as_u64()?).ok());
+            match protocol {
+                Some(version) if version == crate::proto::PROTO_VERSION => start(state, phase, cfg, now),
+                Some(version) => done(phase, upgrade_required(&crate::proto::protocol_mismatch(version)), Vec::new()),
+                None => done(phase, upgrade_required(&crate::proto::protocol_unmarked()), Vec::new()),
+            }
+        }
         Goal::Poll(device) => done(phase, json_ok(state.poll(&device, now)), Vec::new()),
         Goal::Revoke(token) => match (cfg.has_tokens, token) {
             (true, Some(token)) => ask(phase, Wait::RevokeSelf, Effect::RevokeSelf { token }),
@@ -623,7 +635,17 @@ fn begin_request(state: &mut AuthState, phase: &mut Phase, req: Request, cfg: &C
             (true, Some(token)) => ask(phase, Wait::Holder, Effect::Holder { token }),
             _ => done(phase, json_ok(serde_json::json!({ "user": None::<String> })), Vec::new()),
         },
-        Goal::Page(code) => ask(phase, Wait::Github(NeedGh::Page { code }), Effect::LoadGithub),
+        Goal::Page(code) => {
+            let notice = req.query.get("protocol").and_then(|v| v.parse::<u32>().ok()).map_or_else(
+                || (!code.is_empty()).then(crate::proto::protocol_unmarked),
+                |version| (version != crate::proto::PROTO_VERSION).then(|| crate::proto::protocol_mismatch(version)),
+            );
+            if let Some(notice) = notice {
+                done(phase, html(409, page("Update rargo", &format!("<p>{}</p>", escape(&notice)))), Vec::new())
+            } else {
+                ask(phase, Wait::Github(NeedGh::Page { code }), Effect::LoadGithub)
+            }
+        }
         Goal::Github(code) => ask(phase, Wait::Github(NeedGh::Redirect { code }), Effect::LoadGithub),
         Goal::Callback { state: oauth, code } => ask(phase, Wait::Github(NeedGh::Callback { state: oauth, code }), Effect::LoadGithub),
         Goal::Approve { code, invite, name } => approve(state, phase, cfg, now, code, invite, name),
@@ -645,7 +667,7 @@ fn started(device: &str, code: &str) -> Outcome {
     json_ok(serde_json::json!({
         "device": device,
         "code": shown(code),
-        "path": format!("/auth?code={}", shown(code)),
+        "path": format!("/auth?code={}&protocol={}", shown(code), crate::proto::PROTO_VERSION),
         "interval": 2,
         "expires_in": PENDING_FOR_MS / 1000,
     }))
@@ -965,6 +987,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn outdated_clients_get_an_upgrade_notice_before_starting_sign_in() {
+        let mut state = AuthState::default();
+        for (method, path, body) in [
+            ("POST", "/auth/start", r#"{"machine":"old-host"}"#),
+            ("POST", "/auth/start", r#"{"protocol":7}"#),
+            ("POST", "/auth/start", r#"{"protocol":8}"#),
+            ("GET", "/auth?code=ABCD-2345", ""),
+        ] {
+            let req = call(method, path, Some("application/json"), body);
+            let (outcome, _) = drive(&mut state, req, NOW, &cfg(true), &mut Script::default());
+            let (status, _, body) = body_of(&outcome);
+            assert_eq!(status, 409);
+            assert!(body.contains(&format!("cargo install rargo --version {}", env!("CARGO_PKG_VERSION"))));
+        }
+    }
+
     struct Script {
         random: Vec<Result<String, String>>,
         github: Vec<Option<GithubIn>>,
@@ -1104,15 +1143,15 @@ mod tests {
         assert_eq!(body["auth"], false);
         assert_eq!(body["github"], false);
 
-        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &cfg(false), &mut Script::default());
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW, &cfg(false), &mut Script::default());
         assert_eq!(body_of(&outcome).0, 503);
         assert!(body_of(&outcome).2.contains("does not issue tokens"));
         let mut script = Script { random: script_rev(vec![Ok("deviceone".into()), Ok("ABCD2345".into())]), ..Script::default() };
-        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &c, &mut script);
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW, &c, &mut script);
         let body = serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap();
         assert_eq!(body["device"], "deviceone");
         assert_eq!(body["code"], "ABCD-2345");
-        assert_eq!(body["path"], "/auth?code=ABCD-2345");
+        assert_eq!(body["path"], format!("/auth?code=ABCD-2345&protocol={}", crate::proto::PROTO_VERSION));
         assert_eq!(body["interval"], 2);
         assert_eq!(body["expires_in"], 600);
         assert!(st.begin("other".into(), "ABCD2345".into(), NOW) == false);
@@ -1134,11 +1173,11 @@ mod tests {
         let (outcome, _) = drive(&mut st, call("POST", "/auth/whoami", Some("application/json"), r#"{"token":"no"}"#), NOW, &cfg(false), &mut Script::default());
         assert!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["user"].is_null());
 
-        let (outcome, _) = drive(&mut st, parsed("GET /auth?code=abcd2345 HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), ..Script::default() });
+        let (outcome, _) = drive(&mut st, call("GET", &format!("/auth?code=abcd2345&protocol={}", crate::proto::PROTO_VERSION), None, ""), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), ..Script::default() });
         let (status, _, page) = body_of(&outcome);
         assert_eq!(status, 200);
         assert!(page.contains("Sign in with GitHub") && page.contains("ABCD-2345"));
-        let (outcome, _) = drive(&mut st, parsed("GET /auth?code=abcd2345 HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
+        let (outcome, _) = drive(&mut st, call("GET", &format!("/auth?code=abcd2345&protocol={}", crate::proto::PROTO_VERSION), None, ""), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
         assert!(body_of(&outcome).2.contains("Invitation") && !body_of(&outcome).2.contains("Sign in with GitHub"));
         let (outcome, _) = drive(&mut st, parsed("GET /auth HTTP/1.1\r\nHost: build.example\r\n\r\n"), NOW, &cfg(false), &mut Script { github: script_rev(vec![None]), ..Script::default() });
         assert!(body_of(&outcome).2.contains("does not issue tokens"));
@@ -1152,7 +1191,7 @@ mod tests {
         let c = cfg(true);
         let mut script = Script { random: script_rev(vec![Ok("d1".into()), Ok("SAMECODE".into()), Ok("d2".into()), Ok("ABCD2345".into())]), ..Script::default() };
         assert!(st.begin("taken".into(), "SAMECODE".into(), NOW));
-        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &c, &mut script);
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW, &c, &mut script);
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["code"], "ABCD-2345");
         assert!(script.effects.iter().filter(|e| e.starts_with("random")).count() >= 3, "a colliding code draws again");
 
@@ -1222,10 +1261,10 @@ mod tests {
             assert!(st.begin(format!("d{i}"), format!("C{i:07}"), NOW));
         }
         assert!(st.invariants());
-        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW, &c, &mut Script::default());
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW, &c, &mut Script::default());
         assert_eq!(body_of(&outcome).0, 503);
         assert!(body_of(&outcome).2.contains("too many"));
-        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", None, ""), NOW + PENDING_FOR_MS, &c, &mut Script { random: script_rev(vec![Ok("fresh-device".into()), Ok("FFFF2222".into())]), ..Script::default() });
+        let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW + PENDING_FOR_MS, &c, &mut Script { random: script_rev(vec![Ok("fresh-device".into()), Ok("FFFF2222".into())]), ..Script::default() });
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["code"], "FFFF-2222");
         assert!(st.invariants());
     }

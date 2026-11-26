@@ -1,4 +1,4 @@
-use crate::proto::{CONTROL, ClientMsg, Digest, KEEPALIVE, Offer, PROTO_VERSION, RunRequest, ServerMsg};
+use crate::proto::{CONTROL, ClientMsg, Digest, KEEPALIVE, Offer, PROTO_VERSION, RunRequest, ServerMsg, protocol_mismatch};
 use crate::sched::Priority;
 use std::collections::{BTreeSet, HashMap};
 
@@ -159,21 +159,6 @@ pub enum Command {
     Import(String),
     Drift,
     Build,
-}
-
-const SERVER_IN_CARGO_TOML_UNTIL: u32 = 7;
-
-pub fn protocol_mismatch(client: u32) -> String {
-    let server = env!("CARGO_PKG_VERSION");
-    let install = format!("cargo install rargo --version {server}");
-    let (age, verb) = if client < PROTO_VERSION { ("older", "update it") } else { ("newer", "install the matching version") };
-    let rename = if client <= SERVER_IN_CARGO_TOML_UNTIL {
-        "; then name the server once more with `rargo @HOST`, as you did before: the new rargo keeps it in your own \
-         configuration, not in Cargo.toml"
-    } else {
-        ""
-    };
-    format!("this rargo is {age} than the build server, which runs rargo {server}; {verb} with: {install}{rename}")
 }
 
 pub fn command(version: u32, args: &[String], admin: bool, user: &str) -> Command {
@@ -586,13 +571,13 @@ mod tests {
         let server = format!("which runs rargo {}", env!("CARGO_PKG_VERSION"));
         assert!(old.starts_with("this rargo is older than the build server, ") && old.contains(&server), "{old}");
         assert!(old.ends_with(&format!("update it with: {install}")) && !old.contains("protocol"), "{old}");
-        let Command::Fail(oldest) = command(SERVER_IN_CARGO_TOML_UNTIL, &a(&["build"]), false, "bob") else { panic!("a client from before the server left Cargo.toml") };
+        let Command::Fail(oldest) = command(7, &a(&["build"]), false, "bob") else { panic!("a client from before the server left Cargo.toml") };
         assert!(oldest.contains(&format!("update it with: {install}; then name the server once more with `rargo @HOST`")), "{oldest}");
         assert!(oldest.ends_with("not in Cargo.toml") && !oldest.contains("protocol"), "{oldest}");
-        for client in [1, 6, SERVER_IN_CARGO_TOML_UNTIL] {
+        for client in [1, 6, 7] {
             assert!(protocol_mismatch(client).contains("`rargo @HOST`"), "a client that kept its server in Cargo.toml: {client}");
         }
-        for client in SERVER_IN_CARGO_TOML_UNTIL + 1..PROTO_VERSION {
+        for client in 7 + 1..PROTO_VERSION {
             assert!(!protocol_mismatch(client).contains("`rargo @HOST`"), "a client that keeps its server in its own configuration: {client}");
         }
         let Command::Fail(new) = command(PROTO_VERSION + 1, &a(&["build"]), false, "bob") else { panic!("a new client") };

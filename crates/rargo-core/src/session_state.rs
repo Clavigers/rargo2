@@ -531,13 +531,8 @@ fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
     if buf.len() < 9 {
         return Hello::Need(9);
     }
-    if &buf[..8] != magic {
-        let text = if buf[..5] == magic[..5] && buf[6..8] == magic[6..8] {
-            crate::conn_state::protocol_mismatch(buf[5] as u32)
-        } else {
-            "this is a rargo build server, and what connected to it is not rargo".to_string()
-        };
-        return Hello::Foreign(refusal(&text));
+    if buf[..5] != magic[..5] || buf[6..8] != magic[6..8] {
+        return Hello::Foreign(refusal("this is a rargo build server, and what connected to it is not rargo"));
     }
     let user_end = 9 + buf[8] as usize;
     if buf.len() < user_end + 2 {
@@ -548,6 +543,9 @@ fn hello(buf: &[u8], magic: &[u8; 8]) -> Hello {
         return Hello::Need(msg_end);
     }
     assert_eq!(buf.len(), msg_end, "the shell reads exactly what the hello needs");
+    if &buf[..8] != magic {
+        return Hello::Foreign(refusal(&rargo_proto::protocol_mismatch(buf[5] as u32)));
+    }
     let Ok(user) = String::from_utf8(buf[9..user_end].to_vec()) else { return Hello::BadUser };
     Hello::Whole { user, msg1: buf[user_end + 2..].to_vec() }
 }
@@ -685,7 +683,7 @@ mod tests {
         }
         let Hello::Foreign(r) = hello(b"GET / HTTP", magic) else { panic!("another protocol is told so") };
         assert_eq!(r[0], 1);
-        let Hello::Foreign(r) = hello(b"rargo\x07\r\n\x03", magic) else { panic!("an older client is told so") };
+        let Hello::Foreign(r) = hello(b"rargo\x07\r\n\x03ann\x02\x00hi", magic) else { panic!("an older client is told so") };
         let text = String::from_utf8(r[3..].to_vec()).unwrap();
         assert!(text.starts_with("this rargo is older than the build server") && text.contains("cargo install rargo --version "), "{text}");
         assert_eq!(welcome(b"xy"), vec![0, 2, 0, b'x', b'y']);
@@ -716,6 +714,22 @@ mod tests {
         b.extend_from_slice(&(msg1.len() as u16).to_le_bytes());
         b.extend_from_slice(msg1);
         b
+    }
+
+    #[test]
+    fn immediately_older_tcp_hellos_are_read_in_full_before_refusal() {
+        use rargo_proto::secure::MAGIC;
+        for version in [7, 8] {
+            let mut bytes = a_hello("ann", &[42; 48]);
+            bytes[5] = version;
+            let (mut handshake, step) = Handshake::new(MAGIC);
+            let Shake::Reply { write, end: Shook::Refused(_) } = shake_until_check(&mut handshake, step, &bytes) else {
+                panic!("the first message must end with a refusal");
+            };
+            assert_eq!(write[0], 1);
+            assert_eq!(u16::from_le_bytes([write[1], write[2]]) as usize, write.len() - 3);
+            assert_eq!(std::str::from_utf8(&write[3..]).unwrap().trim(), rargo_proto::protocol_mismatch(version.into()));
+        }
     }
 
     #[test]

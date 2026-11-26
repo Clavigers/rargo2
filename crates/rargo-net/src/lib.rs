@@ -343,8 +343,8 @@ impl Conn {
         Ok(())
     }
 
-    fn agree_as_user(&self, name: &str, psk: &[u8; 32]) -> sio::Result<()> {
-        let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral());
+    fn agree_as_user(&self, name: &str, psk: &[u8; 32], marked: bool) -> sio::Result<()> {
+        let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral(), marked);
         self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
@@ -474,6 +474,7 @@ pub struct Endpoint {
     accept_rx: FiberMutex<UnboundedReceiver<Arc<Conn>>>,
     key: LinkKey,
     auth: Auth,
+    marked: bool,
 }
 
 impl Endpoint {
@@ -490,6 +491,10 @@ impl Endpoint {
     }
 
     pub fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> sio::Result<Arc<Endpoint>> {
+        Self::bind_with_hello(addr, accepting, auth, true)
+    }
+
+    fn bind_with_hello(addr: SocketAddr, accepting: bool, auth: Auth, marked: bool) -> sio::Result<Arc<Endpoint>> {
         let key: LinkKey = match &auth {
             Auth::Shared(k) => Some(k.clone()),
             _ => None,
@@ -507,6 +512,7 @@ impl Endpoint {
             accept_rx: FiberMutex::new(rx),
             key,
             auth,
+            marked,
         });
         let ep2 = ep.clone();
         io::spawn(move || ep2.recv_loop());
@@ -530,7 +536,7 @@ impl Endpoint {
         let agreed = match &self.auth {
             Auth::None => Ok(()),
             Auth::Shared(key) => c.agree_as_initiator(key),
-            Auth::User { name, psk } => c.agree_as_user(name, psk),
+            Auth::User { name, psk } => c.agree_as_user(name, psk, self.marked),
             Auth::Users(_) => Err(sio::Error::other("an accepting endpoint does not connect")),
         };
         if let Err(e) = agreed {
