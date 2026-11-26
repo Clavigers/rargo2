@@ -959,6 +959,10 @@ pub(super) fn pid() -> Option<u32> {
     with(|_| PID)
 }
 
+pub(super) fn alive(pid: u32) -> Option<bool> {
+    with(|_| pid == PID || pid == 1)
+}
+
 pub(super) fn uid() -> Option<u32> {
     with(|_| UID)
 }

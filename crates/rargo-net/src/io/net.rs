@@ -52,7 +52,24 @@ pub(super) fn local_of(fd: i32) -> io::Result<SocketAddr> {
     }
 }
 
+/// Calls `call` again whenever a signal interrupts it.
+fn retried(mut call: impl FnMut() -> isize) -> io::Result<usize> {
+    loop {
+        let n = call();
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
 pub(super) fn read_fd(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
+    if !on_fiber() {
+        return retried(|| unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) });
+    }
     match op_event(Op::Recv { fd, len: buf.len(), flags: 0 })? {
         Event::Recv { n, buf: got } => {
             let n = n.min(buf.len()).min(got.len());
@@ -65,11 +82,17 @@ pub(super) fn read_fd(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
 
 pub(super) fn write_all_fd(fd: i32, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
-        let n = match op_event(Op::Send { fd, buf: buf.to_vec() })? {
-            Event::Send { n } if n == 0 => return Err(io::Error::new(ErrorKind::WriteZero, "write closed")),
-            Event::Send { n } => n,
-            _ => return Err(io::Error::other("send")),
+        let n = if !on_fiber() {
+            retried(|| unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) })?
+        } else {
+            match op_event(Op::Send { fd, buf: buf.to_vec() })? {
+                Event::Send { n } => n,
+                _ => return Err(io::Error::other("send")),
+            }
         };
+        if n == 0 {
+            return Err(io::Error::new(ErrorKind::WriteZero, "write closed"));
+        }
         buf = &buf[n..];
     }
     Ok(())
@@ -450,7 +473,23 @@ impl UnixListener {
 }
 
 impl UnixStream {
+    /// Connects with plain system calls, for a caller that is not on a fiber.
+    fn connect_direct(path: &Path) -> io::Result<Self> {
+        let (addr, len) = super::ops::unix_storage(&c_path(path)?)?;
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let stream = Self { fd: OwnedFd { fd } };
+        retried(|| unsafe { libc::connect(fd, (&*addr as *const libc::sockaddr_storage).cast(), len) as isize })?;
+        Ok(stream)
+    }
+
+    /// Connects to the socket at `path`. Off a fiber the stream connects, reads and writes with blocking system calls.
     pub fn connect(path: &Path) -> io::Result<Self> {
+        if !on_fiber() {
+            return Self::connect_direct(path);
+        }
         let fd = sys_socket(libc::AF_UNIX, libc::SOCK_STREAM, 0)?;
         let name = c_path(path)?;
         match op_event(Op::ConnectUnix { fd, path: name }) {
@@ -477,6 +516,22 @@ impl UnixStream {
     }
     pub fn into_split(self) -> (ReadHalf, WriteHalf) {
         split_fd(self.fd.into_raw())
+    }
+}
+
+impl io::Read for UnixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        UnixStream::read(self, buf)
+    }
+}
+
+impl io::Write for UnixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        UnixStream::write_all(self, buf).map(|()| buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
