@@ -101,7 +101,7 @@ impl ScanState {
 }
 
 fn now_ns() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+    rargo_net::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
 }
 
 pub fn hash_file(path: &Path, size: u64) -> io::Result<Digest> {
