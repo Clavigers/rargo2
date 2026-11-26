@@ -175,8 +175,13 @@ def dictator(w: World, lines: list[dict]) -> dict:
 def release(lines: list[dict]) -> dict:
     pub = [l for l in lines if l["event"] == "published"]
     frozen = [l for l in lines if l["event"] == "frozen"]
+    cand = frozen[-1]["version"] if frozen and (not pub or frozen[-1]["version"] != pub[-1]["version"]) else None
+    built = [l for l in lines if l["event"] == "built" and l["version"] == cand]
+    held = [l for l in lines if l["event"] == "release_held" and l["version"] == cand]
     return dict(latest=pub[-1]["version"] if pub else None, latest_t=pub[-1]["t"] if pub else None,
-                candidate=frozen[-1]["version"] if frozen and (not pub or frozen[-1]["version"] != pub[-1]["version"]) else None,
+                candidate=cand, build=built[-1]["build"] if built else None,
+                held=sorted(held[-1]["reasons"]) if held and built and held[-1]["build"] == built[-1]["build"] else [],
+                backports=sum(1 for l in lines if l["event"] == "backported" and l["version"] == cand),
                 pm_running=any(l["actor"] == "pm" for l in lines),
                 pu_running=any(l["actor"] == "power_user" for l in lines))
 
