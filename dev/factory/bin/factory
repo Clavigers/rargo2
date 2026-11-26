@@ -1,0 +1,6 @@
+#!/bin/sh
+# The factory command for agent sessions: the watchdog and foreman put this
+# directory on their PATH and set FACTORY_LOG, FACTORY_ACTOR and
+# FACTORY_PYTHON (the interpreter they run under).
+here=$(dirname "$(readlink -f "$0")")/..
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec "${FACTORY_PYTHON:-python3}" -m factory "$@"

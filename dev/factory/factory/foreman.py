@@ -1,0 +1,147 @@
+"""The foreman. Every tick_minutes it:
+
+1. takes back issues whose holder's session ended (stale) or whose holder is
+   out of quota;
+2. if a bug has been ready longer than preempt_minutes and no agent is free,
+   takes the most recently taken non-bug issue back from its holder;
+3. closes initiatives whose children are all closed, in the log and on
+   GitHub.
+
+All three are decisions inside one tick. Then, outside the tick, it plans: an
+open initiative with no children gets a planning session (a harness run with
+FOREMAN.md as its prompt) that files sub-issues on GitHub, which the observer
+records as the foreman's. The foreman writes no code.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Callable
+
+from . import harness
+from . import machines as M
+from . import model as m
+from .github import GitHub, GitHubError
+from .ledger import Ledger, Refused, utc_now
+from .machines import AgentS, IssueS
+from .model import Kind, Role
+from .watchdog import BIN
+
+
+class Foreman:
+    def __init__(self, ledger: Ledger, gh: GitHub, workdir: Path, prompt: str,
+                 clock: Callable[[], datetime] = utc_now,
+                 plan_timeout: timedelta = timedelta(minutes=45),
+                 replan_after: timedelta = timedelta(hours=24),
+                 run: Callable[..., int] | None = None,
+                 say: Callable[[str], None] = print):
+        self.ledger, self.gh, self.workdir, self.prompt = ledger, gh, Path(workdir), prompt
+        self.clock, self.plan_timeout, self.replan_after = clock, plan_timeout, replan_after
+        self.run_session = run or self._run_session
+        self.say = say
+        self.planned: dict[int, datetime] = {}  # initiative -> when we last tried
+
+    def tick(self) -> None:
+        w = self.ledger.refresh()
+        n = w.tick + 1
+        self._decide("tick_started", tick=n)
+        try:
+            self._take_back()
+            self._preempt()
+            self._close_initiatives()
+        finally:
+            self._decide("tick_ended", tick=n)
+        self._plan()
+
+    def run(self) -> None:
+        while True:
+            self.tick()
+            time.sleep(self.ledger.world.config.foreman.tick_minutes * 60)
+
+    # ------------------------------------------------------------ decisions
+
+    def _take_back(self) -> None:
+        w = self.ledger.world
+        for agent, issue in list(w.holding.items()):
+            if w.is_(M.AGENT, agent, AgentS.off):
+                self._decide("returned", issue=issue, reason="stale")
+            elif w.is_(M.QUOTA, agent, "out"):
+                self._decide("returned", issue=issue, reason="quota")
+
+    def _preempt(self) -> None:
+        w = self.ledger.world
+        limit = w.config.foreman.preempt_minutes
+        if limit is None or w.free_agents():
+            return
+        cutoff = w.t - timedelta(minutes=limit)
+        if not any(i.kind is Kind.bug and w.is_(M.ISSUE, n, IssueS.ready)
+                   and w.since(M.ISSUE, n) <= cutoff for n, i in w.issues.items()):
+            return
+        held = [n for n in w.holding.values() if w.issues[n].kind is not Kind.bug]
+        if held:  # least far in: taken most recently
+            n = max(held, key=lambda n: w.since(M.ISSUE, n))
+            self._decide("returned", issue=n, reason="preempted",
+                         note="a bug has waited longer than the preemption limit")
+
+    def _close_initiatives(self) -> None:
+        w = self.ledger.world
+        for n, i in w.issues.items():
+            if (i.kind is Kind.initiative and w.open_(n) and i.children
+                    and not any(w.open_(c) for c in i.children)):
+                if self._decide("closed", issue=n, reason="done"):
+                    try:
+                        self.gh.close(n, "completed", "Every sub-issue is closed.")
+                    except GitHubError as err:
+                        self.say(f"#{n}: closed in the factory, not on GitHub: {err}")
+
+    def _decide(self, event: str, **fields) -> bool:
+        try:
+            self.ledger.submit(Role.foreman, json.dumps({"event": event, **fields}))
+            return True
+        except Refused as err:
+            self.say(f"foreman: {err}")
+            return False
+
+    # ------------------------------------------------------------ planning
+
+    def _plan(self) -> None:
+        w = self.ledger.refresh()
+        now = self.clock()
+        for n, i in sorted(w.issues.items()):
+            if (i.kind is Kind.initiative and w.open_(n) and not i.children and not i.parked
+                    and now - self.planned.get(n, now - self.replan_after) >= self.replan_after):
+                self.planned[n] = now
+                self.say(f"foreman: planning initiative #{n}")
+                code = self.run_session(n)
+                self.say(f"foreman: planning #{n} ended with exit {code}")
+
+    def _run_session(self, initiative: int) -> int:
+        w = self.ledger.world
+        t = next((a for a in w.config.agents if a.type is m.Harness.claude_code),
+                 w.config.agents[0])
+        cmd = harness.command(t, self.prompt.replace("{initiative}", str(initiative)))
+        if cmd is None:
+            self.say(f"foreman: no {t.type} here to plan with")
+            return 127
+        argv, extra = cmd
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        if (self.workdir / ".git").exists():  # plan against today's main
+            subprocess.run(["git", "-C", str(self.workdir), "pull", "-q", "--ff-only"],
+                           capture_output=True)
+        log = self.workdir / f"plan-{initiative}-{self.clock():%Y%m%dT%H%M%S}.log"
+        env = os.environ | extra | {
+            "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.foreman,
+            "FACTORY_PYTHON": sys.executable,
+            "PATH": f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}"}
+        with open(log, "wb") as out:
+            try:
+                return subprocess.run(argv, cwd=self.workdir, env=env, stdin=subprocess.DEVNULL,
+                                      stdout=out, stderr=subprocess.STDOUT,
+                                      timeout=self.plan_timeout.total_seconds()).returncode
+            except subprocess.TimeoutExpired:
+                return 124
