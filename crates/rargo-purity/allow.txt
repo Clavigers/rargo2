@@ -108,7 +108,7 @@ pure-tests	crates/rargo-core/src/remote.rs	1	tests still touch the world instead
 pure-tests	crates/rargo-core/src/sched.rs	1	tests still touch the world instead of memory: libc calls (1)
 pure-tests	crates/rargo-core/src/session.rs	1	tests still touch the world instead of memory: tempdirs (1)
 pure-tests	crates/rargo-core/src/snapshot.rs	8	tests still touch the world instead of memory: shared state (4), tempdirs (2), the filesystem (2)
-pure-tests	crates/rargo-core/src/store.rs	14	tests still touch the world instead of memory: the filesystem (10), tempdirs (2), shared state (2)
+pure-tests	crates/rargo-core/src/store.rs	16	tests still touch the world instead of memory: the filesystem (12, including changing hardlink permissions for non-root testing), tempdirs (2), shared state (2)
 pure-tests	crates/rargo-core/tests/engine.rs	20	tests still touch the world instead of memory: the filesystem (17), tempdirs (2), the environment (1)
 pure-tests	crates/rargo-net/src/endpoint.rs	4	tests still touch the world instead of memory: the network (4)
 pure-tests	crates/rargo/src/git.rs	24	tests still touch the world instead of memory: the filesystem (18), processes (4), tempdirs (2)
