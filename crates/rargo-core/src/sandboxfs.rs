@@ -455,7 +455,7 @@ impl SandboxFs {
     }
 
     fn retire(&self, id: i32) {
-        self.retired.lock().push((std::time::Instant::now(), id));
+        self.retired.lock().push((crate::io::now(), id));
     }
 
     fn reap_retired(&self) {
@@ -464,7 +464,7 @@ impl SandboxFs {
         if r.is_empty() {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = crate::io::now();
         r.retain(|(t, id)| {
             if now.duration_since(*t) > RETIRE_GRACE {
                 let _ = sess.backing_close(*id);
@@ -619,7 +619,7 @@ fn walk_upper(st: &State, view: &dyn View, dir: u32, dir_path: &[u8], full: bool
 }
 
 fn now() -> (i64, u32) {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let d = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (d.as_secs() as i64, d.subsec_nanos())
 }
 
@@ -1196,8 +1196,7 @@ impl Filesystem for SandboxFs {
             match &mut st.nodes[local as usize] {
                 Kind::File(f) => {
                     if let Src::Upper { file, .. } = &f.src {
-                        let ts = [conv(set.atime), conv(set.mtime)];
-                        unsafe { libc::futimens(file.as_raw_fd(), ts.as_ptr()) };
+                        let _ = file.set_times(conv(set.atime), conv(set.mtime));
                     }
                 }
                 Kind::Dir(d) => {
@@ -1573,10 +1572,7 @@ impl Filesystem for SandboxFs {
         let st = a.st.lock();
         if let Some(Kind::File(f)) = st.nodes.get(n as usize) {
             if let Src::Upper { file, .. } = &f.src {
-                let r = unsafe {
-                    libc::fallocate(file.as_raw_fd(), mode as i32, offset as i64, length as i64)
-                };
-                return if r == 0 { Ok(()) } else { Err(Errno::last()) };
+                return file.allocate(mode as i32, offset, length).map_err(Errno::from);
             }
         }
         Err(Errno::EBADF)

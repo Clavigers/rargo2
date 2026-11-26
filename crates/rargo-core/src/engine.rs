@@ -895,8 +895,8 @@ impl Engine {
         for d in &spec.mkdirs {
             action.mkdir_p(d).map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
         }
-        let (out_r, out_w) = io::pipe::pipe()?;
-        let (err_r, err_w) = io::pipe::pipe()?;
+        let (out_r, out_w) = io::sys::pipe()?;
+        let (err_r, err_w) = io::sys::pipe()?;
         let setup = SetupSpec { argv: spec.argv.clone(), env: spec.env.clone(), cwd: spec.cwd.clone(), net: spec.net };
         let host = HostLayout {
             place: self.place,
