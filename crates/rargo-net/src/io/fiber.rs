@@ -26,6 +26,8 @@ thread_local! {
 pub(super) enum Pause {
     Park,
     Submit { op: Op, cpu: bool },
+    /// The backend already holds the operation under this token.
+    Wait { token: u64 },
 }
 
 pub(super) enum Resume {
@@ -286,7 +288,14 @@ pub(super) fn park() {
 }
 
 pub(super) fn park_op(op: Op, cpu: bool) -> Event {
-    let mut resumed = park_raw(Pause::Submit { op, cpu });
+    let pause = match backend() {
+        Some(Backend::Sim(sim)) if sim.answers_in_place() => match sim.answer_in_place(op) {
+            Ok(event) => return event,
+            Err(token) => Pause::Wait { token },
+        },
+        _ => Pause::Submit { op, cpu },
+    };
+    let mut resumed = park_raw(pause);
     loop {
         match resumed {
             Resume::Event(event) => return event,
@@ -436,6 +445,10 @@ pub(super) fn resume_one(sched: *mut Sched, id: u64) {
             s.fibers.get_mut(&id).unwrap().co = Some(co);
             match pause {
                 Pause::Park => {}
+                Pause::Wait { token } => {
+                    s.fibers.get_mut(&id).unwrap().token = Some(token);
+                    s.waiting.insert(token, id);
+                }
                 Pause::Submit { op, cpu } => match s.ring.submit(op) {
                     Ok(token) => {
                         {

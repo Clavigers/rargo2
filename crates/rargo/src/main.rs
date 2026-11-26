@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn writes_of_one_path_at_once_all_succeed() {
-        io::sim::test(|| {
+        let _ = io::sim::run(0, io::sim::Net::default(), || {
             let dir = io::sim::tempdir();
             let path = dir.join("shared");
             let writers: Vec<_> = (0..16)

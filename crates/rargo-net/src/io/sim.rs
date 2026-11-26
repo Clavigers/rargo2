@@ -149,6 +149,8 @@ enum Due {
 pub struct SimLoop {
     rng: Rng,
     net: Net,
+    /// Whether an operation that needs no waiting is answered where it is asked, without the fiber giving way.
+    in_place: bool,
     now_ms: u64,
     base: Instant,
     next_token: u64,
@@ -206,6 +208,7 @@ impl SimLoop {
         files.insert(PathBuf::from("/"), Node::Dir { mode: 0o755, mtime_ns: (EPOCH_S * 1_000_000_000) as i64 });
         SimLoop {
             rng: Rng(seed),
+            in_place: false,
             net,
             now_ms: 0,
             base: Instant::now(),
@@ -813,6 +816,22 @@ fn datagram_event(from: SocketAddr, mut bytes: Vec<u8>, len: usize, with_addr: b
 }
 
 impl SimLoop {
+    pub(super) fn answers_in_place(&self) -> bool {
+        self.in_place
+    }
+
+    /// Answers an operation that needs no waiting at once. One that must wait is held, and its token comes back.
+    pub(super) fn answer_in_place(&mut self, op: Op) -> Result<Event, u64> {
+        let token = self.next_token;
+        self.next_token += 1;
+        self.report.ops += 1;
+        match self.answer(token, op) {
+            Ok(Some(event)) => Ok(event),
+            Ok(None) => Err(token),
+            Err(err) => Ok(Event::Failed(err)),
+        }
+    }
+
     pub(super) fn submit(&mut self, op: Op) -> io::Result<u64> {
         let token = self.next_token;
         self.next_token += 1;
@@ -1231,9 +1250,19 @@ pub(super) fn uid() -> Option<u32> {
     with(|_| UID)
 }
 
-/// Runs `body` in a simulation with seed 0 and a clean network: the way a unit test gets files, a clock and an environment that live in memory.
+/// Runs `body` in a simulation with seed 0 and a clean network: the way a
+/// unit test gets files, a clock and an environment that live in memory.
+///
+/// An operation that needs no waiting (a file read, a write, a stat) is
+/// answered where it is asked, so a fiber gives way to others only when it
+/// sleeps, waits on a socket or pipe, or yields. That makes a test of one
+/// fiber several times cheaper. A test of how fibers interleave at every
+/// operation uses `run`, where each operation is a point at which another
+/// fiber may go first, as on the real loop.
 pub fn test<R: 'static>(body: impl FnOnce() -> R + 'static) -> R {
-    run(0, Net::default(), body).0
+    let mut sim = SimLoop::new(0, Net::default());
+    sim.in_place = true;
+    run_on(sim, body).0
 }
 
 /// A fresh empty directory in the simulated filesystem.
@@ -1255,9 +1284,13 @@ pub fn tempdir() -> PathBuf {
 /// Runs `main` as the first fiber of a simulated loop and returns its result
 /// with what the run looked like.
 pub fn run<R: 'static>(seed: u64, net: Net, main: impl FnOnce() -> R + 'static) -> (R, Report) {
+    run_on(SimLoop::new(seed, net), main)
+}
+
+fn run_on<R: 'static>(sim: SimLoop, main: impl FnOnce() -> R + 'static) -> (R, Report) {
     let out = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = std::rc::Rc::clone(&out);
-    let report = fiber::drive_sim(SimLoop::new(seed, net), move || {
+    let report = fiber::drive_sim(sim, move || {
         *slot.borrow_mut() = Some(main());
         fiber::rest_in_background();
     });
