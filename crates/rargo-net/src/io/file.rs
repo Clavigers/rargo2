@@ -641,6 +641,30 @@ impl File {
         }
         direct(unsafe { libc::fchmod(self.fd, mode) } as isize, |_| ())
     }
+
+    /// Sets the access and modification times as `futimens` does, so a time may be `UTIME_NOW` or `UTIME_OMIT`. A simulated file keeps only its modification time.
+    pub fn set_times(&self, atime: libc::timespec, mtime: libc::timespec) -> io::Result<()> {
+        if super::sim::active() {
+            let mtime_ns = match mtime.tv_nsec {
+                libc::UTIME_OMIT => None,
+                libc::UTIME_NOW => Some(super::sim::system_now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64)),
+                nsec => Some(mtime.tv_sec * 1_000_000_000 + nsec),
+            };
+            if let Some(done) = super::sim::set_fd_modified(self.fd, mtime_ns) {
+                return done;
+            }
+        }
+        let times = [atime, mtime];
+        direct(unsafe { libc::futimens(self.fd, times.as_ptr()) } as isize, |_| ())
+    }
+
+    /// Reserves or releases a range of the file as `fallocate` does.
+    pub fn allocate(&self, mode: i32, offset: u64, len: u64) -> io::Result<()> {
+        if let Some(done) = super::sim::allocate(self.fd, mode, offset, len) {
+            return done;
+        }
+        direct(unsafe { libc::fallocate(self.fd, mode, offset as libc::off_t, len as libc::off_t) } as isize, |_| ())
+    }
 }
 
 impl std::io::Read for File {

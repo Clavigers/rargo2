@@ -132,3 +132,51 @@ fn a_deadlock_is_reported() {
         notify.notified();
     });
 }
+
+#[test]
+fn a_pipe_holds_its_bytes_in_memory() {
+    sim::test(|| {
+        use std::os::fd::AsRawFd;
+        let (r, w) = io::pipe().unwrap();
+        let (r_fd, w_fd) = (r.as_raw_fd(), w.as_raw_fd());
+        assert_eq!(io::try_read(r_fd, 1).unwrap(), None, "an empty pipe has nothing to take");
+        assert_eq!(io::write_now(w_fd, b"abc").unwrap(), 3);
+        assert_eq!(io::queued(r_fd).unwrap(), 3);
+        assert_eq!(io::try_read(r_fd, 1).unwrap(), Some(b"a".to_vec()));
+        let second = r.nonblocking_reader().unwrap();
+        assert_eq!(io::try_read(second.as_raw_fd(), 8).unwrap(), Some(b"bc".to_vec()), "a second reader takes from the same pipe");
+
+        let mut reader = io::spawn(move || io::read_at(r_fd, 0, 8).unwrap());
+        io::sleep(std::time::Duration::from_millis(5));
+        assert!(!reader.is_finished(), "a read of an empty pipe waits");
+        io::write_at(w_fd, 0, b"late").unwrap();
+        assert_eq!(reader.join().unwrap(), b"late");
+
+        let mut ended = io::spawn(move || io::read_at(r_fd, 0, 8).unwrap());
+        io::yield_now();
+        drop(w);
+        assert_eq!(ended.join().unwrap(), b"", "a pipe with no writer left ends");
+        drop((r, second));
+    });
+}
+
+#[test]
+fn a_file_takes_times_and_allocation_through_its_descriptor() {
+    sim::test(|| {
+        use crate::io::file;
+        let path = sim::tempdir().join("f");
+        let f = file::File::create(&path).unwrap();
+        f.write_all_at(b"abcdef", 0).unwrap();
+        let omit = libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT };
+        f.set_times(omit, libc::timespec { tv_sec: 77, tv_nsec: 5 }).unwrap();
+        assert_eq!(file::metadata(&path).unwrap().mtime_ns(), 77_000_000_005);
+        f.set_times(omit, omit).unwrap();
+        assert_eq!(file::metadata(&path).unwrap().mtime_ns(), 77_000_000_005, "an omitted time stays");
+        f.allocate(0, 0, 10).unwrap();
+        assert_eq!(file::metadata(&path).unwrap().len(), 10);
+        f.allocate(libc::FALLOC_FL_KEEP_SIZE, 0, 100).unwrap();
+        assert_eq!(file::metadata(&path).unwrap().len(), 10);
+        f.allocate(libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, 1, 2).unwrap();
+        assert_eq!(file::read(&path).unwrap(), b"a\0\0def\0\0\0\0");
+    });
+}

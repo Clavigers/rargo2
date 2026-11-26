@@ -109,10 +109,19 @@ enum Node {
     Link(PathBuf),
 }
 
+/// The bytes written to a pipe and not yet read.
+#[derive(Default)]
+struct Pipe {
+    data: VecDeque<u8>,
+    /// The parked read: its token and its buffer size.
+    waiter: Option<(u64, usize)>,
+}
+
 enum Handle {
     Sock(Sock),
     File { ino: u64, path: PathBuf },
     Dir { path: PathBuf },
+    Pipe { id: u64, writes: bool },
 }
 
 /// What a simulated command prints and how it exits.
@@ -151,6 +160,7 @@ pub struct SimLoop {
     bound: BTreeMap<SocketAddr, i32>,
     files: BTreeMap<PathBuf, Node>,
     inodes: BTreeMap<u64, Inode>,
+    pipes: BTreeMap<u64, Pipe>,
     env: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     commands: Option<Commands>,
     report: Report,
@@ -204,6 +214,7 @@ impl SimLoop {
             bound: BTreeMap::new(),
             files,
             inodes: BTreeMap::new(),
+            pipes: BTreeMap::new(),
             env: BTreeMap::new(),
             commands: None,
             report: Report { elapsed_ms: 0, ops: 0, datagrams_sent: 0, datagrams_lost: 0, datagrams_duplicated: 0, trace: 0xcbf2_9ce4_8422_2325 },
@@ -259,7 +270,7 @@ impl SimLoop {
         }
         match self.handles.get(&dir) {
             Some(Handle::Dir { path: base }) | Some(Handle::File { path: base, .. }) => Ok(normal(&base.join(path))),
-            Some(Handle::Sock(_)) => Err(errno(libc::ENOTDIR)),
+            Some(Handle::Sock(_)) | Some(Handle::Pipe { .. }) => Err(errno(libc::ENOTDIR)),
             None => Err(errno(libc::EBADF)),
         }
     }
@@ -428,10 +439,52 @@ impl SimLoop {
         let ino = match self.handles.get(&fd) {
             Some(Handle::File { ino, .. }) => *ino,
             Some(Handle::Dir { .. }) => return Err(errno(libc::EISDIR)),
-            Some(Handle::Sock(_)) => return Err(errno(libc::ESPIPE)),
+            Some(Handle::Sock(_)) | Some(Handle::Pipe { .. }) => return Err(errno(libc::ESPIPE)),
             None => return Err(errno(libc::EBADF)),
         };
         Ok(self.inodes.get_mut(&ino).expect("an open file keeps its inode"))
+    }
+
+    /// The pipe `fd` is an end of, and whether it is the writing end.
+    fn pipe_end(&self, fd: i32) -> Option<(u64, bool)> {
+        match self.handles.get(&fd) {
+            Some(Handle::Pipe { id, writes }) => Some((*id, *writes)),
+            _ => None,
+        }
+    }
+
+    /// Takes up to `len` bytes out of a pipe, or nothing when it is empty.
+    fn pipe_take(&mut self, id: u64, len: usize) -> Option<Vec<u8>> {
+        let pipe = self.pipes.get_mut(&id).expect("an open end keeps its pipe");
+        if pipe.data.is_empty() {
+            return None;
+        }
+        let n = len.min(pipe.data.len());
+        Some(pipe.data.drain(..n).collect())
+    }
+
+    /// Puts bytes into a pipe and hands them to the read parked on it.
+    fn pipe_put(&mut self, id: u64, bytes: &[u8]) {
+        let pipe = self.pipes.get_mut(&id).expect("an open end keeps its pipe");
+        pipe.data.extend(bytes);
+        if let Some((token, len)) = pipe.waiter.take() {
+            let buf = self.pipe_take(id, len).expect("the pipe was just written");
+            self.done(token, Event::Read { n: buf.len(), buf });
+        }
+    }
+
+    /// Forgets a closed end of a pipe: a read parked on a pipe with no writer left sees its end, and a pipe with no end left is freed.
+    fn pipe_closed(&mut self, id: u64) {
+        let open = |sim: &SimLoop, writing: bool| sim.handles.values().any(|h| matches!(h, Handle::Pipe { id: held, writes } if *held == id && *writes == writing));
+        let (writers, readers) = (open(self, true), open(self, false));
+        if !writers {
+            if let Some((token, _)) = self.pipes.get_mut(&id).and_then(|pipe| pipe.waiter.take()) {
+                self.done(token, Event::Read { n: 0, buf: Vec::new() });
+            }
+        }
+        if !writers && !readers {
+            self.pipes.remove(&id);
+        }
     }
 
     fn stat_node(&self, path: &Path) -> io::Result<Box<libc::statx>> {
@@ -481,7 +534,7 @@ impl SimLoop {
                     Ok(Box::new(st))
                 }
                 Some(Handle::Dir { path }) => self.stat_node(&path.clone()),
-                Some(Handle::Sock(_)) => Err(errno(libc::EINVAL)),
+                Some(Handle::Sock(_)) | Some(Handle::Pipe { .. }) => Err(errno(libc::EINVAL)),
                 None => Err(errno(libc::EBADF)),
             };
         }
@@ -593,11 +646,37 @@ impl SimLoop {
                     }
                     Some(Handle::File { ino, .. }) => self.reap(ino),
                     Some(Handle::Dir { .. }) => {}
+                    Some(Handle::Pipe { id, .. }) => self.pipe_closed(id),
                     None => return Err(errno(libc::EBADF)),
                 }
                 Event::Closed
             }
             Op::OpenAt { dir, path, flags, mode } => Event::Open { fd: self.open(dir, &path, flags, mode)? },
+            Op::Read { fd, len, .. } if self.pipe_end(fd).is_some() => {
+                let (id, writes) = self.pipe_end(fd).expect("checked above");
+                if writes {
+                    return Err(errno(libc::EBADF));
+                }
+                match self.pipe_take(id, len) {
+                    Some(buf) => Event::Read { n: buf.len(), buf },
+                    None => {
+                        let pipe = self.pipes.get_mut(&id).expect("an open end keeps its pipe");
+                        if pipe.waiter.is_some() {
+                            return Err(unsupported("two reads parked on one pipe"));
+                        }
+                        pipe.waiter = Some((token, len));
+                        return Ok(None);
+                    }
+                }
+            }
+            Op::Write { fd, buf, .. } if self.pipe_end(fd).is_some() => {
+                let (id, writes) = self.pipe_end(fd).expect("checked above");
+                if !writes {
+                    return Err(errno(libc::EBADF));
+                }
+                self.pipe_put(id, &buf);
+                Event::Write { n: buf.len() }
+            }
             Op::Read { fd, off, len } => {
                 let data = &self.file(fd)?.data;
                 let start = (off as usize).min(data.len());
@@ -746,6 +825,11 @@ impl SimLoop {
                 }
             }
         }
+        for pipe in self.pipes.values_mut() {
+            if pipe.waiter.is_some_and(|(t, _)| t == token) {
+                pipe.waiter = None;
+            }
+        }
     }
 }
 
@@ -809,9 +893,67 @@ pub(super) fn close_now(fd: i32) -> bool {
             }
         }
         Some(Handle::File { ino, .. }) => sim.reap(ino),
+        Some(Handle::Pipe { id, .. }) => sim.pipe_closed(id),
         Some(Handle::Dir { .. }) | None => {}
     })
     .is_some()
+}
+
+/// A pipe held in memory: its reading end and its writing end.
+pub(super) fn pipe() -> Option<(i32, i32)> {
+    with(|sim| {
+        let id = sim.next_ino;
+        sim.next_ino += 1;
+        sim.pipes.insert(id, Pipe::default());
+        (sim.fd(Handle::Pipe { id, writes: false }), sim.fd(Handle::Pipe { id, writes: true }))
+    })
+}
+
+/// A second reading end of the pipe `fd` reads.
+pub(super) fn pipe_reader(fd: i32) -> Option<io::Result<i32>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| match sim.pipe_end(fd) {
+        Some((id, _)) => Ok(sim.fd(Handle::Pipe { id, writes: false })),
+        None => Err(errno(libc::EBADF)),
+    })
+}
+
+/// What a read of a simulated pipe gets without waiting: nothing when the pipe is empty.
+pub(super) fn pipe_try_read(fd: i32, len: usize) -> Option<io::Result<Option<Vec<u8>>>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| match sim.pipe_end(fd) {
+        Some((id, false)) => Ok(sim.pipe_take(id, len)),
+        _ => Err(errno(libc::EBADF)),
+    })
+}
+
+/// Writes to a simulated pipe, which is never full.
+pub(super) fn pipe_write(fd: i32, bytes: &[u8]) -> Option<io::Result<usize>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| match sim.pipe_end(fd) {
+        Some((id, true)) => {
+            sim.pipe_put(id, bytes);
+            Ok(bytes.len())
+        }
+        _ => Err(errno(libc::EBADF)),
+    })
+}
+
+/// How many bytes wait in a simulated pipe.
+pub(super) fn pipe_queued(fd: i32) -> Option<io::Result<usize>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| match sim.pipe_end(fd) {
+        Some((id, _)) => Ok(sim.pipes[&id].data.len()),
+        None => Err(errno(libc::EBADF)),
+    })
 }
 
 /// The wall clock. In a simulation it starts at a fixed date and moves with the simulated clock.
@@ -881,6 +1023,42 @@ pub(super) fn set_fd_mode(fd: i32, mode: u32) -> Option<io::Result<()>> {
     with(|sim| sim.file(fd).map(|inode| inode.mode = mode & 0o7777))
 }
 
+/// Sets a simulated file's modification time through its descriptor; `None` leaves it alone.
+pub(super) fn set_fd_modified(fd: i32, mtime_ns: Option<i64>) -> Option<io::Result<()>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| {
+        sim.file(fd).map(|inode| {
+            if let Some(ns) = mtime_ns {
+                inode.mtime_ns = ns;
+            }
+        })
+    })
+}
+
+/// `fallocate` on a simulated file: it grows to cover the range unless told to keep its size, and a punched range reads as zeros.
+pub(super) fn allocate(fd: i32, mode: i32, offset: u64, len: u64) -> Option<io::Result<()>> {
+    if fd < FIRST_FD {
+        return None;
+    }
+    with(|sim| {
+        let inode = sim.file(fd)?;
+        let end = (offset + len) as usize;
+        if mode & !(libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE) != 0 {
+            return Err(errno(libc::EOPNOTSUPP));
+        }
+        if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 {
+            let end = end.min(inode.data.len());
+            let start = (offset as usize).min(end);
+            inode.data[start..end].fill(0);
+        } else if mode & libc::FALLOC_FL_KEEP_SIZE == 0 && inode.data.len() < end {
+            inode.data.resize(end, 0);
+        }
+        Ok(())
+    })
+}
+
 pub(super) fn set_modified(path: &Path, at: std::time::SystemTime) -> Option<io::Result<()>> {
     with(|sim| {
         let path = sim.real(path)?;
@@ -921,6 +1099,10 @@ pub(super) fn dup(fd: i32) -> Option<io::Result<i32>> {
             Ok(sim.fd(handle))
         }
         Some(Handle::Sock(_)) => Err(unsupported("duplicating a socket")),
+        Some(Handle::Pipe { id, writes }) => {
+            let handle = Handle::Pipe { id: *id, writes: *writes };
+            Ok(sim.fd(handle))
+        }
         None => Err(errno(libc::EBADF)),
     })
 }
