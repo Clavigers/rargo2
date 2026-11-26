@@ -127,6 +127,8 @@ pub struct Report {
     pub runs: u64,
     pub cache_hits: u64,
     pub cuts: u64,
+    pub worker_crashes: u64,
+    pub jobs_lost_to_crashes: u64,
     pub evictions: u64,
     pub uploads: u64,
     pub wants: u64,
@@ -214,8 +216,9 @@ enum Msg {
 #[derive(Debug)]
 enum Ev {
     Deliver { from: Node, to: Node, epoch: u64, msg: Msg },
-    Connect { worker: u64 },
-    Finish { worker: u64, token: u64 },
+    Connect { worker: u64, epoch: u64 },
+    Finish { worker: u64, epoch: u64, token: u64 },
+    Crash { worker: u64 },
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
@@ -350,6 +353,8 @@ impl World {
                 runs: 0,
                 cache_hits: 0,
                 cuts: 0,
+                worker_crashes: 0,
+                jobs_lost_to_crashes: 0,
                 evictions: 0,
                 uploads: 0,
                 wants: 0,
@@ -405,6 +410,8 @@ impl World {
             for id in 1..=w.cfg.workers {
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
                 w.schedule(at, Ev::Cut { worker: id });
+                let at = w.rng.range(0, w.cfg.fault_end_ms);
+                w.schedule(at, Ev::Crash { worker: id });
             }
             for _ in 0..w.cfg.client_cuts {
                 let client = w.rng.range(1, w.cfg.clients);
@@ -554,6 +561,9 @@ impl World {
             }
         }
         for (job, j) in &self.server.jobs {
+            if let Some(h) = j.inputs.iter().find(|h| !self.server.store.contains_key(h)) {
+                return Err(Kind::LostPinned(format!("input {} of unfinished job {job} is gone", h.hex())));
+            }
             if let Some(w) = j.worker {
                 assert!(self.server.pool.route(w, *job), "job {job} sent to worker {w} is routed there");
             }
@@ -564,8 +574,9 @@ impl World {
     fn step(&mut self, ev: Ev) -> Step {
         match ev {
             Ev::Deliver { from, to, epoch, msg } => self.deliver(from, to, epoch, msg),
-            Ev::Connect { worker } => self.connect(worker),
-            Ev::Finish { worker, token } => self.finish(worker, token),
+            Ev::Connect { worker, epoch } => self.connect(worker, epoch),
+            Ev::Finish { worker, epoch, token } => self.finish(worker, epoch, token),
+            Ev::Crash { worker } => self.crash(worker),
             Ev::Cut { worker } => self.cut(worker),
             Ev::Evict => {
                 self.evict();
@@ -629,10 +640,10 @@ impl World {
         }
     }
 
-    fn connect(&mut self, worker: u64) -> Step {
+    fn connect(&mut self, worker: u64, epoch: u64) -> Step {
         let now = self.now;
         let node = self.workers.get_mut(&worker).expect("known");
-        if node.up {
+        if node.up || node.epoch != epoch {
             return Ok(());
         }
         let fx = if now < node.cut_until {
@@ -667,13 +678,39 @@ impl World {
         Ok(())
     }
 
+    fn crash(&mut self, worker: u64) -> Step {
+        let downtime = self.rng.range(1, 1_000);
+        let node = self.workers.get_mut(&worker).expect("known");
+        let (sm, mut fx) = Worker::new();
+        let [worker_state::Effect::Connect { after_ms }] = fx.as_mut_slice() else {
+            unreachable!("a new worker only connects");
+        };
+        // A fresh worker quits if its first connection fails. Wait out any link cut.
+        *after_ms = downtime.max(node.cut_until.saturating_sub(self.now));
+        node.sm = sm;
+        node.running.clear();
+        // A process crash drops in-flight work. The simulated worker disk survives.
+        node.up = false;
+        node.epoch += 1;
+        self.report.worker_crashes += 1;
+
+        let lost = self.server.pool.left(worker);
+        self.report.jobs_lost_to_crashes += lost
+            .iter()
+            .filter(|effect| matches!(effect, pool_state::Effect::Lost { .. }))
+            .count() as u64;
+        self.pool_effects(lost);
+        self.worker_effects(worker, fx)
+    }
+
     fn worker_effects(&mut self, worker: u64, fx: Vec<worker_state::Effect<Sim>>) -> Step {
         let mut queue: VecDeque<worker_state::Effect<Sim>> = fx.into();
         while let Some(e) = queue.pop_front() {
             match e {
                 worker_state::Effect::Connect { after_ms } => {
                     let jitter = self.rng.range(0, 50);
-                    self.schedule(after_ms + jitter, Ev::Connect { worker });
+                    let epoch = self.workers[&worker].epoch;
+                    self.schedule(after_ms + jitter, Ev::Connect { worker, epoch });
                 }
                 worker_state::Effect::Quit => {}
                 worker_state::Effect::Hello => {
@@ -699,7 +736,8 @@ impl World {
                     }
                     let ms = run.ms;
                     node.running.insert(token, (action, run));
-                    self.schedule(ms, Ev::Finish { worker, token });
+                    let epoch = node.epoch;
+                    self.schedule(ms, Ev::Finish { worker, epoch, token });
                 }
                 worker_state::Effect::Abort { token } => {
                     self.workers.get_mut(&worker).expect("known").running.remove(&token);
@@ -710,8 +748,11 @@ impl World {
         Ok(())
     }
 
-    fn finish(&mut self, worker: u64, token: u64) -> Step {
+    fn finish(&mut self, worker: u64, epoch: u64, token: u64) -> Step {
         let node = self.workers.get_mut(&worker).expect("known");
+        if node.epoch != epoch {
+            return Ok(());
+        }
         let Some((job, run)) = node.running.remove(&token) else { return Ok(()) };
         let inputs: Vec<&[u8]> = run.inputs.iter().map(|h| node.store[h].as_slice()).collect();
         let output = model::compile(self.project.actions[run.action].id, &inputs);
@@ -736,12 +777,28 @@ impl World {
         }
         let ignore_pins = self.bug == Some(Bug::EvictPinned);
         let ignore_claims = self.bug == Some(Bug::EvictClaimed);
+        // Jobs can outlive the client round that pinned their inputs.
+        let job_inputs: BTreeSet<Hash> = self.server.jobs.values().flat_map(|j| j.inputs.iter().copied()).collect();
+        // An offer may rely on blobs already in the store without claiming them.
+        let offered: BTreeSet<Hash> = self
+            .server
+            .sessions
+            .values()
+            .filter_map(|s| s.offer.as_ref())
+            .flat_map(|o| o.contents.iter().copied())
+            .collect();
         let candidates: Vec<Hash> = self
             .server
             .store
             .keys()
-            .filter(|h| ignore_pins || self.server.pins.get(h).copied().unwrap_or(0) == 0)
-            .filter(|h| ignore_claims || self.server.trees.holder(h).is_none())
+            .filter(|h| ignore_pins || (!self.server.pins.contains_key(h) && !job_inputs.contains(h)))
+            .filter(|h| {
+                if self.server.trees.holder(h).is_some() {
+                    ignore_claims
+                } else {
+                    !offered.contains(h)
+                }
+            })
             .copied()
             .collect();
         if candidates.is_empty() {
@@ -825,7 +882,9 @@ impl World {
                     }
                 }
                 if wake {
-                    self.try_finish_offer(client);
+                    for client in self.pending_offers() {
+                        self.try_finish_offer(client);
+                    }
                 }
             }
             Up::Request { round, action, inputs } => {
@@ -863,10 +922,13 @@ impl World {
         let Some(sess) = self.server.sessions.remove(&client) else { return };
         let Some(o) = sess.offer else { return };
         self.server.trees.release(o.up);
-        let others: Vec<u64> = self.server.sessions.iter().filter(|(_, s)| s.offer.is_some()).map(|(c, _)| *c).collect();
-        for other in others {
+        for other in self.pending_offers() {
             self.rewant(other);
         }
+    }
+
+    fn pending_offers(&self) -> Vec<u64> {
+        self.server.sessions.iter().filter(|(_, s)| s.offer.is_some()).map(|(c, _)| *c).collect()
     }
 
     fn rewant(&mut self, client: u64) {
@@ -1307,8 +1369,9 @@ fn label(ev: &Ev) -> String {
             };
             format!("{from:?}>{to:?}@{epoch}:{what};")
         }
-        Ev::Connect { worker } => format!("connect {worker};"),
-        Ev::Finish { worker, token } => format!("finish {worker}/{token};"),
+        Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
+        Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
+        Ev::Crash { worker } => format!("crash {worker};"),
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),

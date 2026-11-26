@@ -30,9 +30,28 @@ fn a_seed_replays_the_same_run() {
 }
 
 #[test]
+fn a_worker_restarts_even_if_its_link_was_cut_when_it_crashed() {
+    let report = run(85, None).expect("the only worker reconnects and the build finishes");
+    assert_eq!(report.cuts, 1);
+    assert_eq!(report.worker_crashes, 1);
+}
+
+#[test]
+fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
+    clean(635..636);
+    clean(8360..8361);
+    clean(9391..9392);
+}
+
+#[test]
 fn the_seeds_exercise_faults_the_cache_and_eviction() {
     let reports: Vec<_> = (0..100).map(|s| run(s, None).expect("passes")).collect();
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
+    assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
+    assert!(
+        reports.iter().any(|r| r.jobs_lost_to_crashes > 0),
+        "jobs interrupted by worker crashes are recovered"
+    );
     assert!(reports.iter().any(|r| r.cache_hits > 0), "actions are answered from the cache");
     assert!(reports.iter().any(|r| r.evictions > 0), "content is evicted");
     assert!(reports.iter().any(|r| r.uploads > 0), "clients upload sources");
