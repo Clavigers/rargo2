@@ -1,4 +1,5 @@
 use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
+use crate::io::db::{WriterTask, WriterWake};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use redb::{Database, TableDefinition};
@@ -106,8 +107,6 @@ struct Shared {
     db: Database,
     writer: Mutex<DbWriter>,
     flushing: Mutex<()>,
-    wake: std::sync::OnceLock<crate::io::Notify>,
-    stop: Mutex<bool>,
     born: Instant,
 }
 
@@ -119,7 +118,7 @@ impl Shared {
 
 pub struct Db {
     shared: Arc<Shared>,
-    writing: std::sync::Once,
+    writing: WriterTask,
 }
 
 impl Db {
@@ -144,28 +143,14 @@ impl Db {
             db,
             writer: Mutex::new(DbWriter::new()),
             flushing: Mutex::new(()),
-            wake: std::sync::OnceLock::new(),
-            stop: Mutex::new(false),
             born: crate::io::now(),
         });
-        Ok(Db { shared, writing: std::sync::Once::new() })
+        Ok(Db { shared, writing: WriterTask::default() })
     }
 
     fn written(&self) {
-        if let Some(wake) = self.shared.wake.get() {
-            wake.notify_one();
-            return;
-        }
-        if !crate::io::loop_running() {
-            return;
-        }
-        self.writing.call_once(|| {
-            let shared = self.shared.clone();
-            crate::io::background(move || {
-                let _ = shared.wake.set(crate::io::Notify::new());
-                writer_loop(shared)
-            });
-        });
+        let shared = Arc::clone(&self.shared);
+        self.writing.written(move |wake| writer_loop(shared, wake));
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
@@ -224,10 +209,7 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        *self.shared.stop.lock() = true;
-        if let Some(wake) = self.shared.wake.get() {
-            wake.notify_one();
-        }
+        self.writing.stop();
         flush_off_the_loop(&self.shared);
     }
 }
@@ -279,12 +261,8 @@ fn flush_off_the_loop(shared: &Shared) {
     }
 }
 
-fn writer_loop(shared: Arc<Shared>) {
-    let wake = shared.wake.get().expect("the writer starts with its wake");
-    loop {
-        if *shared.stop.lock() {
-            return;
-        }
+fn writer_loop(shared: Arc<Shared>, wake: WriterWake) {
+    while wake.running() {
         let wait = {
             let w = shared.writer.lock();
             let now = shared.now_ms();
@@ -296,9 +274,40 @@ fn writer_loop(shared: Arc<Shared>) {
         };
         match wait {
             None => crate::io::cpu(|| flush_once(&shared)),
-            Some(ms) => {
-                let _ = crate::io::timeout(Duration::from_millis(ms), || wake.notified());
-            }
+            Some(ms) => wake.wait(Duration::from_millis(ms)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db_writer::DELAY_MS;
+    use crate::io::{sim, sleep};
+
+    fn committed(db: &Db, key: &[u8]) -> bool {
+        let tx = db.shared.db.begin_read().unwrap();
+        let table = tx.open_table(Table::Meta.def()).unwrap();
+        table.get(key).unwrap().is_some()
+    }
+
+    #[test]
+    fn background_flush_wakes_for_writes_and_stops_on_drop() {
+        sim::test(|| {
+            let db = Db::open_in_memory().unwrap();
+            db.put(Table::Meta, b"first", b"value");
+            sleep(Duration::from_millis(DELAY_MS + 1));
+            assert!(committed(&db, b"first"));
+
+            sleep(Duration::from_millis(1));
+            db.put(Table::Meta, b"second", b"value");
+            sleep(Duration::from_millis(DELAY_MS + 1));
+            assert!(committed(&db, b"second"));
+
+            let shared = Arc::downgrade(&db.shared);
+            drop(db);
+            sleep(Duration::from_millis(1));
+            assert!(shared.upgrade().is_none());
+        });
     }
 }
