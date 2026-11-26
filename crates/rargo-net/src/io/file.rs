@@ -842,7 +842,7 @@ pub fn reflink_fd(src: i32, dst: i32) -> bool {
     if super::sim::owns(src) || super::sim::owns(dst) {
         return false;
     }
-    unsafe { libc::ioctl(dst, FICLONE, src) == 0 }
+    unsafe { libc::ioctl(dst, FICLONE as libc::Ioctl, src) == 0 }
 }
 
 pub fn copy_fd(src: i32, dst: i32) -> io::Result<u64> {
