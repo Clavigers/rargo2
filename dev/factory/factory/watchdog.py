@@ -268,8 +268,9 @@ class Watchdog:
         if lost and s.issue is not None:
             mine.pop(str(s.issue), None)
         elif conv:
+            # seq 0: adopted from a watchdog that did not note where it began
             touched = {d["issue"] for d in self._lines()
-                       if d["seq"] > s.seq and d["actor"] == agent and "issue" in d}
+                       if s.seq and d["seq"] > s.seq and d["actor"] == agent and "issue" in d}
             if s.issue is not None:
                 touched.add(s.issue)
             for n in touched:
