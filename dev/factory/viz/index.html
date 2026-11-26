@@ -281,6 +281,7 @@ button.on { border-color: var(--enh); color: var(--enh); }
     <div id="factory">
       <div id="actors">
         <div class="box actor" data-anchor="foreman" id="foreman"></div>
+        <div class="box actor" data-anchor="watchdog" id="watchdog"></div>
         <div id="agentcol" data-anchor="workers" style="display:flex;flex-direction:column;gap:8px"></div>
         <div class="box actor" data-anchor="pm" id="pm"></div>
         <div class="box actor" data-anchor="poweruser" id="poweruser"></div>
@@ -437,6 +438,13 @@ function render() {
     <div class="stat" style="margin-top:6px">next tick in <b>${f.next == null ? '-' : Math.ceil(f.next) + ' min'}</b></div>
     <div class="stat">split <b>${f.planned}</b> initiatives</div>
     <div class="stat">took back <b>${f.took_back}</b> · <b>${f.preempted}</b> preempted</div>`;
+
+  // the watchdog: no tick in the log, only what it did
+  const wd = ev.filter(l => l.actor === 'watchdog'), wl = wd.at(-1);
+  const started = wd.filter(l => l.event === 'session_started').length, crashed = wd.filter(l => l.event === 'session_ended' && l.reason === 'crashed').length;
+  $('watchdog').innerHTML = `<div class="row"><div class="ic">${ic('eye')}</div><div><b>Watchdog</b><div class="sub" style="margin:0">checks every 30 s; starts a session for each agent with work</div></div></div>
+    <div class="stat" style="margin-top:6px">last did <b>${wl ? esc(say(wl)) : 'nothing in view'}</b>${wl ? ' ' + when(wl.t).slice(6) : ''}</div>
+    <div class="stat">recent: <b>${started}</b> started · <b>${crashed}</b> crashed</div>`;
 
   // agents, each with one slot
   $('agentcol').innerHTML = S.agents.map(a => {
