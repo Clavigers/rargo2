@@ -2665,6 +2665,9 @@ impl Run {
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
                         })?;
+                    if self.explain && !outcome.cached {
+                        out.note(&nextest::ran_note(&format!("test of {}", plan.units[*unit as usize].desc), &outcome.result.stats));
+                    }
                     let r = &outcome.result;
                     if r.success() {
                         self.apply_worktree_writes(&r.outputs);
