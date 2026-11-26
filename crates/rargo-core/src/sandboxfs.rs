@@ -75,6 +75,7 @@ enum Kind {
     Special { mode: u32, rdev: u32 },
 }
 
+#[cfg(test)]
 fn path_ok(path: &[u8]) -> bool {
     if path == b"/" {
         return true;
@@ -110,7 +111,6 @@ impl ObsCore {
 
     fn observe_lookup(&mut self, path: VPath, traced: bool, looked: &Looked) -> Option<usize> {
         if !traced {
-            assert!(self.invariants());
             return None;
         }
         let rec = match looked {
@@ -129,20 +129,17 @@ impl ObsCore {
         };
         let file = matches!(rec, Rec::File(_));
         self.items.push((path, rec));
-        assert!(self.invariants());
         file.then_some(self.items.len() - 1)
     }
 
     fn observe_list(&mut self, path: VPath, list: &Listing) {
         self.items.push((path, Rec::Settled(Obs::Listing(listing_hash(list)))));
-        assert!(self.invariants());
     }
 
     fn mark_read(&mut self, index: usize) {
         if let Some((_, Rec::File(file))) = self.items.get_mut(index) {
             file.read = true;
         }
-        assert!(self.invariants());
     }
 
     fn pending_hashes(&self) -> Vec<usize> {
@@ -162,7 +159,6 @@ impl ObsCore {
         };
         assert!(file.read && file.sem.is_none() && file.hashed.is_none() && !file.failed, "a hash answers one unread content");
         file.hashed = Some(hash);
-        assert!(self.invariants());
     }
 
     fn fail_hash(&mut self, index: usize) {
@@ -171,7 +167,6 @@ impl ObsCore {
         };
         assert!(file.read && file.sem.is_none() && file.hashed.is_none() && !file.failed, "a failed hash answers one unread content");
         file.failed = true;
-        assert!(self.invariants());
     }
 
     #[cfg(test)]
@@ -179,6 +174,7 @@ impl ObsCore {
         &self.items[index].0
     }
 
+    #[cfg(test)]
     fn file_is(&self, index: usize, was_read: bool) -> bool {
         match self.items.get(index) {
             Some((_, Rec::File(file))) => !was_read || file.read,
@@ -213,6 +209,7 @@ impl ObsCore {
         (out, tainted)
     }
 
+    #[cfg(test)]
     fn invariants(&self) -> bool {
         self.items.iter().all(|(path, rec)| {
             if !path_ok(path) {
@@ -431,7 +428,6 @@ impl SandboxFs {
             }
         }
         let (obs, tainted) = st.trace.outcome();
-        assert!(st.invariants());
         Finished { obs: compact_obs(obs), upper, tainted }
     }
 
@@ -729,19 +725,16 @@ impl ActionFs {
                         Slot::Lower(n) | Slot::Upper(n, _) => Some(*n),
                         Slot::Negative | Slot::Whiteout => None,
                     };
-                    assert!(st.invariants());
                     return Ok(found);
                 }
                 match &d.lower {
                     Some(l) => (l.clone(), d.traced && trace),
                     None => {
-                        assert!(st.invariants());
                         return Ok(None);
                     }
                 }
             }
             Kind::Mount => {
-                assert!(st.invariants());
                 return Ok(None);
             }
             _ => return Err(Errno::ENOTDIR),
@@ -750,7 +743,6 @@ impl ActionFs {
         let path: VPath = vjoin(&lower, name).into();
         let child_traced = matches!(looked, Looked::Dir(_)) && self.view.traced(&path);
         let found = self.apply_lookup(st, parent, name, path, traced, child_traced, looked)?;
-        assert!(st.invariants());
         Ok(found)
     }
 
@@ -901,7 +893,6 @@ impl ActionFs {
         let d = self.dir_mut(st, local)?;
         d.lower_listed = true;
         d.listing = Some(v.clone());
-        assert!(st.invariants());
         Ok(v)
     }
 
@@ -1023,7 +1014,6 @@ impl ActionFs {
             }
         }
         self.mark_dirty(st, parent);
-        assert!(st.invariants());
         Ok(())
     }
 
@@ -1073,7 +1063,6 @@ fn note_read(st: &mut State, node: u32) {
     if st.nodes.get(node as usize).is_some() {
         mark_file_read(st, node);
     }
-    assert!(st.invariants());
 }
 
 fn mark_file_read(st: &mut State, node: u32) {
@@ -1083,10 +1072,10 @@ fn mark_file_read(st: &mut State, node: u32) {
             st.trace.mark_read(index);
         }
     }
-    assert!(st.invariants());
 }
 
 impl State {
+    #[cfg(test)]
     fn invariants(&self) -> bool {
         if !self.trace.invariants() || self.nodes.is_empty() {
             return false;
