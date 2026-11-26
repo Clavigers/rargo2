@@ -159,6 +159,12 @@ impl<T: Send + 'static> JoinHandle<T> {
             self.abort_here();
             return;
         }
+        if on_loop() {
+            if !cancel_request(self.id) && !fiber_alive(self.id) {
+                self.slot.fail_abort();
+            }
+            return;
+        }
         let id = self.id;
         let slot = Arc::clone(&self.slot);
         call(move || JoinHandle { id, slot }.abort_here());
@@ -338,7 +344,7 @@ impl Interval {
 }
 
 pub fn call<R: Send + 'static>(body: impl FnOnce() -> R + Send + 'static) -> R {
-    if CURRENT.with(|c| c.get()) != 0 {
+    if CURRENT.with(|c| c.get()) != 0 || on_loop() {
         return body();
     }
     let (tx, rx) = std::sync::mpsc::sync_channel(1);

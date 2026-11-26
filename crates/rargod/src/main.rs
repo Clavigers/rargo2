@@ -142,10 +142,10 @@ fn main() -> Result<()> {
     let content = Arc::new(Content::new(store.clone()));
     let fs = Arc::new(SandboxFs::new(content.clone()));
     let mnt = state.join("mnt");
-    rargo_core::io::file::create_dir_all(&mnt)?;
     if let Ok(c) = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()) {
         unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
     }
+    rargo_core::io::file::create_dir_all(&mnt).with_context(|| format!("making the mountpoint {}", mnt.display()))?;
     let session = Arc::new(
         fusewire::Session::mount(
             &mnt,
