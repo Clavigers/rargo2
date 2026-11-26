@@ -2,7 +2,7 @@
 name = "rargo-purity"
 publish = false
 description = "Static checks that keep rargo's code pure"
-version = "0.7.8"
+version = "0.7.9"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/sadosystems/rargo2"
