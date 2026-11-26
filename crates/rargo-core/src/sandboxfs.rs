@@ -419,9 +419,8 @@ impl SandboxFs {
         };
         drop(st);
 
-        use rayon::prelude::*;
         let hashed: Vec<(usize, std::io::Result<crate::hash::Hash>)> =
-            jobs.into_par_iter().map(|(i, src)| (i, self.content.hash(&src))).collect();
+            crate::io::thread::par_map(jobs, |(i, src)| (i, self.content.hash(&src)));
         let mut st = a.st.lock();
         for (i, h) in hashed {
             match h {
