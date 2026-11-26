@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, anyhow};
@@ -111,16 +112,23 @@ impl AuthState {
             _ => None,
         }
     }
+}
 
-    fn invariants(&self) -> bool {
-        self.pending.len() <= MAX_PENDING
-            && self.pending.values().all(|p| {
-                !p.code.is_empty()
-                    && p.tries <= MAX_TRIES + 1
-                    && !(p.denied && p.granted.is_some())
-                    && p.granted.as_ref().is_none_or(|(token, user)| !token.is_empty() && !user.is_empty())
-            })
-            && self.pending.values().map(|p| p.code.as_str()).collect::<std::collections::BTreeSet<_>>().len() == self.pending.len()
+impl StateMachine for AuthState {
+    fn invariants(&self) {
+        assert!(self.pending.len() <= MAX_PENDING, "{} logins pending, over {MAX_PENDING}", self.pending.len());
+        for p in self.pending.values() {
+            assert!(!p.code.is_empty(), "a pending login has a code");
+            assert!(p.tries <= MAX_TRIES + 1, "login {} was tried {} times, over {}", p.code, p.tries, MAX_TRIES + 1);
+            assert!(!(p.denied && p.granted.is_some()), "login {} is not both denied and granted", p.code);
+            assert!(
+                p.granted.as_ref().is_none_or(|(token, user)| !token.is_empty() && !user.is_empty()),
+                "login {} is granted a token for a user",
+                p.code
+            );
+        }
+        let codes: std::collections::BTreeSet<_> = self.pending.values().map(|p| p.code.as_str()).collect();
+        assert_eq!(codes.len(), self.pending.len(), "every pending login has its own code");
     }
 }
 
@@ -241,15 +249,19 @@ struct Phase {
     wait: Option<Wait>,
 }
 
-impl Phase {
-    fn invariants(&self) -> bool {
+impl StateMachine for Phase {
+    fn invariants(&self) {
         match &self.wait {
-            Some(Wait::Draw(DrawNext::Code { device })) => !device.is_empty(),
-            Some(Wait::Redeem { code, .. }) => !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
-            Some(Wait::Exchange { terminal, oauth_state, .. } | Wait::User { terminal, oauth_state } | Wait::Allow { terminal, oauth_state, .. } | Wait::Create { terminal, oauth_state }) => {
-                !terminal.is_empty() && !oauth_state.is_empty()
+            Some(Wait::Draw(DrawNext::Code { device })) => assert!(!device.is_empty(), "drawing a code is for a device"),
+            Some(Wait::Redeem { code, .. }) => {
+                assert!(!code.is_empty(), "a code to redeem is not empty");
+                assert!(code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()), "code {code:?} is upper-case letters and digits");
             }
-            _ => true,
+            Some(Wait::Exchange { terminal, oauth_state, .. } | Wait::User { terminal, oauth_state } | Wait::Allow { terminal, oauth_state, .. } | Wait::Create { terminal, oauth_state }) => {
+                assert!(!terminal.is_empty(), "a login in progress has a terminal");
+                assert!(!oauth_state.is_empty(), "a login in progress has an OAuth state");
+            }
+            _ => {}
         }
     }
 }
@@ -546,7 +558,8 @@ fn intake(buf: &mut Vec<u8>, item: ReadItem) -> Intake {
 /// GitHub calls and token-store writes leave as effects.
 fn handle(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: u64) -> Act {
     let act = step(state, phase, event, cfg, now);
-    assert!(state.invariants() && phase.invariants());
+    state.invariants();
+    phase.invariants();
     act
 }
 
@@ -896,7 +909,8 @@ impl Http {
             let act = {
                 let mut st = self.pending.lock();
                 let act = handle(&mut st, &mut phase, event, &cfg, now);
-                assert!(st.invariants() && phase.invariants());
+                st.invariants();
+                phase.invariants();
                 act
             };
             match act {
@@ -1095,8 +1109,8 @@ mod tests {
         let mut event = Event::Request(req);
         for _ in 0..20 {
             let act = handle(st, &mut phase, event, cfg, now);
-            assert!(st.invariants());
-            assert!(phase.invariants());
+            st.invariants();
+            phase.invariants();
             match act {
                 Act::Done { outcome, notes } => return (outcome, notes),
                 Act::Ask(effect) => event = script.answer(effect),
@@ -1295,7 +1309,7 @@ mod tests {
         for _ in 0..MAX_TRIES {
             let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD2345&invite=BAD-INVITE&name="), NOW, &c, &mut Script { redeem: script_rev(vec![Err("no".into())]), github: script_rev(vec![None]), ..Script::default() });
             assert_eq!(body_of(&outcome).0, 403);
-            assert!(st.invariants());
+            st.invariants();
         }
         let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD2345&invite=GOOD-INVITE&name="), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
         assert!(body_of(&outcome).2.contains("too many wrong invitations"));
@@ -1305,15 +1319,18 @@ mod tests {
         assert!(st.begin("later".into(), "BBBBBBBB".into(), NOW));
         let mut phase = Phase::default();
         let act = handle(&mut st, &mut phase, Event::Request(call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=BBBBBBBB&invite=INV&name=")), &c, NOW);
-        assert!(st.invariants() && phase.invariants());
+        st.invariants();
+        phase.invariants();
         assert!(matches!(act, Act::Ask(Effect::Redeem { .. })));
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"later"}"#), NOW + PENDING_FOR_MS, &c, &mut Script::default()).0).2).unwrap()["status"], "expired");
         let act = handle(&mut st, &mut phase, Event::Redeemed(Ok(issued("t-x", "ann"))), &c, NOW);
-        assert!(st.invariants() && phase.invariants());
+        st.invariants();
+        phase.invariants();
         let Act::Ask(Effect::Revoke { id }) = act else { panic!("the issued token is revoked") };
         assert_eq!(id, "t-x");
         let act = handle(&mut st, &mut phase, Event::Revoked, &c, NOW);
-        assert!(st.invariants() && phase.invariants());
+        st.invariants();
+        phase.invariants();
         let Act::Ask(Effect::LoadGithub) = act else { panic!("the error page asks which form to show") };
         let act = handle(&mut st, &mut phase, Event::Github(None), &c, NOW);
         let Act::Done { outcome, notes } = act else { panic!("done") };
@@ -1328,13 +1345,13 @@ mod tests {
         for i in 0..MAX_PENDING {
             assert!(st.begin(format!("d{i}"), format!("C{i:07}"), NOW));
         }
-        assert!(st.invariants());
+        st.invariants();
         let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW, &c, &mut Script::default());
         assert_eq!(body_of(&outcome).0, 503);
         assert!(body_of(&outcome).2.contains("too many"));
         let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW + PENDING_FOR_MS, &c, &mut Script { random: script_rev(vec![Ok("fresh-device".into()), Ok("FFFF2222".into())]), ..Script::default() });
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["code"], "FFFF-2222");
-        assert!(st.invariants());
+        st.invariants();
     }
 
     #[test]
@@ -1402,7 +1419,8 @@ mod tests {
         let mut saw_revoke = false;
         for _ in 0..8 {
             let act = handle(&mut st, &mut phase, event, &c, NOW);
-            assert!(st.invariants() && phase.invariants());
+            st.invariants();
+            phase.invariants();
             match act {
                 Act::Done { outcome, .. } => {
                     assert!(saw_revoke);

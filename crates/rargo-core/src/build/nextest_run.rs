@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use super::pure::{missing_components, needs_network, offline_args};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -173,8 +174,10 @@ impl NextestRun {
             )
         })
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for NextestRun {
+    fn invariants(&self) {
         assert!(self.round <= MOST_ROUNDS, "rounds are bounded");
         assert!(self.running.keys().all(|k| !self.ran.contains(k)), "a test runs once");
         if self.phase != Phase::Tests {

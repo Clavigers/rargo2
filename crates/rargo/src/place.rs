@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use rargo_net::io::file::PathRing as _;
 use crate::scan::hash_file;
 use rargo_proto::{Delivery, Digest, Write};
@@ -408,26 +410,37 @@ impl Placement {
         }
         Plan { ops, fetch, reused }
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
+#[cfg(test)]
+impl StateMachine for Placement {
+    fn invariants(&self) {
         let ours = |p: &Path| p == self.bound.root || self.bound.holds(p) || within(&self.blobs, p);
         let named = |pid: u32| {
             self.seen.values().any(|s| matches!(s, Sight::List(names) if names.iter().any(|n| crate::tmp::owner(n, crate::tmp::BESIDE) == Some(pid))))
         };
         let wants = self.wants();
-        self.targets.iter().all(|(p, t)| *p == t.path && self.bound.holds(p) && !t.clear)
-            && self.writes.iter().all(|w| self.bound.holds(Path::new(write_path(w))) && !matches!(w, Write::File { .. }))
-            && self.records.keys().all(|p| self.targets.contains_key(p))
-            && self.seen.iter().all(|(look, sight)| {
-                look.answered_by(sight)
-                    && match look {
-                        Look::Stat(p) | Look::Hash(p, _) | Look::Read(p) | Look::List(p) => ours(p),
-                        Look::Process(pid) => named(*pid),
-                    }
-            })
-            && wants.iter().all(|l| !self.seen.contains_key(l))
-            && wants.windows(2).all(|w| w[0] < w[1])
+        for (p, t) in &self.targets {
+            assert!(*p == t.path, "target {} is keyed by its path", t.path.display());
+            assert!(self.bound.holds(p), "target {} is inside the bound", p.display());
+            assert!(!t.clear, "target {} is not left to clear", p.display());
+        }
+        for w in &self.writes {
+            assert!(self.bound.holds(Path::new(write_path(w))), "a write to {} is inside the bound", write_path(w));
+            assert!(!matches!(w, Write::File { .. }), "a whole-file write to {} is not queued", write_path(w));
+        }
+        assert!(self.records.keys().all(|p| self.targets.contains_key(p)), "every record is of a target");
+        for (look, sight) in &self.seen {
+            assert!(look.answered_by(sight), "what was seen answers the look {look:?}");
+            match look {
+                Look::Stat(p) | Look::Hash(p, _) | Look::Read(p) | Look::List(p) => {
+                    assert!(ours(p), "the look at {} is at a path of ours", p.display())
+                }
+                Look::Process(pid) => assert!(named(*pid), "process {pid} was looked at because a listing named it"),
+            }
+        }
+        assert!(wants.iter().all(|l| !self.seen.contains_key(l)), "nothing already seen is wanted again");
+        assert!(wants.windows(2).all(|w| w[0] < w[1]), "the wanted looks are sorted and have no repeats");
     }
 }
 
@@ -494,10 +507,16 @@ impl Waiting {
         }
         ops
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.targets.iter().all(|(hash, ts)| !ts.is_empty() && ts.iter().all(|t| t.hash == *hash && t.path.is_absolute()))
+#[cfg(test)]
+impl StateMachine for Waiting {
+    fn invariants(&self) {
+        for (hash, ts) in &self.targets {
+            assert!(!ts.is_empty(), "a waiting hash has targets");
+            assert!(ts.iter().all(|t| t.hash == *hash), "a target waits under its own hash");
+            assert!(ts.iter().all(|t| t.path.is_absolute()), "every waiting target path is absolute");
+        }
     }
 }
 
@@ -977,7 +996,7 @@ mod tests {
 
         fn deliver(&mut self, waiting: &mut Waiting, bound: &Bound, blobs: &Path, files: Vec<Delivery>, writes: Vec<Write>) -> (Vec<Op>, Vec<Digest>) {
             let mut placement = Placement::new(bound, blobs, &self.placed, files, writes).unwrap();
-            assert!(placement.invariants());
+            placement.invariants();
             loop {
                 let wants = placement.wants();
                 if wants.is_empty() {
@@ -986,7 +1005,7 @@ mod tests {
                 for look in wants {
                     let sight = self.look(&look);
                     placement.saw(look, sight);
-                    assert!(placement.invariants());
+                    placement.invariants();
                 }
             }
             let plan = placement.plan();
@@ -999,7 +1018,7 @@ mod tests {
                 self.run(op).unwrap_or_else(|()| panic!("{op:?} failed"));
             }
             let need = plan.fetch.into_iter().filter_map(|t| { let h = t.hash; waiting.add(t).then_some(h) }).collect();
-            assert!(waiting.invariants());
+            waiting.invariants();
             (plan.ops, need)
         }
 
@@ -1013,7 +1032,7 @@ mod tests {
             for op in waiting.arrived(blobs, hash, &tmp) {
                 assert!(within(blobs, op.path()) || op.path().starts_with("/w") || op.path().starts_with("/o/tgt"), "{op:?}");
                 self.run(&op).unwrap_or_else(|()| panic!("{op:?} failed"));
-                assert!(waiting.invariants());
+                waiting.invariants();
             }
             self.tree.remove(&tmp);
         }
@@ -1277,10 +1296,11 @@ mod tests {
         assert!(waiting.add(shared.clone()));
         assert!(!waiting.add(own.clone()), "the same content is fetched once for every place it goes");
         assert!(!waiting.add(plain.clone()));
-        assert!(waiting.invariants());
+        waiting.invariants();
         let tmp = Path::new("/c/blobs/.incoming-1-1");
         let ops = waiting.arrived(blobs, hash, tmp);
-        assert!(waiting.is_empty() && waiting.invariants());
+        assert!(waiting.is_empty());
+        waiting.invariants();
         let cache = cache_path(blobs, &hash, true);
         let install = |to: &Path| ops.iter().find_map(|op| match op { Op::Install { to: t, ways, required } if t == to => Some((ways.clone(), *required)), _ => None }).unwrap();
         let (ways, required) = install(&cache);

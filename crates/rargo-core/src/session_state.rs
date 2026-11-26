@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::hash::Hash;
 use rargo_proto::{BATCH_SIZE, Blob, ClientMsg, Delivery, Digest, LAZY_SMALL, PART_SIZE, Part, ServerMsg, Write};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -499,8 +500,10 @@ impl SessionState {
         self.wanted.clear();
         std::mem::take(&mut self.parts).into_keys().collect()
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for SessionState {
+    fn invariants(&self) {
         assert!(self.credit <= WINDOW, "the window never holds more than its size");
         assert!(self.next_id >= 1, "delivery ids start at 1");
         if self.closed {
@@ -631,8 +634,10 @@ impl Handshake {
         self.ended = true;
         Shake::Reply { write, end }
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for Handshake {
+    fn invariants(&self) {
         if self.user.is_some() {
             assert!(matches!(hello(&self.buf, &self.magic), Hello::Whole { .. }), "a user comes from a whole hello");
         }

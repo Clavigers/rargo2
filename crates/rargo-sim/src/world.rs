@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::rng::Rng;
 use rargo::daemon_state::{DaemonState, Link, Need};
@@ -523,16 +524,18 @@ impl World {
         c.requested.iter().filter(|a| !c.outputs.contains_key(a)).map(|&a| self.project.actions[a].id).collect()
     }
 
+    /// Every state machine in the world: the server's, each session's, each
+    /// worker's and each client's.
+    fn machines(&self) -> Vec<&dyn StateMachine> {
+        let mut all: Vec<&dyn StateMachine> = vec![&self.server.pool, &self.server.sched, &self.server.trees];
+        all.extend(self.server.sessions.values().map(|s| &s.state as &dyn StateMachine));
+        all.extend(self.workers.values().map(|w| &w.sm as &dyn StateMachine));
+        all.extend(self.clients.values().map(|c| &c.daemon as &dyn StateMachine));
+        all
+    }
+
     fn check(&self) -> Step {
-        self.server.pool.invariants();
-        self.server.sched.invariants();
-        for w in self.workers.values() {
-            w.sm.invariants();
-        }
-        self.server.trees.invariants();
-        for c in self.clients.values() {
-            c.daemon.invariants();
-        }
+        rargo_machine::check_all(self.machines());
         for (client, sess) in &self.server.sessions {
             let Some(o) = &sess.offer else { continue };
             for h in &o.arrived {

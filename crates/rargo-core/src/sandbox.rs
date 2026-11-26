@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -912,7 +913,9 @@ impl Plan {
     pub fn cgroup_dir(&self) -> Option<PathBuf> {
         self.cgroup_root.as_ref().map(|root| root.join(format!("action-{}", self.seq)))
     }
+}
 
+impl StateMachine for Plan {
     fn invariants(&self) {
         let root = &self.root;
         for op in &self.ops {

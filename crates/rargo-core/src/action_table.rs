@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::hash::Hash;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -185,8 +186,10 @@ impl ActionTable {
             Some(State::Running { slot, .. } | State::Ran { slot }) => self.end_flight(id, slot, End::Done),
         }
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for ActionTable {
+    fn invariants(&self) {
         for (slot, f) in &self.flights {
             assert!(
                 matches!(self.requests.get(&f.runner), Some(State::Running { slot: s, .. } | State::Ran { slot: s }) if s == slot),

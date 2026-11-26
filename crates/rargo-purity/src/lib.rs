@@ -282,13 +282,26 @@ impl<'a> Visit<'a> for Asserts {
 
     fn visit_expr_call(&mut self, e: &'a syn::ExprCall) {
         if let Expr::Path(p) = &*e.func
-            && p.path.segments.last().is_some_and(|s| s.ident == "invariants")
+            && checks_invariants(&p.path)
         {
             self.asserts = true;
             self.invariants = true;
         }
         visit::visit_expr_call(self, e);
     }
+}
+
+/// A call that checks a machine's invariants: `invariants` itself, or one of
+/// `rargo_machine`'s helpers that call it (`check`, `check_all`, and
+/// `Checked::new`, which checks on wrapping and after every step).
+fn checks_invariants(path: &Path) -> bool {
+    let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    let tail: Vec<&str> = segs.iter().rev().take(2).rev().map(String::as_str).collect();
+    matches!(tail.as_slice(), [.., "invariants"] | ["rargo_machine", "check" | "check_all"] | ["Checked", "new"])
+}
+
+fn is_state_machine(path: &Path) -> bool {
+    path.segments.last().is_some_and(|s| s.ident == "StateMachine")
 }
 
 fn flatten(prefix: &str, tree: &UseTree, names: &mut BTreeMap<String, String>, globs: &mut BTreeSet<String>) {
@@ -325,7 +338,6 @@ impl<'a> Visit<'a> for Uses {
 }
 
 struct Method {
-    predicate: bool,
     ty: String,
     name: String,
     line: usize,
@@ -341,6 +353,7 @@ struct Scan<'f> {
     uses: Uses,
     findings: Vec<Finding>,
     methods: Vec<Method>,
+    machines: Vec<Method>,
     tests_call_invariants: bool,
 }
 
@@ -447,16 +460,56 @@ impl<'a> Visit<'a> for Scan<'_> {
     }
 
     fn visit_item_impl(&mut self, i: &'a syn::ItemImpl) {
+        let ty = match &*i.self_ty {
+            syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+            _ => None,
+        };
+        if !self.whole_test
+            && !self.shell
+            && let Some(ty) = &ty
+        {
+            match &i.trait_ {
+                Some((_, path, _)) if is_state_machine(path) && !self.testing() => {
+                    for item in &i.items {
+                        let ImplItem::Fn(f) = item else { continue };
+                        if f.sig.ident != "invariants" {
+                            continue;
+                        }
+                        let mut a = Asserts::default();
+                        a.visit_block(&f.block);
+                        self.machines.push(Method {
+                            ty: ty.clone(),
+                            name: "invariants".into(),
+                            line: f.sig.ident.span().start().line,
+                            steps: false,
+                            asserts: a.asserts,
+                        });
+                    }
+                }
+                None => {
+                    for item in &i.items {
+                        if let ImplItem::Fn(f) = item
+                            && f.sig.ident == "invariants"
+                        {
+                            self.add(
+                                Check::SelfCheck,
+                                f.sig.ident.span().start().line,
+                                format!("{ty}::invariants is not StateMachine::invariants"),
+                            );
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
         if !self.testing()
             && !self.shell
             && i.trait_.is_none()
-            && let syn::Type::Path(p) = &*i.self_ty
-            && let Some(last) = p.path.segments.last()
+            && let Some(ty) = ty
         {
-            let ty = last.ident.to_string();
             for item in &i.items {
                 let ImplItem::Fn(f) = item else { continue };
-                if cfg_test(&f.attrs) {
+                if cfg_test(&f.attrs) || f.sig.ident == "invariants" {
                     continue;
                 }
                 let steps = matches!(
@@ -466,7 +519,6 @@ impl<'a> Visit<'a> for Scan<'_> {
                 let mut a = Asserts::default();
                 a.visit_block(&f.block);
                 self.methods.push(Method {
-                    predicate: !matches!(f.sig.output, syn::ReturnType::Default),
                     ty: ty.clone(),
                     name: f.sig.ident.to_string(),
                     line: f.sig.ident.span().start().line,
@@ -654,7 +706,7 @@ pub fn scan(sources: &[(&str, &str)]) -> Vec<Finding> {
     }
     let texts: BTreeMap<&str, &str> = sources.iter().copied().collect();
     let tests = test_files(&parsed);
-    let mut machines: BTreeMap<String, (Vec<Method>, bool)> = BTreeMap::new();
+    let mut machines: BTreeMap<String, (Vec<Method>, Vec<Method>, bool)> = BTreeMap::new();
     for (file, parsed) in &parsed {
         let text = texts[file];
         let mut uses = Uses { names: BTreeMap::new(), globs: BTreeSet::new() };
@@ -668,31 +720,34 @@ pub fn scan(sources: &[(&str, &str)]) -> Vec<Finding> {
             uses,
             findings: Vec::new(),
             methods: Vec::new(),
+            machines: Vec::new(),
             tests_call_invariants: false,
         };
         scan.visit_file(parsed);
         findings.append(&mut scan.findings);
         let owner = tests.get(*file).cloned().unwrap_or_else(|| file.to_string());
-        let calls = scan.tests_call_invariants || (whole_test && text.contains("invariants()"));
+        let calls = scan.tests_call_invariants
+            || (whole_test && ["invariants()", "rargo_machine::check", "Checked::new("].iter().any(|c| text.contains(c)));
         let slot = machines.entry(owner).or_default();
-        slot.0.append(&mut scan.methods);
-        slot.1 |= calls;
+        slot.0.append(&mut scan.machines);
+        slot.1.append(&mut scan.methods);
+        slot.2 |= calls;
     }
-    for (file, (methods, tested)) in machines {
-        let types: BTreeSet<&str> =
-            methods.iter().filter(|m| m.name == "invariants").map(|m| m.ty.as_str()).collect();
+    for (file, (impls, methods, tested)) in machines {
+        let types: BTreeSet<&str> = impls.iter().map(|m| m.ty.as_str()).collect();
         if types.is_empty() {
             continue;
         }
+        for m in impls.iter().filter(|m| !m.asserts) {
+            findings.push(Finding {
+                check: Check::SelfCheck,
+                file: file.clone(),
+                line: m.line,
+                what: format!("{}::invariants asserts nothing", m.ty),
+            });
+        }
         for m in methods.iter().filter(|m| types.contains(m.ty.as_str())) {
-            if m.name == "invariants" && !m.asserts && !m.predicate {
-                findings.push(Finding {
-                    check: Check::SelfCheck,
-                    file: file.clone(),
-                    line: m.line,
-                    what: format!("{}::invariants asserts nothing", m.ty),
-                });
-            } else if m.steps && !m.asserts {
+            if m.steps && !m.asserts {
                 findings.push(Finding {
                     check: Check::SelfCheck,
                     file: file.clone(),

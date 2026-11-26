@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
@@ -27,8 +28,10 @@ impl<W> Calls<W> {
     pub fn lost(&mut self) -> Vec<W> {
         std::mem::take(&mut self.pending).into_values().collect()
     }
+}
 
-    pub fn invariants(&self) {
+impl<W> StateMachine for Calls<W> {
+    fn invariants(&self) {
         assert!(self.next >= 1);
         assert!(self.pending.keys().all(|rid| *rid >= 1 && *rid < self.next), "only issued ids are pending");
     }
@@ -137,8 +140,10 @@ impl WorkerPool {
     pub fn warm(&mut self, worker: u64, known: bool, own: bool) -> bool {
         known && !own && self.workers.contains_key(&worker) && self.warmed.insert(worker)
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for WorkerPool {
+    fn invariants(&self) {
         assert!(self.warmed.iter().all(|w| self.workers.contains_key(w)), "only a worker that is here is warmed");
         assert_eq!(self.order.len(), self.workers.len());
         assert_eq!(self.order.iter().collect::<BTreeSet<_>>().len(), self.order.len(), "a worker is listed once");
@@ -286,8 +291,10 @@ impl Race {
         self.remote = Side::Gone;
         Outcome::Use { who: Who::Local, stopped_other }
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for Race {
+    fn invariants(&self) {
         if self.over {
             assert!(self.remote != Side::Running && self.local != Side::Running, "nothing runs after the race is over");
         }
@@ -300,8 +307,9 @@ impl Race {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rargo_machine::Checked;
 
-    struct Pool(WorkerPool);
+    struct Pool(Checked<WorkerPool>);
 
     impl std::ops::Deref for Pool {
         type Target = WorkerPool;
@@ -312,53 +320,39 @@ mod tests {
 
     impl Pool {
         fn new() -> Pool {
-            let p = WorkerPool::new();
-            p.invariants();
-            Pool(p)
-        }
-
-        fn checked<R>(&self, r: R) -> R {
-            self.0.invariants();
-            r
+            Pool(Checked::new(WorkerPool::new()))
         }
 
         fn joined(&mut self, id: u64, cores: usize) -> Vec<Effect> {
-            let r = self.0.joined(id, cores);
-            self.checked(r)
+            self.0.step(|p| p.joined(id, cores))
         }
 
         fn left(&mut self, id: u64) -> Vec<Effect> {
-            let r = self.0.left(id);
-            self.checked(r)
+            self.0.step(|p| p.left(id))
         }
 
         fn lease(&mut self, among: Option<&[u64]>) -> Option<u64> {
-            let r = self.0.lease(among);
-            self.checked(r)
+            self.0.step(|p| p.lease(among))
         }
 
         fn give_back(&mut self, id: u64) -> Vec<Effect> {
-            let r = self.0.give_back(id);
-            self.checked(r)
+            self.0.step(|p| p.give_back(id))
         }
 
         fn sent(&mut self, action: u64, worker: u64) -> bool {
-            let r = self.0.sent(action, worker);
-            self.checked(r)
+            self.0.step(|p| p.sent(action, worker))
         }
 
         fn finished(&mut self, action: u64, answered: bool) -> Vec<Effect> {
-            let r = self.0.finished(action, answered);
-            self.checked(r)
+            self.0.step(|p| p.finished(action, answered))
         }
 
         fn warm(&mut self, worker: u64, known: bool, own: bool) -> bool {
-            let r = self.0.warm(worker, known, own);
-            self.checked(r)
+            self.0.step(|p| p.warm(worker, known, own))
         }
     }
 
-    struct Racing(Race);
+    struct Racing(Checked<Race>);
 
     impl std::ops::Deref for Racing {
         type Target = Race;
@@ -369,39 +363,27 @@ mod tests {
 
     impl Racing {
         fn new() -> Racing {
-            let r = Race::default();
-            r.invariants();
-            Racing(r)
-        }
-
-        fn checked<R>(&self, r: R) -> R {
-            self.0.invariants();
-            r
+            Racing(Checked::new(Race::default()))
         }
 
         fn claim(&mut self, who: Who) -> bool {
-            let r = self.0.claim(who);
-            self.checked(r)
+            self.0.step(|r| r.claim(who))
         }
 
         fn hedged(&mut self) {
-            self.0.hedged();
-            self.0.invariants();
+            self.0.step(|r| r.hedged())
         }
 
         fn settle(&mut self) -> Option<Settle> {
-            let r = self.0.settle();
-            self.checked(r)
+            self.0.step(|r| r.settle())
         }
 
         fn remote_ended(&mut self, ok: bool) -> Outcome {
-            let r = self.0.remote_ended(ok);
-            self.checked(r)
+            self.0.step(|r| r.remote_ended(ok))
         }
 
         fn local_ended(&mut self) -> Outcome {
-            let r = self.0.local_ended();
-            self.checked(r)
+            self.0.step(|r| r.local_ended())
         }
     }
 

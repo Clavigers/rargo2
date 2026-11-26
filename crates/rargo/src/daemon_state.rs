@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::known_digests::KnownDigests;
 use rargo_proto::Digest;
 use std::collections::BTreeMap;
@@ -179,8 +180,10 @@ impl DaemonState {
         }
         debug_assert!(self.worktrees.values().all(|wt| wt.synced.is_none()), "missing content unsyncs every worktree");
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for DaemonState {
+    fn invariants(&self) {
         assert!(self.connections > 0 || !self.up, "the session is up only after a link was made");
         for (id, wt) in &self.worktrees {
             assert!(*id > 0, "worktree ids start at 1");

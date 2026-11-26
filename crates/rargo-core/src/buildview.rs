@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
@@ -136,14 +137,6 @@ impl BaseView {
     fn cached_list(&self, key: &[u8]) -> Option<Result<Arc<Listing>, i32>> {
         let e = self.memo.listed.get(key)?;
         (e.0 >= self.min_gen.load(Ordering::Relaxed)).then(|| e.1.clone())
-    }
-
-    fn invariants(&self) -> bool {
-        !self.mounts.is_empty()
-            && self.mounts.iter().any(|m| m.at == b"/")
-            && self.mounts.windows(2).all(|w| w[0].at.len() >= w[1].at.len())
-            && self.mounts.iter().all(|m| m.at.starts_with(b"/"))
-            && self.mounts.iter().enumerate().all(|(i, m)| self.mounts[i + 1..].iter().all(|o| o.at != m.at))
     }
 
     fn deposit(&self, req: &HostReq, answer: HostAnswer) {
@@ -329,6 +322,17 @@ impl BaseView {
     }
 }
 
+impl StateMachine for BaseView {
+    fn invariants(&self) {
+        assert!(self.mounts.iter().any(|m| m.at == b"/"), "something is mounted at the root");
+        assert!(self.mounts.windows(2).all(|w| w[0].at.len() >= w[1].at.len()), "the longest mount points come first");
+        assert!(self.mounts.iter().all(|m| m.at.starts_with(b"/")), "every mount point is absolute");
+        for (i, m) in self.mounts.iter().enumerate() {
+            assert!(self.mounts[i + 1..].iter().all(|o| o.at != m.at), "one mount at {}", String::from_utf8_lossy(&m.at));
+        }
+    }
+}
+
 fn host_answer(view: &BaseView, req: &HostReq) {
     assert!(!view.memo.sealed.load(Ordering::SeqCst), "sealed view asked to read {}", req.path.display());
     let answer = match req.kind {
@@ -347,7 +351,7 @@ fn is_strictly_under(path: &[u8], dir: &[u8]) -> bool {
 }
 
 fn given<T>(view: &BaseView, step: Step<T>) -> T {
-    assert!(view.invariants());
+    view.invariants();
     match step {
         Step::Done(value) => value,
         Step::Ask(_) => panic!("a base view is given its contents; the shell answers a host request"),
@@ -434,12 +438,12 @@ fn drive<T>(view: &BaseView, mut step: impl FnMut(&BaseView) -> Step<T>) -> T {
     for _ in 0..10_000 {
         match step(view) {
             Step::Done(value) => {
-                assert!(view.invariants());
+                view.invariants();
                 return value;
             }
             Step::Ask(req) => {
                 host_answer(view, &req);
-                assert!(view.invariants());
+                view.invariants();
             }
         }
     }
@@ -972,9 +976,9 @@ mod tests {
         }));
         assert!(refused.is_err(), "the view does not read the host");
         view.deposit(&req, HostAnswer::Lookup(host_dir()));
-        assert!(view.invariants());
+        view.invariants();
         assert!(matches!(View::lookup(&view, b"/", b"missing"), Looked::Dir(_)));
-        assert!(view.invariants());
+        view.invariants();
     }
 }
 

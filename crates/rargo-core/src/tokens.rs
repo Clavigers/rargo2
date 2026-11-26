@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use anyhow::{Context, Result, bail};
 use rargo_proto::secure;
 use serde::{Deserialize, Serialize};
@@ -452,17 +454,23 @@ impl Tokens {
         let (admin, days) = (invite.admin, invite.token_days);
         Ok(self.create(&user, admin, days, "invitation", at, entropy))
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let unique = |ids: Vec<&str>| {
+#[cfg(test)]
+impl StateMachine for Tokens {
+    fn invariants(&self) {
+        let unique = |what: &str, ids: Vec<&str>| {
             let n = ids.len();
-            ids.into_iter().collect::<std::collections::BTreeSet<_>>().len() == n
+            assert_eq!(ids.into_iter().collect::<std::collections::BTreeSet<_>>().len(), n, "every {what} is unique");
         };
-        self.tokens.iter().all(|t| unhex32(&t.key).is_some())
-            && unique(self.tokens.iter().map(|t| t.id.as_str()).collect())
-            && unique(self.invites.iter().map(|i| i.code.as_str()).collect())
-            && self.github.iter().all(|a| valid_login(&a.login))
+        for t in &self.tokens {
+            assert!(unhex32(&t.key).is_some(), "token {} has a 32-byte hex key", t.id);
+        }
+        unique("token id", self.tokens.iter().map(|t| t.id.as_str()).collect());
+        unique("invite code", self.invites.iter().map(|i| i.code.as_str()).collect());
+        for a in &self.github {
+            assert!(valid_login(&a.login), "{:?} is a valid GitHub login", a.login);
+        }
     }
 }
 
@@ -640,33 +648,34 @@ mod tests {
     #[test]
     fn persisted_tokens_are_verified_expired_and_revoked_without_the_secret() {
         let mut tokens = Tokens::decode(b"{}").unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         let secret = "fixture-credential";
         let token = tokens.create("ann", true, Some(1), "test", 100, ("t-ann", secret)).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         let encoded = tokens.encode().unwrap();
         assert!(!String::from_utf8_lossy(&encoded).contains(secret));
         let mut tokens = Tokens::decode(&encoded).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(tokens.lookup("t-ann", 100), Some((secure::psk_from_secret(secret.as_bytes()), true, "ann".into())));
         assert!(tokens.lookup("t-ann", 86_500).is_none());
         assert_eq!(tokens.holder(&token_text(&token, secret), 101).as_deref(), Some("ann"));
         assert!(SelfRevocation::of("no-dot").is_none());
         assert!(!tokens.revoke_self(&SelfRevocation::of("t-ann.incorrect").unwrap()));
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(tokens.revoke("t-ann", Some("bob")), 0);
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert!(tokens.revoke_self(&SelfRevocation::of(&format!(" {} ", token_text(&token, secret))).unwrap()));
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(tokens.revoke("ann", None), 0);
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert!(tokens.lookup("t-ann", 100).is_none());
         assert!(Tokens::decode(b"{broken").is_err());
         assert!(Tokens::decode(br#"{"tokens":["broken"]}"#).is_err());
         let (read, warning) = Tokens::read(Some(&encoded));
         assert!(warning.is_none() && read.tokens.len() == 1);
         let (read, warning) = Tokens::read(Some(b"{broken"));
-        assert!(warning.unwrap().contains("key must be a string") && read.tokens.is_empty() && read.invariants(), "a malformed file reads as empty, with a warning");
+        assert!(warning.unwrap().contains("key must be a string") && read.tokens.is_empty(), "a malformed file reads as empty, with a warning");
+        read.invariants();
         let (read, warning) = Tokens::read(None);
         assert!(warning.is_none() && read.tokens.is_empty());
     }
@@ -680,7 +689,7 @@ mod tests {
         let cmd = Command::parse(&args, asker, "usage")?;
         let before = tokens.encode().unwrap();
         let said = cmd.apply(tokens, at, cmd.draws().then(|| entropy(n)).as_ref(), github);
-        assert!(tokens.invariants(), "{line}");
+        rargo_machine::check(&tokens, format_args!("{line}"));
         if !cmd.writes() {
             assert_eq!(tokens.encode().unwrap(), before, "{line} changes nothing");
         }
@@ -786,23 +795,23 @@ mod tests {
     fn allow_and_disallow_only_revoke_tokens_from_github() {
         let mut tokens = Tokens::default();
         tokens.allow("Ann", false).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         tokens.allow("ann", true).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(tokens.github.len(), 1);
         assert!(tokens.allowed("ANN").unwrap().admin);
         assert!(tokens.allow("not a login", false).is_err());
-        assert!(tokens.invariants());
+        tokens.invariants();
         tokens.create("ann", true, None, "github", 100, ("t-gh", "fixture-gh")).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         tokens.create("ann", false, None, "invitation", 100, ("t-invite", "fixture-invite")).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(tokens.disallow("Ann"), (true, 1));
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert!(tokens.lookup("t-gh", 100).is_none());
         assert!(tokens.lookup("t-invite", 100).is_some());
         assert_eq!(tokens.revoke("t-invite", Some("ann")), 1);
-        assert!(tokens.invariants());
+        tokens.invariants();
     }
 
     #[test]
@@ -810,26 +819,26 @@ mod tests {
         let mut tokens = Tokens::default();
         let raw = "ABCD2345ABCD2345";
         let code = tokens.invite(Invitation { user: None, admin: false, days: Some(1), uses: 2, token_days: Some(30) }, 100, raw).unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert!(!String::from_utf8_lossy(&tokens.encode().unwrap()).contains(raw));
         assert!(tokens.invited(&code, 86_500).is_none());
         assert!(tokens.redeem(&code, None, 101, ("t-1", "fixture-1")).is_err(), "an invitation for anyone needs a name");
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(tokens.invited(&code, 101).unwrap().uses_left, 2);
         assert!(tokens.redeem(&code, Some("bad name"), 101, ("t-1", "fixture-1")).is_err());
         assert_eq!(tokens.invited(&code, 101).unwrap().uses_left, 2, "a refused name spends nothing");
         let token = tokens.redeem(&code.to_lowercase(), Some("ann"), 101, ("t-1", "fixture-1")).unwrap().unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert_eq!(token.expires, Some(101 + 30 * 86400));
         assert_eq!(tokens.invited(&code, 102).unwrap().uses_left, 1);
         let failed = tokens.redeem(&code, Some("ann"), 102, ("t-1", "duplicate")).unwrap();
         assert!(failed.unwrap_err().to_string().contains("duplicate token id"));
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert!(tokens.invited(&code, 102).is_none(), "the use is spent even when making the token fails");
         assert!(tokens.redeem(&code, Some("bob"), 102, ("t-2", "fixture-2")).is_err());
         let fixed = tokens.invite(Invitation { user: Some("dan"), admin: true, days: None, uses: 1, token_days: None }, 100, "WXYZ2345WXYZ2345").unwrap();
         let dan = tokens.redeem(&fixed, Some("someone-else"), 10_000_000, ("t-3", "fixture-3")).unwrap().unwrap();
-        assert!(tokens.invariants());
+        tokens.invariants();
         assert!(dan.user == "dan" && dan.admin && dan.expires.is_none(), "an invitation for a user makes that user's token");
     }
 }

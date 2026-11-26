@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::chunk::ChunkRef;
 use crate::hash::Hash;
 use std::collections::{BTreeMap, BTreeSet};
@@ -402,8 +403,10 @@ impl StoreIndex {
         out.sort_by_key(|e| e.cold);
         out
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for StoreIndex {
+    fn invariants(&self) {
         let whole: u64 = self.blobs.values().filter(|b| b.is_whole()).map(|b| b.size).sum();
         assert_eq!(whole, self.whole_bytes, "whole bytes are the sum of the whole blobs");
         assert!(self.generation >= 1);

@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::proto::{CONTROL, ClientMsg, Digest, KEEPALIVE, Offer, PROTO_VERSION, RunRequest, ServerMsg, protocol_mismatch};
 use crate::sched::Priority;
 use std::collections::{BTreeSet, HashMap};
@@ -136,8 +137,10 @@ impl ConnectionState {
         out.push(Route::Close);
         out
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for ConnectionState {
+    fn invariants(&self) {
         assert!(!self.running.contains(&CONTROL), "the control stream runs no request");
         assert!(!self.running.contains(&KEEPALIVE), "keepalives run no request");
         if self.closed {

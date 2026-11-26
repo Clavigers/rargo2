@@ -55,5 +55,5 @@ jobs:
           echo "$out"
           grep -q '^io_uring  unavailable, so rargo cannot build here: io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out"
       - name: The crates that are published
-        run: nix develop --command cargo package --locked -p fusewire -p rargo-proto -p rargo-net -p rargo
+        run: nix develop --command cargo package --locked -p rargo-machine -p fusewire -p rargo-proto -p rargo-net -p rargo
       - run: sh -n install/install.sh && sh -n install/install-server.sh

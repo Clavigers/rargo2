@@ -462,6 +462,7 @@ pub fn chown(path: &Path, uid: u32, gid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rargo_machine::StateMachine;
     use crate::db::Db;
 
     #[derive(Default)]
