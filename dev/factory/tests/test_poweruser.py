@@ -148,3 +148,17 @@ def test_no_uses_required_no_sessions(tmp_path):
     f = Factory(tmp_path, uses_required=0).candidate()
     f.pu.step()
     assert f.sessions == []
+
+
+def test_a_use_can_be_voided_afterwards_and_the_build_is_used_again(tmp_path):
+    import pytest
+    from factory.ledger import Refused
+    f = Factory(tmp_path).candidate()
+    f.pu.step()
+    f("human", "use_voided", use=1, note="it exited at once on the plan's limit")
+    assert "uses" in f.ledger.world.hold_reasons("0.7.11")
+    with pytest.raises(Refused, match="already void"):
+        f("human", "use_voided", use=1, note="again")
+    f.now += timedelta(minutes=31)
+    f.pu.step()
+    assert len(f.sessions) == 2 and "uses" not in f.ledger.refresh().hold_reasons("0.7.11")
