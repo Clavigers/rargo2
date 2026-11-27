@@ -1,4 +1,5 @@
 use crate::disk;
+use rargo_core::db::Table;
 use rargo_core::store::Store;
 use rargo_net::io::sim;
 use crate::transport::{self, Side};
@@ -84,22 +85,25 @@ impl Bug {
     }
 }
 
-/// A fault the simulated network makes on its own, which `rargo-sim --off` turns off.
+/// A fault the simulator makes on its own, which `rargo-sim --off` turns off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fault {
     Loss,
     Duplicate,
     Reorder,
+    ServerCrash,
 }
 
 impl Fault {
-    pub const ALL: [Fault; 3] = [Fault::Loss, Fault::Duplicate, Fault::Reorder];
+    pub const ALL: [Fault; 4] = [Fault::Loss, Fault::Duplicate, Fault::Reorder, Fault::ServerCrash];
+    const NETWORK: [Fault; 3] = [Fault::Loss, Fault::Duplicate, Fault::Reorder];
 
     pub fn name(self) -> &'static str {
         match self {
             Fault::Loss => "loss",
             Fault::Duplicate => "duplicate",
             Fault::Reorder => "reorder",
+            Fault::ServerCrash => "server-crash",
         }
     }
 
@@ -108,7 +112,7 @@ impl Fault {
     }
 }
 
-/// Which network faults a run leaves out. Each fault draws from its own stream, so turning one off
+/// Which optional faults a run leaves out. Each fault draws from its own stream, so turning one off
 /// leaves the others' rates and draws as the seed picked them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Off(BTreeSet<Fault>);
@@ -211,6 +215,7 @@ pub struct Report {
     pub tests_timed_out: u64,
     pub cuts: u64,
     pub worker_crashes: u64,
+    pub server_restarts: u64,
     pub jobs_lost_to_crashes: u64,
     pub evictions: u64,
     /// Most client rounds in progress when the server evicted a blob.
@@ -360,6 +365,7 @@ enum Ev {
     Connect { worker: u64, epoch: u64 },
     Finish { worker: u64, epoch: u64, token: u64 },
     Crash { worker: u64 },
+    ServerCrash,
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
@@ -421,7 +427,50 @@ struct Server {
     disk_errors: BTreeMap<u64, (u64, String)>,
 }
 
+fn held_key(client: u64) -> [u8; 8] {
+    client.to_le_bytes()
+}
+
 impl Server {
+    fn new() -> Self {
+        Self {
+            pool: WorkerPool::new(),
+            trees: TreesState::new(),
+            sessions: BTreeMap::new(),
+            sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
+            pipe: SERVER_TOKENS,
+            store: None,
+            pins: BTreeMap::new(),
+            held: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            ready: VecDeque::new(),
+            next_job: 1,
+            disk_errors: BTreeMap::new(),
+        }
+    }
+
+    fn save_held(&self, client: u64) {
+        self.store().db().put(Table::Meta, &held_key(client), &rargo_proto::encode(&self.held[&client]));
+    }
+
+    fn reopen(&mut self, clients: u64) -> Step {
+        let store = self.store();
+        let root = store.root().parent().expect("the server disk root").to_owned();
+        // Event boundaries are durability points for the process-crash fault.
+        store.db().flush_checked().map_err(storage_error)?;
+        *self = Self::new();
+        self.store = Some(disk::open(&root));
+        for client in 1..=clients {
+            let Some(bytes) = self.store().db().get(Table::Meta, &held_key(client)) else { continue };
+            let (round, held): (u64, BTreeSet<Hash>) = rargo_proto::decode(&bytes).map_err(storage_error)?;
+            for hash in &held {
+                *self.pins.entry(*hash).or_default() += 1;
+            }
+            self.held.insert(client, (round, held));
+        }
+        Ok(())
+    }
+
     fn store(&self) -> &Store {
         self.store.as_ref().expect("the server has started")
     }
@@ -532,7 +581,7 @@ fn link_error(error: std::io::Error) -> Kind {
 impl World {
     pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
         let mut rng = Rng::new(seed);
-        let mut net = Fault::ALL.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
+        let mut net = Fault::NETWORK.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
         let mut plan_rng = Rng::new(seed ^ WORKSPACE_STREAM);
         let workspace = Workspace::generate(&mut plan_rng);
         let project = Project::plan(&mut plan_rng, &workspace);
@@ -553,20 +602,7 @@ impl World {
             queue: BTreeMap::new(),
             busy: 0,
             last: BTreeMap::new(),
-            server: Server {
-                pool: WorkerPool::new(),
-                trees: TreesState::new(),
-                sessions: BTreeMap::new(),
-                sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
-                pipe: SERVER_TOKENS,
-                store: None,
-                pins: BTreeMap::new(),
-                held: BTreeMap::new(),
-                jobs: BTreeMap::new(),
-                ready: VecDeque::new(),
-                next_job: 1,
-                disk_errors: BTreeMap::new(),
-            },
+            server: Server::new(),
             workers: BTreeMap::new(),
             clients: BTreeMap::new(),
             report: Report {
@@ -580,6 +616,7 @@ impl World {
                 tests_timed_out: 0,
                 cuts: 0,
                 worker_crashes: 0,
+                server_restarts: 0,
                 jobs_lost_to_crashes: 0,
                 evictions: 0,
                 clients_at_eviction: 0,
@@ -684,6 +721,13 @@ impl World {
         }
         let at = w.rng.range(50, 400);
         w.schedule_housekeeping(at, Ev::Evict);
+        // Keep the crash schedule independent of workload and network draws.
+        let mut crashes = Rng::new(seed ^ 0x7365_7276_6372_6173);
+        if !w.off.has(Fault::ServerCrash) && w.cfg.fault_end_ms > 0 && crashes.chance(500) {
+            for _ in 0..crashes.range(1, 3) {
+                w.schedule(crashes.range(0, w.cfg.fault_end_ms), Ev::ServerCrash);
+            }
+        }
         w
     }
 
@@ -921,6 +965,7 @@ impl World {
             Ev::Connect { worker, epoch } => self.connect(worker, epoch),
             Ev::Finish { worker, epoch, token } => self.finish(worker, epoch, token),
             Ev::Crash { worker } => self.crash(worker),
+            Ev::ServerCrash => self.server_crash(),
             Ev::Cut { worker } => self.cut(worker),
             Ev::Evict => {
                 self.evict();
@@ -1059,6 +1104,46 @@ impl World {
         self.worker_effects(worker, fx)?;
         let lost = self.server.pool.left(worker);
         self.pool_effects(lost);
+        Ok(())
+    }
+
+    fn server_crash(&mut self) -> Step {
+        // Capture the invariant independently of the pin metadata the new server reads.
+        let expected_pins = self.server.pins.clone();
+        self.server.reopen(self.cfg.clients)?;
+        for hash in expected_pins.keys() {
+            if !self.server.store().read(hash).is_ok_and(|bytes| Hash::of(&bytes) == *hash) {
+                return Err(Kind::LostPinned(format!("blob {hash} was lost after a server restart")));
+            }
+        }
+        if self.server.pins != expected_pins {
+            return Err(Kind::LostPinned("server restart changed the pin counts".into()));
+        }
+        self.report.server_restarts += 1;
+
+        // Old datagrams and timers still in the queue carry connection IDs that
+        // can never match the new links.
+        self.connections.clear();
+        self.last.clear();
+        self.server_endpoint = EndpointState::new(true, false, self.link_key.clone());
+        for worker in 1..=self.cfg.workers {
+            let node = self.workers.get_mut(&worker).expect("known worker");
+            if node.up {
+                node.up = false;
+                node.epoch += 1;
+                let effects = node.sm.link_lost();
+                self.worker_effects(worker, effects)?;
+            }
+        }
+        for client in 1..=self.cfg.clients {
+            let c = self.clients.get_mut(&client).expect("known client");
+            if c.up {
+                c.up = false;
+                if !c.dead && !c.finished && c.outputs.len() < self.project.actions.len() {
+                    self.schedule(1, Ev::Sync { client });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1361,6 +1446,7 @@ impl World {
         for h in &o.contents {
             self.pin(client, *h);
         }
+        self.server.save_held(client);
         self.server.trees.release(o.up);
         self.send(Node::Server, Node::Client(client), Msg::Down(Down::Synced { round: o.round, root: o.root }));
     }
@@ -1368,6 +1454,7 @@ impl World {
     fn deliver_output(&mut self, client: u64, round: u64, action: usize, out: Hash, bytes: Vec<u8>) -> Step {
         if self.server.held.get(&client).is_some_and(|(r, _)| *r == round) {
             self.pin(client, out);
+            self.server.save_held(client);
         }
         let server = &mut self.server;
         let Some(sess) = server.sessions.get_mut(&client) else { return Ok(()) };
@@ -1429,7 +1516,11 @@ impl World {
                     Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
                         let message = rargo_core::serve::failure("keeping the build output", &error.into());
                         self.server.disk_errors.insert(j.client, (j.round, message.clone()));
-                        self.send(Node::Server, Node::Client(j.client), Msg::Down(Down::DiskError { round: j.round, message }));
+                        // A job can finish after its client loses the link. The recorded
+                        // error is returned when that client offers the round again.
+                        if self.server.sessions.contains_key(&j.client) {
+                            self.send(Node::Server, Node::Client(j.client), Msg::Down(Down::DiskError { round: j.round, message }));
+                        }
                         return Ok(());
                     }
                     Err(error) => return Err(storage_error(error)),
@@ -1605,6 +1696,7 @@ impl World {
                 c.up_since = now;
                 let outputs = &c.outputs;
                 c.requested.retain(|a| outputs.contains_key(a));
+                c.synced_round = 0;
                 c.pending.clear();
                 c.parts.clear();
                 self.open_link(Node::Client(client))?;
@@ -1711,7 +1803,7 @@ impl World {
             return Ok(());
         }
         match c.watch.tick(Duration::from_millis(now)) {
-            // The world never restarts its server, so a fresh dial would tell the client nothing new.
+            // Server restarts close the link directly. The silence fault keeps it open.
             Tick::Wait | Tick::Probe => {}
             Tick::Ping(_) => self.send(Node::Client(client), Node::Server, Msg::Up(Up::Ping)),
             Tick::Silent(_) if bug == Some(Bug::DeafToSilence) => {}
@@ -1978,6 +2070,7 @@ fn label(ev: &Ev) -> String {
         Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
         Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
         Ev::Crash { worker } => format!("crash {worker};"),
+        Ev::ServerCrash => "server crash and restart;".to_string(),
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
@@ -2003,6 +2096,36 @@ pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_server_restart_reloads_shared_pins_and_discards_old_links() {
+        sim::test(|| {
+            let mut world = World::new(12, None, Off::none());
+            world.server.store = Some(disk::open(&sim::tempdir()));
+            let hash = world.server.store().put_bytes(b"pinned").unwrap();
+            let key = Hash::of(b"action");
+            disk::cache(world.server.store(), key, hash);
+            for client in 1..=world.cfg.clients {
+                world.server.held.insert(client, (1, BTreeSet::new()));
+                world.pin(client, hash);
+                world.server.save_held(client);
+            }
+            world.round(1).unwrap();
+            let old_link = world.connections[&Node::Client(1)].id;
+
+            world.step(Ev::ServerCrash).unwrap();
+            world.check().unwrap();
+            assert!(world.connections.is_empty());
+            assert!(world.server.sessions.is_empty());
+            assert_eq!(world.server.pins[&hash], world.cfg.clients as usize);
+            assert_eq!(disk::cached(world.server.store(), key), Some(hash));
+            assert_eq!(world.report.server_restarts, 1);
+
+            world.sync(1).unwrap();
+            assert_ne!(world.connections[&Node::Client(1)].id, old_link);
+            world.arrive(Node::Client(1), true, old_link, Vec::new()).unwrap();
+        });
+    }
 
     #[test]
     fn a_lost_initial_handshake_is_retransmitted_on_the_simulated_clock() {
