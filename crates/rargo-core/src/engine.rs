@@ -296,8 +296,6 @@ fn read_pipe(fd: &io::PipeEnd) -> std::io::Result<Vec<u8>> {
 #[derive(Clone, Copy)]
 struct ObsPtr(*const dyn Observer);
 
-unsafe impl Send for ObsPtr {}
-
 fn read_stdout(fd: io::PipeEnd, obs: ObsPtr) -> Vec<u8> {
     let mut all = Vec::new();
     loop {

@@ -78,6 +78,7 @@ pub struct Daemon {
     fetching: crate::io::Mutex<()>,
     scratch_seq: Cell<u64>,
     log_phases: OnceCell<bool>,
+    pub(crate) nix_ready: OnceCell<Result<(), String>>,
     pub stats: Arc<DaemonStats>,
 }
 
@@ -252,6 +253,7 @@ impl Daemon {
             fetching: crate::io::Mutex::new(()),
             scratch_seq: Cell::new(0),
             log_phases: OnceCell::new(),
+            nix_ready: OnceCell::new(),
             incr,
             pool: OnceCell::new(),
             nix_attached: Arc::default(),
