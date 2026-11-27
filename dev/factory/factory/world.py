@@ -804,6 +804,15 @@ def _(w: World, e: m.Diverged, a):
 
 @on(m.MergeFailed)
 def _(w: World, e: m.MergeFailed, a):
+    p = w.latest_push(e.pr, e.push)
+    if e.reason is m.MergeFailure.conflict and w.is_(M.CI, f"{e.pr}/{e.push}", CiS.pending):
+        # GitHub starts no CI run on a pull request that conflicts with its
+        # base, so the push can never go green: it needs work now.
+        if not w.is_(M.ISSUE, p.issue, IssueS.checking):
+            w.fail(f"#{p.issue} is not in checks")
+        _void(w, e.pr, e.push, ci=True)
+        w.wait(p.issue)
+        return
     w.wait(_green(w, e).issue)
 
 

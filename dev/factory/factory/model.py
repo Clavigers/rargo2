@@ -549,7 +549,10 @@ class Diverged(Event):
 
 @event({Role.merger}, O)
 class MergeFailed(Event):
-    """The latest push is green and approved but did not merge: needs work."""
+    """The latest push is green and approved but did not merge: needs work.
+    Or, reason conflict only, it conflicts with its base while its CI is
+    still pending: GitHub runs no CI on it, so its pending checks void and it
+    needs work."""
     event: Literal["merge_failed"]
     pr: Number
     push: PushNo
