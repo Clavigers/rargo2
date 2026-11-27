@@ -634,8 +634,21 @@ class UseStarted(Event):
 
 @event({H, PU}, O)
 class UseEnded(Event):
+    """void: the session did not run to its end (it crashed, ran out of
+    quota or time, or was cut off), so it is not a use of the build."""
     event: Literal["use_ended"]
     use: Number
+    void: bool = False
+
+
+@event({H, PU}, D)
+class UseVoided(Event):
+    """An ended power user session turned out not to have been a use of its
+    build (it did nothing, or what it used was not the build). It no longer
+    counts towards uses_required. What it filed stays filed."""
+    event: Literal["use_voided"]
+    use: Number
+    note: Note
 
 
 @event({PM}, D)

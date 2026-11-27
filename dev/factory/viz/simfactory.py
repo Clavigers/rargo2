@@ -414,7 +414,7 @@ class Sim:
             r = w.versions[v]
             build = len(r.builds)
             ended = sum(1 for n, u in w.uses.items() if (u.by, u.version, u.build) == ("power_user", v, build)
-                        and w.is_(M.USE, n, "ended"))
+                        and w.is_(M.USE, n, "ended") and not u.void)
             if build == 0 or r.unbuilt or ended >= w.config.release.uses_required:
                 continue
             use += 1

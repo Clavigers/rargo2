@@ -77,6 +77,7 @@ class Use:
     by: str
     version: str
     build: int
+    void: bool = False  # ended without running to its end: not a use of the build
 
 
 HANDLERS: dict[type, Callable] = {}
@@ -325,7 +326,7 @@ class World:
             out.add(R.known_bugs)
         uses = sum(1 for n, u in self.uses.items()
                    if (u.version, u.build, u.by) == (version, build, Role.power_user)
-                   and self.is_(M.USE, n, "ended"))
+                   and self.is_(M.USE, n, "ended") and not u.void)
         if uses < rules.uses_required:
             out.add(R.uses)
         found_here = [self.issues[n].filed for n in bugs
@@ -938,6 +939,17 @@ def _(w: World, e: m.UseEnded, a):
     if u is None or u.by != a:
         w.fail(f"use {e.use} is not {a}'s")
     w.enter(M.USE, e.use, "ended")
+    u.void = e.void
+
+
+@on(m.UseVoided)
+def _(w: World, e: m.UseVoided, a):
+    u = w.uses.get(e.use)
+    if u is None or u.by != Role.power_user or not w.is_(M.USE, e.use, "ended"):
+        w.fail(f"use {e.use} is not an ended power user session")
+    if u.void:
+        w.fail(f"use {e.use} is already void")
+    u.void = True
 
 
 @on(m.ReleaseHeld)
