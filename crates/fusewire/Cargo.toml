@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-rargo-machine = { path = "../rargo-machine", version = "0.7.11" }
+rargo-machine = { path = "../rargo-machine", version = "0.7.12" }
 libc.workspace = true
 
 [dev-dependencies]
