@@ -300,20 +300,51 @@ pub fn build_paths(root: &str, cargo_home: &str, env: &mut BTreeMap<String, Stri
         (worktree_at.into(), root.into()),
         (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), cargo_home.into()),
     ];
-    if let Some(dir) = env.get_mut("CARGO_TARGET_DIR")
-        && Path::new(dir).is_absolute()
-    {
+    for (var, sandbox) in [("CARGO_TARGET_DIR", "/w/target/rargo-external"), ("CARGO_BUILD_BUILD_DIR", "/w/target/rargo-external-build")] {
+        let Some(dir) = env.get_mut(var) else { continue };
+        if !Path::new(dir).is_absolute() {
+            continue;
+        }
         let local = Path::new(dir).components().collect::<PathBuf>();
         if let Ok(relative) = local.strip_prefix(root) {
             *dir = Path::new(worktree_at).join(relative).to_string_lossy().into_owned();
         } else {
             // Keep compiler outputs in the action filesystem even for client paths under /tmp.
-            let sandbox = "/w/target/rargo-external";
             pairs.push((sandbox.into(), local.to_string_lossy().into_owned()));
             *dir = sandbox.into();
         }
     }
     Translator::new(pairs)
+}
+
+/// The target and build directories a plan chose from cargo configuration
+/// (`build.target-dir`, `build.build-dir`) that lie outside the sandbox's
+/// worktree and cargo home, as the variables and client paths that make
+/// [`build_paths`] map them into the sandbox. Outside those, a directory is
+/// not in the action filesystem (`/tmp` is each action's own tmpfs), so the
+/// plan must be made again with these set. A variable already in `env` was
+/// mapped before planning and is left alone.
+pub fn configured_dirs(
+    target_dir: &str,
+    build_dir: &str,
+    tr: &Translator,
+    env: &BTreeMap<String, String>,
+) -> Vec<(String, String)> {
+    let inside = |dir: &str| {
+        let dir = absolute_in("/", dir);
+        [WORKTREE_AT, CARGO_HOME_AT].iter().any(|at| crate::view::vpath_starts_with(dir.as_bytes(), at))
+    };
+    let mut out = Vec::new();
+    for (var, dir) in [("CARGO_TARGET_DIR", target_dir), ("CARGO_BUILD_BUILD_DIR", build_dir)] {
+        if env.contains_key(var) || !dir.starts_with('/') || inside(dir) {
+            continue;
+        }
+        if var == "CARGO_BUILD_BUILD_DIR" && dir == target_dir {
+            continue;
+        }
+        out.push((var.to_string(), absolute_in("/", &tr.path(dir))));
+    }
+    out
 }
 
 pub fn base_env<'a>(
@@ -471,6 +502,58 @@ mod tests {
         assert!(!flag_target_dir(&given, "/w", &mut env));
         assert!(env.is_empty());
         assert_eq!(with_target_dir(&given, "/w/y"), given);
+    }
+
+    #[test]
+    fn a_configured_target_dir_outside_the_sandbox_is_planned_again_as_the_variable() {
+        // `R` under /tmp, the project at `R/two`; each case is a planned
+        // target dir and where cargo puts it on the client.
+        let root = "/tmp/R/two";
+        for (planned, client) in [
+            ("/tmp/R/two-out", "/tmp/R/two-out"),
+            ("/w/../x", "/tmp/R/x"),
+            ("/w/.cargo/../../x/", "/tmp/R/x"),
+            ("/var/tmp/out", "/var/tmp/out"),
+        ] {
+            let mut env = BTreeMap::new();
+            let tr = build_paths(root, "/home/user/.cargo", &mut env);
+            let dirs = configured_dirs(planned, planned, &tr, &env);
+            assert_eq!(dirs, vec![("CARGO_TARGET_DIR".to_string(), client.to_string())], "{planned}");
+            env.extend(dirs);
+            let tr = build_paths(root, "/home/user/.cargo", &mut env);
+            let sandbox = env["CARGO_TARGET_DIR"].clone();
+            assert_eq!(sandbox, "/w/target/rargo-external");
+            assert_eq!(tr.path(&format!("{sandbox}/debug/two")), format!("{client}/debug/two"));
+            assert_eq!(tr.to_canonical("/tmp/R/two/src"), "/w/src");
+            // Planned again, the directory is in the sandbox: no third plan.
+            assert!(configured_dirs(&sandbox, &sandbox, &tr, &env).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_configured_target_dir_inside_the_worktree_or_given_already_is_kept() {
+        let mut env = BTreeMap::new();
+        let tr = build_paths("/tmp/R/two", "/home/user/.cargo", &mut env);
+        for planned in ["/w/target", "/w/out", "/w/sub/../out", "/c/target"] {
+            assert!(configured_dirs(planned, planned, &tr, &env).is_empty(), "{planned}");
+        }
+        let given = BTreeMap::from([("CARGO_TARGET_DIR".to_string(), "/w/target/rargo-external".to_string())]);
+        assert!(configured_dirs("/tmp/R/two-out", "/w/target/rargo-external", &tr, &given).is_empty());
+    }
+
+    #[test]
+    fn a_configured_build_dir_outside_the_sandbox_is_mapped_apart_from_the_target_dir() {
+        let mut env = BTreeMap::new();
+        let tr = build_paths("/tmp/R/two", "/home/user/.cargo", &mut env);
+        let dirs = configured_dirs("/w/target", "/tmp/R/build", &tr, &env);
+        assert_eq!(dirs, vec![("CARGO_BUILD_BUILD_DIR".to_string(), "/tmp/R/build".to_string())]);
+        env.extend(dirs);
+        let tr = build_paths("/tmp/R/two", "/home/user/.cargo", &mut env);
+        assert_eq!(env["CARGO_BUILD_BUILD_DIR"], "/w/target/rargo-external-build");
+        assert_eq!(tr.path("/w/target/rargo-external-build/debug/deps"), "/tmp/R/build/debug/deps");
+        assert_eq!(tr.path("/w/target/debug/two"), "/tmp/R/two/target/debug/two");
+        let both = configured_dirs("/tmp/R/t", "/tmp/R/b", &tr, &BTreeMap::new());
+        assert_eq!(both.len(), 2);
     }
 
     #[test]

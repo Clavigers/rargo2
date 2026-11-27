@@ -1044,12 +1044,22 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
                 req.borrow_mut().prepared()
             }
             Effect::Plan { as_build } => {
-                let p = prepared.as_ref().expect("a plan follows a prepared worktree");
+                let p = prepared.as_mut().expect("a plan follows a prepared worktree");
                 plan_args = args.clone();
                 if let (Some(i), true) = (check_at, as_build) {
                     plan_args[i] = "build".into();
                 }
-                match plan(d, c, p, &plan_args)? {
+                let mut outcome = plan(d, c, p, &plan_args)?;
+                if let PlanOutcome::Ok(pl) = &outcome {
+                    let chosen = &pl.data.plan;
+                    let dirs = configured_dirs(&chosen.target_dir, &chosen.build_dir, &p.tr, &p.env);
+                    if !dirs.is_empty() {
+                        p.env.extend(dirs);
+                        p.tr = build_paths(&c.root, &c.cargo_home, &mut p.env);
+                        outcome = plan(d, c, p, &plan_args)?;
+                    }
+                }
+                match outcome {
                     PlanOutcome::Ok(pl) => {
                         let plan = &pl.data.plan;
                         let fx = req.borrow_mut().planned(plan.rustc_fork, plan.units.len(), plan.keep_going);
