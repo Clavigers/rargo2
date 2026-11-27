@@ -18,7 +18,7 @@ mod task;
 
 pub use fuse::FuseDrive;
 
-pub use fiber::{drive, loop_running, on_fiber};
+pub use fiber::{drive, loop_running, on_fiber, on_loop_thread};
 pub use fs::{close_fd, fsync_fd, open_at, read_at, read_ready, rename_at, stat_at, try_read, write_at};
 pub use process::{output, wait_exit, wait_exited};
 pub use pipe::{pipe, queued, write_now, PipeEnd};
@@ -27,7 +27,7 @@ pub use net::{lookup_host, recv_fds, send_fds, ReadHalf, TcpListener, TcpStream,
 pub use sim::{now, random, system_now};
 pub use signal::{signal, Signal, SignalKind};
 pub use sync::{oneshot, unbounded_channel, watch, Mutex, MutexGuard, Notify, Permit, RecvError, Semaphore, UnboundedReceiver, UnboundedSender};
-pub use task::{background, blocking, call, spawn_off, cpu, interval, on_this_thread, race_biased, sleep, spawn, timeout, within, yield_now, AbortHandle, Elapsed, Interval, JoinError, JoinHandle};
+pub use task::{background, blocking, call, loop_at_hand, spawn_off, cpu, interval, on_this_thread, race_biased, sleep, spawn, timeout, within, yield_now, AbortHandle, Elapsed, Interval, JoinError, JoinHandle};
 
 use std::io;
 

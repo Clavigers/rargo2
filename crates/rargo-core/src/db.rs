@@ -1,11 +1,12 @@
-use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
-use crate::io::db::{WriterTask, WriterWake};
+use crate::db_writer::Batch;
+#[cfg(doc)]
+use crate::db_writer::DbWriter;
+use crate::io::db::{Disk, Open, Owner, Reopenable};
 use anyhow::{Context, Result};
-use parking_lot::{Mutex, RwLock};
 use redb::{Database, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Table {
@@ -103,64 +104,69 @@ impl Tables for MemTables {
     }
 }
 
-type Open = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>;
-
 struct Shared {
-    db: RwLock<Option<Database>>,
-    open: Open,
-    writer: Mutex<DbWriter>,
+    db: Reopenable,
     born: Instant,
 }
 
-impl Shared {
+impl Disk for Shared {
     fn now_ms(&self) -> u64 {
         crate::io::now().saturating_duration_since(self.born).as_millis() as u64
     }
+
+    fn commit(&self, batch: &Batch) -> Result<()> {
+        self.db.commit(|db| commit(db, batch))
+    }
 }
 
+/// The tables on disk, and the writes not yet committed to them. The
+/// pending writes belong to a [`DbWriter`] that one owner steps: a fiber on
+/// the I/O loop while one runs, which commits them in the background.
+/// A regular database without a loop commits on flush or drop. A database
+/// opened over the simulated filesystem commits only on explicit flush.
 pub struct Db {
     shared: Arc<Shared>,
-    writing: Option<WriterTask>,
+    writer: Owner,
 }
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
         let owned = path.to_path_buf();
-        Db::over(Box::new(move || Database::create(&owned))).with_context(|| format!("opening {}", path.display()))
+        Db::over(Box::new(move || Database::create(&owned)), true)
+            .with_context(|| format!("opening {}", path.display()))
     }
 
     /// A database that lives in memory and is gone when it is dropped.
     pub fn open_in_memory() -> Result<Db> {
-        Db::on_backend(Memory::default())
+        Db::on_backend(Memory::default(), true)
     }
 
     /// Real redb using the simulated filesystem. The caller controls commits.
     pub fn open_simulated(path: &Path) -> Result<Db> {
         assert!(crate::io::sim::active());
         let owned = path.to_path_buf();
-        let mut db = Db::over(Box::new(move || {
-            let file = crate::io::file::OpenOptions::new().read(true).write(true).create(true).open(&owned)?;
-            redb::Builder::new().create_with_backend(SimFile(file))
-        }))?;
-        db.writing = None;
-        Ok(db)
+        Db::over(
+            Box::new(move || {
+                let file = crate::io::file::OpenOptions::new().read(true).write(true).create(true).open(&owned)?;
+                redb::Builder::new().create_with_backend(SimFile(file))
+            }),
+            false,
+        )
     }
 
     /// A database on `disk`, opened again on the same disk after a failed commit.
-    fn on_backend(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
-        Db::over(Box::new(move || redb::Builder::new().create_with_backend(disk.clone())))
+    fn on_backend(disk: impl redb::StorageBackend + Clone, background: bool) -> Result<Db> {
+        Db::over(Box::new(move || redb::Builder::new().create_with_backend(disk.clone())), background)
     }
 
     /// A database on `disk` that never starts a background writer, so a test's writes wait for
     /// its own `flush` and never reach another test's loop.
     #[cfg(test)]
     fn on(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
-        let mut db = Db::on_backend(disk)?;
-        db.writing = None;
-        Ok(db)
+        Db::on_backend(disk, false)
     }
 
-    fn over(open: Open) -> Result<Db> {
+    fn over(open: Open, background: bool) -> Result<Db> {
         let db = open()?;
         {
             let tx = db.begin_write()?;
@@ -169,61 +175,55 @@ impl Db {
             }
             tx.commit()?;
         }
-        let shared = Arc::new(Shared {
-            db: RwLock::new(Some(db)),
-            open,
-            writer: Mutex::new(DbWriter::new()),
-            born: crate::io::now(),
-        });
-        Ok(Db { shared, writing: Some(WriterTask::default()) })
-    }
-
-    fn written(&self) {
-        if let Some(writing) = &self.writing {
-            let shared = Arc::clone(&self.shared);
-            writing.written(move |wake| writer_loop(shared, wake));
-        }
+        let shared = Arc::new(Shared { db: Reopenable::new(db, open), born: crate::io::now() });
+        let writer = Owner::new(shared.clone(), background);
+        Ok(Db { shared, writer })
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
-        if let Some(v) = self.shared.writer.lock().get(table, key) {
+        let key_owned = key.to_vec();
+        if let Some(v) = self.writer.read(move |w| w.get(table, &key_owned)) {
             return v;
         }
-        let db = self.shared.db.read();
-        let tx = db.as_ref()?.begin_read().ok()?;
-        let t = tx.open_table(table.def()).ok()?;
-        let v = t.get(key).ok()??;
-        Some(Arc::from(v.value()))
+        self.shared.db.read(|db| {
+            let tx = db?.begin_read().ok()?;
+            let t = tx.open_table(table.def()).ok()?;
+            let v = t.get(key).ok()??;
+            Some(Arc::from(v.value()))
+        })
     }
 
     pub fn put(&self, table: Table, key: &[u8], val: &[u8]) {
         let now = self.shared.now_ms();
-        self.shared.writer.lock().put(table, key, val, now);
-        self.written();
+        let (key, val) = (key.to_vec(), val.to_vec());
+        self.writer.write(move |w| w.put(table, &key, &val, now));
     }
 
     pub fn delete(&self, table: Table, key: &[u8]) {
         let now = self.shared.now_ms();
-        self.shared.writer.lock().delete(table, key, now);
-        self.written();
+        let key = key.to_vec();
+        self.writer.write(move |w| w.delete(table, &key, now));
     }
 
     pub fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
         let mut out: std::collections::BTreeMap<Vec<u8>, Option<Arc<[u8]>>> = Default::default();
-        if let Some(Ok(tx)) = self.shared.db.read().as_ref().map(Database::begin_read) {
-            if let Ok(t) = tx.open_table(table.def()) {
-                if let Ok(range) = t.range::<&[u8]>(prefix..) {
-                    for item in range {
-                        let Ok((k, v)) = item else { break };
-                        if !k.value().starts_with(prefix) {
-                            break;
+        self.shared.db.read(|db| {
+            if let Some(Ok(tx)) = db.map(Database::begin_read) {
+                if let Ok(t) = tx.open_table(table.def()) {
+                    if let Ok(range) = t.range::<&[u8]>(prefix..) {
+                        for item in range {
+                            let Ok((k, v)) = item else { break };
+                            if !k.value().starts_with(prefix) {
+                                break;
+                            }
+                            out.insert(k.value().to_vec(), Some(Arc::from(v.value())));
                         }
-                        out.insert(k.value().to_vec(), Some(Arc::from(v.value())));
                     }
                 }
             }
-        }
-        for (k, v) in self.shared.writer.lock().pending_with_prefix(table, prefix) {
+        });
+        let prefix = prefix.to_vec();
+        for (k, v) in self.writer.read(move |w| w.pending_with_prefix(table, &prefix)) {
             out.insert(k, v);
         }
         out.into_iter().filter_map(|(k, v)| v.map(|v| (k, v))).collect()
@@ -235,21 +235,20 @@ impl Db {
         }
     }
 
+    /// Commits every write made before this call, and returns once that
+    /// commit has ended.
     pub fn flush(&self) {
         let _ = self.flush_checked();
     }
 
     pub fn flush_checked(&self) -> Result<()> {
-        flush_off_the_loop(&self.shared)
+        self.writer.flush()
     }
 }
 
 impl Drop for Db {
     fn drop(&mut self) {
-        if let Some(writing) = &mut self.writing {
-            writing.stop();
-            self.flush();
-        }
+        self.writer.stop();
     }
 }
 
@@ -273,39 +272,6 @@ fn commit(db: Option<&Database>, batch: &Batch) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
-}
-
-fn flush_once(shared: &Shared) -> Result<()> {
-    // Serialize flushes while allowing readers to use the database during commit.
-    let mut db = shared.db.upgradable_read();
-    let batch = shared.writer.lock().take();
-    if batch.is_empty() {
-        return Ok(());
-    }
-    if db.is_none() {
-        db.with_upgraded(|db| reopen(db, &shared.open));
-    }
-    let done = commit(db.as_ref(), &batch);
-    let now = shared.now_ms();
-    match &done {
-        Ok(()) => shared.writer.lock().flushed(&batch, now),
-        Err(e) => {
-            eprintln!("rargod: db commit failed: {e:#}");
-            shared.writer.lock().failed(now);
-            db.with_upgraded(|db| reopen(db, &shared.open));
-        }
-    }
-    done
-}
-
-// After an I/O error redb refuses every later transaction until the database is opened again.
-// The old handle goes first: a file holds one open database at a time.
-fn reopen(db: &mut Option<Database>, open: &Open) {
-    drop(db.take());
-    match open() {
-        Ok(fresh) => *db = Some(fresh),
-        Err(e) => eprintln!("rargod: db reopen failed: {e:#}"),
-    }
 }
 
 #[derive(Debug)]
@@ -361,44 +327,23 @@ impl redb::StorageBackend for Memory {
     }
 }
 
-fn flush_off_the_loop(shared: &Shared) -> Result<()> {
-    if crate::io::on_fiber() {
-        crate::io::cpu(|| flush_once(shared))
-    } else {
-        flush_once(shared)
-    }
-}
-
-fn writer_loop(shared: Arc<Shared>, wake: WriterWake) {
-    while wake.running() {
-        let wait = {
-            let w = shared.writer.lock();
-            let now = shared.now_ms();
-            match w.due(now) {
-                Due::Now => None,
-                Due::Idle => Some(IDLE_MS),
-                Due::At(t) => Some(t.saturating_sub(now).max(1)),
-            }
-        };
-        match wait {
-            None => {
-                let _ = crate::io::cpu(|| flush_once(&shared));
-            }
-            Some(ms) => wake.wait(Duration::from_millis(ms)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db_writer::DELAY_MS;
     use crate::io::{sim, sleep};
+    use std::time::Duration;
 
     fn committed(db: &Db, key: &[u8]) -> bool {
-        let tx = db.shared.db.read().as_ref().unwrap().begin_read().unwrap();
-        let table = tx.open_table(Table::Meta.def()).unwrap();
-        table.get(key).unwrap().is_some()
+        on_disk(&db.shared.db, key)
+    }
+
+    fn on_disk(db: &Reopenable, key: &[u8]) -> bool {
+        db.read(|db| {
+            let tx = db.unwrap().begin_read().unwrap();
+            let table = tx.open_table(Table::Meta.def()).unwrap();
+            table.get(key).unwrap().is_some()
+        })
     }
 
     #[test]
@@ -419,6 +364,99 @@ mod tests {
             sleep(Duration::from_millis(1));
             assert!(shared.upgrade().is_none());
         });
+    }
+
+    fn scan(db: &Db, prefix: &[u8]) -> Vec<(String, String)> {
+        db.scan_prefix(Table::Meta, prefix)
+            .into_iter()
+            .map(|(k, v)| (String::from_utf8_lossy(&k).into_owned(), String::from_utf8_lossy(&v).into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn the_loop_owner_answers_reads_with_the_pending_writes() {
+        sim::test(|| {
+            let db = Db::open_in_memory().unwrap();
+            db.put(Table::Meta, b"a1", b"old");
+            db.put(Table::Meta, b"a2", b"two");
+            db.flush();
+            assert!(committed(&db, b"a1") && committed(&db, b"a2"), "an explicit flush commits at once");
+
+            db.put(Table::Meta, b"a1", b"new");
+            db.delete(Table::Meta, b"a2");
+            db.put(Table::Meta, b"a3", b"three");
+            db.put(Table::Meta, b"b1", b"other");
+            assert_eq!(db.get(Table::Meta, b"a1").as_deref(), Some(&b"new"[..]));
+            assert_eq!(db.get(Table::Meta, b"a2"), None, "a pending delete hides the committed value");
+            assert_eq!(scan(&db, b"a"), [("a1".into(), "new".into()), ("a3".into(), "three".into())]);
+            assert!(committed(&db, b"a2"), "nothing is committed before the delay");
+
+            sleep(Duration::from_millis(DELAY_MS + 1));
+            assert!(!committed(&db, b"a2") && committed(&db, b"a3"), "the owner commits after the delay");
+            assert_eq!(scan(&db, b"a"), [("a1".into(), "new".into()), ("a3".into(), "three".into())]);
+        });
+    }
+
+    #[test]
+    fn without_a_loop_writes_wait_for_a_flush() {
+        let db = Db::open_in_memory().unwrap();
+        db.put(Table::Meta, b"k", b"v");
+        db.delete(Table::Meta, b"gone");
+        assert_eq!(db.get(Table::Meta, b"k").as_deref(), Some(&b"v"[..]));
+        assert!(!committed(&db, b"k"));
+        db.flush();
+        assert!(committed(&db, b"k"));
+        assert_eq!(scan(&db, b""), [("k".into(), "v".into())]);
+    }
+
+    #[test]
+    fn a_loop_that_ends_hands_the_writes_back() {
+        let db = Db::open_in_memory().unwrap();
+        db.put(Table::Meta, b"before", b"1");
+        let db = sim::test(move || {
+            db.put(Table::Meta, b"during", b"2");
+            assert_eq!(db.get(Table::Meta, b"before").as_deref(), Some(&b"1"[..]));
+            db
+        });
+        assert!(!committed(&db, b"during"), "the loop ended before the delay");
+        assert_eq!(scan(&db, b""), [("before".into(), "1".into()), ("during".into(), "2".into())]);
+        db.put(Table::Meta, b"after", b"3");
+        db.flush();
+        assert!(committed(&db, b"before") && committed(&db, b"during") && committed(&db, b"after"));
+    }
+
+    #[test]
+    fn dropping_commits_what_is_pending() {
+        sim::test(|| {
+            let db = Db::open_in_memory().unwrap();
+            db.put(Table::Meta, b"k", b"v");
+            let shared = Arc::clone(&db.shared);
+            drop(db);
+            assert!(on_disk(&shared.db, b"k"), "dropping the database waits for its last commit");
+        });
+        let db = Db::open_in_memory().unwrap();
+        db.put(Table::Meta, b"k", b"v");
+        let shared = Arc::clone(&db.shared);
+        drop(db);
+        assert!(on_disk(&shared.db, b"k"), "without a loop too");
+    }
+
+    #[test]
+    fn a_database_dropped_as_its_loop_ends_commits_what_is_pending() {
+        let shared = sim::test(|| {
+            let db = Db::open_in_memory().unwrap();
+            let shared = Arc::clone(&db.shared);
+            // The loop ends with this fiber still holding the database. It
+            // starts before the writer's owner, so the loop drops it first,
+            // outside any fiber, where nothing can wait for the owner.
+            crate::io::background(move || {
+                db.put(Table::Meta, b"k", b"v");
+                sleep(Duration::from_secs(3600));
+            });
+            sleep(Duration::from_millis(1));
+            shared
+        });
+        assert!(on_disk(&shared.db, b"k"));
     }
 }
 

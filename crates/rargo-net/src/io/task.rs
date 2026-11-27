@@ -383,6 +383,13 @@ impl Drop for Home {
     }
 }
 
+/// Whether this thread belongs to a running loop: it drives the loop, or it
+/// is a worker of the loop's pool. Unlike [`super::loop_running`], which is
+/// true on any thread while some loop in the process runs.
+pub fn loop_at_hand() -> bool {
+    on_loop() || home().is_some()
+}
+
 pub(super) fn home() -> Option<Arc<Poke>> {
     HOME.with(|h| h.borrow().clone())
 }

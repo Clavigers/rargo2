@@ -180,3 +180,23 @@ fn a_full_disk_stops_writes_only_until_it_has_room_again() {
     assert_eq!(batch_on(disk.with(|s| s.safe.clone())), 3, "the database writes again once the disk has room");
     std::mem::forget(db);
 }
+
+#[test]
+fn the_loop_owner_reports_a_failed_flush_and_retries_the_batch() {
+    crate::io::sim::test(|| {
+        let disk = FakeDisk::holding(Vec::new());
+        let db = Db::on_backend(disk, true).unwrap();
+        write_batch(&db, 1);
+
+        disk.with(|s| s.full = true);
+        db.put(Table::Meta, b"first", &[2]);
+        db.put(Table::Blobs, b"second", &[2]);
+        assert!(db.flush_checked().is_err());
+        assert_eq!(db.get(Table::Meta, b"first").as_deref(), Some(&[2][..]));
+        assert_eq!(batch_on(disk.with(|s| s.safe.clone())), 1);
+
+        disk.with(|s| s.full = false);
+        db.flush_checked().unwrap();
+        assert_eq!(batch_on(disk.with(|s| s.safe.clone())), 2);
+    });
+}
