@@ -108,23 +108,30 @@ impl StoreIndex {
             self.unaccount(&old);
         }
         self.whole_bytes += m.size;
+        assert!(self.hot(&h) == Some(m), "{h} is loaded hot as recorded");
     }
 
     pub fn load_cold(&mut self, h: Hash, c: ColdRecord) {
         if self.blobs.get(&h).is_some_and(Blob::is_whole) {
             return;
         }
+        let whole = self.whole_bytes;
+        let size = c.size;
         self.blobs.insert(
             h,
             Blob { size: c.size, last_used: c.last_used, tier: Tier::Cold { added: c.added, recipe: c.recipe } },
         );
+        assert!(self.is_cold(&h) && self.size_of(&h) == Some(size), "{h} is loaded cold as recorded");
+        assert_eq!(self.whole_bytes, whole, "a cold record replaces no whole blob");
     }
 
     pub fn set_cold_disk(&mut self, bytes: u64) {
         self.cold_disk = bytes;
+        assert_eq!(self.cold_disk, bytes);
     }
 
     pub fn chunks_written(&mut self, bytes: u64) {
+        assert!(self.cold_disk.checked_add(bytes).is_some(), "cold disk bytes do not overflow");
         self.cold_disk += bytes;
     }
 
@@ -195,6 +202,7 @@ impl StoreIndex {
 
     pub fn chunks_collected(&mut self, kept: u64) {
         self.cold_disk = kept;
+        assert_eq!(self.cold_disk, kept);
     }
 
     pub fn put(&mut self, h: Hash, size: u64, mtime_ns: i64, now: u64) -> Put {
@@ -219,18 +227,22 @@ impl StoreIndex {
         };
         let stale = now.saturating_sub(b.last_used) > TOUCH_PERSIST_SECS;
         b.last_used = now;
-        match b.tier {
+        let out = match b.tier {
             Tier::Hot { mtime_ns } if stale => Touch::Persist(HotMeta { size: b.size, mtime_ns, last_used: now }),
             _ => Touch::Quiet,
-        }
+        };
+        assert_eq!(self.blobs[h].last_used, now, "a touched blob was used now");
+        out
     }
 
     pub fn forget(&mut self, h: &Hash) -> Forgot {
         let Some(b) = self.blobs.remove(h) else {
             return Forgot { hot: false, cold: false };
         };
+        let generation = self.generation;
         self.unaccount(&b);
         self.generation += 1;
+        assert!(!self.has(h) && self.generation > generation, "{h} is forgotten in a new generation");
         Forgot { hot: b.is_whole(), cold: !b.is_whole() }
     }
 
@@ -255,6 +267,7 @@ impl StoreIndex {
             return None;
         }
         b.tier = Tier::Freezing { mtime_ns, seen_used: b.last_used };
+        assert!(b.is_whole() && b.is_moving(), "a freezing blob is still whole");
         Some(FreezeStart { size: b.size, mtime_ns, last_used: b.last_used })
     }
 
@@ -264,6 +277,7 @@ impl StoreIndex {
         {
             b.tier = Tier::Hot { mtime_ns };
         }
+        assert!(!self.blobs.get(h).is_some_and(|b| matches!(b.tier, Tier::Freezing { .. })), "{h} is not freezing");
     }
 
     pub fn finish_freeze(&mut self, h: &Hash, recipe: Vec<ChunkRef>, added: u64) -> Option<ColdRecord> {
@@ -300,6 +314,7 @@ impl StoreIndex {
             whole => (whole, None),
         };
         b.tier = next;
+        assert_eq!(out.is_some(), matches!(b.tier, Tier::Thawing { .. }), "only a cold blob thaws");
         match out {
             Some(o) => (Thaw::Build, Some(o)),
             None => (Thaw::NotCold, None),
@@ -309,12 +324,14 @@ impl StoreIndex {
     pub fn abort_thaw(&mut self, h: &Hash) {
         let Some(b) = self.blobs.get_mut(h) else { return };
         if let Tier::Thawing { added, recipe, thawers } = &mut b.tier {
+            assert!(*thawers > 0, "a thawing blob has a thawer to abort");
             if *thawers > 1 {
                 *thawers -= 1;
             } else {
                 b.tier = Tier::Cold { added: *added, recipe: std::mem::take(recipe) };
             }
         }
+        assert!(!matches!(b.tier, Tier::Thawing { thawers: 0, .. }), "{h} has a thawer while it thaws");
     }
 
     pub fn fail_thaw(&mut self, h: &Hash) -> bool {
@@ -322,6 +339,7 @@ impl StoreIndex {
         if thawing {
             self.forget(h);
         }
+        assert!(!(thawing && self.has(h)), "a failed thaw forgets {h}");
         thawing
     }
 
@@ -332,6 +350,7 @@ impl StoreIndex {
         for h in hashes {
             *self.pins.entry(*h).or_insert(0) += 1;
         }
+        assert!(hashes.iter().all(|h| self.is_pinned(h)), "every hash is pinned");
         true
     }
 
@@ -377,6 +396,7 @@ impl StoreIndex {
             freed += bytes;
             out.push(Evicted { hash: h, cold, freed: bytes });
         }
+        assert!(out.iter().all(|e| !self.has(&e.hash) && !self.is_pinned(&e.hash)), "evicted blobs are unpinned and gone");
         out
     }
 
@@ -401,6 +421,7 @@ impl StoreIndex {
             out.push(Evicted { hash: h, cold, freed });
         }
         out.sort_by_key(|e| e.cold);
+        assert!(out.iter().all(|e| !self.has(&e.hash) && !self.is_pinned(&e.hash)), "swept blobs are unpinned and gone");
         out
     }
 }
@@ -422,6 +443,9 @@ impl StateMachine for StoreIndex {
             }
             if let Tier::Thawing { thawers, .. } = b.tier {
                 assert!(thawers > 0, "a thawing blob has a thawer");
+            }
+            if let Tier::Freezing { .. } = b.tier {
+                assert!(b.size >= COLD_MIN_SIZE, "freezing {h} is big enough to go cold");
             }
         }
     }
