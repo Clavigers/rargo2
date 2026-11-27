@@ -2,6 +2,7 @@ use rargo_machine::StateMachine;
 use rargo_net::io::file::PathRing as _;
 use rargo_proto::waits::{self, Wait};
 use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
+use rargo::link_watch::Silence;
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Ranged, Reader, VFile};
 use crate::partial::Partial;
@@ -12,7 +13,7 @@ use rargo_net::link::Link;
 use rargo_proto::{Blob, CONTROL, ClientMsg, Digest, LocalReply, LocalRequest, Offer, PROTO_VERSION, RunRequest, ServerMsg};
 use rayon::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -64,8 +65,8 @@ struct WtState {
     policy_dir: PathBuf,
     loaded: Option<scan::Index>,
     last: Option<Arc<Snap>>,
-    watched: HashMap<PathBuf, i32>,
-    unwatched: HashSet<PathBuf>,
+    watched: BTreeMap<PathBuf, i32>,
+    unwatched: BTreeSet<PathBuf>,
     told_limit: bool,
     note: Option<String>,
 }
@@ -76,7 +77,7 @@ struct Worktree {
     wt_id: String,
     wt_cache: PathBuf,
     state: io::Mutex<WtState>,
-    events: RefCell<HashSet<PathBuf>>,
+    events: RefCell<BTreeSet<PathBuf>>,
     changed: io::Notify,
     running: io::Mutex<()>,
     last_used: Cell<Instant>,
@@ -90,7 +91,7 @@ pub struct Daemon {
     host: String,
     transport: String,
     mux: io::Mutex<Option<Rc<Mux>>>,
-    worktrees: RefCell<HashMap<PathBuf, Rc<Worktree>>>,
+    worktrees: RefCell<BTreeMap<PathBuf, Rc<Worktree>>>,
     // Keep mount creation from racing a checked copy to the same path.
     mounting: io::Mutex<()>,
     watcher: Option<Rc<Watcher>>,
@@ -101,8 +102,8 @@ pub struct Daemon {
     last_active: Cell<Instant>,
     pub counters: Counters,
     big_sync: io::Mutex<()>,
-    fetching: RefCell<HashMap<Digest, Rc<io::Mutex<()>>>>,
-    partials: RefCell<HashMap<Digest, (u64, Rc<Partial>)>>,
+    fetching: RefCell<BTreeMap<Digest, Rc<io::Mutex<()>>>>,
+    partials: RefCell<BTreeMap<Digest, (u64, Rc<Partial>)>>,
     next_partial: Cell<u64>,
     chunks: RefCell<crate::known::Chunks>,
     chunks_changed: Cell<bool>,
@@ -166,7 +167,7 @@ enum Step {
     Fail(&'static str),
     Error(&'static str),
     GiveUp,
-    Silent { quiet: Duration, waiting_for: &'static str },
+    Silent { gone: Silence, waiting_for: &'static str },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,7 +207,7 @@ struct CommandState {
     delivery_ready: bool,
     last: Option<LocalReply>,
     token: Option<u64>,
-    silence: Option<(Duration, &'static str)>,
+    silence: Option<(Silence, &'static str)>,
 }
 
 impl CommandState {
@@ -268,7 +269,7 @@ impl CommandState {
     }
 
     /// The link closed; `silent` is how long the server had said nothing, and what was awaited, when that is why.
-    fn link_lost(&mut self, silent: Option<(Duration, &'static str)>) -> Step {
+    fn link_lost(&mut self, silent: Option<(Silence, &'static str)>) -> Step {
         self.bet = false;
         self.after = None;
         self.fetching = None;
@@ -279,7 +280,7 @@ impl CommandState {
         if self.visible || self.retry_used || self.phase == CommandPhase::Finished {
             self.phase = CommandPhase::Finished;
             return match self.silence {
-                Some((quiet, waiting_for)) => Step::Silent { quiet, waiting_for },
+                Some((gone, waiting_for)) => Step::Silent { gone, waiting_for },
                 None => Step::GiveUp,
             };
         }
@@ -290,9 +291,9 @@ impl CommandState {
 
     /// Connecting failed: after a server went silent, the command ends with that silence, not a new error.
     fn connect_failed(&mut self) -> Option<Step> {
-        let (quiet, waiting_for) = self.silence?;
+        let (gone, waiting_for) = self.silence?;
         self.phase = CommandPhase::Finished;
-        Some(Step::Silent { quiet, waiting_for })
+        Some(Step::Silent { gone, waiting_for })
     }
 
     fn again(&mut self) -> Step {
@@ -539,7 +540,7 @@ impl Daemon {
             host: crate::hostname(),
             transport: io::env::var("RARGO_TRANSPORT").unwrap_or_default(),
             mux: io::Mutex::new(None),
-            worktrees: RefCell::new(HashMap::new()),
+            worktrees: RefCell::new(BTreeMap::new()),
             mounting: io::Mutex::new(()),
             watcher,
             next_wt: Cell::new(1),
@@ -547,8 +548,8 @@ impl Daemon {
             last_active: Cell::new(io::now()),
             counters: Counters::default(),
             big_sync: io::Mutex::new(()),
-            fetching: RefCell::new(HashMap::new()),
-            partials: RefCell::new(HashMap::new()),
+            fetching: RefCell::new(BTreeMap::new()),
+            partials: RefCell::new(BTreeMap::new()),
             next_partial: Cell::new(0),
             chunks: RefCell::new(chunks),
             chunks_changed: Cell::new(false),
@@ -602,7 +603,9 @@ impl Daemon {
             .next()
             .ok_or_else(|| no_link(std::io::Error::new(std::io::ErrorKind::NotFound, "the server's name has no address")))?;
         let link = Link::connect(addr, &self.cfg.user, &self.cfg.psk, &self.transport).map_err(no_link)?;
-        let m = Mux::new(link);
+        let (user, psk, transport) = (self.cfg.user.clone(), self.cfg.psk, self.transport.clone());
+        let probe: crate::mux::Probe = Rc::new(move || Link::connect(addr, &user, &psk, &transport).map(|l| l.close()).is_ok());
+        let m = Mux::new(link, Some(probe));
         *g = Some(m.clone());
         self.knowledge.borrow_mut().connected();
         Ok(m)
@@ -655,14 +658,14 @@ impl Daemon {
                 policy_dir: PathBuf::new(),
                 loaded: Some(loaded),
                 last: None,
-                watched: HashMap::new(),
-                unwatched: HashSet::new(),
+                watched: BTreeMap::new(),
+                unwatched: BTreeSet::new(),
                 told_limit: false,
                 note: None,
             }),
             wt_id,
             wt_cache,
-            events: RefCell::new(HashSet::new()),
+            events: RefCell::new(BTreeSet::new()),
             changed: io::Notify::new(),
             running: io::Mutex::new(()),
             last_used: Cell::new(io::now()),
@@ -784,8 +787,8 @@ impl Daemon {
     }
 
     fn watch(&self, w: &Watcher, wt: &Worktree, st: &mut WtState, snap: &Snap) {
-        let now: HashSet<&PathBuf> = snap.scan.dirs.iter().collect();
-        let mut unwatched = HashSet::new();
+        let now: BTreeSet<&PathBuf> = snap.scan.dirs.iter().collect();
+        let mut unwatched = BTreeSet::new();
         let mut added = Vec::new();
         let mut over_limit = 0usize;
         let mut failed = None;
@@ -867,7 +870,7 @@ impl Daemon {
         };
         add(&self.counters.offers, 1);
         if io::env::var_os("RARGO_DAEMON_TRACE").is_some() {
-            let new: HashSet<&Digest> = trees.iter().collect();
+            let new: BTreeSet<&Digest> = trees.iter().collect();
             let mut paths: Vec<String> = Vec::new();
             let mut todo: Vec<(String, Digest)> = vec![(String::new(), snap.scan.root)];
             while let Some((path, d)) = todo.pop() {
@@ -1192,7 +1195,7 @@ impl Daemon {
 
     fn fetch_chunks(self: &Rc<Self>, p: &Rc<Partial>, idx: Vec<u32>) -> Vec<u32> {
         let Ok(mux) = self.mux() else { return idx };
-        let mut left: HashSet<u32> = idx.iter().copied().collect();
+        let mut left: BTreeSet<u32> = idx.iter().copied().collect();
         let (tx, mut rx) = unbounded_channel();
         let hash = *p.hash();
         let id = mux.ask(&tx, |id| ClientMsg::Chunks { id, hash, idx });
@@ -1436,8 +1439,8 @@ impl Daemon {
     }
 
     /// Ends a command whose server went silent, with one line naming the server and what rargo waited for.
-    fn silent(&self, out: &UnboundedSender<LocalReply>, quiet: Duration, waiting_for: &str) -> LocalReply {
-        let text = rargo::link_watch::silent_text(&self.cfg.server, quiet, waiting_for);
+    fn silent(&self, out: &UnboundedSender<LocalReply>, gone: Silence, waiting_for: &str) -> LocalReply {
+        let text = rargo::link_watch::silent_text(&self.cfg.server, gone, waiting_for);
         let _ = out.send(LocalReply::Stderr(text.into_bytes()));
         LocalReply::Exit(101)
     }
@@ -1515,13 +1518,13 @@ impl Daemon {
                         match self.converse(&mux, run, None, None, None, req, out, &mut command, None) {
                             Ok(Some(reply)) => return Ok(reply),
                             Ok(None) => command.again(),
-                            Err(_) if mux.is_dead() => command.link_lost(mux.silent().map(|quiet| (quiet, "its answer"))),
+                            Err(_) if mux.is_dead() => command.link_lost(mux.silent().map(|gone| (gone, "its answer"))),
                             Err(e) => return Err(e),
                         }
                     }
                     Step::Error(text) => return Err(std::io::Error::other(text)),
                     Step::GiveUp => return Err(lost()),
-                    Step::Silent { quiet, waiting_for } => return Ok(self.silent(out, quiet, waiting_for)),
+                    Step::Silent { gone, waiting_for } => return Ok(self.silent(out, gone, waiting_for)),
                     other => unreachable!("an admin command does not {other:?}"),
                 };
             }
@@ -1637,7 +1640,7 @@ impl Daemon {
                         Ok(Offered::Changed) => command.offered(Sent::Changed),
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
-                            command.link_lost(mux.silent().map(|quiet| (quiet, "its answer to the worktree offer")))
+                            command.link_lost(mux.silent().map(|gone| (gone, "its answer to the worktree offer")))
                         }
                         Err(e) => return Err(e),
                     }
@@ -1678,7 +1681,7 @@ impl Daemon {
                         }
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
-                            command.link_lost(mux.silent().map(|quiet| (quiet, "the build's progress")))
+                            command.link_lost(mux.silent().map(|gone| (gone, "the build's progress")))
                         }
                         Err(e) => return Err(e),
                     }
@@ -1691,7 +1694,7 @@ impl Daemon {
                 Step::Fail(text) => return Ok(Self::fail(out, text.into())),
                 Step::Error(text) => return Err(std::io::Error::other(text)),
                 Step::GiveUp => return Err(failure.take().unwrap_or_else(lost)),
-                Step::Silent { quiet, waiting_for } => return Ok(self.silent(out, quiet, waiting_for)),
+                Step::Silent { gone, waiting_for } => return Ok(self.silent(out, gone, waiting_for)),
             };
         }
     }
@@ -2937,7 +2940,7 @@ mod left_out_tests {
                 Offered(sent) => (format!("offered {sent:?}"), Some(c.offered(sent))),
                 Lost => ("link lost".to_string(), Some(c.link_lost(None))),
                 LostSilent(awaited) => {
-                    (format!("link silent 45 s awaiting {awaited}"), Some(c.link_lost(Some((Duration::from_secs(45), awaited)))))
+                    (format!("link silent 45 s awaiting {awaited}"), Some(c.link_lost(Some((Silence::Quiet(Duration::from_secs(45)), awaited)))))
                 }
             };
             c.invariants();
@@ -2960,7 +2963,7 @@ mod left_out_tests {
             scanned => Some(Offer(Wait))
             offered All => Some(Request)
             link silent 45 s awaiting the build's progress => Some(Link)
-            connect failed => Some(Silent { quiet: 45s, waiting_for: "the build's progress" })
+            connect failed => Some(Silent { gone: Quiet(45s), waiting_for: "the build's progress" })
         "#]].assert_eq(&run(CommandKind::Run, &retry_cannot_connect));
         let retry_spent = [&TO_REQUEST[..], &[LostSilent(progress)], &RELINK, &[Lost]].concat();
         expect![[r#"
@@ -2973,12 +2976,12 @@ mod left_out_tests {
             linked => Some(Scan)
             scanned => Some(Offer(Wait))
             offered All => Some(Request)
-            link lost => Some(Silent { quiet: 45s, waiting_for: "the build's progress" })
+            link lost => Some(Silent { gone: Quiet(45s), waiting_for: "the build's progress" })
         "#]].assert_eq(&run(CommandKind::Run, &retry_spent));
         expect![[r#"
             linked => Some(Request)
             link silent 45 s awaiting its answer => Some(Link)
-            connect failed => Some(Silent { quiet: 45s, waiting_for: "its answer" })
+            connect failed => Some(Silent { gone: Quiet(45s), waiting_for: "its answer" })
         "#]].assert_eq(&run(CommandKind::Admin, &[Linked, LostSilent("its answer"), ConnectFailed]));
     }
 

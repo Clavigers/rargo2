@@ -211,6 +211,8 @@ impl<C: Carried> Worker<C> {
     }
 
     fn run(&mut self, run: Run<C>, has: &dyn Fn(&Hash) -> bool, now_ms: u64) -> Vec<Effect<C>> {
+        assert_eq!(self.link, Link::Up, "a run comes over a link");
+        let action = run.action;
         let mut fx = Vec::new();
         if let Some(old) = self.by_action.remove(&run.action) {
             let act = self.end(old);
@@ -229,13 +231,20 @@ impl<C: Carried> Worker<C> {
             closed: run.closed.into_iter().collect(),
             opened: BTreeMap::new(),
         };
-        if missing.is_empty() {
+        let starts = missing.is_empty();
+        if starts {
             fx.push(Effect::Start { token, action: run.action, run: run.run });
         } else {
             act.waiting = Some(Waiting { missing, since_ms: now_ms, run: run.run });
         }
-        self.acts.insert(token, act);
-        self.by_action.insert(run.action, token);
+        assert!(self.acts.insert(token, act).is_none(), "run {token} gets a fresh token");
+        assert!(self.by_action.insert(action, token).is_none(), "action {action} has one current run");
+        assert_eq!(self.acts[&token].waiting.is_none(), starts, "run {token} starts now or waits for its inputs");
+        assert_eq!(
+            fx.iter().filter(|e| matches!(e, Effect::Start { .. })).count(),
+            usize::from(starts),
+            "a run starts at most once, and only with all its inputs here"
+        );
         fx
     }
 
@@ -244,26 +253,34 @@ impl<C: Carried> Worker<C> {
         let stale: Vec<u64> = self.asks.iter().filter(|(_, (t, _))| *t == token).map(|(ticket, _)| *ticket).collect();
         for ticket in stale {
             let (t, q) = self.asks.remove(&ticket).expect("listed");
-            self.asking.remove(&(t, q));
+            assert_eq!(self.asking.remove(&(t, q)), Some(ticket), "each ask is listed both ways");
         }
+        assert!(!self.acts.contains_key(&token), "run {token} is gone once it ended");
+        assert!(self.asks.values().all(|(t, _)| *t != token), "an ended run {token} leaves no ask behind");
+        assert_eq!(self.asks.len(), self.asking.len());
         act
     }
 
     fn start_ready(&mut self, ready: impl Fn(&Waiting<C::Run>) -> bool) -> Vec<Effect<C>> {
         let tokens: Vec<u64> =
             self.acts.iter().filter(|(_, a)| a.waiting.as_ref().is_some_and(&ready)).map(|(t, _)| *t).collect();
-        tokens
-            .into_iter()
-            .map(|token| {
+        let fx: Vec<Effect<C>> = tokens
+            .iter()
+            .map(|&token| {
                 let act = self.acts.get_mut(&token).expect("listed");
                 let w = act.waiting.take().expect("waiting");
                 Effect::Start { token, action: act.action, run: w.run }
             })
-            .collect()
+            .collect();
+        assert_eq!(fx.len(), tokens.len(), "each ready run starts once");
+        assert!(tokens.iter().all(|t| self.acts[t].waiting.is_none()), "a started run no longer waits");
+        assert!(self.acts.values().all(|a| a.waiting.as_ref().is_none_or(|w| !ready(w))), "no ready run is left waiting");
+        fx
     }
 
     pub fn assembled(&mut self, blob: Hash) -> Vec<Effect<C>> {
         if self.link == Link::Down {
+            assert!(self.acts.is_empty(), "a blob assembled after the link went has no run to start");
             return Vec::new();
         }
         for a in self.acts.values_mut() {
@@ -273,14 +290,24 @@ impl<C: Carried> Worker<C> {
         }
         let mut fx = vec![Effect::Stored { blob }];
         fx.extend(self.start_ready(|w| w.missing.is_empty()));
+        assert!(
+            self.acts.values().all(|a| a.waiting.as_ref().is_none_or(|w| !w.missing.is_empty() && !w.missing.contains(&blob))),
+            "no run waits for the stored blob, nor for nothing"
+        );
         fx
     }
 
     pub fn tick(&mut self, now_ms: u64) -> Vec<Effect<C>> {
         if self.link == Link::Down {
+            assert!(self.acts.is_empty(), "no run waits without a link");
             return Vec::new();
         }
-        self.start_ready(|w| now_ms >= w.since_ms + ANNOUNCED_WAIT_MS)
+        let fx = self.start_ready(|w| now_ms >= w.since_ms + ANNOUNCED_WAIT_MS);
+        assert!(
+            self.acts.values().all(|a| a.waiting.as_ref().is_none_or(|w| now_ms < w.since_ms + ANNOUNCED_WAIT_MS)),
+            "no run waits past its wait"
+        );
+        fx
     }
 
     pub fn ended(&mut self, token: u64) -> Vec<Effect<C>> {
@@ -332,9 +359,14 @@ impl<C: Carried> Worker<C> {
     }
 
     pub fn answered(&mut self, ticket: u64, reply: Option<Reply>) {
-        let Some((token, q)) = self.asks.remove(&ticket) else { return };
-        self.asking.remove(&(token, q.clone()));
+        let Some((token, q)) = self.asks.remove(&ticket) else {
+            assert!(self.asking.values().all(|t| *t != ticket), "an unknown ticket {ticket} is asked nowhere");
+            return;
+        };
+        assert_eq!(self.asking.remove(&(token, q.clone())), Some(ticket), "ticket {ticket} is listed both ways");
+        assert_eq!(self.asks.len(), self.asking.len());
         let act = self.acts.get_mut(&token).expect("an ask's run is known while it is asked");
+        assert!(act.waiting.is_none(), "only a started run {token} is answered");
         match (q, reply) {
             (Query::Lookup { dir, name }, Some(Reply::Looked(w))) => {
                 act.entries.insert((dir, name), w);
@@ -361,17 +393,19 @@ impl<C: Carried> Worker<C> {
             return Need::Have;
         }
         if self.link == Link::Down {
+            assert!(self.fetching.is_empty(), "nothing is fetched without a link");
             return Need::Gone;
         }
         if self.fetching.contains(&h) || self.announced(&h) {
             return Need::Wait;
         }
-        self.fetching.insert(h);
+        assert!(self.fetching.insert(h), "a blob is fetched once at a time");
         Need::Fetch
     }
 
     pub fn fetched(&mut self, h: Hash) {
         self.fetching.remove(&h);
+        assert!(!self.fetching.contains(&h), "a fetched blob is no longer being fetched");
     }
 }
 
@@ -385,6 +419,10 @@ impl<C: Carried> StateMachine for Worker<C> {
         for (action, token) in &self.by_action {
             assert_eq!(self.acts.get(token).map(|a| a.action), Some(*action));
         }
+        assert!(
+            self.acts.keys().chain(self.asks.keys()).all(|t| *t <= self.next_token),
+            "every token and ticket was handed out"
+        );
         assert_eq!(self.asks.len(), self.asking.len());
         for (ticket, key) in &self.asks {
             assert_eq!(self.asking.get(key), Some(ticket), "one ask per question");
