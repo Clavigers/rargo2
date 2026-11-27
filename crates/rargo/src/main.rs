@@ -525,7 +525,21 @@ fn main() {
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
     };
     if kind == "build" {
-        if let (Some(root), Ok(manifest)) = (find_root(&cwd), cli::find_manifest(&world, &args))
+        let root = find_root(&cwd);
+        let configs = cargo_configs(&args, &vars, &cwd, root.as_deref().unwrap_or(&cwd));
+        if let Some(root) = &root
+            && let Some((name, path, source)) = outside_config_dependency(root, &configs)
+        {
+            fall_back_or_end(
+                &format!(
+                    "error: path dependency `{name}` in {source} points to `{}`, outside the synced worktree `{}`\n         move the dependency inside the worktree and update its path, or run with RARGO_FALLBACK=cargo to build locally\n",
+                    path.display(),
+                    root.display(),
+                ),
+                &raw,
+            );
+        }
+        if let (Some(root), Ok(manifest)) = (root, cli::find_manifest(&world, &args))
             && let Some((name, path)) = outside_path_dependency(&root, &manifest)
         {
             fall_back_or_end(
@@ -536,7 +550,7 @@ fn main() {
                 &raw,
             );
         }
-        for source in ignored_compiler_wrappers(&args, &vars, &cwd) {
+        for source in ignored_compiler_wrappers(&vars, &configs) {
             eprintln!("warning: {source} is ignored for remote builds; rargo runs the server's compiler directly");
         }
     }
@@ -685,35 +699,74 @@ fn cargo_config_args(args: &[String]) -> impl Iterator<Item = &str> {
     })
 }
 
-fn ignored_compiler_wrappers(args: &[String], vars: &[(String, String)], cwd: &Path) -> Vec<String> {
-    let var = |name: &str| vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str()).filter(|value| !value.is_empty());
-    let mut sources: Vec<_> = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"]
-        .into_iter().filter(|name| var(name).is_some()).map(str::to_owned).collect();
-    let mut read = std::collections::BTreeSet::new();
-    let mut files = Vec::new();
+struct CargoConfig {
+    source: String,
+    base: PathBuf,
+    table: toml::Table,
+}
 
-    for config in cargo_config_args(args) {
-        match config.parse::<toml::Table>() {
-            Ok(table) => sources.extend(wrapper_config_keys(&table).map(|key| format!("--config build.{key}"))),
-            Err(_) => files.push(cwd.join(config)),
-        }
-    }
+fn cargo_configs(args: &[String], vars: &[(String, String)], cwd: &Path, root: &Path) -> Vec<CargoConfig> {
+    let var = |name: &str| vars.iter().find(|(key, _)| key == name).map(|(_, value)| value.as_str()).filter(|value| !value.is_empty());
     let cargo_home = var("CARGO_HOME").map(|path| cwd.join(path))
         .unwrap_or_else(|| Path::new(var("HOME").unwrap_or("/")).join(".cargo"));
-    // Only worktree files and the selected Cargo home are sent for the remote build.
-    let root = find_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
-    let project_configs = cwd.ancestors().take_while(|path| path.starts_with(&root)).map(|path| path.join(".cargo"));
-    for dir in project_configs.chain(std::iter::once(cargo_home)) {
-        let legacy = dir.join("config");
-        files.push(if legacy.ring_is_file() { legacy } else { dir.join("config.toml") });
-    }
-    for file in files {
+    let project_configs = cwd.ancestors().take_while(|path| path.starts_with(root)).map(|path| path.join(".cargo"));
+    let mut read = std::collections::BTreeSet::new();
+    let mut read_config = |file: PathBuf| {
         if !read.insert(file.clone()) || !io::file::metadata(&file).is_ok_and(|md| md.is_file() && md.len() <= 1 << 20) {
-            continue;
+            return None;
         }
-        if let Some(table) = io::file::read_to_string(&file).ok().and_then(|text| text.parse::<toml::Table>().ok()) {
-            sources.extend(wrapper_config_keys(&table).map(|key| format!("build.{key} in {}", file.display())));
+        let table = io::file::read_to_string(&file).ok()?.parse().ok()?;
+        let base = file.parent()?.parent().unwrap_or(Path::new("/")).to_owned();
+        Some(CargoConfig { source: format!("`{}`", file.display()), base, table })
+    };
+
+    // Read higher-precedence values first, including later --config arguments.
+    let mut configs: Vec<_> = cargo_config_args(args).collect();
+    configs.reverse();
+    let mut configs: Vec<_> = configs.into_iter().filter_map(|config| {
+        match config.parse::<toml::Table>() {
+            Ok(table) => Some(CargoConfig { source: "`--config` CLI option".into(), base: cwd.to_owned(), table }),
+            Err(_) => read_config(cwd.join(config)),
         }
+    }).collect();
+    configs.extend(project_configs.chain(std::iter::once(cargo_home)).filter_map(|dir| {
+        let legacy = dir.join("config");
+        read_config(if legacy.ring_is_file() { legacy } else { dir.join("config.toml") })
+    }));
+    configs
+}
+
+fn outside_config_dependency<'a>(root: &Path, configs: &'a [CargoConfig]) -> Option<(String, PathBuf, &'a str)> {
+    let mut patches_seen = std::collections::BTreeSet::new();
+    for config in configs {
+        let outside = |path| io::file::canonicalize(config.base.join(path)).ok().filter(|path| !path.starts_with(root));
+        let patches = config.table.get("patch").and_then(toml::Value::as_table).into_iter().flatten();
+        for (registry, entries) in patches {
+            for (name, entry) in entries.as_table().into_iter().flatten() {
+                if let Some(path) = entry.get("path").and_then(toml::Value::as_str)
+                    && patches_seen.insert((registry, name))
+                    && let Some(resolved) = outside(path)
+                {
+                    return Some((name.clone(), resolved, &config.source));
+                }
+            }
+        }
+        let paths = config.table.get("paths").and_then(toml::Value::as_array).into_iter().flatten();
+        if let Some(path) = paths.filter_map(toml::Value::as_str).find_map(outside) {
+            let name = read_dependency_manifest(&path.join("Cargo.toml"))
+                .and_then(|(_, table)| Some(table.get("package")?.get("name")?.as_str()?.to_owned()))
+                .unwrap_or_else(|| path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned());
+            return Some((name, path, &config.source));
+        }
+    }
+    None
+}
+
+fn ignored_compiler_wrappers(vars: &[(String, String)], configs: &[CargoConfig]) -> Vec<String> {
+    let mut sources: Vec<_> = ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER"]
+        .into_iter().filter(|name| vars.iter().any(|(key, value)| key == name && !value.is_empty())).map(str::to_owned).collect();
+    for config in configs {
+        sources.extend(wrapper_config_keys(&config.table).map(|key| format!("build.{key} in {}", config.source)));
     }
     sources
 }
@@ -981,6 +1034,49 @@ mod tests {
             assert_eq!(outside_path_dependency(&root, &manifest), external("../../dep"));
             io::file::write(&inner_manifest, "[dependencies]\napp = { path = '..' }\nserde = '1'").unwrap();
             assert_eq!(outside_path_dependency(&root, &manifest), None);
+        });
+    }
+
+    #[test]
+    fn cargo_config_path_overrides_use_the_client_paths_and_sources() {
+        io::sim::test(|| {
+            let temp = io::sim::tempdir();
+            let root = temp.join("app");
+            let cwd = root.join("member");
+            let home = temp.join("cargo-home");
+            let dep = temp.join("checkout");
+            for dir in [root.join(".cargo"), cwd.clone(), home.clone(), dep.clone()] {
+                io::file::create_dir_all(dir).unwrap();
+            }
+            io::file::write(dep.join("Cargo.toml"), "[package]\nname = 'itoa'").unwrap();
+            let vars = vec![("CARGO_HOME".into(), home.to_string_lossy().into_owned())];
+            let project = root.join(".cargo/config.toml");
+            let home_config = home.join("config");
+            let cli_config = root.join(".cargo/extra.toml");
+            io::file::write(&project, "paths = ['../checkout']").unwrap();
+
+            let check = |args: &[String], source: &str| {
+                let configs = cargo_configs(args, &vars, &cwd, &root);
+                assert_eq!(outside_config_dependency(&root, &configs), Some(("itoa".into(), dep.clone(), source)));
+            };
+            check(&[], &format!("`{}`", project.display()));
+
+            io::file::write(&project, "paths = ['member']").unwrap();
+            let configs = cargo_configs(&[], &vars, &cwd, &root);
+            assert_eq!(outside_config_dependency(&root, &configs), None);
+
+            io::file::write(&home_config, format!("[patch.crates-io]\nitoa.path = '{}'", dep.display())).unwrap();
+            check(&[], &format!("`{}`", home_config.display()));
+            let args = ["--config".into(), "patch.crates-io.itoa.path = '.'".into()];
+            let configs = cargo_configs(&args, &vars, &cwd, &root);
+            assert_eq!(outside_config_dependency(&root, &configs), None);
+
+            let args = ["--config=patch.crates-io.itoa.path = '../../checkout'".into()];
+            check(&args, "`--config` CLI option");
+
+            io::file::write(&cli_config, "[patch.crates-io]\nitoa.path = '../checkout'").unwrap();
+            let args = ["--config".into(), "../.cargo/extra.toml".into()];
+            check(&args, &format!("`{}`", cwd.join("../.cargo/extra.toml").display()));
         });
     }
 
