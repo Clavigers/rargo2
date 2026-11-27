@@ -620,34 +620,71 @@ mod tests {
         });
     }
 
-    // Keep the full sample while bounding the work done by each test.
-    macro_rules! save_batches {
-        ($($name:ident: $start:literal..=$end:literal),+ $(,)?) => {
-            $(
-                #[test]
-                fn $name() {
-                    generated_saves($start..=$end);
-                }
-            )+
-        };
-    }
-
     mod generated_saves_keep_each_worktrees_newest_state_and_time {
         use super::generated_saves;
 
-        save_batches! {
-            seeds_1_to_25: 1..=25,
-            seeds_26_to_50: 26..=50,
-            seeds_51_to_75: 51..=75,
-            seeds_76_to_100: 76..=100,
-            seeds_101_to_125: 101..=125,
-            seeds_126_to_150: 126..=150,
-            seeds_151_to_175: 151..=175,
-            seeds_176_to_200: 176..=200,
-            seeds_201_to_225: 201..=225,
-            seeds_226_to_250: 226..=250,
-            seeds_251_to_275: 251..=275,
-            seeds_276_to_300: 276..=300,
+        rargo_machine::test_batches! {
+            generated_saves;
+            seeds_1_to_5: 1..=5,
+            seeds_6_to_10: 6..=10,
+            seeds_11_to_15: 11..=15,
+            seeds_16_to_20: 16..=20,
+            seeds_21_to_25: 21..=25,
+            seeds_26_to_30: 26..=30,
+            seeds_31_to_35: 31..=35,
+            seeds_36_to_40: 36..=40,
+            seeds_41_to_45: 41..=45,
+            seeds_46_to_50: 46..=50,
+            seeds_51_to_55: 51..=55,
+            seeds_56_to_60: 56..=60,
+            seeds_61_to_65: 61..=65,
+            seeds_66_to_70: 66..=70,
+            seeds_71_to_75: 71..=75,
+            seeds_76_to_80: 76..=80,
+            seeds_81_to_85: 81..=85,
+            seeds_86_to_90: 86..=90,
+            seeds_91_to_95: 91..=95,
+            seeds_96_to_100: 96..=100,
+            seeds_101_to_105: 101..=105,
+            seeds_106_to_110: 106..=110,
+            seeds_111_to_115: 111..=115,
+            seeds_116_to_120: 116..=120,
+            seeds_121_to_125: 121..=125,
+            seeds_126_to_130: 126..=130,
+            seeds_131_to_135: 131..=135,
+            seeds_136_to_140: 136..=140,
+            seeds_141_to_145: 141..=145,
+            seeds_146_to_150: 146..=150,
+            seeds_151_to_155: 151..=155,
+            seeds_156_to_160: 156..=160,
+            seeds_161_to_165: 161..=165,
+            seeds_166_to_170: 166..=170,
+            seeds_171_to_175: 171..=175,
+            seeds_176_to_180: 176..=180,
+            seeds_181_to_185: 181..=185,
+            seeds_186_to_190: 186..=190,
+            seeds_191_to_195: 191..=195,
+            seeds_196_to_200: 196..=200,
+            seeds_201_to_205: 201..=205,
+            seeds_206_to_210: 206..=210,
+            seeds_211_to_215: 211..=215,
+            seeds_216_to_220: 216..=220,
+            seeds_221_to_225: 221..=225,
+            seeds_226_to_230: 226..=230,
+            seeds_231_to_235: 231..=235,
+            seeds_236_to_240: 236..=240,
+            seeds_241_to_245: 241..=245,
+            seeds_246_to_250: 246..=250,
+            seeds_251_to_255: 251..=255,
+            seeds_256_to_260: 256..=260,
+            seeds_261_to_265: 261..=265,
+            seeds_266_to_270: 266..=270,
+            seeds_271_to_275: 271..=275,
+            seeds_276_to_280: 276..=280,
+            seeds_281_to_285: 281..=285,
+            seeds_286_to_290: 286..=290,
+            seeds_291_to_295: 291..=295,
+            seeds_296_to_300: 296..=300,
         }
     }
 

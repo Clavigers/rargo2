@@ -83,6 +83,19 @@ impl<M: StateMachine> Deref for Checked<M> {
     }
 }
 
+/// Registers separate tests for independent batches of a deterministic scenario.
+#[macro_export]
+macro_rules! test_batches {
+    ($run:path; $($name:ident: $batch:expr),+ $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                $run($batch);
+            }
+        )+
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

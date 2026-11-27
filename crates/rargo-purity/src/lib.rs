@@ -5,6 +5,9 @@ use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, ImplItem, Item, Path, Token, UseTree};
 
+mod test_modules;
+use test_modules::{cfg_test, test_files};
+
 include!(concat!(env!("OUT_DIR"), "/sources.rs"));
 
 pub const ALLOW: &str = include_str!("../allow.txt");
@@ -251,20 +254,6 @@ fn normalize(full: String) -> String {
         }
     }
     full
-}
-
-fn cfg_test(attrs: &[Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        let p = a.path();
-        if p.is_ident("test") || p.segments.last().is_some_and(|s| s.ident == "test") {
-            return true;
-        }
-        if !p.is_ident("cfg") {
-            return false;
-        }
-        let text: String = a.meta.to_token_stream().to_string().chars().filter(|c| !c.is_whitespace()).collect();
-        text.contains("test") && !text.contains("not(test")
-    })
 }
 
 fn item_attrs(item: &Item) -> &[Attribute] {
@@ -657,28 +646,6 @@ impl<'a> Visit<'a> for Scan<'_> {
         }
         visit::visit_path(self, path);
     }
-}
-
-fn test_files(parsed: &[(&str, syn::File)]) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    for (file, parsed) in parsed {
-        let dir = match file.rsplit_once('/') {
-            Some((d, name)) if name == "lib.rs" || name == "main.rs" || name == "mod.rs" => d.to_string(),
-            Some(_) => file.trim_end_matches(".rs").to_string(),
-            None => continue,
-        };
-        for item in &parsed.items {
-            if let Item::Mod(m) = item
-                && m.content.is_none()
-                && cfg_test(&m.attrs)
-            {
-                for candidate in [format!("{dir}/{}.rs", m.ident), format!("{dir}/{}/mod.rs", m.ident)] {
-                    out.insert(candidate, file.to_string());
-                }
-            }
-        }
-    }
-    out
 }
 
 fn manifest(file: &str, text: &str, findings: &mut Vec<Finding>) {

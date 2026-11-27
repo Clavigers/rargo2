@@ -939,14 +939,18 @@ mod fn_code_selection {
         out
     }
 
-    fn table(nextest: bool) {
+    fn linked_runner(fx: &Fx, nextest: bool) -> impl Fn(App, &[&str], bool) -> (Round, Vec<Hash>) + '_ {
+        move |app, tests, no_cache| {
+            let (view, bins) = link(fx, &app, tests);
+            (round(fx, &view, tests, nextest, no_cache), bins)
+        }
+    }
+
+    fn code_changes(nextest: bool) {
         sim::test(move || {
             let fx = fixture(sh);
             let abc = ["a", "b", "c"];
-            let run = |app: App, tests: &[&str], no_cache: bool| {
-                let (view, bins) = link(&fx, &app, tests);
-                (round(&fx, &view, tests, nextest, no_cache), bins)
-            };
+            let run = linked_runner(&fx, nextest);
 
             let (first, bins) = run(BASE, &abc, false);
             assert_eq!(first.ran, abc);
@@ -973,6 +977,16 @@ mod fn_code_selection {
 
             let (undone, _) = run(base, &abc, false);
             assert_eq!(undone.ran, Vec::<String>::new());
+        });
+    }
+
+    fn cache_controls(nextest: bool) {
+        sim::test(move || {
+            let fx = fixture(sh);
+            let abc = ["a", "b", "c"];
+            let base = App { native: 1, ..BASE };
+            let run = linked_runner(&fx, nextest);
+            assert_eq!(run(base, &abc, false).0.ran, abc);
 
             let (new, _) = run(base, &["a", "b", "c", "d"], false);
             assert_eq!(new.ran, ["d"]);
@@ -980,6 +994,16 @@ mod fn_code_selection {
             let (all, _) = run(base, &abc, true);
             assert_eq!(all.ran, abc, "--no-cache");
             assert!(all.why.iter().all(|w| w == "caching was turned off for it"));
+        });
+    }
+
+    fn missing_identity(nextest: bool) {
+        sim::test(move || {
+            let fx = fixture(sh);
+            let abc = ["a", "b", "c"];
+            let base = App { native: 1, ..BASE };
+            let run = linked_runner(&fx, nextest);
+            assert_eq!(run(base, &abc, false).0.ran, abc);
 
             let flagged = App { render: None, native: 1, ..BASE };
             let (kept, _) = run(flagged, &abc, false);
@@ -996,14 +1020,22 @@ mod fn_code_selection {
         });
     }
 
-    #[test]
-    fn a_test_reruns_when_code_it_executed_or_the_binary_s_rest_changed() {
-        table(false);
+    rargo_machine::test_batches! {
+        code_changes;
+        a_test_reruns_when_code_it_executed_or_the_binary_s_rest_changed: false,
+        a_nextest_test_process_reruns_when_code_it_executed_or_the_binary_s_rest_changed: true,
     }
 
-    #[test]
-    fn a_nextest_test_process_reruns_when_code_it_executed_or_the_binary_s_rest_changed() {
-        table(true);
+    rargo_machine::test_batches! {
+        cache_controls;
+        adding_a_test_and_disabling_cache_run_the_requested_tests: false,
+        adding_a_nextest_test_and_disabling_cache_run_the_requested_tests: true,
+    }
+
+    rargo_machine::test_batches! {
+        missing_identity;
+        a_test_falls_back_to_binary_bytes_without_function_identity: false,
+        a_nextest_test_falls_back_to_binary_bytes_without_function_identity: true,
     }
 
     #[test]

@@ -1131,8 +1131,21 @@ mod tests {
         Delivery { path: path.into(), hash: *blake3::hash(content).as_bytes(), size: content.len() as u64, exec, own }
     }
 
-    #[test]
-    fn generated_placements_leave_the_delivered_tree_keep_what_is_unchanged_and_touch_nothing_else() {
+    mod generated_placements_leave_the_delivered_tree_keep_what_is_unchanged_and_touch_nothing_else {
+        use super::generated_placements;
+
+        rargo_machine::test_batches! {
+            generated_placements;
+            seeds_1_to_50: 1..=50,
+            seeds_51_to_100: 51..=100,
+            seeds_101_to_150: 101..=150,
+            seeds_151_to_200: 151..=200,
+            seeds_201_to_250: 201..=250,
+            seeds_251_to_300: 251..=300,
+        }
+    }
+
+    fn generated_placements(seeds: std::ops::RangeInclusive<u64>) {
         let blobs = Path::new("/home/u/.cache/rargo/blobs");
         let inside = Bound::new(Path::new("/w"), &["/w/target".into()]);
         let outside = Bound::new(Path::new("/w"), &["/o/tgt".into(), "/o/tgt/build".into()]);
@@ -1148,7 +1161,7 @@ mod tests {
         ];
         let contents: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 1 + (i as usize % 2)]).collect();
         let (dead_tmp, live_tmp) = ("/w/target/debug/.rargo-tmp-777-1-app", "/w/target/debug/.rargo-tmp-888-2-app");
-        for seed in 1..=300u64 {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let elsewhere = rng.chance(2);
             let bound = if elsewhere { &outside } else { &inside };

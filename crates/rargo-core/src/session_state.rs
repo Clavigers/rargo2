@@ -1207,11 +1207,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_client_messages_never_leave_a_claim_and_never_send_a_blob_the_client_has() {
+    mod generated_client_messages_never_leave_a_claim_and_never_send_a_blob_the_client_has {
+        use super::generated_client_messages;
+
+        rargo_machine::test_batches! {
+            generated_client_messages;
+            seeds_1_to_25: 1..=25,
+            seeds_26_to_50: 26..=50,
+            seeds_51_to_75: 51..=75,
+            seeds_76_to_100: 76..=100,
+            seeds_101_to_125: 101..=125,
+            seeds_126_to_150: 126..=150,
+            seeds_151_to_175: 151..=175,
+            seeds_176_to_200: 176..=200,
+        }
+    }
+
+    fn generated_client_messages(seeds: std::ops::RangeInclusive<u64>) {
         let pool: Vec<Vec<u8>> = (0..24u8).map(content).collect();
         let hashes: Vec<Digest> = pool.iter().map(|b| digest(b)).collect();
-        for seed in 1..=200u64 {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut w = World {
                 pool: pool.clone(),

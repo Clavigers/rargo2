@@ -580,6 +580,7 @@ pub struct World {
     report: Report,
     trace: Vec<u8>,
     silence: Option<(u64, u64)>,
+    watch_limit: Duration,
     disk_fault: Option<disk::Fault>,
     partitions: BTreeMap<(Node, bool), std::ops::Range<u64>>,
 }
@@ -596,12 +597,17 @@ fn link_error(error: std::io::Error) -> Kind {
 
 impl World {
     pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
+        Self::configured(seed, bug, off, |_, _| {})
+    }
+
+    fn configured(seed: u64, bug: Option<Bug>, off: Off, setup: impl FnOnce(&mut Config, &mut Project)) -> World {
         let mut rng = Rng::new(seed);
         let mut net = Fault::NETWORK.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
         let mut plan_rng = Rng::new(seed ^ WORKSPACE_STREAM);
         let workspace = Workspace::generate(&mut plan_rng);
-        let project = Project::plan(&mut plan_rng, &workspace);
-        let cfg = Config::of(&mut rng, Net::of(&mut net, &off), project.sources);
+        let mut project = Project::plan(&mut plan_rng, &workspace);
+        let mut cfg = Config::of(&mut rng, Net::of(&mut net, &off), project.sources);
+        setup(&mut cfg, &mut project);
         let link_key = transport::key();
         let mut w = World {
             seed,
@@ -658,6 +664,7 @@ impl World {
             },
             trace: Vec::new(),
             silence: None,
+            watch_limit: link_watch::SILENT_AFTER,
             disk_fault: match Rng::new(seed ^ 0x6469_736b).below(12) {
                 0 => Some(disk::Fault::Full),
                 1 => Some(disk::Fault::Torn),
@@ -708,7 +715,7 @@ impl World {
                     pending: BTreeMap::new(),
                     contents: Vec::new(),
                     synced_round: 0,
-                    watch: Watch::new(Duration::ZERO, link_watch::SILENT_AFTER),
+                    watch: Watch::new(Duration::ZERO, w.watch_limit),
                     up_since: 0,
                     dead: false,
                     saved: Vec::new(),
@@ -1826,7 +1833,7 @@ impl World {
                 c.daemon.connected();
                 c.up = true;
                 c.epoch += 1;
-                c.watch = Watch::new(Duration::from_millis(now), link_watch::SILENT_AFTER);
+                c.watch = Watch::new(Duration::from_millis(now), self.watch_limit);
                 c.up_since = now;
                 let outputs = &c.outputs;
                 c.requested.retain(|a| outputs.contains_key(a));
@@ -1943,9 +1950,9 @@ impl World {
             Tick::Silent(_) if bug == Some(Bug::DeafToSilence) => {}
             Tick::Silent(quiet) => {
                 let heard = now - quiet.as_millis() as u64;
-                let slack = link_watch::PING_EVERY.as_millis() as u64 + 2 * max_latency + 2 * WATCH_STEP_MS;
+                let slack = c.watch.ping_every().as_millis() as u64 + 2 * max_latency + 2 * WATCH_STEP_MS;
                 let silent_for = silence.map_or(0, |(start, end)| end.min(now).saturating_sub(start.max(heard)));
-                if silent_for + slack < link_watch::SILENT_AFTER.as_millis() as u64 {
+                if silent_for + slack < self.watch_limit.as_millis() as u64 {
                     return Err(Kind::Silence(format!(
                         "client {client} gave up on its server at {now} ms after {} ms without a word, but the server was silent for only {silent_for} ms of it",
                         quiet.as_millis()
@@ -1962,7 +1969,7 @@ impl World {
         let c = &self.clients[&client];
         if let Some((start, end)) = silence {
             let from = start.max(c.up_since);
-            let bound = from + link_watch::SILENT_AFTER.as_millis() as u64 + max_latency + 2 * WATCH_STEP_MS;
+            let bound = from + self.watch_limit.as_millis() as u64 + max_latency + 2 * WATCH_STEP_MS;
             if c.up && now < end && now > bound {
                 return Err(Kind::Silence(format!(
                     "client {client} still waits at {now} ms on a server silent since {start} ms, past its bound of {bound} ms"
@@ -2287,6 +2294,26 @@ pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dozens_of_client_rounds_overlap_during_eviction() {
+        let off = [Fault::ServerCrash, Fault::Loss, Fault::Duplicate, Fault::Reorder, Fault::Partition]
+            .into_iter().fold(Off::none(), Off::with);
+        // One action and one round per client exercise contention without a
+        // large build graph. Give the links one brief, deterministic outage.
+        let mut world = World::configured(50, None, off, |cfg, project| {
+            cfg.clients = 24;
+            cfg.rounds = 1;
+            cfg.max_latency_ms = 3;
+            project.actions.truncate(1);
+        });
+        world.watch_limit = Duration::from_secs(2);
+        world.silence = Some((550, 3200));
+        let report = world.run().unwrap_or_else(|failure| panic!("{failure}"));
+        assert!(report.clients_at_eviction >= 24, "{report:?}");
+        assert!(report.cache_hits > 0, "clients reuse action outputs");
+        assert!(report.silences > 0, "clients give up on a silent server");
+    }
 
     #[test]
     fn stale_cancellation_cannot_end_the_next_round() {

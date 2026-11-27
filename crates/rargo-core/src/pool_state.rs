@@ -642,9 +642,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_pools_lose_each_action_once_and_route_only_to_its_worker() {
-        for seed in 1..=300u64 {
+    mod generated_pools_lose_each_action_once_and_route_only_to_its_worker {
+        use super::generated_pools;
+
+        rargo_machine::test_batches! {
+            generated_pools;
+            seeds_1_to_50: 1..=50,
+            seeds_51_to_100: 51..=100,
+            seeds_101_to_150: 101..=150,
+            seeds_151_to_200: 151..=200,
+            seeds_201_to_250: 201..=250,
+            seeds_251_to_300: 251..=300,
+        }
+    }
+
+    fn generated_pools(seeds: std::ops::RangeInclusive<u64>) {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut p = Pool::new();
             let mut here: BTreeMap<u64, usize> = BTreeMap::new();

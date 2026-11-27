@@ -72,3 +72,12 @@ jobs:
             sleep "$((remaining < 60 ? remaining : 60))"
           done
       - run: rargo test --locked --workspace
+      - name: Measure per-test CPU
+        run: |
+          export RARGO_CPU_REPORT="$RUNNER_TEMP/rargo-cpu.tsv"
+          status=0
+          python3 dev/purity.py cpu || status=$?
+          if [[ -s "$RARGO_CPU_REPORT" ]]; then
+            awk '$1 > 50 { print }' "$RARGO_CPU_REPORT"
+          fi
+          exit "$status"

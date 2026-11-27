@@ -315,10 +315,27 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_writes_and_flushes_lose_nothing_and_keep_the_last_write() {
+    mod generated_writes_and_flushes_lose_nothing_and_keep_the_last_write {
+        use super::generated_writes;
+
+        rargo_machine::test_batches! {
+            generated_writes;
+            seeds_1_to_30: 1..=30,
+            seeds_31_to_60: 31..=60,
+            seeds_61_to_90: 61..=90,
+            seeds_91_to_120: 91..=120,
+            seeds_121_to_150: 121..=150,
+            seeds_151_to_180: 151..=180,
+            seeds_181_to_210: 181..=210,
+            seeds_211_to_240: 211..=240,
+            seeds_241_to_270: 241..=270,
+            seeds_271_to_300: 271..=300,
+        }
+    }
+
+    fn generated_writes(seeds: std::ops::RangeInclusive<u64>) {
         let tables = [Table::Blobs, Table::Meta, Table::Cold];
-        for seed in 1..=300u64 {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut w = Writer::new();
             let mut disk: BTreeMap<(Table, Vec<u8>), Vec<u8>> = BTreeMap::new();

@@ -59,6 +59,10 @@ impl Watch {
         self.limit
     }
 
+    pub fn ping_every(&self) -> Duration {
+        self.ping_every
+    }
+
     /// How long the server had been silent when the link was given up, once it has been.
     pub fn silent(&self) -> Option<Silence> {
         self.silent

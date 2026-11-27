@@ -134,14 +134,37 @@ fn batch_on(image: Vec<u8>) -> u8 {
     first
 }
 
-#[test]
-fn a_power_cut_keeps_every_finished_batch_and_tears_none() {
+mod a_power_cut_keeps_every_finished_batch_and_tears_none {
+    use super::check_power_cuts;
+
+    rargo_machine::test_batches! {
+        check_power_cuts;
+        offsets_0_mod_16: 0,
+        offsets_1_mod_16: 1,
+        offsets_2_mod_16: 2,
+        offsets_3_mod_16: 3,
+        offsets_4_mod_16: 4,
+        offsets_5_mod_16: 5,
+        offsets_6_mod_16: 6,
+        offsets_7_mod_16: 7,
+        offsets_8_mod_16: 8,
+        offsets_9_mod_16: 9,
+        offsets_10_mod_16: 10,
+        offsets_11_mod_16: 11,
+        offsets_12_mod_16: 12,
+        offsets_13_mod_16: 13,
+        offsets_14_mod_16: 14,
+        offsets_15_mod_16: 15,
+    }
+}
+
+fn check_power_cuts(first_cut: usize) {
     let empty = {
         let disk = FakeDisk::holding(Vec::new());
         drop(Db::on(disk).unwrap());
         disk.with(|s| s.safe.clone())
     };
-    let mut cut = 0;
+    let mut cut = first_cut;
     loop {
         let disk = FakeDisk::holding(empty.clone());
         let db = Db::on(disk).unwrap();
@@ -161,7 +184,7 @@ fn a_power_cut_keeps_every_finished_batch_and_tears_none() {
         if finished == BATCHES {
             break;
         }
-        cut += 1;
+        cut += 16;
     }
     assert!(cut > 0, "the cut fell inside a commit at least once");
 }

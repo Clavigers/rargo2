@@ -1420,10 +1420,27 @@ mod tests {
         ids
     }
 
-    #[test]
-    fn generated_deliveries_reads_and_concurrent_fetches_return_only_proven_bytes_of_the_newest_tree() {
+    mod generated_deliveries_reads_and_concurrent_fetches_return_only_proven_bytes_of_the_newest_tree {
+        use super::generated_deliveries;
+
+        rargo_machine::test_batches! {
+            generated_deliveries;
+            seeds_1_to_30: 1..=30,
+            seeds_31_to_60: 31..=60,
+            seeds_61_to_90: 61..=90,
+            seeds_91_to_120: 91..=120,
+            seeds_121_to_150: 121..=150,
+            seeds_151_to_180: 151..=180,
+            seeds_181_to_210: 181..=210,
+            seeds_211_to_240: 211..=240,
+            seeds_241_to_270: 241..=270,
+            seeds_271_to_300: 271..=300,
+        }
+    }
+
+    fn generated_deliveries(seeds: std::ops::RangeInclusive<u64>) {
         let (mut reads, mut refused, mut stale) = (0, 0, 0);
-        for seed in 1..=300u64 {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut tree = OutputTree { files: Table::new(), generation: 0 };
             let mut model = Table::new();
@@ -1570,7 +1587,7 @@ mod tests {
                 }
             }
         }
-        assert!(reads > 1000 && refused > 100 && stale > 100, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
+        assert!(reads > 100 && refused > 10 && stale > 10, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
     }
 
     enum Ev {
