@@ -14,6 +14,8 @@
 use super::{background, call, cpu, loop_at_hand, on_fiber, on_loop_thread, oneshot, sleep, spawn, unbounded_channel};
 use super::{UnboundedReceiver, UnboundedSender};
 use crate::db_writer::{Batch, DbWriter, Due};
+use parking_lot::RwLock;
+use redb::Database;
 use std::mem;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -24,7 +26,48 @@ pub(crate) trait Disk: Send + Sync + 'static {
     fn commit(&self, batch: &Batch) -> anyhow::Result<()>;
 }
 
+pub(crate) type Open = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>;
+
+/// Keeps readers on a live handle while the writer commits or reopens it.
+pub(crate) struct Reopenable {
+    db: RwLock<Option<Database>>,
+    open: Open,
+}
+
+impl Reopenable {
+    pub(crate) fn new(db: Database, open: Open) -> Self {
+        Self { db: RwLock::new(Some(db)), open }
+    }
+
+    pub(crate) fn read<R>(&self, read: impl FnOnce(Option<&Database>) -> R) -> R {
+        read(self.db.read().as_ref())
+    }
+
+    pub(crate) fn commit(&self, commit: impl FnOnce(Option<&Database>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let mut db = self.db.upgradable_read();
+        if db.is_none() {
+            db.with_upgraded(|db| self.reopen(db));
+        }
+        let result = commit(db.as_ref());
+        if result.is_err() {
+            db.with_upgraded(|db| self.reopen(db));
+        }
+        result
+    }
+
+    fn reopen(&self, db: &mut Option<Database>) {
+        // redb rejects later transactions after an I/O error. Release the
+        // old handle before opening the same file again.
+        drop(db.take());
+        match (self.open)() {
+            Ok(fresh) => *db = Some(fresh),
+            Err(e) => eprintln!("rargod: db reopen failed: {e:#}"),
+        }
+    }
+}
+
 type Step = Box<dyn FnOnce(&mut DbWriter) + Send>;
+type CommitResult = Result<(), Arc<dyn std::error::Error + Send + Sync>>;
 type Done = Box<dyn FnOnce() + Send>;
 type Reply<R> = Box<dyn FnOnce(R) + Send>;
 type Answer<R> = Box<dyn FnOnce() -> Option<R>>;
@@ -32,7 +75,7 @@ type Answer<R> = Box<dyn FnOnce() -> Option<R>>;
 enum Msg {
     Step(Step),
     Committed(Batch, anyhow::Result<()>),
-    Flush(Done),
+    Flush(Reply<CommitResult>),
     Stop(Done),
     /// The time a commit was due at has come.
     Tick,
@@ -46,11 +89,12 @@ enum Slot {
 pub(crate) struct Owner {
     slot: Arc<Mutex<Slot>>,
     disk: Arc<dyn Disk>,
+    background: bool,
 }
 
 impl Owner {
-    pub(crate) fn new(disk: Arc<dyn Disk>) -> Owner {
-        Owner { slot: Arc::new(Mutex::new(Slot::Here(DbWriter::new()))), disk }
+    pub(crate) fn new(disk: Arc<dyn Disk>, background: bool) -> Owner {
+        Owner { slot: Arc::new(Mutex::new(Slot::Here(DbWriter::new()))), disk, background }
     }
 
     fn lock(&self) -> MutexGuard<'_, Slot> {
@@ -78,26 +122,27 @@ impl Owner {
             Slot::Away(tx) => return send(tx, Msg::Step(Box::new(f))),
             Slot::Here(w) => f(w),
         }
-        if loop_at_hand() {
+        if self.background && loop_at_hand() {
             drop(self.hand_over(slot));
         }
     }
 
     /// Commits what is pending now and waits for the commit to end.
-    pub(crate) fn flush(&self) {
+    pub(crate) fn flush(&self) -> anyhow::Result<()> {
         let mut slot = self.lock();
         if let Slot::Here(w) = &mut *slot {
             if !loop_at_hand() || w.is_empty() {
-                commit_here(w, &*self.disk);
-                return;
+                return commit_here(w, &*self.disk);
             }
             slot = self.hand_over(slot);
         }
         let Slot::Away(tx) = &mut *slot else { unreachable!("the writer was just handed over") };
         let (done, wait) = rendezvous();
-        send(tx, Msg::Flush(Box::new(move || done(()))));
+        send(tx, Msg::Flush(done));
         drop(slot);
-        let _ = wait();
+        wait()
+            .ok_or_else(|| anyhow::anyhow!("database writer stopped before replying"))?
+            .map_err(anyhow::Error::new)
     }
 
     /// Takes the writer back from its fiber, committing what is pending.
@@ -116,8 +161,8 @@ impl Owner {
             let _ = wait();
             slot = self.lock();
         }
-        if let Slot::Here(w) = &mut *slot {
-            commit_here(w, &*self.disk);
+        if self.background && let Slot::Here(w) = &mut *slot {
+            let _ = commit_here(w, &*self.disk);
         }
     }
 
@@ -152,6 +197,7 @@ impl Owner {
             in_flight: None,
             stopped: Vec::new(),
             alarm: None,
+            background: self.background,
         };
         background(move || owning.run());
         slot
@@ -175,7 +221,7 @@ fn rendezvous<R: Send + 'static>() -> (Reply<R>, Answer<R>) {
     (Box::new(move |v| drop(tx.send(v))), Box::new(move || rx.recv().ok()))
 }
 
-fn settle(w: &mut DbWriter, batch: &Batch, done: anyhow::Result<()>, now_ms: u64) {
+fn settle(w: &mut DbWriter, batch: &Batch, done: &anyhow::Result<()>, now_ms: u64) {
     match done {
         Ok(()) => w.flushed(batch, now_ms),
         Err(e) => {
@@ -187,13 +233,14 @@ fn settle(w: &mut DbWriter, batch: &Batch, done: anyhow::Result<()>, now_ms: u64
 
 /// One commit, on this thread or from a fiber on the worker pool, while
 /// nothing else can step the writer.
-fn commit_here(w: &mut DbWriter, disk: &dyn Disk) {
+fn commit_here(w: &mut DbWriter, disk: &dyn Disk) -> anyhow::Result<()> {
     let batch = w.take();
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     let done = if on_fiber() { cpu(|| disk.commit(&batch)) } else { disk.commit(&batch) };
-    settle(w, &batch, done, disk.now_ms());
+    settle(w, &batch, &done, disk.now_ms());
+    done
 }
 
 /// The fiber that owns the writer, and what it has been asked.
@@ -204,13 +251,14 @@ struct Owning {
     rx: UnboundedReceiver<Msg>,
     tx: UnboundedSender<Msg>,
     /// Flushes asked for since the last commit began.
-    asked: Vec<Done>,
+    asked: Vec<Reply<CommitResult>>,
     /// The flushes the commit in flight answers, while one is in flight.
-    in_flight: Option<Vec<Done>>,
+    in_flight: Option<Vec<Reply<CommitResult>>>,
     /// Whoever waits for the writer to come back.
     stopped: Vec<Done>,
     /// When the fiber that wakes the owner for a due commit fires, if one is set.
     alarm: Option<u64>,
+    background: bool,
 }
 
 impl Owning {
@@ -218,12 +266,12 @@ impl Owning {
         loop {
             let now = self.disk.now_ms();
             let w = self.writer.as_mut().expect("the owner holds the writer until it ends");
-            let due = w.due(now);
+            let due = if self.background { w.due(now) } else { Due::Idle };
             if self.in_flight.is_none() && (due == Due::Now || !self.asked.is_empty()) {
                 let batch = w.take();
                 let waiting = mem::take(&mut self.asked);
                 if batch.is_empty() {
-                    waiting.into_iter().for_each(|done| done());
+                    waiting.into_iter().for_each(|done| done(Ok(())));
                 } else {
                     self.in_flight = Some(waiting);
                     let (disk, tx) = (Arc::clone(&self.disk), self.tx.clone());
@@ -262,9 +310,10 @@ impl Owning {
         match msg {
             Msg::Step(f) => f(w),
             Msg::Committed(batch, done) => {
-                settle(w, &batch, done, self.disk.now_ms());
+                settle(w, &batch, &done, self.disk.now_ms());
+                let result = done.map_err(|e| Arc::from(e.into_boxed_dyn_error()));
                 let answered = self.in_flight.take().expect("a commit ends only once it began");
-                answered.into_iter().for_each(|done| done());
+                answered.into_iter().for_each(|done| done(result.clone()));
             }
             Msg::Flush(done) => self.asked.push(done),
             Msg::Tick => {
@@ -273,7 +322,9 @@ impl Owning {
                 }
             }
             Msg::Stop(done) => {
-                self.asked.push(Box::new(|| {}));
+                if self.background {
+                    self.asked.push(Box::new(|_| {}));
+                }
                 self.stopped.push(done);
             }
         }
@@ -297,12 +348,16 @@ impl Drop for Owning {
             w.failed(self.disk.now_ms());
             answered.extend(waiting);
         }
-        answered.append(&mut self.stopped);
-        if orphaned {
-            commit_here(&mut w, &*self.disk);
+        if orphaned && self.background {
+            let _ = commit_here(&mut w, &*self.disk);
         }
         *slot = Slot::Here(w);
         drop(slot);
-        answered.into_iter().for_each(|done| done());
+        if !answered.is_empty() {
+            let error: Arc<dyn std::error::Error + Send + Sync> =
+                Arc::from(anyhow::anyhow!("database writer stopped before the commit completed").into_boxed_dyn_error());
+            answered.into_iter().for_each(|done| done(Err(Arc::clone(&error))));
+        }
+        self.stopped.drain(..).for_each(|done| done());
     }
 }

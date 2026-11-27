@@ -651,16 +651,19 @@ impl<'a> ScanCore<'a> {
     }
 
     fn advance(&mut self, answers: Vec<Answer>) -> io::Result<Step> {
+        assert!(self.outcome.is_none(), "a finished scan does not advance");
         self.apply(answers)?;
         self.fold();
         if self.root_done() {
             self.outcome = Some(self.finish()?);
+            assert!(self.pending.is_empty() && !self.dirs.contains_key(b"".as_slice()), "a finished scan has nothing pending and has given up its root");
             return Ok(Step::Done);
         }
         let asks = self.collect_asks();
         if asks.is_empty() {
             return Err(io::Error::other("the scan stopped before the tree was built"));
         }
+        assert!(self.outcome.is_none() && asks.len() == self.pending.len(), "an unfinished scan waits on one answer per question");
         Ok(Step::Ask(asks))
     }
 
@@ -672,10 +675,12 @@ impl<'a> ScanCore<'a> {
         for (pend, answer) in pending.into_iter().zip(answers) {
             self.apply_one(pend, answer)?;
         }
+        assert!(self.pending.is_empty(), "every pending question was answered");
         Ok(())
     }
 
     fn apply_one(&mut self, pend: Pending, answer: Answer) -> io::Result<()> {
+        assert!(self.pending_ok(&pend), "an answer arrives only for a question the scan can still use");
         match pend.kind {
             Pend::List => self.apply_list(pend.rel, answer),
             Pend::Row(index) => self.apply_row(&pend.rel, index, answer),
@@ -709,6 +714,10 @@ impl<'a> ScanCore<'a> {
                 }
             }
         }
+        assert!(
+            names_increase(rows.iter().map(row_name)) && rows.iter().all(|row| matches!(row, Row::Meta { .. })),
+            "a fresh listing is sorted and every row waits on its metadata"
+        );
         self.dirs.get_mut(&rel).unwrap().phase = Phase::Listing(rows);
         Ok(())
     }
@@ -729,7 +738,9 @@ impl<'a> ScanCore<'a> {
     }
 
     fn reduce(&mut self, row: Row, answer: Answer) -> io::Result<Row> {
-        match (row, answer) {
+        assert!(row_rank(&row) < 2, "only a row waiting on a look is answered");
+        let (name, rank) = (row_name(&row).to_vec(), row_rank(&row));
+        let next = match (row, answer) {
             (Row::Meta { name, child, take }, Answer::Meta(meta)) => self.reduce_meta(name, child, take, meta),
             (Row::Cache { name, child, inside }, Answer::Cache(bytes)) => Ok(self.reduce_cache(name, child, inside, bytes.as_deref())),
             (Row::Link { name, .. }, Answer::Link(target)) => Ok(match target {
@@ -738,7 +749,9 @@ impl<'a> ScanCore<'a> {
             }),
             (Row::Content { name, child, stamp, exec }, Answer::Content { at_ns, hash }) => self.reduce_content(name, child, stamp, exec, at_ns, hash),
             _ => Err(io::Error::other("a scan answer does not match its request")),
-        }
+        }?;
+        assert!(row_name(&next) == name.as_slice() && row_rank(&next) > rank, "an answer moves its row forward and keeps its name");
+        Ok(next)
     }
 
     fn reduce_meta(&self, name: Vec<u8>, child: Vec<u8>, take: Take, meta: io::Result<Meta>) -> io::Result<Row> {
@@ -769,7 +782,9 @@ impl<'a> ScanCore<'a> {
         if let Some(digest) = self.plan().reuse(&child) {
             return Row::Ready { name, observed: Observed::Directory(Directory::Reuse(digest)) };
         }
+        assert!(!self.dirs.contains_key(&child), "a subdirectory is opened once");
         self.dirs.insert(child.clone(), DirBuild { inside, phase: Phase::NeedList });
+        assert!(matches!(self.dirs[&child].phase, Phase::NeedList), "an opened subdirectory waits on its listing");
         Row::Child { name, child }
     }
 
@@ -851,6 +866,7 @@ impl<'a> ScanCore<'a> {
     }
 
     fn finish(&mut self) -> io::Result<Scan> {
+        assert!(self.root_done() && self.outcome.is_none(), "the scan finishes once, when its root is done");
         let Some(DirBuild { phase: Phase::Done(directory), .. }) = self.dirs.remove(b"".as_slice()) else {
             return Err(io::Error::other("the scan finished without a root"));
         };
@@ -885,6 +901,10 @@ impl<'a> ScanCore<'a> {
             }
         }
         self.pending = pending;
+        assert!(
+            asks.len() == self.pending.len() && self.pending.iter().all(|pend| self.pending_ok(pend)),
+            "each question asked is pending, and the scan can use its answer"
+        );
         asks
     }
 
@@ -1058,6 +1078,15 @@ fn names_increase<'b>(names: impl Iterator<Item = &'b [u8]>) -> bool {
         prev = Some(name);
     }
     true
+}
+
+/// How far a row has come: 0 waits on its metadata, 1 on a further look, 2 needs nothing more asked.
+fn row_rank(row: &Row) -> u8 {
+    match row {
+        Row::Meta { .. } => 0,
+        Row::Cache { .. } | Row::Link { .. } | Row::Content { .. } => 1,
+        Row::Ready { .. } | Row::Omit { .. } | Row::Child { .. } => 2,
+    }
 }
 
 fn rows_ok(parent: &[u8], rows: &[Row], dirs: &BTreeMap<Vec<u8>, DirBuild>) -> bool {
@@ -1696,5 +1725,38 @@ mod tests {
         };
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
         assert!(err.to_string().contains("/mem/secret"), "{err}");
+    }
+
+    #[test]
+    fn answers_of_the_wrong_kind_or_count_are_errors_not_asserts() {
+        let root = Path::new("/mem");
+        let empty = Index::default();
+        let mut core = ScanCore::whole(root, Some(&empty), &[], None);
+        let Step::Ask(_) = core.advance(Vec::new()).unwrap() else { panic!("the root is listed") };
+        assert!(core.advance(Vec::new()).is_err(), "too few answers");
+        let mut core = ScanCore::whole(root, Some(&empty), &[], None);
+        let Step::Ask(_) = core.advance(Vec::new()).unwrap() else { panic!("the root is listed") };
+        assert!(core.advance(vec![Answer::Cache(None)]).is_err(), "a cache answer to a listing");
+        let mut core = ScanCore::whole(root, Some(&empty), &[], None);
+        let Step::Ask(_) = core.advance(Vec::new()).unwrap() else { panic!("the root is listed") };
+        let Step::Ask(asks) = core.advance(vec![Answer::List(Ok(vec![b"a".to_vec()]))]).unwrap() else { panic!("the entry is looked at") };
+        core.invariants();
+        assert!(matches!(asks.as_slice(), [Ask::Meta { .. }]));
+        assert!(core.advance(vec![Answer::Link(None)]).is_err(), "a link answer to a metadata look");
+    }
+
+    #[test]
+    #[should_panic(expected = "a finished scan does not advance")]
+    fn a_finished_scan_does_not_advance() {
+        let root = Path::new("/mem");
+        let empty = Index::default();
+        let model = Model { root: dir(), at_ns: SETTLED };
+        let mut core = ScanCore::whole(root, Some(&empty), &[], None);
+        let mut answers = Vec::new();
+        while let Step::Ask(asks) = core.advance(std::mem::take(&mut answers)).unwrap() {
+            answers = model.answer(&asks);
+        }
+        core.invariants();
+        let _ = core.advance(Vec::new());
     }
 }

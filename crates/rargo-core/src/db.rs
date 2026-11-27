@@ -1,7 +1,7 @@
 use crate::db_writer::Batch;
 #[cfg(doc)]
 use crate::db_writer::DbWriter;
-use crate::io::db::{Disk, Owner};
+use crate::io::db::{Disk, Open, Owner, Reopenable};
 use anyhow::{Context, Result};
 use redb::{Database, TableDefinition};
 use std::path::Path;
@@ -105,7 +105,7 @@ impl Tables for MemTables {
 }
 
 struct Shared {
-    db: Database,
+    db: Reopenable,
     born: Instant,
 }
 
@@ -115,15 +115,15 @@ impl Disk for Shared {
     }
 
     fn commit(&self, batch: &Batch) -> Result<()> {
-        commit(&self.db, batch)
+        self.db.commit(|db| commit(db, batch))
     }
 }
 
 /// The tables on disk, and the writes not yet committed to them. The
 /// pending writes belong to a [`DbWriter`] that one owner steps: a fiber on
 /// the I/O loop while one runs, which commits them in the background.
-/// Without a loop they reach the disk when the database is flushed or
-/// dropped.
+/// A regular database without a loop commits on flush or drop. A database
+/// opened over the simulated filesystem commits only on explicit flush.
 pub struct Db {
     shared: Arc<Shared>,
     writer: Owner,
@@ -131,15 +131,43 @@ pub struct Db {
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        Db::over(Database::create(path).with_context(|| format!("opening {}", path.display()))?)
+        let owned = path.to_path_buf();
+        Db::over(Box::new(move || Database::create(&owned)), true)
+            .with_context(|| format!("opening {}", path.display()))
     }
 
     /// A database that lives in memory and is gone when it is dropped.
     pub fn open_in_memory() -> Result<Db> {
-        Db::over(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?)
+        Db::on_backend(Memory::default(), true)
     }
 
-    fn over(db: Database) -> Result<Db> {
+    /// Real redb using the simulated filesystem. The caller controls commits.
+    pub fn open_simulated(path: &Path) -> Result<Db> {
+        assert!(crate::io::sim::active());
+        let owned = path.to_path_buf();
+        Db::over(
+            Box::new(move || {
+                let file = crate::io::file::OpenOptions::new().read(true).write(true).create(true).open(&owned)?;
+                redb::Builder::new().create_with_backend(SimFile(file))
+            }),
+            false,
+        )
+    }
+
+    /// A database on `disk`, opened again on the same disk after a failed commit.
+    fn on_backend(disk: impl redb::StorageBackend + Clone, background: bool) -> Result<Db> {
+        Db::over(Box::new(move || redb::Builder::new().create_with_backend(disk.clone())), background)
+    }
+
+    /// A database on `disk` that never starts a background writer, so a test's writes wait for
+    /// its own `flush` and never reach another test's loop.
+    #[cfg(test)]
+    fn on(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
+        Db::on_backend(disk, false)
+    }
+
+    fn over(open: Open, background: bool) -> Result<Db> {
+        let db = open()?;
         {
             let tx = db.begin_write()?;
             for t in ALL {
@@ -147,8 +175,8 @@ impl Db {
             }
             tx.commit()?;
         }
-        let shared = Arc::new(Shared { db, born: crate::io::now() });
-        let writer = Owner::new(shared.clone());
+        let shared = Arc::new(Shared { db: Reopenable::new(db, open), born: crate::io::now() });
+        let writer = Owner::new(shared.clone(), background);
         Ok(Db { shared, writer })
     }
 
@@ -157,10 +185,12 @@ impl Db {
         if let Some(v) = self.writer.read(move |w| w.get(table, &key_owned)) {
             return v;
         }
-        let tx = self.shared.db.begin_read().ok()?;
-        let t = tx.open_table(table.def()).ok()?;
-        let v = t.get(key).ok()??;
-        Some(Arc::from(v.value()))
+        self.shared.db.read(|db| {
+            let tx = db?.begin_read().ok()?;
+            let t = tx.open_table(table.def()).ok()?;
+            let v = t.get(key).ok()??;
+            Some(Arc::from(v.value()))
+        })
     }
 
     pub fn put(&self, table: Table, key: &[u8], val: &[u8]) {
@@ -177,19 +207,21 @@ impl Db {
 
     pub fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
         let mut out: std::collections::BTreeMap<Vec<u8>, Option<Arc<[u8]>>> = Default::default();
-        if let Ok(tx) = self.shared.db.begin_read() {
-            if let Ok(t) = tx.open_table(table.def()) {
-                if let Ok(range) = t.range::<&[u8]>(prefix..) {
-                    for item in range {
-                        let Ok((k, v)) = item else { break };
-                        if !k.value().starts_with(prefix) {
-                            break;
+        self.shared.db.read(|db| {
+            if let Some(Ok(tx)) = db.map(Database::begin_read) {
+                if let Ok(t) = tx.open_table(table.def()) {
+                    if let Ok(range) = t.range::<&[u8]>(prefix..) {
+                        for item in range {
+                            let Ok((k, v)) = item else { break };
+                            if !k.value().starts_with(prefix) {
+                                break;
+                            }
+                            out.insert(k.value().to_vec(), Some(Arc::from(v.value())));
                         }
-                        out.insert(k.value().to_vec(), Some(Arc::from(v.value())));
                     }
                 }
             }
-        }
+        });
         let prefix = prefix.to_vec();
         for (k, v) in self.writer.read(move |w| w.pending_with_prefix(table, &prefix)) {
             out.insert(k, v);
@@ -206,7 +238,11 @@ impl Db {
     /// Commits every write made before this call, and returns once that
     /// commit has ended.
     pub fn flush(&self) {
-        self.writer.flush();
+        let _ = self.flush_checked();
+    }
+
+    pub fn flush_checked(&self) -> Result<()> {
+        self.writer.flush()
     }
 }
 
@@ -216,8 +252,8 @@ impl Drop for Db {
     }
 }
 
-fn commit(db: &Database, batch: &Batch) -> Result<()> {
-    let tx = db.begin_write()?;
+fn commit(db: Option<&Database>, batch: &Batch) -> Result<()> {
+    let tx = db.context("the database could not be opened again")?.begin_write()?;
     for t in ALL {
         let mut table = tx.open_table(t.def())?;
         for (bt, k, v) in &batch.writes {
@@ -238,6 +274,59 @@ fn commit(db: &Database, batch: &Batch) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct SimFile(crate::io::file::File);
+
+impl redb::StorageBackend for SimFile {
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.0.metadata()?.len())
+    }
+
+    fn read(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut bytes = vec![0; len];
+        self.0.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self, _eventual: bool) -> std::io::Result<()> {
+        self.0.sync_data()
+    }
+
+    fn write(&self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write_all_at(bytes, offset)
+    }
+}
+
+/// Memory that a reopened database finds as the failed one left it.
+#[derive(Clone, Debug, Default)]
+struct Memory(Arc<redb::backends::InMemoryBackend>);
+
+impl redb::StorageBackend for Memory {
+    fn len(&self) -> std::io::Result<u64> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.0.read(offset, len)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self, eventual: bool) -> std::io::Result<()> {
+        self.0.sync_data(eventual)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.0.write(offset, data)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,10 +338,12 @@ mod tests {
         on_disk(&db.shared.db, key)
     }
 
-    fn on_disk(db: &Database, key: &[u8]) -> bool {
-        let tx = db.begin_read().unwrap();
-        let table = tx.open_table(Table::Meta.def()).unwrap();
-        table.get(key).unwrap().is_some()
+    fn on_disk(db: &Reopenable, key: &[u8]) -> bool {
+        db.read(|db| {
+            let tx = db.unwrap().begin_read().unwrap();
+            let table = tx.open_table(Table::Meta.def()).unwrap();
+            table.get(key).unwrap().is_some()
+        })
     }
 
     #[test]
@@ -368,3 +459,6 @@ mod tests {
         assert!(on_disk(&shared.db, b"k"));
     }
 }
+
+#[cfg(test)]
+mod disk_tests;

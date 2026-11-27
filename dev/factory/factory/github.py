@@ -106,6 +106,14 @@ class GitHub:
     def reviews(self, pr: int) -> list[dict]:
         return self._api(f"pulls/{pr}/reviews?per_page=100", paginate=True)
 
+    def change(self, base: str, sha: str) -> list[str]:
+        """What sha changes since it left base: the files and the lines added
+        and removed, without positions or context, so that merging base in or
+        rebasing onto it leaves it the same."""
+        diff = self._gh("api", "-H", "Accept: application/vnd.github.diff",
+                        f"repos/{self.repo}/compare/{base}...{sha}")
+        return [line for line in diff.splitlines() if line[:1] in ("+", "-")]
+
     def post(self, pr: int, body: str, as_: str | None = None) -> int:
         """A comment on pr, as the account as_; returns its id."""
         out = self._gh("api", f"repos/{self.repo}/issues/{pr}/comments", "-X", "POST",
