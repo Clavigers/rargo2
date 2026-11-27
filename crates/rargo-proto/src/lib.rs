@@ -234,11 +234,11 @@ pub struct Part {
 
 impl Part {
     pub fn pack(bytes: Vec<u8>) -> Part {
-        if let Ok(z) = zstd::bulk::compress(&bytes, 1) {
-            if z.len() + bytes.len() / 10 < bytes.len() {
-                assert!(z.len() < bytes.len());
-                return Part { data: z, packed: true };
-            }
+        if let Ok(z) = zstd::bulk::compress(&bytes, 1)
+            && z.len() + bytes.len() / 10 < bytes.len()
+        {
+            assert!(z.len() < bytes.len());
+            return Part { data: z, packed: true };
         }
         Part { data: bytes, packed: false }
     }
@@ -275,13 +275,12 @@ const _: () = assert!(CHUNKED_FROM as usize >= PART_SIZE);
 
 impl Blob {
     pub fn pack(hash: Digest, bytes: &[u8]) -> Blob {
-        if bytes.len() >= 256 {
-            if let Ok(z) = zstd::bulk::compress(bytes, 1) {
-                if z.len() + 16 < bytes.len() {
-                    assert!(z.len() < bytes.len());
-                    return Blob { hash, data: z, packed: true };
-                }
-            }
+        if bytes.len() >= 256
+            && let Ok(z) = zstd::bulk::compress(bytes, 1)
+            && z.len() + 16 < bytes.len()
+        {
+            assert!(z.len() < bytes.len());
+            return Blob { hash, data: z, packed: true };
         }
         Blob { hash, data: bytes.to_vec(), packed: false }
     }
@@ -294,7 +293,7 @@ impl Blob {
 pub fn env_allowed(name: &str) -> bool {
     const EXACT: &[&str] = &[
         "LANG", "LANGUAGE", "TZ", "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "RUSTDOCFLAGS", "TERM", "NO_COLOR", "BROWSER",
-        "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM",
+        "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM", "UPDATE_EXPECT",
     ];
     const PREFIXES: &[&str] = &["CARGO_", "RUSTC", "RUSTDOC", "RUST_", "LC_", "__CARGO", "RARGO_", "NEXTEST_"];
     const DROP: &[&str] = &[
@@ -321,6 +320,8 @@ pub fn decode<T: for<'a> Deserialize<'a>>(b: &[u8]) -> std::io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::{expect, Expect};
+    use std::fmt::Write as _;
 
     #[test]
     fn cachedir_tag_carries_its_signature() {
@@ -332,6 +333,8 @@ mod tests {
         assert!(env_allowed("CARGO_TARGET_DIR"));
         assert!(env_allowed("RUSTFLAGS"));
         assert!(env_allowed("RARGO_EXPLAIN"));
+        assert!(env_allowed("UPDATE_EXPECT"));
+        assert!(!env_allowed("UPDATE_EXPECT_OTHER"));
         assert!(!env_allowed("PATH"));
         assert!(!env_allowed("HOME"));
         assert!(!env_allowed("CARGO_HOME"));
@@ -340,20 +343,75 @@ mod tests {
         assert!(!env_allowed("AWS_SECRET_ACCESS_KEY"));
     }
 
+    enum ReorderEvent {
+        Receive(u32, u64, &'static str),
+        End(u32),
+    }
+
+    fn check_reorder(per_stream: bool, events: impl IntoIterator<Item = ReorderEvent>, expected: Expect) {
+        let mut reorder = Reorder::new(per_stream);
+        let mut output = String::new();
+        for event in events {
+            match event {
+                ReorderEvent::Receive(stream, seq, msg) => {
+                    let released = reorder.push(Frame { stream, seq, msg });
+                    writeln!(output, "receive {stream}:{seq} {msg:?} -> {released:?}").unwrap();
+                }
+                ReorderEvent::End(stream) => {
+                    reorder.end(stream);
+                    writeln!(output, "end {stream}").unwrap();
+                }
+            }
+        }
+        expected.assert_eq(&output);
+    }
+
     #[test]
-    fn frames_come_out_in_the_senders_order() {
-        let f = |stream, seq, msg: &'static str| Frame { stream, seq, msg };
-        let mut one: Reorder<&str> = Reorder::new(false);
-        assert!(one.push(f(3, 1, "b")).is_empty());
-        assert_eq!(one.push(f(0, 0, "a")), vec![(0, "a"), (3, "b")]);
-        assert!(one.push(f(0, 0, "again")).is_empty());
-        let mut per: Reorder<&str> = Reorder::new(true);
-        assert_eq!(per.push(f(1, 0, "x")), vec![(1, "x")]);
-        assert!(per.push(f(2, 1, "z")).is_empty());
-        assert_eq!(per.push(f(1, 1, "y")), vec![(1, "y")]);
-        assert_eq!(per.push(f(2, 0, "w")), vec![(2, "w"), (2, "z")]);
-        per.end(2);
-        assert_eq!(per.push(f(2, 0, "new stream 2")), vec![(2, "new stream 2")]);
+    fn frames_share_a_sequence_in_global_order() {
+        use ReorderEvent::Receive;
+
+        check_reorder(
+            false,
+            [Receive(3, 1, "b"), Receive(0, 0, "a"), Receive(0, 0, "again")],
+            expect![[r#"
+                receive 3:1 "b" -> []
+                receive 0:0 "a" -> [(0, "a"), (3, "b")]
+                receive 0:0 "again" -> []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn streams_advance_and_reset_independently() {
+        use ReorderEvent::{End, Receive};
+
+        check_reorder(
+            true,
+            [
+                Receive(1, 0, "x"),
+                Receive(2, 1, "z"),
+                Receive(1, 1, "y"),
+                Receive(2, 0, "w"),
+                Receive(2, 3, "discard on end"),
+                End(2),
+                Receive(2, 0, "new stream 2"),
+                Receive(2, 1, "next"),
+                Receive(2, 2, "fills the gap"),
+                Receive(1, 2, "stream 1 continues"),
+            ],
+            expect![[r#"
+                receive 1:0 "x" -> [(1, "x")]
+                receive 2:1 "z" -> []
+                receive 1:1 "y" -> [(1, "y")]
+                receive 2:0 "w" -> [(2, "w"), (2, "z")]
+                receive 2:3 "discard on end" -> []
+                end 2
+                receive 2:0 "new stream 2" -> [(2, "new stream 2")]
+                receive 2:1 "next" -> [(2, "next")]
+                receive 2:2 "fills the gap" -> [(2, "fills the gap")]
+                receive 1:2 "stream 1 continues" -> [(1, "stream 1 continues")]
+            "#]],
+        );
     }
 
     #[test]

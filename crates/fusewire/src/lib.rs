@@ -548,9 +548,9 @@ fn require_uring(offered: bool) -> std::io::Result<()> {
 
 const MAX_WRITE: u32 = 1 << 20;
 pub const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
-const _: () = assert!(MAX_WRITE % 4096 == 0);
+const _: () = assert!(MAX_WRITE.is_multiple_of(4096));
 const _: () = assert!(MAX_WRITE / 4096 <= u16::MAX as u32);
-const _: () = assert!(BUF_SIZE % 8 == 0);
+const _: () = assert!(BUF_SIZE.is_multiple_of(8));
 const _: () = assert!(BUF_SIZE >= FUSE_MIN_READ_BUFFER);
 const _: () = assert!(
     BUF_SIZE >= MAX_WRITE as usize + std::mem::size_of::<fuse_in_header>() + std::mem::size_of::<fuse_write_in>()
@@ -1200,10 +1200,10 @@ fn dispatch<F: Filesystem>(fs: &F, ctx: &Ctx, call: &mut Call, hdr: &fuse_in_hea
             send(reply, u, fs.statfs(&ctx, node).map(|st| fuse_statfs_out { st }));
         }
         FUSE_RELEASE | FUSE_RELEASEDIR => {
-            if hdr.opcode == FUSE_RELEASE {
-                if let Some(a) = read_struct::<fuse_release_in>(body) {
-                    fs.release_in(&ctx, node, a.fh, a.flags);
-                }
+            if hdr.opcode == FUSE_RELEASE
+                && let Some(a) = read_struct::<fuse_release_in>(body)
+            {
+                fs.release_in(&ctx, node, a.fh, a.flags);
             }
             encode_reply(reply, u, 0, &[]);
         }
@@ -1504,7 +1504,7 @@ mod request_tests {
         }
     }
 
-    fn checked<'a>(h: &'a mut RequestHandler, fs: &Memory, request: &[u8]) -> (Vec<u8>, Vec<Effect>) {
+    fn checked(h: &mut RequestHandler, fs: &Memory, request: &[u8]) -> (Vec<u8>, Vec<Effect>) {
         let handled = h.handle(fs, request);
         let out = (handled.bytes.to_vec(), handled.effects);
         h.invariants();
