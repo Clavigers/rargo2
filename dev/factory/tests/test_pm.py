@@ -204,3 +204,12 @@ def test_bump_leaves_other_packages(tmp_path):
     (tmp_path / "Cargo.toml").write_text('version = "1.0.0"\ndep = { version = "1.0.0" }\n')
     bump(tmp_path, "1.0.0", "1.0.1")
     assert (tmp_path / "Cargo.toml").read_text() == 'version = "1.0.1"\ndep = { version = "1.0.0" }\n'
+
+
+def test_a_tag_moved_on_origin_does_not_stop_it(tmp_path):
+    f = Factory(tmp_path, uses_required=1)
+    f.pm.step()
+    f.commit("more")
+    git(f.dev, "tag", "-f", "v0.7.10")
+    git(f.dev, "push", "-q", "-f", "origin", "main", "--tags")
+    f.pm.step()  # git refuses to move a tag it has, unless forced
