@@ -202,8 +202,8 @@ def wake(w: World, a: str, ready: bool) -> dict | None:
     st = w.state(M.AGENT, a) or "off"
     holds = a in w.holding
     if w.is_(M.QUOTA, a, "out"):
-        at = w.since(M.QUOTA, a) + timedelta(minutes=QUOTA_RETRY)
-        return dict(why="out of quota: the watchdog tries a session again", at=iso(at))
+        at = w.quota_back_at(a, timedelta(minutes=QUOTA_RETRY))
+        return dict(why="out of quota: the watchdog tries a session when its limit has reset", at=iso(at))
     if st == "working":
         return None
     if st == "idle":
