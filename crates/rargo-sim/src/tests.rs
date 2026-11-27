@@ -175,3 +175,12 @@ fn a_restarted_daemon_trusting_the_dead_one_is_caught() {
     caught(0, Bug::TrustAfterCrash, |k| matches!(k, Kind::StateMachine(_) | Kind::Liveness(_) | Kind::Deadlock(_)));
 }
 
+#[test]
+fn a_rescan_that_misses_the_edits_is_caught() {
+    caught(0, Bug::DeafToEdits, |k| matches!(k, Kind::Drift(_)));
+}
+
+#[test]
+fn outputs_that_never_reach_target_are_caught() {
+    caught(0, Bug::UnshownOutputs, |k| matches!(k, Kind::Drift(d) if d.contains("target/")));
+}

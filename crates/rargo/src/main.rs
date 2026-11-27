@@ -23,13 +23,13 @@ mod partial;
 mod place;
 mod project;
 mod report;
-mod scan;
 #[path = "io/signals.rs"]
 mod signals;
 mod status;
 mod tmp;
 mod watch;
 
+use rargo::scan;
 use rargo_net::io;
 use rargo_net::io::file::PathRing as _;
 use rargo_proto::{ExecRequest, LocalReply, LocalRequest};
