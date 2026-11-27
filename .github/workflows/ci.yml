@@ -15,11 +15,8 @@ jobs:
     env:
       RARGO_SERVER: rargo.rs
       RUSTFLAGS: -D warnings
-      RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
-      # rargo can fetch the runtime closure for the test binaries through Nix.
-      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: rargo, signed in to rargo.rs
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
@@ -71,13 +68,15 @@ jobs:
             echo "::warning::The rargo server did not answer. Retrying sign-in."
             sleep "$((remaining < 60 ? remaining : 60))"
           done
-      - run: rargo test --locked --workspace
-      - name: Measure per-test CPU
+      # rargo serves target/ over FUSE-over-io_uring, which the kernel leaves off by default.
+      # A kernel without it gets target/ copied instead.
+      - name: FUSE over io_uring
         run: |
-          export RARGO_CPU_REPORT="$RUNNER_TEMP/rargo-cpu.tsv"
-          status=0
-          python3 dev/purity.py cpu || status=$?
-          if [[ -s "$RARGO_CPU_REPORT" ]]; then
-            awk '$1 > 50 { print }' "$RARGO_CPU_REPORT"
+          sudo modprobe fuse || true
+          if [[ -e /sys/module/fuse/parameters/enable_uring ]]; then
+            echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
+          else
+            echo "::warning::This kernel ($(uname -r)) has no fuse.enable_uring; rargo copies target/ instead."
+            echo "RARGO_OUTPUT=copy" >> "$GITHUB_ENV"
           fi
-          exit "$status"
+      - run: rargo nextest run --locked --workspace

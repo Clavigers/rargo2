@@ -34,7 +34,7 @@ opt-level = 3
 [profile.dev.package.proc-macro2]
 opt-level = 3
 
-# Optimize the test binaries timed by the CPU gate. The simulator checks
+# Optimize the test binaries. The simulator checks
 # every invariant after every event.
 [profile.test]
 opt-level = 3
