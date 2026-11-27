@@ -561,7 +561,17 @@ fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, Stri
     if !dir.starts_with(root) {
         return None;
     }
-    let table = io::file::read_to_string(manifest).ok()?.parse::<toml::Table>().ok()?;
+    let text = io::file::read_to_string(manifest).ok()?;
+    outside_path_dependency_in(root, &dir, &text, |path| io::file::canonicalize(path).ok())
+}
+
+fn outside_path_dependency_in(
+    root: &Path,
+    dir: &Path,
+    text: &str,
+    resolve: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<(String, String)> {
+    let table = text.parse::<toml::Table>().ok()?;
     let targets = table.get("target").and_then(toml::Value::as_table).into_iter()
         .flat_map(|targets| targets.values().filter_map(toml::Value::as_table));
     for section in std::iter::once(&table).chain(targets) {
@@ -570,7 +580,7 @@ fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, Stri
             for (name, dependency) in dependencies {
                 let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else { continue };
                 let joined = dir.join(path);
-                if io::file::canonicalize(&joined).is_ok_and(|resolved| !resolved.starts_with(root)) {
+                if resolve(&joined).is_some_and(|resolved| !resolved.starts_with(root)) {
                     return Some((name.clone(), path.to_owned()));
                 }
             }
@@ -865,16 +875,13 @@ mod tests {
 
     #[test]
     fn direct_path_dependencies_must_stay_inside_the_synced_worktree() {
-        let temp = tempfile::tempdir().unwrap();
-        let base = io::file::canonicalize(temp.path()).unwrap();
-        let root = base.join("app");
-        for dir in [root.join("local"), base.join("dep")] {
-            io::file::create_dir_all(dir).unwrap();
-        }
-        let manifest = root.join("Cargo.toml");
+        let root = Path::new("/work/app");
         let found = |content: &str| {
-            io::file::write(&manifest, content).unwrap();
-            outside_path_dependency(&root, &manifest)
+            outside_path_dependency_in(root, root, content, |path| match path.to_str()? {
+                "/work/app/local" => Some(root.join("local")),
+                "/work/app/../dep" => Some(PathBuf::from("/work/dep")),
+                _ => panic!("unexpected dependency path {path:?}"),
+            })
         };
 
         assert_eq!(found("[dependencies]\nlocal = { path = 'local' }\nserde = '1'"), None);
