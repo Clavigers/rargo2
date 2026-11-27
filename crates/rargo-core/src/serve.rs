@@ -8,7 +8,7 @@ use crate::proto::{CONTROL, ClientMsg, Frame, Reorder, RunRequest, ServerMsg};
 use crate::session::{self, ClientHas, Keys, Session};
 use anyhow::{Context, Result};
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use crate::io::TcpStream;
 use std::rc::Rc;
@@ -138,7 +138,7 @@ pub fn link(d: Arc<Daemon>, link: Rc<Link>, presented: String, admin: bool, keys
         let (pump_link, pump_control) = (link.clone(), control.clone());
         crate::io::spawn(move || pump(pump_link, CONTROL, control_rx, pump_control));
     }
-    let streams: Arc<RefCell<HashMap<u32, Stream>>> = Arc::new(RefCell::new(HashMap::new()));
+    let streams: Arc<RefCell<BTreeMap<u32, Stream>>> = Arc::new(RefCell::new(BTreeMap::new()));
     let conn = Arc::new(RefCell::new(ConnectionState::new()));
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
     let mut todo: VecDeque<Route> = VecDeque::new();

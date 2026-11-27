@@ -546,6 +546,7 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
+    flag_target_dir(&c.args, &c.cwd, &mut env);
     let tr = build_paths(&c.root, &c.cargo_home, &mut env);
     let sandbox_cwd = tr.to_canonical(&c.cwd);
     if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
@@ -649,7 +650,11 @@ fn plan_with(
         env.insert(bytes("CARGO_BUILD_BUILD_DIR"), bytes("/w/target/install-build"));
     }
     let mut argv = vec![PLANNER_AT.to_vec()];
-    for a in args {
+    let args = match (target_dir_flag(args), p.env.get("CARGO_TARGET_DIR")) {
+        (Some(_), Some(dir)) => with_target_dir(args, dir),
+        _ => args.to_vec(),
+    };
+    for a in &args {
         let a = match a.split_once('=') {
             Some((flag, val)) if flag.starts_with("--") && val.starts_with('/') => {
                 format!("{flag}={}", p.tr.to_canonical(val))
@@ -1418,6 +1423,35 @@ impl UnitObserver {
     }
 }
 
+/// The translator for what a test binary prints. Only the tested package's own
+/// dir and the dependency sources under the cargo home are paths the test learns
+/// from its environment; any other `/w` or `/c` string it prints is its own data.
+fn test_output_translator(tr: &Translator, manifest_path: &str) -> Translator {
+    let home = String::from_utf8_lossy(CARGO_HOME_AT).into_owned();
+    let mut sandbox = vec![format!("{home}/registry"), format!("{home}/git")];
+    if let Some(dir) = Path::new(manifest_path).parent().and_then(Path::to_str)
+        && vpath_starts_with(dir.as_bytes(), WORKTREE_AT)
+    {
+        sandbox.push(dir.to_string());
+    }
+    Translator::new(
+        sandbox
+            .into_iter()
+            .filter_map(|s| {
+                let real = tr.path(&s);
+                (real != s).then_some((s, real))
+            })
+            .collect(),
+    )
+}
+
+fn translated(tr: &Translator, data: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(data) {
+        Ok(s) => tr.text(s).into_bytes(),
+        Err(_) => data.to_vec(),
+    }
+}
+
 struct TestObserver {
     out: Output,
     explain: bool,
@@ -1432,10 +1466,10 @@ impl Observer for TestObserver {
         self.out.note(&format!("{} runs because {why}", self.label));
     }
     fn stdout(&self, data: &[u8]) {
-        self.out.raw_out(data);
+        self.out.raw_out(&translated(&self.out.tr, data));
     }
     fn stderr_line(&self, line: &[u8], _live: Option<&dyn Live>) {
-        let mut data = line.to_vec();
+        let mut data = translated(&self.out.tr, line);
         data.push(b'\n');
         self.out.raw_err(&data);
     }
@@ -1721,9 +1755,9 @@ impl Run {
                 break o;
             }
             let seed_layer = seed.as_ref().map(|s| {
-                let l = OutputsLayer::new();
+                let mut l = OutputState::default();
                 l.add_manifest(0, LEVEL_FULL, &s.manifest);
-                Arc::new(l)
+                Arc::new(OutputsLayer::frozen(l))
             });
             let outcome = self
                 .d
@@ -2790,7 +2824,11 @@ impl Run {
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
                             observer: Arc::new(TestObserver {
-                                out: out.derive(out.quiet, out.verbose, out.tr.clone()),
+                                out: out.derive(
+                                    out.quiet,
+                                    out.verbose,
+                                    test_output_translator(&out.tr, &plan.units[*unit as usize].manifest_path),
+                                ),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
@@ -2974,31 +3012,53 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_observer_preserves_sandbox_paths_in_output() {
+    /// What a test printing `line` shows the user, when the tested package's
+    /// manifest is `manifest_path`, the client's worktree `/home/me/project` and
+    /// its cargo home `/home/me/.cargo`.
+    fn test_prints(manifest_path: &str, line: &str) -> (String, String) {
         use rargo_proto::ServerMsg;
 
-        crate::io::sim::test(|| {
+        let (manifest_path, line) = (manifest_path.to_string(), line.to_string());
+        crate::io::sim::test(move || {
             let (tx, mut rx) = crate::io::unbounded_channel();
             let tr = Translator::new(vec![
                 ("/w".into(), "/home/me/project".into()),
                 ("/c".into(), "/home/me/.cargo".into()),
             ]);
             let observer = TestObserver {
-                out: Output::new(tx, false, false).derive(false, false, tr),
+                out: Output::new(tx, false, false).derive(false, false, super::test_output_translator(&tr, &manifest_path)),
                 explain: false,
                 label: String::new(),
             };
-            let output = b"fixture paths: /w/target/debug/app and /c/blobs";
-            observer.stdout(output);
-            observer.stderr_line(output, None);
+            observer.stdout(line.as_bytes());
+            observer.stderr_line(line.as_bytes(), None);
             drop(observer);
-            assert!(matches!(rx.recv().unwrap(), ServerMsg::Stdout(data) if data == output));
-            assert!(matches!(
-                rx.recv().unwrap(),
-                ServerMsg::Stderr(data) if data == [output.as_slice(), b"\n"].concat()
-            ));
-        });
+            let ServerMsg::Stdout(out) = rx.recv().unwrap() else { panic!("stdout first") };
+            let ServerMsg::Stderr(err) = rx.recv().unwrap() else { panic!("then stderr") };
+            (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        })
+    }
+
+    #[test]
+    fn a_test_of_the_root_package_prints_the_clients_paths_for_its_manifest_dir_and_cwd() {
+        let line = "cannot read /w/tests/data/input.json: No such file or directory (os error 2) cwd=/w manifest=/w";
+        let want = "cannot read /home/me/project/tests/data/input.json: No such file or directory (os error 2) cwd=/home/me/project manifest=/home/me/project";
+        assert_eq!(test_prints("/w/Cargo.toml", line), (want.to_string(), format!("{want}\n")));
+    }
+
+    #[test]
+    fn a_test_prints_the_clients_paths_for_dependency_sources() {
+        let line = "panicked at /c/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.0/src/de.rs:3:4 and /c/git/checkouts/x/src/lib.rs";
+        let want = "panicked at /home/me/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.0/src/de.rs:3:4 and /home/me/.cargo/git/checkouts/x/src/lib.rs";
+        assert_eq!(test_prints("/w/crates/fx/Cargo.toml", line).0, want);
+    }
+
+    #[test]
+    fn a_member_packages_test_keeps_other_sandbox_paths_it_prints_as_data() {
+        let line = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/w/crates/rargo";
+        let want = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/home/me/project/crates/rargo";
+        assert_eq!(test_prints("/w/crates/rargo/Cargo.toml", line), (want.to_string(), format!("{want}\n")));
+        assert_eq!(test_prints("/w/crates/rargo/Cargo.toml", "/w/crates/rargo-core/x").0, "/w/crates/rargo-core/x");
     }
 
     #[test]
