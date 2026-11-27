@@ -69,10 +69,14 @@ jobs:
             sleep "$((remaining < 60 ? remaining : 60))"
           done
       # rargo serves target/ over FUSE-over-io_uring, which the kernel leaves off by default.
+      # A kernel without it gets target/ copied instead.
       - name: FUSE over io_uring
         run: |
-          uname -r
-          grep FUSE_IO_URING "/boot/config-$(uname -r)" || true
-          sudo modprobe fuse
-          echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
+          sudo modprobe fuse || true
+          if [[ -e /sys/module/fuse/parameters/enable_uring ]]; then
+            echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
+          else
+            echo "::warning::This kernel ($(uname -r)) has no fuse.enable_uring; rargo copies target/ instead."
+            echo "RARGO_OUTPUT=copy" >> "$GITHUB_ENV"
+          fi
       - run: rargo nextest run --locked --workspace
