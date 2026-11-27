@@ -109,7 +109,7 @@ pub fn server_status(host: &str) -> Result<serde_json::Value, String> {
     Ok(status)
 }
 
-pub fn resolve(host: &str) -> Result<String, String> {
+pub fn resolve(host: &str, names: &mut crate::tmp::Names) -> Result<String, String> {
     if host.contains(':') {
         return Ok(host.to_string());
     }
@@ -137,7 +137,7 @@ pub fn resolve(host: &str) -> Result<String, String> {
     });
     match found {
         Ok((server, text)) => {
-            let _ = crate::write_atomic(&cached, text.as_bytes());
+            let _ = crate::write_atomic(&cached, text.as_bytes(), names);
             Ok(server)
         }
         Err(e) => read(false).ok_or_else(|| not_found_text(host, &e)),
@@ -433,7 +433,7 @@ mod tests {
         assert!(!valid_host("") && !valid_host("a b") && !valid_host("http://x") && !valid_host(":7459"));
         assert_eq!(base_url("build.example:7459"), "http://build.example:7459");
         assert_eq!(base_url("rargo.rs"), "https://rargo.rs");
-        assert_eq!(resolve("build.example:7459").unwrap(), "build.example:7459");
+        assert_eq!(resolve("build.example:7459", &mut crate::tmp::Names::all()).unwrap(), "build.example:7459");
         assert_eq!(split_token("t-abc.0123456789abcdef0123"), Some(("t-abc", "0123456789abcdef0123")));
         assert!(split_token("no-dot").is_none() && split_token("t-abc.short").is_none());
     }

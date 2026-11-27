@@ -20,7 +20,7 @@ struct Report {
     per_package: BTreeMap<String, String>,
 }
 
-pub fn save(r: &FutureReport) -> std::io::Result<u32> {
+pub fn save(r: &FutureReport, names: &mut crate::tmp::Names) -> std::io::Result<u32> {
     let path = Path::new(&r.path);
     let mut disk = rargo_net::io::file::read(path)
         .ok()
@@ -37,7 +37,7 @@ pub fn save(r: &FutureReport) -> std::io::Result<u32> {
     if disk.reports.len() > MAX_REPORTS {
         disk.reports.remove(0);
     }
-    crate::write_atomic(path, &serde_json::to_vec(&disk).map_err(std::io::Error::other)?)?;
+    crate::write_atomic(path, &serde_json::to_vec(&disk).map_err(std::io::Error::other)?, names)?;
     Ok(id)
 }
 
@@ -60,9 +60,9 @@ mod tests {
 
     fn numbered_kept_and_not_repeated() {
         let p = rargo_net::io::sim::tempdir().join("target/.future-incompat-report.json");
-        assert_eq!(save(&report(&p, "a")).unwrap(), 1);
-        assert_eq!(save(&report(&p, "b")).unwrap(), 2);
-        assert_eq!(save(&report(&p, "a")).unwrap(), 1);
+        assert_eq!(save(&report(&p, "a"), &mut crate::tmp::Names::all()).unwrap(), 1);
+        assert_eq!(save(&report(&p, "b"), &mut crate::tmp::Names::all()).unwrap(), 2);
+        assert_eq!(save(&report(&p, "a"), &mut crate::tmp::Names::all()).unwrap(), 1);
         let v: serde_json::Value = serde_json::from_slice(&rargo_net::io::file::read(&p).unwrap()).unwrap();
         assert_eq!(v["version"], 0);
         assert_eq!(v["next_id"], 3);
@@ -73,12 +73,12 @@ mod tests {
             "run `cargo report future-incompatibilities --id 2 --package old@0.1.0`"
         );
         for t in ["c", "d", "e", "f"] {
-            save(&report(&p, t)).unwrap();
+            save(&report(&p, t), &mut crate::tmp::Names::all()).unwrap();
         }
         let v: serde_json::Value = serde_json::from_slice(&rargo_net::io::file::read(&p).unwrap()).unwrap();
         let ids: Vec<u64> = v["reports"].as_array().unwrap().iter().map(|r| r["id"].as_u64().unwrap()).collect();
         assert_eq!(ids, vec![2, 3, 4, 5, 6]);
         rargo_net::io::file::write(&p, br#"{"version":9,"next_id":40,"reports":[]}"#).unwrap();
-        assert_eq!(save(&report(&p, "a")).unwrap(), 1);
+        assert_eq!(save(&report(&p, "a"), &mut crate::tmp::Names::all()).unwrap(), 1);
     }
 }
