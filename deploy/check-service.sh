@@ -42,6 +42,7 @@ for transport in udp tcp; do
     out=$("$R" build 2>&1) && ok "$transport: build" || bad "$transport: build" "$out"
     out=$(./target/debug/rargo-check 2>&1); [ "$out" = "built remotely: 42" ] && ok "$transport: the binary runs here" || bad "$transport: the binary runs here" "$out"
     out=$("$R" test 2>&1); grep -q "test result: ok. 1 passed" <<<"$out" && ok "$transport: test" || bad "$transport: test" "$out"
+    out=$("$R" nextest run 2>&1); grep -q "1 test run: 1 passed" <<<"$out" && ok "$transport: nextest" || bad "$transport: nextest" "$out"
     out=$("$R" --rargo-daemon-status 2>&1); grep -q "^link *$transport" <<<"$out" && ok "$transport: the link is $transport" || bad "$transport: the link is $transport" "$out"
     "$R" --rargo-daemon-stop >/dev/null 2>&1
 done
