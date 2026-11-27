@@ -109,7 +109,6 @@ struct Shared {
     db: RwLock<Option<Database>>,
     open: Open,
     writer: Mutex<DbWriter>,
-    flushing: Mutex<()>,
     born: Instant,
 }
 
@@ -121,7 +120,7 @@ impl Shared {
 
 pub struct Db {
     shared: Arc<Shared>,
-    writing: WriterTask,
+    writing: Option<WriterTask>,
 }
 
 impl Db {
@@ -145,7 +144,7 @@ impl Db {
     #[cfg(test)]
     fn on(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
         let mut db = Db::on_backend(disk)?;
-        db.writing = WriterTask::off();
+        db.writing = None;
         Ok(db)
     }
 
@@ -162,15 +161,16 @@ impl Db {
             db: RwLock::new(Some(db)),
             open,
             writer: Mutex::new(DbWriter::new()),
-            flushing: Mutex::new(()),
             born: crate::io::now(),
         });
-        Ok(Db { shared, writing: WriterTask::default() })
+        Ok(Db { shared, writing: Some(WriterTask::default()) })
     }
 
     fn written(&self) {
-        let shared = Arc::clone(&self.shared);
-        self.writing.written(move |wake| writer_loop(shared, wake));
+        if let Some(writing) = &self.writing {
+            let shared = Arc::clone(&self.shared);
+            writing.written(move |wake| writer_loop(shared, wake));
+        }
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
@@ -230,7 +230,9 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        self.writing.stop();
+        if let Some(writing) = &mut self.writing {
+            writing.stop();
+        }
         flush_off_the_loop(&self.shared);
     }
 }
@@ -258,32 +260,32 @@ fn commit(db: Option<&Database>, batch: &Batch) -> Result<()> {
 }
 
 fn flush_once(shared: &Shared) {
-    let _one = shared.flushing.lock();
+    // Serialize flushes while allowing readers to use the database during commit.
+    let mut db = shared.db.upgradable_read();
     let batch = shared.writer.lock().take();
     if batch.is_empty() {
         return;
     }
-    if shared.db.read().is_none() {
-        reopen(shared);
+    if db.is_none() {
+        db.with_upgraded(|db| reopen(db, &shared.open));
     }
-    let done = commit(shared.db.read().as_ref(), &batch);
+    let done = commit(db.as_ref(), &batch);
     let now = shared.now_ms();
     match done {
         Ok(()) => shared.writer.lock().flushed(&batch, now),
         Err(e) => {
             eprintln!("rargod: db commit failed: {e:#}");
             shared.writer.lock().failed(now);
-            reopen(shared);
+            db.with_upgraded(|db| reopen(db, &shared.open));
         }
     }
 }
 
 // After an I/O error redb refuses every later transaction until the database is opened again.
 // The old handle goes first: a file holds one open database at a time.
-fn reopen(shared: &Shared) {
-    let mut db = shared.db.write();
+fn reopen(db: &mut Option<Database>, open: &Open) {
     drop(db.take());
-    match (shared.open)() {
+    match open() {
         Ok(fresh) => *db = Some(fresh),
         Err(e) => eprintln!("rargod: db reopen failed: {e:#}"),
     }

@@ -12,14 +12,6 @@ pub(crate) struct WriterTask {
 }
 
 impl WriterTask {
-    /// A task that never starts: writes wait for an explicit flush.
-    #[cfg(test)]
-    pub(crate) fn off() -> WriterTask {
-        let slot = OnceLock::new();
-        assert!(slot.set(Arc::new(WakeSlot::new())).is_ok());
-        WriterTask { slot }
-    }
-
     pub(crate) fn written(&self, run: impl FnOnce(WriterWake) + Send + 'static) {
         if self.slot.get().is_none() && !loop_running() {
             return;
