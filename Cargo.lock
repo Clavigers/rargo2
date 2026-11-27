@@ -409,6 +409,7 @@ dependencies = [
 name = "fusewire"
 version = "0.7.12"
 dependencies = [
+ "expect-test",
  "libc",
  "rargo-machine",
 ]
