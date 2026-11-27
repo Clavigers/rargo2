@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -116,9 +115,9 @@ impl Policy {
         Ok(Policy { env: m.env, network: m.network, flake: m.flake, sync: m.sync, nextest: m.nextest })
     }
 
-    pub fn passed_env(&self, client: &HashMap<String, String>) -> Vec<(String, String)> {
+    pub fn passed_env<'a>(&self, client: impl IntoIterator<Item = (&'a String, &'a String)>) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = client
-            .iter()
+            .into_iter()
             .filter(|(k, _)| self.env.pass.iter().any(|p| matches(p, k)))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
@@ -155,7 +154,7 @@ mod tests {
             "#,
         ))
         .unwrap();
-        let client: HashMap<String, String> = [
+        let client: std::collections::BTreeMap<String, String> = [
             ("DATABASE_URL", "postgres://x"),
             ("PROTOC", "/usr/bin/protoc"),
             ("PROTOC_INCLUDE", "/usr/include"),

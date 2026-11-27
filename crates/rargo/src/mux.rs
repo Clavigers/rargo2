@@ -1,10 +1,12 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use rargo_net::io::{self, UnboundedReceiver, UnboundedSender, unbounded_channel};
-use rargo::link_watch::{self, Tick, Watch};
+use rargo::link_watch::{self, Silence, Tick, Watch};
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 const WINDOW: usize = 32 << 20;
@@ -13,7 +15,7 @@ const WATCH_STEP: Duration = Duration::from_millis(200);
 const _: () = assert!(WINDOW <= u32::MAX as usize, "a window's permits fit acquire_many");
 
 fn dead_limit(kind: &str) -> Duration {
-    let set = std::env::var("RARGO_LINK_DEAD_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|n| *n >= 1).map(Duration::from_secs);
+    let set = io::env::var("RARGO_LINK_DEAD_SECS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|n| *n >= 1).map(Duration::from_secs);
     match (set, kind) {
         (Some(base), "udp") => base,
         (Some(base), _) => base * 8,
@@ -117,11 +119,19 @@ impl<S: Clone, M> MuxState<S, M> {
         self.order = Reorder::new(true);
         Some((std::mem::take(&mut self.streams), std::mem::take(&mut self.missing)))
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.streams.keys().all(|&id| id > CONTROL && id < self.next_stream && id != rargo_proto::KEEPALIVE)
-            && (!self.dead || (self.streams.is_empty() && self.missing.is_empty()))
+#[cfg(test)]
+impl<S: Clone, M> StateMachine for MuxState<S, M> {
+    fn invariants(&self) {
+        for &id in self.streams.keys() {
+            assert!(id > CONTROL && id != rargo_proto::KEEPALIVE, "stream {id} is not a reserved id");
+            assert!(id < self.next_stream, "stream {id} was handed out, below {}", self.next_stream);
+        }
+        if self.dead {
+            assert!(self.streams.is_empty(), "a dead mux has no streams");
+            assert!(self.missing.is_empty(), "a dead mux waits for nothing");
+        }
     }
 }
 
@@ -138,33 +148,38 @@ enum DeadWait {
     Tick,
 }
 
+/// Dials the server afresh and says whether it answered: how a silent link tells a restarted server from a gone one.
+pub type Probe = Rc<dyn Fn() -> bool>;
+
 pub struct Mux {
-    link: Arc<Link>,
-    out: Mutex<Out>,
-    window: Arc<io::Semaphore>,
-    state: Mutex<WireState>,
+    link: Rc<Link>,
+    out: RefCell<Out>,
+    window: io::Semaphore,
+    state: RefCell<WireState>,
     pub gone: io::Notify,
     started: Instant,
-    watch: Mutex<Watch>,
-    pub bytes_out: AtomicU64,
-    pub bytes_in: AtomicU64,
+    watch: RefCell<Watch>,
+    pub bytes_out: Cell<u64>,
+    pub bytes_in: Cell<u64>,
 }
 
 impl Mux {
-    pub fn new(link: Link) -> Arc<Mux> {
-        let link = Arc::new(link);
+    /// A link over UDP that goes quiet is probed with `probe`; over TCP a quiet link may just be queued behind its data.
+    pub fn new(link: Link, probe: Option<Probe>) -> Rc<Mux> {
+        let probe = probe.filter(|_| link.kind() == "udp");
+        let link = Rc::new(link);
         let (tx, mut rx) = unbounded_channel::<(Vec<u8>, usize)>();
         let (urgent, mut urgent_rx) = unbounded_channel::<Vec<u8>>();
-        let mux = Arc::new(Mux {
+        let mux = Rc::new(Mux {
             link: link.clone(),
-            out: Mutex::new(Out { seq: 0, tx, urgent }),
-            window: Arc::new(io::Semaphore::new(WINDOW as u32)),
-            state: Mutex::new(MuxState::new()),
+            out: RefCell::new(Out { seq: 0, tx, urgent }),
+            window: io::Semaphore::new(WINDOW as u32),
+            state: RefCell::new(MuxState::new()),
             gone: io::Notify::new(),
-            started: Instant::now(),
-            watch: Mutex::new(Watch::new(Duration::ZERO, dead_limit(link.kind()))),
-            bytes_out: AtomicU64::new(0),
-            bytes_in: AtomicU64::new(0),
+            started: io::now(),
+            watch: RefCell::new(Watch::new(Duration::ZERO, dead_limit(link.kind()))),
+            bytes_out: Cell::new(0),
+            bytes_in: Cell::new(0),
         });
         let m = mux.clone();
         io::spawn(move || {
@@ -178,7 +193,7 @@ impl Mux {
                     Outgoing::Bulk(Some(frame)) => frame,
                     Outgoing::Urgent(None) | Outgoing::Bulk(None) => break,
                 };
-                m.bytes_out.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                m.bytes_out.set(m.bytes_out.get() + frame.len() as u64);
                 let sent = m.link.send(&frame);
                 if bulk > 0 {
                     m.window.add_permits(bulk as u32);
@@ -192,11 +207,11 @@ impl Mux {
         let m = mux.clone();
         io::spawn(move || {
             while let Some(raw) = m.link.recv() {
-                m.bytes_in.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                let now = m.started.elapsed();
-                m.watch.lock().unwrap().heard(now);
+                m.bytes_in.set(m.bytes_in.get() + raw.len() as u64);
+                let now = io::now().saturating_duration_since(m.started);
+                m.watch.borrow_mut().heard(now);
                 let Ok(frame) = rargo_proto::decode::<Frame<ServerMsg>>(&raw) else { break };
-                let ordered = m.state.lock().unwrap().incoming(frame);
+                let ordered = m.state.borrow_mut().incoming(frame);
                 for (stream, msg) in ordered {
                     let msg = match msg {
                         ServerMsg::Packed(z) => match rargo_proto::unpack(&z).and_then(|b| rargo_proto::decode(&b)) {
@@ -205,7 +220,7 @@ impl Mux {
                         },
                         m => m,
                     };
-                    let action = m.state.lock().unwrap().route(stream, msg);
+                    let action = m.state.borrow_mut().route(stream, msg);
                     match action {
                         Route::Stream(dest, msg) => { let _ = dest.send(msg); }
                         Route::Missing(dest, missing) => { let _ = dest.send(missing); }
@@ -222,19 +237,33 @@ impl Mux {
                 if m.is_dead() {
                     break;
                 }
-                let now = m.started.elapsed();
+                let now = io::now().saturating_duration_since(m.started);
+                let idle = (m.link.kind() == "udp").then(|| m.link.idle());
                 let tick = {
-                    let mut watch = m.watch.lock().unwrap();
-                    if m.link.kind() == "udp" {
-                        watch.heard(now.saturating_sub(m.link.idle()));
+                    let mut watch = m.watch.borrow_mut();
+                    if let Some(idle) = idle {
+                        watch.heard(now.saturating_sub(idle));
                     }
                     watch.tick(now)
                 };
                 match tick {
                     Tick::Wait => {}
+                    Tick::Probe => {
+                        if let Some(probe) = probe.clone() {
+                            let p = m.clone();
+                            io::spawn(move || {
+                                let answered = probe();
+                                let now = io::now().saturating_duration_since(p.started);
+                                if p.watch.borrow_mut().probed(now, answered).is_some() {
+                                    p.die();
+                                }
+                            });
+                        }
+                    }
                     Tick::Ping(n) => {
                         let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
-                        let _ = m.out.lock().unwrap().urgent.send(ping);
+                        let urgent = m.out.borrow().urgent.clone();
+                        let _ = urgent.send(ping);
                     }
                     Tick::Silent(_) => {
                         m.die();
@@ -250,13 +279,14 @@ impl Mux {
         self.link.kind()
     }
 
-    /// How long the server had been silent when this link gave up on it, if that is why it closed.
-    pub fn silent(&self) -> Option<Duration> {
-        self.watch.lock().unwrap().silent()
+    /// Why this link gave up on its server, and after how long a silence, if that is why it closed.
+    pub fn silent(&self) -> Option<Silence> {
+        self.watch.borrow().silent()
     }
 
     pub fn is_dead(&self) -> bool {
-        self.state.lock().unwrap().dead || self.link.is_closed()
+        let dead = self.state.borrow().dead;
+        dead || self.link.is_closed()
     }
 
     /// Resolves when the link is closed. A missed wake is caught on the next check.
@@ -276,7 +306,7 @@ impl Mux {
     }
 
     pub fn die(&self) {
-        let drained = self.state.lock().unwrap().fail();
+        let drained = self.state.borrow_mut().fail();
         let Some(endpoints) = drained else { return };
         self.link.close();
         drop(endpoints);
@@ -291,7 +321,7 @@ impl Mux {
                 encoded_msg = Some(ClientMsg::Packed(z));
             }
         }
-        let mut out = self.out.lock().unwrap();
+        let mut out = self.out.borrow_mut();
         let frame = match &encoded_msg {
             Some(packed) => rargo_proto::encode(&Frame { stream, seq: out.seq, msg: packed }),
             None => rargo_proto::encode(&Frame { stream, seq: out.seq, msg }),
@@ -316,25 +346,25 @@ impl Mux {
 
     pub fn open(&self) -> (u32, UnboundedSender<ServerMsg>, UnboundedReceiver<ServerMsg>) {
         let (tx, rx) = unbounded_channel();
-        let (id, rejected) = self.state.lock().unwrap().open(tx.clone());
+        let (id, rejected) = self.state.borrow_mut().open(tx.clone());
         drop(rejected);
         (id, tx, rx)
     }
 
     pub fn cancel(&self, stream: u32) {
-        let closed = self.state.lock().unwrap().close(stream);
+        let closed = self.state.borrow_mut().close(stream);
         if closed.is_some() {
             self.post(stream, &ClientMsg::Cancel);
         }
     }
 
     pub fn next_id(&self) -> u64 {
-        self.state.lock().unwrap().next_id()
+        self.state.borrow_mut().next_id()
     }
 
     pub fn expect_missing(&self, id: u64) -> io::oneshot::Receiver<Missing> {
         let (tx, rx) = io::oneshot::channel();
-        let rejected = self.state.lock().unwrap().expect_missing(id, tx);
+        let rejected = self.state.borrow_mut().expect_missing(id, tx);
         drop(rejected);
         rx
     }
@@ -344,7 +374,7 @@ impl Mux {
     }
 
     pub fn ask(&self, to: &UnboundedSender<ServerMsg>, question: impl FnOnce(u64) -> ClientMsg) -> u64 {
-        let (stream, rejected) = self.state.lock().unwrap().open(to.clone());
+        let (stream, rejected) = self.state.borrow_mut().open(to.clone());
         drop(rejected);
         let id = stream as u64;
         self.post(stream, &question(id));
@@ -356,61 +386,105 @@ impl Mux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
+
+    enum Ev {
+        Open(&'static str),
+        Close(u32),
+        Frame(u32, u64, ServerMsg),
+        Route(u32, ServerMsg),
+        NextId,
+        ExpectMissing(u64, &'static str),
+        Fail,
+    }
+
+    type State = MuxState<&'static str, &'static str>;
+
+    fn routed(state: &mut State, stream: u32, msg: ServerMsg) -> String {
+        match state.route(stream, msg) {
+            Route::Stream(dest, msg) => format!("{dest} <- {msg:?}"),
+            Route::Missing(dest, missing) => format!("{dest} <- missing {missing:?}"),
+            Route::Drop => "dropped".to_string(),
+        }
+    }
+
+    /// Steps a mux through the events, checking its invariants after each, and lists what each step gave back.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
+        let mut state = State::new();
+        state.invariants();
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Open(dest) => format!("open {dest} => {:?}", state.open(dest)),
+                Ev::Close(stream) => format!("close {stream} => {:?}", state.close(stream)),
+                Ev::Frame(stream, seq, msg) => {
+                    let ready = state.incoming(Frame { stream, seq, msg });
+                    let routes: Vec<String> = ready.into_iter().map(|(s, m)| routed(&mut state, s, m)).collect();
+                    format!("frame {stream}#{seq} => {routes:?}")
+                }
+                Ev::Route(stream, msg) => format!("route {stream} => {}", routed(&mut state, stream, msg)),
+                Ev::NextId => format!("next id => {}", state.next_id()),
+                Ev::ExpectMissing(id, dest) => format!("expect missing {id} for {dest} => {:?}", state.expect_missing(id, dest)),
+                Ev::Fail => format!("fail => {:?}", state.fail()),
+            };
+            state.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
+    fn stdout(byte: u8) -> ServerMsg {
+        ServerMsg::Stdout(vec![byte])
+    }
 
     #[test]
     fn reorder_and_terminal_frames_stay_with_their_own_stream() {
-        let mut state = MuxState::<_, ()>::new();
-        let (first, _) = state.open("first");
-        assert!(state.invariants());
-        let (second, _) = state.open("second");
-        assert!(state.invariants());
-
-        let stdout = |byte| ServerMsg::Stdout(vec![byte]);
-        assert!(state.incoming(Frame { stream: first, seq: 1, msg: ServerMsg::Exit(0) }).is_empty());
-        assert!(state.invariants());
-        let msgs = state.incoming(Frame { stream: second, seq: 0, msg: stdout(2) });
-        assert!(state.invariants());
-        let [(stream, msg)] = msgs.try_into().ok().unwrap();
-        assert!(matches!(state.route(stream, msg), Route::Stream("second", ServerMsg::Stdout(bytes)) if bytes == [2]));
-        assert!(state.invariants());
-
-        let msgs = state.incoming(Frame { stream: first, seq: 0, msg: stdout(1) });
-        assert!(state.invariants());
-        let [(stream, msg), (last_stream, last)] = msgs.try_into().ok().unwrap();
-        assert!(matches!(state.route(stream, msg), Route::Stream("first", ServerMsg::Stdout(bytes)) if bytes == [1]));
-        assert!(state.invariants());
-        assert!(matches!(state.route(last_stream, last), Route::Stream("first", ServerMsg::Exit(0))));
-        assert!(state.invariants());
-        assert!(state.incoming(Frame { stream: first, seq: 2, msg: stdout(9) }).is_empty());
-        assert!(state.invariants());
-        assert!(matches!(state.route(first, stdout(9)), Route::Drop));
-        assert!(state.invariants());
+        let events = [
+            Ev::Open("first"),
+            Ev::Open("second"),
+            Ev::Frame(1, 1, ServerMsg::Exit(0)),
+            Ev::Frame(2, 0, stdout(2)),
+            Ev::Frame(1, 0, stdout(1)),
+            Ev::Frame(1, 2, stdout(9)),
+            Ev::Route(1, stdout(9)),
+        ];
+        expect![[r#"
+            open first => (1, None)
+            open second => (2, None)
+            frame 1#1 => []
+            frame 2#0 => ["second <- Stdout([2])"]
+            frame 1#0 => ["first <- Stdout([1])", "first <- Exit(0)"]
+            frame 1#2 => []
+            route 1 => dropped
+        "#]].assert_eq(&run(events));
     }
 
     #[test]
     fn failure_drains_every_open_registration_once() {
-        let mut state = MuxState::new();
-        let (closed, _) = state.open("cancelled");
-        assert!(state.invariants());
-        let (a, _) = state.open("first");
-        assert!(state.invariants());
-        let (b, _) = state.open("second");
-        assert!(state.invariants());
-        assert_eq!(state.close(closed), Some("cancelled"));
-        assert!(state.invariants());
-        let id = state.next_id();
-        assert!(state.invariants());
-        assert_eq!(state.expect_missing(id, "offer"), None);
-        assert!(state.invariants());
-        let (streams, offers) = state.fail().unwrap();
-        assert!(state.invariants());
-        assert_eq!(streams, BTreeMap::from([(a, "first"), (b, "second")]));
-        assert_eq!(offers, BTreeMap::from([(id, "offer")]));
-        assert!(state.fail().is_none());
-        assert!(state.invariants());
-        assert_eq!(state.open("late").1, Some("late"));
-        assert!(state.invariants());
-        assert_eq!(state.expect_missing(id, "late offer"), Some("late offer"));
-        assert!(state.invariants());
+        let events = [
+            Ev::Open("cancelled"),
+            Ev::Open("first"),
+            Ev::Open("second"),
+            Ev::Close(1),
+            Ev::NextId,
+            Ev::ExpectMissing(1, "offer"),
+            Ev::Fail,
+            Ev::Fail,
+            Ev::Open("late"),
+            Ev::ExpectMissing(1, "late offer"),
+        ];
+        expect![[r#"
+            open cancelled => (1, None)
+            open first => (2, None)
+            open second => (3, None)
+            close 1 => Some("cancelled")
+            next id => 1
+            expect missing 1 for offer => None
+            fail => Some(({2: "first", 3: "second"}, {1: "offer"}))
+            fail => None
+            open late => (4, Some("late"))
+            expect missing 1 for late offer => Some("late offer")
+        "#]].assert_eq(&run(events));
     }
 }

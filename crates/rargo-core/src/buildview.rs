@@ -1,56 +1,235 @@
+use rargo_machine::StateMachine;
+use crate::io::buildview::StateLoop;
 use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
-use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub struct HostMemo {
-    looked: DashMap<Vec<u8>, (u64, Looked)>,
-    listed: DashMap<Vec<u8>, (u64, Result<Arc<Listing>, i32>)>,
-    generation: AtomicU64,
-    sealed: AtomicBool,
+/// A host listing as the memo keeps it: shared, or the errno it failed with.
+type Listed = Result<Arc<Listing>, i32>;
+
+/// How many generations a cached host answer outlives its own.
+const MEMO_SPAN: u64 = 64;
+
+/// What the host was seen to hold, by generation, and the oldest generation
+/// each live base view still accepts. The shell reads the host; this only
+/// keeps what it was told.
+pub(crate) struct MemoState {
+    looked: BTreeMap<Vec<u8>, (u64, Looked)>,
+    listed: BTreeMap<Vec<u8>, (u64, Listed)>,
+    generation: u64,
+    views: BTreeMap<u64, u64>,
+    next_view: u64,
+    sealed: bool,
 }
 
-impl Default for HostMemo {
+impl Default for MemoState {
     fn default() -> Self {
-        HostMemo {
-            looked: DashMap::new(),
-            listed: DashMap::new(),
-            generation: AtomicU64::new(1),
-            sealed: AtomicBool::new(false),
+        MemoState {
+            looked: BTreeMap::new(),
+            listed: BTreeMap::new(),
+            generation: 1,
+            views: BTreeMap::new(),
+            next_view: 0,
+            sealed: false,
         }
     }
 }
 
-impl HostMemo {
-    pub fn advance(&self) -> u64 {
-        let g = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if g % 64 == 0 {
-            self.looked.retain(|_, v| v.0 + 64 > g);
-            self.listed.retain(|_, v| v.0 + 64 > g);
+impl MemoState {
+    /// Starts a new generation, and every `MEMO_SPAN` generations forgets
+    /// what no view can accept any more.
+    fn advance(&mut self) -> u64 {
+        self.generation += 1;
+        let g = self.generation;
+        if g.is_multiple_of(MEMO_SPAN) {
+            self.looked.retain(|_, v| v.0 + MEMO_SPAN > g);
+            self.listed.retain(|_, v| v.0 + MEMO_SPAN > g);
+            assert!(self.looked.values().all(|v| v.0 + MEMO_SPAN > g), "pruning left a stale lookup");
+            assert!(self.listed.values().all(|v| v.0 + MEMO_SPAN > g), "pruning left a stale listing");
         }
         g
     }
 
-    pub fn current(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    fn open_view(&mut self, min_gen: u64) -> u64 {
+        assert!(min_gen <= self.generation, "a view accepts generation {min_gen}, which has not started");
+        let id = self.next_view;
+        self.next_view += 1;
+        assert!(self.views.insert(id, min_gen).is_none(), "view {id} opened twice");
+        id
     }
 
-    pub fn store_lookup(&self, key: Vec<u8>, looked: Looked) {
-        self.looked.insert(key, (self.current(), looked));
+    /// The view accepts nothing older than a generation started now.
+    fn renew(&mut self, view: u64) {
+        assert!(self.views.contains_key(&view), "renewing view {view}, which is closed");
+        let g = self.advance();
+        self.views.insert(view, g);
+        assert_eq!(self.views[&view], self.generation);
     }
 
-    pub fn store_list(&self, key: Vec<u8>, listed: Result<Listing, i32>) {
-        self.listed.insert(key, (self.current(), listed.map(Arc::new)));
+    fn close_view(&mut self, view: u64) {
+        self.views.remove(&view);
+        assert!(!self.views.contains_key(&view));
     }
 
-    pub fn seal(&self) {
-        self.sealed.store(true, Ordering::SeqCst);
+    fn min_gen(&self, view: u64) -> u64 {
+        *self.views.get(&view).unwrap_or_else(|| panic!("view {view} is closed"))
+    }
+
+    fn lookup_at(&self, min_gen: u64, key: &[u8]) -> Option<Looked> {
+        let e = self.looked.get(key)?;
+        (e.0 >= min_gen).then(|| e.1.clone())
+    }
+
+    fn list_at(&self, min_gen: u64, key: &[u8]) -> Option<Listed> {
+        let e = self.listed.get(key)?;
+        (e.0 >= min_gen).then(|| e.1.clone())
+    }
+
+    /// Keeps what the shell saw on the host, as of the current generation.
+    fn observe(&mut self, key: Vec<u8>, answer: Observed) {
+        assert!(!self.sealed, "a sealed memo was told what {} holds", String::from_utf8_lossy(&key));
+        let generation = self.generation;
+        match answer {
+            Observed::Lookup(looked) => {
+                self.looked.insert(key, (generation, looked));
+            }
+            Observed::List(listed) => {
+                self.listed.insert(key, (generation, listed));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_lookup(&mut self, key: Vec<u8>, looked: Looked) {
+        self.observe(key, Observed::Lookup(looked));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn store_list(&mut self, key: Vec<u8>, listed: Result<Listing, i32>) {
+        self.observe(key, Observed::List(listed.map(Arc::new)));
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn seal(&mut self) {
+        self.sealed = true;
+        assert!(self.sealed);
+    }
+}
+
+impl StateMachine for MemoState {
+    fn invariants(&self) {
+        assert!(self.generation >= 1, "generations start at 1");
+        assert!(self.looked.values().all(|v| v.0 <= self.generation), "a lookup is from a generation not yet started");
+        assert!(self.listed.values().all(|v| v.0 <= self.generation), "a listing is from a generation not yet started");
+        assert!(self.views.values().all(|&g| g <= self.generation), "a view accepts a generation not yet started");
+        assert!(self.views.keys().all(|&id| id < self.next_view), "a view id was not handed out");
+    }
+}
+
+/// A host observation the shell delivers to the memo.
+enum Observed {
+    Lookup(Looked),
+    List(Listed),
+}
+
+/// The host memo: owned by a shell loop while builds run, or a sealed
+/// in-memory fixture that no one may tell anything new.
+pub struct HostMemo {
+    storage: MemoStorage,
+}
+
+enum MemoStorage {
+    Live(StateLoop<MemoState>),
+    /// A sealed in-memory fixture, for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Frozen(MemoState),
+}
+
+impl Default for HostMemo {
+    fn default() -> Self {
+        HostMemo { storage: MemoStorage::Live(StateLoop::spawn("rargo-host-memo", MemoState::default())) }
+    }
+}
+
+/// Which answers a base view accepts: those its memo's loop says are new
+/// enough for it, or, over a sealed fixture, those from `min_gen` on.
+enum MemoView {
+    Live(u64),
+    Fixed(u64),
+}
+
+impl HostMemo {
+    #[cfg(test)]
+    pub(crate) fn frozen(mut state: MemoState) -> HostMemo {
+        state.seal();
+        state.invariants();
+        HostMemo { storage: MemoStorage::Frozen(state) }
+    }
+
+    pub fn advance(&self) -> u64 {
+        match &self.storage {
+            MemoStorage::Live(owner) => owner.call(|state, ()| state.advance(), ()),
+            MemoStorage::Frozen(_) => panic!("a sealed memo does not advance"),
+        }
+    }
+
+    fn open_view(&self, min_gen: u64) -> MemoView {
+        match &self.storage {
+            MemoStorage::Live(owner) => MemoView::Live(owner.call(|state, min_gen| state.open_view(min_gen), min_gen)),
+            MemoStorage::Frozen(_) => MemoView::Fixed(min_gen),
+        }
+    }
+
+    fn renew(&self, view: &MemoView) {
+        match (&self.storage, view) {
+            (MemoStorage::Live(owner), &MemoView::Live(id)) => owner.call(|state, id| state.renew(id), id),
+            _ => panic!("a view over a sealed memo does not renew"),
+        }
+    }
+
+    fn close_view(&self, view: &MemoView) {
+        if let (MemoStorage::Live(owner), &MemoView::Live(id)) = (&self.storage, view) {
+            owner.tell(move |state| state.close_view(id));
+        }
+    }
+
+    fn lookup(&self, view: &MemoView, key: &[u8]) -> Option<Looked> {
+        match (&self.storage, view) {
+            (MemoStorage::Live(owner), &MemoView::Live(id)) => {
+                owner.call(|state, (id, key)| state.lookup_at(state.min_gen(id), &key), (id, key.to_vec()))
+            }
+            (MemoStorage::Frozen(state), &MemoView::Fixed(min_gen)) => state.lookup_at(min_gen, key),
+            _ => unreachable!("a view is opened by its own memo"),
+        }
+    }
+
+    fn list(&self, view: &MemoView, key: &[u8]) -> Option<Listed> {
+        match (&self.storage, view) {
+            (MemoStorage::Live(owner), &MemoView::Live(id)) => {
+                owner.call(|state, (id, key)| state.list_at(state.min_gen(id), &key), (id, key.to_vec()))
+            }
+            (MemoStorage::Frozen(state), &MemoView::Fixed(min_gen)) => state.list_at(min_gen, key),
+            _ => unreachable!("a view is opened by its own memo"),
+        }
+    }
+
+    fn sealed(&self) -> bool {
+        match &self.storage {
+            MemoStorage::Live(owner) => owner.call(|state, ()| state.sealed, ()),
+            MemoStorage::Frozen(state) => state.sealed,
+        }
+    }
+
+    fn observe(&self, key: Vec<u8>, answer: Observed) {
+        match &self.storage {
+            MemoStorage::Live(owner) => owner.call(|state, (key, answer)| state.observe(key, answer), (key, answer)),
+            MemoStorage::Frozen(_) => panic!("a sealed memo was told what {} holds", String::from_utf8_lossy(&key)),
+        }
     }
 }
 
@@ -64,8 +243,8 @@ pub enum Region {
     Host(HostRegion),
     Snap(Arc<Snapshot>),
     Empty,
-    NixStore { names: Arc<std::collections::HashSet<Vec<u8>>> },
-    Synth(Arc<HashMap<Vec<u8>, SynthEnt>>),
+    NixStore { names: Arc<BTreeSet<Vec<u8>>> },
+    Synth(Arc<BTreeMap<Vec<u8>, SynthEnt>>),
     Link(Vec<u8>),
 }
 
@@ -85,7 +264,7 @@ enum LookupPlan<'a> {
 pub struct BaseView {
     mounts: Vec<Mount>,
     memo: Arc<HostMemo>,
-    min_gen: AtomicU64,
+    accepts: MemoView,
     nix: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
 }
 
@@ -100,7 +279,8 @@ impl BaseView {
             assert!(m.at.starts_with(b"/"), "mount points are absolute");
             assert!(mounts[i + 1..].iter().all(|o| o.at != m.at), "two mounts at {}", crate::view::show(&m.at));
         }
-        BaseView { mounts, memo, min_gen: AtomicU64::new(min_gen), nix: Arc::new(Vec::new()) }
+        let accepts = memo.open_view(min_gen);
+        BaseView { mounts, memo, accepts, nix: Arc::new(Vec::new()) }
     }
 
     pub fn with_nix(mut self, nix: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>) -> BaseView {
@@ -108,8 +288,9 @@ impl BaseView {
         self
     }
 
+    /// Asks the host afresh from now on: nothing cached before this call is accepted.
     pub fn renew(&self) {
-        self.min_gen.store(self.memo.advance(), Ordering::SeqCst);
+        self.memo.renew(&self.accepts);
     }
 
     fn mount_of<'a>(&'a self, dir: &'a [u8]) -> (&'a Mount, &'a [u8]) {
@@ -129,40 +310,25 @@ impl BaseView {
     }
 
     fn cached_lookup(&self, key: &[u8]) -> Option<Looked> {
-        let e = self.memo.looked.get(key)?;
-        (e.0 >= self.min_gen.load(Ordering::Relaxed)).then(|| e.1.clone())
+        self.memo.lookup(&self.accepts, key)
     }
 
     fn cached_list(&self, key: &[u8]) -> Option<Result<Arc<Listing>, i32>> {
-        let e = self.memo.listed.get(key)?;
-        (e.0 >= self.min_gen.load(Ordering::Relaxed)).then(|| e.1.clone())
-    }
-
-    fn invariants(&self) -> bool {
-        !self.mounts.is_empty()
-            && self.mounts.iter().any(|m| m.at == b"/")
-            && self.mounts.windows(2).all(|w| w[0].at.len() >= w[1].at.len())
-            && self.mounts.iter().all(|m| m.at.starts_with(b"/"))
-            && self.mounts.iter().enumerate().all(|(i, m)| self.mounts[i + 1..].iter().all(|o| o.at != m.at))
+        self.memo.list(&self.accepts, key)
     }
 
     fn deposit(&self, req: &HostReq, answer: HostAnswer) {
-        let generation = self.memo.current();
-        match (&req.kind, answer) {
-            (HostKind::Lookup, HostAnswer::Lookup(looked)) => {
-                self.memo.looked.insert(req.key.clone(), (generation, looked));
-            }
-            (HostKind::List, HostAnswer::List(listed)) => {
-                let listed = match listed {
-                    Ok(list) => Ok(Arc::new(list)),
-                    Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
-                };
-                self.memo.listed.insert(req.key.clone(), (generation, listed));
-            }
+        let observed = match (&req.kind, answer) {
+            (HostKind::Lookup, HostAnswer::Lookup(looked)) => Observed::Lookup(looked),
+            (HostKind::List, HostAnswer::List(listed)) => Observed::List(match listed {
+                Ok(list) => Ok(Arc::new(list)),
+                Err(e) => Err(e.raw_os_error().unwrap_or(libc::EIO)),
+            }),
             (HostKind::Lookup, HostAnswer::List(_)) | (HostKind::List, HostAnswer::Lookup(_)) => {
                 panic!("a host answer matches the request");
             }
-        }
+        };
+        self.memo.observe(req.key.clone(), observed);
     }
 
     fn step_host(&self, region: &HostRegion, rel: &[u8], name: &[u8], infer_at: Option<&[u8]>) -> Step<Looked> {
@@ -329,8 +495,25 @@ impl BaseView {
     }
 }
 
+impl Drop for BaseView {
+    fn drop(&mut self) {
+        self.memo.close_view(&self.accepts);
+    }
+}
+
+impl StateMachine for BaseView {
+    fn invariants(&self) {
+        assert!(self.mounts.iter().any(|m| m.at == b"/"), "something is mounted at the root");
+        assert!(self.mounts.windows(2).all(|w| w[0].at.len() >= w[1].at.len()), "the longest mount points come first");
+        assert!(self.mounts.iter().all(|m| m.at.starts_with(b"/")), "every mount point is absolute");
+        for (i, m) in self.mounts.iter().enumerate() {
+            assert!(self.mounts[i + 1..].iter().all(|o| o.at != m.at), "one mount at {}", String::from_utf8_lossy(&m.at));
+        }
+    }
+}
+
 fn host_answer(view: &BaseView, req: &HostReq) {
-    assert!(!view.memo.sealed.load(Ordering::SeqCst), "sealed view asked to read {}", req.path.display());
+    assert!(!view.memo.sealed(), "sealed view asked to read {}", req.path.display());
     let answer = match req.kind {
         HostKind::Lookup => HostAnswer::Lookup(read_host_lookup(&req.path)),
         HostKind::List => HostAnswer::List(read_host_list(&req.path)),
@@ -347,7 +530,7 @@ fn is_strictly_under(path: &[u8], dir: &[u8]) -> bool {
 }
 
 fn given<T>(view: &BaseView, step: Step<T>) -> T {
-    assert!(view.invariants());
+    view.invariants();
     match step {
         Step::Done(value) => value,
         Step::Ask(_) => panic!("a base view is given its contents; the shell answers a host request"),
@@ -434,12 +617,12 @@ fn drive<T>(view: &BaseView, mut step: impl FnMut(&BaseView) -> Step<T>) -> T {
     for _ in 0..10_000 {
         match step(view) {
             Step::Done(value) => {
-                assert!(view.invariants());
+                view.invariants();
                 return value;
             }
             Step::Ask(req) => {
                 host_answer(view, &req);
-                assert!(view.invariants());
+                view.invariants();
             }
         }
     }
@@ -519,25 +702,21 @@ enum LayerEnt {
 
 #[derive(Default)]
 struct LayerDir {
-    children: HashMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
+    children: BTreeMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
 }
 
 #[derive(Default)]
-pub struct OutputsLayer {
-    dirs: DashMap<Vec<u8>, LayerDir>,
-    ranks: DashMap<u32, u64>,
+pub(crate) struct OutputState {
+    dirs: BTreeMap<Vec<u8>, LayerDir>,
+    ranks: BTreeMap<u32, u64>,
 }
 
-impl OutputsLayer {
-    pub fn new() -> OutputsLayer {
-        OutputsLayer::default()
-    }
-
-    pub fn add(&self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
+impl OutputState {
+    pub(crate) fn add(&mut self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
         for (path, e) in entries {
             let Some((parent, name)) = vsplit(path) else { continue };
             {
-                let mut d = self.dirs.entry(parent.to_vec()).or_default();
+                let d = self.dirs.entry(parent.to_vec()).or_default();
                 let list = d.children.entry(name.to_vec()).or_default();
                 list.retain(|(u, s, ent)| !(*u == unit && *s >= stage && matches!(ent, LayerEnt::Implied)));
                 if !list.iter().any(|(u, s, _)| *u == unit && *s == stage) {
@@ -547,7 +726,7 @@ impl OutputsLayer {
             }
             let mut cur = parent;
             while let Some((pp, pn)) = vsplit(cur) {
-                let mut d = self.dirs.entry(pp.to_vec()).or_default();
+                let d = self.dirs.entry(pp.to_vec()).or_default();
                 let list = d.children.entry(pn.to_vec()).or_default();
                 if list.iter().any(|(u, s, _)| *u == unit && *s <= stage) {
                     break;
@@ -559,16 +738,18 @@ impl OutputsLayer {
         }
     }
 
-    pub fn add_manifest(&self, unit: u32, stage: u8, m: &Manifest) {
+    pub(crate) fn add_manifest(&mut self, unit: u32, stage: u8, m: &Manifest) {
         self.add(unit, stage, &m.entries);
+        assert!(m.entries.iter().filter_map(|(path, _)| vsplit(path)).all(|(dir, _)| self.dirs.contains_key(dir)));
     }
 
-    pub fn set_rank(&self, unit: u32, rank: u64) {
+    fn set_rank(&mut self, unit: u32, rank: u64) {
         self.ranks.insert(unit, rank);
+        assert_eq!(self.rank(unit), rank);
     }
 
     fn rank(&self, unit: u32) -> u64 {
-        self.ranks.get(&unit).map(|r| *r).unwrap_or(unit as u64)
+        self.ranks.get(&unit).copied().unwrap_or(unit as u64)
     }
 
     fn pick(&self, list: &[(u32, u8, LayerEnt)], levels: &[u8]) -> Option<LayerEnt> {
@@ -598,10 +779,10 @@ impl OutputsLayer {
 
     fn visible_paths(&self, levels: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        for d in self.dirs.iter() {
-            for (name, list) in &d.value().children {
+        for (dir, d) in &self.dirs {
+            for (name, list) in &d.children {
                 if let Some(LayerEnt::Entry(MEntry::File { .. } | MEntry::Symlink(_))) = self.pick(list, levels) {
-                    out.push(vjoin(d.key(), name));
+                    out.push(vjoin(dir, name));
                 }
             }
         }
@@ -616,6 +797,118 @@ impl OutputsLayer {
                 .iter()
                 .filter_map(|(name, list)| self.pick(list, levels).map(|e| (name.clone(), e)))
                 .collect(),
+        }
+    }
+}
+
+impl StateMachine for OutputState {
+    fn invariants(&self) {
+        for (dir, d) in &self.dirs {
+            for (name, list) in &d.children {
+                for (i, (u, s, _)) in list.iter().enumerate() {
+                    assert!(
+                        list[i + 1..].iter().all(|(v, t, _)| (v, t) != (u, s)),
+                        "unit {u} stage {s} has two entries at {}",
+                        String::from_utf8_lossy(&vjoin(dir, name))
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// An output overlay is either owned by the shell loop or published as an immutable snapshot.
+pub struct OutputsLayer {
+    storage: OutputStorage,
+}
+
+enum OutputStorage {
+    Live(StateLoop<OutputState>),
+    Frozen(OutputState),
+}
+
+impl Default for OutputsLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OutputsLayer {
+    pub fn new() -> Self {
+        Self { storage: OutputStorage::Live(StateLoop::spawn("rargo-output-layer", OutputState::default())) }
+    }
+
+    pub(crate) fn frozen(state: OutputState) -> Self {
+        Self { storage: OutputStorage::Frozen(state) }
+    }
+
+    pub fn add(&self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
+        self.live().call(move |state, entries| state.add(unit, stage, &entries), entries.to_vec());
+    }
+
+    pub fn add_manifest(&self, unit: u32, stage: u8, m: &Manifest) {
+        self.add(unit, stage, &m.entries);
+    }
+
+    pub fn set_rank(&self, unit: u32, rank: u64) {
+        self.live().call(move |state, ()| state.set_rank(unit, rank), ());
+    }
+
+    fn live(&self) -> &StateLoop<OutputState> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner,
+            OutputStorage::Frozen(_) => panic!("a published output layer is immutable"),
+        }
+    }
+
+    fn get(&self, dir: &[u8], name: &[u8], levels: Levels<'_>) -> Option<LayerEnt> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner.call(
+                |state, (dir, name, levels)| state.get(&dir, &name, &levels),
+                (dir.to_vec(), name.to_vec(), levels.shared()),
+            ),
+            OutputStorage::Frozen(state) => state.get(dir, name, levels.slice()),
+        }
+    }
+
+    fn visible_paths(&self, levels: Levels<'_>) -> Vec<Vec<u8>> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner.call(|state, levels| state.visible_paths(&levels), levels.shared()),
+            OutputStorage::Frozen(state) => state.visible_paths(levels.slice()),
+        }
+    }
+
+    fn names(&self, dir: &[u8], levels: Levels<'_>) -> Vec<(Vec<u8>, LayerEnt)> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner.call(
+                |state, (dir, levels)| state.names(&dir, &levels),
+                (dir.to_vec(), levels.shared()),
+            ),
+            OutputStorage::Frozen(state) => state.names(dir, levels.slice()),
+        }
+    }
+}
+
+/// The level of each unit a lookup sees. A view's own levels are shared with
+/// the layer's loop by reference count, so a lookup does not copy them.
+#[derive(Clone, Copy)]
+enum Levels<'a> {
+    Shared(&'a Arc<Vec<u8>>),
+    Fixed(&'static [u8]),
+}
+
+impl Levels<'_> {
+    fn slice(&self) -> &[u8] {
+        match self {
+            Levels::Shared(levels) => levels,
+            Levels::Fixed(levels) => levels,
+        }
+    }
+
+    fn shared(&self) -> Arc<Vec<u8>> {
+        match self {
+            Levels::Shared(levels) => Arc::clone(levels),
+            Levels::Fixed(levels) => Arc::new(levels.to_vec()),
         }
     }
 }
@@ -638,11 +931,11 @@ const SEED_LEVELS: [u8; 1] = [LEVEL_FULL];
 impl BuildView {
     fn layered(&self, dir: &[u8], name: &[u8]) -> Option<LayerEnt> {
         if let Some(seed) = &self.seed {
-            if let Some(e) = seed.get(dir, name, &SEED_LEVELS) {
+            if let Some(e) = seed.get(dir, name, Levels::Fixed(&SEED_LEVELS)) {
                 return Some(e);
             }
         }
-        self.layer.get(dir, name, &self.levels)
+        self.layer.get(dir, name, Levels::Shared(&self.levels))
     }
 }
 
@@ -671,9 +964,9 @@ impl View for BuildView {
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        let mut layered = self.layer.names(dir, &self.levels);
+        let mut layered = self.layer.names(dir, Levels::Shared(&self.levels));
         if let Some(seed) = &self.seed {
-            layered.extend(seed.names(dir, &SEED_LEVELS));
+            layered.extend(seed.names(dir, Levels::Fixed(&SEED_LEVELS)));
         }
         let base = if self.base_has_dir(dir) {
             drive(&self.base, |view| view.step_list(dir))?
@@ -699,7 +992,7 @@ impl View for BuildView {
     }
 
     fn hints(&self) -> Vec<Vec<u8>> {
-        self.layer.visible_paths(&self.levels)
+        self.layer.visible_paths(Levels::Shared(&self.levels))
     }
 
     fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
@@ -747,9 +1040,9 @@ pub struct ViewParts {
 
 #[derive(Clone)]
 pub struct Restricted {
-    pub store_names: Arc<std::collections::HashSet<Vec<u8>>>,
+    pub store_names: Arc<BTreeSet<Vec<u8>>>,
     pub store_paths: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
-    pub etc: Arc<HashMap<Vec<u8>, SynthEnt>>,
+    pub etc: Arc<BTreeMap<Vec<u8>, SynthEnt>>,
     pub links: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -829,11 +1122,11 @@ fn host_dir() -> Looked {
 }
 
 #[cfg(test)]
-fn rooted(real: &str, seed: impl FnOnce(&HostRegion, &HostMemo)) -> Arc<BaseView> {
+fn rooted(real: &str, seed: impl FnOnce(&HostRegion, &mut MemoState)) -> Arc<BaseView> {
     let region = HostRegion::new(real);
-    let memo = Arc::new(HostMemo::default());
-    seed(&region, &memo);
-    memo.seal();
+    let mut memo = MemoState::default();
+    seed(&region, &mut memo);
+    let memo = Arc::new(HostMemo::frozen(memo));
     Arc::new(BaseView::new(
         vec![
             Mount { at: b"/".to_vec(), region: Region::Host(region), traced: true },
@@ -847,6 +1140,8 @@ fn rooted(real: &str, seed: impl FnOnce(&HostRegion, &HostMemo)) -> Arc<BaseView
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     fn file(n: u8) -> MEntry {
         MEntry::File { hash: crate::hash::Hash([n; 32]), exec: false, size: n as u64 }
@@ -862,11 +1157,14 @@ mod tests {
 
     #[test]
     fn layer_visibility_by_level() {
-        let layer = Arc::new(OutputsLayer::new());
+        let mut layer = OutputState::default();
         layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
         layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
         layer.add(1, LEVEL_FULL, &[(b"/t/debug/b/libb.rlib".to_vec(), file(3))]);
 
+        layer.add(1, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(4))]);
+        layer.set_rank(0, 10);
+        let layer = Arc::new(OutputsLayer::frozen(layer));
         let view = |levels: Vec<u8>| BuildView {
             base: layer_base(),
             layer: layer.clone(),
@@ -885,7 +1183,12 @@ mod tests {
         assert_eq!(names, vec![(b"liba.rmeta".to_vec(), DType::File)]);
         assert_eq!(v.list(b"/t/debug").unwrap(), vec![(b"a".to_vec(), DType::Dir)]);
         let v = view(vec![LEVEL_FULL, LEVEL_FULL]);
-        assert!(matches!(v.stat(b"/t/debug/a/liba.rlib"), Looked::File(_)));
+        assert!(matches!(v.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 2));
+        assert_eq!(v.hints(), [
+            b"/t/debug/a/liba.rlib".to_vec(),
+            b"/t/debug/a/liba.rmeta".to_vec(),
+            b"/t/debug/b/libb.rlib".to_vec(),
+        ]);
         assert_eq!(v.list(b"/t/debug").unwrap().len(), 2);
         let v = view(vec![LEVEL_NONE, LEVEL_NONE]);
         assert!(matches!(v.stat(b"/t"), Looked::Dir(_)));
@@ -897,8 +1200,48 @@ mod tests {
     }
 
     #[test]
-    fn explicit_directory_does_not_hide_an_earlier_stage() {
+    fn live_layer_steps_its_loop() {
         let layer = Arc::new(OutputsLayer::new());
+        let view = |levels: Vec<u8>| BuildView {
+            base: layer_base(),
+            layer: layer.clone(),
+            levels: Arc::new(levels),
+            untraced: vec![],
+            seed: None,
+            content: None,
+        };
+        let full = view(vec![LEVEL_FULL, LEVEL_FULL]);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+
+        layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
+        layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
+        layer.add(1, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(4))]);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 4));
+        layer.set_rank(0, 10);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 2));
+
+        let meta = view(vec![LEVEL_META, LEVEL_NONE]);
+        assert!(matches!(meta.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+        assert_eq!(meta.list(b"/t/debug/a").unwrap(), vec![(b"liba.rmeta".to_vec(), DType::File)]);
+        assert_eq!(full.hints(), [b"/t/debug/a/liba.rlib".to_vec(), b"/t/debug/a/liba.rmeta".to_vec()]);
+    }
+
+    #[test]
+    fn live_layer_panic_reaches_the_caller_and_the_loop_goes_on() {
+        let layer = OutputsLayer::new();
+        let OutputStorage::Live(owner) = &layer.storage else { unreachable!() };
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.call(|_, ()| -> () { panic!("a step failed") }, ())
+        }));
+        let cause = failed.unwrap_err();
+        assert_eq!(cause.downcast_ref::<&str>(), Some(&"a step failed"));
+        layer.add(0, LEVEL_FULL, &[(b"/t/x".to_vec(), file(1))]);
+        assert!(layer.get(b"/t", b"x", Levels::Fixed(&[LEVEL_FULL])).is_some());
+    }
+
+    #[test]
+    fn explicit_directory_does_not_hide_an_earlier_stage() {
+        let mut layer = OutputState::default();
         layer.add(0, LEVEL_META, &[(b"/t/debug/a/out/liba.rmeta".to_vec(), file(1))]);
         layer.add(
             0,
@@ -912,7 +1255,7 @@ mod tests {
         );
         let v = BuildView {
             base: rooted("/view/empty", |_, _| {}),
-            layer,
+            layer: Arc::new(OutputsLayer::frozen(layer)),
             levels: Arc::new(vec![LEVEL_META]),
             untraced: vec![],
             seed: None,
@@ -947,9 +1290,9 @@ mod tests {
                 Ok(vec![(b"gone".to_vec(), DType::File), (b"kept".to_vec(), DType::File)]),
             );
         });
-        let layer = Arc::new(OutputsLayer::new());
+        let mut layer = OutputState::default();
         layer.add(0, LEVEL_FULL, &[(b"/gone".to_vec(), MEntry::Whiteout)]);
-        let v = BuildView { base, layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::frozen(layer)), levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
         assert!(matches!(v.stat(b"/gone"), Looked::Absent));
         assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
         let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
@@ -958,6 +1301,7 @@ mod tests {
 
     #[test]
     fn a_base_view_is_given_its_contents() {
+        let mut outcomes = Transcript::default();
         let memo = Arc::new(HostMemo::default());
         let view = BaseView::new(
             vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/no/such/host-view")), traced: true }],
@@ -972,9 +1316,15 @@ mod tests {
         }));
         assert!(refused.is_err(), "the view does not read the host");
         view.deposit(&req, HostAnswer::Lookup(host_dir()));
-        assert!(view.invariants());
-        assert!(matches!(View::lookup(&view, b"/", b"missing"), Looked::Dir(_)));
-        assert!(view.invariants());
+        view.invariants();
+        let Step::Done(found) = view.step_lookup(b"/", b"missing") else {
+            panic!("the deposit answers the lookup");
+        };
+        outcomes.record("retry lookup", found);
+        view.invariants();
+        expect![[r#"
+            retry lookup: Dir(Owner { uid: 0, gid: 0, mode: 493 })
+        "#]].assert_eq(&outcomes.0);
     }
 }
 
@@ -985,7 +1335,7 @@ mod host_listing_tests {
     #[test]
     fn build_view_lists_host_directories() {
         let region = HostRegion::new("/view/host");
-        let memo = Arc::new(HostMemo::default());
+        let mut memo = MemoState::default();
         memo.store_lookup(lookup_key(&region, b"/", b"usr"), host_dir());
         memo.store_lookup(lookup_key(&region, b"/", b"etc"), host_dir());
         memo.store_lookup(lookup_key(&region, b"/usr", b"lib"), host_dir());
@@ -994,13 +1344,13 @@ mod host_listing_tests {
         memo.store_list(list_key(&region, b"/"), Ok(vec![(b"etc".to_vec(), DType::Dir), (b"usr".to_vec(), DType::Dir)]));
         memo.store_list(list_key(&region, b"/usr/lib"), Ok(vec![(b"sample".to_vec(), DType::File)]));
         memo.store_list(list_key(&region, b"/etc"), Ok(vec![(b"settings".to_vec(), DType::File)]));
-        memo.seal();
+        let memo = Arc::new(HostMemo::frozen(memo));
         let base = Arc::new(BaseView::new(
             vec![Mount { at: b"/".to_vec(), region: Region::Host(region), traced: true }],
             memo,
             0,
         ));
-        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::frozen(OutputState::default())), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
         assert_eq!(v.list(b"/usr/lib").unwrap(), vec![(b"sample".to_vec(), DType::File)]);
         assert_eq!(v.list(b"/etc").unwrap(), vec![(b"settings".to_vec(), DType::File)]);
         let mut root: Vec<_> = v.list(b"/").unwrap();
@@ -1021,12 +1371,12 @@ mod mount_tests {
         let home = PathBuf::from("/mem/cargo");
         let region = HostRegion::new(&home);
         let mounted = HostRegion::new("/mem");
-        let memo = Arc::new(HostMemo::default());
+        let mut memo = MemoState::default();
         memo.store_lookup(lookup_key(&mounted, b"/", b"cargo"), host_dir());
         memo.store_lookup(lookup_key(&region, b"/", b"registry"), host_dir());
         memo.store_lookup(lookup_key(&region, b"/registry", b"index"), host_dir());
         memo.store_lookup(lookup_key(&region, b"/", b"config.toml"), host_file(&home.join("config.toml"), 0));
-        memo.seal();
+        let memo = Arc::new(HostMemo::frozen(memo));
         let mut mounts = vec![Mount { at: b"/".to_vec(), region: Region::Empty, traced: true }];
         mounts.extend(cargo_home_mounts(&home));
         let v = BaseView::new(mounts, memo, 0);
@@ -1041,7 +1391,7 @@ mod mount_tests {
     fn file_mounted_below_a_directory_that_does_not_exist() {
         let root = HostRegion::new("/mem/root");
         let tool_parent = HostRegion::new("/mem");
-        let memo = Arc::new(HostMemo::default());
+        let mut memo = MemoState::default();
         memo.store_lookup(lookup_key(&root, b"/", b"opt"), Looked::Absent);
         memo.store_lookup(lookup_key(&root, b"/opt", b"x"), Looked::Absent);
         memo.store_lookup(lookup_key(&root, b"/opt", b"y"), Looked::Absent);
@@ -1049,7 +1399,7 @@ mod mount_tests {
         memo.store_list(list_key(&root, b"/"), Ok(Vec::new()));
         memo.store_list(list_key(&root, b"/opt"), Err(libc::ENOENT));
         memo.store_list(list_key(&root, b"/opt/x"), Err(libc::ENOENT));
-        memo.seal();
+        let memo = Arc::new(HostMemo::frozen(memo));
         let v = BaseView::new(
             vec![
                 Mount { at: b"/".to_vec(), region: Region::Host(root), traced: true },
@@ -1065,5 +1415,86 @@ mod mount_tests {
         assert_eq!(v.list(b"/").unwrap(), vec![(b"opt".to_vec(), DType::Dir)]);
         assert_eq!(v.list(b"/opt").unwrap(), vec![(b"x".to_vec(), DType::Dir)]);
         assert_eq!(v.list(b"/opt/x").unwrap(), vec![(b"tool".to_vec(), DType::File)]);
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+    use rargo_machine::check;
+
+    fn step(memo: &mut MemoState, at: &str, f: impl FnOnce(&mut MemoState)) {
+        f(memo);
+        check(&*memo, at);
+    }
+
+    #[test]
+    fn a_renewed_view_asks_again_and_others_keep_their_answers() {
+        let mut memo = MemoState::default();
+        let (mut old, mut new) = (0, 0);
+        step(&mut memo, "open", |m| {
+            old = m.open_view(1);
+            new = m.open_view(1);
+        });
+        step(&mut memo, "observe", |m| m.observe(b"/k".to_vec(), Observed::Lookup(host_dir())));
+        assert!(memo.lookup_at(memo.min_gen(old), b"/k").is_some());
+        step(&mut memo, "renew", |m| m.renew(new));
+        assert_eq!(memo.min_gen(new), 2);
+        assert!(memo.lookup_at(memo.min_gen(new), b"/k").is_none(), "a renewed view does not accept what came before");
+        assert!(memo.lookup_at(memo.min_gen(old), b"/k").is_some(), "the other view still does");
+        step(&mut memo, "observe again", |m| m.observe(b"/k".to_vec(), Observed::Lookup(Looked::Absent)));
+        assert!(matches!(memo.lookup_at(memo.min_gen(new), b"/k"), Some(Looked::Absent)));
+        step(&mut memo, "close", |m| m.close_view(old));
+        assert!(!memo.views.contains_key(&old));
+    }
+
+    #[test]
+    fn every_span_of_generations_forgets_what_is_too_old() {
+        let mut memo = MemoState::default();
+        step(&mut memo, "observe", |m| m.observe(b"/old".to_vec(), Observed::List(Err(libc::ENOENT))));
+        let advance_to = |memo: &mut MemoState, g: u64| {
+            while memo.generation < g {
+                step(memo, "advance", |m| {
+                    m.advance();
+                });
+            }
+        };
+        advance_to(&mut memo, MEMO_SPAN);
+        assert!(memo.listed.contains_key(b"/old".as_slice()), "an answer outlives its generation by a whole span");
+        advance_to(&mut memo, MEMO_SPAN + 1);
+        step(&mut memo, "observe late", |m| m.observe(b"/late".to_vec(), Observed::List(Ok(Arc::new(Vec::new())))));
+        advance_to(&mut memo, 2 * MEMO_SPAN - 1);
+        assert!(memo.listed.contains_key(b"/old".as_slice()), "pruned only when a span ends");
+        advance_to(&mut memo, 2 * MEMO_SPAN);
+        assert!(!memo.listed.contains_key(b"/old".as_slice()), "generation 1 is forgotten two spans on");
+        assert!(memo.listed.contains_key(b"/late".as_slice()), "a recent listing is kept");
+    }
+
+    #[test]
+    fn a_sealed_memo_refuses_observations() {
+        let memo = HostMemo::frozen(MemoState::default());
+        assert!(memo.sealed());
+        let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            memo.observe(b"/k".to_vec(), Observed::Lookup(host_dir()))
+        }));
+        assert!(told.is_err());
+    }
+
+    #[test]
+    fn a_live_memo_tracks_its_views_until_they_drop() {
+        let memo = Arc::new(HostMemo::default());
+        let g = memo.advance();
+        let view = BaseView::new(
+            vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/no/such/memo-view")), traced: true }],
+            memo.clone(),
+            g,
+        );
+        let MemoView::Live(id) = view.accepts else { panic!("a live memo opens live views") };
+        let MemoStorage::Live(owner) = &memo.storage else { unreachable!() };
+        assert_eq!(owner.call(move |m, ()| m.min_gen(id), ()), g);
+        view.renew();
+        assert_eq!(owner.call(move |m, ()| m.min_gen(id), ()), g + 1);
+        drop(view);
+        assert!(!owner.call(move |m, ()| m.views.contains_key(&id), ()), "a dropped view is closed");
     }
 }

@@ -1,5 +1,5 @@
 use crate::hash::Hash;
-use dashmap::DashMap;
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use crate::io::file::File;
 use std::io;
@@ -20,24 +20,24 @@ pub struct ChunkRef {
 
 pub type Recipe = Vec<ChunkRef>;
 
-fn gear() -> &'static [u64; 256] {
-    static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [0u64; 256];
-        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-        for v in t.iter_mut() {
-            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            *v = z ^ (z >> 31);
-        }
-        t
-    })
+const GEAR: [u64; 256] = gear();
+
+const fn gear() -> [u64; 256] {
+    let mut table = [0; 256];
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut i = 0;
+    while i < table.len() {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        table[i] = z ^ (z >> 31);
+        i += 1;
+    }
+    table
 }
 
 fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
-    let g = gear();
     const MASK_S: u64 = (1 << 18) - 1;
     const MASK_L: u64 = (1 << 14) - 1;
     let mut start = 0;
@@ -48,7 +48,7 @@ fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
         let mut cut = end;
         let mut i = start + MIN_CHUNK;
         while i < mid {
-            h = (h << 1).wrapping_add(g[data[i] as usize]);
+            h = (h << 1).wrapping_add(GEAR[data[i] as usize]);
             if h & MASK_S == 0 {
                 cut = i + 1;
                 break;
@@ -57,7 +57,7 @@ fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
         }
         if cut == end {
             while i < end {
-                h = (h << 1).wrapping_add(g[data[i] as usize]);
+                h = (h << 1).wrapping_add(GEAR[data[i] as usize]);
                 if h & MASK_L == 0 {
                     cut = i + 1;
                     break;
@@ -203,26 +203,43 @@ pub fn chunk_file(file: &File) -> io::Result<Recipe> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    use std::os::fd::AsRawFd;
-    unsafe {
-        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0);
-        if p == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let r = chunk(std::slice::from_raw_parts(p as *const u8, len));
-        libc::munmap(p, len);
-        Ok(r)
-    }
+    Ok(chunk(&file.map(len)?))
 }
 
-#[derive(Default)]
+/// A step of the [`ChunkIndex`]: the shell turns each add and eviction a
+/// remote blob operation asks for into one of these and hands it to the owner.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// `blob` is held locally and is cut as `recipe`. A chunk already located
+    /// keeps its first location; the blob's recipe is replaced.
+    AddBlob { blob: Hash, recipe: Arc<Recipe> },
+    /// The chunk's location turned out not to hold it.
+    Forget(Hash),
+}
+
+/// Where each chunk of the locally held blobs can be read, and each blob's
+/// recipe. Its one owner steps it through [`ChunkIndex::step`].
+#[derive(Clone, Debug, Default)]
 pub struct ChunkIndex {
-    at: DashMap<Hash, (Hash, u64, u32)>,
-    recipes: DashMap<Hash, Arc<Recipe>>,
+    at: BTreeMap<Hash, (Hash, u64, u32)>,
+    recipes: BTreeMap<Hash, Arc<Recipe>>,
 }
 
 impl ChunkIndex {
-    pub fn add_blob(&self, blob: Hash, recipe: Arc<Recipe>) {
+    pub fn step(&mut self, event: Event) {
+        match event {
+            Event::AddBlob { blob, recipe } => {
+                self.add_blob(blob, recipe.clone());
+                assert!(recipe.iter().all(|c| self.at.contains_key(&c.hash)), "every chunk of {blob} is located");
+            }
+            Event::Forget(chunk) => {
+                self.forget_chunk(&chunk);
+                assert!(!self.at.contains_key(&chunk), "{chunk} is forgotten");
+            }
+        }
+    }
+
+    pub fn add_blob(&mut self, blob: Hash, recipe: Arc<Recipe>) {
         let mut off = 0u64;
         for c in recipe.iter() {
             self.at.entry(c.hash).or_insert((blob, off, c.len));
@@ -232,8 +249,13 @@ impl ChunkIndex {
         assert!(self.recipes.contains_key(&blob));
     }
 
+    pub fn forget_chunk(&mut self, chunk: &Hash) {
+        self.at.remove(chunk);
+        assert!(!self.at.contains_key(chunk));
+    }
+
     pub fn recipe(&self, blob: &Hash) -> Option<Arc<Recipe>> {
-        self.recipes.get(blob).map(|r| r.clone())
+        self.recipes.get(blob).cloned()
     }
 
     pub fn has_chunk(&self, chunk: &Hash) -> bool {
@@ -241,15 +263,20 @@ impl ChunkIndex {
     }
 
     pub fn locate(&self, chunk: &Hash) -> Option<(Hash, u64, u32)> {
-        self.at.get(chunk).map(|e| *e)
-    }
-
-    pub fn forget_chunk(&self, chunk: &Hash) {
-        self.at.remove(chunk);
+        self.at.get(chunk).copied()
     }
 
     pub fn chunk_count(&self) -> usize {
         self.at.len()
+    }
+}
+
+impl rargo_machine::StateMachine for ChunkIndex {
+    fn invariants(&self) {
+        for (chunk, (blob, _, len)) in &self.at {
+            assert!(self.recipes.contains_key(blob), "chunk {chunk} is located in blob {blob}, whose recipe is known");
+            assert!(*len as usize <= MAX_CHUNK, "chunk {chunk} is {len} bytes, at most MAX_CHUNK");
+        }
     }
 }
 
@@ -404,7 +431,7 @@ mod tests {
     fn index_locates_chunks_in_blobs() {
         let data = noise(500_000, 5);
         let recipe = Arc::new(chunk(&data));
-        let idx = ChunkIndex::default();
+        let mut idx = ChunkIndex::default();
         let blob = Hash::of(&data);
         idx.add_blob(blob, recipe.clone());
         let third = recipe[2];
@@ -412,5 +439,42 @@ mod tests {
         assert_eq!(b, blob);
         assert_eq!(Hash::of(&data[off as usize..off as usize + len as usize]), third.hash);
         assert!(!idx.has_chunk(&Hash::of(b"unknown")));
+    }
+
+    fn r(chunks: &[(&[u8], u32)]) -> Arc<Recipe> {
+        Arc::new(chunks.iter().map(|(d, len)| ChunkRef { hash: Hash::of(d), len: *len }).collect())
+    }
+
+    #[test]
+    fn index_steps_keep_first_locations_and_replace_recipes() {
+        use rargo_machine::Checked;
+        let (a, b) = (Hash::of(b"blob a"), Hash::of(b"blob b"));
+        let (x, y, z) = (Hash::of(b"x"), Hash::of(b"y"), Hash::of(b"z"));
+        let mut idx = Checked::new(ChunkIndex::default());
+        idx.step(|i| i.step(Event::AddBlob { blob: a, recipe: r(&[(b"x", 10), (b"y", 20)]) }));
+        assert_eq!(idx.locate(&y), Some((a, 10, 20)));
+        idx.step(|i| i.step(Event::AddBlob { blob: b, recipe: r(&[(b"z", 5), (b"y", 20)]) }));
+        assert_eq!(idx.locate(&y), Some((a, 10, 20)), "the first location is kept");
+        assert_eq!(idx.locate(&z), Some((b, 0, 5)));
+        assert_eq!(idx.chunk_count(), 3);
+        let replaced = r(&[(b"z", 5)]);
+        idx.step(|i| i.step(Event::AddBlob { blob: a, recipe: replaced.clone() }));
+        assert_eq!(idx.recipe(&a), Some(replaced), "a blob's recipe is replaced");
+        assert_eq!(idx.locate(&x), Some((a, 0, 10)), "replacing a recipe moves no location");
+        assert_eq!(idx.locate(&z), Some((b, 0, 5)));
+        idx.step(|i| i.step(Event::Forget(y)));
+        assert!(!idx.has_chunk(&y));
+        assert_eq!(idx.chunk_count(), 2);
+        idx.step(|i| i.step(Event::Forget(y)));
+        assert_eq!(idx.chunk_count(), 2, "forgetting an unknown chunk changes nothing");
+        idx.step(|i| i.step(Event::AddBlob { blob: b, recipe: r(&[(b"z", 5), (b"y", 20)]) }));
+        assert_eq!(idx.locate(&y), Some((b, 5, 20)), "a forgotten chunk is located again by the next blob");
+    }
+
+    #[test]
+    fn index_invariants_catch_a_location_without_its_recipe() {
+        let mut idx = ChunkIndex::default();
+        idx.at.insert(Hash::of(b"x"), (Hash::of(b"nowhere"), 0, 1));
+        assert!(std::panic::catch_unwind(|| rargo_machine::StateMachine::invariants(&idx)).is_err());
     }
 }

@@ -6,9 +6,13 @@ refuse() {
     echo "The service runs released versions only: dev/release.sh X.Y.Z releases and deploys one; deploy/update-service.sh vX.Y.Z deploys a published release again." >&2
     exit 1
 }
+fail() {
+    echo "deploy/update-service.sh: $1" >&2
+    exit 1
+}
 want=${1:-}
 [[ "$want" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || refuse "'$want' is not a release tag (vX.Y.Z)"
-assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-sadosystems/rargo2}" --json isDraft,assets \
+assets=$(gh release view "$want" --repo "${RARGO_RELEASE_REPO:-Clavigers/rargo2}" --json isDraft,assets \
     --jq 'select(.isDraft | not) | .assets[].name' 2>/dev/null) || refuse "$want has no published release"
 grep -qx rargo-x86_64-unknown-linux-musl <<<"$assets" || refuse "the release $want does not have the client (rargo-x86_64-unknown-linux-musl)"
 S=${RARGO_SERVICE:-/root/rargo-work/service}
@@ -28,7 +32,6 @@ rel=$S/releases/$version-$commit
 if [ ! -x "$rel/rargod" ]; then
     cd "$S/src"
     cap() { systemd-run --scope -q -p CPUQuota=600% -p MemoryMax=20G "$@"; }
-    planner=$(cap "$repo/deploy/planner.sh" "$S/src" "$work/cargo" "$S/planner")
     CARGO_TARGET_DIR=$S/build cap cargo build --release --locked -p rargod -p rargo-core
     CARGO_TARGET_DIR=$S/build CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
         cap cargo build --release --locked -p rargo --target x86_64-unknown-linux-musl
@@ -36,6 +39,7 @@ if [ ! -x "$rel/rargod" ]; then
     cp "$S/build/release/rargod" "$S/build/release/rargo-sandbox" "$rel.tmp/"
     cp "$S/build/x86_64-unknown-linux-musl/release/rargo" "$rel.tmp/"
     strip "$rel.tmp/rargo"
+    planner=$(cap "$repo/deploy/planner.sh" "$S/src" "$S/planner" "$S/planner-build") || fail "cannot build the planner at $want"
     cp "$planner" "$rel.tmp/planner-cargo"
     cp -R "$S/src/nix/default" "$rel.tmp/default-flake"
     mv "$rel.tmp" "$rel"

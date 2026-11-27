@@ -486,6 +486,17 @@ pub mod fixture {
         out
     }
 
+    /// What a program built by `program` does when it runs: the marks it writes to the file `RARGO_FN_SLOTS` names, and its exit status.
+    pub fn run_of(program: &[u8]) -> Option<(&[u8], u8)> {
+        let text = program.get(TEXT_AT..)?;
+        if text.get(..MARKS_LEN_AT)? != &MARKS_WRITER[..MARKS_LEN_AT] {
+            return None;
+        }
+        let len = u64::from_le_bytes(text.get(MARKS_LEN_AT..MARKS_LEN_AT + 8)?.try_into().ok()?);
+        let marks = text.get(MARKS_WRITER.len()..MARKS_WRITER.len().checked_add(usize::try_from(len).ok()?)?)?;
+        Some((marks, *text.get(EXIT_AT)?))
+    }
+
     pub fn marks(functions: &[Function], ran: &[&str]) -> Vec<u8> {
         let mut m = vec![0u8; functions.len().next_multiple_of(4096).max(4096)];
         for (i, f) in functions.iter().enumerate() {

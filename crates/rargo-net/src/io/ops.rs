@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use io_uring::{opcode, types};
 
+use super::fuse::RingBuffer;
 use super::ring::{Kind, Slot};
 
 pub enum Op {
@@ -38,6 +39,7 @@ pub enum Op {
     SendFds { fd: i32, buf: Vec<u8>, fds: Vec<i32> },
     RecvFds { fd: i32, len: usize },
     Readable { fd: i32 },
+    Fuse { fd: i32, queue: u16, commit: Option<u64>, buffer: Box<RingBuffer> },
     Cpu(Box<dyn FnOnce() + Send>),
     Blocking(Box<dyn FnOnce() + Send>),
 }
@@ -66,6 +68,7 @@ pub enum Event {
     Exited { status: i32 },
     RecvFds { n: usize, buf: Vec<u8>, fds: Vec<i32> },
     Readable,
+    Fuse(Box<RingBuffer>),
     Cpu,
     Failed(io::Error),
 }
@@ -86,8 +89,13 @@ impl Event {
     }
 }
 
-pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) -> io::Result<io_uring::squeue::Entry> {
+pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) -> io::Result<io_uring::squeue::Entry128> {
     let entry = match op {
+        Op::Fuse { fd, queue, commit, mut buffer } => {
+            let entry = buffer.command(fd, queue, commit).user_data(token);
+            inflight.insert(token, Slot { fuse: Some(buffer), ..Slot::empty(Kind::Fuse) });
+            return Ok(entry);
+        }
         Op::Cpu(_) | Op::Blocking(_) => unreachable!("pool work does not enter the ring"),
         Op::Recv { fd, len, flags } => {
             let mut buf = vec![0u8; len];
@@ -229,7 +237,7 @@ pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) ->
             entry
         }
     };
-    Ok(entry)
+    Ok(entry.into())
 }
 
 pub(super) fn store_addr(addr: SocketAddr) -> (Box<libc::sockaddr_storage>, libc::socklen_t) {
@@ -424,7 +432,7 @@ fn wait_status(info: &libc::siginfo_t) -> i32 {
 }
 
 pub(super) fn event_of(slot: Slot, res: i32) -> Event {
-    let Slot { kind, buf, stat, addr, info, path, path2, addrlen, ts, iov, msg, cbuf } = slot;
+    let Slot { kind, buf, stat, addr, info, path, path2, addrlen, ts, iov, msg, cbuf, fuse } = slot;
     let fds = match (&kind, &msg) {
         (Kind::RecvFds, Some(msg)) if res >= 0 => received_fds(msg),
         _ => Vec::new(),
@@ -461,6 +469,7 @@ pub(super) fn event_of(slot: Slot, res: i32) -> Event {
         Kind::SendFds => Event::Send { n: res as usize },
         Kind::RecvFds => Event::RecvFds { n: res as usize, buf: buf.unwrap_or_default(), fds },
         Kind::Readable => Event::Readable,
+        Kind::Fuse => Event::Fuse(fuse.expect("FUSE command owns its buffers")),
     }
 }
 

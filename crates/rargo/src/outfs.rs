@@ -1,13 +1,14 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
-use crate::partial::Partial;
+pub use rargo::out_tree::VFile;
+use rargo::out_tree::{below, Edit, OutputTree, Table};
 use rargo_proto::Digest;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -33,18 +34,11 @@ struct Timed<'a>(&'a OutFs, usize, std::time::Instant);
 impl Drop for Timed<'_> {
     fn drop(&mut self) {
         self.0.op_count[self.1].fetch_add(1, Ordering::Relaxed);
-        self.0.op_nanos[self.1].fetch_add(self.2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.0.op_nanos[self.1].fetch_add(rargo_net::io::now().saturating_duration_since(self.2).as_nanos() as u64, Ordering::Relaxed);
     }
 }
 const LISTING_KEPT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VFile {
-    pub hash: Digest,
-    pub size: u64,
-    pub exec: bool,
-    pub mtime_ns: i64,
-}
 
 struct Node {
     parent: u64,
@@ -62,25 +56,6 @@ struct Inodes {
 }
 
 impl Inodes {
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let mut kids: BTreeMap<u64, u64> = BTreeMap::new();
-        for (id, node) in &self.nodes {
-            if *id != ROOT {
-                *kids.entry(node.parent).or_default() += 1;
-            }
-        }
-        self.nodes.contains_key(&ROOT)
-            && self.children.iter().all(|((parent, name), id)| {
-                self.nodes.get(id).is_some_and(|node| node.parent == *parent && node.name == *name)
-            })
-            && self.nodes.iter().all(|(id, node)| {
-                *id < self.next
-                    && node.kids == kids.get(id).copied().unwrap_or(0)
-                    && (*id == ROOT || (self.nodes.contains_key(&node.parent) && !node.name.is_empty()))
-            })
-    }
-
     fn path(&self, mut id: u64) -> Res<Vec<u8>> {
         let mut parts: Vec<&[u8]> = Vec::new();
         while id != ROOT {
@@ -159,96 +134,31 @@ impl Inodes {
     }
 }
 
-type Table = BTreeMap<Vec<u8>, VFile>;
-
-enum Edit {
-    Put { path: Vec<u8>, file: VFile, replaced_real: bool },
-    Remove(Vec<u8>),
-    Shadow(Vec<u8>),
-}
-
-struct OutputTree {
-    files: Table,
-    generation: u64,
-}
-
-impl OutputTree {
-    fn same(&self, rel: &[u8], file: &VFile) -> bool {
-        self.files.get(rel).is_some_and(|v| v.hash == file.hash && v.exec == file.exec)
-    }
-
-    fn has_below(&self, rel: &[u8]) -> bool {
-        let prefix = below(rel);
-        self.files.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
-    }
-
-    fn lookup<T>(&self, rel: &[u8], real: Option<T>) -> Option<Kind<T>> {
-        if let Some(real) = real {
-            return Some(Kind::Real(real));
+#[cfg(test)]
+impl StateMachine for Inodes {
+    fn invariants(&self) {
+        let mut kids: BTreeMap<u64, u64> = BTreeMap::new();
+        for (id, node) in &self.nodes {
+            if *id != ROOT {
+                *kids.entry(node.parent).or_default() += 1;
+            }
         }
-        if rel.is_empty() {
-            return None;
+        assert!(self.nodes.contains_key(&ROOT), "the root inode is there");
+        for ((parent, name), id) in &self.children {
+            assert!(
+                self.nodes.get(id).is_some_and(|node| node.parent == *parent && node.name == *name),
+                "child {:?} of inode {parent} is inode {id}, which has that parent and name",
+                String::from_utf8_lossy(name)
+            );
         }
-        if let Some(file) = self.files.get(rel) {
-            return Some(Kind::Virtual(file.clone()));
+        for (id, node) in &self.nodes {
+            assert!(*id < self.next, "inode {id} was handed out, below {}", self.next);
+            assert_eq!(node.kids, kids.get(id).copied().unwrap_or(0), "inode {id} counts its children");
+            if *id != ROOT {
+                assert!(self.nodes.contains_key(&node.parent), "inode {id}'s parent {} is there", node.parent);
+                assert!(!node.name.is_empty(), "inode {id} has a name");
+            }
         }
-        self.has_below(rel).then_some(Kind::VDir)
-    }
-
-    fn apply(&mut self, generation: u64, edits: Vec<Edit>) -> Vec<Vec<u8>> {
-        if generation <= self.generation {
-            return Vec::new();
-        }
-        self.generation = generation;
-        let mut changed = Vec::new();
-        for edit in edits {
-            let path = match edit {
-                Edit::Put { path, file, replaced_real } => {
-                    if !replaced_real && self.same(&path, &file) {
-                        continue;
-                    }
-                    self.remove_below(&path);
-                    let mut at = path.as_slice();
-                    while let Some(slash) = at.iter().rposition(|&b| b == b'/') {
-                        at = &at[..slash];
-                        self.files.remove(at);
-                    }
-                    self.files.insert(path.clone(), file);
-                    path
-                }
-                Edit::Remove(path) => {
-                    self.files.remove(&path);
-                    self.remove_below(&path);
-                    path
-                }
-                Edit::Shadow(path) => {
-                    self.files.remove(&path);
-                    path
-                }
-            };
-            changed.push(path);
-        }
-        changed
-    }
-
-    fn remove_below(&mut self, path: &[u8]) {
-        let prefix = below(path);
-        let removed: Vec<_> =
-            self.files.range(prefix.clone()..).take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
-        for key in removed {
-            self.files.remove(&key);
-        }
-    }
-
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        self.files.keys().all(|path| {
-            !path.is_empty()
-                && !path.starts_with(b"/")
-                && !path.ends_with(b"/")
-                && !path.split(|&b| b == b'/').any(|part| part.is_empty())
-                && !self.has_below(path)
-        })
     }
 }
 
@@ -264,7 +174,7 @@ impl Delivery<'_> {
         let real = self.fs.real(rel);
         match rargo_net::io::file::symlink_metadata(&real) {
             Ok(md) if md.is_dir() => {
-                let _ = std::fs::remove_dir_all(&real);
+                let _ = rargo_net::io::file::remove_dir_all(&real);
             }
             Ok(_) => {
                 let _ = rargo_net::io::file::remove_file(&real);
@@ -321,7 +231,7 @@ struct Fetch {
     rel: Vec<u8>,
 }
 
-enum Content<F = File, R = Arc<Partial>> {
+enum Content<F = File, R = Arc<dyn Ranged>> {
     Open(F),
     Unfetched(Fetch),
     Ranged(R),
@@ -351,12 +261,14 @@ impl<F, R> Content<F, R> {
         }
         Ok(())
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        match self {
-            Self::Unfetched(fetch) => !fetch.rel.is_empty() && fetch.size > 0,
-            Self::Open(_) | Self::Ranged(_) => true,
+#[cfg(test)]
+impl<F, R> StateMachine for Content<F, R> {
+    fn invariants(&self) {
+        if let Self::Unfetched(fetch) = self {
+            assert!(!fetch.rel.is_empty(), "an unfetched file has a path");
+            assert!(fetch.size > 0, "an unfetched file has bytes to fetch");
         }
     }
 }
@@ -370,18 +282,17 @@ enum VirtualOpen {
     Materialize { file: VFile, with_content: bool },
 }
 
-impl OutputTree {
-    fn open(&self, rel: &[u8], writing: bool, truncate: bool) -> Res<VirtualOpen> {
-        let file = self.files.get(rel).cloned().ok_or(Errno(libc::ENOENT))?;
-        Ok(if writing {
-            VirtualOpen::Materialize { file, with_content: !truncate }
-        } else if file.size == 0 {
-            VirtualOpen::Empty
-        } else {
-            VirtualOpen::Read(file)
-        })
-    }
+fn open_virtual(tree: &OutputTree, rel: &[u8], writing: bool, truncate: bool) -> Res<VirtualOpen> {
+    let file = tree.files.get(rel).cloned().ok_or(Errno(libc::ENOENT))?;
+    Ok(if writing {
+        VirtualOpen::Materialize { file, with_content: !truncate }
+    } else if file.size == 0 {
+        VirtualOpen::Empty
+    } else {
+        VirtualOpen::Read(file)
+    })
 }
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum How {
@@ -392,7 +303,13 @@ enum How {
 
 pub enum Reader {
     Whole(File),
-    Ranged(Arc<Partial>),
+    Ranged(Arc<dyn Ranged>),
+}
+
+/// A content that is read in ranges while the rest of it is still being fetched.
+pub trait Ranged: Send + Sync {
+    fn hash(&self) -> &Digest;
+    fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 }
 
 pub trait Source: Send + Sync {
@@ -421,8 +338,8 @@ pub struct OutFs {
     gid: u32,
     op_count: [AtomicU64; OPS.len()],
     op_nanos: [AtomicU64; OPS.len()],
-    pub opened_virtual: AtomicU64,
-    pub made_real: AtomicU64,
+    opened_virtual: AtomicU64,
+    made_real: AtomicU64,
 }
 
 fn errno(e: std::io::Error) -> Errno {
@@ -441,11 +358,6 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     p
 }
 
-fn below(prefix: &[u8]) -> Vec<u8> {
-    let mut p = prefix.to_vec();
-    p.push(b'/');
-    p
-}
 
 fn name_cookie(name: &[u8]) -> u64 {
     let h = blake3::hash(name);
@@ -454,6 +366,20 @@ fn name_cookie(name: &[u8]) -> u64 {
     assert!(c < 1 << 63);
     c
 }
+
+fn lookup<T>(tree: &OutputTree, rel: &[u8], real: Option<T>) -> Option<Kind<T>> {
+    if let Some(real) = real {
+        return Some(Kind::Real(real));
+    }
+    if rel.is_empty() {
+        return None;
+    }
+    if let Some(file) = tree.files.get(rel) {
+        return Some(Kind::Virtual(file.clone()));
+    }
+    tree.has_below(rel).then_some(Kind::VDir)
+}
+
 
 enum Kind<T = rargo_net::io::file::Stat> {
     Real(T),
@@ -472,12 +398,12 @@ impl OutFs {
             .unwrap_or_default();
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (uid, gid) = (rargo_net::io::process::euid(), rargo_net::io::process::egid());
         Ok(Arc::new(OutFs {
             under,
             _under_fd: fd,
             state: Mutex::new(Inodes { nodes, children: HashMap::new(), next: 2 }),
-            virt: std::sync::RwLock::new(OutputTree { files: virt, generation: 0 }),
+            virt: std::sync::RwLock::new(OutputTree::new(virt)),
             delivery: Mutex::new(()),
             handles: Mutex::new(HashMap::new()),
             registering: Mutex::new(std::collections::BTreeMap::new()),
@@ -499,7 +425,7 @@ impl OutFs {
     }
 
     fn timed(&self, op: &str) -> Timed<'_> {
-        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), std::time::Instant::now())
+        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), rargo_net::io::now())
     }
 
     pub fn op_report(&self) -> String {
@@ -542,6 +468,16 @@ impl OutFs {
         }
     }
 
+    /// How many times a file that exists only as its hash was opened.
+    pub fn opened_virtual(&self) -> u64 {
+        self.opened_virtual.load(Ordering::Relaxed)
+    }
+
+    /// How many files that existed only as their hash were written out as real files.
+    pub fn made_real(&self) -> u64 {
+        self.made_real.load(Ordering::Relaxed)
+    }
+
     pub fn virtual_count(&self) -> usize {
         self.virt.read().unwrap().files.len()
     }
@@ -552,7 +488,7 @@ impl OutFs {
 
     fn kind(&self, rel: &[u8]) -> Option<Kind> {
         let real = rargo_net::io::file::symlink_metadata(self.real(rel)).ok();
-        self.virt.read().unwrap().lookup(rel, real)
+        lookup(&self.virt.read().unwrap(), rel, real)
     }
 
     fn path(&self, id: u64) -> Res<Vec<u8>> {
@@ -640,9 +576,9 @@ impl OutFs {
         let mode = if v.exec { 0o755 } else { 0o644 };
         if with_content && v.size > 0 {
             let src = self.source.whole(&v.hash, v.size).map_err(errno)?;
-            let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", std::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
+            let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", rargo_net::io::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
             rargo_net::io::file::copy(&src, &tmp).map_err(errno)?;
-            rargo_net::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
+            rargo_net::io::file::set_mode(&tmp, mode).map_err(errno)?;
             rargo_net::io::file::rename(&tmp, &dst).map_err(|e| {
                 let _ = rargo_net::io::file::remove_file(&tmp);
                 errno(e)
@@ -847,7 +783,7 @@ impl OutFs {
             let Some(pid) = text.strip_prefix(crate::tmp::BESIDE).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<i32>().ok()) else {
                 continue;
             };
-            let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let alive = crate::kernel::kill(pid, 0).map_or_else(|e| e.raw_os_error() == Some(libc::EPERM), |()| true);
             if !alive && rargo_net::io::file::remove_file(e.path()).is_ok() {
                 self.changed(&join(&dir, name.as_bytes()));
             }
@@ -869,7 +805,7 @@ impl Filesystem for OutFs {
         let rel = join(&self.path(parent)?, name);
         let tree = self.virt.read().unwrap();
         let real = rargo_net::io::file::symlink_metadata(self.real(&rel)).ok();
-        match tree.lookup(&rel, real) {
+        match lookup(&tree, &rel, real) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
             None => Ok(Entry::negative(TTL)),
         }
@@ -905,7 +841,7 @@ impl Filesystem for OutFs {
                 match set.mtime {
                     Some(TimeSet::At(s, ns)) => v.mtime_ns = s * 1_000_000_000 + ns as i64,
                     Some(TimeSet::Now) => {
-                        v.mtime_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+                        v.mtime_ns = rargo_net::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
                     }
                     None => {}
                 }
@@ -923,7 +859,7 @@ impl Filesystem for OutFs {
             f.set_len(size).map_err(errno)?;
         }
         if let Some(mode) = set.mode {
-            rargo_net::io::file::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777)).map_err(errno)?;
+            rargo_net::io::file::set_mode(&path, mode & 0o7777).map_err(errno)?;
         }
         if set.atime.is_some() || set.mtime.is_some() {
             let spec = |t: Option<TimeSet>| match t {
@@ -933,9 +869,7 @@ impl Filesystem for OutFs {
             };
             let times = [spec(set.atime), spec(set.mtime)];
             let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-            if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-                return Err(Errno::last());
-            }
+            crate::kernel::set_times(&c, &times, libc::AT_SYMLINK_NOFOLLOW).map_err(errno)?;
         }
         self.getattr(ctx, nodeid, None)
     }
@@ -981,7 +915,7 @@ impl Filesystem for OutFs {
         if self.touches_virtual(&rel) {
             return Err(Errno(libc::EEXIST));
         }
-        let make = || std::fs::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
+        let make = || rargo_net::io::file::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
         match make() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.make_parents(&rel)?;
@@ -1186,7 +1120,7 @@ impl Filesystem for OutFs {
             Err(_) => {}
         }
         let truncate = keep & libc::O_TRUNC != 0;
-        let plan = self.virt.read().unwrap().open(&rel, acc != libc::O_RDONLY || truncate, truncate)?;
+        let plan = open_virtual(&self.virt.read().unwrap(), &rel, acc != libc::O_RDONLY || truncate, truncate)?;
         match plan {
             VirtualOpen::Empty => {
                 self.opened_virtual.fetch_add(1, Ordering::Relaxed);
@@ -1357,7 +1291,7 @@ impl Filesystem for OutFs {
                 return Ok(());
             }
         }
-        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| at.elapsed() < LISTING_KEPT).map(|(_, l)| l.clone()) };
+        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| rargo_net::io::now().saturating_duration_since(*at) < LISTING_KEPT).map(|(_, l)| l.clone()) };
         let listing = match cached {
             Some(l) => l,
             None => {
@@ -1391,9 +1325,9 @@ impl Filesystem for OutFs {
                 }
                 let mut all = self.listings.lock().unwrap();
                 if all.len() > 256 {
-                    all.retain(|_, (at, _)| at.elapsed() < LISTING_KEPT);
+                    all.retain(|_, (at, _)| rargo_net::io::now().saturating_duration_since(*at) < LISTING_KEPT);
                 }
-                all.insert(nodeid, (std::time::Instant::now(), l.clone()));
+                all.insert(nodeid, (rargo_net::io::now(), l.clone()));
                 l
             }
         };
@@ -1409,10 +1343,7 @@ impl Filesystem for OutFs {
     fn statfs(&self, _ctx: &Ctx, _nodeid: u64) -> Res<fuse_kstatfs> {
         let _t = self.timed("statfs");
         let c = std::ffi::CString::new(self.under.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-            return Err(Errno::last());
-        }
+        let s = crate::kernel::statvfs(&c).map_err(errno)?;
         Ok(fuse_kstatfs {
             blocks: s.f_blocks as u64,
             bfree: s.f_bfree as u64,
@@ -1430,6 +1361,7 @@ impl Filesystem for OutFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     #[test]
     fn listing_cookies_are_stable_and_ordered() {
@@ -1536,7 +1468,7 @@ mod tests {
                             })
                             .collect();
                         let changed = tree.apply(generation, as_edits);
-                        assert!(tree.invariants(), "seed {seed} step {step}");
+                        rargo_machine::check(&tree, format_args!("seed {seed} step {step}"));
                         if generation > applied {
                             applied = generation;
                             model_apply(&mut model, &edits);
@@ -1547,36 +1479,36 @@ mod tests {
                         assert_eq!(tree.generation, applied, "seed {seed} step {step}");
                         for path in &changed {
                             inodes.changed(path);
-                            assert!(inodes.invariants(), "seed {seed} step {step}");
+                            rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                             if let Some(before) = seen.remove(path) {
                                 let now = *walk(&mut inodes, path).last().unwrap();
-                                assert!(inodes.invariants());
+                                inodes.invariants();
                                 assert_ne!(now, before, "seed {seed} step {step}: a changed name gets a new inode");
                                 inodes.forget(now, 1);
-                                assert!(inodes.invariants());
+                                inodes.invariants();
                             }
                         }
                     }
                     4 => {
                         let path = PATHS[rng.below(PATHS.len())].as_bytes();
                         let ids = walk(&mut inodes, path);
-                        assert!(inodes.invariants(), "seed {seed} step {step}");
+                        rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                         assert_eq!(inodes.path(*ids.last().unwrap()).ok().unwrap(), path);
                         seen.insert(path.to_vec(), *ids.last().unwrap());
                         if rng.below(2) == 0 {
                             for id in ids.iter().rev() {
                                 inodes.forget(*id, 1);
-                                assert!(inodes.invariants(), "seed {seed} step {step}");
+                                rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                             }
                             seen.remove(path);
                         }
                     }
                     5 => {
                         let path = PATHS[rng.below(PATHS.len())].as_bytes();
-                        if let Ok(VirtualOpen::Read(file)) = tree.open(path, false, false) {
+                        if let Ok(VirtualOpen::Read(file)) = open_virtual(&tree, path, false, false) {
                             assert_eq!(model.get(path).map(|f| f.hash), Some(file.hash), "seed {seed} step {step}: an open sees the newest tree");
                             let content = Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel: path.to_vec() });
-                            assert!(content.invariants());
+                            content.invariants();
                             handles.push((file.hash, content));
                         }
                     }
@@ -1600,7 +1532,7 @@ mod tests {
                         let proven = *blake3::hash(&served).as_bytes();
                         let content = if ranged { Content::Ranged(served) } else { Content::Open(served) };
                         let result = handles[h].1.fetched(&request, &proven, content);
-                        assert!(handles[h].1.invariants(), "seed {seed} step {step}");
+                        rargo_machine::check(&handles[h].1, format_args!("seed {seed} step {step}"));
                         assert_eq!(result.is_err(), proven != request.hash, "seed {seed} step {step}: a completion is refused exactly when its bytes are not the content asked for");
                         refused += usize::from(result.is_err());
                     }
@@ -1619,12 +1551,13 @@ mod tests {
                     }
                     _ => {}
                 }
-                assert!(tree.invariants() && inodes.invariants(), "seed {seed} step {step}");
+                rargo_machine::check(&tree, format_args!("seed {seed} step {step}"));
+                rargo_machine::check(&inodes, format_args!("seed {seed} step {step}"));
                 assert_eq!(tree.files.keys().collect::<Vec<_>>(), model.keys().collect::<Vec<_>>(), "seed {seed} step {step}: the tree is the newest delivery's");
                 for path in PATHS {
                     let path = path.as_bytes();
                     let want = model.get(path).map(|file| file.hash);
-                    let got = match tree.lookup::<()>(path, None) {
+                    let got = match lookup::<()>(&tree, path, None) {
                         Some(Kind::Virtual(file)) => Some(file.hash),
                         Some(Kind::VDir) => {
                             let prefix = below(path);
@@ -1640,22 +1573,62 @@ mod tests {
         assert!(reads > 1000 && refused > 100 && stale > 100, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
     }
 
-    #[test]
-    fn replacing_output_detaches_the_name_without_reusing_its_inode() {
+    enum Ev {
+        Lookup(u64, &'static str),
+        Changed(&'static str),
+        Path(u64),
+        Forget(u64, u64),
+    }
+
+    /// Steps an inode table holding only the root through the events, checking it after each, and lists what
+    /// each step gave back.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
         let mut state = Inodes { nodes, children: HashMap::new(), next: 2 };
-        let old = state.lookup(ROOT, b"app");
-        assert!(state.invariants());
-        assert_eq!(state.changed(b"app"), (ROOT, b"app".to_vec()));
-        assert!(state.invariants());
-        let new = state.lookup(ROOT, b"app");
-        assert!(state.invariants());
-        assert_ne!(old, new);
-        assert_eq!(state.path(new).ok().unwrap(), b"app");
-        assert_eq!(state.forget(old, 1), [old]);
-        assert!(state.invariants());
-        assert_eq!(state.lookup(ROOT, b"app"), new);
-        assert!(state.invariants());
+        state.invariants();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Lookup(parent, name) => format!("lookup {parent} {name} => {}", state.lookup(parent, name.as_bytes())),
+                Ev::Changed(path) => {
+                    let (parent, name) = state.changed(path.as_bytes());
+                    format!("changed {path} => detached {} from {parent}", text(&name))
+                }
+                Ev::Path(node) => format!("path {node} => {:?}", state.path(node).map(|p| text(&p)).map_err(|e| e.0)),
+                Ev::Forget(node, n) => format!("forget {node} {n} => {:?}", state.forget(node, n)),
+            };
+            state.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn replacing_output_detaches_the_name_without_reusing_its_inode() {
+        let events = [
+            Ev::Lookup(ROOT, "app"),
+            Ev::Changed("app"),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Path(3),
+            Ev::Path(2),
+            Ev::Forget(2, 1),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Forget(3, 2),
+            Ev::Lookup(ROOT, "app"),
+        ];
+        expect![[r#"
+            lookup 1 app => 2
+            changed app => detached app from 1
+            lookup 1 app => 3
+            path 3 => Ok("app")
+            path 2 => Ok("app")
+            forget 2 1 => [2]
+            lookup 1 app => 3
+            forget 3 2 => [3]
+            lookup 1 app => 4
+        "#]].assert_eq(&run(events));
     }
 }

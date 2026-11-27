@@ -1,0 +1,122 @@
+{
+  "devlo": {
+    "login": "devloai[bot]",
+    "trigger": {
+      "comment": "/devlo-review"
+    },
+    "trigger_as": "kevkevmurrayfalcon-stack",
+    "repos": [
+      "kevkevmurrayfalcon-stack/review_mux"
+    ],
+    "done": {
+      "review": true
+    },
+    "quota": [
+      "devlo is paused for this organization because it is out of credits"
+    ],
+    "cost": {
+      "credits": 6
+    },
+    "quality": 0.7,
+    "timeout_min": 15
+  },
+  "ellipsis": {
+    "login": "ellipsis-dev[bot]",
+    "trigger": {
+      "comment": "@ellipsis review this PR for bugs"
+    },
+    "trigger_as": "sadosystems",
+    "repos": [
+      "Clavigers/review_mux",
+      "Clavigers/rargo2"
+    ],
+    "done": {
+      "comment": "(?s).+"
+    },
+    "clean": "(?i)(didn't|did not) find any (bugs|issues)|found no (bugs|issues)",
+    "cost": {
+      "usd": 0.2
+    },
+    "quality": 0.9,
+    "timeout_min": 15
+  },
+  "coderabbit": {
+    "login": "coderabbitai[bot]",
+    "trigger": {
+      "comment": "@coderabbitai review"
+    },
+    "trigger_as": "sadosystems",
+    "done": {
+      "check_run": "CodeRabbit"
+    },
+    "quota": [
+      "rate limited by coderabbit.ai",
+      "used all free OSS reviews"
+    ],
+    "ignore": [
+      "skip review by coderabbit.ai",
+      "auto-generated reply by CodeRabbit"
+    ],
+    "quality": 0.6,
+    "timeout_min": 20
+  },
+  "greptile": {
+    "login": "greptile-apps[bot]",
+    "trigger": {
+      "comment": "@greptileai"
+    },
+    "trigger_as": "sadosystems",
+    "done": {
+      "comment": "greptile_summary"
+    },
+    "quota": [
+      "greptile-credit-pause",
+      "run out of review credits"
+    ],
+    "blocks": "greptile_confidence_score:[0-3]\\b",
+    "quality": 0.6,
+    "timeout_min": 15
+  },
+  "codeant": {
+    "login": "codeant-ai[bot]",
+    "trigger": {
+      "comment": "@codeant-ai: review"
+    },
+    "trigger_as": "sadosystems",
+    "done": {
+      "comment": "CodeAnt PR Risk"
+    },
+    "ignore": [
+      "Thanks for using CodeAnt",
+      "CodeAnt Review Status"
+    ],
+    "blocks": "(?i)(medium|high|critical) risk",
+    "quality": 0.4,
+    "timeout_min": 15
+  },
+  "qodo": {
+    "login": "qodo-code-review[bot]",
+    "trigger": {
+      "comment": "/agentic_review"
+    },
+    "trigger_as": "sadosystems",
+    "done": {
+      "comment": "Code Review by Qodo"
+    },
+    "blocks": "(?i)View (critical|high|medium) \\(\\d+\\)",
+    "quality": 0.6,
+    "timeout_min": 15
+  },
+  "graphite": {
+    "login": "graphite-app[bot]",
+    "trigger": {
+      "description": "/graphite-review"
+    },
+    "trigger_as": "sadosystems",
+    "done": {
+      "check_run": "Graphite / AI Reviews"
+    },
+    "quality": 0.5,
+    "timeout_min": 20
+  }
+}

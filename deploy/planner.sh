@@ -1,60 +1,39 @@
 #!/bin/bash
 # deploy/planner.sh SRC PLANNER BUILD
-# Brings the planner checkout PLANNER (the cargo fork) to SRC/forks/cargo: BASE
-# plus every patch there, applying the patches it does not have yet, and builds
-# it against SRC/crates/rargo-plan in BUILD (a worktree of PLANNER), so that
-# PLANNER itself stays clean. Prints the path of the built planner.
+# Builds the planner (the cargo fork) for the release checked out in SRC:
+# PLANNER, a checkout of cargo that belongs to the deploy, is set to
+# SRC/forks/cargo/BASE plus every patch there (so a release that adds a patch
+# gets it), built against SRC/crates/rargo-plan with its target in BUILD, and
+# left clean. Prints the path of the built planner.
 set -euo pipefail
 src=$1 planner=$2 build=$3
-stop() {
-    echo "deploy/planner.sh: the planner checkout $planner $1" >&2
-    echo "$2" >&2
+fail() {
+    echo "deploy/planner.sh: $1" >&2
     exit 1
 }
-forks=$src/forks/cargo
-patches=("$forks"/*.patch)
-[ -e "${patches[0]}" ] || { echo "deploy/planner.sh: $forks has no patches" >&2; exit 1; }
-n=${#patches[@]}
-[ -z "$(git -C "$planner" status --porcelain)" ] ||
-    stop "is not clean" "Commit what belongs in the fork (and export it to forks/cargo with forks/export.sh) or discard the changes, then deploy again."
-base=$(git -C "$planner" rev-parse -q --verify "$(cat "$forks/BASE")^{commit}") ||
-    stop "does not have the commit $(cat "$forks/BASE") (forks/cargo/BASE)" "Fetch it (git -C $planner fetch origin), then deploy again."
-git -C "$planner" merge-base --is-ancestor "$base" HEAD ||
-    stop "is not based on $(cat "$forks/BASE") (forks/cargo/BASE)" "Check out BASE plus the patches in forks/cargo (forks/setup.sh shows how), then deploy again."
-mapfile -t have < <(git -C "$planner" rev-list --reverse "$base..HEAD")
-[ "${#have[@]}" -le "$n" ] ||
-    stop "has ${#have[@]} commits on BASE, more than the $n patches in forks/cargo" "Export the fork's commits to forks/cargo (forks/export.sh) and release them, or reset the checkout to BASE plus the $n patches."
-subject() {
-    awk '/^$/ { exit } /^Subject: / { s = substr($0, 10); on = 1; next } on && /^[ \t]/ { s = s $0; next } { on = 0 }
-        END { sub(/^\[PATCH[^]]*\] /, "", s); print s }' "$1"
-}
-for i in "${!have[@]}"; do
-    [ "$(git -C "$planner" log -1 --format=%s "${have[$i]}")" = "$(subject "${patches[$i]}")" ] ||
-        stop "has $(git -C "$planner" log -1 --format='%h "%s"' "${have[$i]}") where forks/cargo has $(basename "${patches[$i]}")" \
-            "Reset the checkout to BASE plus the first $i patches in forks/cargo (the deploy applies the rest), or export the fork's commits (forks/export.sh) and release them."
-done
-if [ "${#have[@]}" -lt "$n" ]; then
-    echo "applying $((n - ${#have[@]})) of the $n patches to the planner checkout" >&2
-    am() { git -C "$planner" -c user.name=rargo -c user.email=noreply@rargo.invalid am "$@"; }
-    am -q "${patches[@]:${#have[@]}}" || {
-        am --abort || true
-        stop "does not take $(basename "${patches[${#have[@]}]}") (git am failed on it, and nothing was applied)" "Rebase the patches onto the checkout by hand, export them (forks/export.sh) and release them."
-    }
-fi
-head=$(git -C "$planner" rev-parse HEAD)
-git -C "$planner" worktree prune
-common() { git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null; }
-if [ -d "$build/src" ] && [ "$(common "$build/src")" = "$(common "$planner")" ]; then
-    git -C "$build/src" checkout -q --force --detach "$head"
-else
-    rm -rf "$build/src"
-    mkdir -p "$build"
-    git -C "$planner" worktree add -q --force --detach "$build/src" "$head"
-fi
-plan=$src/crates/rargo-plan
-sed -i "s|^rargo-plan = { path = \"[^\"]*\" }|rargo-plan = { path = \"$plan\" }|" "$build/src/Cargo.toml"
-grep -qxF "rargo-plan = { path = \"$plan\" }" "$build/src/Cargo.toml" ||
-    stop "has no line rargo-plan = { path = \"...\" } in its Cargo.toml" "The first patch in forks/cargo should add the rargo-plan path dependency."
-(cd "$build/src" && CFG_RELEASE_CHANNEL=stable CARGO_TARGET_DIR=$build/target cargo build --release --bin cargo >&2)
-[ -z "$(git -C "$planner" status --porcelain)" ] || stop "was left changed by the build" "This is a bug in deploy/planner.sh."
-echo "$build/target/release/cargo"
+plan_src=$src/crates/rargo-plan
+base=$(cat "$src/forks/cargo/BASE")
+[ -d "$planner/.git" ] || git clone -q "${RARGO_CARGO_URL:-https://github.com/rust-lang/cargo.git}" "$planner" || fail "cannot clone cargo into $planner"
+git -C "$planner" cat-file -e "$base^{commit}" 2>/dev/null || git -C "$planner" fetch -q origin || fail "cannot fetch cargo into $planner"
+# git am needs an identity even to abort (none may be configured), and a git am
+# a stopped deploy left half done must be aborted, or the next one cannot start.
+am() { git -C "$planner" -c user.name=rargo -c user.email=noreply@rargo.invalid am "$@"; }
+[ ! -d "$(git -C "$planner" rev-parse --path-format=absolute --git-path rebase-apply)" ] || am --abort || fail "cannot abort the git am left in $planner"
+git -C "$planner" checkout -q -f --detach "$base" || fail "cargo has no commit $base (forks/cargo/BASE)"
+git -C "$planner" clean -qfdx
+am -q "$src/forks/cargo/"*.patch \
+    || fail "the patches in forks/cargo do not apply to cargo $base"
+grep -qF 'rargo-plan = { path = "/root/rargo/crates/rargo-plan" }' "$planner/Cargo.toml" \
+    || fail "the planner's Cargo.toml does not name rargo-plan as forks/cargo/0001 does, so it cannot be pointed at $plan_src"
+sed -i "s|/root/rargo/crates/rargo-plan|$plan_src|" "$planner/Cargo.toml"
+(cd "$planner" && CARGO_TARGET_DIR=$build CFG_RELEASE_CHANNEL=stable cargo build --release --bin cargo >&2) \
+    || fail "cannot build the planner against $plan_src"
+plan_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$plan_src/Cargo.toml" | head -n 1)
+used=$(cd "$planner" && cargo tree --offline -e normal -i rargo-plan --depth 0) || fail "cannot read which rargo-plan the planner was built against"
+[ "$used" = "rargo-plan v$plan_version ($plan_src)" ] \
+    || fail "the planner was built against '$used', not rargo-plan v$plan_version ($plan_src)"
+# The build changed Cargo.toml (and Cargo.lock, for the new rargo-plan
+# version): put them back, so the checkout is left as the patches made it.
+git -C "$planner" checkout -q -f HEAD -- .
+[ -z "$(git -C "$planner" status --porcelain)" ] || fail "the build left $planner changed"
+echo "$build/release/cargo"

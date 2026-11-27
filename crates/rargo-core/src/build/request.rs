@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use super::pure::{missing_components, needs_network};
 use std::collections::BTreeSet;
 
@@ -265,8 +266,10 @@ impl BuildRequest {
         }
         self.end(End::Cancelled)
     }
+}
 
-    pub fn invariants(&self) {
+impl StateMachine for BuildRequest {
+    fn invariants(&self) {
         assert!(self.check || !self.as_build, "only a check is planned as a build");
         assert!(self.installing.is_subset(&self.retried), "a unit installs components only on its one retry");
         match self.phase {
@@ -294,6 +297,8 @@ impl BuildRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     const MISSING_MIRI: &[u8] =
         b"error: 'cargo-miri' is not installed for the toolchain 'nightly-x86_64-unknown-linux-gnu'.\n\
@@ -310,105 +315,142 @@ note: offline mode (via `--offline`) can sometimes cause surprising resolution f
 
     const COMPILE_ERROR: &[u8] = b"error[E0425]: cannot find value `x` in this scope\n";
 
-    fn miri() -> Component {
-        ("miri".into(), "nightly-x86_64-unknown-linux-gnu".into())
-    }
-
     #[test]
     fn a_plan_missing_a_component_installs_it_with_the_fetch_and_plans_again() {
+        let mut outcomes = Transcript::default();
         let (mut r, fx) = BuildRequest::new(false, false, false);
-        assert_eq!(fx, [Effect::Prepare]);
-        assert_eq!(r.prepared(), [Effect::Plan { as_build: false }]);
-        assert_eq!(r.plan_failed(MISSING_MIRI, 101), [Effect::Fetch { components: vec![miri()], offline: false }]);
-        assert_eq!(r.fetched(true), [Effect::Prepare]);
-        assert_eq!(r.prepared(), [Effect::Plan { as_build: false }]);
-        assert_eq!(r.plan_failed(MISSING_MIRI, 101), [Effect::ShowPlanFailure, Effect::End(End::Code(101))]);
+        outcomes.record("effects", fx);
+        outcomes.record("prepared", r.prepared());
+        outcomes.record("plan failed", r.plan_failed(MISSING_MIRI, 101));
+        outcomes.record("fetched", r.fetched(true));
+        outcomes.record("prepared", r.prepared());
+        outcomes.record("plan failed", r.plan_failed(MISSING_MIRI, 101));
         r.invariants();
+        expect![[r#"
+            effects: [Prepare]
+            prepared: [Plan { as_build: false }]
+            plan failed: [Fetch { components: [("miri", "nightly-x86_64-unknown-linux-gnu")], offline: false }]
+            fetched: [Prepare]
+            prepared: [Plan { as_build: false }]
+            plan failed: [ShowPlanFailure, End(Code(101))]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn an_offline_plan_needing_the_network_shows_cargo_s_failure() {
+        let mut outcomes = Transcript::default();
         let (mut r, _) = BuildRequest::new(false, false, true);
         r.prepared();
-        assert_eq!(r.plan_failed(OFFLINE, 101), [Effect::ShowPlanFailure, Effect::End(End::Code(101))]);
+        outcomes.record("plan failed", r.plan_failed(OFFLINE, 101));
         let (mut r, _) = BuildRequest::new(false, false, true);
         r.prepared();
-        assert_eq!(
-            r.plan_failed(MISSING_CLIPPY, 101),
-            [Effect::Fetch {
-                components: vec![("clippy".into(), "stable-x86_64-unknown-linux-gnu".into())],
-                offline: true
-            }],
-            "offline still installs components"
-        );
+        // offline still installs components.
+        outcomes.record("plan failed", r.plan_failed(MISSING_CLIPPY, 101));
+        expect![[r#"
+            plan failed: [ShowPlanFailure, End(Code(101))]
+            plan failed: [Fetch { components: [("clippy", "stable-x86_64-unknown-linux-gnu")], offline: true }]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_check_is_planned_as_a_build_when_the_compiler_is_a_fork() {
+        let mut outcomes = Transcript::default();
         let (mut r, _) = BuildRequest::new(true, false, false);
         r.prepared();
-        assert_eq!(r.planned(true, 2, false), [Effect::RememberFork(true), Effect::Plan { as_build: true }]);
-        assert_eq!(r.planned(true, 2, false), [Effect::RunUnits]);
+        outcomes.record("planned", r.planned(true, 2, false));
+        outcomes.record("planned", r.planned(true, 2, false));
         assert!(r.as_build());
         let (mut r, _) = BuildRequest::new(false, true, false);
         r.prepared();
-        assert_eq!(r.planned(true, 1, false), [Effect::RunUnits], "only a check changes how it is planned");
+        // only a check changes how it is planned.
+        outcomes.record("planned", r.planned(true, 1, false));
+        expect![[r#"
+            planned: [RememberFork(true), Plan { as_build: true }]
+            planned: [RunUnits]
+            planned: [RunUnits]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_failed_unit_stops_its_dependents_and_the_build_reports_it() {
+        let mut outcomes = Transcript::default();
         let (mut r, _) = BuildRequest::new(false, false, false);
         r.prepared();
         r.planned(false, 3, false);
         assert!(r.may_start(0));
-        assert_eq!(r.dep(0, false), Go::Wait);
-        assert_eq!(r.unit_failed(0, COMPILE_ERROR), OnFailure::Report);
+        outcomes.record("dep", r.dep(0, false));
+        outcomes.record("unit failed", r.unit_failed(0, COMPILE_ERROR));
         r.unit_ended(0, Unit::Failed);
-        assert_eq!(r.dep(0, true), Go::Skip);
+        outcomes.record("dep", r.dep(0, true));
         r.unit_ended(1, Unit::Skipped);
         assert!(!r.may_start(2), "after a failure nothing new starts unless asked to keep going");
         r.unit_ended(2, Unit::Skipped);
-        assert_eq!(r.units_ended(), (false, vec![Effect::End(End::Code(101))]));
+        outcomes.record("units ended", r.units_ended());
         r.invariants();
+        expect![[r#"
+            dep: Wait
+            unit failed: Report
+            dep: Skip
+            units ended: (false, [End(Code(101))])
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_unit_missing_a_component_installs_it_once_and_runs_again() {
+        let mut outcomes = Transcript::default();
         let (mut r, _) = BuildRequest::new(false, false, false);
         r.prepared();
         r.planned(false, 2, true);
         assert!(r.may_start(0) && r.may_start(1));
-        assert_eq!(r.unit_failed(0, MISSING_MIRI), OnFailure::Install(vec![miri()]));
-        assert_eq!(r.unit_failed(1, MISSING_MIRI), OnFailure::Install(vec![]), "the other waits for the same install");
+        outcomes.record("unit failed", r.unit_failed(0, MISSING_MIRI));
+        // the other waits for the same install.
+        outcomes.record("unit failed", r.unit_failed(1, MISSING_MIRI));
         assert!(r.components_installed(0, true));
         assert!(r.components_installed(1, true));
-        assert_eq!(r.unit_failed(0, MISSING_MIRI), OnFailure::Report, "one retry");
+        // one retry.
+        outcomes.record("unit failed", r.unit_failed(0, MISSING_MIRI));
         r.unit_ended(0, Unit::Failed);
         r.unit_ended(1, Unit::Done);
-        assert_eq!(r.units_ended().1, [Effect::End(End::Code(101))]);
+        outcomes.record("units ended", r.units_ended().1);
         r.invariants();
+        expect![[r#"
+            unit failed: Install([("miri", "nightly-x86_64-unknown-linux-gnu")])
+            unit failed: Install([])
+            unit failed: Report
+            units ended: [End(Code(101))]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn inconsistent_artifacts_retry_the_request_and_a_whole_build_is_delivered() {
+        let mut outcomes = Transcript::default();
         let (mut r, _) = BuildRequest::new(false, false, false);
         r.prepared();
         r.planned(false, 1, false);
         r.may_start(0);
         r.unit_inconsistent(0);
         r.unit_ended(0, Unit::Failed);
-        assert_eq!(r.units_ended(), (false, vec![Effect::End(End::Retry)]));
+        outcomes.record("units ended", r.units_ended());
         let (mut r, _) = BuildRequest::new(false, false, false);
         r.prepared();
         r.planned(false, 1, false);
         r.may_start(0);
         r.unit_meta(0);
-        assert_eq!(r.dep(0, true), Go::Ready);
-        assert_eq!(r.dep(0, false), Go::Wait);
+        outcomes.record("dep", r.dep(0, true));
+        outcomes.record("dep", r.dep(0, false));
         r.unit_ended(0, Unit::Done);
-        assert_eq!(r.units_ended(), (true, vec![Effect::Deliver]));
-        assert_eq!(r.delivered(0), [Effect::End(End::Code(0))]);
-        assert_eq!(r.cancel(), [], "an ended request has nothing to cancel");
+        outcomes.record("units ended", r.units_ended());
+        outcomes.record("delivered", r.delivered(0));
+        // an ended request has nothing to cancel.
+        outcomes.record("cancel", r.cancel());
+        expect![[r#"
+            units ended: (false, [End(Retry)])
+            dep: Ready
+            dep: Wait
+            units ended: (true, [Deliver])
+            delivered: [End(Code(0))]
+            cancel: []
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

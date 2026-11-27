@@ -16,7 +16,7 @@ index 7dc1636..4ad78a5 100644
      let lines = LINES.get_or_init(|| {
          #[allow(clippy::disallowed_methods)]
 -        let raw = std::env::var(rp::UNUSED_ENV).unwrap_or_default();
-+        let raw = rp::joined_env(rp::UNUSED_ENV);
++        let raw = rp::joined_env(rp::UNUSED_ENV, |name| std::env::var(name).ok());
          serde_json::from_str(&raw).unwrap_or_default()
      });
      let (desc, line) = lines.get(&idx)?;

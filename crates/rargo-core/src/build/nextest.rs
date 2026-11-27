@@ -1,5 +1,6 @@
 use super::nextest_run::{Asked, Effect as NextEffect, NextestRun, TestAsked, exit_code};
 use super::*;
+use crate::io::http::{self as outbound, Failure};
 use std::io::Read;
 
 const AT: &[u8] = b"/rargo/nextest";
@@ -144,7 +145,7 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                     let r = rounds.nextest(d, c, &p, &argv, &answers, &ran)?;
                     let asked: Vec<TestAsked> = rounds
                         .asked
-                        .lock()
+                        .borrow_mut()
                         .iter()
                         .map(|q| TestAsked { key: q.key.clone(), listing: q.listing })
                         .collect();
@@ -182,7 +183,7 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             }
             NextEffect::RunTests(keys) => {
                 let rounds = rounds.as_ref().expect("tests run in the rounds");
-                let asked = std::mem::take(&mut *rounds.asked.lock());
+                let asked = std::mem::take(&mut *rounds.asked.borrow_mut());
                 let mut runs = TestRuns(Vec::new());
                 for key in keys {
                     let q = asked.iter().find(|q| q.key == key).expect("the core runs what nextest asked").clone();
@@ -257,7 +258,7 @@ fn ask(
     let base = with_nextest(d, p, nextest);
     let view: Arc<dyn View> = Arc::new(BuildView {
         base,
-        layer: Arc::new(OutputsLayer::new()),
+        layer: Arc::new(OutputsLayer::frozen(OutputState::default())),
         levels: Arc::new(Vec::new()),
         untraced: Vec::new(),
         seed: Some(answer_layer(d, answers, &HashMap::new())?),
@@ -288,7 +289,7 @@ struct Rounds {
     levels: Arc<Vec<u8>>,
     env: BTreeMap<Vec<u8>, Vec<u8>>,
     tests_view: Arc<dyn View>,
-    asked: Mutex<Vec<TestQuestion>>,
+    asked: RefCell<Vec<TestQuestion>>,
 }
 
 impl Rounds {
@@ -303,7 +304,7 @@ impl Rounds {
         let base = with_nextest(d, p, nextest);
         let (layer, levels) = match built {
             Some(b) => (b.layer.clone(), Arc::new(vec![LEVEL_FULL; b.units])),
-            None => (Arc::new(OutputsLayer::new()), Arc::new(Vec::new())),
+            None => (Arc::new(OutputsLayer::frozen(OutputState::default())), Arc::new(Vec::new())),
         };
         let mut env = match built {
             Some(b) => action_env(&b.env, b.cargo_override.as_deref(), c),
@@ -325,7 +326,7 @@ impl Rounds {
             seed: None,
             content: Some(d.engine.content.clone()),
         });
-        Rounds { base, layer, levels, env, tests_view, asked: Mutex::new(Vec::new()) }
+        Rounds { base, layer, levels, env, tests_view, asked: RefCell::new(Vec::new()) }
     }
 
     fn nextest(
@@ -362,7 +363,7 @@ impl Rounds {
             })?
             .result;
         let store = d.store();
-        let mut asked = self.asked.lock();
+        let mut asked = self.asked.borrow_mut();
         asked.clear();
         for (path, e) in &r.outputs.entries {
             if let (true, MEntry::File { hash, .. }) = (is_test_question(path), e)
@@ -621,9 +622,9 @@ fn answer_layer(d: &Daemon, answers: &Answers, ran: &HashMap<String, Ran>) -> Re
         file(&format!("{what}.err"), &a.err, false)?;
         file(&format!("{what}.code"), format!("{}\n", a.code).as_bytes(), false)?;
     }
-    let layer = OutputsLayer::new();
+    let mut layer = OutputState::default();
     layer.add(0, LEVEL_FULL, &entries);
-    Ok(Arc::new(layer))
+    Ok(Arc::new(OutputsLayer::frozen(layer)))
 }
 
 fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -> Result<Answer> {
@@ -666,7 +667,7 @@ fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -
 }
 
 fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer, Option<Built>)> {
-    let kept = Arc::new(Mutex::new(Vec::new()));
+    let kept = std::rc::Rc::new(RefCell::new(Vec::new()));
     let cb = Arc::new(Client {
         args: args.clone(),
         root: c.root.clone(),
@@ -685,14 +686,14 @@ fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer,
         outbox: c.outbox.clone(),
         targets: c.targets.clone(),
     });
-    let keep = Mutex::new(None);
+    let keep = RefCell::new(None);
     let mut code = 101;
     for attempt in 0..3 {
-        kept.lock().clear();
+        kept.borrow_mut().clear();
         match run_request(d, &cb, Some(&keep)) {
             Ok(Finish::Code(k)) => code = k,
             Ok(Finish::Retry) if attempt < 2 => {
-                cb.outbox.lock().0.clear();
+                cb.outbox.borrow_mut().0.clear();
                 continue;
             }
             Ok(Finish::Retry) => c.out.error("the build kept producing inconsistent intermediate artifacts"),
@@ -705,7 +706,7 @@ fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer,
         (c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
         (c.cargo_home.clone(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned()),
     ]);
-    let out = back.text(&String::from_utf8_lossy(&kept.lock())).into_bytes();
+    let out = back.text(&String::from_utf8_lossy(&kept.borrow_mut())).into_bytes();
     Ok((Answer { args, out, err: Vec::new(), code }, keep.into_inner()))
 }
 
@@ -788,29 +789,31 @@ fn newest_release(dir: &Path) -> Result<String> {
     let note = dir.join("newest-release");
     let fresh = crate::io::file::metadata(&note)
         .and_then(|m| m.modified())
-        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < std::time::Duration::from_secs(24 * 3600)));
+        .is_ok_and(|t| crate::io::system_now().duration_since(t).is_ok_and(|age| age < std::time::Duration::from_secs(24 * 3600)));
     if fresh
         && let Some(v) = crate::io::file::read_to_string(&note).ok().map(|s| s.trim().to_string()).filter(|v| version_of(v).is_some())
     {
         return Ok(v);
     }
     let url = format!("{RELEASES}/latest");
-    let r = match agent(false).get(&url).call() {
-        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => bail!("asking {url} for the newest nextest release: {e}"),
+    let r = match outbound::fetch(&request(&url, 0, 0)) {
+        Ok(r) => r,
+        Err(Failure::Send(e)) => bail!("asking {url} for the newest nextest release: {e}"),
+        Err(Failure::Body(e)) => bail!("asking {url} for the newest nextest release: {e}"),
     };
     let tag = r
-        .header("location")
+        .location
+        .as_deref()
         .and_then(|l| l.rsplit('/').next())
         .map(str::to_string)
-        .with_context(|| format!("{url} did not name the newest release (HTTP {})", r.status()))?;
+        .with_context(|| format!("{url} did not name the newest release (HTTP {})", r.status))?;
     let version = tag
         .strip_prefix("cargo-nextest-")
         .filter(|v| version_of(v).is_some())
         .with_context(|| format!("{url} names `{tag}`, which is not a nextest release"))?
         .to_string();
     crate::io::file::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".newest-release.{}", std::process::id()));
+    let tmp = dir.join(format!(".newest-release.{}", crate::io::process::id()));
     crate::io::file::write(&tmp, &version)?;
     crate::io::file::rename(&tmp, &note)?;
     Ok(version)
@@ -834,32 +837,39 @@ fn newest_installed(dir: &Path) -> Option<PathBuf> {
         .map(|(_, b)| b)
 }
 
-fn agent(follow: bool) -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .redirects(if follow { 5 } else { 0 })
-        .timeout(std::time::Duration::from_secs(120))
-        .user_agent(concat!("rargod/", env!("CARGO_PKG_VERSION")))
-        .build()
+/// A GET of `url` that follows up to `redirects` redirects and reads up to `body_limit` bytes of the answer.
+fn request(url: &str, redirects: u32, body_limit: u64) -> outbound::Request<'_> {
+    outbound::Request {
+        method: "GET",
+        url,
+        headers: &[],
+        form: None,
+        redirects: Some(redirects),
+        user_agent: Some(concat!("rargod/", env!("CARGO_PKG_VERSION"))),
+        timeout: std::time::Duration::from_secs(120),
+        body_limit,
+    }
+}
+
+/// The body of `url`, or why it could not be downloaded.
+fn download(url: &str) -> Result<Vec<u8>> {
+    let answer = match outbound::fetch(&request(url, 5, 512 << 20)) {
+        Ok(answer) => answer,
+        Err(Failure::Send(e)) => return Err(anyhow!(e)).with_context(|| format!("downloading {url}")),
+        Err(Failure::Body(e)) => return Err(e).with_context(|| format!("downloading {url}")),
+    };
+    match answer.refused {
+        Some(said) => Err(anyhow!(said)).with_context(|| format!("downloading {url}")),
+        None => Ok(answer.body),
+    }
 }
 
 fn install(dir: &Path, version: &str) -> Result<PathBuf> {
     let triple = format!("{}-unknown-linux-musl", std::env::consts::ARCH);
     let base = format!("{RELEASES}/download/cargo-nextest-{version}/cargo-nextest-{version}-{triple}");
-    let get = |url: &str| -> Result<Vec<u8>> {
-        let mut body = Vec::new();
-        agent(true)
-            .get(url)
-            .call()
-            .with_context(|| format!("downloading {url}"))?
-            .into_reader()
-            .take(512 << 20)
-            .read_to_end(&mut body)
-            .with_context(|| format!("downloading {url}"))?;
-        Ok(body)
-    };
-    let sums = String::from_utf8(get(&format!("{base}.sha256"))?).unwrap_or_default();
+    let sums = String::from_utf8(download(&format!("{base}.sha256"))?).unwrap_or_default();
     let want = sums.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
-    let archive = get(&format!("{base}.tar.gz"))?;
+    let archive = download(&format!("{base}.tar.gz"))?;
     let got = {
         use sha2::Digest;
         format!("{:x}", sha2::Sha256::digest(&archive))
@@ -878,18 +888,15 @@ fn install(dir: &Path, version: &str) -> Result<PathBuf> {
         }
     }
     let program = program.with_context(|| format!("{base}.tar.gz holds no `cargo-nextest`"))?;
-    let tmp = dir.join(format!(".{version}.{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = dir.join(format!(".{version}.{}", crate::io::process::id()));
+    let _ = crate::io::file::remove_dir_all(&tmp);
     crate::io::file::create_dir_all(&tmp)?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let bin = tmp.join("cargo-nextest");
-        crate::io::file::write(&bin, &program)?;
-        crate::io::file::set_permissions(&bin, std::fs::Permissions::from_mode(0o755))?;
-    }
+    let bin = tmp.join("cargo-nextest");
+    crate::io::file::write(&bin, &program)?;
+    crate::io::file::set_mode(&bin, 0o755)?;
     let to = dir.join(version);
     if let Err(e) = crate::io::file::rename(&tmp, &to) {
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = crate::io::file::remove_dir_all(&tmp);
         if !to.join("cargo-nextest").ring_is_file() {
             return Err(e).with_context(|| format!("installing nextest {version} at {}", to.display()));
         }
@@ -969,13 +976,15 @@ mod tests {
 
     #[test]
     fn the_newest_installed_version_is_used() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(newest_installed(tmp.path()), None);
-        for v in ["0.9.9", "0.9.152", "0.9.100", "1.0", ".0.9.200.123"] {
-            std::fs::create_dir_all(tmp.path().join(v)).unwrap();
-            std::fs::write(tmp.path().join(v).join("cargo-nextest"), b"").unwrap();
-        }
-        std::fs::create_dir_all(tmp.path().join("0.10.0")).unwrap();
-        assert_eq!(newest_installed(tmp.path()), Some(tmp.path().join("0.9.152/cargo-nextest")));
+        crate::io::sim::test(|| {
+            let tmp = crate::io::sim::tempdir();
+            assert_eq!(newest_installed(&tmp), None);
+            for v in ["0.9.9", "0.9.152", "0.9.100", "1.0", ".0.9.200.123"] {
+                crate::io::file::create_dir_all(tmp.join(v)).unwrap();
+                crate::io::file::write(tmp.join(v).join("cargo-nextest"), b"").unwrap();
+            }
+            crate::io::file::create_dir_all(tmp.join("0.10.0")).unwrap();
+            assert_eq!(newest_installed(&tmp), Some(tmp.join("0.9.152/cargo-nextest")));
+        });
     }
 }

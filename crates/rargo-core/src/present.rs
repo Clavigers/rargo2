@@ -83,17 +83,14 @@ impl Translator {
     }
 
     pub fn to_canonical(&self, p: &str) -> String {
-        for (canon, real) in &self.pairs {
-            if p == real {
-                return canon.clone();
-            }
-            if let Some(rest) = p.strip_prefix(real.as_str()) {
-                if rest.starts_with('/') {
-                    return format!("{canon}{rest}");
-                }
-            }
-        }
-        p.to_string()
+        self.pairs
+            .iter()
+            .filter_map(|(canon, real)| {
+                let rest = p.strip_prefix(real.as_str())?;
+                (rest.is_empty() || rest.starts_with('/')).then_some((real.len(), canon, rest))
+            })
+            .max_by_key(|(len, _, _)| *len)
+            .map_or_else(|| p.to_string(), |(_, canon, rest)| format!("{canon}{rest}"))
     }
 }
 
@@ -150,7 +147,7 @@ pub struct Output {
     pub quiet: bool,
     pub verbose: bool,
     pub tr: Translator,
-    kept: Option<std::sync::Arc<parking_lot::Mutex<Vec<u8>>>>,
+    kept: Option<std::rc::Rc<std::cell::RefCell<Vec<u8>>>>,
 }
 
 impl Output {
@@ -170,7 +167,7 @@ impl Output {
         }
     }
 
-    pub fn keeping_stdout(&self, into: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Output {
+    pub fn keeping_stdout(&self, into: std::rc::Rc<std::cell::RefCell<Vec<u8>>>) -> Output {
         Output { kept: Some(into), ..self.derive(self.quiet, self.verbose, self.tr.clone()) }
     }
 
@@ -186,7 +183,7 @@ impl Output {
 
     pub fn raw_out(&self, b: &[u8]) {
         if let Some(k) = &self.kept {
-            k.lock().extend_from_slice(b);
+            k.borrow_mut().extend_from_slice(b);
             return;
         }
         if !b.is_empty() {

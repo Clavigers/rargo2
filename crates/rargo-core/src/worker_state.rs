@@ -1,3 +1,4 @@
+use rargo_machine::StateMachine;
 use crate::hash::Hash;
 use crate::remote::WLooked;
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,11 @@ pub trait Carried {
     type Serve: Debug;
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(
+    serialize = "C::Run: serde::Serialize, C::Part: serde::Serialize, C::Serve: serde::Serialize",
+    deserialize = "C::Run: serde::Deserialize<'de>, C::Part: serde::Deserialize<'de>, C::Serve: serde::Deserialize<'de>"
+))]
 pub enum FromServer<C: Carried> {
     Welcome,
     Ask { rid: u64, serve: Option<C::Serve> },
@@ -24,7 +29,8 @@ pub enum FromServer<C: Carried> {
     Other,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound(serialize = "C::Run: serde::Serialize", deserialize = "C::Run: serde::Deserialize<'de>"))]
 pub struct Run<C: Carried> {
     pub action: u64,
     pub incoming: Vec<Hash>,
@@ -205,6 +211,8 @@ impl<C: Carried> Worker<C> {
     }
 
     fn run(&mut self, run: Run<C>, has: &dyn Fn(&Hash) -> bool, now_ms: u64) -> Vec<Effect<C>> {
+        assert_eq!(self.link, Link::Up, "a run comes over a link");
+        let action = run.action;
         let mut fx = Vec::new();
         if let Some(old) = self.by_action.remove(&run.action) {
             let act = self.end(old);
@@ -223,13 +231,20 @@ impl<C: Carried> Worker<C> {
             closed: run.closed.into_iter().collect(),
             opened: BTreeMap::new(),
         };
-        if missing.is_empty() {
+        let starts = missing.is_empty();
+        if starts {
             fx.push(Effect::Start { token, action: run.action, run: run.run });
         } else {
             act.waiting = Some(Waiting { missing, since_ms: now_ms, run: run.run });
         }
-        self.acts.insert(token, act);
-        self.by_action.insert(run.action, token);
+        assert!(self.acts.insert(token, act).is_none(), "run {token} gets a fresh token");
+        assert!(self.by_action.insert(action, token).is_none(), "action {action} has one current run");
+        assert_eq!(self.acts[&token].waiting.is_none(), starts, "run {token} starts now or waits for its inputs");
+        assert_eq!(
+            fx.iter().filter(|e| matches!(e, Effect::Start { .. })).count(),
+            usize::from(starts),
+            "a run starts at most once, and only with all its inputs here"
+        );
         fx
     }
 
@@ -238,26 +253,34 @@ impl<C: Carried> Worker<C> {
         let stale: Vec<u64> = self.asks.iter().filter(|(_, (t, _))| *t == token).map(|(ticket, _)| *ticket).collect();
         for ticket in stale {
             let (t, q) = self.asks.remove(&ticket).expect("listed");
-            self.asking.remove(&(t, q));
+            assert_eq!(self.asking.remove(&(t, q)), Some(ticket), "each ask is listed both ways");
         }
+        assert!(!self.acts.contains_key(&token), "run {token} is gone once it ended");
+        assert!(self.asks.values().all(|(t, _)| *t != token), "an ended run {token} leaves no ask behind");
+        assert_eq!(self.asks.len(), self.asking.len());
         act
     }
 
     fn start_ready(&mut self, ready: impl Fn(&Waiting<C::Run>) -> bool) -> Vec<Effect<C>> {
         let tokens: Vec<u64> =
             self.acts.iter().filter(|(_, a)| a.waiting.as_ref().is_some_and(&ready)).map(|(t, _)| *t).collect();
-        tokens
-            .into_iter()
-            .map(|token| {
+        let fx: Vec<Effect<C>> = tokens
+            .iter()
+            .map(|&token| {
                 let act = self.acts.get_mut(&token).expect("listed");
                 let w = act.waiting.take().expect("waiting");
                 Effect::Start { token, action: act.action, run: w.run }
             })
-            .collect()
+            .collect();
+        assert_eq!(fx.len(), tokens.len(), "each ready run starts once");
+        assert!(tokens.iter().all(|t| self.acts[t].waiting.is_none()), "a started run no longer waits");
+        assert!(self.acts.values().all(|a| a.waiting.as_ref().is_none_or(|w| !ready(w))), "no ready run is left waiting");
+        fx
     }
 
     pub fn assembled(&mut self, blob: Hash) -> Vec<Effect<C>> {
         if self.link == Link::Down {
+            assert!(self.acts.is_empty(), "a blob assembled after the link went has no run to start");
             return Vec::new();
         }
         for a in self.acts.values_mut() {
@@ -267,14 +290,24 @@ impl<C: Carried> Worker<C> {
         }
         let mut fx = vec![Effect::Stored { blob }];
         fx.extend(self.start_ready(|w| w.missing.is_empty()));
+        assert!(
+            self.acts.values().all(|a| a.waiting.as_ref().is_none_or(|w| !w.missing.is_empty() && !w.missing.contains(&blob))),
+            "no run waits for the stored blob, nor for nothing"
+        );
         fx
     }
 
     pub fn tick(&mut self, now_ms: u64) -> Vec<Effect<C>> {
         if self.link == Link::Down {
+            assert!(self.acts.is_empty(), "no run waits without a link");
             return Vec::new();
         }
-        self.start_ready(|w| now_ms >= w.since_ms + ANNOUNCED_WAIT_MS)
+        let fx = self.start_ready(|w| now_ms >= w.since_ms + ANNOUNCED_WAIT_MS);
+        assert!(
+            self.acts.values().all(|a| a.waiting.as_ref().is_none_or(|w| now_ms < w.since_ms + ANNOUNCED_WAIT_MS)),
+            "no run waits past its wait"
+        );
+        fx
     }
 
     pub fn ended(&mut self, token: u64) -> Vec<Effect<C>> {
@@ -326,9 +359,14 @@ impl<C: Carried> Worker<C> {
     }
 
     pub fn answered(&mut self, ticket: u64, reply: Option<Reply>) {
-        let Some((token, q)) = self.asks.remove(&ticket) else { return };
-        self.asking.remove(&(token, q.clone()));
+        let Some((token, q)) = self.asks.remove(&ticket) else {
+            assert!(self.asking.values().all(|t| *t != ticket), "an unknown ticket {ticket} is asked nowhere");
+            return;
+        };
+        assert_eq!(self.asking.remove(&(token, q.clone())), Some(ticket), "ticket {ticket} is listed both ways");
+        assert_eq!(self.asks.len(), self.asking.len());
         let act = self.acts.get_mut(&token).expect("an ask's run is known while it is asked");
+        assert!(act.waiting.is_none(), "only a started run {token} is answered");
         match (q, reply) {
             (Query::Lookup { dir, name }, Some(Reply::Looked(w))) => {
                 act.entries.insert((dir, name), w);
@@ -355,20 +393,24 @@ impl<C: Carried> Worker<C> {
             return Need::Have;
         }
         if self.link == Link::Down {
+            assert!(self.fetching.is_empty(), "nothing is fetched without a link");
             return Need::Gone;
         }
         if self.fetching.contains(&h) || self.announced(&h) {
             return Need::Wait;
         }
-        self.fetching.insert(h);
+        assert!(self.fetching.insert(h), "a blob is fetched once at a time");
         Need::Fetch
     }
 
     pub fn fetched(&mut self, h: Hash) {
         self.fetching.remove(&h);
+        assert!(!self.fetching.contains(&h), "a fetched blob is no longer being fetched");
     }
+}
 
-    pub fn invariants(&self) {
+impl<C: Carried> StateMachine for Worker<C> {
+    fn invariants(&self) {
         if self.link == Link::Down {
             assert!(self.acts.is_empty() && self.asks.is_empty(), "no run outlives its link");
             assert!(self.fetching.is_empty() && self.partial.is_empty());
@@ -377,6 +419,10 @@ impl<C: Carried> Worker<C> {
         for (action, token) in &self.by_action {
             assert_eq!(self.acts.get(token).map(|a| a.action), Some(*action));
         }
+        assert!(
+            self.acts.keys().chain(self.asks.keys()).all(|t| *t <= self.next_token),
+            "every token and ticket was handed out"
+        );
         assert_eq!(self.asks.len(), self.asking.len());
         for (ticket, key) in &self.asks {
             assert_eq!(self.asking.get(key), Some(ticket), "one ask per question");
@@ -397,6 +443,8 @@ impl<C: Carried> Worker<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     #[derive(Debug)]
     struct T;
@@ -430,89 +478,115 @@ mod tests {
         w
     }
 
-    fn started(fx: &[Effect<T>]) -> Vec<(u64, &'static str)> {
-        fx.iter()
-            .filter_map(|e| match e {
-                Effect::Start { action, run, .. } => Some((*action, *run)),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn an_action_runs_once_all_of_its_inputs_are_here() {
+        let mut outcomes = Transcript::default();
         let mut w = up();
         let have = |x: &Hash| *x == h(1);
         let fx = w.server(run(7, vec![h(1), h(2), h(3)], "rustc"), &have, 0);
-        assert!(fx.is_empty(), "inputs 2 and 3 are still coming");
+        // inputs 2 and 3 are still coming.
+        outcomes.record("effects", fx);
         w.invariants();
-        assert_eq!(w.server(FromServer::Push { blob: h(2), first: false, of: 2, part: 1 }, &have, 1).len(), 0);
+        outcomes.record("push tail", w.server(FromServer::Push { blob: h(2), first: false, of: 2, part: 1 }, &have, 1));
         let fx = w.server(FromServer::Push { blob: h(2), first: true, of: 2, part: 0 }, &have, 2);
-        assert!(matches!(&fx[..], [Effect::Assemble { blob, parts }] if *blob == h(2) && parts == &[1, 0]));
+        outcomes.record("effects", fx);
         let fx = w.assembled(h(2));
-        assert!(matches!(fx[..], [Effect::Stored { .. }]), "one input is still coming");
+        // one input is still coming.
+        outcomes.record("effects", fx);
         w.invariants();
         let fx = w.server(FromServer::Push { blob: h(3), first: true, of: 1, part: 0 }, &have, 3);
-        assert_eq!(fx.len(), 1);
+        outcomes.record("push only part", fx);
         let fx = w.assembled(h(3));
-        assert_eq!(started(&fx), vec![(7, "rustc")]);
+        outcomes.record("start", fx);
         w.invariants();
         let fx = w.server(run(8, vec![h(1)], "cc"), &have, 4);
-        assert_eq!(started(&fx), vec![(8, "cc")], "an action whose inputs are all here runs at once");
+        // an action whose inputs are all here runs at once.
+        outcomes.record("start", fx);
         w.invariants();
+        expect![[r#"
+            effects: []
+            push tail: []
+            effects: [Assemble { blob: 0202020202020202, parts: [1, 0] }]
+            effects: [Stored { blob: 0202020202020202 }]
+            push only part: [Assemble { blob: 0303030303030303, parts: [0] }]
+            start: [Stored { blob: 0303030303030303 }, Start { token: 1, action: 7, run: "rustc" }]
+            start: [Start { token: 2, action: 8, run: "cc" }]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn an_input_that_never_comes_is_fetched_after_the_wait() {
+        let mut outcomes = Transcript::default();
         let mut w = up();
-        assert!(w.server(run(1, vec![h(9)], "x"), &|_| false, 100).is_empty());
-        assert_eq!(w.need(h(9), false), Need::Wait, "an announced input is waited for, not fetched");
-        assert!(w.tick(100 + ANNOUNCED_WAIT_MS - 1).is_empty());
+        outcomes.record("server", w.server(run(1, vec![h(9)], "x"), &|_| false, 100));
+        // an announced input is waited for, not fetched.
+        outcomes.record("need", w.need(h(9), false));
+        outcomes.record("tick", w.tick(100 + ANNOUNCED_WAIT_MS - 1));
         let fx = w.tick(100 + ANNOUNCED_WAIT_MS);
-        assert_eq!(started(&fx), vec![(1, "x")]);
-        assert_eq!(w.need(h(9), false), Need::Fetch, "after the wait the run fetches it itself");
-        assert_eq!(w.need(h(9), false), Need::Wait, "and once");
+        outcomes.record("start", fx);
+        // after the wait the run fetches it itself.
+        outcomes.record("need", w.need(h(9), false));
+        // and once.
+        outcomes.record("need", w.need(h(9), false));
         w.fetched(h(9));
-        assert_eq!(w.need(h(9), true), Need::Have);
+        outcomes.record("need", w.need(h(9), true));
         w.invariants();
+        expect![[r#"
+            server: []
+            need: Wait
+            tick: []
+            start: [Start { token: 1, action: 1, run: "x" }]
+            need: Fetch
+            need: Wait
+            need: Have
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn missing_files_are_asked_for_once() {
+        let mut outcomes = Transcript::default();
         let mut w = up();
         let fx = w.server(run(3, vec![], "rustc"), &|_| true, 0);
         let Effect::Start { token, .. } = fx[0] else { panic!("runs") };
         let q = Query::Lookup { dir: b"/w".to_vec(), name: b"lib.rs".to_vec() };
-        assert_eq!(
-            w.query(token, Query::Lookup { dir: b"/w".to_vec(), name: b"known".to_vec() }),
-            Asked::Known(Reply::Looked(WLooked::Other))
-        );
-        assert_eq!(
-            w.query(token, Query::Lookup { dir: b"/w/closed".to_vec(), name: b"b".to_vec() }),
-            Asked::Known(Reply::Looked(WLooked::Absent)),
-            "a name missing from a closed directory is absent without asking"
-        );
+        outcomes.record("query", w.query(token, Query::Lookup { dir: b"/w".to_vec(), name: b"known".to_vec() }));
+        // a name missing from a closed directory is absent without asking.
+        outcomes.record("query", w.query(token, Query::Lookup { dir: b"/w/closed".to_vec(), name: b"b".to_vec() }));
         let Asked::Ask { ticket, action: 3 } = w.query(token, q.clone()) else { panic!("the server is asked") };
-        assert_eq!(w.query(token, q.clone()), Asked::Wait, "a second reader waits for the same answer");
+        // a second reader waits for the same answer.
+        outcomes.record("query", w.query(token, q.clone()));
         w.invariants();
         let file = WLooked::File { size: 3, mode: 0o644, own: false, hash: None, sem: None };
         w.answered(ticket, Some(Reply::Looked(file.clone())));
-        assert_eq!(w.query(token, q.clone()), Asked::Known(Reply::Looked(file)));
+        outcomes.record("query", w.query(token, q.clone()));
         let open = Query::Open { dir: b"/w".to_vec(), name: b"lib.rs".to_vec() };
         let Asked::Ask { ticket, .. } = w.query(token, open.clone()) else { panic!("opened once") };
         w.answered(ticket, Some(Reply::Opened(Ok(h(4)))));
-        assert_eq!(w.query(token, open), Asked::Known(Reply::Opened(Ok(h(4)))));
+        outcomes.record("query", w.query(token, open));
         let list = Query::List { dir: b"/w/src".to_vec() };
         let Asked::Ask { ticket, .. } = w.query(token, list.clone()) else { panic!("listed once") };
         w.answered(ticket, Some(Reply::Listing(Err(2))));
-        assert!(matches!(w.query(token, list), Asked::Ask { .. }), "a failed listing is asked again");
-        assert_eq!(w.need(h(5), false), Need::Fetch);
-        assert_eq!(w.need(h(5), false), Need::Wait, "content is fetched once at a time");
+        // a failed listing is asked again.
+        outcomes.record("query", w.query(token, list));
+        outcomes.record("need", w.need(h(5), false));
+        // content is fetched once at a time.
+        outcomes.record("need", w.need(h(5), false));
         w.invariants();
+        expect![[r#"
+            query: Known(Looked(Other))
+            query: Known(Looked(Absent))
+            query: Wait
+            query: Known(Looked(File { size: 3, mode: 420, own: false, hash: None, sem: None }))
+            query: Known(Opened(Ok(0404040404040404)))
+            query: Ask { ticket: 5, action: 3 }
+            need: Fetch
+            need: Wait
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_server_restart_is_survived() {
+        let mut outcomes = Transcript::default();
         let mut w = up();
         let fx = w.server(run(1, vec![], "a"), &|_| true, 0);
         let Effect::Start { token: old, .. } = fx[0] else { panic!("runs") };
@@ -520,48 +594,67 @@ mod tests {
         w.server(FromServer::Push { blob: h(1), first: true, of: 2, part: 0 }, &|_| false, 0);
         let Asked::Ask { ticket, .. } = w.query(old, Query::List { dir: b"/w".to_vec() }) else { panic!() };
         let fx = w.link_lost();
-        assert!(
-            matches!(fx[..], [Effect::Abort { token }, Effect::Connect { after_ms: RECONNECT_MS }] if token == old)
-        );
+        outcomes.record("effects", fx);
         w.invariants();
-        assert_eq!(w.query(old, Query::List { dir: b"/w".to_vec() }), Asked::Gone, "a reader of a lost run is told so");
+        // a reader of a lost run is told so.
+        outcomes.record("query", w.query(old, Query::List { dir: b"/w".to_vec() }));
         w.answered(ticket, None);
-        assert_eq!(w.need(h(1), false), Need::Gone);
-        assert!(matches!(w.connect_failed(false)[..], [Effect::Connect { after_ms: RECONNECT_MS }]), "it keeps trying");
-        assert!(matches!(w.connected()[..], [Effect::Hello]), "and says hello to the new server");
+        outcomes.record("need", w.need(h(1), false));
+        // it keeps trying.
+        outcomes.record("connect failed", w.connect_failed(false));
+        // and says hello to the new server.
+        outcomes.record("connected", w.connected());
         let fx = w.server(run(1, vec![], "a again"), &|_| true, 10);
         let Effect::Start { token: new, .. } = fx[0] else { panic!("runs") };
         assert_ne!(new, old);
-        assert!(w.ended(old).is_empty(), "the old run's end reports nothing");
-        assert!(matches!(w.ended(new)[..], [Effect::Report { action: 1, .. }]));
-        assert!(w.ended(new).is_empty(), "a run reports once");
+        // the old run's end reports nothing.
+        outcomes.record("ended", w.ended(old));
+        outcomes.record("ended", w.ended(new));
+        // a run reports once.
+        outcomes.record("ended", w.ended(new));
         w.invariants();
         let (mut first, _) = Worker::<T>::new();
-        assert!(matches!(first.connect_failed(false)[..], [Effect::Quit]), "a server never reached is an error");
-        assert!(matches!(first.connect_failed(true)[..], [Effect::Connect { after_ms: 0 }]));
+        // a server never reached is an error.
+        outcomes.record("connect failed", first.connect_failed(false));
+        outcomes.record("connect failed", first.connect_failed(true));
+        expect![[r#"
+            effects: [Abort { token: 1 }, Connect { after_ms: 1000 }]
+            query: Gone
+            need: Gone
+            connect failed: [Connect { after_ms: 1000 }]
+            connected: [Hello]
+            ended: []
+            ended: [Report { token: 4, action: 1 }]
+            ended: []
+            connect failed: [Quit]
+            connect failed: [Connect { after_ms: 0 }]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_cancel_stops_a_running_action_and_forgets_a_waiting_one() {
+        let mut outcomes = Transcript::default();
         let mut w = up();
         let fx = w.server(run(1, vec![], "a"), &|_| true, 0);
         let Effect::Start { token, .. } = fx[0] else { panic!() };
-        assert!(
-            matches!(w.server(FromServer::Cancel { action: 1 }, &|_| true, 0)[..], [Effect::Abort { token: t }] if t == token)
-        );
-        assert!(w.ended(token).is_empty(), "a cancelled run reports nothing");
+        outcomes.record("server", w.server(FromServer::Cancel { action: 1 }, &|_| true, 0));
+        // a cancelled run reports nothing.
+        outcomes.record("ended", w.ended(token));
         w.server(run(2, vec![h(3)], "b"), &|_| false, 0);
-        assert!(w.server(FromServer::Cancel { action: 2 }, &|_| false, 0).is_empty());
-        assert_eq!(started(&w.assembled(h(3))), vec![], "a cancelled waiting run never starts");
-        assert!(matches!(
-            w.server(FromServer::Ask { rid: 4, serve: None }, &|_| true, 0)[..],
-            [Effect::Refuse { rid: 4 }]
-        ));
-        assert!(matches!(
-            w.server(FromServer::Ask { rid: 5, serve: Some("blob") }, &|_| true, 0)[..],
-            [Effect::Serve { rid: 5, .. }]
-        ));
+        outcomes.record("server", w.server(FromServer::Cancel { action: 2 }, &|_| false, 0));
+        // a cancelled waiting run never starts.
+        outcomes.record("assemble after cancel", w.assembled(h(3)));
+        outcomes.record("server", w.server(FromServer::Ask { rid: 4, serve: None }, &|_| true, 0));
+        outcomes.record("server", w.server(FromServer::Ask { rid: 5, serve: Some("blob") }, &|_| true, 0));
         w.invariants();
+        expect![[r#"
+            server: [Abort { token: 1 }]
+            ended: []
+            server: []
+            assemble after cancel: [Stored { blob: 0303030303030303 }]
+            server: [Refuse { rid: 4 }]
+            server: [Serve { rid: 5, serve: "blob" }]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

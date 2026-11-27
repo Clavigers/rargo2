@@ -1,10 +1,10 @@
 use anyhow::{Result, bail};
 use rargo_plan::{BuildOutput, Cmd, LinkArgKind, LinkArgTarget, token};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub type Scripts = HashMap<String, Arc<BuildOutput>>;
+pub type Scripts = BTreeMap<String, Arc<BuildOutput>>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Tok<'a> {

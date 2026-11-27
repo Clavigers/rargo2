@@ -1,10 +1,12 @@
+use rargo_machine::StateMachine;
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::io::http::{self as outbound, Failure};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const PENDING_FOR_MS: u64 = 600_000;
 const MAX_PENDING: usize = 1000;
@@ -32,17 +34,33 @@ struct AuthState {
 impl AuthState {
     fn sweep(&mut self, now: u64) {
         self.pending.retain(|_, p| now.saturating_sub(p.made) < PENDING_FOR_MS);
+        assert!(self.pending.values().all(|p| now.saturating_sub(p.made) < PENDING_FOR_MS), "a swept state holds no expired login");
+        self.invariants();
     }
 
     fn begin(&mut self, device: String, code: String, now: u64) -> bool {
+        let before = self.pending.len();
         if device.is_empty() || code.is_empty() || self.pending.values().any(|p| p.code == code) || self.pending.contains_key(&device) {
+            assert_eq!(self.pending.len(), before, "a refused begin adds no login");
             return false;
         }
-        self.pending.insert(device, Pending { code, made: now, tries: 0, granted: None, denied: false, state: None });
+        self.pending.insert(device.clone(), Pending { code: code.clone(), made: now, tries: 0, granted: None, denied: false, state: None });
+        assert_eq!(self.pending.len(), before + 1, "a begin adds one login");
+        assert!(
+            self.pending.get(&device).is_some_and(|p| p.code == code && p.tries == 0 && p.granted.is_none() && !p.denied && p.state.is_none()),
+            "login {device} begins fresh with its code"
+        );
         true
     }
 
     fn poll(&mut self, device: &str, now: u64) -> serde_json::Value {
+        let answer = self.answer(device, now);
+        let pending = answer["status"] == "pending";
+        assert_eq!(self.pending.contains_key(device), pending, "a poll keeps login {device} only while it is pending");
+        answer
+    }
+
+    fn answer(&mut self, device: &str, now: u64) -> serde_json::Value {
         let Some(pending) = self.pending.get(device) else {
             return serde_json::json!({ "status": "expired" });
         };
@@ -56,6 +74,7 @@ impl AuthState {
         }
         if pending.granted.is_some() {
             let (token, user) = self.pending.remove(device).and_then(|p| p.granted).expect("a granted sign-in holds its token");
+            assert!(!token.is_empty() && !user.is_empty(), "an approved poll hands over a token for a user");
             return serde_json::json!({ "status": "approved", "token": token, "user": user });
         }
         serde_json::json!({ "status": "pending" })
@@ -71,15 +90,19 @@ impl AuthState {
         if pending.granted.is_some() {
             anyhow::bail!("this code has been confirmed already");
         }
+        assert!(pending.code == code && pending.granted.is_none(), "authorize hands out only the waiting login {code}");
         Ok(pending)
     }
 
     fn invite_attempt(&mut self, code: &str, now: u64) -> Result<()> {
         let pending = self.authorize(code, now)?;
+        let tries = pending.tries;
         if !pending.denied {
             pending.tries += 1;
             pending.denied = pending.tries > MAX_TRIES;
         }
+        assert!(pending.tries == tries || pending.tries == tries + 1, "an invitation counts as one try");
+        assert!(pending.tries <= MAX_TRIES + 1, "login {code} stops counting once denied");
         if pending.denied {
             anyhow::bail!("too many wrong invitations for this code: run `rargo auth` again");
         }
@@ -87,40 +110,57 @@ impl AuthState {
     }
 
     fn grant(&mut self, code: &str, token: String, user: String) -> bool {
-        match self.pending.values_mut().find(|p| p.code == code) {
+        let granted = match self.pending.values_mut().find(|p| p.code == code) {
             Some(p) if !p.denied && p.granted.is_none() => {
+                assert!(!token.is_empty() && !user.is_empty(), "login {code} is granted a token for a user");
                 p.granted = Some((token, user));
                 true
             }
             _ => false,
-        }
+        };
+        assert!(!granted || self.pending.values().any(|p| p.code == code && p.granted.is_some()), "a grant leaves login {code} granted");
+        granted
     }
 
-    fn take_github(&mut self, state: &str, now: u64) -> Option<String> {
+    fn take_github(&self, state: &str, now: u64) -> Option<String> {
         self.pending.values().find(|p| p.state.as_deref() == Some(state) && now.saturating_sub(p.made) < PENDING_FOR_MS).map(|p| p.code.clone())
     }
 
     fn grant_github(&mut self, state: &str, token: String, user: String) -> Option<String> {
-        match self.pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
+        let code = match self.pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
             Some(p) if !p.denied && p.granted.is_none() => {
+                assert!(!token.is_empty() && !user.is_empty(), "a GitHub sign-in is granted a token for a user");
                 let code = p.code.clone();
                 p.granted = Some((token, user));
                 p.state = None;
                 Some(code)
             }
             _ => None,
-        }
+        };
+        assert!(
+            code.as_ref().is_none_or(|c| self.pending.values().any(|p| &p.code == c && p.granted.is_some() && p.state.is_none())),
+            "a GitHub grant leaves its login granted and its sign-in spent"
+        );
+        code
     }
+}
 
-    fn invariants(&self) -> bool {
-        self.pending.len() <= MAX_PENDING
-            && self.pending.values().all(|p| {
-                !p.code.is_empty()
-                    && p.tries <= MAX_TRIES + 1
-                    && !(p.denied && p.granted.is_some())
-                    && p.granted.as_ref().is_none_or(|(token, user)| !token.is_empty() && !user.is_empty())
-            })
-            && self.pending.values().map(|p| p.code.as_str()).collect::<std::collections::BTreeSet<_>>().len() == self.pending.len()
+impl StateMachine for AuthState {
+    fn invariants(&self) {
+        assert!(self.pending.len() <= MAX_PENDING, "{} logins pending, over {MAX_PENDING}", self.pending.len());
+        for p in self.pending.values() {
+            assert!(!p.code.is_empty(), "a pending login has a code");
+            assert!(p.tries <= MAX_TRIES + 1, "login {} was tried {} times, over {}", p.code, p.tries, MAX_TRIES + 1);
+            assert!(!(p.denied && p.granted.is_some()), "login {} is not both denied and granted", p.code);
+            assert!(!p.denied || p.tries > MAX_TRIES, "login {} is denied only after {} wrong invitations", p.code, MAX_TRIES);
+            assert!(
+                p.granted.as_ref().is_none_or(|(token, user)| !token.is_empty() && !user.is_empty()),
+                "login {} is granted a token for a user",
+                p.code
+            );
+        }
+        let codes: std::collections::BTreeSet<_> = self.pending.values().map(|p| p.code.as_str()).collect();
+        assert_eq!(codes.len(), self.pending.len(), "every pending login has its own code");
     }
 }
 
@@ -241,15 +281,19 @@ struct Phase {
     wait: Option<Wait>,
 }
 
-impl Phase {
-    fn invariants(&self) -> bool {
+impl StateMachine for Phase {
+    fn invariants(&self) {
         match &self.wait {
-            Some(Wait::Draw(DrawNext::Code { device })) => !device.is_empty(),
-            Some(Wait::Redeem { code, .. }) => !code.is_empty() && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
-            Some(Wait::Exchange { terminal, oauth_state, .. } | Wait::User { terminal, oauth_state } | Wait::Allow { terminal, oauth_state, .. } | Wait::Create { terminal, oauth_state }) => {
-                !terminal.is_empty() && !oauth_state.is_empty()
+            Some(Wait::Draw(DrawNext::Code { device })) => assert!(!device.is_empty(), "drawing a code is for a device"),
+            Some(Wait::Redeem { code, .. }) => {
+                assert!(!code.is_empty(), "a code to redeem is not empty");
+                assert!(code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()), "code {code:?} is upper-case letters and digits");
             }
-            _ => true,
+            Some(Wait::Exchange { terminal, oauth_state, .. } | Wait::User { terminal, oauth_state } | Wait::Allow { terminal, oauth_state, .. } | Wait::Create { terminal, oauth_state }) => {
+                assert!(!terminal.is_empty(), "a login in progress has a terminal");
+                assert!(!oauth_state.is_empty(), "a login in progress has an OAuth state");
+            }
+            _ => {}
         }
     }
 }
@@ -258,7 +302,7 @@ impl Phase {
 struct Request {
     method: String,
     path: String,
-    query: HashMap<String, String>,
+    query: BTreeMap<String, String>,
     host: String,
     body: Vec<u8>,
     json: bool,
@@ -353,7 +397,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn form(s: &str) -> HashMap<String, String> {
+fn form(s: &str) -> BTreeMap<String, String> {
     s.split('&').filter(|p| !p.is_empty()).map(|p| {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
         (percent_decode(k), percent_decode(v))
@@ -546,7 +590,8 @@ fn intake(buf: &mut Vec<u8>, item: ReadItem) -> Intake {
 /// GitHub calls and token-store writes leave as effects.
 fn handle(state: &mut AuthState, phase: &mut Phase, event: Event, cfg: &Cfg, now: u64) -> Act {
     let act = step(state, phase, event, cfg, now);
-    assert!(state.invariants() && phase.invariants());
+    state.invariants();
+    phase.invariants();
     act
 }
 
@@ -793,7 +838,7 @@ fn parse_request(buf: &[u8]) -> Result<Option<Request>> {
 }
 
 fn next_item(stream: &mut rargo_net::io::TcpStream, deadline: Instant) -> ReadItem {
-    let remain = deadline.saturating_duration_since(Instant::now());
+    let remain = deadline.saturating_duration_since(crate::io::now());
     if remain.is_zero() {
         return ReadItem::Socket(ErrorKind::TimedOut, "timed out".into());
     }
@@ -838,7 +883,7 @@ fn write_outcome(stream: &mut rargo_net::io::TcpStream, outcome: &Outcome) -> Re
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    crate::io::system_now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 pub struct Http {
@@ -846,12 +891,12 @@ pub struct Http {
     public: Option<String>,
     port: u16,
     state: Option<std::path::PathBuf>,
-    pending: parking_lot::Mutex<AuthState>,
+    pending: std::cell::RefCell<AuthState>,
 }
 
 impl Http {
     pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
-        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(AuthState::default()) }
+        Http { keys, public, port, state: None, pending: std::cell::RefCell::new(AuthState::default()) }
     }
 
     pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
@@ -879,7 +924,7 @@ impl Http {
 
     pub fn serve(&self, mut stream: rargo_net::io::TcpStream) -> Result<()> {
         let mut buf = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = crate::io::now() + Duration::from_secs(20);
         let req = loop {
             match intake(&mut buf, next_item(&mut stream, deadline)) {
                 Intake::More => {}
@@ -894,9 +939,10 @@ impl Http {
         let mut event = Event::Request(req);
         loop {
             let act = {
-                let mut st = self.pending.lock();
+                let mut st = self.pending.borrow_mut();
                 let act = handle(&mut st, &mut phase, event, &cfg, now);
-                assert!(st.invariants() && phase.invariants());
+                st.invariants();
+                phase.invariants();
                 act
             };
             match act {
@@ -950,37 +996,67 @@ impl Http {
 }
 
 fn github_url() -> String {
-    std::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
+    crate::io::env::var("RARGO_GITHUB_URL").unwrap_or_else(|_| "https://github.com".into()).trim_end_matches('/').to_string()
 }
 
 fn github_api() -> String {
-    std::env::var("RARGO_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').to_string()
+    crate::io::env::var("RARGO_GITHUB_API").unwrap_or_else(|_| "https://api.github.com".into()).trim_end_matches('/').to_string()
 }
 
-fn agent(timeout_secs: u64) -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(Duration::from_secs(timeout_secs)).build()
+/// The most bytes of an answer that are read as its text.
+const TEXT_LIMIT: usize = 10 * 1024 * 1024;
+
+/// The text of GitHub's answer to `request`, or what went wrong, which `asking` introduces.
+fn answer_text(request: &outbound::Request, asking: &str) -> Result<String, String> {
+    let answer = match outbound::fetch(request) {
+        Ok(answer) => answer,
+        Err(Failure::Send(e)) => return Err(format!("{asking}: {e}")),
+        Err(Failure::Body(e)) => return Err(format!("{:#}", anyhow!(e).context("reading GitHub's answer"))),
+    };
+    if let Some(said) = answer.refused {
+        return Err(format!("{asking}: {said}"));
+    }
+    if answer.body.len() > TEXT_LIMIT {
+        return Err("reading GitHub's answer: response too big for into_string".into());
+    }
+    Ok(String::from_utf8_lossy(&answer.body).to_string())
 }
 
 fn post_form(url: &str, accept: &str, fields: &[(&'static str, String)], timeout_secs: u64) -> Result<String, String> {
     let owned: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    agent(timeout_secs).post(url).set("Accept", accept).send_form(&owned).map_err(|e| anyhow!("asking GitHub: {e}")).and_then(|r| r.into_string().context("reading GitHub's answer")).map_err(|e| format!("{e:#}"))
+    let request = outbound::Request {
+        method: "POST",
+        url,
+        headers: &[("Accept", accept)],
+        form: Some(&owned),
+        redirects: None,
+        user_agent: None,
+        timeout: Duration::from_secs(timeout_secs),
+        body_limit: TEXT_LIMIT as u64 + 1,
+    };
+    answer_text(&request, "asking GitHub")
 }
 
 fn get_bearer(url: &str, accept: &str, user_agent: &str, bearer: &str, timeout_secs: u64) -> Result<String, String> {
-    agent(timeout_secs)
-        .get(url)
-        .set("Authorization", &format!("Bearer {bearer}"))
-        .set("Accept", accept)
-        .set("User-Agent", user_agent)
-        .call()
-        .map_err(|e| anyhow!("asking GitHub who signed in: {e}"))
-        .and_then(|r| r.into_string().context("reading GitHub's answer"))
-        .map_err(|e| format!("{e:#}"))
+    let authorization = format!("Bearer {bearer}");
+    let request = outbound::Request {
+        method: "GET",
+        url,
+        headers: &[("Authorization", &authorization), ("Accept", accept), ("User-Agent", user_agent)],
+        form: None,
+        redirects: None,
+        user_agent: None,
+        timeout: Duration::from_secs(timeout_secs),
+        body_limit: TEXT_LIMIT as u64 + 1,
+    };
+    answer_text(&request, "asking GitHub who signed in")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     const NOW: u64 = 1_700_000_000_000;
 
@@ -1095,8 +1171,8 @@ mod tests {
         let mut event = Event::Request(req);
         for _ in 0..20 {
             let act = handle(st, &mut phase, event, cfg, now);
-            assert!(st.invariants());
-            assert!(phase.invariants());
+            st.invariants();
+            phase.invariants();
             match act {
                 Act::Done { outcome, notes } => return (outcome, notes),
                 Act::Ask(effect) => event = script.answer(effect),
@@ -1113,24 +1189,37 @@ mod tests {
 
     #[test]
     fn malformed_requests_are_400_and_a_timeout_is_silent() {
-        let mut buf = Vec::new();
-        assert!(matches!(intake(&mut buf, ReadItem::Socket(ErrorKind::TimedOut, "timed out".into())), Intake::Silent));
-        assert!(matches!(intake(&mut buf, ReadItem::Socket(ErrorKind::WouldBlock, "again".into())), Intake::Silent));
-        let Intake::Reply(outcome) = intake(&mut buf, ReadItem::Ended) else { panic!("early end") };
-        assert_eq!(body_of(&outcome), (400, "text/plain", "bad request: the request ended early\n"));
-        let mut short = Vec::new();
-        assert!(matches!(intake(&mut short, ReadItem::Chunk(b"POST /auth/poll HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc".to_vec())), Intake::More));
-        let Intake::Reply(outcome) = intake(&mut short, ReadItem::Ended) else { panic!("short body") };
-        assert_eq!(body_of(&outcome), (400, "text/plain", "bad request: the request ended early\n"));
-        let Intake::Reply(outcome) = intake(&mut Vec::new(), ReadItem::Socket(ErrorKind::ConnectionReset, "reset".into())) else { panic!("io") };
-        let (status, kind, body) = body_of(&outcome);
-        assert_eq!((status, kind, body), (400, "text/plain", "bad request: reset\n"));
-        let Intake::Reply(outcome) = intake(&mut Vec::new(), ReadItem::Chunk(b"GET /oops HTTP/2.0\r\n\r\n".to_vec())) else { panic!("line") };
-        assert_eq!(body_of(&outcome).2, "bad request: malformed request line\n");
-        let mut buf = Vec::new();
-        assert!(matches!(intake(&mut buf, ReadItem::Chunk(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n1234".to_vec())), Intake::More));
-        assert!(matches!(intake(&mut buf, ReadItem::Chunk(b"5".to_vec())), Intake::Ready(_)));
-        assert!(parse_request(&vec![b'A'; (16 << 10) + 1]).is_err());
+        use ReadItem::{Chunk, Ended, Socket};
+        let raw = |bytes: &[u8]| Chunk(bytes.to_vec());
+        let cases = [
+            ("timeout", vec![Socket(ErrorKind::TimedOut, "timed out".into())]),
+            ("would block", vec![Socket(ErrorKind::WouldBlock, "again".into())]),
+            ("early end", vec![Ended]),
+            ("short body", vec![raw(b"POST /auth/poll HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc"), Ended]),
+            ("reset", vec![Socket(ErrorKind::ConnectionReset, "reset".into())]),
+            ("bad version", vec![raw(b"GET /oops HTTP/2.0\r\n\r\n")]),
+            ("split body", vec![raw(b"POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\n1234"), raw(b"5")]),
+            ("size limit", vec![Chunk(vec![b'A'; (16 << 10) + 1])]),
+        ];
+        let mut outcomes = Transcript::default();
+        for (case, items) in cases {
+            let mut buf = Vec::new();
+            for item in items {
+                outcomes.record(case, intake(&mut buf, item));
+            }
+        }
+        expect![[r#"
+            timeout: Silent
+            would block: Silent
+            early end: Reply(Body { status: 400, kind: "text/plain", body: "bad request: the request ended early\n" })
+            short body: More
+            short body: Reply(Body { status: 400, kind: "text/plain", body: "bad request: the request ended early\n" })
+            reset: Reply(Body { status: 400, kind: "text/plain", body: "bad request: reset\n" })
+            bad version: Reply(Body { status: 400, kind: "text/plain", body: "bad request: malformed request line\n" })
+            split body: More
+            split body: Ready(Request { method: "POST", path: "/", query: {}, host: "", body: [49, 50, 51, 52, 53], json: false })
+            size limit: Reply(Body { status: 400, kind: "text/plain", body: "bad request: the request's head is too long\n" })
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
@@ -1139,7 +1228,6 @@ mod tests {
             parsed(&format!("GET {path} HTTP/1.1\r\nHost: build.example\r\n\r\n"))
         }
         assert!(matches!(get("/.well-known/rargo.json").goal(), Goal::Discovery(host) if host == "build.example"));
-        assert!(matches!(get("/auth?code=AB%2DCD").goal(), Goal::Page(code) if code == "AB-CD"));
         assert!(matches!(get("/auth/github?code=AB%2DCD").goal(), Goal::Github(code) if code == "AB-CD"));
         assert!(matches!(get("/auth/github/callback?state=abc&code=x").goal(), Goal::Callback { state, code } if state == "abc" && code == "x"));
         assert!(matches!(get("/missing").goal(), Goal::Missing));
@@ -1154,9 +1242,15 @@ mod tests {
         assert!(auth_page("abc", None, &cfg(false), false).contains("does not issue tokens"));
         assert!(auth_page("abc", Some("<error>"), &cfg(true), false).contains("&lt;error&gt;"));
         assert!(auth_page("abc", None, &cfg(true), true).contains("Sign in with GitHub"));
-        assert_eq!(form("code=AB%2DCD&name=a+b")["code"], "AB-CD");
-        assert_eq!(form("code=AB%2DCD&name=a+b")["name"], "a b");
-        assert_eq!(percent_decode("100%"), "100%");
+        let mut outcomes = Transcript::default();
+        for path in ["/auth?code=AB%2DCD", "/auth?code=100%"] {
+            let Goal::Page(code) = get(path).goal() else { panic!("expected an auth page") };
+            outcomes.record(path, code);
+        }
+        expect![[r#"
+            /auth?code=AB%2DCD: "AB-CD"
+            /auth?code=100%: "100%"
+        "#]].assert_eq(&outcomes.0);
         assert_eq!(server_for_host(&Cfg { public: None, port: 7459, has_tokens: false, access: String::new() }, "build.example:8080"), "build.example:7459");
         assert_eq!(server_for_host(&Cfg { public: Some("b.example:1".into()), port: 7459, has_tokens: false, access: String::new() }, "rargo.rs"), "b.example:1");
         assert_eq!(Http::new(Arc::new(Keys::open()), None, 7459).server_for("build.example"), "build.example:7459");
@@ -1295,7 +1389,7 @@ mod tests {
         for _ in 0..MAX_TRIES {
             let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD2345&invite=BAD-INVITE&name="), NOW, &c, &mut Script { redeem: script_rev(vec![Err("no".into())]), github: script_rev(vec![None]), ..Script::default() });
             assert_eq!(body_of(&outcome).0, 403);
-            assert!(st.invariants());
+            st.invariants();
         }
         let (outcome, _) = drive(&mut st, call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=ABCD2345&invite=GOOD-INVITE&name="), NOW, &c, &mut Script { github: script_rev(vec![None]), ..Script::default() });
         assert!(body_of(&outcome).2.contains("too many wrong invitations"));
@@ -1305,15 +1399,18 @@ mod tests {
         assert!(st.begin("later".into(), "BBBBBBBB".into(), NOW));
         let mut phase = Phase::default();
         let act = handle(&mut st, &mut phase, Event::Request(call("POST", "/auth/approve", Some("application/x-www-form-urlencoded"), "code=BBBBBBBB&invite=INV&name=")), &c, NOW);
-        assert!(st.invariants() && phase.invariants());
+        st.invariants();
+        phase.invariants();
         assert!(matches!(act, Act::Ask(Effect::Redeem { .. })));
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&drive(&mut st, call("POST", "/auth/poll", Some("application/json"), r#"{"device":"later"}"#), NOW + PENDING_FOR_MS, &c, &mut Script::default()).0).2).unwrap()["status"], "expired");
         let act = handle(&mut st, &mut phase, Event::Redeemed(Ok(issued("t-x", "ann"))), &c, NOW);
-        assert!(st.invariants() && phase.invariants());
+        st.invariants();
+        phase.invariants();
         let Act::Ask(Effect::Revoke { id }) = act else { panic!("the issued token is revoked") };
         assert_eq!(id, "t-x");
         let act = handle(&mut st, &mut phase, Event::Revoked, &c, NOW);
-        assert!(st.invariants() && phase.invariants());
+        st.invariants();
+        phase.invariants();
         let Act::Ask(Effect::LoadGithub) = act else { panic!("the error page asks which form to show") };
         let act = handle(&mut st, &mut phase, Event::Github(None), &c, NOW);
         let Act::Done { outcome, notes } = act else { panic!("done") };
@@ -1328,13 +1425,13 @@ mod tests {
         for i in 0..MAX_PENDING {
             assert!(st.begin(format!("d{i}"), format!("C{i:07}"), NOW));
         }
-        assert!(st.invariants());
+        st.invariants();
         let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW, &c, &mut Script::default());
         assert_eq!(body_of(&outcome).0, 503);
         assert!(body_of(&outcome).2.contains("too many"));
         let (outcome, _) = drive(&mut st, call("POST", "/auth/start", Some("application/json"), &format!(r#"{{"protocol":{}}}"#, crate::proto::PROTO_VERSION)), NOW + PENDING_FOR_MS, &c, &mut Script { random: script_rev(vec![Ok("fresh-device".into()), Ok("FFFF2222".into())]), ..Script::default() });
         assert_eq!(serde_json::from_str::<serde_json::Value>(body_of(&outcome).2).unwrap()["code"], "FFFF-2222");
-        assert!(st.invariants());
+        st.invariants();
     }
 
     #[test]
@@ -1367,8 +1464,25 @@ mod tests {
         assert!(script.effects.iter().any(|e| e.starts_with("post https://github.com/login/oauth/access_token ") && e.contains("code=gh") && e.contains("redirect_uri=https://build.example/auth/github/callback")));
         let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Err("asking GitHub: refused".into())]), ..Script::default() });
         assert!(body_of(&outcome).2.contains("asking GitHub: refused"));
-        let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Ok(r#"{"access_token":"tok"}"#.into()), Ok(r#"{"id":1}"#.into())]), ..Script::default() });
-        assert!(body_of(&outcome).2.contains("did not say who signed in"));
+        let mut outcomes = Transcript::default();
+        for (account, response) in [
+            ("missing login", r#"{"id":1}"#),
+            ("invalid login", r#"{"login":"-nope"}"#),
+        ] {
+            let mut script = Script {
+                github: script_rev(vec![Some(gh())]),
+                body: script_rev(vec![Ok(r#"{"access_token":"tok"}"#.into()), Ok(response.into())]),
+                ..Script::default()
+            };
+            let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut script);
+            let (status, _, page) = body_of(&outcome);
+            let error = page.split_once("class=\"err\">").unwrap().1.split_once('<').unwrap().0;
+            outcomes.record(account, (status, error));
+        }
+        expect![[r#"
+            missing login: (403, "GitHub did not say who signed in")
+            invalid login: (403, "GitHub named an account this server cannot use")
+        "#]].assert_eq(&outcomes.0);
         let (outcome, _) = drive(&mut st, callback("state=oauthstateoauthstateoauthstate01&code=gh"), NOW, &c, &mut Script { github: script_rev(vec![Some(gh())]), body: script_rev(vec![Ok(r#"{"access_token":"tok"}"#.into()), Ok(r#"{"login":"octocat"}"#.into())]), allowed: script_rev(vec![None]), ..Script::default() });
         assert!(body_of(&outcome).2.contains("not on this server's allow list") && body_of(&outcome).2.contains("rargod token allow octocat"));
 
@@ -1402,7 +1516,8 @@ mod tests {
         let mut saw_revoke = false;
         for _ in 0..8 {
             let act = handle(&mut st, &mut phase, event, &c, NOW);
-            assert!(st.invariants() && phase.invariants());
+            st.invariants();
+            phase.invariants();
             match act {
                 Act::Done { outcome, .. } => {
                     assert!(saw_revoke);
@@ -1426,16 +1541,5 @@ mod tests {
             }
         }
         panic!("did not finish");
-    }
-
-    #[test]
-    fn github_json_helpers_reject_a_refusal_and_a_nameless_account() {
-        let success = serde_json::json!({"access_token": "fixture"});
-        let refused = serde_json::json!({"error": "bad_verification_code", "error_description": "The code passed is incorrect or expired."});
-        assert_eq!(GithubExchange::identified(&success).unwrap(), "fixture");
-        assert!(GithubExchange::identified(&refused).unwrap_err().to_string().contains("incorrect or expired"));
-        assert_eq!(GithubExchange::login(&serde_json::json!({"login":"octocat","id":583231})).unwrap(), "octocat");
-        assert!(GithubExchange::login(&serde_json::json!({"message":"Bad credentials"})).is_err());
-        assert!(GithubExchange::login(&serde_json::json!({"login":"-nope"})).is_err());
     }
 }

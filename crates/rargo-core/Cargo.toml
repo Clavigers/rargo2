@@ -9,6 +9,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+rargo-machine = { path = "../rargo-machine" }
 fusewire = { path = "../fusewire" }
 rargo-plan = { path = "../rargo-plan" }
 rargo-proto = { path = "../rargo-proto" }
@@ -32,5 +33,4 @@ zstd.workspace = true
 redb.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 expect-test = "1.5"

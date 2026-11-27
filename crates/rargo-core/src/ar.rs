@@ -158,7 +158,7 @@ fn differences(a: &[u8], b: &[u8]) -> Option<Vec<(usize, usize)>> {
 }
 
 #[derive(Default)]
-pub struct DwoIds(std::collections::HashSet<(Vec<u8>, Vec<u8>)>);
+pub struct DwoIds(std::collections::BTreeSet<(Vec<u8>, Vec<u8>)>);
 
 impl DwoIds {
     pub fn learn(&mut self, a: &[u8], b: &[u8]) -> bool {

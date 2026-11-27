@@ -1,9 +1,9 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 const MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
@@ -107,15 +107,19 @@ impl WatchState {
         descriptors
     }
 
-    #[cfg(test)]
-    fn invariants(&self, changes: &Changes) -> bool {
-        self.owners.iter().all(|(descriptor, (owner, dir))| {
-            *descriptor >= 0 && !dir.as_os_str().is_empty() && self.registered.contains(owner)
-        }) && self.moved.iter().all(|descriptor| self.owners.contains_key(descriptor))
-            && changes.dirty.iter().all(|(owner, paths)| {
-                self.registered.contains(owner) && !paths.is_empty() && paths.iter().all(|path| !path.as_os_str().is_empty())
-            })
-            && changes.rescan.iter().all(|owner| self.registered.contains(owner))
+}
+
+#[cfg(test)]
+impl StateMachine for WatchState {
+    fn invariants(&self) {
+        for (descriptor, (owner, dir)) in &self.owners {
+            assert!(*descriptor >= 0, "watch descriptor {descriptor} is not negative");
+            assert!(!dir.as_os_str().is_empty(), "watch descriptor {descriptor} watches a named directory");
+            assert!(self.registered.contains(owner), "watch descriptor {descriptor} belongs to registered worktree {owner}");
+        }
+        for descriptor in &self.moved {
+            assert!(self.owners.contains_key(descriptor), "moved descriptor {descriptor} is watched");
+        }
     }
 }
 
@@ -126,43 +130,33 @@ pub enum Registration {
 
 pub struct Watcher {
     fd: OwnedFd,
-    state: Mutex<WatchState>,
+    state: RefCell<WatchState>,
 }
 
 impl Watcher {
     pub fn new() -> std::io::Result<Watcher> {
-        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Watcher { fd, state: Mutex::new(WatchState::default()) })
+        let fd = crate::inotify::open(libc::IN_CLOEXEC | libc::IN_NONBLOCK)?;
+        Ok(Watcher { fd, state: RefCell::new(WatchState::default()) })
     }
 
     pub fn add(&self, dir: &Path, owner: u64) -> std::io::Result<Registration> {
-        let c = CString::new(dir.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
-        let mut state = self.state.lock().unwrap();
-        let wd = unsafe { libc::inotify_add_watch(self.fd.as_raw_fd(), c.as_ptr(), MASK) };
-        let result = if wd >= 0 {
-            WatchResult::Added(wd)
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOSPC) {
-                return Err(error);
-            }
-            WatchResult::TooManyDirectories
+        let mut state = self.state.borrow_mut();
+        let result = match crate::inotify::add(&self.fd, dir, MASK) {
+            Ok(wd) => WatchResult::Added(wd),
+            Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => WatchResult::TooManyDirectories,
+            Err(error) => return Err(error),
         };
         Ok(state.register(owner, dir.to_path_buf(), result))
     }
 
     pub fn watches(&self, wd: i32, dir: &Path) -> bool {
-        self.state.lock().unwrap().watches(wd, dir)
+        self.state.borrow().watches(wd, dir)
     }
 
     pub fn remove(&self, wd: i32, dir: &Path) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         if state.remove(wd, dir) {
-            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
+            crate::inotify::remove(&self.fd, wd);
         }
     }
 
@@ -173,9 +167,9 @@ impl Watcher {
     }
 
     pub fn forget(&self, owner: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         for wd in state.forget(owner) {
-            unsafe { libc::inotify_rm_watch(self.fd.as_raw_fd(), wd) };
+            crate::inotify::remove(&self.fd, wd);
         }
     }
 
@@ -194,7 +188,7 @@ impl Watcher {
     }
 
     fn parse(&self, buf: &[u8]) -> Changes {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         let mut out = Changes::default();
         let mut at = 0usize;
         const HEAD: usize = std::mem::size_of::<libc::inotify_event>();
@@ -210,6 +204,7 @@ impl Watcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     struct Rng(u64);
 
@@ -275,10 +270,22 @@ mod tests {
         }
     }
 
+    fn checked(state: &WatchState, changes: &Changes) {
+        state.invariants();
+        for (owner, paths) in &changes.dirty {
+            assert!(state.registered.contains(owner), "dirty worktree {owner} is registered");
+            assert!(!paths.is_empty(), "dirty worktree {owner} names a directory");
+            assert!(paths.iter().all(|path| !path.as_os_str().is_empty()), "dirty worktree {owner} names directories by path");
+        }
+        for owner in &changes.rescan {
+            assert!(state.registered.contains(owner), "rescanned worktree {owner} is registered");
+        }
+    }
+
     fn apply(state: &mut WatchState, changes: &mut Changes, descriptor: Option<i32>, mask: u32) {
         if let Some(descriptor) = descriptor {
             state.apply(Event { descriptor, mask }, changes);
-            assert!(state.invariants(changes));
+            checked(state, changes);
         }
     }
 
@@ -296,7 +303,7 @@ mod tests {
                 let wd = m.next_wd;
                 m.next_wd += 1;
                 assert!(matches!(state.register(owner, path.clone(), WatchResult::Added(wd)), Registration::Watched(w) if w == wd));
-                assert!(state.invariants(&changes));
+                checked(&state, &changes);
                 m.slots.push(Slot { owner, path, wd: Some(wd), moved: false, alive: true });
             }
             for step in 0..300 {
@@ -331,7 +338,7 @@ mod tests {
                             assert!(matches!(state.register(s.owner, s.path.clone(), WatchResult::Added(wd)), Registration::Watched(_)));
                         } else {
                             assert!(state.remove(wd, &state.owners[&wd].1.clone()));
-                            assert!(state.invariants(&changes));
+                            checked(&state, &changes);
                             apply(&mut state, &mut changes, Some(wd), libc::IN_IGNORED);
                             assert!(!state.owners.contains_key(&wd), "seed {seed}: an ignored watch is gone");
                             let fresh = m.next_wd;
@@ -340,7 +347,7 @@ mod tests {
                             s.wd = Some(fresh);
                         }
                         s.moved = false;
-                        assert!(state.invariants(&changes));
+                        checked(&state, &changes);
                     }
                     7 if x != a && m.slots[x].alive && m.slots[a].alive => {
                         let parent = m.touch(a);
@@ -371,7 +378,7 @@ mod tests {
                             state.register(s.owner, s.path.clone(), WatchResult::Added(wd));
                             s.wd = Some(wd);
                         }
-                        assert!(state.invariants(&changes));
+                        checked(&state, &changes);
                     }
                     9 => {
                         apply(&mut state, &mut changes, Some(-1), libc::IN_Q_OVERFLOW);
@@ -387,7 +394,7 @@ mod tests {
                     11 if rng.below(8) == 0 => {
                         let owner = m.slots[x].owner;
                         let mut gone = state.forget(owner);
-                        assert!(state.invariants(&changes));
+                        checked(&state, &changes);
                         let mut want: Vec<i32> = m.slots.iter().filter(|s| s.owner == owner).filter_map(|s| s.wd).collect();
                         gone.sort();
                         want.sort();
@@ -399,68 +406,148 @@ mod tests {
                     }
                     _ => {}
                 }
-                assert!(state.invariants(&changes));
+                checked(&state, &changes);
                 m.check(&changes, seed, step);
             }
         }
     }
 
-    #[test]
-    fn unregistering_a_directory_does_not_remove_another_worktree() {
+    enum Ev {
+        Added(i32, u64, &'static str),
+        TooMany(u64, &'static str),
+        Remove(i32, &'static str),
+        Forget(u64),
+        Apply(i32, u32),
+        /// The shell collects the changes gathered since the last collection.
+        Collect,
+    }
+
+    fn mask_names(mask: u32) -> String {
+        let names = [
+            (libc::IN_CREATE, "CREATE"),
+            (libc::IN_MODIFY, "MODIFY"),
+            (libc::IN_MOVED_FROM, "MOVED_FROM"),
+            (libc::IN_MOVED_TO, "MOVED_TO"),
+            (libc::IN_MOVE_SELF, "MOVE_SELF"),
+            (libc::IN_IGNORED, "IGNORED"),
+            (libc::IN_ISDIR, "ISDIR"),
+            (libc::IN_Q_OVERFLOW, "Q_OVERFLOW"),
+        ];
+        assert_eq!(names.iter().fold(mask, |m, (bit, _)| m & !bit), 0, "every bit of {mask:#x} is named");
+        names.iter().filter(|(bit, _)| mask & bit != 0).map(|(_, name)| *name).collect::<Vec<_>>().join("|")
+    }
+
+    /// Steps a watch state through the events, checking it after each, and lists what each step decided.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
         let mut state = WatchState::default();
         let mut changes = Changes::default();
-        for (descriptor, owner, dir) in [(1, 10, "first"), (2, 10, "first/src"), (3, 20, "second")] {
-            state.register(owner, dir.into(), WatchResult::Added(descriptor));
-            assert!(state.invariants(&changes));
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Added(descriptor, owner, dir) => match state.register(owner, dir.into(), WatchResult::Added(descriptor)) {
+                    Registration::Watched(d) => format!("register {owner} {dir} => watched {d}"),
+                    Registration::Poll(path) => format!("register {owner} {dir} => poll {}", path.display()),
+                },
+                Ev::TooMany(owner, dir) => match state.register(owner, dir.into(), WatchResult::TooManyDirectories) {
+                    Registration::Watched(d) => format!("register {owner} {dir} (too many) => watched {d}"),
+                    Registration::Poll(path) => format!("register {owner} {dir} (too many) => poll {}", path.display()),
+                },
+                Ev::Remove(descriptor, dir) => format!("remove {descriptor} {dir} => {}", state.remove(descriptor, Path::new(dir))),
+                Ev::Forget(owner) => format!("forget {owner} => {:?}", state.forget(owner)),
+                Ev::Apply(descriptor, mask) => {
+                    state.apply(Event { descriptor, mask }, &mut changes);
+                    format!("event {descriptor} {}", mask_names(mask))
+                }
+                Ev::Collect => format!("collect => {:?}", std::mem::take(&mut changes)),
+            };
+            checked(&state, &changes);
+            out += &line;
+            out.push('\n');
         }
-        assert!(!state.remove(2, Path::new("different")));
-        assert!(state.invariants(&changes));
-        assert_eq!(state.forget(10), [1, 2]);
-        assert!(state.invariants(&changes));
-        for descriptor in [1, 2, 3] {
-            state.apply(Event { descriptor, mask: libc::IN_CREATE }, &mut changes);
-            assert!(state.invariants(&changes));
-        }
-        assert_eq!(changes.dirty, BTreeMap::from([(20, BTreeSet::from(["second".into()]))]));
+        out
+    }
+
+    #[test]
+    fn unregistering_a_directory_does_not_remove_another_worktree() {
+        let events = [
+            Ev::Added(1, 10, "first"),
+            Ev::Added(2, 10, "first/src"),
+            Ev::Added(3, 20, "second"),
+            Ev::Remove(2, "different"),
+            Ev::Forget(10),
+            Ev::Apply(1, libc::IN_CREATE),
+            Ev::Apply(2, libc::IN_CREATE),
+            Ev::Apply(3, libc::IN_CREATE),
+            Ev::Collect,
+            Ev::Remove(3, "second"),
+            Ev::Apply(3, libc::IN_CREATE),
+            Ev::Collect,
+        ];
+        expect![[r#"
+            register 10 first => watched 1
+            register 10 first/src => watched 2
+            register 20 second => watched 3
+            remove 2 different => false
+            forget 10 => [1, 2]
+            event 1 CREATE
+            event 2 CREATE
+            event 3 CREATE
+            collect => Changes { dirty: {20: {"second"}}, rescan: {}, rescan_all: false }
+            remove 3 second => true
+            event 3 CREATE
+            collect => Changes { dirty: {}, rescan: {}, rescan_all: false }
+        "#]].assert_eq(&run(events));
     }
 
     #[test]
     fn renames_cover_both_directories_and_invalidate_moved_directory_watches() {
-        let mut state = WatchState::default();
-        let mut changes = Changes::default();
-        state.register(10, "from".into(), WatchResult::Added(1));
-        assert!(state.invariants(&changes));
-        state.register(20, "to".into(), WatchResult::Added(2));
-        assert!(state.invariants(&changes));
-        for (descriptor, mask) in [(1, libc::IN_MOVED_FROM), (2, libc::IN_MOVED_TO)] {
-            state.apply(Event { descriptor, mask }, &mut changes);
-            assert!(state.invariants(&changes));
-        }
-        assert_eq!(changes.dirty, BTreeMap::from([(10, BTreeSet::from(["from".into()])), (20, BTreeSet::from(["to".into()]))]));
-        assert!(changes.rescan.is_empty());
-
-        state.register(10, "from/sub".into(), WatchResult::Added(3));
-        state.apply(Event { descriptor: 3, mask: libc::IN_MOVE_SELF }, &mut changes);
-        assert!(state.invariants(&changes));
-        let mut after = Changes::default();
-        state.apply(Event { descriptor: 3, mask: libc::IN_MODIFY }, &mut after);
-        assert!(state.invariants(&after));
-        assert_eq!(after.rescan, BTreeSet::from([10]), "a moved directory's old path is not trusted until it is watched again");
-        state.register(10, "to/sub".into(), WatchResult::Added(3));
-        let mut rewatched = Changes::default();
-        state.apply(Event { descriptor: 3, mask: libc::IN_MODIFY }, &mut rewatched);
-        assert_eq!(rewatched.dirty, BTreeMap::from([(10, BTreeSet::from(["to/sub".into()]))]));
-        assert!(rewatched.rescan.is_empty());
-
-        for (descriptor, mask) in [(1, libc::IN_ISDIR | libc::IN_MOVED_FROM), (2, libc::IN_ISDIR | libc::IN_MOVED_TO),
-            (1, libc::IN_MOVE_SELF), (1, libc::IN_IGNORED)] {
-            state.apply(Event { descriptor, mask }, &mut changes);
-            assert!(state.invariants(&changes));
-        }
-        assert_eq!(changes.rescan, BTreeSet::from([10, 20]));
-        assert!(!state.owners.contains_key(&1));
-        let decision = state.register(20, "to/new".into(), WatchResult::TooManyDirectories);
-        assert!(state.invariants(&changes));
-        assert!(matches!(decision, Registration::Poll(path) if path == Path::new("to/new")));
+        let events = [
+            Ev::Added(1, 10, "from"),
+            Ev::Added(2, 20, "to"),
+            Ev::Apply(1, libc::IN_MOVED_FROM),
+            Ev::Apply(2, libc::IN_MOVED_TO),
+            Ev::Collect,
+            Ev::Added(3, 10, "from/sub"),
+            Ev::Apply(3, libc::IN_MOVE_SELF),
+            Ev::Collect,
+            Ev::Apply(3, libc::IN_MODIFY),
+            Ev::Collect,
+            Ev::Added(3, 10, "to/sub"),
+            Ev::Apply(3, libc::IN_MODIFY),
+            Ev::Collect,
+            Ev::Apply(1, libc::IN_ISDIR | libc::IN_MOVED_FROM),
+            Ev::Apply(2, libc::IN_ISDIR | libc::IN_MOVED_TO),
+            Ev::Apply(1, libc::IN_MOVE_SELF),
+            Ev::Apply(1, libc::IN_IGNORED),
+            Ev::Apply(1, libc::IN_MODIFY),
+            Ev::Collect,
+            Ev::TooMany(20, "to/new"),
+            Ev::Apply(-1, libc::IN_Q_OVERFLOW),
+            Ev::Collect,
+        ];
+        expect![[r#"
+            register 10 from => watched 1
+            register 20 to => watched 2
+            event 1 MOVED_FROM
+            event 2 MOVED_TO
+            collect => Changes { dirty: {10: {"from"}, 20: {"to"}}, rescan: {}, rescan_all: false }
+            register 10 from/sub => watched 3
+            event 3 MOVE_SELF
+            collect => Changes { dirty: {}, rescan: {10}, rescan_all: false }
+            event 3 MODIFY
+            collect => Changes { dirty: {}, rescan: {10}, rescan_all: false }
+            register 10 to/sub => watched 3
+            event 3 MODIFY
+            collect => Changes { dirty: {10: {"to/sub"}}, rescan: {}, rescan_all: false }
+            event 1 MOVED_FROM|ISDIR
+            event 2 MOVED_TO|ISDIR
+            event 1 MOVE_SELF
+            event 1 IGNORED
+            event 1 MODIFY
+            collect => Changes { dirty: {}, rescan: {10, 20}, rescan_all: false }
+            register 20 to/new (too many) => poll to/new
+            event -1 Q_OVERFLOW
+            collect => Changes { dirty: {}, rescan: {}, rescan_all: true }
+        "#]].assert_eq(&run(events));
     }
 }

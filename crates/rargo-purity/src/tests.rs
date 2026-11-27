@@ -55,10 +55,17 @@ fn ambient_io_is_found_through_imports_and_macros_but_not_in_the_shell() {
     );
     assert!(found("crates/a/src/io.rs", text).is_empty());
     assert!(found("crates/a/src/io/disk.rs", text).is_empty());
-    for not_shell in ["crates/a/src/build.rs", "crates/a/build.rs", "crates/a/examples/bench.rs"] {
+    for shell in ["crates/a/build.rs", "crates/a/examples/bench.rs", "crates/a/examples/bench/main.rs"] {
+        assert!(of(Check::AmbientIo, &found(shell, text)).is_empty(), "{shell}");
+    }
+    for not_shell in ["crates/a/src/build.rs", "crates/a/src/examples/bench.rs", "crates/a/src/build/build.rs"] {
         assert_eq!(of(Check::AmbientIo, &found(not_shell, text)).len(), 5, "{not_shell}");
     }
     assert!(found("crates/a/src/lib.rs", "fn f() -> std::time::Duration { let x = libc::EINTR; todo!() }").is_empty());
+    let addresses = "use core::net::SocketAddr; fn f() -> SocketAddr { SocketAddr::from((core::net::Ipv6Addr::LOCALHOST, 1)) }";
+    assert!(found("crates/a/src/lib.rs", addresses).is_empty());
+    let socket = "use std::net::UdpSocket; fn f() { let _ = UdpSocket::bind(\"[::1]:0\"); }";
+    assert_eq!(of(Check::AmbientIo, &found("crates/a/src/lib.rs", socket)), ["std::net::UdpSocket::bind"]);
     let shadowed = "use std::fs; use std::sync::atomic::{AtomicU8, Ordering};\n\
         fn f(fs: &dyn Store, a: &AtomicU8) { fs.stat(); a.load(Ordering::Relaxed); }";
     assert_eq!(of(Check::AmbientIo, &found("crates/a/src/lib.rs", shadowed)), Vec::<String>::new());
@@ -107,7 +114,7 @@ fn test_code_gets_the_io_and_lock_denials_with_its_own_check() {
 
 #[test]
 fn an_external_test_module_is_test_code_of_the_file_that_declares_it() {
-    let lib = "pub struct S(u8);\nimpl S {\n    pub fn invariants(&self) { assert!(self.0 < 9); }\n    pub fn step(&mut self) { self.0 += 1; self.invariants(); }\n}\n#[cfg(test)]\nmod tests;";
+    let lib = "pub struct S(u8);\nimpl StateMachine for S {\n    fn invariants(&self) { assert!(self.0 < 9); }\n}\nimpl S {\n    pub fn step(&mut self) { self.0 += 1; self.invariants(); }\n}\n#[cfg(test)]\nmod tests;";
     let tests = "use super::*;\n#[test]\nfn t() { let mut s = S(0); s.step(); s.invariants(); std::fs::read(\"x\"); }";
     let list: Vec<_> =
         scan(&[("crates/a/src/lib.rs", lib), ("crates/a/src/tests.rs", tests)]).into_iter().map(|f| (f.check, f.what)).collect();
@@ -115,17 +122,37 @@ fn an_external_test_module_is_test_code_of_the_file_that_declares_it() {
 }
 
 #[test]
-fn a_state_machine_without_assertions_or_tests_is_found() {
-    let text = "pub struct S(u8);\nimpl S {\n    pub fn invariants(&self) {}\n    pub fn step(&mut self) { self.0 += 1; }\n    pub fn peek(&self) -> u8 { self.0 }\n}\nimpl Other { pub fn step(&mut self) {} }";
+fn a_state_machine_is_found_through_its_trait_and_without_assertions_or_tests_is_found() {
+    let text = "pub struct S(u8);\nimpl rargo_machine::StateMachine for S {\n    fn invariants(&self) {}\n}\nimpl S {\n    pub fn step(&mut self) { self.0 += 1; }\n    pub fn peek(&self) -> u8 { self.0 }\n}\nimpl Other { pub fn step(&mut self) {} }";
     let list = found("crates/a/src/lib.rs", text);
     assert_eq!(
         of(Check::SelfCheck, &list),
         ["S::invariants asserts nothing", "S::step changes the state and asserts nothing", "no test calls invariants() on S"]
     );
-    let text = "pub struct S(u8);\nimpl S {\n    pub fn invariants(&self) { debug_assert!(self.0 < 9); }\n    pub fn step(&mut self) { self.0 += 1; self.invariants(); }\n}\n#[cfg(test)]\nmod tests { #[test] fn t() { super::S(0).invariants(); } }";
+    let text = "pub struct S(u8);\nimpl StateMachine for S {\n    fn invariants(&self) { debug_assert!(self.0 < 9); }\n}\nimpl S {\n    pub fn step(&mut self) { self.0 += 1; self.invariants(); }\n}\n#[cfg(test)]\nmod tests { #[test] fn t() { super::S(0).invariants(); } }";
     assert!(of(Check::SelfCheck, &found("crates/a/src/lib.rs", text)).is_empty());
-    let text = "pub struct S(u8);\nimpl S {\n    pub fn invariants(&self) -> bool { self.0 < 9 }\n    pub fn step(&mut self) { self.0 += 1; assert!(self.invariants()); }\n}\n#[cfg(test)]\nmod tests { #[test] fn t() { assert!(super::S(0).invariants()); } }";
+}
+
+#[test]
+fn a_machine_whose_trait_impl_is_test_only_is_not_counted_yet() {
+    let text = "pub struct S(u8);\nimpl S {\n    pub fn step(&mut self) { self.0 += 1; }\n}\n#[cfg(test)]\nimpl StateMachine for S {\n    fn invariants(&self) { assert!(self.0 < 9); }\n}";
     assert!(of(Check::SelfCheck, &found("crates/a/src/lib.rs", text)).is_empty());
+}
+
+#[test]
+fn a_test_checks_invariants_through_the_trait_helpers_too() {
+    for call in ["rargo_machine::check(&S(0), \"here\")", "rargo_machine::check_all([&S(0) as &dyn StateMachine])", "Checked::new(S(0)).step(|s| s.step())"] {
+        let text = format!(
+            "pub struct S(u8);\nimpl StateMachine for S {{\n    fn invariants(&self) {{ assert!(self.0 < 9); }}\n}}\nimpl S {{\n    pub fn step(&mut self) {{ self.0 += 1; self.invariants(); }}\n}}\n#[cfg(test)]\nmod tests {{ #[test] fn t() {{ {call}; }} }}"
+        );
+        assert!(of(Check::SelfCheck, &found("crates/a/src/lib.rs", &text)).is_empty(), "{call}");
+    }
+}
+
+#[test]
+fn an_invariants_method_outside_the_trait_is_found() {
+    let text = "pub struct S(u8);\nimpl S {\n    pub fn invariants(&self) -> bool { self.0 < 9 }\n    pub fn step(&mut self) { self.0 += 1; assert!(self.invariants()); }\n}";
+    assert_eq!(of(Check::SelfCheck, &found("crates/a/src/lib.rs", text)), ["S::invariants is not StateMachine::invariants"]);
 }
 
 #[test]
@@ -149,4 +176,10 @@ fn the_allowlist_format_is_strict() {
     assert!(parse_allow("locks a.rs 2 spaces\n").is_err());
     assert!(parse_allow("lock\ta.rs\t2\tno such check\n").is_err());
     assert!(parse_allow("locks\ta.rs\ttwo\tnot a number\n").is_err());
+}
+
+#[test]
+fn an_address_is_a_value_and_a_socket_is_io() {
+    let list = found("crates/a/src/lib.rs", "fn f(a: std::net::SocketAddr, b: std::net::Ipv4Addr) { let _ = std::net::UdpSocket::bind(a); }");
+    assert_eq!(of(Check::AmbientIo, &list), ["std::net::UdpSocket::bind"]);
 }

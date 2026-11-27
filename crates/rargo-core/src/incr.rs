@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use crate::db::{Table, Tables};
 use crate::hash::Hash;
 use crate::store::{Blobs, Store};
@@ -6,7 +8,7 @@ use crate::view::vpath_starts_with;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateMeta {
@@ -23,19 +25,19 @@ const _: () = assert!(KEEP_WORKTREES > 0);
 
 #[derive(Default)]
 pub struct IncrStats {
-    pub saved: AtomicU64,
-    pub seeded_same_worktree: AtomicU64,
-    pub seeded_ancestor: AtomicU64,
-    pub seeded_other: AtomicU64,
-    pub unseeded: AtomicU64,
-    pub discarded_after_crash: AtomicU64,
+    pub saved: Cell<u64>,
+    pub seeded_same_worktree: Cell<u64>,
+    pub seeded_ancestor: Cell<u64>,
+    pub seeded_other: Cell<u64>,
+    pub unseeded: Cell<u64>,
+    pub discarded_after_crash: Cell<u64>,
 }
 
 pub struct IncrStore {
     db: Arc<dyn Tables>,
     store: Arc<dyn Blobs>,
-    next: AtomicU64,
-    held: std::sync::OnceLock<Box<dyn Fn(&Hash) -> bool + Send + Sync>>,
+    next: Cell<u64>,
+    held: std::cell::OnceCell<Box<dyn Fn(&Hash) -> bool>>,
     pub stats: IncrStats,
 }
 
@@ -66,13 +68,13 @@ impl IncrStore {
         IncrStore {
             db,
             store,
-            next: AtomicU64::new(seed),
-            held: std::sync::OnceLock::new(),
+            next: Cell::new(seed),
+            held: std::cell::OnceCell::new(),
             stats: IncrStats::default(),
         }
     }
 
-    pub fn set_held(&self, f: Box<dyn Fn(&Hash) -> bool + Send + Sync>) {
+    pub fn set_held(&self, f: Box<dyn Fn(&Hash) -> bool>) {
         let _ = self.held.set(f);
     }
 
@@ -155,20 +157,21 @@ impl IncrStore {
                         SeedKind::Ancestor => &self.stats.seeded_ancestor,
                         SeedKind::Other => &self.stats.seeded_other,
                     };
-                    counter.fetch_add(1, Ordering::Relaxed);
+                    counter.set(counter.get() + 1);
                     return Some(Seed { id: *id, manifest, kind, blobs });
                 }
                 None => self.db.delete(Table::Incr, &key(crate_key, *id)),
             }
         }
-        self.stats.unseeded.fetch_add(1, Ordering::Relaxed);
+        self.stats.unseeded.set(self.stats.unseeded.get() + 1);
         None
     }
 
     pub fn save(&self, crate_key: &Hash, worktree: &str, commit: Option<[u8; 20]>, manifest: &Manifest, created: u64) {
         let Ok(raw) = bincode::serialize(manifest) else { return };
         let Ok(h) = self.store.put_bytes(&raw) else { return };
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = self.next.get();
+        self.next.set(id + 1);
         assert!(id < u64::MAX, "state id counter does not wrap");
         let meta = StateMeta {
             manifest: h,
@@ -178,7 +181,7 @@ impl IncrStore {
             bytes: manifest.total_size(),
         };
         self.db.put(Table::Incr, &key(crate_key, id), &bincode::serialize(&meta).unwrap());
-        self.stats.saved.fetch_add(1, Ordering::Relaxed);
+        self.stats.saved.set(self.stats.saved.get() + 1);
         self.prune(crate_key);
     }
 
@@ -188,142 +191,159 @@ impl IncrStore {
         }
     }
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let mut by_crate: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
-        for (k, _) in self.db.scan_prefix(Table::Incr, &[]) {
-            if let (Some(c), Some(id)) = (k.get(..32), k.get(32..40)) {
-                by_crate.entry(c.try_into().unwrap()).or_default().push(u64::from_be_bytes(id.try_into().unwrap()));
-            }
-        }
-        let next = self.next.load(Ordering::Relaxed);
-        by_crate.iter().all(|(c, ids)| {
-            let listed = self.list(&Hash(*c));
-            ids.iter().all(|id| *id < next) && listed.len() == ids.len() && doomed(&listed).is_empty()
-        })
-    }
-
     pub fn discard(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
-        self.stats.discarded_after_crash.fetch_add(1, Ordering::Relaxed);
+        self.stats.discarded_after_crash.set(self.stats.discarded_after_crash.get() + 1);
     }
 
     pub fn forget(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
     }
 
-    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
-        let mut metas: Vec<StateMeta> = Vec::new();
-        for (_, v) in self.db.scan_prefix(Table::Incr, &[]) {
-            if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
-                metas.push(m);
-            }
-        }
-        for meta in metas {
-            live.insert(meta.manifest);
-            let Ok(raw) = self.store.read(&meta.manifest) else { continue };
-            let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
-            for (_, e) in &m.entries {
-                if let MEntry::File { hash, .. } = e {
-                    live.insert(*hash);
-                }
-            }
-        }
+    /// The tables the states are recorded in and the store their files are in.
+    pub fn parts(&self) -> (Arc<dyn Tables>, Arc<dyn Blobs>) {
+        (self.db.clone(), self.store.clone())
+    }
+
+    pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
+        mark(&*self.db, &*self.store, live)
     }
 
     pub fn analyze(&self, store: &Store) -> String {
-        use std::collections::{BTreeMap, HashMap, HashSet};
-        fn kind(path: &[u8]) -> &'static str {
-            let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
-            match name {
-                b"dep-graph.bin" => "dep-graph.bin",
-                b"query-cache.bin" => "query-cache.bin",
-                b"work-products.bin" => "work-products.bin",
-                b"metadata.rmeta" => "metadata.rmeta",
-                n if n.ends_with(b".o") => "object files",
-                n if n.ends_with(b".dwo") => "split debuginfo",
-                n if n.ends_with(b".bc") => "bitcode",
-                _ => "other",
-            }
-        }
-        #[derive(Default)]
-        struct Row {
-            files: u64,
-            logical: u64,
-            blobs: HashSet<Hash>,
-            unique: u64,
-            chunks: HashSet<Hash>,
-            chunk_unique: u64,
-        }
-        let mut states = 0u64;
-        let mut crates: HashSet<[u8; 32]> = HashSet::new();
-        let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
-        let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
-        for (k, v) in self.db.scan_prefix(Table::Incr, &[]) {
-            if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
-                entries.push((k, m));
-            }
-        }
-        let mut sizes: HashMap<Hash, u64> = HashMap::new();
-        for (k, meta) in &entries {
-            let Ok(raw) = self.store.read(&meta.manifest) else { continue };
-            let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
-            states += 1;
-            if let Some(c) = k.get(..32) {
-                crates.insert(c.try_into().unwrap());
-            }
-            for (path, e) in &m.entries {
-                let MEntry::File { hash, size, .. } = e else { continue };
-                let row = rows.entry(kind(path)).or_default();
-                row.files += 1;
-                row.logical += size;
-                if row.blobs.insert(*hash) {
-                    row.unique += size;
-                    sizes.insert(*hash, *size);
-                }
-            }
-        }
-        for row in rows.values_mut() {
-            for blob in &row.blobs {
-                let Ok(f) = store.open_blob(blob) else { continue };
-                let Ok(recipe) = crate::chunk::chunk_file(&f) else { continue };
-                for c in recipe {
-                    if row.chunks.insert(c.hash) {
-                        row.chunk_unique += c.len as u64;
-                    }
-                }
-            }
-        }
-        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        let mut out = format!(
-            "{states} states of {} crates\n{:<20} {:>8} {:>12} {:>14} {:>16}\n",
-            crates.len(),
-            "",
-            "files",
-            "logical GiB",
-            "as files GiB",
-            "as chunks GiB"
-        );
-        let (mut tl, mut tu, mut tc) = (0u64, 0u64, 0u64);
-        for (name, row) in &rows {
-            out += &format!(
-                "{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n",
-                name,
-                row.files,
-                gib(row.logical),
-                gib(row.unique),
-                gib(row.chunk_unique)
-            );
-            tl += row.logical;
-            tu += row.unique;
-            tc += row.chunk_unique;
-        }
-        out += &format!("{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n", "total", "", gib(tl), gib(tu), gib(tc));
-        out
+        analyze(&*self.db, store)
     }
 
     pub fn state_count(&self, crate_key: &Hash) -> usize {
         self.list(crate_key).len()
+    }
+}
+
+/// Adds the incremental states recorded in `db`, and the files they are made of, to `live`.
+pub fn mark(db: &dyn Tables, store: &dyn Blobs, live: &mut std::collections::BTreeSet<Hash>) {
+    let mut metas: Vec<StateMeta> = Vec::new();
+    for (_, v) in db.scan_prefix(Table::Incr, &[]) {
+        if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
+            metas.push(m);
+        }
+    }
+    for meta in metas {
+        live.insert(meta.manifest);
+        let Ok(raw) = store.read(&meta.manifest) else { continue };
+        let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
+        for (_, e) in &m.entries {
+            if let MEntry::File { hash, .. } = e {
+                live.insert(*hash);
+            }
+        }
+    }
+}
+
+/// A table of what the incremental states recorded in `db` hold in `store`.
+pub fn analyze(db: &dyn Tables, store: &Store) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn kind(path: &[u8]) -> &'static str {
+        let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
+        match name {
+            b"dep-graph.bin" => "dep-graph.bin",
+            b"query-cache.bin" => "query-cache.bin",
+            b"work-products.bin" => "work-products.bin",
+            b"metadata.rmeta" => "metadata.rmeta",
+            n if n.ends_with(b".o") => "object files",
+            n if n.ends_with(b".dwo") => "split debuginfo",
+            n if n.ends_with(b".bc") => "bitcode",
+            _ => "other",
+        }
+    }
+    #[derive(Default)]
+    struct Row {
+        files: u64,
+        logical: u64,
+        blobs: BTreeSet<Hash>,
+        unique: u64,
+        chunks: BTreeSet<Hash>,
+        chunk_unique: u64,
+    }
+    let mut states = 0u64;
+    let mut crates: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
+    let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
+    for (k, v) in db.scan_prefix(Table::Incr, &[]) {
+        if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
+            entries.push((k, m));
+        }
+    }
+    for (k, meta) in &entries {
+        let Ok(raw) = store.read(&meta.manifest) else { continue };
+        let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
+        states += 1;
+        if let Some(c) = k.get(..32) {
+            crates.insert(c.try_into().unwrap());
+        }
+        for (path, e) in &m.entries {
+            let MEntry::File { hash, size, .. } = e else { continue };
+            let row = rows.entry(kind(path)).or_default();
+            row.files += 1;
+            row.logical += size;
+            if row.blobs.insert(*hash) {
+                row.unique += size;
+            }
+        }
+    }
+    for row in rows.values_mut() {
+        for blob in &row.blobs {
+            let Ok(f) = store.open_blob(blob) else { continue };
+            let Ok(recipe) = crate::chunk::chunk_file(&f) else { continue };
+            for c in recipe {
+                if row.chunks.insert(c.hash) {
+                    row.chunk_unique += c.len as u64;
+                }
+            }
+        }
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut out = format!(
+        "{states} states of {} crates\n{:<20} {:>8} {:>12} {:>14} {:>16}\n",
+        crates.len(),
+        "",
+        "files",
+        "logical GiB",
+        "as files GiB",
+        "as chunks GiB"
+    );
+    let (mut tl, mut tu, mut tc) = (0u64, 0u64, 0u64);
+    for (name, row) in &rows {
+        out += &format!(
+            "{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n",
+            name,
+            row.files,
+            gib(row.logical),
+            gib(row.unique),
+            gib(row.chunk_unique)
+        );
+        tl += row.logical;
+        tu += row.unique;
+        tc += row.chunk_unique;
+    }
+    out += &format!("{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n", "total", "", gib(tl), gib(tu), gib(tc));
+    out
+}
+
+#[cfg(test)]
+impl StateMachine for IncrStore {
+    fn invariants(&self) {
+        let mut by_crate: BTreeMap<[u8; 32], Vec<u64>> = BTreeMap::new();
+        for (k, _) in self.db.scan_prefix(Table::Incr, &[]) {
+            if let (Some(c), Some(id)) = (k.get(..32), k.get(32..40)) {
+                by_crate.entry(c.try_into().unwrap()).or_default().push(u64::from_be_bytes(id.try_into().unwrap()));
+            }
+        }
+        let next = self.next.get();
+        for (c, ids) in &by_crate {
+            let listed = self.list(&Hash(*c));
+            assert!(ids.iter().all(|id| *id < next), "every stored id {ids:?} was handed out, below {next}");
+            assert_eq!(listed.len(), ids.len(), "the list of a crate is every entry stored for it");
+            assert!(doomed(&listed).is_empty(), "nothing kept for a crate is due to be evicted");
+        }
     }
 }
 
@@ -375,15 +395,23 @@ pub fn apply_changes(dir: &[u8], seed: Option<&Manifest>, changes: &[(Vec<u8>, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     use crate::db::MemTables;
-    use crate::store::MemBlobs;
+    use crate::io::sim;
+    use crate::store::Store;
 
-    fn store() -> (Arc<MemTables>, Arc<MemBlobs>) {
-        (Arc::new(MemTables::default()), Arc::new(MemBlobs::default()))
+    fn blobs() -> Arc<Store> {
+        let db = Arc::new(crate::db::Db::open_in_memory().unwrap());
+        Arc::new(Store::open(&sim::tempdir().join("store"), db).unwrap())
     }
 
-    fn manifest(store: &MemBlobs, files: &[(&str, &str)]) -> Manifest {
+    fn store() -> (Arc<MemTables>, Arc<Store>) {
+        (Arc::new(MemTables::default()), blobs())
+    }
+
+    fn manifest(store: &Store, files: &[(&str, &str)]) -> Manifest {
         Manifest {
             entries: files
                 .iter()
@@ -397,87 +425,112 @@ mod tests {
 
     #[test]
     fn seed_preference_order() {
-        let (db, s) = store();
-        let incr = IncrStore::new(db.clone(), s.clone(), 1);
-        let k = Hash::of(b"crate");
-        let main = [1u8; 20];
-        let side = [2u8; 20];
-        assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-        incr.save(&k, "/wt/main", Some(main), &manifest(&s, &[("/i/x", "main state")]), 100);
-        assert!(incr.invariants());
-        incr.save(&k, "/wt/side", Some(side), &manifest(&s, &[("/i/x", "side state")]), 100);
-        assert!(incr.invariants());
-        let content = |m: &Manifest| match &m.entries[0].1 {
-            MEntry::File { hash, .. } => String::from_utf8(s.read(hash).unwrap()).unwrap(),
-            _ => unreachable!(),
-        };
-        let s1 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s1.manifest).as_str(), s1.kind), ("main state", SeedKind::Ancestor));
-        assert_eq!(s1.blobs.len(), 1);
-        let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s2.manifest).as_str(), s2.kind), ("side state", SeedKind::Other));
-        incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]), 100);
-        assert!(incr.invariants());
-        let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
-        let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s3.manifest).as_str(), s3.kind), ("own state", SeedKind::SameWorktree));
-        incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]), 100);
-        assert!(incr.invariants());
-        let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
-        let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
-        assert!(incr.invariants());
-        assert_eq!((content(&s5.manifest).as_str(), s5.kind), ("one commit back", SeedKind::Ancestor));
-        incr.forget(&k, s5.id);
-        assert!(incr.invariants());
-        incr.discard(&k, s3.id);
-        assert!(incr.invariants());
-        let s4 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
-        assert!(incr.invariants());
-        assert_eq!(content(&s4.manifest), "main state");
+        sim::test(|| {
+            let mut outcomes = Transcript::default();
+            let (db, s) = store();
+            let incr = IncrStore::new(db.clone(), s.clone(), 1);
+            let k = Hash::of(b"crate");
+            let main = [1u8; 20];
+            let side = [2u8; 20];
+            assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
+            incr.save(&k, "/wt/main", Some(main), &manifest(&s, &[("/i/x", "main state")]), 100);
+            incr.invariants();
+            incr.save(&k, "/wt/side", Some(side), &manifest(&s, &[("/i/x", "side state")]), 100);
+            incr.invariants();
+            let content = |m: &Manifest| match &m.entries[0].1 {
+                MEntry::File { hash, .. } => String::from_utf8(s.read(hash).unwrap()).unwrap(),
+                _ => unreachable!(),
+            };
+            let s1 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
+            incr.invariants();
+            outcomes.record("nearest ancestor seed", (content(&s1.manifest).as_str(), s1.kind));
+            outcomes.record("seed blob count", s1.blobs.len());
+            let s2 = incr.pick(&k, "/wt/new", &|_| None).unwrap();
+            incr.invariants();
+            outcomes.record("recent fallback seed", (content(&s2.manifest).as_str(), s2.kind));
+            incr.save(&k, "/wt/new", Some([3u8; 20]), &manifest(&s, &[("/i/x", "own state")]), 100);
+            incr.invariants();
+            let at = |c: &[u8; 20]| if *c == [3u8; 20] { Some(0) } else if *c == main { Some(1) } else { None };
+            let s3 = incr.pick(&k, "/wt/new", &at).unwrap();
+            incr.invariants();
+            outcomes.record("same commit seed", (content(&s3.manifest).as_str(), s3.kind));
+            incr.save(&k, "/wt/other", Some([9u8; 20]), &manifest(&s, &[("/i/x", "one commit back")]), 100);
+            incr.invariants();
+            let later = |c: &[u8; 20]| if *c == [9u8; 20] { Some(1) } else if *c == [3u8; 20] { Some(10) } else { None };
+            let s5 = incr.pick(&k, "/wt/new", &later).unwrap();
+            incr.invariants();
+            outcomes.record("closer ancestor seed", (content(&s5.manifest).as_str(), s5.kind));
+            incr.forget(&k, s5.id);
+            incr.invariants();
+            incr.discard(&k, s3.id);
+            incr.invariants();
+            let s4 = incr.pick(&k, "/wt/new", &|c| (*c == main).then_some(1)).unwrap();
+            incr.invariants();
+            outcomes.record("content", content(&s4.manifest));
+            expect![[r#"
+                nearest ancestor seed: ("main state", Ancestor)
+                seed blob count: 1
+                recent fallback seed: ("side state", Other)
+                same commit seed: ("own state", SameWorktree)
+                closer ancestor seed: ("one commit back", Ancestor)
+                content: "main state"
+            "#]].assert_eq(&outcomes.0);
+        });
     }
 
     #[test]
     fn evicted_state_is_skipped() {
-        let (db, s) = store();
-        let incr = IncrStore::new(db.clone(), s.clone(), 1);
-        let k = Hash::of(b"crate");
-        let m = manifest(&s, &[("/i/x", "will be evicted")]);
-        incr.save(&k, "/wt/a", None, &m, 100);
-        assert!(incr.invariants());
-        if let MEntry::File { hash, .. } = &m.entries[0].1 {
-            s.held.lock().remove(hash);
-        }
-        assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-        assert_eq!(incr.state_count(&k), 0);
+        sim::test(|| {
+            let mut outcomes = Transcript::default();
+            let (db, s) = store();
+            let incr = IncrStore::new(db.clone(), s.clone(), 1);
+            let k = Hash::of(b"crate");
+            let m = manifest(&s, &[("/i/x", "will be evicted")]);
+            incr.save(&k, "/wt/a", None, &m, 100);
+            incr.invariants();
+            if let MEntry::File { hash, .. } = &m.entries[0].1 {
+                s.remove(hash);
+            }
+            assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
+            outcomes.record("state count", incr.state_count(&k));
+            expect![[r#"
+                state count: 0
+            "#]].assert_eq(&outcomes.0);
+        });
     }
 
     #[test]
     fn state_with_files_on_a_worker_is_usable_while_the_worker_holds_them() {
-        let (db, s) = store();
-        let incr = IncrStore::new(db.clone(), s.clone(), 1);
-        let k = Hash::of(b"crate");
-        let away = Hash::of(b"made on a worker, not fetched yet");
-        let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let c2 = connected.clone();
-        incr.set_held(Box::new(move |h| *h == away && c2.load(Ordering::Relaxed)));
-        let mut m = manifest(&s, &[("/i/here", "at home")]);
-        m.entries.push((b"/i/there".to_vec(), MEntry::File { hash: away, exec: false, size: 33 }));
-        incr.save(&k, "/wt/a", None, &m, 100);
-        assert!(incr.invariants());
-        let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
-        assert!(incr.invariants());
-        assert!(seed.blobs.contains(&(away, 33)));
-        assert_eq!(seed.blobs.iter().filter(|(h, _)| !s.has(h)).count(), 1);
-        connected.store(false, Ordering::Relaxed);
-        assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
-        assert_eq!(incr.state_count(&k), 0);
+        sim::test(|| {
+            let mut outcomes = Transcript::default();
+            let (db, s) = store();
+            let incr = IncrStore::new(db.clone(), s.clone(), 1);
+            let k = Hash::of(b"crate");
+            let worker = blobs();
+            let away = worker.put_bytes(b"made on a worker, not fetched yet").unwrap();
+            let on_worker = worker.clone();
+            incr.set_held(Box::new(move |h| on_worker.has(h)));
+            let mut m = manifest(&s, &[("/i/here", "at home")]);
+            m.entries.push((b"/i/there".to_vec(), MEntry::File { hash: away, exec: false, size: 33 }));
+            incr.save(&k, "/wt/a", None, &m, 100);
+            incr.invariants();
+            let seed = incr.pick(&k, "/wt/a", &|_| None).unwrap();
+            incr.invariants();
+            assert!(seed.blobs.contains(&(away, 33)));
+            outcomes.record("blobs absent locally", seed.blobs.iter().filter(|(h, _)| !s.has(h)).count());
+            worker.remove(&away);
+            assert!(incr.pick(&k, "/wt/a", &|_| None).is_none());
+            outcomes.record("state count", incr.state_count(&k));
+            expect![[r#"
+                blobs absent locally: 1
+                state count: 0
+            "#]].assert_eq(&outcomes.0);
+        });
     }
 
     #[test]
     fn changes_apply_over_seed() {
+        let mut outcomes = Transcript::default();
         let f = |n: u8| MEntry::File { hash: Hash([n; 32]), exec: false, size: 1 };
         let seed = Manifest {
             entries: vec![
@@ -494,7 +547,10 @@ mod tests {
         ];
         let m = apply_changes(b"/i", Some(&seed), &changes);
         let paths: Vec<&[u8]> = m.entries.iter().map(|(p, _)| p.as_slice()).collect();
-        assert_eq!(paths, vec![&b"/i/c/s-new"[..], b"/i/c/s-new/a.o", b"/i/c/s-new/dep-graph.bin"]);
+        outcomes.record("paths", paths);
+        expect![[r#"
+            paths: [[47, 105, 47, 99, 47, 115, 45, 110, 101, 119], [47, 105, 47, 99, 47, 115, 45, 110, 101, 119, 47, 97, 46, 111], [47, 105, 47, 99, 47, 115, 45, 110, 101, 119, 47, 100, 101, 112, 45, 103, 114, 97, 112, 104, 46, 98, 105, 110]]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
@@ -508,70 +564,104 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_saves_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        let worktrees: Vec<String> = (0..KEEP_WORKTREES as u64 + 4).map(|i| format!("/wt/{i}")).collect();
-        for seed in 1..=300u64 {
-            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    fn generated_saves(seeds: std::ops::RangeInclusive<u64>) {
+        sim::test(move || {
+            let worktrees: Vec<String> = (0..KEEP_WORKTREES as u64 + 4).map(|i| format!("/wt/{i}")).collect();
             let (db, s) = store();
-            let start = 1000 + rng.below(1000);
-            let incr = IncrStore::new(db, s.clone(), start);
-            let crates = [Hash::of(b"a"), Hash::of(b"b")];
-            let mut given: BTreeMap<u64, (usize, String, u64)> = BTreeMap::new();
-            let mut newest: BTreeMap<(usize, String), u64> = BTreeMap::new();
-            let mut clock = 1_700_000_000u64;
-            for step in 0..60 {
-                let c = rng.below(2) as usize;
-                let spread = if rng.below(3) == 0 { worktrees.len() as u64 } else { 3 };
-                let wt = worktrees[rng.below(spread) as usize].clone();
-                match rng.below(6) {
-                    0 => {
-                        if let Some(seed) = incr.pick(&crates[c], &wt, &|_| None) {
-                            incr.forget(&crates[c], seed.id);
-                            newest.retain(|_, id| *id != seed.id);
+            for seed in seeds {
+                let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+                db.clear();
+                let start = 1000 + rng.below(1000);
+                let incr = IncrStore::new(db.clone(), s.clone(), start);
+                let crates = [Hash::of(b"a"), Hash::of(b"b")];
+                let mut given: BTreeMap<u64, (usize, String, u64)> = BTreeMap::new();
+                let mut newest: BTreeMap<(usize, String), u64> = BTreeMap::new();
+                let mut clock = 1_700_000_000u64;
+                for step in 0..60 {
+                    let c = rng.below(2) as usize;
+                    let spread = if rng.below(3) == 0 { worktrees.len() as u64 } else { 3 };
+                    let wt = worktrees[rng.below(spread) as usize].clone();
+                    match rng.below(6) {
+                        0 => {
+                            if let Some(seed) = incr.pick(&crates[c], &wt, &|_| None) {
+                                incr.forget(&crates[c], seed.id);
+                                newest.retain(|_, id| *id != seed.id);
+                            }
+                        }
+                        _ => {
+                            clock += rng.below(5000);
+                            let id = start + given.len() as u64;
+                            incr.save(&crates[c], &wt, None, &manifest(&s, &[("/i/x", &format!("{seed} {step}"))]), clock);
+                            given.insert(id, (c, wt.clone(), clock));
+                            newest.insert((c, wt), id);
                         }
                     }
-                    _ => {
-                        clock += rng.below(5000);
-                        let id = start + given.len() as u64;
-                        incr.save(&crates[c], &wt, None, &manifest(&s, &[("/i/x", &format!("{seed} {step}"))]), clock);
-                        given.insert(id, (c, wt.clone(), clock));
-                        newest.insert((c, wt), id);
-                    }
-                }
-                assert!(incr.invariants(), "seed {seed} step {step}");
-                for (c, k) in crates.iter().enumerate() {
-                    let listed = incr.list(k);
-                    let distinct: std::collections::BTreeSet<&str> = listed.iter().map(|(_, m)| m.worktree.as_str()).collect();
-                    assert!(listed.len() <= distinct.len().min(KEEP_WORKTREES) + KEEP_EXTRA, "seed {seed}: {} states", listed.len());
-                    for (id, meta) in &listed {
-                        assert_eq!(given.get(id), Some(&(c, meta.worktree.clone(), meta.created)), "seed {seed}: state {id} keeps the time it was saved at");
-                    }
-                    let mut kept_worktrees: Vec<&str> = Vec::new();
-                    for (id, meta) in &listed {
-                        if !kept_worktrees.contains(&meta.worktree.as_str()) {
-                            kept_worktrees.push(&meta.worktree);
-                            if let Some(n) = newest.get(&(c, meta.worktree.clone())).filter(|_| kept_worktrees.len() <= KEEP_WORKTREES) {
-                                assert_eq!(n, id, "seed {seed}: a worktree's newest state is the one kept first");
+                    rargo_machine::check(&incr, format_args!("seed {seed} step {step}"));
+                    for (c, k) in crates.iter().enumerate() {
+                        let listed = incr.list(k);
+                        let distinct: std::collections::BTreeSet<&str> = listed.iter().map(|(_, m)| m.worktree.as_str()).collect();
+                        assert!(listed.len() <= distinct.len().min(KEEP_WORKTREES) + KEEP_EXTRA, "seed {seed}: {} states", listed.len());
+                        for (id, meta) in &listed {
+                            assert_eq!(given.get(id), Some(&(c, meta.worktree.clone(), meta.created)), "seed {seed}: state {id} keeps the time it was saved at");
+                        }
+                        let mut kept_worktrees: Vec<&str> = Vec::new();
+                        for (id, meta) in &listed {
+                            if !kept_worktrees.contains(&meta.worktree.as_str()) {
+                                kept_worktrees.push(&meta.worktree);
+                                if let Some(n) = newest.get(&(c, meta.worktree.clone())).filter(|_| kept_worktrees.len() <= KEEP_WORKTREES) {
+                                    assert_eq!(n, id, "seed {seed}: a worktree's newest state is the one kept first");
+                                }
                             }
                         }
                     }
                 }
             }
-        }
+        });
+    }
+
+    #[test]
+    fn generated_saves_1_to_50_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(1..=50);
+    }
+
+    #[test]
+    fn generated_saves_51_to_100_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(51..=100);
+    }
+
+    #[test]
+    fn generated_saves_101_to_150_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(101..=150);
+    }
+
+    #[test]
+    fn generated_saves_151_to_200_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(151..=200);
+    }
+
+    #[test]
+    fn generated_saves_201_to_250_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(201..=250);
+    }
+
+    #[test]
+    fn generated_saves_251_to_300_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
+        generated_saves(251..=300);
     }
 
     #[test]
     fn pruning_keeps_latest_per_worktree() {
-        let (db, s) = store();
-        let incr = IncrStore::new(db.clone(), s.clone(), 1);
-        let k = Hash::of(b"crate");
-        for round in 0..6 {
-            for wt in ["/wt/a", "/wt/b"] {
-                incr.save(&k, wt, None, &manifest(&s, &[("/i/x", &format!("{wt} {round}"))]), 100);
-                assert!(incr.invariants());
+        sim::test(|| {
+            let (db, s) = store();
+            let incr = IncrStore::new(db.clone(), s.clone(), 1);
+            let k = Hash::of(b"crate");
+            for round in 0..6 {
+                for wt in ["/wt/a", "/wt/b"] {
+                    incr.save(&k, wt, None, &manifest(&s, &[("/i/x", &format!("{wt} {round}"))]), 100);
+                    incr.invariants();
+                }
             }
-        }
-        assert_eq!(incr.state_count(&k), 2 + KEEP_EXTRA);
+            assert_eq!(incr.state_count(&k), 2 + KEEP_EXTRA);
+        });
     }
 }

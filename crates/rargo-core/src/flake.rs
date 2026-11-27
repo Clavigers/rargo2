@@ -1,3 +1,5 @@
+#[cfg(test)]
+use rargo_machine::StateMachine;
 use crate::io::file::PathRing as _;
 use crate::buildview::SynthEnt;
 use crate::db::Table;
@@ -8,10 +10,10 @@ use crate::store::Store;
 use rargo_proto::tree::Node;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::Command;
+use crate::io::process::Command;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,13 +111,18 @@ fn store_names(text: &str, out: &mut BTreeSet<String>) {
     }
 }
 
+/// The directory for temporary files: `TMPDIR`, or `/tmp` without it.
+fn temp_dir() -> std::path::PathBuf {
+    crate::io::env::var_os("TMPDIR").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp".into())
+}
+
 fn run_nix(root: &Path, mut c: Command, uid: u32, gid: u32) -> std::result::Result<Vec<u8>, String> {
     use std::os::unix::process::CommandExt;
-    c.current_dir(root).stdin(std::process::Stdio::null());
-    if uid != unsafe { libc::geteuid() } {
-        c.uid(uid).gid(gid);
+    c.current_dir(root).stdin(crate::io::process::Stdio::null());
+    if uid != crate::io::process::euid() {
+        c.std_mut().uid(uid).gid(gid);
     }
-    let out = crate::io::output(&mut c).map_err(|e| format!("running nix: {e}"))?;
+    let out = c.output().map_err(|e| format!("running nix: {e}"))?;
     if !out.status.success() {
         return Err(format!("nix failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
@@ -323,18 +330,29 @@ impl Resolution {
         let save = *was != Some(env.id);
         self.stage = Stage::Done { env, save };
     }
+}
 
-    #[cfg(test)]
-    fn invariants(&self) -> bool {
-        let sorted = |c: &[String]| c.windows(2).all(|w| w[0] < w[1]);
+#[cfg(test)]
+impl StateMachine for Resolution {
+    fn invariants(&self) {
+        let sorted = |c: &[String]| assert!(c.windows(2).all(|w| w[0] < w[1]), "the closure is sorted and has no repeats");
         match &self.stage {
-            Stage::Cached(env) => sorted(&env.closure),
-            Stage::Evaluating => true,
-            Stage::Rooting { env, names } => !names.is_empty() && env.contains_key("PATH"),
-            Stage::Closing { env, roots } => env.contains_key("PATH") && roots.iter().all(|r| r.as_bytes().get(32) == Some(&b'-')),
-            Stage::Manifesting { env, .. } => sorted(&env.closure),
-            Stage::Done { env, .. } => sorted(&env.closure) && env.id == action_id(&self.key, env) && env.roots.len() == env.closure.len(),
-            Stage::Failed(e) => !e.is_empty(),
+            Stage::Cached(env) | Stage::Manifesting { env, .. } => sorted(&env.closure),
+            Stage::Evaluating => {}
+            Stage::Rooting { env, names } => {
+                assert!(!names.is_empty(), "rooting has names to root");
+                assert!(env.contains_key("PATH"), "an evaluated environment has a PATH");
+            }
+            Stage::Closing { env, roots } => {
+                assert!(env.contains_key("PATH"), "an evaluated environment has a PATH");
+                assert!(roots.iter().all(|r| r.as_bytes().get(32) == Some(&b'-')), "every root is a store path name");
+            }
+            Stage::Done { env, .. } => {
+                sorted(&env.closure);
+                assert!(env.id == action_id(&self.key, env), "a done environment's id is the action id of its key and contents");
+                assert_eq!(env.roots.len(), env.closure.len(), "every closure path has a root");
+            }
+            Stage::Failed(e) => assert!(!e.is_empty(), "a failure says why"),
         }
     }
 }
@@ -409,16 +427,12 @@ pub(crate) fn resolve_shell(
     shell: &str,
     preparing: &dyn Fn(),
 ) -> Result<Arc<FlakeEnv>> {
-    static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    if NIX_READY.get().is_none() {
-        let ready = match crate::io::output(nix().arg("--version")) {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
-            Err(e) => Err(e.to_string()),
-        };
-        let _ = NIX_READY.set(ready);
-    }
-    NIX_READY.get().expect("set above").as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
+    crate::io::nix::ready(|| match nix().arg("--version").output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+        Err(e) => Err(e.to_string()),
+    })
+    .map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
 
     let src = source(snap, dir, extra);
     let shell_key = if shell == "default" {
@@ -451,7 +465,7 @@ pub(crate) fn resolve_shell(
                 resolution.exists(&present);
             }
             Need::Evaluate => {
-                let at = crate::io::cpu(|| d.scratch("flake"))?;
+                let at = d.scratch("flake")?;
                 scratch = Some(at.clone());
                 let out = (|| -> Result<Vec<u8>> {
                     let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
@@ -481,11 +495,12 @@ pub(crate) fn resolve_shell(
                 for r in &roots {
                     c.arg(nix_store.join(r));
                 }
-                let at = scratch.clone().unwrap_or_else(std::env::temp_dir);
+                let at = scratch.clone().unwrap_or_else(temp_dir);
                 resolution.closed(run_nix(&at, c, uid, gid));
             }
             Need::Manifest(closure) => {
-                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), &d.nix_attached));
+                let attached = &d.nix_attached;
+                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), attached));
                 let prepared = match prepared {
                     Ok(p) => p,
                     Err(e) => break Err(e),
@@ -499,7 +514,7 @@ pub(crate) fn resolve_shell(
     };
     if let Some(at) = scratch {
         crate::io::cpu(move || {
-            let _ = std::fs::remove_dir_all(at);
+            let _ = crate::io::file::remove_dir_all(at);
         });
     }
     let (env, save) = done?;
@@ -511,7 +526,7 @@ pub(crate) fn resolve_shell(
 }
 
 impl FlakeEnv {
-    pub fn closure_set(&self) -> Arc<HashSet<Vec<u8>>> {
+    pub fn closure_set(&self) -> Arc<BTreeSet<Vec<u8>>> {
         Arc::new(self.closure.iter().map(|c| c.as_bytes().to_vec()).collect())
     }
 
@@ -519,8 +534,8 @@ impl FlakeEnv {
         self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).ring_is_file())
     }
 
-    pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<HashMap<Vec<u8>, SynthEnt>>> {
-        let mut m = HashMap::new();
+    pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<BTreeMap<Vec<u8>, SynthEnt>>> {
+        let mut m = BTreeMap::new();
         let mut file = |name: &str, content: String| -> Result<()> {
             let hash = store.put_bytes(content.as_bytes())?;
             m.insert(name.as_bytes().to_vec(), SynthEnt::File { hash, size: content.len() as u64 });
@@ -552,6 +567,8 @@ impl FlakeEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     #[test]
     fn the_default_toolchain_has_the_standard_library_s_sources_whatever_the_toolchain_file_asks() {
@@ -594,7 +611,7 @@ mod tests {
 
     fn drive(r: &mut Resolution, present: &BTreeSet<String>, dev_env: &[u8], closure: &[u8]) -> Need {
         for _ in 0..8 {
-            assert!(r.invariants());
+            r.invariants();
             match r.need() {
                 Need::Exists(names) => r.exists(&names.into_iter().filter(|n| present.contains(n)).collect()),
                 Need::Evaluate => r.evaluated(Ok(dev_env.to_vec())),
@@ -608,31 +625,32 @@ mod tests {
 
     #[test]
     fn the_real_dev_environment_resolves_to_its_closure() {
+        let mut outcomes = Transcript::default();
         let key = Hash::of(b"source");
         let closure = lines(CLOSURE);
         let mut r = Resolution::new(key, None, true);
-        assert_eq!(r.need(), Need::Evaluate);
+        outcomes.record("need", r.need());
         r.evaluated(Ok(DEV_ENV.to_vec()));
-        assert!(r.invariants());
+        r.invariants();
         let Need::Exists(asked) = r.need() else { panic!("the roots are checked against the store") };
         assert!(asked.iter().all(|n| n.as_bytes().get(32) == Some(&b'-')));
         r.exists(&closure);
         let Need::Closure(roots) = r.need() else { panic!("the closure of the roots is asked for") };
-        assert_eq!(roots.len(), 39);
+        outcomes.record("closure root count", roots.len());
         assert!(roots.iter().all(|root| closure.contains(root)));
         assert!(roots.iter().any(|root| root.contains("-rust")), "{roots:?}");
         r.closed(Ok(CLOSURE.to_vec()));
         let Need::Manifest(manifest) = r.need() else { panic!("the closure is manifested") };
-        assert_eq!(manifest.len(), 163);
+        outcomes.record("manifest path count", manifest.len());
         assert_eq!(manifest, closure.iter().cloned().collect::<Vec<_>>());
         r.manifested(manifest.iter().map(|n| Hash::of(n.as_bytes())).collect());
-        assert!(r.invariants());
+        r.invariants();
         let Need::Done { env, save: true } = r.need() else { panic!("a fresh evaluation is saved") };
         assert!(env.env["PATH"].split(':').all(|p| p.starts_with("/nix/store/")));
-        assert_eq!(env.env["SSL_CERT_FILE"], CA_AT);
+        outcomes.record("SSL_CERT_FILE", &env.env["SSL_CERT_FILE"]);
         assert!(!env.env.keys().any(|k| k.starts_with("BASH") || k.starts_with("__") || (DROP.contains(&k.as_str()) && env.env[k] != CA_AT)));
         assert!(!env.env.contains_key("HOME") && !env.env.contains_key("NIX_BUILD_TOP") && !env.env.contains_key("shellHook"));
-        assert_eq!(env.id, action_id(&key, &env));
+        outcomes.record("environment id", env.id);
         let without_ca = drive(&mut Resolution::new(key, None, false), &closure, DEV_ENV, CLOSURE);
         let Need::Done { env: plain, .. } = without_ca else { panic!("{without_ca:?}") };
         assert!(!plain.env.contains_key("SSL_CERT_FILE") || plain.env["SSL_CERT_FILE"] != CA_AT);
@@ -641,7 +659,7 @@ mod tests {
         reversed.reverse();
         let reversed = reversed.join(&b'\n');
         let Need::Done { env: again, .. } = drive(&mut Resolution::new(key, None, true), &closure, DEV_ENV, &reversed) else { panic!() };
-        assert_eq!(again, env, "the closure's order does not matter");
+        assert_eq!(again, env, "the closure order does not matter");
 
         let mut cached = Resolution::new(key, Some(env.clone()), true);
         assert_eq!(cached.need(), Need::Exists(env.closure.clone()));
@@ -653,11 +671,21 @@ mod tests {
         gone.remove(&env.closure[7]);
         let mut cached = Resolution::new(key, Some(env.clone()), true);
         cached.exists(&gone);
-        assert_eq!(cached.need(), Need::Evaluate, "a cached closure missing a path is evaluated again");
+        // a cached closure missing a path is evaluated again.
+        outcomes.record("need", cached.need());
+        expect![[r#"
+            need: Evaluate
+            closure root count: 39
+            manifest path count: 163
+            SSL_CERT_FILE: "/etc/ca-certificates.crt"
+            environment id: 0ba5d1d686b3f387
+            need: Evaluate
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn only_a_flake_that_must_be_evaluated_or_built_prepares_the_toolchain() {
+        let mut outcomes = Transcript::default();
         let key = Hash::of(b"source");
         let closure = lines(CLOSURE);
         let prepares = |r: &mut Resolution, present: &BTreeSet<String>| {
@@ -677,38 +705,52 @@ mod tests {
             panic!("the resolution did not finish");
         };
         let (fresh, env) = prepares(&mut Resolution::new(key, None, true), &closure);
-        assert_eq!(fresh, [true, false, true, false, false]);
+        outcomes.record("fresh", fresh);
         let env = env.expect("resolves");
         let (cached, _) = prepares(&mut Resolution::new(key, Some(env.clone()), true), &closure);
-        assert!(!cached.contains(&true), "a cached flake whose paths are present prepares nothing: {cached:?}");
+        outcomes.record("cached", cached);
         let mut gone = closure.clone();
         gone.remove(&env.closure[7]);
         let (missing, _) = prepares(&mut Resolution::new(key, Some(env), true), &gone);
-        assert!(missing.contains(&true), "a cached closure missing a path prepares the toolchain again");
+        outcomes.record("stale", missing);
+        expect![[r#"
+            fresh: [true, false, true, false, false]
+            cached: [false, false, false]
+            stale: [false, true, false, true, false, false]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn failures_and_answers_out_of_turn() {
+        let mut outcomes = Transcript::default();
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.closed(Ok(CLOSURE.to_vec()));
         r.manifested(Vec::new());
         r.exists(&BTreeSet::new());
-        assert_eq!(r.need(), Need::Evaluate, "answers to what was not asked change nothing");
+        // answers to what was not asked change nothing.
+        outcomes.record("need", r.need());
         r.evaluated(Err("nix failed: boom".into()));
-        assert_eq!(r.need(), Need::Failed("nix failed: boom".into()));
+        outcomes.record("need", r.need());
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.evaluated(Ok(br#"{"variables":{"PATH":{"type":"exported","value":"/usr/bin"}}}"#.to_vec()));
-        assert!(matches!(r.need(), Need::Failed(e) if e.contains("exports no tools")));
+        outcomes.record("no tools", r.need());
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.evaluated(Ok(b"not json".to_vec()));
-        assert!(matches!(r.need(), Need::Failed(e) if e.contains("parsing `nix print-dev-env`")));
+        outcomes.record("malformed environment", r.need());
         let mut r = Resolution::new(Hash::ZERO, None, true);
         r.evaluated(Ok(DEV_ENV.to_vec()));
         r.evaluated(Err("late".into()));
         r.exists(&lines(CLOSURE));
         r.closed(Err("nix failed: no store".into()));
-        assert!(r.invariants());
-        assert_eq!(r.need(), Need::Failed("nix failed: no store".into()));
+        r.invariants();
+        outcomes.record("need", r.need());
+        expect![[r#"
+            need: Evaluate
+            need: Failed("nix failed: boom")
+            no tools: Failed("the flake's devShell exports no tools (no store paths, or no PATH)")
+            malformed environment: Failed("parsing `nix print-dev-env`: expected ident at line 1 column 2")
+            need: Failed("nix failed: no store")
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);
@@ -778,7 +820,7 @@ mod tests {
             let fail_close = rng.below(10) == 0;
             let mut steps = 0;
             let end = loop {
-                assert!(r.invariants(), "seed {seed}");
+                rargo_machine::check(&r, format_args!("seed {seed}"));
                 steps += 1;
                 assert!(steps < 10, "seed {seed}");
                 let before = r.need();

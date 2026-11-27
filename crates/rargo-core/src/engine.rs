@@ -1,6 +1,6 @@
 use crate::action_table::{ActionTable, Failure, Ran, ReqId, Start, Woken};
 use crate::hash::{Hash, KeyHasher};
-use crate::sandbox::{HostLayout, Place, SetupSpec, Zygote};
+use crate::sandbox::{HostLayout, Launcher, Place, SetupSpec};
 use crate::sandboxfs::{ActionFs, ActionFsConfig, SandboxFs, UpperKind};
 use crate::sched::{Priority, Scheduler};
 use crate::store::Store;
@@ -9,14 +9,13 @@ use crate::view::*;
 use crate::fn_code;
 use crate::io;
 use anyhow::{Context, Result, bail};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-pub trait Observer: Send + Sync {
+pub trait Observer {
     fn miss(&self) {}
     fn queued(&self, _running: usize, _waiting: usize) {}
     fn wants_explanation(&self) -> bool {
@@ -47,39 +46,43 @@ impl Live for LiveCtl<'_> {
     }
 }
 
-pub type EnvAsker = Arc<dyn Fn(Vec<String>) -> Result<Vec<(String, Option<String>)>> + Send + Sync>;
+pub type EnvAsker = Arc<dyn Fn(Vec<String>) -> Result<Vec<(String, Option<String>)>>>;
 
 pub struct ClientEnv {
-    vars: parking_lot::RwLock<HashMap<String, String>>,
-    checked: parking_lot::RwLock<std::collections::HashSet<String>>,
+    vars: RefCell<BTreeMap<String, String>>,
+    checked: RefCell<BTreeSet<String>>,
     asker: Option<EnvAsker>,
 }
 
 impl ClientEnv {
-    pub fn new(vars: HashMap<String, String>, checked: Vec<String>, asker: Option<EnvAsker>) -> ClientEnv {
+    pub fn new(
+        vars: BTreeMap<String, String>,
+        checked: Vec<String>,
+        asker: Option<EnvAsker>,
+    ) -> ClientEnv {
         ClientEnv {
-            vars: parking_lot::RwLock::new(vars),
-            checked: parking_lot::RwLock::new(checked.into_iter().collect()),
+            vars: RefCell::new(vars),
+            checked: RefCell::new(checked.into_iter().collect()),
             asker,
         }
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
-        self.vars.read().get(name).cloned()
+        self.vars.borrow().get(name).cloned()
     }
 
     pub fn contains_key(&self, name: &str) -> bool {
-        self.vars.read().contains_key(name)
+        self.vars.borrow().contains_key(name)
     }
 
-    pub fn to_map(&self) -> HashMap<String, String> {
-        self.vars.read().clone()
+    pub fn to_map(&self) -> BTreeMap<String, String> {
+        self.vars.borrow().clone()
     }
 
     pub fn ensure(&self, names: &[String]) -> Result<()> {
         let Some(asker) = &self.asker else { return Ok(()) };
         let unknown: Vec<String> = {
-            let (vars, checked) = (self.vars.read(), self.checked.read());
+            let (vars, checked) = (self.vars.borrow(), self.checked.borrow());
             names
                 .iter()
                 .filter(|n| !rargo_proto::env_allowed(n) && !vars.contains_key(*n) && !checked.contains(*n))
@@ -90,7 +93,7 @@ impl ClientEnv {
             return Ok(());
         }
         let answers = asker(unknown.clone())?;
-        let (mut vars, mut checked) = (self.vars.write(), self.checked.write());
+        let (mut vars, mut checked) = (self.vars.borrow_mut(), self.checked.borrow_mut());
         for (name, value) in answers {
             if let Some(v) = value {
                 vars.insert(name, v);
@@ -109,8 +112,8 @@ pub struct Request {
     pub gid: u32,
     pub prio: Priority,
     pub no_cache: bool,
-    pub cacheable: Arc<dyn Fn(&ActionResult) -> bool + Send + Sync>,
-    pub declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String> + Send + Sync>,
+    pub cacheable: Arc<dyn Fn(&ActionResult) -> bool>,
+    pub declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String>>,
     pub observer: Arc<dyn Observer>,
     pub seed_blobs: Arc<Vec<(Hash, u64)>>,
 }
@@ -126,7 +129,7 @@ impl std::fmt::Display for SeedLost {
 
 impl std::error::Error for SeedLost {}
 
-pub trait RemoteRunner: Send + Sync {
+pub trait RemoteRunner {
     fn holds(&self, blob: &Hash) -> bool;
 
     fn offer_state(&self, _whose: (Hash, String), _blobs: Arc<Vec<(Hash, u64)>>) {}
@@ -158,16 +161,16 @@ pub struct Outcome {
 
 #[derive(Default)]
 pub struct EngineStats {
-    pub runs: AtomicU64,
-    pub runs_by_kind: [AtomicU64; 8],
-    pub joined: AtomicU64,
-    pub joined_then_ran: AtomicU64,
-    pub tainted: AtomicU64,
-    pub env_reruns: AtomicU64,
-    pub remote_runs: AtomicU64,
-    pub remote_failed: AtomicU64,
-    pub run_cpu_us: AtomicU64,
-    pub run_wall_us: AtomicU64,
+    pub runs: Cell<u64>,
+    pub runs_by_kind: [Cell<u64>; 8],
+    pub joined: Cell<u64>,
+    pub joined_then_ran: Cell<u64>,
+    pub tainted: Cell<u64>,
+    pub env_reruns: Cell<u64>,
+    pub remote_runs: Cell<u64>,
+    pub remote_failed: Cell<u64>,
+    pub run_cpu_us: Cell<u64>,
+    pub run_wall_us: Cell<u64>,
 }
 
 pub struct Engine {
@@ -175,15 +178,16 @@ pub struct Engine {
     pub content: Arc<Content>,
     pub fs: Arc<SandboxFs>,
     pub mnt: PathBuf,
-    pub zygote: Arc<Zygote>,
+    pub zygote: Arc<dyn Launcher>,
     pub traces: TraceCache,
     pub sched: Arc<Scheduler>,
-    actions: Mutex<ActionTable>,
+    actions: RefCell<ActionTable>,
     flight_ended: io::watch::Sender<()>,
-    seq: AtomicU64,
-    avg_wall_us: AtomicU64,
-    profiles: dashmap::DashMap<Vec<u8>, Arc<Trace>>,
-    pub remote: std::sync::OnceLock<Arc<dyn RemoteRunner>>,
+    seq: Cell<u64>,
+    avg_wall_us: Cell<u64>,
+    log_actions: std::cell::OnceCell<bool>,
+    profiles: RefCell<std::collections::BTreeMap<Vec<u8>, Arc<Trace>>>,
+    pub remote: std::cell::OnceCell<Arc<dyn RemoteRunner>>,
     pub stats: EngineStats,
     pub cgroup_root: Option<PathBuf>,
     pub place: Place,
@@ -211,7 +215,7 @@ struct Requester<'a> {
 
 impl Drop for Requester<'_> {
     fn drop(&mut self) {
-        let woke = self.engine.actions.lock().cancel(self.id);
+        let woke = self.engine.actions.borrow_mut().cancel(self.id);
         if !woke.is_empty() {
             let _ = self.engine.flight_signal().send_replace(());
         }
@@ -221,7 +225,7 @@ impl Drop for Requester<'_> {
 struct Teardown {
     fs: Arc<SandboxFs>,
     sched: Arc<Scheduler>,
-    zygote: Arc<Zygote>,
+    zygote: Arc<dyn Launcher>,
     action: Arc<ActionFs>,
     scratch: PathBuf,
     running: Option<crate::sandbox::Running>,
@@ -258,7 +262,7 @@ impl Drop for Teardown {
             io::cpu(move || {
                 let _ = fs.finish_action(&action);
                 drop(group);
-                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = io::file::remove_dir_all(&scratch);
             });
         }));
     }
@@ -289,24 +293,14 @@ fn default_mem_kb(kind: ActionKind) -> u64 {
     }
 }
 
-fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
-fn read_pipe(fd: &OwnedFd) -> std::io::Result<Vec<u8>> {
+fn read_pipe(fd: &io::PipeEnd) -> std::io::Result<Vec<u8>> {
     io::read_at(fd.as_raw_fd(), 0, 64 * 1024)
 }
 
 #[derive(Clone, Copy)]
 struct ObsPtr(*const dyn Observer);
 
-unsafe impl Send for ObsPtr {}
-
-fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
+fn read_stdout(fd: io::PipeEnd, obs: ObsPtr) -> Vec<u8> {
     let mut all = Vec::new();
     loop {
         let buf = match read_pipe(&fd) {
@@ -319,7 +313,7 @@ fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
     all
 }
 
-fn read_stderr(fd: OwnedFd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
+fn read_stderr(fd: io::PipeEnd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
     let mut all = Vec::new();
     let mut at = 0usize;
     loop {
@@ -351,10 +345,10 @@ impl Engine {
         content: Arc<Content>,
         fs: Arc<SandboxFs>,
         mnt: PathBuf,
-        zygote: Arc<Zygote>,
+        zygote: Arc<dyn Launcher>,
         sched: Arc<Scheduler>,
     ) -> Engine {
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let seed = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
         let traces = TraceCache::new(store.db().clone(), seed);
         Engine {
             store,
@@ -364,12 +358,13 @@ impl Engine {
             zygote,
             traces,
             sched,
-            actions: Mutex::new(ActionTable::new()),
+            actions: RefCell::new(ActionTable::new()),
             flight_ended: io::watch::channel(()).0,
-            seq: AtomicU64::new(1),
-            avg_wall_us: AtomicU64::new(0),
-            profiles: dashmap::DashMap::new(),
-            remote: std::sync::OnceLock::new(),
+            seq: Cell::new(1),
+            avg_wall_us: Cell::new(0),
+            log_actions: std::cell::OnceCell::new(),
+            profiles: RefCell::new(std::collections::BTreeMap::new()),
+            remote: std::cell::OnceCell::new(),
             stats: EngineStats::default(),
             cgroup_root: None,
             place: Place::Server,
@@ -502,7 +497,7 @@ impl Engine {
     }
 
     pub fn obtain(&self, req: Request) -> Result<Outcome> {
-        let id = self.actions.lock().begin();
+        let id = self.actions.borrow_mut().begin();
         let _requester = Requester { engine: self, id };
         let mut announced = false;
         loop {
@@ -519,7 +514,7 @@ impl Engine {
                 }
             }
             let pred = if hit.is_some() { Hash::ZERO } else { self.prediction(&key, &*req.view) };
-            let start = self.actions.lock().start(id, (key, pred), hit.is_some(), req.no_cache);
+            let start = self.actions.borrow_mut().start(id, (key, pred), hit.is_some(), req.no_cache);
             match start {
                 Start::Hit => {
                     let t = hit.expect("a hit was found");
@@ -527,11 +522,12 @@ impl Engine {
                     return Ok(Outcome { result: Arc::new(t.result.clone()), cached: true, side: Vec::new() });
                 }
                 Start::Join => {
-                    self.stats.joined.fetch_add(1, Ordering::Relaxed);
+                    self.stats.joined.set(self.stats.joined.get() + 1);
                     let mut ended = self.flight_signal().subscribe();
                     loop {
                         ended.borrow_and_update();
-                        match self.actions.lock().woken(id) {
+                        let woken = self.actions.borrow_mut().woken(id);
+                        match woken {
                             Woken::Waiting => {}
                             Woken::Retry => break,
                             Woken::Fail(why) => bail!("{why}"),
@@ -542,7 +538,7 @@ impl Engine {
                 }
                 Start::Run { after_wait } => {
                     if after_wait {
-                        self.stats.joined_then_ran.fetch_add(1, Ordering::Relaxed);
+                        self.stats.joined_then_ran.set(self.stats.joined_then_ran.get() + 1);
                     }
                 }
             }
@@ -558,16 +554,16 @@ impl Engine {
                         } else {
                             Failure::Error
                         };
-                        self.actions.lock().failed(id, why);
+                        self.actions.borrow_mut().failed(id, why);
                         let _ = self.flight_signal().send_replace(());
                         return Err(e);
                     }
                 };
                 if tainted {
-                    self.stats.tainted.fetch_add(1, Ordering::Relaxed);
+                    self.stats.tainted.set(self.stats.tainted.get() + 1);
                 }
                 let cacheable = !tainted && (req.cacheable)(&result);
-                let ran = self.actions.lock().ran(id, tainted, cacheable);
+                let ran = self.actions.borrow_mut().ran(id, tainted, cacheable);
                 match ran {
                     Ran::Again => continue,
                     Ran::Record => break (result, Some(obs), side),
@@ -586,17 +582,17 @@ impl Engine {
                     Trace {
                         obs,
                         result: (*result).clone(),
-                        created: std::time::SystemTime::now()
+                        created: io::system_now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
                     },
                 );
                 if let Some(k) = profile_key(&spec) {
-                    self.profiles.insert(k, stored);
+                    self.profiles.borrow_mut().insert(k, stored);
                 }
             }
-            self.actions.lock().settled(id);
+            self.actions.borrow_mut().settled(id);
             let _ = self.flight_signal().send_replace(());
 
             let declared = (req.declared_env)(&result, &self.store);
@@ -606,11 +602,11 @@ impl Engine {
                 let relevant =
                     added.iter().any(|v| !spec.env.contains_key(v.as_bytes()) && req.client_env.contains_key(v));
                 if relevant {
-                    self.stats.env_reruns.fetch_add(1, Ordering::Relaxed);
+                    self.stats.env_reruns.set(self.stats.env_reruns.get() + 1);
                     continue;
                 }
             }
-            self.actions.lock().done(id);
+            self.actions.borrow_mut().done(id);
             return Ok(Outcome { result, cached: false, side });
         }
     }
@@ -711,14 +707,13 @@ impl Engine {
         let permit = self.sched.acquire_saying(req.prio, self.estimate_mem_kb(&key, spec.kind), |running, waiting| {
             req.observer.queued(running, waiting)
         });
-        self.stats.runs.fetch_add(1, Ordering::Relaxed);
-        self.stats.runs_by_kind[spec.kind as usize].fetch_add(1, Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        self.stats.runs.set(self.stats.runs.get() + 1);
+        self.stats.runs_by_kind[spec.kind as usize].set(self.stats.runs_by_kind[spec.kind as usize].get() + 1);
+        let started = io::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer);
         drop(permit);
-        self.note_action_wall(started.elapsed());
-        static LOG_ACTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *LOG_ACTIONS.get_or_init(|| std::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
+        self.note_action_wall(io::now().saturating_duration_since(started));
+        if *self.log_actions.get_or_init(|| io::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
             let outcome = match &r {
                 Ok((result, _, tainted, _)) => format!("exit={:?} tainted={tainted}", result.code()),
                 Err(e) => format!("error={e:#}"),
@@ -748,13 +743,13 @@ impl Engine {
     }
 
     pub fn profile(&self, spec: &ActionSpec) -> Option<Arc<Trace>> {
-        self.profiles.get(&profile_key(spec)?).map(|t| t.clone())
+        self.profiles.borrow().get(&profile_key(spec)?).cloned()
     }
 
     pub(crate) fn note_action_wall(&self, d: std::time::Duration) {
-        let old = self.avg_wall_us.load(Ordering::Relaxed);
+        let old = self.avg_wall_us.get();
         let new = if old == 0 { d.as_micros() as u64 } else { (old * 7 + d.as_micros() as u64) / 8 };
-        self.avg_wall_us.store(new, Ordering::Relaxed);
+        self.avg_wall_us.set(new);
     }
 
     pub(crate) fn run_local(
@@ -763,15 +758,15 @@ impl Engine {
         req: &Request,
         observer: &dyn Observer,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
-        self.stats.runs.fetch_add(1, Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        self.stats.runs.set(self.stats.runs.get() + 1);
+        let started = io::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, observer);
-        self.note_action_wall(started.elapsed());
+        self.note_action_wall(io::now().saturating_duration_since(started));
         r
     }
 
     pub fn avg_action_wall(&self) -> std::time::Duration {
-        std::time::Duration::from_micros(self.avg_wall_us.load(Ordering::Relaxed).max(200_000))
+        std::time::Duration::from_micros(self.avg_wall_us.get().max(200_000))
     }
 
     pub fn execute(
@@ -782,8 +777,9 @@ impl Engine {
         gid: u32,
         observer: &dyn Observer,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
-        let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let scratch = self.store.tmp_dir(&format!("act-{}-{n}", std::process::id()))?;
+        let n = self.seq.get();
+        self.seq.set(n + 1);
+        let scratch = self.store.tmp_dir(&format!("act-{}-{n}", io::process::id()))?;
         let action = self.fs.create_action(ActionFsConfig {
             view,
             uid,
@@ -813,7 +809,7 @@ impl Engine {
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = io::file::remove_dir_all(&scratch);
                 return Err(e);
             }
         };
@@ -822,7 +818,6 @@ impl Engine {
         let content = self.content.clone();
         let upper = fin.upper;
         let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
-            use rayon::prelude::*;
             let mut scratch: Vec<(PathBuf, bool)> = upper
                 .iter()
                 .filter_map(|u| match &u.kind {
@@ -832,18 +827,16 @@ impl Engine {
                 .collect();
             scratch.sort();
             scratch.dedup_by(|a, b| a.0 == b.0);
-            let stored: HashMap<PathBuf, (Hash, u64)> = scratch
-                .into_par_iter()
-                .map(|(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
+            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> =
+                io::thread::par_map(scratch, |(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
                     let r = store
                         .put_file_move(&path, exec)
                         .with_context(|| format!("storing output file {}", path.display()))?;
                     Ok((path, r))
-                })
-                .collect::<Result<_>>()?;
-            let entries: Vec<(Vec<u8>, MEntry)> = upper
-                .into_par_iter()
-                .map(|u| -> Result<(Vec<u8>, MEntry)> {
+                });
+            let stored = stored?;
+            let entries: Result<Vec<(Vec<u8>, MEntry)>> =
+                io::thread::par_map(upper, |u| -> Result<(Vec<u8>, MEntry)> {
                     let e = match u.kind {
                         UpperKind::Dir => MEntry::Dir,
                         UpperKind::Whiteout => MEntry::Whiteout,
@@ -862,13 +855,13 @@ impl Engine {
                         }
                     };
                     Ok((u.path, e))
-                })
-                .collect::<Result<_>>()?;
+                });
+            let entries = entries?;
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
         })?;
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = io::file::remove_dir_all(&scratch);
 
         let mut entries = entries;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -878,8 +871,8 @@ impl Engine {
             entries.into_iter().partition(|(p, _)| spec.discard.iter().any(|d| vpath_starts_with(p, d)));
         assert_eq!(side.len() + entries.len(), total);
         let stats = Stats { wall_us: info.wall_us, cpu_us: info.user_us + info.sys_us, max_rss_kb: info.max_rss_kb };
-        self.stats.run_cpu_us.fetch_add(stats.cpu_us, Ordering::Relaxed);
-        self.stats.run_wall_us.fetch_add(stats.wall_us, Ordering::Relaxed);
+        self.stats.run_cpu_us.set(self.stats.run_cpu_us.get() + stats.cpu_us);
+        self.stats.run_wall_us.set(self.stats.run_wall_us.get() + stats.wall_us);
         let result = ActionResult {
             status: info.status,
             stdout: out_hash,
@@ -903,8 +896,8 @@ impl Engine {
         for d in &spec.mkdirs {
             action.mkdir_p(d).map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
         }
-        let (out_r, out_w) = pipe()?;
-        let (err_r, err_w) = pipe()?;
+        let (out_r, out_w) = io::pipe()?;
+        let (err_r, err_w) = io::pipe()?;
         let setup = SetupSpec { argv: spec.argv.clone(), env: spec.env.clone(), cwd: spec.cwd.clone(), net: spec.net };
         let host = HostLayout {
             place: self.place,
@@ -913,7 +906,7 @@ impl Engine {
             cgroup_root: self.cgroup_root.clone(),
             uid,
             gid,
-            caller: unsafe { (libc::getuid(), libc::getgid()) },
+            caller: (io::process::uid(), io::process::gid()),
             flake: false,
             binds: vec![],
         };
@@ -921,13 +914,13 @@ impl Engine {
         *group_slot = plan.cgroup_dir().map(crate::cgroup::ActionGroup::open);
         let group = group_slot.as_ref();
         assert!(slot.is_none(), "one process per action");
-        let running = slot.insert(self.zygote.spawn(plan, None, out_w, err_w, &self.sched.jobserver_fds())?);
+        let running = slot.insert(self.zygote.launch(plan, out_w, err_w, &self.sched.jobserver_fds())?);
         let id = running.id;
         let exit = running.done.take().expect("the exit is waited once");
         let obs = ObsPtr(unsafe {
             std::mem::transmute::<*const (dyn Observer + '_), *const (dyn Observer + 'static)>(observer)
         });
-        let peak_kb = Arc::new(AtomicU64::new(0));
+        let peak_kb = Arc::new(Cell::new(0));
         let mut watch = None;
         if let Some(g) = group {
             let dir = g.dir.clone();
@@ -938,7 +931,7 @@ impl Engine {
                 loop {
                     every.tick();
                     let kb = io::cpu(|| group.anon_kb());
-                    peak.fetch_max(kb, Ordering::Relaxed);
+                    peak.set(peak.get().max(kb));
                 }
             }));
         }
@@ -985,7 +978,7 @@ impl Engine {
                 info.user_us = user;
                 info.sys_us = sys;
             }
-            info.max_rss_kb = info.max_rss_kb.max(peak_kb.load(Ordering::Relaxed));
+            info.max_rss_kb = info.max_rss_kb.max(peak_kb.get());
         }
         *slot = None;
         *group_slot = None;
@@ -993,5 +986,23 @@ impl Engine {
             bail!("could not start `{}`: {}", spec.label, String::from_utf8_lossy(&stderr).trim());
         }
         Ok((info, stdout, stderr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientEnv;
+
+    #[test]
+    fn client_env_snapshot_is_sorted_by_name() {
+        let env = ClientEnv::new(
+            [("Z".into(), "last".into()), ("A".into(), "first".into())].into(),
+            Vec::new(),
+            None,
+        );
+
+        let snapshot = env.to_map();
+        let entries: Vec<_> = snapshot.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_eq!(entries, [("A", "first"), ("Z", "last")]);
     }
 }

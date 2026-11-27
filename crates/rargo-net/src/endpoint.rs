@@ -1,6 +1,7 @@
 //! Packet routing for one UDP socket. The shell reads and writes that socket.
 //! This type decides which connection a datagram belongs to, and which datagrams to send back.
 
+use rargo_machine::StateMachine;
 use super::{AGREEMENT, DATA_HDR, LinkKey, T_ACK, T_DATA, TAG, open, seal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -77,16 +78,6 @@ impl EndpointState {
         self.invariants();
     }
 
-    #[cfg(test)]
-    fn peer(&self, id: u64) -> Option<SocketAddr> {
-        self.conns.get(&id).map(|c| c.peer)
-    }
-
-    #[cfg(test)]
-    fn last_heard(&self, id: u64) -> Option<u64> {
-        self.conns.get(&id).map(|c| c.last_heard)
-    }
-
     /// One datagram. `now` is the shell's clock reading for this arrival.
     pub fn recv(&mut self, from: SocketAddr, bytes: &[u8], now: u64) -> Routed {
         let out = self.route(from, bytes, now);
@@ -124,19 +115,6 @@ impl EndpointState {
         }
         self.invariants();
         out
-    }
-
-    pub fn invariants(&self) {
-        for id in &self.forgotten {
-            assert!(!self.conns.contains_key(id), "a forgotten connection is not routed");
-            assert!(!self.acks.contains_key(id), "a forgotten connection has no acknowledgement waiting");
-        }
-        for (id, ack) in &self.acks {
-            assert!(self.conns.contains_key(id), "an acknowledgement names a live connection");
-            assert_eq!(ack.body.first().copied(), Some(T_ACK), "an acknowledgement starts with its type");
-            assert!(ack.body.len() >= 9, "an acknowledgement carries its connection id");
-            assert_eq!(ack.body.len() % 12, 9, "an acknowledgement is a header plus whole entries");
-        }
     }
 
     fn route(&mut self, from: SocketAddr, bytes: &[u8], now: u64) -> Routed {
@@ -211,9 +189,26 @@ impl EndpointState {
     }
 }
 
+impl StateMachine for EndpointState {
+    fn invariants(&self) {
+        for id in &self.forgotten {
+            assert!(!self.conns.contains_key(id), "a forgotten connection is not routed");
+            assert!(!self.acks.contains_key(id), "a forgotten connection has no acknowledgement waiting");
+        }
+        for (id, ack) in &self.acks {
+            assert!(self.conns.contains_key(id), "an acknowledgement names a live connection");
+            assert_eq!(ack.body.first().copied(), Some(T_ACK), "an acknowledgement starts with its type");
+            assert!(ack.body.len() >= 9, "an acknowledgement carries its connection id");
+            assert_eq!(ack.body.len() % 12, 9, "an acknowledgement is a header plus whole entries");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::{Expect, expect};
+    use std::fmt::Write as _;
     use std::sync::Arc;
 
     fn at(port: u16) -> SocketAddr {
@@ -236,10 +231,13 @@ mod tests {
         pkt
     }
 
-    fn feed(s: &mut EndpointState, from: SocketAddr, bytes: &[u8], now: u64) -> Routed {
-        let out = s.recv(from, bytes, now);
-        s.invariants();
-        out
+    fn check(s: &mut EndpointState, from: SocketAddr, bytes: &[u8], now: u64, expected: Expect) {
+        let Routed { id, len, events } = s.recv(from, bytes, now);
+        let mut trace = format!("id={id:?}, len={len}\n");
+        for event in events {
+            writeln!(trace, "{event:?}").unwrap();
+        }
+        expected.assert_eq(&trace);
     }
 
     #[test]
@@ -248,16 +246,16 @@ mod tests {
         assert!(s.connect(1, at(1), 0));
         assert!(s.connect(3, at(2), 0));
         s.invariants();
-        let a = feed(&mut s, at(1), &data(1, 4, b"one"), 1);
-        let b = feed(&mut s, at(2), &data(3, 4, b"two"), 2);
-        match &a.events[..] {
-            [RouteEvent::Peer { id: 1, .. }, RouteEvent::Data { id: 1, payload, .. }] => assert_eq!(payload, b"one"),
-            other => panic!("connection 1 got {other:?}"),
-        }
-        match &b.events[..] {
-            [RouteEvent::Peer { id: 3, .. }, RouteEvent::Data { id: 3, payload, .. }] => assert_eq!(payload, b"two"),
-            other => panic!("connection 3 got {other:?}"),
-        }
+        check(&mut s, at(1), &data(1, 4, b"one"), 1, expect![[r#"
+            id=Some(1), len=28
+            Peer { id: 1, from: 10.1.0.1:1 }
+            Data { id: 1, msg: 4, frag: 0, nfrags: 1, payload: [111, 110, 101] }
+        "#]]);
+        check(&mut s, at(2), &data(3, 4, b"two"), 2, expect![[r#"
+            id=Some(3), len=28
+            Peer { id: 3, from: 10.1.0.1:2 }
+            Data { id: 3, msg: 4, frag: 0, nfrags: 1, payload: [116, 119, 111] }
+        "#]]);
         s.ack(1, 4, 0, at(9));
         s.ack(1, 5, 1, at(8));
         s.ack(3, 4, 0, at(7));
@@ -279,25 +277,14 @@ mod tests {
         assert!(shared.connect(1, at(1), 0));
         let mut bad = data(1, 4, b"forged");
         super::seal(&Some(Arc::new([8u8; 32])), &mut bad);
-        let dropped = feed(&mut shared, at(4), &bad, 1);
-        assert!(dropped.events.is_empty());
-        assert_eq!(dropped.id, None);
-        assert_eq!(shared.peer(1), Some(at(1)));
-        assert_eq!(shared.last_heard(1), Some(0));
+        check(&mut shared, at(4), &bad, 1, expect!["id=None, len=0\n"]);
 
         let mut per = EndpointState::new(true, true, None);
         assert!(per.connect(1, at(1), 0));
         per.set_tag(1, [3u8; 32]);
-        per.invariants();
         let spoof = with_tag(data(1, 4, b"forged"), &[4u8; 32]);
-        let dropped = feed(&mut per, at(4), &spoof, 2);
-        assert!(dropped.events.is_empty());
-        assert_eq!(per.peer(1), Some(at(1)));
-        assert_eq!(per.last_heard(1), Some(0));
-        let bare = data(1, 4, b"forged");
-        let dropped = feed(&mut per, at(5), &bare, 3);
-        assert!(dropped.events.is_empty());
-        assert_eq!(per.peer(1), Some(at(1)));
+        check(&mut per, at(4), &spoof, 2, expect!["id=None, len=0\n"]);
+        check(&mut per, at(5), &data(1, 4, b"forged"), 3, expect!["id=None, len=0\n"]);
     }
 
     #[test]
@@ -306,19 +293,16 @@ mod tests {
         assert!(s.connect(1, at(1), 0));
         let tag = [6u8; 32];
         s.set_tag(1, tag);
-        let handshake = data(1, AGREEMENT, b"hi");
-        let early = feed(&mut s, at(2), &handshake, 5);
-        assert!(early.events.iter().any(|e| matches!(e, RouteEvent::Data { msg: AGREEMENT, .. })));
-        assert!(!early.events.iter().any(|e| matches!(e, RouteEvent::Peer { .. })));
-        assert_eq!(s.peer(1), Some(at(1)));
-        assert_eq!(s.last_heard(1), Some(0));
-
+        check(&mut s, at(2), &data(1, AGREEMENT, b"hi"), 5, expect![[r#"
+            id=Some(1), len=27
+            Data { id: 1, msg: 1, frag: 0, nfrags: 1, payload: [104, 105] }
+        "#]]);
         let moved = with_tag(data(1, 4, b"there"), &tag);
-        let got = feed(&mut s, at(2), &moved, 9);
-        assert!(got.events.iter().any(|e| matches!(e, RouteEvent::Peer { id: 1, from } if *from == at(2))));
-        assert!(got.events.iter().any(|e| matches!(e, RouteEvent::Data { payload, .. } if payload == b"there")));
-        assert_eq!(s.peer(1), Some(at(2)));
-        assert_eq!(s.last_heard(1), Some(9));
+        check(&mut s, at(2), &moved, 9, expect![[r#"
+            id=Some(1), len=30
+            Peer { id: 1, from: 10.1.0.1:2 }
+            Data { id: 1, msg: 4, frag: 0, nfrags: 1, payload: [116, 104, 101, 114, 101] }
+        "#]]);
     }
 
     #[test]
@@ -326,14 +310,14 @@ mod tests {
         let mut s = EndpointState::new(true, false, None);
         assert!(s.connect(1, at(1), 0));
         s.forget(1);
-        s.invariants();
         assert!(!s.connect(1, at(1), 1), "a forgotten id is not opened again");
-        let late = feed(&mut s, at(3), &data(1, AGREEMENT, b"again"), 4);
-        assert!(late.events.is_empty());
-        assert_eq!(late.id, None);
-        assert_eq!(s.peer(1), None);
-        let fresh = feed(&mut s, at(3), &data(5, AGREEMENT, b"new"), 6);
-        assert!(fresh.events.iter().any(|e| matches!(e, RouteEvent::Open { id: 5, .. })));
+        check(&mut s, at(3), &data(1, AGREEMENT, b"again"), 4, expect!["id=None, len=0\n"]);
+        check(&mut s, at(3), &data(5, AGREEMENT, b"new"), 6, expect![[r#"
+            id=Some(5), len=28
+            Open { id: 5, from: 10.1.0.1:3 }
+            Peer { id: 5, from: 10.1.0.1:3 }
+            Data { id: 5, msg: 1, frag: 0, nfrags: 1, payload: [110, 101, 119] }
+        "#]]);
     }
 
     #[test]
@@ -349,7 +333,7 @@ mod tests {
         for (n, id) in keys.iter().enumerate() {
             let payload = [n as u8];
             let from = at(2000 + n as u16);
-            let got = feed(&mut s, from, &data(*id, 4, &payload), 100 + n as u64);
+            let got = s.recv(from, &data(*id, 4, &payload), 100 + n as u64);
             let data: Vec<_> = got
                 .events
                 .iter()
@@ -359,7 +343,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(data, vec![(*id, payload.to_vec())]);
-            assert_eq!(s.peer(*id), Some(from));
+            assert!(got.events.contains(&RouteEvent::Peer { id: *id, from }));
             s.ack(*id, 4, 0, from);
             s.invariants();
         }

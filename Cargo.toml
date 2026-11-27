@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.7.10"
+version = "0.7.12"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/sadosystems/rargo2"
+repository = "https://github.com/Clavigers/rargo2"
 homepage = "https://rargo.rs"
 
 [workspace.dependencies]
@@ -32,6 +32,11 @@ debug = "line-tables-only"
 opt-level = 3
 
 [profile.dev.package.proc-macro2]
+opt-level = 3
+
+# Optimize the test binaries timed by the CPU gate. The simulator checks
+# every invariant after every event.
+[profile.test]
 opt-level = 3
 
 [profile.release]

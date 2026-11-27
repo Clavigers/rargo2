@@ -1,6 +1,8 @@
-use crate::buildview::{CARGO_HOME_AT, LEVEL_FULL, LEVEL_META, LEVEL_NONE};
+use crate::buildview::{CARGO_HOME_AT, LEVEL_FULL, LEVEL_META, LEVEL_NONE, WORKTREE_AT};
+use crate::present::Translator;
 use rargo_plan as rp;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct PlanFacts {
@@ -230,7 +232,94 @@ pub fn offline_args(args: &[String]) -> bool {
     false
 }
 
-pub fn base_env(server: &HashMap<String, String>, client: &HashMap<String, String>) -> BTreeMap<String, String> {
+/// The value of the `--target-dir` flag, if the command line names one.
+pub fn target_dir_flag(args: &[String]) -> Option<&str> {
+    let mut it = args.iter().take_while(|a| *a != "--");
+    while let Some(a) = it.next() {
+        if a == "--target-dir" {
+            return it.next().map(String::as_str);
+        }
+        if let Some(dir) = a.strip_prefix("--target-dir=") {
+            return Some(dir);
+        }
+    }
+    None
+}
+
+/// `path` made absolute against `cwd`, with `.` and `..` resolved lexically.
+pub fn absolute_in(cwd: &str, path: &str) -> String {
+    let mut out = PathBuf::from("/");
+    for c in Path::new(cwd).join(path).components() {
+        match c {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::Normal(n) => out.push(n),
+            _ => {}
+        }
+    }
+    out.to_string_lossy().into_owned()
+}
+
+/// A `--target-dir` flag takes the place of `CARGO_TARGET_DIR`, as in cargo,
+/// so that [`build_paths`] maps it into the sandbox the same way.
+pub fn flag_target_dir(args: &[String], cwd: &str, env: &mut BTreeMap<String, String>) -> bool {
+    let Some(dir) = target_dir_flag(args) else { return false };
+    env.insert("CARGO_TARGET_DIR".into(), absolute_in(cwd, dir));
+    true
+}
+
+/// The planner's command line with a `--target-dir` value replaced by `dir`.
+pub fn with_target_dir(args: &[String], dir: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    let mut done = false;
+    while let Some(a) = it.next() {
+        if done || a == "--" {
+            done = true;
+            out.push(a.clone());
+        } else if a == "--target-dir" {
+            out.push(a.clone());
+            if it.next().is_some() {
+                out.push(dir.into());
+            }
+            done = true;
+        } else if a.starts_with("--target-dir=") {
+            out.push(format!("--target-dir={dir}"));
+            done = true;
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+pub fn build_paths(root: &str, cargo_home: &str, env: &mut BTreeMap<String, String>) -> Translator {
+    let worktree_at = std::str::from_utf8(WORKTREE_AT).expect("worktree mount is ASCII");
+    let mut pairs = vec![
+        (worktree_at.into(), root.into()),
+        (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), cargo_home.into()),
+    ];
+    if let Some(dir) = env.get_mut("CARGO_TARGET_DIR")
+        && Path::new(dir).is_absolute()
+    {
+        let local = Path::new(dir).components().collect::<PathBuf>();
+        if let Ok(relative) = local.strip_prefix(root) {
+            *dir = Path::new(worktree_at).join(relative).to_string_lossy().into_owned();
+        } else {
+            // Keep compiler outputs in the action filesystem even for client paths under /tmp.
+            let sandbox = "/w/target/rargo-external";
+            pairs.push((sandbox.into(), local.to_string_lossy().into_owned()));
+            *dir = sandbox.into();
+        }
+    }
+    Translator::new(pairs)
+}
+
+pub fn base_env<'a>(
+    server: impl IntoIterator<Item = (&'a String, &'a String)>,
+    client: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> BTreeMap<String, String> {
     const SERVER: &[&str] =
         &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR"];
     const NOT_FOR_ACTIONS: &[&str] = &["TERM", "NO_COLOR", "BROWSER", "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM"];
@@ -342,6 +431,61 @@ pub fn rustup_failure(ran: Result<(bool, &[u8]), &str>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_target_dir_uses_the_action_fs_and_translates_for_delivery() {
+        let mut env = BTreeMap::from([("CARGO_TARGET_DIR".into(), "/tmp/outside/target/".into())]);
+        let tr = build_paths("/tmp/worktree", "/home/user/.cargo", &mut env);
+        let sandbox = &env["CARGO_TARGET_DIR"];
+        assert!(sandbox.starts_with("/w/target/"));
+        let binary = format!("{sandbox}/debug/second");
+        assert_eq!(tr.path(&binary), "/tmp/outside/target/debug/second");
+        assert_eq!(tr.text(&format!("output: {binary}")), "output: /tmp/outside/target/debug/second");
+    }
+
+    #[test]
+    fn target_dir_flag_is_mapped_like_the_environment_variable() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (given, client) in [
+            (args(&["build", "--target-dir", "/tmp/elsewhere/t"]), "/tmp/elsewhere/t"),
+            (args(&["build", "--target-dir=/tmp/elsewhere/eq"]), "/tmp/elsewhere/eq"),
+            (args(&["build", "--target-dir", "../sibling"]), "/var/tmp/sibling"),
+            (args(&["build", "--target-dir=./out/../t2"]), "/var/tmp/hello/t2"),
+        ] {
+            let mut env = BTreeMap::from([("CARGO_TARGET_DIR".into(), "/ignored".into())]);
+            assert!(flag_target_dir(&given, "/var/tmp/hello", &mut env));
+            let tr = build_paths("/var/tmp/hello", "/home/user/.cargo", &mut env);
+            let sandbox = env["CARGO_TARGET_DIR"].clone();
+            assert!(sandbox.starts_with("/w/"), "{sandbox}");
+            assert_eq!(tr.path(&format!("{sandbox}/debug/hello")), format!("{client}/debug/hello"));
+            let planned = with_target_dir(&given, &sandbox);
+            assert_eq!(target_dir_flag(&planned), Some(sandbox.as_str()));
+            assert_eq!(planned.len(), given.len());
+        }
+    }
+
+    #[test]
+    fn target_dir_flag_after_the_separator_is_not_cargos() {
+        let given: Vec<String> = ["run", "--", "--target-dir", "x"].iter().map(|s| s.to_string()).collect();
+        let mut env = BTreeMap::new();
+        assert!(!flag_target_dir(&given, "/w", &mut env));
+        assert!(env.is_empty());
+        assert_eq!(with_target_dir(&given, "/w/y"), given);
+    }
+
+    #[test]
+    fn target_dir_does_not_change_the_workspace_mapping() {
+        for (target, expected) in [
+            ("relative", "relative"),
+            ("/tmp/worktree/output", "/w/output"),
+            ("/tmp", "/w/target/rargo-external"),
+        ] {
+            let mut env = BTreeMap::from([("CARGO_TARGET_DIR".into(), target.into())]);
+            let tr = build_paths("/tmp/worktree", "/home/user/.cargo", &mut env);
+            assert_eq!(env["CARGO_TARGET_DIR"], expected);
+            assert_eq!(tr.to_canonical("/tmp/worktree/src"), "/w/src");
+        }
+    }
 
     const BUILD_SCRIPTS_PLAN: &str = "\
 roots 0 1
@@ -654,7 +798,9 @@ None
 
     #[test]
     fn the_environment_actions_start_from() {
-        let map = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map = |kv: &[(&str, &str)]| -> BTreeMap<String, String> {
+            kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
         let server = map(&[
             ("PATH", "/usr/bin"),
             ("HOME", "/home/rargod"),

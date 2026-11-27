@@ -1,7 +1,8 @@
 #!/bin/bash
-# deploy/planner.sh on a small stand-in for the cargo fork: BASE plus three
+# deploy/planner.sh on a small stand-in for cargo, offline: BASE plus three
 # patches, the first of which adds the rargo-plan path dependency and a
-# Cargo.lock that has an older rargo-plan version than the release's.
+# Cargo.lock with an older rargo-plan than the release's. A release that adds
+# a patch gets it, and the build leaves the planner checkout clean.
 set -uo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 work=${RARGO_WORK:-/root/rargo-work}
@@ -11,94 +12,72 @@ tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 fail=0
 g() { git -C "$1" -c user.name=t -c user.email=t@t.invalid "${@:2}"; }
 
-fork=$tmp/fork
-mkdir -p "$fork/src"
-cat >"$fork/Cargo.toml" <<'EOF'
-[package]
-name = "cargo"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-EOF
-echo 'fn main() { println!("base"); }' >"$fork/src/main.rs"
-g "$fork" init -q
-g "$fork" add -A
-g "$fork" commit -q -m base
-echo 'rargo-plan = { path = "/root/rargo/crates/rargo-plan" }' >>"$fork/Cargo.toml"
-cat >"$fork/Cargo.lock" <<'EOF'
-version = 4
-
-[[package]]
-name = "cargo"
-version = "0.1.0"
-dependencies = [
- "rargo-plan",
-]
-
-[[package]]
-name = "rargo-plan"
-version = "0.6.5"
-EOF
-echo 'fn main() { println!("one {}", rargo_plan::V); }' >"$fork/src/main.rs"
-g "$fork" add -A
-g "$fork" commit -q -m 'rargo: planning mode'
-sed -i 's/one/two/' "$fork/src/main.rs"
-g "$fork" commit -q -a -m 'rargo: a subject long enough that git format-patch folds it over two lines of the patch header'
-sed -i 's/two/three/' "$fork/src/main.rs"
-g "$fork" commit -q -a -m 'Plan install without placing binaries'
+cargo_repo=$tmp/cargo
+mkdir -p "$cargo_repo/src"
+printf '[package]\nname = "cargo"\nversion = "0.1.0"\nedition = "2021"\n\n[dependencies]\n' >"$cargo_repo/Cargo.toml"
+echo 'fn main() { println!("base"); }' >"$cargo_repo/src/main.rs"
+g "$cargo_repo" init -q
+g "$cargo_repo" add -A
+g "$cargo_repo" commit -q -m base
+echo 'rargo-plan = { path = "/root/rargo/crates/rargo-plan" }' >>"$cargo_repo/Cargo.toml"
+printf 'version = 4\n\n[[package]]\nname = "cargo"\nversion = "0.1.0"\ndependencies = [\n "rargo-plan",\n]\n\n[[package]]\nname = "rargo-plan"\nversion = "0.6.5"\n' >"$cargo_repo/Cargo.lock"
+echo 'fn main() { println!("one {}", rargo_plan::V); }' >"$cargo_repo/src/main.rs"
+g "$cargo_repo" add -A
+g "$cargo_repo" commit -q -m 'rargo: planning mode'
+sed -i 's/one/two/' "$cargo_repo/src/main.rs"
+g "$cargo_repo" commit -q -a -m 'rargo: two'
+sed -i 's/two/three/' "$cargo_repo/src/main.rs"
+g "$cargo_repo" commit -q -a -m 'Plan install without placing binaries'
+patches=$tmp/patches
+g "$cargo_repo" format-patch -q --no-signature -o "$patches" HEAD~3..HEAD
+base=$(git -C "$cargo_repo" rev-parse --short=9 HEAD~3)
+g "$cargo_repo" checkout -q --detach "$base"
+sed -i 's/base/other/' "$cargo_repo/src/main.rs"
+g "$cargo_repo" commit -q -a -m 'not rargo-plan'
+g "$cargo_repo" format-patch -q --no-signature --start-number 9 -o "$patches" HEAD~1..HEAD
+g "$cargo_repo" checkout -q --detach "$base"
 
 src=$tmp/src
 mkdir -p "$src/forks/cargo" "$src/crates/rargo-plan/src"
-g "$fork" format-patch -q --no-signature -o "$src/forks/cargo" HEAD~3..HEAD
-g "$fork" rev-parse --short=9 HEAD~3 >"$src/forks/cargo/BASE"
-grep -q '^ ' "$src/forks/cargo/0002-"*.patch || { echo "FAIL the second patch's subject is not folded, so the test checks less than it says"; fail=1; }
+echo "$base" >"$src/forks/cargo/BASE"
 printf '[package]\nname = "rargo-plan"\nversion = "0.7.10"\nedition = "2021"\n' >"$src/crates/rargo-plan/Cargo.toml"
 echo 'pub const V: &str = "0.7.10";' >"$src/crates/rargo-plan/src/lib.rs"
+release() { rm -f "$src/forks/cargo/"*.patch; for p in "$@"; do cp "$patches/$p"-*.patch "$src/forks/cargo/"; done; }
 
 planner=$tmp/planner build=$tmp/build
-fresh() { rm -rf "$planner"; git clone -q "$fork" "$planner"; g "$planner" reset -q --hard "HEAD~$1"; }
-run() { "$here/deploy/planner.sh" "$src" "$planner" "$build" >"$tmp/out" 2>"$tmp/err"; }
+run() { RARGO_CARGO_URL=$cargo_repo "$here/deploy/planner.sh" "$src" "$planner" "$build" >"$tmp/out" 2>"$tmp/err"; }
 clean() { [ -z "$(git -C "$planner" status --porcelain)" ]; }
+built() {
+    local what=$1 says=$2 subject=$3
+    if run && [ "$("$(cat "$tmp/out")")" = "$says 0.7.10" ] && clean && [ "$(git -C "$planner" log -1 --format=%s)" = "$subject" ]; then
+        echo "ok   $what"
+    else
+        echo "FAIL $what: $(cat "$tmp/out" "$tmp/err")"; git -C "$planner" status --short 2>&1; fail=1
+    fi
+}
 
-fresh 1
-if run && [ "$("$(cat "$tmp/out")")" = "three 0.7.10" ] && clean &&
-    [ "$(git -C "$planner" log -1 --format=%s)" = 'Plan install without placing binaries' ]; then
-    echo "ok   a checkout one patch behind gets the release's new patch, and the planner is built against the release's rargo-plan"
-else
-    echo "FAIL a checkout one patch behind: $(cat "$tmp/out" "$tmp/err")"; git -C "$planner" status --short; fail=1
-fi
-if clean; then echo "ok   building leaves the checkout clean (its Cargo.lock has rargo-plan 0.6.5)"; else echo "FAIL building left the checkout changed"; fail=1; fi
-head=$(git -C "$planner" rev-parse HEAD)
-if run && [ "$("$(cat "$tmp/out")")" = "three 0.7.10" ] && clean && [ "$(git -C "$planner" rev-parse HEAD)" = "$head" ]; then
-    echo "ok   deploying again with every patch in place applies nothing and builds again"
-else
-    echo "FAIL deploying again: $(cat "$tmp/out" "$tmp/err")"; fail=1
-fi
-fresh 3
-if run && [ "$("$(cat "$tmp/out")")" = "three 0.7.10" ] && clean; then
-    echo "ok   a checkout at BASE gets all three patches"
-else
-    echo "FAIL a checkout at BASE: $(cat "$tmp/out" "$tmp/err")"; fail=1
-fi
+release 0001 0002
+built "a first deploy clones cargo, applies the release's patches and builds against its rargo-plan, leaving the checkout clean" two 'rargo: two'
+release 0001 0002 0003
+built "a release that adds a patch to forks/cargo gets it in the planner" three 'Plan install without placing binaries'
+built "deploying the same release again builds the same planner" three 'Plan install without placing binaries'
+echo '// local' >>"$planner/src/main.rs"; echo x >"$planner/stray"
+built "changes left in the planner checkout are discarded" three 'Plan install without placing binaries'
+g "$planner" checkout -q --detach "$base"
+g "$planner" am -q "$src/forks/cargo/0001-"*.patch "$src/forks/cargo/0003-"*.patch >/dev/null 2>&1
+built "a git am left half done is aborted" three 'Plan install without placing binaries'
 
 refused() {
     local what=$1 expect=$2
-    local before; before=$(git -C "$planner" rev-parse HEAD)
     if run; then echo "FAIL $what: accepted"; fail=1; return; fi
-    if ! grep -q "$expect" "$tmp/err" || [ "$(wc -l <"$tmp/err")" -lt 2 ]; then echo "FAIL $what: $(cat "$tmp/err")"; fail=1; return; fi
-    if [ "$(git -C "$planner" rev-parse HEAD)" != "$before" ]; then echo "FAIL $what: the checkout moved"; fail=1; return; fi
-    echo "ok   $what: $(grep '^deploy/planner.sh: ' "$tmp/err" | sed 's/^deploy.planner.sh: //' | head -n 1 | sed "s|$tmp/||")"
+    if ! grep -q "$expect" "$tmp/err"; then echo "FAIL $what: $(cat "$tmp/err")"; fail=1; return; fi
+    echo "ok   $what: $(grep '^deploy/planner.sh: ' "$tmp/err" | sed 's/^deploy.planner.sh: //' | head -n 1 | sed "s|$tmp/||g")"
 }
-fresh 1; echo '// local' >>"$planner/src/main.rs"
-refused 'local changes' 'is not clean'
-fresh 0; echo 'x' >"$planner/x"; g "$planner" add x; g "$planner" commit -q -m 'not a patch'
-refused 'a commit that is not a patch' 'more than the 3 patches'
-fresh 2; echo 'x' >"$planner/x"; g "$planner" add x; g "$planner" commit -q -m 'something else'
-refused 'another commit where a patch belongs' 'where forks/cargo has 0002-'
-fresh 1; sed -i 's/two/TWO/' "$planner/src/main.rs"; g "$planner" commit -q -a --amend --no-edit
-refused 'a checkout the next patch does not apply to' 'does not take 0003-'
-if clean && [ ! -e "$planner/.git/rebase-apply" ]; then echo "ok   and the failed git am is aborted, the checkout clean"; else echo "FAIL the failed git am left the checkout in the middle of it"; fail=1; fi
-rm -rf "$planner"; git init -q "$planner"; echo x >"$planner/x"; g "$planner" add x; g "$planner" commit -q -m other
-refused 'a checkout without BASE' 'does not have the commit'
+release 0001 0003
+refused 'patches that do not apply' 'do not apply to cargo'
+release 0009
+refused 'patches without the rargo-plan dependency' 'does not name rargo-plan'
+release 0001 0002 0003
+echo 0000000000 >"$src/forks/cargo/BASE"
+refused 'a BASE cargo does not have' 'cargo has no commit 0000000000'
 exit $fail
