@@ -3,18 +3,18 @@
 //! so a run is a function of its seed.
 
 use crate::Random;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// The operating system's generator: what a real endpoint draws from. In a
 /// simulation (`io::sim`) it is the simulation's seed instead.
-pub fn os_random() -> Arc<dyn Random> {
-    Arc::new(Os)
+pub fn os_random() -> Rc<dyn Random> {
+    Rc::new(Os)
 }
 
 /// A generator that gives the same values, in the same order, for the same seed.
-pub fn seeded_random(seed: u64) -> Arc<dyn Random> {
-    Arc::new(Seeded(AtomicU64::new(seed ^ 0x5851_f42d_4c95_7f2d)))
+pub fn seeded_random(seed: u64) -> Rc<dyn Random> {
+    Rc::new(Seeded(Cell::new(seed ^ 0x5851_f42d_4c95_7f2d)))
 }
 
 struct Os;
@@ -25,12 +25,13 @@ impl Random for Os {
     }
 }
 
-struct Seeded(AtomicU64);
+struct Seeded(Cell<u64>);
 
 impl Random for Seeded {
     fn fill(&self, out: &mut [u8]) {
         for chunk in out.chunks_mut(8) {
-            let mut z = self.0.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0.get().wrapping_add(0x9e37_79b9_7f4a_7c15);
+            self.0.set(z);
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
             z ^= z >> 31;

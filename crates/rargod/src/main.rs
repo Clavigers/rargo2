@@ -219,6 +219,7 @@ fn main() -> Result<()> {
     let public = opts.public.clone();
     let http_state = state.clone();
     let keys = Arc::new(keys);
+    let pool_seed = rargo_core::tokens::os_seed()?;
     io::drive(4, move || {
         match rargo_core::io::FuseDrive::spawn(&session, &fuse_fs) {
             Ok(drive) => drive.detach(),
@@ -226,7 +227,7 @@ fn main() -> Result<()> {
         }
         io::spawn(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
-            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key) {
+            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key, &mut rargo_core::rng::Rng::new(pool_seed)) {
                 Ok(pool) => {
                     let _ = daemon.engine.remote.set(pool.clone());
                     let _ = daemon.pool.set(pool);
@@ -248,7 +249,7 @@ fn main() -> Result<()> {
         };
         let users: rargo_core::net::UserKeys = {
             let keys = keys.clone();
-            Arc::new(move |user| keys.psk(user))
+            std::rc::Rc::new(move |user| keys.psk(user))
         };
         let local = match listener.local_addr() {
             Ok(addr) => addr,

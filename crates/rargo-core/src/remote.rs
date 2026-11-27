@@ -3,6 +3,7 @@ use crate::engine::{Engine, Live, Observer, RemoteRunner, Request};
 use crate::hash::Hash;
 use crate::net::{Conn, Endpoint};
 use crate::sandbox::NetMode;
+use crate::rng::Rng;
 use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
@@ -16,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,7 +124,7 @@ fn dtype_from_u8(b: u8) -> DType {
 
 
 pub struct Peer {
-    pub conn: Arc<Conn>,
+    pub conn: Rc<Conn>,
     calls: RefCell<pool_state::Calls<crate::io::oneshot::Sender<Resp>>>,
     out: crate::io::UnboundedSender<Vec<u8>>,
     bulk: crate::io::UnboundedSender<Vec<u8>>,
@@ -142,7 +144,7 @@ fn wait_reply(rx: crate::io::oneshot::Receiver<Resp>) -> Result<Resp> {
 }
 
 impl Peer {
-    pub fn new(conn: Arc<Conn>) -> (Arc<Peer>, crate::io::UnboundedReceiver<Msg>) {
+    pub fn new(conn: Rc<Conn>) -> (Arc<Peer>, crate::io::UnboundedReceiver<Msg>) {
         let (out_tx, mut out_rx) = crate::io::unbounded_channel::<Vec<u8>>();
         let (bulk_tx, mut bulk_rx) = crate::io::unbounded_channel::<Vec<u8>>();
         let (in_tx, in_rx) = crate::io::unbounded_channel();
@@ -952,7 +954,7 @@ enum LinkMsg {
 
 fn serve_link(
     state: &Arc<WorkerState>,
-    conn: &Arc<Conn>,
+    conn: &Rc<Conn>,
     inbox: &mut crate::io::UnboundedReceiver<Msg>,
     term: &mut crate::io::Signal,
     intr: &mut crate::io::Signal,
@@ -988,7 +990,7 @@ fn serve_link(
 }
 
 enum Dial {
-    Ready(std::io::Result<Arc<Conn>>),
+    Ready(std::io::Result<Rc<Conn>>),
     Stop,
 }
 
@@ -1026,7 +1028,7 @@ fn worker_links(
     state: &Arc<WorkerState>,
     server: SocketAddr,
     cores: u32,
-    endpoint: Arc<Endpoint>,
+    endpoint: Rc<Endpoint>,
     first: Vec<WEffect>,
 ) -> Result<()> {
     let mut term = crate::io::signal(crate::io::SignalKind::terminate()).expect("signal");
@@ -1451,13 +1453,31 @@ pub struct PoolStats {
     pub nix_lookups: Cell<u64>,
 }
 
+/// Numbers the actions a pool sends out. The first is drawn from the
+/// generator the pool was given, so a daemon restarted against the same
+/// workers does not reuse the numbers of its last life, and a seeded run
+/// numbers its actions the same way every time.
+struct ActionIds(Cell<u64>);
+
+impl ActionIds {
+    fn new(rng: &mut Rng) -> ActionIds {
+        ActionIds(Cell::new(rng.next_u64() >> 1))
+    }
+
+    fn next(&self) -> u64 {
+        let id = self.0.get();
+        self.0.set(id + 1);
+        id
+    }
+}
+
 pub struct Pool {
     workers: RefCell<Vec<Arc<Worker>>>,
     core: RefCell<pool_state::WorkerPool>,
     blobs: Arc<Blobs>,
     host_srcs: Arc<DashMap<Hash, FileSrc>>,
     content: Arc<Content>,
-    next_action: Cell<u64>,
+    next_action: ActionIds,
     pub profile_exclude: Vec<Vec<u8>>,
     pub bandwidth: Cell<u64>,
     pub stats: PoolStats,
@@ -1490,7 +1510,8 @@ fn to_wire(l: &Looked, content: &Content) -> WLooked {
 }
 
 impl Pool {
-    pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey) -> Result<Arc<Pool>> {
+    /// `rng` is the pool's only source of randomness: action IDs come from it.
+    pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey, rng: &mut Rng) -> Result<Arc<Pool>> {
         let endpoint = Endpoint::bind_keyed(addr, true, key).with_context(|| format!("binding {addr}"))?;
         let host_srcs: Arc<DashMap<Hash, FileSrc>> = Arc::new(DashMap::new());
         let blobs = Arc::new(Blobs::new(
@@ -1507,11 +1528,7 @@ impl Pool {
             blobs,
             host_srcs,
             content: engine.content.clone(),
-            next_action: Cell::new({
-                let mut b = [0u8; 8];
-                crate::io::random(&mut b);
-                u64::from_le_bytes(b) >> 1
-            }),
+            next_action: ActionIds::new(rng),
             profile_exclude: vec![
                 crate::buildview::WORKTREE_AT.to_vec(),
                 crate::buildview::CARGO_HOME_AT.to_vec(),
@@ -1569,7 +1586,7 @@ impl Pool {
         )
     }
 
-    fn serve_worker(self: Arc<Self>, conn: Arc<Conn>) {
+    fn serve_worker(self: Arc<Self>, conn: Rc<Conn>) {
         let (peer, mut inbox) = Peer::new(conn.clone());
         let mut worker: Option<Arc<Worker>> = None;
         loop {
@@ -2181,8 +2198,7 @@ impl Pool {
         req: &Request,
         voice: &Voice,
     ) -> RunResult {
-        let action = self.next_action.get();
-        self.next_action.set(action + 1);
+        let action = self.next_action.next();
         let (tx, mut rx) = crate::io::unbounded_channel();
         let t0 = crate::io::now();
         let view: Arc<dyn View> = req.view.clone();
@@ -2706,6 +2722,21 @@ impl Drop for Scope<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn one_seed_numbers_actions_the_same_way() {
+        use super::ActionIds;
+        use crate::rng::Rng;
+        let ids = |seed| {
+            let a = ActionIds::new(&mut Rng::new(seed));
+            (0..5).map(|_| a.next()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(42), ids(42));
+        assert_ne!(ids(42), ids(43));
+        let first = ids(42)[0];
+        assert_eq!(ids(42), (first..first + 5).collect::<Vec<_>>(), "actions are numbered in a row");
+        assert!(first < 1 << 63, "the numbers have room to count up");
+    }
+
     #[test]
     fn contents_go_behind_questions_and_actions() {
         use super::{is_bulk, Msg, Req, Resp};

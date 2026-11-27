@@ -128,6 +128,7 @@ class Model(enum.StrEnum):
 
     claude_opus_5_5 = "claude-opus-5-5"
     claude_fable_5_2 = "claude-fable-5-2"
+    claude_sonnet_5_5 = "claude-sonnet-5-5"
     gpt_6_2_sol = "gpt-6.2-sol"
     grok_4_7 = "grok-4.7"
 
@@ -174,6 +175,9 @@ class ReleaseRules(Strict):
     freeze_every_days: Annotated[int, Field(ge=1)]
     uses_required: Annotated[int, Field(ge=0)]
     soak_minutes: Annotated[int, Field(ge=0)]
+    # The model the power user's sessions run on, in Claude Code. None: the
+    # Claude Code agents' model.
+    use_model: Model | None = None
 
 
 class Config(Strict):
