@@ -1,7 +1,7 @@
 use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
 use crate::io::db::{WriterTask, WriterWake};
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use redb::{Database, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
@@ -103,10 +103,12 @@ impl Tables for MemTables {
     }
 }
 
+type Open = Box<dyn Fn() -> Result<Database, redb::DatabaseError> + Send + Sync>;
+
 struct Shared {
-    db: Database,
+    db: RwLock<Option<Database>>,
+    open: Open,
     writer: Mutex<DbWriter>,
-    flushing: Mutex<()>,
     born: Instant,
 }
 
@@ -118,20 +120,36 @@ impl Shared {
 
 pub struct Db {
     shared: Arc<Shared>,
-    writing: WriterTask,
+    writing: Option<WriterTask>,
 }
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
-        Db::over(Database::create(path).with_context(|| format!("opening {}", path.display()))?)
+        let owned = path.to_path_buf();
+        Db::over(Box::new(move || Database::create(&owned))).with_context(|| format!("opening {}", path.display()))
     }
 
     /// A database that lives in memory and is gone when it is dropped.
     pub fn open_in_memory() -> Result<Db> {
-        Db::over(redb::Builder::new().create_with_backend(redb::backends::InMemoryBackend::new())?)
+        Db::on_backend(Memory::default())
     }
 
-    fn over(db: Database) -> Result<Db> {
+    /// A database on `disk`, opened again on the same disk after a failed commit.
+    fn on_backend(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
+        Db::over(Box::new(move || redb::Builder::new().create_with_backend(disk.clone())))
+    }
+
+    /// A database on `disk` that never starts a background writer, so a test's writes wait for
+    /// its own `flush` and never reach another test's loop.
+    #[cfg(test)]
+    fn on(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
+        let mut db = Db::on_backend(disk)?;
+        db.writing = None;
+        Ok(db)
+    }
+
+    fn over(open: Open) -> Result<Db> {
+        let db = open()?;
         {
             let tx = db.begin_write()?;
             for t in ALL {
@@ -140,24 +158,27 @@ impl Db {
             tx.commit()?;
         }
         let shared = Arc::new(Shared {
-            db,
+            db: RwLock::new(Some(db)),
+            open,
             writer: Mutex::new(DbWriter::new()),
-            flushing: Mutex::new(()),
             born: crate::io::now(),
         });
-        Ok(Db { shared, writing: WriterTask::default() })
+        Ok(Db { shared, writing: Some(WriterTask::default()) })
     }
 
     fn written(&self) {
-        let shared = Arc::clone(&self.shared);
-        self.writing.written(move |wake| writer_loop(shared, wake));
+        if let Some(writing) = &self.writing {
+            let shared = Arc::clone(&self.shared);
+            writing.written(move |wake| writer_loop(shared, wake));
+        }
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Arc<[u8]>> {
         if let Some(v) = self.shared.writer.lock().get(table, key) {
             return v;
         }
-        let tx = self.shared.db.begin_read().ok()?;
+        let db = self.shared.db.read();
+        let tx = db.as_ref()?.begin_read().ok()?;
         let t = tx.open_table(table.def()).ok()?;
         let v = t.get(key).ok()??;
         Some(Arc::from(v.value()))
@@ -177,7 +198,7 @@ impl Db {
 
     pub fn scan_prefix(&self, table: Table, prefix: &[u8]) -> Vec<(Vec<u8>, Arc<[u8]>)> {
         let mut out: std::collections::BTreeMap<Vec<u8>, Option<Arc<[u8]>>> = Default::default();
-        if let Ok(tx) = self.shared.db.begin_read() {
+        if let Some(Ok(tx)) = self.shared.db.read().as_ref().map(Database::begin_read) {
             if let Ok(t) = tx.open_table(table.def()) {
                 if let Ok(range) = t.range::<&[u8]>(prefix..) {
                     for item in range {
@@ -209,13 +230,15 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        self.writing.stop();
+        if let Some(writing) = &mut self.writing {
+            writing.stop();
+        }
         flush_off_the_loop(&self.shared);
     }
 }
 
-fn commit(db: &Database, batch: &Batch) -> Result<()> {
-    let tx = db.begin_write()?;
+fn commit(db: Option<&Database>, batch: &Batch) -> Result<()> {
+    let tx = db.context("the database could not be opened again")?.begin_write()?;
     for t in ALL {
         let mut table = tx.open_table(t.def())?;
         for (bt, k, v) in &batch.writes {
@@ -237,19 +260,60 @@ fn commit(db: &Database, batch: &Batch) -> Result<()> {
 }
 
 fn flush_once(shared: &Shared) {
-    let _one = shared.flushing.lock();
+    // Serialize flushes while allowing readers to use the database during commit.
+    let mut db = shared.db.upgradable_read();
     let batch = shared.writer.lock().take();
     if batch.is_empty() {
         return;
     }
-    let done = commit(&shared.db, &batch);
+    if db.is_none() {
+        db.with_upgraded(|db| reopen(db, &shared.open));
+    }
+    let done = commit(db.as_ref(), &batch);
     let now = shared.now_ms();
     match done {
         Ok(()) => shared.writer.lock().flushed(&batch, now),
         Err(e) => {
             eprintln!("rargod: db commit failed: {e:#}");
             shared.writer.lock().failed(now);
+            db.with_upgraded(|db| reopen(db, &shared.open));
         }
+    }
+}
+
+// After an I/O error redb refuses every later transaction until the database is opened again.
+// The old handle goes first: a file holds one open database at a time.
+fn reopen(db: &mut Option<Database>, open: &Open) {
+    drop(db.take());
+    match open() {
+        Ok(fresh) => *db = Some(fresh),
+        Err(e) => eprintln!("rargod: db reopen failed: {e:#}"),
+    }
+}
+
+/// Memory that a reopened database finds as the failed one left it.
+#[derive(Clone, Debug, Default)]
+struct Memory(Arc<redb::backends::InMemoryBackend>);
+
+impl redb::StorageBackend for Memory {
+    fn len(&self) -> std::io::Result<u64> {
+        self.0.len()
+    }
+
+    fn read(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        self.0.read(offset, len)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self, eventual: bool) -> std::io::Result<()> {
+        self.0.sync_data(eventual)
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.0.write(offset, data)
     }
 }
 
@@ -286,7 +350,7 @@ mod tests {
     use crate::io::{sim, sleep};
 
     fn committed(db: &Db, key: &[u8]) -> bool {
-        let tx = db.shared.db.begin_read().unwrap();
+        let tx = db.shared.db.read().as_ref().unwrap().begin_read().unwrap();
         let table = tx.open_table(Table::Meta.def()).unwrap();
         table.get(key).unwrap().is_some()
     }
@@ -311,3 +375,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod disk_tests;
