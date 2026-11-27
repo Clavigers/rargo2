@@ -2,9 +2,9 @@
 use rargo_machine::StateMachine;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
-use crate::partial::Partial;
+pub use rargo::out_tree::VFile;
+use rargo::out_tree::{below, Edit, OutputTree, Table};
 use rargo_proto::Digest;
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
@@ -39,13 +39,6 @@ impl Drop for Timed<'_> {
 }
 const LISTING_KEPT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VFile {
-    pub hash: Digest,
-    pub size: u64,
-    pub exec: bool,
-    pub mtime_ns: i64,
-}
 
 struct Node {
     parent: u64,
@@ -169,100 +162,6 @@ impl StateMachine for Inodes {
     }
 }
 
-type Table = BTreeMap<Vec<u8>, VFile>;
-
-enum Edit {
-    Put { path: Vec<u8>, file: VFile, replaced_real: bool },
-    Remove(Vec<u8>),
-    Shadow(Vec<u8>),
-}
-
-struct OutputTree {
-    files: Table,
-    generation: u64,
-}
-
-impl OutputTree {
-    fn same(&self, rel: &[u8], file: &VFile) -> bool {
-        self.files.get(rel).is_some_and(|v| v.hash == file.hash && v.exec == file.exec)
-    }
-
-    fn has_below(&self, rel: &[u8]) -> bool {
-        let prefix = below(rel);
-        self.files.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
-    }
-
-    fn lookup<T>(&self, rel: &[u8], real: Option<T>) -> Option<Kind<T>> {
-        if let Some(real) = real {
-            return Some(Kind::Real(real));
-        }
-        if rel.is_empty() {
-            return None;
-        }
-        if let Some(file) = self.files.get(rel) {
-            return Some(Kind::Virtual(file.clone()));
-        }
-        self.has_below(rel).then_some(Kind::VDir)
-    }
-
-    fn apply(&mut self, generation: u64, edits: Vec<Edit>) -> Vec<Vec<u8>> {
-        if generation <= self.generation {
-            return Vec::new();
-        }
-        self.generation = generation;
-        let mut changed = Vec::new();
-        for edit in edits {
-            let path = match edit {
-                Edit::Put { path, file, replaced_real } => {
-                    if !replaced_real && self.same(&path, &file) {
-                        continue;
-                    }
-                    self.remove_below(&path);
-                    let mut at = path.as_slice();
-                    while let Some(slash) = at.iter().rposition(|&b| b == b'/') {
-                        at = &at[..slash];
-                        self.files.remove(at);
-                    }
-                    self.files.insert(path.clone(), file);
-                    path
-                }
-                Edit::Remove(path) => {
-                    self.files.remove(&path);
-                    self.remove_below(&path);
-                    path
-                }
-                Edit::Shadow(path) => {
-                    self.files.remove(&path);
-                    path
-                }
-            };
-            changed.push(path);
-        }
-        changed
-    }
-
-    fn remove_below(&mut self, path: &[u8]) {
-        let prefix = below(path);
-        let removed: Vec<_> =
-            self.files.range(prefix.clone()..).take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
-        for key in removed {
-            self.files.remove(&key);
-        }
-    }
-}
-
-#[cfg(test)]
-impl StateMachine for OutputTree {
-    fn invariants(&self) {
-        for path in self.files.keys() {
-            let at = String::from_utf8_lossy(path);
-            assert!(!path.is_empty(), "no file has an empty path");
-            assert!(!path.split(|&b| b == b'/').any(|part| part.is_empty()), "{at:?} is relative and has no empty parts");
-            assert!(!self.has_below(path), "file {at:?} has nothing below it");
-        }
-    }
-}
-
 pub struct Delivery<'a> {
     fs: &'a OutFs,
     _serial: MutexGuard<'a, ()>,
@@ -332,7 +231,7 @@ struct Fetch {
     rel: Vec<u8>,
 }
 
-enum Content<F = File, R = Arc<Partial>> {
+enum Content<F = File, R = Arc<dyn Ranged>> {
     Open(F),
     Unfetched(Fetch),
     Ranged(R),
@@ -383,18 +282,17 @@ enum VirtualOpen {
     Materialize { file: VFile, with_content: bool },
 }
 
-impl OutputTree {
-    fn open(&self, rel: &[u8], writing: bool, truncate: bool) -> Res<VirtualOpen> {
-        let file = self.files.get(rel).cloned().ok_or(Errno(libc::ENOENT))?;
-        Ok(if writing {
-            VirtualOpen::Materialize { file, with_content: !truncate }
-        } else if file.size == 0 {
-            VirtualOpen::Empty
-        } else {
-            VirtualOpen::Read(file)
-        })
-    }
+fn open_virtual(tree: &OutputTree, rel: &[u8], writing: bool, truncate: bool) -> Res<VirtualOpen> {
+    let file = tree.files.get(rel).cloned().ok_or(Errno(libc::ENOENT))?;
+    Ok(if writing {
+        VirtualOpen::Materialize { file, with_content: !truncate }
+    } else if file.size == 0 {
+        VirtualOpen::Empty
+    } else {
+        VirtualOpen::Read(file)
+    })
 }
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum How {
@@ -405,7 +303,13 @@ enum How {
 
 pub enum Reader {
     Whole(File),
-    Ranged(Arc<Partial>),
+    Ranged(Arc<dyn Ranged>),
+}
+
+/// A content that is read in ranges while the rest of it is still being fetched.
+pub trait Ranged: Send + Sync {
+    fn hash(&self) -> &Digest;
+    fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 }
 
 pub trait Source: Send + Sync {
@@ -434,8 +338,8 @@ pub struct OutFs {
     gid: u32,
     op_count: [AtomicU64; OPS.len()],
     op_nanos: [AtomicU64; OPS.len()],
-    pub opened_virtual: AtomicU64,
-    pub made_real: AtomicU64,
+    opened_virtual: AtomicU64,
+    made_real: AtomicU64,
 }
 
 fn errno(e: std::io::Error) -> Errno {
@@ -454,11 +358,6 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     p
 }
 
-fn below(prefix: &[u8]) -> Vec<u8> {
-    let mut p = prefix.to_vec();
-    p.push(b'/');
-    p
-}
 
 fn name_cookie(name: &[u8]) -> u64 {
     let h = blake3::hash(name);
@@ -467,6 +366,20 @@ fn name_cookie(name: &[u8]) -> u64 {
     assert!(c < 1 << 63);
     c
 }
+
+fn lookup<T>(tree: &OutputTree, rel: &[u8], real: Option<T>) -> Option<Kind<T>> {
+    if let Some(real) = real {
+        return Some(Kind::Real(real));
+    }
+    if rel.is_empty() {
+        return None;
+    }
+    if let Some(file) = tree.files.get(rel) {
+        return Some(Kind::Virtual(file.clone()));
+    }
+    tree.has_below(rel).then_some(Kind::VDir)
+}
+
 
 enum Kind<T = rargo_net::io::file::Stat> {
     Real(T),
@@ -490,7 +403,7 @@ impl OutFs {
             under,
             _under_fd: fd,
             state: Mutex::new(Inodes { nodes, children: HashMap::new(), next: 2 }),
-            virt: std::sync::RwLock::new(OutputTree { files: virt, generation: 0 }),
+            virt: std::sync::RwLock::new(OutputTree::new(virt)),
             delivery: Mutex::new(()),
             handles: Mutex::new(HashMap::new()),
             registering: Mutex::new(std::collections::BTreeMap::new()),
@@ -555,6 +468,16 @@ impl OutFs {
         }
     }
 
+    /// How many times a file that exists only as its hash was opened.
+    pub fn opened_virtual(&self) -> u64 {
+        self.opened_virtual.load(Ordering::Relaxed)
+    }
+
+    /// How many files that existed only as their hash were written out as real files.
+    pub fn made_real(&self) -> u64 {
+        self.made_real.load(Ordering::Relaxed)
+    }
+
     pub fn virtual_count(&self) -> usize {
         self.virt.read().unwrap().files.len()
     }
@@ -565,7 +488,7 @@ impl OutFs {
 
     fn kind(&self, rel: &[u8]) -> Option<Kind> {
         let real = rargo_net::io::file::symlink_metadata(self.real(rel)).ok();
-        self.virt.read().unwrap().lookup(rel, real)
+        lookup(&self.virt.read().unwrap(), rel, real)
     }
 
     fn path(&self, id: u64) -> Res<Vec<u8>> {
@@ -882,7 +805,7 @@ impl Filesystem for OutFs {
         let rel = join(&self.path(parent)?, name);
         let tree = self.virt.read().unwrap();
         let real = rargo_net::io::file::symlink_metadata(self.real(&rel)).ok();
-        match tree.lookup(&rel, real) {
+        match lookup(&tree, &rel, real) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
             None => Ok(Entry::negative(TTL)),
         }
@@ -1197,7 +1120,7 @@ impl Filesystem for OutFs {
             Err(_) => {}
         }
         let truncate = keep & libc::O_TRUNC != 0;
-        let plan = self.virt.read().unwrap().open(&rel, acc != libc::O_RDONLY || truncate, truncate)?;
+        let plan = open_virtual(&self.virt.read().unwrap(), &rel, acc != libc::O_RDONLY || truncate, truncate)?;
         match plan {
             VirtualOpen::Empty => {
                 self.opened_virtual.fetch_add(1, Ordering::Relaxed);
@@ -1438,6 +1361,7 @@ impl Filesystem for OutFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     #[test]
     fn listing_cookies_are_stable_and_ordered() {
@@ -1581,7 +1505,7 @@ mod tests {
                     }
                     5 => {
                         let path = PATHS[rng.below(PATHS.len())].as_bytes();
-                        if let Ok(VirtualOpen::Read(file)) = tree.open(path, false, false) {
+                        if let Ok(VirtualOpen::Read(file)) = open_virtual(&tree, path, false, false) {
                             assert_eq!(model.get(path).map(|f| f.hash), Some(file.hash), "seed {seed} step {step}: an open sees the newest tree");
                             let content = Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel: path.to_vec() });
                             content.invariants();
@@ -1633,7 +1557,7 @@ mod tests {
                 for path in PATHS {
                     let path = path.as_bytes();
                     let want = model.get(path).map(|file| file.hash);
-                    let got = match tree.lookup::<()>(path, None) {
+                    let got = match lookup::<()>(&tree, path, None) {
                         Some(Kind::Virtual(file)) => Some(file.hash),
                         Some(Kind::VDir) => {
                             let prefix = below(path);
@@ -1649,22 +1573,62 @@ mod tests {
         assert!(reads > 1000 && refused > 100 && stale > 100, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
     }
 
-    #[test]
-    fn replacing_output_detaches_the_name_without_reusing_its_inode() {
+    enum Ev {
+        Lookup(u64, &'static str),
+        Changed(&'static str),
+        Path(u64),
+        Forget(u64, u64),
+    }
+
+    /// Steps an inode table holding only the root through the events, checking it after each, and lists what
+    /// each step gave back.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
         let mut nodes = HashMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
         let mut state = Inodes { nodes, children: HashMap::new(), next: 2 };
-        let old = state.lookup(ROOT, b"app");
         state.invariants();
-        assert_eq!(state.changed(b"app"), (ROOT, b"app".to_vec()));
-        state.invariants();
-        let new = state.lookup(ROOT, b"app");
-        state.invariants();
-        assert_ne!(old, new);
-        assert_eq!(state.path(new).ok().unwrap(), b"app");
-        assert_eq!(state.forget(old, 1), [old]);
-        state.invariants();
-        assert_eq!(state.lookup(ROOT, b"app"), new);
-        state.invariants();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Lookup(parent, name) => format!("lookup {parent} {name} => {}", state.lookup(parent, name.as_bytes())),
+                Ev::Changed(path) => {
+                    let (parent, name) = state.changed(path.as_bytes());
+                    format!("changed {path} => detached {} from {parent}", text(&name))
+                }
+                Ev::Path(node) => format!("path {node} => {:?}", state.path(node).map(|p| text(&p)).map_err(|e| e.0)),
+                Ev::Forget(node, n) => format!("forget {node} {n} => {:?}", state.forget(node, n)),
+            };
+            state.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn replacing_output_detaches_the_name_without_reusing_its_inode() {
+        let events = [
+            Ev::Lookup(ROOT, "app"),
+            Ev::Changed("app"),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Path(3),
+            Ev::Path(2),
+            Ev::Forget(2, 1),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Forget(3, 2),
+            Ev::Lookup(ROOT, "app"),
+        ];
+        expect![[r#"
+            lookup 1 app => 2
+            changed app => detached app from 1
+            lookup 1 app => 3
+            path 3 => Ok("app")
+            path 2 => Ok("app")
+            forget 2 1 => [2]
+            lookup 1 app => 3
+            forget 3 2 => [3]
+            lookup 1 app => 4
+        "#]].assert_eq(&run(events));
     }
 }

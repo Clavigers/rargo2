@@ -1,8 +1,12 @@
+mod disk;
 pub mod model;
 pub mod rng;
 mod nextest;
 pub mod workspace;
+pub mod worktree;
 pub mod world;
+
+mod transport;
 
 pub use world::{Bug, Failure, Fault, Kind, Off, Report, run, run_off};
 

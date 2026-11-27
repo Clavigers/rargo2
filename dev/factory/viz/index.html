@@ -480,18 +480,19 @@ function render() {
   $('runners').innerHTML = `<span>${ic('play')}CI: GitHub Actions · ${T['CI failures'] ?? 0}% of runs failed</span>
     <span>${ic('eye')}Reviewers: ${S.reviewers.map(esc).join(', ')} · ${T['reviews asking for changes'] ?? 0}% asked for changes</span>`;
 
-  // releases, the project manager and the power user: modelled, not yet running
+  // releases: the project manager runs; the power user is modelled, not yet running
+  const HOLDS = { known_bugs: 'a bug is open', uses: 'the power user has not used this build', soak: 'too little time since the build', stale_build: 'a backport is in no build yet' };
   const R = S.release;
   $('stable').innerHTML = `<h3>${ic('tag')}Latest release ${R.latest ? '<span class="badge latest">Latest</span>' : ''}</h3>
     ${R.latest ? `<div class="ver">${esc(R.latest)}</div><div class="stat">published ${when(R.latest_t)}</div>` : '<div class="sub">No release in this log. Releases are still cut by hand with dev/release.sh.</div>'}`;
   $('rc').innerHTML = `<h3>${ic('branch')}Release candidate ${R.candidate ? '<span class="badge pre">Pre-release</span>' : ''}</h3>
-    ${R.candidate ? `<div class="ver">${esc(R.candidate)}</div>` : '<div class="sub">No release branch.</div>'}`;
+    ${R.candidate ? `<div class="ver">${esc(R.candidate)}</div><div class="stat">${R.build ? `build ${R.build}` : 'no build yet: waiting for CI on its branch'}${R.backports ? `, ${R.backports} backported` : ''}</div>${(R.held || []).length ? `<div class="stat">held: ${R.held.map(h => HOLDS[h] || h).join('; ')}</div>` : ''}` : '<div class="sub">No release branch.</div>'}`;
   $('pm').className = 'box actor' + (R.pm_running ? '' : ' notrun');
-  $('pm').innerHTML = `<div class="row"><div class="ic">${ic('package')}</div><div><b>Product manager</b><div class="sub" style="margin:0">${R.pm_running ? 'cuts and publishes releases' : 'in the data model, not running yet'}</div></div></div>
+  $('pm').innerHTML = `<div class="row"><div class="ic">${ic('package')}</div><div><b>Project manager</b><div class="sub" style="margin:0">${R.pm_running ? 'cuts and publishes releases' : 'in the data model, not running yet'}</div></div></div>
     <div class="stat" style="margin-top:6px">freezes main, builds, holds or publishes</div>`;
   $('poweruser').className = 'box actor' + (R.pu_running ? '' : ' notrun');
   $('poweruser').innerHTML = `<div class="row"><div class="ic">${ic('agent')}</div><div><b>Power user</b><div class="sub" style="margin:0">${R.pu_running ? 'tries the release candidate' : 'in the data model, not running yet'}</div></div></div>
-    <div class="stat" style="margin-top:6px">uses each build; files bugs and friction</div>`;
+    <div class="stat" style="margin-top:6px">${R.using ? `using ${esc(R.using.version)} build ${R.using.build} since ${when(R.using.t)}` : R.pu_running ? `${R.uses} session${R.uses === 1 ? '' : 's'} done, ${R.found} issue${R.found === 1 ? '' : 's'} filed` : 'uses each build; files bugs and friction'}</div>`;
 
   $('agents').innerHTML = '<tr><th>Agent</th><th>Plan</th><th>State</th><th>Pushes</th><th>Closed</th><th>Given up</th></tr>'
     + S.agents.map(a => `<tr><td>${esc(a.name)}<small>${esc(a.model)}</small></td><td>${esc(a.plan)}</td><td style="color:${ST[agentState(a)]}">${names[agentState(a)] || a.state}</td><td>${a.pushes}</td><td>${a.closed}</td><td>${a.gave_up}</td></tr>`).join('');

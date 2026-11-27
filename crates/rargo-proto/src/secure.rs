@@ -171,29 +171,19 @@ pub fn read_msg<R: Read>(r: &mut R, opener: &mut Opener) -> io::Result<Option<Ve
 const LINK_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const LINK_PROLOGUE: &[u8] = b"rargo worker link v2";
 
-pub struct LinkCipher {
+/// The agreed transport keys of a link. They never change, so a pool thread may seal and open with them.
+pub struct LinkKeys {
     keys: StatelessTransportState,
-    next: std::sync::atomic::AtomicU64,
-    binding: [u8; 32],
 }
 
-impl LinkCipher {
-    fn new(hs: HandshakeState) -> io::Result<LinkCipher> {
-        let binding = blake3::derive_key("rargo link datagram tag v1", hs.get_handshake_hash());
-        Ok(LinkCipher {
-            keys: hs.into_stateless_transport_mode().map_err(err)?,
-            next: std::sync::atomic::AtomicU64::new(0),
-            binding,
-        })
+impl LinkKeys {
+    fn records(len: usize) -> usize {
+        len.div_ceil(RECORD).max(1)
     }
 
-    pub fn binding(&self) -> [u8; 32] {
-        self.binding
-    }
-
-    pub fn seal(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
-        let records = msg.len().div_ceil(RECORD).max(1);
-        let base = self.next.fetch_add(records as u64, std::sync::atomic::Ordering::Relaxed);
+    /// Seals `msg` under the record numbers starting at `base`, which the caller reserved for it.
+    pub fn seal_from(&self, base: u64, msg: &[u8]) -> io::Result<Vec<u8>> {
+        let records = Self::records(msg.len());
         let mut out = vec![0u8; 8 + msg.len() + records * 16];
         out[..8].copy_from_slice(&base.to_le_bytes());
         let mut at = 8;
@@ -219,6 +209,47 @@ impl LinkCipher {
         assert!(at <= body.len());
         out.truncate(at);
         Ok(out)
+    }
+}
+
+/// One end of a link: its keys and the next unused record number, which the owning thread hands out.
+pub struct LinkCipher {
+    keys: LinkKeys,
+    next: std::cell::Cell<u64>,
+    binding: [u8; 32],
+}
+
+impl LinkCipher {
+    fn new(hs: HandshakeState) -> io::Result<LinkCipher> {
+        let binding = blake3::derive_key("rargo link datagram tag v1", hs.get_handshake_hash());
+        Ok(LinkCipher {
+            keys: LinkKeys { keys: hs.into_stateless_transport_mode().map_err(err)? },
+            next: std::cell::Cell::new(0),
+            binding,
+        })
+    }
+
+    pub fn binding(&self) -> [u8; 32] {
+        self.binding
+    }
+
+    pub fn keys(&self) -> &LinkKeys {
+        &self.keys
+    }
+
+    /// Takes the record numbers a message of `len` bytes is sealed under and returns the first.
+    pub fn reserve(&self, len: usize) -> u64 {
+        let base = self.next.get();
+        self.next.set(base.wrapping_add(LinkKeys::records(len) as u64));
+        base
+    }
+
+    pub fn seal(&self, msg: &[u8]) -> io::Result<Vec<u8>> {
+        self.keys.seal_from(self.reserve(msg.len()), msg)
+    }
+
+    pub fn open(&self, wire: &[u8]) -> io::Result<Vec<u8>> {
+        self.keys.open(wire)
     }
 }
 
@@ -321,7 +352,9 @@ impl snow::resolvers::CryptoResolver for SuppliedResolver {
 mod tests {
     use super::*;
 
-    fn pair(a: &[u8; 32], b: &[u8; 32], early: &[u8]) -> io::Result<((Sealer, Opener), (Sealer, Opener), Vec<u8>)> {
+    type Ends = (Sealer, Opener);
+
+    fn pair(a: &[u8; 32], b: &[u8; 32], early: &[u8]) -> io::Result<(Ends, Ends, Vec<u8>)> {
         let (hs, first) = client_start("ann", a, early)?;
         assert_eq!(&first[..8], MAGIC);
         let ulen = first[8] as usize;

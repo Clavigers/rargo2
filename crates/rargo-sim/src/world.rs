@@ -1,6 +1,17 @@
+use crate::disk;
+use rargo_core::db::Table;
+use rargo_core::store::Store;
+use rargo_net::io::sim;
+use crate::transport::{self, Side};
+use rargo_net::sans_io::{EndpointState, LinkKey, RouteEvent};
+use serde::{Deserialize, Serialize};
+use core::net::SocketAddr;
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
 use crate::workspace::Workspace;
+use crate::worktree::{self, Worktree};
+use rargo::out_tree::{Edit, OutputTree, VFile};
+use rargo::scan::{Index, Scan};
 use crate::rng::Rng;
 use crate::nextest::{Outcome, TestRun};
 use rargo_core::build::nextest_run::Phase;
@@ -26,18 +37,6 @@ const WATCH_STEP_MS: u64 = 200;
 /// Seeds the network faults' streams, apart from the one that drives the rest of the world.
 const NET_STREAM: u64 = 0x6e65_7477_6f72_6b21;
 const WORKSPACE_STREAM: u64 = 0x776f_726b_7370_6163;
-/// The first retransmission timeout of a lost packet, as Linux's TCP_RTO_MIN; it doubles on each loss.
-const RTO_MS: u64 = 200;
-/// Losses in a row before a packet gets through; at the rates a seed picks, more never happens.
-const MAX_RETRIES: u32 = 5;
-
-/// The receiving end of one connection: what TCP does under the messages, so that the network may lose,
-/// duplicate and reorder packets while each connection still hands its messages over once and in order.
-#[derive(Default)]
-struct Rx {
-    next: u64,
-    held: BTreeMap<u64, Msg>,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bug {
@@ -48,10 +47,14 @@ pub enum Bug {
     StaleKnowledge,
     DeafToSilence,
     TrustAfterCrash,
+    /// The daemon's watch misses the writes in the worktree, so a rescan reads none of them.
+    DeafToEdits,
+    /// The daemon brings the outputs back without showing them in `target/`.
+    UnshownOutputs,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 7] = [
+    pub const ALL: [Bug; 9] = [
         Bug::EvictPinned,
         Bug::StaleDelivery,
         Bug::NeverAnswer,
@@ -59,6 +62,8 @@ impl Bug {
         Bug::StaleKnowledge,
         Bug::DeafToSilence,
         Bug::TrustAfterCrash,
+        Bug::DeafToEdits,
+        Bug::UnshownOutputs,
     ];
 
     pub fn name(self) -> &'static str {
@@ -70,6 +75,8 @@ impl Bug {
             Bug::StaleKnowledge => "stale-knowledge",
             Bug::DeafToSilence => "deaf-to-silence",
             Bug::TrustAfterCrash => "trust-after-crash",
+            Bug::DeafToEdits => "deaf-to-edits",
+            Bug::UnshownOutputs => "unshown-outputs",
         }
     }
 
@@ -78,22 +85,25 @@ impl Bug {
     }
 }
 
-/// A fault the simulated network makes on its own, which `rargo-sim --off` turns off.
+/// A fault the simulator makes on its own, which `rargo-sim --off` turns off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Fault {
     Loss,
     Duplicate,
     Reorder,
+    ServerCrash,
 }
 
 impl Fault {
-    pub const ALL: [Fault; 3] = [Fault::Loss, Fault::Duplicate, Fault::Reorder];
+    pub const ALL: [Fault; 4] = [Fault::Loss, Fault::Duplicate, Fault::Reorder, Fault::ServerCrash];
+    const NETWORK: [Fault; 3] = [Fault::Loss, Fault::Duplicate, Fault::Reorder];
 
     pub fn name(self) -> &'static str {
         match self {
             Fault::Loss => "loss",
             Fault::Duplicate => "duplicate",
             Fault::Reorder => "reorder",
+            Fault::ServerCrash => "server-crash",
         }
     }
 
@@ -102,7 +112,7 @@ impl Fault {
     }
 }
 
-/// Which network faults a run leaves out. Each fault draws from its own stream, so turning one off
+/// Which optional faults a run leaves out. Each fault draws from its own stream, so turning one off
 /// leaves the others' rates and draws as the seed picked them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Off(BTreeSet<Fault>);
@@ -205,6 +215,7 @@ pub struct Report {
     pub tests_timed_out: u64,
     pub cuts: u64,
     pub worker_crashes: u64,
+    pub server_restarts: u64,
     pub jobs_lost_to_crashes: u64,
     pub evictions: u64,
     /// Most client rounds in progress when the server evicted a blob.
@@ -217,6 +228,10 @@ pub struct Report {
     pub lost: u64,
     pub duplicated: u64,
     pub reordered: u64,
+    pub retransmits: u64,
+    pub disk_full_errors: u64,
+    pub disk_crashes: u64,
+    pub torn_writes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -233,7 +248,7 @@ pub struct Config {
     pub net: Net,
 }
 
-/// How often, per mille of messages, the network loses, duplicates and reorders until `fault_end_ms`.
+/// How often, per mille of datagrams, the network loses, duplicates and reorders until `fault_end_ms`.
 #[derive(Clone, Debug)]
 pub struct Net {
     pub loss_per_mille: u64,
@@ -281,7 +296,7 @@ impl Config {
 #[derive(Debug)]
 pub struct Sim;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimRun {
     action: usize,
     inputs: Vec<Hash>,
@@ -301,7 +316,7 @@ enum Node {
     Client(u64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Up {
     Hello { cores: usize },
     Result { job: u64, output: Vec<u8> },
@@ -312,53 +327,45 @@ enum Up {
     Ping,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Down {
     Session(ServerMsg),
     Synced { round: u64, root: Digest },
     Pong,
+    DiskError { round: u64, message: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Msg {
     Up(Up),
     Work(FromServer<Sim>),
     Down(Down),
 }
 
-impl Msg {
-    /// The copy a duplicating network delivers; the worker's messages are not `Clone` in `rargo-core`.
-    fn copy(&self) -> Msg {
-        match self {
-            Msg::Up(u) => Msg::Up(u.clone()),
-            Msg::Down(d) => Msg::Down(d.clone()),
-            Msg::Work(w) => Msg::Work(match w {
-                FromServer::Welcome => FromServer::Welcome,
-                FromServer::Ask { rid, serve } => FromServer::Ask { rid: *rid, serve: *serve },
-                FromServer::Push { blob, first, of, part } => {
-                    FromServer::Push { blob: *blob, first: *first, of: *of, part: part.clone() }
-                }
-                FromServer::Run(r) => FromServer::Run(worker_state::Run {
-                    action: r.action,
-                    incoming: r.incoming.clone(),
-                    prefill: r.prefill.clone(),
-                    listings: r.listings.clone(),
-                    closed: r.closed.clone(),
-                    run: r.run.clone(),
-                }),
-                FromServer::Cancel { action } => FromServer::Cancel { action: *action },
-                FromServer::Other => FromServer::Other,
-            }),
-        }
-    }
+struct Connection {
+    id: u64,
+    endpoint: EndpointState,
+    sides: [Option<Side>; 2],
+    wakes: [Option<u64>; 2],
+}
+
+fn addr(node: Node) -> SocketAddr {
+    let (kind, id) = match node {
+        Node::Server => (0, 0),
+        Node::Worker(id) => (1, id),
+        Node::Client(id) => (2, id),
+    };
+    SocketAddr::from((core::net::Ipv6Addr::from((kind << 64) | u128::from(id)), 1))
 }
 
 #[derive(Debug)]
 enum Ev {
-    Deliver { from: Node, to: Node, epoch: u64, n: u64, msg: Msg },
+    Datagram { peer: Node, to_server: bool, id: u64, bytes: Vec<u8> },
+    LinkTimer { peer: Node, server: bool, id: u64 },
     Connect { worker: u64, epoch: u64 },
     Finish { worker: u64, epoch: u64, token: u64 },
     Crash { worker: u64 },
+    ServerCrash,
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
@@ -411,13 +418,62 @@ struct Server {
     sessions: BTreeMap<u64, Sess>,
     sched: SchedState,
     pipe: usize,
-    store: BTreeMap<Hash, Vec<u8>>,
+    store: Option<Store>,
     pins: BTreeMap<Hash, usize>,
     held: BTreeMap<u64, (u64, BTreeSet<Hash>)>,
-    cache: BTreeMap<Hash, Hash>,
     jobs: BTreeMap<u64, Job>,
     ready: VecDeque<u64>,
     next_job: u64,
+    disk_errors: BTreeMap<u64, (u64, String)>,
+}
+
+fn held_key(client: u64) -> [u8; 8] {
+    client.to_le_bytes()
+}
+
+impl Server {
+    fn new() -> Self {
+        Self {
+            pool: WorkerPool::new(),
+            trees: TreesState::new(),
+            sessions: BTreeMap::new(),
+            sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
+            pipe: SERVER_TOKENS,
+            store: None,
+            pins: BTreeMap::new(),
+            held: BTreeMap::new(),
+            jobs: BTreeMap::new(),
+            ready: VecDeque::new(),
+            next_job: 1,
+            disk_errors: BTreeMap::new(),
+        }
+    }
+
+    fn save_held(&self, client: u64) {
+        self.store().db().put(Table::Meta, &held_key(client), &rargo_proto::encode(&self.held[&client]));
+    }
+
+    fn reopen(&mut self, clients: u64) -> Step {
+        let store = self.store();
+        let root = store.root().parent().expect("the server disk root").to_owned();
+        // Event boundaries are durability points for the process-crash fault.
+        store.db().flush_checked().map_err(storage_error)?;
+        *self = Self::new();
+        self.store = Some(disk::open(&root));
+        for client in 1..=clients {
+            let Some(bytes) = self.store().db().get(Table::Meta, &held_key(client)) else { continue };
+            let (round, held): (u64, BTreeSet<Hash>) = rargo_proto::decode(&bytes).map_err(storage_error)?;
+            for hash in &held {
+                *self.pins.entry(*hash).or_default() += 1;
+            }
+            self.held.insert(client, (round, held));
+        }
+        Ok(())
+    }
+
+    fn store(&self) -> &Store {
+        self.store.as_ref().expect("the server has started")
+    }
 }
 
 struct Client {
@@ -430,6 +486,15 @@ struct Client {
     edits: Rng,
     edit_scheduled: bool,
     checkout_seed: Option<u64>,
+    /// The files `tree` names, which the daemon's scan reads.
+    worktree: Worktree,
+    /// The daemon's last scan, which it keeps in memory to rescan only what changed.
+    last_scan: Option<Scan>,
+    /// The scan's index as the daemon last saved it, which outlives a crash.
+    index: Index,
+    scan_root: Digest,
+    /// The output filesystem's table of what the client's `target/` holds.
+    target: OutputTree,
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
@@ -450,7 +515,7 @@ struct Client {
 }
 
 impl Client {
-    fn edit(&mut self) {
+    fn edit(&mut self, now_ns: i64) {
         let index = self.edits.below(self.tree.len() as u64) as usize;
         let slot = &mut self.tree[index];
         if slot.is_some() && self.edits.chance(500) {
@@ -461,7 +526,20 @@ impl Client {
             let version = slot.as_ref().map_or_else(|| self.edits.below(2), |bytes| u64::from(*bytes == original));
             *slot = Some(if version == 0 { original } else { model::source(index, version) });
         }
+        self.put(index, now_ns);
     }
+
+    /// Writes source `index` as `tree` has it into the worktree.
+    fn put(&mut self, index: usize, now_ns: i64) {
+        match &self.tree[index] {
+            Some(bytes) => self.worktree.write(&worktree::path(index), bytes.clone(), now_ns),
+            None => self.worktree.remove(&worktree::path(index)),
+        }
+    }
+}
+
+fn ns(ms: u64) -> i64 {
+    ms as i64 * 1_000_000
 }
 
 pub struct World {
@@ -471,13 +549,15 @@ pub struct World {
     cfg: Config,
     rng: Rng,
     net: [Rng; 3],
-    tx: BTreeMap<(Node, Node, u64), u64>,
-    rx: BTreeMap<(Node, Node, u64), Rx>,
+    connections: BTreeMap<Node, Connection>,
+    server_endpoint: EndpointState,
+    link_key: LinkKey,
+    next_conn: u64,
     now: u64,
     seq: u64,
     queue: BTreeMap<(u64, u64), Ev>,
     busy: usize,
-    last: BTreeMap<(Node, Node), u64>,
+    last: BTreeMap<(Node, bool), u64>,
     project: Project,
     server: Server,
     workers: BTreeMap<u64, WorkerNode>,
@@ -485,45 +565,44 @@ pub struct World {
     report: Report,
     trace: Vec<u8>,
     silence: Option<(u64, u64)>,
+    disk_fault: Option<disk::Fault>,
 }
 
 type Step = Result<(), Kind>;
 
+fn storage_error(error: impl fmt::Display) -> Kind {
+    Kind::StateMachine(format!("server disk: {error}"))
+}
+
+fn link_error(error: std::io::Error) -> Kind {
+    Kind::StateMachine(format!("UDP link: {error}"))
+}
+
 impl World {
     pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
         let mut rng = Rng::new(seed);
-        let mut net = Fault::ALL.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
+        let mut net = Fault::NETWORK.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
         let mut plan_rng = Rng::new(seed ^ WORKSPACE_STREAM);
         let workspace = Workspace::generate(&mut plan_rng);
         let project = Project::plan(&mut plan_rng, &workspace);
         let cfg = Config::of(&mut rng, Net::of(&mut net, &off), project.sources);
+        let link_key = transport::key();
         let mut w = World {
             seed,
             bug,
             off,
             rng,
             net,
-            tx: BTreeMap::new(),
-            rx: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            server_endpoint: EndpointState::new(true, false, link_key.clone()),
+            link_key,
+            next_conn: 1,
             now: 0,
             seq: 0,
             queue: BTreeMap::new(),
             busy: 0,
             last: BTreeMap::new(),
-            server: Server {
-                pool: WorkerPool::new(),
-                trees: TreesState::new(),
-                sessions: BTreeMap::new(),
-                sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
-                pipe: SERVER_TOKENS,
-                store: BTreeMap::new(),
-                pins: BTreeMap::new(),
-                held: BTreeMap::new(),
-                cache: BTreeMap::new(),
-                jobs: BTreeMap::new(),
-                ready: VecDeque::new(),
-                next_job: 1,
-            },
+            server: Server::new(),
             workers: BTreeMap::new(),
             clients: BTreeMap::new(),
             report: Report {
@@ -537,6 +616,7 @@ impl World {
                 tests_timed_out: 0,
                 cuts: 0,
                 worker_crashes: 0,
+                server_restarts: 0,
                 jobs_lost_to_crashes: 0,
                 evictions: 0,
                 clients_at_eviction: 0,
@@ -548,9 +628,19 @@ impl World {
                 lost: 0,
                 duplicated: 0,
                 reordered: 0,
+                retransmits: 0,
+                disk_full_errors: 0,
+                disk_crashes: 0,
+                torn_writes: 0,
             },
             trace: Vec::new(),
             silence: None,
+            disk_fault: match Rng::new(seed ^ 0x6469_736b).below(12) {
+                0 => Some(disk::Fault::Full),
+                1 => Some(disk::Fault::Torn),
+                2 => Some(disk::Fault::Crash),
+                _ => None,
+            },
             project,
             cfg,
         };
@@ -575,6 +665,11 @@ impl World {
                     edits: Rng::new(seed ^ id.wrapping_mul(0x912a_e043_5b7d_68f1)),
                     edit_scheduled: false,
                     checkout_seed: Some(seed ^ id.wrapping_mul(0x5cab_f0e9_d1b2_7431)),
+                    worktree: Worktree::default(),
+                    last_scan: None,
+                    index: Index::default(),
+                    scan_root: [0; 32],
+                    target: OutputTree::new(BTreeMap::new()),
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
@@ -594,6 +689,10 @@ impl World {
                     saved: Vec::new(),
                 },
             );
+            let c = w.clients.get_mut(&id).expect("just made");
+            for index in 0..c.tree.len() {
+                c.put(index, 0);
+            }
             let at = w.rng.range(0, 500);
             w.schedule(at, Ev::Round { client: id });
             w.schedule_housekeeping(WATCH_STEP_MS, Ev::Watch { client: id });
@@ -622,6 +721,13 @@ impl World {
         }
         let at = w.rng.range(50, 400);
         w.schedule_housekeeping(at, Ev::Evict);
+        // Keep the crash schedule independent of workload and network draws.
+        let mut crashes = Rng::new(seed ^ 0x7365_7276_6372_6173);
+        if !w.off.has(Fault::ServerCrash) && w.cfg.fault_end_ms > 0 && crashes.chance(500) {
+            for _ in 0..crashes.range(1, 3) {
+                w.schedule(crashes.range(0, w.cfg.fault_end_ms), Ev::ServerCrash);
+            }
+        }
         w
     }
 
@@ -636,71 +742,117 @@ impl World {
         self.queue.insert((self.now + after_ms, self.seq), ev);
     }
 
-    fn send(&mut self, from: Node, to: Node, msg: Msg) {
-        let epoch = match (from, to) {
-            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].epoch,
-            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].epoch,
-            _ => 0,
-        };
-        let latency = self.rng.range(1, self.cfg.max_latency_ms);
-        let in_order = (self.now + latency).max(self.last.get(&(from, to)).copied().unwrap_or(0));
-        let seq = self.tx.entry((from, to, epoch)).or_default();
-        let n = *seq;
-        *seq += 1;
-        let net = self.cfg.net.clone();
-        let faulty = self.now < self.cfg.fault_end_ms;
-        let max_latency = self.cfg.max_latency_ms;
-        let [loss, dup, reorder] = &mut self.net;
-        let mut stall = 0;
-        let mut rto = RTO_MS;
-        for _ in 0..MAX_RETRIES {
-            if !(loss.chance(net.loss_per_mille) && faulty) {
-                break;
-            }
-            self.report.lost += 1;
-            stall += rto;
-            rto *= 2;
+    fn open_link(&mut self, peer: Node) -> Step {
+        let id = self.next_conn;
+        self.next_conn += 1;
+        let mut endpoint = EndpointState::new(false, false, self.link_key.clone());
+        assert!(endpoint.connect(id, addr(Node::Server), self.now));
+        let initiator = Side::new(id, true, self.now).map_err(link_error)?;
+        let connection = Connection { id, endpoint, sides: [Some(initiator), None], wakes: [None; 2] };
+        assert!(self.connections.insert(peer, connection).is_none());
+        self.wake_link(peer, false, self.now);
+        Ok(())
+    }
+
+    fn close_link(&mut self, peer: Node) {
+        if let Some(link) = self.connections.remove(&peer) {
+            self.server_endpoint.forget(link.id);
         }
+        self.last.remove(&(peer, false));
+        self.last.remove(&(peer, true));
+    }
+
+    fn wake_link(&mut self, peer: Node, server: bool, at: u64) {
+        let link = self.connections.get_mut(&peer).expect("a live link");
+        let wake = &mut link.wakes[usize::from(server)];
+        if wake.is_some_and(|current| current <= at) {
+            return;
+        }
+        *wake = Some(at);
+        let id = link.id;
+        self.schedule(at - self.now, Ev::LinkTimer { peer, server, id });
+    }
+
+    fn send(&mut self, from: Node, to: Node, msg: Msg) {
+        let server = from == Node::Server;
+        let peer = if server { to } else { from };
+        let link = self.connections.get_mut(&peer).expect("a live link");
+        link.sides[usize::from(server)].as_mut().expect("a local link side").send(rargo_proto::encode(&msg));
+        self.wake_link(peer, server, self.now);
+    }
+
+    fn transmit(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) {
+        let latency = self.rng.range(1, self.cfg.max_latency_ms);
+        let max_latency = self.cfg.max_latency_ms;
+        let net = &self.cfg.net;
+        let faulty = self.now < self.cfg.fault_end_ms;
+        let [loss, dup, reorder] = &mut self.net;
+        let lost = loss.chance(net.loss_per_mille) && faulty;
         let copy_after = dup.range(1, 4 * max_latency);
         let duplicate = dup.chance(net.duplicate_per_mille) && faulty;
         let early = reorder.range(1, max_latency);
         let reordered = reorder.chance(net.reorder_per_mille) && faulty;
-        let at = if reordered {
+        if lost {
+            self.report.lost += 1;
+            return;
+        }
+        let after = if reordered {
             self.report.reordered += 1;
-            self.now + early + stall
-        } else if stall > 0 {
-            in_order + stall
+            early
         } else {
-            self.last.insert((from, to), in_order);
-            in_order
+            let last = self.last.entry((peer, to_server)).or_default();
+            *last = (*last).max(self.now + latency);
+            *last - self.now
         };
         if duplicate {
             self.report.duplicated += 1;
-            let copy = msg.copy();
-            self.busy += 1;
-            self.seq += 1;
-            self.queue.insert((at + copy_after, self.seq), Ev::Deliver { from, to, epoch, n, msg: copy });
+            self.schedule(after + copy_after, Ev::Datagram { peer, to_server, id, bytes: bytes.clone() });
         }
-        self.busy += 1;
-        self.seq += 1;
-        self.queue.insert((at, self.seq), Ev::Deliver { from, to, epoch, n, msg });
+        self.schedule(after, Ev::Datagram { peer, to_server, id, bytes });
+    }
+
+    fn link_timer(&mut self, peer: Node, server: bool, id: u64) -> Step {
+        let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        let side = usize::from(server);
+        if link.wakes[side] != Some(self.now) {
+            return Ok(());
+        }
+        link.wakes[side] = None;
+        let mut effects = transport::Effects::default();
+        link.sides[side].as_mut().expect("a local link side")
+            .drive(&self.link_key, self.now, &mut effects).map_err(link_error)?;
+        self.report.retransmits += effects.retransmits;
+        for packet in effects.packets {
+            self.transmit(peer, !server, id, packet);
+        }
+        if let Some(at) = effects.wake {
+            self.wake_link(peer, server, at);
+        }
+        Ok(())
     }
 
     fn finished(&self) -> bool {
         self.clients.values().all(|c| c.finished)
     }
 
-    pub fn run(mut self) -> Result<Report, Failure> {
+    pub fn run(self) -> Result<Report, Failure> {
+        let world = Box::new(self);
+        sim::test(move || world.run_with_disk())
+    }
+
+    fn run_with_disk(mut self) -> Result<Report, Failure> {
+        self.server.store = Some(disk::open(&sim::tempdir()));
         let seed = self.seed;
         let bug = self.bug;
         let off = self.off.clone();
         loop {
+            let fail = |w: &World, kind: Kind| Failure { seed, bug, off: off.clone(), at_ms: w.now, kind };
             if self.finished() {
+                self.server.store().db().flush_checked().map_err(|err| fail(&self, storage_error(err)))?;
                 self.report.end_ms = self.now;
                 self.report.trace = Hash::of(&self.trace);
                 return Ok(self.report);
             }
-            let fail = |w: &World, kind: Kind| Failure { seed, bug, off: off.clone(), at_ms: w.now, kind };
             if self.busy == 0 {
                 let open: Vec<String> = self
                     .clients
@@ -781,7 +933,7 @@ impl World {
         for (client, sess) in &self.server.sessions {
             let Some(o) = &sess.offer else { continue };
             for h in &o.arrived {
-                if self.server.trees.holder(h) == Some(o.up) && !self.server.store.contains_key(h) {
+                if self.server.trees.holder(h) == Some(o.up) && !self.server.store().has(h) {
                     return Err(Kind::LostPinned(format!(
                         "blob {} that client {client} uploaded for round {} is claimed and not in the store",
                         h.hex(),
@@ -791,12 +943,12 @@ impl World {
             }
         }
         for (h, n) in &self.server.pins {
-            if *n > 0 && !self.server.store.contains_key(h) {
+            if *n > 0 && !self.server.store().has(h) {
                 return Err(Kind::LostPinned(format!("blob {} is pinned {n} times and not in the store", h.hex())));
             }
         }
         for (job, j) in &self.server.jobs {
-            if let Some(h) = j.inputs.iter().find(|h| !self.server.store.contains_key(h)) {
+            if let Some(h) = j.inputs.iter().find(|h| !self.server.store().has(h)) {
                 return Err(Kind::LostPinned(format!("input {} of unfinished job {job} is gone", h.hex())));
             }
             if let Some(w) = j.worker {
@@ -808,10 +960,12 @@ impl World {
 
     fn step(&mut self, ev: Ev) -> Step {
         match ev {
-            Ev::Deliver { from, to, epoch, n, msg } => self.arrive(from, to, epoch, n, msg),
+            Ev::Datagram { peer, to_server, id, bytes } => self.arrive(peer, to_server, id, bytes),
+            Ev::LinkTimer { peer, server, id } => self.link_timer(peer, server, id),
             Ev::Connect { worker, epoch } => self.connect(worker, epoch),
             Ev::Finish { worker, epoch, token } => self.finish(worker, epoch, token),
             Ev::Crash { worker } => self.crash(worker),
+            Ev::ServerCrash => self.server_crash(),
             Ev::Cut { worker } => self.cut(worker),
             Ev::Evict => {
                 self.evict();
@@ -819,7 +973,7 @@ impl World {
             }
             Ev::Round { client } => self.round(client),
             Ev::Edit { client } => {
-                self.clients.get_mut(&client).expect("known").edit();
+                self.clients.get_mut(&client).expect("known").edit(ns(self.now));
                 Ok(())
             }
             Ev::Checkout { client, round } => self.checkout(client, round),
@@ -841,39 +995,44 @@ impl World {
         }
     }
 
-    fn arrive(&mut self, from: Node, to: Node, epoch: u64, n: u64, msg: Msg) -> Step {
-        if !self.open(from, to, epoch) {
-            self.rx.remove(&(from, to, epoch));
+    fn arrive(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) -> Step {
+        let silence = self.silent_at(self.now);
+        let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        // The silence fault stalls an established client session. Let agreement run so that
+        // the application-level watch can still observe silence on newly connected sessions.
+        if let Some((_, end)) = silence
+            && matches!(peer, Node::Client(_))
+            && link.sides.iter().all(|side| side.as_ref().is_some_and(Side::agreed))
+        {
+            self.schedule(end - self.now, Ev::Datagram { peer, to_server, id, bytes });
             return Ok(());
         }
-        if self.silent_at(self.now).is_some() && matches!((from, to), (Node::Client(_), _) | (_, Node::Client(_))) {
-            let (_, end) = self.silent_at(self.now).expect("checked");
-            self.schedule(end - self.now, Ev::Deliver { from, to, epoch, n, msg });
-            return Ok(());
-        }
-        let rx = self.rx.entry((from, to, epoch)).or_default();
-        if n < rx.next || rx.held.contains_key(&n) {
-            return Ok(());
-        }
-        rx.held.insert(n, msg);
-        loop {
-            let rx = self.rx.entry((from, to, epoch)).or_default();
-            let next = rx.next;
-            let Some(msg) = rx.held.remove(&next) else { return Ok(()) };
-            rx.next += 1;
-            if !self.open(from, to, epoch) {
-                return Ok(());
+        let (from, to) = if to_server { (peer, Node::Server) } else { (Node::Server, peer) };
+        let from_addr = addr(from);
+        let endpoint = if to_server { &mut self.server_endpoint } else { &mut link.endpoint };
+        let side = &mut link.sides[usize::from(to_server)];
+        let mut effects = transport::Effects::default();
+        for event in endpoint.recv(from_addr, &bytes, self.now).events {
+            if matches!(event, RouteEvent::Open { .. }) {
+                assert!(to_server && side.is_none());
+                *side = Some(Side::new(id, false, self.now).map_err(link_error)?);
             }
+            side.as_mut().expect("the endpoint opened the link")
+                .route(endpoint, event, from_addr, self.now, &mut effects).map_err(link_error)?;
+        }
+        let acks = endpoint.take_datagrams();
+        for (dest, ack) in acks {
+            assert_eq!(dest, from_addr);
+            self.transmit(peer, !to_server, id, ack);
+        }
+        if self.connections[&peer].sides[usize::from(to_server)].is_some() {
+            self.wake_link(peer, to_server, self.now);
+        }
+        for bytes in effects.messages {
+            let msg = rargo_proto::decode(&bytes).map_err(link_error)?;
             self.deliver(from, to, msg)?;
         }
-    }
-
-    fn open(&self, from: Node, to: Node, epoch: u64) -> bool {
-        match (from, to) {
-            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].up && self.workers[&w].epoch == epoch,
-            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].up && self.clients[&c].epoch == epoch,
-            _ => true,
-        }
+        Ok(())
     }
 
     fn deliver(&mut self, from: Node, to: Node, msg: Msg) -> Step {
@@ -918,7 +1077,9 @@ impl World {
         } else {
             node.up = true;
             node.epoch += 1;
-            node.sm.connected()
+            let fx = node.sm.connected();
+            self.open_link(Node::Worker(worker))?;
+            fx
         };
         self.worker_effects(worker, fx)
     }
@@ -939,9 +1100,50 @@ impl World {
         node.up = false;
         node.epoch += 1;
         let fx = node.sm.link_lost();
+        self.close_link(Node::Worker(worker));
         self.worker_effects(worker, fx)?;
         let lost = self.server.pool.left(worker);
         self.pool_effects(lost);
+        Ok(())
+    }
+
+    fn server_crash(&mut self) -> Step {
+        // Capture the invariant independently of the pin metadata the new server reads.
+        let expected_pins = self.server.pins.clone();
+        self.server.reopen(self.cfg.clients)?;
+        for hash in expected_pins.keys() {
+            if !self.server.store().read(hash).is_ok_and(|bytes| Hash::of(&bytes) == *hash) {
+                return Err(Kind::LostPinned(format!("blob {hash} was lost after a server restart")));
+            }
+        }
+        if self.server.pins != expected_pins {
+            return Err(Kind::LostPinned("server restart changed the pin counts".into()));
+        }
+        self.report.server_restarts += 1;
+
+        // Old datagrams and timers still in the queue carry connection IDs that
+        // can never match the new links.
+        self.connections.clear();
+        self.last.clear();
+        self.server_endpoint = EndpointState::new(true, false, self.link_key.clone());
+        for worker in 1..=self.cfg.workers {
+            let node = self.workers.get_mut(&worker).expect("known worker");
+            if node.up {
+                node.up = false;
+                node.epoch += 1;
+                let effects = node.sm.link_lost();
+                self.worker_effects(worker, effects)?;
+            }
+        }
+        for client in 1..=self.cfg.clients {
+            let c = self.clients.get_mut(&client).expect("known client");
+            if c.up {
+                c.up = false;
+                if !c.dead && !c.finished && c.outputs.len() < self.project.actions.len() {
+                    self.schedule(1, Ev::Sync { client });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -960,6 +1162,7 @@ impl World {
         node.up = false;
         node.epoch += 1;
         self.report.worker_crashes += 1;
+        self.close_link(Node::Worker(worker));
 
         let lost = self.server.pool.left(worker);
         self.report.jobs_lost_to_crashes += lost
@@ -1039,9 +1242,6 @@ impl World {
             let at = self.rng.range(20, 400);
             self.schedule_housekeeping(at, Ev::Evict);
         }
-        if self.server.store.is_empty() {
-            return;
-        }
         let ignore_pins = self.bug == Some(Bug::EvictPinned);
         let ignore_claims = self.bug == Some(Bug::EvictClaimed);
         // Jobs can outlive the client round that pinned their inputs.
@@ -1056,8 +1256,9 @@ impl World {
             .collect();
         let candidates: Vec<Hash> = self
             .server
-            .store
-            .keys()
+            .store()
+            .all_hashes()
+            .into_iter()
             .filter(|h| ignore_pins || (!self.server.pins.contains_key(h) && !job_inputs.contains(h)))
             .filter(|h| {
                 if self.server.trees.holder(h).is_some() {
@@ -1066,13 +1267,12 @@ impl World {
                     !offered.contains(h)
                 }
             })
-            .copied()
             .collect();
         if candidates.is_empty() {
             return;
         }
         let h = candidates[self.rng.below(candidates.len() as u64) as usize];
-        self.server.store.remove(&h);
+        self.server.store().remove(&h);
         self.report.evictions += 1;
         let active_clients = self
             .clients
@@ -1102,6 +1302,13 @@ impl World {
     }
 
     fn server_from_client(&mut self, client: u64, u: Up) -> Step {
+        if let Up::Offer { round, .. } | Up::Request { round, .. } = &u
+            && let Some((failed, message)) = self.server.disk_errors.get(&client)
+            && round == failed
+        {
+            self.send(Node::Server, Node::Client(client), Msg::Down(Down::DiskError { round: *round, message: message.clone() }));
+            return Ok(());
+        }
         match u {
             Up::Ping => self.send(Node::Server, Node::Client(client), Msg::Down(Down::Pong)),
             Up::Join => {
@@ -1119,8 +1326,8 @@ impl World {
                     server.trees.release(old.up);
                 }
                 let up = server.trees.begin_upload();
-                let store = &server.store;
-                let claimed = server.trees.claim(up, &contents, &|h| store.contains_key(h));
+                let store = server.store.as_ref().expect("the server has started");
+                let claimed = server.trees.claim(up, &contents, &|h| store.has(h));
                 let want: Vec<Digest> = claimed.mine.iter().filter(|h| !sending.contains(h)).map(|h| h.0).collect();
                 sess.offer = Some(Offer { round, root, contents, up, arrived: BTreeSet::new() });
                 if !want.is_empty() {
@@ -1141,7 +1348,7 @@ impl World {
                     match effect {
                         session_state::Effect::Store { hash, bytes } => {
                             let h = Hash(hash);
-                            server.store.insert(h, bytes);
+                            server.store.as_ref().unwrap().put_bytes(&bytes).map_err(storage_error)?;
                             sess.has.extend([hash]);
                             if let Some(o) = &mut sess.offer
                                 && o.contents.contains(&h)
@@ -1164,7 +1371,7 @@ impl World {
                 if self.bug == Some(Bug::NeverAnswer) && self.rng.chance(40) {
                     return Ok(());
                 }
-                if let Some(h) = inputs.iter().find(|h| !self.server.store.contains_key(h)) {
+                if let Some(h) = inputs.iter().find(|h| !self.server.store().has(h)) {
                     return Err(Kind::LostPinned(format!("input {} of a request is gone", h.hex())));
                 }
                 let id = self.project.actions[action].id;
@@ -1173,8 +1380,8 @@ impl World {
                 } else {
                     model::key(id, &inputs)
                 };
-                if let Some(out) = self.server.cache.get(&key).copied()
-                    && let Some(bytes) = self.server.store.get(&out).cloned()
+                if let Some(out) = disk::cached(self.server.store(), key)
+                    && let Ok(bytes) = self.server.store().read(&out)
                 {
                     self.report.cache_hits += 1;
                     return self.deliver_output(client, round, action, out, bytes);
@@ -1207,13 +1414,13 @@ impl World {
     fn rewant(&mut self, client: u64) {
         let server = &mut self.server;
         let Some(o) = server.sessions.get(&client).and_then(|s| s.offer.as_ref()) else { return };
-        let store = &server.store;
+        let store = server.store.as_ref().expect("the server has started");
         let orphans: Vec<Hash> =
-            o.contents.iter().filter(|h| !store.contains_key(h) && server.trees.holder(h).is_none()).copied().collect();
+            o.contents.iter().filter(|h| !store.has(h) && server.trees.holder(h).is_none()).copied().collect();
         if orphans.is_empty() {
             return;
         }
-        let claimed = server.trees.claim(o.up, &orphans, &|h| store.contains_key(h));
+        let claimed = server.trees.claim(o.up, &orphans, &|h| store.has(h));
         let want: Vec<Digest> = claimed.mine.iter().map(|h| h.0).collect();
         self.report.wants += 1;
         self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::WantBlobs(want))));
@@ -1223,7 +1430,7 @@ impl World {
         let server = &mut self.server;
         let Some(sess) = server.sessions.get_mut(&client) else { return };
         let Some(o) = &sess.offer else { return };
-        if !o.contents.iter().all(|h| server.store.contains_key(h)) {
+        if !o.contents.iter().all(|h| server.store.as_ref().unwrap().has(h)) {
             return;
         }
         let o = sess.offer.take().expect("checked above");
@@ -1239,6 +1446,7 @@ impl World {
         for h in &o.contents {
             self.pin(client, *h);
         }
+        self.server.save_held(client);
         self.server.trees.release(o.up);
         self.send(Node::Server, Node::Client(client), Msg::Down(Down::Synced { round: o.round, root: o.root }));
     }
@@ -1246,6 +1454,7 @@ impl World {
     fn deliver_output(&mut self, client: u64, round: u64, action: usize, out: Hash, bytes: Vec<u8>) -> Step {
         if self.server.held.get(&client).is_some_and(|(r, _)| *r == round) {
             self.pin(client, out);
+            self.server.save_held(client);
         }
         let server = &mut self.server;
         let Some(sess) = server.sessions.get_mut(&client) else { return Ok(()) };
@@ -1257,7 +1466,7 @@ impl World {
         loop {
             match outgoing.step() {
                 Next::Read { hash, at, len, .. } => {
-                    let read = server.store.get(&Hash(hash)).map(|v| {
+                    let read = server.store.as_ref().unwrap().read(&Hash(hash)).ok().map(|v| {
                         let at = (at as usize).min(v.len());
                         v[at..(at + len).min(v.len())].to_vec()
                     });
@@ -1294,8 +1503,39 @@ impl World {
                 let fx = self.server.sched.release(job);
                 self.sched_effects(fx);
                 let out = Hash::of(&output);
-                self.server.store.insert(out, output.clone());
-                self.server.cache.insert(j.key, out);
+                let fault = if !self.server.pins.is_empty()
+                    && !self.server.store().has(&out)
+                    && self.clients.get(&j.client).is_some_and(|c| !c.finished && c.round == j.round)
+                {
+                    self.disk_fault.take()
+                } else {
+                    None
+                };
+                match disk::put(&mut self.server.store, &output, fault) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+                        let message = rargo_core::serve::failure("keeping the build output", &error.into());
+                        self.server.disk_errors.insert(j.client, (j.round, message.clone()));
+                        // A job can finish after its client loses the link. The recorded
+                        // error is returned when that client offers the round again.
+                        if self.server.sessions.contains_key(&j.client) {
+                            self.send(Node::Server, Node::Client(j.client), Msg::Down(Down::DiskError { round: j.round, message }));
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(storage_error(error)),
+                }
+                if matches!(fault, Some(disk::Fault::Torn | disk::Fault::Crash)) {
+                    self.report.disk_crashes += 1;
+                    self.report.torn_writes += u64::from(fault == Some(disk::Fault::Torn));
+                    // Reopen and read the pinned files, checking bytes as well as index entries.
+                    for h in self.server.pins.keys() {
+                        if !self.server.store().read(h).is_ok_and(|bytes| Hash::of(&bytes) == *h) {
+                            return Err(Kind::LostPinned(format!("blob {h} was lost after a disk crash")));
+                        }
+                    }
+                }
+                disk::cache(self.server.store(), j.key, out);
                 self.deliver_output(j.client, j.round, j.action, out, output)?;
             }
             Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Ping => unreachable!("only clients say this"),
@@ -1352,7 +1592,9 @@ impl World {
             let j = self.server.jobs.get_mut(&job).expect("a granted job is known");
             j.worker = Some(worker);
             let run = SimRun { action: j.action, inputs: j.inputs.clone(), ms: self.project.actions[j.action].ms };
-            let pushes: Vec<(Hash, Vec<u8>)> = j.inputs.iter().map(|h| (*h, self.server.store[h].clone())).collect();
+            let pushes: Vec<_> = run.inputs.iter().map(|h| {
+                (*h, self.server.store().read(h).expect("a pinned job input is readable"))
+            }).collect();
             let msg = FromServer::Run(worker_state::Run {
                 action: job,
                 incoming: run.inputs.clone(),
@@ -1384,6 +1626,9 @@ impl World {
         // Versions 0 and 1 are used by single-file edits on the original branch.
         let mut rng = Rng::new(c.checkout_seed.take().expect("checkout scheduled once"));
         c.tree = (0..c.tree.len()).map(|index| Some(model::source(index, rng.range(2, 16)))).collect();
+        for index in 0..c.tree.len() {
+            c.put(index, ns(self.now));
+        }
         self.build_snapshot(client)
     }
 
@@ -1391,8 +1636,36 @@ impl World {
         let c = self.clients.get_mut(&client).expect("known");
         // Old jobs keep their round ID even if they finish after the checkout.
         c.round += 1;
-        c.snapshot.clone_from(&c.tree);
-        c.reference = self.project.clean_build(&c.snapshot);
+        if self.bug == Some(Bug::DeafToEdits) {
+            c.worktree.forget_changes();
+        }
+        let scan = c
+            .worktree
+            .scan(&c.target, c.last_scan.take(), &c.index, ns(self.now))
+            .map_err(|e| Kind::StateMachine(format!("client {client} could not scan its worktree: {e}")))?;
+        if scan.index_changed {
+            c.index = scan.index.clone();
+        }
+        // The build reads what the scan saw, and must come out as a clean build of the tree.
+        let present = c.tree.iter().flatten().count() as u64;
+        if scan.file_count != present + worktree::OTHER_FILES {
+            return Err(Kind::Drift(format!(
+                "client {client}'s scan saw {} files where its worktree has {present} sources and {} other files",
+                scan.file_count,
+                worktree::OTHER_FILES
+            )));
+        }
+        let snapshot: Vec<Option<Vec<u8>>> = (0..c.tree.len())
+            .map(|index| {
+                let entry = scan.index.files.get(&worktree::path(index))?;
+                let bytes = c.worktree.read(&worktree::path(index)).filter(|b| Hash::of(b).0 == entry.hash);
+                Some(bytes.map_or_else(|| format!("stale {}", Hash(entry.hash).hex()).into_bytes(), <[u8]>::to_vec))
+            })
+            .collect();
+        c.snapshot = snapshot;
+        c.scan_root = scan.root;
+        c.last_scan = Some(scan);
+        c.reference = self.project.clean_build(&c.tree);
         c.edit_scheduled = false;
         c.synced_round = 0;
         c.outputs.clear();
@@ -1423,8 +1696,10 @@ impl World {
                 c.up_since = now;
                 let outputs = &c.outputs;
                 c.requested.retain(|a| outputs.contains_key(a));
+                c.synced_round = 0;
                 c.pending.clear();
                 c.parts.clear();
+                self.open_link(Node::Client(client))?;
                 self.send(Node::Client(client), Node::Server, Msg::Up(Up::Join));
             }
             Link::Skip => unreachable!("a sync needs the link"),
@@ -1437,7 +1712,7 @@ impl World {
         for (d, b) in contents.iter().zip(blobs) {
             c.cache.insert(*d, b.clone());
         }
-        let root = Hash::of(&contents.concat()).0;
+        let root = c.scan_root;
         let (_, lacking) = c.daemon.offer(Some(1), &root, std::iter::empty(), contents.iter().map(|d| (d, ())));
         let sending: Vec<Digest> = lacking.into_iter().map(|(d, ())| d).collect();
         let upload: Vec<Blob> = sending.iter().map(|d| Blob::pack(*d, &c.cache[d])).collect();
@@ -1461,6 +1736,7 @@ impl World {
         c.cut_until = until;
         let finished = c.finished;
         self.report.client_cuts += 1;
+        self.close_link(Node::Client(client));
         self.drop_session(client);
         if !finished {
             self.schedule(until - now, Ev::Sync { client });
@@ -1475,9 +1751,13 @@ impl World {
             return;
         }
         c.dead = true;
+        // The new daemon scans all of the worktree again, with the index the old one saved.
+        c.last_scan = None;
         self.report.crashes += 1;
         if self.bug != Some(Bug::TrustAfterCrash) {
             c.up = false;
+            // Its sockets die with it; the new daemon opens a link of its own.
+            self.close_link(Node::Client(client));
         }
         self.drop_session(client);
         let at = self.rng.range(10, 1_500);
@@ -1523,7 +1803,8 @@ impl World {
             return Ok(());
         }
         match c.watch.tick(Duration::from_millis(now)) {
-            Tick::Wait => {}
+            // Server restarts close the link directly. The silence fault keeps it open.
+            Tick::Wait | Tick::Probe => {}
             Tick::Ping(_) => self.send(Node::Client(client), Node::Server, Msg::Up(Up::Ping)),
             Tick::Silent(_) if bug == Some(Bug::DeafToSilence) => {}
             Tick::Silent(quiet) => {
@@ -1538,6 +1819,7 @@ impl World {
                 }
                 c.up = false;
                 self.report.silences += 1;
+                self.close_link(Node::Client(client));
                 self.drop_session(client);
                 self.schedule(1_000, Ev::Sync { client });
                 return Ok(());
@@ -1584,6 +1866,9 @@ impl World {
     }
 
     fn client_hears(&mut self, client: u64, d: Down) -> Step {
+        if self.clients[&client].finished {
+            return Ok(());
+        }
         let m = match d {
             Down::Synced { round, root } => {
                 let c = self.clients.get_mut(&client).expect("known");
@@ -1599,6 +1884,15 @@ impl World {
             }
             Down::Session(m) => m,
             Down::Pong => return Ok(()),
+            Down::DiskError { round, message } => {
+                let c = self.clients.get_mut(&client).expect("known");
+                if c.round == round && !c.finished {
+                    assert_eq!(message, rargo_core::serve::OUT_OF_SPACE);
+                    c.finished = true;
+                    self.report.disk_full_errors += 1;
+                }
+                return Ok(());
+            }
         };
         let c = self.clients.get_mut(&client).expect("known");
         match m {
@@ -1671,8 +1965,18 @@ impl World {
             )));
         }
         let c = self.clients.get_mut(&client).expect("known");
+        // The daemon shows each delivery in `target/` as one edit of the output filesystem's table.
+        let file = VFile { hash: Hash::of(&output).0, size: output.len() as u64, exec: false, mtime_ns: ns(self.now) };
+        let path = worktree::target_path(self.project.actions[action].id);
+        if self.bug != Some(Bug::UnshownOutputs) {
+            c.target.apply(c.target.generation + 1, vec![Edit::Put { path, file, replaced_real: false }]);
+            // The table changes only here, so its invariants are checked here and not after every event.
+            c.target.invariants();
+        }
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
+            self.check_target(client)?;
+            let c = self.clients.get_mut(&client).expect("known");
             if let Some(test) = &mut c.test {
                 let scheduled = test.built();
                 self.schedule_tests(client, scheduled);
@@ -1682,6 +1986,27 @@ impl World {
             return Ok(());
         }
         self.request_ready(client);
+        Ok(())
+    }
+
+    /// What the round left in the client's `target/` is a clean build of its tree, and nothing else.
+    fn check_target(&self, client: u64) -> Step {
+        let c = &self.clients[&client];
+        let want: BTreeMap<Vec<u8>, Digest> = self
+            .project
+            .actions
+            .iter()
+            .zip(&c.reference)
+            .map(|(a, out)| (worktree::target_path(a.id), Hash::of(out).0))
+            .collect();
+        let got: BTreeMap<Vec<u8>, Digest> = c.target.files.iter().map(|(p, f)| (p.clone(), f.hash)).collect();
+        if got != want {
+            let wrong = want.iter().filter(|(p, h)| got.get(*p) != Some(h)).count() + got.keys().filter(|p| !want.contains_key(*p)).count();
+            return Err(Kind::Drift(format!(
+                "client {client} round {}: {wrong} files in target/ differ from a clean build of its tree",
+                c.round
+            )));
+        }
         Ok(())
     }
 
@@ -1738,25 +2063,14 @@ fn new_daemon(held: KnownDigests) -> DaemonState {
 
 fn label(ev: &Ev) -> String {
     match ev {
-        Ev::Deliver { from, to, epoch, n, msg } => {
-            let what = match msg {
-                Msg::Up(Up::Hello { .. }) => "hello",
-                Msg::Up(Up::Result { .. }) => "result",
-                Msg::Up(Up::Join) => "join",
-                Msg::Up(Up::Offer { .. }) => "offer",
-                Msg::Up(Up::Session(_)) => "upload",
-                Msg::Up(Up::Request { .. }) => "request",
-                Msg::Up(Up::Ping) => "ping",
-                Msg::Work(_) => "work",
-                Msg::Down(Down::Synced { .. }) => "synced",
-                Msg::Down(Down::Session(_)) => "deliver",
-                Msg::Down(Down::Pong) => "pong",
-            };
-            format!("{from:?}>{to:?}@{epoch}#{n}:{what};")
+        Ev::Datagram { peer, to_server, id, bytes } => {
+            format!("datagram {peer:?}/{to_server}@{id} [{}];", bytes.len())
         }
+        Ev::LinkTimer { peer, server, id } => format!("link timer {peer:?}/{server}@{id};"),
         Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
         Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
         Ev::Crash { worker } => format!("crash {worker};"),
+        Ev::ServerCrash => "server crash and restart;".to_string(),
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
@@ -1777,6 +2091,52 @@ pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
 
 pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure> {
     World::new(seed, bug, off).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_restart_reloads_shared_pins_and_discards_old_links() {
+        sim::test(|| {
+            let mut world = World::new(12, None, Off::none());
+            world.server.store = Some(disk::open(&sim::tempdir()));
+            let hash = world.server.store().put_bytes(b"pinned").unwrap();
+            let key = Hash::of(b"action");
+            disk::cache(world.server.store(), key, hash);
+            for client in 1..=world.cfg.clients {
+                world.server.held.insert(client, (1, BTreeSet::new()));
+                world.pin(client, hash);
+                world.server.save_held(client);
+            }
+            world.round(1).unwrap();
+            let old_link = world.connections[&Node::Client(1)].id;
+
+            world.step(Ev::ServerCrash).unwrap();
+            world.check().unwrap();
+            assert!(world.connections.is_empty());
+            assert!(world.server.sessions.is_empty());
+            assert_eq!(world.server.pins[&hash], world.cfg.clients as usize);
+            assert_eq!(disk::cached(world.server.store(), key), Some(hash));
+            assert_eq!(world.report.server_restarts, 1);
+
+            world.sync(1).unwrap();
+            assert_ne!(world.connections[&Node::Client(1)].id, old_link);
+            world.arrive(Node::Client(1), true, old_link, Vec::new()).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_lost_initial_handshake_is_retransmitted_on_the_simulated_clock() {
+        let mut world = World::new(85, None, Off::none());
+        world.cfg.fault_end_ms = 100;
+        world.cfg.net = Net { loss_per_mille: 1_000, duplicate_per_mille: 0, reorder_per_mille: 0 };
+        let report = world.run().expect("the build finishes after the initial handshake is lost");
+        assert!(report.lost > 0);
+        assert!(report.retransmits > 0);
+        assert!(report.runs > 0);
+    }
 }
 
 #[cfg(test)]
@@ -1822,6 +2182,38 @@ mod edit_tests {
         assert!(world.clients[&1].outputs.is_empty());
         world.client_done(1, new_round, action, new_output.clone()).unwrap();
         assert_eq!(world.clients[&1].outputs[&action], new_output);
+    }
+
+    #[test]
+    fn a_round_scans_only_what_changed_and_a_new_daemon_reuses_the_saved_index() {
+        let mut world = World::new(12, None, Off::none());
+        world.clients.get_mut(&1).unwrap().rounds_left = 3;
+        world.now = 1_000;
+        world.round(1).unwrap();
+        let first = world.clients[&1].last_scan.clone().unwrap();
+        let files = first.file_count;
+        assert_eq!(first.hashed_files, files, "a first scan hashes every file");
+
+        world.now = 2_000;
+        world.step(Ev::Edit { client: 1 }).unwrap();
+        world.now = 3_000;
+        world.round(1).unwrap();
+        let client = &world.clients[&1];
+        let second = client.last_scan.clone().unwrap();
+        assert!(second.hashed_files <= 1, "only the edited file is read again, not {}", second.hashed_files);
+        assert!(second.listed_dirs < second.dirs.len() as u64, "a rescan lists only the directories written in");
+        assert_eq!(client.snapshot, client.tree);
+        assert_ne!(second.root, first.root);
+
+        world.client_crash(1);
+        world.now = 4_000;
+        world.round(1).unwrap();
+        let client = &world.clients[&1];
+        let third = client.last_scan.as_ref().unwrap();
+        assert_eq!(third.listed_dirs, third.dirs.len() as u64, "a new daemon lists all of the worktree");
+        assert_eq!(third.hashed_files, 0, "but reads no file its saved index vouches for");
+        assert_eq!(third.root, second.root);
+        assert_eq!(client.snapshot, client.tree);
     }
 
     #[test]

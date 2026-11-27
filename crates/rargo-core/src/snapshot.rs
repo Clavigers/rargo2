@@ -4,36 +4,41 @@ use crate::trees_state::{TreesState, Upload, Walk};
 use crate::view::*;
 use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
-use parking_lot::Mutex;
+use std::cell::{Cell, RefCell};
 use rargo_proto::tree::{Node, Tree};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-pub trait Uploader: Send + Sync {
+pub trait Uploader {
     fn trees(&self, want: Vec<Hash>) -> Result<Vec<Vec<u8>>>;
     fn blobs(&self, want: Vec<Hash>) -> Result<()>;
 }
 
 #[derive(Default)]
 pub struct SyncStats {
-    pub trees_received: AtomicU64,
-    pub blobs_requested: AtomicU64,
-    pub bytes_received: AtomicU64,
-    pub snapshots: AtomicU64,
-    pub shared_uploads: AtomicU64,
-    pub offers: AtomicU64,
-    pub offered_bytes: AtomicU64,
+    pub trees_received: Cell<u64>,
+    pub blobs_requested: Cell<u64>,
+    pub bytes_received: Cell<u64>,
+    pub snapshots: Cell<u64>,
+    pub shared_uploads: Cell<u64>,
+    pub offers: Cell<u64>,
+    pub offered_bytes: Cell<u64>,
+}
+
+/// The directory manifests of a store, decoded once for every thread that reads them.
+pub struct Manifests {
+    pub store: Arc<Store>,
+    decoded: DashMap<Hash, Arc<Tree>>,
 }
 
 pub struct Trees {
     pub store: Arc<Store>,
-    decoded: DashMap<Hash, Arc<Tree>>,
-    state: Mutex<Shared>,
-    recent: Mutex<HashMap<String, Arc<Snapshot>>>,
+    known: Arc<Manifests>,
+    state: RefCell<Shared>,
+    recent: RefCell<HashMap<String, Arc<Snapshot>>>,
     pub stats: SyncStats,
 }
 
@@ -46,17 +51,7 @@ struct Shared {
 const SYNC_ATTEMPTS: usize = 8;
 const _: () = assert!(SYNC_ATTEMPTS >= 1);
 
-impl Trees {
-    pub fn new(store: Arc<Store>) -> Arc<Trees> {
-        Arc::new(Trees {
-            store,
-            decoded: DashMap::new(),
-            state: Mutex::new(Shared::default()),
-            recent: Mutex::new(HashMap::new()),
-            stats: SyncStats::default(),
-        })
-    }
-
+impl Manifests {
     pub fn get(&self, digest: &Hash) -> Option<Arc<Tree>> {
         if let Some(t) = self.decoded.get(digest) {
             return Some(t.clone());
@@ -83,9 +78,38 @@ impl Trees {
     pub fn put_tree(&self, tree: &Tree) -> Result<Hash> {
         self.put(&tree.encode())
     }
+}
+
+impl Trees {
+    pub fn new(store: Arc<Store>) -> Arc<Trees> {
+        Arc::new(Trees {
+            known: Arc::new(Manifests { store: store.clone(), decoded: DashMap::new() }),
+            store,
+            state: RefCell::new(Shared::default()),
+            recent: RefCell::new(HashMap::new()),
+            stats: SyncStats::default(),
+        })
+    }
+
+    /// The manifests these trees are made of, which threads off the loop may read and add to.
+    pub fn manifests(&self) -> &Arc<Manifests> {
+        &self.known
+    }
+
+    pub fn get(&self, digest: &Hash) -> Option<Arc<Tree>> {
+        self.known.get(digest)
+    }
+
+    pub fn put(&self, encoded: &[u8]) -> Result<Hash> {
+        self.known.put(encoded)
+    }
+
+    pub fn put_tree(&self, tree: &Tree) -> Result<Hash> {
+        self.known.put_tree(tree)
+    }
 
     fn is_complete(&self, d: &Hash, generation: u64) -> bool {
-        self.state.lock().core.is_complete(d, generation)
+        self.state.borrow_mut().core.is_complete(d, generation)
     }
 
     pub fn sync(self: &Arc<Self>, root: Hash, from: &dyn Uploader) -> Result<Arc<Snapshot>> {
@@ -101,8 +125,8 @@ impl Trees {
                 walk.advance(&|d| self.is_complete(d, generation), &|d| self.get(d), &|h| self.store.has(h))
             {
                 let got = from.trees(lacking.clone())?;
-                self.stats.trees_received.fetch_add(got.len() as u64, Ordering::Relaxed);
-                let this = self.clone();
+                self.stats.trees_received.set(self.stats.trees_received.get() + got.len() as u64);
+                let this = self.known.clone();
                 let stored: Result<HashSet<Hash>> = crate::io::cpu(move || got.iter().map(|enc| this.put(enc)).collect());
                 let stored = stored?;
                 if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
@@ -116,9 +140,9 @@ impl Trees {
             if !walk.missing.is_empty() {
                 self.upload(walk.missing.iter().copied().collect(), from)?;
             }
-            self.state.lock().core.completed(&walk.walked, generation, self.store.generation());
+            self.state.borrow_mut().core.completed(&walk.walked, generation, self.store.generation());
             if let Some(s) = self.hold(root) {
-                self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
+                self.stats.snapshots.set(self.stats.snapshots.get() + 1);
                 return Ok(s);
             }
         }
@@ -128,43 +152,20 @@ impl Trees {
     }
 
     fn hold(self: &Arc<Self>, root: Hash) -> Option<Arc<Snapshot>> {
-        let mut all: Vec<Hash> = Vec::new();
-        let mut seen: HashSet<Hash> = HashSet::new();
-        let mut todo = vec![root];
-        seen.insert(root);
-        while let Some(d) = todo.pop() {
-            let tree = self.get(&d)?;
-            if !self.store.has(&d) {
+        let all = worktree_hashes(root, |d| {
+            let tree = self.get(d)?;
+            if !self.store.has(d) {
                 match self.store.put_bytes(&tree.encode()) {
-                    Ok(stored) if stored == d => {}
+                    Ok(stored) if stored == *d => {}
                     _ => return None,
                 }
             }
-            all.push(d);
-            for (_, node) in &tree.entries {
-                match node {
-                    Node::File { hash, .. } => {
-                        let h = Hash(*hash);
-                        if seen.insert(h) {
-                            all.push(h);
-                        }
-                    }
-                    Node::Dir(sub) => {
-                        let sub = Hash(*sub);
-                        if seen.insert(sub) {
-                            todo.push(sub);
-                        }
-                    }
-                    Node::Symlink(_) => {}
-                }
-            }
-        }
-        assert_eq!(all.first(), Some(&root));
-        debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+            Some(tree)
+        })?;
         if !self.store.pin_all(&all) {
             return None;
         }
-        Some(Arc::new(Snapshot { trees: self.clone(), id: root, dirs: DashMap::new(), pinned: all }))
+        Some(Arc::new(Snapshot { trees: self.known.clone(), id: root, dirs: DashMap::new(), pinned: all }))
     }
 
     pub fn lacking(&self, root: Hash) -> (Vec<Hash>, Vec<Hash>) {
@@ -174,7 +175,7 @@ impl Trees {
                 self.store.has(h)
             });
         if trees.is_empty() && blobs.is_empty() {
-            self.state.lock().core.completed(&walked, generation, self.store.generation());
+            self.state.borrow_mut().core.completed(&walked, generation, self.store.generation());
         }
         (trees, blobs)
     }
@@ -183,7 +184,7 @@ impl Trees {
         let mut pending = missing;
         while !pending.is_empty() {
             let (claims, claimed) = {
-                let mut st = self.state.lock();
+                let mut st = self.state.borrow_mut();
                 let up = st.core.begin_upload();
                 st.done.insert(up, Arc::new(crate::io::Notify::new()));
                 let claimed = st.core.claim(up, &pending, &|h| self.store.has(h));
@@ -194,7 +195,7 @@ impl Trees {
             let result = if mine.is_empty() {
                 Ok(())
             } else {
-                self.stats.blobs_requested.fetch_add(mine.len() as u64, Ordering::Relaxed);
+                self.stats.blobs_requested.set(self.stats.blobs_requested.get() + mine.len() as u64);
                 from.blobs(mine.clone())
             };
             drop(claims);
@@ -202,9 +203,9 @@ impl Trees {
             if let Some(h) = mine.iter().find(|h| !self.store.has(h)) {
                 bail!("the client did not upload file content {h}");
             }
-            self.stats.shared_uploads.fetch_add(claimed.theirs.len() as u64, Ordering::Relaxed);
+            self.stats.shared_uploads.set(self.stats.shared_uploads.get() + claimed.theirs.len() as u64);
             for (h, other) in claimed.theirs {
-                let Some(n) = self.state.lock().done.get(&other).cloned() else {
+                let Some(n) = self.state.borrow_mut().done.get(&other).cloned() else {
                     if !self.store.has(&h) {
                         pending.push(h);
                     }
@@ -214,7 +215,7 @@ impl Trees {
                     if self.store.has(&h) {
                         break;
                     }
-                    if self.state.lock().core.holder(&h) != Some(other) {
+                    if self.state.borrow_mut().core.holder(&h) != Some(other) {
                         if !self.store.has(&h) {
                             pending.push(h);
                         }
@@ -228,6 +229,37 @@ impl Trees {
     }
 }
 
+fn worktree_hashes(root: Hash, tree: impl Fn(&Hash) -> Option<Arc<Tree>>) -> Option<Vec<Hash>> {
+    let mut all: Vec<Hash> = Vec::new();
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut todo = vec![root];
+    seen.insert(root);
+    while let Some(d) = todo.pop() {
+        let tree = tree(&d)?;
+        all.push(d);
+        for (_, node) in &tree.entries {
+            match node {
+                Node::File { hash, .. } => {
+                    let h = Hash(*hash);
+                    if seen.insert(h) {
+                        all.push(h);
+                    }
+                }
+                Node::Dir(sub) => {
+                    let sub = Hash(*sub);
+                    if seen.insert(sub) {
+                        todo.push(sub);
+                    }
+                }
+                Node::Symlink(_) => {}
+            }
+        }
+    }
+    assert_eq!(all.first(), Some(&root));
+    debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+    Some(all)
+}
+
 struct Claims<'a> {
     trees: &'a Trees,
     up: Upload,
@@ -235,7 +267,7 @@ struct Claims<'a> {
 
 impl Drop for Claims<'_> {
     fn drop(&mut self) {
-        let mut st = self.trees.state.lock();
+        let mut st = self.trees.state.borrow_mut();
         st.core.release(self.up);
         if let Some(n) = st.done.remove(&self.up) {
             n.notify_waiters();
@@ -245,7 +277,7 @@ impl Drop for Claims<'_> {
 
 impl Trees {
     pub fn remember(&self, worktree: &str, snap: &Arc<Snapshot>) {
-        let mut r = self.recent.lock();
+        let mut r = self.recent.borrow_mut();
         if r.len() > 4096 {
             r.clear();
         }
@@ -253,11 +285,22 @@ impl Trees {
     }
 
     pub fn recent(&self) -> Vec<(String, Arc<Snapshot>)> {
-        self.recent.lock().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.recent.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    /// The roots of the worktrees synced lately.
+    pub fn recent_roots(&self) -> Vec<Hash> {
+        self.recent.borrow().values().map(|s| s.id).collect()
     }
 
     pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
-        let roots: Vec<Hash> = self.recent.lock().values().map(|s| s.id).collect();
+        self.known.mark(self.recent_roots(), live)
+    }
+}
+
+impl Manifests {
+    /// Adds the trees under `roots` and the files they name to `live`.
+    pub fn mark(&self, roots: Vec<Hash>, live: &mut std::collections::BTreeSet<Hash>) {
         let mut stack = roots;
         while let Some(d) = stack.pop() {
             if !live.insert(d) {
@@ -282,7 +325,7 @@ const OWN_EXEC: Owner = Owner::own(0o755);
 const OWN_DIR: Owner = Owner::own(0o755);
 
 pub struct Snapshot {
-    trees: Arc<Trees>,
+    trees: Arc<Manifests>,
     pub id: Hash,
     dirs: DashMap<Vec<u8>, Option<Arc<Tree>>>,
     pinned: Vec<Hash>,
@@ -297,8 +340,8 @@ impl Drop for Snapshot {
 }
 
 impl Snapshot {
-    pub fn new(trees: Arc<Trees>, root: Hash) -> Snapshot {
-        Snapshot { trees, id: root, dirs: DashMap::new(), pinned: Vec::new() }
+    pub fn new(trees: &Trees, root: Hash) -> Snapshot {
+        Snapshot { trees: trees.known.clone(), id: root, dirs: DashMap::new(), pinned: Vec::new() }
     }
 
     fn dir(&self, rel_dir: &[u8]) -> Option<Arc<Tree>> {
@@ -416,7 +459,7 @@ impl Snapshot {
     }
 
     pub fn with_file(&self, rel: &[u8], node: Option<Node>) -> Result<Arc<Snapshot>> {
-        fn set(trees: &Trees, tree: &Tree, comps: &[&[u8]], node: Option<Node>) -> Result<Tree> {
+        fn set(trees: &Manifests, tree: &Tree, comps: &[&[u8]], node: Option<Node>) -> Result<Tree> {
             let mut out = tree.clone();
             let pos = out.entries.binary_search_by(|(n, _)| n.as_slice().cmp(comps[0]));
             let new = if comps.len() == 1 {
@@ -446,7 +489,7 @@ impl Snapshot {
         let root = self.trees.get(&self.id).context("root tree missing")?;
         let new_root = set(&self.trees, &root, &comps, node)?;
         let id = self.trees.put_tree(&new_root)?;
-        Ok(Arc::new(Snapshot::new(self.trees.clone(), id)))
+        Ok(Arc::new(Snapshot { trees: self.trees.clone(), id, dirs: DashMap::new(), pinned: Vec::new() }))
     }
 }
 
@@ -530,20 +573,20 @@ mod tests {
             let first = crate::io::spawn(move || first_trees.sync(root, &Stalled));
             crate::io::yield_now();
             assert!(!first.is_finished(), "the first sync waits on its client's upload");
-            let up = trees.state.lock().core.holder(&blobs[0]).expect("the first sync claims what it uploads");
-            assert_eq!(trees.state.lock().core.holder(&blobs[1]), Some(up));
+            let up = trees.state.borrow_mut().core.holder(&blobs[0]).expect("the first sync claims what it uploads");
+            assert_eq!(trees.state.borrow_mut().core.holder(&blobs[1]), Some(up));
             first.abort();
             for h in &blobs {
-                assert_eq!(trees.state.lock().core.holder(h), None, "a dropped sync leaves no claim behind");
+                assert_eq!(trees.state.borrow_mut().core.holder(h), None, "a dropped sync leaves no claim behind");
             }
-            assert!(!trees.state.lock().done.contains_key(&up), "and nothing waits on it");
+            assert!(!trees.state.borrow_mut().done.contains_key(&up), "and nothing waits on it");
             let second = crate::io::timeout(std::time::Duration::from_secs(5), || trees.sync(root, &fake))
                 .expect("the next sync of the same content does not wait on the dropped one");
             match second {
                 Ok(s) => assert_eq!(s.read(b"b").unwrap(), b"content b"),
                 Err(e) => panic!("the next sync of the same content fails: {e}"),
             }
-            trees.state.lock().core.invariants();
+            trees.state.borrow_mut().core.invariants();
         });
     }
 
@@ -565,8 +608,8 @@ mod tests {
             ("link", Node::Symlink(b"src".to_vec())),
         ]);
         let s1 = trees.sync(root_of(&v1), &fake).unwrap();
-        assert_eq!(trees.stats.trees_received.load(Ordering::Relaxed), 2);
-        assert_eq!(trees.stats.blobs_requested.load(Ordering::Relaxed), 3);
+        assert_eq!(trees.stats.trees_received.get(), 2);
+        assert_eq!(trees.stats.blobs_requested.get(), 3);
         assert!(matches!(s1.lookup(b"/", b"src"), Looked::Dir(_)));
         assert!(matches!(s1.lookup(b"/", b"link"), Looked::Symlink(t) if t == b"src"));
         assert!(matches!(s1.lookup(b"/", b"nope"), Looked::Absent));
@@ -576,7 +619,7 @@ mod tests {
         assert!(s1.list(b"/missing").is_err());
 
         trees.sync(root_of(&v1), &fake).unwrap();
-        assert_eq!(trees.stats.trees_received.load(Ordering::Relaxed), 2);
+        assert_eq!(trees.stats.trees_received.get(), 2);
 
         let src2 = fake.dir(vec![("lib.rs", fake.file(b"pub fn b() {}")), ("util.rs", fake.file(b"// util"))]);
         let v2 = fake.dir(vec![
@@ -585,8 +628,8 @@ mod tests {
             ("link", Node::Symlink(b"src".to_vec())),
         ]);
         let s2 = trees.sync(root_of(&v2), &fake).unwrap();
-        assert_eq!(trees.stats.trees_received.load(Ordering::Relaxed), 4);
-        assert_eq!(trees.stats.blobs_requested.load(Ordering::Relaxed), 4);
+        assert_eq!(trees.stats.trees_received.get(), 4);
+        assert_eq!(trees.stats.blobs_requested.get(), 4);
         assert_ne!(s1.id, s2.id);
         assert_eq!(s2.read(b"src/lib.rs").unwrap(), b"pub fn b() {}");
         });
@@ -664,6 +707,33 @@ mod tests {
             trees.store.evict_to(0, &|_| false);
             assert!(!trees.store.has(&a_file) && !trees.store.has(&root));
             assert!(!trees.store.is_pinned(&a_file));
+        });
+    }
+
+    #[test]
+    fn a_held_snapshot_pins_its_whole_worktree_until_it_is_dropped() {
+        crate::io::sim::test(|| {
+            let (_d, trees, fake) = setup();
+            let v = fake.dir(vec![
+                ("src", fake.dir(vec![("a", fake.file(b"a")), ("deep", fake.dir(vec![("b", fake.file(b"b"))]))])),
+                ("top", fake.file(b"top")),
+            ]);
+            let root = root_of(&v);
+            let s = trees.sync(root, &fake).unwrap();
+            let held = worktree_hashes(root, |d| trees.get(d)).unwrap();
+            assert_eq!(held.len(), 6, "three manifests and three files");
+            assert!(held.iter().all(|h| trees.store.is_pinned(h)));
+
+            let output = trees.store.put_bytes(b"an output nobody holds").unwrap();
+            trees.store.evict_to(0, &|_| false);
+            assert!(!trees.store.has(&output));
+            assert!(held.iter().all(|h| trees.store.has(h)));
+            assert_eq!(s.read(b"src/deep/b").unwrap(), b"b");
+
+            drop(s);
+            assert!(held.iter().all(|h| !trees.store.is_pinned(h)));
+            trees.store.evict_to(0, &|_| false);
+            assert!(held.iter().all(|h| !trees.store.has(h)));
         });
     }
 

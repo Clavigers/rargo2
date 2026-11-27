@@ -1,6 +1,7 @@
 use crate::hash::Hash;
 use crate::io;
-use dashmap::DashMap;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use rargo_plan::{PARSE_ENV, ParseReq, ParseResp, Script};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -24,12 +25,12 @@ impl Proc {
 pub struct Parser {
     exe: PathBuf,
     proc: io::Mutex<Option<Proc>>,
-    memo: DashMap<Hash, Arc<ParseResp>>,
+    memo: RefCell<BTreeMap<Hash, Arc<ParseResp>>>,
 }
 
 impl Parser {
     pub fn new(exe: PathBuf) -> Arc<Parser> {
-        Arc::new(Parser { exe, proc: io::Mutex::new(None), memo: DashMap::new() })
+        Arc::new(Parser { exe, proc: io::Mutex::new(None), memo: RefCell::new(BTreeMap::new()) })
     }
 
     fn start(&self) -> std::io::Result<Proc> {
@@ -76,15 +77,11 @@ impl Parser {
         Self::read_exact(&p.stdout, u32::from_le_bytes(len.try_into().expect("four bytes")) as usize)
     }
 
-    pub fn parse(self: &Arc<Self>, script: &Script, stdout: &[u8]) -> Arc<ParseResp> {
+    pub fn parse(&self, script: &Script, stdout: &[u8]) -> Arc<ParseResp> {
         let req = rargo_plan::encode(&ParseReq { script: script.clone(), stdout: stdout.to_vec() });
         let key = Hash::of(&req);
-        if let Some(r) = self.memo.get(&key) {
+        if let Some(r) = self.memo.borrow().get(&key) {
             return r.clone();
-        }
-        if !io::on_fiber() {
-            let this = Arc::clone(self);
-            return io::call(move || this.ask(key, &req));
         }
         self.ask(key, &req)
     }
@@ -106,7 +103,7 @@ impl Parser {
                 Ok(bytes) => match rargo_plan::decode::<ParseResp>(&bytes) {
                     Ok(resp) => {
                         let resp = Arc::new(resp);
-                        self.memo.insert(key, resp.clone());
+                        self.memo.borrow_mut().insert(key, resp.clone());
                         return resp;
                     }
                     Err(e) => last_err = format!("bad reply from the build-script parser: {e}"),

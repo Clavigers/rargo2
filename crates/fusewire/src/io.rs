@@ -6,12 +6,47 @@
 //! is decided by the session, which hands everything over as plain data.
 
 use crate::abi::{fuse_backing_map, FUSE_DEV_IOC_BACKING_CLOSE, FUSE_DEV_IOC_BACKING_OPEN};
-use crate::{mount_id_in, unmount_action, GuardPlan, Helped, Kernel, Unmount};
+use crate::{mount_id_in, unmount_action, GuardPlan, Helped, Kernel, Lifecycle, LifecycleEvent, LifecycleReply, Unmount};
 use std::ffi::{CStr, OsString};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Mutex};
+
+type LifecycleMessage<G> = (LifecycleEvent, mpsc::Sender<LifecycleReply<G>>);
+
+/// Session methods submit events synchronously. A caller drives the inbox
+/// while holding the loop lock, then carries out effects after releasing it.
+pub(super) struct LifecycleDriver<G> {
+    inbox: mpsc::Sender<LifecycleMessage<G>>,
+    event_loop: Mutex<LifecycleLoop<G>>,
+}
+
+struct LifecycleLoop<G> {
+    inbox: mpsc::Receiver<LifecycleMessage<G>>,
+    machine: Lifecycle<G>,
+}
+
+impl<G> LifecycleDriver<G> {
+    pub(super) fn new(machine: Lifecycle<G>) -> Self {
+        let (inbox, receiver) = mpsc::channel();
+        Self { inbox, event_loop: Mutex::new(LifecycleLoop { inbox: receiver, machine }) }
+    }
+
+    pub(super) fn dispatch(&self, event: LifecycleEvent) -> LifecycleReply<G> {
+        let (reply, response) = mpsc::channel();
+        assert!(self.inbox.send((event, reply)).is_ok(), "session owns the lifecycle inbox");
+        {
+            let mut event_loop = self.event_loop.lock().unwrap();
+            while let Ok((event, reply)) = event_loop.inbox.try_recv() {
+                let result = event_loop.machine.step(event);
+                assert!(reply.send(result).is_ok(), "session caller is awaiting its lifecycle reply");
+            }
+        }
+        response.recv().expect("the lifecycle loop answered every queued event")
+    }
+}
 
 /// The kernel this process runs on.
 #[derive(Clone, Copy, Debug, Default)]

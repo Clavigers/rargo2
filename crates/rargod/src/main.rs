@@ -191,10 +191,20 @@ fn main() -> Result<()> {
         }
     }
     let cargo_home = cargo_home.ring_canonicalize()?;
-    let server_env = io::env::vars().into_iter().collect();
+    let server_env = io::env::vars().into_iter().filter(|(k, _)| !SYSTEMD_ONLY.contains(&k.as_str())).collect();
+    let notifier = match io::env::var_os("NOTIFY_SOCKET") {
+        Some(name) => Some(sys::Notifier::open(&name).with_context(|| format!("NOTIFY_SOCKET {}", name.to_string_lossy()))?),
+        None => None,
+    };
+    let ping_every = watchdog_every(
+        io::env::var("WATCHDOG_USEC").ok().as_deref(),
+        io::env::var("WATCHDOG_PID").ok().as_deref(),
+        io::process::id(),
+    );
     let daemon = Arc::new(Daemon::new(
         Config { state_dir: state.clone(), planner, cargo_home: cargo_home.clone(), uid, gid, server_env },
         engine,
+        rargo_core::tokens::os_seed()?,
     ));
     eprintln!(
         "rargod: store {} ({}), cargo home {}, passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, actions run as uid {uid}",
@@ -218,14 +228,15 @@ fn main() -> Result<()> {
     let public = opts.public.clone();
     let http_state = state.clone();
     let keys = Arc::new(keys);
+    let pool_seed = rargo_core::tokens::os_seed()?;
     io::drive(4, move || {
         match rargo_core::io::FuseDrive::spawn(&session, &fuse_fs) {
             Ok(drive) => drive.detach(),
             Err(err) => stop(&session, Err(err.into())),
         }
-        io::background(move || evict_loop(evicting));
+        io::spawn(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
-            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key) {
+            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key, &mut rargo_core::rng::Rng::new(pool_seed)) {
                 Ok(pool) => {
                     let _ = daemon.engine.remote.set(pool.clone());
                     let _ = daemon.pool.set(pool);
@@ -247,7 +258,7 @@ fn main() -> Result<()> {
         };
         let users: rargo_core::net::UserKeys = {
             let keys = keys.clone();
-            Arc::new(move |user| keys.psk(user))
+            std::rc::Rc::new(move |user| keys.psk(user))
         };
         let local = match listener.local_addr() {
             Ok(addr) => addr,
@@ -274,11 +285,47 @@ fn main() -> Result<()> {
             ),
             Err(err) => stop(&session, Err(err).context(format!("listening on {listen}"))),
         }
+        if let Some(notifier) = notifier {
+            watchdog(notifier, ping_every);
+        }
         let http = Arc::new(rargo_core::http::Http::new(keys.clone(), public, listen.port()).with_state(http_state));
         let result = serve(&daemon, &listener, &keys, &http);
         stop(&session, result);
     });
     unreachable!("the server leaves through stop")
+}
+
+/// What systemd sets for rargod alone: a build action that inherited them
+/// could tell systemd the server is alive when it is not.
+const SYSTEMD_ONLY: [&str; 3] = ["NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID"];
+
+/// How often to tell systemd's watchdog the loop is alive: half its timeout
+/// `WATCHDOG_USEC`, if the watchdog is on and meant for this process.
+fn watchdog_every(usec: Option<&str>, pid: Option<&str>, me: u32) -> Option<std::time::Duration> {
+    if pid.is_some_and(|pid| pid.trim().parse::<u32>().ok() != Some(me)) {
+        return None;
+    }
+    let usec = usec?.trim().parse::<u64>().ok().filter(|&u| u > 0)?;
+    Some(std::time::Duration::from_micros(usec / 2).max(std::time::Duration::from_millis(1)))
+}
+
+/// Tells systemd the server is ready, then, from a fiber on the event loop,
+/// that it is alive every `every`. The pings come from the loop itself, so a
+/// loop that hangs stops them and systemd restarts the server.
+fn watchdog(notifier: sys::Notifier, every: Option<std::time::Duration>) {
+    if let Err(err) = notifier.send("READY=1") {
+        eprintln!("rargod: telling systemd it is ready: {err}");
+    }
+    let Some(every) = every else { return };
+    assert!(!every.is_zero());
+    io::background(move || {
+        loop {
+            io::sleep(every);
+            if let Err(err) = notifier.send("WATCHDOG=1") {
+                eprintln!("rargod: pinging the systemd watchdog: {err}");
+            }
+        }
+    });
 }
 
 fn token_command(args: &[String]) -> Result<()> {
@@ -424,24 +471,21 @@ fn evict_loop((d, budget, cold_after): (Arc<Daemon>, u64, u64)) {
     let mut tick = 0u64;
     loop {
         io::sleep(std::time::Duration::from_secs(20));
-        let d = d.clone();
-        io::cpu(move || {
-            let store = &d.engine.store;
-            if tick % 6 == 5 {
-                let (n, bytes) = d.collect_garbage(600);
-                if n > 0 {
-                    eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
-                }
+        if tick % 6 == 5 {
+            let (n, bytes) = d.collect_garbage(600);
+            if n > 0 {
+                eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
             }
+        }
+        let (store, fs) = (d.engine.store.clone(), d.engine.fs.clone());
+        io::cpu(move || {
             if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
-                let fs = d.engine.fs.clone();
                 let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
                 if n > 0 {
                     eprintln!("rargod: {n} blobs went cold, {} MiB freed", freed >> 20);
                 }
             }
             if store.total_bytes() > budget {
-                let fs = d.engine.fs.clone();
                 let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
                 if freed > 0 {
                     eprintln!("rargod: evicted {} MiB (store now {} MiB)", freed >> 20, store.total_bytes() >> 20);
@@ -449,5 +493,22 @@ fn evict_loop((d, budget, cold_after): (Arc<Daemon>, u64, u64)) {
             }
         });
         tick += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::watchdog_every;
+    use std::time::Duration;
+
+    #[test]
+    fn the_watchdog_is_pinged_at_half_its_timeout_and_only_when_meant_for_this_process() {
+        assert_eq!(watchdog_every(Some("60000000"), None, 7), Some(Duration::from_secs(30)));
+        assert_eq!(watchdog_every(Some("60000000"), Some("7"), 7), Some(Duration::from_secs(30)));
+        assert_eq!(watchdog_every(Some("60000000"), Some("8"), 7), None);
+        assert_eq!(watchdog_every(None, None, 7), None);
+        assert_eq!(watchdog_every(Some("0"), None, 7), None);
+        assert_eq!(watchdog_every(Some("soon"), None, 7), None);
+        assert_eq!(watchdog_every(Some("1"), None, 7), Some(Duration::from_millis(1)));
     }
 }

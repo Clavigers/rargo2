@@ -23,6 +23,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: dev/update-service-test.sh
+      - name: Planner setup and build scripts use this checkout
+        run: dev/forks-test.sh
       - name: install.sh installs a release only once the build server runs it
         run: dev/release-local-test.sh
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9

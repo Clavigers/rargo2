@@ -56,6 +56,9 @@ PARAMS = [
     ("review_minutes", "Checks", "review-mux review (min)", 1, 60, 1, 3),
     ("review_changes", "Checks", "review-mux asks for changes (%)", 0, 80, 1, 25),
     ("conflict", "Checks", "Merges that conflict (%)", 0, 50, 1, 3),
+    ("use_minutes", "Release", "Power user session (min)", 5, 240, 5, 60),
+    ("use_gap", "Release", "Hours between power user sessions", 0, 48, 1, 3),
+    ("use_finds_bug", "Release", "Sessions that find a bug (%)", 0, 100, 5, 30),
 ]
 GUESSES = {k for k, *_ in PARAMS}  # every default is a guess until calibrated
 SPEED = {"claude-code": 1.0, "codex": 1.3, "grok": 1.6}  # work time multipliers, guesses
@@ -78,7 +81,9 @@ class Sim:
         self.planned: set[int] = set()
         self.pending = False  # a config waiting for departing agents
         self._config()
-        for proc in (self.human(), self.dictator(), self.watchdog(), self.initiatives()):
+        self.building = False  # a release branch's CI is running
+        for proc in (self.human(), self.dictator(), self.watchdog(), self.initiatives(),
+                     self.pm(), self.power_user()):
             self.env.process(proc)
 
     # ------------------------------------------------------------ the log
@@ -354,6 +359,71 @@ class Sim:
                       reasons=["other"], note="findings from the review bots")
         else:
             self.emit("reviewer", event="review_done", by=r, pr=pr, push=push, result="approved")
+
+    # ------------------------------------------------------------ releases
+
+    def _candidate(self) -> str | None:
+        return next((v for v in self.w.versions if self.w.is_(M.VERSION, v, "candidate")), None)
+
+    def pm(self):
+        """The project manager's step, every 5 minutes, as factory/pm.py."""
+        held: dict[tuple[str, int], list[str]] = {}
+        while True:
+            yield self.env.timeout(5)
+            w, rules = self.w, self.w.config.release
+            v = self._candidate()
+            if v is None:
+                last = max((x.frozen for x in w.versions.values()), default=None)
+                if last and self.t - last < timedelta(days=rules.freeze_every_days):
+                    continue
+                v = f"0.8.{len(w.versions)}"
+                self.emit("pm", event="frozen", version=v, sha=self._sha())
+            r = w.versions[v]
+            if (not r.builds or r.unbuilt) and not self.building:
+                self.env.process(self.build(v))
+            for pr, p in sorted(w.prs.items()):
+                if (p.merged and p.merged >= r.frozen and pr not in r.backports
+                        and w.issues[p.issue].kind is m.Kind.bug):
+                    self.emit("pm", event="backported", version=v, pr=pr)
+            if not r.builds:
+                continue
+            build, reasons = len(r.builds), sorted(w.hold_reasons(v))
+            if not reasons:
+                self.emit("pm", event="published", version=v, build=build)
+            elif held.get((v, build)) != reasons:
+                held[(v, build)] = reasons
+                self.emit("pm", event="release_held", version=v, build=build, reasons=reasons)
+
+    def build(self, v: str):
+        """CI on the release branch's head; a pass is the next build."""
+        self.building = True
+        yield self.env.timeout(self._lognormal(self.p["ci_minutes"]))
+        self.building = False
+        if self._candidate() == v and self.rng.uniform(0, 100) >= self.p["ci_fail"]:
+            self.emit("pm", event="built", version=v, build=len(self.w.versions[v].builds) + 1,
+                      sha=self._sha())
+
+    def power_user(self):
+        """One use session per build that needs one, as factory/poweruser.py."""
+        use, last = 0, None
+        while True:
+            yield self.env.timeout(5)
+            w, v = self.w, self._candidate()
+            if v is None or (last is not None and self.env.now - last < self.p["use_gap"] * 60):
+                continue
+            r = w.versions[v]
+            build = len(r.builds)
+            ended = sum(1 for n, u in w.uses.items() if (u.by, u.version, u.build) == ("power_user", v, build)
+                        and w.is_(M.USE, n, "ended"))
+            if build == 0 or r.unbuilt or ended >= w.config.release.uses_required:
+                continue
+            use += 1
+            self.emit("power_user", event="use_started", use=use, version=v, build=build)
+            yield self.env.timeout(self._lognormal(self.p["use_minutes"]))
+            if self.rng.uniform(0, 100) < self.p["use_finds_bug"]:
+                self.emit("power_user", event="filed", issue=self._next(), kind="bug")
+            self.emit("power_user", event="use_ended", use=use)
+            last = self.env.now
 
     def _current(self, pr: int, push: int) -> bool:
         return self.w.prs[pr].pushes == push and self.w.is_(M.PR, pr, "open")

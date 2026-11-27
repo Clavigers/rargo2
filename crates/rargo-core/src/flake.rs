@@ -427,16 +427,12 @@ pub(crate) fn resolve_shell(
     shell: &str,
     preparing: &dyn Fn(),
 ) -> Result<Arc<FlakeEnv>> {
-    static NIX_READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    if NIX_READY.get().is_none() {
-        let ready = match nix().arg("--version").output() {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
-            Err(e) => Err(e.to_string()),
-        };
-        let _ = NIX_READY.set(ready);
-    }
-    NIX_READY.get().expect("set above").as_ref().map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
+    crate::io::nix::ready(|| match nix().arg("--version").output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
+        Err(e) => Err(e.to_string()),
+    })
+    .map_err(|e| anyhow::anyhow!("rargod needs Nix with flakes to build: {e}"))?;
 
     let src = source(snap, dir, extra);
     let shell_key = if shell == "default" {
@@ -469,7 +465,7 @@ pub(crate) fn resolve_shell(
                 resolution.exists(&present);
             }
             Need::Evaluate => {
-                let at = crate::io::cpu(|| d.scratch("flake"))?;
+                let at = d.scratch("flake")?;
                 scratch = Some(at.clone());
                 let out = (|| -> Result<Vec<u8>> {
                     let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
@@ -503,7 +499,8 @@ pub(crate) fn resolve_shell(
                 resolution.closed(run_nix(&at, c, uid, gid));
             }
             Need::Manifest(closure) => {
-                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), &d.nix_attached));
+                let attached = &d.nix_attached;
+                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), attached));
                 let prepared = match prepared {
                     Ok(p) => p,
                     Err(e) => break Err(e),

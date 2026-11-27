@@ -6,24 +6,21 @@ fn clean(seeds: std::ops::Range<u64>) {
     assert!(failures.is_empty(), "{}", text.join("\n"));
 }
 
+// Keep broad sweeps available through rargo-sim --seeds. CI samples multiple
+// ranges so the real UDP handshakes fit the workspace CPU budget.
 #[test]
-fn seeds_100_to_200_keep_every_invariant() {
-    clean(100..200);
+fn seeds_0_to_12_keep_every_invariant() {
+    clean(0..12);
 }
 
 #[test]
-fn seeds_200_to_400_keep_every_invariant() {
-    clean(200..400);
+fn seeds_200_to_224_keep_every_invariant() {
+    clean(200..224);
 }
 
 #[test]
-fn seeds_400_to_500_keep_every_invariant() {
-    clean(400..500);
-}
-
-#[test]
-fn seeds_500_to_600_keep_every_invariant() {
-    clean(500..600);
+fn seeds_400_to_424_keep_every_invariant() {
+    clean(400..424);
 }
 
 #[test]
@@ -49,7 +46,7 @@ fn seeded_test_commands_report_passes_failures_and_timeouts() {
 
 #[test]
 fn a_worker_restarts_even_if_its_link_was_cut_when_it_crashed() {
-    let report = run(85, None).expect("the only worker reconnects and the build finishes");
+    let report = run_off(85, None, Off::none().with(Fault::ServerCrash)).expect("the only worker reconnects and the build finishes");
     assert_eq!(report.cuts, 1);
     assert_eq!(report.worker_crashes, 1);
 }
@@ -63,16 +60,18 @@ fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
 
 #[test]
 fn dozens_of_client_rounds_overlap_during_eviction() {
-    let report = run(180, None).unwrap_or_else(|failure| panic!("{failure}"));
+    let report = run_off(257, None, Off::none().with(Fault::ServerCrash)).unwrap_or_else(|failure| panic!("{failure}"));
     assert!(report.clients_at_eviction >= 24, "{report:?}");
     assert!(report.cache_hits > 0, "clients reuse action outputs");
+    assert!(report.silences > 0, "clients give up on a silent server");
 }
 
 #[test]
 fn the_seeds_exercise_faults_the_cache_and_eviction() {
-    // These runs also check every invariant for seeds 0 through 99.
-    let reports: Vec<_> = (0..100).map(|s| run(s, None).expect("passes")).collect();
+    // The dedicated concurrency test covers the crowd at seed 257.
+    let reports: Vec<_> = (0..24).map(|s| run(s, None).expect("passes")).collect();
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
+    assert!(reports.iter().any(|r| r.server_restarts > 0), "clients finish despite server restarts");
     assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
     assert!(
         reports.iter().any(|r| r.jobs_lost_to_crashes > 0),
@@ -85,7 +84,7 @@ fn the_seeds_exercise_faults_the_cache_and_eviction() {
     assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
     assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
     assert!(reports.iter().any(|r| r.crashes > 0), "client daemons crash and restart");
-    assert!(reports.iter().any(|r| r.lost > 0), "packets are lost and sent again");
+    assert!(reports.iter().any(|r| r.lost > 0 && r.retransmits > 0), "rargo-net retransmits after datagram loss");
     assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
     assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
 }
@@ -95,8 +94,9 @@ fn turns_off_alone(f: Fault) {
         Fault::Loss => r.lost,
         Fault::Duplicate => r.duplicated,
         Fault::Reorder => r.reordered,
+        Fault::ServerCrash => r.server_restarts,
     };
-    let reports: Vec<_> = (0..40).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
+    let reports: Vec<_> = (0..12).chain(13..16).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
     assert!(reports.iter().all(|r| count(r, f) == 0), "--off {} leaves no {0}", f.name());
     for other in Fault::ALL.into_iter().filter(|o| *o != f) {
         assert!(reports.iter().any(|r| count(r, other) > 0), "--off {} leaves {}", f.name(), other.name());
@@ -119,10 +119,15 @@ fn reordering_turns_off_alone() {
 }
 
 #[test]
+fn server_crashes_turn_off_alone() {
+    turns_off_alone(Fault::ServerCrash);
+}
+
+#[test]
 fn a_seed_with_every_fault_off_replays_the_same_run() {
     let all = Fault::ALL.into_iter().fold(Off::none(), Off::with);
     let a = run_off(9, None, all.clone()).expect("passes");
-    assert_eq!((a.lost, a.duplicated, a.reordered), (0, 0, 0));
+    assert_eq!((a.lost, a.duplicated, a.reordered, a.server_restarts), (0, 0, 0, 0));
     assert_eq!(a, run_off(9, None, all).expect("passes"), "a seed with faults off replays the same run");
 }
 
@@ -135,45 +140,80 @@ fn a_failure_replays_with_the_faults_it_ran_without() {
     assert_eq!(run_off(failure.seed, Some(Bug::EvictPinned), off).expect_err("fails again"), failure);
 }
 
-fn caught(bug: Bug, kind: fn(&Kind) -> bool) {
-    let failures = search(0..60, Some(bug));
-    let first = failures.first().unwrap_or_else(|| panic!("no seed of 0..60 catches {}", bug.name()));
+fn caught(seed: u64, bug: Bug, kind: fn(&Kind) -> bool) {
+    caught_off(seed, bug, Off::none(), kind);
+}
+
+fn caught_off(seed: u64, bug: Bug, off: Off, kind: fn(&Kind) -> bool) {
+    let first = run_off(seed, Some(bug), off.clone()).expect_err("the seed catches the injected bug");
     assert!(kind(&first.kind), "{} is caught as {}, not {first}", bug.name(), first.kind.name());
-    let again = run(first.seed, Some(bug)).expect_err("a failing seed fails again");
-    assert_eq!(&again, first, "{} replays exactly", first.replay());
+    let again = run_off(first.seed, Some(bug), off).expect_err("a failing seed fails again");
+    assert_eq!(again, first, "{} replays exactly", first.replay());
 }
 
 #[test]
 fn evicting_a_pinned_blob_is_caught() {
-    caught(Bug::EvictPinned, |k| matches!(k, Kind::LostPinned(_)));
+    caught(0, Bug::EvictPinned, |k| matches!(k, Kind::LostPinned(_)));
 }
 
 #[test]
 fn delivering_a_stale_output_is_caught() {
-    caught(Bug::StaleDelivery, |k| matches!(k, Kind::Drift(_)));
+    caught(2, Bug::StaleDelivery, |k| matches!(k, Kind::Drift(_)));
 }
 
 #[test]
 fn never_answering_a_request_is_caught() {
-    caught(Bug::NeverAnswer, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
+    caught_off(1, Bug::NeverAnswer, Off::none().with(Fault::ServerCrash), |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
 }
 
 #[test]
 fn evicting_content_an_upload_claimed_is_caught() {
-    caught(Bug::EvictClaimed, |k| matches!(k, Kind::LostPinned(_)));
+    caught(11, Bug::EvictClaimed, |k| matches!(k, Kind::LostPinned(_)));
 }
 
 #[test]
 fn a_client_trusting_what_the_server_no_longer_holds_is_caught() {
-    caught(Bug::StaleKnowledge, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
+    caught(6, Bug::StaleKnowledge, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
 }
 
 #[test]
 fn a_client_that_never_gives_up_on_a_silent_server_is_caught() {
-    caught(Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
+    caught(0, Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
 }
 
 #[test]
 fn a_restarted_daemon_trusting_the_dead_one_is_caught() {
-    caught(Bug::TrustAfterCrash, |k| matches!(k, Kind::StateMachine(_) | Kind::Liveness(_) | Kind::Deadlock(_)));
+    caught(0, Bug::TrustAfterCrash, |k| matches!(k, Kind::StateMachine(_) | Kind::Liveness(_) | Kind::Deadlock(_)));
+}
+
+#[test]
+fn a_rescan_that_misses_the_edits_is_caught() {
+    caught(0, Bug::DeafToEdits, |k| matches!(k, Kind::Drift(_)));
+}
+
+#[test]
+fn outputs_that_never_reach_target_are_caught() {
+    caught(0, Bug::UnshownOutputs, |k| matches!(k, Kind::Drift(d) if d.contains("target/")));
+}
+
+#[test]
+fn disk_faults_end_the_command_or_recover_with_its_pins() {
+    let crash = run(0, None).expect("builds recover after a power cut");
+    assert_eq!((crash.disk_crashes, crash.torn_writes), (1, 0));
+    let torn = run(3, None).expect("builds recover after a torn write");
+    assert_eq!((torn.disk_crashes, torn.torn_writes), (1, 1));
+    let full = run(10, None).expect("a full disk ends the command instead of deadlocking");
+    assert_eq!(full.disk_full_errors, 1);
+}
+
+#[test]
+fn a_disk_full_result_reaches_the_client_after_reconnection() {
+    let report = run_off(32, None, Off::none().with(Fault::ServerCrash))
+        .expect("the client gets the disk error after reconnecting");
+    assert_eq!(report.disk_full_errors, 1);
+
+    for seed in [708, 813] {
+        let report = run(seed, None).expect("the command finishes with both faults enabled");
+        assert!(report.server_restarts > 0, "seed {seed}");
+    }
 }

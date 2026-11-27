@@ -231,7 +231,7 @@ fn mount<'a>(fake: &'a Fake, at: &str, auto_unmount: bool) -> Session<&'a Fake> 
     Session::mount_on(fake, Path::new(at), &opts(auto_unmount), false).expect("mount")
 }
 
-fn failure<'a>(mounted: std::io::Result<Session<&'a Fake>>) -> std::io::Error {
+fn failure(mounted: std::io::Result<Session<&Fake>>) -> std::io::Error {
     match mounted {
         Ok(_) => panic!("the mount succeeded"),
         Err(e) => e,
@@ -512,6 +512,25 @@ fn a_guard_that_cannot_start_leaves_the_mount_unguarded() {
     fake.took_log();
     session.unmount();
     assert_eq!(fake.took_log(), ["detach \"/mnt/a\""]);
+}
+
+#[test]
+fn ending_the_connection_leaves_the_guard_for_unmount() {
+    let fake = Fake::new();
+    let session = mount(&fake, "/mnt/a", true);
+    fake.took_log();
+
+    session.ended();
+    session.ended();
+    assert!(!session.shown());
+    assert!(session.auto_unmount_active());
+    assert!(fake.took_log().is_empty());
+
+    session.unmount();
+    session.ended();
+    assert!(!session.shown());
+    assert!(!session.auto_unmount_active());
+    assert_eq!(fake.took_log(), ["stand down 1", "detach \"/mnt/a\""]);
 }
 
 #[test]

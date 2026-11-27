@@ -9,6 +9,8 @@ cd $F
 venv/bin/pip install -q 'pydantic>=2.9' pytest simpy
 [ -d repo ] || git clone -q https://github.com/Clavigers/rargo2.git repo
 [ -d plan ] || git clone -q https://github.com/Clavigers/rargo2.git plan
+[ -d use ] || git clone -q https://github.com/Clavigers/rargo2.git use
+[ -d release ] || git clone -q https://github.com/Clavigers/rargo2.git release
 mkdir -p state
 (cd src && ../venv/bin/python -m pytest -q -p no:cacheprovider)
 if [ ! -s log.jsonl ]; then
@@ -16,4 +18,4 @@ if [ ! -s log.jsonl ]; then
 fi
 cp src/deploy/factory-*.service /etc/systemd/system/
 systemctl daemon-reload
-echo "installed; start with: systemctl enable --now factory-observer factory-dictator factory-watchdog factory-viz factory-usage"
+echo "installed; start with: systemctl enable --now factory-observer factory-dictator factory-watchdog factory-viz factory-usage factory-pm factory-power-user"

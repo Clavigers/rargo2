@@ -217,6 +217,30 @@ def test_a_merge_conflict_is_recorded(rig):
     assert rig.led.world.needs_work(1)
 
 
+def test_a_conflicting_push_gets_no_ci_and_needs_work(rig):
+    pushed(rig)
+    rig.gh.pulls[10]["mergeable_state"] = "unknown"  # GitHub has not computed it yet
+    rig.obs.step()
+    assert rig.led.world.is_(M.CI, "10/1", "pending")  # keeps waiting
+    rig.gh.pulls[10]["mergeable_state"] = "dirty"  # and so no CI run starts
+    rig.obs.step()
+    assert lines(rig)[-1] == {**lines(rig)[-1], "event": "merge_failed", "actor": "merger",
+                              "pr": 10, "push": 1, "reason": "conflict"}
+    w = rig.led.world
+    assert w.is_(M.CI, "10/1", "void") and w.needs_work(1) and w.issues[1].pr == 10
+    rig.obs.step()  # recorded once
+    assert sum(d["event"] == "merge_failed" for d in lines(rig)) == 1
+
+
+def test_a_conflict_with_ci_running_waits_for_ci(rig):
+    pushed(rig)
+    rig.gh.ci(SHA, None, status="in_progress")
+    rig.gh.pulls[10]["mergeable_state"] = "dirty"  # main moved after CI started
+    rig.obs.step()
+    assert rig.led.world.is_(M.CI, "10/1", "pending")
+    assert not any(d["event"] == "merge_failed" for d in lines(rig))
+
+
 def test_merges_and_closes_on_github_are_followed(rig):
     pushed(rig)
     rig.gh.pulls[10].update(state="closed", merged_at="now", merged_by={"login": "someone"},
@@ -398,6 +422,12 @@ def test_ellipsis_review_of_the_pushed_commit_is_the_verdict():
 
         def reviews(self, pr):
             return self.rows
+
+        def pull(self, pr):
+            return {"base": {"ref": "main"}}
+
+        def change(self, base, sha):
+            return [f"+{sha}"]
     bot = {"login": "ellipsis-dev[bot]"}
     assert ellipsis(G([]), 1, "aa") is None
     assert ellipsis(G([{"user": bot, "commit_id": "old", "state": "APPROVED"}]), 1, "aa") is None
@@ -405,6 +435,39 @@ def test_ellipsis_review_of_the_pushed_commit_is_the_verdict():
     assert ellipsis(G([{"user": bot, "commit_id": "aa", "state": "APPROVED"}]), 1, "aa") == (m.ReviewResult.approved, None)
     verdict, note = ellipsis(G([{"user": bot, "commit_id": "aa", "state": "COMMENTED", "html_url": "u"}]), 1, "aa")
     assert verdict is m.ReviewResult.changes and "u" in note
+
+
+def test_ellipsis_review_carries_to_a_push_that_makes_the_same_change():
+    """Ellipsis does not review a push that only merges main in or rebases:
+    the factory waited for ever for it (13 pull requests, 2026-11-27)."""
+    from factory.observer import ellipsis
+    from factory import model as m
+
+    class G:
+        def __init__(self, rows, changes):
+            self.rows, self.changes = rows, changes
+
+        def reviews(self, pr):
+            return self.rows
+
+        def pull(self, pr):
+            return {"base": {"ref": "main"}}
+
+        def change(self, base, sha):
+            assert base == "main"
+            return self.changes[sha]
+    bot = {"login": "ellipsis-dev[bot]"}
+    change = ["+++ b/a.rs", "+x"]
+    ok = [{"user": bot, "commit_id": "c1", "state": "APPROVED"}]
+    assert ellipsis(G(ok, {"c1": change, "m1": list(change)}), 1, "m1") == (m.ReviewResult.approved, None)
+    assert ellipsis(G(ok, {"c1": change, "m2": change + ["+y"]}), 1, "m2") is None
+    assert ellipsis(G(ok, {"c1": [], "m3": []}), 1, "m3") is None
+    asked = [{"user": bot, "commit_id": "c2", "state": "COMMENTED", "html_url": "u"}]
+    verdict, note = ellipsis(G(asked, {"c2": change, "m4": change}), 1, "m4")
+    assert verdict is m.ReviewResult.changes and "u" in note
+    # only its last review carries
+    two = ok + [{"user": bot, "commit_id": "c3", "state": "COMMENTED", "html_url": "u"}]
+    assert ellipsis(G(two, {"c1": change, "c3": change + ["+y"], "m5": change}), 1, "m5") is None
 
 
 def test_the_dictator_orchestrates_inside_a_tick_of_its_own(rig, tmp_path):
