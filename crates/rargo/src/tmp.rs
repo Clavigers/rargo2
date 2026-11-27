@@ -1,24 +1,6 @@
-use std::cell::UnsafeCell;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-const SLOTS: usize = 64;
-const PATH_MAX: usize = 4096;
-
-const _: () = assert!(SLOTS > 0);
-const _: () = assert!(PATH_MAX as u32 == libc::PATH_MAX as u32);
-
-struct Slot {
-    live: AtomicBool,
-    taken: AtomicBool,
-    buf: UnsafeCell<[u8; PATH_MAX]>,
-}
-
-unsafe impl Sync for Slot {}
-
-static TABLE: [Slot; SLOTS] =
-    [const { Slot { live: AtomicBool::new(false), taken: AtomicBool::new(false), buf: UnsafeCell::new([0; PATH_MAX]) } }; SLOTS];
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Temp {
     slot: Option<usize>,
@@ -27,42 +9,22 @@ pub struct Temp {
 impl Drop for Temp {
     fn drop(&mut self) {
         if let Some(i) = self.slot {
-            assert!(TABLE[i].taken.load(Ordering::SeqCst));
-            assert!(TABLE[i].live.load(Ordering::SeqCst));
-            TABLE[i].live.store(false, Ordering::SeqCst);
-            TABLE[i].taken.store(false, Ordering::SeqCst);
+            crate::signals::release(i);
         }
     }
 }
 
 pub fn watch(path: &Path) -> Temp {
     let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= PATH_MAX || bytes.contains(&0) {
+    if bytes.len() >= crate::signals::PATH_MAX || bytes.contains(&0) {
         return Temp { slot: None };
     }
-    for (i, s) in TABLE.iter().enumerate() {
-        if s.taken.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            continue;
-        }
-        assert!(!s.live.load(Ordering::SeqCst), "a free slot is never live");
-        unsafe {
-            let buf = &mut *s.buf.get();
-            buf[..bytes.len()].copy_from_slice(bytes);
-            buf[bytes.len()] = 0;
-        }
-        s.live.store(true, Ordering::SeqCst);
-        return Temp { slot: Some(i) };
-    }
-    Temp { slot: None }
+    Temp { slot: crate::signals::hold(bytes) }
 }
 
-/// Calls `each` with the NUL-terminated path of every temporary in use. It only reads the table, so a signal handler may call it.
-fn each_live(mut each: impl FnMut(*const libc::c_char)) {
-    for s in TABLE.iter() {
-        if s.live.load(Ordering::SeqCst) {
-            each(s.buf.get() as *const libc::c_char);
-        }
-    }
+/// Calls `each` with the NUL-terminated path of every temporary in use. A signal handler may call it.
+fn each_live(each: impl FnMut(*const libc::c_char)) {
+    crate::signals::each_held(each);
 }
 
 extern "C" fn on_signal(sig: libc::c_int) {

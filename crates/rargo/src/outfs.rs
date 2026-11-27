@@ -2,7 +2,6 @@
 use rargo_machine::StateMachine;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
-use crate::partial::Partial;
 pub use rargo::out_tree::VFile;
 use rargo::out_tree::{below, Edit, OutputTree, Table};
 use rargo_proto::Digest;
@@ -232,7 +231,7 @@ struct Fetch {
     rel: Vec<u8>,
 }
 
-enum Content<F = File, R = Arc<Partial>> {
+enum Content<F = File, R = Arc<dyn Ranged>> {
     Open(F),
     Unfetched(Fetch),
     Ranged(R),
@@ -304,7 +303,13 @@ enum How {
 
 pub enum Reader {
     Whole(File),
-    Ranged(Arc<Partial>),
+    Ranged(Arc<dyn Ranged>),
+}
+
+/// A content that is read in ranges while the rest of it is still being fetched.
+pub trait Ranged: Send + Sync {
+    fn hash(&self) -> &Digest;
+    fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 }
 
 pub trait Source: Send + Sync {
@@ -333,8 +338,8 @@ pub struct OutFs {
     gid: u32,
     op_count: [AtomicU64; OPS.len()],
     op_nanos: [AtomicU64; OPS.len()],
-    pub opened_virtual: AtomicU64,
-    pub made_real: AtomicU64,
+    opened_virtual: AtomicU64,
+    made_real: AtomicU64,
 }
 
 fn errno(e: std::io::Error) -> Errno {
@@ -461,6 +466,16 @@ impl OutFs {
         if let Ok(packed) = zstd::stream::encode_all(&plain[..], 1) {
             let _ = crate::write_atomic(&self.table, &packed);
         }
+    }
+
+    /// How many times a file that exists only as its hash was opened.
+    pub fn opened_virtual(&self) -> u64 {
+        self.opened_virtual.load(Ordering::Relaxed)
+    }
+
+    /// How many files that existed only as their hash were written out as real files.
+    pub fn made_real(&self) -> u64 {
+        self.made_real.load(Ordering::Relaxed)
     }
 
     pub fn virtual_count(&self) -> usize {

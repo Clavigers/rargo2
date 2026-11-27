@@ -72,16 +72,18 @@ impl std::fmt::Debug for Config {
 
 struct Real {
     vars: Vec<(String, String)>,
-    handlers: std::sync::Once,
+    handlers: std::cell::Cell<bool>,
 }
 
 impl Real {
     fn read() -> Self {
-        Real { vars: io::env::vars(), handlers: std::sync::Once::new() }
+        Real { vars: io::env::vars(), handlers: std::cell::Cell::new(false) }
     }
 
     fn handle_signals(&self) {
-        self.handlers.call_once(tmp::install_handlers);
+        if !self.handlers.replace(true) {
+            tmp::install_handlers();
+        }
     }
 }
 
