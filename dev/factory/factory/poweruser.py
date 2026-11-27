@@ -100,6 +100,8 @@ class PowerUser:
     def _run_session(self, use: int, version: str, build: int, sha: str) -> int:
         w = self.ledger.world
         t = next((a for a in w.config.agents if a.type is m.Harness.claude_code), w.config.agents[0])
+        if w.config.release.use_model is not None:
+            t = t.model_copy(update={"model": w.config.release.use_model})
         prompt = (self.prompt.replace("{version}", version).replace("{build}", str(build))
                   .replace("{sha}", sha).replace("{use}", str(use)))
         cmd = harness.command(t, prompt)
