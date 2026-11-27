@@ -72,17 +72,6 @@ jobs:
             sleep "$((remaining < 60 ? remaining : 60))"
           done
       - run: rargo test --locked --workspace
-      - name: One real sandbox run on a FUSE mount (temporary, for this pull request)
-        run: |
-          sudo modprobe fuse
-          echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
-          rargo build --locked -p rargo-core --bin rargo-sandbox --target x86_64-unknown-linux-musl
-          script='set -e; ls / | wc -l; cat /etc/passwd | wc -c; find /usr -maxdepth 2 | wc -l; cd /tmp; echo hello > x; cat x; mkdir -p d/e; mv x d/e/y; ln -s y d/e/z; cat d/e/z; ls -la d/e; head -c 3000000 /dev/zero > big; cp big big2; cmp big big2; rm -r d big big2; for i in 1 2 3 4 5 6 7 8; do (find /usr/lib -type f 2>/dev/null | head -1500 | xargs cat 2>/dev/null | wc -c) & done; wait; for i in 1 2 3 4; do (find /usr/share -maxdepth 3 2>/dev/null | wc -l) & done; wait; echo SANDBOX-RUN-OK'
-          bin=$(find "$PWD/target/x86_64-unknown-linux-musl" -name rargo-sandbox -type f -perm -u+x | head -1)
-          for mode in "" "--no-passthrough"; do
-            d=$(sudo mktemp -d)
-            sudo timeout 240 "$bin" --quiet --state "$d" $mode -- /bin/sh -c "$script"
-          done
       - name: Measure per-test CPU
         run: |
           export RARGO_CPU_REPORT="$RUNNER_TEMP/rargo-cpu.tsv"

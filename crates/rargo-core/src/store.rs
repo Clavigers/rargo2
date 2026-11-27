@@ -975,47 +975,33 @@ mod tests {
     // the loop keeps running both. That takes a real loop, where file work parks.
     #[test]
     fn a_thaw_while_chunks_are_collected_waits_for_the_collection() {
-        if crate::io::unavailable().is_some() {
-            return;
-        }
-        // The store's 512 shard directories cost most of this test's CPU on a
-        // journaling filesystem; a memory-backed one makes and removes them
-        // in half the time.
-        let base = Some(std::path::PathBuf::from("/dev/shm")).filter(|p| p.is_dir()).unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("rargo-store-cold-lock-{}", crate::io::process::id()));
-        let at = dir.clone();
-        let outcome = crate::io::within(std::time::Duration::from_secs(20), move || {
-            crate::io::run(2, move || {
-                let s = Arc::new(Store::open(&at.join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
-                let data = noise(crate::store_index::COLD_MIN_SIZE as usize);
-                let h = s.put_bytes(&data).unwrap();
-                assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
-                file::write(s.files.chunks.join("00").join("dead"), b"x").unwrap();
-                let (locked, lock_held) = crate::io::oneshot::channel();
-                let (resume, resume_collection) = crate::io::oneshot::channel();
-                let gc = {
-                    let s = Arc::clone(&s);
-                    crate::io::spawn(move || {
-                        s.collect_chunks_once(|| {
-                            locked.send(()).unwrap();
-                            resume_collection.recv().unwrap();
-                        })
+        sim::test(|| {
+            let s = Arc::new(Store::open(&sim::tempdir().join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
+            let data = noise(crate::store_index::COLD_MIN_SIZE as usize);
+            let h = s.put_bytes(&data).unwrap();
+            assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+            file::write(s.files.chunks.join("00").join("dead"), b"x").unwrap();
+            let (locked, lock_held) = crate::io::oneshot::channel();
+            let (resume, resume_collection) = crate::io::oneshot::channel();
+            let gc = {
+                let s = Arc::clone(&s);
+                crate::io::spawn(move || {
+                    s.collect_chunks_once(|| {
+                        locked.send(()).unwrap();
+                        resume_collection.recv().unwrap();
                     })
-                };
-                lock_held.recv().unwrap();
-                assert!(s.cold.collecting.get(), "the collector holds the cold gate");
-                // This fiber can only release the collector after the thaw yields.
-                let mut release = crate::io::spawn(move || resume.send(()).unwrap());
-                let read = s.read(&h).unwrap();
-                release.join().unwrap();
-                let (removed, _) = { gc }.join().unwrap();
-                (removed, read == data)
-            })
+                })
+            };
+            lock_held.recv().unwrap();
+            assert!(s.cold.collecting.get(), "the collector holds the cold gate");
+            // This fiber can only release the collector after the thaw yields.
+            let mut release = crate::io::spawn(move || resume.send(()).unwrap());
+            let read = s.read(&h).unwrap();
+            release.join().unwrap();
+            let (removed, _) = { gc }.join().unwrap();
+            assert_eq!(removed, 1);
+            assert_eq!(read, data, "the thawed blob reads back whole");
         });
-        let _ = file::remove_dir_all(&dir);
-        let (removed, same) = outcome.expect("a thaw and a chunk collection deadlocked the loop");
-        assert_eq!(removed, 1);
-        assert!(same, "the thawed blob reads back whole");
     }
 
     #[test]
