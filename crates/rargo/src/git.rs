@@ -8,7 +8,7 @@ mod write;
 use rargo_net::io::file::PathRing as _;
 use rargo::daemon_state::Head;
 use object::{Id, Object, Store, Type, from_hex, to_hex};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -154,8 +154,8 @@ fn reachable<S: Source>(src: &S, store: &mut Store<S::Data>, shallow: &BTreeSet<
     Some(seen)
 }
 
-fn owners<S: Source>(src: &S, store: &mut Store<S::Data>, shallow: &BTreeSet<Id>, oldest_first: &[Id]) -> Option<HashMap<Id, usize>> {
-    let mut owner = HashMap::new();
+fn owners<S: Source>(src: &S, store: &mut Store<S::Data>, shallow: &BTreeSet<Id>, oldest_first: &[Id]) -> Option<BTreeMap<Id, usize>> {
+    let mut owner = BTreeMap::new();
     for (k, &c) in oldest_first.iter().enumerate() {
         let mut stack = vec![c];
         while let Some(x) = stack.pop() {
@@ -629,13 +629,11 @@ fn history_pieces(first_parent: &[String]) -> Vec<HistoryPiece> {
     pieces
 }
 
-fn piece_commits(owner: &HashMap<Id, usize>, piece: &HistoryPiece) -> Vec<Id> {
-    let mut commits: Vec<Id> = owner.iter().filter(|(_, k)| (piece.first..=piece.end).contains(*k)).map(|(id, _)| *id).collect();
-    commits.sort();
-    commits
+fn piece_commits(owner: &BTreeMap<Id, usize>, piece: &HistoryPiece) -> Vec<Id> {
+    owner.iter().filter(|(_, k)| (piece.first..=piece.end).contains(*k)).map(|(id, _)| *id).collect()
 }
 
-fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner: Option<&HashMap<Id, usize>>) -> Option<(PathBuf, PathBuf)> {
+fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner: Option<&BTreeMap<Id, usize>>) -> Option<(PathBuf, PathBuf)> {
     let (pack, idx) = (dir.join(format!("{}.pack", piece.key)), dir.join(format!("{}.idx", piece.key)));
     if pack.ring_is_file() && idx.ring_is_file() {
         let _ = rargo_net::io::file::set_modified(&pack, rargo_net::io::system_now());

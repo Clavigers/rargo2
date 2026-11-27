@@ -15,7 +15,6 @@ hash-order	crates/rargo-core/src/nixmanifest.rs	7	HashMap or HashSet with the de
 hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/snapshot.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 self-check	crates/rargo-core/src/action_table.rs	3	3 step methods of ActionTable assert nothing
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
