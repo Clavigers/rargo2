@@ -2134,7 +2134,7 @@ impl Run {
             let paths: Vec<&String> = o.library_paths.iter().map(|(_, p)| p).collect();
             let msg = format!(
                 "{{\"reason\":\"build-script-executed\",\"package_id\":{},\"linked_libs\":{},\"linked_paths\":{},\"cfgs\":{},\"env\":{},\"out_dir\":{}}}\n",
-                serde_json::to_string(&u.pkg_spec)?,
+                serde_json::to_string(&self.c.out.tr.package_id(&u.pkg_spec, &u.pkg_name, &u.pkg_version))?,
                 serde_json::to_string(&o.library_links)?,
                 serde_json::to_string(&paths)?,
                 serde_json::to_string(&o.cfgs)?,
@@ -2426,7 +2426,7 @@ impl Run {
         };
         let msg = format!(
             "{{\"reason\":\"compiler-message\",\"package_id\":{},\"manifest_path\":{},\"target\":{},\"message\":{}}}\n",
-            serde_json::Value::String(u.pkg_spec.clone()),
+            serde_json::Value::String(self.c.out.tr.package_id(&u.pkg_spec, &u.pkg_name, &u.pkg_version)),
             serde_json::Value::String(u.manifest_path.clone()),
             u.target_json,
             message_json
@@ -2454,7 +2454,7 @@ impl Run {
             }
             let msg = format!(
                 "{{\"reason\":\"compiler-artifact\",\"package_id\":{},\"manifest_path\":{},\"target\":{},\"profile\":{},\"features\":{},\"filenames\":{},\"executable\":{},\"fresh\":{}}}\n",
-                serde_json::Value::String(u.pkg_spec.clone()),
+                serde_json::Value::String(self.c.out.tr.package_id(&u.pkg_spec, &u.pkg_name, &u.pkg_version)),
                 serde_json::Value::String(u.manifest_path.clone()),
                 u.target_json,
                 u.profile_json,
@@ -2805,11 +2805,12 @@ impl Run {
                         let scripts = self.scripts.borrow_mut();
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
-                    out.status("Running", &display_cmd(&cmd.program, &cmd.args));
+                    let program = client_program(&cmd.program, &out.tr.to_canonical(&self.c.cwd), &out.tr);
+                    out.status("Running", &display_cmd(&program, &cmd.args));
                     return Ok(Finish::Exec(ExecRequest {
-                        program: cmd.program.clone(),
+                        program,
                         args: cmd.args.clone(),
-                        env: cmd.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        env: cmd.env.iter().map(|(k, v)| (k.clone(), v.as_deref().map(|v| client_paths(v, &out.tr)))).collect(),
                         cwd: self.c.cwd.clone(),
                         binds: vec![
                             (self.c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
