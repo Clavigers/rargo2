@@ -7,6 +7,8 @@ They do not build on your machine.
 Your files go to the server. The server builds them. You get the output and the files you asked for.
 Everyone who uses the same server shares one cache.
 
+Keep Cargo path dependencies inside the synced worktree. If a dependency lives in a sibling repository outside that worktree, move it inside and update the dependency path, or use `RARGO_FALLBACK=cargo` to let rargo build locally when it detects the external dependency.
+
 ## Use a server
 
 You need Linux. To run what rargo builds on your machine, with `rargo run` or straight from `target/`, you also need [Nix](https://nixos.org/download/).

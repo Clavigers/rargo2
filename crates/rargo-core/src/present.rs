@@ -82,6 +82,32 @@ impl Translator {
         p.to_string()
     }
 
+    pub fn package_id(&self, spec: &str, name: &str, version: &str) -> String {
+        let Some((file_url, _)) = spec.strip_prefix("path+").and_then(|s| s.rsplit_once('#')) else {
+            return spec.to_owned();
+        };
+        let Some(path) = url::Url::parse(file_url).ok().and_then(|url| url.to_file_path().ok()) else {
+            return spec.to_owned();
+        };
+        let Some(path) = path.to_str() else {
+            return spec.to_owned();
+        };
+        let client_path = self.path(path);
+        if client_path == path {
+            return spec.to_owned();
+        }
+        let Ok(url) = url::Url::from_file_path(client_path) else {
+            return spec.to_owned();
+        };
+
+        // Cargo elides the name when it matches the last URL path segment.
+        if url.path_segments().and_then(|mut segments| segments.next_back()) == Some(name) {
+            format!("path+{url}#{version}")
+        } else {
+            format!("path+{url}#{name}@{version}")
+        }
+    }
+
     pub fn to_canonical(&self, p: &str) -> String {
         self.pairs
             .iter()
@@ -309,6 +335,41 @@ mod tests {
         assert_eq!(t.path("/wx"), "/wx");
         assert_eq!(t.to_canonical("/home/me/proj/sub"), "/w/sub");
         assert_eq!(t.to_canonical("/home/me/project"), "/home/me/project");
+    }
+
+    #[test]
+    fn translates_path_package_ids_like_cargo_metadata() {
+        let t = tr();
+        assert_eq!(
+            t.package_id("path+file:///w#proj@0.1.0", "proj", "0.1.0"),
+            "path+file:///home/me/proj#0.1.0"
+        );
+        assert_eq!(
+            t.package_id("path+file:///w#0.1.0", "w", "0.1.0"),
+            "path+file:///home/me/proj#w@0.1.0"
+        );
+        assert_eq!(
+            t.package_id("path+file:///w/crates/member#1.2.3", "member", "1.2.3"),
+            "path+file:///home/me/proj/crates/member#1.2.3"
+        );
+
+        let t = Translator::new(vec![("/w".into(), "/tmp/my project#1%".into())]);
+        assert_eq!(
+            t.package_id("path+file:///w/my%20dep#dep@1.2.3", "dep", "1.2.3"),
+            "path+file:///tmp/my%20project%231%25/my%20dep#dep@1.2.3"
+        );
+    }
+
+    #[test]
+    fn leaves_unmapped_package_ids_as_planned() {
+        let t = tr();
+        for id in [
+            "path+file:///work#0.1.0",
+            "registry+https://github.com/rust-lang/crates.io-index#dep@1.2.3",
+            "git+file:///w/repo#dep@1.2.3",
+        ] {
+            assert_eq!(t.package_id(id, "dep", "1.2.3"), id);
+        }
     }
 
     #[test]

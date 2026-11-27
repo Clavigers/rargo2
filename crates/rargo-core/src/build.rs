@@ -2101,7 +2101,7 @@ impl Run {
             let paths: Vec<&String> = o.library_paths.iter().map(|(_, p)| p).collect();
             let msg = format!(
                 "{{\"reason\":\"build-script-executed\",\"package_id\":{},\"linked_libs\":{},\"linked_paths\":{},\"cfgs\":{},\"env\":{},\"out_dir\":{}}}\n",
-                serde_json::to_string(&u.pkg_spec)?,
+                serde_json::to_string(&self.c.out.tr.package_id(&u.pkg_spec, &u.pkg_name, &u.pkg_version))?,
                 serde_json::to_string(&o.library_links)?,
                 serde_json::to_string(&paths)?,
                 serde_json::to_string(&o.cfgs)?,
@@ -2393,7 +2393,7 @@ impl Run {
         };
         let msg = format!(
             "{{\"reason\":\"compiler-message\",\"package_id\":{},\"manifest_path\":{},\"target\":{},\"message\":{}}}\n",
-            serde_json::Value::String(u.pkg_spec.clone()),
+            serde_json::Value::String(self.c.out.tr.package_id(&u.pkg_spec, &u.pkg_name, &u.pkg_version)),
             serde_json::Value::String(u.manifest_path.clone()),
             u.target_json,
             message_json
@@ -2421,7 +2421,7 @@ impl Run {
             }
             let msg = format!(
                 "{{\"reason\":\"compiler-artifact\",\"package_id\":{},\"manifest_path\":{},\"target\":{},\"profile\":{},\"features\":{},\"filenames\":{},\"executable\":{},\"fresh\":{}}}\n",
-                serde_json::Value::String(u.pkg_spec.clone()),
+                serde_json::Value::String(self.c.out.tr.package_id(&u.pkg_spec, &u.pkg_name, &u.pkg_version)),
                 serde_json::Value::String(u.manifest_path.clone()),
                 u.target_json,
                 u.profile_json,

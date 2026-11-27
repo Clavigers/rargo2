@@ -218,7 +218,7 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
 /// The manifest the command would use: `--manifest-path` if given, else
 /// the first Cargo.toml walking up from the current directory. Cargo's own
 /// error when there is none, so a command fails before anything is sent.
-fn find_manifest(w: &impl World, args: &[String]) -> Result<PathBuf, String> {
+pub(crate) fn find_manifest(w: &impl World, args: &[String]) -> Result<PathBuf, String> {
     let cwd = w.cwd();
     if let Some(given) = manifest_path_arg(args) {
         let path = cwd.join(&given);
