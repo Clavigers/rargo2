@@ -19,6 +19,19 @@ jobs:
         run: |
           v=${GITHUB_REF_NAME#v}
           [ "$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)" = "$v" ] || { echo "Cargo.toml is not at $v"; exit 1; }
+      - name: The service deploys published releases only
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: dev/update-service-test.sh
+      - name: Planner setup and build scripts use this checkout
+        run: dev/forks-test.sh
+      - name: install.sh installs a release only once the build server runs it
+        run: dev/release-local-test.sh
+      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
+      - name: The default flake's toolchain has the standard library's sources, with and without a toolchain file
+        run: dev/default-flake-check.sh
+      - name: Installer shell syntax
+        run: sh -n install/install.sh && sh -n install/install-server.sh
       - run: rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl && rustup default stable
       - run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools libssl-dev zlib1g-dev pkg-config
       - name: Client (static) and server
@@ -27,6 +40,22 @@ jobs:
             cargo build --locked --release -p rargo --target x86_64-unknown-linux-musl
           cargo build --locked --release -p rargod -p rargo-core
           strip target/x86_64-unknown-linux-musl/release/rargo
+      - name: Verify the shipped client is static
+        run: file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
+      - name: io_uring runs on the runner, and a default Docker container refuses it with what to change
+        run: |
+          d=$(mktemp -d)
+          trap 'rm -rf "$d"' EXIT
+          rc=0; HOME=$d RARGO_SERVER=127.0.0.1:1 RARGO_CACHE_DIR=$d/cache timeout 3 target/x86_64-unknown-linux-musl/release/rargo --rargo-daemon $d/probe.sock || rc=$?
+          test $rc = 124
+          rc=0; out=$(docker run --rm -e RARGO_SERVER=127.0.0.1:1 -e HOME=/tmp -v "$PWD/target/x86_64-unknown-linux-musl/release:/b:ro" ubuntu:24.04 /b/rargo --rargo-daemon /tmp/probe.sock 2>&1) || rc=$?
+          echo "$out"
+          test "$rc" = 101
+          grep -q '^error: io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out"
+          grep -q 'seccomp=unconfined' <<<"$out"
+          out=$(docker run --rm -e HOME=/tmp -v "$PWD/target/x86_64-unknown-linux-musl/release:/b:ro" ubuntu:24.04 /b/rargo status 2>&1)
+          echo "$out"
+          grep -q '^io_uring  unavailable, so rargo cannot build here: io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out"
       - uses: actions/cache@v4
         id: planner
         with:
