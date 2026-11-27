@@ -105,6 +105,12 @@ fn random(n: usize) -> Result<Vec<u8>> {
     Ok(b)
 }
 
+/// A seed from the OS, for the generators the shell hands the server.
+pub fn os_seed() -> Result<u64> {
+    let b = random(8)?;
+    Ok(u64::from_le_bytes(b.try_into().expect("eight bytes")))
+}
+
 const CLEAR: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const _: () = assert!(CLEAR.len() == 32);
 
