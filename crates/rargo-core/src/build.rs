@@ -493,6 +493,8 @@ struct Prepared {
     tr: Translator,
     sandbox_cwd: String,
     env: BTreeMap<String, String>,
+    /// `env` before [`build_paths`] mapped its directories into the sandbox.
+    unmapped: BTreeMap<String, String>,
     channel: Option<&'static str>,
 }
 
@@ -554,13 +556,14 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
         env.entry(k).or_insert(v);
     }
     flag_target_dir(&c.args, &c.cwd, &mut env);
+    let unmapped = env.clone();
     let tr = build_paths(&c.root, &c.cargo_home, &mut env);
     let sandbox_cwd = tr.to_canonical(&c.cwd);
     if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
         bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
     }
     let channel = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd)?.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
-    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, channel })
+    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, unmapped, channel })
 }
 
 const CHANNEL_VAR: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
@@ -1064,12 +1067,21 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
                 req.borrow_mut().prepared()
             }
             Effect::Plan { as_build } => {
-                let p = prepared.as_ref().expect("a plan follows a prepared worktree");
+                let p = prepared.as_mut().expect("a plan follows a prepared worktree");
                 plan_args = args.clone();
                 if let (Some(i), true) = (check_at, as_build) {
                     plan_args[i] = "build".into();
                 }
-                match plan(d, c, p, &plan_args)? {
+                let mut outcome = plan(d, c, p, &plan_args)?;
+                if let PlanOutcome::Ok(pl) = &outcome {
+                    let chosen = &pl.data.plan;
+                    let dirs = configured_dirs(&chosen.target_dir, &chosen.build_dir, &p.tr, &p.env);
+                    if !dirs.is_empty() {
+                        (p.env, p.tr) = map_again(&c.root, &c.cargo_home, &mut p.unmapped, dirs);
+                        outcome = plan(d, c, p, &plan_args)?;
+                    }
+                }
+                match outcome {
                     PlanOutcome::Ok(pl) => {
                         let plan = &pl.data.plan;
                         let fx = req.borrow_mut().planned(plan.rustc_fork, plan.units.len(), plan.keep_going);
