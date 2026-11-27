@@ -32,3 +32,8 @@ where
     use rayon::prelude::*;
     items.into_par_iter().map(each).collect()
 }
+
+/// Starts a thread called `name` that runs `body`.
+pub fn spawn(name: &str, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    std::thread::Builder::new().name(name.into()).spawn(body).map(drop)
+}
