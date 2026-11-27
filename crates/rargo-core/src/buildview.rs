@@ -1,5 +1,5 @@
 use rargo_machine::StateMachine;
-use crate::buildview_io::OutputLoop;
+use crate::io::buildview::OutputLoop;
 use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
@@ -665,30 +665,54 @@ impl OutputsLayer {
         }
     }
 
-    fn get(&self, dir: &[u8], name: &[u8], levels: &[u8]) -> Option<LayerEnt> {
+    fn get(&self, dir: &[u8], name: &[u8], levels: Levels<'_>) -> Option<LayerEnt> {
         match &self.storage {
             OutputStorage::Live(owner) => owner.call(
                 |state, (dir, name, levels)| state.get(&dir, &name, &levels),
-                (dir.to_vec(), name.to_vec(), levels.to_vec()),
+                (dir.to_vec(), name.to_vec(), levels.shared()),
             ),
-            OutputStorage::Frozen(state) => state.get(dir, name, levels),
+            OutputStorage::Frozen(state) => state.get(dir, name, levels.slice()),
         }
     }
 
-    fn visible_paths(&self, levels: &Arc<Vec<u8>>) -> Vec<Vec<u8>> {
+    fn visible_paths(&self, levels: Levels<'_>) -> Vec<Vec<u8>> {
         match &self.storage {
-            OutputStorage::Live(owner) => owner.call(|state, levels| state.visible_paths(&levels), Arc::clone(levels)),
-            OutputStorage::Frozen(state) => state.visible_paths(levels),
+            OutputStorage::Live(owner) => owner.call(|state, levels| state.visible_paths(&levels), levels.shared()),
+            OutputStorage::Frozen(state) => state.visible_paths(levels.slice()),
         }
     }
 
-    fn names(&self, dir: &[u8], levels: &[u8]) -> Vec<(Vec<u8>, LayerEnt)> {
+    fn names(&self, dir: &[u8], levels: Levels<'_>) -> Vec<(Vec<u8>, LayerEnt)> {
         match &self.storage {
             OutputStorage::Live(owner) => owner.call(
                 |state, (dir, levels)| state.names(&dir, &levels),
-                (dir.to_vec(), levels.to_vec()),
+                (dir.to_vec(), levels.shared()),
             ),
-            OutputStorage::Frozen(state) => state.names(dir, levels),
+            OutputStorage::Frozen(state) => state.names(dir, levels.slice()),
+        }
+    }
+}
+
+/// The level of each unit a lookup sees. A view's own levels are shared with
+/// the layer's loop by reference count, so a lookup does not copy them.
+#[derive(Clone, Copy)]
+enum Levels<'a> {
+    Shared(&'a Arc<Vec<u8>>),
+    Fixed(&'static [u8]),
+}
+
+impl Levels<'_> {
+    fn slice(&self) -> &[u8] {
+        match self {
+            Levels::Shared(levels) => levels,
+            Levels::Fixed(levels) => levels,
+        }
+    }
+
+    fn shared(&self) -> Arc<Vec<u8>> {
+        match self {
+            Levels::Shared(levels) => Arc::clone(levels),
+            Levels::Fixed(levels) => Arc::new(levels.to_vec()),
         }
     }
 }
@@ -711,11 +735,11 @@ const SEED_LEVELS: [u8; 1] = [LEVEL_FULL];
 impl BuildView {
     fn layered(&self, dir: &[u8], name: &[u8]) -> Option<LayerEnt> {
         if let Some(seed) = &self.seed {
-            if let Some(e) = seed.get(dir, name, &SEED_LEVELS) {
+            if let Some(e) = seed.get(dir, name, Levels::Fixed(&SEED_LEVELS)) {
                 return Some(e);
             }
         }
-        self.layer.get(dir, name, &self.levels)
+        self.layer.get(dir, name, Levels::Shared(&self.levels))
     }
 }
 
@@ -744,9 +768,9 @@ impl View for BuildView {
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        let mut layered = self.layer.names(dir, &self.levels);
+        let mut layered = self.layer.names(dir, Levels::Shared(&self.levels));
         if let Some(seed) = &self.seed {
-            layered.extend(seed.names(dir, &SEED_LEVELS));
+            layered.extend(seed.names(dir, Levels::Fixed(&SEED_LEVELS)));
         }
         let base = if self.base_has_dir(dir) {
             drive(&self.base, |view| view.step_list(dir))?
@@ -772,7 +796,7 @@ impl View for BuildView {
     }
 
     fn hints(&self) -> Vec<Vec<u8>> {
-        self.layer.visible_paths(&self.levels)
+        self.layer.visible_paths(Levels::Shared(&self.levels))
     }
 
     fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
@@ -977,6 +1001,46 @@ mod tests {
         let mut root: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
         root.sort();
         assert_eq!(root, vec![b"hostfile".to_vec(), b"t".to_vec()]);
+    }
+
+    #[test]
+    fn live_layer_steps_its_loop() {
+        let layer = Arc::new(OutputsLayer::new());
+        let view = |levels: Vec<u8>| BuildView {
+            base: layer_base(),
+            layer: layer.clone(),
+            levels: Arc::new(levels),
+            untraced: vec![],
+            seed: None,
+            content: None,
+        };
+        let full = view(vec![LEVEL_FULL, LEVEL_FULL]);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+
+        layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
+        layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
+        layer.add(1, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(4))]);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 4));
+        layer.set_rank(0, 10);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 2));
+
+        let meta = view(vec![LEVEL_META, LEVEL_NONE]);
+        assert!(matches!(meta.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+        assert_eq!(meta.list(b"/t/debug/a").unwrap(), vec![(b"liba.rmeta".to_vec(), DType::File)]);
+        assert_eq!(full.hints(), [b"/t/debug/a/liba.rlib".to_vec(), b"/t/debug/a/liba.rmeta".to_vec()]);
+    }
+
+    #[test]
+    fn live_layer_panic_reaches_the_caller_and_the_loop_goes_on() {
+        let layer = OutputsLayer::new();
+        let OutputStorage::Live(owner) = &layer.storage else { unreachable!() };
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.call(|_, ()| -> () { panic!("a step failed") }, ())
+        }));
+        let cause = failed.unwrap_err();
+        assert_eq!(cause.downcast_ref::<&str>(), Some(&"a step failed"));
+        layer.add(0, LEVEL_FULL, &[(b"/t/x".to_vec(), file(1))]);
+        assert!(layer.get(b"/t", b"x", Levels::Fixed(&[LEVEL_FULL])).is_some());
     }
 
     #[test]
