@@ -1423,13 +1423,14 @@ impl UnitObserver {
     }
 }
 
-/// The translator for what a test binary prints. Only the tested package's own
-/// dir and the dependency sources under the cargo home are paths the test learns
-/// from its environment; any other `/w` or `/c` string it prints is its own data.
-fn test_output_translator(tr: &Translator, manifest_path: &str) -> Translator {
+/// The translator for what a test binary prints, given the tested package's
+/// manifest dir. Only that dir and the dependency sources under the cargo home
+/// are paths the test learns from its environment; any other `/w` or `/c`
+/// string it prints is its own data.
+fn test_output_translator(tr: &Translator, manifest_dir: Option<&str>) -> Translator {
     let home = String::from_utf8_lossy(CARGO_HOME_AT).into_owned();
     let mut sandbox = vec![format!("{home}/registry"), format!("{home}/git")];
-    if let Some(dir) = Path::new(manifest_path).parent().and_then(Path::to_str)
+    if let Some(dir) = manifest_dir
         && vpath_starts_with(dir.as_bytes(), WORKTREE_AT)
     {
         sandbox.push(dir.to_string());
@@ -1443,6 +1444,10 @@ fn test_output_translator(tr: &Translator, manifest_path: &str) -> Translator {
             })
             .collect(),
     )
+}
+
+fn manifest_dir(manifest_path: &str) -> Option<&str> {
+    Path::new(manifest_path).parent().and_then(Path::to_str)
 }
 
 fn translated(tr: &Translator, data: &[u8]) -> Vec<u8> {
@@ -2827,7 +2832,7 @@ impl Run {
                                 out: out.derive(
                                     out.quiet,
                                     out.verbose,
-                                    test_output_translator(&out.tr, &plan.units[*unit as usize].manifest_path),
+                                    test_output_translator(&out.tr, manifest_dir(&plan.units[*unit as usize].manifest_path)),
                                 ),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
@@ -3026,7 +3031,7 @@ mod tests {
                 ("/c".into(), "/home/me/.cargo".into()),
             ]);
             let observer = TestObserver {
-                out: Output::new(tx, false, false).derive(false, false, super::test_output_translator(&tr, &manifest_path)),
+                out: Output::new(tx, false, false).derive(false, false, super::test_output_translator(&tr, super::manifest_dir(&manifest_path))),
                 explain: false,
                 label: String::new(),
             };

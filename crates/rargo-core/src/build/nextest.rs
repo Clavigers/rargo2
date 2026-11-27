@@ -200,18 +200,13 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                     let (result, cached) = outcome?;
                     deliver_writes(c, &p, built.as_ref(), &result.outputs);
                     let store = d.store();
-                    ran.insert(
-                        q.key.clone(),
-                        Ran {
-                            q: q.key.clone(),
-                            out: store.read(&result.stdout)?,
-                            err: store.read(&result.stderr)?,
-                            status: match result.signal() {
-                                Some(sig) => format!("signal {sig}"),
-                                None => format!("exit {}", result.code().unwrap_or(101)),
-                            },
-                        },
-                    );
+                    let status = match result.signal() {
+                        Some(sig) => format!("signal {sig}"),
+                        None => format!("exit {}", result.code().unwrap_or(101)),
+                    };
+                    let answer =
+                        Ran::new(&p.tr, &q, store.read(&result.stdout)?, store.read(&result.stderr)?, status);
+                    ran.insert(q.key.clone(), answer);
                     fx.extend(run.test_ran(&q.key, cached));
                 }
                 fx
@@ -219,12 +214,12 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             NextEffect::ShowNextest => {
                 let r = last.as_ref().expect("nextest ran");
                 let store = d.store();
-                c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&store.read(&r.stdout)?)).as_bytes());
-                if rounds.is_some() {
-                    c.out.err_text(&without_runner_note(&String::from_utf8_lossy(&store.read(&r.stderr)?)));
-                } else {
-                    c.out.err_text(&String::from_utf8_lossy(&store.read(&r.stderr)?));
-                }
+                let printed = printed_lines(&ran);
+                c.out.raw_out(own_text(&p.tr, &String::from_utf8_lossy(&store.read(&r.stdout)?), &printed).as_bytes());
+                let err = String::from_utf8_lossy(&store.read(&r.stderr)?).into_owned();
+                let err = if rounds.is_some() { without_runner_note(&err) } else { err };
+                let shown = c.out.derive(c.out.quiet, c.out.verbose, Translator::default());
+                shown.err_text(&own_text(&p.tr, &err, &printed));
                 Vec::new()
             }
             NextEffect::Finish => {
@@ -377,6 +372,35 @@ impl Rounds {
     }
 }
 
+/// The lines the tests printed, as nextest shows them: already translated for
+/// the package each test belongs to (#684), without colour or indentation.
+fn printed_lines(ran: &HashMap<String, Ran>) -> HashSet<String> {
+    let mut lines = HashSet::new();
+    for r in ran.values().filter(|r| !r.listing) {
+        for data in [&r.out, &r.err] {
+            for line in String::from_utf8_lossy(data).lines() {
+                let line = strip_ansi(line);
+                if !line.trim().is_empty() {
+                    lines.insert(line.trim().to_string());
+                }
+            }
+        }
+    }
+    lines
+}
+
+/// Nextest's output with its own lines translated in full, and the lines a
+/// test printed left as that test's translation made them: in those, a sandbox
+/// path outside the test's package and dependency sources is data.
+fn own_text(tr: &Translator, text: &str, printed: &HashSet<String>) -> String {
+    text.split_inclusive('\n')
+        .map(|l| match printed.contains(strip_ansi(l).trim()) {
+            true => l.to_string(),
+            false => tr.text(l),
+        })
+        .collect()
+}
+
 fn without_runner_note(err: &str) -> String {
     err.split_inclusive('\n').filter(|l| !l.contains("using target runner `/rargo/nextest/runner`")).collect()
 }
@@ -397,6 +421,10 @@ struct TestQuestion {
 }
 
 impl TestQuestion {
+    fn var(&self, name: &str) -> Option<&str> {
+        self.env.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+
     fn parse(raw: &[u8]) -> Option<TestQuestion> {
         let mut fields = raw.split(|&b| b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
         let cwd = fields.next()?;
@@ -422,9 +450,26 @@ impl TestQuestion {
 
 struct Ran {
     q: String,
+    listing: bool,
     out: Vec<u8>,
     err: Vec<u8>,
     status: String,
+}
+
+impl Ran {
+    /// The answer nextest is handed for a test process: what a test prints is
+    /// translated by #684's rule for its package, here where the core knows
+    /// which package that is; a listing is nextest's to parse, and kept as is.
+    fn new(tr: &Translator, q: &TestQuestion, out: Vec<u8>, err: Vec<u8>, status: String) -> Ran {
+        let (out, err) = match q.listing {
+            true => (out, err),
+            false => {
+                let tr = test_output_translator(tr, q.var("CARGO_MANIFEST_DIR"));
+                (translated(&tr, &out), translated(&tr, &err))
+            }
+        };
+        Ran { q: q.key.clone(), listing: q.listing, out, err, status }
+    }
 }
 
 const PER_RUN: &[&str] =
@@ -932,6 +977,59 @@ mod tests {
         assert_eq!(parse_question(b"metadata\nmetadata\0"), Some(Question::Metadata(vec!["metadata".into()])));
         assert_eq!(parse_question(b"build\n--color=auto\0te"), None);
         assert_eq!(parse_question(b"install\nx\0"), None);
+    }
+
+    fn question(manifest_dir: &str, listing: bool) -> TestQuestion {
+        let mut raw = Vec::new();
+        let list = if listing { "--list" } else { "--exact" };
+        for f in ["/w", "1", "2", "/w/target/debug/deps/app-1", list] {
+            raw.extend_from_slice(f.as_bytes());
+            raw.push(0);
+        }
+        raw.extend_from_slice(format!("CARGO_MANIFEST_DIR={manifest_dir}\0").as_bytes());
+        TestQuestion::parse(&raw).unwrap()
+    }
+
+    fn client() -> Translator {
+        Translator::new(vec![("/w".into(), "/home/me/project".into()), ("/c".into(), "/home/me/.cargo".into())])
+    }
+
+    #[test]
+    fn a_test_run_by_nextest_keeps_other_sandbox_paths_it_prints_as_data() {
+        let tr = client();
+        let printed = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/w/crates/rargo\n";
+        let q = question("/w/crates/rargo", false);
+        let r = Ran::new(&tr, &q, printed.as_bytes().to_vec(), b"at /c/registry/src/x/lib.rs:1\n".to_vec(), "exit 0".into());
+        let want = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/home/me/project/crates/rargo\n";
+        assert_eq!(String::from_utf8(r.out.clone()).unwrap(), want);
+        assert_eq!(String::from_utf8(r.err.clone()).unwrap(), "at /home/me/.cargo/registry/src/x/lib.rs:1\n");
+
+        let ran = HashMap::from([(q.key.clone(), r)]);
+        let shown = own_text(
+            &tr,
+            &format!(
+                "        FAIL [   0.004s] rargo tests::a\n--- STDOUT: rargo tests::a ---\n{want}\
+                 \x1b[31m  at /home/me/.cargo/registry/src/x/lib.rs:1\x1b[0m\n\
+                 error: test run failed, binary /w/target/debug/deps/app-1\n"
+            ),
+            &printed_lines(&ran),
+        );
+        assert_eq!(
+            shown,
+            format!(
+                "        FAIL [   0.004s] rargo tests::a\n--- STDOUT: rargo tests::a ---\n{want}\
+                 \x1b[31m  at /home/me/.cargo/registry/src/x/lib.rs:1\x1b[0m\n\
+                 error: test run failed, binary /home/me/project/target/debug/deps/app-1\n"
+            )
+        );
+    }
+
+    #[test]
+    fn a_test_listing_is_handed_to_nextest_as_it_was_printed() {
+        let q = question("/w", true);
+        let r = Ran::new(&client(), &q, b"/w/x: test\n".to_vec(), Vec::new(), "exit 0".into());
+        assert_eq!(r.out, b"/w/x: test\n");
+        assert!(printed_lines(&HashMap::from([(q.key.clone(), r)])).is_empty());
     }
 
     #[test]
