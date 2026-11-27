@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use dashmap::DashMap;
 use std::cell::{Cell, RefCell};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -365,7 +365,7 @@ impl Blobs {
         peer: &Peer,
         h: &Hash,
         recipe: &Recipe,
-        mut have: HashMap<u32, Vec<u8>>,
+        mut have: BTreeMap<u32, Vec<u8>>,
     ) -> Result<()> {
         if self.store.has(h) {
             return Ok(());
@@ -500,7 +500,7 @@ pub struct WorkerState {
     engine: Arc<Engine>,
     core: RefCell<worker_state::Worker<Wire>>,
     woken: crate::io::watch::Sender<()>,
-    tasks: RefCell<HashMap<u64, crate::io::JoinHandle<()>>>,
+    tasks: RefCell<BTreeMap<u64, crate::io::JoinHandle<()>>>,
     born: std::time::Instant,
     lookups_local: Cell<u64>,
     lookups_remote: Cell<u64>,
@@ -740,7 +740,7 @@ impl WorkerState {
                     let state = self.clone();
                     crate::io::spawn(move || {
                         let mut recipe = None;
-                        let mut chunks = HashMap::new();
+                        let mut chunks = BTreeMap::new();
                         for (part, r, c) in parts {
                             if part == 0 {
                                 recipe = Some(r);
@@ -1006,7 +1006,7 @@ pub fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: cra
         engine: engine.clone(),
         core: RefCell::new(core),
         woken: crate::io::watch::channel(()).0,
-        tasks: RefCell::new(HashMap::new()),
+        tasks: RefCell::new(BTreeMap::new()),
         born: crate::io::now(),
         lookups_local: Cell::new(0),
         lookups_remote: Cell::new(0),
@@ -1370,7 +1370,7 @@ impl AheadQueue {
 
 const IN_FLIGHT_SLACK: Duration = Duration::from_secs(2);
 
-fn still_in_flight(fl: &HashMap<Hash, std::time::Instant>, h: &Hash, now: std::time::Instant) -> bool {
+fn still_in_flight(fl: &BTreeMap<Hash, std::time::Instant>, h: &Hash, now: std::time::Instant) -> bool {
     fl.get(h).is_some_and(|at| *at > now)
 }
 
@@ -1380,8 +1380,8 @@ pub struct Worker {
     pub id: u64,
     peer: Arc<Peer>,
     pub cores: usize,
-    has_blobs: RefCell<HashSet<Hash>>,
-    has_chunks: RefCell<HashSet<Hash>>,
+    has_blobs: RefCell<BTreeSet<Hash>>,
+    has_chunks: RefCell<BTreeSet<Hash>>,
     actions: RefCell<BTreeMap<u64, Arc<RemoteAction>>>,
     alive: Cell<bool>,
     pub pushed_bytes: Cell<u64>,
@@ -1389,8 +1389,8 @@ pub struct Worker {
     overhead_us: Cell<u64>,
     overhead_samples: Cell<u64>,
     link_free_at: RefCell<std::time::Instant>,
-    in_flight: RefCell<HashMap<Hash, std::time::Instant>>,
-    store_paths: RefCell<HashSet<Vec<u8>>>,
+    in_flight: RefCell<BTreeMap<Hash, std::time::Instant>>,
+    store_paths: RefCell<BTreeSet<Vec<u8>>>,
 }
 
 impl Worker {
@@ -1618,7 +1618,7 @@ impl Pool {
                         peer: peer.clone(),
                         cores: cores as usize,
                         has_blobs: RefCell::new(blobs.into_iter().collect()),
-                        has_chunks: RefCell::new(HashSet::new()),
+                        has_chunks: RefCell::new(BTreeSet::new()),
                         actions: RefCell::new(BTreeMap::new()),
                         alive: Cell::new(true),
                         pushed_bytes: Cell::new(0),
@@ -1626,8 +1626,8 @@ impl Pool {
                         overhead_us: Cell::new(0),
                         overhead_samples: Cell::new(0),
                         link_free_at: RefCell::new(crate::io::now()),
-                        in_flight: RefCell::new(HashMap::new()),
-                        store_paths: RefCell::new(HashSet::new()),
+                        in_flight: RefCell::new(BTreeMap::new()),
+                        store_paths: RefCell::new(BTreeSet::new()),
                     });
                     eprintln!("rargod: worker {:x} joined from {} with {cores} cores", conn.id, conn.peer());
                     self.workers.borrow_mut().push(w.clone());
@@ -2055,7 +2055,7 @@ impl Pool {
 }
 
 struct RemoteLive<'a> {
-    early: &'a RefCell<HashMap<Vec<u8>, MEntry>>,
+    early: &'a RefCell<BTreeMap<Vec<u8>, MEntry>>,
     pool: &'a Pool,
     worker: &'a Worker,
 }
@@ -2132,7 +2132,7 @@ impl Pool {
                 let mut prefill = Vec::new();
                 let mut listings = Vec::new();
                 let mut files = Vec::new();
-                let mut seen_dirs: HashSet<Vec<u8>> = HashSet::new();
+                let mut seen_dirs: BTreeSet<Vec<u8>> = BTreeSet::new();
                 for (path, o) in &obs {
                     if let Obs::Listing(_) = o {
                         if let Ok(l) = view.list(path) {
@@ -2292,7 +2292,7 @@ impl Pool {
             }
         }
 
-        let early: RefCell<HashMap<Vec<u8>, MEntry>> = RefCell::new(HashMap::new());
+        let early: RefCell<BTreeMap<Vec<u8>, MEntry>> = RefCell::new(BTreeMap::new());
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let t_sent = crate::io::now().saturating_duration_since(t0);
@@ -2759,7 +2759,7 @@ mod tests {
         use std::time::Duration;
         crate::io::sim::test(|| {
             let now = crate::io::now();
-            let mut fl = std::collections::HashMap::new();
+            let mut fl = std::collections::BTreeMap::new();
             fl.insert(Hash([1; 32]), now + Duration::from_secs(1));
             fl.insert(Hash([2; 32]), now);
             assert!(super::still_in_flight(&fl, &Hash([1; 32]), now));
