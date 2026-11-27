@@ -1,3 +1,4 @@
+mod disk;
 pub mod model;
 pub mod rng;
 mod nextest;

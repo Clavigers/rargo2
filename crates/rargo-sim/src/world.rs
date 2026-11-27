@@ -1,3 +1,6 @@
+use crate::disk;
+use rargo_core::store::Store;
+use rargo_net::io::sim;
 use crate::transport::{self, Side};
 use rargo_net::sans_io::{EndpointState, LinkKey, RouteEvent};
 use serde::{Deserialize, Serialize};
@@ -221,6 +224,9 @@ pub struct Report {
     pub duplicated: u64,
     pub reordered: u64,
     pub retransmits: u64,
+    pub disk_full_errors: u64,
+    pub disk_crashes: u64,
+    pub torn_writes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -321,6 +327,7 @@ enum Down {
     Session(ServerMsg),
     Synced { round: u64, root: Digest },
     Pong,
+    DiskError { round: u64, message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -405,13 +412,19 @@ struct Server {
     sessions: BTreeMap<u64, Sess>,
     sched: SchedState,
     pipe: usize,
-    store: BTreeMap<Hash, Vec<u8>>,
+    store: Option<Store>,
     pins: BTreeMap<Hash, usize>,
     held: BTreeMap<u64, (u64, BTreeSet<Hash>)>,
-    cache: BTreeMap<Hash, Hash>,
     jobs: BTreeMap<u64, Job>,
     ready: VecDeque<u64>,
     next_job: u64,
+    disk_errors: BTreeMap<u64, (u64, String)>,
+}
+
+impl Server {
+    fn store(&self) -> &Store {
+        self.store.as_ref().expect("the server has started")
+    }
 }
 
 struct Client {
@@ -503,9 +516,14 @@ pub struct World {
     report: Report,
     trace: Vec<u8>,
     silence: Option<(u64, u64)>,
+    disk_fault: Option<disk::Fault>,
 }
 
 type Step = Result<(), Kind>;
+
+fn storage_error(error: impl fmt::Display) -> Kind {
+    Kind::StateMachine(format!("server disk: {error}"))
+}
 
 fn link_error(error: std::io::Error) -> Kind {
     Kind::StateMachine(format!("UDP link: {error}"))
@@ -541,13 +559,13 @@ impl World {
                 sessions: BTreeMap::new(),
                 sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
                 pipe: SERVER_TOKENS,
-                store: BTreeMap::new(),
+                store: None,
                 pins: BTreeMap::new(),
                 held: BTreeMap::new(),
-                cache: BTreeMap::new(),
                 jobs: BTreeMap::new(),
                 ready: VecDeque::new(),
                 next_job: 1,
+                disk_errors: BTreeMap::new(),
             },
             workers: BTreeMap::new(),
             clients: BTreeMap::new(),
@@ -574,9 +592,18 @@ impl World {
                 duplicated: 0,
                 reordered: 0,
                 retransmits: 0,
+                disk_full_errors: 0,
+                disk_crashes: 0,
+                torn_writes: 0,
             },
             trace: Vec::new(),
             silence: None,
+            disk_fault: match Rng::new(seed ^ 0x6469_736b).below(12) {
+                0 => Some(disk::Fault::Full),
+                1 => Some(disk::Fault::Torn),
+                2 => Some(disk::Fault::Crash),
+                _ => None,
+            },
             project,
             cfg,
         };
@@ -764,17 +791,24 @@ impl World {
         self.clients.values().all(|c| c.finished)
     }
 
-    pub fn run(mut self) -> Result<Report, Failure> {
+    pub fn run(self) -> Result<Report, Failure> {
+        let world = Box::new(self);
+        sim::test(move || world.run_with_disk())
+    }
+
+    fn run_with_disk(mut self) -> Result<Report, Failure> {
+        self.server.store = Some(disk::open(&sim::tempdir()));
         let seed = self.seed;
         let bug = self.bug;
         let off = self.off.clone();
         loop {
+            let fail = |w: &World, kind: Kind| Failure { seed, bug, off: off.clone(), at_ms: w.now, kind };
             if self.finished() {
+                self.server.store().db().flush_checked().map_err(|err| fail(&self, storage_error(err)))?;
                 self.report.end_ms = self.now;
                 self.report.trace = Hash::of(&self.trace);
                 return Ok(self.report);
             }
-            let fail = |w: &World, kind: Kind| Failure { seed, bug, off: off.clone(), at_ms: w.now, kind };
             if self.busy == 0 {
                 let open: Vec<String> = self
                     .clients
@@ -855,7 +889,7 @@ impl World {
         for (client, sess) in &self.server.sessions {
             let Some(o) = &sess.offer else { continue };
             for h in &o.arrived {
-                if self.server.trees.holder(h) == Some(o.up) && !self.server.store.contains_key(h) {
+                if self.server.trees.holder(h) == Some(o.up) && !self.server.store().has(h) {
                     return Err(Kind::LostPinned(format!(
                         "blob {} that client {client} uploaded for round {} is claimed and not in the store",
                         h.hex(),
@@ -865,12 +899,12 @@ impl World {
             }
         }
         for (h, n) in &self.server.pins {
-            if *n > 0 && !self.server.store.contains_key(h) {
+            if *n > 0 && !self.server.store().has(h) {
                 return Err(Kind::LostPinned(format!("blob {} is pinned {n} times and not in the store", h.hex())));
             }
         }
         for (job, j) in &self.server.jobs {
-            if let Some(h) = j.inputs.iter().find(|h| !self.server.store.contains_key(h)) {
+            if let Some(h) = j.inputs.iter().find(|h| !self.server.store().has(h)) {
                 return Err(Kind::LostPinned(format!("input {} of unfinished job {job} is gone", h.hex())));
             }
             if let Some(w) = j.worker {
@@ -1123,9 +1157,6 @@ impl World {
             let at = self.rng.range(20, 400);
             self.schedule_housekeeping(at, Ev::Evict);
         }
-        if self.server.store.is_empty() {
-            return;
-        }
         let ignore_pins = self.bug == Some(Bug::EvictPinned);
         let ignore_claims = self.bug == Some(Bug::EvictClaimed);
         // Jobs can outlive the client round that pinned their inputs.
@@ -1140,8 +1171,9 @@ impl World {
             .collect();
         let candidates: Vec<Hash> = self
             .server
-            .store
-            .keys()
+            .store()
+            .all_hashes()
+            .into_iter()
             .filter(|h| ignore_pins || (!self.server.pins.contains_key(h) && !job_inputs.contains(h)))
             .filter(|h| {
                 if self.server.trees.holder(h).is_some() {
@@ -1150,13 +1182,12 @@ impl World {
                     !offered.contains(h)
                 }
             })
-            .copied()
             .collect();
         if candidates.is_empty() {
             return;
         }
         let h = candidates[self.rng.below(candidates.len() as u64) as usize];
-        self.server.store.remove(&h);
+        self.server.store().remove(&h);
         self.report.evictions += 1;
         let active_clients = self
             .clients
@@ -1186,6 +1217,13 @@ impl World {
     }
 
     fn server_from_client(&mut self, client: u64, u: Up) -> Step {
+        if let Up::Offer { round, .. } | Up::Request { round, .. } = &u
+            && let Some((failed, message)) = self.server.disk_errors.get(&client)
+            && round == failed
+        {
+            self.send(Node::Server, Node::Client(client), Msg::Down(Down::DiskError { round: *round, message: message.clone() }));
+            return Ok(());
+        }
         match u {
             Up::Ping => self.send(Node::Server, Node::Client(client), Msg::Down(Down::Pong)),
             Up::Join => {
@@ -1203,8 +1241,8 @@ impl World {
                     server.trees.release(old.up);
                 }
                 let up = server.trees.begin_upload();
-                let store = &server.store;
-                let claimed = server.trees.claim(up, &contents, &|h| store.contains_key(h));
+                let store = server.store.as_ref().expect("the server has started");
+                let claimed = server.trees.claim(up, &contents, &|h| store.has(h));
                 let want: Vec<Digest> = claimed.mine.iter().filter(|h| !sending.contains(h)).map(|h| h.0).collect();
                 sess.offer = Some(Offer { round, root, contents, up, arrived: BTreeSet::new() });
                 if !want.is_empty() {
@@ -1225,7 +1263,7 @@ impl World {
                     match effect {
                         session_state::Effect::Store { hash, bytes } => {
                             let h = Hash(hash);
-                            server.store.insert(h, bytes);
+                            server.store.as_ref().unwrap().put_bytes(&bytes).map_err(storage_error)?;
                             sess.has.extend([hash]);
                             if let Some(o) = &mut sess.offer
                                 && o.contents.contains(&h)
@@ -1248,7 +1286,7 @@ impl World {
                 if self.bug == Some(Bug::NeverAnswer) && self.rng.chance(40) {
                     return Ok(());
                 }
-                if let Some(h) = inputs.iter().find(|h| !self.server.store.contains_key(h)) {
+                if let Some(h) = inputs.iter().find(|h| !self.server.store().has(h)) {
                     return Err(Kind::LostPinned(format!("input {} of a request is gone", h.hex())));
                 }
                 let id = self.project.actions[action].id;
@@ -1257,8 +1295,8 @@ impl World {
                 } else {
                     model::key(id, &inputs)
                 };
-                if let Some(out) = self.server.cache.get(&key).copied()
-                    && let Some(bytes) = self.server.store.get(&out).cloned()
+                if let Some(out) = disk::cached(self.server.store(), key)
+                    && let Ok(bytes) = self.server.store().read(&out)
                 {
                     self.report.cache_hits += 1;
                     return self.deliver_output(client, round, action, out, bytes);
@@ -1291,13 +1329,13 @@ impl World {
     fn rewant(&mut self, client: u64) {
         let server = &mut self.server;
         let Some(o) = server.sessions.get(&client).and_then(|s| s.offer.as_ref()) else { return };
-        let store = &server.store;
+        let store = server.store.as_ref().expect("the server has started");
         let orphans: Vec<Hash> =
-            o.contents.iter().filter(|h| !store.contains_key(h) && server.trees.holder(h).is_none()).copied().collect();
+            o.contents.iter().filter(|h| !store.has(h) && server.trees.holder(h).is_none()).copied().collect();
         if orphans.is_empty() {
             return;
         }
-        let claimed = server.trees.claim(o.up, &orphans, &|h| store.contains_key(h));
+        let claimed = server.trees.claim(o.up, &orphans, &|h| store.has(h));
         let want: Vec<Digest> = claimed.mine.iter().map(|h| h.0).collect();
         self.report.wants += 1;
         self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::WantBlobs(want))));
@@ -1307,7 +1345,7 @@ impl World {
         let server = &mut self.server;
         let Some(sess) = server.sessions.get_mut(&client) else { return };
         let Some(o) = &sess.offer else { return };
-        if !o.contents.iter().all(|h| server.store.contains_key(h)) {
+        if !o.contents.iter().all(|h| server.store.as_ref().unwrap().has(h)) {
             return;
         }
         let o = sess.offer.take().expect("checked above");
@@ -1341,7 +1379,7 @@ impl World {
         loop {
             match outgoing.step() {
                 Next::Read { hash, at, len, .. } => {
-                    let read = server.store.get(&Hash(hash)).map(|v| {
+                    let read = server.store.as_ref().unwrap().read(&Hash(hash)).ok().map(|v| {
                         let at = (at as usize).min(v.len());
                         v[at..(at + len).min(v.len())].to_vec()
                     });
@@ -1378,8 +1416,35 @@ impl World {
                 let fx = self.server.sched.release(job);
                 self.sched_effects(fx);
                 let out = Hash::of(&output);
-                self.server.store.insert(out, output.clone());
-                self.server.cache.insert(j.key, out);
+                let fault = if !self.server.pins.is_empty()
+                    && !self.server.store().has(&out)
+                    && self.clients.get(&j.client).is_some_and(|c| !c.finished && c.round == j.round)
+                {
+                    self.disk_fault.take()
+                } else {
+                    None
+                };
+                match disk::put(&mut self.server.store, &output, fault) {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+                        let message = rargo_core::serve::failure("keeping the build output", &error.into());
+                        self.server.disk_errors.insert(j.client, (j.round, message.clone()));
+                        self.send(Node::Server, Node::Client(j.client), Msg::Down(Down::DiskError { round: j.round, message }));
+                        return Ok(());
+                    }
+                    Err(error) => return Err(storage_error(error)),
+                }
+                if matches!(fault, Some(disk::Fault::Torn | disk::Fault::Crash)) {
+                    self.report.disk_crashes += 1;
+                    self.report.torn_writes += u64::from(fault == Some(disk::Fault::Torn));
+                    // Reopen and read the pinned files, checking bytes as well as index entries.
+                    for h in self.server.pins.keys() {
+                        if !self.server.store().read(h).is_ok_and(|bytes| Hash::of(&bytes) == *h) {
+                            return Err(Kind::LostPinned(format!("blob {h} was lost after a disk crash")));
+                        }
+                    }
+                }
+                disk::cache(self.server.store(), j.key, out);
                 self.deliver_output(j.client, j.round, j.action, out, output)?;
             }
             Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Ping => unreachable!("only clients say this"),
@@ -1436,7 +1501,9 @@ impl World {
             let j = self.server.jobs.get_mut(&job).expect("a granted job is known");
             j.worker = Some(worker);
             let run = SimRun { action: j.action, inputs: j.inputs.clone(), ms: self.project.actions[j.action].ms };
-            let pushes: Vec<(Hash, Vec<u8>)> = j.inputs.iter().map(|h| (*h, self.server.store[h].clone())).collect();
+            let pushes: Vec<_> = run.inputs.iter().map(|h| {
+                (*h, self.server.store().read(h).expect("a pinned job input is readable"))
+            }).collect();
             let msg = FromServer::Run(worker_state::Run {
                 action: job,
                 incoming: run.inputs.clone(),
@@ -1707,6 +1774,9 @@ impl World {
     }
 
     fn client_hears(&mut self, client: u64, d: Down) -> Step {
+        if self.clients[&client].finished {
+            return Ok(());
+        }
         let m = match d {
             Down::Synced { round, root } => {
                 let c = self.clients.get_mut(&client).expect("known");
@@ -1722,6 +1792,15 @@ impl World {
             }
             Down::Session(m) => m,
             Down::Pong => return Ok(()),
+            Down::DiskError { round, message } => {
+                let c = self.clients.get_mut(&client).expect("known");
+                if c.round == round && !c.finished {
+                    assert_eq!(message, rargo_core::serve::OUT_OF_SPACE);
+                    c.finished = true;
+                    self.report.disk_full_errors += 1;
+                }
+                return Ok(());
+            }
         };
         let c = self.clients.get_mut(&client).expect("known");
         match m {

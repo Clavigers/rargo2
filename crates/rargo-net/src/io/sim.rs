@@ -95,6 +95,7 @@ struct Sock {
     waiter: Option<(u64, usize, bool)>,
 }
 
+#[derive(Clone)]
 struct Inode {
     data: Vec<u8>,
     mode: u32,
@@ -103,6 +104,7 @@ struct Inode {
     links: u32,
 }
 
+#[derive(Clone)]
 enum Node {
     /// A directory, with when it was made in nanoseconds since the Unix epoch.
     Dir { mode: u32, mtime_ns: i64 },
@@ -146,7 +148,16 @@ enum Due {
     Deliver { to: SocketAddr, from: SocketAddr, bytes: Vec<u8> },
 }
 
+/// An explicit sync barrier for a simulated disk. Restoring it models loss of
+/// all later changes, including directory entries and writes to open files.
+pub struct DiskCheckpoint {
+    files: BTreeMap<PathBuf, Node>,
+    inodes: BTreeMap<u64, Inode>,
+}
+
 pub struct SimLoop {
+    disk_capacity: Option<usize>,
+    torn_write: Option<usize>,
     rng: Rng,
     net: Net,
     /// Whether an operation that needs no waiting is answered where it is asked, without the fiber giving way.
@@ -224,6 +235,8 @@ impl SimLoop {
             handles: BTreeMap::new(),
             bound: BTreeMap::new(),
             files,
+            disk_capacity: None,
+            torn_write: None,
             inodes: BTreeMap::new(),
             pipes: BTreeMap::new(),
             env: BTreeMap::new(),
@@ -464,6 +477,22 @@ impl SimLoop {
                 Ok(self.fd(Handle::File { ino, path }))
             }
         }
+    }
+
+    fn disk_used(&self) -> usize {
+        self.inodes.values().map(|inode| inode.data.len()).sum()
+    }
+
+    fn check_file_growth(&self, fd: i32, end: usize) -> io::Result<()> {
+        if let Some(capacity) = self.disk_capacity
+            && let Some(Handle::File { ino, .. }) = self.handles.get(&fd)
+        {
+            let growth = end.saturating_sub(self.inodes[ino].data.len());
+            if growth > capacity.saturating_sub(self.disk_used()) {
+                return Err(errno(libc::ENOSPC));
+            }
+        }
+        Ok(())
     }
 
     fn file(&mut self, fd: i32) -> io::Result<&mut Inode> {
@@ -735,19 +764,25 @@ impl SimLoop {
                 Event::Read { n: buf.len(), buf }
             }
             Op::Write { fd, off, buf } => {
+                let torn = self.torn_write.take();
+                let bytes = &buf[..torn.unwrap_or(buf.len()).min(buf.len())];
+                let off = if self.appending.contains(&fd) { self.file(fd)?.data.len() } else { off as usize };
+                let end = off + bytes.len();
+                self.check_file_growth(fd, end)?;
                 let now = self.stamp();
-                let appending = self.appending.contains(&fd);
                 let inode = self.file(fd)?;
-                let off = if appending { inode.data.len() } else { off as usize };
-                let end = off + buf.len();
                 if inode.data.len() < end {
                     inode.data.resize(end, 0);
                 }
-                inode.data[off..end].copy_from_slice(&buf);
+                inode.data[off..end].copy_from_slice(bytes);
                 inode.mtime_ns = now;
+                if torn.is_some() {
+                    return Err(errno(libc::EIO));
+                }
                 Event::Write { n: buf.len() }
             }
             Op::Ftruncate { fd, len } => {
+                self.check_file_growth(fd, len as usize)?;
                 let now = self.stamp();
                 let inode = self.file(fd)?;
                 inode.data.resize(len as usize, 0);
@@ -1115,11 +1150,14 @@ pub(super) fn allocate(fd: i32, mode: i32, offset: u64, len: u64) -> Option<io::
         return None;
     }
     with(|sim| {
-        let inode = sim.file(fd)?;
         let end = (offset + len) as usize;
         if mode & !(libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE) != 0 {
             return Err(errno(libc::EOPNOTSUPP));
         }
+        if mode & (libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE) == 0 {
+            sim.check_file_growth(fd, end)?;
+        }
+        let inode = sim.file(fd)?;
         if mode & libc::FALLOC_FL_PUNCH_HOLE != 0 {
             let end = end.min(inode.data.len());
             let start = (offset as usize).min(end);
@@ -1280,6 +1318,38 @@ pub fn test<R: 'static>(body: impl FnOnce() -> R + 'static) -> R {
     let mut sim = SimLoop::new(0, Net::default());
     sim.in_place = true;
     run_on(sim, body).0
+}
+
+/// Leaves the given number of bytes free for growing files. `None` removes
+/// the capacity limit. Overwriting existing bytes takes no additional space.
+pub fn set_disk_free(bytes: Option<usize>) {
+    with(|sim| sim.disk_capacity = bytes.map(|n| sim.disk_used().saturating_add(n)))
+        .expect("a simulation is running");
+}
+
+/// Writes just this prefix on the next regular-file write and returns EIO.
+pub fn tear_next_write(prefix: usize) {
+    with(|sim| sim.torn_write = Some(prefix)).expect("a simulation is running");
+}
+
+/// Syncs file data and directory entries together to a recoverable image.
+pub fn checkpoint_disk() -> DiskCheckpoint {
+    with(|sim| DiskCheckpoint {
+        files: sim.files.clone(),
+        inodes: sim.inodes.iter().filter(|(_, inode)| inode.links > 0).map(|(id, inode)| (*id, inode.clone())).collect(),
+    })
+    .expect("a simulation is running")
+}
+
+/// Cuts power to the disk. Close its file handles before restarting.
+pub fn restart_disk(checkpoint: DiskCheckpoint) {
+    with(|sim| {
+        assert!(sim.handles.values().all(|h| !matches!(h, Handle::File { .. } | Handle::Dir { .. })));
+        sim.files = checkpoint.files;
+        sim.inodes = checkpoint.inodes;
+        sim.torn_write = None;
+    })
+    .expect("a simulation is running");
 }
 
 /// A fresh empty directory in the simulated filesystem.
