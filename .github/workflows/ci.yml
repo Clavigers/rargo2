@@ -42,14 +42,24 @@ jobs:
           sudo modprobe fuse
           echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
       - name: Every test of the workspace (built on the server, run here, as root, one process each), each within its CPU budget
-        env:
-          RARGO_CPU_BUDGET: ${{ github.event.pull_request.number == 616 && 'report' || 'enforce' }}
         run: python3 -I dev/purity.py cpu
       - name: The purity allowlists and the time budgets only shrink
         # Not on a release branch: it holds only commits that passed this on
         # main, and main moves on past it.
         if: ${{ !startsWith(github.ref, 'refs/heads/release/') }}
-        run: git fetch -q --depth=1 origin main && python3 -I dev/purity.py ratchet FETCH_HEAD
+        # A pull request is compared with the main it was merged with for this
+        # run (the first parent of the merge commit under test), not with the
+        # newest main: main may have shrunk a list since, and the older list
+        # would look like an increase this pull request never made (#667).
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            git fetch -q --depth=2 origin "$GITHUB_SHA"
+            base=$(git rev-parse FETCH_HEAD^1)
+          else
+            git fetch -q --depth=1 origin main
+            base=$(git rev-parse FETCH_HEAD)
+          fi
+          python3 -I dev/purity.py ratchet "$base"
       - name: The shipped client
         run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
       - name: io_uring runs on the runner, and a default Docker container refuses it with what to change

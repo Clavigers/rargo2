@@ -29,3 +29,6 @@ flate2 = "1"
 crc32fast = "1"
 
 tempfile.workspace = true
+
+[dev-dependencies]
+expect-test = "1.5"

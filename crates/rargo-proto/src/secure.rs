@@ -321,7 +321,9 @@ impl snow::resolvers::CryptoResolver for SuppliedResolver {
 mod tests {
     use super::*;
 
-    fn pair(a: &[u8; 32], b: &[u8; 32], early: &[u8]) -> io::Result<((Sealer, Opener), (Sealer, Opener), Vec<u8>)> {
+    type Ends = (Sealer, Opener);
+
+    fn pair(a: &[u8; 32], b: &[u8; 32], early: &[u8]) -> io::Result<(Ends, Ends, Vec<u8>)> {
         let (hs, first) = client_start("ann", a, early)?;
         assert_eq!(&first[..8], MAGIC);
         let ulen = first[8] as usize;
