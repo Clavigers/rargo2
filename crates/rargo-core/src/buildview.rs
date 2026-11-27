@@ -3,7 +3,7 @@ use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -65,8 +65,8 @@ pub enum Region {
     Host(HostRegion),
     Snap(Arc<Snapshot>),
     Empty,
-    NixStore { names: Arc<std::collections::HashSet<Vec<u8>>> },
-    Synth(Arc<HashMap<Vec<u8>, SynthEnt>>),
+    NixStore { names: Arc<BTreeSet<Vec<u8>>> },
+    Synth(Arc<BTreeMap<Vec<u8>, SynthEnt>>),
     Link(Vec<u8>),
 }
 
@@ -523,7 +523,7 @@ enum LayerEnt {
 
 #[derive(Default)]
 struct LayerDir {
-    children: HashMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
+    children: BTreeMap<Vec<u8>, Vec<(u32, u8, LayerEnt)>>,
 }
 
 #[derive(Default)]
@@ -751,9 +751,9 @@ pub struct ViewParts {
 
 #[derive(Clone)]
 pub struct Restricted {
-    pub store_names: Arc<std::collections::HashSet<Vec<u8>>>,
+    pub store_names: Arc<BTreeSet<Vec<u8>>>,
     pub store_paths: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
-    pub etc: Arc<HashMap<Vec<u8>, SynthEnt>>,
+    pub etc: Arc<BTreeMap<Vec<u8>, SynthEnt>>,
     pub links: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
@@ -851,6 +851,8 @@ fn rooted(real: &str, seed: impl FnOnce(&HostRegion, &HostMemo)) -> Arc<BaseView
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     fn file(n: u8) -> MEntry {
         MEntry::File { hash: crate::hash::Hash([n; 32]), exec: false, size: n as u64 }
@@ -962,6 +964,7 @@ mod tests {
 
     #[test]
     fn a_base_view_is_given_its_contents() {
+        let mut outcomes = Transcript::default();
         let memo = Arc::new(HostMemo::default());
         let view = BaseView::new(
             vec![Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/no/such/host-view")), traced: true }],
@@ -977,8 +980,14 @@ mod tests {
         assert!(refused.is_err(), "the view does not read the host");
         view.deposit(&req, HostAnswer::Lookup(host_dir()));
         view.invariants();
-        assert!(matches!(View::lookup(&view, b"/", b"missing"), Looked::Dir(_)));
+        let Step::Done(found) = view.step_lookup(b"/", b"missing") else {
+            panic!("the deposit answers the lookup");
+        };
+        outcomes.record("retry lookup", found);
         view.invariants();
+        expect![[r#"
+            retry lookup: Dir(Owner { uid: 0, gid: 0, mode: 493 })
+        "#]].assert_eq(&outcomes.0);
     }
 }
 

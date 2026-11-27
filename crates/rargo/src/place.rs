@@ -6,7 +6,6 @@ use rargo_proto::{Delivery, Digest, Write};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write as _};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 fn hex(d: &Digest) -> String {
@@ -105,13 +104,67 @@ pub(crate) enum Op {
 }
 
 impl Op {
-    #[cfg(test)]
     fn path(&self) -> &Path {
         match self {
             Op::Remove(p) | Op::Unlink(p) | Op::Dir(p) | Op::Symlink(p, _) | Op::Text(p, _) | Op::Record(p, _) => p,
             Op::Install { to, .. } => to,
         }
     }
+}
+
+pub(crate) struct OutputMounts(BTreeSet<u64>);
+
+impl OutputMounts {
+    pub(crate) fn current() -> io::Result<Self> {
+        rargo_net::io::file::read_to_string("/proc/self/mountinfo").map(|info| Self::from_mountinfo(&info))
+    }
+
+    fn from_mountinfo(info: &str) -> Self {
+        Self(info.lines().filter_map(|line| {
+            let (mount, fs) = line.split_once(" - ")?;
+            if fs.split_whitespace().next()? != "fuse.rargo" {
+                return None;
+            }
+            let (major, minor) = mount.split_whitespace().nth(2)?.split_once(':')?;
+            Some(makedev(major.parse().ok()?, minor.parse().ok()?))
+        }).collect())
+    }
+
+    pub(crate) fn check(&self, path: &Path) -> io::Result<()> {
+        // Follow symlinks so aliases of another worktree's target are caught too.
+        self.check_by(path, |p| rargo_net::io::file::metadata(p).map(|md| md.dev()))
+    }
+
+    fn check_by(&self, path: &Path, dev_of: impl Fn(&Path) -> io::Result<u64>) -> io::Result<()> {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        // Missing outputs inherit the filesystem of their closest existing ancestor.
+        let check_device = |candidate: &Path| match dev_of(candidate) {
+            Ok(dev) if self.0.contains(&dev) => Err(io::Error::other(format!(
+                "cannot copy build output to `{}` on a rargo FUSE mount; choose an output directory outside that mount",
+                path.display()
+            ))),
+            Ok(_) => Ok(true),
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(false),
+            Err(e) => Err(e),
+        };
+        check_device(path)?;
+        // An install writes a temporary file beside the destination, even when
+        // the destination itself is a symlink pointing off the mount.
+        for parent in path.ancestors().skip(1) {
+            if check_device(parent)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Linux's `makedev`, as `stat` reports `st_dev`.
+fn makedev(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (u64::from(major), u64::from(minor));
+    ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
 }
 
 fn mode(exec: bool, writable: bool) -> u32 {
@@ -553,12 +606,11 @@ fn look_at(look: &Look) -> Sight {
 #[cfg(target_os = "linux")]
 fn reflink(src: &Path, dst: &Path) -> bool {
     use std::os::fd::AsRawFd;
-    const FICLONE: libc::c_ulong = 0x4004_9409;
     let (Ok(s), Ok(d)) = (rargo_net::io::file::File::open(src), rargo_net::io::file::OpenOptions::new().write(true).create_new(true).open(dst))
     else {
         return false;
     };
-    let ok = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as libc::Ioctl, s.as_raw_fd()) } == 0;
+    let ok = crate::kernel::share_blocks(s.as_raw_fd(), d.as_raw_fd()).is_ok();
     if !ok {
         let _ = rargo_net::io::file::remove_file(dst);
     }
@@ -572,7 +624,7 @@ fn reflink(_src: &Path, _dst: &Path) -> bool {
 
 fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
     let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = to.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, std::process::id(), crate::tmp::seq()));
+    let tmp = to.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, rargo_net::io::process::id(), crate::tmp::seq()));
     assert_eq!(tmp.parent(), to.parent());
     assert_ne!(tmp, to);
     let _watched = crate::tmp::watch(&tmp);
@@ -590,7 +642,7 @@ fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
             How::Move => unreachable!("a move renames its source"),
         }
         if let Some(m) = way.mode {
-            rargo_net::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(m))?;
+            rargo_net::io::file::set_mode(&tmp, m)?;
         }
         rargo_net::io::file::rename(&tmp, to)
     })();
@@ -606,7 +658,7 @@ fn install(to: &Path, ways: &[Way]) -> io::Result<()> {
         let done = match way.how {
             How::Move => way
                 .mode
-                .map_or(Ok(()), |m| rargo_net::io::file::set_permissions(&way.from, std::fs::Permissions::from_mode(m)))
+                .map_or(Ok(()), |m| rargo_net::io::file::set_mode(&way.from, m))
                 .and_then(|()| rargo_net::io::file::rename(&way.from, to)),
             _ => place_beside(to, way),
         };
@@ -668,7 +720,12 @@ impl Placer {
     }
 
     fn run(&mut self, ops: Vec<Op>) -> io::Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mounts = OutputMounts::current()?;
         for op in ops {
+            mounts.check(op.path())?;
             match op {
                 Op::Remove(path) => {
                     if let Ok(md) = rargo_net::io::file::symlink_metadata(&path) {
@@ -715,7 +772,7 @@ impl Placer {
 
     fn scratch(&mut self) -> io::Result<PathBuf> {
         rargo_net::io::file::create_dir_all(&self.cache)?;
-        Ok(self.cache.join(format!(".incoming-{}-{}", std::process::id(), crate::tmp::seq())))
+        Ok(self.cache.join(format!(".incoming-{}-{}", rargo_net::io::process::id(), crate::tmp::seq())))
     }
 
     pub fn blob(&mut self, hash: Digest, bytes: &[u8]) -> io::Result<()> {
@@ -755,6 +812,12 @@ impl Placer {
 
     pub fn deliver(&mut self, root: &Path, targets: &[String], files: Vec<Delivery>, writes: Vec<Write>) -> io::Result<Vec<Digest>> {
         let bound = Bound::new(root, targets);
+        let mounts = OutputMounts::current()?;
+        for path in files.iter().map(|f| f.path.as_str()).chain(writes.iter().map(write_path)).map(Path::new) {
+            if bound.holds(path) {
+                mounts.check(path)?;
+            }
+        }
         let mut placement = Placement::new(&bound, &self.cache, &self.placed, files, writes)
             .map_err(|path| io::Error::other(format!("the server asked to place `{}`, which is not inside {bound}", path.display())))?;
         loop {
@@ -787,7 +850,7 @@ impl Placer {
 
     pub fn prune(&self) {
         let marker = self.cache.join(".pruned");
-        let age = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        let age = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| rargo_net::io::system_now().duration_since(t).ok());
         if age(&marker).is_some_and(|a| a.as_secs() < 3600) || !self.cache.ring_is_dir() {
             return;
         }
@@ -814,7 +877,33 @@ impl Placer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
+    use expect_test::expect;
+
+    #[test]
+    fn copied_outputs_reject_rargo_mounts_including_missing_paths_and_aliases() {
+        let info = "42 1 0:61 / /w/a/target rw - fuse.rargo rargo rw\n43 1 259:3 / / rw - ext4 /dev/x rw\n";
+        let mounts = OutputMounts::from_mountinfo(info);
+        let fuse = makedev(0, 61);
+        assert_eq!(mounts.0, BTreeSet::from([fuse]));
+        assert_eq!(makedev(259, 3), (259 << 8) | 3);
+        assert_eq!(makedev(0x1234, 0x5678), 0x1000_0562_3478);
+        // What a stat that follows symlinks reports: `/w/alias` points into the mount.
+        let dev_of = |p: &Path| -> io::Result<u64> {
+            match p.to_str().unwrap() {
+                "/w/a/target" | "/w/alias" => Ok(fuse),
+                "/" | "/w" | "/w/a" | "/w/b" => Ok(makedev(259, 3)),
+                _ => Err(io::ErrorKind::NotFound.into()),
+            }
+        };
+        for path in ["/w/a/target", "/w/a/target/debug/app", "/w/alias/debug/app"] {
+            let error = mounts.check_by(Path::new(path), dev_of).unwrap_err();
+            assert!(error.to_string().contains("on a rargo FUSE mount"), "{path}: {error}");
+        }
+        for path in ["/w/b/target/debug/app", "/w/a/other"] {
+            mounts.check_by(Path::new(path), dev_of).unwrap();
+        }
+        OutputMounts::from_mountinfo(&info.replace("fuse.rargo", "proc")).check_by(Path::new("/w/a/target"), dev_of).unwrap();
+    }
 
     struct Rng(u64);
 
@@ -1250,148 +1339,225 @@ mod tests {
         let root = Path::new("/w");
         let named = ["/w/target".to_string(), "/srv/out".into(), "/srv/out".into(), "/".into(), "rel/out".into(), "/x/../etc".into(), "".into()];
         let bound = Bound::new(root, &named);
-        assert_eq!(bound.targets, [PathBuf::from("/srv/out"), PathBuf::from("/w/target")], "only plain absolute directories bound a delivery");
-        assert_eq!(bound.to_string(), "the worktree `/w` or the target directory `/srv/out` or the target directory `/w/target`");
-        for (path, worktree, with_targets) in [
-            ("/w/target/debug/app", true, true),
-            ("/w/Cargo.lock", true, true),
-            ("/w", false, false),
-            ("/srv/out", false, true),
-            ("/srv/out/CACHEDIR.TAG", false, true),
-            ("/srv/out/debug/app", false, true),
-            ("/srv/out/../../etc/passwd", false, false),
-            ("/srv/outer/app", false, false),
-            ("/srv", false, false),
-            ("/etc/passwd", false, false),
-            ("/x/../etc/passwd", false, false),
-            ("/w/../etc/passwd", false, false),
-            ("/w/target/../../etc/passwd", false, false),
-            ("/wx/target/app", false, false),
-            ("target/debug/app", false, false),
-            ("", false, false),
+        let mut found = format!("targets {:?}\nbound: {bound}\n", bound.targets);
+        found += "path: within the worktree; worktree alone: holds, file, write; with the targets: holds, file, write\n";
+        let yes = |b: bool| if b { 'y' } else { '-' };
+        for path in [
+            "/w/target/debug/app",
+            "/w/Cargo.lock",
+            "/w",
+            "/srv/out",
+            "/srv/out/CACHEDIR.TAG",
+            "/srv/out/debug/app",
+            "/srv/out/../../etc/passwd",
+            "/srv/outer/app",
+            "/srv",
+            "/etc/passwd",
+            "/x/../etc/passwd",
+            "/w/../etc/passwd",
+            "/w/target/../../etc/passwd",
+            "/wx/target/app",
+            "target/debug/app",
+            "",
         ] {
-            assert_eq!(within(root, Path::new(path)), worktree, "{path}");
-            for (b, inside) in [(Bound::new(root, &[]), worktree), (bound.clone(), with_targets)] {
-                assert_eq!(b.holds(Path::new(path)), inside, "{path} in {b}");
+            found += &format!("{path:?}: {}", yes(within(root, Path::new(path))));
+            for b in [Bound::new(root, &[]), bound.clone()] {
                 let file = Placement::new(&b, Path::new("/c"), &Placed::default(), vec![delivery(path, b"x", false, true)], vec![]);
-                assert_eq!(file.is_ok(), inside, "{path} in {b}");
                 let write = Placement::new(&b, Path::new("/c"), &Placed::default(), vec![], vec![Write::Remove { path: path.into() }]);
-                assert_eq!(write.err(), (!inside).then(|| PathBuf::from(path)), "{path} in {b}");
+                assert_eq!(write.as_ref().err(), (!b.holds(Path::new(path))).then(|| PathBuf::from(path)).as_ref(), "a refusal names the path");
+                found += &format!("; {}{}{}", yes(b.holds(Path::new(path))), yes(file.is_ok()), yes(write.is_ok()));
             }
+            found.push('\n');
         }
-        assert!(!within(Path::new("w"), Path::new("w/a")), "the root is absolute");
+        found += &format!("a relative root holds w/a: {}\n", yes(within(Path::new("w"), Path::new("w/a"))));
+        expect![[r#"
+            targets ["/srv/out", "/w/target"]
+            bound: the worktree `/w` or the target directory `/srv/out` or the target directory `/w/target`
+            path: within the worktree; worktree alone: holds, file, write; with the targets: holds, file, write
+            "/w/target/debug/app": y; yyy; yyy
+            "/w/Cargo.lock": y; yyy; yyy
+            "/w": -; ---; ---
+            "/srv/out": -; ---; yyy
+            "/srv/out/CACHEDIR.TAG": -; ---; yyy
+            "/srv/out/debug/app": -; ---; yyy
+            "/srv/out/../../etc/passwd": -; ---; ---
+            "/srv/outer/app": -; ---; ---
+            "/srv": -; ---; ---
+            "/etc/passwd": -; ---; ---
+            "/x/../etc/passwd": -; ---; ---
+            "/w/../etc/passwd": -; ---; ---
+            "/w/target/../../etc/passwd": -; ---; ---
+            "/wx/target/app": -; ---; ---
+            "target/debug/app": -; ---; ---
+            "": -; ---; ---
+            a relative root holds w/a: -
+        "#]].assert_eq(&found);
+    }
+
+    /// Lists the operations, with the content's hash shown as `<h>` in its cache paths.
+    fn ops_text(ops: &[Op], hash: &Digest) -> String {
+        let h = hex(hash);
+        let short = |p: &Path| p.display().to_string().replace(&format!("{}/{}", &h[..2], &h[2..]), "<h>");
+        let mut out = String::new();
+        for op in ops {
+            out += &match op {
+                Op::Install { to, ways, required } => {
+                    let ways: Vec<String> = ways
+                        .iter()
+                        .map(|w| format!("{:?} {}{}", w.how, short(&w.from), w.mode.map_or(String::new(), |m| format!(" {m:o}"))))
+                        .collect();
+                    format!("  install {} required={required}: {}\n", short(to), ways.join(", "))
+                }
+                Op::Dir(p) => format!("  dir {}\n", short(p)),
+                Op::Remove(p) => format!("  remove {}\n", short(p)),
+                Op::Record(p, d) => format!("  record {} {}\n", short(p), if d == hash { "<h>" } else { "other" }),
+                other => format!("  {other:?}\n"),
+            };
+        }
+        out
     }
 
     #[test]
     fn forged_content_is_refused_and_shared_content_comes_from_the_cache() {
         let content = b"fn main() {}";
         let hash = *blake3::hash(content).as_bytes();
-        assert!(matches_hash(&hash, content));
-        assert!(!matches_hash(&hash, b"forged"));
         let blobs = Path::new("/c/blobs");
+        let tmp = Path::new("/c/blobs/.incoming-1-1");
         let mut waiting = Waiting::default();
+        waiting.invariants();
         let shared = Target { path: "/w/target/debug/app".into(), hash, size: content.len() as u64, exec: true, own: false, clear: false };
         let own = Target { path: "/v/target/debug/app".into(), own: true, ..shared.clone() };
         let plain = Target { path: "/w/target/debug/app.txt".into(), exec: false, ..shared.clone() };
-        assert!(waiting.add(shared.clone()));
-        assert!(!waiting.add(own.clone()), "the same content is fetched once for every place it goes");
-        assert!(!waiting.add(plain.clone()));
+        let cleared = Target { path: "/w/target/debug/dir-was-here".into(), exec: false, clear: true, ..shared.clone() };
+        let mut found = format!("matches: {}; forged matches: {}\n", matches_hash(&hash, content), matches_hash(&hash, b"forged"));
+        for t in [shared, own, plain, cleared] {
+            let path = t.path.display().to_string();
+            found += &format!("add {path} => fetch {}\n", waiting.add(t));
+            waiting.invariants();
+        }
+        found += &format!("arrived =>\n{}", ops_text(&waiting.arrived(blobs, hash, tmp), &hash));
         waiting.invariants();
-        let tmp = Path::new("/c/blobs/.incoming-1-1");
-        let ops = waiting.arrived(blobs, hash, tmp);
-        assert!(waiting.is_empty());
-        waiting.invariants();
-        let cache = cache_path(blobs, &hash, true);
-        let install = |to: &Path| ops.iter().find_map(|op| match op { Op::Install { to: t, ways, required } if t == to => Some((ways.clone(), *required)), _ => None }).unwrap();
-        let (ways, required) = install(&cache);
-        assert!(!required, "a cache that cannot be filled does not stop the placement");
-        assert!(ways.iter().all(|w| w.from == tmp && w.mode == Some(0o555)), "the cache holds a read-only copy: {ways:?}");
-        let (ways, _) = install(&cache_path(blobs, &hash, false));
-        assert!(ways.iter().all(|w| w.how != How::Link), "a second mode is not a link of the first, or one chmod would change both: {ways:?}");
-        let (ways, _) = install(&shared.path);
-        assert_eq!(ways[1], Way { from: cache.clone(), how: How::Link, mode: None }, "a shared output is linked from the cache");
-        assert!(ways.iter().any(|w| w.from == tmp), "and falls back to the download");
-        let (ways, _) = install(&own.path);
-        assert!(ways.iter().all(|w| w.from == tmp && w.how != How::Link && w.mode == Some(0o755)), "an own output is a writable copy: {ways:?}");
+        found += &format!("waiting for nothing: {}\n", waiting.is_empty());
+        found += &format!("arrived unasked =>\n{}", ops_text(&waiting.arrived(blobs, hash, tmp), &hash));
+        expect![[r#"
+            matches: true; forged matches: false
+            add /w/target/debug/app => fetch true
+            add /v/target/debug/app => fetch false
+            add /w/target/debug/app.txt => fetch false
+            add /w/target/debug/dir-was-here => fetch false
+            arrived =>
+              dir /c/blobs/a4
+              install /c/blobs/<h>.x required=false: Reflink /c/blobs/.incoming-1-1 555, Link /c/blobs/.incoming-1-1 555, Copy /c/blobs/.incoming-1-1 555
+              install /c/blobs/<h> required=false: Reflink /c/blobs/.incoming-1-1 444, Copy /c/blobs/.incoming-1-1 444
+              dir /w/target/debug
+              install /w/target/debug/app required=true: Reflink /c/blobs/<h>.x 755, Link /c/blobs/<h>.x, Copy /c/blobs/<h>.x 755, Reflink /c/blobs/.incoming-1-1 755, Copy /c/blobs/.incoming-1-1 755
+              record /w/target/debug/app <h>
+              dir /v/target/debug
+              install /v/target/debug/app required=true: Reflink /c/blobs/.incoming-1-1 755, Copy /c/blobs/.incoming-1-1 755
+              record /v/target/debug/app <h>
+              install /w/target/debug/app.txt required=true: Reflink /c/blobs/<h> 644, Link /c/blobs/<h>, Copy /c/blobs/<h> 644, Reflink /c/blobs/.incoming-1-1 644, Copy /c/blobs/.incoming-1-1 644
+              record /w/target/debug/app.txt <h>
+              remove /w/target/debug/dir-was-here
+              install /w/target/debug/dir-was-here required=true: Reflink /c/blobs/<h> 644, Link /c/blobs/<h>, Copy /c/blobs/<h> 644, Reflink /c/blobs/.incoming-1-1 644, Copy /c/blobs/.incoming-1-1 644
+              record /w/target/debug/dir-was-here <h>
+            waiting for nothing: true
+            arrived unasked =>
+              dir /c/blobs/a4
+              install /c/blobs/<h> required=true: Move /c/blobs/.incoming-1-1 444
+        "#]].assert_eq(&found);
+    }
+
+    fn placement_test(body: impl FnOnce() + 'static) {
+        rargo_net::io::sim::test(move || {
+            rargo_net::io::file::create_dir_all("/proc/self").unwrap();
+            rargo_net::io::file::write("/proc/self/mountinfo", b"").unwrap();
+            body();
+        });
     }
 
     #[test]
     fn large_content_arrives_in_parts() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("t/big");
-        let content: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
-        let h = *blake3::hash(&content).as_bytes();
-        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
-        let d = delivery(dest.to_str().unwrap(), &content, false, true);
-        assert_eq!(p.deliver(tmp.path(), &[], vec![d], vec![]).unwrap(), vec![h]);
-        let (x, y) = content.split_at(700_000);
-        p.part(h, x, false).unwrap();
-        p.part(h, y, true).unwrap();
-        assert_eq!(std::fs::read(&dest).unwrap(), content);
-        assert!(p.settled());
+        placement_test(|| {
+            let tmp = rargo_net::io::sim::tempdir();
+            let dest = tmp.join("t/big");
+            let content: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
+            let h = *blake3::hash(&content).as_bytes();
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let d = delivery(dest.to_str().unwrap(), &content, false, true);
+            assert_eq!(p.deliver(&tmp, &[], vec![d], vec![]).unwrap(), vec![h]);
+            let (x, y) = content.split_at(700_000);
+            p.part(h, x, false).unwrap();
+            p.part(h, y, true).unwrap();
+            assert_eq!(rargo_net::io::file::read(&dest).unwrap(), content);
+            assert!(p.settled());
+        });
     }
 
     #[test]
     fn writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = |n: &str| tmp.path().join(n).to_string_lossy().into_owned();
-        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
-        let src = b"fn generated() {}";
-        let h = *blake3::hash(src).as_bytes();
-        let need = p
-            .deliver(
-                tmp.path(),
-                &[],
-                vec![],
-                vec![
-                    Write::Dir { path: s("gen/deep") },
-                    Write::Text { path: s("target/debug/app.d"), text: Some("app: src/main.rs\n".into()) },
-                    Write::Symlink { path: s("gen/link"), target: b"deep".to_vec() },
-                    Write::File { path: s("src/generated.rs"), hash: h, size: src.len() as u64, exec: false },
-                ],
-            )
-            .unwrap();
-        assert_eq!(need, vec![h]);
-        assert!(p.blob(h, b"forged").is_err(), "content that does not match its hash is refused");
-        p.blob(h, src).unwrap();
-        assert!(tmp.path().join("gen/deep").is_dir());
-        assert_eq!(std::fs::read_link(tmp.path().join("gen/link")).unwrap(), Path::new("deep"));
-        assert_eq!(std::fs::read(tmp.path().join("src/generated.rs")).unwrap(), src);
-        let md = std::fs::metadata(tmp.path().join("src/generated.rs")).unwrap();
-        assert!(md.mode() & 0o200 != 0 && md.nlink() == 1, "a source file is an ordinary writable file");
-        p.deliver(tmp.path(), &[], vec![], vec![Write::Remove { path: s("gen") }, Write::Text { path: s("target/debug/app.d"), text: None }]).unwrap();
-        assert!(!tmp.path().join("gen").exists() && !tmp.path().join("target/debug/app.d").exists());
-        assert!(p.deliver(tmp.path(), &[], vec![], vec![Write::Remove { path: "/etc".into() }]).is_err());
+        placement_test(|| {
+            let tmp = rargo_net::io::sim::tempdir();
+            let s = |n: &str| tmp.join(n).to_string_lossy().into_owned();
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let src = b"fn generated() {}";
+            let h = *blake3::hash(src).as_bytes();
+            let need = p
+                .deliver(
+                    &tmp,
+                    &[],
+                    vec![],
+                    vec![
+                        Write::Dir { path: s("gen/deep") },
+                        Write::Text { path: s("target/debug/app.d"), text: Some("app: src/main.rs\n".into()) },
+                        Write::Symlink { path: s("gen/link"), target: b"deep".to_vec() },
+                        Write::File { path: s("src/generated.rs"), hash: h, size: src.len() as u64, exec: false },
+                    ],
+                )
+                .unwrap();
+            assert_eq!(need, vec![h]);
+            assert!(p.blob(h, b"forged").is_err(), "content that does not match its hash is refused");
+            p.blob(h, src).unwrap();
+            assert!(tmp.join("gen/deep").ring_is_dir());
+            assert_eq!(rargo_net::io::file::read_link(tmp.join("gen/link")).unwrap(), Path::new("deep"));
+            assert_eq!(rargo_net::io::file::read(tmp.join("src/generated.rs")).unwrap(), src);
+            let md = rargo_net::io::file::metadata(tmp.join("src/generated.rs")).unwrap();
+            assert!(md.mode() & 0o200 != 0 && md.nlink() == 1, "a source file is an ordinary writable file");
+            p.deliver(&tmp, &[], vec![], vec![Write::Remove { path: s("gen") }, Write::Text { path: s("target/debug/app.d"), text: None }]).unwrap();
+            assert!(!tmp.join("gen").ring_exists() && !tmp.join("target/debug/app.d").ring_exists());
+            assert!(p.deliver(&tmp, &[], vec![], vec![Write::Remove { path: "/etc".into() }]).is_err());
+        });
     }
 
     #[test]
     fn a_target_directory_outside_the_worktree_is_placed_when_the_server_names_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (root, outside) = (tmp.path().join("proj"), tmp.path().join("outside"));
-        std::fs::create_dir_all(&root).unwrap();
-        let named = [outside.to_string_lossy().into_owned(), root.join("target").to_string_lossy().into_owned()];
-        let content = b"\x7fELF hi";
-        let h = *blake3::hash(content).as_bytes();
-        let app = outside.join("debug/p");
-        let tag = Write::Text { path: outside.join("CACHEDIR.TAG").to_string_lossy().into_owned(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) };
-        let files = vec![delivery(app.to_str().unwrap(), content, true, false)];
-        let mut p = Placer::new(&tmp.path().join("cache"), Placed::default());
-        let refused = p.deliver(&root, &named[1..], files.clone(), vec![tag.clone()]).unwrap_err().to_string();
-        assert_eq!(
-            refused,
-            format!(
-                "the server asked to place `{}`, which is not inside the worktree `{}` or the target directory `{}`",
-                outside.join("CACHEDIR.TAG").display(),
-                root.display(),
-                root.join("target").display()
-            )
-        );
-        assert!(!outside.exists(), "nothing is placed when the delivery is refused");
-        assert_eq!(p.deliver(&root, &named, files, vec![Write::Dir { path: named[0].clone() }, tag]).unwrap(), vec![h]);
-        p.blob(h, content).unwrap();
-        assert_eq!(std::fs::read(&app).unwrap(), content);
-        assert!(outside.join("CACHEDIR.TAG").is_file());
-        let passwd = vec![delivery("/etc/passwd", b"x", false, true)];
-        assert!(p.deliver(&root, &named, passwd, vec![]).is_err(), "and nothing else outside is");
+        placement_test(|| {
+            let tmp = rargo_net::io::sim::tempdir();
+            let (root, outside) = (tmp.join("proj"), tmp.join("outside"));
+            rargo_net::io::file::create_dir_all(&root).unwrap();
+            let named = [outside.to_string_lossy().into_owned(), root.join("target").to_string_lossy().into_owned()];
+            let content = b"\x7fELF hi";
+            let h = *blake3::hash(content).as_bytes();
+            let app = outside.join("debug/p");
+            let tag = Write::Text { path: outside.join("CACHEDIR.TAG").to_string_lossy().into_owned(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) };
+            let files = vec![delivery(app.to_str().unwrap(), content, true, false)];
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let refused = p.deliver(&root, &named[1..], files.clone(), vec![tag.clone()]).unwrap_err().to_string();
+            assert_eq!(
+                refused,
+                format!(
+                    "the server asked to place `{}`, which is not inside the worktree `{}` or the target directory `{}`",
+                    outside.join("CACHEDIR.TAG").display(),
+                    root.display(),
+                    root.join("target").display()
+                )
+            );
+            assert!(!outside.ring_exists(), "nothing is placed when the delivery is refused");
+            assert_eq!(p.deliver(&root, &named, files, vec![Write::Dir { path: named[0].clone() }, tag]).unwrap(), vec![h]);
+            p.blob(h, content).unwrap();
+            assert_eq!(rargo_net::io::file::read(&app).unwrap(), content);
+            assert!(outside.join("CACHEDIR.TAG").ring_is_file());
+            let passwd = vec![delivery("/etc/passwd", b"x", false, true)];
+            assert!(p.deliver(&root, &named, passwd, vec![]).is_err(), "and nothing else outside is");
+        });
     }
 }

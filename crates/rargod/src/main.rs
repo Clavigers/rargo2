@@ -12,6 +12,9 @@ use rargo_core::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[path = "io.rs"]
+mod sys;
+
 struct Opts {
     state: PathBuf,
     store: Option<PathBuf>,
@@ -111,7 +114,7 @@ fn main() -> Result<()> {
         rargo_core::sandbox::zygote_main(args[2].parse()?);
     }
     let opts = parse_args(&args)?;
-    let cgroup_root = if std::env::var_os("RARGO_NO_CGROUPS").is_some() {
+    let cgroup_root = if io::env::var_os("RARGO_NO_CGROUPS").is_some() {
         None
     } else {
         rargo_core::cgroup::setup()
@@ -142,9 +145,7 @@ fn main() -> Result<()> {
     let content = Arc::new(Content::new(store.clone()));
     let fs = Arc::new(SandboxFs::new(content.clone()));
     let mnt = state.join("mnt");
-    if let Ok(c) = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()) {
-        unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) };
-    }
+    let _ = sys::umount(&mnt, libc::MNT_DETACH);
     rargo_core::io::file::create_dir_all(&mnt).with_context(|| format!("making the mountpoint {}", mnt.display()))?;
     let session = Arc::new(
         fusewire::Session::mount_uring(
@@ -181,7 +182,7 @@ fn main() -> Result<()> {
         unreachable!("the worker leaves through stop");
     }
     let cargo_home = opts.cargo_home.clone().unwrap_or_else(|| state.join("cargo-home"));
-    let (uid, gid) = (opts.uid.unwrap_or(unsafe { libc::geteuid() }), opts.gid.unwrap_or(unsafe { libc::getegid() }));
+    let (uid, gid) = (opts.uid.unwrap_or_else(io::process::euid), opts.gid.unwrap_or_else(io::process::egid));
     for dir in ["registry", "git"] {
         let p = cargo_home.join(dir);
         if !p.ring_exists() {
@@ -190,12 +191,11 @@ fn main() -> Result<()> {
         }
     }
     let cargo_home = cargo_home.ring_canonicalize()?;
-    let server_env = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-        .collect();
+    let server_env = io::env::vars().into_iter().collect();
     let daemon = Arc::new(Daemon::new(
         Config { state_dir: state.clone(), planner, cargo_home: cargo_home.clone(), uid, gid, server_env },
         engine,
+        rargo_core::tokens::os_seed()?,
     ));
     eprintln!(
         "rargod: store {} ({}), cargo home {}, passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, actions run as uid {uid}",
@@ -239,7 +239,7 @@ fn main() -> Result<()> {
             let d = daemon.clone();
             let every = std::time::Duration::from_secs(drift_minutes * 60);
             io::spawn(move || {
-                rargo_core::drift::background(d, every, std::time::Instant::now);
+                rargo_core::drift::background(d, every, io::now);
             });
         }
         let listener = match io::TcpListener::bind(listen) {
@@ -351,7 +351,7 @@ fn stop(session: &fusewire::Session, result: Result<()>) -> ! {
             1
         }
     };
-    std::process::exit(code)
+    io::process::exit(code)
 }
 
 fn serve(daemon: &Arc<Daemon>, listener: &io::TcpListener, keys: &Arc<Keys>, http: &Arc<rargo_core::http::Http>) -> Result<()> {

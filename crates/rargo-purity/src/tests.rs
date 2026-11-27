@@ -62,6 +62,10 @@ fn ambient_io_is_found_through_imports_and_macros_but_not_in_the_shell() {
         assert_eq!(of(Check::AmbientIo, &found(not_shell, text)).len(), 5, "{not_shell}");
     }
     assert!(found("crates/a/src/lib.rs", "fn f() -> std::time::Duration { let x = libc::EINTR; todo!() }").is_empty());
+    let addresses = "use core::net::SocketAddr; fn f() -> SocketAddr { SocketAddr::from((core::net::Ipv6Addr::LOCALHOST, 1)) }";
+    assert!(found("crates/a/src/lib.rs", addresses).is_empty());
+    let socket = "use std::net::UdpSocket; fn f() { let _ = UdpSocket::bind(\"[::1]:0\"); }";
+    assert_eq!(of(Check::AmbientIo, &found("crates/a/src/lib.rs", socket)), ["std::net::UdpSocket::bind"]);
     let shadowed = "use std::fs; use std::sync::atomic::{AtomicU8, Ordering};\n\
         fn f(fs: &dyn Store, a: &AtomicU8) { fs.stat(); a.load(Ordering::Relaxed); }";
     assert_eq!(of(Check::AmbientIo, &found("crates/a/src/lib.rs", shadowed)), Vec::<String>::new());
@@ -172,4 +176,10 @@ fn the_allowlist_format_is_strict() {
     assert!(parse_allow("locks a.rs 2 spaces\n").is_err());
     assert!(parse_allow("lock\ta.rs\t2\tno such check\n").is_err());
     assert!(parse_allow("locks\ta.rs\ttwo\tnot a number\n").is_err());
+}
+
+#[test]
+fn an_address_is_a_value_and_a_socket_is_io() {
+    let list = found("crates/a/src/lib.rs", "fn f(a: std::net::SocketAddr, b: std::net::Ipv4Addr) { let _ = std::net::UdpSocket::bind(a); }");
+    assert_eq!(of(Check::AmbientIo, &list), ["std::net::UdpSocket::bind"]);
 }

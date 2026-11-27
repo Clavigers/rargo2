@@ -128,39 +128,16 @@ impl Trees {
     }
 
     fn hold(self: &Arc<Self>, root: Hash) -> Option<Arc<Snapshot>> {
-        let mut all: Vec<Hash> = Vec::new();
-        let mut seen: HashSet<Hash> = HashSet::new();
-        let mut todo = vec![root];
-        seen.insert(root);
-        while let Some(d) = todo.pop() {
-            let tree = self.get(&d)?;
-            if !self.store.has(&d) {
+        let all = worktree_hashes(root, |d| {
+            let tree = self.get(d)?;
+            if !self.store.has(d) {
                 match self.store.put_bytes(&tree.encode()) {
-                    Ok(stored) if stored == d => {}
+                    Ok(stored) if stored == *d => {}
                     _ => return None,
                 }
             }
-            all.push(d);
-            for (_, node) in &tree.entries {
-                match node {
-                    Node::File { hash, .. } => {
-                        let h = Hash(*hash);
-                        if seen.insert(h) {
-                            all.push(h);
-                        }
-                    }
-                    Node::Dir(sub) => {
-                        let sub = Hash(*sub);
-                        if seen.insert(sub) {
-                            todo.push(sub);
-                        }
-                    }
-                    Node::Symlink(_) => {}
-                }
-            }
-        }
-        assert_eq!(all.first(), Some(&root));
-        debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+            Some(tree)
+        })?;
         if !self.store.pin_all(&all) {
             return None;
         }
@@ -226,6 +203,37 @@ impl Trees {
         }
         Ok(())
     }
+}
+
+fn worktree_hashes(root: Hash, tree: impl Fn(&Hash) -> Option<Arc<Tree>>) -> Option<Vec<Hash>> {
+    let mut all: Vec<Hash> = Vec::new();
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut todo = vec![root];
+    seen.insert(root);
+    while let Some(d) = todo.pop() {
+        let tree = tree(&d)?;
+        all.push(d);
+        for (_, node) in &tree.entries {
+            match node {
+                Node::File { hash, .. } => {
+                    let h = Hash(*hash);
+                    if seen.insert(h) {
+                        all.push(h);
+                    }
+                }
+                Node::Dir(sub) => {
+                    let sub = Hash(*sub);
+                    if seen.insert(sub) {
+                        todo.push(sub);
+                    }
+                }
+                Node::Symlink(_) => {}
+            }
+        }
+    }
+    assert_eq!(all.first(), Some(&root));
+    debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+    Some(all)
 }
 
 struct Claims<'a> {
@@ -451,12 +459,10 @@ impl Snapshot {
 }
 
 pub fn chown(path: &Path, uid: u32, gid: u32) {
-    if unsafe { libc::geteuid() } != 0 {
+    if crate::io::process::euid() != 0 {
         return;
     }
-    if let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        unsafe { libc::lchown(c.as_ptr(), uid, gid) };
-    }
+    let _ = crate::io::file::lchown(path, uid, gid);
 }
 
 #[cfg(test)]
@@ -465,52 +471,46 @@ mod tests {
     use rargo_machine::StateMachine;
     use crate::db::Db;
 
-    #[derive(Default)]
+    /// A client: what it has to upload sits in a store of its own.
     struct Fake {
-        trees: Mutex<HashMap<Hash, Vec<u8>>>,
-        blobs: Mutex<HashMap<Hash, Vec<u8>>>,
-        store: Option<Arc<Store>>,
-        asked_trees: AtomicU64,
-        asked_blobs: AtomicU64,
+        has: Arc<Store>,
+        store: Arc<Store>,
     }
 
     impl Fake {
         fn file(&self, content: &[u8]) -> Node {
-            let h = Hash::of(content);
-            self.blobs.lock().insert(h, content.to_vec());
+            let h = self.has.put_bytes(content).unwrap();
             Node::File { hash: h.0, size: content.len() as u64, exec: false }
         }
         fn dir(&self, mut entries: Vec<(&str, Node)>) -> Node {
             entries.sort_by(|a, b| a.0.cmp(b.0));
             let t = Tree { entries: entries.into_iter().map(|(n, e)| (n.as_bytes().to_vec(), e)).collect() };
-            let enc = t.encode();
-            let d = Hash::of(&enc);
-            self.trees.lock().insert(d, enc);
-            Node::Dir(d.0)
+            Node::Dir(self.has.put_bytes(&t.encode()).unwrap().0)
         }
     }
 
     impl Uploader for Fake {
         fn trees(&self, want: Vec<Hash>) -> Result<Vec<Vec<u8>>> {
-            self.asked_trees.fetch_add(want.len() as u64, Ordering::Relaxed);
-            Ok(want.iter().filter_map(|d| self.trees.lock().get(d).cloned()).collect())
+            Ok(want.iter().filter_map(|d| self.has.read(d).ok()).collect())
         }
         fn blobs(&self, want: Vec<Hash>) -> Result<()> {
-            self.asked_blobs.fetch_add(want.len() as u64, Ordering::Relaxed);
             for h in want {
-                if let Some(b) = self.blobs.lock().get(&h) {
-                    self.store.as_ref().unwrap().put_bytes(b)?;
+                if let Ok(b) = self.has.read(&h) {
+                    self.store.put_bytes(&b)?;
                 }
             }
             Ok(())
         }
     }
 
-    fn setup() -> (tempfile::TempDir, Arc<Trees>, Fake) {
-        let d = tempfile::tempdir().unwrap();
-        let db = Arc::new(Db::open(&d.path().join("db.redb")).unwrap());
-        let store = Arc::new(Store::open(&d.path().join("store"), db).unwrap());
-        let fake = Fake { store: Some(store.clone()), ..Default::default() };
+    fn open_store(dir: &Path) -> Arc<Store> {
+        Arc::new(Store::open(dir, Arc::new(Db::open_in_memory().unwrap())).unwrap())
+    }
+
+    fn setup() -> (std::path::PathBuf, Arc<Trees>, Fake) {
+        let d = crate::io::sim::tempdir();
+        let store = open_store(&d.join("store"));
+        let fake = Fake { has: open_store(&d.join("client")), store: store.clone() };
         (d, Trees::new(store), fake)
     }
 
@@ -529,12 +529,10 @@ mod tests {
 
     #[test]
     fn dropping_a_sync_while_it_uploads_releases_its_claims_for_the_next_sync() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
             let (_d, trees, fake) = setup();
             let v = fake.dir(vec![("a", fake.file(b"content a")), ("b", fake.file(b"content b"))]);
-            for enc in fake.trees.lock().values() {
-                trees.put(enc).unwrap();
-            }
+            trees.put(&fake.has.read(&root_of(&v)).unwrap()).unwrap();
             let blobs = [Hash::of(b"content a"), Hash::of(b"content b")];
             let (first_trees, root) = (trees.clone(), root_of(&v));
             let first = crate::io::spawn(move || first_trees.sync(root, &Stalled));
@@ -566,7 +564,7 @@ mod tests {
 
     #[test]
     fn syncs_only_what_is_missing() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
         let (_d, trees, fake) = setup();
         let src = fake.dir(vec![("lib.rs", fake.file(b"pub fn a() {}")), ("util.rs", fake.file(b"// util"))]);
         let v1 = fake.dir(vec![
@@ -575,8 +573,8 @@ mod tests {
             ("link", Node::Symlink(b"src".to_vec())),
         ]);
         let s1 = trees.sync(root_of(&v1), &fake).unwrap();
-        assert_eq!(fake.asked_trees.load(Ordering::Relaxed), 2);
-        assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 3);
+        assert_eq!(trees.stats.trees_received.load(Ordering::Relaxed), 2);
+        assert_eq!(trees.stats.blobs_requested.load(Ordering::Relaxed), 3);
         assert!(matches!(s1.lookup(b"/", b"src"), Looked::Dir(_)));
         assert!(matches!(s1.lookup(b"/", b"link"), Looked::Symlink(t) if t == b"src"));
         assert!(matches!(s1.lookup(b"/", b"nope"), Looked::Absent));
@@ -586,7 +584,7 @@ mod tests {
         assert!(s1.list(b"/missing").is_err());
 
         trees.sync(root_of(&v1), &fake).unwrap();
-        assert_eq!(fake.asked_trees.load(Ordering::Relaxed), 2);
+        assert_eq!(trees.stats.trees_received.load(Ordering::Relaxed), 2);
 
         let src2 = fake.dir(vec![("lib.rs", fake.file(b"pub fn b() {}")), ("util.rs", fake.file(b"// util"))]);
         let v2 = fake.dir(vec![
@@ -595,8 +593,8 @@ mod tests {
             ("link", Node::Symlink(b"src".to_vec())),
         ]);
         let s2 = trees.sync(root_of(&v2), &fake).unwrap();
-        assert_eq!(fake.asked_trees.load(Ordering::Relaxed), 4);
-        assert_eq!(fake.asked_blobs.load(Ordering::Relaxed), 4);
+        assert_eq!(trees.stats.trees_received.load(Ordering::Relaxed), 4);
+        assert_eq!(trees.stats.blobs_requested.load(Ordering::Relaxed), 4);
         assert_ne!(s1.id, s2.id);
         assert_eq!(s2.read(b"src/lib.rs").unwrap(), b"pub fn b() {}");
         });
@@ -613,7 +611,7 @@ mod tests {
 
         fn blobs(&self, want: Vec<Hash>) -> Result<()> {
             self.source.blobs(want)?;
-            let store = self.source.store.as_ref().unwrap();
+            let store = &self.source.store;
             let unrelated = format!("someone else's output {}", store.generation());
             let hash = store.put_bytes(unrelated.as_bytes())?;
             store.remove(&hash);
@@ -623,7 +621,7 @@ mod tests {
 
     #[test]
     fn a_store_that_evicts_other_content_all_the_time_fails_no_sync() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
             let (_d, trees, fake) = setup();
             let names: Vec<String> = (0..512).map(|i| format!("f{i:04}")).collect();
             let mut files: Vec<(&str, Node)> = names.iter().map(|n| (n.as_str(), fake.file(n.as_bytes()))).collect();
@@ -644,7 +642,7 @@ mod tests {
 
     #[test]
     fn a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
             let (_d, trees, fake) = setup();
             let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
             let mut last = None;
@@ -678,11 +676,38 @@ mod tests {
     }
 
     #[test]
+    fn a_held_snapshot_pins_its_whole_worktree_until_it_is_dropped() {
+        crate::io::sim::test(|| {
+            let (_d, trees, fake) = setup();
+            let v = fake.dir(vec![
+                ("src", fake.dir(vec![("a", fake.file(b"a")), ("deep", fake.dir(vec![("b", fake.file(b"b"))]))])),
+                ("top", fake.file(b"top")),
+            ]);
+            let root = root_of(&v);
+            let s = trees.sync(root, &fake).unwrap();
+            let held = worktree_hashes(root, |d| trees.get(d)).unwrap();
+            assert_eq!(held.len(), 6, "three manifests and three files");
+            assert!(held.iter().all(|h| trees.store.is_pinned(h)));
+
+            let output = trees.store.put_bytes(b"an output nobody holds").unwrap();
+            trees.store.evict_to(0, &|_| false);
+            assert!(!trees.store.has(&output));
+            assert!(held.iter().all(|h| trees.store.has(h)));
+            assert_eq!(s.read(b"src/deep/b").unwrap(), b"b");
+
+            drop(s);
+            assert!(held.iter().all(|h| !trees.store.is_pinned(h)));
+            trees.store.evict_to(0, &|_| false);
+            assert!(held.iter().all(|h| !trees.store.has(h)));
+        });
+    }
+
+    #[test]
     fn a_client_that_withholds_content_fails_the_sync() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
         let (_d, trees, fake) = setup();
         let v = fake.dir(vec![("a", fake.file(b"content a"))]);
-        fake.blobs.lock().clear();
+        fake.has.remove(&Hash::of(b"content a"));
         assert!(trees.sync(root_of(&v), &fake).is_err());
         let ghost = Hash::of(b"no such tree");
         assert!(trees.sync(ghost, &fake).is_err());
@@ -691,7 +716,7 @@ mod tests {
 
     #[test]
     fn derived_snapshot_and_materialize() {
-        crate::io::drive(1, || {
+        crate::io::sim::test(|| {
         let (d, trees, fake) = setup();
         let v = fake
             .dir(vec![("Cargo.toml", fake.file(b"[package]")), ("src", fake.dir(vec![("lib.rs", fake.file(b"x"))]))]);
@@ -702,11 +727,11 @@ mod tests {
         assert_eq!(s2.read(b"src/lib.rs").unwrap(), b"x");
         let s3 = s2.with_file(b"src/lib.rs", None).unwrap();
         assert!(s3.node(b"src/lib.rs").is_none());
-        let out = d.path().join("out");
+        let out = d.join("out");
         s2.materialize(&out, 0, 0, &|rel, _| rel != b"src").unwrap();
-        assert_eq!(std::fs::read(out.join("sub/Cargo.lock")).unwrap(), b"# lock");
-        assert!(!out.join("src").exists());
-        std::fs::write(out.join("Cargo.toml"), b"changed").unwrap();
+        assert_eq!(crate::io::file::read(out.join("sub/Cargo.lock")).unwrap(), b"# lock");
+        assert!(!crate::io::file::exists(out.join("src")));
+        crate::io::file::write(out.join("Cargo.toml"), b"changed").unwrap();
         assert_eq!(s2.read(b"Cargo.toml").unwrap(), b"[package]");
         let mut live = std::collections::BTreeSet::new();
         trees.remember("wt", &s2);

@@ -57,21 +57,21 @@ struct RecvState {
     pending: BTreeMap<u64, Vec<u8>>,
 }
 
-pub(crate) enum Admit {
+pub enum Admit {
     Queued,
     Full,
     Closed,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Packet {
+pub struct Packet {
     pub msg: u64,
     pub bytes: Vec<u8>,
     pub dropped: bool,
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Output {
+pub struct Output {
     pub datagrams: Vec<Packet>,
     pub messages: Vec<Vec<u8>>,
     pub acks: Vec<(u64, u32)>,
@@ -101,7 +101,7 @@ pub struct ConnState {
     closed: bool,
 }
 
-pub(crate) fn data_packet(id: u64, msg: u64, frag: u32, nfrags: u32, data: &[u8]) -> Vec<u8> {
+pub fn data_packet(id: u64, msg: u64, frag: u32, nfrags: u32, data: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(DATA_HDR + data.len());
     pkt.push(T_DATA);
     pkt.extend_from_slice(&id.to_le_bytes());
@@ -112,7 +112,7 @@ pub(crate) fn data_packet(id: u64, msg: u64, frag: u32, nfrags: u32, data: &[u8]
     pkt
 }
 
-pub(crate) fn ack_packet(id: u64, entries: &[(u64, u32)]) -> Vec<u8> {
+pub fn ack_packet(id: u64, entries: &[(u64, u32)]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(9 + entries.len() * 12);
     pkt.push(T_ACK);
     pkt.extend_from_slice(&id.to_le_bytes());
@@ -588,6 +588,7 @@ impl StateMachine for ConnState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     fn spin(s: &mut ConnState, now: Duration) -> Output {
         let mut acc = Output::default();
@@ -628,35 +629,22 @@ mod tests {
         assert!(matches!(s.send(b"lost"), Admit::Queued));
         s.invariants();
         let mut t = Duration::ZERO;
-        let mut sent_at = Vec::new();
+        let mut trace = Vec::new();
         for _ in 0..5 {
             let out = spin(&mut s, t);
-            assert_eq!(
-                wire(&out).len(),
-                1,
-                "the unacknowledged fragment is sent again"
-            );
-            assert_eq!(&wire(&out)[0][DATA_HDR..], b"lost");
-            sent_at.push(t);
-            let next = out.deadline.expect("the fragment stays in flight");
-            assert!(next > t);
-            t = next;
+            let payloads: Vec<_> = out.datagrams.iter()
+                .filter(|packet| !packet.dropped)
+                .map(|packet| std::str::from_utf8(&packet.bytes[DATA_HDR..]).unwrap())
+                .collect();
+            trace.push(format!("{t:?}: {payloads:?}, {} retransmits", out.retransmits));
+            t = out.deadline.expect("the fragment stays in flight");
         }
-        let gaps: Vec<u128> = sent_at
-            .windows(2)
-            .map(|w| (w[1] - w[0]).as_millis())
-            .collect();
-        assert_eq!(
-            gaps[0], 200,
-            "the first wait is the initial retransmission timeout"
-        );
-        for i in 0..gaps.len() - 1 {
-            assert_eq!(
-                gaps[i + 1],
-                gaps[i] * 2,
-                "each missed acknowledgement doubles the wait"
-            );
-        }
+        expect![[r#"
+            0ns: ["lost"], 0 retransmits
+            200ms: ["lost"], 1 retransmits
+            600ms: ["lost"], 1 retransmits
+            1.4s: ["lost"], 1 retransmits
+            3s: ["lost"], 1 retransmits"#]].assert_eq(&trace.join("\n"));
     }
 
     #[test]
@@ -668,8 +656,8 @@ mod tests {
         let pkt = wire(&first).pop().expect("the fragment is transmitted");
         let got = b.on_datagram(Duration::from_millis(5), &pkt);
         b.invariants();
-        assert_eq!(got.messages, vec![b"ping".to_vec()]);
-        assert_eq!(got.acks, vec![(1, 0)]);
+        expect!["messages=[[112, 105, 110, 103]], acks=[(1, 0)]"]
+            .assert_eq(&format!("messages={:?}, acks={:?}", got.messages, got.acks));
         let t = first
             .deadline
             .expect("the sender waits for the acknowledgement");
@@ -681,8 +669,8 @@ mod tests {
         let pkt = wire(&again).pop().expect("the fragment is sent again");
         let dup = b.on_datagram(t, &pkt);
         b.invariants();
-        assert!(dup.messages.is_empty(), "the message is delivered once");
-        assert_eq!(dup.acks, vec![(1, 0)]);
+        expect!["messages=[], acks=[(1, 0)]"]
+            .assert_eq(&format!("messages={:?}, acks={:?}", dup.messages, dup.acks));
         let back = a.on_datagram(t + Duration::from_millis(5), &ack_packet(9, &dup.acks));
         a.invariants();
         assert!(back.wake);
@@ -701,45 +689,34 @@ mod tests {
         s.invariants();
         assert!(matches!(s.send(b"y"), Admit::Closed));
         let out = spin(&mut s, Duration::from_secs(1));
-        assert!(out.stopped);
-        assert!(out.datagrams.is_empty());
-        assert!(out.deadline.is_none());
         let again = s.on_timer(Duration::from_secs(2), &mut || 0);
         s.invariants();
-        assert!(again.stopped);
-        assert!(again.datagrams.is_empty());
+        expect![[r#"
+            Output { datagrams: [], messages: [], acks: [], deadline: None, again: false, space: false, wake: false, settled: false, retransmits: 0, stopped: true }
+            Output { datagrams: [], messages: [], acks: [], deadline: None, again: false, space: false, wake: false, settled: false, retransmits: 0, stopped: true }"#]]
+            .assert_eq(&format!("{out:?}\n{again:?}"));
     }
 
     #[test]
     fn a_loss_draw_comes_from_the_caller() {
-        let mut s = ConnState::new(3);
-        s.set_loss(1.0);
-        s.invariants();
-        assert!(matches!(s.send(b"x"), Admit::Queued));
-        let mut draws = 0u32;
-        let out = s.on_timer(Duration::ZERO, &mut || {
-            draws += 1;
-            0
-        });
-        s.invariants();
-        assert_eq!(draws, 1);
-        assert_eq!(out.datagrams.len(), 1);
-        assert!(out.datagrams[0].dropped);
-
-        let mut kept = ConnState::new(3);
-        kept.set_loss(0.5);
-        assert!(matches!(kept.send(b"x"), Admit::Queued));
-        let out = kept.on_timer(Duration::ZERO, &mut || 6_000);
-        kept.invariants();
-        assert!(
-            !out.datagrams[0].dropped,
-            "a draw above the loss fraction is transmitted"
-        );
-
-        let mut quiet = ConnState::new(3);
-        assert!(matches!(quiet.send(b"x"), Admit::Queued));
-        let out = quiet.on_timer(Duration::ZERO, &mut || panic!("no loss fraction, no draw"));
-        assert!(!out.datagrams[0].dropped);
+        let mut trace = Vec::new();
+        for (loss, draw) in [(1.0, 0), (0.5, 6_000), (0.0, 0)] {
+            let mut s = ConnState::new(3);
+            s.set_loss(loss);
+            assert!(matches!(s.send(b"x"), Admit::Queued));
+            let mut draws = 0;
+            let out = s.on_timer(Duration::ZERO, &mut || {
+                draws += 1;
+                draw
+            });
+            s.invariants();
+            let dropped: Vec<_> = out.datagrams.iter().map(|packet| packet.dropped).collect();
+            trace.push(format!("loss={loss}, draws={draws}, dropped={dropped:?}"));
+        }
+        expect![[r#"
+            loss=1, draws=1, dropped=[true]
+            loss=0.5, draws=1, dropped=[false]
+            loss=0, draws=0, dropped=[false]"#]].assert_eq(&trace.join("\n"));
     }
 
     fn payloads(tag: u8) -> Vec<Vec<u8>> {

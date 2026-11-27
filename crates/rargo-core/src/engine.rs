@@ -1,6 +1,6 @@
 use crate::action_table::{ActionTable, Failure, Ran, ReqId, Start, Woken};
 use crate::hash::{Hash, KeyHasher};
-use crate::sandbox::{HostLayout, Place, SetupSpec, Zygote};
+use crate::sandbox::{HostLayout, Launcher, Place, SetupSpec};
 use crate::sandboxfs::{ActionFs, ActionFsConfig, SandboxFs, UpperKind};
 use crate::sched::{Priority, Scheduler};
 use crate::store::Store;
@@ -10,8 +10,8 @@ use crate::fn_code;
 use crate::io;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,13 +50,17 @@ impl Live for LiveCtl<'_> {
 pub type EnvAsker = Arc<dyn Fn(Vec<String>) -> Result<Vec<(String, Option<String>)>> + Send + Sync>;
 
 pub struct ClientEnv {
-    vars: parking_lot::RwLock<HashMap<String, String>>,
-    checked: parking_lot::RwLock<std::collections::HashSet<String>>,
+    vars: parking_lot::RwLock<BTreeMap<String, String>>,
+    checked: parking_lot::RwLock<BTreeSet<String>>,
     asker: Option<EnvAsker>,
 }
 
 impl ClientEnv {
-    pub fn new(vars: HashMap<String, String>, checked: Vec<String>, asker: Option<EnvAsker>) -> ClientEnv {
+    pub fn new(
+        vars: BTreeMap<String, String>,
+        checked: Vec<String>,
+        asker: Option<EnvAsker>,
+    ) -> ClientEnv {
         ClientEnv {
             vars: parking_lot::RwLock::new(vars),
             checked: parking_lot::RwLock::new(checked.into_iter().collect()),
@@ -72,7 +76,7 @@ impl ClientEnv {
         self.vars.read().contains_key(name)
     }
 
-    pub fn to_map(&self) -> HashMap<String, String> {
+    pub fn to_map(&self) -> BTreeMap<String, String> {
         self.vars.read().clone()
     }
 
@@ -175,7 +179,7 @@ pub struct Engine {
     pub content: Arc<Content>,
     pub fs: Arc<SandboxFs>,
     pub mnt: PathBuf,
-    pub zygote: Arc<Zygote>,
+    pub zygote: Arc<dyn Launcher>,
     pub traces: TraceCache,
     pub sched: Arc<Scheduler>,
     actions: Mutex<ActionTable>,
@@ -221,7 +225,7 @@ impl Drop for Requester<'_> {
 struct Teardown {
     fs: Arc<SandboxFs>,
     sched: Arc<Scheduler>,
-    zygote: Arc<Zygote>,
+    zygote: Arc<dyn Launcher>,
     action: Arc<ActionFs>,
     scratch: PathBuf,
     running: Option<crate::sandbox::Running>,
@@ -258,7 +262,7 @@ impl Drop for Teardown {
             io::cpu(move || {
                 let _ = fs.finish_action(&action);
                 drop(group);
-                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = io::file::remove_dir_all(&scratch);
             });
         }));
     }
@@ -289,15 +293,7 @@ fn default_mem_kb(kind: ActionKind) -> u64 {
     }
 }
 
-fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
-fn read_pipe(fd: &OwnedFd) -> std::io::Result<Vec<u8>> {
+fn read_pipe(fd: &io::PipeEnd) -> std::io::Result<Vec<u8>> {
     io::read_at(fd.as_raw_fd(), 0, 64 * 1024)
 }
 
@@ -306,7 +302,7 @@ struct ObsPtr(*const dyn Observer);
 
 unsafe impl Send for ObsPtr {}
 
-fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
+fn read_stdout(fd: io::PipeEnd, obs: ObsPtr) -> Vec<u8> {
     let mut all = Vec::new();
     loop {
         let buf = match read_pipe(&fd) {
@@ -319,7 +315,7 @@ fn read_stdout(fd: OwnedFd, obs: ObsPtr) -> Vec<u8> {
     all
 }
 
-fn read_stderr(fd: OwnedFd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
+fn read_stderr(fd: io::PipeEnd, obs: ObsPtr, action: Arc<ActionFs>, store: Arc<Store>) -> Vec<u8> {
     let mut all = Vec::new();
     let mut at = 0usize;
     loop {
@@ -351,10 +347,10 @@ impl Engine {
         content: Arc<Content>,
         fs: Arc<SandboxFs>,
         mnt: PathBuf,
-        zygote: Arc<Zygote>,
+        zygote: Arc<dyn Launcher>,
         sched: Arc<Scheduler>,
     ) -> Engine {
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let seed = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
         let traces = TraceCache::new(store.db().clone(), seed);
         Engine {
             store,
@@ -586,7 +582,7 @@ impl Engine {
                     Trace {
                         obs,
                         result: (*result).clone(),
-                        created: std::time::SystemTime::now()
+                        created: io::system_now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
@@ -713,12 +709,12 @@ impl Engine {
         });
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
         self.stats.runs_by_kind[spec.kind as usize].fetch_add(1, Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        let started = io::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, &*req.observer);
         drop(permit);
-        self.note_action_wall(started.elapsed());
+        self.note_action_wall(io::now().saturating_duration_since(started));
         static LOG_ACTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *LOG_ACTIONS.get_or_init(|| std::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
+        if *LOG_ACTIONS.get_or_init(|| io::env::var_os("RARGO_LOG_ACTIONS").is_some()) {
             let outcome = match &r {
                 Ok((result, _, tainted, _)) => format!("exit={:?} tainted={tainted}", result.code()),
                 Err(e) => format!("error={e:#}"),
@@ -764,9 +760,9 @@ impl Engine {
         observer: &dyn Observer,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         self.stats.runs.fetch_add(1, Ordering::Relaxed);
-        let started = std::time::Instant::now();
+        let started = io::now();
         let r = self.execute(spec, req.view.clone(), req.uid, req.gid, observer);
-        self.note_action_wall(started.elapsed());
+        self.note_action_wall(io::now().saturating_duration_since(started));
         r
     }
 
@@ -783,7 +779,7 @@ impl Engine {
         observer: &dyn Observer,
     ) -> Result<(ActionResult, Vec<(VPath, Obs)>, bool, Vec<(Vec<u8>, MEntry)>)> {
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let scratch = self.store.tmp_dir(&format!("act-{}-{n}", std::process::id()))?;
+        let scratch = self.store.tmp_dir(&format!("act-{}-{n}", io::process::id()))?;
         let action = self.fs.create_action(ActionFsConfig {
             view,
             uid,
@@ -813,7 +809,7 @@ impl Engine {
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&scratch);
+                let _ = io::file::remove_dir_all(&scratch);
                 return Err(e);
             }
         };
@@ -822,7 +818,6 @@ impl Engine {
         let content = self.content.clone();
         let upper = fin.upper;
         let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
-            use rayon::prelude::*;
             let mut scratch: Vec<(PathBuf, bool)> = upper
                 .iter()
                 .filter_map(|u| match &u.kind {
@@ -832,18 +827,16 @@ impl Engine {
                 .collect();
             scratch.sort();
             scratch.dedup_by(|a, b| a.0 == b.0);
-            let stored: HashMap<PathBuf, (Hash, u64)> = scratch
-                .into_par_iter()
-                .map(|(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
+            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> =
+                io::thread::par_map(scratch, |(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
                     let r = store
                         .put_file_move(&path, exec)
                         .with_context(|| format!("storing output file {}", path.display()))?;
                     Ok((path, r))
-                })
-                .collect::<Result<_>>()?;
-            let entries: Vec<(Vec<u8>, MEntry)> = upper
-                .into_par_iter()
-                .map(|u| -> Result<(Vec<u8>, MEntry)> {
+                });
+            let stored = stored?;
+            let entries: Result<Vec<(Vec<u8>, MEntry)>> =
+                io::thread::par_map(upper, |u| -> Result<(Vec<u8>, MEntry)> {
                     let e = match u.kind {
                         UpperKind::Dir => MEntry::Dir,
                         UpperKind::Whiteout => MEntry::Whiteout,
@@ -862,13 +855,13 @@ impl Engine {
                         }
                     };
                     Ok((u.path, e))
-                })
-                .collect::<Result<_>>()?;
+                });
+            let entries = entries?;
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
         })?;
-        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = io::file::remove_dir_all(&scratch);
 
         let mut entries = entries;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -903,8 +896,8 @@ impl Engine {
         for d in &spec.mkdirs {
             action.mkdir_p(d).map_err(|e| anyhow::anyhow!("creating {}: errno {}", show(d), e.0))?;
         }
-        let (out_r, out_w) = pipe()?;
-        let (err_r, err_w) = pipe()?;
+        let (out_r, out_w) = io::pipe()?;
+        let (err_r, err_w) = io::pipe()?;
         let setup = SetupSpec { argv: spec.argv.clone(), env: spec.env.clone(), cwd: spec.cwd.clone(), net: spec.net };
         let host = HostLayout {
             place: self.place,
@@ -913,7 +906,7 @@ impl Engine {
             cgroup_root: self.cgroup_root.clone(),
             uid,
             gid,
-            caller: unsafe { (libc::getuid(), libc::getgid()) },
+            caller: (io::process::uid(), io::process::gid()),
             flake: false,
             binds: vec![],
         };
@@ -921,7 +914,7 @@ impl Engine {
         *group_slot = plan.cgroup_dir().map(crate::cgroup::ActionGroup::open);
         let group = group_slot.as_ref();
         assert!(slot.is_none(), "one process per action");
-        let running = slot.insert(self.zygote.spawn(plan, None, out_w, err_w, &self.sched.jobserver_fds())?);
+        let running = slot.insert(self.zygote.launch(plan, out_w, err_w, &self.sched.jobserver_fds())?);
         let id = running.id;
         let exit = running.done.take().expect("the exit is waited once");
         let obs = ObsPtr(unsafe {
@@ -993,5 +986,23 @@ impl Engine {
             bail!("could not start `{}`: {}", spec.label, String::from_utf8_lossy(&stderr).trim());
         }
         Ok((info, stdout, stderr))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientEnv;
+
+    #[test]
+    fn client_env_snapshot_is_sorted_by_name() {
+        let env = ClientEnv::new(
+            [("Z".into(), "last".into()), ("A".into(), "first".into())].into(),
+            Vec::new(),
+            None,
+        );
+
+        let snapshot = env.to_map();
+        let entries: Vec<_> = snapshot.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_eq!(entries, [("A", "first"), ("Z", "last")]);
     }
 }

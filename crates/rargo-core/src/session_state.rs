@@ -650,6 +650,8 @@ impl StateMachine for Handshake {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     const SMALL: Sizes = Sizes { part: 4096, batch: 4096, lazy_batch: 2048, lazy_small: 1024 };
 
@@ -672,30 +674,22 @@ mod tests {
     }
 
     #[test]
-    fn the_hello_is_read_in_steps_and_answered() {
-        let magic = b"rargo\x08\r\n";
-        let mut buf = magic.to_vec();
-        assert!(matches!(hello(&buf[..4], magic), Hello::Need(9)));
-        buf.push(3);
-        assert!(matches!(hello(&buf, magic), Hello::Need(14)));
-        buf.extend_from_slice(b"ann");
-        buf.extend_from_slice(&2u16.to_le_bytes());
-        assert!(matches!(hello(&buf, magic), Hello::Need(16)));
-        buf.extend_from_slice(b"hi");
-        match hello(&buf, magic) {
-            Hello::Whole { user, msg1 } => assert_eq!((user.as_str(), msg1.as_slice()), ("ann", &b"hi"[..])),
-            _ => panic!("a whole hello is read"),
+    fn the_hello_is_read_in_steps() {
+        let bytes = a_hello("ann", b"hi");
+        let (mut h, first) = Handshake::new(b"rargo\x08\r\n");
+        let mut outcomes = Transcript::default();
+        outcomes.record("connect", first);
+        for chunk in [&bytes[..4], &bytes[4..9], &bytes[9..14], &bytes[14..]] {
+            outcomes.record("receive", h.received(chunk));
+            h.invariants();
         }
-        let Hello::Foreign(r) = hello(b"GET / HTTP", magic) else { panic!("another protocol is told so") };
-        assert_eq!(r[0], 1);
-        let Hello::Foreign(r) = hello(b"rargo\x07\r\n\x03ann\x02\x00hi", magic) else { panic!("an older client is told so") };
-        let text = String::from_utf8(r[3..].to_vec()).unwrap();
-        assert!(text.starts_with("this rargo is older than the build server") && text.contains("cargo install rargo --version "), "{text}");
-        assert_eq!(welcome(b"xy"), vec![0, 2, 0, b'x', b'y']);
-        assert_eq!(refusal("no"), vec![1, 3, 0, b'n', b'o', b'\n']);
-        let mut bad = magic.to_vec();
-        bad.extend_from_slice(&[1, 0xff, 0, 0]);
-        assert!(matches!(hello(&bad, magic), Hello::BadUser));
+        expect![[r#"
+            connect: Read(9)
+            receive: Read(5)
+            receive: Read(5)
+            receive: Read(2)
+            receive: Check { user: "ann", msg1: [104, 105] }
+        "#]].assert_eq(&outcomes.0);
     }
 
     fn shake_until_check(h: &mut Handshake, mut next: Shake, bytes: &[u8]) -> Shake {
@@ -724,6 +718,7 @@ mod tests {
     #[test]
     fn immediately_older_tcp_hellos_are_read_in_full_before_refusal() {
         use rargo_proto::secure::MAGIC;
+        let mut outcomes = Transcript::default();
         for version in [7, 8, 9] {
             let mut bytes = a_hello("ann", &[42; 48]);
             bytes[5] = version;
@@ -731,24 +726,28 @@ mod tests {
             let Shake::Reply { write, end: Shook::Refused(_) } = shake_until_check(&mut handshake, step, &bytes) else {
                 panic!("the first message must end with a refusal");
             };
-            assert_eq!(write[0], 1);
-            assert_eq!(u16::from_le_bytes([write[1], write[2]]) as usize, write.len() - 3);
-            assert_eq!(std::str::from_utf8(&write[3..]).unwrap().trim(), rargo_proto::protocol_mismatch(version.into()));
+            let message = std::str::from_utf8(&write[3..]).unwrap();
+            assert_eq!(u16::from_le_bytes([write[1], write[2]]) as usize, message.len());
+            let message = message.replace(env!("CARGO_PKG_VERSION"), "<version>");
+            outcomes.record(&format!("protocol {version}"), (write[0], message));
         }
+        expect![[r#"
+            protocol 7: (1, "this rargo is older than the build server, which runs rargo <version>; update it with: cargo install rargo --version <version>; then name the server once more with `rargo @HOST`, as you did before: the new rargo keeps it in your own configuration, not in Cargo.toml\n")
+            protocol 8: (1, "this rargo is older than the build server, which runs rargo <version>; update it with: cargo install rargo --version <version>\n")
+            protocol 9: (1, "this rargo is older than the build server, which runs rargo <version>; update it with: cargo install rargo --version <version>\n")
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn the_handshake_accepts_refuses_and_rejects_early_data_as_steps() {
+        let mut outcomes = Transcript::default();
         let magic = b"rargo\x08\r\n";
         let bytes = a_hello("ann", b"m1");
         let (mut h, first) = Handshake::new(magic);
-        assert_eq!(first, Shake::Read(9));
+        outcomes.record("connect", &first);
         let next = shake_until_check(&mut h, first, &bytes);
-        assert_eq!(next, Shake::Check { user: "ann".into(), msg1: b"m1".to_vec() });
-        assert_eq!(
-            h.checked(Some(Accepted { msg2: b"xy".to_vec(), early: false, admin: true })),
-            Shake::Reply { write: welcome(b"xy"), end: Shook::Accepted { user: "ann".into(), admin: true } }
-        );
+        outcomes.record("hello", next);
+        outcomes.record("checked", h.checked(Some(Accepted { msg2: b"xy".to_vec(), early: false, admin: true })));
         h.invariants();
 
         let (mut h, first) = Handshake::new(magic);
@@ -756,8 +755,8 @@ mod tests {
         let Shake::Reply { write, end: Shook::Refused(why) } = h.checked(None) else {
             panic!("an unknown user is refused")
         };
-        assert_eq!(write, refusal(rargo_proto::REFUSED));
-        assert_eq!(why, "refused `ann`: unknown user or wrong key");
+        outcomes.record("write", write);
+        outcomes.record("why", why);
         h.invariants();
 
         let (mut h, first) = Handshake::new(magic);
@@ -767,78 +766,124 @@ mod tests {
         else {
             panic!("early data ends the link")
         };
-        assert_eq!(write, welcome(b"xy"), "the client is welcomed before the link ends");
-        assert!(why.contains("sent a request with the handshake"));
+        // the client is welcomed before the link ends.
+        outcomes.record("early reply", write);
+        outcomes.record("early refusal", why);
         h.invariants();
 
         let (mut h, _) = Handshake::new(magic);
         let Shake::Reply { write, end: Shook::Refused(why) } = h.received(b"GET / HTT") else {
             panic!("another protocol is told so")
         };
-        assert_eq!(write[0], 1);
-        assert!(why.starts_with("not a rargo client"));
+        outcomes.record("foreign reply", (write[0], std::str::from_utf8(&write[3..]).unwrap()));
+        outcomes.record("foreign refusal", why);
         h.invariants();
 
         let (mut h, _) = Handshake::new(magic);
         let mut bad = magic.to_vec();
         bad.extend_from_slice(&[1, 0xff, 0, 0]);
         let first = h.received(&bad[..9]);
-        assert_eq!(first, Shake::Read(3));
-        assert_eq!(
-            h.received(&bad[9..]),
-            Shake::Reply { write: Vec::new(), end: Shook::Refused("user name is not UTF-8".into()) }
-        );
+        outcomes.record("malformed hello prefix", first);
+        outcomes.record("received", h.received(&bad[9..]));
         h.invariants();
+        expect![[r#"
+            connect: Read(9)
+            hello: Check { user: "ann", msg1: [109, 49] }
+            checked: Reply { write: [0, 2, 0, 120, 121], end: Accepted { user: "ann", admin: true } }
+            write: [1, 70, 0, 116, 104, 101, 32, 115, 101, 114, 118, 101, 114, 32, 100, 111, 101, 115, 32, 110, 111, 116, 32, 107, 110, 111, 119, 32, 116, 104, 105, 115, 32, 116, 111, 107, 101, 110, 44, 32, 111, 114, 32, 105, 116, 32, 119, 97, 115, 32, 114, 101, 118, 111, 107, 101, 100, 32, 111, 114, 32, 104, 97, 115, 32, 101, 120, 112, 105, 114, 101, 100, 10]
+            why: "refused `ann`: unknown user or wrong key"
+            early reply: [0, 2, 0, 120, 121]
+            early refusal: "`ann` sent a request with the handshake, which this protocol version does not do"
+            foreign reply: (1, "this is a rargo build server, and what connected to it is not rargo\n")
+            foreign refusal: "not a rargo client (or a different protocol version)"
+            malformed hello prefix: Read(3)
+            received: Reply { write: [], end: Refused("user name is not UTF-8") }
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn the_window_holds_back_bulk_until_it_is_sent() {
+        let mut outcomes = Transcript::default();
         let mut s = SessionState::with_sizes(SMALL);
-        assert_eq!(s.take_bulk(WINDOW - 10), Ok(true));
-        assert_eq!(s.take_bulk(20), Ok(false));
-        assert_eq!(s.take_bulk(0), Ok(true), "an empty message costs one byte");
+        outcomes.record("take bulk", s.take_bulk(WINDOW - 10));
+        outcomes.record("take bulk", s.take_bulk(20));
+        // an empty message costs one byte.
+        outcomes.record("take bulk", s.take_bulk(0));
         s.sent_bulk(WINDOW - 10);
-        assert_eq!(s.take_bulk(20), Ok(true));
+        outcomes.record("take bulk", s.take_bulk(20));
         s.close_window();
-        assert_eq!(s.take_bulk(1), Err(Gone));
+        outcomes.record("take bulk", s.take_bulk(1));
         s.invariants();
+        expect![[r#"
+            take bulk: Ok(true)
+            take bulk: Ok(false)
+            take bulk: Ok(true)
+            take bulk: Ok(true)
+            take bulk: Err(Gone)
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn answers_go_only_to_the_question_asked() {
+        let mut outcomes = Transcript::default();
         let mut s = SessionState::with_sizes(SMALL);
-        assert_eq!(s.client(ClientMsg::Trees(vec![])).effects, vec![], "nobody asked");
-        assert!(matches!(s.ask(Question::Env(vec!["A".into()])), Ok(ServerMsg::WantEnv(v)) if v == ["A"]));
-        assert_eq!(s.client(ClientMsg::Trees(vec![])).effects, vec![]);
-        assert_eq!(s.client(ClientMsg::Env(vec![])).effects, vec![Effect::Answer(Answer::Env(vec![]))]);
-        assert_eq!(s.client(ClientMsg::Env(vec![])).effects, vec![], "a duplicate answer is dropped");
-        assert_eq!(s.client(ClientMsg::Ping(1)).refused, Some(UNEXPECTED));
+        // nobody asked.
+        outcomes.record("client", s.client(ClientMsg::Trees(vec![])).effects);
+        outcomes.record("ask", s.ask(Question::Env(vec!["A".into()])));
+        outcomes.record("client", s.client(ClientMsg::Trees(vec![])).effects);
+        outcomes.record("client", s.client(ClientMsg::Env(vec![])).effects);
+        // a duplicate answer is dropped.
+        outcomes.record("client", s.client(ClientMsg::Env(vec![])).effects);
+        outcomes.record("client", s.client(ClientMsg::Ping(1)).refused);
         s.close();
-        assert!(s.ask(Question::Trees(vec![])).is_err());
+        outcomes.record("ask after close", s.ask(Question::Trees(vec![])));
         s.invariants();
+        expect![[r#"
+            client: []
+            ask: Ok(WantEnv(["A"]))
+            client: []
+            client: [Answer(Env([]))]
+            client: []
+            client: Some("unexpected message from the client")
+            ask after close: Err(Gone)
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_blob_whose_content_is_not_its_hash_is_refused() {
+        let mut outcomes = Transcript::default();
         let mut s = SessionState::with_sizes(SMALL);
         let good = content(5);
         let mut bad = Blob::pack(digest(&good), &good);
         bad.hash = digest(b"other");
         let step = s.client(ClientMsg::Blobs(vec![Blob::pack(digest(&good), &good), bad]));
-        assert_eq!(step.refused, Some(MISMATCH));
-        assert!(matches!(&step.effects[0], Effect::Store { hash, .. } if *hash == digest(&good)));
+        outcomes.record("refused", step.refused);
+        let Effect::Store { hash, bytes } = &step.effects[0] else { panic!("a valid blob is stored") };
+        outcomes.record("store", (Hash(*hash), bytes.len()));
         let big = content(1);
         let half = big.len() / 2;
         s.client(ClientMsg::BlobPart { hash: digest(b"x"), part: Part::pack(big[..half].to_vec()), last: false });
         let step =
             s.client(ClientMsg::BlobPart { hash: digest(b"x"), part: Part::pack(big[half..].to_vec()), last: true });
-        assert_eq!(step.refused, Some(MISMATCH));
-        assert_eq!(step.effects.last(), Some(&Effect::PartDrop(digest(b"x"))));
-        assert!(s.parts.is_empty());
+        outcomes.record("refused", step.refused);
+        let dropped = step.effects.last().map(|e| match e {
+            Effect::PartDrop(hash) => Hash(*hash),
+            other => panic!("expected a dropped upload, got {other:?}"),
+        });
+        outcomes.record("drop", dropped);
+        outcomes.record("remaining uploads", s.parts.len());
+        expect![[r#"
+            refused: Some("the client sent content that does not match its hash")
+            store: (3ad5d0b3ef113e6a, 986)
+            refused: Some("the client sent content that does not match its hash")
+            drop: Some(3ae7d805f6789a64)
+            remaining uploads: 0
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_delivery_sends_whole_blobs_in_batches_and_big_ones_in_parts() {
+        let mut outcomes = Transcript::default();
         let (small, big) = (content(5), content(0));
         let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
@@ -857,19 +902,26 @@ mod tests {
                 n => panic!("{n:?}"),
             }
         }
-        assert_eq!(
-            seen,
-            ["send deliver", "bulk part", "bulk part", "bulk last part", "bulk blobs 1", "send delivered"],
-            "the big blob goes in parts as it is read; the small ones wait for a batch"
-        );
-        assert!(
-            s.deliver(&mut has, vec![delivery(&small)], vec![], vec![]).is_some_and(|mut o| {
-                let first = o.step();
-                matches!(first, Next::Send(ServerMsg::Deliver { .. }))
-                    && matches!(o.step(), Next::Send(ServerMsg::Delivered { .. }))
-            }),
-            "the same delivery again pushes nothing"
-        );
+        // the big blob goes in parts as it is read; the small ones wait for a batch.
+        outcomes.record("delivery effects", seen);
+        let mut repeat = s.deliver(&mut has, vec![delivery(&small)], vec![], vec![]).unwrap();
+        outcomes.record("repeat delivery", [next_effect(repeat.step()), next_effect(repeat.step())]);
+        expect![[r#"
+            delivery effects: ["send deliver", "bulk part", "bulk part", "bulk last part", "bulk blobs 1", "send delivered"]
+            repeat delivery: ["send deliver", "send delivered"]
+        "#]].assert_eq(&outcomes.0);
+    }
+
+    fn next_effect(next: Next) -> String {
+        match next {
+            Next::Read { hash, at, len, whole } => {
+                format!("read {} at {at} for {len} bytes (whole={whole})", Hash(hash))
+            }
+            Next::Unreadable(hash) => format!("unreadable {}", Hash(hash)),
+            Next::Send(msg) => format!("send {}", name(&msg)),
+            Next::Bulk(msg) => format!("bulk {}", name(&msg)),
+            other => format!("{other:?}"),
+        }
     }
 
     fn name(m: &ServerMsg) -> String {
@@ -885,34 +937,47 @@ mod tests {
 
     #[test]
     fn a_client_that_has_not_said_what_it_has_gets_nothing_pushed_and_a_lazy_one_gets_small_blobs() {
+        let mut outcomes = Transcript::default();
         let (small, mid) = (content(5), content(2));
         let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
         let mut out = s.deliver(&mut has, vec![delivery(&small)], vec![], vec![]).unwrap();
-        assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
-        assert!(matches!(out.step(), Next::Send(ServerMsg::Delivered { .. })));
+        outcomes.record("next effect", next_effect(out.step()));
+        outcomes.record("next effect", next_effect(out.step()));
         let mut lazy = SessionState::with_sizes(SMALL);
         lazy.set_lazy();
         let mut has = ClientSet::default();
         let mut out = lazy.deliver(&mut has, vec![delivery(&small), delivery(&mid)], vec![], vec![]).unwrap();
-        assert!(matches!(out.step(), Next::Send(ServerMsg::Deliver { .. })));
-        assert!(matches!(out.step(), Next::Read { hash, .. } if hash == digest(&small)));
+        outcomes.record("next effect", next_effect(out.step()));
+        outcomes.record("next effect", next_effect(out.step()));
         out.read(None);
-        assert!(
-            matches!(out.step(), Next::Send(ServerMsg::Delivered { .. })),
-            "an unreadable small blob is left to a fetch"
-        );
+        // an unreadable small blob is left to a fetch.
+        outcomes.record("next effect", next_effect(out.step()));
+        expect![[r#"
+            next effect: "send deliver"
+            next effect: "send delivered"
+            next effect: "send deliver"
+            next effect: "read 3ad5d0b3ef113e6aded9f8a9121ed499f944a2bd3b735dc4181fb485fb126aab at 0 for 986 bytes (whole=true)"
+            next effect: "send delivered"
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_fetch_ends_with_fetched_even_when_it_fails() {
+        let mut outcomes = Transcript::default();
         let mut s = SessionState::with_sizes(SMALL);
         let mut has = ClientSet::default();
         let mut out = s.fetch(&mut has, 7, vec![(digest(b"a"), Some(1)), (digest(b"gone"), None)]);
-        assert!(matches!(out.step(), Next::Read { .. }));
+        outcomes.record("next effect", next_effect(out.step()));
         out.read(None);
-        assert!(matches!(out.step(), Next::Unreadable(h) if h == digest(b"a")));
-        assert!(matches!(out.abort(), Some(ServerMsg::Fetched { id: 7 })), "and the client is told");
+        outcomes.record("next effect", next_effect(out.step()));
+        // and the client is told.
+        outcomes.record("abort", out.abort());
+        expect![[r#"
+            next effect: "read 17762fddd969a453925d65717ac3eea21320b66b54342fde15128d6caf21215f at 0 for 1 bytes (whole=true)"
+            next effect: "unreadable 17762fddd969a453925d65717ac3eea21320b66b54342fde15128d6caf21215f"
+            abort: Some(Fetched { id: 7 })
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

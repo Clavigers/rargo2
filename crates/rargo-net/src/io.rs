@@ -2,13 +2,17 @@
 mod fiber;
 pub mod file;
 mod fs;
+pub mod env;
 mod fuse;
 mod net;
 mod ops;
+mod pipe;
 mod pool;
-mod process;
+pub mod process;
+mod random;
 mod ring;
 mod signal;
+pub mod sim;
 mod sync;
 mod task;
 
@@ -17,10 +21,13 @@ pub use fuse::FuseDrive;
 pub use fiber::{drive, loop_running, on_fiber};
 pub use fs::{close_fd, fsync_fd, open_at, read_at, read_ready, rename_at, stat_at, try_read, write_at};
 pub use process::{output, wait_exit, wait_exited};
+pub use pipe::{pipe, queued, write_now, PipeEnd};
+pub use random::{os_random, seeded_random};
 pub use net::{lookup_host, recv_fds, send_fds, ReadHalf, TcpListener, TcpStream, UdpSocket, UnixListener, UnixStream, WriteHalf};
+pub use sim::{now, random, system_now};
 pub use signal::{signal, Signal, SignalKind};
 pub use sync::{oneshot, unbounded_channel, watch, Mutex, MutexGuard, Notify, Permit, RecvError, Semaphore, UnboundedReceiver, UnboundedSender};
-pub use task::{background, blocking, call, spawn_off, cpu, interval, race_biased, sleep, spawn, timeout, yield_now, AbortHandle, Elapsed, Interval, JoinError, JoinHandle};
+pub use task::{background, blocking, call, spawn_off, cpu, interval, on_this_thread, race_biased, sleep, spawn, timeout, within, yield_now, AbortHandle, Elapsed, Interval, JoinError, JoinHandle};
 
 use std::io;
 

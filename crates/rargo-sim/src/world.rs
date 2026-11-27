@@ -1,5 +1,10 @@
+use crate::transport::{self, Side};
+use rargo_net::sans_io::{EndpointState, LinkKey, RouteEvent};
+use serde::{Deserialize, Serialize};
+use core::net::SocketAddr;
 use rargo_machine::StateMachine;
 use crate::model::{self, Project};
+use crate::workspace::Workspace;
 use crate::rng::Rng;
 use crate::nextest::{Outcome, TestRun};
 use rargo_core::build::nextest_run::Phase;
@@ -24,18 +29,7 @@ const SERVER_MEM_KB: u64 = 16 * 1024;
 const WATCH_STEP_MS: u64 = 200;
 /// Seeds the network faults' streams, apart from the one that drives the rest of the world.
 const NET_STREAM: u64 = 0x6e65_7477_6f72_6b21;
-/// The first retransmission timeout of a lost packet, as Linux's TCP_RTO_MIN; it doubles on each loss.
-const RTO_MS: u64 = 200;
-/// Losses in a row before a packet gets through; at the rates a seed picks, more never happens.
-const MAX_RETRIES: u32 = 5;
-
-/// The receiving end of one connection: what TCP does under the messages, so that the network may lose,
-/// duplicate and reorder packets while each connection still hands its messages over once and in order.
-#[derive(Default)]
-struct Rx {
-    next: u64,
-    held: BTreeMap<u64, Msg>,
-}
+const WORKSPACE_STREAM: u64 = 0x776f_726b_7370_6163;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bug {
@@ -45,11 +39,19 @@ pub enum Bug {
     EvictClaimed,
     StaleKnowledge,
     DeafToSilence,
+    TrustAfterCrash,
 }
 
 impl Bug {
-    pub const ALL: [Bug; 6] =
-        [Bug::EvictPinned, Bug::StaleDelivery, Bug::NeverAnswer, Bug::EvictClaimed, Bug::StaleKnowledge, Bug::DeafToSilence];
+    pub const ALL: [Bug; 7] = [
+        Bug::EvictPinned,
+        Bug::StaleDelivery,
+        Bug::NeverAnswer,
+        Bug::EvictClaimed,
+        Bug::StaleKnowledge,
+        Bug::DeafToSilence,
+        Bug::TrustAfterCrash,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -59,6 +61,7 @@ impl Bug {
             Bug::EvictClaimed => "evict-claimed",
             Bug::StaleKnowledge => "stale-knowledge",
             Bug::DeafToSilence => "deaf-to-silence",
+            Bug::TrustAfterCrash => "trust-after-crash",
         }
     }
 
@@ -202,9 +205,11 @@ pub struct Report {
     pub wants: u64,
     pub client_cuts: u64,
     pub silences: u64,
+    pub crashes: u64,
     pub lost: u64,
     pub duplicated: u64,
     pub reordered: u64,
+    pub retransmits: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -212,16 +217,16 @@ pub struct Config {
     pub workers: u64,
     pub clients: u64,
     pub sources: usize,
-    pub actions: usize,
     pub rounds: u64,
     pub fault_end_ms: u64,
     pub cut_per_mille: u64,
     pub max_latency_ms: u64,
     pub client_cuts: u64,
+    pub crashes: u64,
     pub net: Net,
 }
 
-/// How often, per mille of messages, the network loses, duplicates and reorders until `fault_end_ms`.
+/// How often, per mille of datagrams, the network loses, duplicates and reorders until `fault_end_ms`.
 #[derive(Clone, Debug)]
 pub struct Net {
     pub loss_per_mille: u64,
@@ -241,7 +246,7 @@ impl Net {
 }
 
 impl Config {
-    pub fn of(rng: &mut Rng, net: Net) -> Config {
+    pub fn of(rng: &mut Rng, net: Net, sources: usize) -> Config {
         let workers = rng.range(1, 4);
         let client_roll = rng.next_u64();
         // One seed in 128 exercises a crowd. Use the same draw for small worlds
@@ -254,13 +259,13 @@ impl Config {
         Config {
             workers,
             clients,
-            sources: rng.range(3, 10) as usize,
-            actions: rng.range(4, 24) as usize,
+            sources,
             rounds: rng.range(1, 3),
             fault_end_ms: rng.range(0, 8_000),
             cut_per_mille: rng.range(0, 30),
             max_latency_ms: rng.range(1, 60),
             client_cuts: rng.range(0, 3),
+            crashes: rng.range(0, 2),
             net,
         }
     }
@@ -269,7 +274,7 @@ impl Config {
 #[derive(Debug)]
 pub struct Sim;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SimRun {
     action: usize,
     inputs: Vec<Hash>,
@@ -289,7 +294,7 @@ enum Node {
     Client(u64),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Up {
     Hello { cores: usize },
     Result { job: u64, output: Vec<u8> },
@@ -300,60 +305,54 @@ enum Up {
     Ping,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Down {
     Session(ServerMsg),
     Synced { round: u64, root: Digest },
     Pong,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 enum Msg {
     Up(Up),
     Work(FromServer<Sim>),
     Down(Down),
 }
 
-impl Msg {
-    /// The copy a duplicating network delivers; the worker's messages are not `Clone` in `rargo-core`.
-    fn copy(&self) -> Msg {
-        match self {
-            Msg::Up(u) => Msg::Up(u.clone()),
-            Msg::Down(d) => Msg::Down(d.clone()),
-            Msg::Work(w) => Msg::Work(match w {
-                FromServer::Welcome => FromServer::Welcome,
-                FromServer::Ask { rid, serve } => FromServer::Ask { rid: *rid, serve: *serve },
-                FromServer::Push { blob, first, of, part } => {
-                    FromServer::Push { blob: *blob, first: *first, of: *of, part: part.clone() }
-                }
-                FromServer::Run(r) => FromServer::Run(worker_state::Run {
-                    action: r.action,
-                    incoming: r.incoming.clone(),
-                    prefill: r.prefill.clone(),
-                    listings: r.listings.clone(),
-                    closed: r.closed.clone(),
-                    run: r.run.clone(),
-                }),
-                FromServer::Cancel { action } => FromServer::Cancel { action: *action },
-                FromServer::Other => FromServer::Other,
-            }),
-        }
-    }
+struct Connection {
+    id: u64,
+    endpoint: EndpointState,
+    sides: [Option<Side>; 2],
+    wakes: [Option<u64>; 2],
+}
+
+fn addr(node: Node) -> SocketAddr {
+    let (kind, id) = match node {
+        Node::Server => (0, 0),
+        Node::Worker(id) => (1, id),
+        Node::Client(id) => (2, id),
+    };
+    SocketAddr::from((core::net::Ipv6Addr::from((kind << 64) | u128::from(id)), 1))
 }
 
 #[derive(Debug)]
 enum Ev {
-    Deliver { from: Node, to: Node, epoch: u64, n: u64, msg: Msg },
+    Datagram { peer: Node, to_server: bool, id: u64, bytes: Vec<u8> },
+    LinkTimer { peer: Node, server: bool, id: u64 },
     Connect { worker: u64, epoch: u64 },
     Finish { worker: u64, epoch: u64, token: u64 },
     Crash { worker: u64 },
     Cut { worker: u64 },
     Evict,
     Round { client: u64 },
+    Edit { client: u64 },
+    Checkout { client: u64, round: u64 },
     TestComplete { client: u64, key: String, started_ms: u64 },
     Sync { client: u64 },
     ClientCut { client: u64 },
     Watch { client: u64 },
+    ClientCrash { client: u64 },
+    Restart { client: u64 },
 }
 
 struct WorkerNode {
@@ -407,7 +406,13 @@ struct Server {
 struct Client {
     round: u64,
     rounds_left: u64,
-    versions: Vec<u64>,
+    tree: Vec<Option<Vec<u8>>>,
+    // Reconnects and later actions in this round still read the original tree.
+    snapshot: Vec<Option<Vec<u8>>>,
+    reference: Vec<Vec<u8>>,
+    edits: Rng,
+    edit_scheduled: bool,
+    checkout_seed: Option<u64>,
     outputs: BTreeMap<usize, Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
@@ -423,6 +428,23 @@ struct Client {
     synced_round: u64,
     watch: Watch,
     up_since: u64,
+    dead: bool,
+    saved: Vec<u8>,
+}
+
+impl Client {
+    fn edit(&mut self) {
+        let index = self.edits.below(self.tree.len() as u64) as usize;
+        let slot = &mut self.tree[index];
+        if slot.is_some() && self.edits.chance(500) {
+            *slot = None;
+        } else {
+            // Revisiting earlier contents exercises cache hits and re-uploads after eviction.
+            let original = model::source(index, 0);
+            let version = slot.as_ref().map_or_else(|| self.edits.below(2), |bytes| u64::from(*bytes == original));
+            *slot = Some(if version == 0 { original } else { model::source(index, version) });
+        }
+    }
 }
 
 pub struct World {
@@ -432,13 +454,15 @@ pub struct World {
     cfg: Config,
     rng: Rng,
     net: [Rng; 3],
-    tx: BTreeMap<(Node, Node, u64), u64>,
-    rx: BTreeMap<(Node, Node, u64), Rx>,
+    connections: BTreeMap<Node, Connection>,
+    server_endpoint: EndpointState,
+    link_key: LinkKey,
+    next_conn: u64,
     now: u64,
     seq: u64,
     queue: BTreeMap<(u64, u64), Ev>,
     busy: usize,
-    last: BTreeMap<(Node, Node), u64>,
+    last: BTreeMap<(Node, bool), u64>,
     project: Project,
     server: Server,
     workers: BTreeMap<u64, WorkerNode>,
@@ -450,20 +474,29 @@ pub struct World {
 
 type Step = Result<(), Kind>;
 
+fn link_error(error: std::io::Error) -> Kind {
+    Kind::StateMachine(format!("UDP link: {error}"))
+}
+
 impl World {
     pub fn new(seed: u64, bug: Option<Bug>, off: Off) -> World {
         let mut rng = Rng::new(seed);
         let mut net = Fault::ALL.map(|f| Rng::new(seed ^ NET_STREAM ^ f as u64));
-        let cfg = Config::of(&mut rng, Net::of(&mut net, &off));
-        let project = Project::generate(&mut rng, cfg.sources, cfg.actions);
+        let mut plan_rng = Rng::new(seed ^ WORKSPACE_STREAM);
+        let workspace = Workspace::generate(&mut plan_rng);
+        let project = Project::plan(&mut plan_rng, &workspace);
+        let cfg = Config::of(&mut rng, Net::of(&mut net, &off), project.sources);
+        let link_key = transport::key();
         let mut w = World {
             seed,
             bug,
             off,
             rng,
             net,
-            tx: BTreeMap::new(),
-            rx: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            server_endpoint: EndpointState::new(true, false, link_key.clone()),
+            link_key,
+            next_conn: 1,
             now: 0,
             seq: 0,
             queue: BTreeMap::new(),
@@ -503,9 +536,11 @@ impl World {
                 wants: 0,
                 client_cuts: 0,
                 silences: 0,
+                crashes: 0,
                 lost: 0,
                 duplicated: 0,
                 reordered: 0,
+                retransmits: 0,
             },
             trace: Vec::new(),
             silence: None,
@@ -522,21 +557,22 @@ impl World {
             w.worker_effects(id, fx).expect("a new worker only connects");
         }
         for id in 1..=w.cfg.clients {
-            let versions = vec![0; w.cfg.sources];
-            let mut daemon = DaemonState::new(KnownDigests::default());
-            daemon.added(1);
-            daemon.watched(1, true);
             w.clients.insert(
                 id,
                 Client {
                     round: 0,
                     rounds_left: w.cfg.rounds,
-                    versions,
+                    tree: (0..w.cfg.sources).map(|s| Some(model::source(s, 0))).collect(),
+                    snapshot: Vec::new(),
+                    reference: Vec::new(),
+                    edits: Rng::new(seed ^ id.wrapping_mul(0x912a_e043_5b7d_68f1)),
+                    edit_scheduled: false,
+                    checkout_seed: Some(seed ^ id.wrapping_mul(0x5cab_f0e9_d1b2_7431)),
                     outputs: BTreeMap::new(),
                     requested: BTreeSet::new(),
                     finished: false,
                     test: None,
-                    daemon,
+                    daemon: new_daemon(KnownDigests::default()),
                     up: false,
                     epoch: 0,
                     cut_until: 0,
@@ -547,6 +583,8 @@ impl World {
                     synced_round: 0,
                     watch: Watch::new(Duration::ZERO, link_watch::SILENT_AFTER),
                     up_since: 0,
+                    dead: false,
+                    saved: Vec::new(),
                 },
             );
             let at = w.rng.range(0, 500);
@@ -564,6 +602,11 @@ impl World {
                 let client = w.rng.range(1, w.cfg.clients);
                 let at = w.rng.range(0, w.cfg.fault_end_ms);
                 w.schedule(at, Ev::ClientCut { client });
+            }
+            for _ in 0..w.cfg.crashes {
+                let client = w.rng.range(1, w.cfg.clients);
+                let at = w.rng.range(0, w.cfg.fault_end_ms);
+                w.schedule(at, Ev::ClientCrash { client });
             }
             if w.rng.chance(300) {
                 let start = w.rng.range(0, w.cfg.fault_end_ms);
@@ -586,54 +629,93 @@ impl World {
         self.queue.insert((self.now + after_ms, self.seq), ev);
     }
 
-    fn send(&mut self, from: Node, to: Node, msg: Msg) {
-        let epoch = match (from, to) {
-            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].epoch,
-            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].epoch,
-            _ => 0,
-        };
-        let latency = self.rng.range(1, self.cfg.max_latency_ms);
-        let in_order = (self.now + latency).max(self.last.get(&(from, to)).copied().unwrap_or(0));
-        let seq = self.tx.entry((from, to, epoch)).or_default();
-        let n = *seq;
-        *seq += 1;
-        let net = self.cfg.net.clone();
-        let faulty = self.now < self.cfg.fault_end_ms;
-        let max_latency = self.cfg.max_latency_ms;
-        let [loss, dup, reorder] = &mut self.net;
-        let mut stall = 0;
-        let mut rto = RTO_MS;
-        for _ in 0..MAX_RETRIES {
-            if !(loss.chance(net.loss_per_mille) && faulty) {
-                break;
-            }
-            self.report.lost += 1;
-            stall += rto;
-            rto *= 2;
+    fn open_link(&mut self, peer: Node) -> Step {
+        let id = self.next_conn;
+        self.next_conn += 1;
+        let mut endpoint = EndpointState::new(false, false, self.link_key.clone());
+        assert!(endpoint.connect(id, addr(Node::Server), self.now));
+        let initiator = Side::new(id, true, self.now).map_err(link_error)?;
+        let connection = Connection { id, endpoint, sides: [Some(initiator), None], wakes: [None; 2] };
+        assert!(self.connections.insert(peer, connection).is_none());
+        self.wake_link(peer, false, self.now);
+        Ok(())
+    }
+
+    fn close_link(&mut self, peer: Node) {
+        if let Some(link) = self.connections.remove(&peer) {
+            self.server_endpoint.forget(link.id);
         }
+        self.last.remove(&(peer, false));
+        self.last.remove(&(peer, true));
+    }
+
+    fn wake_link(&mut self, peer: Node, server: bool, at: u64) {
+        let link = self.connections.get_mut(&peer).expect("a live link");
+        let wake = &mut link.wakes[usize::from(server)];
+        if wake.is_some_and(|current| current <= at) {
+            return;
+        }
+        *wake = Some(at);
+        let id = link.id;
+        self.schedule(at - self.now, Ev::LinkTimer { peer, server, id });
+    }
+
+    fn send(&mut self, from: Node, to: Node, msg: Msg) {
+        let server = from == Node::Server;
+        let peer = if server { to } else { from };
+        let link = self.connections.get_mut(&peer).expect("a live link");
+        link.sides[usize::from(server)].as_mut().expect("a local link side").send(rargo_proto::encode(&msg));
+        self.wake_link(peer, server, self.now);
+    }
+
+    fn transmit(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) {
+        let latency = self.rng.range(1, self.cfg.max_latency_ms);
+        let max_latency = self.cfg.max_latency_ms;
+        let net = &self.cfg.net;
+        let faulty = self.now < self.cfg.fault_end_ms;
+        let [loss, dup, reorder] = &mut self.net;
+        let lost = loss.chance(net.loss_per_mille) && faulty;
         let copy_after = dup.range(1, 4 * max_latency);
         let duplicate = dup.chance(net.duplicate_per_mille) && faulty;
         let early = reorder.range(1, max_latency);
         let reordered = reorder.chance(net.reorder_per_mille) && faulty;
-        let at = if reordered {
+        if lost {
+            self.report.lost += 1;
+            return;
+        }
+        let after = if reordered {
             self.report.reordered += 1;
-            self.now + early + stall
-        } else if stall > 0 {
-            in_order + stall
+            early
         } else {
-            self.last.insert((from, to), in_order);
-            in_order
+            let last = self.last.entry((peer, to_server)).or_default();
+            *last = (*last).max(self.now + latency);
+            *last - self.now
         };
         if duplicate {
             self.report.duplicated += 1;
-            let copy = msg.copy();
-            self.busy += 1;
-            self.seq += 1;
-            self.queue.insert((at + copy_after, self.seq), Ev::Deliver { from, to, epoch, n, msg: copy });
+            self.schedule(after + copy_after, Ev::Datagram { peer, to_server, id, bytes: bytes.clone() });
         }
-        self.busy += 1;
-        self.seq += 1;
-        self.queue.insert((at, self.seq), Ev::Deliver { from, to, epoch, n, msg });
+        self.schedule(after, Ev::Datagram { peer, to_server, id, bytes });
+    }
+
+    fn link_timer(&mut self, peer: Node, server: bool, id: u64) -> Step {
+        let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        let side = usize::from(server);
+        if link.wakes[side] != Some(self.now) {
+            return Ok(());
+        }
+        link.wakes[side] = None;
+        let mut effects = transport::Effects::default();
+        link.sides[side].as_mut().expect("a local link side")
+            .drive(&self.link_key, self.now, &mut effects).map_err(link_error)?;
+        self.report.retransmits += effects.retransmits;
+        for packet in effects.packets {
+            self.transmit(peer, !server, id, packet);
+        }
+        if let Some(at) = effects.wake {
+            self.wake_link(peer, server, at);
+        }
+        Ok(())
     }
 
     fn finished(&self) -> bool {
@@ -758,7 +840,8 @@ impl World {
 
     fn step(&mut self, ev: Ev) -> Step {
         match ev {
-            Ev::Deliver { from, to, epoch, n, msg } => self.arrive(from, to, epoch, n, msg),
+            Ev::Datagram { peer, to_server, id, bytes } => self.arrive(peer, to_server, id, bytes),
+            Ev::LinkTimer { peer, server, id } => self.link_timer(peer, server, id),
             Ev::Connect { worker, epoch } => self.connect(worker, epoch),
             Ev::Finish { worker, epoch, token } => self.finish(worker, epoch, token),
             Ev::Crash { worker } => self.crash(worker),
@@ -768,6 +851,11 @@ impl World {
                 Ok(())
             }
             Ev::Round { client } => self.round(client),
+            Ev::Edit { client } => {
+                self.clients.get_mut(&client).expect("known").edit();
+                Ok(())
+            }
+            Ev::Checkout { client, round } => self.checkout(client, round),
             Ev::TestComplete { client, key, started_ms } => {
                 self.test_complete(client, &key, started_ms);
                 Ok(())
@@ -778,42 +866,52 @@ impl World {
                 Ok(())
             }
             Ev::Watch { client } => self.watch(client),
+            Ev::ClientCrash { client } => {
+                self.client_crash(client);
+                Ok(())
+            }
+            Ev::Restart { client } => self.restart(client),
         }
     }
 
-    fn arrive(&mut self, from: Node, to: Node, epoch: u64, n: u64, msg: Msg) -> Step {
-        if !self.open(from, to, epoch) {
-            self.rx.remove(&(from, to, epoch));
+    fn arrive(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) -> Step {
+        let silence = self.silent_at(self.now);
+        let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        // The silence fault stalls an established client session. Let agreement run so that
+        // the application-level watch can still observe silence on newly connected sessions.
+        if let Some((_, end)) = silence
+            && matches!(peer, Node::Client(_))
+            && link.sides.iter().all(|side| side.as_ref().is_some_and(Side::agreed))
+        {
+            self.schedule(end - self.now, Ev::Datagram { peer, to_server, id, bytes });
             return Ok(());
         }
-        if self.silent_at(self.now).is_some() && matches!((from, to), (Node::Client(_), _) | (_, Node::Client(_))) {
-            let (_, end) = self.silent_at(self.now).expect("checked");
-            self.schedule(end - self.now, Ev::Deliver { from, to, epoch, n, msg });
-            return Ok(());
-        }
-        let rx = self.rx.entry((from, to, epoch)).or_default();
-        if n < rx.next || rx.held.contains_key(&n) {
-            return Ok(());
-        }
-        rx.held.insert(n, msg);
-        loop {
-            let rx = self.rx.entry((from, to, epoch)).or_default();
-            let next = rx.next;
-            let Some(msg) = rx.held.remove(&next) else { return Ok(()) };
-            rx.next += 1;
-            if !self.open(from, to, epoch) {
-                return Ok(());
+        let (from, to) = if to_server { (peer, Node::Server) } else { (Node::Server, peer) };
+        let from_addr = addr(from);
+        let endpoint = if to_server { &mut self.server_endpoint } else { &mut link.endpoint };
+        let side = &mut link.sides[usize::from(to_server)];
+        let mut effects = transport::Effects::default();
+        for event in endpoint.recv(from_addr, &bytes, self.now).events {
+            if matches!(event, RouteEvent::Open { .. }) {
+                assert!(to_server && side.is_none());
+                *side = Some(Side::new(id, false, self.now).map_err(link_error)?);
             }
+            side.as_mut().expect("the endpoint opened the link")
+                .route(endpoint, event, from_addr, self.now, &mut effects).map_err(link_error)?;
+        }
+        let acks = endpoint.take_datagrams();
+        for (dest, ack) in acks {
+            assert_eq!(dest, from_addr);
+            self.transmit(peer, !to_server, id, ack);
+        }
+        if self.connections[&peer].sides[usize::from(to_server)].is_some() {
+            self.wake_link(peer, to_server, self.now);
+        }
+        for bytes in effects.messages {
+            let msg = rargo_proto::decode(&bytes).map_err(link_error)?;
             self.deliver(from, to, msg)?;
         }
-    }
-
-    fn open(&self, from: Node, to: Node, epoch: u64) -> bool {
-        match (from, to) {
-            (Node::Worker(w), _) | (_, Node::Worker(w)) => self.workers[&w].up && self.workers[&w].epoch == epoch,
-            (Node::Client(c), _) | (_, Node::Client(c)) => self.clients[&c].up && self.clients[&c].epoch == epoch,
-            _ => true,
-        }
+        Ok(())
     }
 
     fn deliver(&mut self, from: Node, to: Node, msg: Msg) -> Step {
@@ -822,6 +920,9 @@ impl World {
             _ => None,
         };
         if let Node::Client(c) = to {
+            if self.clients[&c].dead {
+                return Ok(());
+            }
             let now = Duration::from_millis(self.now);
             self.clients.get_mut(&c).expect("known").watch.heard(now);
         }
@@ -855,7 +956,9 @@ impl World {
         } else {
             node.up = true;
             node.epoch += 1;
-            node.sm.connected()
+            let fx = node.sm.connected();
+            self.open_link(Node::Worker(worker))?;
+            fx
         };
         self.worker_effects(worker, fx)
     }
@@ -876,6 +979,7 @@ impl World {
         node.up = false;
         node.epoch += 1;
         let fx = node.sm.link_lost();
+        self.close_link(Node::Worker(worker));
         self.worker_effects(worker, fx)?;
         let lost = self.server.pool.left(worker);
         self.pool_effects(lost);
@@ -897,6 +1001,7 @@ impl World {
         node.up = false;
         node.epoch += 1;
         self.report.worker_crashes += 1;
+        self.close_link(Node::Worker(worker));
 
         let lost = self.server.pool.left(worker);
         self.report.jobs_lost_to_crashes += lost
@@ -1306,24 +1411,32 @@ impl World {
         }
     }
 
-    fn inputs_of(&self, client: &Client, action: usize) -> Vec<Vec<u8>> {
-        let a = &self.project.actions[action];
-        let mut inputs: Vec<Vec<u8>> = a.sources.iter().map(|&s| model::source(s, client.versions[s])).collect();
-        inputs.extend(a.deps.iter().map(|d| client.outputs[d].clone()));
-        inputs
-    }
-
     fn round(&mut self, client: u64) -> Step {
         let c = self.clients.get_mut(&client).expect("known");
-        c.round += 1;
         c.rounds_left -= 1;
-        c.test = TestRun::generate(self.seed, client, c.round);
-        if c.round > 1 {
-            for _ in 0..self.rng.range(1, 3) {
-                let s = self.rng.below(self.cfg.sources as u64) as usize;
-                c.versions[s] = self.rng.range(0, 2);
-            }
+        c.test = TestRun::generate(self.seed, client, self.cfg.rounds - c.rounds_left);
+        self.build_snapshot(client)
+    }
+
+    fn checkout(&mut self, client: u64, round: u64) -> Step {
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.round != round || c.outputs.len() == self.project.actions.len() {
+            return Ok(());
         }
+        // Versions 0 and 1 are used by single-file edits on the original branch.
+        let mut rng = Rng::new(c.checkout_seed.take().expect("checkout scheduled once"));
+        c.tree = (0..c.tree.len()).map(|index| Some(model::source(index, rng.range(2, 16)))).collect();
+        self.build_snapshot(client)
+    }
+
+    fn build_snapshot(&mut self, client: u64) -> Step {
+        let c = self.clients.get_mut(&client).expect("known");
+        // Old jobs keep their round ID even if they finish after the checkout.
+        c.round += 1;
+        c.snapshot.clone_from(&c.tree);
+        c.reference = self.project.clean_build(&c.snapshot);
+        c.edit_scheduled = false;
+        c.synced_round = 0;
         c.outputs.clear();
         c.requested.clear();
         c.pending.clear();
@@ -1334,7 +1447,7 @@ impl World {
     fn sync(&mut self, client: u64) -> Step {
         let now = self.now;
         let c = self.clients.get_mut(&client).expect("known");
-        if c.finished {
+        if c.finished || c.dead || c.round == 0 {
             return Ok(());
         }
         match c.daemon.link(c.up, Need::Must) {
@@ -1354,18 +1467,18 @@ impl World {
                 c.requested.retain(|a| outputs.contains_key(a));
                 c.pending.clear();
                 c.parts.clear();
+                self.open_link(Node::Client(client))?;
                 self.send(Node::Client(client), Node::Server, Msg::Up(Up::Join));
             }
             Link::Skip => unreachable!("a sync needs the link"),
         }
-        let sources = self.cfg.sources;
         let c = self.clients.get_mut(&client).expect("known");
         let _ = c.daemon.plan_scan(1, None, true);
         c.daemon.scanned(1, None);
-        let blobs: Vec<Vec<u8>> = (0..sources).map(|s| model::source(s, c.versions[s])).collect();
-        let contents: Vec<Digest> = blobs.iter().map(|b| Hash::of(b).0).collect();
+        let blobs = c.snapshot.iter().flatten();
+        let contents: Vec<Digest> = blobs.clone().map(|b| Hash::of(b).0).collect();
         for (d, b) in contents.iter().zip(blobs) {
-            c.cache.insert(*d, b);
+            c.cache.insert(*d, b.clone());
         }
         let root = Hash::of(&contents.concat()).0;
         let (_, lacking) = c.daemon.offer(Some(1), &root, std::iter::empty(), contents.iter().map(|d| (d, ())));
@@ -1391,10 +1504,55 @@ impl World {
         c.cut_until = until;
         let finished = c.finished;
         self.report.client_cuts += 1;
+        self.close_link(Node::Client(client));
         self.drop_session(client);
         if !finished {
             self.schedule(until - now, Ev::Sync { client });
         }
+    }
+
+    /// The client's daemon dies: its link closes, and everything it held in
+    /// memory is gone. Only what it last saved of its knowledge survives.
+    fn client_crash(&mut self, client: u64) {
+        let c = self.clients.get_mut(&client).expect("known");
+        if c.finished || c.dead {
+            return;
+        }
+        c.dead = true;
+        self.report.crashes += 1;
+        if self.bug != Some(Bug::TrustAfterCrash) {
+            c.up = false;
+            // Its sockets die with it; the new daemon opens a link of its own.
+            self.close_link(Node::Client(client));
+        }
+        self.drop_session(client);
+        let at = self.rng.range(10, 1_500);
+        self.schedule(at, Ev::Restart { client });
+    }
+
+    /// The client side finds its daemon gone, starts a new one and runs the
+    /// command it was running again from the start. The new daemon rebuilds
+    /// what it knows of the server: it reads the knowledge last saved, which
+    /// the server may have evicted since, and makes a new link and session.
+    fn restart(&mut self, client: u64) -> Step {
+        let lost_save = self.rng.chance(300);
+        let c = self.clients.get_mut(&client).expect("known");
+        c.dead = false;
+        if self.bug != Some(Bug::TrustAfterCrash) {
+            let held = if lost_save { None } else { KnownDigests::decode(&c.saved) };
+            c.daemon = new_daemon(held.unwrap_or_default());
+            c.cache.clear();
+        }
+        if c.outputs.len() == self.project.actions.len() {
+            // It died between commands: the next one starts the new daemon's link.
+            return Ok(());
+        }
+        c.outputs.clear();
+        c.requested.clear();
+        c.pending.clear();
+        c.parts.clear();
+        c.synced_round = 0;
+        self.sync(client)
     }
 
     fn watch(&mut self, client: u64) -> Step {
@@ -1407,7 +1565,7 @@ impl World {
         }
         self.schedule_housekeeping(WATCH_STEP_MS, Ev::Watch { client });
         let c = self.clients.get_mut(&client).expect("known");
-        if !c.up {
+        if !c.up || c.dead {
             return Ok(());
         }
         match c.watch.tick(Duration::from_millis(now)) {
@@ -1426,6 +1584,7 @@ impl World {
                 }
                 c.up = false;
                 self.report.silences += 1;
+                self.close_link(Node::Client(client));
                 self.drop_session(client);
                 self.schedule(1_000, Ev::Sync { client });
                 return Ok(());
@@ -1450,9 +1609,21 @@ impl World {
             return;
         }
         let ready = self.project.ready(&|a| c.outputs.contains_key(&a), &|a| c.requested.contains(&a));
+        if !ready.is_empty() && !c.edit_scheduled {
+            let round = c.round;
+            let checkout = c.checkout_seed.is_some();
+            self.clients.get_mut(&client).expect("known").edit_scheduled = true;
+            self.schedule(1, Ev::Edit { client });
+            if checkout {
+                self.schedule(1, Ev::Checkout { client, round });
+            }
+        }
         for action in ready {
             let c = &self.clients[&client];
-            let inputs = self.inputs_of(c, action).iter().map(|b| Hash::of(b)).collect();
+            let spec = &self.project.actions[action];
+            let sources = spec.sources.iter().filter_map(|&s| c.snapshot[s].as_deref());
+            let deps = spec.deps.iter().map(|d| c.outputs[d].as_slice());
+            let inputs = sources.chain(deps).map(Hash::of).collect();
             let round = c.round;
             self.clients.get_mut(&client).expect("known").requested.insert(action);
             self.send(Node::Client(client), Node::Server, Msg::Up(Up::Request { round, action, inputs }));
@@ -1468,6 +1639,7 @@ impl World {
                 }
                 let contents = c.contents.clone();
                 c.daemon.synced(Some(1), root, contents.iter());
+                c.save();
                 c.synced_round = round;
                 self.request_ready(client);
                 return Ok(());
@@ -1482,6 +1654,7 @@ impl World {
                     return Ok(());
                 }
                 c.daemon.missing(want.iter());
+                c.save();
                 let upload: Vec<Blob> = want.iter().filter_map(|d| c.cache.get(d).map(|b| Blob::pack(*d, b))).collect();
                 if upload.len() != want.len() {
                     return Err(Kind::StateMachine(format!("the server wants content client {client} never had")));
@@ -1532,13 +1705,11 @@ impl World {
 
     fn client_done(&mut self, client: u64, round: u64, action: usize, output: Vec<u8>) -> Step {
         let c = &self.clients[&client];
-        if round != c.round || c.outputs.contains_key(&action) {
+        if round != c.round || c.outputs.contains_key(&action) || !c.requested.contains(&action) {
             return Ok(());
         }
-        let inputs = self.inputs_of(c, action);
-        let refs: Vec<&[u8]> = inputs.iter().map(|b| b.as_slice()).collect();
-        let want = model::compile(self.project.actions[action].id, &refs);
-        if output != want {
+        let want = &c.reference[action];
+        if &output != want {
             return Err(Kind::Drift(format!(
                 "client {client} round {round} got {:?} for action {} where its tree gives {:?}",
                 String::from_utf8_lossy(&output[..output.len().min(40)]),
@@ -1588,40 +1759,50 @@ impl World {
         if c.rounds_left == 0 {
             c.finished = true;
         } else {
+            self.schedule(0, Ev::Edit { client });
             let at = self.rng.range(0, 1_000);
             self.schedule(at, Ev::Round { client });
         }
     }
 }
 
+impl Client {
+    /// The daemon writes its knowledge of the server to disk, as the real one
+    /// does, so a daemon started after a crash reads it back.
+    fn save(&mut self) {
+        if let Some(bytes) = self.daemon.held.take_changes() {
+            self.saved = bytes;
+        }
+    }
+}
+
+fn new_daemon(held: KnownDigests) -> DaemonState {
+    let mut daemon = DaemonState::new(held);
+    daemon.added(1);
+    daemon.watched(1, true);
+    daemon
+}
+
 fn label(ev: &Ev) -> String {
     match ev {
-        Ev::Deliver { from, to, epoch, n, msg } => {
-            let what = match msg {
-                Msg::Up(Up::Hello { .. }) => "hello",
-                Msg::Up(Up::Result { .. }) => "result",
-                Msg::Up(Up::Join) => "join",
-                Msg::Up(Up::Offer { .. }) => "offer",
-                Msg::Up(Up::Session(_)) => "upload",
-                Msg::Up(Up::Request { .. }) => "request",
-                Msg::Up(Up::Ping) => "ping",
-                Msg::Work(_) => "work",
-                Msg::Down(Down::Synced { .. }) => "synced",
-                Msg::Down(Down::Session(_)) => "deliver",
-                Msg::Down(Down::Pong) => "pong",
-            };
-            format!("{from:?}>{to:?}@{epoch}#{n}:{what};")
+        Ev::Datagram { peer, to_server, id, bytes } => {
+            format!("datagram {peer:?}/{to_server}@{id} [{}];", bytes.len())
         }
+        Ev::LinkTimer { peer, server, id } => format!("link timer {peer:?}/{server}@{id};"),
         Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
         Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
         Ev::Crash { worker } => format!("crash {worker};"),
         Ev::Cut { worker } => format!("cut {worker};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
+        Ev::Edit { client } => format!("edit {client};"),
+        Ev::Checkout { client, round } => format!("checkout {client} round {round};"),
         Ev::TestComplete { client, key, .. } => format!("test result {client}/{key};"),
         Ev::Sync { client } => format!("sync {client};"),
         Ev::ClientCut { client } => format!("client cut {client};"),
         Ev::Watch { client } => format!("watch {client};"),
+        Ev::ClientCrash { client } => format!("crash {client};"),
+        Ev::Restart { client } => format!("restart {client};"),
     }
 }
 
@@ -1631,4 +1812,102 @@ pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
 
 pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure> {
     World::new(seed, bug, off).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lost_initial_handshake_is_retransmitted_on_the_simulated_clock() {
+        let mut world = World::new(85, None, Off::none());
+        world.cfg.fault_end_ms = 100;
+        world.cfg.net = Net { loss_per_mille: 1_000, duplicate_per_mille: 0, reorder_per_mille: 0 };
+        let report = world.run().expect("the build finishes after the initial handshake is lost");
+        assert!(report.lost > 0);
+        assert!(report.retransmits > 0);
+        assert!(report.runs > 0);
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+
+    #[test]
+    fn checkout_replaces_the_build_snapshot_and_ignores_old_results() {
+        let mut world = World::new(12, None, Off::none());
+        world.round(1).unwrap();
+        let old_round = world.clients[&1].round;
+        let old_tree = world.clients[&1].snapshot.clone();
+        let action = world.project.ready(&|_| false, &|_| false)[0];
+        let old_output = world.clients[&1].reference[action].clone();
+
+        world.clients.get_mut(&1).unwrap().synced_round = old_round;
+        world.request_ready(1);
+        assert!(world.clients[&1].requested.contains(&action));
+        assert!(world.queue.values().any(|event| matches!(
+            event,
+            Ev::Checkout { client: 1, round } if *round == old_round
+        )));
+
+        let rounds_left = world.clients[&1].rounds_left;
+        world.step(Ev::Checkout { client: 1, round: old_round }).unwrap();
+        let client = &world.clients[&1];
+        assert_eq!(client.rounds_left, rounds_left);
+        assert_eq!(client.snapshot, client.tree);
+        assert!(client.snapshot.iter().zip(old_tree).all(|(new, old)| *new != old));
+        assert!(client.requested.is_empty());
+        let new_round = client.round;
+        let clean = world.project.clean_build(&client.tree);
+        assert_eq!(client.reference, clean);
+        let new_output = clean[action].clone();
+        assert_ne!(new_output, old_output);
+
+        let root = Hash::of(&client.contents.concat()).0;
+        world.client_hears(1, Down::Synced { round: old_round, root }).unwrap();
+        assert!(world.clients[&1].requested.is_empty());
+        world.client_hears(1, Down::Synced { round: new_round, root }).unwrap();
+        assert!(world.clients[&1].requested.contains(&action));
+        world.client_done(1, old_round, action, old_output).unwrap();
+        assert!(world.clients[&1].outputs.is_empty());
+        world.client_done(1, new_round, action, new_output.clone()).unwrap();
+        assert_eq!(world.clients[&1].outputs[&action], new_output);
+    }
+
+    #[test]
+    fn live_edits_leave_the_current_build_on_its_snapshot() {
+        let mut world = World::new(12, None, Off::none());
+        world.clients.get_mut(&1).unwrap().rounds_left = 2;
+        world.round(1).unwrap();
+        let original = world.clients[&1].snapshot.clone();
+        let original_contents = world.clients[&1].contents.clone();
+        let mut edited = false;
+        let mut deleted = false;
+        let mut added = false;
+        for _ in 0..32 {
+            let before = world.clients[&1].tree.clone();
+            world.step(Ev::Edit { client: 1 }).unwrap();
+            let client = &world.clients[&1];
+            for (old, new) in before.iter().zip(&client.tree) {
+                edited |= old.is_some() && new.is_some() && old != new;
+                deleted |= old.is_some() && new.is_none();
+                added |= old.is_none() && new.is_some();
+            }
+        }
+        assert!(edited && deleted && added);
+
+        world.sync(1).unwrap();
+        let client = &world.clients[&1];
+        assert_eq!(client.contents, original_contents);
+        assert_eq!(client.snapshot, original);
+        assert_eq!(client.reference, world.project.clean_build(&original));
+
+        world.round(1).unwrap();
+        let client = &world.clients[&1];
+        assert_eq!(client.snapshot, client.tree);
+        assert_ne!(client.snapshot, original);
+        assert_eq!(client.reference, world.project.clean_build(&client.tree));
+        assert_ne!(client.reference, world.project.clean_build(&original));
+    }
 }

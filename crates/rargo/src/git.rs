@@ -367,7 +367,7 @@ fn ignored_in<S: Source>(src: &S, root: &Path, global: Option<&[u8]>) -> Option<
 
 pub enum Bytes {
     Owned(Vec<u8>),
-    Mapped(memmap2::Mmap),
+    Mapped(rargo_net::io::file::Mapped),
 }
 
 impl AsRef<[u8]> for Bytes {
@@ -392,7 +392,7 @@ impl Source for Disk {
             return None;
         }
         if md.len() >= 1 << 20 {
-            return unsafe { memmap2::Mmap::map(&f) }.ok().map(Bytes::Mapped);
+            return f.map(md.len() as usize).ok().map(Bytes::Mapped);
         }
         let mut v = Vec::with_capacity(md.len() as usize);
         f.read_to_end(&mut v).ok()?;
@@ -422,16 +422,16 @@ impl Source for Disk {
 }
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
+    rargo_net::io::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from)
 }
 
 fn xdg_config() -> Option<PathBuf> {
-    std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()).map(PathBuf::from).or_else(|| Some(home()?.join(".config")))
+    rargo_net::io::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()).map(PathBuf::from).or_else(|| Some(home()?.join(".config")))
 }
 
 fn configs(git_dir: &Path, common: &Path) -> Vec<Vec<u8>> {
     let mut paths = Vec::new();
-    if std::env::var_os("GIT_CONFIG_NOSYSTEM").is_none() {
+    if rargo_net::io::env::var_os("GIT_CONFIG_NOSYSTEM").is_none() {
         paths.push(PathBuf::from("/etc/gitconfig"));
     }
     paths.extend(xdg_config().map(|x| x.join("git/config")));
@@ -541,19 +541,19 @@ pub fn thin(root: &Path, head: &Head, cache: &Path, history: bool) -> Option<Pat
         return Some(dir);
     }
     crate::tmp::sweep(&all, ".tmp-");
-    let tmp = all.join(format!(".tmp-{}-{key}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = all.join(format!(".tmp-{}-{key}", rargo_net::io::process::id()));
+    let _ = rargo_net::io::file::remove_dir_all(&tmp);
     let made = build(root, head, history, &tmp).and_then(|()| match rargo_net::io::file::rename(&tmp, &dir) {
         Ok(()) => Some(()),
         Err(_) if dir.join("HEAD").ring_is_file() => Some(()),
         Err(_) => None,
     });
-    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = rargo_net::io::file::remove_dir_all(&tmp);
     made?;
     for e in rargo_net::io::file::read_dir(&all).into_iter().flatten().flatten() {
-        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| rargo_net::io::system_now().duration_since(t).ok());
         if e.path() != dir && old.is_some_and(|a| a.as_secs() > 14 * 86400) {
-            let _ = std::fs::remove_dir_all(e.path());
+            let _ = rargo_net::io::file::remove_dir_all(e.path());
         }
     }
     Some(dir)
@@ -584,8 +584,8 @@ pub fn history(head: &Head, cache: &Path) -> Option<PathBuf> {
         let oldest_first: Vec<Id> = chain.iter().rev().copied().collect();
         Some(owners(&Disk, &mut store, &shallow, &oldest_first)?)
     };
-    let tmp = store_dir.join("heads").join(format!(".tmp-{}-{}", std::process::id(), head.commit));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = store_dir.join("heads").join(format!(".tmp-{}-{}", rargo_net::io::process::id(), head.commit));
+    let _ = rargo_net::io::file::remove_dir_all(&tmp);
     rargo_net::io::file::create_dir_all(tmp.join("pack")).ok()?;
     for piece in &pieces {
         let (pack, idx) = piece_files(&mut store, &pieces_dir, piece, owner.as_ref())?;
@@ -596,10 +596,10 @@ pub fn history(head: &Head, cache: &Path) -> Option<PathBuf> {
     match rargo_net::io::file::rename(&tmp, &at) {
         Ok(()) => {}
         Err(_) if at.join("pack").ring_is_dir() => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = rargo_net::io::file::remove_dir_all(&tmp);
         }
         Err(_) => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = rargo_net::io::file::remove_dir_all(&tmp);
             return None;
         }
     }
@@ -638,7 +638,7 @@ fn piece_commits(owner: &HashMap<Id, usize>, piece: &HistoryPiece) -> Vec<Id> {
 fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner: Option<&HashMap<Id, usize>>) -> Option<(PathBuf, PathBuf)> {
     let (pack, idx) = (dir.join(format!("{}.pack", piece.key)), dir.join(format!("{}.idx", piece.key)));
     if pack.ring_is_file() && idx.ring_is_file() {
-        let _ = std::fs::File::options().append(true).open(&pack).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        let _ = rargo_net::io::file::set_modified(&pack, rargo_net::io::system_now());
         return Some((pack, idx));
     }
     let mut objects = Vec::new();
@@ -646,7 +646,7 @@ fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner
         objects.push((id, store.read(&Disk, &id)?));
     }
     let packed = pack_of(&objects);
-    let base = dir.join(format!(".tmp-{}-{}", std::process::id(), piece.key));
+    let base = dir.join(format!(".tmp-{}-{}", rargo_net::io::process::id(), piece.key));
     let (made_pack, made_idx) = (base.with_extension("pack"), base.with_extension("idx"));
     let moved = rargo_net::io::file::write(&made_pack, &packed.pack).is_ok()
         && rargo_net::io::file::write(&made_idx, &packed.idx).is_ok()
@@ -658,13 +658,12 @@ fn piece_files(store: &mut Store<Bytes>, dir: &Path, piece: &HistoryPiece, owner
 }
 
 fn sweep_history(store: &Path) {
-    let stale = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 14 * 86400);
+    let stale = |p: &Path| rargo_net::io::file::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| rargo_net::io::system_now().duration_since(t).ok()).is_some_and(|a| a.as_secs() > 14 * 86400);
     for e in rargo_net::io::file::read_dir(store.join("heads")).into_iter().flatten().flatten() {
         if stale(&e.path()) {
-            let _ = std::fs::remove_dir_all(e.path());
+            let _ = rargo_net::io::file::remove_dir_all(e.path());
         }
     }
-    use std::os::unix::fs::MetadataExt;
     for e in rargo_net::io::file::read_dir(store.join("pieces")).into_iter().flatten().flatten() {
         if e.metadata().is_ok_and(|m| m.nlink() == 1) && stale(&e.path()) {
             let _ = rargo_net::io::file::remove_file(e.path());
@@ -702,170 +701,194 @@ pub fn asks_for_history<'a>(root: &Path, files: impl Iterator<Item = &'a [u8]>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use rargo_net::io::{file, sim};
 
-    fn run(dir: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"])
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    /// Writes the recorded repositories into the simulated filesystem under `dir`.
+    fn on_disk(dir: &Path) {
+        for (path, (kind, data)) in fixture().files {
+            let path = dir.join(path.strip_prefix(AT).unwrap());
+            file::create_dir_all(path.parent().unwrap()).unwrap();
+            match kind {
+                b'd' => file::create_dir_all(&path).unwrap(),
+                b'l' => file::symlink(std::str::from_utf8(&data).unwrap(), &path).unwrap(),
+                _ => file::write(&path, &data).unwrap(),
+            }
+        }
+    }
+
+    fn copy_tree(from: &Path, to: &Path) {
+        file::create_dir_all(to).unwrap();
+        for e in file::read_dir(from).unwrap().flatten() {
+            let dest = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_tree(&e.path(), &dest);
+            } else {
+                file::write(&dest, file::read(e.path()).unwrap()).unwrap();
+            }
+        }
+    }
+
+    /// Makes `copy/.git` the stand-in, with the history's packs beside its own.
+    fn show(stand_in: &Path, history: Option<&Path>, copy: &Path) {
+        let _ = file::remove_dir_all(copy.join(".git"));
+        copy_tree(stand_in, &copy.join(".git"));
+        if let Some(h) = history {
+            copy_tree(h, &copy.join(".git/objects"));
+        }
+    }
+
+    /// Stores `data` as a loose object of `common` and returns its name.
+    fn write_loose(common: &Path, kind: Type, data: &[u8]) -> String {
+        use std::io::Write as _;
+        let hex = to_hex(&object::object_id(kind, data));
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(format!("{} {}\0", kind.name(), data.len()).as_bytes()).unwrap();
+        z.write_all(data).unwrap();
+        let path = common.join("objects").join(&hex[..2]).join(&hex[2..]);
+        file::create_dir_all(path.parent().unwrap()).unwrap();
+        file::write(path, z.finish().unwrap()).unwrap();
+        hex
+    }
+
+    fn listed_index(git_dir: &Path) -> Vec<String> {
+        let mut entries = index::parse(&file::read(git_dir.join("index")).unwrap()).unwrap().entries;
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        entries
+            .iter()
+            .map(|e| {
+                let kind = if e.mode == 0o160000 { "commit" } else { "blob" };
+                format!("{:06o} {kind} {}\t{}", e.mode, to_hex(&e.id), String::from_utf8_lossy(&e.path))
+            })
+            .collect()
     }
 
     #[test]
     fn thin_git_answers_what_build_scripts_ask() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        std::fs::write(repo.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
-        std::os::unix::fs::symlink("src/lib.rs", repo.join("link")).unwrap();
-        run(&repo, &["init", "-q"]);
-        run(&repo, &["checkout", "-q", "-b", "feature/x"]);
-        run(&repo, &["add", "-A"]);
-        run(&repo, &["commit", "-q", "-m", "first"]);
-        std::fs::write(repo.join("src/lib.rs"), "pub fn b() {}\n").unwrap();
-        run(&repo, &["commit", "-q", "-am", "second"]);
-        let commit = run(&repo, &["rev-parse", "HEAD"]);
+        sim::test(|| {
+            let f = fixture();
+            let tmp = sim::tempdir();
+            on_disk(&tmp);
+            let (main, repo) = (tmp.join("fx"), tmp.join("wt"));
+            let commit = lines(&f.expect["wt-head"])[0].clone();
 
-        let h = head(&repo).unwrap();
-        assert_eq!(h.commit, commit);
-        assert_eq!(h.branch.as_deref(), Some("refs/heads/feature/x"));
-        let cache = tmp.path().join("cache");
-        let thin_dir = thin(&repo, &h, &cache, false).unwrap();
-        assert_eq!(thin(&repo, &h, &cache, false).unwrap(), thin_dir, "made once per commit");
+            let h = head(&repo).unwrap();
+            assert_eq!(h.commit, commit);
+            assert_eq!(h.branch.as_deref(), Some("refs/heads/feature/x"));
+            let cache = tmp.join("cache");
+            let thin_dir = thin(&repo, &h, &cache, false).unwrap();
+            assert_eq!(thin(&repo, &h, &cache, false).unwrap(), thin_dir, "made once per commit");
 
-        let copy = tmp.path().join("copy");
-        std::fs::create_dir_all(copy.join("src")).unwrap();
-        std::fs::write(copy.join("src/lib.rs"), "pub fn b() {}\n").unwrap();
-        std::os::unix::fs::symlink("src/lib.rs", copy.join("link")).unwrap();
-        let status = Command::new("cp").arg("-r").arg(&thin_dir).arg(copy.join(".git")).status().unwrap();
-        assert!(status.success());
-        assert_eq!(run(&copy, &["rev-parse", "HEAD"]), commit);
-        assert_eq!(run(&copy, &["log", "-1", "--format=%H %s"]), format!("{commit} second"));
-        assert_eq!(run(&copy, &["rev-parse", "--abbrev-ref", "HEAD"]), "feature/x");
-        assert_eq!(run(&copy, &["status", "--porcelain"]), "");
-        let short = run(&repo, &["rev-parse", "--short", "HEAD"]);
-        assert_eq!(run(&copy, &["describe", "--always", "--dirty"]), short);
-        assert_eq!(run(&copy, &["log", "-1", "--format=%h"]), short);
-        run(&repo, &["config", "core.abbrev", "11"]);
-        let h11 = head(&repo).unwrap();
-        let other_cache = tmp.path().join("cache11");
-        let thin11 = thin(&repo, &h11, &other_cache, false).unwrap();
-        assert!(std::fs::read_to_string(thin11.join("config")).unwrap().contains("abbrev = 11"));
-        run(&repo, &["config", "--unset", "core.abbrev"]);
-        std::fs::write(copy.join("src/lib.rs"), "pub fn c() {}\n").unwrap();
-        assert_eq!(run(&copy, &["status", "--porcelain"]), "M src/lib.rs");
-        assert!(run(&copy, &["describe", "--always", "--dirty"]).ends_with("-dirty"));
-        assert_eq!(run(&copy, &["rev-list", "--count", "HEAD"]), "1");
-        let size: u64 = walk(&thin_dir);
-        assert!(size < 20_000, "{size} bytes");
+            let copy = tmp.join("copy");
+            show(&thin_dir, None, &copy);
+            let stood = resolve(&Disk, &copy).unwrap();
+            assert_eq!(stood.commit, commit, "rev-parse HEAD");
+            assert_eq!(stood.branch.as_deref(), Some("refs/heads/feature/x"), "rev-parse --abbrev-ref HEAD");
+            let git_dir = copy.join(".git");
+            let mut store = Store::open(&Disk, &git_dir.join("objects"));
+            let mut original = Store::open(&Disk, &main.join(".git/objects"));
+            let at = id(&commit);
+            assert_eq!(store.read(&Disk, &at), original.read(&Disk, &at), "log -1");
+            let tree: Vec<String> = f.expect["ls-tree"].split(|&b| b == 0).filter(|r| !r.is_empty()).map(|r| String::from_utf8_lossy(r).into_owned()).collect();
+            assert_eq!(listed_index(&git_dir), tree, "status finds the index at HEAD");
+            let short = lines(&f.expect["short"])[0].len();
+            assert!(file::read_to_string(git_dir.join("config")).unwrap().contains(&format!("abbrev = {short}\n")), "describe --always and %h");
+            assert_eq!(first_parents(&Disk, &mut store, &shallow(&Disk, &git_dir), at).unwrap(), [at], "rev-list --count HEAD is 1");
 
-        let wt = tmp.path().join("wt");
-        run(&repo, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap(), "HEAD~1"]);
-        let h2 = head(&wt).unwrap();
-        assert_eq!(h2.commit, run(&repo, &["rev-parse", "HEAD~1"]));
-        assert!(h2.branch.is_none());
-        assert_ne!(thin(&wt, &h2, &cache, false).unwrap(), thin_dir);
-        assert!(head(tmp.path()).is_none());
-    }
+            let config = main.join(".git/config");
+            let before = file::read(&config).unwrap();
+            file::write(&config, [before.as_slice(), b"[core]\n\tabbrev = 11\n"].concat()).unwrap();
+            let h11 = head(&repo).unwrap();
+            let other_cache = tmp.join("cache11");
+            let thin11 = thin(&repo, &h11, &other_cache, false).unwrap();
+            assert!(file::read_to_string(thin11.join("config")).unwrap().contains("abbrev = 11"));
+            file::write(&config, before).unwrap();
+            let size: u64 = walk(&thin_dir);
+            assert!(size < 20_000, "{size} bytes");
 
-    fn show(stand_in: &Path, history: Option<&Path>, copy: &Path) {
-        let _ = std::fs::remove_dir_all(copy.join(".git"));
-        assert!(Command::new("cp").arg("-r").arg(stand_in).arg(copy.join(".git")).status().unwrap().success());
-        if let Some(h) = history {
-            let status = Command::new("sh").arg("-c").arg(format!("cp -r '{}'/. '{}'", h.display(), copy.join(".git/objects").display())).status().unwrap();
-            assert!(status.success());
-        }
+            let wt = tmp.join("wt-detached");
+            let h2 = head(&wt).unwrap();
+            assert_eq!(h2.commit, lines(&f.expect["wt-detached-head"])[0]);
+            assert!(h2.branch.is_none());
+            assert_ne!(thin(&wt, &h2, &cache, false).unwrap(), thin_dir);
+            assert!(head(&tmp).is_none());
+        });
     }
 
     #[test]
-    fn with_history_describe_and_counts_answer_as_on_the_client() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        run(&repo, &["init", "-q"]);
-        let commit = |msg: &str| {
-            let file = if msg.starts_with("side") || msg == "elsewhere" { "g" } else { "f" };
-            std::fs::write(repo.join(file), msg).unwrap();
-            run(&repo, &["add", "-A"]);
-            run(&repo, &["commit", "-q", "-m", msg]);
-        };
-        commit("one");
-        run(&repo, &["tag", "-a", "v0.1.0", "-m", "first release"]);
-        commit("two");
-        commit("three");
-        run(&repo, &["checkout", "-q", "-b", "side", "HEAD~1"]);
-        commit("side one");
-        run(&repo, &["tag", "side-light"]);
-        commit("side two");
-        run(&repo, &["checkout", "-q", "main"]);
-        run(&repo, &["merge", "-q", "--no-ff", "-m", "merge side", "side"]);
-        commit("four");
-        run(&repo, &["tag", "-a", "v0.2.0", "-m", "second release"]);
-        commit("five");
-        commit("six");
-        run(&repo, &["checkout", "-q", "side"]);
-        commit("elsewhere");
-        run(&repo, &["tag", "elsewhere"]);
-        run(&repo, &["checkout", "-q", "main"]);
+    fn with_history_the_stand_in_holds_every_commit_and_tag_head_reaches() {
+        sim::test(|| {
+            let f = fixture();
+            let tmp = sim::tempdir();
+            on_disk(&tmp);
+            let repo = tmp.join("fx");
+            let common = repo.join(".git");
 
-        let h = head(&repo).unwrap();
-        let cache = tmp.path().join("cache");
-        let objects = history(&h, &cache).unwrap();
-        let stand_in = thin(&repo, &h, &cache, true).unwrap();
-        assert!(!stand_in.join("shallow").exists());
-        let copy = tmp.path().join("copy");
-        std::fs::create_dir_all(&copy).unwrap();
-        std::fs::write(copy.join("f"), "six").unwrap();
-        std::fs::write(copy.join("g"), "side two").unwrap();
-        show(&stand_in, Some(&objects), &copy);
-        for q in [
-            &["describe"][..],
-            &["describe", "--tags"],
-            &["describe", "--tags", "--long", "--abbrev=12"],
-            &["describe", "--tags", "--abbrev=0"],
-            &["describe", "--always", "--dirty"],
-            &["rev-list", "--count", "HEAD"],
-            &["rev-list", "--count", "v0.1.0..HEAD"],
-            &["log", "-1", "--date=short", "--abbrev=9", "--format=%H %h %cd %(describe:tags)"],
-            &["log", "--format=%s"],
-            &["tag", "--merged", "HEAD"],
-        ] {
-            assert_eq!(run(&copy, q), run(&repo, q), "git {q:?}");
-        }
-        assert_eq!(run(&copy, &["rev-list", "--count", "HEAD"]), "9");
-        assert_eq!(run(&copy, &["tag"]), run(&repo, &["tag", "--merged", "HEAD"]), "only the tags HEAD reaches");
+            let h = head(&repo).unwrap();
+            let at = id(&h.commit);
+            let cache = tmp.join("cache");
+            let objects = history(&h, &cache).unwrap();
+            let stand_in = thin(&repo, &h, &cache, true).unwrap();
+            assert!(!file::exists(stand_in.join("shallow")));
+            let copy = tmp.join("copy");
+            show(&stand_in, Some(&objects), &copy);
+            let git_dir = copy.join(".git");
+            let mut store = Store::open(&Disk, &git_dir.join("objects"));
+            let mut original = Store::open(&Disk, &common.join("objects"));
+            let none = BTreeSet::new();
+            let chain: Vec<String> = first_parents(&Disk, &mut store, &none, at).unwrap().iter().map(to_hex).collect();
+            assert_eq!(chain, lines(&f.expect["first-parent"]), "rev-list --first-parent HEAD");
+            let reached = reachable(&Disk, &mut store, &none, at).unwrap();
+            assert_eq!(reached, reachable(&Disk, &mut original, &none, at).unwrap(), "rev-list HEAD");
+            let commits = lines(&f.expect["all-objects"]).iter().filter(|l| l.contains(" commit ")).count();
+            assert_eq!(reached.len(), commits, "rev-list --count HEAD");
+            for c in &reached {
+                assert_eq!(store.read(&Disk, c), original.read(&Disk, c), "log");
+            }
+            let (refs, tag_objects) = stand_in_tags(&f.expect["merged"]);
+            assert_eq!(file::read_to_string(git_dir.join("packed-refs")).unwrap(), refs, "tag --merged HEAD: only the tags HEAD reaches");
+            assert!(!tag_objects.is_empty());
+            for t in &tag_objects {
+                assert_eq!(store.read(&Disk, &id(t)), original.read(&Disk, &id(t)), "describe reads the tag {t}");
+            }
 
-        let pieces = objects.parent().unwrap().parent().unwrap().join("pieces");
-        let before = packs(&pieces);
-        commit("seven");
-        let h7 = head(&repo).unwrap();
-        let objects7 = history(&h7, &cache).unwrap();
-        assert_eq!(objects7.parent(), objects.parent(), "one store per repository");
-        assert_eq!(packs(&pieces), before + 1);
-        assert_eq!(packs(&objects7.join("pack")), before + 1, "the first-parent chain is 8 commits: 8 pieces of one");
-        let seen = thin(&repo, &h7, &cache, true).unwrap();
-        run(&repo, &["tag", "-a", "v0.3.0", "-m", "third release"]);
-        let tagged = head(&repo).unwrap();
-        assert_ne!(tagged.tags, h7.tags, "the tags' seal changed");
-        let stand_in = thin(&repo, &tagged, &cache, true).unwrap();
-        assert_ne!(stand_in, seen);
-        std::fs::write(copy.join("f"), "seven").unwrap();
-        show(&stand_in, Some(&objects7), &copy);
-        assert_eq!(run(&copy, &["describe"]), "v0.3.0");
+            let pieces = objects.parent().unwrap().parent().unwrap().join("pieces");
+            let before = packs(&pieces);
+            assert_eq!(before, chain.len(), "a short first-parent chain is pieces of one");
+            let tree = to_hex(&object::commit(&original.read(&Disk, &at).unwrap().data).unwrap().tree);
+            let who = "t <t@t> 1772000000 +0000";
+            let seven = write_loose(&common, Type::Commit, format!("tree {tree}\nparent {}\nauthor {who}\ncommitter {who}\n\nseven\n", h.commit).as_bytes());
+            file::write(common.join("refs/heads/main"), format!("{seven}\n")).unwrap();
+            let h7 = head(&repo).unwrap();
+            assert_eq!(h7.commit, seven);
+            let objects7 = history(&h7, &cache).unwrap();
+            assert_eq!(objects7.parent(), objects.parent(), "one store per repository");
+            assert_eq!(packs(&pieces), before + 1);
+            assert_eq!(packs(&objects7.join("pack")), before + 1, "one piece more for one commit more");
+            let seen = thin(&repo, &h7, &cache, true).unwrap();
+            let tag = write_loose(&common, Type::Tag, format!("object {seven}\ntype commit\ntag v0.3.0\ntagger {who}\n\nthird release\n").as_bytes());
+            file::write(common.join("refs/tags/v0.3.0"), format!("{tag}\n")).unwrap();
+            let tagged = head(&repo).unwrap();
+            assert_ne!(tagged.tags, h7.tags, "the tags' seal changed");
+            let stand_in = thin(&repo, &tagged, &cache, true).unwrap();
+            assert_ne!(stand_in, seen);
+            show(&stand_in, Some(&objects7), &copy);
+            let names_the_tag = format!("{tag} refs/tags/v0.3.0\n^{seven}\n");
+            assert!(file::read_to_string(git_dir.join("packed-refs")).unwrap().contains(&names_the_tag), "describe is v0.3.0");
+            let mut store = Store::open(&Disk, &git_dir.join("objects"));
+            assert_eq!(object::tag(&store.read(&Disk, &id(&tag)).unwrap().data), Some((id(&seven), Type::Commit)));
+            assert_eq!(reachable(&Disk, &mut store, &none, id(&seven)).unwrap().len(), commits + 1);
 
-        let bare = thin(&repo, &tagged, &cache, false).unwrap();
-        show(&bare, None, &copy);
-        assert_eq!(run(&copy, &["describe", "--tags"]), "v0.3.0");
-        assert_eq!(run(&copy, &["rev-list", "--count", "HEAD"]), "1");
+            let bare = thin(&repo, &tagged, &cache, false).unwrap();
+            show(&bare, None, &copy);
+            assert!(file::read_to_string(git_dir.join("packed-refs")).unwrap().contains(&names_the_tag), "describe --tags is v0.3.0");
+            let mut store = Store::open(&Disk, &git_dir.join("objects"));
+            let cut = shallow(&Disk, &git_dir);
+            assert_eq!(first_parents(&Disk, &mut store, &cut, id(&seven)).unwrap().len(), 1, "rev-list --count HEAD is 1");
+        });
     }
 
     fn packs(dir: &Path) -> usize {
-        std::fs::read_dir(dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "pack")).count()
+        file::read_dir(dir).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "pack")).count()
     }
 
     struct Fixture {
@@ -1125,10 +1148,6 @@ mod tests {
     }
 
     fn walk(dir: &Path) -> u64 {
-        std::fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .map(|e| if e.path().is_dir() { walk(&e.path()) } else { e.metadata().unwrap().len() })
-            .sum()
+        file::read_dir(dir).unwrap().flatten().map(|e| if e.file_type().unwrap().is_dir() { walk(&e.path()) } else { e.metadata().unwrap().len() }).sum()
     }
 }
