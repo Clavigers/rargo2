@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use crate::io::file::File;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -44,7 +44,7 @@ struct Dir {
     parent: u32,
     lower: Option<VPath>,
     traced: bool,
-    entries: HashMap<Box<[u8]>, Slot>,
+    entries: BTreeMap<Box<[u8]>, Slot>,
     dirty: bool,
     owner: Owner,
     lower_listed: bool,
@@ -257,7 +257,7 @@ fn initial_nodes(view: &dyn View, mountpoints: &[Vec<u8>]) -> Vec<Kind> {
         parent: 0,
         traced: view.traced(&root_path),
         lower: Some(root_path),
-        entries: HashMap::new(),
+        entries: BTreeMap::new(),
         dirty: false,
         owner: Owner { uid: 0, gid: 0, mode: 0o755 },
         lower_listed: false,
@@ -350,6 +350,13 @@ pub struct FsStats {
     pub writes: AtomicU64,
 }
 
+impl FsStats {
+    /// How many lookups, opens, reads and writes were served.
+    pub fn counts(&self) -> [u64; 4] {
+        [&self.lookups, &self.opens, &self.reads, &self.writes].map(|n| n.load(Ordering::Relaxed))
+    }
+}
+
 impl SandboxFs {
     pub fn new(content: Arc<Content>) -> SandboxFs {
         SandboxFs {
@@ -419,9 +426,8 @@ impl SandboxFs {
         };
         drop(st);
 
-        use rayon::prelude::*;
         let hashed: Vec<(usize, std::io::Result<crate::hash::Hash>)> =
-            jobs.into_par_iter().map(|(i, src)| (i, self.content.hash(&src))).collect();
+            crate::io::thread::par_map(jobs, |(i, src)| (i, self.content.hash(&src)));
         let mut st = a.st.lock();
         for (i, h) in hashed {
             match h {
@@ -455,7 +461,7 @@ impl SandboxFs {
     }
 
     fn retire(&self, id: i32) {
-        self.retired.lock().push((std::time::Instant::now(), id));
+        self.retired.lock().push((crate::io::now(), id));
     }
 
     fn reap_retired(&self) {
@@ -464,7 +470,7 @@ impl SandboxFs {
         if r.is_empty() {
             return;
         }
-        let now = std::time::Instant::now();
+        let now = crate::io::now();
         r.retain(|(t, id)| {
             if now.duration_since(*t) > RETIRE_GRACE {
                 let _ = sess.backing_close(*id);
@@ -501,7 +507,7 @@ impl SandboxFs {
 }
 
 fn compact_obs(obs: Vec<(VPath, Obs)>) -> Vec<(VPath, Obs)> {
-    let mut implied: std::collections::HashSet<&[u8]> = Default::default();
+    let mut implied: std::collections::BTreeSet<&[u8]> = Default::default();
     for (p, o) in &obs {
         match o {
             Obs::Absent => {}
@@ -619,7 +625,7 @@ fn walk_upper(st: &State, view: &dyn View, dir: u32, dir_path: &[u8], full: bool
 }
 
 fn now() -> (i64, u32) {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let d = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (d.as_secs() as i64, d.subsec_nanos())
 }
 
@@ -759,7 +765,7 @@ impl ActionFs {
                         parent,
                         lower: Some(path.clone()),
                         traced: child_traced,
-                        entries: HashMap::new(),
+                        entries: BTreeMap::new(),
                         dirty: false,
                         owner: *owner,
                         lower_listed: false,
@@ -926,7 +932,7 @@ impl ActionFs {
                 parent,
                 lower: None,
                 traced: false,
-                entries: HashMap::new(),
+                entries: BTreeMap::new(),
                 dirty: true,
                 owner: Owner::own(mode & 0o7777),
                 lower_listed: true,
@@ -1196,8 +1202,7 @@ impl Filesystem for SandboxFs {
             match &mut st.nodes[local as usize] {
                 Kind::File(f) => {
                     if let Src::Upper { file, .. } = &f.src {
-                        let ts = [conv(set.atime), conv(set.mtime)];
-                        unsafe { libc::futimens(file.as_raw_fd(), ts.as_ptr()) };
+                        let _ = file.set_times(conv(set.atime), conv(set.mtime));
                     }
                 }
                 Kind::Dir(d) => {
@@ -1573,10 +1578,7 @@ impl Filesystem for SandboxFs {
         let st = a.st.lock();
         if let Some(Kind::File(f)) = st.nodes.get(n as usize) {
             if let Src::Upper { file, .. } = &f.src {
-                let r = unsafe {
-                    libc::fallocate(file.as_raw_fd(), mode as i32, offset as i64, length as i64)
-                };
-                return if r == 0 { Ok(()) } else { Err(Errno::last()) };
+                return file.allocate(mode as i32, offset, length).map_err(Errno::from);
             }
         }
         Err(Errno::EBADF)
@@ -1585,6 +1587,8 @@ impl Filesystem for SandboxFs {
 
 #[cfg(test)]
 mod model_tests {
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -2188,7 +2192,14 @@ mod model_tests {
         st.trace.fail_hash(index);
         st.invariants();
         let (obs, tainted) = st.trace.outcome();
-        assert!(tainted);
-        assert!(matches!(obs.as_slice(), [(path, Obs::File { hash, exec: false })] if path.as_ref() == b"/f" && *hash == crate::hash::Hash::ZERO));
+        let mut outcomes = Transcript::default();
+        outcomes.record("tainted", tainted);
+        for (path, observation) in obs {
+            outcomes.record(&String::from_utf8_lossy(path.as_ref()), observation);
+        }
+        expect![[r#"
+            tainted: true
+            /f: File { hash: 0000000000000000, exec: false }
+        "#]].assert_eq(&outcomes.0);
     }
 }

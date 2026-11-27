@@ -1,7 +1,7 @@
 use rargo_machine::StateMachine;
 use crate::proto::{CONTROL, ClientMsg, Digest, KEEPALIVE, Offer, PROTO_VERSION, RunRequest, ServerMsg, protocol_mismatch};
 use crate::sched::Priority;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug)]
 pub enum Route {
@@ -71,6 +71,15 @@ impl ConnectionState {
 
     pub fn message(&mut self, stream: u32, msg: ClientMsg, key_valid: bool) -> Vec<Route> {
         assert_ne!(stream, KEEPALIVE, "keepalives are answered by the link");
+        self.invariants();
+        let was_closed = self.closed;
+        let routes = self.route_message(stream, msg, key_valid);
+        assert!(!was_closed || (self.closed && routes.is_empty()), "a closed connection routes nothing");
+        self.invariants();
+        routes
+    }
+
+    fn route_message(&mut self, stream: u32, msg: ClientMsg, key_valid: bool) -> Vec<Route> {
         if self.closed {
             return Vec::new();
         }
@@ -99,43 +108,67 @@ impl ConnectionState {
                 if !self.running.insert(stream) {
                     return unknown(stream, &ClientMsg::Run(req));
                 }
+                assert!(self.is_running(stream));
                 vec![Route::Run { stream, req }]
             }
-            ClientMsg::Cancel => self.end(stream),
+            ClientMsg::Cancel => self.stream_failed(stream),
             m if for_a_session(&m) && self.running.contains(&stream) => vec![Route::Stream { stream, msg: m }],
             m => unknown(stream, &m),
         }
     }
 
-    fn end(&mut self, stream: u32) -> Vec<Route> {
-        if self.running.remove(&stream) { vec![Route::Cancel { stream }] } else { Vec::new() }
-    }
-
     pub fn stream_failed(&mut self, stream: u32) -> Vec<Route> {
-        self.end(stream)
+        self.invariants();
+        let routes = if self.running.remove(&stream) {
+            vec![Route::Cancel { stream }]
+        } else {
+            Vec::new()
+        };
+        assert!(!self.is_running(stream));
+        self.invariants();
+        routes
     }
 
     pub fn finished(&mut self, stream: u32) {
+        self.invariants();
         self.running.remove(&stream);
+        assert!(!self.is_running(stream));
+        self.invariants();
     }
 
     pub fn key_checked(&mut self, valid: bool) -> Vec<Route> {
-        if valid { Vec::new() } else { self.close() }
+        self.invariants();
+        let was_closed = self.closed;
+        let routes = if valid { Vec::new() } else { self.close() };
+        assert_eq!(self.closed, was_closed || !valid);
+        self.invariants();
+        routes
     }
 
     pub fn control_failed(&mut self) -> Vec<Route> {
-        self.close()
+        self.invariants();
+        let routes = self.close();
+        assert!(self.closed);
+        self.invariants();
+        routes
     }
 
     pub fn close(&mut self) -> Vec<Route> {
-        if self.closed {
-            return Vec::new();
-        }
-        self.closed = true;
-        let mut out: Vec<Route> =
-            std::mem::take(&mut self.running).into_iter().map(|stream| Route::Cancel { stream }).collect();
-        out.push(Route::Close);
-        out
+        self.invariants();
+        let routes = if self.closed {
+            Vec::new()
+        } else {
+            self.closed = true;
+            let count = self.running.len();
+            let mut out: Vec<Route> =
+                std::mem::take(&mut self.running).into_iter().map(|stream| Route::Cancel { stream }).collect();
+            assert_eq!(out.len(), count);
+            out.push(Route::Close);
+            out
+        };
+        assert!(self.closed);
+        self.invariants();
+        routes
     }
 }
 
@@ -189,7 +222,7 @@ pub fn command(version: u32, args: &[String], admin: bool, user: &str) -> Comman
     }
 }
 
-pub fn priority(env: &HashMap<String, String>, stderr_tty: bool) -> Priority {
+pub fn priority(env: &BTreeMap<String, String>, stderr_tty: bool) -> Priority {
     match env.get("RARGO_PRIORITY").map(|s| s.as_str()) {
         Some("human") => Priority::Human,
         Some("agent") => Priority::Agent,
@@ -199,7 +232,7 @@ pub fn priority(env: &HashMap<String, String>, stderr_tty: bool) -> Priority {
     }
 }
 
-pub fn wants_color(args: &[String], env: &HashMap<String, String>, tty: bool) -> bool {
+pub fn wants_color(args: &[String], env: &BTreeMap<String, String>, tty: bool) -> bool {
     let mut choice: Option<&str> = None;
     let mut it = args.iter().take_while(|a| *a != "--");
     while let Some(a) = it.next() {
@@ -410,6 +443,8 @@ pub fn status_text(f: &StatusFigures) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     fn run(args: &[&str]) -> ClientMsg {
         ClientMsg::Run(Box::new(RunRequest {
@@ -436,7 +471,7 @@ mod tests {
         routes
             .iter()
             .map(|r| match r {
-                Route::Reply(_) => "reply".into(),
+                Route::Reply(msg) => format!("reply {msg:?}"),
                 Route::Offer(_) => "offer".into(),
                 Route::Control(_) => "control".into(),
                 Route::Fetch { stream, .. } => format!("fetch {stream}"),
@@ -452,156 +487,226 @@ mod tests {
             .collect()
     }
 
-    fn msg(c: &mut ConnectionState, stream: u32, m: ClientMsg, key_valid: bool) -> Vec<Route> {
-        let routes = c.message(stream, m, key_valid);
-        c.invariants();
-        routes
+    enum Event {
+        Message(u32, ClientMsg, bool),
+        Finish(u32),
+        StreamFailed(u32),
+        ControlFailed,
+        KeyChecked(bool),
+        Close,
     }
 
-    fn fin(c: &mut ConnectionState, stream: u32) {
-        c.finished(stream);
-        c.invariants();
+    impl Event {
+        fn message(stream: u32, msg: ClientMsg) -> Self {
+            Self::Message(stream, msg, true)
+        }
     }
 
-    fn key(c: &mut ConnectionState, valid: bool) -> Vec<Route> {
-        let routes = c.key_checked(valid);
-        c.invariants();
-        routes
-    }
-
-    fn close(c: &mut ConnectionState) -> Vec<Route> {
-        let routes = c.close();
-        c.invariants();
-        routes
-    }
-
-    fn failed(c: &mut ConnectionState, stream: u32) -> Vec<Route> {
-        let routes = c.stream_failed(stream);
-        c.invariants();
-        routes
-    }
-
-    fn control_failed(c: &mut ConnectionState) -> Vec<Route> {
-        let routes = c.control_failed();
-        c.invariants();
-        routes
+    fn replay(events: impl IntoIterator<Item = Event>) -> String {
+        let mut state = ConnectionState::new();
+        let mut outcomes = Transcript::default();
+        for event in events {
+            let (name, routes) = match event {
+                Event::Message(stream, msg, valid) => {
+                    let name = format!("{stream}: {}", kind(&msg));
+                    (name, state.message(stream, msg, valid))
+                }
+                Event::Finish(stream) => {
+                    state.finished(stream);
+                    (format!("{stream}: finish"), vec![])
+                }
+                Event::StreamFailed(stream) => (format!("{stream}: fail"), state.stream_failed(stream)),
+                Event::ControlFailed => ("control failed".into(), state.control_failed()),
+                Event::KeyChecked(valid) => (format!("key valid={valid}"), state.key_checked(valid)),
+                Event::Close => ("close".into(), state.close()),
+            };
+            outcomes.record(&name, names(&routes));
+            state.invariants();
+        }
+        outcomes.0
     }
 
     #[test]
     fn a_failed_stream_ends_only_itself_and_a_failed_control_stream_ends_the_connection() {
-        let mut c = ConnectionState::new();
-        msg(&mut c, 2, run(&["build"]), true);
-        msg(&mut c, 4, run(&["build"]), true);
-        assert_eq!(names(&failed(&mut c, 2)), ["cancel 2"]);
-        assert_eq!(names(&failed(&mut c, 2)), Vec::<String>::new(), "a stream ends once");
-        assert!(c.is_running(4) && !c.is_closed());
-        assert_eq!(names(&control_failed(&mut c)), ["cancel 4", "close"]);
-        assert!(control_failed(&mut c).is_empty());
-        assert!(failed(&mut c, 4).is_empty());
+        use Event::*;
+        expect![[r#"
+            2: a build request: ["run 2"]
+            4: a build request: ["run 4"]
+            2: fail: ["cancel 2"]
+            2: fail: []
+            control failed: ["cancel 4", "close"]
+            control failed: []
+            4: fail: []
+        "#]].assert_eq(&replay([
+            Event::message(2, run(&["build"])),
+            Event::message(4, run(&["build"])),
+            StreamFailed(2),
+            StreamFailed(2),
+            ControlFailed,
+            ControlFailed,
+            StreamFailed(4),
+        ]));
     }
 
     #[test]
     fn streams_are_independent_and_a_cancel_reaches_only_its_stream() {
-        let mut c = ConnectionState::new();
-        assert_eq!(names(&msg(&mut c, 3, run(&["build"]), true)), ["run 3"]);
-        assert_eq!(names(&msg(&mut c, 5, run(&["test"]), true)), ["run 5"]);
-        assert_eq!(names(&msg(&mut c, 5, ClientMsg::Changed, true)), ["to 5"]);
-        assert_eq!(names(&msg(&mut c, 3, ClientMsg::Cancel, true)), ["cancel 3"]);
-        assert_eq!(names(&msg(&mut c, 3, ClientMsg::Cancel, true)), Vec::<String>::new(), "a stream ends once");
-        assert!(c.is_running(5) && !c.is_running(3));
-        assert_eq!(names(&msg(&mut c, 5, ClientMsg::Env(Vec::new()), true)), ["to 5"]);
-        assert_eq!(
-            names(&msg(&mut c, 3, ClientMsg::Changed, true)),
-            ["report 3: unexpected a worktree change on stream 3"]
-        );
-        fin(&mut c, 5);
-        assert!(!c.is_running(5));
+        let message = Event::message;
+        expect![[r#"
+            3: a build request: ["run 3"]
+            5: a build request: ["run 5"]
+            5: a worktree change: ["to 5"]
+            3: a cancel: ["cancel 3"]
+            3: a cancel: []
+            5: environment variables: ["to 5"]
+            3: a worktree change: ["report 3: unexpected a worktree change on stream 3"]
+            5: finish: []
+            5: a cancel: []
+        "#]].assert_eq(&replay([
+            message(3, run(&["build"])),
+            message(5, run(&["test"])),
+            message(5, ClientMsg::Changed),
+            message(3, ClientMsg::Cancel),
+            message(3, ClientMsg::Cancel),
+            message(5, ClientMsg::Env(vec![])),
+            message(3, ClientMsg::Changed),
+            Event::Finish(5),
+            message(5, ClientMsg::Cancel),
+        ]));
     }
 
     #[test]
     fn a_closed_connection_cancels_all_of_its_streams() {
-        let mut c = ConnectionState::new();
-        for s in [2, 4, 6] {
-            msg(&mut c, s, run(&["build"]), true);
-        }
-        fin(&mut c, 4);
-        assert_eq!(names(&close(&mut c)), ["cancel 2", "cancel 6", "close"]);
-        assert!(close(&mut c).is_empty());
-        assert!(msg(&mut c, 8, run(&["build"]), true).is_empty(), "a closed connection takes no request");
+        use Event::{Close, Finish};
+        expect![[r#"
+            2: a build request: ["run 2"]
+            4: a build request: ["run 4"]
+            6: a build request: ["run 6"]
+            4: finish: []
+            close: ["cancel 2", "cancel 6", "close"]
+            close: []
+            8: a build request: []
+        "#]].assert_eq(&replay([
+            Event::message(2, run(&["build"])),
+            Event::message(4, run(&["build"])),
+            Event::message(6, run(&["build"])),
+            Finish(4),
+            Close,
+            Close,
+            Event::message(8, run(&["build"])),
+        ]));
     }
 
     #[test]
     fn a_request_on_a_key_no_longer_valid_is_refused_and_ends_the_connection() {
-        let mut c = ConnectionState::new();
-        msg(&mut c, 2, run(&["build"]), true);
-        assert_eq!(names(&msg(&mut c, 4, run(&["build"]), false)), ["refuse 4", "cancel 2", "close"]);
-        let mut d = ConnectionState::new();
-        msg(&mut d, 2, run(&["build"]), true);
-        assert_eq!(names(&key(&mut d, true)), Vec::<String>::new());
-        assert_eq!(names(&key(&mut d, false)), ["cancel 2", "close"]);
+        expect![[r#"
+            2: a build request: ["run 2"]
+            4: a build request: ["refuse 4", "cancel 2", "close"]
+        "#]].assert_eq(&replay([
+            Event::message(2, run(&["build"])),
+            Event::Message(4, run(&["build"]), false),
+        ]));
+        expect![[r#"
+            2: a build request: ["run 2"]
+            key valid=true: []
+            key valid=false: ["cancel 2", "close"]
+        "#]].assert_eq(&replay([
+            Event::message(2, run(&["build"])),
+            Event::KeyChecked(true),
+            Event::KeyChecked(false),
+        ]));
     }
 
     #[test]
     fn unknown_messages_are_reported_not_fatal() {
-        let mut c = ConnectionState::new();
-        let r = msg(&mut c, CONTROL, run(&["build"]), true);
-        assert_eq!(names(&r), ["report 0: unexpected a build request on the control stream"]);
-        assert_eq!(
-            names(&msg(&mut c, CONTROL, ClientMsg::Cancel, true)),
-            ["report 0: unexpected a cancel on the control stream"]
-        );
-        assert_eq!(names(&msg(&mut c, CONTROL, ClientMsg::Ping(7), true)), ["reply"]);
-        assert_eq!(names(&msg(&mut c, CONTROL, ClientMsg::Changed, true)), ["control"]);
-        msg(&mut c, 3, run(&["build"]), true);
-        assert_eq!(names(&msg(&mut c, 3, ClientMsg::Ping(1), true)), ["report 3: unexpected a ping on stream 3"]);
-        assert_eq!(names(&msg(&mut c, 3, run(&["build"]), true)), ["report 3: unexpected a build request on stream 3"]);
-        assert!(c.is_running(3) && !c.is_closed(), "the stream and the connection go on");
-        assert_eq!(names(&msg(&mut c, 9, ClientMsg::Fetch { id: 1, hashes: vec![] }, true)), ["fetch 9"]);
-        assert!(!c.is_running(9), "a fetch is not a request that runs");
+        let msg = Event::message;
+        expect![[r#"
+            0: a build request: ["report 0: unexpected a build request on the control stream"]
+            0: a cancel: ["report 0: unexpected a cancel on the control stream"]
+            0: a ping: ["reply Pong(7)"]
+            0: a worktree change: ["control"]
+            3: a build request: ["run 3"]
+            3: a ping: ["report 3: unexpected a ping on stream 3"]
+            3: a build request: ["report 3: unexpected a build request on stream 3"]
+            9: a fetch: ["fetch 9"]
+            close: ["cancel 3", "close"]
+        "#]].assert_eq(&replay([
+            msg(CONTROL, run(&["build"])),
+            msg(CONTROL, ClientMsg::Cancel),
+            msg(CONTROL, ClientMsg::Ping(7)),
+            msg(CONTROL, ClientMsg::Changed),
+            msg(3, run(&["build"])),
+            msg(3, ClientMsg::Ping(1)),
+            msg(3, run(&["build"])),
+            msg(9, ClientMsg::Fetch { id: 1, hashes: vec![] }),
+            Event::Close,
+        ]));
     }
 
     #[test]
     fn an_admin_command_from_a_non_admin_is_refused() {
-        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        for cmd in ["__gc", "__compact", "__export", "__import"] {
-            assert!(
-                matches!(command(PROTO_VERSION, &a(&[cmd, "/d"]), false, "bob"), Command::Fail(t) if t.contains("may not administer"))
-            );
+        let cases: &[(bool, &[&str])] = &[
+            (false, &["__gc"]),
+            (false, &["__compact"]),
+            (false, &["__export", "/d"]),
+            (false, &["__import", "/d"]),
+            (true, &["__gc"]),
+            (true, &["__export", "/d"]),
+            (true, &["__import"]),
+            (false, &["__status"]),
+            (false, &["build"]),
+        ];
+        let mut outcomes = Transcript::default();
+        for &(admin, words) in cases {
+            let args = words.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let user = if admin { "ann" } else { "bob" };
+            outcomes.record(&format!("{user} runs {}", words.join(" ")), command(PROTO_VERSION, &args, admin, user));
         }
-        assert_eq!(command(PROTO_VERSION, &a(&["__gc"]), true, "ann"), Command::Gc);
-        let install = format!("cargo install rargo --version {}", env!("CARGO_PKG_VERSION"));
-        let Command::Fail(old) = command(PROTO_VERSION - 1, &a(&["build"]), false, "bob") else { panic!("an old client") };
-        let server = format!("which runs rargo {}", env!("CARGO_PKG_VERSION"));
-        assert!(old.starts_with("this rargo is older than the build server, ") && old.contains(&server), "{old}");
-        assert!(old.ends_with(&format!("update it with: {install}")) && !old.contains("protocol"), "{old}");
-        let Command::Fail(oldest) = command(7, &a(&["build"]), false, "bob") else { panic!("a client from before the server left Cargo.toml") };
-        assert!(oldest.contains(&format!("update it with: {install}; then name the server once more with `rargo @HOST`")), "{oldest}");
-        assert!(oldest.ends_with("not in Cargo.toml") && !oldest.contains("protocol"), "{oldest}");
-        for client in [1, 6, 7] {
-            assert!(protocol_mismatch(client).contains("`rargo @HOST`"), "a client that kept its server in Cargo.toml: {client}");
+        expect![[r#"
+            bob runs __gc: Fail("user `bob` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)")
+            bob runs __compact: Fail("user `bob` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)")
+            bob runs __export /d: Fail("user `bob` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)")
+            bob runs __import /d: Fail("user `bob` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)")
+            ann runs __gc: Gc
+            ann runs __export /d: Export("/d")
+            ann runs __import: Fail("a directory is required")
+            bob runs __status: Status
+            bob runs build: Build
+        "#]].assert_eq(&outcomes.0);
+    }
+
+    #[test]
+    fn a_mismatched_client_is_told_how_to_install_the_server_version() {
+        let args = ["build".into()];
+        let denied = |client, admin| {
+            let Command::Fail(message) = command(client, &args, admin, "bob") else {
+                panic!("a client with a mismatched version cannot run");
+            };
+            message.replace(env!("CARGO_PKG_VERSION"), "<version>")
+        };
+        let mut outcomes = Transcript::default();
+        for (label, version, admin) in [
+            ("old", PROTO_VERSION - 1, false),
+            ("legacy", 7, false),
+            ("new", PROTO_VERSION + 1, false),
+            ("old admin", PROTO_VERSION - 1, true),
+        ] {
+            outcomes.record(label, denied(version, admin));
         }
-        for client in 7 + 1..PROTO_VERSION {
-            assert!(!protocol_mismatch(client).contains("`rargo @HOST`"), "a client that keeps its server in its own configuration: {client}");
+        expect![[r#"
+            old: "this rargo is older than the build server, which runs rargo <version>; update it with: cargo install rargo --version <version>"
+            legacy: "this rargo is older than the build server, which runs rargo <version>; update it with: cargo install rargo --version <version>; then name the server once more with `rargo @HOST`, as you did before: the new rargo keeps it in your own configuration, not in Cargo.toml"
+            new: "this rargo is newer than the build server, which runs rargo <version>; install the matching version with: cargo install rargo --version <version>"
+            old admin: "this rargo is older than the build server, which runs rargo <version>; update it with: cargo install rargo --version <version>"
+        "#]].assert_eq(&outcomes.0);
+        for client in 1..PROTO_VERSION {
+            assert_eq!(denied(client, false).contains("`rargo @HOST`"), client <= 7, "client {client}");
         }
-        let Command::Fail(new) = command(PROTO_VERSION + 1, &a(&["build"]), false, "bob") else { panic!("a new client") };
-        assert!(new.starts_with("this rargo is newer than the build server, ") && new.ends_with(&install), "{new}");
-        assert!(new.contains("install the matching version with: ") && !new.contains("protocol") && !new.contains("rargo @HOST"), "{new}");
-        assert_eq!(command(PROTO_VERSION, &a(&["__export", "/d"]), true, "ann"), Command::Export("/d".into()));
-        assert_eq!(
-            command(PROTO_VERSION, &a(&["__import"]), true, "ann"),
-            Command::Fail("a directory is required".into())
-        );
-        assert_eq!(command(PROTO_VERSION, &a(&["__status"]), false, "bob"), Command::Status);
-        assert_eq!(command(PROTO_VERSION, &a(&["build"]), false, "bob"), Command::Build);
-        assert!(
-            matches!(command(PROTO_VERSION - 1, &a(&["build"]), true, "ann"), Command::Fail(t) if t.contains("is older than the build server"))
-        );
     }
 
     #[test]
     fn color_and_priority_follow_the_request() {
         let env =
-            |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<HashMap<_, _>>();
+            |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>();
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let term = env(&[("TERM", "xterm")]);
         assert!(wants_color(&a(&["build"]), &term, true));
@@ -623,16 +728,43 @@ mod tests {
     fn status_text_names_every_figure() {
         let mut f = StatusFigures { requests: 7, running: 2, tokens: 8, store_bytes: 3 << 20, ..Default::default() };
         f.runs_by_kind = vec![("rustc", 4), ("build-script", 1)];
-        let t = status_text(&f);
-        assert!(t.starts_with("requests            7\n"));
-        assert!(t.contains("store               0 blobs, 3.0 MiB\n"));
-        assert!(t.contains("actions by kind     rustc 4, build-script 1\n"));
-        assert!(t.contains("scheduler           2 running, 0 waiting, peak 0, 0 granted, 8 tokens\n"));
-        assert!(t.contains("drift               not checked yet\n"));
-        assert!(t.ends_with("workers             not accepting workers\n"));
+        expect![[r#"
+            requests            7
+            sync                0 worktree states, 0 manifests and 0 files received from clients (0 changes pushed unasked, 0 files asked for, 0 awaited from another client's upload), 0.0 MiB received, 0.0 MiB of results sent; 0 client daemons have connected
+            store               0 blobs, 3.0 MiB
+            cold tier           0 blobs of 0.0 MiB kept as 0.0 MiB of chunks
+            cache               0 hits, 0 misses, 0 traces stored
+            actions run         0 (0.0s cpu, 0.0s wall)
+            actions by kind     rustc 4, build-script 1
+            in-flight dedup     0 joined, 0 of those ran anyway
+            reruns              0 changed-input, 0 environment
+            scheduler           2 running, 0 waiting, peak 0, 0 granted, 8 tokens
+            fuse                0 lookups, 0 opens, 0 userspace reads, 0 userspace writes
+            plans decoded       0
+            incremental         0 states saved; seeds: 0 same worktree, 0 ancestor, 0 other, 0 none; 0 dropped after a crash
+            verify              0 cached units re-run cleanly, 0 differed
+            drift               not checked yet
+            workers             not accepting workers
+        "#]].assert_eq(&status_text(&f));
         f.workers = Some(WorkerFigures { count: 3, overhead: "12 ms".into(), ..Default::default() });
-        assert!(status_text(&f).contains("workers             3 connected; 0 actions dispatched"));
-        assert_eq!(t.lines().count(), 16);
+        expect![[r#"
+            requests            7
+            sync                0 worktree states, 0 manifests and 0 files received from clients (0 changes pushed unasked, 0 files asked for, 0 awaited from another client's upload), 0.0 MiB received, 0.0 MiB of results sent; 0 client daemons have connected
+            store               0 blobs, 3.0 MiB
+            cold tier           0 blobs of 0.0 MiB kept as 0.0 MiB of chunks
+            cache               0 hits, 0 misses, 0 traces stored
+            actions run         0 (0.0s cpu, 0.0s wall)
+            actions by kind     rustc 4, build-script 1
+            in-flight dedup     0 joined, 0 of those ran anyway
+            reruns              0 changed-input, 0 environment
+            scheduler           2 running, 0 waiting, peak 0, 0 granted, 8 tokens
+            fuse                0 lookups, 0 opens, 0 userspace reads, 0 userspace writes
+            plans decoded       0
+            incremental         0 states saved; seeds: 0 same worktree, 0 ancestor, 0 other, 0 none; 0 dropped after a crash
+            verify              0 cached units re-run cleanly, 0 differed
+            drift               not checked yet
+            workers             3 connected; 0 actions dispatched (0 of them also started here on an idle core: 0 finished here first, 0 were stopped because the worker was ahead), 0 kept local (core free), 0 kept local (a local core came free first), 0 kept local (transfer too costly), 0 kept local (no worker has the incremental state), 0 worker failures; overhead per remote action 12 ms; incremental compiles on workers: 0 without state, 0 with the state the worker held; state left on workers 0.0 MiB in 0 files, of which 0.0 MiB in 0 files came home in the background and 0 files were fetched for a compile here; 0 states made here sent to workers ahead of need (0.0 MiB); sent ahead 0.0 MiB, not sent because already there 0.0 MiB; outputs fetched 0.0 MiB, reused locally 0.0 MiB; 0 answers sent ahead, 0 lookups and 0 opens asked, 0 nix store lookups
+        "#]].assert_eq(&status_text(&f));
     }
 
     struct Rng(u64);

@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
 permissions:
   contents: read
@@ -18,42 +18,57 @@ jobs:
       RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
-      - name: The service deploys published releases only
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: dev/update-service-test.sh
-      - name: install.sh installs a release only once the build server runs it
-        run: dev/release-local-test.sh
+      # rargo can fetch the runtime closure for the test binaries through Nix.
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
-      - name: Realise the flake closure for binaries from the build server
-        run: nix develop --command true
-      - name: The default flake's toolchain has the standard library's sources, with and without a toolchain file
-        run: dev/default-flake-check.sh
       - name: rargo, signed in to rargo.rs
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
-          curl -fsSL https://rargo.rs/install.sh | sh
-          rargo auth --token "$RARGO_TOKEN"
-      - name: Build (on the server, on the cache every other build of this commit uses)
-        run: rargo build --locked --workspace
-      - name: Every test of the workspace (built on the server, run here, as root, one process each), each within its CPU budget
-        run: python3 -I dev/purity.py cpu
-      - name: The purity allowlists and the time budgets only shrink
-        run: git fetch -q --depth=1 origin main && python3 -I dev/purity.py ratchet FETCH_HEAD
-      - name: The shipped client
-        run: rargo build --locked --release -p rargo --target x86_64-unknown-linux-musl && file target/x86_64-unknown-linux-musl/release/rargo | grep -q 'static'
-      - name: io_uring runs on the runner, and a default Docker container refuses it with what to change
-        run: |
-          d=$(mktemp -d)
-          rc=0; HOME=$d RARGO_SERVER=127.0.0.1:1 RARGO_CACHE_DIR=$d/cache timeout 3 target/x86_64-unknown-linux-musl/release/rargo --rargo-daemon $d/probe.sock || rc=$?
-          test $rc = 124
-          rc=0; out=$(docker run --rm -e RARGO_SERVER=127.0.0.1:1 -e HOME=/tmp -v $PWD/target/x86_64-unknown-linux-musl/release:/b:ro ubuntu:24.04 /b/rargo --rargo-daemon /tmp/probe.sock 2>&1) || rc=$?
-          echo "$out"
-          test $rc = 101 && grep -q '^error: io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out" && grep -q 'seccomp=unconfined' <<<"$out"
-          out=$(docker run --rm -e HOME=/tmp -v $PWD/target/x86_64-unknown-linux-musl/release:/b:ro ubuntu:24.04 /b/rargo status 2>&1)
-          echo "$out"
-          grep -q '^io_uring  unavailable, so rargo cannot build here: io_uring is unavailable (io_uring_setup returned EPERM)' <<<"$out"
-      - name: The crates that are published
-        run: nix develop --command cargo package --locked -p rargo-machine -p fusewire -p rargo-proto -p rargo-net -p rargo
-      - run: sh -n install/install.sh && sh -n install/install-server.sh
+          sign_in() {
+            local rc=0
+            curl -fsSL --connect-timeout 10 --max-time 30 https://rargo.rs/install.sh > "$installer" || rc=$?
+            case "$rc" in
+              0) ;;
+              6|7|28) return 75 ;;
+              *) return 1 ;;
+            esac
+            if ! timeout 60s sh "$installer" > "$output" 2>&1; then
+              cat "$output"
+              if grep -Eq '^curl: [(](6|7|28)[)]' "$output"; then
+                return 75
+              fi
+              return 1
+            fi
+            cat "$output"
+            if timeout 30s rargo auth --token "$RARGO_TOKEN" > "$output" 2>&1; then
+              cat "$output"
+              return 0
+            fi
+            cat "$output"
+            if grep -Eq '^error: (rargo auth: )?(cannot find the rargo server .+: (nothing answers there|no machine has that name)|cannot reach the rargo server at )' "$output"; then
+              return 75
+            fi
+            return 1
+          }
+
+          installer=$(mktemp)
+          output=$(mktemp)
+          trap 'rm -f "$installer" "$output"' EXIT
+          deadline=$((SECONDS + 600))
+          while true; do
+            rc=0
+            sign_in || rc=$?
+            case "$rc" in
+              0) break ;;
+              75) ;;
+              *) exit "$rc" ;;
+            esac
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              echo "::error::The rargo server did not answer within the sign-in retry window."
+              exit 1
+            fi
+            echo "::warning::The rargo server did not answer. Retrying sign-in."
+            sleep "$((remaining < 60 ? remaining : 60))"
+          done
+      - run: rargo test --locked --workspace

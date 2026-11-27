@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, squeue::Entry128, types, IoUring};
 
 use super::ops::{prepare, event_of, Event, Op};
 use super::pool::{Job, Jobs, Pool, worker};
@@ -37,6 +37,7 @@ pub(super) enum Kind {
     SendFds,
     RecvFds,
     Readable,
+    Fuse,
 }
 
 pub(super) struct Slot {
@@ -51,11 +52,12 @@ pub(super) struct Slot {
     pub(super) path2: Option<CString>,
     pub(super) iov: Option<Box<libc::iovec>>,
     pub(super) msg: Option<Box<libc::msghdr>>,
+    pub(super) fuse: Option<Box<super::fuse::RingBuffer>>,
     pub(super) cbuf: Option<Vec<u8>>,
 }
 
 pub struct Loop {
-    pub(super) ring: IoUring,
+    pub(super) ring: IoUring<Entry128>,
     pub(super) next: u64,
     pub(super) inflight: BTreeMap<u64, Slot>,
     pub(super) pool: Pool,
@@ -70,7 +72,7 @@ pub(super) fn probe() -> io::Result<()> {
 impl Loop {
     pub fn new(workers: usize) -> io::Result<Self> {
         assert!(workers >= 1, "the worker pool has at least one thread");
-        let ring = IoUring::new(RING_ENTRIES)?;
+        let ring = IoUring::builder().build(RING_ENTRIES)?;
         let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if efd < 0 {
             return Err(io::Error::last_os_error());
@@ -148,7 +150,7 @@ impl Loop {
         if !self.inflight.contains_key(&token) {
             return;
         }
-        let entry = opcode::AsyncCancel::new(token).build().user_data(CANCEL);
+        let entry = opcode::AsyncCancel::new(token).build().user_data(CANCEL).into();
         unsafe {
             if self.ring.submission().push(&entry).is_err() {
                 let _ = self.ring.submit();
@@ -176,7 +178,7 @@ impl Loop {
 
     fn arm_eventfd(&mut self) -> io::Result<()> {
         let mut buf = vec![0u8; 8];
-        let entry = opcode::Read::new(types::Fd(self.pool.efd), buf.as_mut_ptr(), buf.len() as u32).build().user_data(EVENTFD);
+        let entry = opcode::Read::new(types::Fd(self.pool.efd), buf.as_mut_ptr(), buf.len() as u32).build().user_data(EVENTFD).into();
         self.inflight.insert(EVENTFD, Slot::buf(Kind::Read, buf));
         unsafe {
             self.ring.submission().push(&entry).map_err(|_| io::Error::other("submission queue is full"))?;
@@ -231,7 +233,7 @@ impl Drop for Loop {
 
 impl Slot {
     pub(super) fn empty(kind: Kind) -> Self {
-        Self { kind, buf: None, stat: None, addr: None, addrlen: None, ts: None, info: None, path: None, path2: None, iov: None, msg: None, cbuf: None }
+        Self { kind, buf: None, stat: None, addr: None, addrlen: None, ts: None, info: None, path: None, path2: None, iov: None, msg: None, fuse: None, cbuf: None }
     }
     pub(super) fn buf(kind: Kind, buf: Vec<u8>) -> Self {
         Self { buf: Some(buf), ..Self::empty(kind) }

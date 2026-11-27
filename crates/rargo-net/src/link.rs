@@ -2,11 +2,11 @@ use rargo_machine::StateMachine;
 use crate::io::{self as shell, JoinHandle, Mutex as FiberMutex, Notify, ReadHalf, TcpStream, WriteHalf};
 use crate::{Auth, Conn, Endpoint};
 use rargo_proto::secure::{self, Opener, Sealer};
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::rc::Rc;
 use std::time::Duration;
 
 /// A TCP record is a little-endian length and then that many bytes.
@@ -136,24 +136,20 @@ struct Inbox {
 }
 
 struct Shared {
-    mu: Mutex<Inbox>,
+    mu: RefCell<Inbox>,
     space: Notify,
     data: Notify,
 }
 
 pub struct TcpLink {
     wr: FiberMutex<Option<(WriteHalf, Sealer)>>,
-    shared: Arc<Shared>,
-    closed: AtomicBool,
-    reader: Mutex<Option<JoinHandle<()>>>,
-}
-
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    shared: Rc<Shared>,
+    closed: Cell<bool>,
+    reader: Option<JoinHandle<()>>,
 }
 
 pub enum Link {
-    Udp(Arc<Conn>, Arc<Endpoint>),
+    Udp(Rc<Conn>, Rc<Endpoint>),
     Tcp(TcpLink),
 }
 
@@ -231,18 +227,18 @@ impl Link {
     pub fn tcp(stream: TcpStream, sealer: Sealer, opener: Opener) -> Link {
         let _ = stream.set_nodelay(true);
         let (rd, wr) = stream.into_split();
-        let shared = Arc::new(Shared {
-            mu: Mutex::new(Inbox { msgs: VecDeque::new(), stop: false, eof: false }),
+        let shared = Rc::new(Shared {
+            mu: RefCell::new(Inbox { msgs: VecDeque::new(), stop: false, eof: false }),
             space: Notify::new(),
             data: Notify::new(),
         });
-        let reading = Arc::clone(&shared);
+        let reading = Rc::clone(&shared);
         let reader = shell::spawn(move || tcp_read(rd, opener, reading));
         Link::Tcp(TcpLink {
             wr: FiberMutex::new(Some((wr, sealer))),
             shared,
-            closed: AtomicBool::new(false),
-            reader: Mutex::new(Some(reader)),
+            closed: Cell::new(false),
+            reader: Some(reader),
         })
     }
 
@@ -310,7 +306,7 @@ impl Link {
     pub fn is_closed(&self) -> bool {
         match self {
             Link::Udp(c, _) => c.is_closed(),
-            Link::Tcp(t) => t.closed.load(Ordering::SeqCst),
+            Link::Tcp(t) => t.closed.get(),
         }
     }
 
@@ -324,7 +320,7 @@ impl Link {
 
 impl TcpLink {
     fn send(&self, msg: &[u8]) -> io::Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.closed.get() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
         }
         let mut g = self.wr.lock();
@@ -343,27 +339,28 @@ impl TcpLink {
 
     fn recv(&self) -> Option<Vec<u8>> {
         loop {
-            let mut g = lock(&self.shared.mu);
-            if let Some(msg) = g.msgs.pop_front() {
-                let drained = g.msgs.is_empty();
-                drop(g);
+            let (taken, drained, eof) = {
+                let mut inbox = self.shared.mu.borrow_mut();
+                let taken = inbox.msgs.pop_front();
+                (taken, inbox.msgs.is_empty(), inbox.eof)
+            };
+            if let Some(msg) = taken {
                 if drained {
                     self.shared.space.notify_one();
                 }
                 return Some(msg);
             }
-            if g.eof {
+            if eof {
                 return None;
             }
-            drop(g);
             self.shared.data.notified();
         }
     }
 
     fn halt(&self) {
-        self.closed.store(true, Ordering::SeqCst);
+        self.closed.set(true);
         {
-            let mut g = lock(&self.shared.mu);
+            let mut g = self.shared.mu.borrow_mut();
             g.stop = true;
             g.eof = true;
         }
@@ -372,14 +369,14 @@ impl TcpLink {
         if let Some((mut wr, _)) = self.wr.lock().take() {
             let _ = wr.halt();
         }
-        assert!(self.closed.load(Ordering::SeqCst));
+        assert!(self.closed.get());
     }
 }
 
 impl Drop for TcpLink {
     fn drop(&mut self) {
         self.halt();
-        if let Some(mut reader) = lock(&self.reader).take() {
+        if let Some(mut reader) = self.reader.take() {
             let _ = reader.join();
         }
     }
@@ -387,7 +384,7 @@ impl Drop for TcpLink {
 
 fn deliver(shared: &Shared, msg: Vec<u8>) -> bool {
     {
-        let mut g = lock(&shared.mu);
+        let mut g = shared.mu.borrow_mut();
         if g.stop {
             return false;
         }
@@ -399,7 +396,7 @@ fn deliver(shared: &Shared, msg: Vec<u8>) -> bool {
 
 fn mark_eof(shared: &Shared) {
     {
-        let mut g = lock(&shared.mu);
+        let mut g = shared.mu.borrow_mut();
         g.eof = true;
         g.stop = true;
     }
@@ -407,13 +404,13 @@ fn mark_eof(shared: &Shared) {
     shared.data.notify_waiters();
 }
 
-fn tcp_read(mut stream: ReadHalf, mut opener: Opener, shared: Arc<Shared>) {
+fn tcp_read(mut stream: ReadHalf, mut opener: Opener, shared: Rc<Shared>) {
     let mut dec = FrameDecoder::new(FRAME_LIMIT);
     let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
     let mut buf = vec![0u8; 256 << 10];
     let mut need_more = false;
     loop {
-        if lock(&shared.mu).stop {
+        if shared.mu.borrow().stop {
             return;
         }
         while let Some(rec) = pending.pop_front() {
@@ -437,7 +434,7 @@ fn tcp_read(mut stream: ReadHalf, mut opener: Opener, shared: Arc<Shared>) {
         if !need_more && dec.missing() == 0 {
             loop {
                 let waiting = {
-                    let g = lock(&shared.mu);
+                    let g = shared.mu.borrow();
                     if g.stop {
                         return;
                     }
@@ -475,27 +472,16 @@ fn tcp_read(mut stream: ReadHalf, mut opener: Opener, shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
     use rargo_proto::secure::{client_finish, client_start, psk_from_secret, server_accept};
 
-    fn round_trip(limit: usize, payloads: &[Vec<u8>]) -> Vec<Vec<u8>> {
-        let mut wire = Vec::new();
-        for p in payloads {
-            wire.extend(encode_frame(p, limit).unwrap());
-        }
-        let mut d = FrameDecoder::new(limit);
-        let got = d.push(&wire).unwrap();
-        d.invariants();
-        assert_eq!(d.end(), Ok(()));
-        assert_eq!(d.missing(), 0);
-        got
-    }
-
     #[test]
-    fn frames_round_trip_and_an_empty_frame_is_a_frame() {
-        let payloads = [vec![], vec![1, 2, 3], vec![9; 20]];
-        assert_eq!(round_trip(FRAME_LIMIT, &payloads), payloads);
-        let exact = vec![7u8; 4];
-        assert_eq!(round_trip(4, &[exact.clone()]), vec![exact]);
+    fn an_empty_frame_and_a_frame_at_the_limit_are_delivered() {
+        let mut decoder = FrameDecoder::new(4);
+        let frames = decoder.push(&[0, 0, 0, 0, 4, 0, 0, 0, 7, 7, 7, 7]);
+        expect!["Ok([[], [7, 7, 7, 7]])"].assert_eq(&format!("{frames:?}"));
+        expect!["Ok(())"].assert_eq(&format!("{:?}", decoder.end()));
+        decoder.invariants();
     }
 
     #[test]
@@ -544,19 +530,21 @@ mod tests {
     #[test]
     fn an_oversize_frame_is_refused() {
         assert_eq!(encode_frame(&[1, 2, 3], 2), Err(FrameError::Oversize { len: 3, limit: 2 }));
-        let mut raw = 5u32.to_le_bytes().to_vec();
-        raw.extend_from_slice(&[9; 5]);
-        let mut d = FrameDecoder::new(4);
-        assert!(d.push(&raw[..2]).unwrap().is_empty());
-        d.invariants();
-        assert_eq!(d.missing(), 2);
-        assert_eq!(d.push(&raw[2..6]), Err(FrameError::Oversize { len: 5, limit: 4 }));
-        d.invariants();
-        assert_eq!(d.push(&[0]), Err(FrameError::Oversize { len: 5, limit: 4 }));
-        let huge = (FRAME_LIMIT as u32 + 1).to_le_bytes().to_vec();
-        let mut d = FrameDecoder::new(FRAME_LIMIT);
-        assert_eq!(d.push(&huge), Err(FrameError::Oversize { len: FRAME_LIMIT + 1, limit: FRAME_LIMIT }));
-        d.invariants();
+        let mut decoder = FrameDecoder::new(4);
+        let mut trace = Vec::new();
+        for chunk in [&[5, 0][..], &[0, 0, 9, 9], &[0]] {
+            trace.push(format!("{:?}, missing={}", decoder.push(chunk), decoder.missing()));
+            decoder.invariants();
+        }
+        expect![[r#"
+            Ok([]), missing=2
+            Err(Oversize { len: 5, limit: 4 }), missing=0
+            Err(Oversize { len: 5, limit: 4 }), missing=0"#]].assert_eq(&trace.join("\n"));
+        let mut decoder = FrameDecoder::new(FRAME_LIMIT);
+        let huge = (FRAME_LIMIT as u32 + 1).to_le_bytes();
+        expect!["Err(Oversize { len: 65536, limit: 65535 })"]
+            .assert_eq(&format!("{:?}", decoder.push(&huge)));
+        decoder.invariants();
     }
 
     #[test]

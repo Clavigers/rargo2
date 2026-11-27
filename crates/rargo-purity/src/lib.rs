@@ -129,6 +129,17 @@ pub fn is_shell(file: &str) -> bool {
     in_crate.is_some_and(|path| path == "build.rs" || path.starts_with("examples/"))
 }
 
+/// Types under a denied module that are plain values: naming an address
+/// opens no socket, so they are not I/O.
+const VALUES: &[&str] = &[
+    "std::net::SocketAddr",
+    "std::net::SocketAddrV4",
+    "std::net::SocketAddrV6",
+    "std::net::IpAddr",
+    "std::net::Ipv4Addr",
+    "std::net::Ipv6Addr",
+];
+
 const AMBIENT: &[&str] = &[
     "std::fs",
     "std::net",
@@ -230,6 +241,10 @@ fn under(full: &str, prefix: &str) -> bool {
 }
 
 fn normalize(full: String) -> String {
+    // core::net contains address values and parsers, but no socket I/O.
+    if under(&full, "core::net") {
+        return full;
+    }
     for root in ["core::", "alloc::"] {
         if let Some(rest) = full.strip_prefix(root) {
             return format!("std::{rest}");
@@ -414,7 +429,7 @@ impl Scan<'_> {
     }
 
     fn denied(&mut self, full: &str, line: usize) {
-        if under(full, "std::sync::atomic::Ordering") {
+        if under(full, "std::sync::atomic::Ordering") || VALUES.iter().any(|v| under(full, v)) {
             return;
         }
         let testing = self.testing();
@@ -489,7 +504,7 @@ impl<'a> Visit<'a> for Scan<'_> {
             && let Some(ty) = &ty
         {
             match &i.trait_ {
-                Some((_, path, _)) if is_state_machine(path) && !self.testing() => {
+                Some((_, path, _)) if is_state_machine(path) => {
                     for item in &i.items {
                         let ImplItem::Fn(f) = item else { continue };
                         if f.sig.ident != "invariants" {

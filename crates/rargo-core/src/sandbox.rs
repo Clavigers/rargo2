@@ -2,12 +2,12 @@ use rargo_machine::StateMachine;
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
+use crate::io::sandbox as sys;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -90,7 +90,7 @@ enum FromZygote {
 pub struct Zygote {
     sock: OwnedFd,
     sending: crate::io::Mutex<()>,
-    pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
+    pending: Arc<Mutex<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
     next: AtomicU64,
     pid: i32,
     reading: std::sync::Once,
@@ -141,20 +141,19 @@ fn recv_frame(sock: RawFd) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
 
 impl Zygote {
     pub fn start(exe: &Path) -> Result<Arc<Zygote>> {
-        let (ours, theirs) = UnixStream::pair()?;
+        let (sock, theirs) = sys::socket_pair()?;
         let theirs_fd = theirs.as_raw_fd();
-        unsafe { libc::fcntl(theirs_fd, libc::F_SETFD, 0) };
-        let child = std::process::Command::new(exe)
+        let _ = sys::set_close_on_exec(theirs_fd, false);
+        let child = crate::io::process::Command::new(exe)
             .arg("--internal-zygote")
             .arg(theirs_fd.to_string())
-            .stdin(std::process::Stdio::null())
+            .stdin(crate::io::process::Stdio::null())
             .spawn()
             .with_context(|| format!("starting zygote {}", exe.display()))?;
         drop(theirs);
         let pid = child.id() as i32;
         drop(child);
-        let sock = OwnedFd::from(ours);
-        let pending: Arc<Mutex<HashMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
+        let pending: Arc<Mutex<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
         Ok(Arc::new(Zygote {
             sock,
             sending: crate::io::Mutex::new(()),
@@ -188,8 +187,8 @@ impl Zygote {
         &self,
         plan: Plan,
         stdin: Option<OwnedFd>,
-        stdout: OwnedFd,
-        stderr: OwnedFd,
+        stdout: impl AsRawFd,
+        stderr: impl AsRawFd,
         extra: &[RawFd],
     ) -> Result<Running> {
         self.reading.call_once(|| self.read_exits());
@@ -222,9 +221,29 @@ impl Zygote {
     }
 }
 
+/// What starts the process of an action from its plan and stops it again.
+/// On a kernel that is the zygote; a simulation has no processes and brings its own.
+pub trait Launcher: Send + Sync {
+    /// Starts what `plan` describes with `stdout` and `stderr` as its output and `extra` as further descriptors it inherits.
+    fn launch(&self, plan: Plan, stdout: crate::io::PipeEnd, stderr: crate::io::PipeEnd, extra: &[RawFd]) -> Result<Running>;
+
+    /// Stops the process that `launch` named `id`.
+    fn kill(&self, id: u64);
+}
+
+impl Launcher for Zygote {
+    fn launch(&self, plan: Plan, stdout: crate::io::PipeEnd, stderr: crate::io::PipeEnd, extra: &[RawFd]) -> Result<Running> {
+        self.spawn(plan, None, stdout, stderr, extra)
+    }
+
+    fn kill(&self, id: u64) {
+        Zygote::kill(self, id)
+    }
+}
+
 impl Drop for Zygote {
     fn drop(&mut self) {
-        unsafe { libc::shutdown(self.sock.as_raw_fd(), libc::SHUT_RDWR) };
+        let _ = sys::shutdown(self.sock.as_raw_fd());
         if crate::io::on_fiber() {
             let _ = crate::io::wait_exit(self.pid);
         }
@@ -232,13 +251,11 @@ impl Drop for Zygote {
 }
 
 pub fn zygote_main(fd: RawFd) -> ! {
-    unsafe {
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-        libc::prctl(libc::PR_SET_NAME, c"rargo-zygote".as_ptr());
-    }
+    let _ = sys::set_close_on_exec(fd, true);
+    let _ = sys::die_with_parent();
+    let _ = sys::set_process_name(c"rargo-zygote");
     crate::io::run(1, move || zygote_serve(fd));
-    std::process::exit(0)
+    crate::io::process::exit(0)
 }
 
 fn zygote_serve(sock: RawFd) {
@@ -252,7 +269,7 @@ fn zygote_serve(sock: RawFd) {
                 let (Some(out), Some(err)) = (it.next(), it.next()) else { continue };
                 let stdin = if has_stdin { it.next() } else { None };
                 let extras: Vec<OwnedFd> = it.take(extra).collect();
-                let started = std::time::Instant::now();
+                let started = crate::io::now();
                 match spawn_init(&plan, stdin, out, err, extras) {
                     Ok((pid, status_pipe)) => {
                         assert!(children.borrow_mut().insert(id, pid).is_none(), "spawn ids are unique");
@@ -275,30 +292,29 @@ fn zygote_serve(sock: RawFd) {
             }
             Ok(ToZygote::Kill { id }) => {
                 if let Some(pid) = children.borrow().get(&id) {
-                    unsafe { libc::kill(*pid, libc::SIGKILL) };
+                    let _ = crate::io::sys::kill(*pid);
                 }
             }
             Err(_) => {}
         }
     }
     for pid in children.borrow().values() {
-        unsafe { libc::kill(*pid, libc::SIGKILL) };
+        let _ = crate::io::sys::kill(*pid);
     }
 }
 
 fn child_exit(pid: i32, status_pipe: OwnedFd, started: std::time::Instant) -> ExitInfo {
     let _ = crate::io::wait_exited(pid);
-    let mut status = 0i32;
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    let reaped = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
-    assert_eq!(reaped, pid, "a child the ring saw exit is reaped at once");
+    let reaped = sys::reap(pid);
+    assert_eq!(reaped.pid, pid, "a child the ring saw exit is reaped at once");
+    let status = reaped.status;
     let mut info = ExitInfo {
         status,
         setup_failed: false,
-        user_us: ru.ru_utime.tv_sec as u64 * 1_000_000 + ru.ru_utime.tv_usec as u64,
-        sys_us: ru.ru_stime.tv_sec as u64 * 1_000_000 + ru.ru_stime.tv_usec as u64,
-        max_rss_kb: ru.ru_maxrss as u64,
-        wall_us: started.elapsed().as_micros() as u64,
+        user_us: reaped.user_us,
+        sys_us: reaped.sys_us,
+        max_rss_kb: reaped.max_rss_kb,
+        wall_us: crate::io::now().saturating_duration_since(started).as_micros() as u64,
     };
     let mut report = Vec::with_capacity(5);
     while report.len() < 5 {
@@ -324,14 +340,9 @@ fn path_cstr(p: &Path) -> CString {
     cstr(p.as_os_str().as_bytes())
 }
 
-fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-    let mut fds = [0; 2];
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
-}
-
+/// Carries out a plan up to its clone in this process, then clones the
+/// sandbox's first process, which carries out the rest. Returns that
+/// process's id and the pipe it reports its outcome on.
 fn spawn_init(
     plan: &Plan,
     stdin: Option<OwnedFd>,
@@ -339,7 +350,7 @@ fn spawn_init(
     stderr: OwnedFd,
     extras: Vec<OwnedFd>,
 ) -> io::Result<(i32, OwnedFd)> {
-    let (status_r, status_w) = pipe()?;
+    let (status_r, status_w) = sys::pipe()?;
     let clone_at = plan
         .ops
         .iter()
@@ -352,20 +363,17 @@ fn spawn_init(
         Op::Clone { flags } => *flags,
         _ => unreachable!("the clone op is at clone_at"),
     };
-    let pid = unsafe {
-        libc::syscall(libc::SYS_clone, (flags | libc::SIGCHLD) as libc::c_ulong, 0usize, 0usize, 0usize, 0usize)
-    } as i32;
-    if pid < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let pid = sys::clone(flags)?;
     if pid == 0 {
         drop(status_r);
         let code = run_child(plan, clone_at + 1, stdin, stdout, stderr, extras, status_w);
-        unsafe { libc::_exit(code) };
+        sys::exit_now(code);
     }
     Ok((pid, status_r))
 }
 
+/// The sandbox's first process: sets the namespaces up, forks the process
+/// that executes the command, and reports how that one ended.
 fn run_child(
     plan: &Plan,
     from: usize,
@@ -375,46 +383,39 @@ fn run_child(
     extras: Vec<OwnedFd>,
     status_w: OwnedFd,
 ) -> i32 {
-    let fail = |status_w: &OwnedFd, stderr: &OwnedFd, status: i32, setup_failed: bool| {
-        report(status_w.as_raw_fd(), status, setup_failed);
-        let _ = stderr;
+    let failed = |status_w: &OwnedFd| {
+        report(status_w.as_raw_fd(), 126 << 8, true);
+        126
     };
     let Some(fork_at) = plan.ops.iter().position(|op| matches!(op, Op::Fork)) else {
-        report(status_w.as_raw_fd(), 126 << 8, true);
-        return 126;
+        return failed(&status_w);
     };
     for op in &plan.ops[from..fork_at] {
         if let Err(e) = apply(op) {
             write_all_fd(stderr.as_raw_fd(), format!("rargo: sandbox setup failed: {e}\n").as_bytes());
-            fail(&status_w, &stderr, 126 << 8, true);
-            return 126;
+            return failed(&status_w);
         }
     }
-    let Ok((exec_r, exec_w)) = pipe() else {
-        fail(&status_w, &stderr, 126 << 8, true);
-        return 126;
+    let Ok((exec_r, exec_w)) = sys::pipe() else {
+        return failed(&status_w);
     };
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        fail(&status_w, &stderr, 126 << 8, true);
-        return 126;
-    }
+    let Ok(pid) = sys::fork() else {
+        return failed(&status_w);
+    };
     if pid == 0 {
         drop(exec_r);
-        let exec_w_hi = unsafe { libc::fcntl(exec_w.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+        let exec_w_hi = sys::dup_above(exec_w.as_raw_fd(), 200).unwrap_or(-1);
         drop(exec_w);
         let err = run_exec(plan, fork_at + 1, stdin, stdout, stderr, extras);
         write_all_fd(exec_w_hi, &err.raw_os_error().unwrap_or(libc::EIO).to_le_bytes());
-        unsafe { libc::_exit(127) };
+        sys::exit_now(127);
     }
     drop(exec_w);
-    let stderr_fd = stderr.into_raw_fd();
     drop(stdout);
     drop(stdin);
     drop(extras);
     let mut errbuf = [0u8; 4];
-    let mut f = std::fs::File::from(exec_r);
-    let exec_failed = f.read_exact(&mut errbuf).is_ok();
+    let exec_failed = read_exact_fd(exec_r.as_raw_fd(), &mut errbuf);
     if exec_failed {
         let e = io::Error::from_raw_os_error(i32::from_le_bytes(errbuf));
         let prog = plan.ops.iter().find_map(|op| match op {
@@ -422,23 +423,24 @@ fn run_child(
             _ => None,
         });
         let prog = prog.as_deref().unwrap_or("");
-        write_all_fd(stderr_fd, format!("rargo: cannot execute `{prog}`: {e}\n").as_bytes());
+        write_all_fd(stderr.as_raw_fd(), format!("rargo: cannot execute `{prog}`: {e}\n").as_bytes());
     }
-    unsafe { libc::close(stderr_fd) };
+    drop(stderr);
     loop {
-        let mut status = 0;
-        let r = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if r == pid {
-            report(status_w.as_raw_fd(), status, exec_failed);
-            return 0;
-        }
-        if r < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            report(status_w.as_raw_fd(), 126 << 8, true);
-            return 126;
+        match sys::wait_any() {
+            Ok((reaped, status)) if reaped == pid => {
+                report(status_w.as_raw_fd(), status, exec_failed);
+                return 0;
+            }
+            Ok(_) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINTR) => {}
+            Err(_) => return failed(&status_w),
         }
     }
 }
 
+/// The process that becomes the command: wires its descriptors, carries out
+/// the plan's last steps and executes. It returns only with why it could not.
 fn run_exec(
     plan: &Plan,
     from: usize,
@@ -458,33 +460,27 @@ fn run_exec(
     io::Error::from_raw_os_error(libc::ENOENT)
 }
 
+/// Puts the command's input, output and error on descriptors 0, 1 and 2 and
+/// the extra descriptors from `EXTRA_FD_BASE` up, and unblocks every signal.
 fn wire(stdin: Option<OwnedFd>, stdout: OwnedFd, stderr: OwnedFd, extras: Vec<OwnedFd>) -> io::Result<()> {
-    unsafe {
-        match &stdin {
-            Some(fd) => {
-                libc::dup2(fd.as_raw_fd(), 0);
-            }
-            None => {
-                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-                if null >= 0 {
-                    libc::dup2(null, 0);
-                    libc::close(null);
-                }
+    match &stdin {
+        Some(fd) => {
+            let _ = sys::dup_to(fd.as_raw_fd(), 0);
+        }
+        None => {
+            if let Ok(null) = sys::open_read(c"/dev/null") {
+                let _ = sys::dup_to(null.as_raw_fd(), 0);
             }
         }
-        libc::dup2(stdout.as_raw_fd(), 1);
-        libc::dup2(stderr.as_raw_fd(), 2);
-        let parked: Vec<i32> = extras.iter().map(|fd| libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100)).collect();
-        drop(extras);
-        for (i, fd) in parked.iter().enumerate() {
-            if *fd < 0 || libc::dup2(*fd, EXTRA_FD_BASE + i as i32) < 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        let mut mask: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut mask);
-        libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
     }
+    let _ = sys::dup_to(stdout.as_raw_fd(), 1);
+    let _ = sys::dup_to(stderr.as_raw_fd(), 2);
+    let parked: Vec<io::Result<RawFd>> = extras.iter().map(|fd| sys::dup_above(fd.as_raw_fd(), 100)).collect();
+    drop(extras);
+    for (i, fd) in parked.into_iter().enumerate() {
+        sys::dup_to(fd?, EXTRA_FD_BASE + i as i32)?;
+    }
+    sys::unblock_signals();
     Ok(())
 }
 
@@ -495,74 +491,35 @@ fn report(fd: RawFd, status: i32, setup_failed: bool) {
     write_all_fd(fd, &buf);
 }
 
-fn mount_at(src: Option<&Path>, tgt: &Path, fstype: Option<&str>, flags: u64, data: Option<&str>) -> io::Result<()> {
-    let src_c = src.map(path_cstr);
-    let tgt_c = path_cstr(tgt);
-    let fs_c = fstype.map(|s| CString::new(s).unwrap());
-    let data_c = data.map(|s| CString::new(s).unwrap());
-    let r = unsafe {
-        libc::mount(
-            src_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            tgt_c.as_ptr(),
-            fs_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            flags as libc::c_ulong,
-            data_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr() as *const libc::c_void),
-        )
-    };
-    if r != 0 {
-        let e = io::Error::last_os_error();
-        return Err(io::Error::new(e.kind(), format!("mount {}: {e}", tgt.display())));
-    }
-    Ok(())
-}
-
-fn pivot(root: &Path) -> io::Result<()> {
-    let root_c = path_cstr(root);
-    unsafe {
-        if libc::chdir(root_c.as_ptr()) != 0
-            || libc::syscall(libc::SYS_pivot_root, c".".as_ptr(), c".".as_ptr()) != 0
-            || libc::umount2(c".".as_ptr(), libc::MNT_DETACH) != 0
-            || libc::chdir(c"/".as_ptr()) != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
-fn loopback_up() -> io::Result<()> {
-    unsafe {
-        let s = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
-        if s < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut ifr: libc::ifreq = std::mem::zeroed();
-        ifr.ifr_name[0] = b'l' as libc::c_char;
-        ifr.ifr_name[1] = b'o' as libc::c_char;
-        if libc::ioctl(s, libc::SIOCGIFFLAGS, &mut ifr) != 0 {
-            let e = io::Error::last_os_error();
-            libc::close(s);
-            return Err(e);
-        }
-        ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-        let set = libc::ioctl(s, libc::SIOCSIFFLAGS, &ifr);
-        let err = (set != 0).then(io::Error::last_os_error);
-        libc::close(s);
-        if let Some(e) = err {
-            return Err(e);
-        }
-    }
-    Ok(())
+fn mount_at(m: &Mount) -> io::Result<()> {
+    let src = m.src.as_deref().map(path_cstr);
+    let target = path_cstr(&m.target);
+    let fstype = m.fstype.as_deref().map(|s| CString::new(s).unwrap());
+    let data = m.data.as_deref().map(|s| CString::new(s).unwrap());
+    sys::mount(src.as_deref(), &target, fstype.as_deref(), m.flags, data.as_deref())
+        .map_err(|e| io::Error::new(e.kind(), format!("mount {}: {e}", m.target.display())))
 }
 
 fn write_all_fd(fd: RawFd, mut b: &[u8]) {
     while !b.is_empty() {
-        let r = unsafe { libc::write(fd, b.as_ptr() as *const _, b.len()) };
-        if r <= 0 {
-            return;
+        match sys::write(fd, b) {
+            Ok(n) if n > 0 => b = &b[n..],
+            _ => return,
         }
-        b = &b[r as usize..];
     }
+}
+
+/// Fills `buf` from `fd`; false when the descriptor ends or fails first.
+fn read_exact_fd(fd: RawFd, mut buf: &mut [u8]) -> bool {
+    while !buf.is_empty() {
+        match sys::read(fd, buf) {
+            Ok(0) => return false,
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -612,62 +569,28 @@ pub struct Plan {
 
 pub(crate) fn apply(op: &Op) -> io::Result<()> {
     match op {
-        Op::CreateDir { path, parents: true } => {
-            std::fs::create_dir_all(path)?;
-            Ok(())
-        }
-        Op::CreateDir { path, parents: false } => {
-            std::fs::create_dir(path)?;
-            Ok(())
-        }
-        Op::Write { path, data } => {
-            std::fs::write(path, data)?;
-            Ok(())
-        }
-        Op::DeathSignal => {
-            if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        Op::Hostname(name) => {
-            let b = name.as_bytes();
-            if unsafe { libc::sethostname(b.as_ptr() as *const _, b.len()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        }
-        Op::Loopback => loopback_up(),
-        Op::Mount(m) => mount_at(m.src.as_deref(), &m.target, m.fstype.as_deref(), m.flags, m.data.as_deref()),
-        Op::CreateFile(path) => {
-            std::fs::File::create(path)?;
-            Ok(())
-        }
-        Op::Symlink { target, path } => {
-            std::os::unix::fs::symlink(target, path)?;
-            Ok(())
-        }
+        Op::CreateDir { path, parents: true } => sys::create_dir_all(path),
+        Op::CreateDir { path, parents: false } => sys::create_dir(path),
+        Op::Write { path, data } => sys::write_file(path, data),
+        Op::DeathSignal => sys::die_with_parent(),
+        Op::Hostname(name) => sys::set_hostname(name.as_bytes()),
+        Op::Loopback => sys::loopback_up(),
+        Op::Mount(m) => mount_at(m),
+        Op::CreateFile(path) => sys::create_file(path),
+        Op::Symlink { target, path } => sys::symlink(Path::new(target), path),
         Op::Devpts { mount, link } => {
-            if mount_at(mount.src.as_deref(), &mount.target, mount.fstype.as_deref(), mount.flags, mount.data.as_deref()).is_ok() {
-                std::os::unix::fs::symlink("pts/ptmx", link)?;
+            if mount_at(mount).is_ok() {
+                sys::symlink(Path::new("pts/ptmx"), link)?;
             }
             Ok(())
         }
-        Op::Pivot(root) => pivot(root),
-        Op::SetIds { uid, gid } => unsafe {
-            libc::setgroups(0, std::ptr::null());
-            if libc::setgid(*gid) != 0 || libc::setuid(*uid) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        },
-        Op::Chdir(cwd) => {
-            let c = cstr(cwd);
-            if unsafe { libc::chdir(c.as_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
+        Op::Pivot(root) => sys::pivot_root(&path_cstr(root)),
+        Op::SetIds { uid, gid } => {
+            let _ = sys::drop_groups();
+            sys::set_gid(*gid)?;
+            sys::set_uid(*uid)
         }
+        Op::Chdir(cwd) => sys::chdir(&cstr(cwd)),
         Op::Exec { argv, env, candidates } => exec_at(argv, env, candidates),
         Op::Clone { .. } | Op::Fork => Err(io::Error::other("clone and fork are applied by the executor")),
     }
@@ -684,15 +607,9 @@ fn exec_at(argv: &[Vec<u8>], env: &[(Vec<u8>, Vec<u8>)], candidates: &[Vec<u8>])
             cstr(&kv)
         })
         .collect();
-    let mut argv_p: Vec<*const libc::c_char> = argv_c.iter().map(|a| a.as_ptr()).collect();
-    argv_p.push(std::ptr::null());
-    let mut env_p: Vec<*const libc::c_char> = env_c.iter().map(|a| a.as_ptr()).collect();
-    env_p.push(std::ptr::null());
     let mut last = io::Error::from_raw_os_error(libc::ENOENT);
     for c in candidates {
-        let c = cstr(c);
-        unsafe { libc::execve(c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr()) };
-        let e = io::Error::last_os_error();
+        let e = sys::execve(&cstr(c), &argv_c, &env_c);
         if e.raw_os_error() != Some(libc::ENOENT) && e.raw_os_error() != Some(libc::ENOTDIR) {
             return Err(e);
         }
@@ -912,6 +829,24 @@ pub fn plan(spec: &SetupSpec, host: &HostLayout) -> io::Result<Plan> {
 impl Plan {
     pub fn cgroup_dir(&self) -> Option<PathBuf> {
         self.cgroup_root.as_ref().map(|root| root.join(format!("action-{}", self.seq)))
+    }
+}
+
+/// What a plan ends in: the program of which action it starts, and how.
+#[cfg(test)]
+pub(crate) struct Exec<'a> {
+    pub(crate) seq: u64,
+    pub(crate) cwd: &'a [u8],
+    pub(crate) argv: &'a [Vec<u8>],
+    pub(crate) env: &'a [(Vec<u8>, Vec<u8>)],
+    pub(crate) candidates: &'a [Vec<u8>],
+}
+
+#[cfg(test)]
+impl Plan {
+    pub(crate) fn exec(&self) -> Exec<'_> {
+        let Some(Op::Exec { argv, env, candidates }) = self.ops.last() else { panic!("a plan ends in its exec") };
+        Exec { seq: self.seq, cwd: &self.cwd, argv, env, candidates }
     }
 }
 

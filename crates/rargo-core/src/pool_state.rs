@@ -22,11 +22,19 @@ impl<W> Calls<W> {
     }
 
     pub fn answer(&mut self, rid: u64) -> Option<W> {
-        self.pending.remove(&rid)
+        let before = self.pending.len();
+        let waiter = self.pending.remove(&rid);
+        assert!(!self.pending.contains_key(&rid), "an answered request is no longer pending");
+        assert_eq!(self.pending.len() + usize::from(waiter.is_some()), before, "an answer ends at most one request");
+        waiter
     }
 
     pub fn lost(&mut self) -> Vec<W> {
-        std::mem::take(&mut self.pending).into_values().collect()
+        let before = self.pending.len();
+        let lost: Vec<W> = std::mem::take(&mut self.pending).into_values().collect();
+        assert!(self.pending.is_empty(), "nothing is pending once all is lost");
+        assert_eq!(lost.len(), before, "every pending waiter is told");
+        lost
     }
 }
 
@@ -77,18 +85,23 @@ impl WorkerPool {
 
     pub fn left(&mut self, id: u64) -> Vec<Effect> {
         if self.workers.remove(&id).is_none() {
+            assert!(!self.order.contains(&id), "an unknown worker is not listed");
             return Vec::new();
         }
         self.order.retain(|w| *w != id);
         self.leased.remove(&id);
         self.warmed.remove(&id);
         let lost: Vec<u64> = self.actions.iter().filter(|(_, w)| **w == id).map(|(a, _)| *a).collect();
-        lost.into_iter()
+        let effects: Vec<Effect> = lost
+            .into_iter()
             .map(|action| {
                 self.actions.remove(&action);
                 Effect::Lost { action }
             })
-            .collect()
+            .collect();
+        assert!(!self.order.contains(&id) && !self.leased.contains_key(&id) && !self.warmed.contains(&id));
+        assert!(self.actions.values().all(|w| *w != id), "a worker that left runs nothing");
+        effects
     }
 
     pub fn lease(&mut self, among: Option<&[u64]>) -> Option<u64> {
@@ -102,19 +115,30 @@ impl WorkerPool {
                 best = Some((*id, free));
             }
         }
-        let (id, _) = best?;
+        let Some((id, free)) = best else {
+            assert!(
+                self.order.iter().filter(|id| among.is_none_or(|ids| ids.contains(id))).all(|id| self.workers[id].free == 0),
+                "nothing is leased only while no core is free"
+            );
+            return None;
+        };
         self.workers.get_mut(&id).expect("chosen").free -= 1;
         *self.leased.entry(id).or_default() += 1;
+        assert!(among.is_none_or(|ids| ids.contains(&id)), "a lease is taken among the workers asked for");
+        assert_eq!(self.workers[&id].free, free - 1, "a lease takes one core");
         Some(id)
     }
 
     pub fn give_back(&mut self, id: u64) -> Vec<Effect> {
         let Some(n) = self.leased.get_mut(&id) else { return vec![Effect::Wake] };
+        assert!(*n >= 1, "a leased worker holds a lease");
         *n -= 1;
         if *n == 0 {
             self.leased.remove(&id);
         }
-        self.workers.get_mut(&id).expect("a leased worker is here").free += 1;
+        let slot = self.workers.get_mut(&id).expect("a leased worker is here");
+        slot.free += 1;
+        assert!(slot.free <= slot.cores, "a core comes back once");
         vec![Effect::Wake]
     }
 
@@ -131,14 +155,19 @@ impl WorkerPool {
     }
 
     pub fn finished(&mut self, action: u64, answered: bool) -> Vec<Effect> {
-        match self.actions.remove(&action) {
+        let effects = match self.actions.remove(&action) {
             Some(worker) if !answered => vec![Effect::Cancel { worker, action }],
             _ => Vec::new(),
-        }
+        };
+        assert!(!self.actions.contains_key(&action), "a finished action is no longer routed");
+        assert!(effects.is_empty() || !answered, "only an unanswered action is cancelled");
+        effects
     }
 
     pub fn warm(&mut self, worker: u64, known: bool, own: bool) -> bool {
-        known && !own && self.workers.contains_key(&worker) && self.warmed.insert(worker)
+        let fresh = known && !own && self.workers.contains_key(&worker) && self.warmed.insert(worker);
+        assert!(!fresh || self.warmed.contains(&worker), "a worker is warmed once");
+        fresh
     }
 }
 
@@ -229,13 +258,16 @@ impl Race {
     }
 
     pub fn claim(&mut self, who: Who) -> bool {
-        match self.owner {
+        let won = match self.owner {
             None => {
                 self.owner = Some(who);
                 true
             }
             Some(o) => o == who,
-        }
+        };
+        assert!(self.owner.is_some(), "a race has an owner once claimed");
+        assert_eq!(won, self.owner == Some(who), "a claim is won only by the owner");
+        won
     }
 
     pub fn may_hedge(&self, away: bool, hedging: bool) -> bool {
@@ -253,7 +285,7 @@ impl Race {
     }
 
     pub fn settle(&mut self) -> Option<Settle> {
-        match self.owner {
+        let settled = match self.owner {
             Some(Who::Remote) if self.local == Side::Running => {
                 self.local = Side::Gone;
                 Some(Settle::StopLocal)
@@ -263,7 +295,13 @@ impl Race {
                 Some(Settle::DropRemote)
             }
             _ => None,
+        };
+        match self.owner {
+            Some(Who::Remote) => assert_ne!(self.local, Side::Running, "the owner's rival is stopped"),
+            Some(Who::Local) => assert_ne!(self.remote, Side::Running, "the owner's rival is stopped"),
+            None => assert_eq!(settled, None, "a race without an owner settles nothing"),
         }
+        settled
     }
 
     pub fn remote_ended(&mut self, ok: bool) -> Outcome {
@@ -307,6 +345,8 @@ impl StateMachine for Race {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use rargo_machine::Checked;
 
     struct Pool(Checked<WorkerPool>);
@@ -400,103 +440,164 @@ mod tests {
 
     #[test]
     fn a_disconnected_worker_s_actions_finish_elsewhere() {
+        let mut outcomes = Transcript::default();
         let mut p = Pool::new();
-        assert_eq!(p.joined(1, 2), vec![Effect::Wake, Effect::Wake], "each new core wakes a waiter");
+        // each new core wakes a waiter.
+        outcomes.record("joined", p.joined(1, 2));
         p.invariants();
-        assert_eq!(p.joined(2, 1), vec![Effect::Wake]);
+        outcomes.record("joined", p.joined(2, 1));
         p.invariants();
-        assert_eq!(p.lease(None), Some(1), "the worker with the most free cores is chosen");
+        // the worker with the most free cores is chosen.
+        outcomes.record("lease", p.lease(None));
         p.invariants();
-        assert!(p.sent(10, 1));
-        assert_eq!(p.lease(None), Some(1), "first joined wins a tie");
-        assert!(p.sent(11, 1));
-        assert_eq!(p.lease(None), Some(2));
-        assert!(p.sent(12, 2));
+        outcomes.record("sent", p.sent(10, 1));
+        // first joined wins a tie.
+        outcomes.record("lease", p.lease(None));
+        outcomes.record("sent", p.sent(11, 1));
+        outcomes.record("lease", p.lease(None));
+        outcomes.record("sent", p.sent(12, 2));
         p.invariants();
         let fx = p.left(1);
-        assert_eq!(fx, vec![Effect::Lost { action: 10 }, Effect::Lost { action: 11 }]);
+        outcomes.record("effects", fx);
         p.invariants();
-        assert!(!p.route(1, 10), "nothing from the gone worker reaches its actions");
+        // nothing from the gone worker reaches its actions.
+        outcomes.record("route", p.route(1, 10));
         let mut race = Racing::new();
-        assert_eq!(race.remote_ended(false), Outcome::RunElsewhere, "a lost action without a hedge runs here");
+        // a lost action without a hedge runs here.
+        outcomes.record("remote ended", race.remote_ended(false));
         race.invariants();
         let mut hedged = Racing::new();
         hedged.hedged();
-        assert_eq!(hedged.remote_ended(false), Outcome::WaitLocal, "a lost action with a hedge finishes in it");
-        assert_eq!(hedged.local_ended(), Outcome::Use { who: Who::Local, stopped_other: false });
+        // a lost action with a hedge finishes in it.
+        outcomes.record("remote ended", hedged.remote_ended(false));
+        outcomes.record("local ended", hedged.local_ended());
         hedged.invariants();
-        assert_eq!(p.give_back(1), vec![Effect::Wake]);
-        assert_eq!(p.lease(None), None, "worker 2's core is busy and worker 1 is gone");
-        assert_eq!(p.finished(12, true), vec![]);
+        outcomes.record("give back", p.give_back(1));
+        // worker 2's core is busy and worker 1 is gone.
+        outcomes.record("lease", p.lease(None));
+        outcomes.record("finished", p.finished(12, true));
         p.give_back(2);
-        assert_eq!(p.lease(None), Some(2));
-        assert!(!p.sent(13, 1), "nothing is sent to a gone worker");
+        outcomes.record("lease", p.lease(None));
+        // nothing is sent to a gone worker.
+        outcomes.record("sent", p.sent(13, 1));
         p.invariants();
+        expect![[r#"
+            joined: [Wake, Wake]
+            joined: [Wake]
+            lease: Some(1)
+            sent: true
+            lease: Some(1)
+            sent: true
+            lease: Some(2)
+            sent: true
+            effects: [Lost { action: 10 }, Lost { action: 11 }]
+            route: false
+            remote ended: RunElsewhere
+            remote ended: WaitLocal
+            local ended: Use { who: Local, stopped_other: false }
+            give back: [Wake]
+            lease: None
+            finished: []
+            lease: Some(2)
+            sent: false
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_hedged_action_s_first_result_wins_and_the_other_is_cancelled() {
+        let mut outcomes = Transcript::default();
         let mut r = Racing::new();
-        assert!(r.may_hedge(false, true));
-        assert!(!r.may_hedge(true, true), "an action whose state is away is not hedged");
+        outcomes.record("may hedge", r.may_hedge(false, true));
+        // an action whose state is away is not hedged.
+        outcomes.record("may hedge", r.may_hedge(true, true));
         r.hedged();
-        assert!(!r.may_hedge(false, true), "one hedge");
-        assert_eq!(r.local_ended(), Outcome::Use { who: Who::Local, stopped_other: true });
+        // one hedge.
+        outcomes.record("may hedge", r.may_hedge(false, true));
+        outcomes.record("local ended", r.local_ended());
         r.invariants();
         let mut p = Pool::new();
         p.joined(1, 1);
         p.lease(None);
         p.sent(5, 1);
-        assert_eq!(
-            p.finished(5, false),
-            vec![Effect::Cancel { worker: 1, action: 5 }],
-            "the remote loser is cancelled"
-        );
+        // the remote loser is cancelled.
+        outcomes.record("finished", p.finished(5, false));
         p.invariants();
 
         let mut r = Racing::new();
         r.hedged();
-        assert_eq!(
-            r.remote_ended(true),
-            Outcome::Use { who: Who::Remote, stopped_other: true },
-            "the local loser is stopped"
-        );
+        // the local loser is stopped.
+        outcomes.record("remote ended", r.remote_ended(true));
         r.invariants();
 
         let mut r = Racing::new();
-        assert!(r.claim(Who::Remote), "the first to speak owns the output");
-        assert!(!r.may_hedge(false, true), "an action that already speaks is not hedged");
-        assert!(!r.claim(Who::Local));
+        // the first to speak owns the output.
+        outcomes.record("claim", r.claim(Who::Remote));
+        // an action that already speaks is not hedged.
+        outcomes.record("may hedge", r.may_hedge(false, true));
+        outcomes.record("claim", r.claim(Who::Local));
         let mut r = Racing::new();
         r.hedged();
-        assert!(r.claim(Who::Local));
-        assert_eq!(r.settle(), Some(Settle::DropRemote), "once the hedge speaks, the remote run is dropped");
-        assert_eq!(r.local_ended(), Outcome::Use { who: Who::Local, stopped_other: false });
+        outcomes.record("claim", r.claim(Who::Local));
+        // once the hedge speaks, the remote run is dropped.
+        outcomes.record("settle", r.settle());
+        outcomes.record("local ended", r.local_ended());
         r.invariants();
+        expect![[r#"
+            may hedge: true
+            may hedge: false
+            may hedge: false
+            local ended: Use { who: Local, stopped_other: true }
+            finished: [Cancel { worker: 1, action: 5 }]
+            remote ended: Use { who: Remote, stopped_other: true }
+            claim: true
+            may hedge: false
+            claim: false
+            claim: true
+            settle: Some(DropRemote)
+            local ended: Use { who: Local, stopped_other: false }
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn where_an_action_goes_and_which_worker_is_warmed_are_decided_here() {
-        assert_eq!(placing(true, false, false), Placing::Local, "a free local slot and nobody waiting: run here");
-        assert_eq!(placing(true, false, true), Placing::LeaseNow, "unless the action's state is on a worker");
-        assert_eq!(
-            placing(false, false, false),
-            Placing::RaceLocal,
-            "a busy server races a lease against a local slot"
-        );
-        assert_eq!(placing(true, true, true), Placing::RaceLocal);
+        let mut outcomes = Transcript::default();
+        // a free local slot and nobody waiting: run here.
+        outcomes.record("placing", placing(true, false, false));
+        // unless the action's state is on a worker.
+        outcomes.record("placing", placing(true, false, true));
+        // a busy server races a lease against a local slot.
+        outcomes.record("placing", placing(false, false, false));
+        outcomes.record("placing", placing(true, true, true));
         let mut p = Pool::new();
         p.joined(1, 1);
-        assert!(!p.warm(1, false, false), "nothing known, nothing to warm");
-        assert!(!p.warm(1, true, true), "an action's own trace is sent with it");
-        assert!(p.warm(1, true, false), "a profile warms a worker");
-        assert!(!p.warm(1, true, false), "once");
-        assert!(!p.warm(2, true, false), "only a worker that is here");
+        // nothing known, nothing to warm.
+        outcomes.record("warm", p.warm(1, false, false));
+        // an action's own trace is sent with it.
+        outcomes.record("warm", p.warm(1, true, true));
+        // a profile warms a worker.
+        outcomes.record("warm", p.warm(1, true, false));
+        // once.
+        outcomes.record("warm", p.warm(1, true, false));
+        // only a worker that is here.
+        outcomes.record("warm", p.warm(2, true, false));
         p.left(1);
         p.joined(1, 1);
-        assert!(p.warm(1, true, false), "a worker that comes back is warmed again");
+        // a worker that comes back is warmed again.
+        outcomes.record("warm", p.warm(1, true, false));
         assert!(worth_sending(true, 5, 10, false) && !worth_sending(true, 11, 10, false));
         assert!(!worth_sending(false, 0, 10, false) && worth_sending(false, 99, 1, true));
+        expect![[r#"
+            placing: Local
+            placing: LeaseNow
+            placing: RaceLocal
+            placing: RaceLocal
+            warm: false
+            warm: false
+            warm: true
+            warm: false
+            warm: false
+            warm: true
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]

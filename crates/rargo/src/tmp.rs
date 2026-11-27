@@ -1,24 +1,6 @@
-use std::cell::UnsafeCell;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-const SLOTS: usize = 64;
-const PATH_MAX: usize = 4096;
-
-const _: () = assert!(SLOTS > 0);
-const _: () = assert!(PATH_MAX as u32 == libc::PATH_MAX as u32);
-
-struct Slot {
-    live: AtomicBool,
-    taken: AtomicBool,
-    buf: UnsafeCell<[u8; PATH_MAX]>,
-}
-
-unsafe impl Sync for Slot {}
-
-static TABLE: [Slot; SLOTS] =
-    [const { Slot { live: AtomicBool::new(false), taken: AtomicBool::new(false), buf: UnsafeCell::new([0; PATH_MAX]) } }; SLOTS];
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Temp {
     slot: Option<usize>,
@@ -27,66 +9,39 @@ pub struct Temp {
 impl Drop for Temp {
     fn drop(&mut self) {
         if let Some(i) = self.slot {
-            assert!(TABLE[i].taken.load(Ordering::SeqCst));
-            assert!(TABLE[i].live.load(Ordering::SeqCst));
-            TABLE[i].live.store(false, Ordering::SeqCst);
-            TABLE[i].taken.store(false, Ordering::SeqCst);
+            crate::signals::release(i);
         }
     }
 }
 
 pub fn watch(path: &Path) -> Temp {
     let bytes = path.as_os_str().as_bytes();
-    if bytes.len() >= PATH_MAX || bytes.contains(&0) {
+    if bytes.len() >= crate::signals::PATH_MAX || bytes.contains(&0) {
         return Temp { slot: None };
     }
-    for (i, s) in TABLE.iter().enumerate() {
-        if s.taken.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            continue;
-        }
-        assert!(!s.live.load(Ordering::SeqCst), "a free slot is never live");
-        unsafe {
-            let buf = &mut *s.buf.get();
-            buf[..bytes.len()].copy_from_slice(bytes);
-            buf[bytes.len()] = 0;
-        }
-        s.live.store(true, Ordering::SeqCst);
-        return Temp { slot: Some(i) };
-    }
-    Temp { slot: None }
+    Temp { slot: crate::signals::hold(bytes) }
+}
+
+/// Calls `each` with the NUL-terminated path of every temporary in use. A signal handler may call it.
+fn each_live(each: impl FnMut(*const libc::c_char)) {
+    crate::signals::each_held(each);
 }
 
 extern "C" fn on_signal(sig: libc::c_int) {
-    for s in TABLE.iter() {
-        if s.live.load(Ordering::SeqCst) {
-            unsafe { libc::unlink(s.buf.get() as *const libc::c_char) };
-        }
-    }
-    unsafe {
-        libc::signal(sig, libc::SIG_DFL);
-        libc::raise(sig);
-    }
+    each_live(|path| unsafe { crate::signals::unlink(path) });
+    crate::signals::die_of(sig);
 }
 
 pub fn install_handlers() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        unsafe {
-            let mut old: libc::sigaction = std::mem::zeroed();
-            libc::sigaction(sig, std::ptr::null(), &mut old);
-            if old.sa_sigaction == libc::SIG_IGN {
-                continue;
-            }
-            let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
-            libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        if !crate::signals::ignored(sig) {
+            crate::signals::handle(sig, on_signal);
         }
     }
 }
 
 pub(crate) fn alive(pid: u32) -> bool {
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    rargo_net::io::process::alive(pid)
 }
 
 pub(crate) fn owner(name: &str, prefix: &str) -> Option<u32> {
@@ -102,7 +57,7 @@ pub fn sweep(dir: &Path, prefix: &str) -> usize {
     for e in rd.flatten() {
         let name = e.file_name();
         let Some(pid) = name.to_str().and_then(|n| owner(n, prefix)) else { continue };
-        if pid != std::process::id() && !alive(pid) {
+        if pid != rargo_net::io::process::id() && !alive(pid) {
             gone.push(e.path());
         }
     }
@@ -130,57 +85,49 @@ pub fn seq() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rargo_net::io::{file, process, sim};
 
     #[test]
     fn sweep_removes_only_what_dead_processes_left() {
-        let tmp = tempfile::tempdir().unwrap();
-        let d = tmp.path();
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        std::fs::write(d.join(format!(".rargo-tmp-{dead}-3-libfoo.rlib")), b"x").unwrap();
-        std::fs::write(d.join(format!(".rargo-tmp-{dead}-app.d")), b"x").unwrap();
-        std::fs::write(d.join(format!(".rargo-tmp-{}-1-mine", std::process::id())), b"x").unwrap();
-        std::fs::write(d.join(".rargo-tmp-1-9-init"), b"x").unwrap();
-        std::fs::write(d.join(".rargo-tmp-notapid-x"), b"x").unwrap();
-        std::fs::write(d.join("libfoo.rlib"), b"x").unwrap();
-        assert_eq!(sweep(d, BESIDE), 2);
-        let mut left: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-        left.sort();
-        assert_eq!(
-            left,
-            vec![
-                ".rargo-tmp-1-9-init".to_string(),
-                format!(".rargo-tmp-{}-1-mine", std::process::id()),
-                ".rargo-tmp-notapid-x".to_string(),
-                "libfoo.rlib".to_string()
-            ]
-        );
+        sim::test(|| {
+            let d = sim::tempdir();
+            let (me, dead) = (process::id(), process::id() + 1);
+            assert!(alive(me) && alive(1) && !alive(dead));
+            file::write(d.join(format!(".rargo-tmp-{dead}-3-libfoo.rlib")), b"x").unwrap();
+            file::write(d.join(format!(".rargo-tmp-{dead}-app.d")), b"x").unwrap();
+            file::write(d.join(format!(".rargo-tmp-{me}-1-mine")), b"x").unwrap();
+            file::write(d.join(".rargo-tmp-1-9-init"), b"x").unwrap();
+            file::write(d.join(".rargo-tmp-notapid-x"), b"x").unwrap();
+            file::write(d.join("libfoo.rlib"), b"x").unwrap();
+            assert_eq!(sweep(&d, BESIDE), 2);
+            let mut left: Vec<String> = file::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            left.sort();
+            assert_eq!(
+                left,
+                vec![
+                    ".rargo-tmp-1-9-init".to_string(),
+                    format!(".rargo-tmp-{me}-1-mine"),
+                    ".rargo-tmp-notapid-x".to_string(),
+                    "libfoo.rlib".to_string()
+                ]
+            );
+        });
     }
 
     #[test]
-    fn a_signal_removes_temporaries_in_use() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (kept, lost) = (tmp.path().join("kept"), tmp.path().join("lost"));
-        std::fs::write(&kept, b"x").unwrap();
-        std::fs::write(&lost, b"x").unwrap();
-        let pid = unsafe { libc::fork() };
-        if pid == 0 {
-            for s in TABLE.iter() {
-                s.live.store(false, Ordering::SeqCst);
-                s.taken.store(false, Ordering::SeqCst);
-            }
-            install_handlers();
-            let g = watch(&kept);
-            drop(g);
-            let _g = watch(&lost);
-            unsafe { libc::raise(libc::SIGTERM) };
-            std::process::exit(0);
-        }
-        let mut status = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
-        assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGTERM, "status {status:#x}");
-        assert!(kept.exists());
-        assert!(!lost.exists());
+    fn a_signal_would_remove_the_temporaries_in_use_and_no_others() {
+        let (kept, lost) = (Path::new("/a-signal/kept"), Path::new("/a-signal/lost"));
+        let live = || {
+            let mut paths = Vec::new();
+            each_live(|path| paths.push(unsafe { std::ffi::CStr::from_ptr(path) }.to_bytes().to_vec()));
+            paths
+        };
+        drop(watch(kept));
+        let guard = watch(lost);
+        assert!(guard.slot.is_some(), "the table has a free slot");
+        assert!(live().contains(&lost.as_os_str().as_bytes().to_vec()));
+        assert!(!live().contains(&kept.as_os_str().as_bytes().to_vec()));
+        drop(guard);
+        assert!(!live().contains(&lost.as_os_str().as_bytes().to_vec()));
     }
 }

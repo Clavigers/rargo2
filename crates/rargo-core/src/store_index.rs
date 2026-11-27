@@ -108,23 +108,30 @@ impl StoreIndex {
             self.unaccount(&old);
         }
         self.whole_bytes += m.size;
+        assert!(self.hot(&h) == Some(m), "{h} is loaded hot as recorded");
     }
 
     pub fn load_cold(&mut self, h: Hash, c: ColdRecord) {
         if self.blobs.get(&h).is_some_and(Blob::is_whole) {
             return;
         }
+        let whole = self.whole_bytes;
+        let size = c.size;
         self.blobs.insert(
             h,
             Blob { size: c.size, last_used: c.last_used, tier: Tier::Cold { added: c.added, recipe: c.recipe } },
         );
+        assert!(self.is_cold(&h) && self.size_of(&h) == Some(size), "{h} is loaded cold as recorded");
+        assert_eq!(self.whole_bytes, whole, "a cold record replaces no whole blob");
     }
 
     pub fn set_cold_disk(&mut self, bytes: u64) {
         self.cold_disk = bytes;
+        assert_eq!(self.cold_disk, bytes);
     }
 
     pub fn chunks_written(&mut self, bytes: u64) {
+        assert!(self.cold_disk.checked_add(bytes).is_some(), "cold disk bytes do not overflow");
         self.cold_disk += bytes;
     }
 
@@ -195,6 +202,7 @@ impl StoreIndex {
 
     pub fn chunks_collected(&mut self, kept: u64) {
         self.cold_disk = kept;
+        assert_eq!(self.cold_disk, kept);
     }
 
     pub fn put(&mut self, h: Hash, size: u64, mtime_ns: i64, now: u64) -> Put {
@@ -219,18 +227,22 @@ impl StoreIndex {
         };
         let stale = now.saturating_sub(b.last_used) > TOUCH_PERSIST_SECS;
         b.last_used = now;
-        match b.tier {
+        let out = match b.tier {
             Tier::Hot { mtime_ns } if stale => Touch::Persist(HotMeta { size: b.size, mtime_ns, last_used: now }),
             _ => Touch::Quiet,
-        }
+        };
+        assert_eq!(self.blobs[h].last_used, now, "a touched blob was used now");
+        out
     }
 
     pub fn forget(&mut self, h: &Hash) -> Forgot {
         let Some(b) = self.blobs.remove(h) else {
             return Forgot { hot: false, cold: false };
         };
+        let generation = self.generation;
         self.unaccount(&b);
         self.generation += 1;
+        assert!(!self.has(h) && self.generation > generation, "{h} is forgotten in a new generation");
         Forgot { hot: b.is_whole(), cold: !b.is_whole() }
     }
 
@@ -255,6 +267,7 @@ impl StoreIndex {
             return None;
         }
         b.tier = Tier::Freezing { mtime_ns, seen_used: b.last_used };
+        assert!(b.is_whole() && b.is_moving(), "a freezing blob is still whole");
         Some(FreezeStart { size: b.size, mtime_ns, last_used: b.last_used })
     }
 
@@ -264,6 +277,7 @@ impl StoreIndex {
         {
             b.tier = Tier::Hot { mtime_ns };
         }
+        assert!(!self.blobs.get(h).is_some_and(|b| matches!(b.tier, Tier::Freezing { .. })), "{h} is not freezing");
     }
 
     pub fn finish_freeze(&mut self, h: &Hash, recipe: Vec<ChunkRef>, added: u64) -> Option<ColdRecord> {
@@ -300,6 +314,7 @@ impl StoreIndex {
             whole => (whole, None),
         };
         b.tier = next;
+        assert_eq!(out.is_some(), matches!(b.tier, Tier::Thawing { .. }), "only a cold blob thaws");
         match out {
             Some(o) => (Thaw::Build, Some(o)),
             None => (Thaw::NotCold, None),
@@ -309,12 +324,14 @@ impl StoreIndex {
     pub fn abort_thaw(&mut self, h: &Hash) {
         let Some(b) = self.blobs.get_mut(h) else { return };
         if let Tier::Thawing { added, recipe, thawers } = &mut b.tier {
+            assert!(*thawers > 0, "a thawing blob has a thawer to abort");
             if *thawers > 1 {
                 *thawers -= 1;
             } else {
                 b.tier = Tier::Cold { added: *added, recipe: std::mem::take(recipe) };
             }
         }
+        assert!(!matches!(b.tier, Tier::Thawing { thawers: 0, .. }), "{h} has a thawer while it thaws");
     }
 
     pub fn fail_thaw(&mut self, h: &Hash) -> bool {
@@ -322,6 +339,7 @@ impl StoreIndex {
         if thawing {
             self.forget(h);
         }
+        assert!(!(thawing && self.has(h)), "a failed thaw forgets {h}");
         thawing
     }
 
@@ -332,6 +350,7 @@ impl StoreIndex {
         for h in hashes {
             *self.pins.entry(*h).or_insert(0) += 1;
         }
+        assert!(hashes.iter().all(|h| self.is_pinned(h)), "every hash is pinned");
         true
     }
 
@@ -377,6 +396,7 @@ impl StoreIndex {
             freed += bytes;
             out.push(Evicted { hash: h, cold, freed: bytes });
         }
+        assert!(out.iter().all(|e| !self.has(&e.hash) && !self.is_pinned(&e.hash)), "evicted blobs are unpinned and gone");
         out
     }
 
@@ -401,6 +421,7 @@ impl StoreIndex {
             out.push(Evicted { hash: h, cold, freed });
         }
         out.sort_by_key(|e| e.cold);
+        assert!(out.iter().all(|e| !self.has(&e.hash) && !self.is_pinned(&e.hash)), "swept blobs are unpinned and gone");
         out
     }
 }
@@ -423,6 +444,9 @@ impl StateMachine for StoreIndex {
             if let Tier::Thawing { thawers, .. } = b.tier {
                 assert!(thawers > 0, "a thawing blob has a thawer");
             }
+            if let Tier::Freezing { .. } = b.tier {
+                assert!(b.size >= COLD_MIN_SIZE, "freezing {h} is big enough to go cold");
+            }
         }
     }
 }
@@ -430,6 +454,8 @@ impl StateMachine for StoreIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     fn h(i: u8) -> Hash {
         Hash([i; 32])
@@ -450,16 +476,22 @@ mod tests {
 
     #[test]
     fn eviction_is_lru_and_respects_pins() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         for (i, used) in [(1, 10), (2, 20), (3, 30)] {
             ix.put(h(i), 1000, 0, used);
         }
         let gone = ix.evict(1500, 0, 100, &|x| *x == h(1));
-        assert_eq!(gone.iter().map(|e| e.hash).collect::<Vec<_>>(), vec![h(2), h(3)]);
-        assert_eq!(gone.iter().map(|e| e.freed).sum::<u64>(), 2000);
+        outcomes.record("evictions", &gone);
+        outcomes.record("bytes freed", gone.iter().map(|e| e.freed).sum::<u64>());
         assert!(ix.has(&h(1)) && !ix.has(&h(2)) && !ix.has(&h(3)));
-        assert_eq!(ix.generation(), 3);
+        outcomes.record("generation", ix.generation());
         ix.invariants();
+        expect![[r#"
+            evictions: [Evicted { hash: 0202020202020202, cold: false, freed: 1000 }, Evicted { hash: 0303030303030303, cold: false, freed: 1000 }]
+            bytes freed: 2000
+            generation: 3
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
@@ -490,55 +522,76 @@ mod tests {
 
     #[test]
     fn a_blob_used_while_going_cold_stays_whole() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 1 << 20, 0, 5);
         ix.begin_freeze(&h(1)).unwrap();
-        assert_eq!(ix.touch(&h(1), 9), Touch::Quiet);
-        assert_eq!(ix.finish_freeze(&h(1), recipe(1 << 20), 10), None);
+        outcomes.record("touch", ix.touch(&h(1), 9));
+        outcomes.record("finish freeze", ix.finish_freeze(&h(1), recipe(1 << 20), 10));
         assert!(ix.is_whole(&h(1)));
         assert!(ix.begin_freeze(&h(2)).is_none());
         ix.put(h(3), 100, 0, 1);
         assert!(ix.begin_freeze(&h(3)).is_none(), "a small blob stays whole");
         ix.invariants();
+        expect![[r#"
+            touch: Quiet
+            finish freeze: None
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_failed_thaw_drops_the_blob() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 1 << 20, 0, 5);
         ix.begin_freeze(&h(1)).unwrap();
         ix.finish_freeze(&h(1), recipe(1 << 20), 10).unwrap();
         ix.begin_thaw(&h(1));
-        let g = ix.generation();
+        outcomes.record("generation before failed thaw", ix.generation());
         assert!(ix.fail_thaw(&h(1)));
         assert!(!ix.has(&h(1)));
-        assert_eq!(ix.generation(), g + 1);
+        outcomes.record("generation", ix.generation());
         ix.invariants();
+        expect![[r#"
+            generation before failed thaw: 1
+            generation: 2
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn touch_persists_only_after_ten_minutes() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 10, 3, 100);
-        assert_eq!(ix.touch(&h(1), 200), Touch::Quiet);
-        assert_eq!(ix.touch(&h(1), 801), Touch::Persist(HotMeta { size: 10, mtime_ns: 3, last_used: 801 }));
-        assert_eq!(ix.touch(&h(2), 801), Touch::Absent);
+        outcomes.record("touch", ix.touch(&h(1), 200));
+        outcomes.record("touch", ix.touch(&h(1), 801));
+        outcomes.record("touch", ix.touch(&h(2), 801));
+        expect![[r#"
+            touch: Quiet
+            touch: Persist(HotMeta { size: 10, mtime_ns: 3, last_used: 801 })
+            touch: Absent
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn sweep_drops_what_is_not_live_and_not_pinned() {
+        let mut outcomes = Transcript::default();
         let mut ix = StoreIndex::new();
         ix.put(h(1), 10, 0, 1);
         ix.put(h(2), 20, 0, 1);
         ix.put(h(3), 30, 0, 1000);
         assert!(ix.pin_all(&[h(2)]));
         let gone = ix.sweep(&|x| *x == h(4), 100, 1050);
-        assert_eq!(gone, vec![Evicted { hash: h(1), cold: false, freed: 10 }]);
+        outcomes.record("gone", gone);
         ix.unpin_all(&[h(2)]);
         let gone = ix.sweep(&|_| false, 0, 1050);
-        assert_eq!(gone.len(), 2);
+        outcomes.record("sweep after unpin", gone);
         assert!(!ix.pin_all(&[h(1)]));
         ix.invariants();
+        expect![[r#"
+            gone: [Evicted { hash: 0101010101010101, cold: false, freed: 10 }]
+            sweep after unpin: [Evicted { hash: 0202020202020202, cold: false, freed: 20 }, Evicted { hash: 0303030303030303, cold: false, freed: 30 }]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

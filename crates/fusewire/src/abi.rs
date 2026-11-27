@@ -26,6 +26,7 @@ pub const FUSE_EXPLICIT_INVAL_DATA: u64 = 1 << 25;
 pub const FUSE_INIT_EXT: u64 = 1 << 30;
 pub const FUSE_DIRECT_IO_ALLOW_MMAP: u64 = 1 << 36;
 pub const FUSE_PASSTHROUGH: u64 = 1 << 37;
+pub const FUSE_OVER_IO_URING: u64 = 1 << 41;
 
 pub const FOPEN_DIRECT_IO: u32 = 1 << 0;
 pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
@@ -89,6 +90,7 @@ pub const FUSE_CREATE: u32 = 35;
 pub const FUSE_INTERRUPT: u32 = 36;
 pub const FUSE_BMAP: u32 = 37;
 pub const FUSE_DESTROY: u32 = 38;
+pub const FUSE_NOTIFY_REPLY: u32 = 41;
 pub const FUSE_IOCTL: u32 = 39;
 pub const FUSE_POLL: u32 = 40;
 pub const FUSE_BATCH_FORGET: u32 = 42;

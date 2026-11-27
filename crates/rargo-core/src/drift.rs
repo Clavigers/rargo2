@@ -6,13 +6,13 @@ use crate::proto::ServerMsg;
 use crate::sched::Priority;
 use crate::snapshot::Snapshot;
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Clone)]
 pub struct LastClient {
-    pub env: Arc<HashMap<String, String>>,
+    pub env: Arc<BTreeMap<String, String>>,
     pub home: Arc<Home>,
     pub root: String,
     pub dir: std::path::PathBuf,
@@ -64,13 +64,13 @@ impl Report {
 pub fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, time: fn() -> Instant) -> Result<Report> {
     let scratch = d.scratch("drift")?;
     let result = check_in(d, snapshot, who, &scratch, time);
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = crate::io::file::remove_dir_all(&scratch);
     result
 }
 
 fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch: &std::path::Path, time: fn() -> Instant) -> Result<Report> {
     let (uid, gid) = (d.cfg.uid, d.cfg.gid);
-    let mut env: HashMap<String, String> = d.cfg.server_env.clone();
+    let mut env: BTreeMap<String, String> = d.cfg.server_env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     for (k, v) in who.env.iter() {
         if rargo_proto::env_allowed(k) && !k.starts_with("RARGO_") && k != "CARGO_TARGET_DIR" && k != "CARGO_BUILD_TARGET_DIR" {
             env.insert(k.clone(), v.clone());
@@ -86,14 +86,14 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     env.retain(|k, _| !k.starts_with("NIX_"));
     env.extend(flake.env.clone());
     let cargo = flake.which("cargo").context("the build flake does not provide Cargo")?;
-    let client_env: HashMap<String, String> = (*who.env).clone();
+    let client_env: BTreeMap<String, String> = (*who.env).clone();
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
     let started = time();
     let stock_cwd = scratch.join(&who.dir);
-    let stock = (|| -> Result<std::process::Output> {
+    let stock = (|| -> Result<crate::io::process::Output> {
         use std::os::unix::process::CommandExt;
         let stock_cwd = crate::io::cpu(|| -> Result<std::path::PathBuf> {
             snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
@@ -101,7 +101,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             anyhow::ensure!(stock_cwd.starts_with(scratch2.ring_canonicalize()?), "drift check directory is outside the snapshot");
             Ok(stock_cwd)
         })?;
-        let mut c = std::process::Command::new("nice");
+        let mut c = crate::io::process::Command::new("nice");
         c.args(["-n", "19", cargo.as_str(), "build", "--offline", "-j", "4"])
             .current_dir(&stock_cwd)
             .env_clear()
@@ -111,17 +111,17 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             .env("RUSTC_WORKSPACE_WRAPPER", "")
             .env("CARGO_HOME", &home)
             .env("CARGO_TARGET_DIR", scratch2.join("target-stock"))
-            .stdin(std::process::Stdio::null());
-        if uid != unsafe { libc::geteuid() } {
-            c.uid(uid).gid(gid);
+            .stdin(crate::io::process::Stdio::null());
+        if uid != crate::io::process::euid() {
+            c.std_mut().uid(uid).gid(gid);
         }
-        crate::io::output(&mut c).context("running stock cargo")
+        c.output().context("running stock cargo")
     })()?;
     let stock_ran = (started, time());
 
     let run = |args: &[&str], flag: &str| -> (i32, String) {
         let (tx, mut rx) = crate::io::unbounded_channel();
-        let mut env: HashMap<String, String> = (*who.env).clone();
+        let mut env: BTreeMap<String, String> = (*who.env).clone();
         env.insert(flag.into(), "1".into());
         env.remove("CARGO_TARGET_DIR");
         env.remove("CARGO_BUILD_TARGET_DIR");
@@ -152,11 +152,11 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
         }
         (code, text)
     };
-    let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
+    let before = d.stats.verify_units.get();
     let started = time();
     let (code, mut text) = run(&["build"], "RARGO_VERIFY");
     let rargo_ran = (started, time());
-    let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let verified_units = d.stats.verify_units.get() - before;
     if code == 0 {
         let (_, tests) = run(&["test", "--no-fail-fast"], crate::build::VERIFY_TESTS);
         text.extend(tests.lines().filter(|l| l.starts_with("warning: verify: ") || l.starts_with("note: verify: ")).map(|l| format!("{l}\n")));
@@ -216,7 +216,7 @@ pub fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> I
             if running + waiting > 0 {
                 continue;
             }
-            let Some(who) = d.last_clients.lock().get(&worktree).cloned() else { continue };
+            let Some(who) = d.last_clients.borrow_mut().get(&worktree).cloned() else { continue };
             if who.checked == Some(snapshot.id) {
                 continue;
             }
@@ -225,8 +225,8 @@ pub fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> I
                 Err(e) => format!("{}: drift check could not run: {e:#}\n", who.root),
             };
             eprint!("rargod: drift check: {text}");
-            *d.drift_report.lock() = Some(text);
-            if let Some(c) = d.last_clients.lock().get_mut(&worktree).filter(|c| c.at == who.at) {
+            *d.drift_report.borrow_mut() = Some(text);
+            if let Some(c) = d.last_clients.borrow_mut().get_mut(&worktree).filter(|c| c.at == who.at) {
                 c.checked = Some(snapshot.id);
             }
         }

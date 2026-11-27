@@ -17,19 +17,17 @@ use crate::store::Store;
 use crate::trace::*;
 use crate::view::*;
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use dashmap::DashMap;
-use parking_lot::Mutex;
+use std::cell::{Cell, OnceCell, RefCell};
 use rargo_plan as rp;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 mod nextest;
-mod pure;
+pub mod pure;
 mod request;
-mod nextest_run;
+pub mod nextest_run;
 
 use request::{BuildRequest, Effect, End, Go, OnFailure, Unit};
 
@@ -51,35 +49,44 @@ pub struct Config {
 
 #[derive(Default)]
 pub struct DaemonStats {
-    pub requests: AtomicU64,
-    pub plans_decoded: AtomicU64,
-    pub verify_units: AtomicU64,
-    pub verify_mismatches: AtomicU64,
-    pub bytes_in: AtomicU64,
-    pub bytes_out: AtomicU64,
-    pub links: AtomicU64,
-    pub files_in: AtomicU64,
+    pub requests: Cell<u64>,
+    pub plans_decoded: Cell<u64>,
+    pub verify_units: Cell<u64>,
+    pub verify_mismatches: Cell<u64>,
+    pub bytes_in: Cell<u64>,
+    pub bytes_out: Cell<u64>,
+    pub links: Cell<u64>,
+    pub files_in: Cell<u64>,
 }
 
 pub struct Daemon {
-    fork_seen: DashMap<(String, String), bool>,
+    fork_seen: RefCell<BTreeMap<(String, String), bool>>,
     pub cfg: Config,
     pub engine: Arc<Engine>,
     pub memo: Arc<HostMemo>,
     pub trees: Arc<Trees>,
     pub parser: Arc<Parser>,
     pub incr: crate::incr::IncrStore,
-    pub pool: OnceLock<Arc<crate::remote::Pool>>,
-    pub(crate) nix_attached: Arc<Mutex<HashSet<String>>>,
-    pub drift_report: Mutex<Option<String>>,
-    pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    pub deliveries: Mutex<HashMap<String, (u64, Arc<std::collections::HashSet<rargo_proto::Digest>>)>>,
+    pub pool: OnceCell<Arc<crate::remote::Pool>>,
+    pub(crate) nix_attached: Arc<crate::nixmanifest::Attached>,
+    pub drift_report: RefCell<Option<String>>,
+    pub last_clients: RefCell<HashMap<String, crate::drift::LastClient>>,
+    pub deliveries: RefCell<Deliveries>,
     pub client_blobs: Arc<crate::remote::Blobs>,
-    plans: DashMap<Hash, Arc<PlanData>>,
-    masks: DashMap<String, Vec<Vec<u8>>>,
+    plans: RefCell<BTreeMap<Hash, Arc<PlanData>>>,
+    masks: RefCell<BTreeMap<String, Vec<Vec<u8>>>>,
     fetching: crate::io::Mutex<()>,
-    scratch_seq: AtomicU64,
+    scratch_seq: Cell<u64>,
+    log_phases: OnceCell<bool>,
     pub stats: Arc<DaemonStats>,
+}
+
+/// What each worktree was last delivered, under the token that names it.
+pub struct Deliveries {
+    /// Every random value the server hands out (delivery tokens) is drawn here,
+    /// from the seed `Daemon::new` was given.
+    pub random: crate::rng::Rng,
+    pub by_worktree: BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>,
 }
 
 pub struct Home {
@@ -102,7 +109,7 @@ pub struct Client {
     pub worktree: String,
     pub commits: Arc<Vec<[u8; 20]>>,
     pub home: Arc<Home>,
-    pub outbox: Arc<Mutex<(Vec<Delivery>, Vec<Write>, std::collections::BTreeSet<String>)>>,
+    pub outbox: Arc<RefCell<(Vec<Delivery>, Vec<Write>, std::collections::BTreeSet<String>)>>,
     pub targets: Vec<String>,
 }
 
@@ -117,14 +124,14 @@ impl Client {
             s.deliver_lazy(files, writes, self.targets.clone());
             return;
         }
-        let mut q = self.outbox.lock();
+        let mut q = self.outbox.borrow_mut();
         q.0.extend(files);
         q.1.extend(writes);
         q.2.extend(self.targets.iter().cloned());
     }
 
     pub fn flush(&self) -> Result<()> {
-        let (files, writes, targets) = std::mem::take(&mut *self.outbox.lock());
+        let (files, writes, targets) = std::mem::take(&mut *self.outbox.borrow_mut());
         match &self.session {
             Some(s) => s.deliver(files, writes, targets.into_iter().collect()),
             None => Ok(()),
@@ -138,9 +145,9 @@ const _: () = assert!(LEVEL_META < LEVEL_FULL);
 pub struct PlanData {
     pub plan: rp::Plan,
     facts: PlanFacts,
-    levels: Vec<OnceLock<Arc<Vec<u8>>>>,
-    meta_levels: Vec<OnceLock<Arc<Vec<u8>>>>,
-    needs: OnceLock<Arc<Vec<u8>>>,
+    levels: Vec<OnceCell<Arc<Vec<u8>>>>,
+    meta_levels: Vec<OnceCell<Arc<Vec<u8>>>>,
+    needs: OnceCell<Arc<Vec<u8>>>,
 }
 
 impl PlanData {
@@ -150,9 +157,9 @@ impl PlanData {
         PlanData {
             plan,
             facts,
-            levels: (0..n).map(|_| OnceLock::new()).collect(),
-            meta_levels: (0..n).map(|_| OnceLock::new()).collect(),
-            needs: OnceLock::new(),
+            levels: (0..n).map(|_| OnceCell::new()).collect(),
+            meta_levels: (0..n).map(|_| OnceCell::new()).collect(),
+            needs: OnceCell::new(),
         }
     }
 
@@ -211,13 +218,13 @@ struct Run {
     pd: Arc<PlanData>,
     base: Arc<BaseView>,
     layer: Arc<OutputsLayer>,
-    scripts: Mutex<Scripts>,
+    scripts: RefCell<Scripts>,
     states: Vec<watch::Sender<UState>>,
-    results: Vec<OnceLock<(Arc<ActionResult>, bool)>>,
-    times: Mutex<Vec<crate::timings::UnitTime>>,
-    early: Mutex<HashMap<usize, Vec<(Vec<u8>, MEntry)>>>,
-    ui: Mutex<Ui>,
-    req: Arc<Mutex<BuildRequest>>,
+    results: Vec<OnceCell<(Arc<ActionResult>, bool)>>,
+    times: RefCell<Vec<crate::timings::UnitTime>>,
+    early: RefCell<HashMap<usize, Vec<(Vec<u8>, MEntry)>>>,
+    ui: RefCell<Ui>,
+    req: Arc<RefCell<BuildRequest>>,
     base_env: BTreeMap<String, String>,
     no_cache_tests: bool,
     explain: bool,
@@ -226,12 +233,12 @@ struct Run {
     policy: crate::policy::Policy,
     verify: bool,
     verify_tests: bool,
-    verified: AtomicU64,
-    verify_mismatches: Mutex<Vec<(String, Vec<Vec<u8>>)>>,
-    verify_unreproducible: Mutex<Vec<String>>,
-    unit_keys: Vec<OnceLock<Hash>>,
+    verified: Cell<u64>,
+    verify_mismatches: RefCell<Vec<(String, Vec<Vec<u8>>)>>,
+    verify_unreproducible: RefCell<Vec<String>>,
+    unit_keys: Vec<OnceCell<Hash>>,
     need: Option<Arc<Vec<u8>>>,
-    script_warnings: Mutex<Vec<String>>,
+    script_warnings: RefCell<Vec<String>>,
 }
 
 fn bytes(s: &str) -> Vec<u8> {
@@ -239,10 +246,12 @@ fn bytes(s: &str) -> Vec<u8> {
 }
 
 impl Daemon {
-    pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
+    /// `seed` seeds the server's random values: the shell draws it from the OS,
+    /// tests and the simulator pass their own.
+    pub fn new(cfg: Config, engine: Arc<Engine>, seed: u64) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
-        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), seed);
+        let incr_seed = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), incr_seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
@@ -251,28 +260,30 @@ impl Daemon {
         Daemon {
             trees,
             fetching: crate::io::Mutex::new(()),
-            scratch_seq: AtomicU64::new(0),
+            scratch_seq: Cell::new(0),
+            log_phases: OnceCell::new(),
             incr,
-            pool: OnceLock::new(),
-            nix_attached: Arc::new(Mutex::new(HashSet::new())),
-            drift_report: Mutex::new(None),
-            last_clients: Mutex::new(HashMap::new()),
-            deliveries: Mutex::new(HashMap::new()),
+            pool: OnceCell::new(),
+            nix_attached: Arc::default(),
+            drift_report: RefCell::new(None),
+            last_clients: RefCell::new(HashMap::new()),
+            deliveries: RefCell::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
             client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
             cfg,
             engine,
             memo: Arc::new(HostMemo::default()),
             parser,
-            plans: DashMap::new(),
-            fork_seen: DashMap::new(),
-            masks: DashMap::new(),
+            plans: RefCell::new(BTreeMap::new()),
+            fork_seen: RefCell::new(BTreeMap::new()),
+            masks: RefCell::new(BTreeMap::new()),
             stats: Arc::new(DaemonStats::default()),
         }
     }
 
     pub fn scratch(&self, what: &str) -> Result<PathBuf> {
-        let n = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
-        let dir = self.store().tmp_dir(&format!("{what}-{}-{n}", std::process::id()))?;
+        let n = self.scratch_seq.get();
+        self.scratch_seq.set(n + 1);
+        let dir = self.store().tmp_dir(&format!("{what}-{}-{n}", crate::io::process::id()))?;
         Ok(dir)
     }
 
@@ -289,14 +300,13 @@ impl Daemon {
         static MAKING: crate::io::Mutex<()> = crate::io::Mutex::new(());
         let _one = MAKING.lock();
         if !dir.join(".complete").ring_exists() {
-            use std::os::unix::fs::PermissionsExt;
             crate::io::file::create_dir_all(&dir)?;
-            crate::io::file::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            crate::io::file::set_mode(&dir, 0o700)?;
             crate::snapshot::chown(&dir, self.cfg.uid, self.cfg.gid);
             for (name, content) in &files {
                 let p = dir.join(name);
                 crate::io::file::write(&p, content)?;
-                crate::io::file::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                crate::io::file::set_mode(&p, 0o600)?;
                 crate::snapshot::chown(&p, self.cfg.uid, self.cfg.gid);
             }
             for shared in ["registry", "git", ".package-cache", ".package-cache-mutate", ".global-cache"] {
@@ -315,58 +325,16 @@ impl Daemon {
     }
 
     pub fn export_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let blobs = dir.join("blobs");
-        crate::io::file::create_dir_all(&blobs)?;
-        let traces = self.engine.traces.all();
-        let mut wanted: HashSet<Hash> = HashSet::new();
-        for (_, t) in &traces {
-            wanted.insert(t.result.stdout);
-            wanted.insert(t.result.stderr);
-            for (_, e) in &t.result.outputs.entries {
-                if let MEntry::File { hash, .. } = e {
-                    wanted.insert(*hash);
-                }
-            }
-        }
-        let mut written = 0;
-        for h in &wanted {
-            let dest = blobs.join(h.hex());
-            if dest.ring_exists() {
-                continue;
-            }
-            let Ok(mut src) = self.store().open_blob(h) else { continue };
-            let mut out = crate::io::file::File::create(&dest)?;
-            std::io::copy(&mut src, &mut out)?;
-            written += 1;
-        }
-        let bundle = (traces, self.engine.traces.all_needs_env());
-        let raw = bincode::serialize(&bundle)?;
-        crate::io::file::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
-        Ok((bundle.0.len(), written))
+        let (tables, store) = (self.engine.traces.tables(), self.store().clone());
+        crate::io::cpu(move || export_cache(&*tables, &store, dir))
     }
 
     pub fn import_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let raw = zstd::decode_all(&crate::io::file::read(dir.join("traces.bin"))?[..])?;
-        let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
-        let mut blobs = 0;
-        for e in crate::io::file::read_dir(dir.join("blobs"))?.flatten() {
-            let Some(want) = e.file_name().to_str().and_then(Hash::from_hex) else { continue };
-            if self.store().has(&want) {
-                continue;
-            }
-            let (got, _) = self.store().put_file_copy(&crate::io::file::File::open(e.path())?, false)?;
-            if got != want {
-                self.store().remove(&got);
-                bail!("blob {} in the export does not have the content its name claims", want);
-            }
-            blobs += 1;
-        }
-        let mut n = 0;
+        let store = self.store().clone();
+        let (traces, needs, blobs) = crate::io::cpu(move || import_blobs(&store, dir))?;
+        let n = traces.len();
         for (key, t) in traces {
-            if t.complete(self.store()) {
-                self.engine.traces.insert(&key, t);
-                n += 1;
-            }
+            self.engine.traces.insert(&key, t);
         }
         for (key, vars) in needs {
             self.engine.traces.add_needs_env(&key, &vars);
@@ -375,18 +343,78 @@ impl Daemon {
     }
 
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
-        let mut live = HashSet::new();
-        self.engine.traces.mark(&mut live);
-        self.incr.mark(&mut live);
-        self.trees.mark(&mut live);
-        let fs = self.engine.fs.clone();
-        self.store().sweep(&live, min_age_secs, &|h| fs.forget_backing(h))
+        let traces = self.engine.traces.tables();
+        let (states, state_blobs) = self.incr.parts();
+        let (manifests, roots) = (self.trees.manifests().clone(), self.trees.recent_roots());
+        let (store, fs) = (self.store().clone(), self.engine.fs.clone());
+        crate::io::cpu(move || {
+            let mut live = std::collections::BTreeSet::new();
+            crate::trace::mark(&*traces, &mut live);
+            crate::incr::mark(&*states, &*state_blobs, &mut live);
+            manifests.mark(roots, &mut live);
+            store.sweep(&live, min_age_secs, &|h| fs.forget_backing(h))
+        })
     }
+}
+
+/// Writes every trace recorded in `tables`, and the blobs of `store` they refer to, under `dir`.
+fn export_cache(tables: &dyn crate::db::Tables, store: &Store, dir: &Path) -> Result<(usize, usize)> {
+    let blobs = dir.join("blobs");
+    crate::io::file::create_dir_all(&blobs)?;
+    let traces = crate::trace::all(tables);
+    let mut wanted: HashSet<Hash> = HashSet::new();
+    for (_, t) in &traces {
+        wanted.insert(t.result.stdout);
+        wanted.insert(t.result.stderr);
+        for (_, e) in &t.result.outputs.entries {
+            if let MEntry::File { hash, .. } = e {
+                wanted.insert(*hash);
+            }
+        }
+    }
+    let mut written = 0;
+    for h in &wanted {
+        let dest = blobs.join(h.hex());
+        if dest.ring_exists() {
+            continue;
+        }
+        let Ok(mut src) = store.open_blob(h) else { continue };
+        let mut out = crate::io::file::File::create(&dest)?;
+        std::io::copy(&mut src, &mut out)?;
+        written += 1;
+    }
+    let bundle = (traces, crate::trace::all_needs_env(tables));
+    let raw = bincode::serialize(&bundle)?;
+    crate::io::file::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
+    Ok((bundle.0.len(), written))
+}
+
+type Imported = (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>, usize);
+
+/// Puts the blobs exported under `dir` into `store` and reads the traces whose files are then all there.
+fn import_blobs(store: &Store, dir: &Path) -> Result<Imported> {
+    let raw = zstd::decode_all(&crate::io::file::read(dir.join("traces.bin"))?[..])?;
+    let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
+    let mut blobs = 0;
+    for e in crate::io::file::read_dir(dir.join("blobs"))?.flatten() {
+        let Some(want) = e.file_name().to_str().and_then(Hash::from_hex) else { continue };
+        if store.has(&want) {
+            continue;
+        }
+        let (got, _) = store.put_file_copy(&crate::io::file::File::open(e.path())?, false)?;
+        if got != want {
+            store.remove(&got);
+            bail!("blob {} in the export does not have the content its name claims", want);
+        }
+        blobs += 1;
+    }
+    let traces: Vec<(Hash, Trace)> = traces.into_iter().filter(|(_, t)| t.complete(store)).collect();
+    Ok((traces, needs, blobs))
 }
 
 pub fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
     let _hold = crate::nixmanifest::hold_build();
-    d.stats.requests.fetch_add(1, Ordering::Relaxed);
+    d.stats.requests.set(d.stats.requests.get() + 1);
     let c = Arc::new(c);
     if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {
         let result = match nextest::run(&d, &c) {
@@ -408,7 +436,7 @@ pub fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
             Ok(Finish::Code(code)) => result = Ok(code),
             Ok(Finish::Exec(e)) => result = Err(e),
             Ok(Finish::Retry) if attempt < 2 => {
-                c.outbox.lock().0.clear();
+                c.outbox.borrow_mut().0.clear();
                 continue;
             }
             Ok(Finish::Retry) => c.out.error("the build kept producing inconsistent intermediate artifacts"),
@@ -466,7 +494,7 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     let policy = crate::policy::snapshot_policy(&snapshot, &dir).map_err(|e| anyhow!(e))?;
     let generation = d.memo.advance();
     let mut masks = vec![vjoin(WORKTREE_AT, b"target")];
-    if let Some(extra) = d.masks.get(&c.worktree) {
+    if let Some(extra) = d.masks.borrow().get(&c.worktree) {
         for m in extra.iter() {
             if !masks.contains(m) {
                 masks.push(m.clone());
@@ -504,14 +532,6 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     };
     let base = parts.build(d.memo.clone(), generation, false);
     let plan_base: Arc<dyn View> = Arc::new(Hosted::new(parts.build(d.memo.clone(), generation, true)));
-    let tr = Translator::new(vec![
-        (String::from_utf8_lossy(WORKTREE_AT).into_owned(), c.root.clone()),
-        (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), c.cargo_home.clone()),
-    ]);
-    let sandbox_cwd = tr.to_canonical(&c.cwd);
-    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
-        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
-    }
     let client_env = c.env.to_map();
     let mut env = base_env(&d.cfg.server_env, &client_env);
     for k in ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
@@ -525,6 +545,12 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     env.insert("RUSTC_WORKSPACE_WRAPPER".into(), String::new());
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
+    }
+    flag_target_dir(&c.args, &c.cwd, &mut env);
+    let tr = build_paths(&c.root, &c.cargo_home, &mut env);
+    let sandbox_cwd = tr.to_canonical(&c.cwd);
+    if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
+        bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
     }
     let channel = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd)?.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
     Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, channel })
@@ -624,7 +650,11 @@ fn plan_with(
         env.insert(bytes("CARGO_BUILD_BUILD_DIR"), bytes("/w/target/install-build"));
     }
     let mut argv = vec![PLANNER_AT.to_vec()];
-    for a in args {
+    let args = match (target_dir_flag(args), p.env.get("CARGO_TARGET_DIR")) {
+        (Some(_), Some(dir)) => with_target_dir(args, dir),
+        _ => args.to_vec(),
+    };
+    for a in &args {
         let a = match a.split_once('=') {
             Some((flag, val)) if flag.starts_with("--") && val.starts_with('/') => {
                 format!("{flag}={}", p.tr.to_canonical(val))
@@ -673,17 +703,18 @@ fn plan_with(
         entries: r.outputs.entries.iter().filter(|(p, _)| p.ends_with(b"/Cargo.lock")).cloned().collect(),
     };
     apply_writes(c, &p.tr, &[], &lock_writes);
-    let data = match d.plans.get(hash) {
-        Some(pd) => pd.clone(),
+    let known = d.plans.borrow().get(hash).cloned();
+    let data = match known {
+        Some(pd) => pd,
         None => {
             let raw = d.store().read(hash)?;
             let plan: rp::Plan = rp::decode(&raw).map_err(|e| anyhow!("unreadable plan: {e}"))?;
             if plan.version != rp::PLAN_VERSION {
                 bail!("plan format {} does not match this rargod ({})", plan.version, rp::PLAN_VERSION);
             }
-            d.stats.plans_decoded.fetch_add(1, Ordering::Relaxed);
+            d.stats.plans_decoded.set(d.stats.plans_decoded.get() + 1);
             let pd = Arc::new(PlanData::new(plan));
-            d.plans.insert(*hash, pd.clone());
+            d.plans.borrow_mut().insert(*hash, pd.clone());
             pd
         }
     };
@@ -776,26 +807,26 @@ fn fetch(
     }
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
-    let out = (|| -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
+    let out = (|| -> Result<std::result::Result<Option<crate::io::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
         crate::io::cpu(|| snap.materialize(&scratch2, uid, gid, &|_, _| true))?;
         if install {
             for path in fetch_args.iter().filter_map(|a| a.strip_prefix("--path=")) {
                 let path = Path::new(path);
                 ensure!(
-                    path.is_absolute() && path.canonicalize()?.starts_with(scratch2.canonicalize()?),
+                    path.is_absolute() && crate::io::file::canonicalize(path)?.starts_with(crate::io::file::canonicalize(&scratch2)?),
                     "install path lies outside the synced worktree"
                 );
             }
         }
         let run = |program: &Path, args: &[String]| {
-            let mut cmd = std::process::Command::new(program);
+            let mut cmd = crate::io::process::Command::new(program);
             cmd.args(args).current_dir(&cwd).env_clear().envs(&env);
-            cmd.stdin(std::process::Stdio::null());
-            if uid != unsafe { libc::geteuid() } {
-                cmd.uid(uid).gid(gid);
+            cmd.stdin(crate::io::process::Stdio::null());
+            if uid != crate::io::process::euid() {
+                cmd.std_mut().uid(uid).gid(gid);
             }
-            crate::io::output(&mut cmd)
+            cmd.output()
         };
         let _ = run(Path::new("rustc"), &["-V".to_string()]);
         if let Err(said) = add_components(&components, &run) {
@@ -809,16 +840,16 @@ fn fetch(
     let out = match out {
         Ok(Ok(Some(o))) => o,
         Ok(Err(said)) => {
-            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = crate::io::file::remove_dir_all(&scratch);
             c.out.raw_err(&said);
             return Ok(None);
         }
         Ok(Ok(None)) => {
-            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = crate::io::file::remove_dir_all(&scratch);
             return Ok(Some(p.snapshot.clone()));
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = crate::io::file::remove_dir_all(&scratch);
             return Err(e);
         }
     };
@@ -852,7 +883,7 @@ fn fetch(
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = crate::io::file::remove_dir_all(&scratch);
     if !out.status.success() {
         return Ok(None);
     }
@@ -862,7 +893,7 @@ fn fetch(
 
 fn add_components(
     components: &[(String, String)],
-    run: &dyn Fn(&Path, &[String]) -> std::io::Result<std::process::Output>,
+    run: &dyn Fn(&Path, &[String]) -> std::io::Result<crate::io::process::Output>,
 ) -> std::result::Result<(), Vec<u8>> {
     for add in rustup_adds(components) {
         let ran = run(Path::new("rustup"), &add);
@@ -887,13 +918,13 @@ fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, Stri
     let added = {
         use std::os::unix::process::CommandExt;
         let run = |program: &Path, args: &[String]| {
-            let mut cmd = std::process::Command::new(program);
+            let mut cmd = crate::io::process::Command::new(program);
             cmd.args(args).current_dir("/").env_clear().envs(&env);
-            cmd.stdin(std::process::Stdio::null());
-            if uid != unsafe { libc::geteuid() } {
-                cmd.uid(uid).gid(gid);
+            cmd.stdin(crate::io::process::Stdio::null());
+            if uid != crate::io::process::euid() {
+                cmd.std_mut().uid(uid).gid(gid);
             }
-            crate::io::output(&mut cmd)
+            cmd.output()
         };
         add_components(&components, &run)
     };
@@ -913,18 +944,17 @@ fn say(c: &Client, wait: Wait) {
     }
 }
 
-fn phase(started: Instant, c: &Client, what: &str) {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("RARGO_PHASES").is_some()) {
-        eprintln!("rargod: phase {:>8.3} s  {what}  ({} {})", started.elapsed().as_secs_f64(), c.worktree, c.args.join(" "));
+fn phase(d: &Daemon, started: Instant, c: &Client, what: &str) {
+    if *d.log_phases.get_or_init(|| crate::io::env::var_os("RARGO_PHASES").is_some()) {
+        eprintln!("rargod: phase {:>8.3} s  {what}  ({} {})", crate::io::now().saturating_duration_since(started).as_secs_f64(), c.worktree, c.args.join(" "));
     }
 }
 
-struct CancelOnDrop(Arc<Mutex<BuildRequest>>);
+struct CancelOnDrop(Arc<RefCell<BuildRequest>>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
-        let mut req = self.0.lock();
+        let mut req = self.0.borrow_mut();
         if !matches!(req.phase(), request::Phase::Done(_)) {
             req.cancel();
         }
@@ -934,7 +964,7 @@ impl Drop for CancelOnDrop {
 fn remember_client(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<()> {
 if c.session.is_some() && !c.worktree.is_empty() {
     d.trees.remember(&c.worktree, &c.snapshot);
-    let mut last = d.last_clients.lock();
+    let mut last = d.last_clients.borrow_mut();
     let dir = c.policy_dir()?;
     let checked = last.get(&c.worktree).filter(|l| l.dir == dir).and_then(|l| l.checked);
     last.insert(
@@ -944,7 +974,7 @@ if c.session.is_some() && !c.worktree.is_empty() {
             home: c.home.clone(),
             root: c.root.clone(),
             dir,
-            at: Instant::now(),
+            at: crate::io::now(),
             checked,
         },
     );
@@ -960,8 +990,8 @@ struct Built {
     cargo_override: Option<String>,
 }
 
-fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
-    let started = Instant::now();
+fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Built>>>) -> Result<Finish> {
+    let started = crate::io::now();
     let mut args: Vec<String> = c.args.clone();
     let mut no_cache_tests = false;
     if let Some(pos) = args.iter().take_while(|a| *a != "--").position(|a| a == "--no-cache") {
@@ -976,9 +1006,9 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
     let check_at = subcommand_pos(&args).filter(|&i| args[i] == "check" || args[i] == "c");
     let check_at = check_at.filter(|_| c.env.get("RARGO_CHECK_AS_BUILD").as_deref() == Some("1"));
     let fork_key = (c.worktree.clone(), c.env.get("RUSTUP_TOOLCHAIN").unwrap_or_default());
-    let seen_fork = d.fork_seen.get(&fork_key).map(|v| *v).unwrap_or(false);
+    let seen_fork = d.fork_seen.borrow().get(&fork_key).copied().unwrap_or(false);
     let (req, first) = BuildRequest::new(check_at.is_some(), seen_fork, offline_args(&args));
-    let req = Arc::new(Mutex::new(req));
+    let req = Arc::new(RefCell::new(req));
     let _cancel = CancelOnDrop(req.clone());
     let mut todo: std::collections::VecDeque<Effect> = first.into();
     let mut snapshot = c.snapshot.clone();
@@ -996,7 +1026,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
                 let first = prepared.is_none();
                 let ready = prepare(d, c, snapshot.clone())?;
                 if first {
-                    phase(started, c, "worktree prepared");
+                    phase(d, started, c, "worktree prepared");
                     remember_client(d, c)?;
                     // Resolve an unpinned registry install against the online index before planning from the cache.
                     if refresh_install && fetch(d, c, &ready, &args, Vec::new(), false)?.is_none() {
@@ -1004,7 +1034,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
                     }
                 }
                 prepared = Some(ready);
-                req.lock().prepared()
+                req.borrow_mut().prepared()
             }
             Effect::Plan { as_build } => {
                 let p = prepared.as_ref().expect("a plan follows a prepared worktree");
@@ -1015,19 +1045,19 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
                 match plan(d, c, p, &plan_args)? {
                     PlanOutcome::Ok(pl) => {
                         let plan = &pl.data.plan;
-                        let fx = req.lock().planned(plan.rustc_fork, plan.units.len(), plan.keep_going);
+                        let fx = req.borrow_mut().planned(plan.rustc_fork, plan.units.len(), plan.keep_going);
                         planned = Some(pl);
                         fx
                     }
                     PlanOutcome::Failed { stderr, stdout, code } => {
-                        let fx = req.lock().plan_failed(&stderr, code);
+                        let fx = req.borrow_mut().plan_failed(&stderr, code);
                         plan_failure = Some((stdout, stderr));
                         fx
                     }
                 }
             }
             Effect::RememberFork(b) => {
-                d.fork_seen.insert(fork_key.clone(), b);
+                d.fork_seen.borrow_mut().insert(fork_key.clone(), b);
                 Vec::new()
             }
             Effect::Fetch { components, offline } => {
@@ -1037,7 +1067,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
                 if let Some(s) = got {
                     snapshot = s;
                 }
-                req.lock().fetched(ok)
+                req.borrow_mut().fetched(ok)
             }
             Effect::ShowPlanFailure => {
                 let p = prepared.as_ref().expect("a plan failure follows a prepared worktree");
@@ -1052,21 +1082,22 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
             Effect::RunUnits => break,
             Effect::Deliver => unreachable!("delivery follows the units"),
         };
-        req.lock().invariants();
+        req.borrow_mut().invariants();
         todo.extend(next);
     }
     let p = prepared.expect("units follow a prepared worktree");
     let planned = planned.expect("units follow a plan");
-    let as_build = req.lock().as_build();
+    let as_build = req.borrow_mut().as_build();
     let pd = planned.data;
     let plan = &pd.plan;
     env_known.join().map_err(|e| anyhow!("asking the client for its environment: {e}"))??;
-    phase(started, c, "planned");
+    phase(d, started, c, "planned");
 
     for dir in [&plan.target_dir, &plan.build_dir] {
         let b = dir.as_bytes().to_vec();
         if vpath_starts_with(&b, WORKTREE_AT) && b != vjoin(WORKTREE_AT, b"target") {
-            let mut m = d.masks.entry(c.worktree.clone()).or_default();
+            let mut masks = d.masks.borrow_mut();
+            let m = masks.entry(c.worktree.clone()).or_default();
             if !m.contains(&b) {
                 m.push(b);
             }
@@ -1109,12 +1140,12 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         pd: pd.clone(),
         base: p.base.clone(),
         layer: Arc::new(OutputsLayer::new()),
-        scripts: Mutex::new(Scripts::new()),
+        scripts: RefCell::new(Scripts::new()),
         states: (0..n).map(|_| watch::channel(UState::Pending).0).collect(),
-        results: (0..n).map(|_| OnceLock::new()).collect(),
-        times: Mutex::new(vec![Default::default(); n]),
-        early: Mutex::new(HashMap::new()),
-        ui: Mutex::new(Ui::default()),
+        results: (0..n).map(|_| OnceCell::new()).collect(),
+        times: RefCell::new(vec![Default::default(); n]),
+        early: RefCell::new(HashMap::new()),
+        ui: RefCell::new(Ui::default()),
         req: req.clone(),
         base_env: env,
         no_cache_tests,
@@ -1124,15 +1155,15 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         policy: p.policy.clone(),
         verify: c.env.contains_key("RARGO_VERIFY"),
         verify_tests: c.env.contains_key(VERIFY_TESTS),
-        verified: AtomicU64::new(0),
-        verify_mismatches: Mutex::new(Vec::new()),
-        verify_unreproducible: Mutex::new(Vec::new()),
-        unit_keys: (0..n).map(|_| OnceLock::new()).collect(),
+        verified: Cell::new(0),
+        verify_mismatches: RefCell::new(Vec::new()),
+        verify_unreproducible: RefCell::new(Vec::new()),
+        unit_keys: (0..n).map(|_| OnceCell::new()).collect(),
         need: if as_build { Some(pd.needs()) } else { None },
-        script_warnings: Mutex::new(Vec::new()),
+        script_warnings: RefCell::new(Vec::new()),
     });
     if let Some(keep) = keep {
-        *keep.lock() = Some(Built {
+        *keep.borrow_mut() = Some(Built {
             layer: run.layer.clone(),
             units: n,
             target_dirs: vec![plan.target_dir.clone(), plan.build_dir.clone()],
@@ -1166,14 +1197,14 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
                 UState::Skipped => Unit::Skipped,
                 UState::Pending | UState::Meta => unreachable!("a unit's task ends with the unit"),
             };
-            r.req.lock().unit_ended(i, end);
+            r.req.borrow_mut().unit_ended(i, end);
             r.states[i].send_replace(st);
         }));
     }
     for t in tasks.0.iter_mut() {
         t.join().map_err(|e| anyhow!("a unit task panicked: {e}"))?;
     }
-    let (ok, after) = req.lock().units_ended();
+    let (ok, after) = req.borrow_mut().units_ended();
     if after == [Effect::End(End::Retry)] {
         return Ok(Finish::Retry);
     }
@@ -1187,10 +1218,10 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
     }
 
     if run.verify_tests {
-        c2.out.note(&format!("verify: {} kept test pass(es) re-run", run.verified.load(Ordering::Relaxed)));
+        c2.out.note(&format!("verify: {} kept test pass(es) re-run", run.verified.get()));
     }
     if run.verify {
-        let all = run.verify_mismatches.lock().clone();
+        let all = run.verify_mismatches.borrow_mut().clone();
         let read_by_someone = |path: &[u8]| -> bool {
             run.unit_keys.iter().filter_map(|k| k.get()).any(|k| {
                 d.engine.traces.traces(k).iter().any(|(_, t)| t.obs.iter().any(|(p, _)| p.as_ref() == path))
@@ -1207,21 +1238,21 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         for m in &bad {
             c2.out.warn(&format!("verify: {m}"));
         }
-        let unreproducible = std::mem::take(&mut *run.verify_unreproducible.lock());
+        let unreproducible = std::mem::take(&mut *run.verify_unreproducible.borrow_mut());
         for m in &unreproducible {
             c2.out.note(&format!("verify: not compared: {m}"));
         }
         c2.out.note(&format!(
             "verify: {} cached unit(s) re-run cleanly, {} differed, {} not reproducible by the tools themselves",
-            run.verified.load(Ordering::Relaxed),
+            run.verified.get(),
             bad.len(),
             unreproducible.len()
         ));
-        d.stats.verify_units.fetch_add(run.verified.load(Ordering::Relaxed), Ordering::Relaxed);
-        d.stats.verify_mismatches.fetch_add(bad.len() as u64, Ordering::Relaxed);
+        d.stats.verify_units.set(d.stats.verify_units.get() + run.verified.get());
+        d.stats.verify_mismatches.set(d.stats.verify_mismatches.get() + bad.len() as u64);
     }
     {
-        let unused = std::mem::take(&mut run.ui.lock().unused_externs);
+        let unused = std::mem::take(&mut run.ui.borrow_mut().unused_externs);
         let mut groups: HashMap<(&str, &str), Option<std::collections::BTreeSet<String>>> = HashMap::new();
         for (i, line) in &unused {
             let u = &plan.units[*i];
@@ -1271,10 +1302,10 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
             }
         }
     }
-    phase(started, c, "units answered");
+    phase(d, started, c, "units answered");
     let incompat = run.future_incompat_summary()?;
     let finished = || {
-        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
+        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(crate::io::now().saturating_duration_since(started))));
         for (kind, text) in &incompat {
             match kind {
                 'w' => c2.out.warn(text),
@@ -1288,7 +1319,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
     }
     if run.need.is_some() {
         finished();
-        req.lock().delivered(0);
+        req.borrow_mut().delivered(0);
         return Ok(Finish::Code(0));
     }
     if subcommand_pos(&args).is_some_and(|i| args[i] == "install") {
@@ -1297,13 +1328,13 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
         run.materialize_roots();
         run.write_depinfo();
     }
-    phase(started, c, "results listed for the client");
+    phase(d, started, c, "results listed for the client");
     finished();
 
     let done = run.steps();
-    phase(started, c, "done");
+    phase(d, started, c, "done");
     if let Ok(Finish::Code(code)) = &done {
-        req.lock().delivered(*code);
+        req.borrow_mut().delivered(*code);
     }
     done
 }
@@ -1312,7 +1343,7 @@ struct UnitObserver {
     run: Arc<Run>,
     i: usize,
     shown: String,
-    pending: Mutex<Vec<u8>>,
+    pending: RefCell<Vec<u8>>,
 }
 
 impl Observer for UnitObserver {
@@ -1370,7 +1401,7 @@ impl UnitObserver {
             return;
         }
         let ready = {
-            let mut pending = self.pending.lock();
+            let mut pending = self.pending.borrow_mut();
             pending.extend_from_slice(data);
             let mut ready = Vec::new();
             while let Some(nl) = pending.iter().position(|b| *b == b'\n') {
@@ -1386,14 +1417,43 @@ impl UnitObserver {
             let Ok(line) = std::str::from_utf8(&line) else { continue };
             let Some(msg) = script_warning_message(line) else { continue };
             let text = format!("{}@{}: {}", u.pkg_name, u.pkg_version, msg);
-            self.run.script_warnings.lock().push(text.clone());
+            self.run.script_warnings.borrow_mut().push(text.clone());
             self.run.c.out.warn(&text);
         }
     }
 }
 
+/// The translator for what a test binary prints. Only the tested package's own
+/// dir and the dependency sources under the cargo home are paths the test learns
+/// from its environment; any other `/w` or `/c` string it prints is its own data.
+fn test_output_translator(tr: &Translator, manifest_path: &str) -> Translator {
+    let home = String::from_utf8_lossy(CARGO_HOME_AT).into_owned();
+    let mut sandbox = vec![format!("{home}/registry"), format!("{home}/git")];
+    if let Some(dir) = Path::new(manifest_path).parent().and_then(Path::to_str)
+        && vpath_starts_with(dir.as_bytes(), WORKTREE_AT)
+    {
+        sandbox.push(dir.to_string());
+    }
+    Translator::new(
+        sandbox
+            .into_iter()
+            .filter_map(|s| {
+                let real = tr.path(&s);
+                (real != s).then_some((s, real))
+            })
+            .collect(),
+    )
+}
+
+fn translated(tr: &Translator, data: &[u8]) -> Vec<u8> {
+    match std::str::from_utf8(data) {
+        Ok(s) => tr.text(s).into_bytes(),
+        Err(_) => data.to_vec(),
+    }
+}
+
 struct TestObserver {
-    out: Arc<Client>,
+    out: Output,
     explain: bool,
     label: String,
 }
@@ -1403,15 +1463,15 @@ impl Observer for TestObserver {
         self.explain
     }
     fn explain(&self, why: &str) {
-        self.out.out.note(&format!("{} runs because {why}", self.label));
+        self.out.note(&format!("{} runs because {why}", self.label));
     }
     fn stdout(&self, data: &[u8]) {
-        self.out.out.raw_out(self.out.out.tr.text(&String::from_utf8_lossy(data)).as_bytes());
+        self.out.raw_out(&translated(&self.out.tr, data));
     }
     fn stderr_line(&self, line: &[u8], _live: Option<&dyn Live>) {
-        let mut l = self.out.out.tr.text(&String::from_utf8_lossy(line));
-        l.push('\n');
-        self.out.out.raw_err(l.as_bytes());
+        let mut data = translated(&self.out.tr, line);
+        data.push(b'\n');
+        self.out.raw_err(&data);
     }
 }
 
@@ -1452,7 +1512,7 @@ impl Run {
         let mut rx = self.states[j].subscribe();
         loop {
             rx.borrow_and_update();
-            match self.req.lock().dep(j, meta_ok) {
+            match self.req.borrow_mut().dep(j, meta_ok) {
                 Go::Ready => return true,
                 Go::Skip => return false,
                 Go::Wait => {}
@@ -1542,7 +1602,7 @@ impl Run {
                 let mut rx = self.states[prev].subscribe();
                 loop {
                     rx.borrow_and_update();
-                    if !matches!(self.req.lock().dep(prev, false), Go::Wait) {
+                    if !matches!(self.req.borrow_mut().dep(prev, false), Go::Wait) {
                         break;
                     }
                     if rx.changed().is_err() {
@@ -1559,7 +1619,7 @@ impl Run {
                 }
             }
         }
-        if !self.req.lock().may_start(i) {
+        if !self.req.borrow_mut().may_start(i) {
             return Ok(UState::Skipped);
         }
         let Some(cmd) = &u.cmd else { return Ok(UState::Done) };
@@ -1567,7 +1627,7 @@ impl Run {
             return Ok(UState::Done);
         }
         let cmd = {
-            let scripts = self.scripts.lock();
+            let scripts = self.scripts.borrow_mut();
             expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::ScriptWins)?
         };
         let (kind, mut args) = match u.kind {
@@ -1654,7 +1714,7 @@ impl Run {
 
         let script = u.script.clone();
         let parser_d = self.d.clone();
-        let declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String> + Send + Sync> = match (&u.kind, script) {
+        let declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String>> = match (&u.kind, script) {
             (rp::UnitKind::RunScript, Some(s)) => Arc::new(move |r, store| {
                 if !r.success() {
                     return Vec::new();
@@ -1667,7 +1727,7 @@ impl Run {
             }),
             _ => Arc::new(rustc_env_deps),
         };
-        let cacheable: Arc<dyn Fn(&ActionResult) -> bool + Send + Sync> = Arc::new(|r| r.success());
+        let cacheable: Arc<dyn Fn(&ActionResult) -> bool> = Arc::new(|r| r.success());
         let mut from_full = match (&full_argv, self.verify) {
             (Some(argv), false) => self.d.engine.cached(&Request {
                 spec: ActionSpec { argv: argv.clone(), ..spec.clone() },
@@ -1684,20 +1744,20 @@ impl Run {
                     run: self.clone(),
                     i,
                     shown: display_cmd(&cmd.program, &args),
-                    pending: Mutex::new(Vec::new()),
+                    pending: RefCell::new(Vec::new()),
                 }),
             }),
             _ => None,
         };
-        self.times.lock()[i].start = Some(std::time::Instant::now());
+        self.times.borrow_mut()[i].start = Some(crate::io::now());
         let outcome = loop {
             if let Some(o) = from_full.take() {
                 break o;
             }
             let seed_layer = seed.as_ref().map(|s| {
-                let l = OutputsLayer::new();
+                let mut l = OutputState::default();
                 l.add_manifest(0, LEVEL_FULL, &s.manifest);
-                Arc::new(l)
+                Arc::new(OutputsLayer::frozen(l))
             });
             let outcome = self
                 .d
@@ -1717,7 +1777,7 @@ impl Run {
                         run: self.clone(),
                         i,
                         shown: display_cmd(&cmd.program, &args),
-                        pending: Mutex::new(Vec::new()),
+                        pending: RefCell::new(Vec::new()),
                     }),
                 });
             let outcome = match outcome {
@@ -1740,10 +1800,10 @@ impl Run {
             }
             if !r.success() {
                 let stderr = self.d.store().read(&r.stderr).unwrap_or_default();
-                let on_failure = self.req.lock().unit_failed(i, &stderr);
+                let on_failure = self.req.borrow_mut().unit_failed(i, &stderr);
                 if let OnFailure::Install(missing) = on_failure {
                     let added = add_components_for(&self.d, &self.c, missing)?;
-                    if self.req.lock().components_installed(i, added) {
+                    if self.req.borrow_mut().components_installed(i, added) {
                         self.base.renew();
                         continue;
                     }
@@ -1753,9 +1813,9 @@ impl Run {
         };
         {
             let st = &outcome.result.stats;
-            let mut times = self.times.lock();
+            let mut times = self.times.borrow_mut();
             let t = &mut times[i];
-            t.end = Some(std::time::Instant::now());
+            t.end = Some(crate::io::now());
             t.cached = outcome.cached;
             (t.wall_us, t.cpu_us, t.rss_kb) = (st.wall_us, st.cpu_us, st.max_rss_kb);
         }
@@ -1777,10 +1837,10 @@ impl Run {
                     declared_env: Arc::new(|_, _| Vec::new()),
                     observer: Arc::new(NullObserver),
                 })?;
-            self.verified.fetch_add(1, Ordering::Relaxed);
+            self.verified.set(self.verified.get() + 1);
             let (a, b) = (&outcome.result.outputs.entries, &clean.result.outputs.entries);
             if !clean.result.success() {
-                self.verify_mismatches.lock().push((
+                self.verify_mismatches.borrow_mut().push((
                     format!("{}: cached as a success, but a clean run fails ({})", u.desc, describe_status(clean.result.status)),
                     Vec::new(),
                 ));
@@ -1810,10 +1870,10 @@ impl Run {
                 };
                 if sorted(&cached) == sorted(&clean_lines) {
                     self.verify_unreproducible
-                        .lock()
+                        .borrow_mut()
                         .push(format!("{}: prints the same instructions to cargo in a different order from run to run", u.desc));
                 } else {
-                    self.verify_mismatches.lock().push((
+                    self.verify_mismatches.borrow_mut().push((
                         format!(
                             "{}: a clean run prints different instructions to cargo (cached only: {:?}; clean only: {:?})",
                             u.desc,
@@ -1879,7 +1939,7 @@ impl Run {
                 let split_debug = a.iter().any(|(p, _)| p.ends_with(b".rcgu.dwo"));
                 let only_linked = u.needs_objects && split_debug && differing.iter().all(|p| !compiled(p));
                 if !differing.is_empty() && (reordered_inputs || only_linked) {
-                    self.verify_unreproducible.lock().push(format!(
+                    self.verify_unreproducible.borrow_mut().push(format!(
                         "{}: {}",
                         u.desc,
                         if reordered_inputs {
@@ -1900,7 +1960,7 @@ impl Run {
                             Some(crate::ar::describe_difference(&bx, &by))
                         })
                         .unwrap_or_else(|| "present in only one of the two".to_string());
-                    self.verify_mismatches.lock().push((
+                    self.verify_mismatches.borrow_mut().push((
                         format!(
                             "{}: a clean run produces different output than the cached one ({}; the first: {how})",
                             u.desc,
@@ -1940,10 +2000,10 @@ impl Run {
             return Ok(UState::Failed);
         }
 
-        if let Some(early) = self.early.lock().get(&i) {
+        if let Some(early) = self.early.borrow_mut().get(&i) {
             for (path, e) in early {
                 if r.outputs.get(path) != Some(e) {
-                    self.req.lock().unit_inconsistent(i);
+                    self.req.borrow_mut().unit_inconsistent(i);
                     return Ok(UState::Failed);
                 }
             }
@@ -1988,9 +2048,7 @@ impl Run {
         let u = &self.plan().units[i];
         let Some(s) = u.script.clone() else { return Ok(true) };
         let stdout = self.d.store().read(&r.stdout)?;
-        let d = self.d.clone();
-        let s2 = s.clone();
-        let parsed = crate::io::cpu(move || d.parser.parse(&s2, &stdout));
+        let parsed = self.d.parser.parse(&s, &stdout);
         let o = match &*parsed {
             Ok(o) => o.clone(),
             Err(msg) => {
@@ -2005,7 +2063,7 @@ impl Run {
                 if *is_err {
                     self.c.out.error(&text);
                 } else {
-                    let mut seen = self.script_warnings.lock();
+                    let mut seen = self.script_warnings.borrow_mut();
                     if let Some(pos) = seen.iter().position(|s| s == &text) {
                         seen.swap_remove(pos);
                     } else {
@@ -2028,7 +2086,7 @@ impl Run {
             );
             self.c.out.raw_out(self.c.out.tr.text(&msg).as_bytes());
         }
-        self.scripts.lock().insert(s.meta.clone(), Arc::new(o));
+        self.scripts.borrow_mut().insert(s.meta.clone(), Arc::new(o));
         if has_error {
             self.c.out.error("build script logged errors");
             return Ok(false);
@@ -2038,7 +2096,7 @@ impl Run {
 
     fn note_working_on(&self, i: usize) {
         let u = &self.plan().units[i];
-        let mut ui = self.ui.lock();
+        let mut ui = self.ui.borrow_mut();
         let (set, verb) = match u.verb {
             rp::Verb::Silent => return,
             rp::Verb::Documenting => (&mut ui.documented, "Documenting"),
@@ -2054,7 +2112,7 @@ impl Run {
 
     fn write_timings(&self, started: std::time::Instant) {
         let plan = self.plan();
-        let times = self.times.lock().clone();
+        let times = self.times.borrow_mut().clone();
         let rows: Vec<crate::timings::Row> = plan
             .units
             .iter()
@@ -2069,12 +2127,12 @@ impl Run {
                 needs_objects: u.needs_objects,
             })
             .collect();
-        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let unix = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let stamp = crate::timings::stamp(unix);
         let html = crate::timings::render(
             &format!("cargo {}", self.c.args.join(" ")),
             &stamp,
-            started.elapsed(),
+            crate::io::now().saturating_duration_since(started),
             self.d.engine.sched.tokens(),
             &rows,
         );
@@ -2092,7 +2150,7 @@ impl Run {
 
     fn future_incompat_summary(&self) -> Result<Vec<(char, String)>> {
         let plan = self.plan();
-        let reports = std::mem::take(&mut self.ui.lock().future_incompat);
+        let reports = std::mem::take(&mut self.ui.borrow_mut().future_incompat);
         if reports.is_empty() {
             return Ok(if plan.future_incompat_report {
                 vec![('n', "0 dependencies had future-incompatible warnings".to_string())]
@@ -2200,7 +2258,7 @@ impl Run {
                 .as_array()
                 .map(|a| a.iter().filter_map(|it| it["diagnostic"]["rendered"].as_str().map(|s| s.to_string())).collect())
                 .unwrap_or_default();
-            self.ui.lock().future_incompat.insert(i, rendered);
+            self.ui.borrow_mut().future_incompat.insert(i, rendered);
             return;
         }
         let is_summary = |m: &str| {
@@ -2230,7 +2288,7 @@ impl Run {
                     })
                 });
                 let lint = !v["code"].is_null();
-                let mut ui = self.ui.lock();
+                let mut ui = self.ui.borrow_mut();
                 let emitted = ui.seen_diag.insert(Hash::of(rendered.as_bytes()));
                 if emitted {
                     self.c.out.err_text(&format!("{rendered}\n"));
@@ -2264,9 +2322,9 @@ impl Run {
                     if let Some(entry) = live.ingest(artifact.as_bytes()) {
                         let ents = vec![(artifact.as_bytes().to_vec(), entry)];
                         self.layer.add(i as u32, LEVEL_META, &ents);
-                        self.early.lock().entry(i).or_default().extend(ents);
-                        self.times.lock()[i].meta = Some(std::time::Instant::now());
-                        self.req.lock().unit_meta(i);
+                        self.early.borrow_mut().entry(i).or_default().extend(ents);
+                        self.times.borrow_mut()[i].meta = Some(crate::io::now());
+                        self.req.borrow_mut().unit_meta(i);
                         self.states[i].send_replace(UState::Meta);
                     }
                 }
@@ -2274,7 +2332,7 @@ impl Run {
             return;
         }
         if v.get("unused_extern_names").is_some() {
-            self.ui.lock().unused_externs.insert(i, line.to_string());
+            self.ui.borrow_mut().unused_externs.insert(i, line.to_string());
             return;
         }
         let Some((_, message, level)) = diag else { return };
@@ -2282,7 +2340,7 @@ impl Run {
             return;
         }
         {
-            let mut ui = self.ui.lock();
+            let mut ui = self.ui.borrow_mut();
             let cnt = ui.counts.entry(i).or_default();
             match level {
                 "warning" => cnt.warnings_seen += 1,
@@ -2322,7 +2380,7 @@ impl Run {
     fn finish_unit_messages(&self, i: usize, r: &ActionResult, cached: bool) {
         let plan = self.plan();
         let u = &plan.units[i];
-        let cnt = self.ui.lock().counts.get(&i).cloned().unwrap_or_default();
+        let cnt = self.ui.borrow_mut().counts.get(&i).cloned().unwrap_or_default();
         if cnt.total > 0 {
             self.report_warning_count(u, &cnt);
         }
@@ -2380,7 +2438,7 @@ impl Run {
         let plan = self.plan();
         let u = &plan.units[i];
         {
-            let scripts = self.scripts.lock();
+            let scripts = self.scripts.borrow_mut();
             for meta in &u.script_metas {
                 if let Some(o) = scripts.get(meta) {
                     for (is_err, m) in &o.log_messages {
@@ -2394,7 +2452,7 @@ impl Run {
                 }
             }
         }
-        let cnt = self.ui.lock().counts.get(&i).cloned().unwrap_or_default();
+        let cnt = self.ui.borrow_mut().counts.get(&i).cloned().unwrap_or_default();
         if cnt.total > 0 {
             self.report_warning_count(u, &cnt);
         }
@@ -2444,7 +2502,7 @@ impl Run {
                 }
             }
         }
-        let mut ui = self.ui.lock();
+        let mut ui = self.ui.borrow_mut();
         if !ui.said_waiting && !plan.keep_going {
             ui.said_waiting = true;
             let others_running = self.d.engine.sched.snapshot().0 > 1;
@@ -2485,7 +2543,7 @@ impl Run {
                 }
             }
             if let Some(root_dir) = Path::new(&u.manifest_path).parent() {
-                let scripts = self.scripts.lock();
+                let scripts = self.scripts.borrow_mut();
                 for meta in &u.script_metas {
                     if let Some(o) = scripts.get(meta) {
                         for f in &o.rerun_if_changed {
@@ -2660,10 +2718,10 @@ impl Run {
         match self.d.engine.recheck_kept(req, DRIFT_SAMPLE) {
             crate::engine::Kept::NotKept | crate::engine::Kept::NotSampled => {}
             crate::engine::Kept::Holds => {
-                self.verified.fetch_add(1, Ordering::Relaxed);
+                self.verified.set(self.verified.get() + 1);
             }
             crate::engine::Kept::Fails { functions, failure } => {
-                self.verified.fetch_add(1, Ordering::Relaxed);
+                self.verified.set(self.verified.get() + 1);
                 out.warn(&format!("verify: {}", crate::fn_code::drift_line(&label, &functions, &failure)));
             }
         }
@@ -2687,7 +2745,7 @@ impl Run {
                 }
                 rp::Step::Run { cmd, .. } => {
                     let cmd = {
-                        let scripts = self.scripts.lock();
+                        let scripts = self.scripts.borrow_mut();
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
                     out.status("Running", &display_cmd(&cmd.program, &cmd.args));
@@ -2718,7 +2776,7 @@ impl Run {
                 }
                 rp::Step::Exec { kind, unit, cmd, rerun, harness } => {
                     let cmd = {
-                        let scripts = self.scripts.lock();
+                        let scripts = self.scripts.borrow_mut();
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
                     if out.verbose {
@@ -2766,7 +2824,11 @@ impl Run {
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
                             observer: Arc::new(TestObserver {
-                                out: self.c.clone(),
+                                out: out.derive(
+                                    out.quiet,
+                                    out.verbose,
+                                    test_output_translator(&out.tr, &plan.units[*unit as usize].manifest_path),
+                                ),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
@@ -2950,6 +3012,55 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// What a test printing `line` shows the user, when the tested package's
+    /// manifest is `manifest_path`, the client's worktree `/home/me/project` and
+    /// its cargo home `/home/me/.cargo`.
+    fn test_prints(manifest_path: &str, line: &str) -> (String, String) {
+        use rargo_proto::ServerMsg;
+
+        let (manifest_path, line) = (manifest_path.to_string(), line.to_string());
+        crate::io::sim::test(move || {
+            let (tx, mut rx) = crate::io::unbounded_channel();
+            let tr = Translator::new(vec![
+                ("/w".into(), "/home/me/project".into()),
+                ("/c".into(), "/home/me/.cargo".into()),
+            ]);
+            let observer = TestObserver {
+                out: Output::new(tx, false, false).derive(false, false, super::test_output_translator(&tr, &manifest_path)),
+                explain: false,
+                label: String::new(),
+            };
+            observer.stdout(line.as_bytes());
+            observer.stderr_line(line.as_bytes(), None);
+            drop(observer);
+            let ServerMsg::Stdout(out) = rx.recv().unwrap() else { panic!("stdout first") };
+            let ServerMsg::Stderr(err) = rx.recv().unwrap() else { panic!("then stderr") };
+            (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+        })
+    }
+
+    #[test]
+    fn a_test_of_the_root_package_prints_the_clients_paths_for_its_manifest_dir_and_cwd() {
+        let line = "cannot read /w/tests/data/input.json: No such file or directory (os error 2) cwd=/w manifest=/w";
+        let want = "cannot read /home/me/project/tests/data/input.json: No such file or directory (os error 2) cwd=/home/me/project manifest=/home/me/project";
+        assert_eq!(test_prints("/w/Cargo.toml", line), (want.to_string(), format!("{want}\n")));
+    }
+
+    #[test]
+    fn a_test_prints_the_clients_paths_for_dependency_sources() {
+        let line = "panicked at /c/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.0/src/de.rs:3:4 and /c/git/checkouts/x/src/lib.rs";
+        let want = "panicked at /home/me/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.0/src/de.rs:3:4 and /home/me/.cargo/git/checkouts/x/src/lib.rs";
+        assert_eq!(test_prints("/w/crates/fx/Cargo.toml", line).0, want);
+    }
+
+    #[test]
+    fn a_member_packages_test_keeps_other_sandbox_paths_it_prints_as_data() {
+        let line = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/w/crates/rargo";
+        let want = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/home/me/project/crates/rargo";
+        assert_eq!(test_prints("/w/crates/rargo/Cargo.toml", line), (want.to_string(), format!("{want}\n")));
+        assert_eq!(test_prints("/w/crates/rargo/Cargo.toml", "/w/crates/rargo-core/x").0, "/w/crates/rargo-core/x");
+    }
+
     #[test]
     fn a_build_script_that_failed_for_want_of_a_system_library_is_told_where_libraries_come_from() {
         let udev = "  thread 'main' panicked at libudev-sys-0.1.4/build.rs:38:41:\n  pkg-config exited with status code 1\n  > PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs --cflags libudev\n\n  The system library `libudev` required by crate `libudev-sys` was not found.\n  Package libudev was not found in the pkg-config search path.\n  Perhaps you should add the directory containing `libudev.pc'\n";

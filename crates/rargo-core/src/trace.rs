@@ -5,11 +5,10 @@ use crate::hash::{Hash, KeyHasher};
 use crate::sandbox::NetMode;
 use crate::store::Store;
 use crate::view::{Content, FileSrc, Obs, VPath, View, obs_holds};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::{Cell, RefCell};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ActionKind {
@@ -224,16 +223,16 @@ const MAX_TRACES_PER_KEY: usize = 24;
 
 #[derive(Default)]
 pub struct CacheStats {
-    pub hits: AtomicU64,
-    pub misses: AtomicU64,
-    pub stored: AtomicU64,
+    pub hits: Cell<u64>,
+    pub misses: Cell<u64>,
+    pub stored: Cell<u64>,
 }
 
 pub struct TraceCache {
     db: Arc<dyn Tables>,
-    mem: DashMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>,
-    next_id: AtomicU64,
-    env_names: parking_lot::Mutex<Option<std::collections::BTreeSet<String>>>,
+    mem: RefCell<std::collections::BTreeMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>>,
+    next_id: Cell<u64>,
+    env_names: RefCell<Option<std::collections::BTreeSet<String>>>,
     pub stats: CacheStats,
 }
 
@@ -245,11 +244,11 @@ fn trace_key(weak: &Hash, id: u64) -> Vec<u8> {
 
 impl TraceCache {
     pub fn new(db: Arc<dyn Tables>, seed: u64) -> TraceCache {
-        TraceCache { db, mem: DashMap::new(), env_names: parking_lot::Mutex::new(None), next_id: AtomicU64::new(seed), stats: CacheStats::default() }
+        TraceCache { db, mem: RefCell::new(std::collections::BTreeMap::new()), env_names: RefCell::new(None), next_id: Cell::new(seed), stats: CacheStats::default() }
     }
 
     fn load(&self, weak: &Hash) -> Arc<Vec<(u64, Arc<Trace>)>> {
-        if let Some(v) = self.mem.get(weak) {
+        if let Some(v) = self.mem.borrow().get(weak) {
             return v.clone();
         }
         let mut list = Vec::new();
@@ -264,7 +263,7 @@ impl TraceCache {
         }
         list.sort_by(|a, b| b.0.cmp(&a.0));
         let list = Arc::new(list);
-        self.mem.insert(*weak, list.clone());
+        self.mem.borrow_mut().insert(*weak, list.clone());
         list
     }
 
@@ -283,16 +282,17 @@ impl TraceCache {
                 continue;
             }
             t.touch(&content.store);
-            self.stats.hits.fetch_add(1, Ordering::Relaxed);
+            self.stats.hits.set(self.stats.hits.get() + 1);
             return Some(t.clone());
         }
-        self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        self.stats.misses.set(self.stats.misses.get() + 1);
         None
     }
 
     pub fn insert(&self, weak: &Hash, trace: Trace) -> Arc<Trace> {
         let mut list: Vec<(u64, Arc<Trace>)> = self.load(weak).as_ref().clone();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
         let raw = bincode::serialize(&trace).expect("trace serialises");
         let packed = zstd::encode_all(&raw[..], 3).expect("zstd");
         self.db.put(Table::Traces, &trace_key(weak, id), &packed);
@@ -302,8 +302,8 @@ impl TraceCache {
             let (old, _) = list.pop().unwrap();
             self.db.delete(Table::Traces, &trace_key(weak, old));
         }
-        self.mem.insert(*weak, Arc::new(list));
-        self.stats.stored.fetch_add(1, Ordering::Relaxed);
+        self.mem.borrow_mut().insert(*weak, Arc::new(list));
+        self.stats.stored.set(self.stats.stored.get() + 1);
         trace
     }
 
@@ -311,7 +311,7 @@ impl TraceCache {
         self.db.delete(Table::Traces, &trace_key(weak, id));
         let mut list: Vec<(u64, Arc<Trace>)> = self.load(weak).as_ref().clone();
         list.retain(|(i, _)| *i != id);
-        self.mem.insert(*weak, Arc::new(list));
+        self.mem.borrow_mut().insert(*weak, Arc::new(list));
     }
 
     pub fn needs_env(&self, weak: &Hash) -> Vec<String> {
@@ -337,7 +337,7 @@ impl TraceCache {
             let mut k = b"env:".to_vec();
             k.extend_from_slice(&weak.0);
             self.db.put(Table::Meta, &k, &bincode::serialize(&cur).unwrap());
-            if let Some(names) = &mut *self.env_names.lock() {
+            if let Some(names) = &mut *self.env_names.borrow_mut() {
                 names.extend(added.iter().cloned());
             }
         }
@@ -345,7 +345,7 @@ impl TraceCache {
     }
 
     pub fn every_env_name(&self) -> Vec<String> {
-        let mut names = self.env_names.lock();
+        let mut names = self.env_names.borrow_mut();
         names
             .get_or_insert_with(|| self.all_needs_env().into_iter().flat_map(|(_, v)| v).collect())
             .iter()
@@ -353,40 +353,60 @@ impl TraceCache {
             .collect()
     }
 
+    /// The tables the traces are recorded in.
+    pub fn tables(&self) -> Arc<dyn Tables> {
+        self.db.clone()
+    }
+
     pub fn all(&self) -> Vec<(Hash, Trace)> {
-        let mut out = Vec::new();
-        for (k, v) in self.db.scan_prefix(Table::Traces, &[]) {
-            if k.len() != 40 {
-                continue;
-            }
-            let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
-            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
-            out.push((Hash(k[..32].try_into().unwrap()), t));
-        }
-        out
+        all(&*self.db)
     }
 
     pub fn all_needs_env(&self) -> Vec<(Hash, Vec<String>)> {
-        self.db
-            .scan_prefix(Table::Meta, b"env:")
-            .into_iter()
-            .filter_map(|(k, v)| {
-                let key = Hash(k.get(4..36)?.try_into().ok()?);
-                Some((key, bincode::deserialize::<Vec<String>>(&v).ok()?))
-            })
-            .collect()
+        all_needs_env(&*self.db)
     }
 
-    pub fn mark(&self, live: &mut std::collections::HashSet<Hash>) {
-        for (_, v) in self.db.scan_prefix(Table::Traces, &[]) {
-            let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
-            let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
-            live.insert(t.result.stdout);
-            live.insert(t.result.stderr);
-            for (_, e) in &t.result.outputs.entries {
-                if let MEntry::File { hash, .. } = e {
-                    live.insert(*hash);
-                }
+    pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
+        mark(&*self.db, live)
+    }
+}
+
+/// Every trace recorded in `db`, with the key it is recorded under.
+pub fn all(db: &dyn Tables) -> Vec<(Hash, Trace)> {
+    let mut out = Vec::new();
+    for (k, v) in db.scan_prefix(Table::Traces, &[]) {
+        if k.len() != 40 {
+            continue;
+        }
+        let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
+        let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
+        out.push((Hash(k[..32].try_into().unwrap()), t));
+    }
+    out
+}
+
+/// The environment variables each key recorded in `db` is known to read.
+pub fn all_needs_env(db: &dyn Tables) -> Vec<(Hash, Vec<String>)> {
+    db
+        .scan_prefix(Table::Meta, b"env:")
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let key = Hash(k.get(4..36)?.try_into().ok()?);
+            Some((key, bincode::deserialize::<Vec<String>>(&v).ok()?))
+        })
+        .collect()
+}
+
+/// Adds what the traces recorded in `db` refer to in the store to `live`.
+pub fn mark(db: &dyn Tables, live: &mut std::collections::BTreeSet<Hash>) {
+    for (_, v) in db.scan_prefix(Table::Traces, &[]) {
+        let Ok(raw) = zstd::decode_all(&v[..]) else { continue };
+        let Ok(t) = bincode::deserialize::<Trace>(&raw) else { continue };
+        live.insert(t.result.stdout);
+        live.insert(t.result.stderr);
+        for (_, e) in &t.result.outputs.entries {
+            if let MEntry::File { hash, .. } = e {
+                live.insert(*hash);
             }
         }
     }
@@ -395,19 +415,19 @@ impl TraceCache {
 #[cfg(test)]
 impl StateMachine for TraceCache {
     fn invariants(&self) {
-        let next = self.next_id.load(Ordering::Relaxed);
+        let next = self.next_id.get();
         let stored = |weak: &Hash| -> Vec<u64> {
             let mut ids: Vec<u64> = self.db.scan_prefix(Table::Traces, &weak.0).into_iter().filter(|(k, _)| k.len() == 40).map(|(k, _)| u64::from_be_bytes(k[32..40].try_into().unwrap())).collect();
             ids.sort_by(|a, b| b.cmp(a));
             ids
         };
-        let names: Option<std::collections::BTreeSet<String>> = self.env_names.lock().clone();
-        for e in self.mem.iter() {
-            let ids: Vec<u64> = e.value().iter().map(|(id, _)| *id).collect();
+        let names: Option<std::collections::BTreeSet<String>> = self.env_names.borrow_mut().clone();
+        for (weak, list) in self.mem.borrow().iter() {
+            let ids: Vec<u64> = list.iter().map(|(id, _)| *id).collect();
             assert!(ids.len() <= MAX_TRACES_PER_KEY, "{} traces are kept for one key, over {MAX_TRACES_PER_KEY}", ids.len());
             assert!(ids.windows(2).all(|w| w[0] > w[1]), "a key's traces are newest first: {ids:?}");
             assert!(ids.iter().all(|id| *id < next), "every trace id {ids:?} was handed out, below {next}");
-            assert_eq!(ids, stored(e.key()), "the traces in memory are the traces in the database");
+            assert_eq!(ids, stored(weak), "the traces in memory are the traces in the database");
         }
         if let Some(n) = names {
             let needed: std::collections::BTreeSet<String> = self.all_needs_env().into_iter().flat_map(|(_, v)| v).collect();
@@ -419,6 +439,8 @@ impl StateMachine for TraceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use crate::db::MemTables;
 
     fn trace(n: u8, created: u64) -> Trace {
@@ -439,6 +461,7 @@ mod tests {
 
     #[test]
     fn trace_ids_follow_the_given_seed_and_each_key_keeps_its_newest() {
+        let mut outcomes = Transcript::default();
         let (a, b) = (Hash::of(b"action a"), Hash::of(b"action b"));
         let run = |seed: u64| {
             let db = Arc::new(MemTables::default());
@@ -454,30 +477,33 @@ mod tests {
         let (db, c, keys) = run(500);
         assert_eq!(run(500).2, keys, "the same seed gives the same ids");
         assert_ne!(run(7).2, keys);
-        let of_a: Vec<u64> = (500..530).filter(|i| (i - 500) % 3 != 0).rev().collect();
-        assert_eq!(ids(&c, &a), of_a, "20 traces of a, newest first");
-        let of_b: Vec<u64> = (500..530).filter(|i| (i - 500) % 3 == 0).rev().collect();
-        assert_eq!(ids(&c, &b), of_b);
+        // 20 traces of a, newest first.
+        outcomes.record("ids", ids(&c, &a));
+        outcomes.record("ids", ids(&c, &b));
         for n in 0..30u8 {
             c.insert(&a, trace(n, 2000));
             c.invariants();
         }
-        assert_eq!(ids(&c, &a), (530..560).rev().take(MAX_TRACES_PER_KEY).collect::<Vec<u64>>(), "only the newest 24 are kept");
-        assert_eq!(db.scan_prefix(Table::Traces, &a.0).len(), MAX_TRACES_PER_KEY, "and the rest are deleted");
-        assert_eq!(c.traces(&a)[0].1.created, 2000, "a trace keeps the time it was given");
+        // only the newest 24 are kept.
+        outcomes.record("ids", ids(&c, &a));
+        // and the rest are deleted.
+        outcomes.record("scan prefix", db.scan_prefix(Table::Traces, &a.0).len());
+        // a trace keeps the time it was given.
+        outcomes.record("traces", c.traces(&a)[0].1.created);
         c.remove(&a, 545);
         c.invariants();
         assert!(!ids(&c, &a).contains(&545));
 
         let again = TraceCache::new(db.clone(), 900);
-        assert_eq!(ids(&again, &a), ids(&c, &a), "another cache reads the same traces back");
+        // another cache reads the same traces back.
+        outcomes.record("ids", ids(&again, &a));
         again.invariants();
         let created: Vec<u64> = again.traces(&b).iter().map(|(_, t)| t.created).collect();
-        assert_eq!(created, (0..30u64).filter(|n| n % 3 == 0).rev().map(|n| 1000 + n).collect::<Vec<u64>>());
-        assert_eq!(again.all().len(), MAX_TRACES_PER_KEY - 1 + 10);
-        let mut live = std::collections::HashSet::new();
+        outcomes.record("created", created);
+        outcomes.record("all", again.all().len());
+        let mut live = std::collections::BTreeSet::new();
         again.mark(&mut live);
-        let expected: std::collections::HashSet<Hash> = again
+        let expected: std::collections::BTreeSet<Hash> = again
             .all()
             .iter()
             .flat_map(|(_, t)| {
@@ -487,25 +513,47 @@ mod tests {
             .collect();
         assert_eq!(live, expected, "every kept trace's outputs are live");
         assert!(live.contains(&Hash([0; 32])), "including the oldest trace of b");
+        expect![[r#"
+            ids: [529, 528, 526, 525, 523, 522, 520, 519, 517, 516, 514, 513, 511, 510, 508, 507, 505, 504, 502, 501]
+            ids: [527, 524, 521, 518, 515, 512, 509, 506, 503, 500]
+            ids: [559, 558, 557, 556, 555, 554, 553, 552, 551, 550, 549, 548, 547, 546, 545, 544, 543, 542, 541, 540, 539, 538, 537, 536]
+            scan prefix: 24
+            traces: 2000
+            ids: [559, 558, 557, 556, 555, 554, 553, 552, 551, 550, 549, 548, 547, 546, 544, 543, 542, 541, 540, 539, 538, 537, 536]
+            created: [1027, 1024, 1021, 1018, 1015, 1012, 1009, 1006, 1003, 1000]
+            all: 33
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn the_environment_an_action_needs_is_merged_and_remembered() {
+        let mut outcomes = Transcript::default();
         let db = Arc::new(MemTables::default());
         let c = TraceCache::new(db.clone(), 1);
         let (a, b) = (Hash::of(b"a"), Hash::of(b"b"));
-        assert!(c.needs_env(&a).is_empty() && c.every_env_name().is_empty());
+        outcomes.record("initial environment names", (c.needs_env(&a), c.every_env_name()));
         c.invariants();
-        assert_eq!(c.add_needs_env(&a, &["PATH".into(), "HOME".into()]), ["PATH", "HOME"]);
+        outcomes.record("add needs env", c.add_needs_env(&a, &["PATH".into(), "HOME".into()]));
         c.invariants();
-        assert_eq!(c.add_needs_env(&a, &["HOME".into(), "CC".into()]), ["CC"]);
-        assert!(c.add_needs_env(&a, &["CC".into()]).is_empty());
-        assert_eq!(c.add_needs_env(&b, &["RUSTFLAGS".into()]), ["RUSTFLAGS"]);
+        outcomes.record("add needs env", c.add_needs_env(&a, &["HOME".into(), "CC".into()]));
+        outcomes.record("add needs env", c.add_needs_env(&a, &["CC".into()]));
+        outcomes.record("add needs env", c.add_needs_env(&b, &["RUSTFLAGS".into()]));
         c.invariants();
-        assert_eq!(c.needs_env(&a), ["CC", "HOME", "PATH"]);
-        assert_eq!(c.every_env_name(), ["CC", "HOME", "PATH", "RUSTFLAGS"]);
+        outcomes.record("needs env", c.needs_env(&a));
+        outcomes.record("every env name", c.every_env_name());
         let again = TraceCache::new(db, 1);
-        assert_eq!(again.all_needs_env().len(), 2);
-        assert_eq!(again.every_env_name(), ["CC", "HOME", "PATH", "RUSTFLAGS"]);
+        outcomes.record("all needs env", again.all_needs_env().len());
+        outcomes.record("every env name", again.every_env_name());
+        expect![[r#"
+            initial environment names: ([], [])
+            add needs env: ["PATH", "HOME"]
+            add needs env: ["CC"]
+            add needs env: []
+            add needs env: ["RUSTFLAGS"]
+            needs env: ["CC", "HOME", "PATH"]
+            every env name: ["CC", "HOME", "PATH", "RUSTFLAGS"]
+            all needs env: 2
+            every env name: ["CC", "HOME", "PATH", "RUSTFLAGS"]
+        "#]].assert_eq(&outcomes.0);
     }
 }

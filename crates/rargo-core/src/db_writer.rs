@@ -1,10 +1,9 @@
 use rargo_machine::StateMachine;
 use crate::db::Table;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const DELAY_MS: u64 = 100;
-pub const IDLE_MS: u64 = 500;
 pub const FULL_BYTES: usize = 64 << 20;
 
 type Key = (Table, Vec<u8>);
@@ -58,6 +57,8 @@ impl DbWriter {
     }
 
     fn write(&mut self, table: Table, key: &[u8], value: Value, now_ms: u64) {
+        assert!(self.seq < u64::MAX, "a write needs a fresh sequence number");
+        let since = self.since.unwrap_or(now_ms);
         self.seq += 1;
         self.bytes += size(key, &value);
         let old = self.pending.insert((table, key.to_vec()), Entry { value, seq: self.seq });
@@ -65,14 +66,19 @@ impl DbWriter {
             self.bytes -= size(key, &old.value);
         }
         self.since.get_or_insert(now_ms);
+        assert_eq!(self.since, Some(since), "writing preserves the first queued time");
     }
 
     pub fn put(&mut self, table: Table, key: &[u8], value: &[u8], now_ms: u64) {
-        self.write(table, key, Some(Arc::from(value)), now_ms);
+        let value: Arc<[u8]> = Arc::from(value);
+        self.write(table, key, Some(value.clone()), now_ms);
+        assert!(matches!(self.get(table, key), Some(Some(stored)) if Arc::ptr_eq(&stored, &value)),
+            "a put queues the new value");
     }
 
     pub fn delete(&mut self, table: Table, key: &[u8], now_ms: u64) {
         self.write(table, key, None, now_ms);
+        assert!(matches!(self.get(table, key), Some(None)), "a delete queues a tombstone");
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Value> {
@@ -106,11 +112,14 @@ impl DbWriter {
             b.seqs.push(e.seq);
         }
         self.flushing = !b.is_empty();
+        assert_eq!(b.writes.len(), self.pending.len(), "the batch covers the pending queue");
+        assert_eq!(b.seqs.len(), b.writes.len(), "each batch write has a sequence number");
         b
     }
 
     pub fn flushed(&mut self, batch: &Batch, now_ms: u64) {
         assert!(self.flushing || batch.is_empty(), "a flush ends only once it began");
+        assert_eq!(batch.writes.len(), batch.seqs.len(), "each batch write has a sequence number");
         for ((t, k, _), seq) in batch.writes.iter().zip(&batch.seqs) {
             let key = (*t, k.clone());
             if self.pending.get(&key).is_some_and(|e| e.seq == *seq) {
@@ -119,15 +128,24 @@ impl DbWriter {
             }
         }
         self.end_flush(now_ms);
+        assert!(!self.flushing, "a completed flush leaves no batch in flight");
     }
 
     pub fn failed(&mut self, now_ms: u64) {
+        assert!(self.flushing, "only an in-flight flush can fail");
+        let pending = self.pending.len();
+        let bytes = self.bytes;
         self.end_flush(now_ms);
+        assert!(!self.flushing, "a failed flush leaves no batch in flight");
+        assert_eq!((self.pending.len(), self.bytes), (pending, bytes), "a failed flush keeps the pending writes");
     }
 
     fn end_flush(&mut self, now_ms: u64) {
+        assert_eq!(self.since.is_some(), !self.pending.is_empty() || self.flushing,
+            "queued or in-flight writes have a start time");
         self.flushing = false;
         self.since = if self.pending.is_empty() { None } else { Some(now_ms) };
+        assert_eq!(self.since, (!self.pending.is_empty()).then_some(now_ms), "remaining writes restart the clock");
     }
 }
 
@@ -136,8 +154,11 @@ impl StateMachine for DbWriter {
         let bytes: usize = self.pending.iter().map(|((_, k), e)| size(k, &e.value)).sum();
         assert_eq!(bytes, self.bytes, "pending bytes are the sum of the pending writes");
         assert_eq!(self.since.is_some(), !self.pending.is_empty(), "the clock runs exactly while writes wait");
+        assert!(!self.flushing || !self.pending.is_empty(), "in-flight writes stay queued until acknowledged");
+        let mut seqs = BTreeSet::new();
         for e in self.pending.values() {
-            assert!(e.seq >= 1 && e.seq <= self.seq, "every write has its own number");
+            assert!(e.seq >= 1 && e.seq <= self.seq, "pending numbers come from the writer");
+            assert!(seqs.insert(e.seq), "every pending write has its own number");
         }
     }
 }
@@ -145,6 +166,8 @@ impl StateMachine for DbWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use rargo_machine::Checked;
 
     struct Writer(Checked<DbWriter>);
@@ -183,61 +206,102 @@ mod tests {
     }
 
     #[test]
-    fn a_flush_is_due_a_delay_after_the_first_write_or_when_full() {
+    fn taking_an_empty_batch_leaves_the_writer_idle() {
         let mut w = Writer::new();
-        assert_eq!(w.due(1000), Due::Idle);
-        w.put(Table::Meta, b"a", b"1", 1000);
-        assert_eq!(w.due(1000), Due::At(1000 + DELAY_MS));
-        w.put(Table::Meta, b"b", b"2", 1050);
-        assert_eq!(w.due(1050), Due::At(1000 + DELAY_MS), "later writes do not push the flush back");
-        assert_eq!(w.due(1000 + DELAY_MS - 1), Due::At(1000 + DELAY_MS));
-        assert_eq!(w.due(1000 + DELAY_MS), Due::Now);
+        let batch = w.take();
+        assert!(batch.is_empty());
+        w.flushed(&batch, 10);
+        assert_eq!(w.due(10), Due::Idle);
+        assert!(w.take().is_empty());
+    }
+
+    #[test]
+    fn a_flush_is_due_a_delay_after_the_first_write_or_when_full() {
+        let mut outcomes = Transcript::default();
+        let mut w = Writer::new();
+        outcomes.record("empty at 1000", w.due(1000));
+        for (at, key, value) in [(1000, b"a", b"1"), (1050, b"b", b"2")] {
+            w.put(Table::Meta, key, value, at);
+            outcomes.record(&format!("after put at {at}"), w.due(at));
+        }
+        for at in [1000 + DELAY_MS - 1, 1000 + DELAY_MS] {
+            outcomes.record(&format!("tick at {at}"), w.due(at));
+        }
         let b = w.take();
-        assert_eq!(w.due(1200), Due::At(1300), "nothing more is due while a flush runs");
+        outcomes.record("flush in flight", w.due(1200));
         w.flushed(&b, 1200);
-        assert_eq!(w.due(1200), Due::Idle);
+        outcomes.record("due", w.due(1200));
         w.put(Table::Blobs, b"big", &vec![0u8; FULL_BYTES], 2000);
-        assert_eq!(w.due(2000), Due::Now, "a full queue is flushed at once");
+        outcomes.record("full queue", w.due(2000));
         w.invariants();
+        expect![[r#"
+            empty at 1000: Idle
+            after put at 1000: At(1100)
+            after put at 1050: At(1100)
+            tick at 1099: At(1100)
+            tick at 1100: Now
+            flush in flight: At(1300)
+            due: Idle
+            full queue: Now
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_write_made_during_a_flush_stays_for_the_next() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
         w.put(Table::Meta, b"k", b"old", 0);
         w.put(Table::Meta, b"j", b"x", 0);
         let b = w.take();
-        assert_eq!(b.writes.len(), 2);
+        outcomes.record("batch size", b.writes.len());
         w.put(Table::Meta, b"k", b"new", 50);
         w.flushed(&b, 60);
-        assert_eq!(w.get(Table::Meta, b"k"), Some(Some(Arc::from(&b"new"[..]))));
-        assert_eq!(w.get(Table::Meta, b"j"), None);
-        assert_eq!(w.due(60), Due::At(60 + DELAY_MS));
+        outcomes.record("get k", w.get(Table::Meta, b"k").flatten().as_deref().map(String::from_utf8_lossy));
+        outcomes.record("get j", w.get(Table::Meta, b"j"));
+        outcomes.record("due", w.due(60));
         w.invariants();
+        expect![[r#"
+            batch size: 2
+            get k: Some("new")
+            get j: None
+            due: At(160)
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_failed_flush_keeps_every_write_and_tries_again_later() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
         w.put(Table::Traces, b"t", b"v", 0);
         w.delete(Table::Traces, b"u", 0);
         let _ = w.take();
         w.failed(500);
-        assert_eq!(w.due(500), Due::At(500 + DELAY_MS));
-        assert_eq!(w.take().writes.len(), 2);
+        outcomes.record("due", w.due(500));
+        outcomes.record("retry batch size", w.take().writes.len());
+        expect![[r#"
+            due: At(600)
+            retry batch size: 2
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn pending_writes_are_found_by_prefix_and_deletes_show() {
+        let mut outcomes = Transcript::default();
         let mut w = Writer::new();
         w.put(Table::Incr, b"ab1", b"1", 0);
         w.put(Table::Incr, b"ab2", b"2", 0);
         w.put(Table::Incr, b"ac", b"3", 0);
         w.put(Table::Meta, b"ab9", b"4", 0);
         w.delete(Table::Incr, b"ab3", 0);
-        let found: Vec<(Vec<u8>, bool)> =
-            w.pending_with_prefix(Table::Incr, b"ab").into_iter().map(|(k, v)| (k, v.is_some())).collect();
-        assert_eq!(found, vec![(b"ab1".to_vec(), true), (b"ab2".to_vec(), true), (b"ab3".to_vec(), false)]);
+        let found: Vec<_> =
+            w.pending_with_prefix(Table::Incr, b"ab")
+                .into_iter()
+                .map(|(k, v)| (String::from_utf8(k).unwrap(), v.is_some()))
+                .collect();
+        outcomes.record("pending prefix entries", found);
+        expect![[r#"
+            pending prefix entries: [("ab1", true), ("ab2", true), ("ab3", false)]
+        "#]].assert_eq(&outcomes.0);
     }
 
     struct Rng(u64);

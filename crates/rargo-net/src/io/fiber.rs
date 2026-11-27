@@ -12,6 +12,7 @@ use corosensei::{Coroutine, CoroutineResult, Yielder};
 
 use super::ops::{Event, Op};
 use super::ring::Loop;
+use super::sim::{Report, SimLoop};
 
 pub(super) const STACK: usize = 8 << 20;
 
@@ -25,6 +26,8 @@ thread_local! {
 pub(super) enum Pause {
     Park,
     Submit { op: Op, cpu: bool },
+    /// The backend already holds the operation under this token.
+    Wait { token: u64 },
 }
 
 pub(super) enum Resume {
@@ -56,7 +59,7 @@ pub(super) struct Fiber {
 }
 
 pub(super) struct Sched {
-    pub(super) ring: Loop,
+    pub(super) ring: Backend,
     pub(super) poke: Arc<Poke>,
     pub(super) next_id: u64,
     pub(super) fibers: BTreeMap<u64, Fiber>,
@@ -65,12 +68,64 @@ pub(super) struct Sched {
     pub(super) waiting: BTreeMap<u64, u64>,
 }
 
+/// What answers the scheduler's operations: the kernel's io_uring, or a simulation.
+pub(super) enum Backend {
+    Real(Loop),
+    Sim(SimLoop),
+}
+
+impl Backend {
+    fn submit(&mut self, op: Op) -> io::Result<u64> {
+        match self {
+            Backend::Real(ring) => ring.submit(op),
+            Backend::Sim(sim) => sim.submit(op),
+        }
+    }
+
+    fn wait(&mut self) -> io::Result<Vec<(u64, Event)>> {
+        match self {
+            Backend::Real(ring) => ring.wait(),
+            Backend::Sim(sim) => sim.wait(),
+        }
+    }
+
+    fn cancel(&mut self, token: u64) {
+        match self {
+            Backend::Real(ring) => ring.cancel(token),
+            Backend::Sim(sim) => sim.cancel(token),
+        }
+    }
+}
+
+/// Every fiber but the caller becomes a background fiber, so the loop ends them when the caller returns.
+pub(super) fn rest_in_background() {
+    let me = current_id();
+    let s = unsafe { &mut *sched_ptr() };
+    for (id, fiber) in s.fibers.iter_mut() {
+        if *id != me {
+            fiber.background = true;
+        }
+    }
+}
+
+/// The backend of the loop this thread is driving, if it is driving one.
+pub(super) fn backend() -> Option<&'static mut Backend> {
+    let p = SCHED.with(|c| c.get());
+    if p.is_null() { None } else { Some(unsafe { &mut (*p).ring }) }
+}
+
 pub fn loop_running() -> bool {
-    poke_global().lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    on_loop() || poke_global().lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
 pub fn on_fiber() -> bool {
     CURRENT.with(|c| c.get()) != 0
+}
+
+/// Whether this thread drives a loop: one that must never block on what a
+/// fiber of its own loop has yet to do.
+pub fn on_loop_thread() -> bool {
+    on_loop()
 }
 
 pub(super) fn on_loop() -> bool {
@@ -239,7 +294,14 @@ pub(super) fn park() {
 }
 
 pub(super) fn park_op(op: Op, cpu: bool) -> Event {
-    let mut resumed = park_raw(Pause::Submit { op, cpu });
+    let pause = match backend() {
+        Some(Backend::Sim(sim)) if sim.answers_in_place() => match sim.answer_in_place(op) {
+            Ok(event) => return event,
+            Err(token) => Pause::Wait { token },
+        },
+        _ => Pause::Submit { op, cpu },
+    };
+    let mut resumed = park_raw(pause);
     loop {
         match resumed {
             Resume::Event(event) => return event,
@@ -262,10 +324,23 @@ pub(super) fn op_event(op: Op) -> io::Result<Event> {
 }
 
 pub fn drive(workers: usize, main: impl FnOnce() + 'static) {
-    assert!(!on_loop(), "the event loop is already running");
     let ring = boot(workers);
+    let efd = ring.wake_fd();
+    drive_on(Backend::Real(ring), efd, main);
+}
+
+/// Drives `main` on a simulated backend, on this thread alone, and reports the run.
+pub(super) fn drive_sim(sim: SimLoop, main: impl FnOnce() + 'static) -> Report {
+    match drive_on(Backend::Sim(sim), -1, main) {
+        Backend::Sim(sim) => sim.report(),
+        Backend::Real(_) => unreachable!("the loop returns the backend it was given"),
+    }
+}
+
+fn drive_on(ring: Backend, efd: i32, main: impl FnOnce() + 'static) -> Backend {
+    assert!(!on_loop(), "the event loop is already running");
     let poke = Arc::new(Poke {
-        efd: ring.wake_fd(),
+        efd,
         q: StdMutex::new(Vec::new()),
         spawn: StdMutex::new(Vec::new()),
     });
@@ -290,9 +365,11 @@ pub fn drive(workers: usize, main: impl FnOnce() + 'static) {
             *poke_global().lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
-    let _clear = Clear;
+    let clear = Clear;
     spawn_raw(Spec { parent: None, race: None, task: None, background: false }, main);
     run(ptr);
+    drop(clear);
+    sched.ring
 }
 
 pub(super) fn run(sched: *mut Sched) {
@@ -374,6 +451,10 @@ pub(super) fn resume_one(sched: *mut Sched, id: u64) {
             s.fibers.get_mut(&id).unwrap().co = Some(co);
             match pause {
                 Pause::Park => {}
+                Pause::Wait { token } => {
+                    s.fibers.get_mut(&id).unwrap().token = Some(token);
+                    s.waiting.insert(token, id);
+                }
                 Pause::Submit { op, cpu } => match s.ring.submit(op) {
                     Ok(token) => {
                         {

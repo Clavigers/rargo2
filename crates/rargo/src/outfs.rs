@@ -2,14 +2,13 @@
 use rargo_machine::StateMachine;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
-use crate::partial::Partial;
+pub use rargo::out_tree::VFile;
+use rargo::out_tree::{below, Edit, OutputTree, Table};
 use rargo_proto::Digest;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -35,18 +34,11 @@ struct Timed<'a>(&'a OutFs, usize, std::time::Instant);
 impl Drop for Timed<'_> {
     fn drop(&mut self) {
         self.0.op_count[self.1].fetch_add(1, Ordering::Relaxed);
-        self.0.op_nanos[self.1].fetch_add(self.2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.0.op_nanos[self.1].fetch_add(rargo_net::io::now().saturating_duration_since(self.2).as_nanos() as u64, Ordering::Relaxed);
     }
 }
 const LISTING_KEPT: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VFile {
-    pub hash: Digest,
-    pub size: u64,
-    pub exec: bool,
-    pub mtime_ns: i64,
-}
 
 struct Node {
     parent: u64,
@@ -58,8 +50,8 @@ struct Node {
 }
 
 struct Inodes {
-    nodes: HashMap<u64, Node>,
-    children: HashMap<(u64, Vec<u8>), u64>,
+    nodes: BTreeMap<u64, Node>,
+    children: BTreeMap<(u64, Vec<u8>), u64>,
     next: u64,
 }
 
@@ -170,100 +162,6 @@ impl StateMachine for Inodes {
     }
 }
 
-type Table = BTreeMap<Vec<u8>, VFile>;
-
-enum Edit {
-    Put { path: Vec<u8>, file: VFile, replaced_real: bool },
-    Remove(Vec<u8>),
-    Shadow(Vec<u8>),
-}
-
-struct OutputTree {
-    files: Table,
-    generation: u64,
-}
-
-impl OutputTree {
-    fn same(&self, rel: &[u8], file: &VFile) -> bool {
-        self.files.get(rel).is_some_and(|v| v.hash == file.hash && v.exec == file.exec)
-    }
-
-    fn has_below(&self, rel: &[u8]) -> bool {
-        let prefix = below(rel);
-        self.files.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
-    }
-
-    fn lookup<T>(&self, rel: &[u8], real: Option<T>) -> Option<Kind<T>> {
-        if let Some(real) = real {
-            return Some(Kind::Real(real));
-        }
-        if rel.is_empty() {
-            return None;
-        }
-        if let Some(file) = self.files.get(rel) {
-            return Some(Kind::Virtual(file.clone()));
-        }
-        self.has_below(rel).then_some(Kind::VDir)
-    }
-
-    fn apply(&mut self, generation: u64, edits: Vec<Edit>) -> Vec<Vec<u8>> {
-        if generation <= self.generation {
-            return Vec::new();
-        }
-        self.generation = generation;
-        let mut changed = Vec::new();
-        for edit in edits {
-            let path = match edit {
-                Edit::Put { path, file, replaced_real } => {
-                    if !replaced_real && self.same(&path, &file) {
-                        continue;
-                    }
-                    self.remove_below(&path);
-                    let mut at = path.as_slice();
-                    while let Some(slash) = at.iter().rposition(|&b| b == b'/') {
-                        at = &at[..slash];
-                        self.files.remove(at);
-                    }
-                    self.files.insert(path.clone(), file);
-                    path
-                }
-                Edit::Remove(path) => {
-                    self.files.remove(&path);
-                    self.remove_below(&path);
-                    path
-                }
-                Edit::Shadow(path) => {
-                    self.files.remove(&path);
-                    path
-                }
-            };
-            changed.push(path);
-        }
-        changed
-    }
-
-    fn remove_below(&mut self, path: &[u8]) {
-        let prefix = below(path);
-        let removed: Vec<_> =
-            self.files.range(prefix.clone()..).take_while(|(key, _)| key.starts_with(&prefix)).map(|(key, _)| key.clone()).collect();
-        for key in removed {
-            self.files.remove(&key);
-        }
-    }
-}
-
-#[cfg(test)]
-impl StateMachine for OutputTree {
-    fn invariants(&self) {
-        for path in self.files.keys() {
-            let at = String::from_utf8_lossy(path);
-            assert!(!path.is_empty(), "no file has an empty path");
-            assert!(!path.split(|&b| b == b'/').any(|part| part.is_empty()), "{at:?} is relative and has no empty parts");
-            assert!(!self.has_below(path), "file {at:?} has nothing below it");
-        }
-    }
-}
-
 pub struct Delivery<'a> {
     fs: &'a OutFs,
     _serial: MutexGuard<'a, ()>,
@@ -276,7 +174,7 @@ impl Delivery<'_> {
         let real = self.fs.real(rel);
         match rargo_net::io::file::symlink_metadata(&real) {
             Ok(md) if md.is_dir() => {
-                let _ = std::fs::remove_dir_all(&real);
+                let _ = rargo_net::io::file::remove_dir_all(&real);
             }
             Ok(_) => {
                 let _ = rargo_net::io::file::remove_file(&real);
@@ -333,7 +231,7 @@ struct Fetch {
     rel: Vec<u8>,
 }
 
-enum Content<F = File, R = Arc<Partial>> {
+enum Content<F = File, R = Arc<dyn Ranged>> {
     Open(F),
     Unfetched(Fetch),
     Ranged(R),
@@ -384,18 +282,17 @@ enum VirtualOpen {
     Materialize { file: VFile, with_content: bool },
 }
 
-impl OutputTree {
-    fn open(&self, rel: &[u8], writing: bool, truncate: bool) -> Res<VirtualOpen> {
-        let file = self.files.get(rel).cloned().ok_or(Errno(libc::ENOENT))?;
-        Ok(if writing {
-            VirtualOpen::Materialize { file, with_content: !truncate }
-        } else if file.size == 0 {
-            VirtualOpen::Empty
-        } else {
-            VirtualOpen::Read(file)
-        })
-    }
+fn open_virtual(tree: &OutputTree, rel: &[u8], writing: bool, truncate: bool) -> Res<VirtualOpen> {
+    let file = tree.files.get(rel).cloned().ok_or(Errno(libc::ENOENT))?;
+    Ok(if writing {
+        VirtualOpen::Materialize { file, with_content: !truncate }
+    } else if file.size == 0 {
+        VirtualOpen::Empty
+    } else {
+        VirtualOpen::Read(file)
+    })
 }
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum How {
@@ -406,7 +303,13 @@ enum How {
 
 pub enum Reader {
     Whole(File),
-    Ranged(Arc<Partial>),
+    Ranged(Arc<dyn Ranged>),
+}
+
+/// A content that is read in ranges while the rest of it is still being fetched.
+pub trait Ranged: Send + Sync {
+    fn hash(&self) -> &Digest;
+    fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>>;
 }
 
 pub trait Source: Send + Sync {
@@ -421,22 +324,22 @@ pub struct OutFs {
     state: Mutex<Inodes>,
     virt: std::sync::RwLock<OutputTree>,
     delivery: Mutex<()>,
-    handles: Mutex<HashMap<u64, Handle>>,
+    handles: Mutex<BTreeMap<u64, Handle>>,
     registering: Mutex<std::collections::BTreeMap<u64, bool>>,
     next_fh: AtomicU64,
     source: Box<dyn Source>,
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
-    dirs: Mutex<HashMap<u64, DirState>>,
-    listings: Mutex<HashMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
-    swept: Mutex<std::collections::HashSet<Vec<u8>>>,
+    dirs: Mutex<BTreeMap<u64, DirState>>,
+    listings: Mutex<BTreeMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
+    swept: Mutex<std::collections::BTreeSet<Vec<u8>>>,
     uid: u32,
     gid: u32,
     op_count: [AtomicU64; OPS.len()],
     op_nanos: [AtomicU64; OPS.len()],
-    pub opened_virtual: AtomicU64,
-    pub made_real: AtomicU64,
+    opened_virtual: AtomicU64,
+    made_real: AtomicU64,
 }
 
 fn errno(e: std::io::Error) -> Errno {
@@ -455,11 +358,6 @@ fn join(dir: &[u8], name: &[u8]) -> Vec<u8> {
     p
 }
 
-fn below(prefix: &[u8]) -> Vec<u8> {
-    let mut p = prefix.to_vec();
-    p.push(b'/');
-    p
-}
 
 fn name_cookie(name: &[u8]) -> u64 {
     let h = blake3::hash(name);
@@ -468,6 +366,20 @@ fn name_cookie(name: &[u8]) -> u64 {
     assert!(c < 1 << 63);
     c
 }
+
+fn lookup<T>(tree: &OutputTree, rel: &[u8], real: Option<T>) -> Option<Kind<T>> {
+    if let Some(real) = real {
+        return Some(Kind::Real(real));
+    }
+    if rel.is_empty() {
+        return None;
+    }
+    if let Some(file) = tree.files.get(rel) {
+        return Some(Kind::Virtual(file.clone()));
+    }
+    tree.has_below(rel).then_some(Kind::VDir)
+}
+
 
 enum Kind<T = rargo_net::io::file::Stat> {
     Real(T),
@@ -484,24 +396,24 @@ impl OutFs {
             .and_then(|raw| zstd::stream::decode_all(&raw[..]).ok())
             .and_then(|plain| bincode::deserialize(&plain).ok())
             .unwrap_or_default();
-        let mut nodes = HashMap::new();
+        let mut nodes = BTreeMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let (uid, gid) = (rargo_net::io::process::euid(), rargo_net::io::process::egid());
         Ok(Arc::new(OutFs {
             under,
             _under_fd: fd,
-            state: Mutex::new(Inodes { nodes, children: HashMap::new(), next: 2 }),
-            virt: std::sync::RwLock::new(OutputTree { files: virt, generation: 0 }),
+            state: Mutex::new(Inodes { nodes, children: BTreeMap::new(), next: 2 }),
+            virt: std::sync::RwLock::new(OutputTree::new(virt)),
             delivery: Mutex::new(()),
-            handles: Mutex::new(HashMap::new()),
+            handles: Mutex::new(BTreeMap::new()),
             registering: Mutex::new(std::collections::BTreeMap::new()),
             next_fh: AtomicU64::new(1),
             source,
             session: OnceLock::new(),
             table: table.to_path_buf(),
             dirty: AtomicBool::new(false),
-            dirs: Mutex::new(HashMap::new()),
-            listings: Mutex::new(HashMap::new()),
+            dirs: Mutex::new(BTreeMap::new()),
+            listings: Mutex::new(BTreeMap::new()),
             swept: Mutex::new(Default::default()),
             uid,
             gid,
@@ -513,7 +425,7 @@ impl OutFs {
     }
 
     fn timed(&self, op: &str) -> Timed<'_> {
-        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), std::time::Instant::now())
+        Timed(self, OPS.iter().position(|o| *o == op).unwrap_or(0), rargo_net::io::now())
     }
 
     pub fn op_report(&self) -> String {
@@ -556,6 +468,16 @@ impl OutFs {
         }
     }
 
+    /// How many times a file that exists only as its hash was opened.
+    pub fn opened_virtual(&self) -> u64 {
+        self.opened_virtual.load(Ordering::Relaxed)
+    }
+
+    /// How many files that existed only as their hash were written out as real files.
+    pub fn made_real(&self) -> u64 {
+        self.made_real.load(Ordering::Relaxed)
+    }
+
     pub fn virtual_count(&self) -> usize {
         self.virt.read().unwrap().files.len()
     }
@@ -566,7 +488,7 @@ impl OutFs {
 
     fn kind(&self, rel: &[u8]) -> Option<Kind> {
         let real = rargo_net::io::file::symlink_metadata(self.real(rel)).ok();
-        self.virt.read().unwrap().lookup(rel, real)
+        lookup(&self.virt.read().unwrap(), rel, real)
     }
 
     fn path(&self, id: u64) -> Res<Vec<u8>> {
@@ -654,9 +576,9 @@ impl OutFs {
         let mode = if v.exec { 0o755 } else { 0o644 };
         if with_content && v.size > 0 {
             let src = self.source.whole(&v.hash, v.size).map_err(errno)?;
-            let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", std::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
+            let tmp = self.real(&join(b"", format!(".rargo-real-{}-{}", rargo_net::io::process::id(), self.next_fh.fetch_add(1, Ordering::Relaxed)).as_bytes()));
             rargo_net::io::file::copy(&src, &tmp).map_err(errno)?;
-            rargo_net::io::file::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(errno)?;
+            rargo_net::io::file::set_mode(&tmp, mode).map_err(errno)?;
             rargo_net::io::file::rename(&tmp, &dst).map_err(|e| {
                 let _ = rargo_net::io::file::remove_file(&tmp);
                 errno(e)
@@ -861,7 +783,7 @@ impl OutFs {
             let Some(pid) = text.strip_prefix(crate::tmp::BESIDE).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<i32>().ok()) else {
                 continue;
             };
-            let alive = unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+            let alive = crate::kernel::kill(pid, 0).map_or_else(|e| e.raw_os_error() == Some(libc::EPERM), |()| true);
             if !alive && rargo_net::io::file::remove_file(e.path()).is_ok() {
                 self.changed(&join(&dir, name.as_bytes()));
             }
@@ -883,7 +805,7 @@ impl Filesystem for OutFs {
         let rel = join(&self.path(parent)?, name);
         let tree = self.virt.read().unwrap();
         let real = rargo_net::io::file::symlink_metadata(self.real(&rel)).ok();
-        match tree.lookup(&rel, real) {
+        match lookup(&tree, &rel, real) {
             Some(kind) => Ok(self.entry(parent, name, &kind)),
             None => Ok(Entry::negative(TTL)),
         }
@@ -919,7 +841,7 @@ impl Filesystem for OutFs {
                 match set.mtime {
                     Some(TimeSet::At(s, ns)) => v.mtime_ns = s * 1_000_000_000 + ns as i64,
                     Some(TimeSet::Now) => {
-                        v.mtime_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+                        v.mtime_ns = rargo_net::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
                     }
                     None => {}
                 }
@@ -937,7 +859,7 @@ impl Filesystem for OutFs {
             f.set_len(size).map_err(errno)?;
         }
         if let Some(mode) = set.mode {
-            rargo_net::io::file::set_permissions(&path, std::fs::Permissions::from_mode(mode & 0o7777)).map_err(errno)?;
+            rargo_net::io::file::set_mode(&path, mode & 0o7777).map_err(errno)?;
         }
         if set.atime.is_some() || set.mtime.is_some() {
             let spec = |t: Option<TimeSet>| match t {
@@ -947,9 +869,7 @@ impl Filesystem for OutFs {
             };
             let times = [spec(set.atime), spec(set.mtime)];
             let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-            if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-                return Err(Errno::last());
-            }
+            crate::kernel::set_times(&c, &times, libc::AT_SYMLINK_NOFOLLOW).map_err(errno)?;
         }
         self.getattr(ctx, nodeid, None)
     }
@@ -995,7 +915,7 @@ impl Filesystem for OutFs {
         if self.touches_virtual(&rel) {
             return Err(Errno(libc::EEXIST));
         }
-        let make = || std::fs::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
+        let make = || rargo_net::io::file::DirBuilder::new().mode(mode & 0o7777).create(self.real(&rel));
         match make() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 self.make_parents(&rel)?;
@@ -1200,7 +1120,7 @@ impl Filesystem for OutFs {
             Err(_) => {}
         }
         let truncate = keep & libc::O_TRUNC != 0;
-        let plan = self.virt.read().unwrap().open(&rel, acc != libc::O_RDONLY || truncate, truncate)?;
+        let plan = open_virtual(&self.virt.read().unwrap(), &rel, acc != libc::O_RDONLY || truncate, truncate)?;
         match plan {
             VirtualOpen::Empty => {
                 self.opened_virtual.fetch_add(1, Ordering::Relaxed);
@@ -1371,7 +1291,7 @@ impl Filesystem for OutFs {
                 return Ok(());
             }
         }
-        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| at.elapsed() < LISTING_KEPT).map(|(_, l)| l.clone()) };
+        let cached = if offset == 0 { None } else { self.listings.lock().unwrap().get(&nodeid).filter(|(at, _)| rargo_net::io::now().saturating_duration_since(*at) < LISTING_KEPT).map(|(_, l)| l.clone()) };
         let listing = match cached {
             Some(l) => l,
             None => {
@@ -1405,9 +1325,9 @@ impl Filesystem for OutFs {
                 }
                 let mut all = self.listings.lock().unwrap();
                 if all.len() > 256 {
-                    all.retain(|_, (at, _)| at.elapsed() < LISTING_KEPT);
+                    all.retain(|_, (at, _)| rargo_net::io::now().saturating_duration_since(*at) < LISTING_KEPT);
                 }
-                all.insert(nodeid, (std::time::Instant::now(), l.clone()));
+                all.insert(nodeid, (rargo_net::io::now(), l.clone()));
                 l
             }
         };
@@ -1423,10 +1343,7 @@ impl Filesystem for OutFs {
     fn statfs(&self, _ctx: &Ctx, _nodeid: u64) -> Res<fuse_kstatfs> {
         let _t = self.timed("statfs");
         let c = std::ffi::CString::new(self.under.as_os_str().as_bytes()).map_err(|_| Errno(libc::EINVAL))?;
-        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-            return Err(Errno::last());
-        }
+        let s = crate::kernel::statvfs(&c).map_err(errno)?;
         Ok(fuse_kstatfs {
             blocks: s.f_blocks as u64,
             bfree: s.f_bfree as u64,
@@ -1444,6 +1361,7 @@ impl Filesystem for OutFs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
 
     #[test]
     fn listing_cookies_are_stable_and_ordered() {
@@ -1509,9 +1427,9 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut tree = OutputTree { files: Table::new(), generation: 0 };
             let mut model = Table::new();
-            let mut nodes = HashMap::new();
+            let mut nodes = BTreeMap::new();
             nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-            let mut inodes = Inodes { nodes, children: HashMap::new(), next: 2 };
+            let mut inodes = Inodes { nodes, children: BTreeMap::new(), next: 2 };
             let mut store: BTreeMap<Digest, Vec<u8>> = BTreeMap::new();
             let mut next_generation = 0u64;
             let mut applied = 0u64;
@@ -1587,7 +1505,7 @@ mod tests {
                     }
                     5 => {
                         let path = PATHS[rng.below(PATHS.len())].as_bytes();
-                        if let Ok(VirtualOpen::Read(file)) = tree.open(path, false, false) {
+                        if let Ok(VirtualOpen::Read(file)) = open_virtual(&tree, path, false, false) {
                             assert_eq!(model.get(path).map(|f| f.hash), Some(file.hash), "seed {seed} step {step}: an open sees the newest tree");
                             let content = Content::Unfetched(Fetch { hash: file.hash, size: file.size, rel: path.to_vec() });
                             content.invariants();
@@ -1639,7 +1557,7 @@ mod tests {
                 for path in PATHS {
                     let path = path.as_bytes();
                     let want = model.get(path).map(|file| file.hash);
-                    let got = match tree.lookup::<()>(path, None) {
+                    let got = match lookup::<()>(&tree, path, None) {
                         Some(Kind::Virtual(file)) => Some(file.hash),
                         Some(Kind::VDir) => {
                             let prefix = below(path);
@@ -1655,22 +1573,62 @@ mod tests {
         assert!(reads > 1000 && refused > 100 && stale > 100, "the runs read ({reads}), refuse bad completions ({refused}) and race deliveries ({stale})");
     }
 
+    enum Ev {
+        Lookup(u64, &'static str),
+        Changed(&'static str),
+        Path(u64),
+        Forget(u64, u64),
+    }
+
+    /// Steps an inode table holding only the root through the events, checking it after each, and lists what
+    /// each step gave back.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
+        let mut state = Inodes { nodes, children: BTreeMap::new(), next: 2 };
+        state.invariants();
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Lookup(parent, name) => format!("lookup {parent} {name} => {}", state.lookup(parent, name.as_bytes())),
+                Ev::Changed(path) => {
+                    let (parent, name) = state.changed(path.as_bytes());
+                    format!("changed {path} => detached {} from {parent}", text(&name))
+                }
+                Ev::Path(node) => format!("path {node} => {:?}", state.path(node).map(|p| text(&p)).map_err(|e| e.0)),
+                Ev::Forget(node, n) => format!("forget {node} {n} => {:?}", state.forget(node, n)),
+            };
+            state.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn replacing_output_detaches_the_name_without_reusing_its_inode() {
-        let mut nodes = HashMap::new();
-        nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        let mut state = Inodes { nodes, children: HashMap::new(), next: 2 };
-        let old = state.lookup(ROOT, b"app");
-        state.invariants();
-        assert_eq!(state.changed(b"app"), (ROOT, b"app".to_vec()));
-        state.invariants();
-        let new = state.lookup(ROOT, b"app");
-        state.invariants();
-        assert_ne!(old, new);
-        assert_eq!(state.path(new).ok().unwrap(), b"app");
-        assert_eq!(state.forget(old, 1), [old]);
-        state.invariants();
-        assert_eq!(state.lookup(ROOT, b"app"), new);
-        state.invariants();
+        let events = [
+            Ev::Lookup(ROOT, "app"),
+            Ev::Changed("app"),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Path(3),
+            Ev::Path(2),
+            Ev::Forget(2, 1),
+            Ev::Lookup(ROOT, "app"),
+            Ev::Forget(3, 2),
+            Ev::Lookup(ROOT, "app"),
+        ];
+        expect![[r#"
+            lookup 1 app => 2
+            changed app => detached app from 1
+            lookup 1 app => 3
+            path 3 => Ok("app")
+            path 2 => Ok("app")
+            forget 2 1 => [2]
+            lookup 1 app => 3
+            forget 3 2 => [3]
+            lookup 1 app => 4
+        "#]].assert_eq(&run(events));
     }
 }
