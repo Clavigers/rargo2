@@ -808,18 +808,23 @@ mod tests {
         });
     }
 
+    fn noise(len: usize) -> Vec<u8> {
+        let mut a = vec![0u8; len];
+        let mut x = 0x1234_5678_9abc_def0u64;
+        for b in a.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        a
+    }
+
     #[test]
     fn cold_blobs_come_back_and_share_chunks() {
         sim::test(|| {
             let (_d, s) = store();
-            let mut a = vec![0u8; 3 << 20];
-            let mut x = 0x1234_5678_9abc_def0u64;
-            for b in a.iter_mut() {
-                x ^= x << 13;
-                x ^= x >> 7;
-                x ^= x << 17;
-                *b = x as u8;
-            }
+            let a = noise(3 << 20);
             let mut b = a.clone();
             b[1 << 20..(1 << 20) + 16].copy_from_slice(b"sixteen new byte");
             let (ha, hb) = (s.put_bytes(&a).unwrap(), s.put_bytes(&b).unwrap());
@@ -839,6 +844,53 @@ mod tests {
             assert_eq!(s.read(&hb).unwrap(), b);
             assert!(s.read(&ha).is_err());
         });
+    }
+
+    // The order of both rargod hangs (#632): `collect_chunks` runs on a pool thread
+    // with a home loop, as in rargod's evict loop under `io::cpu`, holds the write
+    // lock, and has the loop do its `read_dir`, `metadata` and `remove_file`. A
+    // fiber that thaws meanwhile must wait for the lock off the loop thread, or the
+    // loop blocks, the collector never gets its I/O back, and neither finishes. That
+    // takes a real loop and pool, which a simulation, with one thread, does not have.
+    #[test]
+    fn a_thaw_while_chunks_are_collected_waits_off_the_loop() {
+        if crate::io::unavailable().is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("rargo-store-cold-lock-{}", crate::io::process::id()));
+        let at = dir.clone();
+        let outcome = crate::io::within(std::time::Duration::from_secs(20), move || {
+            crate::io::run(2, move || {
+                let s = Arc::new(Store::open(&at.join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
+                let data = noise(3 << 20);
+                let h = s.put_bytes(&data).unwrap();
+                assert!(crate::io::cpu(|| s.freeze(&h, &|_| {})).unwrap().is_some());
+                // Dead chunks, so the collector holds the lock across many trips to the loop.
+                for i in 0..2000 {
+                    file::write(s.chunks.join(format!("{:02x}", i % 256)).join(format!("dead-{i}")), b"x").unwrap();
+                }
+                let gc = {
+                    let s = Arc::clone(&s);
+                    crate::io::spawn(move || crate::io::cpu(|| s.collect_chunks()))
+                };
+                let mut held = false;
+                while !gc.is_finished() {
+                    if s.cold_lock.try_read().is_err() {
+                        held = true;
+                        break;
+                    }
+                    crate::io::sleep(std::time::Duration::from_millis(1));
+                }
+                let read = s.read(&h).unwrap();
+                let (removed, _) = { gc }.join().unwrap();
+                (held, removed, read == data)
+            })
+        });
+        let _ = file::remove_dir_all(&dir);
+        let (held, removed, same) = outcome.expect("a thaw and a chunk collection deadlocked the loop");
+        assert!(held, "the thaw started while the collector held the cold lock");
+        assert_eq!(removed, 2000);
+        assert!(same, "the thawed blob reads back whole");
     }
 
     #[test]
