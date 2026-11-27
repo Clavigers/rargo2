@@ -46,7 +46,7 @@ fn a_seed_replays_the_same_run() {
 
 #[test]
 fn seeded_test_commands_report_passes_failures_and_timeouts() {
-    let report = run(3, None).expect("commands finish");
+    let report = run(2, None).expect("commands finish");
     assert!(report.tests_passed > 0);
     assert!(report.tests_failed > 0);
     assert!(report.tests_timed_out > 0);
@@ -78,7 +78,7 @@ fn dozens_of_client_rounds_overlap_during_eviction() {
 fn the_seeds_exercise_faults_the_cache_and_eviction() {
     // Together these seeds exercise every condition checked below. The seed
     // batches separately run the simulator's invariants over a wider sample.
-    let reports = [13, 15].map(|seed| run(seed, None).expect("passes"));
+    let reports = [0, 8].map(|seed| run(seed, None).expect("passes"));
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
     assert!(reports.iter().any(|r| r.server_restarts > 0), "clients finish despite server restarts");
     assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
@@ -250,8 +250,10 @@ fn compiler_failures_are_repeatable_for_the_same_inputs() {
 
 #[test]
 fn builds_exercise_compiler_exits_and_discard_staged_artifacts_on_cancel() {
-    let reports: Vec<_> = (0..24).map(|seed| run(seed, None).expect("passes")).collect();
-    assert!(reports.iter().any(|r| r.failed_builds > 0));
-    assert!(reports.iter().any(|r| r.long_runs > 0 && r.cancelled_builds > 0 && r.aborted_runs > 0));
-    assert!(reports.iter().any(|r| r.cancelled_with_outputs > 0));
+    // Seed 3 fails a build, cancels one with staged outputs and aborts a long
+    // run; the seed batches run the invariants over a wider sample.
+    let r = run(3, None).expect("passes");
+    assert!(r.failed_builds > 0);
+    assert!(r.long_runs > 0 && r.cancelled_builds > 0 && r.aborted_runs > 0);
+    assert!(r.cancelled_with_outputs > 0);
 }
