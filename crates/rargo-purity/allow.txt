@@ -25,7 +25,6 @@ self-check	crates/rargo-core/src/session_state.rs	16	16 step methods of Handshak
 self-check	crates/rargo-core/src/store_index.rs	15	15 step methods of StoreIndex assert nothing
 self-check	crates/rargo-core/src/trees_state.rs	2	2 step methods of TreesState assert nothing
 self-check	crates/rargo-core/src/worker_state.rs	8	8 step methods of Worker assert nothing
-self-check	crates/rargo-net/src/conn.rs	1	1 step method of ConnState asserts nothing
 self-check	crates/rargo-net/src/endpoint.rs	1	1 step method of EndpointState asserts nothing
 self-check	crates/rargo-net/src/handshake.rs	2	2 step methods of Handshake assert nothing
 self-check	crates/rargo/src/scan.rs	8	8 step methods of ScanCore assert nothing
