@@ -92,7 +92,7 @@ pub fn valid_login(login: &str) -> bool {
 
 pub struct TokenStore {
     path: PathBuf,
-    cached: parking_lot::Mutex<(Option<(SystemTime, u64)>, Arc<Tokens>)>,
+    cached: std::cell::RefCell<(Option<(SystemTime, u64)>, Arc<Tokens>)>,
 }
 
 pub fn now() -> u64 {
@@ -162,24 +162,38 @@ pub fn valid_name(name: &str) -> bool {
 
 impl TokenStore {
     pub fn new(path: PathBuf) -> TokenStore {
-        TokenStore { path, cached: parking_lot::Mutex::new((None, Arc::new(Tokens::default()))) }
+        TokenStore { path, cached: std::cell::RefCell::new((None, Arc::new(Tokens::default()))) }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// A store over the same file that starts from this one's cache, for a pool job to own.
+    pub fn detached(&self) -> TokenStore {
+        TokenStore { path: self.path.clone(), cached: std::cell::RefCell::new(self.cached.borrow().clone()) }
+    }
+
+    /// Takes the cache a detached store ended its job with.
+    pub fn adopt(&self, detached: TokenStore) {
+        *self.cached.borrow_mut() = detached.cached.into_inner();
+    }
+
     fn file(&self) -> Arc<Tokens> {
         let stamp = crate::io::file::metadata(&self.path).ok().and_then(|m| Some((m.modified().ok()?, m.len())));
-        let mut c = self.cached.lock();
-        if c.0 != stamp || stamp.is_none() {
-            let (file, warning) = Tokens::read(crate::io::file::read(&self.path).ok().as_deref());
-            if let Some(w) = warning {
-                eprintln!("rargod: {}: {w}", self.path.display());
+        {
+            let cached = self.cached.borrow();
+            if cached.0 == stamp && stamp.is_some() {
+                return cached.1.clone();
             }
-            *c = (stamp, Arc::new(file));
         }
-        c.1.clone()
+        let (file, warning) = Tokens::read(crate::io::file::read(&self.path).ok().as_deref());
+        if let Some(w) = warning {
+            eprintln!("rargod: {}: {w}", self.path.display());
+        }
+        let file = Arc::new(file);
+        *self.cached.borrow_mut() = (stamp, file.clone());
+        file
     }
 
     fn change<T>(&self, f: impl FnOnce(&mut Tokens) -> Result<T>) -> Result<T> {
@@ -210,7 +224,7 @@ impl TokenStore {
             w.sync_all()?;
         }
         crate::io::file::rename(&tmp, &self.path)?;
-        *self.cached.lock() = (None, Arc::new(Tokens::default()));
+        *self.cached.borrow_mut() = (None, Arc::new(Tokens::default()));
         Ok(out)
     }
 
