@@ -1,22 +1,13 @@
-//! A random generator that the caller seeds. Logic draws from one it is
-//! handed; the shell seeds it from the OS (`Rng::from_shell`), tests and
-//! `rargo-sim` from their own seed, so a run can be replayed from its seed.
+//! The server's random numbers: a generator the caller seeds. The shell seeds
+//! it from the OS; tests and `rargo-sim` seed it from their own seed, so the
+//! same seed gives the same IDs.
 
-/// SplitMix64: small, fast, and fully determined by its seed.
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
 
 impl Rng {
-    pub fn seeded(seed: u64) -> Rng {
-        Rng(seed)
-    }
-
-    /// Seeded by the shell's `io::random`: the kernel's bytes, or in a
-    /// simulation the simulation's seed.
-    pub fn from_shell() -> Rng {
-        let mut b = [0u8; 8];
-        crate::io::random(&mut b);
-        Rng::seeded(u64::from_le_bytes(b))
+    pub fn new(seed: u64) -> Rng {
+        Rng(seed ^ 0x5851_f42d_4c95_7f2d)
     }
 
     pub fn next_u64(&mut self) -> u64 {
@@ -30,15 +21,17 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
-    use super::Rng;
+    use super::*;
 
     #[test]
-    fn one_seed_gives_one_sequence() {
+    fn the_same_seed_draws_the_same_numbers_and_another_seed_others() {
         let draw = |seed| {
-            let mut r = Rng::seeded(seed);
-            (0..8).map(|_| r.next_u64()).collect::<Vec<_>>()
+            let mut r = Rng::new(seed);
+            (0..16).map(|_| r.next_u64()).collect::<Vec<_>>()
         };
         assert_eq!(draw(7), draw(7));
         assert_ne!(draw(7), draw(8));
+        let a = draw(0);
+        assert!(a.iter().all(|&x| x != 0) && a.windows(2).all(|w| w[0] != w[1]));
     }
 }

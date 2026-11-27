@@ -195,6 +195,7 @@ fn main() -> Result<()> {
     let daemon = Arc::new(Daemon::new(
         Config { state_dir: state.clone(), planner, cargo_home: cargo_home.clone(), uid, gid, server_env },
         engine,
+        rargo_core::tokens::os_seed()?,
     ));
     eprintln!(
         "rargod: store {} ({}), cargo home {}, passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, actions run as uid {uid}",
@@ -218,6 +219,7 @@ fn main() -> Result<()> {
     let public = opts.public.clone();
     let http_state = state.clone();
     let keys = Arc::new(keys);
+    let pool_seed = rargo_core::tokens::os_seed()?;
     io::drive(4, move || {
         match rargo_core::io::FuseDrive::spawn(&session, &fuse_fs) {
             Ok(drive) => drive.detach(),
@@ -225,7 +227,7 @@ fn main() -> Result<()> {
         }
         io::background(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
-            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key, &mut rargo_core::rng::Rng::from_shell()) {
+            match rargo_core::remote::Pool::listen(&daemon.engine, addr, key, &mut rargo_core::rng::Rng::new(pool_seed)) {
                 Ok(pool) => {
                     let _ = daemon.engine.remote.set(pool.clone());
                     let _ = daemon.pool.set(pool);

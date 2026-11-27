@@ -21,6 +21,7 @@ def test_a_simulated_week_is_legal_and_does_work(seed):
     s.run_until(7 * DAY)  # World.apply refuses any illegal move
     events = [l["event"] for l in s.lines]
     assert events.count("merged") > 10 and "taken" in events
+    assert {"frozen", "built", "release_held", "use_started", "use_ended"} <= set(events)
     # The lines are a log the real checker accepts from scratch.
     w = World()
     for l in s.lines:

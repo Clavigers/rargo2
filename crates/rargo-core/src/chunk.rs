@@ -20,24 +20,24 @@ pub struct ChunkRef {
 
 pub type Recipe = Vec<ChunkRef>;
 
-fn gear() -> &'static [u64; 256] {
-    static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [0u64; 256];
-        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-        for v in t.iter_mut() {
-            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            *v = z ^ (z >> 31);
-        }
-        t
-    })
+const GEAR: [u64; 256] = gear();
+
+const fn gear() -> [u64; 256] {
+    let mut table = [0; 256];
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut i = 0;
+    while i < table.len() {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        table[i] = z ^ (z >> 31);
+        i += 1;
+    }
+    table
 }
 
 fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
-    let g = gear();
     const MASK_S: u64 = (1 << 18) - 1;
     const MASK_L: u64 = (1 << 14) - 1;
     let mut start = 0;
@@ -48,7 +48,7 @@ fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
         let mut cut = end;
         let mut i = start + MIN_CHUNK;
         while i < mid {
-            h = (h << 1).wrapping_add(g[data[i] as usize]);
+            h = (h << 1).wrapping_add(GEAR[data[i] as usize]);
             if h & MASK_S == 0 {
                 cut = i + 1;
                 break;
@@ -57,7 +57,7 @@ fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
         }
         if cut == end {
             while i < end {
-                h = (h << 1).wrapping_add(g[data[i] as usize]);
+                h = (h << 1).wrapping_add(GEAR[data[i] as usize]);
                 if h & MASK_L == 0 {
                     cut = i + 1;
                     break;

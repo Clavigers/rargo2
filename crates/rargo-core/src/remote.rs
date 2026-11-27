@@ -2658,7 +2658,7 @@ mod tests {
         use super::ActionIds;
         use crate::rng::Rng;
         let ids = |seed| {
-            let a = ActionIds::new(&mut Rng::seeded(seed));
+            let a = ActionIds::new(&mut Rng::new(seed));
             (0..5).map(|_| a.next()).collect::<Vec<_>>()
         };
         assert_eq!(ids(42), ids(42));
