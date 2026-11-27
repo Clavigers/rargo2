@@ -73,13 +73,21 @@ pub struct Daemon {
     pub(crate) nix_attached: Arc<crate::nixmanifest::Attached>,
     pub drift_report: Mutex<Option<String>>,
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    pub deliveries: Mutex<std::collections::BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>>,
+    pub deliveries: Mutex<Deliveries>,
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
     fetching: crate::io::Mutex<()>,
     scratch_seq: AtomicU64,
     pub stats: Arc<DaemonStats>,
+}
+
+/// What each worktree was last delivered, under the token that names it.
+pub struct Deliveries {
+    /// Every random value the server hands out (delivery tokens) is drawn here,
+    /// from the seed `Daemon::new` was given.
+    pub random: crate::rng::Rng,
+    pub by_worktree: BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>,
 }
 
 pub struct Home {
@@ -239,10 +247,12 @@ fn bytes(s: &str) -> Vec<u8> {
 }
 
 impl Daemon {
-    pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
+    /// `seed` seeds the server's random values: the shell draws it from the OS,
+    /// tests and the simulator pass their own.
+    pub fn new(cfg: Config, engine: Arc<Engine>, seed: u64) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
-        let seed = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
-        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), seed);
+        let incr_seed = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), incr_seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
@@ -257,7 +267,7 @@ impl Daemon {
             nix_attached: Arc::default(),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
-            deliveries: Mutex::new(std::collections::BTreeMap::new()),
+            deliveries: Mutex::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
             client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
             cfg,
             engine,
@@ -936,7 +946,7 @@ if c.session.is_some() && !c.worktree.is_empty() {
     last.insert(
         c.worktree.clone(),
         crate::drift::LastClient {
-            env: Arc::new(c.env.to_map().into_iter().collect()),
+            env: Arc::new(c.env.to_map()),
             home: c.home.clone(),
             root: c.root.clone(),
             dir,
@@ -1389,7 +1399,7 @@ impl UnitObserver {
 }
 
 struct TestObserver {
-    out: Arc<Client>,
+    out: Output,
     explain: bool,
     label: String,
 }
@@ -1399,15 +1409,15 @@ impl Observer for TestObserver {
         self.explain
     }
     fn explain(&self, why: &str) {
-        self.out.out.note(&format!("{} runs because {why}", self.label));
+        self.out.note(&format!("{} runs because {why}", self.label));
     }
     fn stdout(&self, data: &[u8]) {
-        self.out.out.raw_out(self.out.out.tr.text(&String::from_utf8_lossy(data)).as_bytes());
+        self.out.raw_out(data);
     }
     fn stderr_line(&self, line: &[u8], _live: Option<&dyn Live>) {
-        let mut l = self.out.out.tr.text(&String::from_utf8_lossy(line));
-        l.push('\n');
-        self.out.out.raw_err(l.as_bytes());
+        let mut data = line.to_vec();
+        data.push(b'\n');
+        self.out.raw_err(&data);
     }
 }
 
@@ -2762,7 +2772,7 @@ impl Run {
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
                             observer: Arc::new(TestObserver {
-                                out: self.c.clone(),
+                                out: out.derive(out.quiet, out.verbose, out.tr.clone()),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
@@ -2946,6 +2956,33 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_observer_preserves_sandbox_paths_in_output() {
+        use rargo_proto::ServerMsg;
+
+        crate::io::sim::test(|| {
+            let (tx, mut rx) = crate::io::unbounded_channel();
+            let tr = Translator::new(vec![
+                ("/w".into(), "/home/me/project".into()),
+                ("/c".into(), "/home/me/.cargo".into()),
+            ]);
+            let observer = TestObserver {
+                out: Output::new(tx, false, false).derive(false, false, tr),
+                explain: false,
+                label: String::new(),
+            };
+            let output = b"fixture paths: /w/target/debug/app and /c/blobs";
+            observer.stdout(output);
+            observer.stderr_line(output, None);
+            drop(observer);
+            assert!(matches!(rx.recv().unwrap(), ServerMsg::Stdout(data) if data == output));
+            assert!(matches!(
+                rx.recv().unwrap(),
+                ServerMsg::Stderr(data) if data == [output.as_slice(), b"\n"].concat()
+            ));
+        });
+    }
+
     #[test]
     fn a_build_script_that_failed_for_want_of_a_system_library_is_told_where_libraries_come_from() {
         let udev = "  thread 'main' panicked at libudev-sys-0.1.4/build.rs:38:41:\n  pkg-config exited with status code 1\n  > PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs --cflags libudev\n\n  The system library `libudev` required by crate `libudev-sys` was not found.\n  Package libudev was not found in the pkg-config search path.\n  Perhaps you should add the directory containing `libudev.pc'\n";

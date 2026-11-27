@@ -1,9 +1,8 @@
 locks	crates/rargo-core/src/build.rs	60	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/buildview.rs	10	shares state between threads outside a shell or worker pool: dashmap (4), atomics (6)
-locks	crates/rargo-core/src/chunk.rs	4	shares state between threads outside a shell or worker pool: once cells (2), dashmap (2)
-locks	crates/rargo-core/src/db.rs	10	shares state between threads outside a shell or worker pool: parking_lot locks (10)
+locks	crates/rargo-core/src/chunk.rs	2	shares state between threads outside a shell or worker pool: dashmap (2)
+locks	crates/rargo-core/src/db.rs	4	shares the write buffer and commit serialization between threads: parking_lot locks (4)
 locks	crates/rargo-core/src/engine.rs	27	shares state between threads outside a shell or worker pool: atomics (15), parking_lot locks (6), once cells (4), dashmap (2)
-locks	crates/rargo-core/src/flake.rs	2	shares state between threads outside a shell or worker pool: once cells (2)
 locks	crates/rargo-core/src/http.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
 locks	crates/rargo-core/src/incr.rs	10	shares state between threads outside a shell or worker pool: atomics (8), once cells (2)
 locks	crates/rargo-core/src/nixmanifest.rs	17	shares state between threads outside a shell or worker pool
@@ -31,7 +30,6 @@ locks	crates/rargo/src/partial.rs	6	shares state between threads outside a shell
 locks	crates/rargo/src/tmp.rs	6	shares state between threads outside a shell or worker pool: atomics (6)
 locks	crates/rargo/src/watch.rs	2	shares state between threads outside a shell or worker pool: std locks (2)
 hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/engine.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/http.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/incr.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/nixmanifest.rs	7	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
@@ -46,9 +44,7 @@ hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random 
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 self-check	crates/rargo-core/src/action_table.rs	3	3 step methods of ActionTable assert nothing
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
-self-check	crates/rargo-core/src/db_writer.rs	5	5 step methods of DbWriter assert nothing
 self-check	crates/rargo-core/src/http.rs	8	8 step methods of AuthState assert nothing
-self-check	crates/rargo-core/src/pool_state.rs	9	9 step methods of Calls, Race, WorkerPool assert nothing
 self-check	crates/rargo-core/src/sched_state.rs	6	6 step methods of SchedState assert nothing
 self-check	crates/rargo-core/src/session_state.rs	16	16 step methods of Handshake, SessionState assert nothing
 self-check	crates/rargo-core/src/store_index.rs	15	15 step methods of StoreIndex assert nothing

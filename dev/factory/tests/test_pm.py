@@ -24,6 +24,11 @@ class Checks:
 
     def __init__(self):
         self.result = "success"
+        self.reruns = 0
+
+    def rerun_failed(self, sha):
+        self.reruns += 1
+        return 1
 
     def check_runs(self, sha):
         if self.result is None:
@@ -120,7 +125,12 @@ def test_no_build_until_ci_passes(tmp_path):
     assert f.events() == ["frozen"]
     f.checks.result = "failure"
     f.pm.step()
-    assert f.events() == ["frozen"] and any("CI failed" in s for s in f.said)
+    f.pm.step()  # too soon to run it again
+    assert f.events() == ["frozen"] and f.checks.reruns == 1
+    for _ in range(5):
+        f.now += timedelta(minutes=21)
+        f.pm.step()
+    assert f.checks.reruns == 3 and any("4 times" in s for s in f.said)
     f.checks.result = "success"
     f.pm.step()
     assert f.events() == ["frozen", "built", "published"]
@@ -146,6 +156,8 @@ def test_a_bug_fixed_after_the_freeze_is_backported_and_built_again(tmp_path):
     f = Factory(tmp_path, uses_required=1)
     f.pm.step()
     sha = f.fix(issue=5, pr=50)
+    f.pm.step()
+    assert f.events()[-2:] == ["backported", "release_held"]  # held: a backport in no build
     f.pm.step()
     ev = f.events()
     assert ev.count("backported") == 1 and ev.count("built") == 2
