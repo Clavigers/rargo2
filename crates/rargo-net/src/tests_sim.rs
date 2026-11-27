@@ -14,9 +14,9 @@ fn body(i: usize) -> Vec<u8> {
     (0..len).map(|b| (b ^ i) as u8).collect()
 }
 
-/// A client and a server exchange `MESSAGES` messages each way over an encrypted link.
-fn exchange(seed: u64, net: Net) -> Report {
-    let ((), report) = sim::run(seed, net, || {
+/// A client and a server exchange `messages` messages each way over an encrypted link.
+fn exchange(seed: u64, net: Net, messages: usize) -> Report {
+    let ((), report) = sim::run(seed, net, move || {
         let key = Some(Arc::new([7u8; 32]));
         let server_addr = "10.0.0.1:7000".parse().unwrap();
         let server = Endpoint::bind_keyed(server_addr, true, key.clone()).expect("the server binds");
@@ -24,14 +24,14 @@ fn exchange(seed: u64, net: Net) -> Report {
 
         let mut served = io::spawn(move || {
             let conn = server.accept().expect("a client arrives");
-            for i in 0..MESSAGES {
+            for i in 0..messages {
                 assert_eq!(conn.recv().expect("the link stays up"), body(i), "message {i} arrives whole and in order");
                 conn.send(&body(i + 1)).expect("the reply is queued");
             }
         });
 
         let conn = client.connect(server_addr).expect("the handshake completes");
-        for i in 0..MESSAGES {
+        for i in 0..messages {
             conn.send(&body(i)).expect("the message is queued");
             assert_eq!(conn.recv().expect("the link stays up"), body(i + 1), "reply {i} arrives whole and in order");
         }
@@ -42,16 +42,19 @@ fn exchange(seed: u64, net: Net) -> Report {
 
 #[test]
 fn a_clean_network_carries_every_message() {
-    let report = exchange(1, Net::default());
+    let report = exchange(1, Net::default(), MESSAGES);
     assert_eq!(report.datagrams_lost, 0);
 }
 
 #[test]
 fn one_seed_is_one_run() {
     let net = Net { loss_per_mille: 100, duplicate_per_mille: 50, delay_ms: (1, 40) };
-    let first = exchange(42, net);
-    assert_eq!(first, exchange(42, net), "the same seed replays the same run");
-    assert_ne!(first.trace, exchange(43, net).trace, "another seed is another run");
+    // A short exchange still exercises fragmentation and loss with these seeds.
+    let messages = 8;
+    let first = exchange(42, net, messages);
+    assert!(first.datagrams_lost > 0);
+    assert_eq!(first, exchange(42, net, messages), "the same seed replays the same run");
+    assert_ne!(first.trace, exchange(43, net, messages).trace, "another seed is another run");
 }
 
 mod a_bad_network_delivers_everything_in_order_for_many_seeds {
@@ -66,7 +69,7 @@ fn check_bad_network(seeds: std::ops::Range<u64>) {
     let net = Net { loss_per_mille: 200, duplicate_per_mille: 100, delay_ms: (1, 80) };
     let (mut simulated_ms, mut lost) = (0u64, 0u64);
     for seed in seeds {
-        let report = exchange(seed, net);
+        let report = exchange(seed, net, MESSAGES);
         simulated_ms += report.elapsed_ms;
         lost += report.datagrams_lost;
     }
