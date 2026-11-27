@@ -54,11 +54,18 @@ fn one_seed_is_one_run() {
     assert_ne!(first.trace, exchange(43, net).trace, "another seed is another run");
 }
 
-#[test]
-fn a_bad_network_delivers_everything_in_order_for_many_seeds() {
+mod a_bad_network_delivers_everything_in_order_for_many_seeds {
+    rargo_machine::test_batches! {
+        super::check_bad_network;
+        seeds_0_and_1: 0..2,
+        seeds_2_and_3: 2..4,
+    }
+}
+
+fn check_bad_network(seeds: std::ops::Range<u64>) {
     let net = Net { loss_per_mille: 200, duplicate_per_mille: 100, delay_ms: (1, 80) };
     let (mut simulated_ms, mut lost) = (0u64, 0u64);
-    for seed in 0..4 {
+    for seed in seeds {
         let report = exchange(seed, net);
         simulated_ms += report.elapsed_ms;
         lost += report.datagrams_lost;

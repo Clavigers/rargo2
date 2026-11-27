@@ -858,7 +858,11 @@ mod tests {
         if crate::io::unavailable().is_some() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("rargo-store-cold-lock-{}", crate::io::process::id()));
+        // The store's 512 shard directories cost most of this test's CPU on a
+        // journaling filesystem; a memory-backed one makes and removes them
+        // in half the time.
+        let base = Some(std::path::PathBuf::from("/dev/shm")).filter(|p| p.is_dir()).unwrap_or_else(std::env::temp_dir);
+        let dir = base.join(format!("rargo-store-cold-lock-{}", crate::io::process::id()));
         let at = dir.clone();
         let outcome = crate::io::within(std::time::Duration::from_secs(20), move || {
             crate::io::run(2, move || {

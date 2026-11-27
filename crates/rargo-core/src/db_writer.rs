@@ -34,13 +34,21 @@ impl Batch {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct DbWriter {
     pending: BTreeMap<Key, Entry>,
     bytes: usize,
     seq: u64,
     since: Option<u64>,
     flushing: bool,
+    /// Pending bytes at which a flush is due at once: `FULL_BYTES`, or less in tests.
+    full_bytes: usize,
+}
+
+impl Default for DbWriter {
+    fn default() -> DbWriter {
+        DbWriter::new()
+    }
 }
 
 fn size(key: &[u8], value: &Value) -> usize {
@@ -49,7 +57,11 @@ fn size(key: &[u8], value: &Value) -> usize {
 
 impl DbWriter {
     pub fn new() -> DbWriter {
-        DbWriter::default()
+        DbWriter::full_at(FULL_BYTES)
+    }
+
+    fn full_at(full_bytes: usize) -> DbWriter {
+        DbWriter { pending: BTreeMap::new(), bytes: 0, seq: 0, since: None, flushing: false, full_bytes }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -98,7 +110,7 @@ impl DbWriter {
         if self.flushing {
             return Due::At(now_ms + DELAY_MS);
         }
-        if self.bytes >= FULL_BYTES || now_ms >= since + DELAY_MS {
+        if self.bytes >= self.full_bytes || now_ms >= since + DELAY_MS {
             return Due::Now;
         }
         Due::At(since + DELAY_MS)
@@ -217,8 +229,11 @@ mod tests {
 
     #[test]
     fn a_flush_is_due_a_delay_after_the_first_write_or_when_full() {
+        // A full queue behaves the same at any size; a small one spares the
+        // test copying FULL_BYTES.
+        const FULL: usize = 1 << 10;
         let mut outcomes = Transcript::default();
-        let mut w = Writer::new();
+        let mut w = Writer(Checked::new(DbWriter::full_at(FULL)));
         outcomes.record("empty at 1000", w.due(1000));
         for (at, key, value) in [(1000, b"a", b"1"), (1050, b"b", b"2")] {
             w.put(Table::Meta, key, value, at);
@@ -231,7 +246,7 @@ mod tests {
         outcomes.record("flush in flight", w.due(1200));
         w.flushed(&b, 1200);
         outcomes.record("due", w.due(1200));
-        w.put(Table::Blobs, b"big", &vec![0u8; FULL_BYTES], 2000);
+        w.put(Table::Blobs, b"big", &[0u8; FULL], 2000);
         outcomes.record("full queue", w.due(2000));
         w.invariants();
         expect![[r#"

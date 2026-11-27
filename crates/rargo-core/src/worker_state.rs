@@ -668,9 +668,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_server_sessions_run_each_action_once_its_inputs_are_here_and_ask_each_question_once() {
-        for seed in 1..=300u64 {
+    mod generated_server_sessions_run_each_action_once_its_inputs_are_here_and_ask_each_question_once {
+        rargo_machine::test_batches! {
+            super::check_generated_server_sessions;
+            seeds_1_to_150: 1..=150,
+            seeds_151_to_300: 151..=300,
+        }
+    }
+
+    fn check_generated_server_sessions(seeds: std::ops::RangeInclusive<u64>) {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let (mut w, _) = Worker::<T>::new();
             let mut store: BTreeSet<Hash> = BTreeSet::new();
