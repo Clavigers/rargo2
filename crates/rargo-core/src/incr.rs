@@ -602,7 +602,8 @@ mod tests {
                         let distinct: std::collections::BTreeSet<&str> = listed.iter().map(|(_, m)| m.worktree.as_str()).collect();
                         assert!(listed.len() <= distinct.len().min(KEEP_WORKTREES) + KEEP_EXTRA, "seed {seed}: {} states", listed.len());
                         for (id, meta) in &listed {
-                            assert_eq!(given.get(id), Some(&(c, meta.worktree.clone(), meta.created)), "seed {seed}: state {id} keeps the time it was saved at");
+                            let expected = given.get(id).map(|(crate_index, worktree, created)| (*crate_index, worktree.as_str(), *created));
+                            assert_eq!(expected, Some((c, meta.worktree.as_str(), meta.created)), "seed {seed}: state {id} keeps the time it was saved at");
                         }
                         let mut kept_worktrees: Vec<&str> = Vec::new();
                         for (id, meta) in &listed {
@@ -619,34 +620,35 @@ mod tests {
         });
     }
 
-    #[test]
-    fn generated_saves_1_to_50_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        generated_saves(1..=50);
+    // Keep the full sample while bounding the work done by each test.
+    macro_rules! save_batches {
+        ($($name:ident: $start:literal..=$end:literal),+ $(,)?) => {
+            $(
+                #[test]
+                fn $name() {
+                    generated_saves($start..=$end);
+                }
+            )+
+        };
     }
 
-    #[test]
-    fn generated_saves_51_to_100_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        generated_saves(51..=100);
-    }
+    mod generated_saves_keep_each_worktrees_newest_state_and_time {
+        use super::generated_saves;
 
-    #[test]
-    fn generated_saves_101_to_150_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        generated_saves(101..=150);
-    }
-
-    #[test]
-    fn generated_saves_151_to_200_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        generated_saves(151..=200);
-    }
-
-    #[test]
-    fn generated_saves_201_to_250_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        generated_saves(201..=250);
-    }
-
-    #[test]
-    fn generated_saves_251_to_300_keep_each_worktrees_newest_state_with_the_time_it_was_given() {
-        generated_saves(251..=300);
+        save_batches! {
+            seeds_1_to_25: 1..=25,
+            seeds_26_to_50: 26..=50,
+            seeds_51_to_75: 51..=75,
+            seeds_76_to_100: 76..=100,
+            seeds_101_to_125: 101..=125,
+            seeds_126_to_150: 126..=150,
+            seeds_151_to_175: 151..=175,
+            seeds_176_to_200: 176..=200,
+            seeds_201_to_225: 201..=225,
+            seeds_226_to_250: 226..=250,
+            seeds_251_to_275: 251..=275,
+            seeds_276_to_300: 276..=300,
+        }
     }
 
     #[test]

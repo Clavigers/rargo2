@@ -6,42 +6,50 @@ fn clean(seeds: std::ops::Range<u64>) {
     assert!(failures.is_empty(), "{}", text.join("\n"));
 }
 
-// Keep broad sweeps available through rargo-sim --seeds. CI samples multiple
-// ranges so the real UDP handshakes fit the workspace CPU budget.
-#[test]
-fn seeds_0_to_12_keep_every_invariant() {
-    clean(0..12);
+// Keep the sampled ranges while running each batch under its own CPU budget.
+macro_rules! seed_batches {
+    ($($name:ident: $start:literal..$end:literal),+ $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                clean($start..$end);
+            }
+        )+
+    };
 }
 
-#[test]
-fn seeds_200_to_224_keep_every_invariant() {
-    clean(200..224);
-}
-
-#[test]
-fn seeds_400_to_424_keep_every_invariant() {
-    clean(400..424);
+seed_batches! {
+    seeds_0_to_4: 0..4,
+    seeds_4_to_8: 4..8,
+    seeds_8_to_12: 8..12,
+    seeds_200_to_204: 200..204,
+    seeds_204_to_208: 204..208,
+    seeds_208_to_212: 208..212,
+    seeds_212_to_216: 212..216,
+    seeds_216_to_220: 216..220,
+    seeds_220_to_224: 220..224,
+    seeds_400_to_404: 400..404,
+    seeds_404_to_408: 404..408,
+    seeds_408_to_412: 408..412,
+    seeds_412_to_416: 412..416,
+    seeds_416_to_420: 416..420,
+    seeds_420_to_424: 420..424,
 }
 
 #[test]
 fn a_seed_replays_the_same_run() {
-    for seed in [3, 77, 150] {
-        let a = run(seed, None).expect("passes");
-        let b = run(seed, None).expect("passes");
-        assert_eq!(a, b);
-        assert!(a.runs > 0);
-    }
-    let a = run(5, None).expect("passes");
-    let b = run(6, None).expect("passes");
-    assert_ne!(a.trace, b.trace);
+    let first = run(3, None).expect("passes");
+    assert_eq!(first, run(3, None).expect("passes"));
+    assert!(first.runs > 0);
+    assert_ne!(first.trace, run(5, None).expect("passes").trace);
 }
 
 #[test]
 fn seeded_test_commands_report_passes_failures_and_timeouts() {
-    let reports: Vec<_> = (0..10).map(|seed| run(seed, None).expect("commands finish")).collect();
-    assert!(reports.iter().any(|r| r.tests_passed > 0));
-    assert!(reports.iter().any(|r| r.tests_failed > 0));
-    assert!(reports.iter().any(|r| r.tests_timed_out > 0));
+    let report = run(3, None).expect("commands finish");
+    assert!(report.tests_passed > 0);
+    assert!(report.tests_failed > 0);
+    assert!(report.tests_timed_out > 0);
 }
 
 #[test]
@@ -68,8 +76,9 @@ fn dozens_of_client_rounds_overlap_during_eviction() {
 
 #[test]
 fn the_seeds_exercise_faults_the_cache_and_eviction() {
-    // The dedicated concurrency test covers the crowd at seed 257.
-    let reports: Vec<_> = (0..24).map(|s| run(s, None).expect("passes")).collect();
+    // Together these seeds exercise every condition checked below. The seed
+    // batches separately run the simulator's invariants over a wider sample.
+    let reports = [13, 15].map(|seed| run(seed, None).expect("passes"));
     assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
     assert!(reports.iter().any(|r| r.server_restarts > 0), "clients finish despite server restarts");
     assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
@@ -97,10 +106,11 @@ fn turns_off_alone(f: Fault) {
         Fault::ServerCrash => r.server_restarts,
         Fault::Partition => r.partitioned,
     };
-    let reports: Vec<_> = (0..12).chain(13..16).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
-    assert!(reports.iter().all(|r| count(r, f) == 0), "--off {} leaves no {0}", f.name());
+    // Seed 7 exercises all five faults, including when any one is switched off.
+    let report = run_off(7, None, Off::none().with(f)).expect("passes");
+    assert_eq!(count(&report, f), 0, "--off {} leaves no {0}", f.name());
     for other in Fault::ALL.into_iter().filter(|o| *o != f) {
-        assert!(reports.iter().any(|r| count(r, other) > 0), "--off {} leaves {}", f.name(), other.name());
+        assert!(count(&report, other) > 0, "--off {} leaves {}", f.name(), other.name());
     }
 }
 

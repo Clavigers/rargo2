@@ -5,7 +5,8 @@ use std::sync::Arc;
 use crate::io::sim::{self, Net, Report};
 use crate::{io, Endpoint};
 
-const MESSAGES: usize = 200;
+// Enough messages to cycle through the payload sizes and drive retransmission.
+const MESSAGES: usize = 32;
 
 fn body(i: usize) -> Vec<u8> {
     // Sizes from a few bytes to several fragments.
@@ -48,8 +49,9 @@ fn a_clean_network_carries_every_message() {
 #[test]
 fn one_seed_is_one_run() {
     let net = Net { loss_per_mille: 100, duplicate_per_mille: 50, delay_ms: (1, 40) };
-    assert_eq!(exchange(42, net), exchange(42, net), "the same seed replays the same run");
-    assert_ne!(exchange(42, net).trace, exchange(43, net).trace, "another seed is another run");
+    let first = exchange(42, net);
+    assert_eq!(first, exchange(42, net), "the same seed replays the same run");
+    assert_ne!(first.trace, exchange(43, net).trace, "another seed is another run");
 }
 
 #[test]

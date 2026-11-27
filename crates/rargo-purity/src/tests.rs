@@ -10,10 +10,11 @@ fn of(check: Check, list: &[(Check, String)]) -> Vec<String> {
     out
 }
 
-#[test]
-fn the_workspace_keeps_to_every_check_within_its_allowlist() {
-    let allow = parse_allow(ALLOW).unwrap_or_else(|e| panic!("{e}"));
-    let findings = scan(SOURCES);
+pub(super) fn workspace_purity(prefix: &str) {
+    let sources: Vec<_> = SOURCES.iter().copied().filter(|(file, _)| file.starts_with(prefix)).collect();
+    let mut allow = parse_allow(ALLOW).unwrap_or_else(|e| panic!("{e}"));
+    allow.retain(|e| e.file.starts_with(prefix));
+    let findings = scan(&sources);
     let reports: Vec<String> = Check::ALL.iter().filter_map(|c| compare(*c, &findings, &allow).err()).collect();
     assert!(reports.is_empty(), "{}", reports.join("\n"));
 }
