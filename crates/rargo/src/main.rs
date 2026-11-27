@@ -950,36 +950,38 @@ mod tests {
 
     #[test]
     fn path_dependencies_must_stay_inside_the_synced_worktree() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("app");
-        std::fs::create_dir(&root).unwrap();
-        std::fs::create_dir(temp.path().join("dep")).unwrap();
-        let inner = root.join("inner");
-        std::fs::create_dir(&inner).unwrap();
-        let manifest = root.join("Cargo.toml");
-        let inner_manifest = inner.join("Cargo.toml");
-        let external = |path: &str| Some(("renamed".into(), path.into()));
-        for section in [
-            "dependencies",
-            "dev-dependencies",
-            "target.'cfg(unix)'.build-dependencies",
-            "patch.crates-io",
-        ] {
-            std::fs::write(&manifest, format!("[{section}]\nrenamed = {{ package = 'dep', path = '../dep' }}")).unwrap();
+        io::sim::test(|| {
+            let temp = io::sim::tempdir();
+            let root = temp.join("app");
+            io::file::create_dir(&root).unwrap();
+            io::file::create_dir(temp.join("dep")).unwrap();
+            let inner = root.join("inner");
+            io::file::create_dir(&inner).unwrap();
+            let manifest = root.join("Cargo.toml");
+            let inner_manifest = inner.join("Cargo.toml");
+            let external = |path: &str| Some(("renamed".into(), path.into()));
+            for section in [
+                "dependencies",
+                "dev-dependencies",
+                "target.'cfg(unix)'.build-dependencies",
+                "patch.crates-io",
+            ] {
+                io::file::write(&manifest, format!("[{section}]\nrenamed = {{ package = 'dep', path = '../dep' }}")).unwrap();
+                assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
+            }
+
+            io::file::write(&manifest, "[dependencies]\ninner = { path = 'inner' }\n[workspace.dependencies]\nrenamed = { path = '../dep' }").unwrap();
+            io::file::write(&inner_manifest, "[dependencies]\nrenamed.workspace = true").unwrap();
+            assert_eq!(outside_path_dependency(&root, &inner_manifest), external("../dep"));
             assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
-        }
+            io::file::write(&manifest, "[workspace]\nmembers = ['in*']\n[workspace.dependencies]\nrenamed = { path = '../dep' }").unwrap();
+            assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
 
-        std::fs::write(&manifest, "[dependencies]\ninner = { path = 'inner' }\n[workspace.dependencies]\nrenamed = { path = '../dep' }").unwrap();
-        std::fs::write(&inner_manifest, "[dependencies]\nrenamed.workspace = true").unwrap();
-        assert_eq!(outside_path_dependency(&root, &inner_manifest), external("../dep"));
-        assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
-        std::fs::write(&manifest, "[workspace]\nmembers = ['in*']\n[workspace.dependencies]\nrenamed = { path = '../dep' }").unwrap();
-        assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
-
-        std::fs::write(&inner_manifest, "[dependencies]\nrenamed = { path = '../../dep' }").unwrap();
-        assert_eq!(outside_path_dependency(&root, &manifest), external("../../dep"));
-        std::fs::write(&inner_manifest, "[dependencies]\napp = { path = '..' }\nserde = '1'").unwrap();
-        assert_eq!(outside_path_dependency(&root, &manifest), None);
+            io::file::write(&inner_manifest, "[dependencies]\nrenamed = { path = '../../dep' }").unwrap();
+            assert_eq!(outside_path_dependency(&root, &manifest), external("../../dep"));
+            io::file::write(&inner_manifest, "[dependencies]\napp = { path = '..' }\nserde = '1'").unwrap();
+            assert_eq!(outside_path_dependency(&root, &manifest), None);
+        });
     }
 
     #[test]
