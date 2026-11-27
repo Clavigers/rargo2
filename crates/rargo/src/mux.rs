@@ -366,61 +366,105 @@ impl Mux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use expect_test::expect;
+
+    enum Ev {
+        Open(&'static str),
+        Close(u32),
+        Frame(u32, u64, ServerMsg),
+        Route(u32, ServerMsg),
+        NextId,
+        ExpectMissing(u64, &'static str),
+        Fail,
+    }
+
+    type State = MuxState<&'static str, &'static str>;
+
+    fn routed(state: &mut State, stream: u32, msg: ServerMsg) -> String {
+        match state.route(stream, msg) {
+            Route::Stream(dest, msg) => format!("{dest} <- {msg:?}"),
+            Route::Missing(dest, missing) => format!("{dest} <- missing {missing:?}"),
+            Route::Drop => "dropped".to_string(),
+        }
+    }
+
+    /// Steps a mux through the events, checking its invariants after each, and lists what each step gave back.
+    fn run(events: impl IntoIterator<Item = Ev>) -> String {
+        let mut state = State::new();
+        state.invariants();
+        let mut out = String::new();
+        for ev in events {
+            let line = match ev {
+                Ev::Open(dest) => format!("open {dest} => {:?}", state.open(dest)),
+                Ev::Close(stream) => format!("close {stream} => {:?}", state.close(stream)),
+                Ev::Frame(stream, seq, msg) => {
+                    let ready = state.incoming(Frame { stream, seq, msg });
+                    let routes: Vec<String> = ready.into_iter().map(|(s, m)| routed(&mut state, s, m)).collect();
+                    format!("frame {stream}#{seq} => {routes:?}")
+                }
+                Ev::Route(stream, msg) => format!("route {stream} => {}", routed(&mut state, stream, msg)),
+                Ev::NextId => format!("next id => {}", state.next_id()),
+                Ev::ExpectMissing(id, dest) => format!("expect missing {id} for {dest} => {:?}", state.expect_missing(id, dest)),
+                Ev::Fail => format!("fail => {:?}", state.fail()),
+            };
+            state.invariants();
+            out += &line;
+            out.push('\n');
+        }
+        out
+    }
+
+    fn stdout(byte: u8) -> ServerMsg {
+        ServerMsg::Stdout(vec![byte])
+    }
 
     #[test]
     fn reorder_and_terminal_frames_stay_with_their_own_stream() {
-        let mut state = MuxState::<_, ()>::new();
-        let (first, _) = state.open("first");
-        state.invariants();
-        let (second, _) = state.open("second");
-        state.invariants();
-
-        let stdout = |byte| ServerMsg::Stdout(vec![byte]);
-        assert!(state.incoming(Frame { stream: first, seq: 1, msg: ServerMsg::Exit(0) }).is_empty());
-        state.invariants();
-        let msgs = state.incoming(Frame { stream: second, seq: 0, msg: stdout(2) });
-        state.invariants();
-        let [(stream, msg)] = msgs.try_into().ok().unwrap();
-        assert!(matches!(state.route(stream, msg), Route::Stream("second", ServerMsg::Stdout(bytes)) if bytes == [2]));
-        state.invariants();
-
-        let msgs = state.incoming(Frame { stream: first, seq: 0, msg: stdout(1) });
-        state.invariants();
-        let [(stream, msg), (last_stream, last)] = msgs.try_into().ok().unwrap();
-        assert!(matches!(state.route(stream, msg), Route::Stream("first", ServerMsg::Stdout(bytes)) if bytes == [1]));
-        state.invariants();
-        assert!(matches!(state.route(last_stream, last), Route::Stream("first", ServerMsg::Exit(0))));
-        state.invariants();
-        assert!(state.incoming(Frame { stream: first, seq: 2, msg: stdout(9) }).is_empty());
-        state.invariants();
-        assert!(matches!(state.route(first, stdout(9)), Route::Drop));
-        state.invariants();
+        let events = [
+            Ev::Open("first"),
+            Ev::Open("second"),
+            Ev::Frame(1, 1, ServerMsg::Exit(0)),
+            Ev::Frame(2, 0, stdout(2)),
+            Ev::Frame(1, 0, stdout(1)),
+            Ev::Frame(1, 2, stdout(9)),
+            Ev::Route(1, stdout(9)),
+        ];
+        expect![[r#"
+            open first => (1, None)
+            open second => (2, None)
+            frame 1#1 => []
+            frame 2#0 => ["second <- Stdout([2])"]
+            frame 1#0 => ["first <- Stdout([1])", "first <- Exit(0)"]
+            frame 1#2 => []
+            route 1 => dropped
+        "#]].assert_eq(&run(events));
     }
 
     #[test]
     fn failure_drains_every_open_registration_once() {
-        let mut state = MuxState::new();
-        let (closed, _) = state.open("cancelled");
-        state.invariants();
-        let (a, _) = state.open("first");
-        state.invariants();
-        let (b, _) = state.open("second");
-        state.invariants();
-        assert_eq!(state.close(closed), Some("cancelled"));
-        state.invariants();
-        let id = state.next_id();
-        state.invariants();
-        assert_eq!(state.expect_missing(id, "offer"), None);
-        state.invariants();
-        let (streams, offers) = state.fail().unwrap();
-        state.invariants();
-        assert_eq!(streams, BTreeMap::from([(a, "first"), (b, "second")]));
-        assert_eq!(offers, BTreeMap::from([(id, "offer")]));
-        assert!(state.fail().is_none());
-        state.invariants();
-        assert_eq!(state.open("late").1, Some("late"));
-        state.invariants();
-        assert_eq!(state.expect_missing(id, "late offer"), Some("late offer"));
-        state.invariants();
+        let events = [
+            Ev::Open("cancelled"),
+            Ev::Open("first"),
+            Ev::Open("second"),
+            Ev::Close(1),
+            Ev::NextId,
+            Ev::ExpectMissing(1, "offer"),
+            Ev::Fail,
+            Ev::Fail,
+            Ev::Open("late"),
+            Ev::ExpectMissing(1, "late offer"),
+        ];
+        expect![[r#"
+            open cancelled => (1, None)
+            open first => (2, None)
+            open second => (3, None)
+            close 1 => Some("cancelled")
+            next id => 1
+            expect missing 1 for offer => None
+            fail => Some(({2: "first", 3: "second"}, {1: "offer"}))
+            fail => None
+            open late => (4, Some("late"))
+            expect missing 1 for late offer => Some("late offer")
+        "#]].assert_eq(&run(events));
     }
 }

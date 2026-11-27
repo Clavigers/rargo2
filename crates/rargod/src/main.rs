@@ -195,6 +195,7 @@ fn main() -> Result<()> {
     let daemon = Arc::new(Daemon::new(
         Config { state_dir: state.clone(), planner, cargo_home: cargo_home.clone(), uid, gid, server_env },
         engine,
+        rargo_core::tokens::os_seed()?,
     ));
     eprintln!(
         "rargod: store {} ({}), cargo home {}, passthrough {}, per-action cgroups {}, {} jobs, {} GiB memory budget, actions run as uid {uid}",
