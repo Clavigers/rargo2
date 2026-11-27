@@ -156,7 +156,9 @@ def main(argv: list[str]) -> int:
             from .pm import Pm
             cmd = os.environ.get("FACTORY_RELEASE")  # run with the version; unset: publish nothing
             Pm(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
-               publish=shlex.split(cmd) if cmd else None).run()
+               publish=shlex.split(cmd) if cmd else None,
+               notes_prompt=(HERE / "RELEASE-NOTES.md").read_text(),
+               state=pathlib.Path(env("FACTORY_LOG")).parent / "state").run()
             return 0
         case ["power-user", slug, checkout]:
             from .github import GitHub
