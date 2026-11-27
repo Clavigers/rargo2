@@ -350,6 +350,13 @@ pub struct FsStats {
     pub writes: AtomicU64,
 }
 
+impl FsStats {
+    /// How many lookups, opens, reads and writes were served.
+    pub fn counts(&self) -> [u64; 4] {
+        [&self.lookups, &self.opens, &self.reads, &self.writes].map(|n| n.load(Ordering::Relaxed))
+    }
+}
+
 impl SandboxFs {
     pub fn new(content: Arc<Content>) -> SandboxFs {
         SandboxFs {
