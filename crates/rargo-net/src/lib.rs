@@ -12,13 +12,13 @@ pub mod sans_io {
 }
 
 use rargo_machine::StateMachine;
-use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::cell::{Cell, OnceCell, RefCell};
+use std::collections::{BTreeMap, VecDeque};
 pub mod io;
 use std::io as sio;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use crate::io::{Mutex as FiberMutex, Notify, UdpSocket, UnboundedReceiver, UnboundedSender};
 
@@ -38,7 +38,7 @@ const _: () = assert!(MIN_RTO.as_nanos() < MAX_RTO.as_nanos());
 const _: () = assert!(DATA_HDR == 25);
 const _: () = assert!(SEND_BUFFER >= FRAG);
 
-pub(crate) fn connect_within(wait: Duration, endpoint: &Arc<Endpoint>, server: SocketAddr) -> sio::Result<Arc<Conn>> {
+pub(crate) fn connect_within(wait: Duration, endpoint: &Rc<Endpoint>, server: SocketAddr) -> sio::Result<Rc<Conn>> {
     match io::timeout(wait, || endpoint.connect(server)) {
         Ok(r) => r,
         Err(_) => Err(sio::Error::new(sio::ErrorKind::TimedOut, "no answer over UDP")),
@@ -47,13 +47,17 @@ pub(crate) fn connect_within(wait: Duration, endpoint: &Arc<Endpoint>, server: S
 
 #[derive(Default)]
 pub struct NetStats {
-    pub sent_packets: AtomicU64,
-    pub sent_bytes: AtomicU64,
-    pub retransmits: AtomicU64,
-    pub recv_packets: AtomicU64,
-    pub recv_bytes: AtomicU64,
-    pub messages_in: AtomicU64,
-    pub messages_out: AtomicU64,
+    pub sent_packets: Cell<u64>,
+    pub sent_bytes: Cell<u64>,
+    pub retransmits: Cell<u64>,
+    pub recv_packets: Cell<u64>,
+    pub recv_bytes: Cell<u64>,
+    pub messages_in: Cell<u64>,
+    pub messages_out: Cell<u64>,
+}
+
+fn bump(counter: &Cell<u64>, by: u64) {
+    counter.set(counter.get().wrapping_add(by));
 }
 
 pub type LinkKey = Option<Arc<[u8; 32]>>;
@@ -61,7 +65,7 @@ pub type LinkKey = Option<Arc<[u8; 32]>>;
 /// A source of random bytes: connection ids, handshake ephemerals and the
 /// seed of the retransmit jitter all come from one, passed in by the caller.
 /// `io::os_random` is the real one, `io::seeded_random` the one for tests.
-pub trait Random: Send + Sync {
+pub trait Random {
     fn fill(&self, out: &mut [u8]);
 }
 
@@ -87,7 +91,7 @@ fn ephemeral(random: &dyn Random) -> [u8; 32] {
     b
 }
 
-pub type UserKeys = Arc<dyn Fn(&str) -> Option<[u8; 32]> + Send + Sync>;
+pub type UserKeys = Rc<dyn Fn(&str) -> Option<[u8; 32]>>;
 
 #[derive(Clone)]
 pub enum Auth {
@@ -136,51 +140,51 @@ pub struct Conn {
     pub id: u64,
     key: LinkKey,
     per_conn: bool,
-    cipher: std::sync::OnceLock<rargo_proto::secure::LinkCipher>,
-    tag: std::sync::OnceLock<[u8; 32]>,
-    user: std::sync::OnceLock<String>,
-    sock: Arc<UdpSocket>,
-    peer: Mutex<SocketAddr>,
+    cipher: OnceCell<rargo_proto::secure::LinkCipher>,
+    tag: OnceCell<[u8; 32]>,
+    user: OnceCell<String>,
+    sock: Rc<UdpSocket>,
+    peer: Cell<SocketAddr>,
     epoch: Instant,
-    state: Mutex<conn::ConnState>,
+    state: RefCell<conn::ConnState>,
     wake_sender: Notify,
     pub send_settled: Notify,
     space: Notify,
     inbound_tx: UnboundedSender<Vec<u8>>,
     inbound_rx: FiberMutex<UnboundedReceiver<Vec<u8>>>,
     pub stats: NetStats,
-    closed: std::sync::atomic::AtomicBool,
-    last_heard: Mutex<Instant>,
-    rng: AtomicU64,
-    random: Arc<dyn Random>,
-    handshake_in: Mutex<Vec<Vec<u8>>>,
+    closed: Cell<bool>,
+    last_heard: Cell<Instant>,
+    rng: Cell<u64>,
+    random: Rc<dyn Random>,
+    handshake_in: RefCell<Vec<Vec<u8>>>,
 }
 
 impl Conn {
-    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey, per_conn: bool, random: Arc<dyn Random>) -> Arc<Conn> {
+    fn new(id: u64, sock: Rc<UdpSocket>, peer: SocketAddr, key: LinkKey, per_conn: bool, random: Rc<dyn Random>) -> Rc<Conn> {
         let (tx, rx) = io::unbounded_channel();
-        let c = Arc::new(Conn {
+        let c = Rc::new(Conn {
             id,
             key,
             per_conn,
-            cipher: std::sync::OnceLock::new(),
-            tag: std::sync::OnceLock::new(),
-            user: std::sync::OnceLock::new(),
+            cipher: OnceCell::new(),
+            tag: OnceCell::new(),
+            user: OnceCell::new(),
             sock,
-            peer: Mutex::new(peer),
+            peer: Cell::new(peer),
             epoch: io::now(),
-            state: Mutex::new(conn::ConnState::new(id)),
+            state: RefCell::new(conn::ConnState::new(id)),
             wake_sender: Notify::new(),
             send_settled: Notify::new(),
             space: Notify::new(),
             inbound_tx: tx,
             inbound_rx: FiberMutex::new(rx),
             stats: NetStats::default(),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            last_heard: Mutex::new(io::now()),
-            rng: AtomicU64::new(jitter_seed(random.as_ref())),
+            closed: Cell::new(false),
+            last_heard: Cell::new(io::now()),
+            rng: Cell::new(jitter_seed(random.as_ref())),
             random,
-            handshake_in: Mutex::new(Vec::new()),
+            handshake_in: RefCell::new(Vec::new()),
         });
         let c2 = c.clone();
         io::spawn(move || c2.sender_loop());
@@ -188,7 +192,7 @@ impl Conn {
     }
 
     pub fn set_loss(&self, fraction: f32) {
-        self.state.lock().set_loss(fraction);
+        self.state.borrow_mut().set_loss(fraction);
     }
 
     pub fn user(&self) -> Option<&str> {
@@ -200,29 +204,29 @@ impl Conn {
     }
 
     pub fn peer(&self) -> SocketAddr {
-        *self.peer.lock()
+        self.peer.get()
     }
 
     pub fn idle(&self) -> Duration {
-        io::now().saturating_duration_since(*self.last_heard.lock())
+        io::now().saturating_duration_since(self.last_heard.get())
     }
 
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.state.lock().close();
+        self.closed.set(true);
+        self.state.borrow_mut().close();
         self.wake_sender.notify_one();
     }
 
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::SeqCst)
+        self.closed.get()
     }
 
     pub fn send_idle(&self) -> bool {
-        self.state.lock().send_idle()
+        self.state.borrow().send_idle()
     }
 
     pub fn sender_state(&self) -> String {
-        let v = self.state.lock().view();
+        let v = self.state.borrow().view();
         format!(
             "window {:.0} (slow start below {:.0}), {} in flight, {} KiB queued, round trip {:?} (shortest {:?}), {} sent, {} retransmitted",
             v.cwnd,
@@ -231,13 +235,13 @@ impl Conn {
             v.queued_bytes >> 10,
             v.srtt,
             v.min_rtt,
-            self.stats.sent_packets.load(Ordering::Relaxed),
-            self.stats.retransmits.load(Ordering::Relaxed)
+            self.stats.sent_packets.get(),
+            self.stats.retransmits.get()
         )
     }
 
     pub fn rtt(&self) -> Option<Duration> {
-        self.state.lock().rtt()
+        self.state.borrow().rtt()
     }
 
     pub fn send(&self, msg: &[u8]) -> sio::Result<()> {
@@ -247,7 +251,9 @@ impl Conn {
         let Some(cipher) = self.cipher.get() else {
             return Err(sio::Error::other("link: no keys agreed yet"));
         };
-        let sealed = if msg.len() >= 256 << 10 { io::cpu(|| cipher.seal(msg)) } else { cipher.seal(msg) }?;
+        let base = cipher.reserve(msg.len());
+        let keys = cipher.keys();
+        let sealed = if msg.len() >= 256 << 10 { io::cpu(|| keys.seal_from(base, msg)) } else { keys.seal_from(base, msg) }?;
         self.send_raw(&sealed)
     }
 
@@ -256,9 +262,10 @@ impl Conn {
             if self.is_closed() {
                 return Err(sio::Error::new(sio::ErrorKind::BrokenPipe, "connection closed"));
             }
-            match self.state.lock().send(msg) {
+            let admit = self.state.borrow_mut().send(msg);
+            match admit {
                 conn::Admit::Queued => {
-                    self.stats.messages_out.fetch_add(1, Ordering::Relaxed);
+                    bump(&self.stats.messages_out, 1);
                     self.wake_sender.notify_one();
                     return Ok(());
                 }
@@ -272,14 +279,14 @@ impl Conn {
     pub fn recv(&self) -> Option<Vec<u8>> {
         loop {
             let raw = self.recv_raw()?;
-            if self.handshake_in.lock().iter().any(|m| m == &raw) {
+            if self.handshake_in.borrow().iter().any(|m| m == &raw) {
                 continue;
             }
             if !self.encrypted() {
                 return Some(raw);
             }
-            let cipher = self.cipher.get()?;
-            let opened = if raw.len() >= 256 << 10 { io::cpu(|| cipher.open(&raw)) } else { cipher.open(&raw) };
+            let keys = self.cipher.get()?.keys();
+            let opened = if raw.len() >= 256 << 10 { io::cpu(|| keys.open(&raw)) } else { keys.open(&raw) };
             return match opened {
                 Ok(m) => Some(m),
                 Err(_) => {
@@ -295,7 +302,7 @@ impl Conn {
     }
 
     fn note_handshake(&self, msg: &[u8]) {
-        self.handshake_in.lock().push(msg.to_vec());
+        self.handshake_in.borrow_mut().push(msg.to_vec());
     }
 
     fn ephemeral(&self) -> [u8; 32] {
@@ -398,12 +405,12 @@ impl Conn {
         io::now().saturating_duration_since(self.epoch)
     }
 
-    fn jitter(rng: &AtomicU64) -> u64 {
-        let mut x = rng.load(Ordering::Relaxed);
+    fn jitter(rng: &Cell<u64>) -> u64 {
+        let mut x = rng.get();
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        rng.store(x, Ordering::Relaxed);
+        rng.set(x);
         x
     }
 
@@ -423,25 +430,25 @@ impl Conn {
         if messages.is_empty() {
             return;
         }
-        let seen = self.handshake_in.lock();
+        let seen = self.handshake_in.borrow();
         for m in messages {
             if seen.iter().any(|h| h == &m) {
                 continue;
             }
-            self.stats.messages_in.fetch_add(1, Ordering::Relaxed);
+            bump(&self.stats.messages_in, 1);
             let _ = self.inbound_tx.send(m);
         }
     }
 
     fn emit(&self, packets: Vec<conn::Packet>) {
         for p in packets {
-            self.stats.sent_packets.fetch_add(1, Ordering::Relaxed);
-            self.stats.sent_bytes.fetch_add(p.bytes.len() as u64, Ordering::Relaxed);
+            bump(&self.stats.sent_packets, 1);
+            bump(&self.stats.sent_bytes, p.bytes.len() as u64);
             if p.dropped {
                 continue;
             }
             let mut pkt = p.bytes;
-            let peer = *self.peer.lock();
+            let peer = self.peer.get();
             seal(&self.key, &mut pkt);
             if p.msg != AGREEMENT {
                 self.tag_datagram(&mut pkt);
@@ -457,7 +464,7 @@ impl Conn {
         }
     }
 
-    fn sender_loop(self: Arc<Self>) {
+    fn sender_loop(self: Rc<Self>) {
         loop {
             if self.is_closed() {
                 return;
@@ -465,12 +472,12 @@ impl Conn {
             let now = self.now();
             let rng = &self.rng;
             let mut draw = || Self::jitter(rng);
-            let out = self.state.lock().on_timer(now, &mut draw);
+            let out = self.state.borrow_mut().on_timer(now, &mut draw);
             if out.stopped {
                 return;
             }
             self.signals(&out);
-            self.stats.retransmits.fetch_add(out.retransmits, Ordering::Relaxed);
+            bump(&self.stats.retransmits, out.retransmits);
             let again = out.again;
             let deadline = out.deadline;
             self.emit(out.datagrams);
@@ -490,38 +497,61 @@ impl Conn {
     fn on_ack(&self, msg: u64, frag: u32) {
         let pkt = conn::ack_packet(self.id, &[(msg, frag)]);
         let now = self.now();
-        let out = self.state.lock().on_datagram(now, &pkt);
+        let out = self.state.borrow_mut().on_datagram(now, &pkt);
         self.signals(&out);
     }
 
     fn on_data(&self, msg: u64, frag: u32, nfrags: u32, data: &[u8]) -> bool {
         let pkt = conn::data_packet(self.id, msg, frag, nfrags, data);
         let now = self.now();
-        let out = self.state.lock().on_datagram(now, &pkt);
+        let out = self.state.borrow_mut().on_datagram(now, &pkt);
         let ack = !out.acks.is_empty();
         self.deliver(out.messages);
         ack
     }
 }
 
+/// Connections that are ready for `Endpoint::accept`, oldest first.
+#[derive(Default)]
+struct Accepted {
+    queue: RefCell<VecDeque<Rc<Conn>>>,
+    ready: Notify,
+}
+
+impl Accepted {
+    fn push(&self, conn: Rc<Conn>) {
+        self.queue.borrow_mut().push_back(conn);
+        self.ready.notify_one();
+    }
+
+    fn pop(&self) -> Rc<Conn> {
+        loop {
+            let next = self.queue.borrow_mut().pop_front();
+            if let Some(conn) = next {
+                return conn;
+            }
+            self.ready.notified();
+        }
+    }
+}
+
 pub struct Endpoint {
-    sock: Arc<UdpSocket>,
-    conns: Mutex<HashMap<u64, Arc<Conn>>>,
-    state: Mutex<endpoint::EndpointState>,
+    sock: Rc<UdpSocket>,
+    conns: RefCell<BTreeMap<u64, Rc<Conn>>>,
+    state: RefCell<endpoint::EndpointState>,
     t0: Instant,
-    accept_tx: UnboundedSender<Arc<Conn>>,
-    accept_rx: FiberMutex<UnboundedReceiver<Arc<Conn>>>,
+    accepted: Rc<Accepted>,
     key: LinkKey,
     auth: Auth,
-    random: Arc<dyn Random>,
+    random: Rc<dyn Random>,
 }
 
 impl Endpoint {
-    pub fn bind(addr: SocketAddr, accepting: bool) -> sio::Result<Arc<Endpoint>> {
+    pub fn bind(addr: SocketAddr, accepting: bool) -> sio::Result<Rc<Endpoint>> {
         Endpoint::bind_keyed(addr, accepting, None)
     }
 
-    pub fn bind_keyed(addr: SocketAddr, accepting: bool, key: LinkKey) -> sio::Result<Arc<Endpoint>> {
+    pub fn bind_keyed(addr: SocketAddr, accepting: bool, key: LinkKey) -> sio::Result<Rc<Endpoint>> {
         let auth = match key {
             Some(k) => Auth::Shared(k),
             None => Auth::None,
@@ -529,27 +559,25 @@ impl Endpoint {
         Endpoint::bind_auth(addr, accepting, auth)
     }
 
-    pub fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> sio::Result<Arc<Endpoint>> {
+    pub fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> sio::Result<Rc<Endpoint>> {
         Endpoint::bind_random(addr, accepting, auth, io::os_random())
     }
 
     /// Binds an endpoint that draws every random value from `random`.
-    pub fn bind_random(addr: SocketAddr, accepting: bool, auth: Auth, random: Arc<dyn Random>) -> sio::Result<Arc<Endpoint>> {
+    pub fn bind_random(addr: SocketAddr, accepting: bool, auth: Auth, random: Rc<dyn Random>) -> sio::Result<Rc<Endpoint>> {
         let key: LinkKey = match &auth {
             Auth::Shared(k) => Some(k.clone()),
             _ => None,
         };
-        let sock = Arc::new(UdpSocket::bind(addr)?);
+        let sock = Rc::new(UdpSocket::bind(addr)?);
         sock.set_buffers(16 << 20);
-        let (tx, rx) = io::unbounded_channel();
         let per_conn = matches!(auth, Auth::Users(_) | Auth::User { .. } | Auth::UnmarkedUser { .. });
-        let ep = Arc::new(Endpoint {
+        let ep = Rc::new(Endpoint {
             sock,
-            conns: Mutex::new(HashMap::new()),
-            state: Mutex::new(endpoint::EndpointState::new(accepting, per_conn, key.clone())),
+            conns: RefCell::new(BTreeMap::new()),
+            state: RefCell::new(endpoint::EndpointState::new(accepting, per_conn, key.clone())),
             t0: io::now(),
-            accept_tx: tx,
-            accept_rx: FiberMutex::new(rx),
+            accepted: Rc::default(),
             key,
             auth,
             random,
@@ -563,12 +591,12 @@ impl Endpoint {
         self.sock.local_addr()
     }
 
-    pub fn connect(&self, peer: SocketAddr) -> sio::Result<Arc<Conn>> {
+    pub fn connect(&self, peer: SocketAddr) -> sio::Result<Rc<Conn>> {
         let id = conn_id(self.random.as_ref());
         let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn(), self.random.clone());
         let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
-        assert!(self.state.lock().connect(id, peer, now), "connection ids are unique");
-        assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
+        assert!(self.state.borrow_mut().connect(id, peer, now), "connection ids are unique");
+        assert!(self.conns.borrow_mut().insert(id, c.clone()).is_none(), "connection ids are unique");
         let agreed = match &self.auth {
             Auth::None => Ok(()),
             Auth::Shared(key) => c.agree_as_initiator(key),
@@ -583,8 +611,8 @@ impl Endpoint {
         Ok(c)
     }
 
-    pub fn accept(&self) -> Option<Arc<Conn>> {
-        self.accept_rx.lock().recv()
+    pub fn accept(&self) -> Option<Rc<Conn>> {
+        Some(self.accepted.pop())
     }
 
     fn per_conn(&self) -> bool {
@@ -592,8 +620,9 @@ impl Endpoint {
     }
 
     pub fn forget(&self, id: u64) {
-        self.state.lock().forget(id);
-        if let Some(c) = self.conns.lock().remove(&id) {
+        self.state.borrow_mut().forget(id);
+        let removed = self.conns.borrow_mut().remove(&id);
+        if let Some(c) = removed {
             c.close();
         }
     }
@@ -603,23 +632,21 @@ impl Endpoint {
             return;
         }
         let id = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
-        let tag = self.conns.lock().get(&id).and_then(|c| c.tag.get().copied());
+        let tag = self.conns.borrow().get(&id).and_then(|c| c.tag.get().copied());
         if let Some(tag) = tag {
-            self.state.lock().set_tag(id, tag);
+            self.state.borrow_mut().set_tag(id, tag);
         }
     }
 
     fn open_conn(&self, id: u64, from: SocketAddr) {
         let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn(), self.random.clone());
-        assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
+        assert!(self.conns.borrow_mut().insert(id, c.clone()).is_none(), "connection ids are unique");
         match (self.key.clone(), &self.auth) {
             (_, Auth::Users(keys)) => {
-                let (c, tx, keys) = (c.clone(), self.accept_tx.clone(), keys.clone());
+                let (c, accepted, keys) = (c.clone(), self.accepted.clone(), keys.clone());
                 io::spawn(move || {
                     match c.agree_with_user(&keys) {
-                        Ok(()) => {
-                            let _ = tx.send(c);
-                        }
+                        Ok(()) => accepted.push(c),
                         Err(_) => {
                             io::sleep(Duration::from_secs(2));
                             c.close();
@@ -628,15 +655,13 @@ impl Endpoint {
                 });
             }
             (None, _) => {
-                let _ = self.accept_tx.send(c.clone());
+                self.accepted.push(c.clone());
             }
             (Some(key), _) => {
-                let (c, tx) = (c.clone(), self.accept_tx.clone());
+                let (c, accepted) = (c.clone(), self.accepted.clone());
                 io::spawn(move || {
                     match c.agree_as_responder(&key) {
-                        Ok(()) => {
-                            let _ = tx.send(c);
-                        }
+                        Ok(()) => accepted.push(c),
                         Err(_) => c.close(),
                     }
                 });
@@ -644,54 +669,57 @@ impl Endpoint {
         }
     }
 
+    fn conn(&self, id: u64) -> Option<Rc<Conn>> {
+        self.conns.borrow().get(&id).cloned()
+    }
+
     fn ingest(&self, from: SocketAddr, bytes: &[u8]) {
         self.sync_tag(bytes);
         let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
-        let routed = self.state.lock().recv(from, bytes, now);
+        let routed = self.state.borrow_mut().recv(from, bytes, now);
         for ev in routed.events {
             match ev {
                 endpoint::RouteEvent::Open { id, from } => self.open_conn(id, from),
                 endpoint::RouteEvent::Peer { id, from } => {
-                    if let Some(c) = self.conns.lock().get(&id) {
-                        *c.last_heard.lock() = io::now();
-                        *c.peer.lock() = from;
+                    if let Some(c) = self.conn(id) {
+                        c.last_heard.set(io::now());
+                        c.peer.set(from);
                     }
                 }
                 endpoint::RouteEvent::Data { id, msg, frag, nfrags, payload } => {
-                    let conn = self.conns.lock().get(&id).cloned();
-                    if let Some(c) = conn {
+                    if let Some(c) = self.conn(id) {
                         if c.on_data(msg, frag, nfrags, &payload) {
-                            self.state.lock().ack(id, msg, frag, from);
+                            self.state.borrow_mut().ack(id, msg, frag, from);
                         }
                     }
                 }
                 endpoint::RouteEvent::Ack { id, msg, frag } => {
-                    if let Some(c) = self.conns.lock().get(&id) {
+                    if let Some(c) = self.conn(id) {
                         c.on_ack(msg, frag);
                     }
                 }
             }
         }
         if let Some(id) = routed.id {
-            if let Some(c) = self.conns.lock().get(&id) {
-                c.stats.recv_packets.fetch_add(1, Ordering::Relaxed);
-                c.stats.recv_bytes.fetch_add(routed.len as u64, Ordering::Relaxed);
+            if let Some(c) = self.conn(id) {
+                bump(&c.stats.recv_packets, 1);
+                bump(&c.stats.recv_bytes, routed.len as u64);
             }
         }
     }
 
-    fn recv_loop(self: Arc<Self>) {
+    fn recv_loop(self: Rc<Self>) {
         let mut buf = vec![0u8; 65536];
         loop {
             let Ok((n, from)) = self.sock.recv_from(&mut buf) else { return };
             self.ingest(from, &buf[..n]);
             while let Ok((n, from)) = self.sock.try_recv_from(&mut buf) {
                 self.ingest(from, &buf[..n]);
-                if self.state.lock().ack_full() {
+                if self.state.borrow().ack_full() {
                     break;
                 }
             }
-            let outbound = self.state.lock().take_datagrams();
+            let outbound = self.state.borrow_mut().take_datagrams();
             for (to, pkt) in outbound {
                 let _ = self.sock.send_to(&pkt, to);
             }

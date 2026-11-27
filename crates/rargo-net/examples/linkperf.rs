@@ -8,7 +8,7 @@ fn main() {
         let psk = [9u8; 32];
         match args[1].as_str() {
             "serve" => {
-                let users: rargo_net::UserKeys = std::sync::Arc::new(move |_| Some(psk));
+                let users: rargo_net::UserKeys = std::rc::Rc::new(move |_| Some(psk));
                 let ep = Endpoint::bind_auth(args[2].parse().unwrap(), true, Auth::Users(users)).unwrap();
                 while let Some(c) = ep.accept() {
                     let c2 = c.clone();

@@ -40,8 +40,8 @@ fn main() {
                     String::from_utf8_lossy(&got).parse::<usize>().unwrap() >> 20,
                     dt,
                     mib as f64 / dt,
-                    c.stats.sent_packets.load(std::sync::atomic::Ordering::Relaxed),
-                    c.stats.retransmits.load(std::sync::atomic::Ordering::Relaxed),
+                    c.stats.sent_packets.get(),
+                    c.stats.retransmits.get(),
                     c.rtt()
                 );
             }

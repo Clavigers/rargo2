@@ -248,7 +248,7 @@ fn main() -> Result<()> {
         };
         let users: rargo_core::net::UserKeys = {
             let keys = keys.clone();
-            Arc::new(move |user| keys.psk(user))
+            std::rc::Rc::new(move |user| keys.psk(user))
         };
         let local = match listener.local_addr() {
             Ok(addr) => addr,
