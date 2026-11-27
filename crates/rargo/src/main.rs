@@ -496,6 +496,7 @@ fn main() {
     let (cfg, args, vars, kind) = match cli::plan(&world, argv0.as_deref(), &raw) {
         cli::Plan::Cargo { release, banner } => {
             if let Some(banner) = banner {
+                let banner = if cli::colour(&world.vars, std::io::stdout().is_terminal()) { cli::paint(&banner) } else { banner };
                 println!("{banner}");
             }
             if release {
