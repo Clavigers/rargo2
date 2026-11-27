@@ -70,6 +70,9 @@ class GitHub:
     def check_runs(self, sha: str) -> list[dict]:
         return self._api(f"commits/{sha}/check-runs?per_page=100")["check_runs"]
 
+    def job(self, check_run_id: int) -> dict:
+        return self._api(f"actions/jobs/{check_run_id}")
+
     def rerun_failed(self, sha: str) -> int:
         """Run again the failed jobs of the workflow runs on this commit."""
         runs = self._api(f"actions/runs?head_sha={sha}&per_page=100")["workflow_runs"]

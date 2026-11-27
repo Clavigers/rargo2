@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from typing import Callable
 
 from . import machines as M
@@ -53,6 +54,8 @@ NEEDS_TYPE = "<!-- factory: needs-type -->"
 CLOSES = re.compile(r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)|\(#(\d+)\)\s*$", re.M)
 PARK = "guard"  # the label by which the owner puts an issue on hold
 LOCK = "wip-"  # labels by which others outside the factory lock an issue
+SIGN_IN_STEP = "rargo, signed in to rargo.rs"
+OUTAGE_RERUN_INTERVAL = 10 * 60
 FAILED = {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
 PASSED = {"success", "neutral", "skipped"}
 
@@ -128,6 +131,7 @@ class Observer:
         self.trusted = trusted | {owner}
         self.ci_apps, self.merging, self.say = ci_apps, merge, say
         self.reviewers = {**REVIEWERS, **(reviewers or {})}
+        self.outage_reruns: dict[str, float] = {}
         self.since: datetime | None = None
         self.asked: set[int] = set()  # issues we asked for a type label
         self.noted: set[tuple] = set()  # things said once
@@ -173,7 +177,9 @@ class Observer:
         if w.is_(M.CI, key, CiS.pending):
             runs = self._ci_runs(p.sha)
             result = self._ci(runs)
-            if result:
+            if result == "fail" and self._sign_in_only(runs):
+                self._rerun_outage(pr, p.sha)
+            elif result:
                 self._record(Role.ci, "ci_done", pr=pr, push=p.pushes, result=result)
             elif (not runs and g.get("mergeable_state") == "dirty"
                   and w.is_(M.ISSUE, p.issue, IssueS.checking)):
@@ -204,6 +210,28 @@ class Observer:
         w = self.ledger.world
         if self.merging and green(w, pr) and w.is_(M.ISSUE, p.issue, IssueS.checking):
             self._merge(pr, p.pushes, p.sha)
+
+    def _sign_in_only(self, runs: list[dict]) -> bool:
+        for run in runs:
+            if run["conclusion"] not in FAILED:
+                continue
+            if run["conclusion"] != "failure" or run["app"]["slug"] != "github-actions":
+                return False
+            job = self.gh.job(run["id"])
+            failed_steps = [step["name"] for step in job.get("steps") or []
+                            if step["conclusion"] in FAILED]
+            if job["conclusion"] != "failure" or failed_steps != [SIGN_IN_STEP]:
+                return False
+        return True
+
+    def _rerun_outage(self, pr: int, sha: str) -> None:
+        now = monotonic()
+        last = self.outage_reruns.get(sha)
+        if last is not None and now - last < OUTAGE_RERUN_INTERVAL:
+            return
+        self.outage_reruns[sha] = now
+        self.say(f"pr {pr}: only rargo sign-in failed at {sha[:8]}; keeping CI pending and retrying")
+        self.gh.rerun_failed(sha)
 
     def _ci_runs(self, sha: str) -> list[dict]:
         return [r for r in self.gh.check_runs(sha) if r["app"]["slug"] in self.ci_apps]
