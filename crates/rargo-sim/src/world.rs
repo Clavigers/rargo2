@@ -206,6 +206,7 @@ enum Up {
 #[derive(Debug)]
 enum Down {
     Session(ServerMsg),
+    RoundTerminal { round: u64, msg: ServerMsg },
     Synced { round: u64, root: Digest },
     Pong,
 }
@@ -968,9 +969,9 @@ impl World {
         sess.ended = Some(round);
         self.cancel_jobs(client, Some(round));
         if let Some(bytes) = diagnostic {
-            self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::Stderr(bytes))));
+            self.send(Node::Server, Node::Client(client), Msg::Down(Down::RoundTerminal { round, msg: ServerMsg::Stderr(bytes) }));
         }
-        self.send(Node::Server, Node::Client(client), Msg::Down(Down::Session(ServerMsg::Exit(code))));
+        self.send(Node::Server, Node::Client(client), Msg::Down(Down::RoundTerminal { round, msg: ServerMsg::Exit(code) }));
     }
 
     fn rewant(&mut self, client: u64) {
@@ -1314,6 +1315,12 @@ impl World {
                 self.request_ready(client);
                 return Ok(());
             }
+            Down::RoundTerminal { round, msg } => {
+                if round != self.clients[&client].round {
+                    return Ok(());
+                }
+                msg
+            }
             Down::Session(m) => m,
             Down::Pong => return Ok(()),
         };
@@ -1458,7 +1465,7 @@ fn label(ev: &Ev) -> String {
                 Msg::Up(Up::Cancel { .. }) => "cancel",
                 Msg::Work(_) => "work",
                 Msg::Down(Down::Synced { .. }) => "synced",
-                Msg::Down(Down::Session(_)) => "deliver",
+                Msg::Down(Down::Session(_) | Down::RoundTerminal { .. }) => "deliver",
                 Msg::Down(Down::Pong) => "pong",
             };
             format!("{from:?}>{to:?}@{epoch}:{what};")
@@ -1477,4 +1484,26 @@ fn label(ev: &Ev) -> String {
 
 pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
     World::new(seed, bug).run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_cancellation_cannot_end_the_next_round() {
+        let mut world = World::new(0, None);
+        world.clients.get_mut(&1).unwrap().round = 2;
+        world
+            .client_hears(1, Down::RoundTerminal { round: 1, msg: ServerMsg::Exit(model::CANCELLED) })
+            .unwrap();
+        assert!(!world.clients[&1].round_ended);
+        assert_eq!(world.report.cancelled_builds, 0);
+
+        world
+            .client_hears(1, Down::RoundTerminal { round: 2, msg: ServerMsg::Exit(model::CANCELLED) })
+            .unwrap();
+        assert!(world.clients[&1].round_ended);
+        assert_eq!(world.report.cancelled_builds, 1);
+    }
 }
