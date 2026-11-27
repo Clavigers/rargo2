@@ -17,11 +17,11 @@ impl HeldFile {
         (Self(path), held)
     }
 
-    pub fn save(&self, body: &[u8]) -> io::Result<()> {
+    pub fn save(&self, body: &[u8], names: &mut crate::tmp::Names) -> io::Result<()> {
         if let Some(dir) = self.0.parent() {
             rargo_net::io::file::create_dir_all(dir)?;
         }
-        crate::write_atomic(&self.0, body)
+        crate::write_atomic(&self.0, body, names)
     }
 }
 
@@ -55,8 +55,8 @@ pub fn load_chunks(cache: &Path) -> Chunks {
         .unwrap_or_default()
 }
 
-pub fn save_chunks(cache: &Path, chunks: &Chunks) -> io::Result<()> {
-    crate::write_atomic(&chunks_path(cache), &encode_chunks(chunks))
+pub fn save_chunks(cache: &Path, chunks: &Chunks, names: &mut crate::tmp::Names) -> io::Result<()> {
+    crate::write_atomic(&chunks_path(cache), &encode_chunks(chunks), names)
 }
 
 fn encode_chunks(chunks: &Chunks) -> Vec<u8> {
@@ -90,7 +90,7 @@ mod tests {
         let (file, mut held) = HeldFile::load(&tmp, "build.example:7459", "ann");
         assert_eq!(all(&held).len(), 3);
         held.add([a, b].iter());
-        file.save(&held.encode()).unwrap();
+        file.save(&held.encode(), &mut crate::tmp::Names::all()).unwrap();
         let (_, again) = HeldFile::load(&tmp, "build.example:7459", "ann");
         assert_eq!(all(&again), vec![(c, 3)]);
         assert_eq!(again.len(), 2);
@@ -103,7 +103,7 @@ mod tests {
         let mut chunks = Chunks::new();
         chunks.insert(a, (b, 4096, 512));
         chunks.insert(c, (b, 0, 4096));
-        save_chunks(&tmp, &chunks).unwrap();
+        save_chunks(&tmp, &chunks, &mut crate::tmp::Names::all()).unwrap();
         assert_eq!(load_chunks(&tmp), chunks);
         let reversed: Chunks = [(c, (b, 0, 4096)), (a, (b, 4096, 512))].into_iter().collect();
         assert_eq!(encode_chunks(&reversed), encode_chunks(&chunks), "the same chunks encode to the same bytes");

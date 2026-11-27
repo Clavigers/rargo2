@@ -39,11 +39,12 @@ use std::io::{IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Writes `bytes` to `path` through a temporary beside it that `names` numbers.
+pub fn write_atomic(path: &Path, bytes: &[u8], names: &mut tmp::Names) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         io::file::create_dir_all(parent)?;
     }
-    let write = atomic_write::Plan::new(path, io::process::id(), tmp::seq());
+    let write = atomic_write::Plan::new(path, io::process::id(), names.next());
     let _watched = tmp::watch(write.temporary());
     for effect in write.effects(bytes) {
         match effect {
@@ -78,11 +79,12 @@ impl std::fmt::Debug for Config {
 struct Real {
     vars: Vec<(String, String)>,
     handlers: std::cell::Cell<bool>,
+    names: std::cell::RefCell<tmp::Names>,
 }
 
 impl Real {
     fn read() -> Self {
-        Real { vars: io::env::vars(), handlers: std::cell::Cell::new(false) }
+        Real { vars: io::env::vars(), handlers: std::cell::Cell::new(false), names: std::cell::RefCell::new(tmp::Names::all()) }
     }
 
     fn handle_signals(&self) {
@@ -107,7 +109,7 @@ impl cli::World for Real {
 
     fn resolve(&self, host: &str) -> Result<String, String> {
         self.handle_signals();
-        project::resolve(host)
+        project::resolve(host, &mut self.names.borrow_mut())
     }
 
     fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String> {
@@ -236,7 +238,7 @@ fn parse_hex20(s: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-pub fn recent_commits(root: &Path, head: &rargo::daemon_state::Head, wt_cache: &Path) -> Vec<[u8; 20]> {
+pub fn recent_commits(root: &Path, head: &rargo::daemon_state::Head, wt_cache: &Path, names: &mut tmp::Names) -> Vec<[u8; 20]> {
     let head = &head.commit;
     let memo = wt_cache.join("commits");
     let parse = |text: &str| -> Vec<[u8; 20]> { text.lines().filter_map(parse_hex20).collect() };
@@ -246,7 +248,7 @@ pub fn recent_commits(root: &Path, head: &rargo::daemon_state::Head, wt_cache: &
         }
     }
     let listed = git::first_parent_list(root, head, 64).unwrap_or_else(|| format!("{head}\n"));
-    let _ = write_atomic(&memo, listed.as_bytes());
+    let _ = write_atomic(&memo, listed.as_bytes(), names);
     parse(&listed)
 }
 

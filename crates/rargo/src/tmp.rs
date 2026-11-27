@@ -1,6 +1,5 @@
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Temp {
     slot: Option<usize>,
@@ -77,9 +76,35 @@ pub fn sweep(dir: &Path, prefix: &str) -> usize {
 
 pub const BESIDE: &str = ".rargo-tmp-";
 
-pub fn seq() -> u64 {
-    static SEQ: AtomicU64 = AtomicU64::new(1);
-    SEQ.fetch_add(1, Ordering::Relaxed)
+/// Numbers that tell the temporary files of this process apart. No two `Names` cut from one give the same number, so each can go to a thread of its own.
+#[derive(Debug)]
+pub struct Names {
+    next: u64,
+    end: u64,
+}
+
+const PART: u64 = 1 << 32;
+
+impl Names {
+    /// Every number. A process uses one of these at a time, and cuts from it what its threads use.
+    pub fn all() -> Names {
+        Names { next: 1, end: u64::MAX }
+    }
+
+    /// A number this gives once.
+    pub fn next(&mut self) -> u64 {
+        assert!(self.next < self.end, "the numbers for temporary files are used up");
+        let n = self.next;
+        self.next += 1;
+        n
+    }
+
+    /// Cuts off numbers that this then no longer gives.
+    pub fn part(&mut self) -> Names {
+        assert!(self.end - self.next > PART, "the numbers for temporary files are used up");
+        self.end -= PART;
+        Names { next: self.end, end: self.end + PART }
+    }
 }
 
 #[cfg(test)]
@@ -112,6 +137,20 @@ mod tests {
                 ]
             );
         });
+    }
+
+    #[test]
+    fn names_cut_from_one_never_give_the_same_number() {
+        let mut all = Names::all();
+        let (mut a, mut b) = (all.part(), all.part());
+        let mut seen = std::collections::BTreeSet::new();
+        for names in [&mut all, &mut a, &mut b] {
+            for _ in 0..100 {
+                assert!(seen.insert(names.next()));
+            }
+        }
+        assert!(a.end <= b.next || b.end <= a.next);
+        assert!(all.end <= a.next.min(b.next));
     }
 
     #[test]

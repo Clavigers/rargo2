@@ -12,50 +12,6 @@ use fusewire::abi::{
 };
 use fusewire::{Filesystem, Session, BUF_SIZE};
 
-/// Where the handlers of one mounted filesystem run.
-trait Serve: Clone + 'static {
-    fn request(&self, session: &Session, buffer: &mut RingBuffer) -> io::Result<Option<u64>>;
-    fn control(&self, session: &Session, request: &[u8]) -> Vec<Vec<u8>>;
-}
-
-/// Handlers run in the fiber that took the request, on the loop thread.
-struct OnLoop<F>(Rc<F>);
-
-impl<F> Clone for OnLoop<F> {
-    fn clone(&self) -> Self {
-        OnLoop(Rc::clone(&self.0))
-    }
-}
-
-impl<F: Filesystem + 'static> Serve for OnLoop<F> {
-    fn request(&self, session: &Session, buffer: &mut RingBuffer) -> io::Result<Option<u64>> {
-        buffer.reply(session, self.0.as_ref())
-    }
-
-    fn control(&self, session: &Session, request: &[u8]) -> Vec<Vec<u8>> {
-        replies(session, self.0.as_ref(), request)
-    }
-}
-
-/// Handlers run on a blocking pool thread while the fiber waits.
-struct OnPool<F>(Arc<F>);
-
-impl<F> Clone for OnPool<F> {
-    fn clone(&self) -> Self {
-        OnPool(Arc::clone(&self.0))
-    }
-}
-
-impl<F: Filesystem + Send + Sync + 'static> Serve for OnPool<F> {
-    fn request(&self, session: &Session, buffer: &mut RingBuffer) -> io::Result<Option<u64>> {
-        super::blocking(|| buffer.reply(session, self.0.as_ref()))
-    }
-
-    fn control(&self, session: &Session, request: &[u8]) -> Vec<Vec<u8>> {
-        super::blocking(|| replies(session, self.0.as_ref(), request))
-    }
-}
-
 pub struct FuseDrive {
     readers: Vec<super::JoinHandle<()>>,
     stop: bool,
@@ -68,28 +24,16 @@ impl FuseDrive {
     where
         F: Filesystem + 'static,
     {
-        Self::start(session, OnLoop(Rc::clone(fs)))
-    }
-
-    /// Serves `session` from `fs` with every handler run on a blocking pool thread.
-    pub fn spawn_threaded<F>(session: &Arc<Session>, fs: &Arc<F>) -> io::Result<Self>
-    where
-        F: Filesystem + Send + Sync + 'static,
-    {
-        Self::start(session, OnPool(Arc::clone(fs)))
-    }
-
-    fn start<S: Serve>(session: &Arc<Session>, serve: S) -> io::Result<Self> {
         let queues = possible_queues()?;
         let mut readers = Vec::with_capacity(usize::from(queues) + 1);
         for queue in 0..queues {
-            let (session, serve) = (Arc::clone(session), serve.clone());
-            readers.push(super::spawn(move || serve_queue(session, serve, queue)));
+            let (session, fs) = (Arc::clone(session), Rc::clone(fs));
+            readers.push(super::spawn(move || serve_queue(session, fs, queue)));
         }
 
         // Linux still delivers FORGET, INTERRUPT and other control traffic here.
         let fd = session.device_fd();
-        let session = Arc::clone(session);
+        let (session, fs) = (Arc::clone(session), Rc::clone(fs));
         let reader = super::spawn(move || loop {
             match super::read_at(fd, 0, BUF_SIZE) {
                 Ok(request) if request.is_empty() => break session.ended(),
@@ -110,8 +54,8 @@ impl FuseDrive {
                         eprintln!("error: FUSE-over-io_uring received an unexpected opcode on /dev/fuse: {opcode:?}");
                         std::process::exit(101);
                     }
-                    let (session, serve) = (Arc::clone(&session), serve.clone());
-                    drop(super::spawn(move || answer(fd, &session, &serve, &request)));
+                    let (session, fs) = (Arc::clone(&session), Rc::clone(&fs));
+                    drop(super::spawn(move || answer(fd, &session, fs.as_ref(), &request)));
                 }
                 Err(e)
                     if matches!(
@@ -253,7 +197,7 @@ impl RingBuffer {
     }
 }
 
-fn serve_queue<S: Serve>(session: Arc<Session>, serve: S, queue: u16) {
+fn serve_queue<F: Filesystem>(session: Arc<Session>, fs: Rc<F>, queue: u16) {
     let fd = session.device_fd();
     let mut commit = None;
     let mut buffer = Box::new(RingBuffer::new());
@@ -279,7 +223,7 @@ fn serve_queue<S: Serve>(session: Arc<Session>, serve: S, queue: u16) {
                 std::process::exit(101);
             }
         };
-        let next = serve.request(&session, &mut buffer);
+        let next = buffer.reply(&session, fs.as_ref());
         match next {
             Ok(Some(id)) => commit = Some(id),
             Ok(None) => break,
@@ -292,8 +236,8 @@ fn serve_queue<S: Serve>(session: Arc<Session>, serve: S, queue: u16) {
     session.ended();
 }
 
-fn answer<S: Serve>(fd: i32, session: &Session, serve: &S, request: &[u8]) {
-    for reply in serve.control(session, request) {
+fn answer<F: Filesystem>(fd: i32, session: &Session, fs: &F, request: &[u8]) {
+    for reply in replies(session, fs, request) {
         if write_fuse(fd, &reply).is_err() {
             return session.ended();
         }
