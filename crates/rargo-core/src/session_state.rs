@@ -515,7 +515,9 @@ impl SessionState {
             assert!(self.wanted.is_empty(), "a want that is gone holds no claim");
             return Progress::Gone;
         }
-        assert!(!self.wanted.is_empty() && !self.wanted.iter().any(stored), "a waiting want waits for blobs not stored");
+        // Only what this call established: `stored` reads a store other
+        // sessions write, so asking it again could see a blob stored since.
+        assert!(!self.wanted.is_empty(), "a waiting want waits for some blob");
         Progress::Wait
     }
 
@@ -705,6 +707,20 @@ mod tests {
 
     fn delivery(bytes: &[u8]) -> Delivery {
         Delivery { path: "f".into(), hash: digest(bytes), size: bytes.len() as u64, exec: false, own: false }
+    }
+
+    #[test]
+    fn a_blob_another_session_stores_while_progress_runs_leaves_it_waiting() {
+        let blob = digest(&content(3));
+        let mut s = SessionState::with_sizes(SMALL);
+        s.want(&[blob], &|_| false);
+        let asked = std::cell::Cell::new(0);
+        let stored_since_first_ask = |_: &Digest| {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        assert_eq!(s.progress(&stored_since_first_ask), Progress::Wait);
+        assert_eq!(s.progress(&|_| true), Progress::Done);
     }
 
     #[test]
