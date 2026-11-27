@@ -1,7 +1,7 @@
 use rargo_machine::StateMachine;
 use anyhow::{Context, Result, bail};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
 use std::io;
@@ -9,8 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use crate::io::sandbox as sys;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NetMode {
@@ -90,10 +90,10 @@ enum FromZygote {
 pub struct Zygote {
     sock: OwnedFd,
     sending: crate::io::Mutex<()>,
-    pending: Arc<Mutex<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
-    next: AtomicU64,
+    pending: Rc<RefCell<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>>,
+    next: Cell<u64>,
     pid: i32,
-    reading: std::sync::Once,
+    reading: OnceCell<crate::io::JoinHandle<()>>,
 }
 
 pub struct Running {
@@ -153,29 +153,30 @@ impl Zygote {
         drop(theirs);
         let pid = child.id() as i32;
         drop(child);
-        let pending: Arc<Mutex<BTreeMap<u64, crate::io::oneshot::Sender<ExitInfo>>>> = Default::default();
         Ok(Arc::new(Zygote {
             sock,
             sending: crate::io::Mutex::new(()),
-            pending,
-            next: AtomicU64::new(1),
+            pending: Default::default(),
+            next: Cell::new(1),
             pid,
-            reading: std::sync::Once::new(),
+            reading: OnceCell::new(),
         }))
     }
 
-    fn read_exits(&self) {
+    /// Starts the fiber that tells each waiting spawn how its process ended.
+    fn read_exits(&self) -> crate::io::JoinHandle<()> {
         let fd = self.sock.as_raw_fd();
         let waiting = self.pending.clone();
-        crate::io::background(move || {
+        crate::io::spawn(move || {
             while let Ok(Some((payload, _))) = recv_frame(fd) {
                 let Ok(FromZygote::Exited { id, info }) = bincode::deserialize(&payload) else { continue };
-                if let Some(tx) = waiting.lock().remove(&id) {
+                let waiter = waiting.borrow_mut().remove(&id);
+                if let Some(tx) = waiter {
                     let _ = tx.send(info);
                 }
             }
-            waiting.lock().clear();
-        });
+            waiting.borrow_mut().clear();
+        })
     }
 
     fn send(&self, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
@@ -191,10 +192,11 @@ impl Zygote {
         stderr: impl AsRawFd,
         extra: &[RawFd],
     ) -> Result<Running> {
-        self.reading.call_once(|| self.read_exits());
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.reading.get_or_init(|| self.read_exits());
+        let id = self.next.get();
+        self.next.set(id + 1);
         let (tx, rx) = crate::io::oneshot::channel();
-        assert!(self.pending.lock().insert(id, tx).is_none(), "spawn ids are unique");
+        assert!(self.pending.borrow_mut().insert(id, tx).is_none(), "spawn ids are unique");
         let msg = bincode::serialize(&ToZygote::Spawn {
             id,
             plan,
@@ -208,7 +210,7 @@ impl Zygote {
         fds.extend_from_slice(extra);
         assert_eq!(fds.len(), 2 + stdin.is_some() as usize + extra.len());
         if let Err(e) = self.send(&msg, &fds) {
-            self.pending.lock().remove(&id);
+            self.pending.borrow_mut().remove(&id);
             bail!("zygote is not reachable: {e}");
         }
         Ok(Running { id, done: Some(rx) })
@@ -243,6 +245,11 @@ impl Launcher for Zygote {
 
 impl Drop for Zygote {
     fn drop(&mut self) {
+        if let Some(reading) = self.reading.get() {
+            if crate::io::loop_running() {
+                reading.abort();
+            }
+        }
         let _ = sys::shutdown(self.sock.as_raw_fd());
         if crate::io::on_fiber() {
             let _ = crate::io::wait_exit(self.pid);

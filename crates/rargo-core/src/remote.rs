@@ -2526,9 +2526,11 @@ impl RemoteRunner for Pool {
             enum Wake {
                 Remote(RunResult),
                 Local(RunResult),
-                Permit(crate::sched::Permit),
+                Permit,
                 Voice,
             }
+            // The slot a hedge was granted waits here until its wake is read.
+            let granted: Cell<Option<crate::sched::Permit>> = Cell::new(None);
             let mut local: Option<(usize, crate::sched::Permit)> = None;
             let (tx, mut rx) = crate::io::unbounded_channel::<Wake>();
             let mut scope = Scope::default();
@@ -2566,9 +2568,10 @@ impl RemoteRunner for Pool {
                 let wants_permit = local.is_none() && remote.is_some() && may_hedge;
                 match (wants_permit, acquiring) {
                     (true, None) => {
-                        let tx = tx.clone();
+                        let (tx, granted) = (tx.clone(), &granted);
                         acquiring = Some(scope.spawn(move || {
-                            let _ = tx.send(Wake::Permit(engine.sched.acquire(crate::sched::Priority::Idle, mem)));
+                            granted.set(Some(engine.sched.acquire(crate::sched::Priority::Idle, mem)));
+                            let _ = tx.send(Wake::Permit);
                         }));
                     }
                     (false, Some(waiting)) => {
@@ -2607,8 +2610,9 @@ impl RemoteRunner for Pool {
                         self.stats.hedge_won.set(self.stats.hedge_won.get() + 1);
                         return Some(r);
                     }
-                    Wake::Permit(permit) => {
+                    Wake::Permit => {
                         acquiring = None;
+                        let Some(permit) = granted.take() else { continue };
                         if local.is_some() || remote.is_none() {
                             continue;
                         }
