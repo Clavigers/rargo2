@@ -84,7 +84,7 @@ type Shell = fn(&mut Proc, &str) -> i32;
 
 /// A process in an action's sandbox: its command, and the kernel's side of its file access.
 struct Proc {
-    fs: Arc<SandboxFs>,
+    fs: Rc<SandboxFs>,
     handler: fusewire::RequestHandler,
     unique: u64,
     root: u64,
@@ -339,7 +339,7 @@ enum Note {
 
 /// Stands where the zygote does: every launch is a fiber that acts as the planned process.
 struct Machine {
-    fs: Arc<SandboxFs>,
+    fs: Rc<SandboxFs>,
     shell: Shell,
     notes: io::UnboundedSender<Note>,
 }
@@ -398,7 +398,7 @@ fn fixture_with(shell: Shell, action_timeout: Duration) -> Fx {
     let db = Arc::new(Db::open_in_memory().unwrap());
     let store = Arc::new(Store::open(&tmp.join("store"), db).unwrap());
     let content = Arc::new(Content::new(store.clone()));
-    let fs = Arc::new(SandboxFs::new(content.clone()));
+    let fs = Rc::new(SandboxFs::new(content.clone()));
 
     let (notes, mut inbox) = io::unbounded_channel();
     let killed = Rc::new(RefCell::new(Vec::new()));

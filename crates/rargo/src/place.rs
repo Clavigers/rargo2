@@ -23,8 +23,8 @@ impl Placed {
     pub fn load(path: &Path) -> Placed {
         rargo_net::io::file::read(path).ok().and_then(|b| bincode::deserialize(&b).ok()).unwrap_or_default()
     }
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        crate::write_atomic(path, &bincode::serialize(self).map_err(io::Error::other)?)
+    pub fn save(&self, path: &Path, names: &mut crate::tmp::Names) -> io::Result<()> {
+        crate::write_atomic(path, &bincode::serialize(self).map_err(io::Error::other)?, names)
     }
 }
 
@@ -622,9 +622,9 @@ fn reflink(_src: &Path, _dst: &Path) -> bool {
     false
 }
 
-fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
+fn place_beside(to: &Path, way: &Way, names: &mut crate::tmp::Names) -> io::Result<()> {
     let name = to.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = to.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, rargo_net::io::process::id(), crate::tmp::seq()));
+    let tmp = to.with_file_name(format!("{}{}-{}-{name}", crate::tmp::BESIDE, rargo_net::io::process::id(), names.next()));
     assert_eq!(tmp.parent(), to.parent());
     assert_ne!(tmp, to);
     let _watched = crate::tmp::watch(&tmp);
@@ -652,7 +652,7 @@ fn place_beside(to: &Path, way: &Way) -> io::Result<()> {
     done
 }
 
-fn install(to: &Path, ways: &[Way]) -> io::Result<()> {
+fn install(to: &Path, ways: &[Way], names: &mut crate::tmp::Names) -> io::Result<()> {
     let mut last = io::Error::other("no way to place the file");
     for way in ways {
         let done = match way.how {
@@ -660,7 +660,7 @@ fn install(to: &Path, ways: &[Way]) -> io::Result<()> {
                 .mode
                 .map_or(Ok(()), |m| rargo_net::io::file::set_mode(&way.from, m))
                 .and_then(|()| rargo_net::io::file::rename(&way.from, to)),
-            _ => place_beside(to, way),
+            _ => place_beside(to, way, names),
         };
         match done {
             Ok(()) => return Ok(()),
@@ -695,6 +695,7 @@ pub struct Placer {
     parts: BTreeMap<Digest, Part>,
     pub fetched_bytes: u64,
     pub reused_files: u64,
+    pub names: crate::tmp::Names,
 }
 
 impl Drop for Placer {
@@ -706,7 +707,8 @@ impl Drop for Placer {
 }
 
 impl Placer {
-    pub fn new(cache_dir: &Path, placed: Placed) -> Placer {
+    /// `names` numbers the temporary files this makes.
+    pub fn new(cache_dir: &Path, placed: Placed, names: crate::tmp::Names) -> Placer {
         crate::tmp::sweep(&cache_dir.join("blobs"), ".incoming-");
         Placer {
             cache: cache_dir.join("blobs"),
@@ -716,6 +718,7 @@ impl Placer {
             parts: BTreeMap::new(),
             fetched_bytes: 0,
             reused_files: 0,
+            names,
         }
     }
 
@@ -744,9 +747,9 @@ impl Placer {
                     let _ = rargo_net::io::file::remove_file(&path);
                     rargo_net::io::file::symlink(std::ffi::OsStr::from_bytes(&target), path)?;
                 }
-                Op::Text(path, text) => crate::write_atomic(&path, text.as_bytes())?,
+                Op::Text(path, text) => crate::write_atomic(&path, text.as_bytes(), &mut self.names)?,
                 Op::Install { to, ways, required } => {
-                    let done = install(&to, &ways);
+                    let done = install(&to, &ways, &mut self.names);
                     if required {
                         done?;
                     }
@@ -772,7 +775,7 @@ impl Placer {
 
     fn scratch(&mut self) -> io::Result<PathBuf> {
         rargo_net::io::file::create_dir_all(&self.cache)?;
-        Ok(self.cache.join(format!(".incoming-{}-{}", rargo_net::io::process::id(), crate::tmp::seq())))
+        Ok(self.cache.join(format!(".incoming-{}-{}", rargo_net::io::process::id(), self.names.next())))
     }
 
     pub fn blob(&mut self, hash: Digest, bytes: &[u8]) -> io::Result<()> {
@@ -1495,7 +1498,7 @@ mod tests {
             let dest = tmp.join("t/big");
             let content: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
             let h = *blake3::hash(&content).as_bytes();
-            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default(), crate::tmp::Names::all());
             let d = delivery(dest.to_str().unwrap(), &content, false, true);
             assert_eq!(p.deliver(&tmp, &[], vec![d], vec![]).unwrap(), vec![h]);
             let (x, y) = content.split_at(700_000);
@@ -1511,7 +1514,7 @@ mod tests {
         placement_test(|| {
             let tmp = rargo_net::io::sim::tempdir();
             let s = |n: &str| tmp.join(n).to_string_lossy().into_owned();
-            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default(), crate::tmp::Names::all());
             let src = b"fn generated() {}";
             let h = *blake3::hash(src).as_bytes();
             let need = p
@@ -1553,7 +1556,7 @@ mod tests {
             let app = outside.join("debug/p");
             let tag = Write::Text { path: outside.join("CACHEDIR.TAG").to_string_lossy().into_owned(), text: Some("Signature: 8a477f597d28d172789f06886806bc55\n".into()) };
             let files = vec![delivery(app.to_str().unwrap(), content, true, false)];
-            let mut p = Placer::new(&tmp.join("cache"), Placed::default());
+            let mut p = Placer::new(&tmp.join("cache"), Placed::default(), crate::tmp::Names::all());
             let refused = p.deliver(&root, &named[1..], files.clone(), vec![tag.clone()]).unwrap_err().to_string();
             assert_eq!(
                 refused,

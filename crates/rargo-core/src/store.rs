@@ -6,11 +6,11 @@ use crate::store_index::{ColdRecord, HotMeta, StoreIndex, Touch};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use crate::io::file::{File, OpenOptions};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -37,17 +37,80 @@ pub enum Placed {
     Copy,
 }
 
+/// The content store. The loop thread owns it: what it holds is decided there, and
+/// work for the pool is done by `StoreFiles` on names and records the loop hands out.
 pub struct Store {
+    files: StoreFiles,
+    db: Arc<Db>,
+    tmp_seq: Cell<u64>,
+    cold: ColdGate,
+    index: RefCell<StoreIndex>,
+}
+
+/// Where the store's files lie and how they are written. It holds no state, so any thread may use it.
+struct StoreFiles {
     root: PathBuf,
     blobs: PathBuf,
     tmp: PathBuf,
-    db: Arc<Db>,
     reflink: bool,
     dev: u64,
-    tmp_seq: AtomicU64,
     chunks: PathBuf,
-    cold_lock: std::sync::RwLock<()>,
-    index: parking_lot::Mutex<StoreIndex>,
+}
+
+/// Keeps chunk collection apart from freezing and thawing, which write and read chunks
+/// the index does not list yet. Fibers of the loop wait here while the pool does the work.
+#[derive(Default)]
+struct ColdGate {
+    working: Cell<usize>,
+    collecting: Cell<bool>,
+    changed: OnceCell<crate::io::Notify>,
+}
+
+struct ColdWork<'a>(&'a ColdGate);
+struct ColdCollection<'a>(&'a ColdGate);
+
+impl ColdGate {
+    fn wait(&self) {
+        self.changed.get_or_init(crate::io::Notify::new).notified();
+    }
+
+    fn wake(&self) {
+        if let Some(changed) = self.changed.get() {
+            changed.notify_waiters();
+        }
+    }
+
+    /// Enters as one that freezes or thaws, once no collection runs.
+    fn work(&self) -> ColdWork<'_> {
+        while self.collecting.get() {
+            self.wait();
+        }
+        self.working.set(self.working.get() + 1);
+        ColdWork(self)
+    }
+
+    /// Enters as the collector, once nothing freezes, thaws or collects.
+    fn collect(&self) -> ColdCollection<'_> {
+        while self.collecting.get() || self.working.get() > 0 {
+            self.wait();
+        }
+        self.collecting.set(true);
+        ColdCollection(self)
+    }
+}
+
+impl Drop for ColdWork<'_> {
+    fn drop(&mut self) {
+        self.0.working.set(self.0.working.get() - 1);
+        self.0.wake();
+    }
+}
+
+impl Drop for ColdCollection<'_> {
+    fn drop(&mut self) {
+        self.0.collecting.set(false);
+        self.0.wake();
+    }
 }
 
 impl From<ColdMeta> for ColdRecord {
@@ -140,21 +203,16 @@ impl Store {
             ok
         };
         Ok(Store {
-            root: root.to_path_buf(),
-            blobs,
-            tmp,
+            files: StoreFiles { root: root.to_path_buf(), blobs, tmp, reflink, dev, chunks },
             db,
-            reflink,
-            dev,
-            tmp_seq: AtomicU64::new(0),
-            chunks,
-            cold_lock: std::sync::RwLock::new(()),
-            index: parking_lot::Mutex::new(index),
+            tmp_seq: Cell::new(0),
+            cold: ColdGate::default(),
+            index: RefCell::new(index),
         })
     }
 
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.files.root
     }
 
     pub fn db(&self) -> &Arc<Db> {
@@ -162,46 +220,48 @@ impl Store {
     }
 
     pub fn supports_reflink(&self) -> bool {
-        self.reflink
+        self.files.reflink
     }
 
     pub fn total_bytes(&self) -> u64 {
-        self.index.lock().total_bytes()
+        self.index.borrow_mut().total_bytes()
     }
 
     pub fn cold_stats(&self) -> (usize, u64, u64) {
-        self.index.lock().cold_stats()
+        self.index.borrow_mut().cold_stats()
     }
 
     pub fn all_hashes(&self) -> Vec<Hash> {
-        self.index.lock().all_hashes()
+        self.index.borrow_mut().all_hashes()
     }
 
     pub fn blob_count(&self) -> usize {
-        self.index.lock().whole_count()
+        self.index.borrow_mut().whole_count()
     }
 
     fn path_of(&self, h: &Hash, exec: bool) -> PathBuf {
-        let hex = h.hex();
-        let mut p = self.blobs.join(&hex[..2]);
-        assert_eq!(hex.len(), 64);
-        p.push(if exec { format!("{}.x", &hex[2..]) } else { hex[2..].to_string() });
-        p
+        self.files.path_of(h, exec)
+    }
+
+    fn next_tmp(&self) -> u64 {
+        let n = self.tmp_seq.get();
+        self.tmp_seq.set(n + 1);
+        n
     }
 
     pub fn tmp_path(&self) -> PathBuf {
-        let n = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        self.tmp.join(format!("t{}-{n}", crate::io::process::id()))
+        let n = self.next_tmp();
+        self.files.tmp.join(format!("t{}-{n}", crate::io::process::id()))
     }
 
     pub fn tmp_dir(&self, name: &str) -> io::Result<PathBuf> {
-        let p = self.tmp.join(name);
+        let p = self.files.tmp.join(name);
         crate::io::file::create_dir_all(&p)?;
         Ok(p)
     }
 
     pub fn has(&self, h: &Hash) -> bool {
-        self.index.lock().has(h)
+        self.index.borrow_mut().has(h)
     }
 
     pub fn blobs(self: &Arc<Self>) -> Arc<dyn Blobs> {
@@ -209,74 +269,30 @@ impl Store {
     }
 
     pub fn size_of(&self, h: &Hash) -> Option<u64> {
-        self.index.lock().size_of(h)
-    }
-
-    fn chunk_path(&self, c: &Hash) -> PathBuf {
-        let hex = c.hex();
-        let mut p = self.chunks.join(&hex[..2]);
-        p.push(&hex[2..]);
-        p
+        self.index.borrow_mut().size_of(h)
     }
 
     fn set_cold_disk(&self) {
-        let bytes = self.index.lock().cold_stats().2;
+        let bytes = self.index.borrow_mut().cold_stats().2;
         self.db.put(Table::Meta, COLD_DISK_KEY, &bytes.to_le_bytes());
     }
 
-    fn write_chunk(&self, c: &Hash, data: &[u8]) -> io::Result<u64> {
-        let dst = self.chunk_path(c);
-        if dst.ring_exists() {
-            return Ok(0);
-        }
-        let packed = zstd::bulk::compress(data, 3)?;
-        assert_eq!(Hash::of(data), *c, "a chunk is stored under its own hash");
-        let (tag, body): (u8, &[u8]) = if packed.len() < data.len() { (1, &packed) } else { (0, data) };
-        assert!(body.len() <= data.len());
-        let tmp = self.tmp_path();
-        {
-            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
-            f.write_all(&[tag])?;
-            f.write_all(body)?;
-        }
-        let linked = crate::io::file::hard_link(&tmp, &dst);
-        let _ = crate::io::file::remove_file(&tmp);
-        match linked {
-            Ok(()) => Ok(body.len() as u64 + 1),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(0),
-            Err(e) => Err(e),
-        }
-    }
-
-    fn read_chunk(&self, c: &ChunkRef) -> io::Result<Vec<u8>> {
-        let raw = crate::io::file::read(self.chunk_path(&c.hash))?;
-        let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("chunk {} is damaged", c.hash));
-        let data = match raw.split_first() {
-            Some((0, body)) => body.to_vec(),
-            Some((1, body)) => zstd::bulk::decompress(body, c.len as usize).map_err(|_| bad())?,
-            _ => return Err(bad()),
-        };
-        if data.len() != c.len as usize {
-            return Err(bad());
-        }
-        Ok(data)
-    }
-
     pub fn freeze(&self, h: &Hash, before: &dyn Fn(&Hash)) -> io::Result<Option<u64>> {
-        let _g = self.cold_lock.read().unwrap();
-        let Some(start) = self.index.lock().begin_freeze(h) else {
+        let _working = self.cold.work();
+        let Some(start) = self.index.borrow_mut().begin_freeze(h) else {
             return Ok(None);
         };
-        let chunked = self.write_cold_chunks(h, start.size, start.mtime_ns);
+        let (files, tmp) = (&self.files, self.tmp_path());
+        let chunked = crate::io::cpu(|| files.write_cold_chunks(h, start.size, start.mtime_ns, &tmp));
         let (recipe, added, variants) = match chunked {
             Ok(Some(c)) => c,
             other => {
-                self.index.lock().abort_freeze(h);
+                self.index.borrow_mut().abort_freeze(h);
                 return other.map(|_| None);
             }
         };
         let record = {
-            let mut ix = self.index.lock();
+            let mut ix = self.index.borrow_mut();
             ix.chunks_written(added);
             ix.finish_freeze(h, recipe, added)
         };
@@ -295,53 +311,8 @@ impl Store {
         Ok(Some((size * variants.len() as u64).saturating_sub(added)))
     }
 
-    #[allow(clippy::type_complexity)]
-    fn write_cold_chunks(
-        &self,
-        h: &Hash,
-        size: u64,
-        mtime: i64,
-    ) -> io::Result<Option<(Vec<ChunkRef>, u64, Vec<PathBuf>)>> {
-        let variants: Vec<PathBuf> =
-            [self.path_of(h, false), self.path_of(h, true)].into_iter().filter(|p| p.ring_exists()).collect();
-        let Some(first) = variants.first() else {
-            return Ok(None);
-        };
-        for v in &variants {
-            if crate::io::file::metadata(v)?.nlink() != 1 {
-                return Ok(None);
-            }
-        }
-        let f = File::open(first)?;
-        let m = f.metadata()?;
-        if m.len() != size || (variants.len() == 1 && m.mtime_ns() != mtime) {
-            return Ok(None);
-        }
-        let recipe = crate::chunk::chunk_file(&f)?;
-        assert_eq!(recipe.iter().map(|c| c.len as u64).sum::<u64>(), size, "the recipe covers the blob");
-        let mut added = 0u64;
-        let mut off = 0u64;
-        let mut buf = Vec::new();
-        for c in &recipe {
-            if !self.chunk_path(&c.hash).ring_exists() {
-                buf.resize(c.len as usize, 0);
-                f.read_exact_at(&mut buf, off)?;
-                if Hash::of(&buf) != c.hash {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("blob {h} changed while going cold"),
-                    ));
-                }
-                added += self.write_chunk(&c.hash, &buf)?;
-            }
-            off += c.len as u64;
-        }
-        assert_eq!(off, size);
-        Ok(Some((recipe, added, variants)))
-    }
-
     pub fn freeze_idle(&self, min_idle_secs: u64, before: &dyn Fn(&Hash)) -> (usize, u64) {
-        let idle = self.index.lock().freeze_candidates(now_secs(), min_idle_secs);
+        let idle = self.index.borrow_mut().freeze_candidates(now_secs(), min_idle_secs);
         let (mut n, mut freed) = (0, 0);
         for h in idle {
             if let Ok(Some(b)) = self.freeze(&h, before) {
@@ -352,57 +323,31 @@ impl Store {
         (n, freed)
     }
 
-    // `cold_lock` is a blocking lock held across file I/O. A fiber that holds it parks
-    // on that I/O, and the next fiber to take it then blocks the event-loop thread, so
-    // the parked holder never resumes. Likewise a pool thread that holds it has the loop
-    // do its file I/O, and waits forever once the loop thread blocks on the lock. So no
-    // fiber takes it on the loop thread: `blocking` moves the body to the pool, and runs
-    // it in place when it is already off a fiber. `freeze` is only called from the pool.
     fn thaw(&self, h: &Hash) -> io::Result<()> {
-        crate::io::blocking(|| self.thaw_off_loop(h))
-    }
-
-    fn thaw_off_loop(&self, h: &Hash) -> io::Result<()> {
-        let _g = self.cold_lock.read().unwrap();
-        let (_, started) = self.index.lock().begin_thaw(h);
+        let _working = self.cold.work();
+        let (_, started) = self.index.borrow_mut().begin_thaw(h);
         let Some((size, recipe)) = started else {
             return Ok(());
         };
-        let tmp = self.tmp_path();
-        let built = (|| -> io::Result<()> {
-            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
-            let mut hasher = blake3::Hasher::new();
-            let mut written = 0u64;
-            for c in &recipe {
-                let data = self.read_chunk(c)?;
-                assert_eq!(data.len(), c.len as usize);
-                hasher.update(&data);
-                f.write_all(&data)?;
-                written += data.len() as u64;
-            }
-            assert_eq!(written, size, "a cold recipe covers its blob");
-            if Hash(*hasher.finalize().as_bytes()) != *h {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("cold blob {h} does not add up")));
-            }
-            Ok(())
-        })();
+        let (files, tmp) = (&self.files, self.tmp_path());
+        let built = crate::io::cpu(|| files.build_thawed(&tmp, h, size, &recipe));
         if let Err(e) = built {
             let _ = crate::io::file::remove_file(&tmp);
-            if self.index.lock().fail_thaw(h) {
+            if self.index.borrow_mut().fail_thaw(h) {
                 self.db.delete(Table::Cold, &h.0);
             }
             return Err(e);
         }
         let installed = self.install(&tmp, *h, false, size);
         if installed.is_err() {
-            self.index.lock().abort_thaw(h);
+            self.index.borrow_mut().abort_thaw(h);
         }
         installed
     }
 
     fn ensure_whole(&self, h: &Hash) -> io::Result<()> {
         let cold = {
-            let ix = self.index.lock();
+            let ix = self.index.borrow();
             !ix.is_whole(h) && ix.is_cold(h)
         };
         if cold {
@@ -412,21 +357,22 @@ impl Store {
     }
 
     pub fn generation(&self) -> u64 {
-        self.index.lock().generation()
+        self.index.borrow_mut().generation()
     }
 
     pub fn collect_chunks(&self) -> (usize, u64) {
-        crate::io::blocking(|| self.collect_chunks_off_loop(|| {}))
+        self.collect_chunks_once(|| {})
     }
 
-    fn collect_chunks_off_loop(&self, locked: impl FnOnce()) -> (usize, u64) {
-        let _g = self.cold_lock.write().unwrap();
-        locked();
-        let live = self.index.lock().live_chunks();
+    /// Removes the chunks no cold blob names. `held` runs once nothing else freezes or thaws.
+    fn collect_chunks_once(&self, held: impl FnOnce()) -> (usize, u64) {
+        let _collecting = self.cold.collect();
+        held();
+        let live = self.index.borrow().live_chunks();
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
         for i in 0..256 {
             let prefix = format!("{i:02x}");
-            let Ok(rd) = crate::io::file::read_dir(self.chunks.join(&prefix)) else {
+            let Ok(rd) = crate::io::file::read_dir(self.files.chunks.join(&prefix)) else {
                 continue;
             };
             for ent in rd.flatten() {
@@ -444,7 +390,7 @@ impl Store {
                 }
             }
         }
-        self.index.lock().chunks_collected(kept);
+        self.index.borrow_mut().chunks_collected(kept);
         self.set_cold_disk();
         (n, freed)
     }
@@ -452,50 +398,50 @@ impl Store {
     fn record(&self, h: Hash, size: u64, mtime_ns: i64) {
         let m = BlobMeta { size, mtime_ns, last_used: now_secs() };
         self.db.put(Table::Blobs, &h.0, &bincode::serialize(&m).unwrap());
-        let put = self.index.lock().put(h, size, mtime_ns, m.last_used);
+        let put = self.index.borrow_mut().put(h, size, mtime_ns, m.last_used);
         if put.was_cold {
             self.db.delete(Table::Cold, &h.0);
         }
     }
 
     pub fn touch(&self, h: &Hash) {
-        let touched = self.index.lock().touch(h, now_secs());
+        let touched = self.index.borrow_mut().touch(h, now_secs());
         if let Touch::Persist(m) = touched {
             self.db.put(Table::Blobs, &h.0, &bincode::serialize(&blob_meta(m)).unwrap());
         }
     }
 
     fn existing(&self, h: &Hash, exec: bool) -> Option<PathBuf> {
-        let p = self.path_of(h, exec);
-        if p.ring_exists() {
-            return Some(p);
-        }
-        let q = self.path_of(h, !exec);
-        q.ring_exists().then_some(q)
+        self.files.existing(h, exec)
+    }
+
+    /// The content hash and size of `bytes`, hashed on the pool when there is much to hash.
+    fn hash_bytes(bytes: &[u8]) -> Hash {
+        if bytes.len() >= 1 << 20 { crate::io::cpu(|| Hash::of(bytes)) } else { Hash::of(bytes) }
     }
 
     pub fn open_blob(&self, h: &Hash) -> io::Result<File> {
         self.ensure_whole(h)?;
-        let meta = self.index.lock().hot(h);
+        let meta = self.index.borrow_mut().hot(h);
         let Some(meta) = meta else {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("blob {h} not in store")));
         };
         let Some(p) = self.existing(h, false) else {
-            if self.index.lock().is_cold(h) {
+            if self.index.borrow_mut().is_cold(h) {
                 return self.open_blob(h);
             }
             self.forget(h);
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("blob {h} missing")));
         };
         let f = match File::open(&p) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound && self.index.lock().is_cold(h) => {
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.index.borrow_mut().is_cold(h) => {
                 return self.open_blob(h);
             }
             r => r?,
         };
         let m = f.metadata()?;
         if m.len() != meta.size || m.mtime_ns() != meta.mtime_ns {
-            let (actual, _) = Hash::of_file(&f)?;
+            let (actual, _) = crate::io::cpu(|| Hash::of_file(&f))?;
             if actual != *h {
                 self.forget(h);
                 let _ = crate::io::file::remove_file(self.path_of(h, false));
@@ -512,7 +458,7 @@ impl Store {
     }
 
     fn forget(&self, h: &Hash) {
-        let gone = self.index.lock().forget(h);
+        let gone = self.index.borrow_mut().forget(h);
         self.db.delete(Table::Blobs, &h.0);
         if gone.cold {
             self.db.delete(Table::Cold, &h.0);
@@ -529,7 +475,12 @@ impl Store {
     }
 
     pub fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash> {
-        let h = Hash::of(bytes);
+        self.put_hashed_bytes(Self::hash_bytes(bytes), bytes)
+    }
+
+    /// Stores `bytes`, whose content hash the caller has worked out to be `h`.
+    pub fn put_hashed_bytes(&self, h: Hash, bytes: &[u8]) -> io::Result<Hash> {
+        debug_assert_eq!(Hash::of(bytes), h);
         if self.has(&h) {
             self.touch(&h);
             return Ok(h);
@@ -545,7 +496,7 @@ impl Store {
     }
 
     pub fn put_file_move(&self, path: &Path, exec: bool) -> io::Result<(Hash, u64)> {
-        let (h, size) = Hash::of_path(path)?;
+        let (h, size) = crate::io::cpu(|| Hash::of_path(path))?;
         if self.has(&h) && self.existing(&h, exec).is_some() {
             let _ = crate::io::file::remove_file(path);
             self.touch(&h);
@@ -556,7 +507,7 @@ impl Store {
     }
 
     pub fn put_file_link(&self, path: &Path, exec: bool) -> io::Result<(Hash, u64)> {
-        let (h, size) = Hash::of_path(path)?;
+        let (h, size) = crate::io::cpu(|| Hash::of_path(path))?;
         if self.has(&h) && self.existing(&h, exec).is_some() {
             self.touch(&h);
             return Ok((h, size));
@@ -588,14 +539,45 @@ impl Store {
         self.install(tmp, h, false, size)
     }
 
+    /// Stores each file by moving it in, as `put_file_move` does one, hashing and placing them on the pool together.
+    pub fn put_files_move(&self, items: Vec<(PathBuf, bool)>) -> Vec<io::Result<(Hash, u64)>> {
+        let files = &self.files;
+        let hashed: Vec<(PathBuf, bool, io::Result<(Hash, u64)>)> = crate::io::cpu(|| {
+            crate::io::thread::par_map(items, |(path, exec)| {
+                let hashed = Hash::of_path(&path);
+                (path, exec, hashed)
+            })
+        });
+        // The index says which contents are held; the pool then keeps or places each file.
+        let known: Vec<bool> =
+            hashed.iter().map(|(_, _, hashed)| hashed.as_ref().is_ok_and(|(h, _)| self.has(h))).collect();
+        let placed: Vec<io::Result<(Hash, u64, Option<i64>)>> = crate::io::cpu(|| {
+            crate::io::thread::par_map(hashed.into_iter().zip(known).collect(), |((path, exec, hashed), known)| {
+                let (h, size) = hashed?;
+                if known && files.existing(&h, exec).is_some() {
+                    let _ = crate::io::file::remove_file(&path);
+                    return Ok((h, size, None));
+                }
+                Ok((h, size, Some(files.place(&path, &h, exec, size)?)))
+            })
+        });
+        placed
+            .into_iter()
+            .map(|placed| {
+                let (h, size, mtime_ns) = placed?;
+                match mtime_ns {
+                    Some(mtime_ns) => self.record(h, size, mtime_ns),
+                    None => self.touch(&h),
+                }
+                Ok((h, size))
+            })
+            .collect()
+    }
+
     fn install(&self, tmp: &Path, h: Hash, exec: bool, size: u64) -> io::Result<()> {
-        let dst = self.path_of(&h, exec);
-        crate::io::file::set_mode(tmp, if exec { 0o555 } else { 0o444 })?;
-        crate::io::file::rename(tmp, &dst)?;
-        let m = crate::io::file::metadata(&dst)?;
-        assert_eq!(m.len(), size, "the installed file is the size the caller hashed");
-        self.record(h, size, m.mtime_ns());
-        assert!(self.index.lock().is_whole(&h));
+        let mtime_ns = self.files.place(tmp, &h, exec, size)?;
+        self.record(h, size, mtime_ns);
+        assert!(self.index.borrow().is_whole(&h));
         Ok(())
     }
 
@@ -620,7 +602,7 @@ impl Store {
         self.ensure_whole(h)?;
         let parent = dest.parent().context("destination has no parent")?;
         let tmp =
-            parent.join(format!(".rargo-tmp-{}-{}", crate::io::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
+            parent.join(format!(".rargo-tmp-{}-{}", crate::io::process::id(), self.next_tmp()));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
             let src = self.open_blob(h)?;
@@ -648,15 +630,15 @@ impl Store {
 
     pub fn materialize(&self, h: &Hash, exec: bool, dest: &Path) -> Result<Placed> {
         self.ensure_whole(h)?;
-        let meta = self.index.lock().hot(h).with_context(|| format!("blob {h} not in store"))?;
+        let meta = self.index.borrow_mut().hot(h).with_context(|| format!("blob {h} not in store"))?;
         self.touch(h);
         let parent = dest.parent().context("destination has no parent")?;
         let tmp =
-            parent.join(format!(".rargo-tmp-{}-{}", crate::io::process::id(), self.tmp_seq.fetch_add(1, Ordering::Relaxed)));
+            parent.join(format!(".rargo-tmp-{}-{}", crate::io::process::id(), self.next_tmp()));
         let mode = if exec { 0o755 } else { 0o644 };
         let placed = (|| -> Result<Placed> {
-            let same_fs = crate::io::file::metadata(parent)?.dev() == self.dev;
-            if same_fs && self.reflink {
+            let same_fs = crate::io::file::metadata(parent)?.dev() == self.files.dev;
+            if same_fs && self.files.reflink {
                 let src = self.open_blob(h)?;
                 let dst = OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp)?;
                 if reflink(&src, &dst) {
@@ -693,15 +675,15 @@ impl Store {
     }
 
     pub fn pin_all(&self, hashes: &[Hash]) -> bool {
-        self.index.lock().pin_all(hashes)
+        self.index.borrow_mut().pin_all(hashes)
     }
 
     pub fn unpin_all(&self, hashes: &[Hash]) {
-        self.index.lock().unpin_all(hashes)
+        self.index.borrow_mut().unpin_all(hashes)
     }
 
     pub fn is_pinned(&self, h: &Hash) -> bool {
-        self.index.lock().is_pinned(h)
+        self.index.borrow_mut().is_pinned(h)
     }
 
     pub fn evict_to(&self, budget: u64, pinned: &dyn Fn(&Hash) -> bool) -> u64 {
@@ -715,7 +697,7 @@ impl Store {
         pinned: &dyn Fn(&Hash) -> bool,
         on_evict: &dyn Fn(&Hash),
     ) -> u64 {
-        let gone = self.index.lock().evict(budget, min_age_secs, now_secs(), pinned);
+        let gone = self.index.borrow_mut().evict(budget, min_age_secs, now_secs(), pinned);
         self.drop_evicted(&gone, on_evict);
         if gone.iter().any(|e| e.cold) {
             self.collect_chunks();
@@ -742,7 +724,7 @@ impl Store {
         min_age_secs: u64,
         on_evict: &dyn Fn(&Hash),
     ) -> (usize, u64) {
-        let gone = self.index.lock().sweep(&|h| live.contains(h), min_age_secs, now_secs());
+        let gone = self.index.borrow_mut().sweep(&|h| live.contains(h), min_age_secs, now_secs());
         self.drop_evicted(&gone, on_evict);
         let mut bytes: u64 = gone.iter().map(|e| e.freed).sum();
         if gone.iter().any(|e| e.cold) {
@@ -755,6 +737,147 @@ impl Store {
         self.forget(h);
         let _ = crate::io::file::remove_file(self.path_of(h, false));
         let _ = crate::io::file::remove_file(self.path_of(h, true));
+    }
+}
+
+impl StoreFiles {
+    fn path_of(&self, h: &Hash, exec: bool) -> PathBuf {
+        let hex = h.hex();
+        let mut p = self.blobs.join(&hex[..2]);
+        assert_eq!(hex.len(), 64);
+        p.push(if exec { format!("{}.x", &hex[2..]) } else { hex[2..].to_string() });
+        p
+    }
+
+    fn chunk_path(&self, c: &Hash) -> PathBuf {
+        let hex = c.hex();
+        let mut p = self.chunks.join(&hex[..2]);
+        p.push(&hex[2..]);
+        p
+    }
+
+    fn existing(&self, h: &Hash, exec: bool) -> Option<PathBuf> {
+        let p = self.path_of(h, exec);
+        if p.ring_exists() {
+            return Some(p);
+        }
+        let q = self.path_of(h, !exec);
+        q.ring_exists().then_some(q)
+    }
+
+    /// Moves the file at `tmp` to where blob `h` lies and gives the time it then carries.
+    fn place(&self, tmp: &Path, h: &Hash, exec: bool, size: u64) -> io::Result<i64> {
+        let dst = self.path_of(h, exec);
+        crate::io::file::set_mode(tmp, if exec { 0o555 } else { 0o444 })?;
+        crate::io::file::rename(tmp, &dst)?;
+        let m = crate::io::file::metadata(&dst)?;
+        assert_eq!(m.len(), size, "the installed file is the size the caller hashed");
+        Ok(m.mtime_ns())
+    }
+
+    /// Writes chunk `c` unless it is there, by way of the temporary file `tmp`, and gives the bytes it added.
+    fn write_chunk(&self, c: &Hash, data: &[u8], tmp: &Path) -> io::Result<u64> {
+        let dst = self.chunk_path(c);
+        if dst.ring_exists() {
+            return Ok(0);
+        }
+        let packed = zstd::bulk::compress(data, 3)?;
+        assert_eq!(Hash::of(data), *c, "a chunk is stored under its own hash");
+        let (tag, body): (u8, &[u8]) = if packed.len() < data.len() { (1, &packed) } else { (0, data) };
+        assert!(body.len() <= data.len());
+        {
+            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(tmp)?;
+            f.write_all(&[tag])?;
+            f.write_all(body)?;
+        }
+        let linked = crate::io::file::hard_link(tmp, &dst);
+        let _ = crate::io::file::remove_file(tmp);
+        match linked {
+            Ok(()) => Ok(body.len() as u64 + 1),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn read_chunk(&self, c: &ChunkRef) -> io::Result<Vec<u8>> {
+        let raw = crate::io::file::read(self.chunk_path(&c.hash))?;
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, format!("chunk {} is damaged", c.hash));
+        let data = match raw.split_first() {
+            Some((0, body)) => body.to_vec(),
+            Some((1, body)) => zstd::bulk::decompress(body, c.len as usize).map_err(|_| bad())?,
+            _ => return Err(bad()),
+        };
+        if data.len() != c.len as usize {
+            return Err(bad());
+        }
+        Ok(data)
+    }
+
+    /// Writes the chunks of whole blob `h` that are not stored yet. `tmp` is a name the loop
+    /// gave this call alone; each chunk is written by way of it, one after the other.
+    #[allow(clippy::type_complexity)]
+    fn write_cold_chunks(
+        &self,
+        h: &Hash,
+        size: u64,
+        mtime: i64,
+        tmp: &Path,
+    ) -> io::Result<Option<(Vec<ChunkRef>, u64, Vec<PathBuf>)>> {
+        let variants: Vec<PathBuf> =
+            [self.path_of(h, false), self.path_of(h, true)].into_iter().filter(|p| p.ring_exists()).collect();
+        let Some(first) = variants.first() else {
+            return Ok(None);
+        };
+        for v in &variants {
+            if crate::io::file::metadata(v)?.nlink() != 1 {
+                return Ok(None);
+            }
+        }
+        let f = File::open(first)?;
+        let m = f.metadata()?;
+        if m.len() != size || (variants.len() == 1 && m.mtime_ns() != mtime) {
+            return Ok(None);
+        }
+        let recipe = crate::chunk::chunk_file(&f)?;
+        assert_eq!(recipe.iter().map(|c| c.len as u64).sum::<u64>(), size, "the recipe covers the blob");
+        let mut added = 0u64;
+        let mut off = 0u64;
+        let mut buf = Vec::new();
+        for c in &recipe {
+            if !self.chunk_path(&c.hash).ring_exists() {
+                buf.resize(c.len as usize, 0);
+                f.read_exact_at(&mut buf, off)?;
+                if Hash::of(&buf) != c.hash {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("blob {h} changed while going cold"),
+                    ));
+                }
+                added += self.write_chunk(&c.hash, &buf, tmp)?;
+            }
+            off += c.len as u64;
+        }
+        assert_eq!(off, size);
+        Ok(Some((recipe, added, variants)))
+    }
+
+    /// Puts cold blob `h` together from its chunks in the file `tmp` and checks that it adds up.
+    fn build_thawed(&self, tmp: &Path, h: &Hash, size: u64, recipe: &[ChunkRef]) -> io::Result<()> {
+        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o444).open(tmp)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut written = 0u64;
+        for c in recipe {
+            let data = self.read_chunk(c)?;
+            assert_eq!(data.len(), c.len as usize);
+            hasher.update(&data);
+            f.write_all(&data)?;
+            written += data.len() as u64;
+        }
+        assert_eq!(written, size, "a cold recipe covers its blob");
+        if Hash(*hasher.finalize().as_bytes()) != *h {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("cold blob {h} does not add up")));
+        }
+        Ok(())
     }
 }
 
@@ -792,7 +915,7 @@ mod tests {
     fn detects_write_through_hardlink() {
         sim::test(|| {
             let (d, mut s) = store();
-            s.reflink = false;
+            s.files.reflink = false;
             let dest = d.join("linked");
             // Keep a writable handle while the store moves the inode and makes it
             // read-only. The materialized hardlink then shares that same inode.
@@ -847,55 +970,38 @@ mod tests {
         });
     }
 
-    // The order of both rargod hangs (#632): `collect_chunks` runs on a pool thread
-    // with a home loop, as in rargod's evict loop under `io::cpu`, holds the write
-    // lock, and has the loop do its `read_dir`, `metadata` and `remove_file`. A
-    // fiber that thaws meanwhile must wait for the lock off the loop thread, or the
-    // loop blocks, the collector never gets its I/O back, and neither finishes. That
-    // takes a real loop and pool, which a simulation, with one thread, does not have.
+    // A fiber that collects chunks holds the cold gate while it parks on its file work.
+    // A fiber that thaws meanwhile parks at the gate until the collection is done, and
+    // the loop keeps running both. That takes a real loop, where file work parks.
     #[test]
-    fn a_thaw_while_chunks_are_collected_waits_off_the_loop() {
-        if crate::io::unavailable().is_some() {
-            return;
-        }
-        // The store's 512 shard directories cost most of this test's CPU on a
-        // journaling filesystem; a memory-backed one makes and removes them
-        // in half the time.
-        let base = Some(std::path::PathBuf::from("/dev/shm")).filter(|p| p.is_dir()).unwrap_or_else(std::env::temp_dir);
-        let dir = base.join(format!("rargo-store-cold-lock-{}", crate::io::process::id()));
-        let at = dir.clone();
-        let outcome = crate::io::within(std::time::Duration::from_secs(20), move || {
-            crate::io::run(2, move || {
-                let s = Arc::new(Store::open(&at.join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
-                let data = noise(crate::store_index::COLD_MIN_SIZE as usize);
-                let h = s.put_bytes(&data).unwrap();
-                assert!(crate::io::cpu(|| s.freeze(&h, &|_| {})).unwrap().is_some());
-                file::write(s.chunks.join("00").join("dead"), b"x").unwrap();
-                let (locked, lock_held) = crate::io::oneshot::channel();
-                let (resume, resume_collection) = crate::io::oneshot::channel();
-                let gc = {
-                    let s = Arc::clone(&s);
-                    crate::io::spawn(move || crate::io::cpu(|| {
-                        s.collect_chunks_off_loop(|| {
-                            locked.send(()).unwrap();
-                            crate::io::call(move || resume_collection.recv().unwrap());
-                        })
-                    }))
-                };
-                lock_held.recv().unwrap();
-                assert!(s.cold_lock.try_read().is_err(), "the collector holds the cold lock");
-                // This fiber can only release the collector after the thaw yields.
-                let mut release = crate::io::spawn(move || resume.send(()).unwrap());
-                let read = s.read(&h).unwrap();
-                release.join().unwrap();
-                let (removed, _) = { gc }.join().unwrap();
-                (removed, read == data)
-            })
+    fn a_thaw_while_chunks_are_collected_waits_for_the_collection() {
+        sim::test(|| {
+            let s = Arc::new(Store::open(&sim::tempdir().join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
+            let data = noise(crate::store_index::COLD_MIN_SIZE as usize);
+            let h = s.put_bytes(&data).unwrap();
+            assert!(s.freeze(&h, &|_| {}).unwrap().is_some());
+            file::write(s.files.chunks.join("00").join("dead"), b"x").unwrap();
+            let (locked, lock_held) = crate::io::oneshot::channel();
+            let (resume, resume_collection) = crate::io::oneshot::channel();
+            let gc = {
+                let s = Arc::clone(&s);
+                crate::io::spawn(move || {
+                    s.collect_chunks_once(|| {
+                        locked.send(()).unwrap();
+                        resume_collection.recv().unwrap();
+                    })
+                })
+            };
+            lock_held.recv().unwrap();
+            assert!(s.cold.collecting.get(), "the collector holds the cold gate");
+            // This fiber can only release the collector after the thaw yields.
+            let mut release = crate::io::spawn(move || resume.send(()).unwrap());
+            let read = s.read(&h).unwrap();
+            release.join().unwrap();
+            let (removed, _) = { gc }.join().unwrap();
+            assert_eq!(removed, 1);
+            assert_eq!(read, data, "the thawed blob reads back whole");
         });
-        let _ = file::remove_dir_all(&dir);
-        let (removed, same) = outcome.expect("a thaw and a chunk collection deadlocked the loop");
-        assert_eq!(removed, 1);
-        assert!(same, "the thawed blob reads back whole");
     }
 
     #[test]
@@ -937,7 +1043,7 @@ mod tests {
     }
 }
 
-pub trait Blobs: Send + Sync {
+pub trait Blobs {
     fn put_bytes(&self, bytes: &[u8]) -> io::Result<Hash>;
     fn read(&self, h: &Hash) -> io::Result<Vec<u8>>;
     fn has(&self, h: &Hash) -> bool;

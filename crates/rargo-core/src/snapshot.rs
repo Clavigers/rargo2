@@ -3,7 +3,6 @@ use crate::store::Store;
 use crate::trees_state::{TreesState, Upload, Walk};
 use crate::view::*;
 use anyhow::{Context, Result, bail};
-use dashmap::DashMap;
 use std::cell::{Cell, RefCell};
 use rargo_proto::tree::{Node, Tree};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,10 +27,10 @@ pub struct SyncStats {
     pub offered_bytes: Cell<u64>,
 }
 
-/// The directory manifests of a store, decoded once for every thread that reads them.
+/// The directory manifests of a store, decoded once. The loop thread owns the decoded forms.
 pub struct Manifests {
     pub store: Arc<Store>,
-    decoded: DashMap<Hash, Arc<Tree>>,
+    decoded: RefCell<BTreeMap<Hash, Arc<Tree>>>,
 }
 
 pub struct Trees {
@@ -51,28 +50,47 @@ struct Shared {
 const SYNC_ATTEMPTS: usize = 8;
 const _: () = assert!(SYNC_ATTEMPTS >= 1);
 
+/// Checks the manifest `encoded` and puts it in `store`, on any thread.
+/// Decodes a directory manifest a client sent and gives the hash it is stored under.
+fn decode_manifest(encoded: &[u8]) -> Result<(Hash, Tree)> {
+    let tree = Tree::decode(encoded).context("the client sent a malformed directory manifest")?;
+    Ok((Hash::of(encoded), tree))
+}
+
+pub fn store_manifest(store: &Store, encoded: &[u8]) -> Result<(Hash, Tree)> {
+    let (digest, tree) = decode_manifest(encoded)?;
+    store.put_hashed_bytes(digest, encoded)?;
+    Ok((digest, tree))
+}
+
 impl Manifests {
     pub fn get(&self, digest: &Hash) -> Option<Arc<Tree>> {
-        if let Some(t) = self.decoded.get(digest) {
-            return Some(t.clone());
+        let known = self.decoded.borrow().get(digest).cloned();
+        if known.is_some() {
+            return known;
         }
         if !self.store.has(digest) {
             return None;
         }
         let bytes = self.store.read(digest).ok()?;
         let tree = Arc::new(Tree::decode(&bytes).ok()?);
-        if self.decoded.len() > 200_000 {
-            self.decoded.clear();
+        let mut decoded = self.decoded.borrow_mut();
+        if decoded.len() > 200_000 {
+            decoded.clear();
         }
-        self.decoded.insert(*digest, tree.clone());
+        decoded.insert(*digest, tree.clone());
         Some(tree)
     }
 
     pub fn put(&self, encoded: &[u8]) -> Result<Hash> {
-        let tree = Tree::decode(encoded).context("the client sent a malformed directory manifest")?;
-        let digest = self.store.put_bytes(encoded)?;
-        self.decoded.insert(digest, Arc::new(tree));
+        let (digest, tree) = store_manifest(&self.store, encoded)?;
+        self.remember(digest, tree);
         Ok(digest)
+    }
+
+    /// Keeps the decoded form of a manifest that `store_manifest` stored.
+    pub fn remember(&self, digest: Hash, tree: Tree) {
+        self.decoded.borrow_mut().insert(digest, Arc::new(tree));
     }
 
     pub fn put_tree(&self, tree: &Tree) -> Result<Hash> {
@@ -83,7 +101,7 @@ impl Manifests {
 impl Trees {
     pub fn new(store: Arc<Store>) -> Arc<Trees> {
         Arc::new(Trees {
-            known: Arc::new(Manifests { store: store.clone(), decoded: DashMap::new() }),
+            known: Arc::new(Manifests { store: store.clone(), decoded: RefCell::new(BTreeMap::new()) }),
             store,
             state: RefCell::new(Shared::default()),
             recent: RefCell::new(BTreeMap::new()),
@@ -91,7 +109,7 @@ impl Trees {
         })
     }
 
-    /// The manifests these trees are made of, which threads off the loop may read and add to.
+    /// The manifests these trees are made of.
     pub fn manifests(&self) -> &Arc<Manifests> {
         &self.known
     }
@@ -126,9 +144,14 @@ impl Trees {
             {
                 let got = from.trees(lacking.clone())?;
                 self.stats.trees_received.set(self.stats.trees_received.get() + got.len() as u64);
-                let this = self.known.clone();
-                let stored: Result<BTreeSet<Hash>> = crate::io::cpu(move || got.iter().map(|enc| this.put(enc)).collect());
-                let stored = stored?;
+                let decoded: Vec<Result<(Hash, Tree)>> = crate::io::cpu(|| got.iter().map(|enc| decode_manifest(enc)).collect());
+                let mut stored = BTreeSet::new();
+                for (enc, decoded) in got.iter().zip(decoded) {
+                    let (digest, tree) = decoded?;
+                    self.store.put_hashed_bytes(digest, enc)?;
+                    stored.insert(digest);
+                    self.known.remember(digest, tree);
+                }
                 if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
                     bail!("the client did not send directory manifest {d}");
                 }
@@ -165,7 +188,7 @@ impl Trees {
         if !self.store.pin_all(&all) {
             return None;
         }
-        Some(Arc::new(Snapshot { trees: self.known.clone(), id: root, dirs: DashMap::new(), pinned: all }))
+        Some(Arc::new(Snapshot { trees: self.known.clone(), id: root, dirs: RefCell::new(BTreeMap::new()), pinned: all }))
     }
 
     pub fn lacking(&self, root: Hash) -> (Vec<Hash>, Vec<Hash>) {
@@ -301,12 +324,19 @@ impl Trees {
 impl Manifests {
     /// Adds the trees under `roots` and the files they name to `live`.
     pub fn mark(&self, roots: Vec<Hash>, live: &mut std::collections::BTreeSet<Hash>) {
+        mark_trees(&self.store, roots, live)
+    }
+}
+
+/// Adds the trees `store` holds under `roots`, and the files they name, to `live`, on any thread.
+pub fn mark_trees(store: &Store, roots: Vec<Hash>, live: &mut std::collections::BTreeSet<Hash>) {
+    {
         let mut stack = roots;
         while let Some(d) = stack.pop() {
             if !live.insert(d) {
                 continue;
             }
-            let Some(tree) = self.get(&d) else { continue };
+            let Some(tree) = store.read(&d).ok().and_then(|bytes| Tree::decode(&bytes).ok()) else { continue };
             for (_, node) in &tree.entries {
                 match node {
                     Node::File { hash, .. } => {
@@ -327,7 +357,7 @@ const OWN_DIR: Owner = Owner::own(0o755);
 pub struct Snapshot {
     trees: Arc<Manifests>,
     pub id: Hash,
-    dirs: DashMap<Vec<u8>, Option<Arc<Tree>>>,
+    dirs: RefCell<BTreeMap<Vec<u8>, Option<Arc<Tree>>>>,
     pinned: Vec<Hash>,
 }
 
@@ -341,22 +371,23 @@ impl Drop for Snapshot {
 
 impl Snapshot {
     pub fn new(trees: &Trees, root: Hash) -> Snapshot {
-        Snapshot { trees: trees.known.clone(), id: root, dirs: DashMap::new(), pinned: Vec::new() }
+        Snapshot { trees: trees.known.clone(), id: root, dirs: RefCell::new(BTreeMap::new()), pinned: Vec::new() }
     }
 
     fn dir(&self, rel_dir: &[u8]) -> Option<Arc<Tree>> {
         if rel_dir == b"/" || rel_dir.is_empty() {
             return self.trees.get(&self.id);
         }
-        if let Some(t) = self.dirs.get(rel_dir) {
-            return t.clone();
+        let known = self.dirs.borrow().get(rel_dir).cloned();
+        if let Some(t) = known {
+            return t;
         }
         let (parent, name) = vsplit(rel_dir)?;
         let t = self.dir(parent).and_then(|p| match p.get(name) {
             Some(Node::Dir(d)) => self.trees.get(&Hash(*d)),
             _ => None,
         });
-        self.dirs.insert(rel_dir.to_vec(), t.clone());
+        self.dirs.borrow_mut().insert(rel_dir.to_vec(), t.clone());
         t
     }
 
@@ -489,7 +520,7 @@ impl Snapshot {
         let root = self.trees.get(&self.id).context("root tree missing")?;
         let new_root = set(&self.trees, &root, &comps, node)?;
         let id = self.trees.put_tree(&new_root)?;
-        Ok(Arc::new(Snapshot { trees: self.trees.clone(), id, dirs: DashMap::new(), pinned: Vec::new() }))
+        Ok(Arc::new(Snapshot { trees: self.trees.clone(), id, dirs: RefCell::new(BTreeMap::new()), pinned: Vec::new() }))
     }
 }
 
@@ -570,7 +601,7 @@ mod tests {
             trees.put(&fake.has.read(&root_of(&v)).unwrap()).unwrap();
             let blobs = [Hash::of(b"content a"), Hash::of(b"content b")];
             let (first_trees, root) = (trees.clone(), root_of(&v));
-            let first = crate::io::spawn(move || first_trees.sync(root, &Stalled));
+            let first = crate::io::spawn(move || first_trees.sync(root, &Stalled).is_ok());
             crate::io::yield_now();
             assert!(!first.is_finished(), "the first sync waits on its client's upload");
             let up = trees.state.borrow_mut().core.holder(&blobs[0]).expect("the first sync claims what it uploads");

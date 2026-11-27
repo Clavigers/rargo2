@@ -1,8 +1,9 @@
 use crate::hash::Hash;
 use crate::store::Store;
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use crate::io::file::File;
+use std::cell::{OnceCell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -64,7 +65,7 @@ pub enum Obs {
     Code { executed: Hash, rest: Hash },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HostSig {
     pub dev: u64,
     pub ino: u64,
@@ -96,7 +97,7 @@ impl HostSig {
     }
 }
 
-pub trait LazyBlob: Send + Sync {
+pub trait LazyBlob {
     fn materialize(&self, store: &Store) -> io::Result<Hash>;
 }
 
@@ -196,7 +197,7 @@ pub fn listing_hash(entries: &Listing) -> Hash {
     Hash(*h.finalize().as_bytes())
 }
 
-pub trait View: Send + Sync {
+pub trait View {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked;
     fn list(&self, dir: &[u8]) -> io::Result<Listing>;
     fn traced(&self, _dir: &[u8]) -> bool {
@@ -220,34 +221,36 @@ pub trait View: Send + Sync {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BackingKey {
     Blob(Hash),
     Host(HostSig),
 }
 
-pub type Fetcher = Arc<dyn Fn(&Hash) -> io::Result<()> + Send + Sync>;
+pub type Fetcher = Arc<dyn Fn(&Hash) -> io::Result<()>>;
 
+/// What is known about file contents beside the store itself. The loop thread owns it.
 pub struct Content {
     pub store: Arc<Store>,
-    host_hashes: DashMap<HostSig, Hash>,
-    fetcher: std::sync::OnceLock<Fetcher>,
-    meta_ids: DashMap<Hash, Option<Hash>>,
+    host_hashes: RefCell<BTreeMap<HostSig, Hash>>,
+    fetcher: OnceCell<Fetcher>,
+    meta_ids: RefCell<BTreeMap<Hash, Option<Hash>>>,
 }
 
 impl Content {
     pub fn new(store: Arc<Store>) -> Content {
         Content {
             store,
-            host_hashes: DashMap::new(),
-            fetcher: std::sync::OnceLock::new(),
-            meta_ids: DashMap::new(),
+            host_hashes: RefCell::new(BTreeMap::new()),
+            fetcher: OnceCell::new(),
+            meta_ids: RefCell::new(BTreeMap::new()),
         }
     }
 
     pub fn metadata_identity(&self, blob: &Hash) -> Option<Hash> {
-        if let Some(v) = self.meta_ids.get(blob) {
-            return *v;
+        let known = self.meta_ids.borrow().get(blob).copied();
+        if let Some(v) = known {
+            return v;
         }
         let id = (|| {
             use std::io::Read;
@@ -261,7 +264,7 @@ impl Content {
             h.field(&head[7..8]).field(&head[24..40]);
             Some(h.finish())
         })();
-        self.meta_ids.insert(*blob, id);
+        self.meta_ids.borrow_mut().insert(*blob, id);
         id
     }
 
@@ -361,12 +364,13 @@ impl Content {
         match src {
             FileSrc::Blob(h) => Some(*h),
             FileSrc::Host { sig, .. } => {
-                if let Some(h) = self.host_hashes.get(sig) {
-                    return Some(*h);
+                let known = self.host_hashes.borrow().get(sig).copied();
+                if let Some(h) = known {
+                    return Some(h);
                 }
                 let v = self.db().get(crate::db::Table::HostSigs, &sig.key())?;
                 let h = Hash(v[..].try_into().ok()?);
-                self.host_hashes.insert(*sig, h);
+                self.host_hashes.borrow_mut().insert(*sig, h);
                 Some(h)
             }
             FileSrc::Lazy(_) => None,
@@ -380,17 +384,7 @@ impl Content {
         match src {
             FileSrc::Blob(h) => Ok(*h),
             FileSrc::Host { path, sig } => {
-                let f = crate::io::file::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
-                let before = HostSig::of(&f.metadata()?);
-                if before != *sig {
-                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
-                }
-                assert_eq!(before.size, sig.size);
-                let (h, _) = Hash::of_file(&f)?;
-                let after = HostSig::of(&f.metadata()?);
-                if after != before {
-                    return Err(io::Error::from_raw_os_error(libc::ESTALE));
-                }
+                let h = crate::io::cpu(|| hash_host(path, sig))?;
                 self.record_host(*sig, h);
                 Ok(h)
             }
@@ -399,9 +393,25 @@ impl Content {
     }
 
     pub fn record_host(&self, sig: HostSig, h: Hash) {
-        self.host_hashes.insert(sig, h);
+        self.host_hashes.borrow_mut().insert(sig, h);
         self.db().put(crate::db::Table::HostSigs, &sig.key(), &h.0);
     }
+}
+
+/// The content hash of the host file at `path`, as long as it is and stays the file `sig` describes.
+pub fn hash_host(path: &Path, sig: &HostSig) -> io::Result<Hash> {
+    let f = crate::io::file::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)?;
+    let before = HostSig::of(&f.metadata()?);
+    if before != *sig {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    assert_eq!(before.size, sig.size);
+    let (h, _) = Hash::of_file(&f)?;
+    let after = HostSig::of(&f.metadata()?);
+    if after != before {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    Ok(h)
 }
 
 pub(crate) enum CheckObservation {

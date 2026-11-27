@@ -11,7 +11,6 @@ use crate::pool_state::{self, Outcome, Settle, Who};
 use crate::send_ahead::{self, AHEAD_MAX, BATCH_BYTES, inline_indices};
 use crate::worker_state;
 use anyhow::{Context, Result, anyhow, bail};
-use dashmap::DashMap;
 use std::cell::{Cell, RefCell};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -236,7 +235,8 @@ impl Peer {
 }
 
 
-pub trait BlobSource: Send + Sync {
+/// Where the bytes of a blob are read from. It is asked on the loop thread.
+pub trait BlobSource {
     fn open(&self, h: &Hash) -> io::Result<crate::io::file::File>;
 }
 
@@ -264,8 +264,7 @@ pub struct Outline {
 
 
 /// The outline of blob `h` as `source` holds it, and whether it is worth remembering.
-fn read_outline(source: &dyn BlobSource, h: &Hash) -> Option<(Outline, bool)> {
-    let f = source.open(h).ok()?;
+fn read_outline(f: &crate::io::file::File) -> Option<(Outline, bool)> {
     let len = f.metadata().ok()?.len() as usize;
     if len == 0 {
         return Some((Outline { cvs: Vec::new(), lazy: Vec::new() }, false));
@@ -308,8 +307,8 @@ impl Blobs {
         if let Some(o) = self.outlines.borrow().get(h) {
             return Some(o.clone());
         }
-        let (source, blob) = (self.source.clone(), *h);
-        let (o, keep) = crate::io::cpu(move || read_outline(&*source, &blob))?;
+        let f = self.source.open(h).ok()?;
+        let (o, keep) = crate::io::cpu(move || read_outline(&f))?;
         let o = Arc::new(o);
         if keep {
             self.outlines.borrow_mut().insert(*h, o.clone());
@@ -322,17 +321,16 @@ impl Blobs {
         if let Some(r) = known {
             return Some(r);
         }
-        let (source, blob) = (self.source.clone(), *h);
-        let r = Arc::new(crate::io::cpu(move || chunk::chunk_file(&source.open(&blob).ok()?).ok())?);
+        let f = self.source.open(h).ok()?;
+        let r = Arc::new(crate::io::cpu(move || chunk::chunk_file(&f).ok())?);
         self.index.borrow_mut().step(chunk::Event::AddBlob { blob: *h, recipe: r.clone() });
         Some(r)
     }
 
     pub fn serve_chunks(&self, h: &Hash, idx: &[u32]) -> Result<Vec<Vec<u8>>> {
         let recipe = self.recipe(h).ok_or_else(|| anyhow!("unknown blob {h}"))?;
-        let source = self.source.clone();
+        let f = self.source.open(h)?;
         crate::io::cpu(move || {
-            let f = source.open(h)?;
             let mut offsets = Vec::with_capacity(recipe.len());
             let mut off = 0u64;
             for c in recipe.iter() {
@@ -495,7 +493,6 @@ impl worker_state::Carried for Wire {
 type WEffect = worker_state::Effect<Wire>;
 
 pub struct WorkerState {
-    asks: Asks,
     peer: RefCell<Option<Arc<Peer>>>,
     blobs: Arc<Blobs>,
     engine: Arc<Engine>,
@@ -509,53 +506,7 @@ pub struct WorkerState {
     nix: RefCell<BTreeMap<Vec<u8>, Arc<crate::nixmanifest::Installed>>>,
 }
 
-/// What a view that is read off the loop asks the worker's loop for.
-enum Ask {
-    Query { token: u64, q: worker_state::Query, reply: crate::io::oneshot::Sender<Option<worker_state::Reply>> },
-    Blob { blob: Hash, reply: crate::io::oneshot::Sender<io::Result<()>> },
-}
-
-/// The way from any thread to the worker's state, which the loop owns.
-#[derive(Clone)]
-struct Asks(crate::io::UnboundedSender<Ask>);
-
-impl Asks {
-    fn query(&self, token: u64, q: worker_state::Query) -> Option<worker_state::Reply> {
-        let asks = self.0.clone();
-        crate::io::call(move || {
-            let (reply, answer) = crate::io::oneshot::channel();
-            asks.send(Ask::Query { token, q, reply }).ok()?;
-            answer.recv().flatten()
-        })
-    }
-
-    fn blob(&self, blob: Hash) -> io::Result<()> {
-        let asks = self.0.clone();
-        let answer = crate::io::call(move || {
-            let (reply, answer) = crate::io::oneshot::channel();
-            asks.send(Ask::Blob { blob, reply }).ok()?;
-            answer.recv()
-        });
-        answer.unwrap_or_else(|| Err(io::Error::other(format!("content {blob} is not here and the worker is stopping"))))
-    }
-}
-
 impl WorkerState {
-    /// Answers each question of `asks` in a fiber of its own until the last asker is gone.
-    fn serve_asks(self: &Arc<Self>, mut asks: crate::io::UnboundedReceiver<Ask>) {
-        while let Some(ask) = asks.recv() {
-            let state = self.clone();
-            crate::io::spawn(move || match ask {
-                Ask::Query { token, q, reply } => {
-                    let _ = reply.send(state.ask_here(token, q));
-                }
-                Ask::Blob { blob, reply } => {
-                    let _ = reply.send(state.pull_blob(blob));
-                }
-            });
-        }
-    }
-
     fn peer(&self) -> Option<Arc<Peer>> {
         self.peer.borrow_mut().clone()
     }
@@ -779,11 +730,7 @@ impl WorkerState {
         let state = self.clone();
         let task = crate::io::spawn(move || {
             let RunWire { spec, uid, gid, untraced, closure } = run;
-            let nix = {
-                let known = state.nix.borrow();
-                closure.iter().filter_map(|n| known.get(n).map(|i| (n.clone(), i.clone()))).collect()
-            };
-            let view = Arc::new(RemoteView { asks: state.asks.clone(), nix, token, untraced, closure });
+            let view = Arc::new(RemoteView { state: state.clone(), token, untraced, closure });
             let aspec = ActionSpec {
                 kind: spec.kind,
                 argv: spec.argv,
@@ -827,7 +774,7 @@ impl WorkerState {
 }
 
 struct RemoteFile {
-    asks: Asks,
+    state: Arc<WorkerState>,
     token: u64,
     dir: Vec<u8>,
     name: Vec<u8>,
@@ -836,19 +783,18 @@ struct RemoteFile {
 impl LazyBlob for RemoteFile {
     fn materialize(&self, _store: &Store) -> io::Result<Hash> {
         let q = worker_state::Query::Open { dir: self.dir.clone(), name: self.name.clone() };
-        let h = match self.asks.query(self.token, q) {
+        let h = match self.state.ask_here(self.token, q) {
             Some(worker_state::Reply::Opened(Ok(h))) => h,
             Some(worker_state::Reply::Opened(Err(errno))) => return Err(io::Error::from_raw_os_error(errno)),
             _ => return Err(io::Error::from_raw_os_error(libc::EIO)),
         };
-        self.asks.blob(h)?;
+        self.state.pull_blob(h)?;
         Ok(h)
     }
 }
 
 pub struct RemoteView {
-    asks: Asks,
-    nix: BTreeMap<Vec<u8>, Arc<crate::nixmanifest::Installed>>,
+    state: Arc<WorkerState>,
     token: u64,
     untraced: Vec<Vec<u8>>,
     closure: Vec<Vec<u8>>,
@@ -871,7 +817,7 @@ impl RemoteView {
                 src: match hash {
                     Some(h) => FileSrc::Blob(*h),
                     None => FileSrc::Lazy(Arc::new(RemoteFile {
-                        asks: self.asks.clone(),
+                        state: self.state.clone(),
                         token: self.token,
                         dir: dir.to_vec(),
                         name: name.to_vec(),
@@ -884,21 +830,22 @@ impl RemoteView {
 
 impl View for RemoteView {
     fn lookup(&self, dir: &[u8], name: &[u8]) -> Looked {
-        if let Some(l) = crate::nixmanifest::lookup_at(|n| self.nix.get(n).cloned(), &self.closure, dir, name) {
+        if let Some(l) = crate::nixmanifest::lookup_at(|n| self.state.nix.borrow().get(n).cloned(), &self.closure, dir, name) {
+            self.state.lookups_local.set(self.state.lookups_local.get() + 1);
             return l;
         }
         let q = worker_state::Query::Lookup { dir: dir.to_vec(), name: name.to_vec() };
-        match self.asks.query(self.token, q) {
+        match self.state.ask_here(self.token, q) {
             Some(worker_state::Reply::Looked(w)) => self.convert(dir, name, &w),
             _ => Looked::Absent,
         }
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        if let Some(l) = crate::nixmanifest::list_at(|n| self.nix.get(n).cloned(), &self.closure, dir) {
+        if let Some(l) = crate::nixmanifest::list_at(|n| self.state.nix.borrow().get(n).cloned(), &self.closure, dir) {
             return l;
         }
-        match self.asks.query(self.token, worker_state::Query::List { dir: dir.to_vec() }) {
+        match self.state.ask_here(self.token, worker_state::Query::List { dir: dir.to_vec() }) {
             Some(worker_state::Reply::Listing(Ok(l))) => Ok(l.into_iter().map(|(n, t)| (n, dtype_from_u8(t))).collect()),
             Some(worker_state::Reply::Listing(Err(errno))) => Err(io::Error::from_raw_os_error(errno)),
             _ => Err(io::Error::from_raw_os_error(libc::EIO)),
@@ -998,10 +945,7 @@ pub fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: cra
     let endpoint = Endpoint::bind_keyed("0.0.0.0:0".parse().unwrap(), false, key)?;
     let blobs = Arc::new(Blobs::new(engine.store.clone(), None));
     let (core, first) = worker_state::Worker::new();
-    let (asks, asked) = crate::io::unbounded_channel();
-    let asks = Asks(asks);
     let state = Arc::new(WorkerState {
-        asks: asks.clone(),
         peer: RefCell::new(None),
         blobs,
         engine: engine.clone(),
@@ -1014,12 +958,9 @@ pub fn worker_main(engine: Arc<Engine>, server: SocketAddr, cores: u32, key: cra
         starved: Cell::new(0),
         nix: RefCell::new(BTreeMap::new()),
     });
-    engine.content.set_fetcher(Arc::new(move |h| asks.blob(*h)));
-    let serving = state.clone();
-    let asks_served = crate::io::spawn(move || serving.serve_asks(asked));
-    let ended = worker_links(&engine, &state, server, cores, endpoint, first);
-    asks_served.abort();
-    ended
+    let fetching = state.clone();
+    engine.content.set_fetcher(Arc::new(move |h| fetching.pull_blob(*h)));
+    worker_links(&engine, &state, server, cores, endpoint, first)
 }
 
 /// Keeps a link to the server at `server` up and serves it until the worker is told to stop.
@@ -1412,7 +1353,7 @@ impl Worker {
 
 struct ServerSource {
     store: Arc<Store>,
-    host: Arc<DashMap<Hash, FileSrc>>,
+    host: Rc<crate::nixmanifest::HostSrcs>,
     content: Arc<Content>,
 }
 
@@ -1421,8 +1362,8 @@ impl BlobSource for ServerSource {
         if self.store.has(h) {
             return self.store.open_blob(h);
         }
-        let src = self.host.get(h).map(|s| s.clone()).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let (f, _, _) = self.content.open(&src)?;
+        let (path, sig) = self.host.get(h).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let (f, _, _) = self.content.open(&FileSrc::Host { path, sig })?;
         Ok(f)
     }
 }
@@ -1475,7 +1416,7 @@ pub struct Pool {
     workers: RefCell<Vec<Arc<Worker>>>,
     core: RefCell<pool_state::WorkerPool>,
     blobs: Arc<Blobs>,
-    host_srcs: Arc<DashMap<Hash, FileSrc>>,
+    host_srcs: Rc<crate::nixmanifest::HostSrcs>,
     content: Arc<Content>,
     next_action: ActionIds,
     pub profile_exclude: Vec<Vec<u8>>,
@@ -1513,7 +1454,7 @@ impl Pool {
     /// `rng` is the pool's only source of randomness: action IDs come from it.
     pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey, rng: &mut Rng) -> Result<Arc<Pool>> {
         let endpoint = Endpoint::bind_keyed(addr, true, key).with_context(|| format!("binding {addr}"))?;
-        let host_srcs: Arc<DashMap<Hash, FileSrc>> = Arc::new(DashMap::new());
+        let host_srcs: Rc<crate::nixmanifest::HostSrcs> = Rc::default();
         let blobs = Arc::new(Blobs::new(
             engine.store.clone(),
             Some(Arc::new(ServerSource {
@@ -1568,7 +1509,7 @@ impl Pool {
         if v.is_empty() { "not measured yet".into() } else { v.join(", ") }
     }
 
-    pub fn host_sources(&self) -> &Arc<DashMap<Hash, FileSrc>> {
+    pub fn host_sources(&self) -> &Rc<crate::nixmanifest::HostSrcs> {
         &self.host_srcs
     }
 
@@ -1717,10 +1658,9 @@ impl Pool {
                 self.note_nix(&dir);
                 self.stats.lookups_served.set(self.stats.lookups_served.get() + 1);
                 a.asked.set(a.asked.get() + 1);
-                let (view, content, trace) = (a.view.clone(), self.content.clone(), self.tuning.trace);
-                let (looked, wire) = crate::io::cpu(move || {
-                    let looked = view.lookup(&dir, &name);
-                    if trace {
+                let looked = a.view.lookup(&dir, &name);
+                let wire = {
+                    if self.tuning.trace {
                         let kind = match &looked {
                             Looked::File(_) => "file",
                             Looked::Dir(_) => "dir",
@@ -1729,9 +1669,8 @@ impl Pool {
                         };
                         eprintln!("rargod: asked lookup {kind} {}/{}", String::from_utf8_lossy(&dir), String::from_utf8_lossy(&name));
                     }
-                    let wire = to_wire(&looked, &content);
-                    (looked, wire)
-                });
+                    to_wire(&looked, &self.content)
+                };
                 if let (Looked::File(f), WLooked::File { hash: Some(h), .. }) = (&looked, &wire) {
                     self.remember_src(&a, *h, &f.src);
                 }
@@ -1740,24 +1679,25 @@ impl Pool {
             Req::List { action, dir } => {
                 let Some(a) = acting(action) else { return Resp::Err("no such action".into()) };
                 self.note_nix(&dir);
-                let view = a.view.clone();
-                Resp::Listing(crate::io::cpu(move || {
-                    view.list(&dir)
+                Resp::Listing(
+                    a.view
+                        .list(&dir)
                         .map(|l| l.into_iter().map(|(n, t)| (n, dtype_to_u8(t))).collect())
-                        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
-                }))
+                        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO)),
+                )
             }
             Req::Open { action, dir, name } => {
                 let Some(a) = acting(action) else { return Resp::Err("no such action".into()) };
                 self.note_nix(&dir);
                 self.stats.opens_served.set(self.stats.opens_served.get() + 1);
                 a.asked.set(a.asked.get() + 1);
-                let (view, content) = (a.view.clone(), self.content.clone());
-                let opened = crate::io::cpu(move || {
-                    let Looked::File(f) = view.lookup(&dir, &name) else { return None };
-                    let hashed = content.hash(&f.src);
-                    Some((f.src, hashed))
-                });
+                let opened = match a.view.lookup(&dir, &name) {
+                    Looked::File(f) => {
+                        let hashed = self.content.hash(&f.src);
+                        Some((f.src, hashed))
+                    }
+                    _ => None,
+                };
                 match opened {
                     None => Resp::Opened(Err(libc::ENOENT)),
                     Some((src, Ok(h))) => {
@@ -1784,14 +1724,13 @@ impl Pool {
                     let why = if self.blobs.store.has(&blob) {
                         "in the store, but unreadable".to_string()
                     } else {
-                        let shown = self.host_srcs.get(&blob).map(|s| s.clone());
+                        let shown = self.host_srcs.get(&blob);
                         match shown {
-                            Some(FileSrc::Host { path, sig }) => match crate::io::file::symlink_metadata(&path) {
+                            Some((path, sig)) => match crate::io::file::symlink_metadata(&path) {
                                 Ok(m) if HostSig::of(&m) == sig => format!("{} is unchanged but could not be read", path.display()),
                                 Ok(_) => format!("{} has changed since it was shown", path.display()),
                                 Err(e) => format!("{}: {e}", path.display()),
                             },
-                            Some(_) => "known, but not as a file on this machine".to_string(),
                             None => match self.left_on.borrow().get(&blob) {
                                 Some(l) => format!(
                                     "part of the incremental state `{}` left on worker {:x}{}",
@@ -1819,8 +1758,8 @@ impl Pool {
     }
 
     fn remember_src(&self, a: &RemoteAction, h: Hash, src: &FileSrc) {
-        if let FileSrc::Host { .. } = src {
-            self.host_srcs.entry(h).or_insert_with(|| src.clone());
+        if let FileSrc::Host { path, sig } = src {
+            self.host_srcs.note(h, path, *sig);
             a.served.borrow_mut().push(src.clone());
         }
     }
@@ -2106,16 +2045,13 @@ impl Pool {
                 );
                 if spec.kind == ActionKind::Rustc && links(&spec.argv) && engine.profile(spec).is_none() {
                     if let Some(program) = spec.argv.first() {
-                        let view = view.clone();
-                        let program = program.clone();
-                        let libs = crate::io::cpu(move || sysroot_libs(&*view, &program));
+                        let libs = sysroot_libs(&**view, program);
                         obs.extend(libs.into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })));
                     }
                 }
                 if spec.kind == ActionKind::Rustc {
                     if let Some(root) = crate_root(&spec.argv, &spec.cwd) {
-                        let view = view.clone();
-                        let (dirs, files) = crate::io::cpu(move || source_tree(&*view, &root));
+                        let (dirs, files) = source_tree(&**view, &root);
                         obs.extend(files.into_iter().map(|p| (VPath::from(p), Obs::File { hash: Hash::ZERO, exec: false })));
                         obs.extend(dirs.iter().map(|d| (VPath::from(d.clone()), Obs::Listing(Hash::ZERO))));
                         closed = dirs;
@@ -2125,10 +2061,9 @@ impl Pool {
             }
         };
         if let Some(obs) = predicted {
-            let view = view.clone();
-            let content = self.content.clone();
-            let host_srcs = self.host_srcs.clone();
-            let (p, l, files, served) = crate::io::cpu(move || {
+            let content = &self.content;
+            let host_srcs = &self.host_srcs;
+            let (p, l, files, served) = {
                 let mut served = Vec::new();
                 let mut prefill = Vec::new();
                 let mut listings = Vec::new();
@@ -2155,15 +2090,15 @@ impl Pool {
                         let looked = view.lookup(&dir, &name);
                         let mut w = to_wire(&looked, &content);
                         if let (Looked::File(f), WLooked::File { hash: Some(h), .. }) = (&looked, &w) {
-                            if let FileSrc::Host { .. } = &f.src {
-                                host_srcs.entry(*h).or_insert_with(|| f.src.clone());
+                            if let FileSrc::Host { path, sig } = &f.src {
+                                host_srcs.note(*h, path, *sig);
                                 served.push(f.src.clone());
                             }
                         }
                         if let (Looked::File(f), true) = (&looked, matches!(o, Obs::File { .. }) && vjoin(&dir, &name) == path[..]) {
                             if let Ok(h) = content.hash(&f.src) {
-                                if let FileSrc::Host { .. } = &f.src {
-                                    host_srcs.entry(h).or_insert_with(|| f.src.clone());
+                                if let FileSrc::Host { path, sig } = &f.src {
+                                    host_srcs.note(h, path, *sig);
                                     served.push(f.src.clone());
                                 }
                                 if let WLooked::File { hash, .. } = &mut w {
@@ -2176,7 +2111,7 @@ impl Pool {
                     }
                 }
                 (prefill, listings, files, served)
-            });
+            };
             ra.served.borrow_mut().extend(served);
             prefill = p;
             listings = l;
@@ -2225,8 +2160,7 @@ impl Pool {
 
         let (mut prefill, mut listings, incoming, mut closed) = self.predict(w, engine, spec, key, &view, &ra)?;
         if !req.seed_blobs.is_empty() {
-            let (view, content, dirs) = (view.clone(), self.content.clone(), spec.discard.clone());
-            let (p, l) = crate::io::cpu(move || side_tree(&*view, &content, &dirs));
+            let (p, l) = side_tree(&*view, &self.content, &spec.discard);
             closed.extend(l.iter().map(|(d, _)| d.clone()));
             prefill.extend(p);
             listings.extend(l);
@@ -2590,9 +2524,11 @@ impl RemoteRunner for Pool {
             enum Wake {
                 Remote(RunResult),
                 Local(RunResult),
-                Permit(crate::sched::Permit),
+                Permit,
                 Voice,
             }
+            // The slot a hedge was granted waits here until its wake is read.
+            let granted: Cell<Option<crate::sched::Permit>> = Cell::new(None);
             let mut local: Option<(usize, crate::sched::Permit)> = None;
             let (tx, mut rx) = crate::io::unbounded_channel::<Wake>();
             let mut scope = Scope::default();
@@ -2630,9 +2566,10 @@ impl RemoteRunner for Pool {
                 let wants_permit = local.is_none() && remote.is_some() && may_hedge;
                 match (wants_permit, acquiring) {
                     (true, None) => {
-                        let tx = tx.clone();
+                        let (tx, granted) = (tx.clone(), &granted);
                         acquiring = Some(scope.spawn(move || {
-                            let _ = tx.send(Wake::Permit(engine.sched.acquire(crate::sched::Priority::Idle, mem)));
+                            granted.set(Some(engine.sched.acquire(crate::sched::Priority::Idle, mem)));
+                            let _ = tx.send(Wake::Permit);
                         }));
                     }
                     (false, Some(waiting)) => {
@@ -2671,8 +2608,9 @@ impl RemoteRunner for Pool {
                         self.stats.hedge_won.set(self.stats.hedge_won.get() + 1);
                         return Some(r);
                     }
-                    Wake::Permit(permit) => {
+                    Wake::Permit => {
                         acquiring = None;
+                        let Some(permit) = granted.take() else { continue };
                         if local.is_some() || remote.is_none() {
                             continue;
                         }

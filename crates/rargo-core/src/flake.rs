@@ -449,7 +449,8 @@ pub(crate) fn resolve_shell(
     let hosts = d.pool.get().map(|p| p.host_sources().clone());
     let tables: Arc<dyn crate::db::Tables> = store.db().clone();
     let disk: Arc<dyn crate::nixmanifest::StoreFs> = Arc::new(crate::nixmanifest::Disk);
-    let cached = crate::io::cpu(|| store.db().get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
+    let db = store.db().clone();
+    let cached = crate::io::cpu(|| db.get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
     let mut resolution = Resolution::new(shell_key, cached, host_ca_bundle().is_some());
     let mut scratch: Option<std::path::PathBuf> = None;
     let mut said = false;
@@ -468,7 +469,7 @@ pub(crate) fn resolve_shell(
                 let at = d.scratch("flake")?;
                 scratch = Some(at.clone());
                 let out = (|| -> Result<Vec<u8>> {
-                    let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
+                    let dir = (|| -> Result<std::path::PathBuf> { Ok(match &src.root {
                         Some(root) => {
                             snap.materialize(&at, uid, gid, &|rel, node| evaluated_entry(root.as_os_str().as_bytes(), rel, node))?;
                             at.join(root)
@@ -482,7 +483,7 @@ pub(crate) fn resolve_shell(
                             }
                             at.clone()
                         }
-                    }) })?;
+                    }) })()?;
                     let mut c = nix();
                     c.args(["print-dev-env", "--json", "--no-write-lock-file"]).arg(format!(".#{shell}"));
                     run_nix(&dir, c, uid, gid).map_err(anyhow::Error::msg)
@@ -500,7 +501,7 @@ pub(crate) fn resolve_shell(
             }
             Need::Manifest(closure) => {
                 let attached = &d.nix_attached;
-                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), attached));
+                let prepared = crate::nixmanifest::schedule(d.nix_hashing(), &tables, &disk, nix_store, &closure, hosts.as_ref(), attached);
                 let prepared = match prepared {
                     Ok(p) => p,
                     Err(e) => break Err(e),
@@ -520,7 +521,7 @@ pub(crate) fn resolve_shell(
     let (env, save) = done?;
     if save {
         let value = bincode::serialize(&env)?;
-        crate::io::cpu(|| store.db().put(Table::Meta, &k, &value));
+        crate::io::cpu(|| db.put(Table::Meta, &k, &value));
     }
     Ok(Arc::new(env))
 }

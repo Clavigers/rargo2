@@ -95,12 +95,9 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     let stock_cwd = scratch.join(&who.dir);
     let stock = (|| -> Result<crate::io::process::Output> {
         use std::os::unix::process::CommandExt;
-        let stock_cwd = crate::io::cpu(|| -> Result<std::path::PathBuf> {
-            snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
-            let stock_cwd = stock_cwd.ring_canonicalize()?;
-            anyhow::ensure!(stock_cwd.starts_with(scratch2.ring_canonicalize()?), "drift check directory is outside the snapshot");
-            Ok(stock_cwd)
-        })?;
+        snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
+        let stock_cwd = stock_cwd.ring_canonicalize()?;
+        anyhow::ensure!(stock_cwd.starts_with(scratch2.ring_canonicalize()?), "drift check directory is outside the snapshot");
         let mut c = crate::io::process::Command::new("nice");
         c.args(["-n", "19", cargo.as_str(), "build", "--offline", "-j", "4"])
             .current_dir(&stock_cwd)

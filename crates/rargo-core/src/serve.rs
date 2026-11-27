@@ -82,38 +82,58 @@ fn pump(link: Rc<Link>, stream: u32, mut rx: crate::io::UnboundedReceiver<Server
     sess.close_window();
 }
 
-/// What storing an offer took in: its trees, their bytes, its files and their bytes.
+/// What storing an offer took in: its trees, their bytes, its files, their bytes, and the trees decoded.
 #[derive(Default)]
 struct Offered {
     trees: u64,
     tree_bytes: u64,
     files: u64,
     file_bytes: u64,
+    decoded: Vec<(Hash, rargo_proto::tree::Tree)>,
 }
 
 fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     let stats = &d.trees.stats;
     stats.offers.set(stats.offers.get() + 1);
-    let (manifests, store) = (d.trees.manifests().clone(), d.engine.store.clone());
+    let store = &d.engine.store;
     let (trees, blobs) = (o.trees, o.blobs);
-    let took = crate::io::cpu(move || {
-        let mut took = Offered::default();
-        for t in &trees {
-            if manifests.put(t).is_ok() {
-                took.trees += 1;
-                took.tree_bytes += t.len() as u64;
-            }
-        }
-        for b in blobs {
-            let claimed = b.hash;
-            let Ok(bytes) = b.unpack() else { continue };
-            if Hash::of(&bytes).0 == claimed && store.put_bytes(&bytes).is_ok() {
-                took.files += 1;
-                took.file_bytes += bytes.len() as u64;
-            }
-        }
-        took
+    // The pool decodes, unpacks and hashes what was sent; the loop then stores what held up.
+    let (trees, blobs) = crate::io::cpu(move || {
+        let trees: Vec<_> = trees
+            .into_iter()
+            .filter_map(|t| {
+                let tree = rargo_proto::tree::Tree::decode(&t).ok()?;
+                Some((Hash::of(&t), t, tree))
+            })
+            .collect();
+        let blobs: Vec<(Hash, Vec<u8>)> = blobs
+            .into_iter()
+            .filter_map(|b| {
+                let claimed = b.hash;
+                let bytes = b.unpack().ok()?;
+                let hash = Hash::of(&bytes);
+                (hash.0 == claimed).then_some((hash, bytes))
+            })
+            .collect();
+        (trees, blobs)
     });
+    let mut took = Offered::default();
+    for (digest, encoded, tree) in trees {
+        if store.put_hashed_bytes(digest, &encoded).is_ok() {
+            took.trees += 1;
+            took.tree_bytes += encoded.len() as u64;
+            took.decoded.push((digest, tree));
+        }
+    }
+    for (hash, bytes) in blobs {
+        if store.put_hashed_bytes(hash, &bytes).is_ok() {
+            took.files += 1;
+            took.file_bytes += bytes.len() as u64;
+        }
+    }
+    for (digest, tree) in took.decoded {
+        d.trees.manifests().remember(digest, tree);
+    }
     stats.trees_received.set(stats.trees_received.get() + took.trees);
     stats.offered_bytes.set(stats.offered_bytes.get() + took.tree_bytes + took.file_bytes);
     d.stats.bytes_in.set(d.stats.bytes_in.get() + took.file_bytes);
@@ -399,8 +419,8 @@ fn serve(
             };
         }
         Command::Incr => {
-            let ((states, _), store) = (d.incr.parts(), d.engine.store.clone());
-            return say(&sess, crate::io::cpu(move || crate::incr::analyze(&*states, &store)));
+            let (states, _) = d.incr.parts();
+            return say(&sess, crate::incr::analyze(&*states, &d.engine.store));
         }
         Command::Gc => {
             let (running, waiting, _, _) = d.engine.sched.snapshot();
@@ -417,8 +437,7 @@ fn serve(
             );
         }
         Command::Compact => {
-            let (store, fs) = (d.engine.store.clone(), d.engine.fs.clone());
-            let (n, freed) = crate::io::cpu(move || store.freeze_idle(0, &|h| fs.forget_backing(h)));
+            let (n, freed) = d.engine.store.freeze_idle(0, &|h| d.engine.fs.forget_backing(h));
             d.engine.store.db().flush();
             let (cn, logical, disk) = d.engine.store.cold_stats();
             let mib = |b: u64| b as f64 / (1 << 20) as f64;

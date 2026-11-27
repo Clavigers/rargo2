@@ -162,9 +162,9 @@ pub fn loopback_up() -> io::Result<()> {
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
     ifr.ifr_name[0] = b'l' as libc::c_char;
     ifr.ifr_name[1] = b'o' as libc::c_char;
-    ok(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS, &mut ifr) })?;
+    ok(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS as libc::Ioctl, &mut ifr) })?;
     unsafe { ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short };
-    ok(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS, &ifr) })
+    ok(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS as libc::Ioctl, &ifr) })
 }
 
 /// Sets this UTS namespace's host name.

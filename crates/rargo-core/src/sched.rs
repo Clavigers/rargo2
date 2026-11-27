@@ -1,5 +1,5 @@
 use crate::sched_state::{Broker, Effects, Job, SchedState};
-use parking_lot::Mutex;
+use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeMap;
 use crate::io::PipeEnd;
 use std::os::fd::{AsRawFd, RawFd};
@@ -17,14 +17,15 @@ pub enum Priority {
 
 struct Inner {
     state: SchedState,
-    senders: BTreeMap<Job, oneshot::Sender<Permit>>,
+    senders: BTreeMap<Job, oneshot::Sender<()>>,
     next_job: Job,
     shutdown: bool,
 }
 
+/// Hands out job slots. The loop thread owns it, and its broker is a fiber there.
 pub struct Scheduler {
-    inner: Mutex<Inner>,
-    wake_broker: std::sync::OnceLock<crate::io::Notify>,
+    inner: RefCell<Inner>,
+    broker: OnceCell<(Arc<crate::io::Notify>, crate::io::JoinHandle<()>)>,
     born: Instant,
     pipe_r: PipeEnd,
     pipe_w: PipeEnd,
@@ -42,6 +43,36 @@ impl Drop for Permit {
     }
 }
 
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        if let Some((_, broker)) = self.broker.get() {
+            if crate::io::loop_running() {
+                broker.abort();
+            }
+        }
+    }
+}
+
+/// The wait for a slot. Dropped before the slot is taken, it gives a slot granted meanwhile back.
+struct Waiting<'a> {
+    sched: &'a Arc<Scheduler>,
+    job: Job,
+    taken: bool,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if self.taken {
+            return;
+        }
+        // A job still waiting has its sender; pruning cancels it once the receiver is gone.
+        let granted = !self.sched.inner.borrow().senders.contains_key(&self.job);
+        if granted {
+            self.sched.release(self.job);
+        }
+    }
+}
+
 fn write_token(fd: RawFd) {
     let _ = crate::io::write_now(fd, b"|");
 }
@@ -54,13 +85,13 @@ impl Scheduler {
         }
         let pipe_try = pipe_r.nonblocking_reader()?;
         let s = Arc::new(Scheduler {
-            inner: Mutex::new(Inner {
+            inner: RefCell::new(Inner {
                 state: SchedState::new(tokens, mem_budget_kb),
                 senders: BTreeMap::new(),
                 next_job: 0,
                 shutdown: false,
             }),
-            wake_broker: std::sync::OnceLock::new(),
+            broker: OnceCell::new(),
             born: crate::io::now(),
             pipe_r,
             pipe_w,
@@ -70,7 +101,7 @@ impl Scheduler {
     }
 
     pub fn tokens(&self) -> usize {
-        self.inner.lock().state.tokens()
+        self.inner.borrow_mut().state.tokens()
     }
 
     pub fn jobserver_fds(&self) -> [RawFd; 2] {
@@ -78,7 +109,7 @@ impl Scheduler {
     }
 
     pub fn snapshot(&self) -> (usize, usize, usize, u64) {
-        let i = self.inner.lock();
+        let i = self.inner.borrow_mut();
         let (running, _, peak, granted) = i.state.snapshot();
         let waiting =
             i.state.wanted_jobs().into_iter().filter(|j| i.senders.get(j).is_some_and(|t| !t.is_closed())).count();
@@ -86,20 +117,21 @@ impl Scheduler {
     }
 
     pub fn free_tokens(&self) -> usize {
-        self.inner.lock().state.spare() + self.in_pipe()
+        self.inner.borrow_mut().state.spare() + self.in_pipe()
     }
 
     fn kick(&self) {
-        if let Some(wake) = self.wake_broker.get() {
+        if let Some((wake, _)) = self.broker.get() {
             wake.notify_one();
         }
     }
 
     fn start_broker(self: &Arc<Self>) {
-        self.wake_broker.get_or_init(|| {
+        self.broker.get_or_init(|| {
             let weak = Arc::downgrade(self);
-            crate::io::background(move || broker(weak));
-            crate::io::Notify::new()
+            let wake = Arc::new(crate::io::Notify::new());
+            let woken = wake.clone();
+            (wake, crate::io::spawn(move || broker(weak, woken)))
         });
     }
 
@@ -110,8 +142,8 @@ impl Scheduler {
     /// Like `acquire`; when no slot is free as the job asks, `queued` is told how many jobs run and how many wait.
     pub fn acquire_saying(self: &Arc<Self>, prio: Priority, mem_kb: u64, queued: impl FnOnce(usize, usize)) -> Permit {
         self.start_broker();
-        let (rx, waits) = {
-            let mut i = self.inner.lock();
+        let (rx, job, waits) = {
+            let mut i = self.inner.borrow_mut();
             self.prune(&mut i);
             let (tx, rx) = oneshot::channel();
             let job = i.next_job;
@@ -122,14 +154,19 @@ impl Scheduler {
             self.apply(&mut i, fx);
             self.kick();
             let (running, waiting, _, _) = i.state.snapshot();
-            (rx, (free == 0).then_some((running, waiting)))
+            (rx, job, (free == 0).then_some((running, waiting)))
         };
+        let mut waiting_for = Waiting { sched: self, job, taken: false };
         if let Some((running, waiting)) = waits {
             queued(running, waiting);
         }
         match rx.recv() {
-            Some(permit) => permit,
+            Some(()) => {
+                waiting_for.taken = true;
+                Permit { sched: self.clone(), job }
+            }
             None => {
+                waiting_for.taken = true;
                 let hang = crate::io::Notify::new();
                 loop {
                     hang.notified();
@@ -152,8 +189,7 @@ impl Scheduler {
         while let Some(fx) = todo.pop() {
             for job in fx.grant {
                 let tx = i.senders.remove(&job).expect("a granted job has a sender");
-                if let Err(p) = tx.send(Permit { sched: self.clone(), job }) {
-                    std::mem::forget(p);
+                if tx.send(()).is_err() {
                     todo.push(i.state.release(job));
                 }
             }
@@ -175,7 +211,7 @@ impl Scheduler {
     }
 
     fn release(self: &Arc<Self>, job: Job) {
-        let mut i = self.inner.lock();
+        let mut i = self.inner.borrow_mut();
         let fx = i.state.release(job);
         self.apply(&mut i, fx);
         self.prune(&mut i);
@@ -183,7 +219,7 @@ impl Scheduler {
     }
 
     pub fn restore(self: &Arc<Self>, tokens: usize) {
-        let mut i = self.inner.lock();
+        let mut i = self.inner.borrow_mut();
         let fx = i.state.token_in(tokens);
         self.apply(&mut i, fx);
     }
@@ -201,17 +237,24 @@ impl Scheduler {
     }
 
     pub fn shutdown(&self) {
-        self.inner.lock().shutdown = true;
+        self.inner.borrow_mut().shutdown = true;
         self.kick();
         write_token(self.pipe_w.as_raw_fd());
     }
 }
 
-fn broker(weak: std::sync::Weak<Scheduler>) {
+/// What the broker waits for once the scheduler has nothing for it to do.
+enum Rest {
+    Wake(u64),
+    Token(RawFd),
+}
+
+fn broker(weak: std::sync::Weak<Scheduler>, wake: Arc<crate::io::Notify>) {
     loop {
-        let Some(s) = weak.upgrade() else { return };
-        let step = {
-            let mut i = s.inner.lock();
+        // The scheduler is held only between waits, so that its last owner is never this fiber.
+        let rest = {
+            let Some(s) = weak.upgrade() else { return };
+            let mut i = s.inner.borrow_mut();
             if i.shutdown {
                 return;
             }
@@ -224,30 +267,27 @@ fn broker(weak: std::sync::Weak<Scheduler>) {
                     }
                     continue;
                 }
-                step => step,
+                Broker::Wait(ms) => Rest::Wake(ms),
+                Broker::Read => Rest::Token(s.pipe_r.as_raw_fd()),
             }
         };
-        match step {
-            Broker::Wait(ms) => {
-                let wake = s.wake_broker.get().expect("the broker starts with its wake");
+        match rest {
+            Rest::Wake(ms) => {
                 let _ = crate::io::timeout(Duration::from_millis(ms), || wake.notified());
-                if Arc::strong_count(&s) == 1 {
-                    return;
-                }
             }
-            Broker::Read => {
-                let Ok(token) = crate::io::read_at(s.pipe_r.as_raw_fd(), 0, 1) else { continue };
+            Rest::Token(pipe) => {
+                let Ok(token) = crate::io::read_at(pipe, 0, 1) else { continue };
                 if token.len() != 1 {
                     continue;
                 }
-                let mut i = s.inner.lock();
+                let Some(s) = weak.upgrade() else { return };
+                let mut i = s.inner.borrow_mut();
                 if i.shutdown {
                     return;
                 }
                 let fx = i.state.token_in(1);
                 s.apply(&mut i, fx);
             }
-            Broker::TakeForIdle => unreachable!("taken above"),
         }
     }
 }
@@ -267,7 +307,7 @@ mod tests {
             let _a = s.acquire(Priority::Agent, 0);
             assert_eq!(s.free_tokens(), 0);
             let s2 = s.clone();
-            let mut second = crate::io::spawn(move || s2.acquire(Priority::Agent, 0));
+            let mut second = crate::io::spawn(move || drop(s2.acquire(Priority::Agent, 0)));
             crate::io::sleep(std::time::Duration::from_millis(50));
             assert!(!second.is_finished());
             write_token(w);

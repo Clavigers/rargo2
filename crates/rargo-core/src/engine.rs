@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub trait Observer {
@@ -176,7 +177,7 @@ pub struct EngineStats {
 pub struct Engine {
     pub store: Arc<Store>,
     pub content: Arc<Content>,
-    pub fs: Arc<SandboxFs>,
+    pub fs: Rc<SandboxFs>,
     pub mnt: PathBuf,
     pub zygote: Arc<dyn Launcher>,
     pub traces: TraceCache,
@@ -223,7 +224,7 @@ impl Drop for Requester<'_> {
 }
 
 struct Teardown {
-    fs: Arc<SandboxFs>,
+    fs: Rc<SandboxFs>,
     sched: Arc<Scheduler>,
     zygote: Arc<dyn Launcher>,
     action: Arc<ActionFs>,
@@ -242,7 +243,7 @@ impl Drop for Teardown {
         let (fs, action, scratch, group) =
             (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
         let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
-        drop(io::spawn_off(move || {
+        drop(io::spawn(move || {
             let held = match (&running, &group) {
                 (Some(_), Some(g)) => io::cpu(|| {
                     g.freeze();
@@ -259,8 +260,8 @@ impl Drop for Teardown {
             if held > 0 {
                 sched.restore(held);
             }
+            let _ = fs.finish_action(&action);
             io::cpu(move || {
-                let _ = fs.finish_action(&action);
                 drop(group);
                 let _ = io::file::remove_dir_all(&scratch);
             });
@@ -343,7 +344,7 @@ impl Engine {
     pub fn new(
         store: Arc<Store>,
         content: Arc<Content>,
-        fs: Arc<SandboxFs>,
+        fs: Rc<SandboxFs>,
         mnt: PathBuf,
         zygote: Arc<dyn Launcher>,
         sched: Arc<Scheduler>,
@@ -801,11 +802,7 @@ impl Engine {
         let run = self.run_in(spec, uid, gid, observer, &action, &mut teardown);
         teardown.armed = false;
         drop(teardown);
-        let fin = {
-            let fs = self.fs.clone();
-            let a = action.clone();
-            io::cpu(move || fs.finish_action(&a))
-        };
+        let fin = self.fs.finish_action(&action);
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
             Err(e) => {
@@ -815,52 +812,52 @@ impl Engine {
         };
 
         let store = self.store.clone();
-        let content = self.content.clone();
-        let upper = fin.upper;
-        let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
-            let mut scratch: Vec<(PathBuf, bool)> = upper
+        // What each output is, or the scratch file whose content is yet to be stored.
+        let mut upper: Vec<(Vec<u8>, std::result::Result<MEntry, (PathBuf, bool)>)> = Vec::with_capacity(fin.upper.len());
+        for u in fin.upper {
+            let entry = match u.kind {
+                UpperKind::Dir => Ok(MEntry::Dir),
+                UpperKind::Whiteout => Ok(MEntry::Whiteout),
+                UpperKind::Symlink(t) => Ok(MEntry::Symlink(t)),
+                UpperKind::File { path, exec } => Err((path, exec)),
+                UpperKind::LowerFile { info } => {
+                    let hash = self.content.hash(&info.src)?;
+                    if !store.has(&hash) {
+                        let (f, _, _) = self.content.open(&info.src)?;
+                        store.put_file_copy(&f, info.exec())?;
+                    }
+                    Ok(MEntry::File { hash, exec: info.exec(), size: info.size })
+                }
+            };
+            upper.push((u.path, entry));
+        }
+        let (entries, out_hash, err_hash) = (|| -> Result<_> {
+            let mut files: Vec<(PathBuf, bool)> = upper.iter().filter_map(|(_, entry)| entry.as_ref().err().cloned()).collect();
+            files.sort();
+            files.dedup_by(|a, b| a.0 == b.0);
+            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> = files
                 .iter()
-                .filter_map(|u| match &u.kind {
-                    UpperKind::File { path, exec } => Some((path.clone(), *exec)),
-                    _ => None,
+                .zip(store.put_files_move(files.clone()))
+                .map(|((path, _), put)| {
+                    let r = put.with_context(|| format!("storing output file {}", path.display()))?;
+                    Ok((path.clone(), r))
                 })
                 .collect();
-            scratch.sort();
-            scratch.dedup_by(|a, b| a.0 == b.0);
-            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> =
-                io::thread::par_map(scratch, |(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
-                    let r = store
-                        .put_file_move(&path, exec)
-                        .with_context(|| format!("storing output file {}", path.display()))?;
-                    Ok((path, r))
-                });
             let stored = stored?;
-            let entries: Result<Vec<(Vec<u8>, MEntry)>> =
-                io::thread::par_map(upper, |u| -> Result<(Vec<u8>, MEntry)> {
-                    let e = match u.kind {
-                        UpperKind::Dir => MEntry::Dir,
-                        UpperKind::Whiteout => MEntry::Whiteout,
-                        UpperKind::Symlink(t) => MEntry::Symlink(t),
-                        UpperKind::File { path, exec } => {
-                            let (hash, size) = stored[&path];
-                            MEntry::File { hash, exec, size }
-                        }
-                        UpperKind::LowerFile { info } => {
-                            let hash = content.hash(&info.src)?;
-                            if !store.has(&hash) {
-                                let (f, _, _) = content.open(&info.src)?;
-                                store.put_file_copy(&f, info.exec())?;
-                            }
-                            MEntry::File { hash, exec: info.exec(), size: info.size }
-                        }
-                    };
-                    Ok((u.path, e))
-                });
-            let entries = entries?;
+            let entries: Vec<(Vec<u8>, MEntry)> = upper
+                .into_iter()
+                .map(|(path, entry)| {
+                    let entry = entry.unwrap_or_else(|(scratch, exec)| {
+                        let (hash, size) = stored[&scratch];
+                        MEntry::File { hash, exec, size }
+                    });
+                    (path, entry)
+                })
+                .collect();
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
-        })?;
+        })()?;
         let _ = io::file::remove_dir_all(&scratch);
 
         let mut entries = entries;

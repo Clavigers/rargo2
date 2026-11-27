@@ -1,4 +1,5 @@
 use std::io;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use io_uring::{opcode, squeue::Entry128, types};
@@ -17,20 +18,22 @@ pub struct FuseDrive {
 }
 
 impl FuseDrive {
-    pub fn spawn<F>(session: &Arc<Session>, fs: &Arc<F>) -> io::Result<Self>
+    /// Serves `session` from `fs` on the loop thread: each kernel queue has a
+    /// fiber that takes a request, runs its handler and commits the reply.
+    pub fn spawn<F>(session: &Arc<Session>, fs: &Rc<F>) -> io::Result<Self>
     where
-        F: Filesystem + Send + Sync + 'static,
+        F: Filesystem + 'static,
     {
         let queues = possible_queues()?;
         let mut readers = Vec::with_capacity(usize::from(queues) + 1);
         for queue in 0..queues {
-            let (session, fs) = (Arc::clone(session), Arc::clone(fs));
+            let (session, fs) = (Arc::clone(session), Rc::clone(fs));
             readers.push(super::spawn(move || serve_queue(session, fs, queue)));
         }
 
         // Linux still delivers FORGET, INTERRUPT and other control traffic here.
         let fd = session.device_fd();
-        let (session, fs) = (Arc::clone(session), Arc::clone(fs));
+        let (session, fs) = (Arc::clone(session), Rc::clone(fs));
         let reader = super::spawn(move || loop {
             match super::read_at(fd, 0, BUF_SIZE) {
                 Ok(request) if request.is_empty() => break session.ended(),
@@ -51,10 +54,8 @@ impl FuseDrive {
                         eprintln!("error: FUSE-over-io_uring received an unexpected opcode on /dev/fuse: {opcode:?}");
                         std::process::exit(101);
                     }
-                    let (session, fs) = (Arc::clone(&session), Arc::clone(&fs));
-                    drop(super::spawn(move || {
-                        answer(fd, &session, fs.as_ref(), &request)
-                    }));
+                    let (session, fs) = (Arc::clone(&session), Rc::clone(&fs));
+                    drop(super::spawn(move || answer(fd, &session, fs.as_ref(), &request)));
                 }
                 Err(e)
                     if matches!(
@@ -196,7 +197,7 @@ impl RingBuffer {
     }
 }
 
-fn serve_queue<F: Filesystem + Send + Sync + 'static>(session: Arc<Session>, fs: Arc<F>, queue: u16) {
+fn serve_queue<F: Filesystem>(session: Arc<Session>, fs: Rc<F>, queue: u16) {
     let fd = session.device_fd();
     let mut commit = None;
     let mut buffer = Box::new(RingBuffer::new());
@@ -222,7 +223,7 @@ fn serve_queue<F: Filesystem + Send + Sync + 'static>(session: Arc<Session>, fs:
                 std::process::exit(101);
             }
         };
-        let next = super::blocking(|| buffer.reply(&session, fs.as_ref()));
+        let next = buffer.reply(&session, fs.as_ref());
         match next {
             Ok(Some(id)) => commit = Some(id),
             Ok(None) => break,
@@ -235,27 +236,27 @@ fn serve_queue<F: Filesystem + Send + Sync + 'static>(session: Arc<Session>, fs:
     session.ended();
 }
 
-fn answer<F: Filesystem + Sync>(fd: i32, session: &Session, fs: &F, request: &[u8]) {
-    let replies = super::blocking(|| {
-        let mut aligned: Vec<u64> = vec![0; request.len().div_ceil(8)];
-        let request = unsafe {
-            let dst =
-                std::slice::from_raw_parts_mut(aligned.as_mut_ptr() as *mut u8, request.len());
-            dst.copy_from_slice(request);
-            std::slice::from_raw_parts(aligned.as_ptr() as *const u8, request.len())
-        };
-        let mut out = Vec::new();
-        session.respond(&mut session.handler(), fs, request, |bytes: &[u8]| {
-            out.push(bytes.to_vec());
-            Ok(())
-        });
-        out
-    });
-    for reply in replies {
+fn answer<F: Filesystem>(fd: i32, session: &Session, fs: &F, request: &[u8]) {
+    for reply in replies(session, fs, request) {
         if write_fuse(fd, &reply).is_err() {
             return session.ended();
         }
     }
+}
+
+fn replies<F: Filesystem>(session: &Session, fs: &F, request: &[u8]) -> Vec<Vec<u8>> {
+    let mut aligned: Vec<u64> = vec![0; request.len().div_ceil(8)];
+    let request = unsafe {
+        let dst = std::slice::from_raw_parts_mut(aligned.as_mut_ptr() as *mut u8, request.len());
+        dst.copy_from_slice(request);
+        std::slice::from_raw_parts(aligned.as_ptr() as *const u8, request.len())
+    };
+    let mut out = Vec::new();
+    session.respond(&mut session.handler(), fs, request, |bytes: &[u8]| {
+        out.push(bytes.to_vec());
+        Ok(())
+    });
+    out
 }
 
 fn write_fuse(fd: i32, bytes: &[u8]) -> std::io::Result<()> {

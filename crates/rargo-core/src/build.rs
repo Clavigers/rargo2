@@ -68,7 +68,8 @@ pub struct Daemon {
     pub parser: Arc<Parser>,
     pub incr: crate::incr::IncrStore,
     pub pool: OnceCell<Arc<crate::remote::Pool>>,
-    pub(crate) nix_attached: Arc<crate::nixmanifest::Attached>,
+    pub(crate) nix_attached: std::rc::Rc<crate::nixmanifest::Attached>,
+    nix_hashing: OnceCell<crate::nixmanifest::Hashing>,
     pub drift_report: RefCell<Option<String>>,
     pub last_clients: RefCell<HashMap<String, crate::drift::LastClient>>,
     pub deliveries: RefCell<Deliveries>,
@@ -264,7 +265,8 @@ impl Daemon {
             log_phases: OnceCell::new(),
             incr,
             pool: OnceCell::new(),
-            nix_attached: Arc::default(),
+            nix_attached: Default::default(),
+            nix_hashing: OnceCell::new(),
             drift_report: RefCell::new(None),
             last_clients: RefCell::new(HashMap::new()),
             deliveries: RefCell::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
@@ -325,13 +327,11 @@ impl Daemon {
     }
 
     pub fn export_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let (tables, store) = (self.engine.traces.tables(), self.store().clone());
-        crate::io::cpu(move || export_cache(&*tables, &store, dir))
+        export_cache(&*self.engine.traces.tables(), self.store(), dir)
     }
 
     pub fn import_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let store = self.store().clone();
-        let (traces, needs, blobs) = crate::io::cpu(move || import_blobs(&store, dir))?;
+        let (traces, needs, blobs) = import_blobs(self.store(), dir)?;
         let n = traces.len();
         for (key, t) in traces {
             self.engine.traces.insert(&key, t);
@@ -342,18 +342,24 @@ impl Daemon {
         Ok((n, blobs))
     }
 
+    /// The thread that hashes Nix store paths, started when it is first wanted.
+    pub(crate) fn nix_hashing(&self) -> &crate::nixmanifest::Hashing {
+        self.nix_hashing.get_or_init(crate::nixmanifest::Hashing::start)
+    }
+
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
         let traces = self.engine.traces.tables();
         let (states, state_blobs) = self.incr.parts();
-        let (manifests, roots) = (self.trees.manifests().clone(), self.trees.recent_roots());
-        let (store, fs) = (self.store().clone(), self.engine.fs.clone());
-        crate::io::cpu(move || {
+        let roots = self.trees.recent_roots();
+        let store = self.store();
+        let mut live = crate::io::cpu(move || {
             let mut live = std::collections::BTreeSet::new();
             crate::trace::mark(&*traces, &mut live);
-            crate::incr::mark(&*states, &*state_blobs, &mut live);
-            manifests.mark(roots, &mut live);
-            store.sweep(&live, min_age_secs, &|h| fs.forget_backing(h))
-        })
+            live
+        });
+        crate::incr::mark(&*states, &*state_blobs, &mut live);
+        crate::snapshot::mark_trees(store, roots, &mut live);
+        store.sweep(&live, min_age_secs, &|h| self.engine.fs.forget_backing(h))
     }
 }
 
@@ -384,8 +390,8 @@ fn export_cache(tables: &dyn crate::db::Tables, store: &Store, dir: &Path) -> Re
         written += 1;
     }
     let bundle = (traces, crate::trace::all_needs_env(tables));
-    let raw = bincode::serialize(&bundle)?;
-    crate::io::file::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
+    let packed = crate::io::cpu(|| -> Result<Vec<u8>> { Ok(zstd::encode_all(&bincode::serialize(&bundle)?[..], 3)?) })?;
+    crate::io::file::write(dir.join("traces.bin"), packed)?;
     Ok((bundle.0.len(), written))
 }
 
@@ -393,8 +399,9 @@ type Imported = (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>, usize);
 
 /// Puts the blobs exported under `dir` into `store` and reads the traces whose files are then all there.
 fn import_blobs(store: &Store, dir: &Path) -> Result<Imported> {
-    let raw = zstd::decode_all(&crate::io::file::read(dir.join("traces.bin"))?[..])?;
-    let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
+    let packed = crate::io::file::read(dir.join("traces.bin"))?;
+    let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) =
+        crate::io::cpu(|| -> Result<_> { Ok(bincode::deserialize(&zstd::decode_all(&packed[..])?)?) })?;
     let mut blobs = 0;
     for e in crate::io::file::read_dir(dir.join("blobs"))?.flatten() {
         let Some(want) = e.file_name().to_str().and_then(Hash::from_hex) else { continue };
@@ -413,7 +420,7 @@ fn import_blobs(store: &Store, dir: &Path) -> Result<Imported> {
 }
 
 pub fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
-    let _hold = crate::nixmanifest::hold_build();
+    let _hold = d.nix_hashing().hold_build();
     d.stats.requests.set(d.stats.requests.get() + 1);
     let c = Arc::new(c);
     if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {
@@ -809,7 +816,7 @@ fn fetch(
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
     let out = (|| -> Result<std::result::Result<Option<crate::io::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
-        crate::io::cpu(|| snap.materialize(&scratch2, uid, gid, &|_, _| true))?;
+        snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         if install {
             for path in fetch_args.iter().filter_map(|a| a.strip_prefix("--path=")) {
                 let path = Path::new(path);

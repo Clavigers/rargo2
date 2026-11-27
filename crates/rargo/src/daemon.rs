@@ -4,7 +4,7 @@ use rargo_proto::waits::{self, Wait};
 use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use rargo::link_watch::Silence;
 use crate::mux::Mux;
-use crate::outfs::{OutFs, Ranged, Reader, VFile};
+use crate::outfs::{OutFs, Reader, VFile};
 use crate::partial::Partial;
 use crate::place::{OutputMounts, Placed, Placer};
 use crate::watch::{Registration, Watcher};
@@ -48,7 +48,7 @@ fn add(counter: &Cell<u64>, n: u64) {
 }
 
 struct Mounted {
-    fs: Arc<OutFs>,
+    fs: Rc<OutFs>,
     session: Arc<fusewire::Session>,
     dir: PathBuf,
     dev: u64,
@@ -105,6 +105,7 @@ pub struct Daemon {
     fetching: RefCell<BTreeMap<Digest, Rc<io::Mutex<()>>>>,
     partials: RefCell<BTreeMap<Digest, (u64, Rc<Partial>)>>,
     next_partial: Cell<u64>,
+    names: RefCell<crate::tmp::Names>,
     chunks: RefCell<crate::known::Chunks>,
     chunks_changed: Cell<bool>,
     knowledge: RefCell<DaemonState>,
@@ -551,6 +552,7 @@ impl Daemon {
             fetching: RefCell::new(BTreeMap::new()),
             partials: RefCell::new(BTreeMap::new()),
             next_partial: Cell::new(0),
+            names: RefCell::new(crate::tmp::Names::all()),
             chunks: RefCell::new(chunks),
             chunks_changed: Cell::new(false),
             knowledge: RefCell::new(DaemonState::new(held)),
@@ -718,6 +720,7 @@ impl Daemon {
         let (root, cache, wt_cache) = (wt.root.clone(), self.cache.clone(), wt.wt_cache.clone());
         let (previous, loaded) = (st.last.take(), st.loaded.take());
         let policy_dir = st.policy_dir.clone();
+        let mut names = self.names();
         let snap = io::cpu(move || -> std::io::Result<Snap> {
             let mut policy = crate::load_policy(&root, &policy_dir);
             if let Ok(inside) = cache.ring_canonicalize().unwrap_or_else(|_| cache.clone()).strip_prefix(&root) {
@@ -743,7 +746,7 @@ impl Daemon {
             };
             let mut scan = scanned.map_err(|e| std::io::Error::new(e.kind(), format!("scanning {}: {e}", root.display())))?;
             if scan.index_changed {
-                let _ = scan.index.to_bytes().and_then(|b| crate::write_atomic(&wt_cache.join("index"), &b));
+                let _ = scan.index.to_bytes().and_then(|b| crate::write_atomic(&wt_cache.join("index"), &b, &mut names));
             }
             if let Some(h) = &head {
                 let history = match policy.git {
@@ -760,13 +763,13 @@ impl Daemon {
                             let at = dir.parent().and_then(Path::parent).unwrap_or(dir).join("index");
                             let s = scan::scan_store(dir, &scan::Index::load(&at))?;
                             if s.index_changed {
-                                let _ = s.index.to_bytes().and_then(|b| crate::write_atomic(&at, &b));
+                                let _ = s.index.to_bytes().and_then(|b| crate::write_atomic(&at, &b, &mut names));
                             }
                             Some(s)
                         }
                         None => None,
                     };
-                    scan::graft_git(&mut scan, &root, &thin, stored, crate::write_atomic)?;
+                    scan::graft_git(&mut scan, &root, &thin, stored, |path, bytes| crate::write_atomic(path, bytes, &mut names))?;
                 }
             }
             Ok(Snap { scan, policy, head, left_out })
@@ -971,24 +974,29 @@ impl Daemon {
         self.knowledge.borrow_mut().synced(worktree.map(|wt| wt.id), snap.scan.root, snap.scan.trees.keys().chain(snap.scan.files.keys()));
     }
 
+    /// Numbers for temporary files that nothing else in this process uses, for one job to name its files with.
+    fn names(&self) -> crate::tmp::Names {
+        self.names.borrow_mut().part()
+    }
+
     pub fn save_known(&self) {
         {
             let _serial = self.saving_held.lock();
             let state = self.knowledge.borrow_mut().held.take_changes();
-            if let Some(body) = state && let Err(e) = self.held_file.save(&body) {
+            if let Some(body) = state && let Err(e) = self.held_file.save(&body, &mut self.names()) {
                 self.knowledge.borrow_mut().held.save_failed();
                 eprintln!("rargo daemon: cannot keep what the server holds: {e}");
             }
         }
         if self.chunks_changed.replace(false) {
             let chunks = self.chunks.borrow().clone();
-            if let Err(e) = crate::known::save_chunks(&self.cache, &chunks) {
+            if let Err(e) = crate::known::save_chunks(&self.cache, &chunks, &mut self.names()) {
                 eprintln!("rargo daemon: cannot keep the chunk index: {e}");
             }
         }
     }
 
-    fn out_for(self: &Rc<Self>, wt: &Rc<Worktree>, req: &LocalRequest, cwd: &Path) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
+    fn out_for(self: &Rc<Self>, wt: &Rc<Worktree>, req: &LocalRequest, cwd: &Path) -> std::io::Result<Option<(Rc<OutFs>, PathBuf)>> {
         let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
             || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
@@ -998,7 +1006,7 @@ impl Daemon {
         let unmount = || {
             let mounted = wt.out.borrow_mut().take();
             if let Some(m) = mounted {
-                m.fs.save();
+                m.fs.save(self.names());
                 io::blocking(|| m.session.unmount());
             }
         };
@@ -1013,7 +1021,7 @@ impl Daemon {
         }
         let mounted = wt.out.borrow().as_ref().map(|m| (m.session.clone(), m.dir.clone(), m.dev));
         if let Some((session, dir, dev)) = mounted {
-            if session.shown() && dev_at(&mountinfo(), &dir) == Some(dev) {
+            if io::blocking(|| session.shown()) && dev_at(&mountinfo(), &dir) == Some(dev) {
                 let fs = wt.out.borrow().as_ref().map(|m| m.fs.clone());
                 if let Some(fs) = fs {
                     return Ok(Some((fs, dir)));
@@ -1054,10 +1062,7 @@ impl Daemon {
         if !tag.ring_exists() {
             rargo_net::io::file::write(&tag, rargo_proto::CACHEDIR_TAG)?;
         }
-        let (asks, asked) = unbounded_channel();
-        let source = Box::new(Contents { cache: self.cache.clone(), asks });
-        let d = Rc::downgrade(self);
-        io::spawn(move || answer_asks(d, asked));
+        let source = Box::new(Contents { cache: self.cache.clone(), d: Rc::downgrade(self) });
         let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
         let root = io::process::euid() == 0;
         let opts = fusewire::MountOptions {
@@ -1079,7 +1084,7 @@ impl Daemon {
         for wt in all {
             let mounted = wt.out.borrow_mut().take();
             if let Some(m) = mounted {
-                m.fs.save();
+                m.fs.save(self.names());
                 io::blocking(|| m.session.unmount());
             }
         }
@@ -1361,7 +1366,7 @@ impl Daemon {
             }
         }
         let id = mux.fetch(vec![hash], &tx);
-        let mut placer = Placer::new(cache, Placed::default());
+        let mut placer = Placer::new(cache, Placed::default(), self.names());
         loop {
             match next_msg(&mux, &mut rx)? {
                 ServerMsg::Blobs(blobs) => {
@@ -1650,8 +1655,8 @@ impl Daemon {
                     let (env, env_checked) = env_for(&fresh.policy);
                     let commits = match &fresh.head {
                         Some(h) => {
-                            let (root, h, wt_cache) = (root.clone(), h.clone(), wt.wt_cache.clone());
-                            io::cpu(move || crate::recent_commits(&root, &h, &wt_cache))
+                            let (root, h, wt_cache, mut names) = (root.clone(), h.clone(), wt.wt_cache.clone(), self.names());
+                            io::cpu(move || crate::recent_commits(&root, &h, &wt_cache, &mut names))
                         }
                         None => Vec::new(),
                     };
@@ -1706,7 +1711,7 @@ impl Daemon {
         run: RunRequest,
         snap: Option<&Arc<Snap>>,
         wt: Option<&Rc<Worktree>>,
-        shown: Option<&(Arc<OutFs>, PathBuf)>,
+        shown: Option<&(Rc<OutFs>, PathBuf)>,
         req: &LocalRequest,
         out: &UnboundedSender<LocalReply>,
         command: &mut CommandState,
@@ -1725,9 +1730,8 @@ impl Daemon {
         let delivered_path = wt.map(|w| w.wt_cache.join("delivered"));
         let root = wt.map(|w| w.root.as_path());
         let cache = &self.cache;
-        let mut placer = io::cpu(|| {
-            Placer::new(cache, placed_path.as_deref().map(Placed::load).unwrap_or_default())
-        });
+        let names = self.names();
+        let mut placer = io::cpu(|| Placer::new(cache, placed_path.as_deref().map(Placed::load).unwrap_or_default(), names));
         let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
         command.start(left_out.is_some());
         let mut bet_rx = None;
@@ -1825,20 +1829,17 @@ impl Daemon {
                     if grew {
                         let _turn = self.saving_asked.lock();
                         let text = self.asked.borrow().join("\n") + "\n";
-                        let _ = crate::write_atomic(&self.cache.join("env-names"), text.as_bytes());
+                        let _ = crate::write_atomic(&self.cache.join("env-names"), text.as_bytes(), &mut self.names());
                     }
                 }
                 CommandEffect::Deliver(files, writes, targets) => {
                     let _mounting = self.mounting.lock();
-                    io::cpu(|| -> std::io::Result<()> {
-                        let (files, writes) = match shown {
-                            Some((fs, dir)) => show(fs, dir, files, writes)?,
-                            None => (files, writes),
-                        };
-                        let root = root.ok_or_else(|| std::io::Error::other("the server sent files for a command that has no worktree"))?;
-                        placer.deliver(root, &targets, files, writes)?;
-                        Ok(())
-                    })?;
+                    let (files, writes) = match shown {
+                        Some((fs, dir)) => fs.deliver(self.names(), |delivery| show(delivery, dir, files, writes))?,
+                        None => (files, writes),
+                    };
+                    let root = root.ok_or_else(|| std::io::Error::other("the server sent files for a command that has no worktree"))?;
+                    io::cpu(|| placer.deliver(root, &targets, files, writes))?;
                 }
                 CommandEffect::Blobs(blobs) => {
                     let _mounting = self.mounting.lock();
@@ -1859,7 +1860,7 @@ impl Daemon {
                     command.verified_fetch(complete).map_err(std::io::Error::other)?;
                 }
                 CommandEffect::Report(r) => {
-                    let id = match io::cpu(|| report::save(&r)) {
+                    let id = match io::cpu(|| report::save(&r, &mut placer.names)) {
                         Ok(id) => id,
                         Err(e) => {
                             let text = format!("warning: failed to write on-disk future incompatible report {}: {e}\n", r.path);
@@ -1887,7 +1888,7 @@ impl Daemon {
             }
         };
         if let Some((fs, _)) = shown {
-            io::cpu(|| fs.save());
+            fs.save(self.names());
         }
         if !placer.settled() {
             return Err(std::io::Error::other("the server did not send every file it announced"));
@@ -1896,12 +1897,12 @@ impl Daemon {
         io::cpu(|| {
             if let Some(path) = &placed_path {
                 if placer.changed {
-                    let _ = placer.placed.save(path);
+                    let _ = placer.placed.save(path, &mut placer.names);
                     placer.prune();
                 }
             }
             if let (Some(t), Some(delivered)) = (token, &delivered_path) {
-                let _ = crate::write_atomic(delivered, format!("{t}\n").as_bytes());
+                let _ = crate::write_atomic(delivered, format!("{t}\n").as_bytes(), &mut placer.names);
             }
         });
         Ok(Some(final_reply))
@@ -1971,96 +1972,14 @@ impl Daemon {
     }
 }
 
-/// What the handlers of an output directory, which run on pool threads, ask of the daemon on the loop.
-enum Ask {
-    Whole { hash: Digest, size: u64, reply: io::oneshot::Sender<std::io::Result<PathBuf>> },
-    Reader { hash: Digest, size: u64, reply: io::oneshot::Sender<std::io::Result<Fetched>> },
-    Read { id: u64, offset: u64, len: usize, reply: io::oneshot::Sender<std::io::Result<Vec<u8>>> },
-    Release(u64),
-}
-
-/// How a content can be read: as a whole file in the cache, or in ranges through the reader with this number, which proves this hash.
-enum Fetched {
-    Whole(PathBuf),
-    Ranged(u64, Digest),
-}
-
 fn stopping() -> std::io::Error {
     std::io::Error::other("the daemon is stopping")
 }
 
-/// Sends the daemon the question `make` builds around a reply channel, and waits for the answer.
-fn ask<T: Send + 'static>(
-    asks: &UnboundedSender<Ask>,
-    make: impl FnOnce(io::oneshot::Sender<std::io::Result<T>>) -> Ask + Send + 'static,
-) -> std::io::Result<T> {
-    let asks = asks.clone();
-    io::call(move || {
-        let (reply, answer) = io::oneshot::channel();
-        if asks.send(make(reply)).is_err() {
-            return Err(stopping());
-        }
-        answer.recv().unwrap_or_else(|| Err(stopping()))
-    })
-}
-
-/// The partly fetched contents that open files of an output directory read, by reader number.
-#[derive(Default)]
-struct Readers {
-    open: RefCell<BTreeMap<u64, Rc<Partial>>>,
-    next: Cell<u64>,
-}
-
-/// Answers what one output directory asks until that directory is gone. Each question is answered by a fiber of its own.
-fn answer_asks(d: Weak<Daemon>, mut asked: UnboundedReceiver<Ask>) {
-    let readers = Rc::new(Readers::default());
-    while let Some(ask) = asked.recv() {
-        match ask {
-            Ask::Whole { hash, size, reply } => {
-                let d = d.clone();
-                io::spawn(move || {
-                    let path = d.upgrade().ok_or_else(stopping).and_then(|d| d.whole(hash, size));
-                    let _ = reply.send(path);
-                });
-            }
-            Ask::Reader { hash, size, reply } => {
-                let (d, readers) = (d.clone(), readers.clone());
-                io::spawn(move || {
-                    let fetched = d.upgrade().ok_or_else(stopping).and_then(|d| {
-                        if size >= rargo_proto::CHUNKED_FROM
-                            && let Some(p) = d.partial(hash, size)?
-                        {
-                            let (id, proven) = (readers.next.get(), *p.hash());
-                            readers.next.set(id + 1);
-                            readers.open.borrow_mut().insert(id, p);
-                            return Ok(Fetched::Ranged(id, proven));
-                        }
-                        d.fetch_content(hash, size).map(Fetched::Whole)
-                    });
-                    if let Err(Ok(Fetched::Ranged(id, _))) = reply.send(fetched) {
-                        let unread = readers.open.borrow_mut().remove(&id);
-                        drop(unread);
-                    }
-                });
-            }
-            Ask::Read { id, offset, len, reply } => {
-                let reader = readers.open.borrow().get(&id).cloned();
-                io::spawn(move || {
-                    let bytes = reader.ok_or_else(stopping).and_then(|p| p.read_at(offset, len));
-                    let _ = reply.send(bytes);
-                });
-            }
-            Ask::Release(id) => {
-                let released = readers.open.borrow_mut().remove(&id);
-                drop(released);
-            }
-        }
-    }
-}
-
+/// Where an output directory gets the content of its files: the cache, and past that the daemon.
 struct Contents {
     cache: PathBuf,
-    asks: UnboundedSender<Ask>,
+    d: Weak<Daemon>,
 }
 
 impl crate::outfs::Source for Contents {
@@ -2069,43 +1988,22 @@ impl crate::outfs::Source for Contents {
     }
 
     fn whole(&self, hash: &Digest, size: u64) -> std::io::Result<PathBuf> {
-        let hash = *hash;
-        ask(&self.asks, move |reply| Ask::Whole { hash, size, reply })
+        self.d.upgrade().ok_or_else(stopping)?.whole(*hash, size)
     }
 
     fn reader(&self, hash: &Digest, size: u64) -> std::io::Result<(Reader, Digest)> {
         if let Some(path) = crate::place::cached(&self.cache, hash, size) {
-            return Ok((Reader::Whole(rargo_net::io::file::File::open(path)?), *hash));
+            return Ok((Reader::Whole(Rc::new(rargo_net::io::file::File::open(path)?)), *hash));
         }
-        let hash = *hash;
-        match ask(&self.asks, move |reply| Ask::Reader { hash, size, reply })? {
-            Fetched::Ranged(id, proven) => Ok((Reader::Ranged(Arc::new(RangedReader { id, hash: proven, asks: self.asks.clone() })), proven)),
-            Fetched::Whole(path) => Ok((Reader::Whole(rargo_net::io::file::File::open(path)?), hash)),
+        let d = self.d.upgrade().ok_or_else(stopping)?;
+        if size >= rargo_proto::CHUNKED_FROM
+            && let Some(p) = d.partial(*hash, size)?
+        {
+            let proven = *p.hash();
+            return Ok((Reader::Ranged(p), proven));
         }
-    }
-}
-
-/// An open file's hold on a partly fetched content, which the daemon keeps until this is dropped.
-struct RangedReader {
-    id: u64,
-    hash: Digest,
-    asks: UnboundedSender<Ask>,
-}
-
-impl Ranged for RangedReader {
-    fn hash(&self) -> &Digest {
-        &self.hash
-    }
-
-    fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-        let id = self.id;
-        ask(&self.asks, move |reply| Ask::Read { id, offset, len, reply })
-    }
-}
-
-impl Drop for RangedReader {
-    fn drop(&mut self) {
-        let _ = self.asks.send(Ask::Release(self.id));
+        let path = d.fetch_content(*hash, size)?;
+        Ok((Reader::Whole(Rc::new(rargo_net::io::file::File::open(path)?)), *hash))
     }
 }
 
@@ -2187,15 +2085,17 @@ fn release_mounts(dir: &Path) {
     let info = mountinfo();
     let mounts = mounts_at(&info, dir).count();
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
-    for _ in 0..mounts {
-        if crate::kernel::unmount(&c, libc::MNT_DETACH).is_err() {
-            fusewire::unmount_with_helper(dir);
+    io::blocking(|| {
+        for _ in 0..mounts {
+            if crate::kernel::unmount(&c, libc::MNT_DETACH).is_err() {
+                fusewire::unmount_with_helper(dir);
+            }
         }
-    }
+    });
 }
 
 fn show(
-    fs: &Arc<OutFs>,
+    delivery: &mut crate::outfs::Delivery,
     dir: &Path,
     files: Vec<rargo_proto::Delivery>,
     writes: Vec<rargo_proto::Write>,
@@ -2203,7 +2103,6 @@ fn show(
     use rargo_proto::Write;
     let inside = |path: &str| target_relative(dir, Path::new(path));
     let now = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
-    let mut delivery = fs.begin_delivery();
     let mut rest_writes = Vec::new();
     for w in writes {
         let path = match &w {
@@ -2215,20 +2114,20 @@ fn show(
         };
         match w {
             Write::Dir { .. } => {
-                rargo_net::io::file::create_dir_all(fs.real_for_write(&join_rel(&rel))?)?;
+                rargo_net::io::file::create_dir_all(delivery.real_for_write(&join_rel(&rel))?)?;
                 delivery.wrote(&rel);
             }
             Write::Remove { .. } | Write::Text { text: None, .. } => delivery.remove(&rel),
             Write::Symlink { target, .. } => {
-                let real = fs.real_for_write(&rel)?;
+                let real = delivery.real_for_write(&rel)?;
                 let _ = rargo_net::io::file::remove_file(&real);
                 rargo_net::io::file::symlink(std::ffi::OsStr::from_bytes(&target), &real)?;
                 delivery.wrote(&rel);
             }
             Write::Text { text: Some(text), .. } => {
-                let real = fs.real_for_write(&rel)?;
+                let real = delivery.real_for_write(&rel)?;
                 if rargo_net::io::file::read_to_string(&real).ok().as_deref() != Some(text.as_str()) {
-                    crate::write_atomic(&real, text.as_bytes())?;
+                    crate::write_atomic(&real, text.as_bytes(), &mut delivery.names)?;
                     delivery.wrote(&rel);
                 }
             }

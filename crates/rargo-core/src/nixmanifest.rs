@@ -4,15 +4,16 @@ use crate::db::{Table, Tables};
 use crate::hash::Hash;
 use crate::view::{DType, FileInfo, FileSrc, HostSig, Listing, Looked, Owner};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use rargo_proto::tree::{self, Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
+use std::sync::Arc;
 
 const NIX_DIR: Owner = Owner {
     uid: 0,
@@ -102,21 +103,41 @@ pub trait HostFiles {
     fn record(&self, hash: Hash, path: PathBuf, sig: HostSig);
 }
 
-impl HostFiles for DashMap<Hash, FileSrc> {
-    fn record(&self, hash: Hash, path: PathBuf, sig: HostSig) {
-        self.entry(hash).or_insert_with(|| FileSrc::Host { path: Arc::from(path), sig });
-    }
-}
-
-/// The store paths whose files are recorded already.
+/// The host files known to hold given content, by content hash. The loop thread owns them.
 #[derive(Default)]
-pub struct Attached(parking_lot::Mutex<BTreeSet<String>>);
+pub struct HostSrcs(RefCell<BTreeMap<Hash, (Arc<Path>, HostSig)>>);
 
-impl Attached {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, BTreeSet<String>> {
-        self.0.lock()
+impl HostSrcs {
+    /// The file recorded as holding the bytes of `hash`.
+    pub fn get(&self, hash: &Hash) -> Option<(Arc<Path>, HostSig)> {
+        self.0.borrow().get(hash).cloned()
+    }
+
+    /// Records the file at `path` as holding the bytes of `hash`, unless a holder is recorded already.
+    pub fn note(&self, hash: Hash, path: &Arc<Path>, sig: HostSig) {
+        self.0.borrow_mut().entry(hash).or_insert_with(|| (path.clone(), sig));
     }
 }
+
+impl HostFiles for HostSrcs {
+    fn record(&self, hash: Hash, path: PathBuf, sig: HostSig) {
+        self.0.borrow_mut().entry(hash).or_insert_with(|| (Arc::from(path), sig));
+    }
+}
+
+/// The files one piece of work off the loop found, for the loop to record.
+#[derive(Default)]
+struct Collected(RefCell<Vec<(Hash, PathBuf, HostSig)>>);
+
+impl HostFiles for Collected {
+    fn record(&self, hash: Hash, path: PathBuf, sig: HostSig) {
+        self.0.borrow_mut().push((hash, path, sig));
+    }
+}
+
+/// The store paths whose files are recorded already. The loop thread owns them.
+#[derive(Default)]
+pub struct Attached(RefCell<BTreeSet<String>>);
 
 fn kind_of(path: &Path, meta: &crate::io::file::Stat) -> io::Result<Kind> {
     let ft = meta.file_type();
@@ -473,26 +494,66 @@ pub fn log_cost(cost: &Cost) {
     );
 }
 
+/// Answers what the saved manifests know of `names` and leaves the rest to the hashing thread.
+/// It runs on the loop thread, which records what the work off it finds.
 pub fn schedule(
+    hashing: &Hashing,
     db: &Arc<dyn Tables>,
     fs: &Arc<dyn StoreFs>,
     store: &Path,
     names: &[String],
-    hosts: Option<&Arc<DashMap<Hash, FileSrc>>>,
-    seen: &Arc<Attached>,
+    hosts: Option<&Rc<HostSrcs>>,
+    seen: &Rc<Attached>,
 ) -> Result<Prepared> {
-    let (prepared, pending) = plan(db.as_ref(), fs.as_ref(), store, names, hosts.map(|m| m.as_ref() as &dyn HostFiles), seen)?;
+    let mut known: BTreeSet<String> = {
+        let all = seen.0.borrow();
+        names.iter().filter(|name| all.contains(*name)).cloned().collect()
+    };
+    let want_hosts = hosts.is_some();
+    let (planned, files, known) = crate::io::cpu(|| {
+        let files = Collected::default();
+        let found = want_hosts.then_some(&files as &dyn HostFiles);
+        let planned = plan(db.as_ref(), fs.as_ref(), store, names, found, &mut known);
+        (planned, files.0.into_inner(), known)
+    });
+    if let Some(hosts) = hosts {
+        for (hash, path, sig) in files {
+            hosts.record(hash, path, sig);
+        }
+    }
+    seen.0.borrow_mut().extend(known);
+    let (prepared, pending) = planned?;
     if !pending.is_empty() {
-        let job = Arc::new(Job {
-            db: Arc::clone(db),
-            fs: Arc::clone(fs),
-            store: store.to_path_buf(),
-            hosts: hosts.cloned(),
-            seen: Arc::clone(seen),
-            cost: parking_lot::Mutex::new(Cost::default()),
-            left: std::sync::atomic::AtomicUsize::new(pending.len()),
-        });
-        enqueue(pending.into_iter().map(|name| (Arc::clone(&job), name)));
+        let (done, mut hashed) = crate::io::unbounded_channel();
+        let job = Arc::new(Job { db: Arc::clone(db), fs: Arc::clone(fs), store: store.to_path_buf(), want_hosts, done });
+        let left = pending.len();
+        hashing.0.change(|queue| queue.push(pending.into_iter().map(|name| (Arc::clone(&job), name))));
+        drop(job);
+        let (db, hosts, seen) = (Arc::clone(db), hosts.cloned(), Rc::clone(seen));
+        drop(crate::io::spawn(move || {
+            let mut cost = Cost::default();
+            for _ in 0..left {
+                let Some(Hashed { name, files, attached, fresh, cost: spent }) = hashed.recv() else { break };
+                // The files are recorded before the manifest is saved, so whoever finds the manifest finds them.
+                if let Some(hosts) = &hosts {
+                    for (hash, path, sig) in files {
+                        hosts.record(hash, path, sig);
+                    }
+                }
+                if attached {
+                    seen.0.borrow_mut().insert(name.clone());
+                }
+                cost.hashed_files += spent.hashed_files;
+                cost.hashed_bytes += spent.hashed_bytes;
+                cost.millis += spent.millis;
+                cost.reused_paths += spent.reused_paths;
+                cost.new_paths += spent.new_paths;
+                if let Some(fresh) = fresh {
+                    keep_hashed(db.as_ref(), &name, &fresh, &mut cost);
+                }
+            }
+            log_cost(&cost);
+        }));
     }
     Ok(prepared)
 }
@@ -503,7 +564,7 @@ fn plan(
     store: &Path,
     names: &[String],
     hosts: Option<&dyn HostFiles>,
-    seen: &Attached,
+    seen: &mut BTreeSet<String>,
 ) -> Result<(Prepared, Vec<String>)> {
     let mut cost = Cost::default();
     let mut roots = Vec::with_capacity(names.len());
@@ -512,8 +573,7 @@ fn plan(
         let path = store.join(name);
         if let Some(kind) = load(db, name.as_bytes()) {
             cost.reused_paths += 1;
-            let mut guard = seen.lock();
-            let kind = adopt(db, fs, name, &path, kind, true, hosts, &mut guard, &mut cost, false)?;
+            let kind = adopt(db, fs, name, &path, kind, true, hosts, seen, &mut cost, false)?;
             roots.push(identity(&kind));
         } else {
             roots.push(Hash::ZERO);
@@ -607,75 +667,63 @@ impl<T> StateMachine for Queue<T> {
     }
 }
 
+/// One request to hash store paths, as the hashing thread holds it.
 struct Job {
     db: Arc<dyn Tables>,
     fs: Arc<dyn StoreFs>,
     store: PathBuf,
-    hosts: Option<Arc<DashMap<Hash, FileSrc>>>,
-    seen: Arc<Attached>,
-    cost: parking_lot::Mutex<Cost>,
-    left: std::sync::atomic::AtomicUsize,
+    want_hosts: bool,
+    done: crate::io::UnboundedSender<Hashed>,
 }
 
-type Hashing = (parking_lot::Mutex<Queue<(Arc<Job>, String)>>, parking_lot::Condvar);
+/// What the hashing thread found for one store path, for the loop to record and save.
+struct Hashed {
+    name: String,
+    files: Vec<(Hash, PathBuf, HostSig)>,
+    attached: bool,
+    fresh: Option<Fresh>,
+    cost: Cost,
+}
 
-fn hashing() -> &'static Hashing {
-    static Q: OnceLock<Hashing> = OnceLock::new();
-    static WORKER: OnceLock<()> = OnceLock::new();
-    let q = Q.get_or_init(|| (parking_lot::Mutex::new(Queue::new(one_core())), parking_lot::Condvar::new()));
-    WORKER.get_or_init(|| {
-        crate::io::thread::spawn_niced("nix-hash", IDLE, || {
-            let (queue, cv) = hashing();
-            loop {
-                let next = {
-                    let mut q = queue.lock();
-                    loop {
-                        match q.take() {
-                            Some(item) => break item,
-                            None => cv.wait(&mut q),
-                        }
-                    }
-                };
-                let (job, name) = next;
-                {
-                    let mut cost = job.cost.lock();
-                    let hosts = job.hosts.as_deref().map(|m| m as &dyn HostFiles);
-                    hash_one(job.db.as_ref(), job.fs.as_ref(), &job.store, hosts, &job.seen, &name, &mut cost);
-                }
-                if job.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-                    log_cost(&job.cost.lock());
-                }
-            }
+/// The thread that hashes store paths one at a time, and the queue it takes them from.
+pub struct Hashing(Arc<crate::io::thread::Monitor<Queue<(Arc<Job>, String)>>>);
+
+impl Hashing {
+    /// Starts the hashing thread with nothing to do.
+    pub fn start() -> Hashing {
+        let queue = Arc::new(crate::io::thread::Monitor::new(Queue::<(Arc<Job>, String)>::new(one_core())));
+        let work = Arc::clone(&queue);
+        crate::io::thread::spawn_niced("nix-hash", IDLE, move || loop {
+            let (job, name) = work.wait(|queue| queue.take());
+            let mut cost = Cost::default();
+            let mut seen = BTreeSet::new();
+            let files = Collected::default();
+            let found = job.want_hosts.then_some(&files as &dyn HostFiles);
+            let fresh = hash_unsaved(job.db.as_ref(), job.fs.as_ref(), &job.store, found, &mut seen, &name, &mut cost);
+            let attached = seen.contains(&name);
+            let _ = job.done.send(Hashed { name, files: files.0.into_inner(), attached, fresh, cost });
         })
         .expect("starting nix hash thread");
-    });
-    q
-}
+        Hashing(queue)
+    }
 
-fn enqueue(items: impl IntoIterator<Item = (Arc<Job>, String)>) {
-    let (queue, cv) = hashing();
-    queue.lock().push(items);
-    cv.notify_all();
+    /// Holds hashing back on a one-core server for as long as the returned build runs.
+    pub fn hold_build(&self) -> BuildHold {
+        self.0.change(|queue| queue.hold());
+        BuildHold(Arc::clone(&self.0))
+    }
 }
 
 /// The scheduling priority of the hashing thread: the lowest there is.
 const IDLE: i32 = 19;
 
-pub struct BuildHold {
-    _private: (),
-}
-
-pub fn hold_build() -> BuildHold {
-    hashing().0.lock().hold();
-    BuildHold { _private: () }
-}
+pub struct BuildHold(Arc<crate::io::thread::Monitor<Queue<(Arc<Job>, String)>>>);
 
 impl Drop for BuildHold {
     fn drop(&mut self) {
-        let (queue, cv) = hashing();
-        if queue.lock().release() {
-            cv.notify_all();
-        }
+        self.0.change(|queue| {
+            queue.release();
+        });
     }
 }
 
@@ -711,34 +759,38 @@ fn quota_is_one_core(max: &str) -> bool {
     )
 }
 
-fn hash_one(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, hosts: Option<&dyn HostFiles>, seen: &Attached, name: &str, cost: &mut Cost) {
+/// Hashes the store path `name` unless its manifest is saved already, and gives back what is yet to be saved.
+fn hash_unsaved(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, hosts: Option<&dyn HostFiles>, seen: &mut BTreeSet<String>, name: &str, cost: &mut Cost) -> Option<Fresh> {
     let path = store.join(name);
     if let Some(kind) = load(db, name.as_bytes()) {
-        let mut seen = seen.lock();
-        if let Err(e) = adopt(db, fs, name, &path, kind, true, hosts, &mut seen, cost, false) {
+        if let Err(e) = adopt(db, fs, name, &path, kind, true, hosts, seen, cost, false) {
             eprintln!("rargod: nix path {name}: {e:#}");
         }
-        return;
+        return None;
     }
     let t = crate::io::now();
     let fresh = match hash_path_mode(fs, &path, false) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("rargod: nix path {name}: {e}");
-            return;
+            return None;
         }
     };
     cost.millis += crate::io::now().saturating_duration_since(t).as_millis() as u64;
     if let Some(hosts) = hosts {
-        let mut seen = seen.lock();
         if !seen.contains(name) {
             if let Err(e) = attach_kind(fs, &fresh.kind, &path, hosts) {
                 eprintln!("rargod: nix path {name} manifest does not match the files ({e})");
-                return;
+                return None;
             }
             seen.insert(name.to_string());
         }
     }
+    Some(fresh)
+}
+
+/// Saves the manifest of the freshly hashed store path `name` and counts what hashing it took.
+fn keep_hashed(db: &dyn Tables, name: &str, fresh: &Fresh, cost: &mut Cost) {
     if let Err(e) = save(db, name.as_bytes(), &fresh.kind) {
         eprintln!("rargod: nix path {name}: {e:#}");
         return;
@@ -746,6 +798,13 @@ fn hash_one(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, hosts: Option<&dyn 
     cost.new_paths += 1;
     cost.hashed_files += fresh.files;
     cost.hashed_bytes += fresh.bytes;
+}
+
+#[cfg(test)]
+fn hash_one(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, hosts: Option<&dyn HostFiles>, seen: &mut BTreeSet<String>, name: &str, cost: &mut Cost) {
+    if let Some(fresh) = hash_unsaved(db, fs, store, hosts, seen, name, cost) {
+        keep_hashed(db, name, &fresh, cost);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1316,20 +1375,20 @@ mod tests {
         db: MemTables,
         fs: FakeStore,
         store: PathBuf,
-        seen: Attached,
+        seen: RefCell<BTreeSet<String>>,
     }
 
     fn parts(fs: FakeStore) -> Parts {
-        Parts { db: MemTables::default(), fs, store: PathBuf::from("/store"), seen: Attached::default() }
+        Parts { db: MemTables::default(), fs, store: PathBuf::from("/store"), seen: RefCell::default() }
     }
 
     fn plan_of(parts: &Parts, fs: &FakeStore, hosts: Option<&dyn HostFiles>, names: &[&str]) -> (Prepared, Vec<String>) {
         let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-        plan(&parts.db, fs, &parts.store, &names, hosts, &parts.seen).unwrap()
+        plan(&parts.db, fs, &parts.store, &names, hosts, &mut parts.seen.borrow_mut()).unwrap()
     }
 
     fn hash(parts: &Parts, hosts: Option<&dyn HostFiles>, name: &str, cost: &mut Cost) {
-        hash_one(&parts.db, &parts.fs, &parts.store, hosts, &parts.seen, name, cost);
+        hash_one(&parts.db, &parts.fs, &parts.store, hosts, &mut parts.seen.borrow_mut(), name, cost);
     }
 
     #[test]
@@ -1390,7 +1449,7 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded.get(&Hash::of(b"tool-bytes")).map(PathBuf::as_path), Some(Path::new("/store/aaa/bin/tool")));
         assert!(recorded.contains_key(&Hash::of(b"note")));
-        assert!(parts.seen.lock().contains("aaa"));
+        assert!(parts.seen.borrow().contains("aaa"));
     }
 
     #[test]

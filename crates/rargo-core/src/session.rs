@@ -321,21 +321,15 @@ impl Session {
         let failed = loop {
             match out.step() {
                 Next::Read { hash, at, len, whole } => {
-                    let store = self.store.clone();
                     let file = open.take().filter(|(h, _)| *h == hash);
-                    let (next, read) = io::cpu(move || {
-                        let read = read_blob(&store, hash, at, len, whole, file);
-                        match read {
-                            Ok((bytes, file)) => {
+                    match read_blob(&self.store, hash, at, len, whole, file) {
+                        Ok((bytes, file)) => {
+                            out = io::cpu(move || {
                                 out.read(Some(bytes));
-                                (out, Ok(file))
-                            }
-                            Err(e) => (out, Err(e)),
+                                out
+                            });
+                            open = file;
                         }
-                    });
-                    out = next;
-                    match read {
-                        Ok(file) => open = file,
                         Err(e) => break Err(anyhow::Error::from(e)),
                     }
                 }
