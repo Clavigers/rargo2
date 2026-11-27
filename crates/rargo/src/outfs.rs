@@ -5,7 +5,7 @@ use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, Set
 pub use rargo::out_tree::VFile;
 use rargo::out_tree::{below, Edit, OutputTree, Table};
 use rargo_proto::Digest;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use rargo_net::io::file::File;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -50,8 +50,8 @@ struct Node {
 }
 
 struct Inodes {
-    nodes: HashMap<u64, Node>,
-    children: HashMap<(u64, Vec<u8>), u64>,
+    nodes: BTreeMap<u64, Node>,
+    children: BTreeMap<(u64, Vec<u8>), u64>,
     next: u64,
 }
 
@@ -324,16 +324,16 @@ pub struct OutFs {
     state: Mutex<Inodes>,
     virt: std::sync::RwLock<OutputTree>,
     delivery: Mutex<()>,
-    handles: Mutex<HashMap<u64, Handle>>,
+    handles: Mutex<BTreeMap<u64, Handle>>,
     registering: Mutex<std::collections::BTreeMap<u64, bool>>,
     next_fh: AtomicU64,
     source: Box<dyn Source>,
     session: OnceLock<Arc<Session>>,
     table: PathBuf,
     dirty: AtomicBool,
-    dirs: Mutex<HashMap<u64, DirState>>,
-    listings: Mutex<HashMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
-    swept: Mutex<std::collections::HashSet<Vec<u8>>>,
+    dirs: Mutex<BTreeMap<u64, DirState>>,
+    listings: Mutex<BTreeMap<u64, (std::time::Instant, Arc<Vec<(u64, Vec<u8>, u32)>>)>>,
+    swept: Mutex<std::collections::BTreeSet<Vec<u8>>>,
     uid: u32,
     gid: u32,
     op_count: [AtomicU64; OPS.len()],
@@ -396,24 +396,24 @@ impl OutFs {
             .and_then(|raw| zstd::stream::decode_all(&raw[..]).ok())
             .and_then(|plain| bincode::deserialize(&plain).ok())
             .unwrap_or_default();
-        let mut nodes = HashMap::new();
+        let mut nodes = BTreeMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
         let (uid, gid) = (rargo_net::io::process::euid(), rargo_net::io::process::egid());
         Ok(Arc::new(OutFs {
             under,
             _under_fd: fd,
-            state: Mutex::new(Inodes { nodes, children: HashMap::new(), next: 2 }),
+            state: Mutex::new(Inodes { nodes, children: BTreeMap::new(), next: 2 }),
             virt: std::sync::RwLock::new(OutputTree::new(virt)),
             delivery: Mutex::new(()),
-            handles: Mutex::new(HashMap::new()),
+            handles: Mutex::new(BTreeMap::new()),
             registering: Mutex::new(std::collections::BTreeMap::new()),
             next_fh: AtomicU64::new(1),
             source,
             session: OnceLock::new(),
             table: table.to_path_buf(),
             dirty: AtomicBool::new(false),
-            dirs: Mutex::new(HashMap::new()),
-            listings: Mutex::new(HashMap::new()),
+            dirs: Mutex::new(BTreeMap::new()),
+            listings: Mutex::new(BTreeMap::new()),
             swept: Mutex::new(Default::default()),
             uid,
             gid,
@@ -1427,9 +1427,9 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut tree = OutputTree { files: Table::new(), generation: 0 };
             let mut model = Table::new();
-            let mut nodes = HashMap::new();
+            let mut nodes = BTreeMap::new();
             nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-            let mut inodes = Inodes { nodes, children: HashMap::new(), next: 2 };
+            let mut inodes = Inodes { nodes, children: BTreeMap::new(), next: 2 };
             let mut store: BTreeMap<Digest, Vec<u8>> = BTreeMap::new();
             let mut next_generation = 0u64;
             let mut applied = 0u64;
@@ -1583,9 +1583,9 @@ mod tests {
     /// Steps an inode table holding only the root through the events, checking it after each, and lists what
     /// each step gave back.
     fn run(events: impl IntoIterator<Item = Ev>) -> String {
-        let mut nodes = HashMap::new();
+        let mut nodes = BTreeMap::new();
         nodes.insert(ROOT, Node { parent: 0, name: Vec::new(), nlookup: 1, kids: 0, cached: 0, backing: None });
-        let mut state = Inodes { nodes, children: HashMap::new(), next: 2 };
+        let mut state = Inodes { nodes, children: BTreeMap::new(), next: 2 };
         state.invariants();
         let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
         let mut out = String::new();
