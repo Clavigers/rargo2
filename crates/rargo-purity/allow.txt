@@ -1,5 +1,4 @@
 locks	crates/rargo-core/src/buildview.rs	12	shares state between threads outside a shell or worker pool: dashmap (6), atomics (6)
-locks	crates/rargo-core/src/db.rs	4	shares the write buffer and commit serialization between threads: parking_lot locks (4)
 locks	crates/rargo-core/src/nixmanifest.rs	17	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/remote.rs	5	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/sandbox.rs	6	shares state between threads outside a shell or worker pool: parking_lot locks (4), atomics (2)
