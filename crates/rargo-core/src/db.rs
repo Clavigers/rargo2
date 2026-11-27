@@ -349,4 +349,22 @@ mod tests {
         drop(db);
         assert!(on_disk(&shared.db, b"k"), "without a loop too");
     }
+
+    #[test]
+    fn a_database_dropped_as_its_loop_ends_commits_what_is_pending() {
+        let shared = sim::test(|| {
+            let db = Db::open_in_memory().unwrap();
+            let shared = Arc::clone(&db.shared);
+            // The loop ends with this fiber still holding the database. It
+            // starts before the writer's owner, so the loop drops it first,
+            // outside any fiber, where nothing can wait for the owner.
+            crate::io::background(move || {
+                db.put(Table::Meta, b"k", b"v");
+                sleep(Duration::from_secs(3600));
+            });
+            sleep(Duration::from_millis(1));
+            shared
+        });
+        assert!(on_disk(&shared.db, b"k"));
+    }
 }

@@ -73,13 +73,11 @@ impl Owner {
     pub(crate) fn write(&self, f: impl FnOnce(&mut DbWriter) + Send + 'static) {
         let mut slot = self.lock();
         match &mut *slot {
-            Slot::Away(tx) => send(tx, Msg::Step(Box::new(f))),
-            Slot::Here(w) => {
-                f(w);
-                if loop_at_hand() {
-                    self.hand_over(&mut slot);
-                }
-            }
+            Slot::Away(tx) => return send(tx, Msg::Step(Box::new(f))),
+            Slot::Here(w) => f(w),
+        }
+        if loop_at_hand() {
+            drop(self.hand_over(slot));
         }
     }
 
@@ -91,7 +89,7 @@ impl Owner {
                 commit_here(w, &*self.disk);
                 return;
             }
-            self.hand_over(&mut slot);
+            slot = self.hand_over(slot);
         }
         let Slot::Away(tx) = &mut *slot else { unreachable!("the writer was just handed over") };
         let (done, wait) = rendezvous();
@@ -121,10 +119,25 @@ impl Owner {
         }
     }
 
-    fn hand_over(&self, slot: &mut Slot) {
-        // A channel belongs to the loop that will own the writer.
-        let (tx, rx) = if on_loop_thread() { unbounded_channel() } else { call(unbounded_channel) };
-        let Slot::Here(w) = mem::replace(slot, Slot::Away(tx.clone())) else {
+    /// Hands the writer to a new owning fiber, and gives back the slot,
+    /// locked, holding either that fiber's channel or another's.
+    fn hand_over<'a>(&'a self, mut slot: MutexGuard<'a, Slot>) -> MutexGuard<'a, Slot> {
+        // A channel belongs to the loop that will own the writer. Off the
+        // loop's thread only the loop can make one, and the slot must not be
+        // locked while waiting for it: the loop itself may be waiting for
+        // the lock.
+        let (tx, rx) = if on_loop_thread() {
+            unbounded_channel()
+        } else {
+            drop(slot);
+            let made = call(unbounded_channel);
+            slot = self.lock();
+            if matches!(*slot, Slot::Away(_)) {
+                return slot;
+            }
+            made
+        };
+        let Slot::Here(w) = mem::replace(&mut *slot, Slot::Away(tx.clone())) else {
             unreachable!("only a writer held here can be handed over")
         };
         let owning = Owning {
@@ -138,6 +151,7 @@ impl Owner {
             stopped: Vec::new(),
         };
         background(move || owning.run());
+        slot
     }
 }
 
@@ -252,6 +266,9 @@ impl Owning {
 
 impl Drop for Owning {
     fn drop(&mut self) {
+        // With the database gone nobody will take the writer back, so what
+        // is pending is committed here or never.
+        let orphaned = Arc::strong_count(&self.slot) == 1;
         let held = Arc::clone(&self.slot);
         let mut slot = held.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(msg) = self.rx.try_recv() {
@@ -265,6 +282,9 @@ impl Drop for Owning {
             answered.extend(waiting);
         }
         answered.append(&mut self.stopped);
+        if orphaned {
+            commit_here(&mut w, &*self.disk);
+        }
         *slot = Slot::Here(w);
         drop(slot);
         answered.into_iter().for_each(|done| done());
