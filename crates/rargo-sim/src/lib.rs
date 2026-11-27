@@ -2,6 +2,7 @@ pub mod model;
 pub mod rng;
 mod nextest;
 pub mod workspace;
+pub mod worktree;
 pub mod world;
 
 mod transport;

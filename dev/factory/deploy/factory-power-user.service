@@ -13,7 +13,7 @@ Environment=FACTORY_CLAUDE_CODE=/root/.local/bin/claude
 Environment=PYTHONPATH=/root/factory/src
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/root/factory
-ExecStart=/root/factory/venv/bin/python -m factory power-user /root/factory/use
+ExecStart=/root/factory/venv/bin/python -m factory power-user Clavigers/rargo2 /root/factory/use
 Restart=always
 RestartSec=10
 

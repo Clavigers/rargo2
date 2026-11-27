@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use crate::io::TcpStream;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub fn connection(
@@ -28,14 +29,14 @@ pub fn connection(
     let (user, admin, sealer, opener) =
         crate::io::timeout(std::time::Duration::from_secs(20), || session::accept(&mut stream, &keys))
             .context("handshake timed out")??;
-    link(d, Arc::new(Link::tcp(stream, sealer, opener)), user, admin, keys);
+    link(d, Rc::new(Link::tcp(stream, sealer, opener)), user, admin, keys);
     Ok(())
 }
 
 pub fn udp_connection(
     d: Arc<Daemon>,
-    conn: Arc<crate::net::Conn>,
-    endpoint: Arc<crate::net::Endpoint>,
+    conn: Rc<crate::net::Conn>,
+    endpoint: Rc<crate::net::Endpoint>,
     keys: Arc<Keys>,
 ) {
     let Some(user) = conn.user().map(String::from) else {
@@ -43,7 +44,7 @@ pub fn udp_connection(
         return;
     };
     let admin = keys.admin(&user);
-    link(d, Arc::new(Link::Udp(conn, endpoint)), user, admin, keys);
+    link(d, Rc::new(Link::Udp(conn, endpoint)), user, admin, keys);
 }
 
 struct Stream {
@@ -56,7 +57,7 @@ enum RecvWait {
     Idle,
 }
 
-fn pump(link: Arc<Link>, stream: u32, mut rx: crate::io::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
+fn pump(link: Rc<Link>, stream: u32, mut rx: crate::io::UnboundedReceiver<ServerMsg>, sess: Arc<Session>) {
     assert_ne!(stream, crate::proto::KEEPALIVE, "keepalives are not a session's stream");
     let mut seq = 0u64;
     while let Some(m) = rx.recv() {
@@ -128,7 +129,7 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     })
 }
 
-pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
+pub fn link(d: Arc<Daemon>, link: Rc<Link>, presented: String, admin: bool, keys: Arc<Keys>) {
     let user = keys.name_of(&presented);
     let mut checked = crate::io::now();
     let has = Arc::new(ClientHas::default());
@@ -380,10 +381,13 @@ fn serve(
             assert!(!req.args.is_empty(), "a command was named");
             let args = req.args[1..].to_vec();
             let (asker_user, from) = (user.clone(), format!("rargo auth, by {user}"));
-            let said = crate::io::cpu(move || {
+            let job = store.detached();
+            let (said, job) = crate::io::cpu(move || {
                 let asker = crate::tokens::Asker { user: &asker_user, admin, from: &from };
-                crate::tokens::command(&store, &args, &asker, TOKEN_USAGE)
+                let said = crate::tokens::command(&job, &args, &asker, TOKEN_USAGE);
+                (said, job)
             });
+            store.adopt(job);
             return match said {
                 Ok((out, err)) => {
                     if !err.is_empty() {

@@ -240,7 +240,7 @@ pub fn mark(db: &dyn Tables, store: &dyn Blobs, live: &mut std::collections::BTr
 
 /// A table of what the incremental states recorded in `db` hold in `store`.
 pub fn analyze(db: &dyn Tables, store: &Store) -> String {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet};
     fn kind(path: &[u8]) -> &'static str {
         let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
         match name {
@@ -258,13 +258,13 @@ pub fn analyze(db: &dyn Tables, store: &Store) -> String {
     struct Row {
         files: u64,
         logical: u64,
-        blobs: HashSet<Hash>,
+        blobs: BTreeSet<Hash>,
         unique: u64,
-        chunks: HashSet<Hash>,
+        chunks: BTreeSet<Hash>,
         chunk_unique: u64,
     }
     let mut states = 0u64;
-    let mut crates: HashSet<[u8; 32]> = HashSet::new();
+    let mut crates: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
     let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
     for (k, v) in db.scan_prefix(Table::Incr, &[]) {
@@ -272,7 +272,6 @@ pub fn analyze(db: &dyn Tables, store: &Store) -> String {
             entries.push((k, m));
         }
     }
-    let mut sizes: HashMap<Hash, u64> = HashMap::new();
     for (k, meta) in &entries {
         let Ok(raw) = store.read(&meta.manifest) else { continue };
         let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
@@ -287,7 +286,6 @@ pub fn analyze(db: &dyn Tables, store: &Store) -> String {
             row.logical += size;
             if row.blobs.insert(*hash) {
                 row.unique += size;
-                sizes.insert(*hash, *size);
             }
         }
     }
