@@ -13,3 +13,7 @@ syn = { version = "2", default-features = false, features = ["full", "parsing", 
 quote = { version = "1", default-features = false }
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 
+
+[build-dependencies]
+syn = { version = "2", default-features = false, features = ["full", "parsing", "printing"] }
+quote = { version = "1", default-features = false }

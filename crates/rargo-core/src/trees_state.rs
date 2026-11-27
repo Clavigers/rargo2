@@ -400,9 +400,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_completeness_cache_never_says_complete_while_a_blob_is_missing() {
-        for seed in 1..=200u64 {
+    mod the_completeness_cache_never_says_complete_while_a_blob_is_missing {
+        use super::check_completeness_cache;
+
+        rargo_machine::test_batches! {
+            check_completeness_cache;
+            seeds_1_to_50: 1..=50,
+            seeds_51_to_100: 51..=100,
+            seeds_101_to_150: 101..=150,
+            seeds_151_to_200: 151..=200,
+        }
+    }
+
+    fn check_completeness_cache(seeds: std::ops::RangeInclusive<u64>) {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut w = World::new();
             let mut st = TreesState::new();

@@ -10,10 +10,10 @@ fn of(check: Check, list: &[(Check, String)]) -> Vec<String> {
     out
 }
 
-pub(super) fn workspace_purity(prefix: &str) {
-    let sources: Vec<_> = SOURCES.iter().copied().filter(|(file, _)| file.starts_with(prefix)).collect();
+pub(super) fn workspace_purity(files: &[&str]) {
+    let sources: Vec<_> = SOURCES.iter().copied().filter(|(file, _)| files.contains(file)).collect();
     let mut allow = parse_allow(ALLOW).unwrap_or_else(|e| panic!("{e}"));
-    allow.retain(|e| e.file.starts_with(prefix));
+    allow.retain(|e| files.contains(&e.file.as_str()));
     let findings = scan(&sources);
     let reports: Vec<String> = Check::ALL.iter().filter_map(|c| compare(*c, &findings, &allow).err()).collect();
     assert!(reports.is_empty(), "{}", reports.join("\n"));

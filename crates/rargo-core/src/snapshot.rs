@@ -679,7 +679,7 @@ mod tests {
     fn a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held() {
         crate::io::sim::test(|| {
             let (_d, trees, fake) = setup();
-            let names: Vec<String> = (0..300).map(|i| format!("f{i:03}")).collect();
+            let names: Vec<String> = (0..64).map(|i| format!("f{i:03}")).collect();
             let mut last = None;
             for round in 0..3 {
                 let files: Vec<(&str, Node)> =

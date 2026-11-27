@@ -416,11 +416,12 @@ impl Store {
     }
 
     pub fn collect_chunks(&self) -> (usize, u64) {
-        crate::io::blocking(|| self.collect_chunks_off_loop())
+        crate::io::blocking(|| self.collect_chunks_off_loop(|| {}))
     }
 
-    fn collect_chunks_off_loop(&self) -> (usize, u64) {
+    fn collect_chunks_off_loop(&self, locked: impl FnOnce()) -> (usize, u64) {
         let _g = self.cold_lock.write().unwrap();
+        locked();
         let live = self.index.lock().live_chunks();
         let (mut n, mut freed, mut kept) = (0usize, 0u64, 0u64);
         for i in 0..256 {
@@ -862,34 +863,34 @@ mod tests {
         let outcome = crate::io::within(std::time::Duration::from_secs(20), move || {
             crate::io::run(2, move || {
                 let s = Arc::new(Store::open(&at.join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
-                let data = noise(1 << 20);
+                let data = noise(crate::store_index::COLD_MIN_SIZE as usize);
                 let h = s.put_bytes(&data).unwrap();
                 assert!(crate::io::cpu(|| s.freeze(&h, &|_| {})).unwrap().is_some());
-                // Dead chunks, so the collector holds the lock across many trips to the loop.
-                for i in 0..500 {
-                    file::write(s.chunks.join(format!("{:02x}", i % 256)).join(format!("dead-{i}")), b"x").unwrap();
-                }
+                file::write(s.chunks.join("00").join("dead"), b"x").unwrap();
+                let (locked, lock_held) = crate::io::oneshot::channel();
+                let (resume, resume_collection) = crate::io::oneshot::channel();
                 let gc = {
                     let s = Arc::clone(&s);
-                    crate::io::spawn(move || crate::io::cpu(|| s.collect_chunks()))
+                    crate::io::spawn(move || crate::io::cpu(|| {
+                        s.collect_chunks_off_loop(|| {
+                            locked.send(()).unwrap();
+                            crate::io::call(move || resume_collection.recv().unwrap());
+                        })
+                    }))
                 };
-                let mut held = false;
-                while !gc.is_finished() {
-                    if s.cold_lock.try_read().is_err() {
-                        held = true;
-                        break;
-                    }
-                    crate::io::sleep(std::time::Duration::from_millis(1));
-                }
+                lock_held.recv().unwrap();
+                assert!(s.cold_lock.try_read().is_err(), "the collector holds the cold lock");
+                // This fiber can only release the collector after the thaw yields.
+                let mut release = crate::io::spawn(move || resume.send(()).unwrap());
                 let read = s.read(&h).unwrap();
+                release.join().unwrap();
                 let (removed, _) = { gc }.join().unwrap();
-                (held, removed, read == data)
+                (removed, read == data)
             })
         });
         let _ = file::remove_dir_all(&dir);
-        let (held, removed, same) = outcome.expect("a thaw and a chunk collection deadlocked the loop");
-        assert!(held, "the thaw started while the collector held the cold lock");
-        assert_eq!(removed, 500);
+        let (removed, same) = outcome.expect("a thaw and a chunk collection deadlocked the loop");
+        assert_eq!(removed, 1);
         assert!(same, "the thawed blob reads back whole");
     }
 

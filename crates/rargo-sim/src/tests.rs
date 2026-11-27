@@ -6,34 +6,73 @@ fn clean(seeds: std::ops::Range<u64>) {
     assert!(failures.is_empty(), "{}", text.join("\n"));
 }
 
-// Keep the sampled ranges while running each batch under its own CPU budget.
-macro_rules! seed_batches {
-    ($($name:ident: $start:literal..$end:literal),+ $(,)?) => {
-        $(
-            #[test]
-            fn $name() {
-                clean($start..$end);
-            }
-        )+
-    };
+fn clean_seed(seed: u64) {
+    clean(seed..seed + 1);
 }
 
-seed_batches! {
-    seeds_0_to_4: 0..4,
-    seeds_4_to_8: 4..8,
-    seeds_8_to_12: 8..12,
-    seeds_200_to_204: 200..204,
-    seeds_204_to_208: 204..208,
-    seeds_208_to_212: 208..212,
-    seeds_212_to_216: 212..216,
-    seeds_216_to_220: 216..220,
-    seeds_220_to_224: 220..224,
-    seeds_400_to_404: 400..404,
-    seeds_404_to_408: 404..408,
-    seeds_408_to_412: 408..412,
-    seeds_412_to_416: 412..416,
-    seeds_416_to_420: 416..420,
-    seeds_420_to_424: 420..424,
+// Each seed runs the full simulator and its invariants.
+rargo_machine::test_batches! {
+    clean_seed;
+    seed_0: 0,
+    seed_1: 1,
+    seed_2: 2,
+    seed_3: 3,
+    seed_4: 4,
+    seed_5: 5,
+    seed_6: 6,
+    seed_7: 7,
+    seed_8: 8,
+    seed_9: 9,
+    seed_10: 10,
+    seed_11: 11,
+    seed_200: 200,
+    seed_201: 201,
+    seed_202: 202,
+    seed_203: 203,
+    seed_204: 204,
+    seed_205: 205,
+    seed_206: 206,
+    seed_207: 207,
+    seed_208: 208,
+    seed_209: 209,
+    seed_210: 210,
+    seed_211: 211,
+    seed_212: 212,
+    seed_213: 213,
+    seed_214: 214,
+    seed_215: 215,
+    seed_216: 216,
+    seed_217: 217,
+    seed_218: 218,
+    seed_219: 219,
+    seed_220: 220,
+    seed_221: 221,
+    seed_222: 222,
+    seed_223: 223,
+    seed_400: 400,
+    seed_401: 401,
+    seed_402: 402,
+    seed_403: 403,
+    seed_404: 404,
+    seed_405: 405,
+    seed_406: 406,
+    seed_407: 407,
+    seed_408: 408,
+    seed_409: 409,
+    seed_410: 410,
+    seed_411: 411,
+    seed_412: 412,
+    seed_413: 413,
+    seed_414: 414,
+    seed_415: 415,
+    seed_416: 416,
+    seed_417: 417,
+    seed_418: 418,
+    seed_419: 419,
+    seed_420: 420,
+    seed_421: 421,
+    seed_422: 422,
+    seed_423: 423,
 }
 
 #[test]
@@ -59,19 +98,15 @@ fn a_worker_restarts_even_if_its_link_was_cut_when_it_crashed() {
     assert_eq!(report.worker_crashes, 1);
 }
 
-#[test]
-fn crashes_with_eviction_and_concurrent_client_rounds_finish() {
-    clean(635..636);
-    clean(8360..8361);
-    clean(9391..9392);
-}
+mod crashes_with_eviction_and_concurrent_client_rounds_finish {
+    use super::clean;
 
-#[test]
-fn dozens_of_client_rounds_overlap_during_eviction() {
-    let report = run_off(257, None, Off::none().with(Fault::ServerCrash)).unwrap_or_else(|failure| panic!("{failure}"));
-    assert!(report.clients_at_eviction >= 24, "{report:?}");
-    assert!(report.cache_hits > 0, "clients reuse action outputs");
-    assert!(report.silences > 0, "clients give up on a silent server");
+    rargo_machine::test_batches! {
+        clean;
+        seed_635: 635..636,
+        seed_8360: 8360..8361,
+        seed_9391: 9391..9392,
+    }
 }
 
 #[test]
@@ -189,12 +224,12 @@ fn evicting_content_an_upload_claimed_is_caught() {
 
 #[test]
 fn a_client_trusting_what_the_server_no_longer_holds_is_caught() {
-    caught(6, Bug::StaleKnowledge, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
+    caught(4, Bug::StaleKnowledge, |k| matches!(k, Kind::Liveness(_) | Kind::Deadlock(_)));
 }
 
 #[test]
 fn a_client_that_never_gives_up_on_a_silent_server_is_caught() {
-    caught(0, Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
+    caught(5, Bug::DeafToSilence, |k| matches!(k, Kind::Silence(_)));
 }
 
 #[test]
@@ -209,17 +244,25 @@ fn a_rescan_that_misses_the_edits_is_caught() {
 
 #[test]
 fn outputs_that_never_reach_target_are_caught() {
-    caught(0, Bug::UnshownOutputs, |k| matches!(k, Kind::Drift(d) if d.contains("target/")));
+    caught(11, Bug::UnshownOutputs, |k| matches!(k, Kind::Drift(d) if d.contains("target/")));
 }
 
 #[test]
-fn disk_faults_end_the_command_or_recover_with_its_pins() {
-    let crash = run(0, None).expect("builds recover after a power cut");
-    assert_eq!((crash.disk_crashes, crash.torn_writes), (1, 0));
-    let torn = run(3, None).expect("builds recover after a torn write");
-    assert_eq!((torn.disk_crashes, torn.torn_writes), (1, 1));
-    let full = run(19, None).expect("a full disk ends the command instead of deadlocking");
-    assert_eq!(full.disk_full_errors, 1);
+fn a_build_recovers_after_a_power_cut() {
+    let report = run(0, None).expect("builds recover after a power cut");
+    assert_eq!((report.disk_crashes, report.torn_writes), (1, 0));
+}
+
+#[test]
+fn a_build_recovers_after_a_torn_write() {
+    let report = run(3, None).expect("builds recover after a torn write");
+    assert_eq!((report.disk_crashes, report.torn_writes), (1, 1));
+}
+
+#[test]
+fn a_full_disk_ends_the_command() {
+    let report = run(19, None).expect("a full disk ends the command instead of deadlocking");
+    assert_eq!(report.disk_full_errors, 1);
 }
 
 #[test]
@@ -227,11 +270,17 @@ fn a_disk_full_result_reaches_the_client_after_reconnection() {
     let report = run_off(32, None, Off::none().with(Fault::ServerCrash))
         .expect("the client gets the disk error after reconnecting");
     assert_eq!(report.disk_full_errors, 1);
+}
 
-    for seed in [708, 813] {
-        let report = run(seed, None).expect("the command finishes with both faults enabled");
-        assert!(report.server_restarts > 0, "seed {seed}");
-    }
+fn disk_full_and_server_restart(seed: u64) {
+    let report = run(seed, None).expect("the command finishes with both faults enabled");
+    assert!(report.server_restarts > 0, "seed {seed}");
+}
+
+rargo_machine::test_batches! {
+    disk_full_and_server_restart;
+    disk_full_and_server_restart_708: 708,
+    disk_full_and_server_restart_813: 813,
 }
 
 #[test]

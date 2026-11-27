@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import resource
@@ -74,25 +75,75 @@ def cpu_of(argv, cwd, env):
     return used * 1000, run
 
 
-def cpu(extra):
-    if measure(open(BUDGETS).read()) != MEASURE:
-        sys.exit(f"{BUDGETS} must measure {MEASURE}, which is what this script measures")
-    suite, default, slow = parse_budgets(open(BUDGETS).read())
+def fetch_runtime(program):
+    # Direct execution bypasses rargo's Nix runtime setup. A missing ELF
+    # interpreter surfaces as ENOENT even when the test binary exists.
+    elf = subprocess.run(["readelf", "-W", "-l", "-d", program], check=True, capture_output=True, text=True).stdout
+    loader = re.search(r"Requesting program interpreter: (/nix/store/[^\]]+)", elf)
+    if not loader or os.path.exists(loader[1]):
+        return False
+    store = re.compile(r"/nix/store/[0-9a-z]{32}-[\w.+?=-]+")
+    essential = store.match(loader[1])
+    if not essential:
+        return False
+    paths = dict.fromkeys(store.findall(elf))
+    roots = os.path.expanduser("~/.cache/rargo/nix")
+    os.makedirs(roots, exist_ok=True)
+    for path in paths:
+        if not os.path.exists(path):
+            fetched = subprocess.run(["nix-store", "--realise", path, "--add-root", os.path.join(roots, os.path.basename(path))],
+                                     capture_output=True, text=True)
+            # The compiler's shell environment can appear in RUNPATH
+            # without being available from a substituter.
+            if path == essential[0] and fetched.returncode:
+                sys.exit(f"fetching the test runtime {path} failed:\n{fetched.stderr}")
+    return True
+
+
+def list_tests(program, cwd, env):
+    argv = [program, "--list", "--format", "terse"]
+    try:
+        listed = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+    except FileNotFoundError:
+        if not os.path.isfile(program) or not fetch_runtime(program):
+            raise
+        listed = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
+    if listed.returncode:
+        sys.exit(f"listing tests in {program} failed:\n{listed.stdout}{listed.stderr}")
+    return [line[:-len(": test")] for line in listed.stdout.splitlines() if line.endswith(": test")]
+
+
+def test_programs(extra):
     root = os.getcwd()
-    asroot = [] if os.geteuid() == 0 else ["sudo", "-E"]
-    took, failed = {}, []
     for program in programs(extra):
         package = program.split("/")[3]
         crate = os.path.join(root, "crates", package)
+        executable = os.path.join(root, program)
+        env = dict(os.environ, CARGO_MANIFEST_DIR=crate, CARGO_PKG_NAME=package)
+        yield executable, crate, package, list_tests(executable, crate, env)
+
+
+def cpu(extra):
+    if measure(open(BUDGETS).read()) != MEASURE:
+        sys.exit(f"{BUDGETS} must measure {MEASURE}, which is what this script measures")
+    built = list(test_programs(extra))
+    if os.geteuid() != 0:
+        # Elevate once, after building and preparing runtimes, so getrusage
+        # counts the tests and their children without a sudo process per test.
+        supervisor = ["sudo", "-E", sys.executable, os.path.abspath(__file__), "cpu-built"]
+        sys.exit(subprocess.run(supervisor, input=json.dumps(built), text=True).returncode)
+    measure_cpu(built)
+
+
+def measure_cpu(built):
+    suite, default, slow = parse_budgets(open(BUDGETS).read())
+    took, failed = {}, []
+    for program, crate, package, tests in built:
         name = re.sub(r"-[0-9a-f]{16}$", "", os.path.basename(program))
         env = dict(os.environ, CARGO_MANIFEST_DIR=crate, CARGO_PKG_NAME=package)
-        listed = subprocess.run([os.path.join(root, program), "--list", "--format", "terse"],
-                                cwd=crate, env=env, capture_output=True, text=True)
-        tests = [line[: -len(": test")] for line in listed.stdout.splitlines() if line.endswith(": test")]
         for test in tests:
             key = f"{name} {test}"
-            ms, run = cpu_of([*asroot, os.path.join(root, program), "--exact", test, "--test-threads=1", "-q"],
-                             crate, env)
+            ms, run = cpu_of([program, "--exact", test, "--test-threads=1", "-q"], crate, env)
             took[key] = ms
             if run.returncode != 0:
                 failed.append(key)
@@ -179,6 +230,8 @@ def ratchet(base):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["cpu"]:
         cpu(sys.argv[2:])
+    elif sys.argv[1:] == ["cpu-built"]:
+        measure_cpu(json.load(sys.stdin))
     elif len(sys.argv) == 3 and sys.argv[1] == "ratchet":
         ratchet(sys.argv[2])
     else:

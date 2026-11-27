@@ -528,10 +528,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_arrivals_and_releases_keep_the_scheduler_consistent() {
+    mod generated_arrivals_and_releases_keep_the_scheduler_consistent {
+        use super::generated_arrivals;
+
+        rargo_machine::test_batches! {
+            generated_arrivals;
+            seeds_1_to_50: 1..=50,
+            seeds_51_to_100: 51..=100,
+            seeds_101_to_150: 101..=150,
+            seeds_151_to_200: 151..=200,
+            seeds_201_to_250: 201..=250,
+            seeds_251_to_300: 251..=300,
+        }
+    }
+
+    fn generated_arrivals(seeds: std::ops::RangeInclusive<u64>) {
         let prios = [Priority::Idle, Priority::Background, Priority::Agent, Priority::Human];
-        for seed in 1..=300u64 {
+        for seed in seeds {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let tokens = 1 + rng.below(6) as usize;
             let budget = 1000;

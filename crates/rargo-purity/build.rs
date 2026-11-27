@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -16,11 +17,27 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
     }
 }
 
-fn source_group(path: &str) -> &str {
-    const CRATES: &str = "crates/";
-    path.strip_prefix(CRATES)
-        .and_then(|rest| rest.find('/').map(|end| &path[..=CRATES.len() + end]))
-        .unwrap_or(path)
+#[path = "src/test_modules.rs"]
+mod test_modules;
+
+// Keep the owner and its external tests in one scan. Edges can chain, so
+// group the connected files even if one module also declares its own tests.
+fn source_groups<'a>(files: &'a [String], root: &Path) -> Vec<Vec<&'a str>> {
+    let parsed: Vec<_> = files.iter().filter(|file| file.ends_with(".rs")).filter_map(|file| {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        // The scanner itself reports syntax errors.
+        syn::parse_file(&text).ok().map(|parsed| (file.as_str(), parsed))
+    }).collect();
+    let owners = test_modules::test_files(&parsed);
+    let mut groups: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for file in files {
+        let mut owner = file.as_str();
+        while let Some(parent) = owners.get(owner) {
+            owner = parent;
+        }
+        groups.entry(owner).or_default().push(file);
+    }
+    groups.into_values().collect()
 }
 
 fn main() {
@@ -33,16 +50,29 @@ fn main() {
         writeln!(text, "    ({file:?}, include_str!({:?})),", root.join(file).display().to_string()).unwrap();
     }
     text.push_str("];\n");
-    // Keep a crate's sources together so the scanner can associate external
-    // test modules with the state machines they exercise.
-    for files in files.chunk_by(|a, b| source_group(a) == source_group(b)) {
-        let prefix = source_group(&files[0]);
-        let name = prefix.strip_prefix("crates/").map_or("manifest".to_string(), |name| {
-            name.trim_end_matches('/').replace('-', "_")
-        });
-        writeln!(text, "#[cfg(test)] #[test] fn workspace_purity_{name}() {{ tests::workspace_purity({prefix:?}); }}").unwrap();
+    // Keep small files together to limit test process overhead, but give
+    // large modules their own budget.
+    const SHARD_BYTES: u64 = 80_000;
+    let mut shard = Vec::new();
+    let mut bytes = 0;
+    let mut index = 0;
+    for group in source_groups(&files, &root) {
+        let size: u64 = group.iter().map(|file| std::fs::metadata(root.join(file)).unwrap().len()).sum();
+        if !shard.is_empty() && bytes + size > SHARD_BYTES {
+            write_test(&mut text, index, &shard);
+            index += 1;
+            shard.clear();
+            bytes = 0;
+        }
+        shard.extend(group);
+        bytes += size;
     }
+    write_test(&mut text, index, &shard);
     std::fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join("sources.rs"), text).unwrap();
     println!("cargo:rerun-if-changed={}", root.join("crates").display());
     println!("cargo:rerun-if-changed={}", root.join("Cargo.toml").display());
+}
+
+fn write_test(text: &mut String, index: usize, files: &[&str]) {
+    writeln!(text, "#[cfg(test)] #[test] fn workspace_purity_{index}() {{ tests::workspace_purity(&{files:?}); }}").unwrap();
 }
