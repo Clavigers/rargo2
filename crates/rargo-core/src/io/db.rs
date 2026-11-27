@@ -11,9 +11,9 @@
 //! loop ends, it hands the writer back with everything sent to it applied, so
 //! no write is lost and a later loop can own it again.
 
-use super::{background, call, cpu, loop_at_hand, on_fiber, on_loop_thread, oneshot, spawn, timeout, unbounded_channel};
+use super::{background, call, cpu, loop_at_hand, on_fiber, on_loop_thread, oneshot, sleep, spawn, unbounded_channel};
 use super::{UnboundedReceiver, UnboundedSender};
-use crate::db_writer::{Batch, DbWriter, Due, IDLE_MS};
+use crate::db_writer::{Batch, DbWriter, Due};
 use std::mem;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -34,6 +34,8 @@ enum Msg {
     Committed(Batch, anyhow::Result<()>),
     Flush(Done),
     Stop(Done),
+    /// The time a commit was due at has come.
+    Tick,
 }
 
 enum Slot {
@@ -149,6 +151,7 @@ impl Owner {
             asked: Vec::new(),
             in_flight: None,
             stopped: Vec::new(),
+            alarm: None,
         };
         background(move || owning.run());
         slot
@@ -206,6 +209,8 @@ struct Owning {
     in_flight: Option<Vec<Done>>,
     /// Whoever waits for the writer to come back.
     stopped: Vec<Done>,
+    /// When the fiber that wakes the owner for a due commit fires, if one is set.
+    alarm: Option<u64>,
 }
 
 impl Owning {
@@ -232,16 +237,22 @@ impl Owning {
             if !self.stopped.is_empty() && self.in_flight.is_none() && self.asked.is_empty() {
                 return;
             }
-            let wait = match due {
-                Due::Idle => IDLE_MS,
-                Due::At(t) => t.saturating_sub(now).max(1),
-                Due::Now => 1,
-            };
-            let rx = &mut self.rx;
-            match timeout(Duration::from_millis(wait), || rx.recv()) {
-                Err(_) => {}
-                Ok(None) => return,
-                Ok(Some(msg)) => self.take(msg),
+            // Waiting on the channel alone, with one fiber to wake the owner
+            // when a commit is due, costs no fiber per message.
+            if let (Due::At(t), None) = (due, self.in_flight.as_ref())
+                && self.alarm.is_none_or(|at| at > t)
+            {
+                self.alarm = Some(t);
+                let tx = self.tx.clone();
+                let wait = Duration::from_millis(t.saturating_sub(now).max(1));
+                background(move || {
+                    sleep(wait);
+                    let _ = tx.send(Msg::Tick);
+                });
+            }
+            match self.rx.recv() {
+                None => return,
+                Some(msg) => self.take(msg),
             }
         }
     }
@@ -256,6 +267,11 @@ impl Owning {
                 answered.into_iter().for_each(|done| done());
             }
             Msg::Flush(done) => self.asked.push(done),
+            Msg::Tick => {
+                if self.alarm.is_some_and(|at| at <= self.disk.now_ms()) {
+                    self.alarm = None;
+                }
+            }
             Msg::Stop(done) => {
                 self.asked.push(Box::new(|| {}));
                 self.stopped.push(done);
