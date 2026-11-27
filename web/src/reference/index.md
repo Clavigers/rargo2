@@ -56,7 +56,7 @@ Everything that is not a build (`cargo add`, `cargo login`, `cargo fmt`) is hand
 
 ## Nextest
 
-`rargo nextest` builds the test binaries and runs nextest on the build server. It returns nextest's output, exit status, and reports such as JUnit XML. The client passes `NEXTEST_*` variables.
+`rargo nextest` builds the test binaries and runs nextest on the build server. It returns nextest's output, exit status, and reports such as JUnit XML. The test binaries stay on the server; none are put in `target/`. The client passes `NEXTEST_*` variables.
 
 Set `nextest = "X.Y.Z"` under `[workspace.metadata.rargo]` in the project's `Cargo.toml`, or set `nextest-version` in `.config/nextest.toml`, to pin the version. Without a project version, rargo uses the version installed on the client if available, then the newest release. The server verifies the download's checksum and keeps each version installed separately.
 

@@ -1020,6 +1020,9 @@ fn test_dep_dirs(plan: &rp::Plan) -> BTreeMap<String, Vec<String>> {
     by_dir
 }
 
+/// Runs the build the client asked for. With `keep`, the build is the one
+/// nextest asked for: its tests run on the server, so what it built stays
+/// there and none of it is delivered into the client's `target/`.
 fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Built>>>) -> Result<Finish> {
     let started = crate::io::now();
     let mut args: Vec<String> = c.args.clone();
@@ -1364,7 +1367,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
     }
     if subcommand_pos(&args).is_some_and(|i| args[i] == "install") {
         run.deliver_install()?;
-    } else {
+    } else if keep.is_none() {
         run.materialize_roots();
         run.write_depinfo();
     }
