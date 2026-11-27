@@ -22,11 +22,19 @@ impl<W> Calls<W> {
     }
 
     pub fn answer(&mut self, rid: u64) -> Option<W> {
-        self.pending.remove(&rid)
+        let before = self.pending.len();
+        let waiter = self.pending.remove(&rid);
+        assert!(!self.pending.contains_key(&rid), "an answered request is no longer pending");
+        assert_eq!(self.pending.len() + usize::from(waiter.is_some()), before, "an answer ends at most one request");
+        waiter
     }
 
     pub fn lost(&mut self) -> Vec<W> {
-        std::mem::take(&mut self.pending).into_values().collect()
+        let before = self.pending.len();
+        let lost: Vec<W> = std::mem::take(&mut self.pending).into_values().collect();
+        assert!(self.pending.is_empty(), "nothing is pending once all is lost");
+        assert_eq!(lost.len(), before, "every pending waiter is told");
+        lost
     }
 }
 
@@ -77,18 +85,23 @@ impl WorkerPool {
 
     pub fn left(&mut self, id: u64) -> Vec<Effect> {
         if self.workers.remove(&id).is_none() {
+            assert!(!self.order.contains(&id), "an unknown worker is not listed");
             return Vec::new();
         }
         self.order.retain(|w| *w != id);
         self.leased.remove(&id);
         self.warmed.remove(&id);
         let lost: Vec<u64> = self.actions.iter().filter(|(_, w)| **w == id).map(|(a, _)| *a).collect();
-        lost.into_iter()
+        let effects: Vec<Effect> = lost
+            .into_iter()
             .map(|action| {
                 self.actions.remove(&action);
                 Effect::Lost { action }
             })
-            .collect()
+            .collect();
+        assert!(!self.order.contains(&id) && !self.leased.contains_key(&id) && !self.warmed.contains(&id));
+        assert!(self.actions.values().all(|w| *w != id), "a worker that left runs nothing");
+        effects
     }
 
     pub fn lease(&mut self, among: Option<&[u64]>) -> Option<u64> {
@@ -102,19 +115,30 @@ impl WorkerPool {
                 best = Some((*id, free));
             }
         }
-        let (id, _) = best?;
+        let Some((id, free)) = best else {
+            assert!(
+                self.order.iter().filter(|id| among.is_none_or(|ids| ids.contains(id))).all(|id| self.workers[id].free == 0),
+                "nothing is leased only while no core is free"
+            );
+            return None;
+        };
         self.workers.get_mut(&id).expect("chosen").free -= 1;
         *self.leased.entry(id).or_default() += 1;
+        assert!(among.is_none_or(|ids| ids.contains(&id)), "a lease is taken among the workers asked for");
+        assert_eq!(self.workers[&id].free, free - 1, "a lease takes one core");
         Some(id)
     }
 
     pub fn give_back(&mut self, id: u64) -> Vec<Effect> {
         let Some(n) = self.leased.get_mut(&id) else { return vec![Effect::Wake] };
+        assert!(*n >= 1, "a leased worker holds a lease");
         *n -= 1;
         if *n == 0 {
             self.leased.remove(&id);
         }
-        self.workers.get_mut(&id).expect("a leased worker is here").free += 1;
+        let slot = self.workers.get_mut(&id).expect("a leased worker is here");
+        slot.free += 1;
+        assert!(slot.free <= slot.cores, "a core comes back once");
         vec![Effect::Wake]
     }
 
@@ -131,14 +155,19 @@ impl WorkerPool {
     }
 
     pub fn finished(&mut self, action: u64, answered: bool) -> Vec<Effect> {
-        match self.actions.remove(&action) {
+        let effects = match self.actions.remove(&action) {
             Some(worker) if !answered => vec![Effect::Cancel { worker, action }],
             _ => Vec::new(),
-        }
+        };
+        assert!(!self.actions.contains_key(&action), "a finished action is no longer routed");
+        assert!(effects.is_empty() || !answered, "only an unanswered action is cancelled");
+        effects
     }
 
     pub fn warm(&mut self, worker: u64, known: bool, own: bool) -> bool {
-        known && !own && self.workers.contains_key(&worker) && self.warmed.insert(worker)
+        let fresh = known && !own && self.workers.contains_key(&worker) && self.warmed.insert(worker);
+        assert!(!fresh || self.warmed.contains(&worker), "a worker is warmed once");
+        fresh
     }
 }
 
@@ -229,13 +258,16 @@ impl Race {
     }
 
     pub fn claim(&mut self, who: Who) -> bool {
-        match self.owner {
+        let won = match self.owner {
             None => {
                 self.owner = Some(who);
                 true
             }
             Some(o) => o == who,
-        }
+        };
+        assert!(self.owner.is_some(), "a race has an owner once claimed");
+        assert_eq!(won, self.owner == Some(who), "a claim is won only by the owner");
+        won
     }
 
     pub fn may_hedge(&self, away: bool, hedging: bool) -> bool {
@@ -253,7 +285,7 @@ impl Race {
     }
 
     pub fn settle(&mut self) -> Option<Settle> {
-        match self.owner {
+        let settled = match self.owner {
             Some(Who::Remote) if self.local == Side::Running => {
                 self.local = Side::Gone;
                 Some(Settle::StopLocal)
@@ -263,7 +295,13 @@ impl Race {
                 Some(Settle::DropRemote)
             }
             _ => None,
+        };
+        match self.owner {
+            Some(Who::Remote) => assert_ne!(self.local, Side::Running, "the owner's rival is stopped"),
+            Some(Who::Local) => assert_ne!(self.remote, Side::Running, "the owner's rival is stopped"),
+            None => assert_eq!(settled, None, "a race without an owner settles nothing"),
         }
+        settled
     }
 
     pub fn remote_ended(&mut self, ok: bool) -> Outcome {

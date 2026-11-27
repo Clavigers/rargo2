@@ -803,6 +803,7 @@ dependencies = [
  "bincode",
  "blake3",
  "crc32fast",
+ "expect-test",
  "flate2",
  "fusewire",
  "libc",
@@ -904,8 +905,10 @@ dependencies = [
  "rargo",
  "rargo-core",
  "rargo-machine",
+ "rargo-net",
  "rargo-plan",
  "rargo-proto",
+ "serde",
 ]
 
 [[package]]

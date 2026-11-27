@@ -440,6 +440,7 @@ fn serve(
     let before: Option<Arc<std::collections::BTreeSet<crate::proto::Digest>>> = {
         let known = d.deliveries.lock();
         known
+            .by_worktree
             .get(&worktree)
             .filter(|(token, _)| req.delivered != 0 && *token == req.delivered)
             .map(|(_, set)| set.clone())
@@ -520,17 +521,24 @@ fn serve(
                 delivered.extend(set.iter().copied());
             }
         }
-        let mut b = [0u8; 8];
-        crate::io::random(&mut b);
-        let token = u64::from_le_bytes(b) | 1;
-        assert_ne!(token, 0);
-        d.deliveries.lock().insert(worktree, (token, Arc::new(delivered)));
+        let mut known = d.deliveries.lock();
+        let token = delivery_token(&mut known.random);
+        known.by_worktree.insert(worktree, (token, Arc::new(delivered)));
+        drop(known);
         sess.send(ServerMsg::DeliveryToken(token));
     }
     match outcome {
         Ok(code) => ServerMsg::Exit(code),
         Err(exec) => ServerMsg::Exec(exec),
     }
+}
+
+/// A delivery token: drawn from the generator the caller passed in, never 0
+/// (0 means the client has none).
+fn delivery_token(rng: &mut crate::rng::Rng) -> u64 {
+    let token = rng.next_u64() | 1;
+    assert_ne!(token, 0);
+    token
 }
 
 pub fn status_text(d: &Daemon) -> String {
@@ -652,5 +660,22 @@ mod failure_tests {
         assert_eq!(failure("", &anyhow::anyhow!("no such token")), "no such token");
         assert!(!OUT_OF_SPACE.contains("os error") && OUT_OF_SPACE.contains("administrator"));
         assert!(TOKEN_ENDED.contains("it was revoked or has expired. Run `rargo auth`") && !TOKEN_ENDED.contains(crate::proto::REFUSED));
+    }
+}
+
+#[cfg(test)]
+mod random_tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    #[test]
+    fn two_runs_with_the_same_seed_hand_out_the_same_delivery_tokens() {
+        let run = |seed| {
+            let mut rng = Rng::new(seed);
+            (0..8).map(|_| delivery_token(&mut rng)).collect::<Vec<u64>>()
+        };
+        assert_eq!(run(42), run(42));
+        assert_ne!(run(42), run(43));
+        assert!(run(0).iter().all(|&t| t != 0));
     }
 }

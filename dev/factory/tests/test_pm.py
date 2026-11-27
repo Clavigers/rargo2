@@ -157,6 +157,8 @@ def test_a_bug_fixed_after_the_freeze_is_backported_and_built_again(tmp_path):
     f.pm.step()
     sha = f.fix(issue=5, pr=50)
     f.pm.step()
+    assert f.events()[-2:] == ["backported", "release_held"]  # held: a backport in no build
+    f.pm.step()
     ev = f.events()
     assert ev.count("backported") == 1 and ev.count("built") == 2
     assert f"cherry picked from commit {sha}" in git(f.origin, "log", "-1", "--format=%B", "release/0.7.11")

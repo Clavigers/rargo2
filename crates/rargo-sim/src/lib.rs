@@ -4,6 +4,8 @@ mod nextest;
 pub mod workspace;
 pub mod world;
 
+mod transport;
+
 pub use world::{Bug, Failure, Fault, Kind, Off, Report, run, run_off};
 
 pub fn search(seeds: std::ops::Range<u64>, bug: Option<Bug>) -> Vec<Failure> {
