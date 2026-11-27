@@ -316,6 +316,32 @@ pub fn client_paths(value: &str, tr: &Translator) -> String {
     value.split(':').map(client).collect::<Vec<_>>().join(":")
 }
 
+/// A status line from the plan (such as `Executable unittests src/main.rs (target/...)`) with
+/// each path under an external target directory given its client path, as `rargo run` names its
+/// program: the client has no `target/rargo-external`.
+pub fn client_text(msg: &str, sandbox_cwd: &str, tr: &Translator) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, after) = rest.split_at(end);
+        let core = word.trim_start_matches(['(', '`', '\'', '"']);
+        let core = core.trim_end_matches([')', '`', '\'', '"', ',']);
+        if core.is_empty() {
+            out.push_str(word);
+        } else {
+            let start = word.find(core).expect("core is a part of word");
+            out.push_str(&word[..start]);
+            out.push_str(&client_program(core, sandbox_cwd, tr));
+            out.push_str(&word[start + core.len()..]);
+        }
+        let space = after.len() - after.trim_start().len();
+        out.push_str(&after[..space]);
+        rest = &after[space..];
+    }
+    out
+}
+
 pub fn build_paths(root: &str, cargo_home: &str, env: &mut BTreeMap<String, String>) -> Translator {
     let worktree_at = std::str::from_utf8(WORKTREE_AT).expect("worktree mount is ASCII");
     let mut pairs = vec![
@@ -631,6 +657,24 @@ mod tests {
             client_paths("/w/target/rargo-external/debug/deps:/w/target/debug/deps:/usr/lib", &tr),
             "/tmp/x/one-out/debug/deps:/w/target/debug/deps:/usr/lib"
         );
+    }
+
+    #[test]
+    fn test_status_lines_name_binaries_in_an_external_target_dir_by_their_client_path() {
+        let mut env = BTreeMap::from([("CARGO_TARGET_DIR".into(), "/tmp/x/td-out".into())]);
+        let tr = build_paths("/root/td", "/root/.cargo", &mut env);
+        for (msg, expected) in [
+            (
+                "unittests src/main.rs (target/rargo-external/debug/build/td/3f/out/td-3f)",
+                "unittests src/main.rs (/tmp/x/td-out/debug/build/td/3f/out/td-3f)",
+            ),
+            ("`/w/target/rargo-external/debug/deps/td-3f --nocapture`", "`/tmp/x/td-out/debug/deps/td-3f --nocapture`"),
+            ("unittests src/main.rs (target/debug/deps/td-3f)", "unittests src/main.rs (target/debug/deps/td-3f)"),
+            ("td", "td"),
+            ("a  (b) ``", "a  (b) ``"),
+        ] {
+            assert_eq!(client_text(msg, "/w", &tr), expected, "{msg}");
+        }
     }
 
     #[test]
