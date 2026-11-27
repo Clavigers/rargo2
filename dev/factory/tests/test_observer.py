@@ -217,6 +217,30 @@ def test_a_merge_conflict_is_recorded(rig):
     assert rig.led.world.needs_work(1)
 
 
+def test_a_conflicting_push_gets_no_ci_and_needs_work(rig):
+    pushed(rig)
+    rig.gh.pulls[10]["mergeable_state"] = "unknown"  # GitHub has not computed it yet
+    rig.obs.step()
+    assert rig.led.world.is_(M.CI, "10/1", "pending")  # keeps waiting
+    rig.gh.pulls[10]["mergeable_state"] = "dirty"  # and so no CI run starts
+    rig.obs.step()
+    assert lines(rig)[-1] == {**lines(rig)[-1], "event": "merge_failed", "actor": "merger",
+                              "pr": 10, "push": 1, "reason": "conflict"}
+    w = rig.led.world
+    assert w.is_(M.CI, "10/1", "void") and w.needs_work(1) and w.issues[1].pr == 10
+    rig.obs.step()  # recorded once
+    assert sum(d["event"] == "merge_failed" for d in lines(rig)) == 1
+
+
+def test_a_conflict_with_ci_running_waits_for_ci(rig):
+    pushed(rig)
+    rig.gh.ci(SHA, None, status="in_progress")
+    rig.gh.pulls[10]["mergeable_state"] = "dirty"  # main moved after CI started
+    rig.obs.step()
+    assert rig.led.world.is_(M.CI, "10/1", "pending")
+    assert not any(d["event"] == "merge_failed" for d in lines(rig))
+
+
 def test_merges_and_closes_on_github_are_followed(rig):
     pushed(rig)
     rig.gh.pulls[10].update(state="closed", merged_at="now", merged_by={"login": "someone"},

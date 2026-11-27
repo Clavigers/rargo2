@@ -546,6 +546,7 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     for (k, v) in policy.passed_env(&client_env) {
         env.entry(k).or_insert(v);
     }
+    flag_target_dir(&c.args, &c.cwd, &mut env);
     let tr = build_paths(&c.root, &c.cargo_home, &mut env);
     let sandbox_cwd = tr.to_canonical(&c.cwd);
     if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
@@ -649,7 +650,11 @@ fn plan_with(
         env.insert(bytes("CARGO_BUILD_BUILD_DIR"), bytes("/w/target/install-build"));
     }
     let mut argv = vec![PLANNER_AT.to_vec()];
-    for a in args {
+    let args = match (target_dir_flag(args), p.env.get("CARGO_TARGET_DIR")) {
+        (Some(_), Some(dir)) => with_target_dir(args, dir),
+        _ => args.to_vec(),
+    };
+    for a in &args {
         let a = match a.split_once('=') {
             Some((flag, val)) if flag.starts_with("--") && val.starts_with('/') => {
                 format!("{flag}={}", p.tr.to_canonical(val))
@@ -1721,9 +1726,9 @@ impl Run {
                 break o;
             }
             let seed_layer = seed.as_ref().map(|s| {
-                let l = OutputsLayer::new();
+                let mut l = OutputState::default();
                 l.add_manifest(0, LEVEL_FULL, &s.manifest);
-                Arc::new(l)
+                Arc::new(OutputsLayer::frozen(l))
             });
             let outcome = self
                 .d

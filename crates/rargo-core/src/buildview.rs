@@ -1,4 +1,5 @@
 use rargo_machine::StateMachine;
+use crate::io::buildview::OutputLoop;
 use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
@@ -527,21 +528,17 @@ struct LayerDir {
 }
 
 #[derive(Default)]
-pub struct OutputsLayer {
-    dirs: DashMap<Vec<u8>, LayerDir>,
-    ranks: DashMap<u32, u64>,
+pub(crate) struct OutputState {
+    dirs: BTreeMap<Vec<u8>, LayerDir>,
+    ranks: BTreeMap<u32, u64>,
 }
 
-impl OutputsLayer {
-    pub fn new() -> OutputsLayer {
-        OutputsLayer::default()
-    }
-
-    pub fn add(&self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
+impl OutputState {
+    pub(crate) fn add(&mut self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
         for (path, e) in entries {
             let Some((parent, name)) = vsplit(path) else { continue };
             {
-                let mut d = self.dirs.entry(parent.to_vec()).or_default();
+                let d = self.dirs.entry(parent.to_vec()).or_default();
                 let list = d.children.entry(name.to_vec()).or_default();
                 list.retain(|(u, s, ent)| !(*u == unit && *s >= stage && matches!(ent, LayerEnt::Implied)));
                 if !list.iter().any(|(u, s, _)| *u == unit && *s == stage) {
@@ -551,7 +548,7 @@ impl OutputsLayer {
             }
             let mut cur = parent;
             while let Some((pp, pn)) = vsplit(cur) {
-                let mut d = self.dirs.entry(pp.to_vec()).or_default();
+                let d = self.dirs.entry(pp.to_vec()).or_default();
                 let list = d.children.entry(pn.to_vec()).or_default();
                 if list.iter().any(|(u, s, _)| *u == unit && *s <= stage) {
                     break;
@@ -563,16 +560,16 @@ impl OutputsLayer {
         }
     }
 
-    pub fn add_manifest(&self, unit: u32, stage: u8, m: &Manifest) {
+    pub(crate) fn add_manifest(&mut self, unit: u32, stage: u8, m: &Manifest) {
         self.add(unit, stage, &m.entries);
     }
 
-    pub fn set_rank(&self, unit: u32, rank: u64) {
+    fn set_rank(&mut self, unit: u32, rank: u64) {
         self.ranks.insert(unit, rank);
     }
 
     fn rank(&self, unit: u32) -> u64 {
-        self.ranks.get(&unit).map(|r| *r).unwrap_or(unit as u64)
+        self.ranks.get(&unit).copied().unwrap_or(unit as u64)
     }
 
     fn pick(&self, list: &[(u32, u8, LayerEnt)], levels: &[u8]) -> Option<LayerEnt> {
@@ -602,10 +599,10 @@ impl OutputsLayer {
 
     fn visible_paths(&self, levels: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
-        for d in self.dirs.iter() {
-            for (name, list) in &d.value().children {
+        for (dir, d) in &self.dirs {
+            for (name, list) in &d.children {
                 if let Some(LayerEnt::Entry(MEntry::File { .. } | MEntry::Symlink(_))) = self.pick(list, levels) {
-                    out.push(vjoin(d.key(), name));
+                    out.push(vjoin(dir, name));
                 }
             }
         }
@@ -620,6 +617,102 @@ impl OutputsLayer {
                 .iter()
                 .filter_map(|(name, list)| self.pick(list, levels).map(|e| (name.clone(), e)))
                 .collect(),
+        }
+    }
+}
+
+/// An output overlay is either owned by the shell loop or published as an immutable snapshot.
+pub struct OutputsLayer {
+    storage: OutputStorage,
+}
+
+enum OutputStorage {
+    Live(OutputLoop),
+    Frozen(OutputState),
+}
+
+impl Default for OutputsLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OutputsLayer {
+    pub fn new() -> Self {
+        Self { storage: OutputStorage::Live(OutputLoop::spawn()) }
+    }
+
+    pub(crate) fn frozen(state: OutputState) -> Self {
+        Self { storage: OutputStorage::Frozen(state) }
+    }
+
+    pub fn add(&self, unit: u32, stage: u8, entries: &[(Vec<u8>, MEntry)]) {
+        self.live().call(move |state, entries| state.add(unit, stage, &entries), entries.to_vec());
+    }
+
+    pub fn add_manifest(&self, unit: u32, stage: u8, m: &Manifest) {
+        self.add(unit, stage, &m.entries);
+    }
+
+    pub fn set_rank(&self, unit: u32, rank: u64) {
+        self.live().call(move |state, ()| state.set_rank(unit, rank), ());
+    }
+
+    fn live(&self) -> &OutputLoop {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner,
+            OutputStorage::Frozen(_) => panic!("a published output layer is immutable"),
+        }
+    }
+
+    fn get(&self, dir: &[u8], name: &[u8], levels: Levels<'_>) -> Option<LayerEnt> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner.call(
+                |state, (dir, name, levels)| state.get(&dir, &name, &levels),
+                (dir.to_vec(), name.to_vec(), levels.shared()),
+            ),
+            OutputStorage::Frozen(state) => state.get(dir, name, levels.slice()),
+        }
+    }
+
+    fn visible_paths(&self, levels: Levels<'_>) -> Vec<Vec<u8>> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner.call(|state, levels| state.visible_paths(&levels), levels.shared()),
+            OutputStorage::Frozen(state) => state.visible_paths(levels.slice()),
+        }
+    }
+
+    fn names(&self, dir: &[u8], levels: Levels<'_>) -> Vec<(Vec<u8>, LayerEnt)> {
+        match &self.storage {
+            OutputStorage::Live(owner) => owner.call(
+                |state, (dir, levels)| state.names(&dir, &levels),
+                (dir.to_vec(), levels.shared()),
+            ),
+            OutputStorage::Frozen(state) => state.names(dir, levels.slice()),
+        }
+    }
+}
+
+/// The level of each unit a lookup sees. A view's own levels are shared with
+/// the layer's loop by reference count, so a lookup does not copy them.
+#[derive(Clone, Copy)]
+enum Levels<'a> {
+    Shared(&'a Arc<Vec<u8>>),
+    Fixed(&'static [u8]),
+}
+
+impl Levels<'_> {
+    fn slice(&self) -> &[u8] {
+        match self {
+            Levels::Shared(levels) => levels,
+            Levels::Fixed(levels) => levels,
+        }
+    }
+
+    fn shared(&self) -> Arc<Vec<u8>> {
+        match self {
+            Levels::Shared(levels) => Arc::clone(levels),
+            Levels::Fixed(levels) => Arc::new(levels.to_vec()),
         }
     }
 }
@@ -642,11 +735,11 @@ const SEED_LEVELS: [u8; 1] = [LEVEL_FULL];
 impl BuildView {
     fn layered(&self, dir: &[u8], name: &[u8]) -> Option<LayerEnt> {
         if let Some(seed) = &self.seed {
-            if let Some(e) = seed.get(dir, name, &SEED_LEVELS) {
+            if let Some(e) = seed.get(dir, name, Levels::Fixed(&SEED_LEVELS)) {
                 return Some(e);
             }
         }
-        self.layer.get(dir, name, &self.levels)
+        self.layer.get(dir, name, Levels::Shared(&self.levels))
     }
 }
 
@@ -675,9 +768,9 @@ impl View for BuildView {
     }
 
     fn list(&self, dir: &[u8]) -> io::Result<Listing> {
-        let mut layered = self.layer.names(dir, &self.levels);
+        let mut layered = self.layer.names(dir, Levels::Shared(&self.levels));
         if let Some(seed) = &self.seed {
-            layered.extend(seed.names(dir, &SEED_LEVELS));
+            layered.extend(seed.names(dir, Levels::Fixed(&SEED_LEVELS)));
         }
         let base = if self.base_has_dir(dir) {
             drive(&self.base, |view| view.step_list(dir))?
@@ -703,7 +796,7 @@ impl View for BuildView {
     }
 
     fn hints(&self) -> Vec<Vec<u8>> {
-        self.layer.visible_paths(&self.levels)
+        self.layer.visible_paths(Levels::Shared(&self.levels))
     }
 
     fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
@@ -868,11 +961,14 @@ mod tests {
 
     #[test]
     fn layer_visibility_by_level() {
-        let layer = Arc::new(OutputsLayer::new());
+        let mut layer = OutputState::default();
         layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
         layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
         layer.add(1, LEVEL_FULL, &[(b"/t/debug/b/libb.rlib".to_vec(), file(3))]);
 
+        layer.add(1, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(4))]);
+        layer.set_rank(0, 10);
+        let layer = Arc::new(OutputsLayer::frozen(layer));
         let view = |levels: Vec<u8>| BuildView {
             base: layer_base(),
             layer: layer.clone(),
@@ -891,7 +987,12 @@ mod tests {
         assert_eq!(names, vec![(b"liba.rmeta".to_vec(), DType::File)]);
         assert_eq!(v.list(b"/t/debug").unwrap(), vec![(b"a".to_vec(), DType::Dir)]);
         let v = view(vec![LEVEL_FULL, LEVEL_FULL]);
-        assert!(matches!(v.stat(b"/t/debug/a/liba.rlib"), Looked::File(_)));
+        assert!(matches!(v.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 2));
+        assert_eq!(v.hints(), [
+            b"/t/debug/a/liba.rlib".to_vec(),
+            b"/t/debug/a/liba.rmeta".to_vec(),
+            b"/t/debug/b/libb.rlib".to_vec(),
+        ]);
         assert_eq!(v.list(b"/t/debug").unwrap().len(), 2);
         let v = view(vec![LEVEL_NONE, LEVEL_NONE]);
         assert!(matches!(v.stat(b"/t"), Looked::Dir(_)));
@@ -903,8 +1004,48 @@ mod tests {
     }
 
     #[test]
-    fn explicit_directory_does_not_hide_an_earlier_stage() {
+    fn live_layer_steps_its_loop() {
         let layer = Arc::new(OutputsLayer::new());
+        let view = |levels: Vec<u8>| BuildView {
+            base: layer_base(),
+            layer: layer.clone(),
+            levels: Arc::new(levels),
+            untraced: vec![],
+            seed: None,
+            content: None,
+        };
+        let full = view(vec![LEVEL_FULL, LEVEL_FULL]);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+
+        layer.add(0, LEVEL_META, &[(b"/t/debug/a/liba.rmeta".to_vec(), file(1))]);
+        layer.add(0, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(2))]);
+        layer.add(1, LEVEL_FULL, &[(b"/t/debug/a/liba.rlib".to_vec(), file(4))]);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 4));
+        layer.set_rank(0, 10);
+        assert!(matches!(full.stat(b"/t/debug/a/liba.rlib"), Looked::File(f) if f.size == 2));
+
+        let meta = view(vec![LEVEL_META, LEVEL_NONE]);
+        assert!(matches!(meta.stat(b"/t/debug/a/liba.rlib"), Looked::Absent));
+        assert_eq!(meta.list(b"/t/debug/a").unwrap(), vec![(b"liba.rmeta".to_vec(), DType::File)]);
+        assert_eq!(full.hints(), [b"/t/debug/a/liba.rlib".to_vec(), b"/t/debug/a/liba.rmeta".to_vec()]);
+    }
+
+    #[test]
+    fn live_layer_panic_reaches_the_caller_and_the_loop_goes_on() {
+        let layer = OutputsLayer::new();
+        let OutputStorage::Live(owner) = &layer.storage else { unreachable!() };
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.call(|_, ()| -> () { panic!("a step failed") }, ())
+        }));
+        let cause = failed.unwrap_err();
+        assert_eq!(cause.downcast_ref::<&str>(), Some(&"a step failed"));
+        layer.add(0, LEVEL_FULL, &[(b"/t/x".to_vec(), file(1))]);
+        assert!(layer.get(b"/t", b"x", Levels::Fixed(&[LEVEL_FULL])).is_some());
+    }
+
+    #[test]
+    fn explicit_directory_does_not_hide_an_earlier_stage() {
+        let mut layer = OutputState::default();
         layer.add(0, LEVEL_META, &[(b"/t/debug/a/out/liba.rmeta".to_vec(), file(1))]);
         layer.add(
             0,
@@ -918,7 +1059,7 @@ mod tests {
         );
         let v = BuildView {
             base: rooted("/view/empty", |_, _| {}),
-            layer,
+            layer: Arc::new(OutputsLayer::frozen(layer)),
             levels: Arc::new(vec![LEVEL_META]),
             untraced: vec![],
             seed: None,
@@ -953,9 +1094,9 @@ mod tests {
                 Ok(vec![(b"gone".to_vec(), DType::File), (b"kept".to_vec(), DType::File)]),
             );
         });
-        let layer = Arc::new(OutputsLayer::new());
+        let mut layer = OutputState::default();
         layer.add(0, LEVEL_FULL, &[(b"/gone".to_vec(), MEntry::Whiteout)]);
-        let v = BuildView { base, layer, levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::frozen(layer)), levels: Arc::new(vec![LEVEL_FULL]), untraced: vec![], seed: None, content: None };
         assert!(matches!(v.stat(b"/gone"), Looked::Absent));
         assert!(matches!(v.stat(b"/kept"), Looked::File(_)));
         let names: Vec<_> = v.list(b"/").unwrap().into_iter().map(|e| e.0).collect();
@@ -1013,7 +1154,7 @@ mod host_listing_tests {
             memo,
             0,
         ));
-        let v = BuildView { base, layer: Arc::new(OutputsLayer::new()), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
+        let v = BuildView { base, layer: Arc::new(OutputsLayer::frozen(OutputState::default())), levels: Arc::new(vec![]), untraced: vec![], seed: None, content: None };
         assert_eq!(v.list(b"/usr/lib").unwrap(), vec![(b"sample".to_vec(), DType::File)]);
         assert_eq!(v.list(b"/etc").unwrap(), vec![(b"settings".to_vec(), DType::File)]);
         let mut root: Vec<_> = v.list(b"/").unwrap();
