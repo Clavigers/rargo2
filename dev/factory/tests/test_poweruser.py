@@ -162,3 +162,16 @@ def test_a_use_can_be_voided_afterwards_and_the_build_is_used_again(tmp_path):
     f.now += timedelta(minutes=31)
     f.pu.step()
     assert len(f.sessions) == 2 and "uses" not in f.ledger.refresh().hold_reasons("0.7.11")
+
+
+def test_a_checkout_that_fails_opens_no_use(tmp_path):
+    import subprocess
+    f = Factory(tmp_path).candidate()
+    def broken(sha):
+        raise subprocess.CalledProcessError(1, "git fetch")
+    f.pu.prepare = broken
+    try:
+        f.pu.step()
+    except subprocess.CalledProcessError:
+        pass
+    assert f.ledger.world.uses == {} and f.sessions == []

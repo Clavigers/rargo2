@@ -48,11 +48,13 @@ class PowerUser:
                  timeout: timedelta = timedelta(minutes=90),
                  settle: timedelta = timedelta(minutes=20), poll: float = 20.0,
                  run: Callable[..., int] | None = None,
+                 prepare: Callable[[str], None] | None = None,
                  say: Callable[[str], None] = print):
         self.ledger, self.gh, self.checkout, self.prompt = ledger, gh, Path(checkout), prompt
         self.clock, self.gap, self.retry, self.timeout = clock, gap, retry, timeout
         self.settle, self.poll = settle, poll
         self.run_session = run or self._run_session
+        self.prepare = prepare or (self._checkout if run is None else lambda sha: None)
         self.say = say
 
     def run(self, every: float = 300.0) -> None:
@@ -92,6 +94,7 @@ class PowerUser:
         if d is None:
             return
         version, build, sha = d
+        self.prepare(sha)  # before the use opens: a checkout that fails is no session
         use = max(self.ledger.world.uses, default=0) + 1
         began = self.clock()
         self._record("use_started", use=use, version=version, build=build)
@@ -117,6 +120,11 @@ class PowerUser:
             self.say(f"power user: use {use}: the log never got {sorted(missing)}")
         self.say(f"power user: use {use} filed {sorted(filed) or 'nothing'}")
 
+    def _checkout(self, sha: str) -> None:
+        git = ["git", "-C", str(self.checkout)]
+        subprocess.run([*git, "fetch", "-q", "--tags", "origin"], check=True, capture_output=True)
+        subprocess.run([*git, "checkout", "-q", "--detach", "-f", sha], check=True, capture_output=True)
+
     def _run_session(self, use: int, version: str, build: int, sha: str) -> int:
         w = self.ledger.world
         t = next((a for a in w.config.agents if a.type is m.Harness.claude_code), w.config.agents[0])
@@ -129,9 +137,6 @@ class PowerUser:
             self.say(f"power user: no {t.type} here to run a session with")
             return 127
         argv, extra = cmd
-        git = ["git", "-C", str(self.checkout)]
-        subprocess.run([*git, "fetch", "-q", "--tags", "origin"], check=True, capture_output=True)
-        subprocess.run([*git, "checkout", "-q", "--detach", "-f", sha], check=True, capture_output=True)
         env = os.environ | extra | {
             "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.power_user,
             "FACTORY_PYTHON": sys.executable,
