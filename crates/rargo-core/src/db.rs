@@ -134,6 +134,18 @@ impl Db {
         Db::on_backend(Memory::default())
     }
 
+    /// Real redb using the simulated filesystem. The caller controls commits.
+    pub fn open_simulated(path: &Path) -> Result<Db> {
+        assert!(crate::io::sim::active());
+        let owned = path.to_path_buf();
+        let mut db = Db::over(Box::new(move || {
+            let file = crate::io::file::OpenOptions::new().read(true).write(true).create(true).open(&owned)?;
+            redb::Builder::new().create_with_backend(SimFile(file))
+        }))?;
+        db.writing = None;
+        Ok(db)
+    }
+
     /// A database on `disk`, opened again on the same disk after a failed commit.
     fn on_backend(disk: impl redb::StorageBackend + Clone) -> Result<Db> {
         Db::over(Box::new(move || redb::Builder::new().create_with_backend(disk.clone())))
@@ -224,7 +236,11 @@ impl Db {
     }
 
     pub fn flush(&self) {
-        flush_off_the_loop(&self.shared);
+        let _ = self.flush_checked();
+    }
+
+    pub fn flush_checked(&self) -> Result<()> {
+        flush_off_the_loop(&self.shared)
     }
 }
 
@@ -232,8 +248,8 @@ impl Drop for Db {
     fn drop(&mut self) {
         if let Some(writing) = &mut self.writing {
             writing.stop();
+            self.flush();
         }
-        flush_off_the_loop(&self.shared);
     }
 }
 
@@ -259,19 +275,19 @@ fn commit(db: Option<&Database>, batch: &Batch) -> Result<()> {
     Ok(())
 }
 
-fn flush_once(shared: &Shared) {
+fn flush_once(shared: &Shared) -> Result<()> {
     // Serialize flushes while allowing readers to use the database during commit.
     let mut db = shared.db.upgradable_read();
     let batch = shared.writer.lock().take();
     if batch.is_empty() {
-        return;
+        return Ok(());
     }
     if db.is_none() {
         db.with_upgraded(|db| reopen(db, &shared.open));
     }
     let done = commit(db.as_ref(), &batch);
     let now = shared.now_ms();
-    match done {
+    match &done {
         Ok(()) => shared.writer.lock().flushed(&batch, now),
         Err(e) => {
             eprintln!("rargod: db commit failed: {e:#}");
@@ -279,6 +295,7 @@ fn flush_once(shared: &Shared) {
             db.with_upgraded(|db| reopen(db, &shared.open));
         }
     }
+    done
 }
 
 // After an I/O error redb refuses every later transaction until the database is opened again.
@@ -288,6 +305,33 @@ fn reopen(db: &mut Option<Database>, open: &Open) {
     match open() {
         Ok(fresh) => *db = Some(fresh),
         Err(e) => eprintln!("rargod: db reopen failed: {e:#}"),
+    }
+}
+
+#[derive(Debug)]
+struct SimFile(crate::io::file::File);
+
+impl redb::StorageBackend for SimFile {
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.0.metadata()?.len())
+    }
+
+    fn read(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mut bytes = vec![0; len];
+        self.0.read_exact_at(&mut bytes, offset)?;
+        Ok(bytes)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.0.set_len(len)
+    }
+
+    fn sync_data(&self, _eventual: bool) -> std::io::Result<()> {
+        self.0.sync_data()
+    }
+
+    fn write(&self, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.write_all_at(bytes, offset)
     }
 }
 
@@ -317,11 +361,11 @@ impl redb::StorageBackend for Memory {
     }
 }
 
-fn flush_off_the_loop(shared: &Shared) {
+fn flush_off_the_loop(shared: &Shared) -> Result<()> {
     if crate::io::on_fiber() {
-        crate::io::cpu(|| flush_once(shared));
+        crate::io::cpu(|| flush_once(shared))
     } else {
-        flush_once(shared);
+        flush_once(shared)
     }
 }
 
@@ -337,7 +381,9 @@ fn writer_loop(shared: Arc<Shared>, wake: WriterWake) {
             }
         };
         match wait {
-            None => crate::io::cpu(|| flush_once(&shared)),
+            None => {
+                let _ = crate::io::cpu(|| flush_once(&shared));
+            }
             Some(ms) => wake.wait(Duration::from_millis(ms)),
         }
     }

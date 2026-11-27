@@ -184,3 +184,13 @@ fn a_rescan_that_misses_the_edits_is_caught() {
 fn outputs_that_never_reach_target_are_caught() {
     caught(0, Bug::UnshownOutputs, |k| matches!(k, Kind::Drift(d) if d.contains("target/")));
 }
+
+#[test]
+fn disk_faults_end_the_command_or_recover_with_its_pins() {
+    let crash = run(0, None).expect("builds recover after a power cut");
+    assert_eq!((crash.disk_crashes, crash.torn_writes), (1, 0));
+    let torn = run(3, None).expect("builds recover after a torn write");
+    assert_eq!((torn.disk_crashes, torn.torn_writes), (1, 1));
+    let full = run(10, None).expect("a full disk ends the command instead of deadlocking");
+    assert_eq!(full.disk_full_errors, 1);
+}
