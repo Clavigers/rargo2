@@ -7,14 +7,13 @@ use crate::session_state::{
 use crate::snapshot::Uploader;
 use crate::store::Store;
 use anyhow::{Result, anyhow, bail};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use rargo_proto::secure::{self, Opener, Sealer};
 use rargo_proto::{ClientMsg, Delivery, Digest, ServerMsg, Write};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 pub struct Keys {
     open: bool,
@@ -67,27 +66,27 @@ impl Keys {
 
 #[derive(Default)]
 pub struct ClientHas {
-    set: Mutex<ClientSet>,
+    set: RefCell<ClientSet>,
 }
 
 impl ClientHas {
     pub fn extend(&self, digests: impl IntoIterator<Item = Digest>) {
-        self.set.lock().extend(digests);
+        self.set.borrow_mut().extend(digests);
     }
 }
 
 pub struct Session {
     tx: UnboundedSender<ServerMsg>,
     has: Arc<ClientHas>,
-    state: Mutex<SessionState>,
+    state: RefCell<SessionState>,
     store: Arc<Store>,
-    trees_reply: Mutex<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
-    env_reply: Mutex<Option<oneshot::Sender<Vec<(String, Option<String>)>>>>,
-    report_reply: Mutex<Option<oneshot::Sender<u32>>>,
+    trees_reply: RefCell<Option<oneshot::Sender<Vec<Vec<u8>>>>>,
+    env_reply: RefCell<Option<oneshot::Sender<Vec<(String, Option<String>)>>>>,
+    report_reply: RefCell<Option<oneshot::Sender<u32>>>,
     asking: io::Mutex<()>,
     arrivals: Notify,
     window: Notify,
-    parts: Mutex<BTreeMap<Digest, (PathBuf, crate::io::file::File)>>,
+    parts: io::Mutex<BTreeMap<Digest, (PathBuf, crate::io::file::File)>>,
     totals: Arc<crate::build::DaemonStats>,
 }
 
@@ -105,34 +104,34 @@ impl Session {
         let s = Arc::new(Session {
             tx,
             has,
-            state: Mutex::new(SessionState::new()),
+            state: RefCell::new(SessionState::new()),
             store,
-            trees_reply: Mutex::new(None),
-            env_reply: Mutex::new(None),
-            report_reply: Mutex::new(None),
+            trees_reply: RefCell::new(None),
+            env_reply: RefCell::new(None),
+            report_reply: RefCell::new(None),
             asking: io::Mutex::new(()),
             arrivals: Notify::new(),
             window: Notify::new(),
-            parts: Mutex::new(BTreeMap::new()),
+            parts: io::Mutex::new(BTreeMap::new()),
             totals,
         });
         (s, rx)
     }
 
     pub fn knows(&self, digests: impl IntoIterator<Item = Digest>) {
-        self.state.lock().knows(&mut self.has.set.lock(), digests);
+        self.state.borrow_mut().knows(&mut self.has.set.borrow_mut(), digests);
     }
 
     pub fn set_lazy(&self) {
-        self.state.lock().set_lazy();
+        self.state.borrow_mut().set_lazy();
     }
 
     pub fn is_lazy(&self) -> bool {
-        self.state.lock().is_lazy()
+        self.state.borrow_mut().is_lazy()
     }
 
     pub fn deliver_lazy(&self, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) {
-        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes, targets);
+        let out = self.state.borrow_mut().deliver(&mut self.has.set.borrow_mut(), files, writes, targets);
         let Some(mut out) = out else { return };
         loop {
             match out.step() {
@@ -148,16 +147,16 @@ impl Session {
     }
 
     pub fn delivered(&self) -> BTreeSet<Digest> {
-        self.state.lock().delivered().iter().copied().collect()
+        self.state.borrow_mut().delivered().iter().copied().collect()
     }
 
     pub fn sent_bulk(&self, bytes: usize) {
-        self.state.lock().sent_bulk(bytes);
+        self.state.borrow_mut().sent_bulk(bytes);
         self.window.notify_waiters();
     }
 
     pub fn close_window(&self) {
-        self.state.lock().close_window();
+        self.state.borrow_mut().close_window();
         self.window.notify_waiters();
     }
 
@@ -170,7 +169,7 @@ impl Session {
     }
 
     fn gone(&self) -> anyhow::Error {
-        if self.state.lock().has_changed() {
+        if self.state.borrow_mut().has_changed() {
             anyhow!("the worktree changed while it was being synced")
         } else {
             anyhow!("the client went away")
@@ -180,7 +179,7 @@ impl Session {
     fn send_bulk(&self, m: ServerMsg) -> Result<()> {
         let bytes = bulk_size(&m);
         loop {
-            let took = self.state.lock().take_bulk(bytes);
+            let took = self.state.borrow_mut().take_bulk(bytes);
             match took {
                 Err(_) => return Err(self.gone()),
                 Ok(true) => break,
@@ -188,15 +187,15 @@ impl Session {
             }
             self.window.notified();
         }
-        self.totals.bytes_out.fetch_add(crate::session_state::bulk_cost(bytes) as u64, Ordering::Relaxed);
+        self.totals.bytes_out.set(self.totals.bytes_out.get() + crate::session_state::bulk_cost(bytes) as u64);
         self.tx.send(m).map_err(|_| self.gone())
     }
 
     pub fn close(&self) {
-        let parts = self.state.lock().close();
-        self.trees_reply.lock().take();
-        self.env_reply.lock().take();
-        self.report_reply.lock().take();
+        let parts = self.state.borrow_mut().close();
+        self.trees_reply.borrow_mut().take();
+        self.env_reply.borrow_mut().take();
+        self.report_reply.borrow_mut().take();
         self.window.notify_waiters();
         self.arrivals.notify_waiters();
         let mut files = self.parts.lock();
@@ -209,8 +208,8 @@ impl Session {
     }
 
     pub fn incoming(&self, msg: ClientMsg) -> Result<()> {
-        let step = self.state.lock().client(msg);
-        self.totals.bytes_in.fetch_add(step.bytes_in, Ordering::Relaxed);
+        let step = self.state.borrow_mut().client(msg);
+        self.totals.bytes_in.set(self.totals.bytes_in.get() + step.bytes_in);
         for e in step.effects {
             self.carry_out(e)?;
         }
@@ -225,7 +224,7 @@ impl Session {
             Effect::Store { hash, bytes } => {
                 self.store.put_bytes(&bytes)?;
                 assert!(self.store.has(&Hash(hash)), "a stored blob is in the store");
-                self.totals.files_in.fetch_add(1, Ordering::Relaxed);
+                self.totals.files_in.set(self.totals.files_in.get() + 1);
             }
             Effect::PartOpen(hash) => {
                 let path = self.store.tmp_path();
@@ -234,7 +233,7 @@ impl Session {
                         self.parts.lock().insert(hash, (path, f));
                     }
                     Err(e) => {
-                        self.state.lock().part_failed(&hash);
+                        self.state.borrow_mut().part_failed(&hash);
                         return Err(e.into());
                     }
                 }
@@ -249,7 +248,7 @@ impl Session {
                 drop(file);
                 self.store.install_hashed(&path, Hash(hash), size)?;
                 assert!(self.store.has(&Hash(hash)), "an installed blob is in the store");
-                self.totals.files_in.fetch_add(1, Ordering::Relaxed);
+                self.totals.files_in.set(self.totals.files_in.get() + 1);
             }
             Effect::PartDrop(hash) => {
                 if let Some((path, _)) = self.parts.lock().remove(&hash) {
@@ -257,17 +256,17 @@ impl Session {
                 }
             }
             Effect::Answer(Answer::Trees(t)) => {
-                if let Some(tx) = self.trees_reply.lock().take() {
+                if let Some(tx) = self.trees_reply.borrow_mut().take() {
                     let _ = tx.send(t);
                 }
             }
             Effect::Answer(Answer::Env(e)) => {
-                if let Some(tx) = self.env_reply.lock().take() {
+                if let Some(tx) = self.env_reply.borrow_mut().take() {
                     let _ = tx.send(e);
                 }
             }
             Effect::Answer(Answer::Report(id)) => {
-                if let Some(tx) = self.report_reply.lock().take() {
+                if let Some(tx) = self.report_reply.borrow_mut().take() {
                     let _ = tx.send(id);
                 }
             }
@@ -276,15 +275,15 @@ impl Session {
         Ok(())
     }
 
-    fn ask<T: Send>(&self, q: Question, slot: &Mutex<Option<oneshot::Sender<T>>>) -> Result<T> {
+    fn ask<T: Send>(&self, q: Question, slot: &RefCell<Option<oneshot::Sender<T>>>) -> Result<T> {
         let _g = self.asking.lock();
         let (tx, rx) = oneshot::channel();
-        *slot.lock() = Some(tx);
-        let asked = self.state.lock().ask(q);
+        *slot.borrow_mut() = Some(tx);
+        let asked = self.state.borrow_mut().ask(q);
         match asked {
             Ok(m) => self.send(m),
             Err(_) => {
-                slot.lock().take();
+                slot.borrow_mut().take();
                 return Err(self.gone());
             }
         }
@@ -300,7 +299,7 @@ impl Session {
     }
 
     pub fn deliver(&self, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) -> Result<()> {
-        let out = self.state.lock().deliver(&mut self.has.set.lock(), files, writes, targets);
+        let out = self.state.borrow_mut().deliver(&mut self.has.set.borrow_mut(), files, writes, targets);
         match out {
             Some(out) => self.send_out(out),
             None => Ok(()),
@@ -308,12 +307,12 @@ impl Session {
     }
 
     pub fn count_out(&self, bytes: usize) {
-        self.totals.bytes_out.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.totals.bytes_out.set(self.totals.bytes_out.get() + bytes as u64);
     }
 
     pub fn fetch(&self, id: u64, hashes: Vec<Digest>) -> Result<()> {
         let found: Vec<(Digest, Option<u64>)> = hashes.into_iter().map(|h| (h, self.store.size_of(&Hash(h)))).collect();
-        let out = self.state.lock().fetch(&mut self.has.set.lock(), id, found);
+        let out = self.state.borrow_mut().fetch(&mut self.has.set.borrow_mut(), id, found);
         self.send_out(out)
     }
 
@@ -401,11 +400,11 @@ impl Uploader for Session {
     fn blobs(&self, want: Vec<Hash>) -> Result<()> {
         let _g = self.asking.lock();
         let digests: Vec<Digest> = want.iter().map(|h| h.0).collect();
-        let ask = self.state.lock().want(&digests, &|d| self.store.has(&Hash(*d)));
+        let ask = self.state.borrow_mut().want(&digests, &|d| self.store.has(&Hash(*d)));
         let wanting = Wanting(self);
         self.send(ask);
         loop {
-            let progress = self.state.lock().progress(&|d| self.store.has(&Hash(*d)));
+            let progress = self.state.borrow_mut().progress(&|d| self.store.has(&Hash(*d)));
             match progress {
                 Progress::Done => break,
                 Progress::Gone => return Err(self.gone()),
@@ -422,7 +421,7 @@ struct Wanting<'a>(&'a Session);
 
 impl Drop for Wanting<'_> {
     fn drop(&mut self) {
-        self.0.state.lock().abandon_want();
+        self.0.state.borrow_mut().abandon_want();
     }
 }
 

@@ -860,12 +860,12 @@ pub struct Http {
     public: Option<String>,
     port: u16,
     state: Option<std::path::PathBuf>,
-    pending: parking_lot::Mutex<AuthState>,
+    pending: std::cell::RefCell<AuthState>,
 }
 
 impl Http {
     pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
-        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(AuthState::default()) }
+        Http { keys, public, port, state: None, pending: std::cell::RefCell::new(AuthState::default()) }
     }
 
     pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
@@ -908,7 +908,7 @@ impl Http {
         let mut event = Event::Request(req);
         loop {
             let act = {
-                let mut st = self.pending.lock();
+                let mut st = self.pending.borrow_mut();
                 let act = handle(&mut st, &mut phase, event, &cfg, now);
                 st.invariants();
                 phase.invariants();
