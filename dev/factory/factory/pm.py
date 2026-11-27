@@ -16,6 +16,13 @@ Every few minutes it does the next thing that is due, and records it:
    it publishes: it runs the release command, and records `published` only
    if that succeeded. With no release command set it publishes nothing and
    says so.
+5. Release notes. A version of the factory's whose tag has a GitHub release
+   gets its notes written: one harness session (RELEASE-NOTES.md) reads what
+   changed since the tag before and writes notes for a person who uses
+   rargo, and the project manager puts them on the release in place of the
+   list of pull request titles GitHub generates. It goes by the tag, not by
+   `published`, so a release made by hand gets notes too. The notes are kept
+   in state/notes/X.Y.Z.md; a version with that file is done.
 
 It decides nothing a rule does not: what holds a release is the world's
 hold_reasons, and the log refuses a `published` they forbid. Every step can
@@ -24,13 +31,16 @@ be repeated: one that stopped half way is finished by the next.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from . import harness
 from . import machines as M
 from . import model as m
 from .github import GitHub, GitHubError
@@ -63,13 +73,24 @@ def bump(root: Path, old: str, new: str) -> None:
             b if "source = " in b else b.replace(was, now) for b in blocks))
 
 
+NOTES_TRIES = 3  # sessions per version, until the project manager restarts
+NOTES_MIN = 300  # characters: less is not release notes
+NOTES_TIMEOUT = timedelta(minutes=30)
+
+
 class Pm:
     def __init__(self, ledger: Ledger, gh: GitHub, checkout: Path,
                  clock: Callable[[], datetime] = utc_now,
                  publish: list[str] | None = None,
                  ci_apps=frozenset({"github-actions"}),
-                 say: Callable[[str], None] = print):
+                 say: Callable[[str], None] = print,
+                 notes_prompt: str | None = None, state: Path | None = None,
+                 write_notes: Callable[[str, str, Path], int] | None = None):
         self.ledger, self.gh, self.checkout = ledger, gh, Path(checkout)
+        # notes_prompt None: no release notes are written
+        self.notes_prompt, self.state = notes_prompt, Path(state) if state else None
+        self.write_notes = write_notes or self._write_notes
+        self.notes_tries: dict[str, int] = {}
         self.clock, self.publish, self.ci_apps, self.say = clock, publish, ci_apps, say
         self.told: set[str] = set()  # things said once
         self.reruns: dict[str, list[datetime]] = {}  # commit -> when its CI was run again
@@ -89,6 +110,7 @@ class Pm:
         if w.config is None:
             return
         self._git("fetch", "-q", "--prune", "--tags", "--force", "origin")  # a tag moved on origin must not stop us
+        self._notes()
         version = next((v for v in w.versions if w.is_(M.VERSION, v, "candidate")), None)
         if version is None:
             version = self._freeze()
@@ -220,6 +242,52 @@ class Pm:
                        f"(exit {r.returncode})", tell=True)
             return
         self._record("published", version=version, build=build)
+
+    # ------------------------------------------------------------ notes
+
+    def _notes(self) -> None:
+        if self.notes_prompt is None or self.state is None:
+            return
+        for version in self.ledger.world.versions:
+            out = self.state / "notes" / f"{version}.md"
+            tag = f"v{version}"
+            if out.exists() or self.notes_tries.get(version, 0) >= NOTES_TRIES or not self._has(tag):
+                continue
+            if self.gh.release(tag) is None:  # the release workflow has not made it yet
+                continue
+            self.notes_tries[version] = self.notes_tries.get(version, 0) + 1
+            previous = self._git("describe", "--tags", "--abbrev=0", "--match", "v*", f"{tag}^")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            draft = out.with_suffix(".draft.md")
+            draft.unlink(missing_ok=True)
+            code = self.write_notes(version, previous, draft)
+            text = draft.read_text().strip() if draft.exists() else ""
+            if code != 0 or len(text) < NOTES_MIN:
+                self._once(f"no release notes for {version}: the session ended with exit {code} "
+                           f"and {len(text)} characters (try {self.notes_tries[version]} of {NOTES_TRIES})",
+                           tell=self.notes_tries[version] == NOTES_TRIES)
+                continue
+            self.gh.set_release_notes(tag, draft)
+            draft.rename(out)
+            self.say(f"pm: release notes for {version} are on {tag}")
+
+    def _write_notes(self, version: str, previous: str, out: Path) -> int:
+        w = self.ledger.world
+        t = next((a for a in w.config.agents if a.type is m.Harness.claude_code), w.config.agents[0])
+        prompt = (self.notes_prompt.replace("{version}", version).replace("{previous}", previous)
+                  .replace("{out}", str(out)))
+        cmd = harness.command(t, prompt)
+        if cmd is None:
+            self.say(f"pm: no {t.type} here to write release notes with")
+            return 127
+        argv, extra = cmd
+        with open(out.with_suffix(".log"), "wb") as log:
+            try:
+                return subprocess.run(argv, cwd=self.checkout, env=os.environ | extra,
+                                      stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                      timeout=NOTES_TIMEOUT.total_seconds()).returncode
+            except subprocess.TimeoutExpired:
+                return 124
 
     # ------------------------------------------------------------ helpers
 

@@ -48,6 +48,18 @@ class GitHub:
             return [x for page in data for x in page]
         return data
 
+    def release(self, tag: str) -> dict | None:
+        """The GitHub release for a tag, or None if it has none."""
+        try:
+            return self._api(f"releases/tags/{tag}")
+        except GitHubError as err:
+            if "404" in str(err) or "Not Found" in str(err):
+                return None
+            raise
+
+    def set_release_notes(self, tag: str, path) -> None:
+        self._gh("release", "edit", tag, "-R", self.repo, "--notes-file", str(path))
+
     def issues(self, since: datetime | None) -> list[dict]:
         """Issues (not pull requests): every open one, or with since, every one
         updated since then, open or closed."""
