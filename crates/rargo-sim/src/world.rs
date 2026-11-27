@@ -92,10 +92,11 @@ pub enum Fault {
     Duplicate,
     Reorder,
     ServerCrash,
+    Partition,
 }
 
 impl Fault {
-    pub const ALL: [Fault; 4] = [Fault::Loss, Fault::Duplicate, Fault::Reorder, Fault::ServerCrash];
+    pub const ALL: [Fault; 5] = [Fault::Loss, Fault::Duplicate, Fault::Reorder, Fault::ServerCrash, Fault::Partition];
     const NETWORK: [Fault; 3] = [Fault::Loss, Fault::Duplicate, Fault::Reorder];
 
     pub fn name(self) -> &'static str {
@@ -104,6 +105,7 @@ impl Fault {
             Fault::Duplicate => "duplicate",
             Fault::Reorder => "reorder",
             Fault::ServerCrash => "server-crash",
+            Fault::Partition => "partition",
         }
     }
 
@@ -228,6 +230,7 @@ pub struct Report {
     pub lost: u64,
     pub duplicated: u64,
     pub reordered: u64,
+    pub partitioned: u64,
     pub retransmits: u64,
     pub disk_full_errors: u64,
     pub disk_crashes: u64,
@@ -566,6 +569,7 @@ pub struct World {
     trace: Vec<u8>,
     silence: Option<(u64, u64)>,
     disk_fault: Option<disk::Fault>,
+    partitions: BTreeMap<(Node, bool), std::ops::Range<u64>>,
 }
 
 type Step = Result<(), Kind>;
@@ -594,6 +598,7 @@ impl World {
             rng,
             net,
             connections: BTreeMap::new(),
+            partitions: BTreeMap::new(),
             server_endpoint: EndpointState::new(true, false, link_key.clone()),
             link_key,
             next_conn: 1,
@@ -628,6 +633,7 @@ impl World {
                 lost: 0,
                 duplicated: 0,
                 reordered: 0,
+                partitioned: 0,
                 retransmits: 0,
                 disk_full_errors: 0,
                 disk_crashes: 0,
@@ -726,6 +732,20 @@ impl World {
         if !w.off.has(Fault::ServerCrash) && w.cfg.fault_end_ms > 0 && crashes.chance(500) {
             for _ in 0..crashes.range(1, 3) {
                 w.schedule(crashes.range(0, w.cfg.fault_end_ms), Ev::ServerCrash);
+            }
+        }
+        if !w.off.has(Fault::Partition) && w.cfg.fault_end_ms > 0 {
+            let mut rng = Rng::new(seed ^ NET_STREAM ^ Fault::Partition as u64);
+            let peer = rng.range(1, w.cfg.workers + w.cfg.clients);
+            let peer = if peer <= w.cfg.workers { Node::Worker(peer) } else { Node::Client(peer - w.cfg.workers) };
+            let start = rng.range(0, w.cfg.fault_end_ms - 1);
+            let end = rng.range(start + 1, w.cfg.fault_end_ms);
+            let directions = rng.range(1, 3);
+            if directions & 1 != 0 {
+                w.partitions.insert((peer, false), start..end);
+            }
+            if directions & 2 != 0 {
+                w.partitions.insert((peer, true), start..end);
             }
         }
         w
@@ -998,6 +1018,12 @@ impl World {
     fn arrive(&mut self, peer: Node, to_server: bool, id: u64, bytes: Vec<u8>) -> Step {
         let silence = self.silent_at(self.now);
         let Some(link) = self.connections.get_mut(&peer).filter(|link| link.id == id) else { return Ok(()) };
+        // Drop datagrams in the affected direction. The transport's clock
+        // drives retransmission, including for packets already in flight.
+        if self.partitions.get(&(peer, to_server)).is_some_and(|window| window.contains(&self.now)) {
+            self.report.partitioned += 1;
+            return Ok(());
+        }
         // The silence fault stalls an established client session. Let agreement run so that
         // the application-level watch can still observe silence on newly connected sessions.
         if let Some((_, end)) = silence
@@ -2125,6 +2151,40 @@ mod tests {
             assert_ne!(world.connections[&Node::Client(1)].id, old_link);
             world.arrive(Node::Client(1), true, old_link, Vec::new()).unwrap();
         });
+    }
+
+    #[test]
+    fn a_one_way_partition_heals_without_replacing_the_link() {
+        let mut world = World::new(85, None, Off::none().with(Fault::Partition));
+        let peer = Node::Worker(1);
+        world.open_link(peer).unwrap();
+        let id = world.connections[&peer].id;
+        world.partitions.insert((peer, false), 0..100);
+        world.arrive(peer, false, id, Vec::new()).unwrap();
+        assert_eq!(world.report.partitioned, 1);
+        world.arrive(peer, true, id, Vec::new()).unwrap();
+        assert_eq!(world.report.partitioned, 1);
+        world.now = 100;
+        world.arrive(peer, false, id, Vec::new()).unwrap();
+        assert_eq!(world.report.partitioned, 1);
+        assert_eq!(world.connections[&peer].id, id);
+    }
+
+    #[test]
+    fn partitions_cover_workers_and_clients_in_both_directions() {
+        let mut seen = BTreeSet::new();
+        for seed in 0..600 {
+            let world = World::new(seed, None, Off::none());
+            if let Some(&(peer, _)) = world.partitions.keys().next() {
+                let outbound = world.partitions.contains_key(&(peer, false));
+                let inbound = world.partitions.contains_key(&(peer, true));
+                seen.insert((matches!(peer, Node::Worker(_)), outbound, inbound));
+            }
+        }
+        assert_eq!(seen, BTreeSet::from([
+            (false, true, false), (false, false, true), (false, true, true),
+            (true, true, false), (true, false, true), (true, true, true),
+        ]));
     }
 
     #[test]
