@@ -271,8 +271,47 @@ pub(crate) fn find_manifest(w: &impl World, args: &[String]) -> Result<PathBuf, 
         .ok_or_else(|| format!("could not find `Cargo.toml` in `{}` or any parent directory", cwd.display()))
 }
 
+/// Where a command runs from when `--manifest-path` names a manifest in a
+/// worktree the current directory is not in: the manifest's own directory,
+/// with the flags cargo reads as paths made absolute against `cwd`, so they
+/// still mean what they meant there. `manifest` is the canonical path of the
+/// named manifest; `root_of` finds the worktree of a directory. None when
+/// the command already runs inside the manifest's worktree, or there is none.
+pub(crate) fn rehome(cwd: &Path, args: &[String], manifest: &Path, root_of: impl Fn(&Path) -> Option<PathBuf>) -> Option<(PathBuf, Vec<String>)> {
+    manifest_path_arg(args)?;
+    let dir = manifest.parent()?;
+    let root = root_of(dir)?;
+    if root_of(cwd).as_ref() == Some(&root) {
+        return None;
+    }
+    const PATHS: [&str; 5] = ["--manifest-path", "--target-dir", "--artifact-dir", "--out-dir", "--lockfile-path"];
+    let absolute = |flag: &str, value: &str| -> String {
+        if flag == "--manifest-path" { manifest.to_string_lossy().into_owned() } else { cwd.join(value).to_string_lossy().into_owned() }
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            out.push(arg.clone());
+            out.extend(it.by_ref().cloned());
+            break;
+        }
+        if let Some(flag) = PATHS.iter().find(|f| *f == arg) {
+            out.push(arg.clone());
+            if let Some(value) = it.next() {
+                out.push(absolute(flag, value));
+            }
+        } else if let Some((flag, value)) = arg.split_once('=').filter(|(f, _)| PATHS.contains(f)) {
+            out.push(format!("{flag}={}", absolute(flag, value)));
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    Some((dir.to_path_buf(), out))
+}
+
 /// The value of `--manifest-path`, in either spelling, before any `--`.
-fn manifest_path_arg(args: &[String]) -> Option<String> {
+pub(crate) fn manifest_path_arg(args: &[String]) -> Option<String> {
     let mut it = args.iter().take_while(|a| *a != "--");
     while let Some(a) = it.next() {
         if a == "--manifest-path" {
@@ -778,6 +817,33 @@ mod tests {
         let w = fake(&[]);
         plan(&w, None, &os(&["auth", "remove", "x.example"]));
         assert_eq!(w.asked(), ["credential x.example"]);
+    }
+
+    #[test]
+    fn a_manifest_named_in_another_worktree_moves_the_command_there_with_its_path_flags_kept_meaning_the_same() {
+        let root_of = |dir: &Path| ["/work/demo", "/home/ann/other"].iter().map(PathBuf::from).find(|r| dir.starts_with(r));
+        let manifest = Path::new("/work/demo/Cargo.toml");
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        type Case<'a> = (&'a str, Vec<&'a str>, Option<Vec<&'a str>>);
+        let cases: Vec<Case> = vec![
+            ("/work", vec!["build", "--manifest-path", "demo/Cargo.toml"], Some(vec!["build", "--manifest-path", "/work/demo/Cargo.toml"])),
+            ("/work", vec!["build", "--manifest-path=demo/Cargo.toml"], Some(vec!["build", "--manifest-path=/work/demo/Cargo.toml"])),
+            ("/home/ann/other", vec!["test", "--manifest-path", "/work/demo/Cargo.toml"], Some(vec!["test", "--manifest-path", "/work/demo/Cargo.toml"])),
+            (
+                "/work",
+                vec!["build", "--manifest-path", "demo/Cargo.toml", "--target-dir", "t", "--artifact-dir=out", "--", "--target-dir", "x"],
+                Some(vec!["build", "--manifest-path", "/work/demo/Cargo.toml", "--target-dir", "/work/t", "--artifact-dir=/work/out", "--", "--target-dir", "x"]),
+            ),
+            ("/work/demo/src", vec!["build", "--manifest-path", "../Cargo.toml"], None),
+            ("/work", vec!["build"], None),
+            ("/work", vec!["run", "--", "--manifest-path", "demo/Cargo.toml"], None),
+        ];
+        for (cwd, args, expected) in cases {
+            let got = rehome(Path::new(cwd), &words(&args), manifest, root_of);
+            let expected = expected.map(|a| (PathBuf::from("/work/demo"), words(&a)));
+            assert_eq!(got, expected, "{cwd} {args:?}");
+        }
+        assert_eq!(rehome(Path::new("/work"), &words(&["build", "--manifest-path", "x/Cargo.toml"]), Path::new("/work/x/Cargo.toml"), root_of), None);
     }
 
     #[test]

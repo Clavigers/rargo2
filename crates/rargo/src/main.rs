@@ -525,6 +525,11 @@ fn main() {
         Ok(d) => d,
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
     };
+    let manifest = cli::manifest_path_arg(&args).and_then(|given| io::file::canonicalize(cwd.join(given)).ok());
+    let (cwd, args) = match manifest.and_then(|m| cli::rehome(&cwd, &args, &m, find_root)) {
+        Some(moved) => moved,
+        None => (cwd, args),
+    };
     if kind == "build" {
         let root = find_root(&cwd);
         let configs = cargo_configs(&args, &vars, &cwd, root.as_deref().unwrap_or(&cwd));
