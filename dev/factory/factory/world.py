@@ -192,6 +192,36 @@ class World:
             self.fail(f"push {push} is not pr {pr}'s latest ({p.pushes})")
         return p
 
+    def quota_back_at(self, agent: str, retry: timedelta) -> datetime:
+        """When to try an agent that is out of quota again, from what its
+        harness last said about its plan (quota_seen):
+
+        - a reading taken since it ran out, with no limit full: now;
+        - a limit read as full: when that limit resets, however far off;
+        - a reading from before it ran out: when the limit that was nearly
+          full then (90%) resets;
+        - nothing to go on: `retry` after it ran out.
+
+        A limit named for one model, as "Current week (Fable)", counts only
+        for agents on that model."""
+        out = self.since(M.QUOTA, agent)
+        t = next(a for a in self.config.agents if agent.rsplit("-", 1)[0] == a.type)
+        seen = self.quota_seen.get(str(t.type))
+        if seen is None:
+            return out + retry
+        when, windows = seen
+
+        def mine(x) -> bool:
+            only = x.name[x.name.rfind("(") + 1:-1].lower() if x.name.endswith(")") else ""
+            return not only or only == "all models" or only in str(t.model).lower()
+        full = [x.resets for x in windows if mine(x) and x.used >= 100 and x.resets]
+        if full:  # a reset already past when it ran out says nothing: the reading is stale
+            return max(full) if max(full) > out else out + retry
+        if when >= out:
+            return when
+        near = [x.resets for x in windows if mine(x) and x.used >= 90 and x.resets and x.resets > out]
+        return min(near) if near else out + retry
+
     def reserved_for(self, n: int) -> str | None:
         """The agent a ready issue waits for: the one that held it last, while
         it has quota and for affinity_minutes after the issue came back."""
