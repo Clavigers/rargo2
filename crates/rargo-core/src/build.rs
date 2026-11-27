@@ -1382,6 +1382,13 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
     done
 }
 
+/// The `CARGO_TARGET_TMPDIR` a unit was compiled with, which cargo creates
+/// before running the integration test or bench that may write there.
+fn target_tmpdir(u: &rp::Unit) -> Option<&str> {
+    let cmd = u.cmd.as_ref()?;
+    cmd.env.iter().find(|(k, _)| k == "CARGO_TARGET_TMPDIR").and_then(|(_, v)| v.as_deref())
+}
+
 struct UnitObserver {
     run: Arc<Run>,
     i: usize,
@@ -2868,7 +2875,7 @@ impl Run {
                         } else {
                             NetMode::Loopback
                         },
-                        mkdirs: vec![],
+                        mkdirs: target_tmpdir(&plan.units[*unit as usize]).into_iter().map(bytes).collect(),
                         root_id: self.root_id,
                         discard: vec![],
                         label: format!("test {}", plan.units[*unit as usize].desc),
@@ -3150,6 +3157,24 @@ mod tests {
         let line = "thread 't' (3) panicked at /w/dep/src/lib.rs:1:17: dep manifest=/w/dep, not /w/other/x";
         let want = "thread 't' (3) panicked at /home/me/project/dep/src/lib.rs:1:17: dep manifest=/home/me/project/dep, not /w/other/x";
         assert_eq!(test_with_deps_prints("/w/app/Cargo.toml", &["/w/dep", "/c/registry/src/i/serde-1.0.0"], line).0, want);
+    }
+
+    #[test]
+    fn an_integration_test_runs_with_the_target_tmpdir_it_was_compiled_with_created() {
+        let unit = |env: serde_json::Value| -> rp::Unit {
+            serde_json::from_value(serde_json::json!({
+                "kind": "Compile", "cmd": {"program": "rustc", "args": [], "env": env, "cwd": null},
+                "deps": [], "outputs": [], "rmeta_early": false, "needs_objects": false,
+                "pkg": "p", "pkg_id": "p", "pkg_name": "p", "pkg_version": "0.1.0", "desc": "p", "verb": "Compiling",
+                "is_local": true, "repository": null, "show_warnings": true, "fix_hint": null, "pkg_spec": "",
+                "manifest_path": "/w/Cargo.toml", "target_json": "", "profile_json": "", "features": [],
+                "executable": null, "script": null, "script_metas": [], "scrape_can_fail": false,
+            }))
+            .unwrap()
+        };
+        let it = unit(serde_json::json!([["CARGO_PKG_NAME", "p"], ["CARGO_TARGET_TMPDIR", "/w/target/tmp"]]));
+        assert_eq!(target_tmpdir(&it), Some("/w/target/tmp"));
+        assert_eq!(target_tmpdir(&unit(serde_json::json!([["CARGO_PKG_NAME", "p"]]))), None);
     }
 
     #[test]
