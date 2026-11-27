@@ -1,0 +1,36 @@
+name: planner
+# The planner (the cargo fork) is built only by the release workflow and by
+# deploy/update-service.sh, so a change to crates/rargo-plan that breaks a
+# patch in forks/cargo used to show only at release (#682). This checks the
+# planner against crates/rargo-plan, as the release workflow builds it, on
+# every change to either (#689).
+on:
+  push:
+    branches: [main, 'release/**']
+    paths: ['crates/rargo-plan/**', 'forks/cargo/**', '.github/workflows/planner.yml']
+  pull_request:
+    paths: ['crates/rargo-plan/**', 'forks/cargo/**', '.github/workflows/planner.yml']
+permissions:
+  contents: read
+concurrency:
+  group: planner-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  planner-compiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libssl-dev zlib1g-dev pkg-config
+      - name: The patches in forks/cargo apply to forks/cargo/BASE
+        run: |
+          git clone -q --filter=blob:none https://github.com/rust-lang/cargo.git planner
+          git -C planner checkout -q -b rargo "$(cat forks/cargo/BASE)"
+          git -C planner -c user.name=rargo -c user.email=noreply@rargo.invalid am "$PWD"/forks/cargo/*.patch
+      - name: The planner names this checkout's rargo-plan
+        run: |
+          sed -i "s|/root/rargo/crates/rargo-plan|$PWD/crates/rargo-plan|" planner/Cargo.toml
+          grep -q "$PWD/crates/rargo-plan" planner/Cargo.toml
+      - name: The planner compiles against crates/rargo-plan
+        run: cd planner && CFG_RELEASE_CHANNEL=stable cargo check --bin cargo
