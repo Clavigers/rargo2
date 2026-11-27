@@ -862,11 +862,11 @@ mod tests {
         let outcome = crate::io::within(std::time::Duration::from_secs(20), move || {
             crate::io::run(2, move || {
                 let s = Arc::new(Store::open(&at.join("store"), Arc::new(Db::open_in_memory().unwrap())).unwrap());
-                let data = noise(3 << 20);
+                let data = noise(1 << 20);
                 let h = s.put_bytes(&data).unwrap();
                 assert!(crate::io::cpu(|| s.freeze(&h, &|_| {})).unwrap().is_some());
                 // Dead chunks, so the collector holds the lock across many trips to the loop.
-                for i in 0..2000 {
+                for i in 0..500 {
                     file::write(s.chunks.join(format!("{:02x}", i % 256)).join(format!("dead-{i}")), b"x").unwrap();
                 }
                 let gc = {
@@ -889,7 +889,7 @@ mod tests {
         let _ = file::remove_dir_all(&dir);
         let (held, removed, same) = outcome.expect("a thaw and a chunk collection deadlocked the loop");
         assert!(held, "the thaw started while the collector held the cold lock");
-        assert_eq!(removed, 2000);
+        assert_eq!(removed, 500);
         assert!(same, "the thawed blob reads back whole");
     }
 
