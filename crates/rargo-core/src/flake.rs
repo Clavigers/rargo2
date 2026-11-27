@@ -500,7 +500,7 @@ pub(crate) fn resolve_shell(
             }
             Need::Manifest(closure) => {
                 let attached = &d.nix_attached;
-                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), attached));
+                let prepared = crate::nixmanifest::schedule(d.nix_hashing(), &tables, &disk, nix_store, &closure, hosts.as_ref(), attached);
                 let prepared = match prepared {
                     Ok(p) => p,
                     Err(e) => break Err(e),

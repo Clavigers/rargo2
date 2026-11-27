@@ -68,7 +68,8 @@ pub struct Daemon {
     pub parser: Arc<Parser>,
     pub incr: crate::incr::IncrStore,
     pub pool: OnceCell<Arc<crate::remote::Pool>>,
-    pub(crate) nix_attached: Arc<crate::nixmanifest::Attached>,
+    pub(crate) nix_attached: std::rc::Rc<crate::nixmanifest::Attached>,
+    nix_hashing: OnceCell<crate::nixmanifest::Hashing>,
     pub drift_report: RefCell<Option<String>>,
     pub last_clients: RefCell<HashMap<String, crate::drift::LastClient>>,
     pub deliveries: RefCell<Deliveries>,
@@ -264,7 +265,8 @@ impl Daemon {
             log_phases: OnceCell::new(),
             incr,
             pool: OnceCell::new(),
-            nix_attached: Arc::default(),
+            nix_attached: Default::default(),
+            nix_hashing: OnceCell::new(),
             drift_report: RefCell::new(None),
             last_clients: RefCell::new(HashMap::new()),
             deliveries: RefCell::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
@@ -340,6 +342,11 @@ impl Daemon {
             self.engine.traces.add_needs_env(&key, &vars);
         }
         Ok((n, blobs))
+    }
+
+    /// The thread that hashes Nix store paths, started when it is first wanted.
+    pub(crate) fn nix_hashing(&self) -> &crate::nixmanifest::Hashing {
+        self.nix_hashing.get_or_init(crate::nixmanifest::Hashing::start)
     }
 
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
@@ -419,7 +426,7 @@ fn import_blobs(store: &Store, dir: &Path) -> Result<Imported> {
 }
 
 pub fn handle(d: Arc<Daemon>, c: Client) -> Result<i32, ExecRequest> {
-    let _hold = crate::nixmanifest::hold_build();
+    let _hold = d.nix_hashing().hold_build();
     d.stats.requests.set(d.stats.requests.get() + 1);
     let c = Arc::new(c);
     if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "nextest") {

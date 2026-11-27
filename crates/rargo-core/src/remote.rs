@@ -11,13 +11,11 @@ use crate::pool_state::{self, Outcome, Settle, Who};
 use crate::send_ahead::{self, AHEAD_MAX, BATCH_BYTES, inline_indices};
 use crate::worker_state;
 use anyhow::{Context, Result, anyhow, bail};
-use dashmap::DashMap;
 use std::cell::{Cell, RefCell};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1355,7 +1353,7 @@ impl Worker {
 
 struct ServerSource {
     store: Arc<Store>,
-    host: Arc<DashMap<Hash, (Arc<Path>, HostSig)>>,
+    host: Rc<crate::nixmanifest::HostSrcs>,
     content: Arc<Content>,
 }
 
@@ -1364,7 +1362,7 @@ impl BlobSource for ServerSource {
         if self.store.has(h) {
             return self.store.open_blob(h);
         }
-        let (path, sig) = self.host.get(h).map(|s| s.clone()).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let (path, sig) = self.host.get(h).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
         let (f, _, _) = self.content.open(&FileSrc::Host { path, sig })?;
         Ok(f)
     }
@@ -1418,7 +1416,7 @@ pub struct Pool {
     workers: RefCell<Vec<Arc<Worker>>>,
     core: RefCell<pool_state::WorkerPool>,
     blobs: Arc<Blobs>,
-    host_srcs: Arc<DashMap<Hash, (Arc<Path>, HostSig)>>,
+    host_srcs: Rc<crate::nixmanifest::HostSrcs>,
     content: Arc<Content>,
     next_action: ActionIds,
     pub profile_exclude: Vec<Vec<u8>>,
@@ -1456,7 +1454,7 @@ impl Pool {
     /// `rng` is the pool's only source of randomness: action IDs come from it.
     pub fn listen(engine: &Arc<Engine>, addr: SocketAddr, key: crate::net::LinkKey, rng: &mut Rng) -> Result<Arc<Pool>> {
         let endpoint = Endpoint::bind_keyed(addr, true, key).with_context(|| format!("binding {addr}"))?;
-        let host_srcs: Arc<DashMap<Hash, (Arc<Path>, HostSig)>> = Arc::new(DashMap::new());
+        let host_srcs: Rc<crate::nixmanifest::HostSrcs> = Rc::default();
         let blobs = Arc::new(Blobs::new(
             engine.store.clone(),
             Some(Arc::new(ServerSource {
@@ -1511,7 +1509,7 @@ impl Pool {
         if v.is_empty() { "not measured yet".into() } else { v.join(", ") }
     }
 
-    pub fn host_sources(&self) -> &Arc<DashMap<Hash, (Arc<Path>, HostSig)>> {
+    pub fn host_sources(&self) -> &Rc<crate::nixmanifest::HostSrcs> {
         &self.host_srcs
     }
 
@@ -1726,7 +1724,7 @@ impl Pool {
                     let why = if self.blobs.store.has(&blob) {
                         "in the store, but unreadable".to_string()
                     } else {
-                        let shown = self.host_srcs.get(&blob).map(|s| s.clone());
+                        let shown = self.host_srcs.get(&blob);
                         match shown {
                             Some((path, sig)) => match crate::io::file::symlink_metadata(&path) {
                                 Ok(m) if HostSig::of(&m) == sig => format!("{} is unchanged but could not be read", path.display()),
@@ -1761,7 +1759,7 @@ impl Pool {
 
     fn remember_src(&self, a: &RemoteAction, h: Hash, src: &FileSrc) {
         if let FileSrc::Host { path, sig } = src {
-            self.host_srcs.entry(h).or_insert_with(|| (path.clone(), *sig));
+            self.host_srcs.note(h, path, *sig);
             a.served.borrow_mut().push(src.clone());
         }
     }
@@ -2093,14 +2091,14 @@ impl Pool {
                         let mut w = to_wire(&looked, &content);
                         if let (Looked::File(f), WLooked::File { hash: Some(h), .. }) = (&looked, &w) {
                             if let FileSrc::Host { path, sig } = &f.src {
-                                host_srcs.entry(*h).or_insert_with(|| (path.clone(), *sig));
+                                host_srcs.note(*h, path, *sig);
                                 served.push(f.src.clone());
                             }
                         }
                         if let (Looked::File(f), true) = (&looked, matches!(o, Obs::File { .. }) && vjoin(&dir, &name) == path[..]) {
                             if let Ok(h) = content.hash(&f.src) {
                                 if let FileSrc::Host { path, sig } = &f.src {
-                                    host_srcs.entry(h).or_insert_with(|| (path.clone(), *sig));
+                                    host_srcs.note(h, path, *sig);
                                     served.push(f.src.clone());
                                 }
                                 if let WLooked::File { hash, .. } = &mut w {
