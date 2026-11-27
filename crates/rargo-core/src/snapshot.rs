@@ -51,9 +51,15 @@ const SYNC_ATTEMPTS: usize = 8;
 const _: () = assert!(SYNC_ATTEMPTS >= 1);
 
 /// Checks the manifest `encoded` and puts it in `store`, on any thread.
-pub fn store_manifest(store: &Store, encoded: &[u8]) -> Result<(Hash, Tree)> {
+/// Decodes a directory manifest a client sent and gives the hash it is stored under.
+fn decode_manifest(encoded: &[u8]) -> Result<(Hash, Tree)> {
     let tree = Tree::decode(encoded).context("the client sent a malformed directory manifest")?;
-    let digest = store.put_bytes(encoded)?;
+    Ok((Hash::of(encoded), tree))
+}
+
+pub fn store_manifest(store: &Store, encoded: &[u8]) -> Result<(Hash, Tree)> {
+    let (digest, tree) = decode_manifest(encoded)?;
+    store.put_hashed_bytes(digest, encoded)?;
     Ok((digest, tree))
 }
 
@@ -138,10 +144,11 @@ impl Trees {
             {
                 let got = from.trees(lacking.clone())?;
                 self.stats.trees_received.set(self.stats.trees_received.get() + got.len() as u64);
-                let store = &*self.store;
-                let decoded: Result<Vec<(Hash, Tree)>> = crate::io::cpu(|| got.iter().map(|enc| store_manifest(store, enc)).collect());
+                let decoded: Vec<Result<(Hash, Tree)>> = crate::io::cpu(|| got.iter().map(|enc| decode_manifest(enc)).collect());
                 let mut stored = BTreeSet::new();
-                for (digest, tree) in decoded? {
+                for (enc, decoded) in got.iter().zip(decoded) {
+                    let (digest, tree) = decoded?;
+                    self.store.put_hashed_bytes(digest, enc)?;
                     stored.insert(digest);
                     self.known.remember(digest, tree);
                 }

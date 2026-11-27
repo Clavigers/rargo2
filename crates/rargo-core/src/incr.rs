@@ -292,7 +292,7 @@ pub fn analyze(db: &dyn Tables, store: &Store) -> String {
     for row in rows.values_mut() {
         for blob in &row.blobs {
             let Ok(f) = store.open_blob(blob) else { continue };
-            let Ok(recipe) = crate::chunk::chunk_file(&f) else { continue };
+            let Ok(recipe) = crate::io::cpu(|| crate::chunk::chunk_file(&f)) else { continue };
             for c in recipe {
                 if row.chunks.insert(c.hash) {
                     row.chunk_unique += c.len as u64;
