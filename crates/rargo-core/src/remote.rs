@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,7 +123,7 @@ fn dtype_from_u8(b: u8) -> DType {
 
 
 pub struct Peer {
-    pub conn: Arc<Conn>,
+    pub conn: Rc<Conn>,
     calls: RefCell<pool_state::Calls<crate::io::oneshot::Sender<Resp>>>,
     out: crate::io::UnboundedSender<Vec<u8>>,
     bulk: crate::io::UnboundedSender<Vec<u8>>,
@@ -142,7 +143,7 @@ fn wait_reply(rx: crate::io::oneshot::Receiver<Resp>) -> Result<Resp> {
 }
 
 impl Peer {
-    pub fn new(conn: Arc<Conn>) -> (Arc<Peer>, crate::io::UnboundedReceiver<Msg>) {
+    pub fn new(conn: Rc<Conn>) -> (Arc<Peer>, crate::io::UnboundedReceiver<Msg>) {
         let (out_tx, mut out_rx) = crate::io::unbounded_channel::<Vec<u8>>();
         let (bulk_tx, mut bulk_rx) = crate::io::unbounded_channel::<Vec<u8>>();
         let (in_tx, in_rx) = crate::io::unbounded_channel();
@@ -951,7 +952,7 @@ enum LinkMsg {
 
 fn serve_link(
     state: &Arc<WorkerState>,
-    conn: &Arc<Conn>,
+    conn: &Rc<Conn>,
     inbox: &mut crate::io::UnboundedReceiver<Msg>,
     term: &mut crate::io::Signal,
     intr: &mut crate::io::Signal,
@@ -987,7 +988,7 @@ fn serve_link(
 }
 
 enum Dial {
-    Ready(std::io::Result<Arc<Conn>>),
+    Ready(std::io::Result<Rc<Conn>>),
     Stop,
 }
 
@@ -1025,7 +1026,7 @@ fn worker_links(
     state: &Arc<WorkerState>,
     server: SocketAddr,
     cores: u32,
-    endpoint: Arc<Endpoint>,
+    endpoint: Rc<Endpoint>,
     first: Vec<WEffect>,
 ) -> Result<()> {
     let mut term = crate::io::signal(crate::io::SignalKind::terminate()).expect("signal");
@@ -1568,7 +1569,7 @@ impl Pool {
         )
     }
 
-    fn serve_worker(self: Arc<Self>, conn: Arc<Conn>) {
+    fn serve_worker(self: Arc<Self>, conn: Rc<Conn>) {
         let (peer, mut inbox) = Peer::new(conn.clone());
         let mut worker: Option<Arc<Worker>> = None;
         loop {
