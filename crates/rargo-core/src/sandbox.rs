@@ -223,7 +223,7 @@ impl Zygote {
 
 /// What starts the process of an action from its plan and stops it again.
 /// On a kernel that is the zygote; a simulation has no processes and brings its own.
-pub trait Launcher: Send + Sync {
+pub trait Launcher {
     /// Starts what `plan` describes with `stdout` and `stderr` as its output and `extra` as further descriptors it inherits.
     fn launch(&self, plan: Plan, stdout: crate::io::PipeEnd, stderr: crate::io::PipeEnd, extra: &[RawFd]) -> Result<Running>;
 

@@ -13,6 +13,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 pub trait Observer {
@@ -176,7 +177,7 @@ pub struct EngineStats {
 pub struct Engine {
     pub store: Arc<Store>,
     pub content: Arc<Content>,
-    pub fs: Arc<SandboxFs>,
+    pub fs: Rc<SandboxFs>,
     pub mnt: PathBuf,
     pub zygote: Arc<dyn Launcher>,
     pub traces: TraceCache,
@@ -223,7 +224,7 @@ impl Drop for Requester<'_> {
 }
 
 struct Teardown {
-    fs: Arc<SandboxFs>,
+    fs: Rc<SandboxFs>,
     sched: Arc<Scheduler>,
     zygote: Arc<dyn Launcher>,
     action: Arc<ActionFs>,
@@ -242,7 +243,7 @@ impl Drop for Teardown {
         let (fs, action, scratch, group) =
             (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
         let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
-        drop(io::spawn_off(move || {
+        drop(io::spawn(move || {
             let held = match (&running, &group) {
                 (Some(_), Some(g)) => io::cpu(|| {
                     g.freeze();
@@ -259,8 +260,8 @@ impl Drop for Teardown {
             if held > 0 {
                 sched.restore(held);
             }
+            let _ = fs.finish_action(&action);
             io::cpu(move || {
-                let _ = fs.finish_action(&action);
                 drop(group);
                 let _ = io::file::remove_dir_all(&scratch);
             });
@@ -343,7 +344,7 @@ impl Engine {
     pub fn new(
         store: Arc<Store>,
         content: Arc<Content>,
-        fs: Arc<SandboxFs>,
+        fs: Rc<SandboxFs>,
         mnt: PathBuf,
         zygote: Arc<dyn Launcher>,
         sched: Arc<Scheduler>,
@@ -801,11 +802,7 @@ impl Engine {
         let run = self.run_in(spec, uid, gid, observer, &action, &mut teardown);
         teardown.armed = false;
         drop(teardown);
-        let fin = {
-            let fs = self.fs.clone();
-            let a = action.clone();
-            io::cpu(move || fs.finish_action(&a))
-        };
+        let fin = self.fs.finish_action(&action);
         let (info, stdout, stderr) = match run {
             Ok(v) => v,
             Err(e) => {

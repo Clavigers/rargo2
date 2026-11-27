@@ -346,14 +346,20 @@ impl Daemon {
         let traces = self.engine.traces.tables();
         let (states, state_blobs) = self.incr.parts();
         let (manifests, roots) = (self.trees.manifests().clone(), self.trees.recent_roots());
-        let (store, fs) = (self.store().clone(), self.engine.fs.clone());
-        crate::io::cpu(move || {
+        let store = self.store().clone();
+        let (swept, gone) = crate::io::cpu(move || {
             let mut live = std::collections::BTreeSet::new();
             crate::trace::mark(&*traces, &mut live);
             crate::incr::mark(&*states, &*state_blobs, &mut live);
             manifests.mark(roots, &mut live);
-            store.sweep(&live, min_age_secs, &|h| fs.forget_backing(h))
-        })
+            let gone = RefCell::new(Vec::new());
+            let swept = store.sweep(&live, min_age_secs, &|h| gone.borrow_mut().push(*h));
+            (swept, gone.into_inner())
+        });
+        for h in &gone {
+            self.engine.fs.forget_backing(h);
+        }
+        swept
     }
 }
 

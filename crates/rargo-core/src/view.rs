@@ -64,7 +64,7 @@ pub enum Obs {
     Code { executed: Hash, rest: Hash },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HostSig {
     pub dev: u64,
     pub ino: u64,
@@ -220,7 +220,7 @@ pub trait View: Send + Sync {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BackingKey {
     Blob(Hash),
     Host(HostSig),

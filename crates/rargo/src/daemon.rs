@@ -1069,7 +1069,7 @@ impl Daemon {
         };
         let session = Arc::new(io::blocking(|| fusewire::Session::mount_uring(&dir, &opts))?);
         fs.attach(session.clone());
-        rargo_net::io::FuseDrive::spawn(&session, &fs)?.detach();
+        rargo_net::io::FuseDrive::spawn_threaded(&session, &fs)?.detach();
         let dev = dev_at(&mountinfo(), &dir).ok_or_else(|| std::io::Error::other("the mount does not show in /proc/self/mountinfo"))?;
         Ok(Mounted { fs, session, dir, dev })
     }

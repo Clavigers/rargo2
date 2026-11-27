@@ -1,16 +1,15 @@
 #[cfg(test)]
 use rargo_machine::StateMachine;
 use crate::view::*;
-use dashmap::DashMap;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
-use parking_lot::Mutex;
+use crate::io::Mutex;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::BTreeMap;
 use crate::io::file::File;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const LOWER_MTIME: u64 = 946_684_800;
@@ -331,42 +330,44 @@ pub struct Finished {
     pub tainted: bool,
 }
 
+/// The filesystem every action's sandbox is a directory of. The loop thread
+/// owns it: each FUSE request is handled by a fiber there.
 pub struct SandboxFs {
-    actions: DashMap<u64, Arc<ActionFs>>,
-    next_seq: AtomicU64,
+    actions: RefCell<BTreeMap<u64, Arc<ActionFs>>>,
+    next_seq: Cell<u64>,
     content: Arc<Content>,
-    session: OnceLock<Arc<Session>>,
-    backing: DashMap<BackingKey, (i32, AtomicU64)>,
-    retired: Mutex<Vec<(std::time::Instant, i32)>>,
-    tick: AtomicU64,
+    session: OnceCell<Arc<Session>>,
+    backing: RefCell<BTreeMap<BackingKey, (i32, u64)>>,
+    retired: RefCell<Vec<(std::time::Instant, i32)>>,
+    tick: Cell<u64>,
     stats: FsStats,
 }
 
 #[derive(Default)]
 pub struct FsStats {
-    pub lookups: AtomicU64,
-    pub opens: AtomicU64,
-    pub reads: AtomicU64,
-    pub writes: AtomicU64,
+    pub lookups: Cell<u64>,
+    pub opens: Cell<u64>,
+    pub reads: Cell<u64>,
+    pub writes: Cell<u64>,
 }
 
 impl FsStats {
     /// How many lookups, opens, reads and writes were served.
     pub fn counts(&self) -> [u64; 4] {
-        [&self.lookups, &self.opens, &self.reads, &self.writes].map(|n| n.load(Ordering::Relaxed))
+        [&self.lookups, &self.opens, &self.reads, &self.writes].map(Cell::get)
     }
 }
 
 impl SandboxFs {
     pub fn new(content: Arc<Content>) -> SandboxFs {
         SandboxFs {
-            actions: DashMap::new(),
-            next_seq: AtomicU64::new(1),
+            actions: RefCell::new(BTreeMap::new()),
+            next_seq: Cell::new(1),
             content,
-            session: OnceLock::new(),
-            backing: DashMap::new(),
-            retired: Mutex::new(Vec::new()),
-            tick: AtomicU64::new(0),
+            session: OnceCell::new(),
+            backing: RefCell::new(BTreeMap::new()),
+            retired: RefCell::new(Vec::new()),
+            tick: Cell::new(0),
             stats: FsStats::default(),
         }
     }
@@ -391,16 +392,20 @@ impl SandboxFs {
     }
 
     pub fn create_action(&self, cfg: ActionFsConfig) -> Arc<ActionFs> {
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        let seq = self.next_seq.get();
+        self.next_seq.set(seq + 1);
         let a = Arc::new(ActionFs::assemble(seq, cfg.view, cfg.uid, cfg.gid, cfg.scratch, &cfg.mountpoints, cfg.size_blind));
-        assert!(self.actions.insert(seq, a.clone()).is_none(), "action sequence numbers are unique");
+        assert!(self.actions.borrow_mut().insert(seq, a.clone()).is_none(), "action sequence numbers are unique");
         a
     }
 
     pub fn finish_action(&self, a: &Arc<ActionFs>) -> Finished {
-        self.actions.remove(&a.seq);
+        self.actions.borrow_mut().remove(&a.seq);
         if let Some(s) = self.session.get() {
-            let _ = s.notify_inval_entry(FUSE_ROOT_ID, Self::dir_name(a.seq).as_bytes());
+            // The kernel takes the mount root's lock for this, which a lookup that waits for
+            // its handler may hold, so the loop thread must stay free to run that handler.
+            let name = Self::dir_name(a.seq);
+            let _ = crate::io::blocking(|| s.notify_inval_entry(FUSE_ROOT_ID, name.as_bytes()));
         }
         let mut st = a.st.lock();
         assert!(!st.finished, "action finished twice");
@@ -426,8 +431,12 @@ impl SandboxFs {
         };
         drop(st);
 
-        let hashed: Vec<(usize, std::io::Result<crate::hash::Hash>)> =
-            crate::io::thread::par_map(jobs, |(i, src)| (i, self.content.hash(&src)));
+        let hashed: Vec<(usize, std::io::Result<crate::hash::Hash>)> = if jobs.is_empty() {
+            Vec::new()
+        } else {
+            let content = &*self.content;
+            crate::io::cpu(|| crate::io::thread::par_map(jobs, |(i, src)| (i, content.hash(&src))))
+        };
         let mut st = a.st.lock();
         for (i, h) in hashed {
             match h {
@@ -439,21 +448,33 @@ impl SandboxFs {
         Finished { obs: compact_obs(obs), upper, tainted }
     }
 
+    fn next_tick(&self) -> u64 {
+        let tick = self.tick.get();
+        self.tick.set(tick + 1);
+        tick
+    }
+
+    /// The backing id already registered for `key`, marked as just used.
+    fn cached_backing(&self, key: &BackingKey) -> Option<i32> {
+        let tick = self.next_tick();
+        let mut backing = self.backing.borrow_mut();
+        let (id, used) = backing.get_mut(key)?;
+        *used = tick;
+        Some(*id)
+    }
+
     fn backing_id(&self, key: BackingKey, file: &File) -> Res<i32> {
-        let tick = self.tick.fetch_add(1, Ordering::Relaxed);
-        let id = match self.backing.entry(key) {
-            dashmap::mapref::entry::Entry::Occupied(e) => {
-                e.get().1.store(tick, Ordering::Relaxed);
-                return Ok(e.get().0);
-            }
-            dashmap::mapref::entry::Entry::Vacant(v) => {
-                let sess = self.session.get().ok_or(Errno::EIO)?;
-                let id = sess.backing_open(file.as_raw_fd())?;
-                v.insert((id, AtomicU64::new(tick)));
-                id
-            }
+        if let Some(id) = self.cached_backing(&key) {
+            return Ok(id);
+        }
+        let sess = self.session.get().ok_or(Errno::EIO)?;
+        let id = sess.backing_open(file.as_raw_fd())?;
+        let full = {
+            let mut backing = self.backing.borrow_mut();
+            backing.insert(key, (id, self.next_tick()));
+            backing.len() > BACKING_CACHE_MAX
         };
-        if self.backing.len() > BACKING_CACHE_MAX {
+        if full {
             self.trim_backing();
         }
         self.reap_retired();
@@ -461,12 +482,12 @@ impl SandboxFs {
     }
 
     fn retire(&self, id: i32) {
-        self.retired.lock().push((crate::io::now(), id));
+        self.retired.borrow_mut().push((crate::io::now(), id));
     }
 
     fn reap_retired(&self) {
         let Some(sess) = self.session.get() else { return };
-        let mut r = self.retired.lock();
+        let mut r = self.retired.borrow_mut();
         if r.is_empty() {
             return;
         }
@@ -482,18 +503,19 @@ impl SandboxFs {
     }
 
     fn trim_backing(&self) {
-        let mut all: Vec<(u64, BackingKey)> =
-            self.backing.iter().map(|e| (e.value().1.load(Ordering::Relaxed), *e.key())).collect();
+        let mut backing = self.backing.borrow_mut();
+        let mut all: Vec<(u64, BackingKey)> = backing.iter().map(|(key, (_, used))| (*used, *key)).collect();
         all.sort_unstable_by_key(|e| e.0);
         for (_, k) in all.into_iter().take(BACKING_CACHE_MAX / 4) {
-            if let Some((_, (id, _))) = self.backing.remove(&k) {
+            if let Some((id, _)) = backing.remove(&k) {
                 self.retire(id);
             }
         }
     }
 
     pub fn forget_backing(&self, h: &crate::hash::Hash) {
-        if let Some((_, (id, _))) = self.backing.remove(&BackingKey::Blob(*h)) {
+        let gone = self.backing.borrow_mut().remove(&BackingKey::Blob(*h));
+        if let Some((id, _)) = gone {
             self.retire(id);
         }
     }
@@ -501,7 +523,7 @@ impl SandboxFs {
     fn action(&self, node: u64) -> Res<(Arc<ActionFs>, u32)> {
         let seq = node >> LOCAL_BITS;
         let local = (node & LOCAL_MASK) as u32;
-        let a = self.actions.get(&seq).ok_or(Errno::ESTALE)?.clone();
+        let a = self.actions.borrow().get(&seq).cloned().ok_or(Errno::ESTALE)?;
         Ok((a, local))
     }
 }
@@ -1126,14 +1148,14 @@ impl StateMachine for State {
 
 impl Filesystem for SandboxFs {
     fn lookup(&self, _ctx: &Ctx, parent: u64, name: &[u8]) -> Res<Entry> {
-        self.stats.lookups.fetch_add(1, Ordering::Relaxed);
+        self.stats.lookups.set(self.stats.lookups.get() + 1);
         if parent == FUSE_ROOT_ID {
             let seq = std::str::from_utf8(name)
                 .ok()
                 .and_then(|s| s.strip_prefix('a'))
                 .and_then(|s| s.parse::<u64>().ok())
                 .ok_or(Errno::ENOENT)?;
-            let a = self.actions.get(&seq).ok_or(Errno::ENOENT)?.clone();
+            let a = self.actions.borrow().get(&seq).cloned().ok_or(Errno::ENOENT)?;
             let st = a.st.lock();
             return Ok(a.entry(&st, ROOT_LOCAL));
         }
@@ -1398,7 +1420,7 @@ impl Filesystem for SandboxFs {
     }
 
     fn open(&self, _ctx: &Ctx, node: u64, flags: u32) -> Res<Opened> {
-        self.stats.opens.fetch_add(1, Ordering::Relaxed);
+        self.stats.opens.set(self.stats.opens.get() + 1);
         let (a, n) = self.action(node)?;
         let mut st = a.st.lock();
         let acc = flags as i32 & libc::O_ACCMODE;
@@ -1425,12 +1447,11 @@ impl Filesystem for SandboxFs {
                         FileSrc::Host { sig, .. } => Some(BackingKey::Host(*sig)),
                         FileSrc::Lazy(_) => self.content.known_hash(&info.src).map(BackingKey::Blob),
                     };
-                    if let Some(e) = key.and_then(|k| self.backing.get(&k)) {
-                        e.1.store(self.tick.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+                    if let Some(id) = key.and_then(|k| self.cached_backing(&k)) {
                         let src = info.src.clone();
                         f.opens += 1;
                         f.lower_pt_opens += 1;
-                        (Next::Cached(e.0), src)
+                        (Next::Cached(id), src)
                     } else {
                         let (file, key, actual) = self.content.open(&info.src)?;
                         let recorded = actual.clone();
@@ -1504,7 +1525,7 @@ impl Filesystem for SandboxFs {
     }
 
     fn read(&self, _ctx: &Ctx, node: u64, _fh: u64, offset: u64, size: u32, out: &mut Vec<u8>) -> Res<()> {
-        self.stats.reads.fetch_add(1, Ordering::Relaxed);
+        self.stats.reads.set(self.stats.reads.get() + 1);
         let (a, n) = self.action(node)?;
         let file = a.st.lock().read_source(n)?.clone();
         out.resize(size as usize, 0);
@@ -1525,7 +1546,7 @@ impl Filesystem for SandboxFs {
     }
 
     fn write(&self, _ctx: &Ctx, node: u64, _fh: u64, offset: u64, data: &[u8]) -> Res<u32> {
-        self.stats.writes.fetch_add(1, Ordering::Relaxed);
+        self.stats.writes.set(self.stats.writes.get() + 1);
         let (a, n) = self.action(node)?;
         let file = {
             let st = a.st.lock();

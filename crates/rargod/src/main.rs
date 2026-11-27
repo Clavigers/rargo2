@@ -143,7 +143,7 @@ fn main() -> Result<()> {
     let store_path = opts.store.as_deref().unwrap_or(&default_store);
     let store = Arc::new(Store::open(store_path, db).with_context(|| format!("opening store {}", store_path.display()))?);
     let content = Arc::new(Content::new(store.clone()));
-    let fs = Arc::new(SandboxFs::new(content.clone()));
+    let fs = std::rc::Rc::new(SandboxFs::new(content.clone()));
     let mnt = state.join("mnt");
     let _ = sys::umount(&mnt, libc::MNT_DETACH);
     rargo_core::io::file::create_dir_all(&mnt).with_context(|| format!("making the mountpoint {}", mnt.display()))?;
@@ -477,21 +477,26 @@ fn evict_loop((d, budget, cold_after): (Arc<Daemon>, u64, u64)) {
                 eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
             }
         }
-        let (store, fs) = (d.engine.store.clone(), d.engine.fs.clone());
-        io::cpu(move || {
+        let store = d.engine.store.clone();
+        let gone = io::cpu(move || {
+            let gone = std::cell::RefCell::new(Vec::new());
             if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
-                let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
+                let (n, freed) = store.freeze_idle(cold_after, &|h| gone.borrow_mut().push(*h));
                 if n > 0 {
                     eprintln!("rargod: {n} blobs went cold, {} MiB freed", freed >> 20);
                 }
             }
             if store.total_bytes() > budget {
-                let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
+                let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| gone.borrow_mut().push(*h));
                 if freed > 0 {
                     eprintln!("rargod: evicted {} MiB (store now {} MiB)", freed >> 20, store.total_bytes() >> 20);
                 }
             }
+            gone.into_inner()
         });
+        for h in &gone {
+            d.engine.fs.forget_backing(h);
+        }
         tick += 1;
     }
 }

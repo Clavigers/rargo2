@@ -417,8 +417,15 @@ fn serve(
             );
         }
         Command::Compact => {
-            let (store, fs) = (d.engine.store.clone(), d.engine.fs.clone());
-            let (n, freed) = crate::io::cpu(move || store.freeze_idle(0, &|h| fs.forget_backing(h)));
+            let store = d.engine.store.clone();
+            let ((n, freed), frozen) = crate::io::cpu(move || {
+                let frozen = RefCell::new(Vec::new());
+                let did = store.freeze_idle(0, &|h| frozen.borrow_mut().push(*h));
+                (did, frozen.into_inner())
+            });
+            for h in &frozen {
+                d.engine.fs.forget_backing(h);
+            }
             d.engine.store.db().flush();
             let (cn, logical, disk) = d.engine.store.cold_stats();
             let mib = |b: u64| b as f64 / (1 << 20) as f64;

@@ -66,7 +66,7 @@ fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
     let db = Arc::new(rargo_core::db::Db::open(&state.join("db.redb"))?);
     let store = Arc::new(rargo_core::store::Store::open(&state.join("store"), db)?);
     let content = Arc::new(Content::new(store.clone()));
-    let fs = Arc::new(SandboxFs::new(content));
+    let fs = std::rc::Rc::new(SandboxFs::new(content));
     let mnt = state.join("mnt");
     rargo_core::io::file::create_dir_all(&mnt)?;
     let session = Arc::new(fusewire::Session::mount_uring(
@@ -125,13 +125,12 @@ fn sandbox(args: Vec<String>) -> anyhow::Result<()> {
         info.max_rss_kb / 1024
     );
     let st = fs.stats();
-    use std::sync::atomic::Ordering::Relaxed;
     eprintln!(
         "[rargo-sandbox] fuse: lookups={} opens={} reads={} writes={}; observations={} upper={} tainted={}",
-        st.lookups.load(Relaxed),
-        st.opens.load(Relaxed),
-        st.reads.load(Relaxed),
-        st.writes.load(Relaxed),
+        st.lookups.get(),
+        st.opens.get(),
+        st.reads.get(),
+        st.writes.get(),
         fin.obs.len(),
         fin.upper.len(),
         fin.tainted
