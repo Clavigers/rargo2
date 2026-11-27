@@ -1,5 +1,4 @@
 use rargo_machine::StateMachine;
-use crate::io::buildview::StateLoop;
 use crate::snapshot::Snapshot;
 use crate::trace::{MEntry, Manifest};
 use crate::view::*;
@@ -1496,5 +1495,28 @@ mod memo_tests {
         assert_eq!(owner.call(move |m, ()| m.min_gen(id), ()), g + 1);
         drop(view);
         assert!(!owner.call(move |m, ()| m.views.contains_key(&id), ()), "a dropped view is closed");
+    }
+}
+
+/// The owner of a build view's live state on the loop thread. Each step runs
+/// where it is asked for, and the state's invariants are checked after it.
+struct StateLoop<S> {
+    state: std::cell::RefCell<S>,
+}
+
+impl<S: StateMachine> StateLoop<S> {
+    fn spawn(_name: &str, state: S) -> Self {
+        Self { state: std::cell::RefCell::new(state) }
+    }
+
+    fn call<A, T>(&self, step: impl FnOnce(&mut S, A) -> T, args: A) -> T {
+        let mut state = self.state.borrow_mut();
+        let answer = step(&mut state, args);
+        state.invariants();
+        answer
+    }
+
+    fn tell(&self, step: impl FnOnce(&mut S)) {
+        self.call(|state, ()| step(state), ());
     }
 }

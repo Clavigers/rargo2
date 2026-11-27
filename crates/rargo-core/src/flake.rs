@@ -468,7 +468,7 @@ pub(crate) fn resolve_shell(
                 let at = d.scratch("flake")?;
                 scratch = Some(at.clone());
                 let out = (|| -> Result<Vec<u8>> {
-                    let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
+                    let dir = (|| -> Result<std::path::PathBuf> { Ok(match &src.root {
                         Some(root) => {
                             snap.materialize(&at, uid, gid, &|rel, node| evaluated_entry(root.as_os_str().as_bytes(), rel, node))?;
                             at.join(root)
@@ -482,7 +482,7 @@ pub(crate) fn resolve_shell(
                             }
                             at.clone()
                         }
-                    }) })?;
+                    }) })()?;
                     let mut c = nix();
                     c.args(["print-dev-env", "--json", "--no-write-lock-file"]).arg(format!(".#{shell}"));
                     run_nix(&dir, c, uid, gid).map_err(anyhow::Error::msg)

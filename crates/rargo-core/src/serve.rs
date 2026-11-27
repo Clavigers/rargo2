@@ -82,26 +82,28 @@ fn pump(link: Rc<Link>, stream: u32, mut rx: crate::io::UnboundedReceiver<Server
     sess.close_window();
 }
 
-/// What storing an offer took in: its trees, their bytes, its files and their bytes.
+/// What storing an offer took in: its trees, their bytes, its files, their bytes, and the trees decoded.
 #[derive(Default)]
 struct Offered {
     trees: u64,
     tree_bytes: u64,
     files: u64,
     file_bytes: u64,
+    decoded: Vec<(Hash, rargo_proto::tree::Tree)>,
 }
 
 fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     let stats = &d.trees.stats;
     stats.offers.set(stats.offers.get() + 1);
-    let (manifests, store) = (d.trees.manifests().clone(), d.engine.store.clone());
+    let store = d.engine.store.clone();
     let (trees, blobs) = (o.trees, o.blobs);
     let took = crate::io::cpu(move || {
         let mut took = Offered::default();
         for t in &trees {
-            if manifests.put(t).is_ok() {
+            if let Ok(stored) = crate::snapshot::store_manifest(&store, t) {
                 took.trees += 1;
                 took.tree_bytes += t.len() as u64;
+                took.decoded.push(stored);
             }
         }
         for b in blobs {
@@ -114,6 +116,9 @@ fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
         }
         took
     });
+    for (digest, tree) in took.decoded {
+        d.trees.manifests().remember(digest, tree);
+    }
     stats.trees_received.set(stats.trees_received.get() + took.trees);
     stats.offered_bytes.set(stats.offered_bytes.get() + took.tree_bytes + took.file_bytes);
     d.stats.bytes_in.set(d.stats.bytes_in.get() + took.file_bytes);

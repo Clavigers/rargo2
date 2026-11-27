@@ -102,9 +102,9 @@ pub trait HostFiles {
     fn record(&self, hash: Hash, path: PathBuf, sig: HostSig);
 }
 
-impl HostFiles for DashMap<Hash, FileSrc> {
+impl HostFiles for DashMap<Hash, (Arc<Path>, HostSig)> {
     fn record(&self, hash: Hash, path: PathBuf, sig: HostSig) {
-        self.entry(hash).or_insert_with(|| FileSrc::Host { path: Arc::from(path), sig });
+        self.entry(hash).or_insert_with(|| (Arc::from(path), sig));
     }
 }
 
@@ -478,7 +478,7 @@ pub fn schedule(
     fs: &Arc<dyn StoreFs>,
     store: &Path,
     names: &[String],
-    hosts: Option<&Arc<DashMap<Hash, FileSrc>>>,
+    hosts: Option<&Arc<DashMap<Hash, (Arc<Path>, HostSig)>>>,
     seen: &Arc<Attached>,
 ) -> Result<Prepared> {
     let (prepared, pending) = plan(db.as_ref(), fs.as_ref(), store, names, hosts.map(|m| m.as_ref() as &dyn HostFiles), seen)?;
@@ -611,7 +611,7 @@ struct Job {
     db: Arc<dyn Tables>,
     fs: Arc<dyn StoreFs>,
     store: PathBuf,
-    hosts: Option<Arc<DashMap<Hash, FileSrc>>>,
+    hosts: Option<Arc<DashMap<Hash, (Arc<Path>, HostSig)>>>,
     seen: Arc<Attached>,
     cost: parking_lot::Mutex<Cost>,
     left: std::sync::atomic::AtomicUsize,

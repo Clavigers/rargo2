@@ -431,12 +431,26 @@ impl SandboxFs {
         };
         drop(st);
 
-        let hashed: Vec<(usize, std::io::Result<crate::hash::Hash>)> = if jobs.is_empty() {
-            Vec::new()
-        } else {
-            let content = &*self.content;
-            crate::io::cpu(|| crate::io::thread::par_map(jobs, |(i, src)| (i, content.hash(&src))))
-        };
+        let mut hashed: Vec<(usize, std::io::Result<crate::hash::Hash>)> = Vec::new();
+        let mut host = Vec::new();
+        for (i, src) in jobs {
+            match (&src, self.content.known_hash(&src)) {
+                (_, Some(h)) => hashed.push((i, Ok(h))),
+                (FileSrc::Host { path, sig }, None) => host.push((i, path.clone(), *sig)),
+                _ => hashed.push((i, self.content.hash(&src))),
+            }
+        }
+        if !host.is_empty() {
+            let done: Vec<(usize, HostSig, std::io::Result<crate::hash::Hash>)> = crate::io::cpu(|| {
+                crate::io::thread::par_map(host, |(i, path, sig)| (i, sig, hash_host(&path, &sig)))
+            });
+            for (i, sig, h) in done {
+                if let Ok(h) = &h {
+                    self.content.record_host(sig, *h);
+                }
+                hashed.push((i, h));
+            }
+        }
         let mut st = a.st.lock();
         for (i, h) in hashed {
             match h {

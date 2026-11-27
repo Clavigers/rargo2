@@ -345,13 +345,13 @@ impl Daemon {
     pub fn collect_garbage(&self, min_age_secs: u64) -> (usize, u64) {
         let traces = self.engine.traces.tables();
         let (states, state_blobs) = self.incr.parts();
-        let (manifests, roots) = (self.trees.manifests().clone(), self.trees.recent_roots());
+        let roots = self.trees.recent_roots();
         let store = self.store().clone();
         let (swept, gone) = crate::io::cpu(move || {
             let mut live = std::collections::BTreeSet::new();
             crate::trace::mark(&*traces, &mut live);
             crate::incr::mark(&*states, &*state_blobs, &mut live);
-            manifests.mark(roots, &mut live);
+            crate::snapshot::mark_trees(&store, roots, &mut live);
             let gone = RefCell::new(Vec::new());
             let swept = store.sweep(&live, min_age_secs, &|h| gone.borrow_mut().push(*h));
             (swept, gone.into_inner())
@@ -815,7 +815,7 @@ fn fetch(
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
     let out = (|| -> Result<std::result::Result<Option<crate::io::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
-        crate::io::cpu(|| snap.materialize(&scratch2, uid, gid, &|_, _| true))?;
+        snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
         if install {
             for path in fetch_args.iter().filter_map(|a| a.strip_prefix("--path=")) {
                 let path = Path::new(path);

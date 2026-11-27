@@ -812,16 +812,28 @@ impl Engine {
         };
 
         let store = self.store.clone();
-        let content = self.content.clone();
-        let upper = fin.upper;
+        // What each output is, or the scratch file whose content is yet to be stored.
+        let mut upper: Vec<(Vec<u8>, std::result::Result<MEntry, (PathBuf, bool)>)> = Vec::with_capacity(fin.upper.len());
+        for u in fin.upper {
+            let entry = match u.kind {
+                UpperKind::Dir => Ok(MEntry::Dir),
+                UpperKind::Whiteout => Ok(MEntry::Whiteout),
+                UpperKind::Symlink(t) => Ok(MEntry::Symlink(t)),
+                UpperKind::File { path, exec } => Err((path, exec)),
+                UpperKind::LowerFile { info } => {
+                    let hash = self.content.hash(&info.src)?;
+                    if !store.has(&hash) {
+                        let (f, _, _) = self.content.open(&info.src)?;
+                        let (store, exec) = (&*store, info.exec());
+                        io::cpu(|| store.put_file_copy(&f, exec))?;
+                    }
+                    Ok(MEntry::File { hash, exec: info.exec(), size: info.size })
+                }
+            };
+            upper.push((u.path, entry));
+        }
         let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
-            let mut scratch: Vec<(PathBuf, bool)> = upper
-                .iter()
-                .filter_map(|u| match &u.kind {
-                    UpperKind::File { path, exec } => Some((path.clone(), *exec)),
-                    _ => None,
-                })
-                .collect();
+            let mut scratch: Vec<(PathBuf, bool)> = upper.iter().filter_map(|(_, entry)| entry.as_ref().err().cloned()).collect();
             scratch.sort();
             scratch.dedup_by(|a, b| a.0 == b.0);
             let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> =
@@ -832,28 +844,16 @@ impl Engine {
                     Ok((path, r))
                 });
             let stored = stored?;
-            let entries: Result<Vec<(Vec<u8>, MEntry)>> =
-                io::thread::par_map(upper, |u| -> Result<(Vec<u8>, MEntry)> {
-                    let e = match u.kind {
-                        UpperKind::Dir => MEntry::Dir,
-                        UpperKind::Whiteout => MEntry::Whiteout,
-                        UpperKind::Symlink(t) => MEntry::Symlink(t),
-                        UpperKind::File { path, exec } => {
-                            let (hash, size) = stored[&path];
-                            MEntry::File { hash, exec, size }
-                        }
-                        UpperKind::LowerFile { info } => {
-                            let hash = content.hash(&info.src)?;
-                            if !store.has(&hash) {
-                                let (f, _, _) = content.open(&info.src)?;
-                                store.put_file_copy(&f, info.exec())?;
-                            }
-                            MEntry::File { hash, exec: info.exec(), size: info.size }
-                        }
-                    };
-                    Ok((u.path, e))
-                });
-            let entries = entries?;
+            let entries: Vec<(Vec<u8>, MEntry)> = upper
+                .into_iter()
+                .map(|(path, entry)| {
+                    let entry = entry.unwrap_or_else(|(scratch, exec)| {
+                        let (hash, size) = stored[&scratch];
+                        MEntry::File { hash, exec, size }
+                    });
+                    (path, entry)
+                })
+                .collect();
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))

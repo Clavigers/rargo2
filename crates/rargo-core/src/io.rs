@@ -4,7 +4,6 @@
 
 pub use rargo_net::io::*;
 
-pub(crate) mod buildview;
 pub(crate) mod db;
 pub mod http;
 pub mod nix;
