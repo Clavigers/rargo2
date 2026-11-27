@@ -10,7 +10,8 @@ uses_required, with no backport waiting for a build. Then it
    there with POWER-USER.md as its prompt. The session builds the candidate,
    uses it, and files bugs and friction on GitHub; the observer records them
    as found in this use;
-3. waits long enough for the observer to have seen those issues, and records
+3. waits until the observer has recorded every issue the session filed (it
+   finds them on GitHub by the session's line in their bodies), and records
    `use_ended`.
 
 Sessions are at least `gap` apart, so a week of small backports does not
@@ -32,21 +33,23 @@ from typing import Callable
 from . import harness
 from . import machines as M
 from . import model as m
+from .github import GitHubError
 from .ledger import Alarm, Ledger, Refused, utc_now
 from .model import Role
 from .watchdog import BIN
 
 
 class PowerUser:
-    def __init__(self, ledger: Ledger, checkout: Path, prompt: str,
+    def __init__(self, ledger: Ledger, gh, checkout: Path, prompt: str,
                  clock: Callable[[], datetime] = utc_now,
                  gap: timedelta = timedelta(hours=3),
                  timeout: timedelta = timedelta(minutes=90),
-                 settle: float = 150.0,
+                 settle: timedelta = timedelta(minutes=20), poll: float = 20.0,
                  run: Callable[..., int] | None = None,
                  say: Callable[[str], None] = print):
-        self.ledger, self.checkout, self.prompt = ledger, Path(checkout), prompt
-        self.clock, self.gap, self.timeout, self.settle = clock, gap, timeout, settle
+        self.ledger, self.gh, self.checkout, self.prompt = ledger, gh, Path(checkout), prompt
+        self.clock, self.gap, self.timeout = clock, gap, timeout
+        self.settle, self.poll = settle, poll
         self.run_session = run or self._run_session
         self.say = say
 
@@ -54,7 +57,7 @@ class PowerUser:
         while True:
             try:
                 self.step()
-            except (subprocess.CalledProcessError, Alarm, Refused) as err:
+            except (subprocess.CalledProcessError, GitHubError, Alarm, Refused) as err:
                 self.say(f"power user: {err}")  # the next step tries again
             time.sleep(every)
 
@@ -88,14 +91,28 @@ class PowerUser:
             return
         version, build, sha = d
         use = max(self.ledger.world.uses, default=0) + 1
+        began = self.clock()
         self._record("use_started", use=use, version=version, build=build)
         self.say(f"power user: use {use}: {version} build {build} at {sha[:7]}")
         try:
             code = self.run_session(use, version, build, sha)
             self.say(f"power user: use {use} ended with exit {code}")
-            time.sleep(self.settle)  # the observer records what it filed, in this use
+            self._settle(use, began)
         finally:
             self._record("use_ended", use=use)
+
+    def _settle(self, use: int, began: datetime) -> None:
+        """Wait until the log has every issue this session filed: they are
+        found in this use only while it is open."""
+        mark = f"use session {use}."
+        filed = {i["number"] for i in self.gh.issues(began - timedelta(minutes=5))
+                 if mark in (i.get("body") or "") and "factory-actor: power_user" in i["body"]}
+        until = self.clock() + self.settle
+        while filed - set(self.ledger.refresh().issues) and self.clock() < until:
+            time.sleep(self.poll)
+        if missing := filed - set(self.ledger.world.issues):
+            self.say(f"power user: use {use}: the log never got {sorted(missing)}")
+        self.say(f"power user: use {use} filed {sorted(filed) or 'nothing'}")
 
     def _run_session(self, use: int, version: str, build: int, sha: str) -> int:
         w = self.ledger.world
