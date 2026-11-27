@@ -7,11 +7,11 @@ use crate::present::Output;
 use crate::proto::{CONTROL, ClientMsg, Frame, Reorder, RunRequest, ServerMsg};
 use crate::session::{self, ClientHas, Keys, Session};
 use anyhow::{Context, Result};
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use crate::io::TcpStream;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 pub fn connection(
     d: Arc<Daemon>,
@@ -81,24 +81,42 @@ fn pump(link: Arc<Link>, stream: u32, mut rx: crate::io::UnboundedReceiver<Serve
     sess.close_window();
 }
 
+/// What storing an offer took in: its trees, their bytes, its files and their bytes.
+#[derive(Default)]
+struct Offered {
+    trees: u64,
+    tree_bytes: u64,
+    files: u64,
+    file_bytes: u64,
+}
+
 fn offer(d: &Daemon, o: crate::proto::Offer) -> Option<ServerMsg> {
     let stats = &d.trees.stats;
-    stats.offers.fetch_add(1, Ordering::Relaxed);
-    for t in &o.trees {
-        if d.trees.put(t).is_ok() {
-            stats.trees_received.fetch_add(1, Ordering::Relaxed);
-            stats.offered_bytes.fetch_add(t.len() as u64, Ordering::Relaxed);
+    stats.offers.set(stats.offers.get() + 1);
+    let (manifests, store) = (d.trees.manifests().clone(), d.engine.store.clone());
+    let (trees, blobs) = (o.trees, o.blobs);
+    let took = crate::io::cpu(move || {
+        let mut took = Offered::default();
+        for t in &trees {
+            if manifests.put(t).is_ok() {
+                took.trees += 1;
+                took.tree_bytes += t.len() as u64;
+            }
         }
-    }
-    for b in o.blobs {
-        let claimed = b.hash;
-        let Ok(bytes) = b.unpack() else { continue };
-        if Hash::of(&bytes).0 == claimed && d.engine.store.put_bytes(&bytes).is_ok() {
-            stats.offered_bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            d.stats.bytes_in.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            d.stats.files_in.fetch_add(1, Ordering::Relaxed);
+        for b in blobs {
+            let claimed = b.hash;
+            let Ok(bytes) = b.unpack() else { continue };
+            if Hash::of(&bytes).0 == claimed && store.put_bytes(&bytes).is_ok() {
+                took.files += 1;
+                took.file_bytes += bytes.len() as u64;
+            }
         }
-    }
+        took
+    });
+    stats.trees_received.set(stats.trees_received.get() + took.trees);
+    stats.offered_bytes.set(stats.offered_bytes.get() + took.tree_bytes + took.file_bytes);
+    d.stats.bytes_in.set(d.stats.bytes_in.get() + took.file_bytes);
+    d.stats.files_in.set(d.stats.files_in.get() + took.files);
     if !o.ask {
         return None;
     }
@@ -119,25 +137,25 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
         let (pump_link, pump_control) = (link.clone(), control.clone());
         crate::io::spawn(move || pump(pump_link, CONTROL, control_rx, pump_control));
     }
-    let streams: Arc<parking_lot::Mutex<HashMap<u32, Stream>>> = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let conn = Arc::new(parking_lot::Mutex::new(ConnectionState::new()));
+    let streams: Arc<RefCell<HashMap<u32, Stream>>> = Arc::new(RefCell::new(HashMap::new()));
+    let conn = Arc::new(RefCell::new(ConnectionState::new()));
     let mut order: Reorder<ClientMsg> = Reorder::new(false);
     let mut todo: VecDeque<Route> = VecDeque::new();
-    d.stats.links.fetch_add(1, Ordering::Relaxed);
+    d.stats.links.set(d.stats.links.get() + 1);
     'link: loop {
         while let Some(route) = todo.pop_front() {
             match route {
                 Route::Close => break 'link,
                 Route::Reply(m) => control.send(m),
                 Route::Offer(o) => {
-                    if let Some(reply) = crate::io::cpu(|| offer(&d, *o)) {
+                    if let Some(reply) = offer(&d, *o) {
                         control.send(reply);
                     }
                 }
                 Route::Control(m) => {
                     if let Err(e) = control.incoming(m) {
                         eprintln!("rargod: {user}: {e:#}");
-                        todo.extend(conn.lock().control_failed());
+                        todo.extend(conn.borrow_mut().control_failed());
                     }
                 }
                 Route::Fetch { stream, id, hashes } => {
@@ -154,18 +172,16 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
                     crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
                     let blobs = d.client_blobs.clone();
                     crate::io::spawn(move || {
-                        crate::io::cpu(move || {
-                            let chunks: Vec<_> = blobs
-                                .recipe(&Hash(hash))
-                                .map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect())
-                                .unwrap_or_default();
-                            let (outline, lazy) = match blobs.outline(&Hash(hash)) {
-                                Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
-                                _ => (Vec::new(), Vec::new()),
-                            };
-                            sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
-                            sess.send(ServerMsg::Fetched { id });
-                        });
+                        let chunks: Vec<_> = blobs
+                            .recipe(&Hash(hash))
+                            .map(|r| r.iter().map(|c| (c.hash.0, c.len)).collect())
+                            .unwrap_or_default();
+                        let (outline, lazy) = match blobs.outline(&Hash(hash)) {
+                            Some(o) if !chunks.is_empty() => (o.cvs.clone(), o.lazy.clone()),
+                            _ => (Vec::new(), Vec::new()),
+                        };
+                        sess.send(ServerMsg::Recipe { hash, chunks, outline, lazy });
+                        sess.send(ServerMsg::Fetched { id });
                     });
                 }
                 Route::Chunks { stream, id, hash, idx } => {
@@ -174,16 +190,15 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
                     crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
                     let blobs = d.client_blobs.clone();
                     crate::io::spawn(move || {
-                        crate::io::cpu(move || {
-                            for group in idx.chunks(16) {
-                                let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
-                                let chunks: Vec<(u32, crate::proto::Part)> =
-                                    group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect();
-                                sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
-                                sess.send(ServerMsg::Chunks { hash, chunks });
-                            }
-                            sess.send(ServerMsg::Fetched { id });
-                        });
+                        for group in idx.chunks(16) {
+                            let Ok(data) = blobs.serve_chunks(&Hash(hash), group) else { break };
+                            let chunks: Vec<(u32, crate::proto::Part)> = crate::io::cpu(move || {
+                                group.iter().copied().zip(data.into_iter().map(crate::proto::Part::pack)).collect()
+                            });
+                            sess.count_out(chunks.iter().map(|(_, p)| p.data.len()).sum());
+                            sess.send(ServerMsg::Chunks { hash, chunks });
+                        }
+                        sess.send(ServerMsg::Fetched { id });
                     });
                 }
                 Route::Refuse { stream } => {
@@ -202,7 +217,7 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
                     let mut pumping = crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
                     let (serve_d, serve_user, serve_keys, serve_sess) = (d.clone(), user.clone(), keys.clone(), sess.clone());
                     let mut work = crate::io::spawn(move || serve(serve_d, *req, serve_user, admin, serve_keys, serve_sess));
-                    streams.lock().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
+                    streams.borrow_mut().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
                     let (streams2, conn2, sess2) = (streams.clone(), conn.clone(), sess.clone());
                     crate::io::spawn(move || {
                         let msg = match work.join() {
@@ -216,25 +231,25 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
                         sess2.send(msg);
                         let _ = pumping.join();
                         sess2.close();
-                        let mut s = streams2.lock();
+                        let mut s = streams2.borrow_mut();
                         if s.get(&stream).is_some_and(|st| Arc::ptr_eq(&st.sess, &sess2)) {
                             s.remove(&stream);
-                            conn2.lock().finished(stream);
+                            conn2.borrow_mut().finished(stream);
                         }
                     });
                 }
                 Route::Stream { stream, msg } => {
-                    let sess = streams.lock().get(&stream).map(|st| st.sess.clone());
+                    let sess = streams.borrow_mut().get(&stream).map(|st| st.sess.clone());
                     if let Some(sess) = sess
                         && let Err(e) = sess.incoming(msg)
                     {
                         eprintln!("rargod: {e:#}");
                         sess.send(ServerMsg::Stderr(format!("error: {e:#}\n").into_bytes()));
-                        todo.extend(conn.lock().stream_failed(stream));
+                        todo.extend(conn.borrow_mut().stream_failed(stream));
                     }
                 }
                 Route::Cancel { stream } => {
-                    let gone = streams.lock().remove(&stream);
+                    let gone = streams.borrow_mut().remove(&stream);
                     if let Some(st) = gone {
                         st.sess.close();
                         st.abort.abort();
@@ -248,7 +263,7 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
             if !valid {
                 eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
             }
-            todo.extend(conn.lock().key_checked(valid));
+            todo.extend(conn.borrow_mut().key_checked(valid));
             checked = crate::io::now();
             continue;
         }
@@ -291,13 +306,13 @@ pub fn link(d: Arc<Daemon>, link: Arc<Link>, presented: String, admin: bool, key
                 m => m,
             };
             let valid = !matches!(msg, ClientMsg::Run(_)) || keys.still_valid(&presented);
-            todo.extend(conn.lock().message(stream, msg, valid));
+            todo.extend(conn.borrow_mut().message(stream, msg, valid));
         }
     }
-    let rest = conn.lock().close();
+    let rest = conn.borrow_mut().close();
     for route in rest {
         if let Route::Cancel { stream } = route {
-            let gone = streams.lock().remove(&stream);
+            let gone = streams.borrow_mut().remove(&stream);
             if let Some(st) = gone {
                 st.sess.close();
                 st.abort.abort();
@@ -380,14 +395,13 @@ fn serve(
             };
         }
         Command::Incr => {
-            let d2 = d.clone();
-            return say(&sess, crate::io::cpu(move || d2.incr.analyze(&d2.engine.store)));
+            let ((states, _), store) = (d.incr.parts(), d.engine.store.clone());
+            return say(&sess, crate::io::cpu(move || crate::incr::analyze(&*states, &store)));
         }
         Command::Gc => {
             let (running, waiting, _, _) = d.engine.sched.snapshot();
             let age = if running + waiting == 0 { 0 } else { 600 };
-            let d2 = d.clone();
-            let (n, bytes) = crate::io::cpu(move || d2.collect_garbage(age));
+            let (n, bytes) = d.collect_garbage(age);
             d.engine.store.db().flush();
             return say(
                 &sess,
@@ -399,11 +413,8 @@ fn serve(
             );
         }
         Command::Compact => {
-            let d2 = d.clone();
-            let (n, freed) = crate::io::cpu(move || {
-                let fs = d2.engine.fs.clone();
-                d2.engine.store.freeze_idle(0, &|h| fs.forget_backing(h))
-            });
+            let (store, fs) = (d.engine.store.clone(), d.engine.fs.clone());
+            let (n, freed) = crate::io::cpu(move || store.freeze_idle(0, &|h| fs.forget_backing(h)));
             d.engine.store.db().flush();
             let (cn, logical, disk) = d.engine.store.cold_stats();
             let mib = |b: u64| b as f64 / (1 << 20) as f64;
@@ -420,11 +431,8 @@ fn serve(
         Command::Export(dir) | Command::Import(dir) => {
             let export = matches!(command, Command::Export(_));
             let dir = dir.clone();
-            let d2 = d.clone();
-            let reply = crate::io::cpu(move || {
-                let dir = PathBuf::from(dir);
-                if export { d2.export_cache(&dir) } else { d2.import_cache(&dir) }
-            });
+            let dir = PathBuf::from(dir);
+            let reply = if export { d.export_cache(&dir) } else { d.import_cache(&dir) };
             return match reply {
                 Ok((traces, blobs)) => say(
                     &sess,
@@ -438,7 +446,7 @@ fn serve(
 
     let worktree = req.worktree.clone();
     let before: Option<Arc<std::collections::BTreeSet<crate::proto::Digest>>> = {
-        let known = d.deliveries.lock();
+        let known = d.deliveries.borrow_mut();
         known
             .by_worktree
             .get(&worktree)
@@ -488,7 +496,7 @@ fn serve(
         return match crate::drift::check(&d, &snapshot, &who, crate::io::now) {
             Ok(r) => {
                 let text = r.render();
-                *d.drift_report.lock() = Some(format!("{}: {text}", req.root));
+                *d.drift_report.borrow_mut() = Some(format!("{}: {text}", req.root));
                 sess.send(ServerMsg::Stdout(text.into_bytes()));
                 ServerMsg::Exit(if r.agrees() { 0 } else { 1 })
             }
@@ -521,7 +529,7 @@ fn serve(
                 delivered.extend(set.iter().copied());
             }
         }
-        let mut known = d.deliveries.lock();
+        let mut known = d.deliveries.borrow_mut();
         let token = delivery_token(&mut known.random);
         known.by_worktree.insert(worktree, (token, Arc::new(delivered)));
         drop(known);
@@ -550,10 +558,10 @@ fn status_figures(d: &Daemon) -> StatusFigures {
     let (running, waiting, peak, granted) = e.sched.snapshot();
     let t = &e.traces.stats;
     let s = &e.stats;
-    let f = e.fs.stats();
+    let [lookups, opens, reads, writes] = e.fs.stats().counts();
     let y = &d.trees.stats;
     let (cold_blobs, cold_logical, cold_disk) = e.store.cold_stats();
-    let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    let n = |a: &std::cell::Cell<u64>| a.get();
     StatusFigures {
         requests: n(&d.stats.requests),
         snapshots: n(&y.snapshots),
@@ -589,10 +597,10 @@ fn status_figures(d: &Daemon) -> StatusFigures {
         peak: peak as u64,
         granted,
         tokens: e.sched.tokens() as u64,
-        lookups: n(&f.lookups),
-        opens: n(&f.opens),
-        reads: n(&f.reads),
-        writes: n(&f.writes),
+        lookups,
+        opens,
+        reads,
+        writes,
         plans_decoded: n(&d.stats.plans_decoded),
         incr_saved: n(&d.incr.stats.saved),
         seeded_same_worktree: n(&d.incr.stats.seeded_same_worktree),
@@ -602,7 +610,7 @@ fn status_figures(d: &Daemon) -> StatusFigures {
         discarded_after_crash: n(&d.incr.stats.discarded_after_crash),
         verify_units: n(&d.stats.verify_units),
         verify_mismatches: n(&d.stats.verify_mismatches),
-        drift: d.drift_report.lock().clone(),
+        drift: d.drift_report.borrow_mut().clone(),
         workers: d.pool.get().map(|p| {
             let (pushed, skipped, fetched, reused) = p.transfer_totals();
             let ps = &p.stats;

@@ -8,7 +8,7 @@ use crate::view::vpath_starts_with;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::cell::Cell;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateMeta {
@@ -25,19 +25,19 @@ const _: () = assert!(KEEP_WORKTREES > 0);
 
 #[derive(Default)]
 pub struct IncrStats {
-    pub saved: AtomicU64,
-    pub seeded_same_worktree: AtomicU64,
-    pub seeded_ancestor: AtomicU64,
-    pub seeded_other: AtomicU64,
-    pub unseeded: AtomicU64,
-    pub discarded_after_crash: AtomicU64,
+    pub saved: Cell<u64>,
+    pub seeded_same_worktree: Cell<u64>,
+    pub seeded_ancestor: Cell<u64>,
+    pub seeded_other: Cell<u64>,
+    pub unseeded: Cell<u64>,
+    pub discarded_after_crash: Cell<u64>,
 }
 
 pub struct IncrStore {
     db: Arc<dyn Tables>,
     store: Arc<dyn Blobs>,
-    next: AtomicU64,
-    held: std::sync::OnceLock<Box<dyn Fn(&Hash) -> bool + Send + Sync>>,
+    next: Cell<u64>,
+    held: std::cell::OnceCell<Box<dyn Fn(&Hash) -> bool>>,
     pub stats: IncrStats,
 }
 
@@ -68,13 +68,13 @@ impl IncrStore {
         IncrStore {
             db,
             store,
-            next: AtomicU64::new(seed),
-            held: std::sync::OnceLock::new(),
+            next: Cell::new(seed),
+            held: std::cell::OnceCell::new(),
             stats: IncrStats::default(),
         }
     }
 
-    pub fn set_held(&self, f: Box<dyn Fn(&Hash) -> bool + Send + Sync>) {
+    pub fn set_held(&self, f: Box<dyn Fn(&Hash) -> bool>) {
         let _ = self.held.set(f);
     }
 
@@ -157,20 +157,21 @@ impl IncrStore {
                         SeedKind::Ancestor => &self.stats.seeded_ancestor,
                         SeedKind::Other => &self.stats.seeded_other,
                     };
-                    counter.fetch_add(1, Ordering::Relaxed);
+                    counter.set(counter.get() + 1);
                     return Some(Seed { id: *id, manifest, kind, blobs });
                 }
                 None => self.db.delete(Table::Incr, &key(crate_key, *id)),
             }
         }
-        self.stats.unseeded.fetch_add(1, Ordering::Relaxed);
+        self.stats.unseeded.set(self.stats.unseeded.get() + 1);
         None
     }
 
     pub fn save(&self, crate_key: &Hash, worktree: &str, commit: Option<[u8; 20]>, manifest: &Manifest, created: u64) {
         let Ok(raw) = bincode::serialize(manifest) else { return };
         let Ok(h) = self.store.put_bytes(&raw) else { return };
-        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let id = self.next.get();
+        self.next.set(id + 1);
         assert!(id < u64::MAX, "state id counter does not wrap");
         let meta = StateMeta {
             manifest: h,
@@ -180,7 +181,7 @@ impl IncrStore {
             bytes: manifest.total_size(),
         };
         self.db.put(Table::Incr, &key(crate_key, id), &bincode::serialize(&meta).unwrap());
-        self.stats.saved.fetch_add(1, Ordering::Relaxed);
+        self.stats.saved.set(self.stats.saved.get() + 1);
         self.prune(crate_key);
     }
 
@@ -192,124 +193,139 @@ impl IncrStore {
 
     pub fn discard(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
-        self.stats.discarded_after_crash.fetch_add(1, Ordering::Relaxed);
+        self.stats.discarded_after_crash.set(self.stats.discarded_after_crash.get() + 1);
     }
 
     pub fn forget(&self, crate_key: &Hash, id: u64) {
         self.db.delete(Table::Incr, &key(crate_key, id));
     }
 
+    /// The tables the states are recorded in and the store their files are in.
+    pub fn parts(&self) -> (Arc<dyn Tables>, Arc<dyn Blobs>) {
+        (self.db.clone(), self.store.clone())
+    }
+
     pub fn mark(&self, live: &mut std::collections::BTreeSet<Hash>) {
-        let mut metas: Vec<StateMeta> = Vec::new();
-        for (_, v) in self.db.scan_prefix(Table::Incr, &[]) {
-            if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
-                metas.push(m);
-            }
-        }
-        for meta in metas {
-            live.insert(meta.manifest);
-            let Ok(raw) = self.store.read(&meta.manifest) else { continue };
-            let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
-            for (_, e) in &m.entries {
-                if let MEntry::File { hash, .. } = e {
-                    live.insert(*hash);
-                }
-            }
-        }
+        mark(&*self.db, &*self.store, live)
     }
 
     pub fn analyze(&self, store: &Store) -> String {
-        use std::collections::{BTreeMap, BTreeSet};
-        fn kind(path: &[u8]) -> &'static str {
-            let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
-            match name {
-                b"dep-graph.bin" => "dep-graph.bin",
-                b"query-cache.bin" => "query-cache.bin",
-                b"work-products.bin" => "work-products.bin",
-                b"metadata.rmeta" => "metadata.rmeta",
-                n if n.ends_with(b".o") => "object files",
-                n if n.ends_with(b".dwo") => "split debuginfo",
-                n if n.ends_with(b".bc") => "bitcode",
-                _ => "other",
-            }
-        }
-        #[derive(Default)]
-        struct Row {
-            files: u64,
-            logical: u64,
-            blobs: BTreeSet<Hash>,
-            unique: u64,
-            chunks: BTreeSet<Hash>,
-            chunk_unique: u64,
-        }
-        let mut states = 0u64;
-        let mut crates: BTreeSet<[u8; 32]> = BTreeSet::new();
-        let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
-        let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
-        for (k, v) in self.db.scan_prefix(Table::Incr, &[]) {
-            if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
-                entries.push((k, m));
-            }
-        }
-        for (k, meta) in &entries {
-            let Ok(raw) = self.store.read(&meta.manifest) else { continue };
-            let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
-            states += 1;
-            if let Some(c) = k.get(..32) {
-                crates.insert(c.try_into().unwrap());
-            }
-            for (path, e) in &m.entries {
-                let MEntry::File { hash, size, .. } = e else { continue };
-                let row = rows.entry(kind(path)).or_default();
-                row.files += 1;
-                row.logical += size;
-                if row.blobs.insert(*hash) {
-                    row.unique += size;
-                }
-            }
-        }
-        for row in rows.values_mut() {
-            for blob in &row.blobs {
-                let Ok(f) = store.open_blob(blob) else { continue };
-                let Ok(recipe) = crate::chunk::chunk_file(&f) else { continue };
-                for c in recipe {
-                    if row.chunks.insert(c.hash) {
-                        row.chunk_unique += c.len as u64;
-                    }
-                }
-            }
-        }
-        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        let mut out = format!(
-            "{states} states of {} crates\n{:<20} {:>8} {:>12} {:>14} {:>16}\n",
-            crates.len(),
-            "",
-            "files",
-            "logical GiB",
-            "as files GiB",
-            "as chunks GiB"
-        );
-        let (mut tl, mut tu, mut tc) = (0u64, 0u64, 0u64);
-        for (name, row) in &rows {
-            out += &format!(
-                "{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n",
-                name,
-                row.files,
-                gib(row.logical),
-                gib(row.unique),
-                gib(row.chunk_unique)
-            );
-            tl += row.logical;
-            tu += row.unique;
-            tc += row.chunk_unique;
-        }
-        out += &format!("{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n", "total", "", gib(tl), gib(tu), gib(tc));
-        out
+        analyze(&*self.db, store)
     }
 
     pub fn state_count(&self, crate_key: &Hash) -> usize {
         self.list(crate_key).len()
     }
+}
+
+/// Adds the incremental states recorded in `db`, and the files they are made of, to `live`.
+pub fn mark(db: &dyn Tables, store: &dyn Blobs, live: &mut std::collections::BTreeSet<Hash>) {
+    let mut metas: Vec<StateMeta> = Vec::new();
+    for (_, v) in db.scan_prefix(Table::Incr, &[]) {
+        if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
+            metas.push(m);
+        }
+    }
+    for meta in metas {
+        live.insert(meta.manifest);
+        let Ok(raw) = store.read(&meta.manifest) else { continue };
+        let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
+        for (_, e) in &m.entries {
+            if let MEntry::File { hash, .. } = e {
+                live.insert(*hash);
+            }
+        }
+    }
+}
+
+/// A table of what the incremental states recorded in `db` hold in `store`.
+pub fn analyze(db: &dyn Tables, store: &Store) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    fn kind(path: &[u8]) -> &'static str {
+        let name = path.rsplit(|&c| c == b'/').next().unwrap_or(path);
+        match name {
+            b"dep-graph.bin" => "dep-graph.bin",
+            b"query-cache.bin" => "query-cache.bin",
+            b"work-products.bin" => "work-products.bin",
+            b"metadata.rmeta" => "metadata.rmeta",
+            n if n.ends_with(b".o") => "object files",
+            n if n.ends_with(b".dwo") => "split debuginfo",
+            n if n.ends_with(b".bc") => "bitcode",
+            _ => "other",
+        }
+    }
+    #[derive(Default)]
+    struct Row {
+        files: u64,
+        logical: u64,
+        blobs: BTreeSet<Hash>,
+        unique: u64,
+        chunks: BTreeSet<Hash>,
+        chunk_unique: u64,
+    }
+    let mut states = 0u64;
+    let mut crates: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut rows: BTreeMap<&'static str, Row> = BTreeMap::new();
+    let mut entries: Vec<(Vec<u8>, StateMeta)> = Vec::new();
+    for (k, v) in db.scan_prefix(Table::Incr, &[]) {
+        if let Ok(m) = bincode::deserialize::<StateMeta>(&v) {
+            entries.push((k, m));
+        }
+    }
+    for (k, meta) in &entries {
+        let Ok(raw) = store.read(&meta.manifest) else { continue };
+        let Ok(m) = bincode::deserialize::<Manifest>(&raw) else { continue };
+        states += 1;
+        if let Some(c) = k.get(..32) {
+            crates.insert(c.try_into().unwrap());
+        }
+        for (path, e) in &m.entries {
+            let MEntry::File { hash, size, .. } = e else { continue };
+            let row = rows.entry(kind(path)).or_default();
+            row.files += 1;
+            row.logical += size;
+            if row.blobs.insert(*hash) {
+                row.unique += size;
+            }
+        }
+    }
+    for row in rows.values_mut() {
+        for blob in &row.blobs {
+            let Ok(f) = store.open_blob(blob) else { continue };
+            let Ok(recipe) = crate::chunk::chunk_file(&f) else { continue };
+            for c in recipe {
+                if row.chunks.insert(c.hash) {
+                    row.chunk_unique += c.len as u64;
+                }
+            }
+        }
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let mut out = format!(
+        "{states} states of {} crates\n{:<20} {:>8} {:>12} {:>14} {:>16}\n",
+        crates.len(),
+        "",
+        "files",
+        "logical GiB",
+        "as files GiB",
+        "as chunks GiB"
+    );
+    let (mut tl, mut tu, mut tc) = (0u64, 0u64, 0u64);
+    for (name, row) in &rows {
+        out += &format!(
+            "{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n",
+            name,
+            row.files,
+            gib(row.logical),
+            gib(row.unique),
+            gib(row.chunk_unique)
+        );
+        tl += row.logical;
+        tu += row.unique;
+        tc += row.chunk_unique;
+    }
+    out += &format!("{:<20} {:>8} {:>12.2} {:>14.2} {:>16.2}\n", "total", "", gib(tl), gib(tu), gib(tc));
+    out
 }
 
 #[cfg(test)]
@@ -321,7 +337,7 @@ impl StateMachine for IncrStore {
                 by_crate.entry(c.try_into().unwrap()).or_default().push(u64::from_be_bytes(id.try_into().unwrap()));
             }
         }
-        let next = self.next.load(Ordering::Relaxed);
+        let next = self.next.get();
         for (c, ids) in &by_crate {
             let listed = self.list(&Hash(*c));
             assert!(ids.iter().all(|id| *id < next), "every stored id {ids:?} was handed out, below {next}");
