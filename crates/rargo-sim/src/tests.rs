@@ -164,7 +164,7 @@ fn evicting_a_pinned_blob_is_caught() {
 
 #[test]
 fn delivering_a_stale_output_is_caught() {
-    caught(2, Bug::StaleDelivery, |k| matches!(k, Kind::Drift(_)));
+    caught(6, Bug::StaleDelivery, |k| matches!(k, Kind::Drift(_)));
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn disk_faults_end_the_command_or_recover_with_its_pins() {
     assert_eq!((crash.disk_crashes, crash.torn_writes), (1, 0));
     let torn = run(3, None).expect("builds recover after a torn write");
     assert_eq!((torn.disk_crashes, torn.torn_writes), (1, 1));
-    let full = run(10, None).expect("a full disk ends the command instead of deadlocking");
+    let full = run(19, None).expect("a full disk ends the command instead of deadlocking");
     assert_eq!(full.disk_full_errors, 1);
 }
 
@@ -222,4 +222,26 @@ fn a_disk_full_result_reaches_the_client_after_reconnection() {
         let report = run(seed, None).expect("the command finishes with both faults enabled");
         assert!(report.server_restarts > 0, "seed {seed}");
     }
+}
+
+#[test]
+fn compiler_failures_are_repeatable_for_the_same_inputs() {
+    use crate::model::compile;
+
+    let errors: Vec<_> = (0..100)
+        .filter_map(|seed| compile(seed, 1000, &[b"source"]).err().map(|error| (seed, error)))
+        .collect();
+    assert!(!errors.is_empty());
+    for (seed, error) in errors {
+        assert_eq!(compile(seed, 1000, &[b"source"]), Err(error));
+        assert!((0..100).any(|version| compile(seed, 1000, &[&[version]]).is_ok()));
+    }
+}
+
+#[test]
+fn builds_exercise_compiler_exits_and_discard_staged_artifacts_on_cancel() {
+    let reports: Vec<_> = (0..24).map(|seed| run(seed, None).expect("passes")).collect();
+    assert!(reports.iter().any(|r| r.failed_builds > 0));
+    assert!(reports.iter().any(|r| r.long_runs > 0 && r.cancelled_builds > 0 && r.aborted_runs > 0));
+    assert!(reports.iter().any(|r| r.cancelled_with_outputs > 0));
 }

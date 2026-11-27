@@ -211,6 +211,11 @@ pub struct Report {
     pub end_ms: u64,
     pub trace: Hash,
     pub runs: u64,
+    pub long_runs: u64,
+    pub failed_builds: u64,
+    pub cancelled_builds: u64,
+    pub cancelled_with_outputs: u64,
+    pub aborted_runs: u64,
     pub cache_hits: u64,
     pub tests_passed: u64,
     pub tests_failed: u64,
@@ -322,17 +327,19 @@ enum Node {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Up {
     Hello { cores: usize },
-    Result { job: u64, output: Vec<u8> },
+    Result { job: u64, output: Result<Vec<u8>, Vec<u8>> },
     Join,
     Offer { round: u64, root: Digest, contents: Vec<Digest>, sending: Vec<Digest> },
     Session(ClientMsg),
     Request { round: u64, action: usize, inputs: Vec<Hash> },
+    Cancel { round: u64 },
     Ping,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Down {
     Session(ServerMsg),
+    RoundTerminal { round: u64, msg: ServerMsg },
     Synced { round: u64, root: Digest },
     Pong,
     DiskError { round: u64, message: String },
@@ -370,6 +377,7 @@ enum Ev {
     Crash { worker: u64 },
     ServerCrash,
     Cut { worker: u64 },
+    Cancel { worker: u64, epoch: u64, token: u64 },
     Evict,
     Round { client: u64 },
     Edit { client: u64 },
@@ -413,6 +421,7 @@ struct Sess {
     state: SessionState,
     has: ClientSet,
     offer: Option<Offer>,
+    ended: Option<u64>,
 }
 
 struct Server {
@@ -498,7 +507,10 @@ struct Client {
     scan_root: Digest,
     /// The output filesystem's table of what the client's `target/` holds.
     target: OutputTree,
+    // Dependency outputs are staged until the build succeeds.
     outputs: BTreeMap<usize, Vec<u8>>,
+    round_ended: bool,
+    diagnostic: Option<Vec<u8>>,
     requested: BTreeSet<usize>,
     finished: bool,
     test: Option<TestRun>,
@@ -615,6 +627,11 @@ impl World {
                 end_ms: 0,
                 trace: Hash::of(b""),
                 runs: 0,
+                long_runs: 0,
+                failed_builds: 0,
+                cancelled_builds: 0,
+                cancelled_with_outputs: 0,
+                aborted_runs: 0,
                 cache_hits: 0,
                 tests_passed: 0,
                 tests_failed: 0,
@@ -677,6 +694,8 @@ impl World {
                     scan_root: [0; 32],
                     target: OutputTree::new(BTreeMap::new()),
                     outputs: BTreeMap::new(),
+                    round_ended: false,
+                    diagnostic: None,
                     requested: BTreeSet::new(),
                     finished: false,
                     test: None,
@@ -950,6 +969,12 @@ impl World {
 
     fn check(&self) -> Step {
         rargo_machine::check_all(self.machines());
+        for client in self.clients.values() {
+            assert!(client.target.files.is_empty() || client.target.files.len() == self.project.actions.len());
+            if client.round_ended {
+                assert!(client.outputs.is_empty() && client.pending.is_empty() && client.parts.is_empty());
+            }
+        }
         for (client, sess) in &self.server.sessions {
             let Some(o) = &sess.offer else { continue };
             for h in &o.arrived {
@@ -987,6 +1012,19 @@ impl World {
             Ev::Crash { worker } => self.crash(worker),
             Ev::ServerCrash => self.server_crash(),
             Ev::Cut { worker } => self.cut(worker),
+            Ev::Cancel { worker, epoch, token } => {
+                if self.workers[&worker].epoch == epoch
+                    && let Some((job, _)) = self.workers[&worker].running.get(&token)
+                    && let Some(j) = self.server.jobs.get(job)
+                    && j.round == self.clients[&j.client].round
+                    && self.clients[&j.client].up
+                    && !self.clients[&j.client].round_ended
+                    && self.clients[&j.client].outputs.len() < self.project.actions.len()
+                {
+                    self.send(Node::Client(j.client), Node::Server, Msg::Up(Up::Cancel { round: j.round }));
+                }
+                Ok(())
+            }
             Ev::Evict => {
                 self.evict();
                 Ok(())
@@ -1079,7 +1117,11 @@ impl World {
                 let now = self.now;
                 let node = self.workers.get_mut(&w).expect("known");
                 let store = &node.store;
+                let cancel = matches!(m, FromServer::Cancel { .. });
                 let fx = node.sm.server(m, &|h| store.contains_key(h), now);
+                if cancel && fx.iter().any(|e| matches!(e, worker_state::Effect::Abort { .. })) {
+                    self.report.aborted_runs += 1;
+                }
                 self.worker_effects(w, fx)
             }
             (_, Msg::Down(d)) => {
@@ -1234,6 +1276,12 @@ impl World {
                     node.running.insert(token, (action, run));
                     let epoch = node.epoch;
                     self.schedule(ms, Ev::Finish { worker, epoch, token });
+                    if ms >= model::LONG_RUN_MS {
+                        self.report.long_runs += 1;
+                        if self.seed.is_multiple_of(3) {
+                            self.schedule(ms / 2, Ev::Cancel { worker, epoch, token });
+                        }
+                    }
                 }
                 worker_state::Effect::Abort { token } => {
                     self.workers.get_mut(&worker).expect("known").running.remove(&token);
@@ -1251,7 +1299,7 @@ impl World {
         }
         let Some((job, run)) = node.running.remove(&token) else { return Ok(()) };
         let inputs: Vec<&[u8]> = run.inputs.iter().map(|h| node.store[h].as_slice()).collect();
-        let output = model::compile(self.project.actions[run.action].id, &inputs);
+        let output = model::compile(self.seed, self.project.actions[run.action].id, &inputs);
         let fx = node.sm.ended(token);
         self.report.runs += 1;
         for e in fx {
@@ -1307,7 +1355,7 @@ impl World {
             .count();
         self.report.clients_at_eviction = self.report.clients_at_eviction.max(active_clients);
         let worker = self.rng.range(1, self.cfg.workers);
-        let busy: BTreeSet<Hash> = self
+        let mut busy: BTreeSet<Hash> = self
             .server
             .jobs
             .values()
@@ -1315,6 +1363,7 @@ impl World {
             .flat_map(|j| j.inputs.iter().copied())
             .collect();
         let node = self.workers.get_mut(&worker).expect("known");
+        busy.extend(node.running.values().flat_map(|(_, run)| run.inputs.iter().copied()));
         if let Some(h) = node.store.keys().find(|h| !busy.contains(h)).copied() {
             node.store.remove(&h);
         }
@@ -1339,7 +1388,7 @@ impl World {
             Up::Ping => self.send(Node::Server, Node::Client(client), Msg::Down(Down::Pong)),
             Up::Join => {
                 self.drop_session(client);
-                let mut sess = Sess { state: SessionState::new(), has: ClientSet::default(), offer: None };
+                let mut sess = Sess { state: SessionState::new(), has: ClientSet::default(), offer: None, ended: None };
                 sess.state.knows(&mut sess.has, std::iter::empty());
                 self.server.sessions.insert(client, sess);
             }
@@ -1362,6 +1411,7 @@ impl World {
                 }
                 self.try_finish_offer(client);
             }
+            Up::Cancel { round } => self.end_server_round(client, round, model::CANCELLED, None),
             Up::Session(m) => {
                 let server = &mut self.server;
                 let sess = server.sessions.get_mut(&client).expect("a client joins before it uploads");
@@ -1394,6 +1444,9 @@ impl World {
                 }
             }
             Up::Request { round, action, inputs } => {
+                if self.server.sessions[&client].ended == Some(round) {
+                    return Ok(());
+                }
                 if self.bug == Some(Bug::NeverAnswer) && self.rng.chance(40) {
                     return Ok(());
                 }
@@ -1431,6 +1484,48 @@ impl World {
         for other in self.pending_offers() {
             self.rewant(other);
         }
+    }
+
+    fn cancel_jobs(&mut self, client: u64, round: u64) {
+        let jobs: Vec<_> = self
+            .server
+            .jobs
+            .iter()
+            .filter(|(_, j)| j.client == client && j.round == round)
+            .map(|(&job, _)| job)
+            .collect();
+        for job in jobs {
+            self.server.ready.retain(|&ready| ready != job);
+            let j = self.server.jobs.remove(&job).expect("selected job");
+            let fx = self.server.pool.finished(job, false);
+            self.pool_effects(fx);
+            if let Some(worker) = j.worker {
+                let fx = self.server.pool.give_back(worker);
+                self.pool_effects(fx);
+            }
+            let fx = if self.server.sched.is_running(job) {
+                self.server.sched.release(job)
+            } else {
+                self.server.sched.cancel(job)
+            };
+            self.sched_effects(fx);
+        }
+    }
+
+    fn end_server_round(&mut self, client: u64, round: u64, code: i32, diagnostic: Option<Vec<u8>>) {
+        if self.server.held.get(&client).is_none_or(|(held, _)| *held != round) {
+            return;
+        }
+        let Some(sess) = self.server.sessions.get_mut(&client) else { return };
+        if sess.ended == Some(round) {
+            return;
+        }
+        sess.ended = Some(round);
+        self.cancel_jobs(client, round);
+        if let Some(bytes) = diagnostic {
+            self.send(Node::Server, Node::Client(client), Msg::Down(Down::RoundTerminal { round, msg: ServerMsg::Stderr(bytes) }));
+        }
+        self.send(Node::Server, Node::Client(client), Msg::Down(Down::RoundTerminal { round, msg: ServerMsg::Exit(code) }));
     }
 
     fn pending_offers(&self) -> Vec<u64> {
@@ -1528,6 +1623,13 @@ impl World {
                 let j = self.server.jobs.remove(&job).expect("a routed job is known");
                 let fx = self.server.sched.release(job);
                 self.sched_effects(fx);
+                let output = match output {
+                    Ok(output) => output,
+                    Err(diagnostic) => {
+                        self.end_server_round(j.client, j.round, model::FAILED, Some(diagnostic));
+                        return Ok(());
+                    }
+                };
                 let out = Hash::of(&output);
                 let fault = if !self.server.pins.is_empty()
                     && !self.server.store().has(&out)
@@ -1564,7 +1666,7 @@ impl World {
                 disk::cache(self.server.store(), j.key, out);
                 self.deliver_output(j.client, j.round, j.action, out, output)?;
             }
-            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Ping => unreachable!("only clients say this"),
+            Up::Join | Up::Offer { .. } | Up::Session(_) | Up::Request { .. } | Up::Cancel { .. } | Up::Ping => unreachable!("only clients say this"),
         }
         Ok(())
     }
@@ -1583,7 +1685,9 @@ impl World {
                     let fx = self.server.sched.request(job, Priority::Agent, mem_kb);
                     self.sched_effects(fx);
                 }
-                pool_state::Effect::Cancel { .. } => {}
+                pool_state::Effect::Cancel { worker, action } => {
+                    self.send(Node::Server, Node::Worker(worker), Msg::Work(FromServer::Cancel { action }));
+                }
             }
         }
         if wake {
@@ -1617,7 +1721,9 @@ impl World {
             assert!(self.server.pool.sent(job, worker), "a leased worker is here");
             let j = self.server.jobs.get_mut(&job).expect("a granted job is known");
             j.worker = Some(worker);
-            let run = SimRun { action: j.action, inputs: j.inputs.clone(), ms: self.project.actions[j.action].ms };
+            let a = &self.project.actions[j.action];
+            let ms = model::duration(self.seed, model::key(a.id, &j.inputs), a.ms);
+            let run = SimRun { action: j.action, inputs: j.inputs.clone(), ms };
             let pushes: Vec<_> = run.inputs.iter().map(|h| {
                 (*h, self.server.store().read(h).expect("a pinned job input is readable"))
             }).collect();
@@ -1646,7 +1752,7 @@ impl World {
 
     fn checkout(&mut self, client: u64, round: u64) -> Step {
         let c = self.clients.get_mut(&client).expect("known");
-        if c.round != round || c.outputs.len() == self.project.actions.len() {
+        if c.round_ended || c.round != round || c.outputs.len() == self.project.actions.len() {
             return Ok(());
         }
         // Versions 0 and 1 are used by single-file edits on the original branch.
@@ -1695,6 +1801,8 @@ impl World {
         c.edit_scheduled = false;
         c.synced_round = 0;
         c.outputs.clear();
+        c.round_ended = false;
+        c.diagnostic = None;
         c.requested.clear();
         c.pending.clear();
         c.daemon.changed(1, false);
@@ -1704,7 +1812,7 @@ impl World {
     fn sync(&mut self, client: u64) -> Step {
         let now = self.now;
         let c = self.clients.get_mut(&client).expect("known");
-        if c.finished || c.dead || c.round == 0 {
+        if c.round_ended || c.finished || c.dead || c.round == 0 {
             return Ok(());
         }
         match c.daemon.link(c.up, Need::Must) {
@@ -1866,7 +1974,7 @@ impl World {
 
     fn request_ready(&mut self, client: u64) {
         let c = &self.clients[&client];
-        if c.synced_round != c.round {
+        if c.round_ended || c.synced_round != c.round {
             return;
         }
         let ready = self.project.ready(&|a| c.outputs.contains_key(&a), &|a| c.requested.contains(&a));
@@ -1908,6 +2016,13 @@ impl World {
                 self.request_ready(client);
                 return Ok(());
             }
+            Down::RoundTerminal { round, msg } => {
+                let c = &self.clients[&client];
+                if round != c.round || c.outputs.len() == self.project.actions.len() {
+                    return Ok(());
+                }
+                msg
+            }
             Down::Session(m) => m,
             Down::Pong => return Ok(()),
             Down::DiskError { round, message } => {
@@ -1921,7 +2036,36 @@ impl World {
             }
         };
         let c = self.clients.get_mut(&client).expect("known");
+        if c.round_ended {
+            return Ok(());
+        }
         match m {
+            ServerMsg::Stderr(bytes) => c.diagnostic = Some(bytes),
+            ServerMsg::Exit(code @ (model::FAILED | model::CANCELLED)) => {
+                if code == model::FAILED {
+                    let c = &self.clients[&client];
+                    let expected = c
+                        .requested
+                        .iter()
+                        .filter(|a| !c.outputs.contains_key(a))
+                        .filter_map(|&a| self.compiler_error(c, a))
+                        .any(|diagnostic| c.diagnostic.as_ref() == Some(&diagnostic));
+                    if !expected {
+                        return Err(Kind::Drift(format!("client {client} received an unexpected compiler diagnostic")));
+                    }
+                    self.report.failed_builds += 1;
+                } else {
+                    self.report.cancelled_builds += 1;
+                    self.report.cancelled_with_outputs += u64::from(!c.outputs.is_empty());
+                }
+                let c = self.clients.get_mut(&client).expect("known");
+                c.round_ended = true;
+                c.outputs.clear();
+                c.pending.clear();
+                c.parts.clear();
+                c.test = None;
+                self.complete_round(client);
+            }
             ServerMsg::WantBlobs(want) => {
                 if self.bug == Some(Bug::StaleKnowledge) {
                     return Ok(());
@@ -1978,10 +2122,16 @@ impl World {
 
     fn client_done(&mut self, client: u64, round: u64, action: usize, output: Vec<u8>) -> Step {
         let c = &self.clients[&client];
-        if round != c.round || c.outputs.contains_key(&action) || !c.requested.contains(&action) {
+        if c.round_ended || round != c.round || c.outputs.contains_key(&action) || !c.requested.contains(&action) {
             return Ok(());
         }
         let want = &c.reference[action];
+        if self.compiler_error(c, action).is_some() {
+            return Err(Kind::Drift(format!(
+                "client {client} round {round} got output for action {} that should fail",
+                self.project.actions[action].id
+            )));
+        }
         if &output != want {
             return Err(Kind::Drift(format!(
                 "client {client} round {round} got {:?} for action {} where its tree gives {:?}",
@@ -1991,17 +2141,9 @@ impl World {
             )));
         }
         let c = self.clients.get_mut(&client).expect("known");
-        // The daemon shows each delivery in `target/` as one edit of the output filesystem's table.
-        let file = VFile { hash: Hash::of(&output).0, size: output.len() as u64, exec: false, mtime_ns: ns(self.now) };
-        let path = worktree::target_path(self.project.actions[action].id);
-        if self.bug != Some(Bug::UnshownOutputs) {
-            c.target.apply(c.target.generation + 1, vec![Edit::Put { path, file, replaced_real: false }]);
-            // The table changes only here, so its invariants are checked here and not after every event.
-            c.target.invariants();
-        }
         c.outputs.insert(action, output);
         if c.outputs.len() == self.project.actions.len() {
-            self.check_target(client)?;
+            self.publish_target(client)?;
             let c = self.clients.get_mut(&client).expect("known");
             if let Some(test) = &mut c.test {
                 let scheduled = test.built();
@@ -2013,6 +2155,28 @@ impl World {
         }
         self.request_ready(client);
         Ok(())
+    }
+
+    fn compiler_error(&self, c: &Client, action: usize) -> Option<Vec<u8>> {
+        let spec = &self.project.actions[action];
+        let sources = spec.sources.iter().filter_map(|&s| c.snapshot[s].as_deref());
+        let deps = spec.deps.iter().map(|&d| c.reference[d].as_slice());
+        let inputs: Vec<_> = sources.chain(deps).collect();
+        model::compile(self.seed, spec.id, &inputs).err()
+    }
+
+    fn publish_target(&mut self, client: u64) -> Step {
+        let c = self.clients.get_mut(&client).expect("known");
+        if self.bug != Some(Bug::UnshownOutputs) {
+            let edits = c.outputs.iter().map(|(&action, output)| {
+                let file = VFile { hash: Hash::of(output).0, size: output.len() as u64, exec: false, mtime_ns: ns(self.now) };
+                let path = worktree::target_path(self.project.actions[action].id);
+                Edit::Put { path, file, replaced_real: false }
+            }).collect();
+            c.target.apply(c.target.generation + 1, edits);
+            c.target.invariants();
+        }
+        self.check_target(client)
     }
 
     /// What the round left in the client's `target/` is a clean build of its tree, and nothing else.
@@ -2098,6 +2262,7 @@ fn label(ev: &Ev) -> String {
         Ev::Crash { worker } => format!("crash {worker};"),
         Ev::ServerCrash => "server crash and restart;".to_string(),
         Ev::Cut { worker } => format!("cut {worker};"),
+        Ev::Cancel { worker, epoch, token } => format!("cancel {worker}@{epoch}/{token};"),
         Ev::Evict => "evict;".to_string(),
         Ev::Round { client } => format!("round {client};"),
         Ev::Edit { client } => format!("edit {client};"),
@@ -2122,6 +2287,28 @@ pub fn run_off(seed: u64, bug: Option<Bug>, off: Off) -> Result<Report, Failure>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_cancellation_cannot_end_the_next_round() {
+        let mut world = World::new(0, None, Off::none());
+        let client = world.clients.get_mut(&1).unwrap();
+        client.round = 2;
+        client.outputs.insert(0, b"staged output".to_vec());
+        world
+            .client_hears(1, Down::RoundTerminal { round: 1, msg: ServerMsg::Exit(model::CANCELLED) })
+            .unwrap();
+        assert!(!world.clients[&1].round_ended);
+        assert_eq!(world.report.cancelled_builds, 0);
+        assert_eq!(world.clients[&1].outputs.len(), 1);
+
+        world
+            .client_hears(1, Down::RoundTerminal { round: 2, msg: ServerMsg::Exit(model::CANCELLED) })
+            .unwrap();
+        assert!(world.clients[&1].round_ended);
+        assert_eq!(world.report.cancelled_builds, 1);
+        assert!(world.clients[&1].outputs.is_empty());
+        assert!(world.clients[&1].target.files.is_empty());
+    }
 
     #[test]
     fn a_server_restart_reloads_shared_pins_and_discards_old_links() {
