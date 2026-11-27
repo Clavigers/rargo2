@@ -64,7 +64,7 @@ impl Report {
 pub fn check(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, time: fn() -> Instant) -> Result<Report> {
     let scratch = d.scratch("drift")?;
     let result = check_in(d, snapshot, who, &scratch, time);
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = crate::io::file::remove_dir_all(&scratch);
     result
 }
 
@@ -93,7 +93,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
     let (snap, scratch2, home) = (snapshot.clone(), scratch.to_path_buf(), who.home.dir.clone());
     let started = time();
     let stock_cwd = scratch.join(&who.dir);
-    let stock = (|| -> Result<std::process::Output> {
+    let stock = (|| -> Result<crate::io::process::Output> {
         use std::os::unix::process::CommandExt;
         let stock_cwd = crate::io::cpu(|| -> Result<std::path::PathBuf> {
             snap.materialize(&scratch2, uid, gid, &|_, _| true)?;
@@ -101,7 +101,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             anyhow::ensure!(stock_cwd.starts_with(scratch2.ring_canonicalize()?), "drift check directory is outside the snapshot");
             Ok(stock_cwd)
         })?;
-        let mut c = std::process::Command::new("nice");
+        let mut c = crate::io::process::Command::new("nice");
         c.args(["-n", "19", cargo.as_str(), "build", "--offline", "-j", "4"])
             .current_dir(&stock_cwd)
             .env_clear()
@@ -111,11 +111,11 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             .env("RUSTC_WORKSPACE_WRAPPER", "")
             .env("CARGO_HOME", &home)
             .env("CARGO_TARGET_DIR", scratch2.join("target-stock"))
-            .stdin(std::process::Stdio::null());
-        if uid != unsafe { libc::geteuid() } {
-            c.uid(uid).gid(gid);
+            .stdin(crate::io::process::Stdio::null());
+        if uid != crate::io::process::euid() {
+            c.std_mut().uid(uid).gid(gid);
         }
-        crate::io::output(&mut c).context("running stock cargo")
+        c.output().context("running stock cargo")
     })()?;
     let stock_ran = (started, time());
 
@@ -130,7 +130,7 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
             root: "/w".into(),
             cwd: std::path::Path::new("/w").join(&who.dir).to_string_lossy().into_owned(),
             cargo_home: "/c".into(),
-            env: Arc::new(ClientEnv::new(env.into_iter().collect(), Vec::new(), None)),
+            env: Arc::new(ClientEnv::new(env, Vec::new(), None)),
             uid,
             gid,
             prio: Priority::Background,

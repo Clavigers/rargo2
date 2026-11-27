@@ -3,6 +3,14 @@ mod conn;
 mod endpoint;
 mod handshake;
 
+/// The UDP link's state machines and packet adapters for shells with their own clock and I/O.
+pub mod sans_io {
+    pub use crate::conn::{Admit, ConnState, Output, Packet, ack_packet, data_packet};
+    pub use crate::endpoint::{EndpointState, RouteEvent, Routed};
+    pub use crate::handshake::{Action, Agreed, Handshake};
+    pub use crate::{HANDSHAKE_WAIT, LinkKey, seal};
+}
+
 use rargo_machine::StateMachine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -50,6 +58,35 @@ pub struct NetStats {
 
 pub type LinkKey = Option<Arc<[u8; 32]>>;
 
+/// A source of random bytes: connection ids, handshake ephemerals and the
+/// seed of the retransmit jitter all come from one, passed in by the caller.
+/// `io::os_random` is the real one, `io::seeded_random` the one for tests.
+pub trait Random: Send + Sync {
+    fn fill(&self, out: &mut [u8]);
+}
+
+fn draw_u64(random: &dyn Random) -> u64 {
+    let mut b = [0u8; 8];
+    random.fill(&mut b);
+    u64::from_le_bytes(b)
+}
+
+/// A new connection's id: odd, so it is never zero.
+fn conn_id(random: &dyn Random) -> u64 {
+    draw_u64(random) | 1
+}
+
+/// The seed of a connection's xorshift jitter, which must not be zero.
+fn jitter_seed(random: &dyn Random) -> u64 {
+    draw_u64(random) | 1
+}
+
+fn ephemeral(random: &dyn Random) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    random.fill(&mut b);
+    b
+}
+
 pub type UserKeys = Arc<dyn Fn(&str) -> Option<[u8; 32]> + Send + Sync>;
 
 #[derive(Clone)]
@@ -70,12 +107,12 @@ const AGREEMENT: u64 = 1;
 fn handshake_key(key: &[u8; 32]) -> [u8; 32] {
     blake3::derive_key("rargo worker link handshake v2", key)
 }
-const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
+pub const HANDSHAKE_WAIT: Duration = Duration::from_secs(20);
 const TAG: usize = 16;
 const _: () = assert!(DATA_HDR + FRAG + 2 * TAG <= 1500 - 20 - 8);
 const _: () = assert!(AGREEMENT >= 1, "message ids start at 1");
 
-fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
+pub fn seal(key: &LinkKey, pkt: &mut Vec<u8>) {
     if let Some(k) = key {
         let before = pkt.len();
         let tag = blake3::keyed_hash(k, pkt);
@@ -115,11 +152,12 @@ pub struct Conn {
     closed: std::sync::atomic::AtomicBool,
     last_heard: Mutex<Instant>,
     rng: AtomicU64,
+    random: Arc<dyn Random>,
     handshake_in: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Conn {
-    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey, per_conn: bool) -> Arc<Conn> {
+    fn new(id: u64, sock: Arc<UdpSocket>, peer: SocketAddr, key: LinkKey, per_conn: bool, random: Arc<dyn Random>) -> Arc<Conn> {
         let (tx, rx) = io::unbounded_channel();
         let c = Arc::new(Conn {
             id,
@@ -130,7 +168,7 @@ impl Conn {
             user: std::sync::OnceLock::new(),
             sock,
             peer: Mutex::new(peer),
-            epoch: Instant::now(),
+            epoch: io::now(),
             state: Mutex::new(conn::ConnState::new(id)),
             wake_sender: Notify::new(),
             send_settled: Notify::new(),
@@ -139,8 +177,9 @@ impl Conn {
             inbound_rx: FiberMutex::new(rx),
             stats: NetStats::default(),
             closed: std::sync::atomic::AtomicBool::new(false),
-            last_heard: Mutex::new(Instant::now()),
-            rng: AtomicU64::new(id | 1),
+            last_heard: Mutex::new(io::now()),
+            rng: AtomicU64::new(jitter_seed(random.as_ref())),
+            random,
             handshake_in: Mutex::new(Vec::new()),
         });
         let c2 = c.clone();
@@ -165,7 +204,7 @@ impl Conn {
     }
 
     pub fn idle(&self) -> Duration {
-        self.last_heard.lock().elapsed()
+        io::now().saturating_duration_since(*self.last_heard.lock())
     }
 
     pub fn close(&self) {
@@ -259,10 +298,8 @@ impl Conn {
         self.handshake_in.lock().push(msg.to_vec());
     }
 
-    fn ephemeral() -> [u8; 32] {
-        let mut b = [0u8; 32];
-        unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 32, 0) };
-        b
+    fn ephemeral(&self) -> [u8; 32] {
+        ephemeral(self.random.as_ref())
     }
 
     fn install(&self, agreed: handshake::Agreed) {
@@ -288,7 +325,7 @@ impl Conn {
     }
 
     fn drive(&self, hs: &mut handshake::Handshake, keys: Option<&UserKeys>) -> sio::Result<handshake::Agreed> {
-        let deadline = Instant::now() + HANDSHAKE_WAIT;
+        let deadline = io::now() + HANDSHAKE_WAIT;
         let mut action = hs.start()?;
         loop {
             hs.invariants();
@@ -298,7 +335,7 @@ impl Conn {
                     action = hs.sent()?;
                 }
                 handshake::Action::Wait => {
-                    let left = deadline.saturating_duration_since(Instant::now());
+                    let left = deadline.saturating_duration_since(io::now());
                     if left.is_zero() {
                         return Err(hs.timeout_error());
                     }
@@ -334,31 +371,31 @@ impl Conn {
     }
 
     fn agree_as_initiator(&self, key: &[u8; 32]) -> sio::Result<()> {
-        let mut hs = handshake::Handshake::shared_initiator(*key, Self::ephemeral());
+        let mut hs = handshake::Handshake::shared_initiator(*key, self.ephemeral());
         self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
 
     fn agree_as_responder(&self, key: &[u8; 32]) -> sio::Result<()> {
-        let mut hs = handshake::Handshake::shared_responder(*key, Self::ephemeral());
+        let mut hs = handshake::Handshake::shared_responder(*key, self.ephemeral());
         self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
 
     fn agree_as_user(&self, name: &str, psk: &[u8; 32], marked: bool) -> sio::Result<()> {
-        let mut hs = handshake::Handshake::user_initiator(name, *psk, Self::ephemeral(), marked);
+        let mut hs = handshake::Handshake::user_initiator(name, *psk, self.ephemeral(), marked);
         self.install(self.drive(&mut hs, None)?);
         Ok(())
     }
 
     fn agree_with_user(&self, keys: &UserKeys) -> sio::Result<()> {
-        let mut hs = handshake::Handshake::user_responder(Self::ephemeral());
+        let mut hs = handshake::Handshake::user_responder(self.ephemeral());
         self.install(self.drive(&mut hs, Some(keys))?);
         Ok(())
     }
 
     fn now(&self) -> Duration {
-        self.epoch.elapsed()
+        io::now().saturating_duration_since(self.epoch)
     }
 
     fn jitter(rng: &AtomicU64) -> u64 {
@@ -476,6 +513,7 @@ pub struct Endpoint {
     accept_rx: FiberMutex<UnboundedReceiver<Arc<Conn>>>,
     key: LinkKey,
     auth: Auth,
+    random: Arc<dyn Random>,
 }
 
 impl Endpoint {
@@ -492,6 +530,11 @@ impl Endpoint {
     }
 
     pub fn bind_auth(addr: SocketAddr, accepting: bool, auth: Auth) -> sio::Result<Arc<Endpoint>> {
+        Endpoint::bind_random(addr, accepting, auth, io::os_random())
+    }
+
+    /// Binds an endpoint that draws every random value from `random`.
+    pub fn bind_random(addr: SocketAddr, accepting: bool, auth: Auth, random: Arc<dyn Random>) -> sio::Result<Arc<Endpoint>> {
         let key: LinkKey = match &auth {
             Auth::Shared(k) => Some(k.clone()),
             _ => None,
@@ -504,11 +547,12 @@ impl Endpoint {
             sock,
             conns: Mutex::new(HashMap::new()),
             state: Mutex::new(endpoint::EndpointState::new(accepting, per_conn, key.clone())),
-            t0: Instant::now(),
+            t0: io::now(),
             accept_tx: tx,
             accept_rx: FiberMutex::new(rx),
             key,
             auth,
+            random,
         });
         let ep2 = ep.clone();
         io::spawn(move || ep2.recv_loop());
@@ -520,13 +564,9 @@ impl Endpoint {
     }
 
     pub fn connect(&self, peer: SocketAddr) -> sio::Result<Arc<Conn>> {
-        let id = {
-            let mut b = [0u8; 8];
-            unsafe { libc::getrandom(b.as_mut_ptr() as *mut _, 8, 0) };
-            u64::from_le_bytes(b) | 1
-        };
-        let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn());
-        let now = self.t0.elapsed().as_millis() as u64;
+        let id = conn_id(self.random.as_ref());
+        let c = Conn::new(id, self.sock.clone(), peer, self.key.clone(), self.per_conn(), self.random.clone());
+        let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
         assert!(self.state.lock().connect(id, peer, now), "connection ids are unique");
         assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
         let agreed = match &self.auth {
@@ -570,7 +610,7 @@ impl Endpoint {
     }
 
     fn open_conn(&self, id: u64, from: SocketAddr) {
-        let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn());
+        let c = Conn::new(id, self.sock.clone(), from, self.key.clone(), self.per_conn(), self.random.clone());
         assert!(self.conns.lock().insert(id, c.clone()).is_none(), "connection ids are unique");
         match (self.key.clone(), &self.auth) {
             (_, Auth::Users(keys)) => {
@@ -606,14 +646,14 @@ impl Endpoint {
 
     fn ingest(&self, from: SocketAddr, bytes: &[u8]) {
         self.sync_tag(bytes);
-        let now = self.t0.elapsed().as_millis() as u64;
+        let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
         let routed = self.state.lock().recv(from, bytes, now);
         for ev in routed.events {
             match ev {
                 endpoint::RouteEvent::Open { id, from } => self.open_conn(id, from),
                 endpoint::RouteEvent::Peer { id, from } => {
                     if let Some(c) = self.conns.lock().get(&id) {
-                        *c.last_heard.lock() = Instant::now();
+                        *c.last_heard.lock() = io::now();
                         *c.peer.lock() = from;
                     }
                 }
@@ -659,4 +699,41 @@ impl Endpoint {
     }
 }
 
+#[cfg(test)]
+mod tests_sim;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    fn draws(seed: u64) -> (Vec<u64>, [u8; 32], u64) {
+        let random = io::seeded_random(seed);
+        let ids = (0..4).map(|_| conn_id(random.as_ref())).collect();
+        (ids, ephemeral(random.as_ref()), jitter_seed(random.as_ref()))
+    }
+
+    #[test]
+    fn the_same_seed_gives_the_same_ids() {
+        let (ids, eph, jitter) = draws(7);
+        assert_eq!(draws(7), (ids.clone(), eph, jitter), "a run is a function of its seed");
+        assert!(ids.iter().all(|id| id & 1 == 1), "connection ids are never zero");
+        assert_ne!(jitter, 0, "xorshift never leaves zero");
+        let mut distinct = ids.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), ids.len(), "one run's ids differ");
+        assert_ne!(draws(8).0, ids, "another seed gives other ids");
+    }
+
+    #[test]
+    fn a_seeded_source_fills_any_length() {
+        let random = io::seeded_random(1);
+        let mut odd = [0u8; 13];
+        random.fill(&mut odd);
+        assert_ne!(odd, [0u8; 13]);
+        let (a, b) = (io::seeded_random(1), io::seeded_random(1));
+        let (mut x, mut y) = ([0u8; 13], [0u8; 13]);
+        a.fill(&mut x);
+        b.fill(&mut y);
+        assert_eq!(x, y);
+    }
+}

@@ -419,6 +419,8 @@ impl StateMachine for TraceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use crate::db::MemTables;
 
     fn trace(n: u8, created: u64) -> Trace {
@@ -439,6 +441,7 @@ mod tests {
 
     #[test]
     fn trace_ids_follow_the_given_seed_and_each_key_keeps_its_newest() {
+        let mut outcomes = Transcript::default();
         let (a, b) = (Hash::of(b"action a"), Hash::of(b"action b"));
         let run = |seed: u64| {
             let db = Arc::new(MemTables::default());
@@ -454,27 +457,30 @@ mod tests {
         let (db, c, keys) = run(500);
         assert_eq!(run(500).2, keys, "the same seed gives the same ids");
         assert_ne!(run(7).2, keys);
-        let of_a: Vec<u64> = (500..530).filter(|i| (i - 500) % 3 != 0).rev().collect();
-        assert_eq!(ids(&c, &a), of_a, "20 traces of a, newest first");
-        let of_b: Vec<u64> = (500..530).filter(|i| (i - 500) % 3 == 0).rev().collect();
-        assert_eq!(ids(&c, &b), of_b);
+        // 20 traces of a, newest first.
+        outcomes.record("ids", ids(&c, &a));
+        outcomes.record("ids", ids(&c, &b));
         for n in 0..30u8 {
             c.insert(&a, trace(n, 2000));
             c.invariants();
         }
-        assert_eq!(ids(&c, &a), (530..560).rev().take(MAX_TRACES_PER_KEY).collect::<Vec<u64>>(), "only the newest 24 are kept");
-        assert_eq!(db.scan_prefix(Table::Traces, &a.0).len(), MAX_TRACES_PER_KEY, "and the rest are deleted");
-        assert_eq!(c.traces(&a)[0].1.created, 2000, "a trace keeps the time it was given");
+        // only the newest 24 are kept.
+        outcomes.record("ids", ids(&c, &a));
+        // and the rest are deleted.
+        outcomes.record("scan prefix", db.scan_prefix(Table::Traces, &a.0).len());
+        // a trace keeps the time it was given.
+        outcomes.record("traces", c.traces(&a)[0].1.created);
         c.remove(&a, 545);
         c.invariants();
         assert!(!ids(&c, &a).contains(&545));
 
         let again = TraceCache::new(db.clone(), 900);
-        assert_eq!(ids(&again, &a), ids(&c, &a), "another cache reads the same traces back");
+        // another cache reads the same traces back.
+        outcomes.record("ids", ids(&again, &a));
         again.invariants();
         let created: Vec<u64> = again.traces(&b).iter().map(|(_, t)| t.created).collect();
-        assert_eq!(created, (0..30u64).filter(|n| n % 3 == 0).rev().map(|n| 1000 + n).collect::<Vec<u64>>());
-        assert_eq!(again.all().len(), MAX_TRACES_PER_KEY - 1 + 10);
+        outcomes.record("created", created);
+        outcomes.record("all", again.all().len());
         let mut live = std::collections::BTreeSet::new();
         again.mark(&mut live);
         let expected: std::collections::BTreeSet<Hash> = again
@@ -487,25 +493,47 @@ mod tests {
             .collect();
         assert_eq!(live, expected, "every kept trace's outputs are live");
         assert!(live.contains(&Hash([0; 32])), "including the oldest trace of b");
+        expect![[r#"
+            ids: [529, 528, 526, 525, 523, 522, 520, 519, 517, 516, 514, 513, 511, 510, 508, 507, 505, 504, 502, 501]
+            ids: [527, 524, 521, 518, 515, 512, 509, 506, 503, 500]
+            ids: [559, 558, 557, 556, 555, 554, 553, 552, 551, 550, 549, 548, 547, 546, 545, 544, 543, 542, 541, 540, 539, 538, 537, 536]
+            scan prefix: 24
+            traces: 2000
+            ids: [559, 558, 557, 556, 555, 554, 553, 552, 551, 550, 549, 548, 547, 546, 544, 543, 542, 541, 540, 539, 538, 537, 536]
+            created: [1027, 1024, 1021, 1018, 1015, 1012, 1009, 1006, 1003, 1000]
+            all: 33
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn the_environment_an_action_needs_is_merged_and_remembered() {
+        let mut outcomes = Transcript::default();
         let db = Arc::new(MemTables::default());
         let c = TraceCache::new(db.clone(), 1);
         let (a, b) = (Hash::of(b"a"), Hash::of(b"b"));
-        assert!(c.needs_env(&a).is_empty() && c.every_env_name().is_empty());
+        outcomes.record("initial environment names", (c.needs_env(&a), c.every_env_name()));
         c.invariants();
-        assert_eq!(c.add_needs_env(&a, &["PATH".into(), "HOME".into()]), ["PATH", "HOME"]);
+        outcomes.record("add needs env", c.add_needs_env(&a, &["PATH".into(), "HOME".into()]));
         c.invariants();
-        assert_eq!(c.add_needs_env(&a, &["HOME".into(), "CC".into()]), ["CC"]);
-        assert!(c.add_needs_env(&a, &["CC".into()]).is_empty());
-        assert_eq!(c.add_needs_env(&b, &["RUSTFLAGS".into()]), ["RUSTFLAGS"]);
+        outcomes.record("add needs env", c.add_needs_env(&a, &["HOME".into(), "CC".into()]));
+        outcomes.record("add needs env", c.add_needs_env(&a, &["CC".into()]));
+        outcomes.record("add needs env", c.add_needs_env(&b, &["RUSTFLAGS".into()]));
         c.invariants();
-        assert_eq!(c.needs_env(&a), ["CC", "HOME", "PATH"]);
-        assert_eq!(c.every_env_name(), ["CC", "HOME", "PATH", "RUSTFLAGS"]);
+        outcomes.record("needs env", c.needs_env(&a));
+        outcomes.record("every env name", c.every_env_name());
         let again = TraceCache::new(db, 1);
-        assert_eq!(again.all_needs_env().len(), 2);
-        assert_eq!(again.every_env_name(), ["CC", "HOME", "PATH", "RUSTFLAGS"]);
+        outcomes.record("all needs env", again.all_needs_env().len());
+        outcomes.record("every env name", again.every_env_name());
+        expect![[r#"
+            initial environment names: ([], [])
+            add needs env: ["PATH", "HOME"]
+            add needs env: ["CC"]
+            add needs env: []
+            add needs env: ["RUSTFLAGS"]
+            needs env: ["CC", "HOME", "PATH"]
+            every env name: ["CC", "HOME", "PATH", "RUSTFLAGS"]
+            all needs env: 2
+            every env name: ["CC", "HOME", "PATH", "RUSTFLAGS"]
+        "#]].assert_eq(&outcomes.0);
     }
 }

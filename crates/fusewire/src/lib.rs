@@ -1,12 +1,11 @@
 pub mod abi;
+pub mod io;
 
 use rargo_machine::StateMachine;
 use abi::*;
-use std::ffi::CString;
-use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::ffi::{CStr, CString, OsString};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,12 +32,12 @@ impl Errno {
     pub const EBUSY: Errno = Errno(libc::EBUSY);
 
     pub fn last() -> Errno {
-        Errno(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
+        Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
     }
 }
 
-impl From<io::Error> for Errno {
-    fn from(e: io::Error) -> Self {
+impl From<std::io::Error> for Errno {
+    fn from(e: std::io::Error) -> Self {
         Errno(e.raw_os_error().unwrap_or(libc::EIO))
     }
 }
@@ -165,7 +164,7 @@ pub struct Caps {
 }
 
 #[allow(unused_variables)]
-pub trait Filesystem: Send + Sync + 'static {
+pub trait Filesystem {
     fn lookup(&self, ctx: &Ctx, parent: u64, name: &[u8]) -> Res<Entry>;
     fn forget(&self, nodeid: u64, nlookup: u64) {}
     fn getattr(&self, ctx: &Ctx, nodeid: u64, fh: Option<u64>) -> Res<(fuse_attr, Duration)>;
@@ -286,22 +285,234 @@ fn read_struct<T: Copy>(b: &[u8]) -> Option<T> {
     Some(unsafe { std::ptr::read_unaligned(b.as_ptr() as *const T) })
 }
 
+/// What a session asks of the kernel it is mounted on. Each method is one
+/// request that is carried out as told; the session decides what to ask and
+/// what an answer means.
+pub trait Kernel {
+    /// The open connection to the FUSE device.
+    type Device: AsRawFd;
+    /// The socket a mount helper hands the connection over on.
+    type Socket;
+    /// A running unmount guard.
+    type Guard;
 
-
-pub struct Session {
-    dev: OwnedFd,
-    mountpoint: PathBuf,
-    caps: Caps,
-    unmounted: AtomicBool,
-    helper: bool,
-    guard: std::sync::Mutex<Option<Guard>>,
-    mount_id: Option<u64>,
-    connected: AtomicBool,
+    fn open_device(&self) -> std::io::Result<Self::Device>;
+    fn is_dir(&self, path: &Path) -> std::io::Result<bool>;
+    fn euid(&self) -> u32;
+    fn egid(&self) -> u32;
+    fn mount(&self, source: &CStr, target: &CStr, fstype: &CStr, flags: libc::c_ulong, data: &CStr) -> std::io::Result<()>;
+    /// Runs `program` to completion with one end of a socket pair, whose
+    /// descriptor number is in the variable `fd_env`, and keeps the other end.
+    fn run_with_socket(&self, program: &str, args: &[OsString], fd_env: &str) -> std::io::Result<Helped<Self::Socket>>;
+    /// The device a helper passed over `socket`, if it passed one.
+    fn receive_device(&self, socket: Self::Socket) -> std::io::Result<Option<Self::Device>>;
+    /// Runs `program` to completion with no input or output.
+    fn run_quiet(&self, program: &str, args: &[OsString]);
+    /// `statx` of `path` asking for `mask`: the mask the kernel answered and
+    /// the mount id field.
+    fn statx_mount_id(&self, path: &CStr, mask: u32) -> Option<(u32, u64)>;
+    fn read_to_string(&self, path: &str) -> std::io::Result<String>;
+    /// Starts a process that outlives this one and carries out `plan` when
+    /// this one dies without standing it down.
+    fn spawn_guard(&self, plan: &GuardPlan) -> std::io::Result<Self::Guard>;
+    /// Tells a guard to exit without unmounting, and waits for it.
+    fn stand_down(&self, guard: Self::Guard);
+    /// Lazily unmounts `target`.
+    fn detach(&self, target: &CStr);
+    fn read(&self, device: &Self::Device, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn write(&self, device: &Self::Device, bytes: &[u8]) -> std::io::Result<usize>;
+    fn backing_open(&self, device: &Self::Device, fd: RawFd) -> std::io::Result<i32>;
+    fn backing_close(&self, device: &Self::Device, id: u32) -> std::io::Result<i32>;
 }
 
-struct Guard {
-    pipe: OwnedFd,
-    pid: libc::pid_t,
+/// How a mount helper's run ended.
+pub struct Helped<S> {
+    pub success: bool,
+    pub stderr: Vec<u8>,
+    pub socket: S,
+}
+
+/// Everything an unmount guard needs to know before it is started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardPlan {
+    /// The guard's process name.
+    pub name: CString,
+    /// What the guard's command line reads as.
+    pub title: Vec<u8>,
+    /// Where this process's command line lives in memory, start and end.
+    pub title_area: Option<(usize, usize)>,
+    pub ignored_signals: Vec<i32>,
+    /// The mountpoint.
+    pub target: CString,
+    /// The mount the guard is for, when the kernel names mounts.
+    pub mount_id: Option<u64>,
+    /// The `statx` mask that asks for a mount id.
+    pub statx_mask: u32,
+    /// The command that unmounts in place of a direct unmount, when the mount
+    /// was made by a helper.
+    pub helper: Option<Vec<CString>>,
+}
+
+/// What to do about a mountpoint when a session's mount should go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmount {
+    /// Something else is mounted there now.
+    Leave,
+    Detach,
+    Helper,
+}
+
+/// Decides how to unmount, from the id of the session's mount, the id of what
+/// is mounted there now, and whether a helper made the mount.
+pub fn unmount_action(mine: Option<u64>, there: Option<u64>, helper: bool) -> Unmount {
+    match (mine, there) {
+        (Some(mine), Some(there)) if mine != there => Unmount::Leave,
+        _ if helper => Unmount::Helper,
+        _ => Unmount::Detach,
+    }
+}
+
+const STATX_MNT_ID: u32 = 0x1000;
+const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+const MNT_ID_MASK: u32 = STATX_MNT_ID | STATX_MNT_ID_UNIQUE;
+
+/// The mount id in a `statx` answer, if the kernel filled one in.
+pub fn mount_id_in(answer: Option<(u32, u64)>) -> Option<u64> {
+    answer.and_then(|(mask, id)| (mask & MNT_ID_MASK != 0).then_some(id))
+}
+
+fn mount_id<K: Kernel>(kernel: &K, path: &CStr) -> Option<u64> {
+    mount_id_in(kernel.statx_mount_id(path, MNT_ID_MASK))
+}
+
+const HELPER: &str = "fusermount3";
+const HELPER_FD_ENV: &str = "_FUSE_COMMFD";
+const MOUNT_FLAGS: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME;
+const GUARD_IGNORES: [i32; 5] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGPIPE];
+
+fn mount_data(fd: RawFd, uid: u32, gid: u32, opts: &MountOptions) -> String {
+    let mut data = format!("fd={fd},rootmode=40000,user_id={uid},group_id={gid}");
+    if opts.allow_other {
+        data.push_str(",allow_other");
+    }
+    if opts.default_permissions {
+        data.push_str(",default_permissions");
+    }
+    data
+}
+
+fn helper_mount_args(mountpoint: &Path, opts: &MountOptions) -> Vec<OsString> {
+    let mut options = format!("rw,nosuid,nodev,noatime,fsname={0},subtype={0}", opts.fsname);
+    if opts.default_permissions {
+        options.push_str(",default_permissions");
+    }
+    if opts.allow_other {
+        options.push_str(",allow_other");
+    }
+    vec!["-o".into(), options.into(), "--".into(), mountpoint.into()]
+}
+
+const HELPER_UNMOUNT_FLAGS: [&str; 4] = ["-u", "-z", "-q", "--"];
+
+fn helper_unmount_args(mountpoint: &Path) -> Vec<OsString> {
+    HELPER_UNMOUNT_FLAGS.iter().map(OsString::from).chain([mountpoint.into()]).collect()
+}
+
+/// Where the process's command line lives, from its `/proc/self/stat`.
+fn arg_area(stat: &str) -> Option<(usize, usize)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut f = rest.split_ascii_whitespace().skip(45);
+    let (start, end) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
+    (start != 0 && end > start).then_some((start, end))
+}
+
+fn guard_plan(tgt: &CStr, stat: Option<&str>, mount_id: Option<u64>, helper: bool) -> GuardPlan {
+    let mut title = b"unmount-guard: ".to_vec();
+    title.extend_from_slice(tgt.to_bytes());
+    let command = || {
+        let words = [HELPER].into_iter().chain(HELPER_UNMOUNT_FLAGS).map(|word| CString::new(word).unwrap());
+        words.chain([tgt.to_owned()]).collect()
+    };
+    GuardPlan {
+        name: c"unmount-guard".to_owned(),
+        title,
+        title_area: stat.and_then(arg_area),
+        ignored_signals: GUARD_IGNORES.to_vec(),
+        target: tgt.to_owned(),
+        mount_id,
+        statx_mask: MNT_ID_MASK,
+        helper: helper.then(command),
+    }
+}
+
+fn mount_with_helper<K: Kernel>(kernel: &K, mountpoint: &Path, opts: &MountOptions) -> std::io::Result<K::Device> {
+    let out = kernel.run_with_socket(HELPER, &helper_mount_args(mountpoint, opts), HELPER_FD_ENV)?;
+    if !out.success {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()));
+    }
+    kernel
+        .receive_device(out.socket)?
+        .ok_or_else(|| std::io::Error::other("fusermount3 did not hand over the connection"))
+}
+
+enum LifecycleEvent {
+    GuardActive,
+    MayBeShown,
+    Ended,
+    Unmount,
+}
+
+enum LifecycleReply<G> {
+    Status(bool),
+    Ended,
+    Unmount { guard: Option<G> },
+    AlreadyUnmounted,
+}
+
+struct Lifecycle<G> {
+    connected: bool,
+    unmounted: bool,
+    guard: Option<G>,
+}
+
+impl<G> Lifecycle<G> {
+    fn new(guard: Option<G>) -> Self {
+        Self { connected: true, unmounted: false, guard }
+    }
+
+    fn step(&mut self, event: LifecycleEvent) -> LifecycleReply<G> {
+        let reply = match event {
+            LifecycleEvent::GuardActive => LifecycleReply::Status(self.guard.is_some()),
+            LifecycleEvent::MayBeShown => LifecycleReply::Status(self.connected && !self.unmounted),
+            LifecycleEvent::Ended => {
+                self.connected = false;
+                LifecycleReply::Ended
+            }
+            LifecycleEvent::Unmount if self.unmounted => LifecycleReply::AlreadyUnmounted,
+            LifecycleEvent::Unmount => {
+                self.unmounted = true;
+                LifecycleReply::Unmount { guard: self.guard.take() }
+            }
+        };
+        self.invariants();
+        reply
+    }
+}
+
+impl<G> StateMachine for Lifecycle<G> {
+    fn invariants(&self) {
+        assert!(!self.unmounted || self.guard.is_none(), "unmount takes ownership of the guard");
+    }
+}
+
+pub struct Session<K: Kernel = io::Real> {
+    kernel: K,
+    dev: K::Device,
+    mountpoint: PathBuf,
+    caps: Caps,
+    helper: bool,
+    mount_id: Option<u64>,
+    lifecycle: io::LifecycleDriver<K::Guard>,
 }
 
 #[derive(Clone, Debug)]
@@ -325,12 +536,12 @@ impl Default for MountOptions {
     }
 }
 
-fn require_uring(offered: bool) -> io::Result<()> {
+fn require_uring(offered: bool) -> std::io::Result<()> {
     if offered {
         return Ok(());
     }
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
         "FUSE-over-io_uring is unavailable. Use Linux 6.14 or newer with CONFIG_FUSE_IO_URING and set fuse.enable_uring=Y.",
     ))
 }
@@ -340,87 +551,136 @@ fn require_uring(offered: bool) -> io::Result<()> {
 fn missing_uring_offer_explains_how_to_enable_it() {
     assert!(require_uring(true).is_ok());
     let err = require_uring(false).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     assert!(err.to_string().contains("fuse.enable_uring=Y"));
 }
 
 const MAX_WRITE: u32 = 1 << 20;
 pub const BUF_SIZE: usize = MAX_WRITE as usize + 2 * 4096;
-const _: () = assert!(MAX_WRITE % 4096 == 0);
+const _: () = assert!(MAX_WRITE.is_multiple_of(4096));
 const _: () = assert!(MAX_WRITE / 4096 <= u16::MAX as u32);
-const _: () = assert!(BUF_SIZE % 8 == 0);
+const _: () = assert!(BUF_SIZE.is_multiple_of(8));
 const _: () = assert!(BUF_SIZE >= FUSE_MIN_READ_BUFFER);
 const _: () = assert!(
     BUF_SIZE >= MAX_WRITE as usize + std::mem::size_of::<fuse_in_header>() + std::mem::size_of::<fuse_write_in>()
 );
 
-impl Session {
-    pub fn mount(mountpoint: &Path, opts: &MountOptions) -> io::Result<Session> {
-        Self::mount_with_transport(mountpoint, opts, false)
+/// The reply to the kernel's first request, which must be INIT, and the
+/// capabilities that reply settles on.
+fn init_reply(request: &[u8], want_passthrough: bool, uring: bool) -> std::io::Result<(Vec<u8>, Caps)> {
+    let hdr: fuse_in_header = read_struct(request).ok_or_else(|| std::io::Error::other("short INIT"))?;
+    if hdr.opcode != FUSE_INIT {
+        return Err(std::io::Error::other("first FUSE request was not INIT"));
+    }
+    let init: Option<fuse_init_in> = read_struct(&request[std::mem::size_of::<fuse_in_header>()..]);
+    if uring {
+        require_uring(init.as_ref().is_some_and(|init| {
+            init.major == FUSE_KERNEL_VERSION
+                && init.flags & FUSE_INIT_EXT as u32 != 0
+                && (u64::from(init.flags2) << 32) & FUSE_OVER_IO_URING != 0
+        }))?;
+    }
+    let init = init.ok_or_else(|| std::io::Error::other("short INIT body"))?;
+    if init.major != FUSE_KERNEL_VERSION || init.minor < 31 {
+        return Err(std::io::Error::other(format!(
+            "unsupported FUSE protocol {}.{}",
+            init.major, init.minor
+        )));
+    }
+    let kflags = init.flags as u64 | ((init.flags2 as u64) << 32);
+    let mut want = FUSE_ASYNC_READ
+        | FUSE_BIG_WRITES
+        | FUSE_ATOMIC_O_TRUNC
+        | FUSE_PARALLEL_DIROPS
+        | FUSE_MAX_PAGES
+        | FUSE_CACHE_SYMLINKS
+        | FUSE_NO_OPENDIR_SUPPORT
+        | FUSE_ASYNC_DIO
+        | FUSE_DIRECT_IO_ALLOW_MMAP
+        | FUSE_INIT_EXT;
+    if uring {
+        want |= FUSE_OVER_IO_URING;
+    }
+    let passthrough = want_passthrough && kflags & FUSE_PASSTHROUGH != 0;
+    if passthrough {
+        want |= FUSE_PASSTHROUGH;
+    } else {
+        want |= FUSE_WRITEBACK_CACHE;
+    }
+    let flags = want & kflags;
+    let out = fuse_init_out {
+        major: FUSE_KERNEL_VERSION,
+        minor: FUSE_KERNEL_MINOR_VERSION.min(init.minor),
+        max_readahead: init.max_readahead,
+        flags: flags as u32,
+        max_background: 256,
+        congestion_threshold: 192,
+        max_write: MAX_WRITE,
+        time_gran: 1,
+        max_pages: (MAX_WRITE / 4096) as u16,
+        map_alignment: 0,
+        flags2: (flags >> 32) as u32,
+        max_stack_depth: if passthrough { 2 } else { 0 },
+        request_timeout: 0,
+        unused: [0; 11],
+    };
+    assert!(out.minor >= 31);
+    assert!(out.minor <= FUSE_KERNEL_MINOR_VERSION);
+    assert!(flags & !kflags == 0, "only flags the kernel offers");
+    assert!(!(flags & FUSE_PASSTHROUGH != 0 && flags & FUSE_WRITEBACK_CACHE != 0));
+    assert!(hdr.unique != 0, "INIT is a request that takes a reply");
+    let mut bytes = Vec::new();
+    encode_reply(&mut bytes, hdr.unique, 0, &[as_bytes(&out)]);
+    let caps = Caps { minor: out.minor, passthrough: flags & FUSE_PASSTHROUGH != 0, max_write: MAX_WRITE };
+    Ok((bytes, caps))
+}
+
+impl Session<io::Real> {
+    pub fn mount(mountpoint: &Path, opts: &MountOptions) -> std::io::Result<Session> {
+        Self::mount_on(io::Real, mountpoint, opts, false)
     }
 
-    pub fn mount_uring(mountpoint: &Path, opts: &MountOptions) -> io::Result<Self> {
-        Self::mount_with_transport(mountpoint, opts, true)
+    pub fn mount_uring(mountpoint: &Path, opts: &MountOptions) -> std::io::Result<Self> {
+        Self::mount_on(io::Real, mountpoint, opts, true)
     }
+}
 
-    fn mount_with_transport(mountpoint: &Path, opts: &MountOptions, uring: bool) -> io::Result<Self> {
-        let dev = open_dev()?;
-        let meta = std::fs::metadata(mountpoint)?;
-        if !meta.is_dir() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "mountpoint is not a directory"));
+impl<K: Kernel> Session<K> {
+    /// Mounts on `kernel`, over io_uring when `uring` is set.
+    pub fn mount_on(kernel: K, mountpoint: &Path, opts: &MountOptions, uring: bool) -> std::io::Result<Self> {
+        let dev = kernel.open_device()?;
+        if !kernel.is_dir(mountpoint)? {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "mountpoint is not a directory"));
         }
-        let mut data = format!(
-            "fd={},rootmode=40000,user_id={},group_id={}",
-            dev.as_raw_fd(),
-            unsafe { libc::geteuid() },
-            unsafe { libc::getegid() }
-        );
-        if opts.allow_other {
-            data.push_str(",allow_other");
-        }
-        if opts.default_permissions {
-            data.push_str(",default_permissions");
-        }
+        let data = mount_data(dev.as_raw_fd(), kernel.euid(), kernel.egid(), opts);
         let src = CString::new(opts.fsname.clone()).unwrap();
         let tgt = CString::new(mountpoint.as_os_str().as_encoded_bytes()).unwrap();
         let fstype = CString::new(format!("fuse.{}", opts.fsname)).unwrap();
         let cdata = CString::new(data).unwrap();
-        let flags = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME;
-        let r = unsafe {
-            libc::mount(
-                src.as_ptr(),
-                tgt.as_ptr(),
-                fstype.as_ptr(),
-                flags,
-                cdata.as_ptr() as *const libc::c_void,
-            )
-        };
         let mut helper = false;
-        let mut guard = None;
-        let dev = if r == 0 {
-            dev
-        } else {
-            let e = io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EPERM) {
-                return Err(e);
+        let dev = match kernel.mount(&src, &tgt, &fstype, MOUNT_FLAGS, &cdata) {
+            Ok(()) => dev,
+            Err(e) if e.raw_os_error() != Some(libc::EPERM) => return Err(e),
+            Err(e) => {
+                helper = true;
+                mount_with_helper(&kernel, mountpoint, opts)
+                    .map_err(|h| std::io::Error::new(h.kind(), format!("mount: {e}; fusermount3: {h}")))?
             }
-            helper = true;
-            mount_with_helper(mountpoint, opts)
-                .map_err(|h| io::Error::new(h.kind(), format!("mount: {e}; fusermount3: {h}")))?
         };
-        let mount_id = mount_id(&tgt);
+        let mount_id = mount_id(&kernel, &tgt);
+        let mut guard = None;
         if opts.auto_unmount {
-            guard = spawn_guard(&tgt, mount_id, helper).ok();
+            let stat = kernel.read_to_string("/proc/self/stat").ok();
+            guard = kernel.spawn_guard(&guard_plan(&tgt, stat.as_deref(), mount_id, helper)).ok();
         }
         let mut sess = Session {
+            kernel,
             dev,
             mountpoint: mountpoint.to_path_buf(),
             caps: Caps::default(),
-            unmounted: AtomicBool::new(false),
             helper,
-            guard: std::sync::Mutex::new(guard),
             mount_id,
-            connected: AtomicBool::new(true),
+            lifecycle: io::LifecycleDriver::new(Lifecycle::new(guard)),
         };
         if let Err(e) = sess.handshake(opts, uring) {
             sess.unmount();
@@ -431,88 +691,18 @@ impl Session {
         Ok(sess)
     }
 
-    fn handshake(&mut self, opts: &MountOptions, uring: bool) -> io::Result<()> {
+    fn handshake(&mut self, opts: &MountOptions, uring: bool) -> std::io::Result<()> {
         let mut buf = vec![0u8; BUF_SIZE];
         let n = loop {
-            let n = unsafe {
-                libc::read(self.dev.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                return Err(e);
+            match self.kernel.read(&self.dev, &mut buf) {
+                Ok(n) => break n,
+                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
+                Err(e) => return Err(e),
             }
-            break n as usize;
         };
-        let hdr: fuse_in_header =
-            read_struct(&buf[..n]).ok_or_else(|| io::Error::other("short INIT"))?;
-        if hdr.opcode != FUSE_INIT {
-            return Err(io::Error::other("first FUSE request was not INIT"));
-        }
-        let init: Option<fuse_init_in> = read_struct(&buf[std::mem::size_of::<fuse_in_header>()..n]);
-        if uring {
-            require_uring(init.as_ref().is_some_and(|init| {
-                init.major == FUSE_KERNEL_VERSION
-                    && init.flags & FUSE_INIT_EXT as u32 != 0
-                    && (u64::from(init.flags2) << 32) & FUSE_OVER_IO_URING != 0
-            }))?;
-        }
-        let init = init.ok_or_else(|| io::Error::other("short INIT body"))?;
-        if init.major != FUSE_KERNEL_VERSION || init.minor < 31 {
-            return Err(io::Error::other(format!(
-                "unsupported FUSE protocol {}.{}",
-                init.major, init.minor
-            )));
-        }
-        let kflags = init.flags as u64 | ((init.flags2 as u64) << 32);
-        let mut want = FUSE_ASYNC_READ
-            | FUSE_BIG_WRITES
-            | FUSE_ATOMIC_O_TRUNC
-            | FUSE_PARALLEL_DIROPS
-            | FUSE_MAX_PAGES
-            | FUSE_CACHE_SYMLINKS
-            | FUSE_NO_OPENDIR_SUPPORT
-            | FUSE_ASYNC_DIO
-            | FUSE_DIRECT_IO_ALLOW_MMAP
-            | FUSE_INIT_EXT;
-        if uring {
-            want |= FUSE_OVER_IO_URING;
-        }
-        let passthrough = opts.passthrough && kflags & FUSE_PASSTHROUGH != 0;
-        if passthrough {
-            want |= FUSE_PASSTHROUGH;
-        } else {
-            want |= FUSE_WRITEBACK_CACHE;
-        }
-        let flags = want & kflags;
-        let out = fuse_init_out {
-            major: FUSE_KERNEL_VERSION,
-            minor: FUSE_KERNEL_MINOR_VERSION.min(init.minor),
-            max_readahead: init.max_readahead,
-            flags: flags as u32,
-            max_background: 256,
-            congestion_threshold: 192,
-            max_write: MAX_WRITE,
-            time_gran: 1,
-            max_pages: (MAX_WRITE / 4096) as u16,
-            map_alignment: 0,
-            flags2: (flags >> 32) as u32,
-            max_stack_depth: if passthrough { 2 } else { 0 },
-            request_timeout: 0,
-            unused: [0; 11],
-        };
-        assert!(out.minor >= 31);
-        assert!(out.minor <= FUSE_KERNEL_MINOR_VERSION);
-        assert!(flags & !kflags == 0, "only flags the kernel offers");
-        assert!(!(flags & FUSE_PASSTHROUGH != 0 && flags & FUSE_WRITEBACK_CACHE != 0));
-        reply(self.dev.as_raw_fd(), hdr.unique, 0, &[as_bytes(&out)])?;
-        self.caps = Caps {
-            minor: out.minor,
-            passthrough: flags & FUSE_PASSTHROUGH != 0,
-            max_write: MAX_WRITE,
-        };
+        let (bytes, caps) = init_reply(&buf[..n], opts.passthrough, uring)?;
+        self.kernel.write(&self.dev, &bytes)?;
+        self.caps = caps;
         Ok(())
     }
 
@@ -528,53 +718,40 @@ impl Session {
         self.dev.as_raw_fd()
     }
 
-    pub fn carry(&self, effect: &Effect) -> io::Result<i32> {
-        let fd = self.dev.as_raw_fd();
-        let status = match effect {
-            Effect::Notify(bytes) => {
-                let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
-                return match written {
-                    w if w >= 0 => Ok(0),
-                    _ => match io::Error::last_os_error() {
-                        e if e.raw_os_error() == Some(libc::ENOENT) => Ok(0),
-                        e => Err(e),
-                    },
-                };
-            }
-            Effect::Register { fd: source, .. } => {
-                let map = fuse_backing_map { fd: *source, flags: 0, padding: 0 };
-                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_OPEN as libc::Ioctl, &map as *const _) }
-            }
-            Effect::Unregister(id) => {
-                let id = *id as u32;
-                unsafe { libc::ioctl(fd, FUSE_DEV_IOC_BACKING_CLOSE as libc::Ioctl, &id as *const _) }
-            }
-        };
-        if status < 0 { Err(io::Error::last_os_error()) } else { Ok(status) }
+    pub fn carry(&self, effect: &Effect) -> std::io::Result<i32> {
+        match effect {
+            Effect::Notify(bytes) => match self.kernel.write(&self.dev, bytes) {
+                Ok(_) => Ok(0),
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Ok(0),
+                Err(e) => Err(e),
+            },
+            Effect::Register { fd: source, .. } => self.kernel.backing_open(&self.dev, *source),
+            Effect::Unregister(id) => self.kernel.backing_close(&self.dev, *id as u32),
+        }
     }
 
-    pub fn backing_open(&self, fd: RawFd) -> io::Result<i32> {
+    pub fn backing_open(&self, fd: RawFd) -> std::io::Result<i32> {
         self.carry(&Effect::Register { fd, token: 0 })
     }
 
-    pub fn backing_close(&self, id: i32) -> io::Result<()> {
+    pub fn backing_close(&self, id: i32) -> std::io::Result<()> {
         self.carry(&Effect::Unregister(id)).map(|_| ())
     }
 
-    pub fn notify_inval_entry(&self, parent: u64, name: &[u8]) -> io::Result<()> {
+    pub fn notify_inval_entry(&self, parent: u64, name: &[u8]) -> std::io::Result<()> {
         self.carry(&Effect::Notify(inval_entry_bytes(parent, name))).map(|_| ())
     }
 
     pub fn auto_unmount_active(&self) -> bool {
-        self.guard.lock().unwrap().is_some()
+        matches!(self.lifecycle.dispatch(LifecycleEvent::GuardActive), LifecycleReply::Status(true))
     }
 
     pub fn shown(&self) -> bool {
-        if self.unmounted.load(Ordering::SeqCst) || !self.connected.load(Ordering::SeqCst) {
+        if !matches!(self.lifecycle.dispatch(LifecycleEvent::MayBeShown), LifecycleReply::Status(true)) {
             return false;
         }
         let Ok(tgt) = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()) else { return false };
-        match (self.mount_id, mount_id(&tgt)) {
+        match (self.mount_id, mount_id(&self.kernel, &tgt)) {
             (Some(mine), Some(there)) => mine == there,
             (Some(_), None) => false,
             (None, _) => true,
@@ -582,248 +759,28 @@ impl Session {
     }
 
     pub fn unmount(&self) {
-        if self.unmounted.swap(true, Ordering::SeqCst) {
-            return;
-        }
+        let LifecycleReply::Unmount { guard } = self.lifecycle.dispatch(LifecycleEvent::Unmount) else { return };
         let tgt = CString::new(self.mountpoint.as_os_str().as_encoded_bytes()).ok();
-        if let Some(Guard { pipe, pid }) = self.guard.lock().unwrap().take() {
-            unsafe {
-                libc::write(pipe.as_raw_fd(), [1u8].as_ptr() as *const libc::c_void, 1);
-                drop(pipe);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
+        if let Some(guard) = guard {
+            self.kernel.stand_down(guard);
         }
-        let ours = match (self.mount_id, tgt.as_deref().and_then(mount_id)) {
-            (Some(mine), Some(there)) => mine == there,
-            _ => true,
-        };
-        if !ours {
-            return;
-        }
-        if self.helper {
-            unmount_with_helper(&self.mountpoint);
-        } else if let Some(tgt) = tgt {
-            unsafe { libc::umount2(tgt.as_ptr(), libc::MNT_DETACH) };
+        let there = tgt.as_deref().and_then(|tgt| mount_id(&self.kernel, tgt));
+        match (unmount_action(self.mount_id, there, self.helper), tgt) {
+            (Unmount::Helper, _) => self.kernel.run_quiet(HELPER, &helper_unmount_args(&self.mountpoint)),
+            (Unmount::Detach, Some(tgt)) => self.kernel.detach(&tgt),
+            (Unmount::Detach, None) | (Unmount::Leave, _) => {}
         }
     }
 }
 
-fn mount_id(path: &std::ffi::CStr) -> Option<u64> {
-    const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
-    const STATX_MNT_ID: u32 = 0x1000;
-    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
-    let mut buf = [0u64; 32];
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_statx,
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC,
-            STATX_MNT_ID | STATX_MNT_ID_UNIQUE,
-            buf.as_mut_ptr(),
-        )
-    };
-    let mask = (buf[0] & 0xffff_ffff) as u32;
-    (r == 0 && mask & (STATX_MNT_ID | STATX_MNT_ID_UNIQUE) != 0).then_some(buf[18])
-}
-
-fn spawn_guard(tgt: &std::ffi::CStr, mount_id: Option<u64>, helper: bool) -> io::Result<Guard> {
-    let name = c"unmount-guard";
-    let mut title = b"unmount-guard: ".to_vec();
-    title.extend_from_slice(tgt.to_bytes());
-    let args: Option<(usize, usize)> = std::fs::read_to_string("/proc/self/stat").ok().and_then(|s| {
-        let rest = &s[s.rfind(')')? + 1..];
-        let mut f = rest.split_ascii_whitespace().skip(45);
-        let (start, end) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
-        (start != 0 && end > start).then_some((start, end))
-    });
-    let argv_owned = [c"fusermount3", c"-u", c"-z", c"-q", c"--", tgt];
-    let mut argv: Vec<*const libc::c_char> = argv_owned.iter().map(|a| a.as_ptr()).collect();
-    argv.push(std::ptr::null());
-    let mut p = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (r, w) = (p[0], p[1]);
-    let mut q = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe2(q.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        let e = io::Error::last_os_error();
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-        }
-        return Err(e);
-    }
-    let (ready_r, ready_w) = (q[0], q[1]);
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let e = io::Error::last_os_error();
-        unsafe {
-            libc::close(r);
-            libc::close(w);
-            libc::close(ready_r);
-            libc::close(ready_w);
-        }
-        return Err(e);
-    }
-    if pid == 0 {
-        unsafe {
-            libc::setsid();
-            libc::prctl(libc::PR_SET_NAME, name.as_ptr());
-            if let Some((start, end)) = args {
-                let (area, len) = (start as *mut u8, end - start);
-                std::ptr::write_bytes(area, 0, len);
-                std::ptr::copy_nonoverlapping(title.as_ptr(), area, title.len().min(len - 1));
-            }
-            for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT, libc::SIGPIPE] {
-                libc::signal(sig, libc::SIG_IGN);
-            }
-            libc::write(ready_w, [1u8].as_ptr() as *const libc::c_void, 1);
-            if r > 0 {
-                libc::syscall(libc::SYS_close_range, 0 as libc::c_uint, (r - 1) as libc::c_uint, 0 as libc::c_uint);
-            }
-            if libc::syscall(libc::SYS_close_range, (r + 1) as libc::c_uint, libc::c_uint::MAX, 0 as libc::c_uint) != 0 {
-                for fd in (r + 1)..65536 {
-                    libc::close(fd);
-                }
-            }
-            let mut byte = [0u8; 1];
-            loop {
-                let n = libc::read(r, byte.as_mut_ptr() as *mut libc::c_void, 1);
-                if n > 0 {
-                    libc::_exit(0);
-                }
-                if n == 0 || *libc::__errno_location() != libc::EINTR {
-                    break;
-                }
-            }
-            let still_ours = match (mount_id, self::mount_id(tgt)) {
-                (Some(mine), Some(there)) => mine == there,
-                _ => true,
-            };
-            if still_ours {
-                if helper {
-                    libc::execvp(argv[0], argv.as_ptr());
-                    libc::_exit(1);
-                }
-                libc::umount2(tgt.as_ptr(), libc::MNT_DETACH);
-            }
-            libc::_exit(0);
-        }
-    }
-    unsafe {
-        libc::close(r);
-        libc::close(ready_w);
-        let mut byte = [0u8; 1];
-        while libc::read(ready_r, byte.as_mut_ptr() as *mut libc::c_void, 1) < 0
-            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-        {}
-        libc::close(ready_r);
-        Ok(Guard { pipe: OwnedFd::from_raw_fd(w), pid })
-    }
-}
-
-impl Drop for Session {
+impl<K: Kernel> Drop for Session<K> {
     fn drop(&mut self) {
         self.unmount();
     }
 }
 
 pub fn unmount_with_helper(mountpoint: &Path) {
-    let _ = std::process::Command::new("fusermount3")
-        .args(["-u", "-z", "-q", "--"])
-        .arg(mountpoint)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-fn mount_with_helper(mountpoint: &Path, opts: &MountOptions) -> io::Result<OwnedFd> {
-    let mut pair = [0 as libc::c_int; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (ours, theirs) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
-    unsafe { libc::fcntl(ours.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
-    let mut options = format!("rw,nosuid,nodev,noatime,fsname={0},subtype={0}", opts.fsname);
-    if opts.default_permissions {
-        options.push_str(",default_permissions");
-    }
-    if opts.allow_other {
-        options.push_str(",allow_other");
-    }
-    let mut cmd = std::process::Command::new("fusermount3");
-    cmd.arg("-o").arg(options).arg("--").arg(mountpoint).env("_FUSE_COMMFD", theirs.as_raw_fd().to_string());
-    cmd.stdin(std::process::Stdio::null());
-    let out = cmd.output()?;
-    drop(theirs);
-    if !out.status.success() {
-        return Err(io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_string()));
-    }
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut libc::c_void, iov_len: 1 };
-    let mut control = [0u8; 64];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = control.len() as _;
-    let n = unsafe { libc::recvmsg(ours.as_raw_fd(), &mut msg, 0) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&msg);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let fd = std::ptr::read_unaligned(libc::CMSG_DATA(c) as *const libc::c_int);
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                return Ok(OwnedFd::from_raw_fd(fd));
-            }
-            c = libc::CMSG_NXTHDR(&msg, c);
-        }
-    }
-    Err(io::Error::other("fusermount3 did not hand over the connection"))
-}
-
-fn open_dev() -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::open(c"/dev/fuse".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-fn reply(fd: RawFd, unique: u64, error: i32, parts: &[&[u8]]) -> io::Result<()> {
-    let len: usize = std::mem::size_of::<fuse_out_header>() + parts.iter().map(|p| p.len()).sum::<usize>();
-    assert!(parts.len() < 5, "iov has room for the header and four parts");
-    assert!(len <= u32::MAX as usize);
-    if unique != 0 {
-        assert!(error <= 0);
-    } else {
-        assert!(error > 0);
-    }
-    let hdr = fuse_out_header { len: len as u32, error, unique };
-    let mut iov: [libc::iovec; 5] = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; 5];
-    iov[0] = libc::iovec {
-        iov_base: &hdr as *const _ as *mut libc::c_void,
-        iov_len: std::mem::size_of::<fuse_out_header>(),
-    };
-    let mut n = 1;
-    for p in parts {
-        if p.is_empty() {
-            continue;
-        }
-        iov[n] = libc::iovec { iov_base: p.as_ptr() as *mut libc::c_void, iov_len: p.len() };
-        n += 1;
-    }
-    assert_eq!(iov[..n].iter().map(|v| v.iov_len).sum::<usize>(), len);
-    let r = unsafe { libc::writev(fd, iov.as_ptr(), n as i32) };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    io::Real.run_quiet(HELPER, &helper_unmount_args(mountpoint));
 }
 
 fn ttl_parts(d: Duration) -> (u64, u32) {
@@ -856,12 +813,12 @@ fn open_out(o: &Opened) -> fuse_open_out {
     fuse_open_out { fh: o.fh, open_flags: o.flags, backing_id: o.backing_id }
 }
 
-impl Session {
+impl<K: Kernel> Session<K> {
     pub fn serve<F, R, W>(&self, fs: &F, mut read: R, mut write: W)
     where
         F: Filesystem,
-        R: FnMut(&mut [u8]) -> io::Result<usize>,
-        W: FnMut(&[u8]) -> io::Result<()>,
+        R: FnMut(&mut [u8]) -> std::io::Result<usize>,
+        W: FnMut(&[u8]) -> std::io::Result<()>,
     {
         let mut storage = vec![0u64; BUF_SIZE / 8];
         let mut handler = self.handler();
@@ -894,13 +851,13 @@ impl Session {
     }
 
     pub fn ended(&self) {
-        self.connected.store(false, Ordering::SeqCst);
+        self.lifecycle.dispatch(LifecycleEvent::Ended);
     }
 
     pub fn respond<F, W>(&self, handler: &mut RequestHandler, fs: &F, request: &[u8], mut write: W) -> bool
     where
         F: Filesystem,
-        W: FnMut(&[u8]) -> io::Result<()>,
+        W: FnMut(&[u8]) -> std::io::Result<()>,
     {
         let mut handled = handler.handle(fs, request);
         loop {
@@ -1252,10 +1209,10 @@ fn dispatch<F: Filesystem>(fs: &F, ctx: &Ctx, call: &mut Call, hdr: &fuse_in_hea
             send(reply, u, fs.statfs(&ctx, node).map(|st| fuse_statfs_out { st }));
         }
         FUSE_RELEASE | FUSE_RELEASEDIR => {
-            if hdr.opcode == FUSE_RELEASE {
-                if let Some(a) = read_struct::<fuse_release_in>(body) {
-                    fs.release_in(&ctx, node, a.fh, a.flags);
-                }
+            if hdr.opcode == FUSE_RELEASE
+                && let Some(a) = read_struct::<fuse_release_in>(body)
+            {
+                fs.release_in(&ctx, node, a.fh, a.flags);
             }
             encode_reply(reply, u, 0, &[]);
         }
@@ -1305,17 +1262,19 @@ fn dispatch<F: Filesystem>(fs: &F, ctx: &Ctx, call: &mut Call, hdr: &fuse_in_hea
 }
 
 #[cfg(test)]
+mod session_tests;
+
+#[cfg(test)]
 mod request_tests {
     use super::*;
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicU64;
+    use std::cell::{Cell, RefCell};
 
     const HEADER: usize = std::mem::size_of::<fuse_in_header>();
     const OUT: usize = std::mem::size_of::<fuse_out_header>();
     const BACKING_FD: RawFd = 99;
 
-    const RECORDED: &[(&str, &str)] = &[
+    pub(crate) const RECORDED: &[(&str, &str)] = &[
         ("INIT", "680000001a0000000200000000000000000000000000000000000000000000000000000000000000070000002d00000000000200fbffff73ff0500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
         ("LOOKUP", "2d0000000100000004000000000000000100000000000000000000000000000028212d000000000066696c6500"),
         ("STATX", "400000003400000006000000000000000200000000000000000000000000000028212d00000000000000000000000000000000000000000000000000ff0f0000"),
@@ -1375,11 +1334,11 @@ mod request_tests {
 
     #[derive(Default)]
     struct Memory {
-        flips: AtomicU64,
-        next_fh: AtomicU64,
-        forgotten: Mutex<Vec<(u64, u64)>>,
-        released: Mutex<Vec<u64>>,
-        backing: Mutex<BTreeMap<u64, i32>>,
+        flips: Cell<u64>,
+        next_fh: Cell<u64>,
+        forgotten: RefCell<Vec<(u64, u64)>>,
+        released: RefCell<Vec<u64>>,
+        backing: RefCell<BTreeMap<u64, i32>>,
     }
 
     impl Memory {
@@ -1388,7 +1347,7 @@ mod request_tests {
                 (1, b"file") => Ok(2),
                 (1, b"slow") => Ok(3),
                 (1, b"gone") => Ok(4),
-                (1, b"flip") => Ok(5 + self.flips.fetch_add(1, Ordering::SeqCst).min(1)),
+                (1, b"flip") => Ok(5 + self.flips.replace(self.flips.get() + 1).min(1)),
                 (1, b"through") => Ok(7),
                 (1, b"refused") => Ok(9),
                 _ => Err(Errno::ENOENT),
@@ -1396,7 +1355,7 @@ mod request_tests {
         }
 
         fn passthrough(&self, ctx: &Ctx) -> Opened {
-            let fh = 70 + self.next_fh.fetch_add(1, Ordering::SeqCst);
+            let fh = 70 + self.next_fh.replace(self.next_fh.get() + 1);
             ctx.effects.register(BACKING_FD, fh);
             Opened { fh, flags: FOPEN_PASSTHROUGH, backing_id: 0 }
         }
@@ -1412,7 +1371,7 @@ mod request_tests {
         }
 
         fn forget(&self, nodeid: u64, nlookup: u64) {
-            self.forgotten.lock().unwrap().push((nodeid, nlookup));
+            self.forgotten.borrow_mut().push((nodeid, nlookup));
         }
 
         fn getattr(&self, _: &Ctx, node: u64, _: Option<u64>) -> Res<(fuse_attr, Duration)> {
@@ -1442,7 +1401,7 @@ mod request_tests {
         fn registered(&self, _: &Ctx, token: u64, id: Res<i32>) -> Res<Opened> {
             Ok(match id {
                 Ok(id) => {
-                    self.backing.lock().unwrap().insert(token, id);
+                    self.backing.borrow_mut().insert(token, id);
                     Opened { fh: token, flags: FOPEN_PASSTHROUGH, backing_id: id }
                 }
                 Err(_) => Opened { fh: token, flags: FOPEN_KEEP_CACHE, backing_id: 0 },
@@ -1463,14 +1422,14 @@ mod request_tests {
         }
 
         fn release_in(&self, ctx: &Ctx, _: u64, fh: u64, _: u32) {
-            self.released.lock().unwrap().push(fh);
-            if let Some(id) = self.backing.lock().unwrap().remove(&fh) {
+            self.released.borrow_mut().push(fh);
+            if let Some(id) = self.backing.borrow_mut().remove(&fh) {
                 ctx.effects.unregister(id);
             }
         }
     }
 
-    fn unhex(s: &str) -> Vec<u8> {
+    pub(crate) fn unhex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
@@ -1552,7 +1511,7 @@ mod request_tests {
         }
     }
 
-    fn checked<'a>(h: &'a mut RequestHandler, fs: &Memory, request: &[u8]) -> (Vec<u8>, Vec<Effect>) {
+    fn checked(h: &mut RequestHandler, fs: &Memory, request: &[u8]) -> (Vec<u8>, Vec<Effect>) {
         let handled = h.handle(fs, request);
         let out = (handled.bytes.to_vec(), handled.effects);
         h.invariants();
@@ -1618,8 +1577,8 @@ mod request_tests {
         for listed in ["LOOKUP", "GETATTR", "OPEN", "READ", "READDIR", "RELEASE", "BATCH_FORGET", "INTERRUPT"] {
             assert!(seen.contains(listed), "the recording has a {listed}");
         }
-        assert_eq!(*fs.forgotten.lock().unwrap(), model.forgotten);
-        assert_eq!(*fs.released.lock().unwrap(), model.released);
+        assert_eq!(*fs.forgotten.borrow(), model.forgotten);
+        assert_eq!(*fs.released.borrow(), model.released);
     }
 
     #[test]
@@ -1634,7 +1593,7 @@ mod request_tests {
         batch.extend_from_slice(as_bytes(&fuse_forget_one { nodeid: 5, nlookup: 2 }));
         let (bytes, _) = checked(&mut h, &fs, &frame(FUSE_BATCH_FORGET, 6, 0, &batch));
         assert!(bytes.is_empty(), "a batch that claims more entries than it carries forgets those it carries");
-        assert_eq!(*fs.forgotten.lock().unwrap(), [(2, 3), (6, 1), (5, 2)]);
+        assert_eq!(*fs.forgotten.borrow(), [(2, 3), (6, 1), (5, 2)]);
 
         let mut waiting = RequestHandler::new(MAX_WRITE);
         let open = frame(FUSE_OPEN, 52, 7, as_bytes(&fuse_open_in { flags: 0, open_flags: 0 }));
@@ -1808,9 +1767,9 @@ mod request_tests {
                 }
                 assert!(!h.pending(), "seed {seed} step {step}");
             }
-            assert_eq!(*fs.forgotten.lock().unwrap(), model.forgotten, "seed {seed}");
-            assert_eq!(*fs.released.lock().unwrap(), model.released, "seed {seed}");
-            assert_eq!(*fs.backing.lock().unwrap(), held, "seed {seed}: what is registered is what was not released");
+            assert_eq!(*fs.forgotten.borrow(), model.forgotten, "seed {seed}");
+            assert_eq!(*fs.released.borrow(), model.released, "seed {seed}");
+            assert_eq!(*fs.backing.borrow(), held, "seed {seed}: what is registered is what was not released");
         }
     }
 

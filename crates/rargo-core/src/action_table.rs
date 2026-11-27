@@ -235,6 +235,8 @@ impl StateMachine for ActionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
 
     struct Checked(ActionTable);
 
@@ -304,14 +306,15 @@ mod tests {
 
     #[test]
     fn identical_concurrent_requests_run_once() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let (a, b, c) = (t.begin(), t.begin(), t.begin());
-        assert_eq!(t.start(a, slot(1), false, false), Start::Run { after_wait: false });
-        assert_eq!(t.start(b, slot(1), false, false), Start::Join);
-        assert_eq!(t.start(c, slot(1), false, false), Start::Join);
-        assert_eq!(t.woken(b), Woken::Waiting);
-        assert_eq!(t.ran(a, false, true), Ran::Record);
-        assert_eq!(t.settled(a), vec![b, c]);
+        outcomes.record("start", t.start(a, slot(1), false, false));
+        outcomes.record("start", t.start(b, slot(1), false, false));
+        outcomes.record("start", t.start(c, slot(1), false, false));
+        outcomes.record("woken", t.woken(b));
+        outcomes.record("ran", t.ran(a, false, true));
+        outcomes.record("settled", t.settled(a));
         t.done(a);
         for j in [b, c] {
             assert_eq!(t.woken(j), Woken::Retry);
@@ -319,110 +322,162 @@ mod tests {
         }
         assert!(!t.is_running(&slot(1)));
         t.invariants();
+        expect![[r#"
+            start: Run { after_wait: false }
+            start: Join
+            start: Join
+            woken: Waiting
+            ran: Record
+            settled: [2, 3]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_failure_is_reported_and_never_recorded() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let a = t.begin();
         t.start(a, slot(1), false, false);
-        assert_eq!(t.ran(a, false, false), Ran::Keep, "a result that is not cacheable (a failure) is not recorded");
+        // a result that is not cacheable (a failure) is not recorded.
+        outcomes.record("ran", t.ran(a, false, false));
         t.settled(a);
         t.done(a);
         let b = t.begin();
         t.start(b, slot(2), false, false);
         let j = t.begin();
         t.start(j, slot(2), false, false);
-        assert_eq!(t.failed(b, Failure::Error), vec![j]);
-        assert_eq!(t.woken(j), Woken::Retry, "a joiner whose runner failed runs for itself");
-        assert_eq!(t.start(j, slot(2), false, false), Start::Run { after_wait: true });
+        outcomes.record("failed", t.failed(b, Failure::Error));
+        // a joiner whose runner failed runs for itself.
+        outcomes.record("woken", t.woken(j));
+        outcomes.record("start", t.start(j, slot(2), false, false));
         t.invariants();
+        expect![[r#"
+            ran: Keep
+            failed: [3]
+            woken: Retry
+            start: Run { after_wait: true }
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_timed_out_run_fails_its_joiners_with_it() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let (a, b) = (t.begin(), t.begin());
         t.start(a, slot(1), false, false);
         t.start(b, slot(1), false, false);
-        assert_eq!(t.failed(a, Failure::TimedOut("`x` ran longer than 1 s".into())), vec![b]);
-        assert_eq!(t.woken(b), Woken::Fail("`x` ran longer than 1 s".into()));
+        outcomes.record("failed", t.failed(a, Failure::TimedOut("`x` ran longer than 1 s".into())));
+        outcomes.record("woken", t.woken(b));
         t.invariants();
+        expect![[r#"
+            failed: [2]
+            woken: Fail("`x` ran longer than 1 s")
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_cancelled_requester_does_not_cancel_the_others() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let (a, b, c) = (t.begin(), t.begin(), t.begin());
         t.start(a, slot(1), false, false);
         t.start(b, slot(1), false, false);
         t.start(c, slot(1), false, false);
-        assert_eq!(t.cancel(c), Vec::<ReqId>::new(), "a joiner leaving wakes nobody");
-        assert_eq!(t.cancel(a), vec![b], "the runner leaving wakes the rest");
-        assert_eq!(t.woken(b), Woken::Retry);
-        assert_eq!(t.start(b, slot(1), false, false), Start::Run { after_wait: true });
-        assert_eq!(t.ran(b, false, true), Ran::Record);
+        // a joiner leaving wakes nobody.
+        outcomes.record("cancel", t.cancel(c));
+        // the runner leaving wakes the rest.
+        outcomes.record("cancel", t.cancel(a));
+        outcomes.record("woken", t.woken(b));
+        outcomes.record("start", t.start(b, slot(1), false, false));
+        outcomes.record("ran", t.ran(b, false, true));
         t.settled(b);
         t.done(b);
         t.invariants();
+        expect![[r#"
+            cancel: []
+            cancel: [2]
+            woken: Retry
+            start: Run { after_wait: true }
+            ran: Record
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_lost_seed_ends_the_flight_and_the_request_is_retried() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let (a, j) = (t.begin(), t.begin());
-        assert_eq!(t.start(a, slot(1), false, false), Start::Run { after_wait: false });
-        assert_eq!(t.start(j, slot(1), false, false), Start::Join);
-        assert_eq!(t.failed(a, Failure::SeedLost), vec![j], "a lost seed ends the flight and wakes its joiners");
+        outcomes.record("start", t.start(a, slot(1), false, false));
+        outcomes.record("start", t.start(j, slot(1), false, false));
+        // a lost seed ends the flight and wakes its joiners.
+        outcomes.record("failed", t.failed(a, Failure::SeedLost));
         assert!(!t.is_running(&slot(1)), "nothing is left running for the action");
         let again = t.begin();
-        assert_eq!(
-            t.start(again, slot(1), false, false),
-            Start::Run { after_wait: false },
-            "build.rs asks again with another seed: the same action runs, it neither joins nor hits"
-        );
-        assert_eq!(t.woken(j), Woken::Retry);
-        assert_eq!(
-            t.start(j, slot(1), false, false),
-            Start::Run { after_wait: true },
-            "a joiner whose wait ended without a result runs for itself and does not wait on that action again"
-        );
-        assert_eq!(t.ran(again, false, true), Ran::Record);
-        assert_eq!(t.settled(again), Vec::<ReqId>::new(), "the flight is the joiner's now");
+        // build.rs asks again with another seed: the same action runs, it neither joins nor hits.
+        outcomes.record("start", t.start(again, slot(1), false, false));
+        outcomes.record("woken", t.woken(j));
+        // a joiner whose wait ended without a result runs for itself and does not wait on that action again.
+        outcomes.record("start", t.start(j, slot(1), false, false));
+        outcomes.record("ran", t.ran(again, false, true));
+        // the flight is the joiner's now.
+        outcomes.record("settled", t.settled(again));
         t.done(again);
-        assert_eq!(t.ran(j, false, true), Ran::Record);
-        assert_eq!(t.settled(j), Vec::<ReqId>::new());
+        outcomes.record("ran", t.ran(j, false, true));
+        outcomes.record("settled", t.settled(j));
         t.done(j);
         assert!(!t.is_running(&slot(1)));
+        expect![[r#"
+            start: Run { after_wait: false }
+            start: Join
+            failed: [2]
+            start: Run { after_wait: false }
+            woken: Retry
+            start: Run { after_wait: true }
+            ran: Record
+            settled: []
+            ran: Record
+            settled: []
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn a_tainted_run_is_repeated_and_then_kept_unrecorded() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let a = t.begin();
         t.start(a, slot(1), false, false);
-        assert_eq!(t.ran(a, true, true), Ran::Again);
-        assert_eq!(t.ran(a, true, true), Ran::Again);
-        assert_eq!(
-            t.ran(a, true, true),
-            Ran::Keep,
-            "after {MAX_ATTEMPTS} tainted runs the result is used, not recorded"
-        );
+        outcomes.record("ran", t.ran(a, true, true));
+        outcomes.record("ran", t.ran(a, true, true));
+        outcomes.record("ran", t.ran(a, true, true));
         t.invariants();
+        expect![[r#"
+            ran: Again
+            ran: Again
+            ran: Keep
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
     fn no_cache_runs_beside_a_flight_and_takes_it_over() {
+        let mut outcomes = Transcript::default();
         let mut t = Checked::new();
         let (a, b, j) = (t.begin(), t.begin(), t.begin());
         t.start(a, slot(1), false, false);
         t.start(j, slot(1), false, false);
-        assert_eq!(t.start(b, slot(1), true, true), Start::Run { after_wait: false }, "no cache, no hit and no join");
-        assert_eq!(t.ran(a, false, true), Ran::Record);
-        assert_eq!(t.settled(a), Vec::<ReqId>::new(), "the flight is b's now");
+        // no cache, no hit and no join.
+        outcomes.record("start", t.start(b, slot(1), true, true));
+        outcomes.record("ran", t.ran(a, false, true));
+        // the flight is b's now.
+        outcomes.record("settled", t.settled(a));
         t.ran(b, false, true);
-        assert_eq!(t.settled(b), vec![j]);
+        outcomes.record("settled", t.settled(b));
         t.invariants();
+        expect![[r#"
+            start: Run { after_wait: false }
+            ran: Record
+            settled: []
+            settled: [3]
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]

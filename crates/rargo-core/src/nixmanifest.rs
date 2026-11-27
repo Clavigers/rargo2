@@ -9,12 +9,10 @@ use rargo_proto::tree::{self, Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 const NIX_DIR: Owner = Owner {
     uid: 0,
@@ -98,10 +96,32 @@ pub trait StoreFs: Send + Sync {
 
 pub struct Disk;
 
+/// Where the files of hashed store paths are recorded, by content hash.
+pub trait HostFiles {
+    /// Records the store file at `path` as holding the bytes of `hash`, unless a holder is recorded already.
+    fn record(&self, hash: Hash, path: PathBuf, sig: HostSig);
+}
+
+impl HostFiles for DashMap<Hash, FileSrc> {
+    fn record(&self, hash: Hash, path: PathBuf, sig: HostSig) {
+        self.entry(hash).or_insert_with(|| FileSrc::Host { path: Arc::from(path), sig });
+    }
+}
+
+/// The store paths whose files are recorded already.
+#[derive(Default)]
+pub struct Attached(parking_lot::Mutex<HashSet<String>>);
+
+impl Attached {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, HashSet<String>> {
+        self.0.lock()
+    }
+}
+
 fn kind_of(path: &Path, meta: &crate::io::file::Stat) -> io::Result<Kind> {
     let ft = meta.file_type();
     Ok(if ft.is_symlink() {
-        Kind::Link(fs::read_link(path)?.as_os_str().as_bytes().to_vec())
+        Kind::Link(crate::io::file::read_link(path)?.as_os_str().as_bytes().to_vec())
     } else if ft.is_dir() {
         Kind::Dir
     } else if ft.is_file() {
@@ -118,7 +138,7 @@ impl StoreFs for Disk {
 
     fn list(&self, dir: &Path) -> io::Result<Vec<(Vec<u8>, Kind)>> {
         let mut out = Vec::new();
-        for ent in fs::read_dir(dir)? {
+        for ent in crate::io::file::read_dir(dir)? {
             let ent = ent?;
             let path = ent.path();
             out.push((ent.file_name().as_bytes().to_vec(), kind_of(&path, &crate::io::file::symlink_metadata(&path)?)?));
@@ -412,7 +432,7 @@ pub fn prepare(
     fs: &dyn StoreFs,
     store: &Path,
     names: &[String],
-    hosts: Option<&DashMap<Hash, FileSrc>>,
+    hosts: Option<&dyn HostFiles>,
     seen: &mut HashSet<String>,
 ) -> Result<Prepared> {
     let mut cost = Cost::default();
@@ -425,9 +445,9 @@ pub fn prepare(
                 (k, true)
             }
             None => {
-                let t = Instant::now();
+                let t = crate::io::now();
                 let fresh = hash_path_mode(fs, &path, true).with_context(|| format!("hashing {name}"))?;
-                cost.millis += t.elapsed().as_millis() as u64;
+                cost.millis += crate::io::now().saturating_duration_since(t).as_millis() as u64;
                 save(db, name.as_bytes(), &fresh.kind)?;
                 cost.new_paths += 1;
                 cost.hashed_files += fresh.files;
@@ -459,9 +479,9 @@ pub fn schedule(
     store: &Path,
     names: &[String],
     hosts: Option<&Arc<DashMap<Hash, FileSrc>>>,
-    seen: &Arc<parking_lot::Mutex<HashSet<String>>>,
+    seen: &Arc<Attached>,
 ) -> Result<Prepared> {
-    let (prepared, pending) = plan(db.as_ref(), fs.as_ref(), store, names, hosts.map(|m| m.as_ref()), seen)?;
+    let (prepared, pending) = plan(db.as_ref(), fs.as_ref(), store, names, hosts.map(|m| m.as_ref() as &dyn HostFiles), seen)?;
     if !pending.is_empty() {
         let job = Arc::new(Job {
             db: Arc::clone(db),
@@ -482,8 +502,8 @@ fn plan(
     fs: &dyn StoreFs,
     store: &Path,
     names: &[String],
-    hosts: Option<&DashMap<Hash, FileSrc>>,
-    seen: &parking_lot::Mutex<HashSet<String>>,
+    hosts: Option<&dyn HostFiles>,
+    seen: &Attached,
 ) -> Result<(Prepared, Vec<String>)> {
     let mut cost = Cost::default();
     let mut roots = Vec::with_capacity(names.len());
@@ -510,7 +530,7 @@ fn adopt(
     path: &Path,
     mut kind: StoredKind,
     was_cached: bool,
-    hosts: Option<&DashMap<Hash, FileSrc>>,
+    hosts: Option<&dyn HostFiles>,
     seen: &mut HashSet<String>,
     cost: &mut Cost,
     parallel: bool,
@@ -521,10 +541,10 @@ fn adopt(
                 "rargod: nix path {name} manifest does not match the files ({e}); hashing it again"
             );
             db.delete(Table::Meta, &meta_key(name.as_bytes()));
-            let t = Instant::now();
+            let t = crate::io::now();
             let fresh =
                 hash_path_mode(fs, path, parallel).with_context(|| format!("hashing {name} again"))?;
-            cost.millis += t.elapsed().as_millis() as u64;
+            cost.millis += crate::io::now().saturating_duration_since(t).as_millis() as u64;
             save(db, name.as_bytes(), &fresh.kind)?;
             if was_cached {
                 cost.reused_paths = cost.reused_paths.saturating_sub(1);
@@ -592,7 +612,7 @@ struct Job {
     fs: Arc<dyn StoreFs>,
     store: PathBuf,
     hosts: Option<Arc<DashMap<Hash, FileSrc>>>,
-    seen: Arc<parking_lot::Mutex<HashSet<String>>>,
+    seen: Arc<Attached>,
     cost: parking_lot::Mutex<Cost>,
     left: std::sync::atomic::AtomicUsize,
 }
@@ -604,32 +624,30 @@ fn hashing() -> &'static Hashing {
     static WORKER: OnceLock<()> = OnceLock::new();
     let q = Q.get_or_init(|| (parking_lot::Mutex::new(Queue::new(one_core())), parking_lot::Condvar::new()));
     WORKER.get_or_init(|| {
-        std::thread::Builder::new()
-            .name("nix-hash".into())
-            .spawn(|| {
-                idle_priority();
-                let (queue, cv) = hashing();
-                loop {
-                    let next = {
-                        let mut q = queue.lock();
-                        loop {
-                            match q.take() {
-                                Some(item) => break item,
-                                None => cv.wait(&mut q),
-                            }
+        crate::io::thread::spawn_niced("nix-hash", IDLE, || {
+            let (queue, cv) = hashing();
+            loop {
+                let next = {
+                    let mut q = queue.lock();
+                    loop {
+                        match q.take() {
+                            Some(item) => break item,
+                            None => cv.wait(&mut q),
                         }
-                    };
-                    let (job, name) = next;
-                    {
-                        let mut cost = job.cost.lock();
-                        hash_one(&job, &name, &mut cost);
                     }
-                    if job.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-                        log_cost(&job.cost.lock());
-                    }
+                };
+                let (job, name) = next;
+                {
+                    let mut cost = job.cost.lock();
+                    let hosts = job.hosts.as_deref().map(|m| m as &dyn HostFiles);
+                    hash_one(job.db.as_ref(), job.fs.as_ref(), &job.store, hosts, &job.seen, &name, &mut cost);
                 }
-            })
-            .expect("starting nix hash thread");
+                if job.left.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+                    log_cost(&job.cost.lock());
+                }
+            }
+        })
+        .expect("starting nix hash thread");
     });
     q
 }
@@ -640,14 +658,8 @@ fn enqueue(items: impl IntoIterator<Item = (Arc<Job>, String)>) {
     cv.notify_all();
 }
 
-fn idle_priority() {
-    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
-    if tid > 0 {
-        unsafe {
-            libc::setpriority(libc::PRIO_PROCESS, tid as libc::id_t, 19);
-        }
-    }
-}
+/// The scheduling priority of the hashing thread: the lowest there is.
+const IDLE: i32 = 19;
 
 pub struct BuildHold {
     _private: (),
@@ -668,16 +680,16 @@ impl Drop for BuildHold {
 }
 
 fn one_core() -> bool {
-    let Ok(text) = fs::read_to_string("/proc/self/cgroup") else {
+    let Ok(text) = crate::io::file::read_to_string("/proc/self/cgroup") else {
         return false;
     };
     let Some(rest) = text.lines().find_map(|line| line.strip_prefix("0::")) else {
         return false;
     };
     let rel = format!("/sys/fs/cgroup{rest}/cpu.max");
-    let max = match fs::read_to_string(&rel) {
+    let max = match crate::io::file::read_to_string(&rel) {
         Ok(max) => max,
-        Err(_) => match fs::read_to_string(format!("/proc/1/root{rel}")) {
+        Err(_) => match crate::io::file::read_to_string(format!("/proc/1/root{rel}")) {
             Ok(max) => max,
             Err(_) => return false,
         },
@@ -699,35 +711,35 @@ fn quota_is_one_core(max: &str) -> bool {
     )
 }
 
-fn hash_one(job: &Job, name: &str, cost: &mut Cost) {
-    let path = job.store.join(name);
-    if let Some(kind) = load(job.db.as_ref(), name.as_bytes()) {
-        let mut seen = job.seen.lock();
-        if let Err(e) = adopt(job.db.as_ref(), job.fs.as_ref(), name, &path, kind, true, job.hosts.as_deref(), &mut seen, cost, false) {
+fn hash_one(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, hosts: Option<&dyn HostFiles>, seen: &Attached, name: &str, cost: &mut Cost) {
+    let path = store.join(name);
+    if let Some(kind) = load(db, name.as_bytes()) {
+        let mut seen = seen.lock();
+        if let Err(e) = adopt(db, fs, name, &path, kind, true, hosts, &mut seen, cost, false) {
             eprintln!("rargod: nix path {name}: {e:#}");
         }
         return;
     }
-    let t = Instant::now();
-    let fresh = match hash_path_mode(job.fs.as_ref(), &path, false) {
+    let t = crate::io::now();
+    let fresh = match hash_path_mode(fs, &path, false) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("rargod: nix path {name}: {e}");
             return;
         }
     };
-    cost.millis += t.elapsed().as_millis() as u64;
-    if let Some(hosts) = job.hosts.as_deref() {
-        let mut seen = job.seen.lock();
+    cost.millis += crate::io::now().saturating_duration_since(t).as_millis() as u64;
+    if let Some(hosts) = hosts {
+        let mut seen = seen.lock();
         if !seen.contains(name) {
-            if let Err(e) = attach_kind(job.fs.as_ref(), &fresh.kind, &path, hosts) {
+            if let Err(e) = attach_kind(fs, &fresh.kind, &path, hosts) {
                 eprintln!("rargod: nix path {name} manifest does not match the files ({e})");
                 return;
             }
             seen.insert(name.to_string());
         }
     }
-    if let Err(e) = save(job.db.as_ref(), name.as_bytes(), &fresh.kind) {
+    if let Err(e) = save(db, name.as_bytes(), &fresh.kind) {
         eprintln!("rargod: nix path {name}: {e:#}");
         return;
     }
@@ -794,13 +806,13 @@ pub fn judge(expected: Vec<(PathBuf, Expect)>, seen: Vec<io::Result<(Kind, HostS
     Verdict::Matches(files)
 }
 
-fn attach_kind(fs: &dyn StoreFs, kind: &StoredKind, path: &Path, hosts: &DashMap<Hash, FileSrc>) -> Result<(), String> {
+fn attach_kind(fs: &dyn StoreFs, kind: &StoredKind, path: &Path, hosts: &dyn HostFiles) -> Result<(), String> {
     let expected = expectations(kind, path)?;
     let seen = expected.iter().map(|(p, _)| fs.host(p)).collect();
     match judge(expected, seen) {
         Verdict::Matches(files) => {
             for (hash, path, sig) in files {
-                hosts.entry(hash).or_insert_with(|| FileSrc::Host { path: Arc::from(path), sig });
+                hosts.record(hash, path, sig);
             }
             Ok(())
         }
@@ -1029,8 +1041,10 @@ pub fn list_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::Transcript;
+    use expect_test::expect;
     use crate::db::MemTables;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::cell::RefCell;
 
     #[derive(Clone, Debug)]
     enum Ent {
@@ -1045,7 +1059,6 @@ mod tests {
         ents: BTreeMap<PathBuf, Ent>,
         odd: BTreeMap<PathBuf, Vec<Vec<u8>>>,
         broken: BTreeSet<PathBuf>,
-        hashed: AtomicU64,
     }
 
     impl FakeStore {
@@ -1058,6 +1071,12 @@ mod tests {
                 self.ents.entry(a.to_path_buf()).or_insert(Ent::Dir);
             }
             self.ents.insert(path, e);
+        }
+
+        /// The store with only the entries under `dir`: asking it about anything else fails.
+        fn only(&self, dir: &str) -> FakeStore {
+            let ents = self.ents.iter().filter(|(p, _)| p.starts_with(dir)).map(|(p, e)| (p.clone(), e.clone())).collect();
+            FakeStore { ents, ..FakeStore::default() }
         }
 
         fn kind(e: &Ent) -> Kind {
@@ -1100,7 +1119,6 @@ mod tests {
         }
 
         fn hash(&self, path: &Path) -> io::Result<(Hash, u64)> {
-            self.hashed.fetch_add(1, Ordering::Relaxed);
             match self.ents.get(path) {
                 Some(Ent::File(data, _)) => Ok((Hash::of(data), data.len() as u64)),
                 _ => Err(missing(path)),
@@ -1226,21 +1244,27 @@ mod tests {
         fs.put("/s/d/sub/x", Ent::File(b"x".to_vec(), false));
         fs.broken.insert(PathBuf::from("/s/d/sub"));
         let mut rng = Rng(7);
-        let f = walk_shuffled(&fs, Path::new("/s/f"), &mut rng).unwrap();
-        assert!(matches!(f.kind, StoredKind::File { size: 9, exec: true, .. }) && (f.files, f.bytes) == (1, 9));
-        let l = walk_shuffled(&fs, Path::new("/s/l"), &mut rng).unwrap();
-        assert!(matches!(&l.kind, StoredKind::Link(t) if t == b"f") && (l.files, l.bytes) == (0, 0));
-        let p = walk_shuffled(&fs, Path::new("/s/p"), &mut rng).err().unwrap();
-        assert_eq!(p.to_string(), "/s/p is not a file, directory or symlink");
-        let d = walk_shuffled(&fs, Path::new("/s/d"), &mut rng).err().unwrap();
-        assert_eq!(d.to_string(), "/s/d/sub: permission denied");
-        let gone = walk_shuffled(&fs, Path::new("/s/none"), &mut rng).err().unwrap();
-        assert_eq!(gone.to_string(), "/s/none: /s/none is missing");
+        let mut outcomes = Transcript::default();
+        for path in ["/s/f", "/s/l", "/s/p", "/s/d", "/s/none"] {
+            match walk_shuffled(&fs, Path::new(path), &mut rng) {
+                Ok(fresh) => outcomes.record(path, (fresh.kind, fresh.files, fresh.bytes)),
+                Err(err) => outcomes.record(path, err.to_string()),
+            }
+        }
         let mut walk = Walk::new(Path::new("/s/f"));
         walk.saw(Ask::Stat("/s/f".into()), Ok(Answer::Hash(Hash::ZERO, 0)));
         walk.invariants();
-        assert!(walk.finish().is_err(), "an answer of the wrong shape fails the walk");
-        assert!(Walk::new(Path::new("/s/f")).finish().is_err(), "an unfinished walk has no manifest");
+        outcomes.record("wrong answer shape", walk.finish().err().expect("the walk failed").to_string());
+        outcomes.record("unfinished walk", Walk::new(Path::new("/s/f")).finish().err().expect("the walk failed").to_string());
+        expect![[r#"
+            /s/f: (File { hash: a42be855d08d82d7, size: 9, exec: true }, 1, 9)
+            /s/l: (Link([102]), 0, 0)
+            /s/p: "/s/p is not a file, directory or symlink"
+            /s/d: "/s/d/sub: permission denied"
+            /s/none: "/s/none: /s/none is missing"
+            wrong answer shape: "/s/f: Hash(0000000000000000, 0) does not answer Stat(\"/s/f\")"
+            unfinished walk: "/s/f is not walked yet"
+        "#]].assert_eq(&outcomes.0);
     }
 
     #[test]
@@ -1277,24 +1301,35 @@ mod tests {
         fs
     }
 
-    fn job(fs: FakeStore, hosts: Option<Arc<DashMap<Hash, FileSrc>>>) -> (Job, Arc<FakeStore>) {
-        let fake = Arc::new(fs);
-        let dynfs: Arc<dyn StoreFs> = fake.clone();
-        let job = Job {
-            db: Arc::new(MemTables::default()),
-            fs: dynfs,
-            store: PathBuf::from("/store"),
-            hosts,
-            seen: Arc::new(parking_lot::Mutex::new(HashSet::new())),
-            cost: parking_lot::Mutex::new(Cost::default()),
-            left: std::sync::atomic::AtomicUsize::new(0),
-        };
-        (job, fake)
+    /// The files a run recorded, held by the test alone.
+    #[derive(Default)]
+    struct Recorded(RefCell<BTreeMap<Hash, PathBuf>>);
+
+    impl HostFiles for Recorded {
+        fn record(&self, hash: Hash, path: PathBuf, _: HostSig) {
+            self.0.borrow_mut().entry(hash).or_insert(path);
+        }
     }
 
-    fn plan_of(job: &Job, names: &[&str]) -> (Prepared, Vec<String>) {
+    /// What the hashing thread works on: the saved manifests, the store, and the paths already recorded.
+    struct Parts {
+        db: MemTables,
+        fs: FakeStore,
+        store: PathBuf,
+        seen: Attached,
+    }
+
+    fn parts(fs: FakeStore) -> Parts {
+        Parts { db: MemTables::default(), fs, store: PathBuf::from("/store"), seen: Attached::default() }
+    }
+
+    fn plan_of(parts: &Parts, fs: &FakeStore, hosts: Option<&dyn HostFiles>, names: &[&str]) -> (Prepared, Vec<String>) {
         let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
-        plan(job.db.as_ref(), job.fs.as_ref(), &job.store, &names, job.hosts.as_deref(), &job.seen).unwrap()
+        plan(&parts.db, fs, &parts.store, &names, hosts, &parts.seen).unwrap()
+    }
+
+    fn hash(parts: &Parts, hosts: Option<&dyn HostFiles>, name: &str, cost: &mut Cost) {
+        hash_one(&parts.db, &parts.fs, &parts.store, hosts, &parts.seen, name, cost);
     }
 
     #[test]
@@ -1306,14 +1341,12 @@ mod tests {
         assert_eq!(first.cost.new_paths, 2);
         assert_eq!(first.cost.reused_paths, 0);
         assert_eq!(first.cost.hashed_files, 3);
-        assert_eq!(fs.hashed.load(Ordering::Relaxed), 3);
-        let second = ensure(&db, &fs, store, &["bbb".into(), "ccc".into()]).unwrap();
+        let second = ensure(&db, &fs.only("/store/ccc"), store, &["bbb".into(), "ccc".into()]).unwrap();
         assert_eq!(second.cost.reused_paths, 1, "bbb was hashed with the first closure");
         assert_eq!(second.cost.new_paths, 1);
         assert_eq!(second.cost.hashed_files, 1, "only ccc's file is new");
-        assert_eq!(fs.hashed.load(Ordering::Relaxed), 4);
         assert_eq!(second.roots[0], first.roots[1], "bbb keeps its tree");
-        let third = ensure(&db, &fs, store, &["aaa".into(), "bbb".into()]).unwrap();
+        let third = ensure(&db, &FakeStore::default(), store, &["aaa".into(), "bbb".into()]).unwrap();
         assert_eq!(third.cost.hashed_files, 0);
         assert_eq!(third.cost.reused_paths, 2);
         assert_eq!(third.roots, first.roots);
@@ -1322,41 +1355,42 @@ mod tests {
 
     #[test]
     fn scheduling_answers_from_saved_manifests_and_leaves_the_rest_to_the_hash_queue() {
-        let (job, fake) = job(tree(), None);
-        let (first, pending) = plan_of(&job, &["aaa", "bbb"]);
+        let parts = parts(tree());
+        let nothing_to_read = FakeStore::default();
+        let (first, pending) = plan_of(&parts, &nothing_to_read, None, &["aaa", "bbb"]);
         assert_eq!(first.roots, vec![Hash::ZERO, Hash::ZERO]);
-        assert_eq!(pending, ["aaa", "bbb"]);
-        assert_eq!(fake.hashed.load(Ordering::Relaxed), 0, "planning hashes nothing");
+        assert_eq!(pending, ["aaa", "bbb"], "planning hashes nothing: it does not read the store");
         let mut cost = Cost::default();
         for name in &pending {
-            hash_one(&job, name, &mut cost);
+            hash(&parts, None, name, &mut cost);
         }
         assert_eq!((cost.new_paths, cost.hashed_files), (2, 3));
-        let (second, pending) = plan_of(&job, &["bbb", "ccc"]);
-        assert_eq!(second.roots[0], identity(&load(job.db.as_ref(), b"bbb").unwrap()));
-        assert_eq!(second.roots[0], model(&fake, Path::new("/store/bbb")).0);
+        let (second, pending) = plan_of(&parts, &nothing_to_read, None, &["bbb", "ccc"]);
+        assert_eq!(second.roots[0], identity(&load(&parts.db, b"bbb").unwrap()));
+        assert_eq!(second.roots[0], model(&parts.fs, Path::new("/store/bbb")).0);
         assert_eq!((second.cost.reused_paths, second.roots[1]), (1, Hash::ZERO));
         assert_eq!(pending, ["ccc"]);
-        hash_one(&job, "ccc", &mut cost);
-        hash_one(&job, "ccc", &mut cost);
+        hash(&parts, None, "ccc", &mut cost);
+        hash(&parts, None, "ccc", &mut cost);
         assert_eq!(cost.new_paths, 3, "a path saved meanwhile is not hashed again");
-        let (third, pending) = plan_of(&job, &["aaa", "bbb"]);
+        let (third, pending) = plan_of(&parts, &nothing_to_read, None, &["aaa", "bbb"]);
         assert!(pending.is_empty() && third.cost.reused_paths == 2 && third.roots.iter().all(|r| *r != Hash::ZERO));
         let mut nothing = Cost::default();
-        hash_one(&job, "gone", &mut nothing);
-        assert!(load(job.db.as_ref(), b"gone").is_none() && nothing.new_paths == 0, "a path that cannot be hashed is skipped");
+        hash(&parts, None, "gone", &mut nothing);
+        assert!(load(&parts.db, b"gone").is_none() && nothing.new_paths == 0, "a path that cannot be hashed is skipped");
     }
 
     #[test]
     fn hashing_records_files_in_the_caller_map() {
-        let hosts = Arc::new(DashMap::new());
-        let (job, _) = job(tree(), Some(hosts.clone()));
-        let (_, pending) = plan_of(&job, &["aaa"]);
-        hash_one(&job, &pending[0], &mut Cost::default());
-        assert_eq!(hosts.len(), 2);
-        assert!(matches!(hosts.get(&Hash::of(b"tool-bytes")).map(|e| e.clone()), Some(FileSrc::Host { path, .. }) if path.as_ref() == Path::new("/store/aaa/bin/tool")));
-        assert!(hosts.contains_key(&Hash::of(b"note")));
-        assert!(job.seen.lock().contains("aaa"));
+        let hosts = Recorded::default();
+        let parts = parts(tree());
+        let (_, pending) = plan_of(&parts, &parts.fs, Some(&hosts), &["aaa"]);
+        hash(&parts, Some(&hosts), &pending[0], &mut Cost::default());
+        let recorded = hosts.0.borrow();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded.get(&Hash::of(b"tool-bytes")).map(PathBuf::as_path), Some(Path::new("/store/aaa/bin/tool")));
+        assert!(recorded.contains_key(&Hash::of(b"note")));
+        assert!(parts.seen.lock().contains("aaa"));
     }
 
     #[test]
@@ -1476,14 +1510,14 @@ mod tests {
     fn a_manifest_that_no_longer_matches_the_files_is_hashed_again() {
         let mut fs = tree();
         let db = MemTables::default();
-        let hosts: DashMap<Hash, FileSrc> = DashMap::new();
+        let hosts = Recorded::default();
         let store = Path::new("/store");
         ensure(&db, &fs, store, &["bbb".into()]).unwrap();
         fs.put("/store/bbb/readme", Ent::File(b"changed".to_vec(), false));
         let p = prepare(&db, &fs, store, &["bbb".into()], Some(&hosts), &mut HashSet::new()).unwrap();
         assert_eq!((p.cost.reused_paths, p.cost.new_paths, p.cost.hashed_files), (0, 1, 1));
         assert_eq!(p.roots[0], model(&fs, Path::new("/store/bbb")).0);
-        assert!(hosts.contains_key(&Hash::of(b"changed")));
+        assert!(hosts.0.borrow().contains_key(&Hash::of(b"changed")));
     }
 
     #[test]
@@ -1534,13 +1568,10 @@ mod tests {
     fn remembering_a_file_does_not_copy_its_bytes() {
         let fs = tree();
         let db = MemTables::default();
-        let hosts: DashMap<Hash, FileSrc> = DashMap::new();
+        let hosts = Recorded::default();
         prepare(&db, &fs, Path::new("/store"), &["aaa".into()], Some(&hosts), &mut HashSet::new()).unwrap();
         let h = Hash::of(b"tool-bytes");
-        match hosts.get(&h).map(|e| e.clone()) {
-            Some(FileSrc::Host { path, .. }) => assert_eq!(path.as_ref(), Path::new("/store/aaa/bin/tool")),
-            other => panic!("host file: {other:?}"),
-        }
+        assert_eq!(hosts.0.borrow().get(&h).map(PathBuf::as_path), Some(Path::new("/store/aaa/bin/tool")), "the file is recorded where it lies in the store");
         assert!(db.get(Table::Meta, &meta_key(b"aaa")).is_some());
         assert!(db.get(Table::Blobs, &h.0).is_none());
     }

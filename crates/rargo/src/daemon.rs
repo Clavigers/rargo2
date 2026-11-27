@@ -5,7 +5,7 @@ use rargo::daemon_state::{self, DaemonState, Head, Need, ScanPlan};
 use crate::mux::Mux;
 use crate::outfs::{OutFs, Reader, VFile};
 use crate::partial::Partial;
-use crate::place::{Placed, Placer};
+use crate::place::{OutputMounts, Placed, Placer};
 use crate::watch::{Registration, Watcher};
 use crate::{Config, Policy, git, report, scan};
 use rargo_net::link::Link;
@@ -85,6 +85,8 @@ pub struct Daemon {
     transport: String,
     mux: io::Mutex<Option<Arc<Mux>>>,
     worktrees: Mutex<HashMap<PathBuf, Arc<Worktree>>>,
+    // Keep mount creation from racing a checked copy to the same path.
+    mounting: io::Mutex<()>,
     watcher: Option<Arc<Watcher>>,
     next_wt: AtomicU64,
     asked: Mutex<Vec<String>>,
@@ -490,8 +492,7 @@ fn low_space_text(cache: &Path, free: u64) -> Option<String> {
 
 fn free_bytes(dir: &Path) -> Option<u64> {
     let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+    crate::kernel::statvfs(&c).ok().map(|s| s.f_bavail as u64 * s.f_frsize as u64)
 }
 
 fn no_link(e: std::io::Error) -> std::io::Error {
@@ -527,13 +528,14 @@ impl Daemon {
             cfg,
             cache,
             host: crate::hostname(),
-            transport: std::env::var("RARGO_TRANSPORT").unwrap_or_default(),
+            transport: io::env::var("RARGO_TRANSPORT").unwrap_or_default(),
             mux: io::Mutex::new(None),
             worktrees: Mutex::new(HashMap::new()),
+            mounting: io::Mutex::new(()),
             watcher,
             next_wt: AtomicU64::new(1),
             active: AtomicUsize::new(0),
-            last_active: Mutex::new(Instant::now()),
+            last_active: Mutex::new(io::now()),
             counters: Counters::default(),
             big_sync: io::Mutex::new(()),
             fetching: Mutex::new(HashMap::new()),
@@ -612,7 +614,7 @@ impl Daemon {
     fn worktree(self: &Arc<Self>, root: &Path) -> Arc<Worktree> {
         let mut all = self.worktrees.lock().unwrap();
         if let Some(wt) = all.get(root) {
-            *wt.last_used.lock().unwrap() = Instant::now();
+            *wt.last_used.lock().unwrap() = io::now();
             return wt.clone();
         }
         let wt_id = {
@@ -640,7 +642,7 @@ impl Daemon {
             events: Mutex::new(HashSet::new()),
             changed: io::Notify::new(),
             running: io::Mutex::new(()),
-            last_used: Mutex::new(Instant::now()),
+            last_used: Mutex::new(io::now()),
             out: Mutex::new(None),
             out_failed: AtomicBool::new(false),
         });
@@ -840,7 +842,7 @@ impl Daemon {
             None
         };
         self.counters.offers.fetch_add(1, Ordering::Relaxed);
-        if std::env::var_os("RARGO_DAEMON_TRACE").is_some() {
+        if io::env::var_os("RARGO_DAEMON_TRACE").is_some() {
             let new: HashSet<&Digest> = trees.iter().collect();
             let mut paths: Vec<String> = Vec::new();
             let mut todo: Vec<(String, Digest)> = vec![(String::new(), snap.scan.root)];
@@ -959,17 +961,23 @@ impl Daemon {
         }
     }
 
-    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
+    fn out_for(self: &Arc<Self>, wt: &Arc<Worktree>, req: &LocalRequest, cwd: &Path) -> std::io::Result<Option<(Arc<OutFs>, PathBuf)>> {
         let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
             || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
             || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
         let same_ns = req.mount_ns == crate::mount_ns();
         let want = self.watcher.is_some() && var(&req.vars, "RARGO_OUTPUT") != Some("copy") && !elsewhere && same_ns;
+        let _mounting = self.mounting.lock();
         let mut g = wt.out.lock().unwrap();
         if !want {
             if let Some(m) = g.take() {
                 m.fs.save();
                 io::blocking(|| m.session.unmount());
+            }
+            // Checked only now: an explicit target dir may name this
+            // worktree's own `target`, whose mount was just released.
+            if let Some(dir) = explicit_target_dir(req) {
+                OutputMounts::current()?.check(&cwd.join(dir))?;
             }
             return Ok(None);
         }
@@ -1003,6 +1011,7 @@ impl Daemon {
 
     fn mount_out(self: &Arc<Self>, wt: &Arc<Worktree>) -> std::io::Result<Mounted> {
         let dir = wt.root.join("target");
+        OutputMounts::current()?.check(&wt.root)?;
         release_mounts(&dir);
         if rargo_net::io::file::symlink_metadata(&dir).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
             return Err(std::io::Error::other("`target` is a symbolic link"));
@@ -1014,7 +1023,7 @@ impl Daemon {
         }
         let source = Box::new(Contents { d: Arc::downgrade(self) });
         let fs = OutFs::new(&dir, &wt.wt_cache.join("virtual"), source)?;
-        let root = unsafe { libc::geteuid() } == 0;
+        let root = io::process::euid() == 0;
         let opts = fusewire::MountOptions {
             fsname: "rargo".into(),
             allow_other: root,
@@ -1172,7 +1181,7 @@ impl Daemon {
             }
             if !recipe.is_empty() {
                 let slot = crate::place::cache_slot(&self.cache, &hash);
-                let tmp = slot.with_file_name(format!(".incoming-{}-{}", std::process::id(), mux.next_id()));
+                let tmp = slot.with_file_name(format!(".incoming-{}-{}", io::process::id(), mux.next_id()));
                 if let Some(parent) = slot.parent() {
                     rargo_net::io::file::create_dir_all(parent)?;
                 }
@@ -1226,7 +1235,7 @@ impl Daemon {
                     let _ = rargo_net::io::file::remove_file(&tmp);
                     return Err(std::io::Error::other("the server sent content that does not match its hash"));
                 }
-                let _ = rargo_net::io::file::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o444));
+                let _ = rargo_net::io::file::set_mode(&tmp, 0o444);
                 rargo_net::io::file::rename(&tmp, &slot)?;
                 let mut index = self.chunks.lock().unwrap();
                 if index.len() > crate::known::MOST_CHUNKS {
@@ -1266,7 +1275,7 @@ impl Daemon {
     }
 
     fn touch(&self) {
-        *self.last_active.lock().unwrap() = Instant::now();
+        *self.last_active.lock().unwrap() = io::now();
     }
 
     fn close_down(&self, socket: &Path) {
@@ -1421,7 +1430,7 @@ impl Daemon {
         let shown = if req.kind == "sync" {
             None
         } else {
-            match self.out_for(&wt, req) {
+            match self.out_for(&wt, req, &cwd) {
                 Ok(shown) => shown,
                 Err(err) => return Ok(Self::fail(out, err.to_string())),
             }
@@ -1433,10 +1442,10 @@ impl Daemon {
                 _ => {}
             }
         }
-        let taken_up = Instant::now();
+        let taken_up = io::now();
         let phase = |what: &str| {
             if stats {
-                let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", taken_up.elapsed().as_secs_f64()).into_bytes()));
+                let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", io::now().saturating_duration_since(taken_up).as_secs_f64()).into_bytes()));
             }
         };
         let mut step = command.begin();
@@ -1444,7 +1453,7 @@ impl Daemon {
         let mut snap: Option<Arc<Snap>> = None;
         let mut bet = None;
         let mut failure = None;
-        let mut started = Instant::now();
+        let mut started = io::now();
         loop {
             step = match step {
                 Step::Link => {
@@ -1455,7 +1464,7 @@ impl Daemon {
                         Ok(mux) => {
                             link = Some(mux);
                             phase("link to the server ready");
-                            started = Instant::now();
+                            started = io::now();
                             command.linked()
                         }
                         Err(e) => command.connect_failed().ok_or(e)?,
@@ -1476,7 +1485,7 @@ impl Daemon {
                             format!(
                                 "rargo: scanned {} files in {:.1} ms ({} read, {:.1} MiB), looking at {} of {} directories\n",
                                 fresh.scan.file_count,
-                                started.elapsed().as_secs_f64() * 1e3,
+                                io::now().saturating_duration_since(started).as_secs_f64() * 1e3,
                                 fresh.scan.hashed_files,
                                 fresh.scan.hashed_bytes as f64 / 1048576.0,
                                 fresh.scan.listed_dirs,
@@ -1687,6 +1696,7 @@ impl Daemon {
                     }
                 }
                 CommandEffect::Deliver(files, writes, targets) => {
+                    let _mounting = self.mounting.lock();
                     io::cpu(|| -> std::io::Result<()> {
                         let (files, writes) = match shown {
                             Some((fs, dir)) => show(fs, dir, files, writes)?,
@@ -1697,15 +1707,19 @@ impl Daemon {
                         Ok(())
                     })?;
                 }
-                CommandEffect::Blobs(blobs) => io::cpu(|| -> std::io::Result<()> {
-                    for b in blobs {
-                        let hash = b.hash;
-                        placer.blob(hash, &b.unpack()?)?;
-                    }
-                    Ok(())
-                })?,
+                CommandEffect::Blobs(blobs) => {
+                    let _mounting = self.mounting.lock();
+                    io::cpu(|| -> std::io::Result<()> {
+                        for b in blobs {
+                            let hash = b.hash;
+                            placer.blob(hash, &b.unpack()?)?;
+                        }
+                        Ok(())
+                    })?;
+                }
                 CommandEffect::Part(hash, part, last) => {
-                    io::cpu(|| -> std::io::Result<()> { placer.part(hash, &part.unpack()?, last) })?
+                    let _mounting = self.mounting.lock();
+                    io::cpu(|| placer.part(hash, &part.unpack()?, last))?;
                 }
                 CommandEffect::VerifyFetch => {
                     let complete = command.fetching.as_ref().is_some_and(|(_, hashes)| hashes.iter().all(|hash| !placer.pending(hash)));
@@ -1912,6 +1926,19 @@ fn next_msg(mux: &Arc<Mux>, rx: &mut UnboundedReceiver<ServerMsg>) -> std::io::R
     }
 }
 
+fn explicit_target_dir(req: &LocalRequest) -> Option<&str> {
+    let mut args = req.args.iter().take_while(|arg| *arg != "--");
+    while let Some(arg) = args.next() {
+        if arg == "--target-dir" {
+            return args.next().map(String::as_str);
+        }
+        if let Some(dir) = arg.strip_prefix("--target-dir=") {
+            return Some(dir);
+        }
+    }
+    var(&req.vars, "CARGO_TARGET_DIR").or_else(|| var(&req.vars, "CARGO_BUILD_TARGET_DIR"))
+}
+
 fn mountinfo() -> String {
     rargo_net::io::file::read_to_string("/proc/self/mountinfo").unwrap_or_default()
 }
@@ -1923,7 +1950,13 @@ fn mounts_at<'a>(info: &'a str, dir: &Path) -> impl Iterator<Item = &'a str> {
 
 fn dev_at(info: &str, dir: &Path) -> Option<u64> {
     let (major, minor) = mounts_at(info, dir).last()?.split(' ').nth(2)?.split_once(':')?;
-    Some(libc::makedev(major.parse().ok()?, minor.parse().ok()?))
+    Some(device_number(major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The device number Linux makes of a major and a minor number.
+fn device_number(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (u64::from(major), u64::from(minor));
+    ((major & 0xffff_f000) << 32) | ((major & 0xfff) << 8) | ((minor & 0xffff_ff00) << 12) | (minor & 0xff)
 }
 
 fn release_mounts(dir: &Path) {
@@ -1931,7 +1964,7 @@ fn release_mounts(dir: &Path) {
     let mounts = mounts_at(&info, dir).count();
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return };
     for _ in 0..mounts {
-        if unsafe { libc::umount2(c.as_ptr(), libc::MNT_DETACH) } != 0 {
+        if crate::kernel::unmount(&c, libc::MNT_DETACH).is_err() {
             fusewire::unmount_with_helper(dir);
         }
     }
@@ -1945,7 +1978,7 @@ fn show(
 ) -> std::io::Result<(Vec<rargo_proto::Delivery>, Vec<rargo_proto::Write>)> {
     use rargo_proto::Write;
     let inside = |path: &str| target_relative(dir, Path::new(path));
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
+    let now = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
     let mut delivery = fs.begin_delivery();
     let mut rest_writes = Vec::new();
     for w in writes {
@@ -2175,9 +2208,65 @@ fn upload(mux: &Arc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> s
 #[cfg(test)]
 mod upload_tests {
     use super::*;
+    use expect_test::expect;
+
+    /// Plans the upload of `want`, each file named by its first byte and `size` bytes long, and lists the plan.
+    fn plan(want: &[u8], sizes: &[(u8, u64)], budget: usize) -> String {
+        let files = sizes.iter().map(|&(i, size)| ([i; 32], (PathBuf::from(i.to_string()), size))).collect();
+        let Some(plan) = UploadPlan::new(want.iter().map(|&i| [i; 32]).collect(), &files, budget) else {
+            return "no plan\n".to_string();
+        };
+        plan.invariants();
+        let name = |file: &UploadFile| format!("{}:{}", file.hash[0], file.size);
+        let mut out = format!("part size {}\n", plan.part_size);
+        for batch in &plan.batches {
+            out += &format!("batch {}\n", batch.iter().map(name).collect::<Vec<_>>().join(" "));
+        }
+        for file in &plan.multipart {
+            out += &format!("multipart {}\n", name(file));
+        }
+        out
+    }
 
     #[test]
     fn upload_plans_keep_first_occurrence_order_within_both_frame_types() {
+        let sizes = [(1, 0), (2, 100), (3, 168), (4, 169), (5, 40), (6, 1_000), (7, 60), (8, 104)];
+        let want = [3, 1, 4, 1, 5, 2, 6, 5, 7, 8, 3];
+        let found = [128, 232, 4096].map(|budget| format!("budget {budget}\n{}", plan(&want, &sizes, budget))).concat();
+        expect![[r#"
+            budget 128
+            part size 64
+            batch 1:0
+            batch 5:40
+            batch 7:60
+            multipart 3:168
+            multipart 4:169
+            multipart 2:100
+            multipart 6:1000
+            multipart 8:104
+            budget 232
+            part size 168
+            batch 3:168
+            batch 1:0 5:40
+            batch 2:100
+            batch 7:60
+            batch 8:104
+            multipart 4:169
+            multipart 6:1000
+            budget 4096
+            part size 4032
+            batch 3:168 1:0 4:169 5:40 2:100 6:1000 7:60 8:104
+        "#]].assert_eq(&found);
+        expect![[r#"
+            no plan
+        "#]].assert_eq(&plan(&[1, 9], &sizes, 4096));
+        expect![[r#"
+            no plan
+        "#]].assert_eq(&plan(&[1], &sizes, UPLOAD_OVERHEAD));
+    }
+
+    #[test]
+    fn generated_upload_plans_keep_first_occurrence_order_within_both_frame_types() {
         for budget in [128usize, 232, 4096] {
             let mut want = Vec::new();
             let mut files = std::collections::BTreeMap::new();
@@ -2194,38 +2283,72 @@ mod upload_tests {
                 assert_eq!(plan.batches.iter().flatten().map(|entry| entry.hash).collect::<Vec<_>>(), small);
                 assert_eq!(plan.multipart.iter().map(|entry| entry.hash).collect::<Vec<_>>(), large);
             }
-            assert!(UploadPlan::new(vec![[255; 32]], &files, budget).is_none());
         }
+    }
+
+    #[test]
+    fn a_target_relative_directory_is_named_by_its_dot_entry() {
         assert_eq!(join_rel(b"debug"), b"debug/.");
+    }
+
+    /// Feeds `input` to a multipart upload of `content` in reads of `part_size` bytes, checking it after each,
+    /// and lists the frames it sends; like the upload, it stops at the first read the machine refuses.
+    fn multipart(content: &[u8], input: &[u8], part_size: usize) -> String {
+        let hash = *blake3::hash(content).as_bytes();
+        let mut upload =
+            Multipart { hash, size: content.len() as u64, part_size, bytes: 0, hasher: blake3::Hasher::new(), held: None };
+        upload.invariants();
+        let frame = |(msg, bytes): (ClientMsg, usize)| match msg {
+            ClientMsg::BlobPart { hash: got, part, last } => {
+                assert_eq!(got, hash, "a part names its content");
+                let data = part.unpack().unwrap();
+                format!("part {:?} last={last} ({bytes} bytes on the wire)", String::from_utf8_lossy(&data))
+            }
+            other => format!("unexpected {other:?}"),
+        };
+        let mut out = String::new();
+        for (i, chunk) in input.chunks(part_size).enumerate() {
+            let read = upload.read(chunk.to_vec());
+            upload.invariants();
+            let refused = read.is_err();
+            let sent = match read {
+                Ok(Some(sent)) => frame(sent),
+                Ok(None) => "nothing yet".to_string(),
+                Err(()) => "refused, and the upload stops".to_string(),
+            };
+            out += &format!("read {i} {:?} => {sent}\n", String::from_utf8_lossy(chunk));
+            if refused {
+                return out;
+            }
+        }
+        out + &format!("finish => {}\n", upload.finish().map_or("nothing".to_string(), frame))
     }
 
     #[test]
     fn only_verified_multipart_content_gets_a_terminal_frame() {
-        let input = b"one two three";
-        let hash = *blake3::hash(input).as_bytes();
-        let fresh = || Multipart { hash, size: input.len() as u64, part_size: 4, bytes: 0, hasher: blake3::Hasher::new(), held: None };
-        let mut content = fresh();
-        let mut transferred = Vec::new();
-        for chunk in input.chunks(4) {
-            if let Some((ClientMsg::BlobPart { hash: got, part, last: false }, bytes)) = content.read(chunk.to_vec()).ok().unwrap() {
-                assert_eq!(got, hash);
-                assert!(bytes <= 4);
-                transferred.extend(part.unpack().unwrap());
-            }
-            content.invariants();
-        }
-        let (ClientMsg::BlobPart { hash: got, part, last: true }, bytes) = content.finish().unwrap() else { panic!("expected final part") };
-        assert_eq!(got, hash);
-        assert!(bytes <= 4);
-        transferred.extend(part.unpack().unwrap());
-        assert_eq!(transferred, input);
-
-        let mut corrupt = fresh();
-        for chunk in b"one TWO three".chunks(4) {
-            let _ = corrupt.read(chunk.to_vec()).unwrap();
-            corrupt.invariants();
-        }
-        assert!(corrupt.finish().is_none());
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "two " => part "one " last=false (4 bytes on the wire)
+            read 2 "thre" => part "two " last=false (4 bytes on the wire)
+            read 3 "e" => part "thre" last=false (4 bytes on the wire)
+            finish => part "e" last=true (1 bytes on the wire)
+        "#]].assert_eq(&multipart(b"one two three", b"one two three", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "TWO " => part "one " last=false (4 bytes on the wire)
+            read 2 "thre" => part "TWO " last=false (4 bytes on the wire)
+            read 3 "e" => part "thre" last=false (4 bytes on the wire)
+            finish => nothing
+        "#]].assert_eq(&multipart(b"one two three", b"one TWO three", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "two " => refused, and the upload stops
+        "#]].assert_eq(&multipart(b"one two", b"one two three", 4));
+        expect![[r#"
+            read 0 "one " => nothing yet
+            read 1 "two" => part "one " last=false (4 bytes on the wire)
+            finish => nothing
+        "#]].assert_eq(&multipart(b"one two three", b"one two", 4));
     }
 }
 
@@ -2258,7 +2381,7 @@ fn serve_command(d: Arc<Daemon>, stream: io::UnixStream, socket: PathBuf) {
         let _ = wr.write_all(&(done.len() as u32).to_le_bytes());
         let _ = wr.write_all(&done);
         let _ = wr.shutdown();
-        std::process::exit(0);
+        io::process::exit(0);
     }
     let (tx, mut rx) = unbounded_channel::<LocalReply>();
     let work = io::spawn(move || d.command(req, tx));
@@ -2307,10 +2430,10 @@ pub fn serve(socket: &Path) -> ! {
         };
         {
             use std::os::fd::AsRawFd;
-            let started = Instant::now();
-            while unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                if started.elapsed() > Duration::from_secs(3) {
-                    std::process::exit(0);
+            let started = io::now();
+            while crate::kernel::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB).is_err() {
+                if io::now().saturating_duration_since(started) > Duration::from_secs(3) {
+                    io::process::exit(0);
                 }
                 io::sleep(Duration::from_millis(20));
             }
@@ -2322,9 +2445,9 @@ pub fn serve(socket: &Path) -> ! {
         };
         let d = Daemon::new(cfg, cache, true);
         let idle = Duration::from_secs(
-            std::env::var("RARGO_DAEMON_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800),
+            io::env::var("RARGO_DAEMON_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800),
         );
-        eprintln!("rargo daemon: {} serving {} on {}", std::process::id(), d.cfg.server, socket.display());
+        eprintln!("rargo daemon: {} serving {} on {}", io::process::id(), d.cfg.server, socket.display());
         let mut term = io::signal(io::SignalKind::terminate()).expect("signal handler");
         let mut int = io::signal(io::SignalKind::interrupt()).expect("signal handler");
         enum Gate {
@@ -2361,13 +2484,13 @@ pub fn serve(socket: &Path) -> ! {
                 Gate::Conn(Err(_)) => {}
                 Gate::Idle => {
                     let showing = d.worktrees.lock().unwrap().values().any(|w| w.out.lock().unwrap().is_some());
-                    let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && d.last_active.lock().unwrap().elapsed() > idle;
+                    let quiet = !showing && d.active.load(Ordering::SeqCst) == 0 && io::now().saturating_duration_since(*d.last_active.lock().unwrap()) > idle;
                     d.save_known();
                     if quiet {
                         d.close_down(&socket);
                         break;
                     }
-                    if !socket.exists() {
+                    if !socket.ring_exists() {
                         d.unmount_all();
                         break;
                     }
@@ -2375,7 +2498,7 @@ pub fn serve(socket: &Path) -> ! {
                         let mut all = d.worktrees.lock().unwrap();
                         let old: Vec<PathBuf> = all
                             .iter()
-                            .filter(|(_, w)| w.out.lock().unwrap().is_none() && w.last_used.lock().unwrap().elapsed() > Duration::from_secs(4 * 3600))
+                            .filter(|(_, w)| w.out.lock().unwrap().is_none() && io::now().saturating_duration_since(*w.last_used.lock().unwrap()) > Duration::from_secs(4 * 3600))
                             .map(|(p, _)| p.clone())
                             .collect();
                         old.iter().filter_map(|p| all.remove(p)).collect()
@@ -2391,7 +2514,7 @@ pub fn serve(socket: &Path) -> ! {
             }
         }
         drop(lock);
-        std::process::exit(0);
+        io::process::exit(0);
     });
     unreachable!("the daemon leaves through exit")
 }
@@ -2461,6 +2584,7 @@ fn paths_in<'t>(text: &'t str, root: &'t str) -> impl Iterator<Item = String> + 
 
 #[cfg(test)]
 mod left_out_tests {
+    use expect_test::expect;
     struct Rng(u64);
 
     impl Rng {
@@ -2565,49 +2689,101 @@ mod left_out_tests {
         Ended::Reply
     }
 
+    #[derive(Clone, Copy)]
+    enum Ev {
+        Begin,
+        Linked,
+        ConnectFailed,
+        Scanned,
+        Offered(Sent),
+        Lost,
+        LostSilent(&'static str),
+    }
+
+    use Ev::*;
+
+    /// Steps a command of `kind` through the events, checking it after each, and lists the step each one gave.
+    fn run(kind: CommandKind, events: &[Ev]) -> String {
+        let mut c = CommandState::new(kind, Probe::Wait);
+        c.invariants();
+        let mut out = String::new();
+        for &ev in events {
+            let (name, step) = match ev {
+                Begin => ("begin".to_string(), Some(c.begin())),
+                Linked => ("linked".to_string(), Some(c.linked())),
+                ConnectFailed => ("connect failed".to_string(), c.connect_failed()),
+                Scanned => ("scanned".to_string(), Some(c.scanned())),
+                Offered(sent) => (format!("offered {sent:?}"), Some(c.offered(sent))),
+                Lost => ("link lost".to_string(), Some(c.link_lost(None))),
+                LostSilent(awaited) => {
+                    (format!("link silent 45 s awaiting {awaited}"), Some(c.link_lost(Some((Duration::from_secs(45), awaited)))))
+                }
+            };
+            c.invariants();
+            out += &format!("{name} => {step:?}\n");
+        }
+        out
+    }
+
+    const TO_REQUEST: [Ev; 5] = [Begin, ConnectFailed, Linked, Scanned, Offered(Sent::All)];
+    const RELINK: [Ev; 3] = [Linked, Scanned, Offered(Sent::All)];
+
     #[test]
     fn a_server_gone_silent_ends_the_command_with_that_silence_once_its_retry_cannot_connect_or_is_spent() {
-        let to_request = |c: &mut CommandState| {
-            assert_eq!(c.begin(), Step::Link);
-            assert_eq!(c.connect_failed(), None, "a first connect that fails is its own error");
-            assert_eq!(c.linked(), Step::Scan);
-            assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
-            assert_eq!(c.offered(Sent::All), Step::Request);
-        };
-        let quiet = Duration::from_secs(45);
-        let silent = Step::Silent { quiet, waiting_for: "the build's progress" };
+        let progress = "the build's progress";
+        let retry_cannot_connect = [&TO_REQUEST[..], &[LostSilent(progress), ConnectFailed]].concat();
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link silent 45 s awaiting the build's progress => Some(Link)
+            connect failed => Some(Silent { quiet: 45s, waiting_for: "the build's progress" })
+        "#]].assert_eq(&run(CommandKind::Run, &retry_cannot_connect));
+        let retry_spent = [&TO_REQUEST[..], &[LostSilent(progress)], &RELINK, &[Lost]].concat();
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link silent 45 s awaiting the build's progress => Some(Link)
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(Silent { quiet: 45s, waiting_for: "the build's progress" })
+        "#]].assert_eq(&run(CommandKind::Run, &retry_spent));
+        expect![[r#"
+            linked => Some(Request)
+            link silent 45 s awaiting its answer => Some(Link)
+            connect failed => Some(Silent { quiet: 45s, waiting_for: "its answer" })
+        "#]].assert_eq(&run(CommandKind::Admin, &[Linked, LostSilent("its answer"), ConnectFailed]));
+    }
 
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(Some((quiet, "the build's progress"))), Step::Link, "a silent link is retried once");
-        c.invariants();
-        assert_eq!(c.connect_failed(), Some(silent), "a retry that cannot connect ends with the silence");
-        c.invariants();
-
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(Some((quiet, "the build's progress"))), Step::Link);
-        assert_eq!(c.linked(), Step::Scan);
-        assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
-        assert_eq!(c.offered(Sent::All), Step::Request);
-        assert_eq!(c.link_lost(None), silent, "a spent retry ends with the earlier silence");
-
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(None), Step::Link);
-        assert_eq!(c.connect_failed(), None, "after a plain drop a failed connect is its own error");
-        let mut c = CommandState::new(CommandKind::Run, Probe::Wait);
-        to_request(&mut c);
-        assert_eq!(c.link_lost(None), Step::Link);
-        assert_eq!(c.linked(), Step::Scan);
-        assert_eq!(c.scanned(), Step::Offer(Probe::Wait));
-        assert_eq!(c.offered(Sent::All), Step::Request);
-        assert_eq!(c.link_lost(None), Step::GiveUp);
-
-        let mut c = CommandState::new(CommandKind::Admin, Probe::Wait);
-        assert_eq!(c.linked(), Step::Request);
-        assert_eq!(c.link_lost(Some((quiet, "its answer"))), Step::Link);
-        assert_eq!(c.connect_failed(), Some(Step::Silent { quiet, waiting_for: "its answer" }));
+    #[test]
+    fn a_plain_drop_is_retried_once_and_a_failed_connect_after_it_is_its_own_error() {
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(Link)
+            connect failed => None
+        "#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost, ConnectFailed]].concat()));
+        expect![[r#"
+            begin => Some(Link)
+            connect failed => None
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(Link)
+            linked => Some(Scan)
+            scanned => Some(Offer(Wait))
+            offered All => Some(Request)
+            link lost => Some(GiveUp)
+        "#]].assert_eq(&run(CommandKind::Run, &[&TO_REQUEST[..], &[Lost], &RELINK, &[Lost]].concat()));
     }
 
     #[test]

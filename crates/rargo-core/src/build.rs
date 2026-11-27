@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 mod nextest;
-mod pure;
+pub mod pure;
 mod request;
 pub mod nextest_run;
 
@@ -70,16 +70,24 @@ pub struct Daemon {
     pub parser: Arc<Parser>,
     pub incr: crate::incr::IncrStore,
     pub pool: OnceLock<Arc<crate::remote::Pool>>,
-    pub(crate) nix_attached: Arc<Mutex<HashSet<String>>>,
+    pub(crate) nix_attached: Arc<crate::nixmanifest::Attached>,
     pub drift_report: Mutex<Option<String>>,
     pub last_clients: Mutex<HashMap<String, crate::drift::LastClient>>,
-    pub deliveries: Mutex<std::collections::BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>>,
+    pub deliveries: Mutex<Deliveries>,
     pub client_blobs: Arc<crate::remote::Blobs>,
     plans: DashMap<Hash, Arc<PlanData>>,
     masks: DashMap<String, Vec<Vec<u8>>>,
     fetching: crate::io::Mutex<()>,
     scratch_seq: AtomicU64,
     pub stats: Arc<DaemonStats>,
+}
+
+/// What each worktree was last delivered, under the token that names it.
+pub struct Deliveries {
+    /// Every random value the server hands out (delivery tokens) is drawn here,
+    /// from the seed `Daemon::new` was given.
+    pub random: crate::rng::Rng,
+    pub by_worktree: BTreeMap<String, (u64, Arc<std::collections::BTreeSet<rargo_proto::Digest>>)>,
 }
 
 pub struct Home {
@@ -239,10 +247,12 @@ fn bytes(s: &str) -> Vec<u8> {
 }
 
 impl Daemon {
-    pub fn new(cfg: Config, engine: Arc<Engine>) -> Daemon {
+    /// `seed` seeds the server's random values: the shell draws it from the OS,
+    /// tests and the simulator pass their own.
+    pub fn new(cfg: Config, engine: Arc<Engine>, seed: u64) -> Daemon {
         let parser = Parser::new(cfg.planner.clone());
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
-        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), seed);
+        let incr_seed = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(1);
+        let incr = crate::incr::IncrStore::new(engine.store.db().clone(), engine.store.blobs(), incr_seed);
         {
             let engine = engine.clone();
             incr.set_held(Box::new(move |h| engine.remote.get().is_some_and(|r| r.holds(h))));
@@ -254,10 +264,10 @@ impl Daemon {
             scratch_seq: AtomicU64::new(0),
             incr,
             pool: OnceLock::new(),
-            nix_attached: Arc::new(Mutex::new(HashSet::new())),
+            nix_attached: Arc::default(),
             drift_report: Mutex::new(None),
             last_clients: Mutex::new(HashMap::new()),
-            deliveries: Mutex::new(std::collections::BTreeMap::new()),
+            deliveries: Mutex::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
             client_blobs: Arc::new(crate::remote::Blobs::new(engine.store.clone(), None)),
             cfg,
             engine,
@@ -272,7 +282,7 @@ impl Daemon {
 
     pub fn scratch(&self, what: &str) -> Result<PathBuf> {
         let n = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
-        let dir = self.store().tmp_dir(&format!("{what}-{}-{n}", std::process::id()))?;
+        let dir = self.store().tmp_dir(&format!("{what}-{}-{n}", crate::io::process::id()))?;
         Ok(dir)
     }
 
@@ -289,14 +299,13 @@ impl Daemon {
         static MAKING: crate::io::Mutex<()> = crate::io::Mutex::new(());
         let _one = MAKING.lock();
         if !dir.join(".complete").ring_exists() {
-            use std::os::unix::fs::PermissionsExt;
             crate::io::file::create_dir_all(&dir)?;
-            crate::io::file::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            crate::io::file::set_mode(&dir, 0o700)?;
             crate::snapshot::chown(&dir, self.cfg.uid, self.cfg.gid);
             for (name, content) in &files {
                 let p = dir.join(name);
                 crate::io::file::write(&p, content)?;
-                crate::io::file::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+                crate::io::file::set_mode(&p, 0o600)?;
                 crate::snapshot::chown(&p, self.cfg.uid, self.cfg.gid);
             }
             for shared in ["registry", "git", ".package-cache", ".package-cache-mutate", ".global-cache"] {
@@ -773,26 +782,26 @@ fn fetch(
     }
     let (uid, gid) = (c.uid, c.gid);
     let (snap, scratch2) = (p.snapshot.clone(), scratch.clone());
-    let out = (|| -> Result<std::result::Result<Option<std::process::Output>, Vec<u8>>> {
+    let out = (|| -> Result<std::result::Result<Option<crate::io::process::Output>, Vec<u8>>> {
         use std::os::unix::process::CommandExt;
         crate::io::cpu(|| snap.materialize(&scratch2, uid, gid, &|_, _| true))?;
         if install {
             for path in fetch_args.iter().filter_map(|a| a.strip_prefix("--path=")) {
                 let path = Path::new(path);
                 ensure!(
-                    path.is_absolute() && path.canonicalize()?.starts_with(scratch2.canonicalize()?),
+                    path.is_absolute() && crate::io::file::canonicalize(path)?.starts_with(crate::io::file::canonicalize(&scratch2)?),
                     "install path lies outside the synced worktree"
                 );
             }
         }
         let run = |program: &Path, args: &[String]| {
-            let mut cmd = std::process::Command::new(program);
+            let mut cmd = crate::io::process::Command::new(program);
             cmd.args(args).current_dir(&cwd).env_clear().envs(&env);
-            cmd.stdin(std::process::Stdio::null());
-            if uid != unsafe { libc::geteuid() } {
-                cmd.uid(uid).gid(gid);
+            cmd.stdin(crate::io::process::Stdio::null());
+            if uid != crate::io::process::euid() {
+                cmd.std_mut().uid(uid).gid(gid);
             }
-            crate::io::output(&mut cmd)
+            cmd.output()
         };
         let _ = run(Path::new("rustc"), &["-V".to_string()]);
         if let Err(said) = add_components(&components, &run) {
@@ -806,16 +815,16 @@ fn fetch(
     let out = match out {
         Ok(Ok(Some(o))) => o,
         Ok(Err(said)) => {
-            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = crate::io::file::remove_dir_all(&scratch);
             c.out.raw_err(&said);
             return Ok(None);
         }
         Ok(Ok(None)) => {
-            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = crate::io::file::remove_dir_all(&scratch);
             return Ok(Some(p.snapshot.clone()));
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&scratch);
+            let _ = crate::io::file::remove_dir_all(&scratch);
             return Err(e);
         }
     };
@@ -849,7 +858,7 @@ fn fetch(
             }
         }
     }
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = crate::io::file::remove_dir_all(&scratch);
     if !out.status.success() {
         return Ok(None);
     }
@@ -859,7 +868,7 @@ fn fetch(
 
 fn add_components(
     components: &[(String, String)],
-    run: &dyn Fn(&Path, &[String]) -> std::io::Result<std::process::Output>,
+    run: &dyn Fn(&Path, &[String]) -> std::io::Result<crate::io::process::Output>,
 ) -> std::result::Result<(), Vec<u8>> {
     for add in rustup_adds(components) {
         let ran = run(Path::new("rustup"), &add);
@@ -884,13 +893,13 @@ fn add_components_for(d: &Arc<Daemon>, c: &Client, components: Vec<(String, Stri
     let added = {
         use std::os::unix::process::CommandExt;
         let run = |program: &Path, args: &[String]| {
-            let mut cmd = std::process::Command::new(program);
+            let mut cmd = crate::io::process::Command::new(program);
             cmd.args(args).current_dir("/").env_clear().envs(&env);
-            cmd.stdin(std::process::Stdio::null());
-            if uid != unsafe { libc::geteuid() } {
-                cmd.uid(uid).gid(gid);
+            cmd.stdin(crate::io::process::Stdio::null());
+            if uid != crate::io::process::euid() {
+                cmd.std_mut().uid(uid).gid(gid);
             }
-            crate::io::output(&mut cmd)
+            cmd.output()
         };
         add_components(&components, &run)
     };
@@ -912,8 +921,8 @@ fn say(c: &Client, wait: Wait) {
 
 fn phase(started: Instant, c: &Client, what: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("RARGO_PHASES").is_some()) {
-        eprintln!("rargod: phase {:>8.3} s  {what}  ({} {})", started.elapsed().as_secs_f64(), c.worktree, c.args.join(" "));
+    if *ON.get_or_init(|| crate::io::env::var_os("RARGO_PHASES").is_some()) {
+        eprintln!("rargod: phase {:>8.3} s  {what}  ({} {})", crate::io::now().saturating_duration_since(started).as_secs_f64(), c.worktree, c.args.join(" "));
     }
 }
 
@@ -937,11 +946,11 @@ if c.session.is_some() && !c.worktree.is_empty() {
     last.insert(
         c.worktree.clone(),
         crate::drift::LastClient {
-            env: Arc::new(c.env.to_map().into_iter().collect()),
+            env: Arc::new(c.env.to_map()),
             home: c.home.clone(),
             root: c.root.clone(),
             dir,
-            at: Instant::now(),
+            at: crate::io::now(),
             checked,
         },
     );
@@ -958,7 +967,7 @@ struct Built {
 }
 
 fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Built>>>) -> Result<Finish> {
-    let started = Instant::now();
+    let started = crate::io::now();
     let mut args: Vec<String> = c.args.clone();
     let mut no_cache_tests = false;
     if let Some(pos) = args.iter().take_while(|a| *a != "--").position(|a| a == "--no-cache") {
@@ -1271,7 +1280,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&Mutex<Option<Buil
     phase(started, c, "units answered");
     let incompat = run.future_incompat_summary()?;
     let finished = || {
-        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(started.elapsed())));
+        c2.out.status("Finished", &format!("{}{}", plan.finished, elapsed(crate::io::now().saturating_duration_since(started))));
         for (kind, text) in &incompat {
             match kind {
                 'w' => c2.out.warn(text),
@@ -1390,7 +1399,7 @@ impl UnitObserver {
 }
 
 struct TestObserver {
-    out: Arc<Client>,
+    out: Output,
     explain: bool,
     label: String,
 }
@@ -1400,15 +1409,15 @@ impl Observer for TestObserver {
         self.explain
     }
     fn explain(&self, why: &str) {
-        self.out.out.note(&format!("{} runs because {why}", self.label));
+        self.out.note(&format!("{} runs because {why}", self.label));
     }
     fn stdout(&self, data: &[u8]) {
-        self.out.out.raw_out(self.out.out.tr.text(&String::from_utf8_lossy(data)).as_bytes());
+        self.out.raw_out(data);
     }
     fn stderr_line(&self, line: &[u8], _live: Option<&dyn Live>) {
-        let mut l = self.out.out.tr.text(&String::from_utf8_lossy(line));
-        l.push('\n');
-        self.out.out.raw_err(l.as_bytes());
+        let mut data = line.to_vec();
+        data.push(b'\n');
+        self.out.raw_err(&data);
     }
 }
 
@@ -1686,7 +1695,7 @@ impl Run {
             }),
             _ => None,
         };
-        self.times.lock()[i].start = Some(std::time::Instant::now());
+        self.times.lock()[i].start = Some(crate::io::now());
         let outcome = loop {
             if let Some(o) = from_full.take() {
                 break o;
@@ -1752,7 +1761,7 @@ impl Run {
             let st = &outcome.result.stats;
             let mut times = self.times.lock();
             let t = &mut times[i];
-            t.end = Some(std::time::Instant::now());
+            t.end = Some(crate::io::now());
             t.cached = outcome.cached;
             (t.wall_us, t.cpu_us, t.rss_kb) = (st.wall_us, st.cpu_us, st.max_rss_kb);
         }
@@ -2066,12 +2075,12 @@ impl Run {
                 needs_objects: u.needs_objects,
             })
             .collect();
-        let unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let unix = crate::io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let stamp = crate::timings::stamp(unix);
         let html = crate::timings::render(
             &format!("cargo {}", self.c.args.join(" ")),
             &stamp,
-            started.elapsed(),
+            crate::io::now().saturating_duration_since(started),
             self.d.engine.sched.tokens(),
             &rows,
         );
@@ -2262,7 +2271,7 @@ impl Run {
                         let ents = vec![(artifact.as_bytes().to_vec(), entry)];
                         self.layer.add(i as u32, LEVEL_META, &ents);
                         self.early.lock().entry(i).or_default().extend(ents);
-                        self.times.lock()[i].meta = Some(std::time::Instant::now());
+                        self.times.lock()[i].meta = Some(crate::io::now());
                         self.req.lock().unit_meta(i);
                         self.states[i].send_replace(UState::Meta);
                     }
@@ -2763,7 +2772,7 @@ impl Run {
                             cacheable: Arc::new(|r| r.success()),
                             declared_env: Arc::new(|_, _| Vec::new()),
                             observer: Arc::new(TestObserver {
-                                out: self.c.clone(),
+                                out: out.derive(out.quiet, out.verbose, out.tr.clone()),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
                             }),
@@ -2947,6 +2956,33 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_observer_preserves_sandbox_paths_in_output() {
+        use rargo_proto::ServerMsg;
+
+        crate::io::sim::test(|| {
+            let (tx, mut rx) = crate::io::unbounded_channel();
+            let tr = Translator::new(vec![
+                ("/w".into(), "/home/me/project".into()),
+                ("/c".into(), "/home/me/.cargo".into()),
+            ]);
+            let observer = TestObserver {
+                out: Output::new(tx, false, false).derive(false, false, tr),
+                explain: false,
+                label: String::new(),
+            };
+            let output = b"fixture paths: /w/target/debug/app and /c/blobs";
+            observer.stdout(output);
+            observer.stderr_line(output, None);
+            drop(observer);
+            assert!(matches!(rx.recv().unwrap(), ServerMsg::Stdout(data) if data == output));
+            assert!(matches!(
+                rx.recv().unwrap(),
+                ServerMsg::Stderr(data) if data == [output.as_slice(), b"\n"].concat()
+            ));
+        });
+    }
+
     #[test]
     fn a_build_script_that_failed_for_want_of_a_system_library_is_told_where_libraries_come_from() {
         let udev = "  thread 'main' panicked at libudev-sys-0.1.4/build.rs:38:41:\n  pkg-config exited with status code 1\n  > PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs --cflags libudev\n\n  The system library `libudev` required by crate `libudev-sys` was not found.\n  Package libudev was not found in the pkg-config search path.\n  Perhaps you should add the directory containing `libudev.pc'\n";
