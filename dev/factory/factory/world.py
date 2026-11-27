@@ -942,6 +942,16 @@ def _(w: World, e: m.UseEnded, a):
     u.void = e.void
 
 
+@on(m.UseVoided)
+def _(w: World, e: m.UseVoided, a):
+    u = w.uses.get(e.use)
+    if u is None or u.by != Role.power_user or not w.is_(M.USE, e.use, "ended"):
+        w.fail(f"use {e.use} is not an ended power user session")
+    if u.void:
+        w.fail(f"use {e.use} is already void")
+    u.void = True
+
+
 @on(m.ReleaseHeld)
 def _(w: World, e: m.ReleaseHeld, a):
     _latest_build(w, e)

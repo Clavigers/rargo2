@@ -180,7 +180,8 @@ def release(lines: list[dict]) -> dict:
     held = [l for l in lines if l["event"] == "release_held" and l["version"] == cand]
     started = {l["use"]: l for l in lines if l["event"] == "use_started" and l["actor"] == "power_user"}
     ended = {l["use"] for l in lines if l["event"] == "use_ended" and l["actor"] == "power_user"}
-    void = sum(1 for l in lines if l["event"] == "use_ended" and l["actor"] == "power_user" and l.get("void"))
+    void = sum(1 for l in lines if l["event"] == "use_voided" or (
+        l["event"] == "use_ended" and l["actor"] == "power_user" and l.get("void")))
     found = sum(1 for l in lines if l["event"] == "filed" and l["actor"] == "power_user")
     return dict(using=next((dict(use=n, version=u["version"], build=u["build"], t=u["t"])
                             for n, u in started.items() if n not in ended), None),

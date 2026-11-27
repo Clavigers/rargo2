@@ -208,5 +208,6 @@ Starts in `open`.
 | `backported` | decision | pm | `version`: text<br>`pr`: int | A bug fix merged after the freeze enters the version's branch. |
 | `use_started` | observation | human, power_user | `use`: int<br>`version`: text<br>`build`: int | One session at a time each, on a version's latest build: a candidate for the power user, a published release for the human. |
 | `use_ended` | observation | human, power_user | `use`: int<br>`void?`: boolean | void: the session did not run to its end (it crashed, ran out of quota or time, or was cut off), so it is not a use of the build. |
+| `use_voided` | decision | human, power_user | `use`: int<br>`note`: text | An ended power user session turned out not to have been a use of its build (it did nothing, or what it used was not the build). It no longer counts towards uses_required. What it filed stays filed. |
 | `release_held` | decision | pm | `version`: text<br>`build`: int<br>`reasons`: set of `known_bugs` \| `uses` \| `soak` \| `stale_build` | The reasons are exactly those true of the latest build. |
 | `published` | decision | pm | `version`: text<br>`build`: int | The latest build, with no hold reason true of it. |

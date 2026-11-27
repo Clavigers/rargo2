@@ -641,6 +641,16 @@ class UseEnded(Event):
     void: bool = False
 
 
+@event({H, PU}, D)
+class UseVoided(Event):
+    """An ended power user session turned out not to have been a use of its
+    build (it did nothing, or what it used was not the build). It no longer
+    counts towards uses_required. What it filed stays filed."""
+    event: Literal["use_voided"]
+    use: Number
+    note: Note
+
+
 @event({PM}, D)
 class ReleaseHeld(Event):
     """The reasons are exactly those true of the latest build."""
