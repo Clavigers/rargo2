@@ -114,27 +114,27 @@ mod crashes_with_eviction_and_concurrent_client_rounds_finish {
 }
 
 #[test]
-fn the_seeds_exercise_faults_the_cache_and_eviction() {
-    // Together these seeds exercise every condition checked below. The seed
-    // batches separately run the simulator's invariants over a wider sample.
-    let reports = [54, 59].map(|seed| run(seed, None).expect("passes"));
-    assert!(reports.iter().any(|r| r.cuts > 0), "links are cut");
-    assert!(reports.iter().any(|r| r.server_restarts > 0), "clients finish despite server restarts");
-    assert!(reports.iter().any(|r| r.worker_crashes > 0), "workers crash");
-    assert!(
-        reports.iter().any(|r| r.jobs_lost_to_crashes > 0),
-        "jobs interrupted by worker crashes are recovered"
-    );
-    assert!(reports.iter().any(|r| r.cache_hits > 0), "actions are answered from the cache");
-    assert!(reports.iter().any(|r| r.evictions > 0), "content is evicted");
-    assert!(reports.iter().any(|r| r.uploads > 0), "clients upload sources");
-    assert!(reports.iter().any(|r| r.wants > 0), "the server asks for content a client thought it held");
-    assert!(reports.iter().any(|r| r.client_cuts > 0), "client links are cut");
-    assert!(reports.iter().any(|r| r.silences > 0), "clients give up on a silent server");
-    assert!(reports.iter().any(|r| r.crashes > 0), "client daemons crash and restart");
-    assert!(reports.iter().any(|r| r.lost > 0 && r.retransmits > 0), "rargo-net retransmits after datagram loss");
-    assert!(reports.iter().any(|r| r.duplicated > 0), "packets arrive twice");
-    assert!(reports.iter().any(|r| r.reordered > 0), "packets overtake the ones sent before them");
+fn seed_54_exercises_faults_the_cache_and_eviction() {
+    let report = run(54, None).expect("passes");
+    assert!(report.cuts > 0, "links are cut");
+    assert!(report.server_restarts > 0, "clients finish despite server restarts");
+    assert!(report.worker_crashes > 0, "workers crash");
+    assert!(report.jobs_lost_to_crashes > 0, "jobs interrupted by worker crashes are recovered");
+    assert!(report.cache_hits > 0, "actions are answered from the cache");
+    assert!(report.evictions > 0, "content is evicted");
+    assert!(report.uploads > 0, "clients upload sources");
+    assert!(report.client_cuts > 0, "client links are cut");
+    assert!(report.crashes > 0, "client daemons crash and restart");
+    assert!(report.lost > 0 && report.retransmits > 0, "rargo-net retransmits after datagram loss");
+    assert!(report.reordered > 0, "packets overtake the ones sent before them");
+}
+
+#[test]
+fn seed_59_exercises_missing_content_silence_and_duplicates() {
+    let report = run(59, None).expect("passes");
+    assert!(report.wants > 0, "the server asks for content a client thought it held");
+    assert!(report.silences > 0, "clients give up on a silent server");
+    assert!(report.duplicated > 0, "packets arrive twice");
 }
 
 fn turns_off_alone(f: Fault) {

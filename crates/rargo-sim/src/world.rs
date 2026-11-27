@@ -28,6 +28,7 @@ use rargo_core::worker_state::{self, Carried, FromServer, Worker};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use rargo_proto::{Blob, ClientMsg, Delivery, Digest, ServerMsg};
 use std::fmt;
+use std::io::Write;
 use std::time::Duration;
 
 pub const LIVENESS_MS: u64 = 120_000;
@@ -424,6 +425,38 @@ struct Sess {
     ended: Option<u64>,
 }
 
+// A successful membership check stays valid until the store forgets a blob.
+struct PresentBlobs {
+    generation: u64,
+    slots: [Option<Hash>; 256],
+}
+
+impl PresentBlobs {
+    fn new() -> Self {
+        Self { generation: 0, slots: [None; 256] }
+    }
+
+    fn refresh(&mut self, store: &Store) {
+        let generation = store.generation();
+        if self.generation != generation {
+            self.slots.fill(None);
+            self.generation = generation;
+        }
+    }
+
+    fn contains(&mut self, store: &Store, hash: &Hash) -> bool {
+        let slot = &mut self.slots[usize::from(hash.0[0])];
+        if slot.as_ref() == Some(hash) {
+            return true;
+        }
+        if store.has(hash) {
+            *slot = Some(*hash);
+            return true;
+        }
+        false
+    }
+}
+
 struct Server {
     pool: WorkerPool,
     trees: TreesState,
@@ -431,6 +464,7 @@ struct Server {
     sched: SchedState,
     pipe: usize,
     store: Option<Store>,
+    present: PresentBlobs,
     pins: BTreeMap<Hash, usize>,
     held: BTreeMap<u64, (u64, BTreeSet<Hash>)>,
     jobs: BTreeMap<u64, Job>,
@@ -452,6 +486,7 @@ impl Server {
             sched: SchedState::new(SERVER_TOKENS, SERVER_MEM_KB),
             pipe: SERVER_TOKENS,
             store: None,
+            present: PresentBlobs::new(),
             pins: BTreeMap::new(),
             held: BTreeMap::new(),
             jobs: BTreeMap::new(),
@@ -931,7 +966,7 @@ impl World {
             self.now = at;
             self.report.events += 1;
             self.trace.extend_from_slice(&at.to_le_bytes());
-            self.trace.extend_from_slice(label(&ev).as_bytes());
+            write_label(&mut self.trace, &ev);
             let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.step(ev)?;
                 self.check()
@@ -963,29 +998,33 @@ impl World {
         c.requested.iter().filter(|a| !c.outputs.contains_key(a)).map(|&a| self.project.actions[a].id).collect()
     }
 
-    /// Every state machine in the world: the server's, each session's, each
-    /// worker's and each client's.
-    fn machines(&self) -> Vec<&dyn StateMachine> {
-        let mut all: Vec<&dyn StateMachine> = vec![&self.server.pool, &self.server.sched, &self.server.trees];
-        all.extend(self.server.sessions.values().map(|s| &s.state as &dyn StateMachine));
-        all.extend(self.workers.values().map(|w| &w.sm as &dyn StateMachine));
-        all.extend(self.clients.values().map(|c| &c.daemon as &dyn StateMachine));
-        all.extend(self.clients.values().filter_map(|c| c.test.as_ref()).map(|t| &t.machine as &dyn StateMachine));
-        all
-    }
-
-    fn check(&self) -> Step {
-        rargo_machine::check_all(self.machines());
+    fn check(&mut self) -> Step {
+        let server = &mut self.server;
+        server.pool.invariants();
+        server.sched.invariants();
+        server.trees.invariants();
+        for session in server.sessions.values() {
+            session.state.invariants();
+        }
+        for worker in self.workers.values() {
+            worker.sm.invariants();
+        }
         for client in self.clients.values() {
+            client.daemon.invariants();
+            if let Some(test) = &client.test {
+                test.machine.invariants();
+            }
             assert!(client.target.files.is_empty() || client.target.files.len() == self.project.actions.len());
             if client.round_ended {
                 assert!(client.outputs.is_empty() && client.pending.is_empty() && client.parts.is_empty());
             }
         }
-        for (client, sess) in &self.server.sessions {
+        let store = server.store.as_ref().expect("the server has started");
+        server.present.refresh(store);
+        for (client, sess) in &server.sessions {
             let Some(o) = &sess.offer else { continue };
             for h in &o.arrived {
-                if self.server.trees.holder(h) == Some(o.up) && !self.server.store().has(h) {
+                if server.trees.holder(h) == Some(o.up) && !server.present.contains(store, h) {
                     return Err(Kind::LostPinned(format!(
                         "blob {} that client {client} uploaded for round {} is claimed and not in the store",
                         h.hex(),
@@ -994,17 +1033,17 @@ impl World {
                 }
             }
         }
-        for (h, n) in &self.server.pins {
-            if *n > 0 && !self.server.store().has(h) {
+        for (h, n) in &server.pins {
+            if *n > 0 && !server.present.contains(store, h) {
                 return Err(Kind::LostPinned(format!("blob {} is pinned {n} times and not in the store", h.hex())));
             }
         }
-        for (job, j) in &self.server.jobs {
-            if let Some(h) = j.inputs.iter().find(|h| !self.server.store().has(h)) {
+        for (job, j) in &server.jobs {
+            if let Some(h) = j.inputs.iter().find(|h| !server.present.contains(store, h)) {
                 return Err(Kind::LostPinned(format!("input {} of unfinished job {job} is gone", h.hex())));
             }
             if let Some(w) = j.worker {
-                assert!(self.server.pool.route(w, *job), "job {job} sent to worker {w} is routed there");
+                assert!(server.pool.route(w, *job), "job {job} sent to worker {w} is routed there");
             }
         }
         Ok(())
@@ -2258,29 +2297,30 @@ fn new_daemon(held: KnownDigests) -> DaemonState {
     daemon
 }
 
-fn label(ev: &Ev) -> String {
+fn write_label(trace: &mut Vec<u8>, ev: &Ev) {
     match ev {
         Ev::Datagram { peer, to_server, id, bytes } => {
-            format!("datagram {peer:?}/{to_server}@{id} [{}];", bytes.len())
+            write!(trace, "datagram {peer:?}/{to_server}@{id} [{}];", bytes.len())
         }
-        Ev::LinkTimer { peer, server, id } => format!("link timer {peer:?}/{server}@{id};"),
-        Ev::Connect { worker, epoch } => format!("connect {worker}@{epoch};"),
-        Ev::Finish { worker, epoch, token } => format!("finish {worker}@{epoch}/{token};"),
-        Ev::Crash { worker } => format!("crash {worker};"),
-        Ev::ServerCrash => "server crash and restart;".to_string(),
-        Ev::Cut { worker } => format!("cut {worker};"),
-        Ev::Cancel { worker, epoch, token } => format!("cancel {worker}@{epoch}/{token};"),
-        Ev::Evict => "evict;".to_string(),
-        Ev::Round { client } => format!("round {client};"),
-        Ev::Edit { client } => format!("edit {client};"),
-        Ev::Checkout { client, round } => format!("checkout {client} round {round};"),
-        Ev::TestComplete { client, key, .. } => format!("test result {client}/{key};"),
-        Ev::Sync { client } => format!("sync {client};"),
-        Ev::ClientCut { client } => format!("client cut {client};"),
-        Ev::Watch { client } => format!("watch {client};"),
-        Ev::ClientCrash { client } => format!("crash {client};"),
-        Ev::Restart { client } => format!("restart {client};"),
+        Ev::LinkTimer { peer, server, id } => write!(trace, "link timer {peer:?}/{server}@{id};"),
+        Ev::Connect { worker, epoch } => write!(trace, "connect {worker}@{epoch};"),
+        Ev::Finish { worker, epoch, token } => write!(trace, "finish {worker}@{epoch}/{token};"),
+        Ev::Crash { worker } => write!(trace, "crash {worker};"),
+        Ev::ServerCrash => trace.write_all(b"server crash and restart;"),
+        Ev::Cut { worker } => write!(trace, "cut {worker};"),
+        Ev::Cancel { worker, epoch, token } => write!(trace, "cancel {worker}@{epoch}/{token};"),
+        Ev::Evict => trace.write_all(b"evict;"),
+        Ev::Round { client } => write!(trace, "round {client};"),
+        Ev::Edit { client } => write!(trace, "edit {client};"),
+        Ev::Checkout { client, round } => write!(trace, "checkout {client} round {round};"),
+        Ev::TestComplete { client, key, .. } => write!(trace, "test result {client}/{key};"),
+        Ev::Sync { client } => write!(trace, "sync {client};"),
+        Ev::ClientCut { client } => write!(trace, "client cut {client};"),
+        Ev::Watch { client } => write!(trace, "watch {client};"),
+        Ev::ClientCrash { client } => write!(trace, "crash {client};"),
+        Ev::Restart { client } => write!(trace, "restart {client};"),
     }
+    .expect("writing into the trace buffer cannot fail");
 }
 
 pub fn run(seed: u64, bug: Option<Bug>) -> Result<Report, Failure> {
@@ -2301,9 +2341,9 @@ mod tests {
             .into_iter().fold(Off::none(), Off::with);
         // One action and one round per client exercise contention without a
         // large build graph. Give the links one brief, deterministic outage.
-        // Twenty clients is the smallest crowd `Config::of` draws.
+        const CLIENTS: u64 = 18;
         let mut world = World::configured(50, None, off, |cfg, project| {
-            cfg.clients = 20;
+            cfg.clients = CLIENTS;
             cfg.rounds = 1;
             cfg.max_latency_ms = 3;
             project.actions.truncate(1);
@@ -2311,7 +2351,7 @@ mod tests {
         world.watch_limit = Duration::from_secs(2);
         world.silence = Some((550, 3200));
         let report = world.run().unwrap_or_else(|failure| panic!("{failure}"));
-        assert!(report.clients_at_eviction >= 20, "{report:?}");
+        assert_eq!(report.clients_at_eviction, CLIENTS as usize, "{report:?}");
         assert!(report.cache_hits > 0, "clients reuse action outputs");
         assert!(report.silences > 0, "clients give up on a silent server");
     }
