@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from time import monotonic
 from typing import Callable
 
@@ -75,7 +76,13 @@ class ReviewerStuck(Exception):
 
 ELLIPSIS = "ellipsis-dev[bot]"
 ELLIPSIS_WAIT = timedelta(minutes=30)
+BOTS = Path(__file__).parent.parent / "deploy" / "bots.json"
 _first_seen: dict[tuple[int, str], datetime] = {}  # when a push was first found unreviewed
+_asked: dict[tuple[int, str], datetime] = {}  # when Ellipsis was asked to review a push
+
+
+def now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def ellipsis(gh: GitHub, pr: int, sha: str):
@@ -83,22 +90,58 @@ def ellipsis(gh: GitHub, pr: int, sha: str):
     the verdict: an approval approves; anything else it says asks for
     changes. It does not review a push that leaves the pull request's own
     change as it was (main merged in, or a rebase onto main): its last review
-    is then the verdict on that push too. No review after ELLIPSIS_WAIT needs
-    the owner."""
+    is then the verdict on that push too.
+
+    No review after ELLIPSIS_WAIT: the observer asks it once, by the comment
+    deploy/bots.json gives, and its answer (an issue comment) is the verdict,
+    read as review-mux reads it. No answer after a second ELLIPSIS_WAIT: the
+    push goes back to an agent, saying so. Nobody is waited for."""
     all_ = [r for r in gh.reviews(pr) if r["user"]["login"] == ELLIPSIS]
     mine = [r for r in all_ if r.get("commit_id") == sha]
     if not mine and all_ and _same_change(gh, pr, all_[-1].get("commit_id"), sha):
         mine = all_[-1:]
-    if not mine:
-        seen = _first_seen.setdefault((pr, sha), datetime.now(timezone.utc))
-        if datetime.now(timezone.utc) - seen > ELLIPSIS_WAIT:
-            raise ReviewerStuck(f"Ellipsis has not reviewed {sha[:8]} in {ELLIPSIS_WAIT.seconds // 60} minutes")
+    if mine:
+        _forget(pr, sha)
+        last = mine[-1]
+        if last["state"] == "APPROVED":
+            return m.ReviewResult.approved, None
+        return m.ReviewResult.changes, f"Ellipsis: {last.get('html_url', 'see its review on the pull request')}"
+    t = now()
+    wait = ELLIPSIS_WAIT.seconds // 60
+    asked = _asked.get((pr, sha))
+    if asked is None:
+        if t - _first_seen.setdefault((pr, sha), t) <= ELLIPSIS_WAIT:
+            return None
+        bot = _ellipsis_bot()
+        gh.post(pr, bot.trigger_text, as_=bot.trigger_as)
+        _asked[(pr, sha)] = t
         return None
-    _first_seen.pop((pr, sha), None)
-    last = mine[-1]
-    if last["state"] == "APPROVED":
+    from .review.mux import answer
+    from .review.record import iso
+    bot = _ellipsis_bot()
+    a = answer(bot, iso(asked), gh.issue_comments(pr), [], [])
+    if a and a.outcome == "done":
+        _forget(pr, sha)
+        if bot.summary_blocks(a.raw):
+            return m.ReviewResult.changes, f"Ellipsis, asked: {a.url}"
         return m.ReviewResult.approved, None
-    return m.ReviewResult.changes, f"Ellipsis: {last.get('html_url', 'see its review on the pull request')}"
+    if t - asked <= ELLIPSIS_WAIT:
+        return None
+    _forget(pr, sha)
+    why = f"; it said only: {a.url}" if a else ""
+    return m.ReviewResult.changes, (
+        f"Ellipsis gave no review of {sha[:8]} in {wait} minutes, nor answered being asked "
+        f"in {wait} more{why}. Nothing in the change need be wrong: push again to be reviewed.")
+
+
+def _forget(pr: int, sha: str) -> None:
+    _first_seen.pop((pr, sha), None)
+    _asked.pop((pr, sha), None)
+
+
+def _ellipsis_bot():
+    from .review.bots import load
+    return load(str(BOTS))["ellipsis"]
 
 
 _same: dict[tuple[str, str], bool] = {}  # (reviewed commit, pushed commit): the same change?

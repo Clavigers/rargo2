@@ -75,6 +75,36 @@ def plain(body: str) -> str:
     return re.sub(r"[ \t]+", " ", body).strip()
 
 
+def answer(b: Bot, since: str, comments, reviews, runs) -> Answer | None:
+    """The bot's answer since the time since (as iso), among the pull
+    request's issue comments, reviews and check runs, or None."""
+    mine = [c for c in comments if c["user"]["login"] == b.login
+            and (c.get("updated_at") or c["created_at"]) >= since]
+    for c in mine:
+        if b.is_quota(c["body"]):
+            return Answer(b.name, "quota", c["html_url"], c["body"])
+    kind, want = next(iter(b.done.items()))
+    if kind == "comment":
+        for c in mine:
+            if not b.is_ignored(c["body"]) and re.search(want, c["body"]):
+                return Answer(b.name, "done", c["html_url"], c["body"])
+    elif kind == "review":
+        for r in reviews:
+            if r["user"]["login"] == b.login and (r.get("submitted_at") or "") >= since:
+                return Answer(b.name, "done", r["html_url"], r.get("body") or "")
+    elif kind == "check_run":
+        for r in runs:
+            if (r["name"] == want and r["status"] == "completed"
+                    and (r.get("started_at") or "") >= since
+                    and r.get("conclusion") != "skipped"):
+                out = r.get("output") or {}
+                text = f"{out.get('title') or ''}\n{out.get('summary') or ''}"
+                if b.is_quota(text) or "rate limit" in text.lower():
+                    return Answer(b.name, "quota", r["html_url"], text)
+                return Answer(b.name, "done", r["html_url"], text)
+    return None
+
+
 class Mux:
     def __init__(self, gh, record: Record, bots: dict[str, Bot], settings: Settings | None = None,
                  report_as: str | None = None, clock: Callable[[], datetime] | None = None,
@@ -148,7 +178,7 @@ class Mux:
         now = self.clock()
         for name, since in h.triggered.items():
             b = self.bots[name]
-            a = self._answer(b, since, comments, reviews, runs)
+            a = answer(b, since, comments, reviews, runs)
             if a and a.outcome == "done":
                 answers.append(a)
             if name in h.settled:
@@ -169,33 +199,6 @@ class Mux:
                 self._rec(pr, sha, "timeout", bot=name)
                 h.settled[name] = "timeout"
         return answers
-
-    def _answer(self, b: Bot, since: str, comments, reviews, runs) -> Answer | None:
-        mine = [c for c in comments if c["user"]["login"] == b.login
-                and (c.get("updated_at") or c["created_at"]) >= since]
-        for c in mine:
-            if b.is_quota(c["body"]):
-                return Answer(b.name, "quota", c["html_url"], c["body"])
-        kind, want = next(iter(b.done.items()))
-        if kind == "comment":
-            for c in mine:
-                if not b.is_ignored(c["body"]) and re.search(want, c["body"]):
-                    return Answer(b.name, "done", c["html_url"], c["body"])
-        elif kind == "review":
-            for r in reviews:
-                if r["user"]["login"] == b.login and (r.get("submitted_at") or "") >= since:
-                    return Answer(b.name, "done", r["html_url"], r.get("body") or "")
-        elif kind == "check_run":
-            for r in runs:
-                if (r["name"] == want and r["status"] == "completed"
-                        and (r.get("started_at") or "") >= since
-                        and r.get("conclusion") != "skipped"):
-                    out = r.get("output") or {}
-                    text = f"{out.get('title') or ''}\n{out.get('summary') or ''}"
-                    if b.is_quota(text) or "rate limit" in text.lower():
-                        return Answer(b.name, "quota", r["html_url"], text)
-                    return Answer(b.name, "done", r["html_url"], text)
-        return None
 
     # ------------------------------------------------------------ reporting
 
