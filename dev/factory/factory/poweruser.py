@@ -122,7 +122,7 @@ class PowerUser:
 
     def _checkout(self, sha: str) -> None:
         git = ["git", "-C", str(self.checkout)]
-        subprocess.run([*git, "fetch", "-q", "--tags", "origin"], check=True, capture_output=True)
+        subprocess.run([*git, "fetch", "-q", "--tags", "--force", "origin"], check=True, capture_output=True)
         subprocess.run([*git, "checkout", "-q", "--detach", "-f", sha], check=True, capture_output=True)
 
     def _run_session(self, use: int, version: str, build: int, sha: str) -> int:

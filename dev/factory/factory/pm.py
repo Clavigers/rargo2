@@ -88,7 +88,7 @@ class Pm:
         w = self.ledger.refresh()
         if w.config is None:
             return
-        self._git("fetch", "-q", "--prune", "--tags", "origin")
+        self._git("fetch", "-q", "--prune", "--tags", "--force", "origin")  # a tag moved on origin must not stop us
         version = next((v for v in w.versions if w.is_(M.VERSION, v, "candidate")), None)
         if version is None:
             version = self._freeze()
