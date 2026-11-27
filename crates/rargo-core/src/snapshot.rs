@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use dashmap::DashMap;
 use std::cell::{Cell, RefCell};
 use rargo_proto::tree::{Node, Tree};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -38,7 +38,7 @@ pub struct Trees {
     pub store: Arc<Store>,
     known: Arc<Manifests>,
     state: RefCell<Shared>,
-    recent: RefCell<HashMap<String, Arc<Snapshot>>>,
+    recent: RefCell<BTreeMap<String, Arc<Snapshot>>>,
     pub stats: SyncStats,
 }
 
@@ -86,7 +86,7 @@ impl Trees {
             known: Arc::new(Manifests { store: store.clone(), decoded: DashMap::new() }),
             store,
             state: RefCell::new(Shared::default()),
-            recent: RefCell::new(HashMap::new()),
+            recent: RefCell::new(BTreeMap::new()),
             stats: SyncStats::default(),
         })
     }
@@ -127,7 +127,7 @@ impl Trees {
                 let got = from.trees(lacking.clone())?;
                 self.stats.trees_received.set(self.stats.trees_received.get() + got.len() as u64);
                 let this = self.known.clone();
-                let stored: Result<HashSet<Hash>> = crate::io::cpu(move || got.iter().map(|enc| this.put(enc)).collect());
+                let stored: Result<BTreeSet<Hash>> = crate::io::cpu(move || got.iter().map(|enc| this.put(enc)).collect());
                 let stored = stored?;
                 if let Some(d) = lacking.iter().find(|d| !stored.contains(d)) {
                     bail!("the client did not send directory manifest {d}");
@@ -231,7 +231,7 @@ impl Trees {
 
 fn worktree_hashes(root: Hash, tree: impl Fn(&Hash) -> Option<Arc<Tree>>) -> Option<Vec<Hash>> {
     let mut all: Vec<Hash> = Vec::new();
-    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut seen: BTreeSet<Hash> = BTreeSet::new();
     let mut todo = vec![root];
     seen.insert(root);
     while let Some(d) = todo.pop() {
@@ -256,7 +256,7 @@ fn worktree_hashes(root: Hash, tree: impl Fn(&Hash) -> Option<Arc<Tree>>) -> Opt
         }
     }
     assert_eq!(all.first(), Some(&root));
-    debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+    debug_assert_eq!(all.iter().collect::<BTreeSet<_>>().len(), all.len(), "each hash is pinned once");
     Some(all)
 }
 
