@@ -527,6 +527,86 @@ def test_ellipsis_review_carries_to_a_push_that_makes_the_same_change():
     assert ellipsis(G(two, {"c1": change, "c3": change + ["+y"], "m5": change}), 1, "m5") is None
 
 
+class Unreviewed:
+    """A pull request Ellipsis has not reviewed, on a clock the test moves."""
+    BOT = "ellipsis-dev[bot]"
+
+    def __init__(self, monkeypatch):
+        from factory import observer
+        self.t = datetime(2026, 11, 27, 6, tzinfo=timezone.utc)
+        monkeypatch.setattr(observer, "now", lambda: self.t)
+        monkeypatch.setattr(observer, "_first_seen", {})
+        monkeypatch.setattr(observer, "_asked", {})
+        self.said: list[dict] = []
+        self.posted: list[tuple[int, str, str]] = []
+
+    def later(self, minutes):
+        self.t += timedelta(minutes=minutes)
+
+    def say(self, body):
+        self.said.append({"user": {"login": self.BOT}, "body": body, "html_url": "https://x/10#c9",
+                          "created_at": self.t.strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+    def reviews(self, pr):
+        return []
+
+    def issue_comments(self, pr):
+        return self.said
+
+    def post(self, pr, body, as_=None):
+        self.posted.append((pr, body, as_))
+        return 1
+
+
+def test_ellipsis_with_no_review_is_asked_once_and_its_answer_is_the_verdict(monkeypatch):
+    from factory.observer import ellipsis
+    trigger = json.loads((Path(__file__).parent.parent / "deploy" / "bots.json").read_text())["ellipsis"]
+    g = Unreviewed(monkeypatch)
+    assert ellipsis(g, 10, "aa") is None
+    g.later(30)
+    assert ellipsis(g, 10, "aa") is None and g.posted == []  # not yet past the wait
+    g.later(1)
+    assert ellipsis(g, 10, "aa") is None
+    g.later(5)
+    assert ellipsis(g, 10, "aa") is None
+    assert g.posted == [(10, trigger["trigger"]["comment"], trigger["trigger_as"])]  # once
+    g.later(1)
+    g.say("I didn't find any bugs in this PR. 8 lines, $0.20")
+    assert ellipsis(g, 10, "aa") == (m.ReviewResult.approved, None)
+
+    g = Unreviewed(monkeypatch)
+    ellipsis(g, 10, "bb")
+    g.later(31)
+    ellipsis(g, 10, "bb")
+    g.later(1)
+    g.say("The loop in a.py skips its last item. $0.31")
+    verdict, note = ellipsis(g, 10, "bb")
+    assert verdict is m.ReviewResult.changes and "https://x/10#c9" in note
+
+
+def test_ellipsis_with_no_answer_when_asked_sends_the_push_back(rig, monkeypatch):
+    g = Unreviewed(monkeypatch)
+    for name in ("reviews", "issue_comments", "post"):
+        setattr(rig.gh, name, getattr(g, name))
+    submit(rig, "human", "config_applied", config=dict(CONFIG, version=2, reviewers=["ellipsis"]))
+    pushed(rig)
+    rig.gh.ci(SHA, "success")
+    rig.obs.step()
+    g.later(31)
+    rig.obs.step()
+    assert len(g.posted) == 1
+    g.later(30)
+    rig.obs.step()
+    assert rig.led.world.is_(M.REVIEW, "10/1/ellipsis", "pending")  # still within the second wait
+    g.later(1)
+    rig.obs.step()
+    last = lines(rig)[-1]
+    assert (last["event"], last["by"], last["result"]) == ("review_done", "ellipsis", "changes")
+    assert "nor answered being asked" in last["note"]
+    assert rig.led.world.needs_work(1)
+    assert len(g.posted) == 1 and not any("stuck" in x for x in rig.said)
+
+
 def test_the_dictator_orchestrates_inside_a_tick_of_its_own(rig, tmp_path):
     import copy
     cfg = copy.deepcopy(CONFIG) | {"version": 2}

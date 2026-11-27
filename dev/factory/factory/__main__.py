@@ -27,7 +27,9 @@
   schema                    JSON Schema of an event body
 
 submit, mine and ready read the log from FACTORY_LOG and act as FACTORY_ACTOR;
-the watchdog sets both for every session it starts.
+the watchdog sets both for every session it starts. status also says when
+this code differs from dev/factory on origin/main in the clone FACTORY_REPO
+(default: the directory repo beside the log).
 """
 import json
 import os
@@ -95,6 +97,11 @@ def main(argv: list[str]) -> int:
             return submit(body, dry=True)
         case ["status"]:
             print(Ledger(env("FACTORY_LOG")).world.status())
+            from .drift import line
+            repo = os.environ.get("FACTORY_REPO") or pathlib.Path(env("FACTORY_LOG")).parent / "repo"
+            said = line(HERE, pathlib.Path(repo))
+            if said:
+                print(said)
             return 0
         case ["config"]:
             print(Ledger(env("FACTORY_LOG")).world.config.model_dump_json(indent=1))
