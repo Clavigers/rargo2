@@ -1,5 +1,5 @@
 mod config;
-mod ignore;
+pub(super) mod ignore;
 mod index;
 mod object;
 mod sha1;
