@@ -106,11 +106,7 @@ def cpu(extra):
         limit = slow.get(key, default)
         if ms > limit:
             over.append(f"{key} used {ms:.0f} ms of CPU; its budget is {limit} ms")
-    if os.environ.get("RARGO_CPU_BUDGET") == "report":
-        for line in over:
-            print(f"over budget, reported only: {line}")
-    else:
-        problems += over
+    problems += over
     for key, limit in sorted(slow.items()):
         if key not in took:
             problems.append(f"{BUDGETS} gives {key} a budget, but no test of that name ran; remove the line")
