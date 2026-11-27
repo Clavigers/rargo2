@@ -847,6 +847,7 @@ dependencies = [
  "tar",
  "toml",
  "ureq",
+ "url",
  "zstd",
 ]
 
