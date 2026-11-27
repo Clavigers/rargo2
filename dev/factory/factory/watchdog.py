@@ -9,7 +9,9 @@ Each step reconciles the world (the log) with the processes on this machine:
    if it ran out.
 2. An agent the log says is live but that has no process here (the watchdog
    itself restarted, and the process is gone) is recorded as crashed.
-3. An agent out of quota for quota_retry is given quota_back, so the next step
+3. An agent out of quota is given quota_back when its plan's last quota
+   reading says the limit it hit has reset (World.quota_back_at), or after
+   quota_retry when there is no reading to go on, so the next step
    tries it: the only way to learn a plan reset is to try.
 4. Every agent that is off, has quota, is not backing off from a crash, and
    has work (it still holds an issue, or some issue is ready) gets a worktree
@@ -128,7 +130,7 @@ class Watchdog:
                 self.say(f"{agent}: live in the log but has no process here")
         now = self.clock()
         for agent in w.config.names():
-            if w.is_(M.QUOTA, agent, "out") and now - w.since(M.QUOTA, agent) >= self.quota_retry:
+            if w.is_(M.QUOTA, agent, "out") and now >= w.quota_back_at(agent, self.quota_retry):
                 self._record("quota_back", agent=agent)
         w = self.ledger.world
         for agent in w.config.names():

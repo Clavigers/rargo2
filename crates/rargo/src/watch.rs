@@ -3,7 +3,7 @@ use rargo_machine::StateMachine;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::cell::RefCell;
 
 const MASK: u32 = libc::IN_CREATE
     | libc::IN_DELETE
@@ -130,17 +130,17 @@ pub enum Registration {
 
 pub struct Watcher {
     fd: OwnedFd,
-    state: Mutex<WatchState>,
+    state: RefCell<WatchState>,
 }
 
 impl Watcher {
     pub fn new() -> std::io::Result<Watcher> {
         let fd = crate::inotify::open(libc::IN_CLOEXEC | libc::IN_NONBLOCK)?;
-        Ok(Watcher { fd, state: Mutex::new(WatchState::default()) })
+        Ok(Watcher { fd, state: RefCell::new(WatchState::default()) })
     }
 
     pub fn add(&self, dir: &Path, owner: u64) -> std::io::Result<Registration> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         let result = match crate::inotify::add(&self.fd, dir, MASK) {
             Ok(wd) => WatchResult::Added(wd),
             Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => WatchResult::TooManyDirectories,
@@ -150,11 +150,11 @@ impl Watcher {
     }
 
     pub fn watches(&self, wd: i32, dir: &Path) -> bool {
-        self.state.lock().unwrap().watches(wd, dir)
+        self.state.borrow().watches(wd, dir)
     }
 
     pub fn remove(&self, wd: i32, dir: &Path) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         if state.remove(wd, dir) {
             crate::inotify::remove(&self.fd, wd);
         }
@@ -167,7 +167,7 @@ impl Watcher {
     }
 
     pub fn forget(&self, owner: u64) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         for wd in state.forget(owner) {
             crate::inotify::remove(&self.fd, wd);
         }
@@ -188,7 +188,7 @@ impl Watcher {
     }
 
     fn parse(&self, buf: &[u8]) -> Changes {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.borrow_mut();
         let mut out = Changes::default();
         let mut at = 0usize;
         const HEAD: usize = std::mem::size_of::<libc::inotify_event>();

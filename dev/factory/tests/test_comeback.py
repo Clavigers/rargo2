@@ -131,3 +131,50 @@ def test_quota_readings_are_in_the_log(tmp_path):
     rows = [json.loads(x) for x in open(path).read().splitlines()][1:]
     assert [(r["event"], r["harness"], r["windows"][0]["used"]) for r in rows] == \
         [("quota_seen", "codex", 19.0), ("quota_seen", "codex", 21.0)]
+
+
+def out_of_quota(windows=None, before=None):
+    from datetime import timedelta
+    g = log()
+    if before:
+        g("watchdog", "quota_seen", harness="claude-code", windows=before)
+    g("watchdog", "session_ended", agent=C1, reason="quota")("watchdog", "quota_out", agent=C1)
+    out = g.w.t
+    if windows:
+        g("watchdog", "quota_seen", harness="claude-code", windows=windows, after=10)
+    return g.w.quota_back_at(C1, timedelta(minutes=30)), out, g.w.t
+
+
+def test_out_of_quota_with_no_reading_is_tried_after_the_retry():
+    from datetime import timedelta
+    at, out, _ = out_of_quota()
+    assert at == out + timedelta(minutes=30)
+
+
+def test_a_reading_with_room_brings_it_back_at_once():
+    at, out, seen = out_of_quota([{"name": "Current session", "used": 26.0, "resets": "2026-11-25T09:00:00Z"}])
+    assert at == seen
+
+
+def test_a_full_limit_is_waited_out_however_long():
+    at, out, _ = out_of_quota([{"name": "Current session", "used": 3.0, "resets": "2026-11-25T09:00:00Z"},
+                               {"name": "Weekly limit", "used": 100.0, "resets": "2026-11-29T18:47:00Z"}])
+    assert at.isoformat() == "2026-11-29T18:47:00+00:00"
+
+
+def test_another_models_limit_does_not_count():
+    at, out, seen = out_of_quota([{"name": "Current week (Fable)", "used": 100.0, "resets": "2026-11-29T18:47:00Z"},
+                                  {"name": "Current week (all models)", "used": 31.0, "resets": "2026-11-29T18:47:00Z"}])
+    assert at == seen
+
+
+def test_an_older_reading_names_the_limit_that_was_nearly_full():
+    at, out, _ = out_of_quota(before=[{"name": "Current session", "used": 97.0, "resets": "2026-11-25T02:30:00Z"},
+                                      {"name": "Current week (all models)", "used": 31.0, "resets": "2026-11-29T05:00:00Z"}])
+    assert at.isoformat() == "2026-11-25T02:30:00+00:00" and at > out
+
+
+def test_a_full_limit_whose_reset_passed_before_it_ran_out_is_a_stale_reading():
+    from datetime import timedelta
+    at, out, _ = out_of_quota(before=[{"name": "Weekly limit", "used": 100.0, "resets": "2026-11-24T18:00:00Z"}])
+    assert at == out + timedelta(minutes=30)
