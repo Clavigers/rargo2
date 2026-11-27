@@ -2138,14 +2138,12 @@ enum LinkWait {
 }
 
 fn next_msg(mux: &Rc<Mux>, rx: &mut UnboundedReceiver<ServerMsg>) -> std::io::Result<ServerMsg> {
-    loop {
-        match io::race_biased(vec![
-            Box::new(|| LinkWait::Msg(rx.recv())),
-            Box::new(|| { mux.until_dead(); LinkWait::Dead }),
-        ]) {
-            LinkWait::Msg(Some(msg)) => return Ok(msg),
-            LinkWait::Msg(None) | LinkWait::Dead => return Err(lost()),
-        }
+    match io::race_biased(vec![
+        Box::new(|| LinkWait::Msg(rx.recv())),
+        Box::new(|| { mux.until_dead(); LinkWait::Dead }),
+    ]) {
+        LinkWait::Msg(Some(msg)) => Ok(msg),
+        LinkWait::Msg(None) | LinkWait::Dead => Err(lost()),
     }
 }
 
