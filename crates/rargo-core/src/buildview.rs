@@ -1470,6 +1470,13 @@ mod memo_tests {
     }
 
     #[test]
+    fn a_state_loop_checks_invariants_after_a_step_only_with_debug_assertions() {
+        let owner = StateLoop::spawn("test", MemoState::default());
+        let broke = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.tell(|m| m.generation = 0)));
+        assert_eq!(broke.is_err(), cfg!(debug_assertions), "a release server does not scan its state after every step (#788)");
+    }
+
+    #[test]
     fn a_sealed_memo_refuses_observations() {
         let memo = HostMemo::frozen(MemoState::default());
         assert!(memo.sealed());
@@ -1499,7 +1506,11 @@ mod memo_tests {
 }
 
 /// The owner of a build view's live state on the loop thread. Each step runs
-/// where it is asked for, and the state's invariants are checked after it.
+/// where it is asked for. With debug assertions (tests, the simulator) the
+/// state's invariants are checked after it; a release server does not, since
+/// they scan every lookup and output a build has made, after every FUSE
+/// request, which made a cached build of a large workspace ten times slower
+/// (#788).
 struct StateLoop<S> {
     state: std::cell::RefCell<S>,
 }
@@ -1512,7 +1523,9 @@ impl<S: StateMachine> StateLoop<S> {
     fn call<A, T>(&self, step: impl FnOnce(&mut S, A) -> T, args: A) -> T {
         let mut state = self.state.borrow_mut();
         let answer = step(&mut state, args);
-        state.invariants();
+        if cfg!(debug_assertions) {
+            state.invariants();
+        }
         answer
     }
 
