@@ -525,6 +525,17 @@ fn main() {
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
     };
     if kind == "build" {
+        if let (Some(root), Ok(manifest)) = (find_root(&cwd), cli::find_manifest(&world, &args))
+            && let Some((name, path)) = outside_path_dependency(&root, &manifest)
+        {
+            fall_back_or_end(
+                &format!(
+                    "error: path dependency `{name}` points to `{path}`, outside the synced worktree `{}`\n         move the dependency inside the worktree and update its path, or run with RARGO_FALLBACK=cargo to build locally\n",
+                    root.display(),
+                ),
+                &raw,
+            );
+        }
         for source in ignored_compiler_wrappers(&args, &vars, &cwd) {
             eprintln!("warning: {source} is ignored for remote builds; rargo runs the server's compiler directly");
         }
@@ -543,6 +554,29 @@ fn main() {
         fall_back_or_end(&ring_refused_text(&why), &raw);
     }
     through_daemon(cfg, cache, req, &raw)
+}
+
+fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, String)> {
+    let dir = io::file::canonicalize(manifest.parent()?).ok()?;
+    if !dir.starts_with(root) {
+        return None;
+    }
+    let table = io::file::read_to_string(manifest).ok()?.parse::<toml::Table>().ok()?;
+    let targets = table.get("target").and_then(toml::Value::as_table).into_iter()
+        .flat_map(|targets| targets.values().filter_map(toml::Value::as_table));
+    for section in std::iter::once(&table).chain(targets) {
+        for kind in ["dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies"] {
+            let Some(dependencies) = section.get(kind).and_then(toml::Value::as_table) else { continue };
+            for (name, dependency) in dependencies {
+                let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else { continue };
+                let joined = dir.join(path);
+                if io::file::canonicalize(&joined).is_ok_and(|resolved| !resolved.starts_with(root)) {
+                    return Some((name.clone(), path.to_owned()));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn wrapper_config_keys(table: &toml::Table) -> impl Iterator<Item = &'static str> + '_ {
@@ -828,6 +862,29 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn direct_path_dependencies_must_stay_inside_the_synced_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = io::file::canonicalize(temp.path()).unwrap();
+        let root = base.join("app");
+        for dir in [root.join("local"), base.join("dep")] {
+            io::file::create_dir_all(dir).unwrap();
+        }
+        let manifest = root.join("Cargo.toml");
+        let found = |content: &str| {
+            io::file::write(&manifest, content).unwrap();
+            outside_path_dependency(&root, &manifest)
+        };
+
+        assert_eq!(found("[dependencies]\nlocal = { path = 'local' }\nserde = '1'"), None);
+        for section in ["dependencies", "dev-dependencies", "target.'cfg(unix)'.build-dependencies"] {
+            assert_eq!(
+                found(&format!("[{section}]\nrenamed = {{ package = 'dep', path = '../dep' }}")),
+                Some(("renamed".into(), "../dep".into())),
+            );
+        }
+    }
 
     #[test]
     fn socket_name_follows_the_configuration() {
