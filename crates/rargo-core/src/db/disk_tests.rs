@@ -1,6 +1,11 @@
 use super::{Db, Table};
 use std::cell::RefCell;
 use std::io;
+use std::rc::Rc;
+
+/// A disk image. Images are megabytes long, so disks share them and copy one
+/// only when it changes while shared.
+type Image = Rc<Vec<u8>>;
 
 #[derive(Clone)]
 enum Change {
@@ -24,8 +29,8 @@ impl Change {
 
 #[derive(Default)]
 struct State {
-    live: Vec<u8>,
-    safe: Vec<u8>,
+    live: Image,
+    safe: Image,
     unsynced: Vec<Change>,
     changes: usize,
     cut_after: Option<usize>,
@@ -40,7 +45,7 @@ thread_local! {
 struct FakeDisk(usize);
 
 impl FakeDisk {
-    fn holding(image: Vec<u8>) -> FakeDisk {
+    fn holding(image: Image) -> FakeDisk {
         DISKS.with_borrow_mut(|all| {
             all.push(State { live: image.clone(), safe: image, ..State::default() });
             FakeDisk(all.len() - 1)
@@ -60,7 +65,7 @@ impl FakeDisk {
                 return Err(io::ErrorKind::StorageFull.into());
             }
             s.changes += 1;
-            change.apply(&mut s.live);
+            change.apply(Rc::make_mut(&mut s.live));
             s.unsynced.push(change);
             Ok(())
         })
@@ -70,7 +75,7 @@ impl FakeDisk {
         self.with(|s| s.cut_after.is_some_and(|n| s.changes >= n))
     }
 
-    fn after_power_cut(&self, kept: u64) -> Vec<u8> {
+    fn after_power_cut(&self, kept: u64) -> Image {
         let (mut image, unsynced, len) = self.with(|s| (s.safe.clone(), s.unsynced.clone(), s.live.len()));
         let mut bits = kept.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
         for change in &unsynced {
@@ -79,11 +84,15 @@ impl FakeDisk {
             bits ^= bits << 17;
             match (bits % 3, change) {
                 (0, _) => {}
-                (1, Change::Write(at, data)) => Change::Write(*at, data[..data.len() / 2].to_vec()).apply(&mut image),
-                _ => change.apply(&mut image),
+                (1, Change::Write(at, data)) => {
+                    Change::Write(*at, data[..data.len() / 2].to_vec()).apply(Rc::make_mut(&mut image))
+                }
+                _ => change.apply(Rc::make_mut(&mut image)),
             }
         }
-        image.resize(len.max(image.len()), 0);
+        if image.len() < len {
+            Rc::make_mut(&mut image).resize(len, 0);
+        }
         image
     }
 }
@@ -107,7 +116,7 @@ impl redb::StorageBackend for FakeDisk {
             if s.cut_after.is_some_and(|n| s.changes >= n) {
                 return Err(io::Error::other("the power is off"));
             }
-            s.safe = s.live.clone();
+            s.safe = Rc::clone(&s.live);
             s.unsynced.clear();
             Ok(())
         })
@@ -126,7 +135,7 @@ fn write_batch(db: &Db, n: u8) {
     db.flush();
 }
 
-fn batch_on(image: Vec<u8>) -> u8 {
+fn batch_on(image: Image) -> u8 {
     let db = Db::on(FakeDisk::holding(image)).expect("the database opens after a power cut");
     let first = db.get(Table::Meta, b"first").map_or(0, |v| v[0]);
     let second = db.get(Table::Blobs, b"second").map_or(0, |v| v[0]);
@@ -160,13 +169,13 @@ mod a_power_cut_keeps_every_finished_batch_and_tears_none {
 
 fn check_power_cuts(first_cut: usize) {
     let empty = {
-        let disk = FakeDisk::holding(Vec::new());
+        let disk = FakeDisk::holding(Image::default());
         drop(Db::on(disk).unwrap());
         disk.with(|s| s.safe.clone())
     };
     let mut cut = first_cut;
     loop {
-        let disk = FakeDisk::holding(empty.clone());
+        let disk = FakeDisk::holding(Rc::clone(&empty));
         let db = Db::on(disk).unwrap();
         let start = disk.with(|s| s.changes);
         disk.with(|s| s.cut_after = Some(start + cut));
@@ -191,7 +200,7 @@ fn check_power_cuts(first_cut: usize) {
 
 #[test]
 fn a_full_disk_stops_writes_only_until_it_has_room_again() {
-    let disk = FakeDisk::holding(Vec::new());
+    let disk = FakeDisk::holding(Image::default());
     let db = Db::on(disk).unwrap();
     write_batch(&db, 1);
     disk.with(|s| s.full = true);
@@ -207,7 +216,7 @@ fn a_full_disk_stops_writes_only_until_it_has_room_again() {
 #[test]
 fn the_loop_owner_reports_a_failed_flush_and_retries_the_batch() {
     crate::io::sim::test(|| {
-        let disk = FakeDisk::holding(Vec::new());
+        let disk = FakeDisk::holding(Image::default());
         let db = Db::on_backend(disk, true).unwrap();
         write_batch(&db, 1);
 

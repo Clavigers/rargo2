@@ -80,7 +80,11 @@ fn a_seed_replays_the_same_run() {
     let first = run(3, None).expect("passes");
     assert_eq!(first, run(3, None).expect("passes"));
     assert!(first.runs > 0);
-    assert_ne!(first.trace, run(5, None).expect("passes").trace);
+}
+
+#[test]
+fn another_seed_makes_another_run() {
+    assert_ne!(run(3, None).expect("passes").trace, run(5, None).expect("passes").trace);
 }
 
 #[test]

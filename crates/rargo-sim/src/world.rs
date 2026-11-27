@@ -2296,13 +2296,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dozens_of_client_rounds_overlap_during_eviction() {
+    fn a_crowd_of_client_rounds_overlap_during_eviction() {
         let off = [Fault::ServerCrash, Fault::Loss, Fault::Duplicate, Fault::Reorder, Fault::Partition]
             .into_iter().fold(Off::none(), Off::with);
         // One action and one round per client exercise contention without a
         // large build graph. Give the links one brief, deterministic outage.
+        // Twenty clients is the smallest crowd `Config::of` draws.
         let mut world = World::configured(50, None, off, |cfg, project| {
-            cfg.clients = 24;
+            cfg.clients = 20;
             cfg.rounds = 1;
             cfg.max_latency_ms = 3;
             project.actions.truncate(1);
@@ -2310,7 +2311,7 @@ mod tests {
         world.watch_limit = Duration::from_secs(2);
         world.silence = Some((550, 3200));
         let report = world.run().unwrap_or_else(|failure| panic!("{failure}"));
-        assert!(report.clients_at_eviction >= 24, "{report:?}");
+        assert!(report.clients_at_eviction >= 20, "{report:?}");
         assert!(report.cache_hits > 0, "clients reuse action outputs");
         assert!(report.silences > 0, "clients give up on a silent server");
     }
