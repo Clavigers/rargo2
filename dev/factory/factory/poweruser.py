@@ -2,24 +2,34 @@
 and files what goes wrong.
 
 Every few minutes it looks for a use that is due: a candidate whose latest
-build has had fewer power user sessions end on it than the config's
-uses_required, with no backport waiting for a build. Then it
+build has had fewer power user uses end on it than the config's
+uses_required, with no backport waiting for a build. With
+`release.use_beyond_required` it also goes on using a candidate's latest
+build when no build needs a use. Then it
 
 1. records `use_started` for that build;
-2. checks the build's commit out in CHECKOUT and runs one harness session
-   there with POWER-USER.md as its prompt. The session builds the candidate,
-   uses it, and files bugs and friction on GitHub; the observer records them
-   as found in this use;
-3. waits until the observer has recorded every issue the session filed (it
-   finds them on GitHub by the session's line in their bodies), and records
+2. checks the build's commit out in CHECKOUT and runs harness sessions there
+   with POWER-USER.md as their prompt, one after another, until the use has
+   lasted the config's `release.use_minutes` (one session when that is not
+   set), a session fails, or the build is no longer the latest. A session
+   ends when its model says it is done, long before a person would stop, so
+   one session is a few minutes of use: the time comes from running many.
+   Each is given one area to concentrate on (FOCUS, in turn) and what the
+   sessions before it reported, so it goes where they did not. A session
+   builds the candidate, uses it, and files bugs and friction on GitHub; the
+   observer records them as found in this use;
+3. waits until the observer has recorded every issue the sessions filed (it
+   finds them on GitHub by the use's line in their bodies), and records
    `use_ended`.
 
 Sessions are at least the config's `release.use_gap_minutes` apart (three
 hours when it is not set), so a week of small backports does not become a
 week of sessions unless the config asks for that. A session that did not
-exit cleanly (a crash, no quota, the time limit) ends its use as void: it is
-not a use of the build, and another is tried after `retry`, or after the gap
-when that is shorter. So is a use left open by a power user
+exit cleanly (a crash, no quota, the time limit), or that ended within
+MIN_SESSION (a harness that only printed that it may not run), is a failed
+session. A use none of whose sessions succeeded ends as void: it is not a
+use of the build, and another is tried after `retry`, or after the gap when
+that is shorter. So is a use left open by a power user
 that stopped, which the next one ends. It writes no code and touches no pull
 request.
 """
@@ -42,7 +52,42 @@ from .ledger import Alarm, Ledger, Refused, utc_now
 from .model import Role
 from .watchdog import BIN
 
-GAP = timedelta(hours=3)  # between sessions, when the config's release.use_gap_minutes is not set
+GAP = timedelta(hours=3)  # between uses, when the config's release.use_gap_minutes is not set
+MIN_SESSION = timedelta(minutes=2)  # a session over sooner than this did not use anything
+MAX_SESSIONS = 40  # in one use, whatever its budget
+NOTES = 3  # earlier sessions whose closing reports the next one is given
+NOTE_CHARS = 3000
+
+# What a session concentrates on. Each session takes the next one, across uses.
+FOCUS = (
+    ("the everyday path",
+     "build, check, test, run, an edit and a rebuild, a clean cache and a warm one, on this "
+     "repository and on two or three small crates you write or clone"),
+    ("what changed in this version",
+     "read `git log --oneline $(git describe --tags --abbrev=0 HEAD^)..HEAD` and try every change a "
+     "user can reach, the way its commit message says it behaves and the ways it does not mention"),
+    ("rough handling",
+     "interrupt builds and start again, run several builds at once in one project and in two, kill "
+     "your server mid-build and bring it back, fill or remove its state directory, give wrong arguments"),
+    ("errors a user will read",
+     "break code, manifests, lockfiles, dependencies and toolchain files in the ways people do, and "
+     "judge whether each message says what went wrong and what to do"),
+    ("the other cargo commands",
+     "clippy, doc, bench, install, nextest, run with arguments, examples, workspaces with several "
+     "members, features, build scripts, proc macros, and what an editor's rust-analyzer runs"),
+    ("several clients and sign-in",
+     "tokens and `rargo auth`, two clients with separate caches building the same and different "
+     "projects against your one server, a client on an older checkout, UDP and TCP links"),
+    ("projects unlike this one",
+     "clone a few real crates from crates.io or GitHub of different shapes (a big dependency tree, "
+     "a -sys crate, a project with its own flake.nix or rust-toolchain file) and work in them"),
+    ("speed against plain cargo",
+     "time cold and warm builds, a one-line edit, a no-op rebuild and a test run with rargo and with "
+     "cargo on the same projects; anything slower than cargo where it should not be is a problem"),
+    ("the documentation as a new user",
+     "follow README.md, the Book and the Reference word for word on a clean setup, and file every "
+     "step that does not work as written or leaves a new user stuck"),
+)
 
 
 class PowerUser:
@@ -57,6 +102,7 @@ class PowerUser:
         self.ledger, self.gh, self.checkout, self.prompt = ledger, gh, Path(checkout), prompt
         self.clock, self.gap, self.retry, self.timeout = clock, gap, retry, timeout
         self.settle, self.poll = settle, poll
+        self.round = 1  # which session of the use is running
         self.run_session = run or self._run_session
         self.prepare = prepare or (self._checkout if run is None else lambda sha: None)
         self.say = say
@@ -89,9 +135,23 @@ class PowerUser:
             ended = sum(1 for n, u in mine.items() if (u.version, u.build) == (version, build)
                         and w.is_(M.USE, n, "ended") and not u.void)
             if ended < w.config.release.uses_required:
-                sha = [l["sha"] for l in self._lines("built") if l["version"] == version][-1]
-                return version, build, sha
+                return version, build, self._sha(version)
+        if w.config.release.use_beyond_required:
+            for version, v in w.versions.items():
+                if w.is_(M.VERSION, version, "candidate") and v.builds and not v.unbuilt:
+                    return version, len(v.builds), self._sha(version)
         return None
+
+    def _sha(self, version: str) -> str:
+        return [l["sha"] for l in self._lines("built") if l["version"] == version][-1]
+
+    def _more(self, version: str, build: int, began: datetime) -> bool:
+        """Whether the use goes on to another session."""
+        w = self.ledger.refresh()
+        budget, v = w.config.release.use_minutes, w.versions[version]
+        return (budget is not None and self.round < MAX_SESSIONS
+                and self.clock() - began < timedelta(minutes=budget)
+                and w.is_(M.VERSION, version, "candidate") and len(v.builds) == build and not v.unbuilt)
 
     def step(self) -> None:
         w = self.ledger.refresh()
@@ -107,13 +167,16 @@ class PowerUser:
         began = self.clock()
         self._record("use_started", use=use, version=version, build=build)
         self.say(f"power user: use {use}: {version} build {build} at {sha[:7]}")
-        code = None
+        codes: list[int] = []
         try:
-            code = self.run_session(use, version, build, sha)
-            self.say(f"power user: use {use} ended with exit {code}")
+            for self.round in range(1, MAX_SESSIONS + 1):
+                codes.append(self.run_session(use, version, build, sha))
+                self.say(f"power user: use {use} session {self.round} ended with exit {codes[-1]}")
+                if codes[-1] != 0 or not self._more(version, build, began):
+                    break
             self._settle(use, began)
         finally:
-            self._record("use_ended", use=use, void=code != 0)
+            self._record("use_ended", use=use, void=0 not in codes)
 
     def _settle(self, use: int, began: datetime) -> None:
         """Wait until the log has every issue this session filed: they are
@@ -138,8 +201,17 @@ class PowerUser:
         t = next((a for a in w.config.agents if a.type is m.Harness.claude_code), w.config.agents[0])
         if w.config.release.use_model is not None:
             t = t.model_copy(update={"model": w.config.release.use_model})
+        log = self.checkout.parent / "state" / "logs"
+        log.mkdir(parents=True, exist_ok=True)
+        before = sorted(log.glob("use-*.log"), key=lambda p: p.stat().st_mtime)
+        area, how = FOCUS[len(before) % len(FOCUS)]
+        notes = "\n\n".join(
+            f"--- an earlier session ended with:\n{text[-NOTE_CHARS:]}"
+            for p in before[-NOTES:] if (text := p.read_text(errors="replace").strip()))
         prompt = (self.prompt.replace("{version}", version).replace("{build}", str(build))
-                  .replace("{sha}", sha).replace("{use}", str(use)))
+                  .replace("{sha}", sha).replace("{use}", str(use))
+                  .replace("{session}", str(self.round)).replace("{focus}", f"{area}: {how}")
+                  .replace("{notes}", notes or "None: this is the first session."))
         cmd = harness.command(t, prompt)
         if cmd is None:
             self.say(f"power user: no {t.type} here to run a session with")
@@ -149,15 +221,19 @@ class PowerUser:
             "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.power_user,
             "FACTORY_PYTHON": sys.executable,
             "PATH": f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}"}
-        log = self.checkout.parent / "state" / "logs"
-        log.mkdir(parents=True, exist_ok=True)
-        with open(log / f"use-{use}.log", "wb") as out:
+        started = time.monotonic()
+        with open(log / f"use-{use}-{self.round}.log", "wb") as out:
             try:
-                return subprocess.run(argv, cwd=self.checkout, env=env, stdin=subprocess.DEVNULL,
+                code = subprocess.run(argv, cwd=self.checkout, env=env, stdin=subprocess.DEVNULL,
                                       stdout=out, stderr=subprocess.STDOUT,
                                       timeout=self.timeout.total_seconds()).returncode
             except subprocess.TimeoutExpired:
                 return 124
+        if code == 0 and time.monotonic() - started < MIN_SESSION.total_seconds():
+            self.say(f"power user: use {use} session {self.round} ended within "
+                     f"{MIN_SESSION.seconds // 60} minutes: not a session")
+            return 75  # EX_TEMPFAIL: a harness that exits 0 saying it is out of quota
+        return code
 
     def _record(self, event: str, **fields) -> None:
         self.ledger.submit(Role.power_user, json.dumps({"event": event, **fields}))

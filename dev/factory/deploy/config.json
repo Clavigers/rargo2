@@ -50,7 +50,9 @@
     "freeze_every_days": 7,
     "uses_required": 1,
     "soak_minutes": 120,
-    "use_gap_minutes": 15
+    "use_gap_minutes": 15,
+    "use_minutes": 120,
+    "use_beyond_required": true
   },
   "guesses": [
     "dictator.affinity_minutes",

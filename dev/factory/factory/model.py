@@ -177,6 +177,12 @@ class ReleaseRules(Strict):
     soak_minutes: Annotated[int, Field(ge=0)]
     # Power user sessions start at least this far apart. None: 180.
     use_gap_minutes: Annotated[int, Field(ge=0)] | None = None
+    # A use goes on, one power user session after another on the same build,
+    # until it has lasted this long. None: a use is one session.
+    use_minutes: Annotated[int, Field(ge=1)] | None = None
+    # With every build's required uses done, the power user goes on using the
+    # latest build of a candidate. False: it rests until there is a new build.
+    use_beyond_required: bool = False
     # The model the power user's sessions run on, in Claude Code. None: the
     # Claude Code agents' model.
     use_model: Model | None = None

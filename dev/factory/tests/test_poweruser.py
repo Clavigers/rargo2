@@ -12,13 +12,14 @@ T0 = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
 
 
 class Factory:
-    def __init__(self, tmp, uses_required=1, during=None, use_gap_minutes=None):
+    def __init__(self, tmp, uses_required=1, during=None, use_gap_minutes=None, **release):
         self.now = T0
         self.ledger = Ledger(tmp / "log.jsonl", clock=lambda: self.now)
         cfg = copy.deepcopy(CONFIG)
         cfg["release"] = {"freeze_every_days": 7, "uses_required": uses_required, "soak_minutes": 0}
         if use_gap_minutes is not None:
             cfg["release"]["use_gap_minutes"] = use_gap_minutes
+        cfg["release"] |= release
         self("human", "config_applied", config=cfg)
         self.sessions, self.said, self.during, self.lost, self.exit = [], [], during, False, 0
         self.on_github = []
@@ -136,6 +137,64 @@ def test_a_failed_session_is_tried_again_after_the_gap_when_that_is_shorter(tmp_
     f.now += timedelta(minutes=10)
     f.pu.step()
     assert len(f.sessions) == 2
+
+
+def test_a_use_runs_sessions_until_its_time_is_spent(tmp_path):
+    spend = lambda f: setattr(f, "now", f.now + timedelta(minutes=12))
+    f = Factory(tmp_path, during=spend, use_minutes=30).candidate()
+    f.pu.step()
+    assert len(f.sessions) == 3 and {s[0] for s in f.sessions} == {1}  # 12, 24, 36 minutes: one use
+    assert f.events()[-2:] == ["use_started", "use_ended"] and not f.ledger.world.uses[1].void
+
+
+def test_a_use_stops_when_its_build_is_no_longer_the_latest(tmp_path):
+    def newer(f):
+        f.now += timedelta(minutes=5)
+        if len(f.sessions) == 2:
+            f("pm", "built", version="0.7.11", build=2, sha="b" * 40)
+    f = Factory(tmp_path, during=newer, use_minutes=600).candidate()
+    f.pu.step()
+    assert len(f.sessions) == 2 and not f.ledger.world.uses[1].void
+
+
+def test_a_use_whose_later_session_fails_still_counts(tmp_path):
+    def later_fails(f):
+        f.now += timedelta(minutes=5)
+        f.exit = 1 if len(f.sessions) == 2 else 0
+    f = Factory(tmp_path, during=later_fails, use_minutes=600).candidate()
+    f.pu.step()
+    assert len(f.sessions) == 2 and not f.ledger.world.uses[1].void
+
+
+def test_it_goes_on_using_a_build_only_when_the_config_says(tmp_path):
+    f = Factory(tmp_path).candidate()
+    f.pu.step()
+    f.now += timedelta(hours=4)
+    f.pu.step()
+    assert len(f.sessions) == 1
+    (tmp_path / "g").mkdir()
+    g = Factory(tmp_path / "g", use_beyond_required=True, use_gap_minutes=15)
+    g.candidate()
+    g.pu.step()
+    g.now += timedelta(minutes=20)
+    g.pu.step()
+    assert [s[:3] for s in g.sessions] == [(1, "0.7.11", 1), (2, "0.7.11", 1)]
+
+
+def test_the_prompt_names_a_focus_and_carries_the_last_reports(tmp_path, monkeypatch):
+    import factory.poweruser as P
+    f = Factory(tmp_path).candidate()
+    logs = tmp_path / "state" / "logs"
+    logs.mkdir(parents=True)
+    (logs / "use-1-1.log").write_text("Not tried: sign-in with tokens.")
+    seen = {}
+    monkeypatch.setattr(P.harness, "command", lambda t, prompt: (seen.setdefault("prompt", prompt), None)[1])
+    pu = P.PowerUser(f.ledger, f, tmp_path / "use", "S{session} F{focus} N{notes}", clock=f.clock,
+                     say=f.said.append, prepare=lambda sha: None)
+    f.ledger.refresh()
+    assert pu._run_session(2, "0.7.11", 1, SHA) == 127
+    area, _ = P.FOCUS[1]  # one log is there already, so this session takes the second area
+    assert seen["prompt"].startswith(f"S1 F{area}: ") and "Not tried: sign-in with tokens." in seen["prompt"]
 
 
 def test_a_use_left_open_is_ended(tmp_path):
