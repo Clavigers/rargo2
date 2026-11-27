@@ -997,11 +997,10 @@ impl Daemon {
     }
 
     fn out_for(self: &Rc<Self>, wt: &Rc<Worktree>, req: &LocalRequest, cwd: &Path) -> std::io::Result<Option<(Rc<OutFs>, PathBuf)>> {
-        let elsewhere = var(&req.vars, "CARGO_TARGET_DIR").is_some()
-            || var(&req.vars, "CARGO_BUILD_TARGET_DIR").is_some()
-            || req.args.iter().any(|a| a == "--target-dir" || a.starts_with("--target-dir="));
+        let target = explicit_target_dir(req).map(|dir| cwd.join(dir));
         let same_ns = req.mount_ns == crate::mount_ns();
-        let want = self.watcher.is_some() && var(&req.vars, "RARGO_OUTPUT") != Some("copy") && !elsewhere && same_ns;
+        let shows = self.watcher.is_some() && var(&req.vars, "RARGO_OUTPUT") != Some("copy") && same_ns;
+        let use_ = out_use(shows, target.is_some());
         let _mounting = self.mounting.lock();
         let unmount = || {
             let mounted = wt.out.borrow_mut().take();
@@ -1010,13 +1009,15 @@ impl Daemon {
                 io::blocking(|| m.session.unmount());
             }
         };
-        if !want {
+        // Checked only once the mount is settled: an explicit target dir may
+        // name this worktree's own `target`, whose mount was just released.
+        let check = |dir: Option<&Path>| match &target {
+            Some(t) if dir.is_none_or(|d| copied_beside(t, d)) => OutputMounts::current()?.check(t),
+            _ => Ok(()),
+        };
+        if use_ == OutUse::Release {
             unmount();
-            // Checked only now: an explicit target dir may name this
-            // worktree's own `target`, whose mount was just released.
-            if let Some(dir) = explicit_target_dir(req) {
-                OutputMounts::current()?.check(&cwd.join(dir))?;
-            }
+            check(None)?;
             return Ok(None);
         }
         let mounted = wt.out.borrow().as_ref().map(|m| (m.session.clone(), m.dir.clone(), m.dev));
@@ -1024,11 +1025,16 @@ impl Daemon {
             if io::blocking(|| session.shown()) && dev_at(&mountinfo(), &dir) == Some(dev) {
                 let fs = wt.out.borrow().as_ref().map(|m| m.fs.clone());
                 if let Some(fs) = fs {
+                    check(Some(&dir))?;
                     return Ok(Some((fs, dir)));
                 }
             }
             drop(session);
             unmount();
+        }
+        if use_ == OutUse::Keep {
+            check(None)?;
+            return Ok(None);
         }
         if wt.out_failed.get() && var(&req.vars, "RARGO_OUTPUT") != Some("fuse") {
             return Ok(None);
@@ -2046,6 +2052,30 @@ fn next_msg(mux: &Rc<Mux>, rx: &mut UnboundedReceiver<ServerMsg>) -> std::io::Re
         LinkWait::Msg(Some(msg)) => Ok(msg),
         LinkWait::Msg(None) | LinkWait::Dead => Err(lost()),
     }
+}
+
+/// What a command does with its worktree's virtual `target`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutUse {
+    /// Shows its outputs there, mounting it if it is not mounted.
+    Mount,
+    /// Builds into another target dir: a mount that is up stays up, and shows what lands under it; none is made.
+    Keep,
+    /// Copies its outputs into the real `target`, so the mount must go.
+    Release,
+}
+
+fn out_use(shows: bool, explicit_target: bool) -> OutUse {
+    match (shows, explicit_target) {
+        (false, _) => OutUse::Release,
+        (true, true) => OutUse::Keep,
+        (true, false) => OutUse::Mount,
+    }
+}
+
+/// Whether outputs for `target` are copied rather than shown by the mount on `mounted`.
+fn copied_beside(target: &Path, mounted: &Path) -> bool {
+    !target.starts_with(mounted)
 }
 
 fn explicit_target_dir(req: &LocalRequest) -> Option<&str> {
@@ -3091,6 +3121,28 @@ mod tests {
         assert_eq!(super::dev_at(info, Path::new("/w/target2")), Some(63));
         assert_eq!(super::dev_at(info, Path::new("/w")), None);
         assert_eq!(super::mounts_at(info, Path::new("/w/target")).count(), 2);
+    }
+
+    #[test]
+    fn another_target_dir_keeps_the_mounted_target_and_only_copy_mode_releases_it() {
+        assert_eq!(out_use(true, false), OutUse::Mount);
+        assert_eq!(out_use(true, true), OutUse::Keep);
+        assert_eq!(out_use(false, false), OutUse::Release);
+        assert_eq!(out_use(false, true), OutUse::Release);
+    }
+
+    #[test]
+    fn a_target_dir_under_the_mount_is_shown_and_any_other_is_copied() {
+        let mounted = Path::new("/w/target");
+        for (target, copied) in [
+            ("/w/target", false),
+            ("/w/target/rust-analyzer", false),
+            ("/w/target-other", true),
+            ("/w/other", true),
+            ("/tmp/x", true),
+        ] {
+            assert_eq!(copied_beside(Path::new(target), mounted), copied, "{target}");
+        }
     }
 
     #[test]
