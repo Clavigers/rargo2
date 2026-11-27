@@ -33,6 +33,37 @@ pub const BANNER: &str = "Usage: rargo [CARGO COMMAND...]\n\n\
      --rargo-version  Print rargo's version and protocol\n\n\
      Cargo's help follows.\n";
 
+/// Whether help may carry colour: `CARGO_TERM_COLOR` decides when it says always or never, then `NO_COLOR`, then the terminal.
+pub fn colour(vars: &[(String, String)], tty: bool) -> bool {
+    let var = |name: &str| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str()).filter(|v| !v.is_empty());
+    match var("CARGO_TERM_COLOR") {
+        Some("always") => true,
+        Some("never") => false,
+        _ => var("NO_COLOR").is_none() && tty,
+    }
+}
+
+/// The banner with its headings, usage and command names in bold yellow.
+pub fn paint(text: &str) -> String {
+    let bold = |s: &str| format!("\x1b[1;33m{s}\x1b[0m");
+    let mut out = String::new();
+    for line in text.split_inclusive('\n') {
+        let (body, end) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
+        if let Some(usage) = body.strip_prefix("Usage: ") {
+            out += &format!("{} {}", bold("Usage:"), bold(usage));
+        } else if let Some(entry) = body.strip_prefix("    ") {
+            let (name, rest) = entry.split_at(entry.find("  ").unwrap_or(entry.len()));
+            out += &format!("    {}{rest}", bold(name));
+        } else if body.ends_with(':') {
+            out += &bold(body);
+        } else {
+            out += body;
+        }
+        out += end;
+    }
+    out
+}
+
 pub fn version() -> String {
     format!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION)
 }
@@ -153,7 +184,7 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
         }
     }
     let alone = |names: &[&str]| !cargo_link && raw.len() == 1 && first.and_then(OsStr::to_str).is_some_and(|a| names.contains(&a));
-    let banner = if alone(&["--help", "-h", "help"]) {
+    let banner = if (raw.is_empty() && !cargo_link) || alone(&["--help", "-h", "help"]) {
         Some(BANNER.to_string())
     } else if alone(&["--version", "-V"]) {
         Some(version())
@@ -676,6 +707,8 @@ mod tests {
             (Some("/usr/bin/cargo"), vec!["status"], fake(&[]), cargo.clone()),
             (Some("rargo"), vec!["-h"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
             (None, vec!["--help"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
+            (None, vec![], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
+            (Some("/bin/cargo"), vec![], fake(&[]), cargo.clone()),
             (Some("/bin/cargo"), vec!["-h"], fake(&[]), cargo.clone()),
             (None, vec!["-h", "build"], fake(&[]), cargo.clone()),
             (None, vec!["--rargo-version"], fake(&[]), Plan::Print(format!("rargo {} (protocol {})", env!("CARGO_PKG_VERSION"), rargo_proto::PROTO_VERSION))),
@@ -737,7 +770,6 @@ mod tests {
             (None, vec!["check", "--version"], fake(&[]), cargo.clone()),
             (None, vec!["test", "-h"], fake(&[]), cargo.clone()),
             (None, vec!["metadata"], fake(&[]), cargo.clone()),
-            (None, vec![], fake(&[]), cargo.clone()),
             (None, vec!["build", "--unit-graph"], fake(&[]), usage("error: rargo does not support --unit-graph for remote builds; use local Cargo to get a unit graph with local paths")),
             (None, vec!["build", "--", "--unit-graph"], fake(&[]), remote(&["build", "--", "--unit-graph"], &[], "build")),
             (None, vec!["--color", "always", "b"], fake(&[]), remote(&["--color", "always", "b"], &[], "build")),
@@ -937,6 +969,32 @@ mod tests {
             removed("h", Err("offline".into())),
             ("forgot the token for h on this machine".into(), Some("warning: the server could not be told to revoke it (offline); it keeps working for whoever has a copy until an administrator runs `rargod token revoke`".into()))
         );
+    }
+
+    #[test]
+    fn painting_adds_only_colour_and_only_where_the_terminal_and_environment_allow() {
+        let painted = paint(BANNER);
+        let plain = painted.replace("\x1b[1;33m", "").replace("\x1b[0m", "");
+        assert_eq!(plain, BANNER);
+        for bold in ["Usage:", "rargo [CARGO COMMAND...]", "rargo's own commands:", "@HOST", "auth", "status", "--rargo-version"] {
+            assert!(painted.contains(&format!("\x1b[1;33m{bold}\x1b[0m")), "{bold}");
+        }
+        assert_eq!(painted.matches("\x1b[1;33m").count(), 7);
+        assert_eq!(paint(&version()), version());
+        let vars = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        for (pairs, tty, expected) in [
+            (vec![], true, true),
+            (vec![], false, false),
+            (vec![("NO_COLOR", "1")], true, false),
+            (vec![("NO_COLOR", "")], true, true),
+            (vec![("CARGO_TERM_COLOR", "always")], false, true),
+            (vec![("CARGO_TERM_COLOR", "always"), ("NO_COLOR", "1")], false, true),
+            (vec![("CARGO_TERM_COLOR", "never")], true, false),
+            (vec![("CARGO_TERM_COLOR", "auto")], true, true),
+            (vec![("CARGO_TERM_COLOR", "auto")], false, false),
+        ] {
+            assert_eq!(colour(&vars(&pairs), tty), expected, "{pairs:?} {tty}");
+        }
     }
 
     #[test]
