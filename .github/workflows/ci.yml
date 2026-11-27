@@ -24,6 +24,51 @@ jobs:
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
         run: |
-          curl -fsSL https://rargo.rs/install.sh | sh
-          rargo auth --token "$RARGO_TOKEN"
+          sign_in() {
+            local rc=0
+            curl -fsSL --connect-timeout 10 --max-time 30 https://rargo.rs/install.sh > "$installer" || rc=$?
+            case "$rc" in
+              0) ;;
+              6|7|28) return 75 ;;
+              *) return 1 ;;
+            esac
+            if ! timeout 60s sh "$installer" > "$output" 2>&1; then
+              cat "$output"
+              if grep -Eq '^curl: [(](6|7|28)[)]' "$output"; then
+                return 75
+              fi
+              return 1
+            fi
+            cat "$output"
+            if timeout 30s rargo auth --token "$RARGO_TOKEN" > "$output" 2>&1; then
+              cat "$output"
+              return 0
+            fi
+            cat "$output"
+            if grep -Eq '^error: (rargo auth: )?(cannot find the rargo server .+: (nothing answers there|no machine has that name)|cannot reach the rargo server at )' "$output"; then
+              return 75
+            fi
+            return 1
+          }
+
+          installer=$(mktemp)
+          output=$(mktemp)
+          trap 'rm -f "$installer" "$output"' EXIT
+          deadline=$((SECONDS + 600))
+          while true; do
+            rc=0
+            sign_in || rc=$?
+            case "$rc" in
+              0) break ;;
+              75) ;;
+              *) exit "$rc" ;;
+            esac
+            remaining=$((deadline - SECONDS))
+            if (( remaining <= 0 )); then
+              echo "::error::The rargo server did not answer within the sign-in retry window."
+              exit 1
+            fi
+            echo "::warning::The rargo server did not answer. Retrying sign-in."
+            sleep "$((remaining < 60 ? remaining : 60))"
+          done
       - run: rargo test --locked --workspace

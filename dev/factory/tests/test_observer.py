@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -9,7 +10,7 @@ from factory.dictator import Dictator
 from factory.github import GitHubError
 from factory.ledger import Ledger
 from factory.machines import IssueS
-from factory.observer import Observer
+from factory.observer import Observer, SIGN_IN_STEP
 
 OWNER = "sadosystems"
 SHA, SHA2, MAIN = "a" * 40, "b" * 40, "c" * 40
@@ -29,6 +30,8 @@ class FakeGitHub:
         self.issue_list: dict[int, dict] = {}
         self.pulls: dict[int, dict] = {}
         self.runs: dict[str, list] = {}
+        self.jobs: dict[int, dict] = {}
+        self.rerun: list[str] = []
         self.posted: list[tuple[int, str]] = []
         self.closed: list[int] = []
         self.merge_error: str | None = None
@@ -46,9 +49,20 @@ class FakeGitHub:
                          "merged_at": None, "merged_by": None, "merge_commit_sha": None,
                          "mergeable_state": "clean"}
 
-    def ci(self, sha, conclusion, status="completed", app="github-actions"):
+    def ci(self, sha, conclusion, status="completed", app="github-actions", failed_steps=()):
+        job_id = len(self.jobs) + 1
+        self.jobs[job_id] = {"conclusion": conclusion, "steps": [
+            {"name": name, "conclusion": "failure"} for name in failed_steps
+        ]}
         self.runs.setdefault(sha, []).append(
-            {"app": {"slug": app}, "status": status, "conclusion": conclusion})
+            {"id": job_id, "app": {"slug": app}, "status": status, "conclusion": conclusion})
+
+    def job(self, check_run_id):
+        return self.jobs[check_run_id]
+
+    def rerun_failed(self, sha):
+        self.rerun.append(sha)
+        return 1
 
     # the interface the observer uses
     def issues(self, since):
@@ -169,10 +183,53 @@ def test_green_and_approved_merges(rig):
 
 def test_red_ci_sends_it_back(rig):
     pushed(rig)
-    rig.gh.ci(SHA, "failure")
+    rig.gh.ci(SHA, "failure", failed_steps=["Build"])
     rig.obs.step()
     w = rig.led.world
     assert w.is_(M.CI, "10/1", "fail") and w.needs_work(1)
+    assert rig.gh.rerun == []
+
+
+def test_sign_in_step_matches_workflow():
+    workflow = Path(__file__).resolve().parents[3] / ".github/workflows/ci.yml"
+    step_names = [line.strip().removeprefix("- name: ") for line in workflow.read_text().splitlines()
+                  if line.lstrip().startswith("- name: ")]
+    assert SIGN_IN_STEP in step_names
+
+
+def test_sign_in_failure_keeps_ci_pending_and_throttles_reruns(rig, monkeypatch):
+    now = 0
+    monkeypatch.setattr("factory.observer.monotonic", lambda: now)
+    pushed(rig)
+    rig.gh.ci(SHA, "failure", failed_steps=[SIGN_IN_STEP])
+    rig.gh.ci(SHA, "success")
+    rig.obs.step()
+    assert rig.led.world.is_(M.CI, "10/1", "pending")
+    assert rig.gh.rerun == [SHA]
+    assert any("keeping CI pending" in message for message in rig.said)
+
+    now = 599
+    rig.obs.step()
+    assert rig.gh.rerun == [SHA]
+    now = 600
+    rig.obs.step()
+    assert rig.gh.rerun == [SHA, SHA]
+    assert not any(line["event"] == "ci_done" for line in lines(rig))
+
+    rig.gh.runs[SHA].clear()
+    rig.gh.ci(SHA, "success")
+    rig.obs.step()
+    assert rig.led.world.is_(M.CI, "10/1", "pass")
+
+
+def test_sign_in_and_another_job_failure_sends_it_back(rig):
+    pushed(rig)
+    rig.gh.ci(SHA, "failure", failed_steps=[SIGN_IN_STEP])
+    rig.gh.ci(SHA, "failure", failed_steps=["Test"])
+    rig.obs.step()
+    w = rig.led.world
+    assert w.is_(M.CI, "10/1", "fail") and w.needs_work(1)
+    assert rig.gh.rerun == []
 
 
 def test_a_foreign_push_sends_the_issue_back_to_an_agent(rig):
