@@ -59,7 +59,10 @@ impl EndpointState {
             self.invariants();
             return false;
         }
+        let before = self.conns.len();
         self.conns.insert(id, Route { peer, tag: None, last_heard: now });
+        assert_eq!(self.conns.len(), before + 1, "connect adds exactly one route");
+        assert!(self.conns[&id].peer == peer && self.conns[&id].tag.is_none(), "a new route starts untagged at its peer");
         self.invariants();
         true
     }
@@ -68,6 +71,7 @@ impl EndpointState {
         if let Some(c) = self.conns.get_mut(&id) {
             c.tag = Some(tag);
         }
+        assert!(self.conns.get(&id).is_none_or(|c| c.tag == Some(tag)), "a live route carries the tag it was given");
         self.invariants();
     }
 
@@ -75,17 +79,37 @@ impl EndpointState {
         self.conns.remove(&id);
         self.acks.remove(&id);
         self.forgotten.insert(id);
+        assert!(!self.conns.contains_key(&id) && !self.acks.contains_key(&id), "a forgotten id has no route and no acknowledgement");
         self.invariants();
     }
 
     /// One datagram. `now` is the shell's clock reading for this arrival.
     pub fn recv(&mut self, from: SocketAddr, bytes: &[u8], now: u64) -> Routed {
+        let before = self.conns.len();
         let out = self.route(from, bytes, now);
+        assert!(out.len <= bytes.len(), "a routed packet is no longer than the datagram");
+        let opened = out.events.iter().filter(|e| matches!(e, RouteEvent::Open { .. })).count();
+        assert_eq!(self.conns.len(), before + opened, "only an Open event adds a route");
+        match out.id {
+            Some(id) => {
+                assert!(self.conns.contains_key(&id), "a routed datagram names a live connection");
+                for e in &out.events {
+                    let (RouteEvent::Open { id: e_id, .. }
+                    | RouteEvent::Peer { id: e_id, .. }
+                    | RouteEvent::Data { id: e_id, .. }
+                    | RouteEvent::Ack { id: e_id, .. }) = e;
+                    assert_eq!(*e_id, id, "every event names the routed connection");
+                }
+            }
+            None => assert!(out.len == 0 && out.events.is_empty(), "a dropped datagram yields nothing"),
+        }
         self.invariants();
         out
     }
 
     pub fn ack(&mut self, id: u64, msg: u64, frag: u32, to: SocketAddr) {
+        assert!(self.conns.contains_key(&id), "only a live connection is acknowledged");
+        let before = self.acks.get(&id).map_or(9, |a| a.body.len());
         let entry = self.acks.entry(id).or_insert_with(|| {
             let mut body = vec![T_ACK];
             body.extend_from_slice(&id.to_le_bytes());
@@ -93,6 +117,7 @@ impl EndpointState {
         });
         entry.body.extend_from_slice(&msg.to_le_bytes());
         entry.body.extend_from_slice(&frag.to_le_bytes());
+        assert_eq!(self.acks[&id].body.len(), before + 12, "an acknowledgement grows by one entry");
         self.invariants();
     }
 
@@ -101,6 +126,7 @@ impl EndpointState {
     }
 
     pub fn take_datagrams(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+        let pending = self.acks.len();
         let mut out = Vec::new();
         for (id, ack) in std::mem::take(&mut self.acks) {
             let mut pkt = ack.body;
@@ -113,6 +139,8 @@ impl EndpointState {
             }
             out.push((ack.to, pkt));
         }
+        assert!(self.acks.is_empty(), "every waiting acknowledgement is taken");
+        assert_eq!(out.len(), pending, "one datagram per connection with acknowledgements waiting");
         self.invariants();
         out
     }
@@ -137,9 +165,11 @@ impl EndpointState {
             if !(self.accepting && pkt[0] == T_DATA) {
                 return Routed { id: None, len: 0, events: Vec::new() };
             }
+            assert!(!self.forgotten.contains(&id), "a forgotten id is never opened again");
             self.conns.insert(id, Route { peer: from, tag: None, last_heard: now });
             events.push(RouteEvent::Open { id, from });
         }
+        assert!(self.conns.contains_key(&id), "past this point the packet names a live connection");
         if proven {
             let c = self.conns.get_mut(&id).expect("a routed packet names a live connection");
             c.peer = from;
@@ -198,7 +228,7 @@ impl StateMachine for EndpointState {
         for (id, ack) in &self.acks {
             assert!(self.conns.contains_key(id), "an acknowledgement names a live connection");
             assert_eq!(ack.body.first().copied(), Some(T_ACK), "an acknowledgement starts with its type");
-            assert!(ack.body.len() >= 9, "an acknowledgement carries its connection id");
+            assert!(ack.body.len() >= 9 + 12, "a waiting acknowledgement carries its connection id and at least one entry");
             assert_eq!(ack.body.len() % 12, 9, "an acknowledgement is a header plus whole entries");
         }
     }

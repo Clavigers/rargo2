@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const DELAY_MS: u64 = 100;
-pub const IDLE_MS: u64 = 500;
 pub const FULL_BYTES: usize = 64 << 20;
 
 type Key = (Table, Vec<u8>);

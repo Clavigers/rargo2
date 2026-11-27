@@ -122,6 +122,12 @@ pub fn on_fiber() -> bool {
     CURRENT.with(|c| c.get()) != 0
 }
 
+/// Whether this thread drives a loop: one that must never block on what a
+/// fiber of its own loop has yet to do.
+pub fn on_loop_thread() -> bool {
+    on_loop()
+}
+
 pub(super) fn on_loop() -> bool {
     LOOP_THREAD.with(|c| c.get().is_some())
 }

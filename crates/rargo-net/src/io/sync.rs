@@ -434,6 +434,11 @@ impl<T> UnboundedSender<T> {
 }
 
 impl<T> UnboundedReceiver<T> {
+    /// The next queued value, if one is queued now; never parks.
+    pub fn try_recv(&mut self) -> Option<T> {
+        self.chan.q.lock().unwrap_or_else(|e| e.into_inner()).values.pop_front()
+    }
+
     pub fn recv(&mut self) -> Option<T> {
         loop {
             let me = current_id();

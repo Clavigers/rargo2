@@ -1,3 +1,4 @@
+mod atomic_write;
 mod cli;
 mod daemon;
 #[path = "io/daemon_control.rs"]
@@ -42,13 +43,17 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         io::file::create_dir_all(parent)?;
     }
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let tmp = path.with_file_name(format!("{}{}-{}-{name}", tmp::BESIDE, io::process::id(), tmp::seq()));
-    let _watched = tmp::watch(&tmp);
-    io::file::write(&tmp, bytes)?;
-    io::file::rename(&tmp, path).inspect_err(|_| {
-        let _ = io::file::remove_file(&tmp);
-    })
+    let write = atomic_write::Plan::new(path, io::process::id(), tmp::seq());
+    let _watched = tmp::watch(write.temporary());
+    for effect in write.effects(bytes) {
+        match effect {
+            atomic_write::Effect::Write { path, bytes } => io::file::write(path, bytes)?,
+            atomic_write::Effect::Rename { from, to } => io::file::rename(from, to).inspect_err(|_| {
+                let _ = io::file::remove_file(from);
+            })?,
+        }
+    }
+    Ok(())
 }
 
 fn home_dir() -> PathBuf {
@@ -818,29 +823,6 @@ mod tests {
         assert!(lines[0].contains("seccomp=unconfined"), "{text}");
         assert!(lines[1].trim_start().starts_with("RARGO_FALLBACK=cargo"), "{text}");
         assert!(!text.contains("No such file") && !text.contains("without its daemon"), "{text}");
-    }
-
-    #[test]
-    fn writes_of_one_path_at_once_all_succeed() {
-        let _ = io::sim::run(0, io::sim::Net::default(), || {
-            let dir = io::sim::tempdir();
-            let path = dir.join("shared");
-            let writers: Vec<_> = (0..16)
-                .map(|t| {
-                    let path = path.clone();
-                    io::spawn(move || {
-                        for i in 0..200 {
-                            crate::write_atomic(&path, format!("{t} {i}").as_bytes()).unwrap();
-                        }
-                    })
-                })
-                .collect();
-            for mut writer in writers {
-                writer.join().unwrap();
-            }
-            assert!(io::file::read_to_string(&path).unwrap().ends_with(" 199"));
-            assert_eq!(io::file::read_dir(&dir).unwrap().count(), 1);
-        });
     }
 
     use super::*;

@@ -1,4 +1,3 @@
-locks	crates/rargo-core/src/db.rs	4	shares the write buffer and commit serialization between threads: parking_lot locks (4)
 locks	crates/rargo-core/src/nixmanifest.rs	17	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/remote.rs	5	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/sandbox.rs	6	shares state between threads outside a shell or worker pool: parking_lot locks (4), atomics (2)
@@ -10,15 +9,12 @@ locks	crates/rargo-core/src/view.rs	6	shares state between threads outside a she
 locks	crates/rargo/src/outfs.rs	30	shares state between threads outside a shell or worker pool: std locks (16), atomics (12), once cells (2)
 locks	crates/rargo/src/tmp.rs	2	shares state between threads outside a shell or worker pool
 hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 self-check	crates/rargo-core/src/build/request.rs	10	10 step methods of BuildRequest assert nothing
 self-check	crates/rargo-core/src/flake.rs	4	4 step methods of Resolution assert nothing
 self-check	crates/rargo-core/src/nixmanifest.rs	5	5 step methods of Queue, Walk assert nothing
 self-check	crates/rargo-core/src/sandboxfs.rs	3	3 step methods of ObsCore assert nothing
 self-check	crates/rargo-core/src/store_index.rs	15	15 step methods of StoreIndex assert nothing
 self-check	crates/rargo-core/src/tokens.rs	7	7 step methods of Tokens assert nothing
-self-check	crates/rargo-net/src/endpoint.rs	1	1 step method of EndpointState asserts nothing
 self-check	crates/rargo/src/daemon.rs	10	10 step methods of CommandState, Multipart assert nothing
 self-check	crates/rargo/src/mux.rs	5	5 step methods of MuxState assert nothing
 self-check	crates/rargo/src/outfs.rs	1	1 step method of Content asserts nothing
