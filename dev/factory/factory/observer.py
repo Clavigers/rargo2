@@ -15,7 +15,9 @@ What it records:
   each reviewer's verdict (`review_done`), and a merge done on GitHub by
   someone else (`merged`, by the human or an outsider).
 - Merges it does itself, as the merger, once CI passed and every reviewer
-  approved: `merged`, or `merge_failed`.
+  approved: `merged`, or `merge_failed`. Also `merge_failed conflict` for a
+  push whose CI is pending while its pull request conflicts with its base:
+  GitHub runs no CI on it, so it would wait for ever.
 
 An issue body says where an issue sits with lines of its own:
     Part of #N        its initiative
@@ -145,9 +147,17 @@ class Observer:
             return
         key = f"{pr}/{p.pushes}"
         if w.is_(M.CI, key, CiS.pending):
-            result = self._ci(p.sha)
+            runs = self._ci_runs(p.sha)
+            result = self._ci(runs)
             if result:
                 self._record(Role.ci, "ci_done", pr=pr, push=p.pushes, result=result)
+            elif (not runs and g.get("mergeable_state") == "dirty"
+                  and w.is_(M.ISSUE, p.issue, IssueS.checking)):
+                # GitHub starts no CI run on a pull request that conflicts with
+                # its base. "unknown" (just after a push) is not "dirty": wait.
+                self.say(f"pr {pr}: push {p.pushes} conflicts with its base; CI will not run")
+                self._record(Role.merger, "merge_failed", pr=pr, push=p.pushes, reason="conflict")
+                return
         for r in p.reviewers:
             if self.ledger.world.is_(M.REVIEW, f"{key}/{r}", ReviewS.pending):
                 try:
@@ -171,8 +181,11 @@ class Observer:
         if self.merging and green(w, pr) and w.is_(M.ISSUE, p.issue, IssueS.checking):
             self._merge(pr, p.pushes, p.sha)
 
-    def _ci(self, sha: str) -> str | None:
-        runs = [r for r in self.gh.check_runs(sha) if r["app"]["slug"] in self.ci_apps]
+    def _ci_runs(self, sha: str) -> list[dict]:
+        return [r for r in self.gh.check_runs(sha) if r["app"]["slug"] in self.ci_apps]
+
+    @staticmethod
+    def _ci(runs: list[dict]) -> str | None:
         if not runs or any(r["status"] != "completed" for r in runs):
             return None
         if any(r["conclusion"] in FAILED for r in runs):
