@@ -2720,11 +2720,12 @@ impl Run {
                         let scripts = self.scripts.lock();
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
-                    out.status("Running", &display_cmd(&cmd.program, &cmd.args));
+                    let program = client_program(&cmd.program, &out.tr.to_canonical(&self.c.cwd), &out.tr);
+                    out.status("Running", &display_cmd(&program, &cmd.args));
                     return Ok(Finish::Exec(ExecRequest {
-                        program: cmd.program.clone(),
+                        program,
                         args: cmd.args.clone(),
-                        env: cmd.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                        env: cmd.env.iter().map(|(k, v)| (k.clone(), v.as_deref().map(|v| client_paths(v, &out.tr)))).collect(),
                         cwd: self.c.cwd.clone(),
                         binds: vec![
                             (self.c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
