@@ -47,8 +47,8 @@ pub struct Frame<M> {
 
 pub struct Reorder<M> {
     per_stream: bool,
-    next: std::collections::HashMap<u32, u64>,
-    held: std::collections::HashMap<u32, std::collections::BTreeMap<u64, (u32, M)>>,
+    next: std::collections::BTreeMap<u32, u64>,
+    held: std::collections::BTreeMap<u32, std::collections::BTreeMap<u64, (u32, M)>>,
 }
 
 impl<M> Reorder<M> {
