@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use rargo_proto::tree::{self, Node, Tree};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -110,10 +110,10 @@ impl HostFiles for DashMap<Hash, FileSrc> {
 
 /// The store paths whose files are recorded already.
 #[derive(Default)]
-pub struct Attached(parking_lot::Mutex<HashSet<String>>);
+pub struct Attached(parking_lot::Mutex<BTreeSet<String>>);
 
 impl Attached {
-    fn lock(&self) -> parking_lot::MutexGuard<'_, HashSet<String>> {
+    fn lock(&self) -> parking_lot::MutexGuard<'_, BTreeSet<String>> {
         self.0.lock()
     }
 }
@@ -424,7 +424,7 @@ fn hash_path_mode(fs: &dyn StoreFs, path: &Path, parallel: bool) -> io::Result<F
 }
 
 pub fn ensure(db: &dyn Tables, fs: &dyn StoreFs, store: &Path, names: &[String]) -> Result<Prepared> {
-    prepare(db, fs, store, names, None, &mut HashSet::new())
+    prepare(db, fs, store, names, None, &mut BTreeSet::new())
 }
 
 pub fn prepare(
@@ -433,7 +433,7 @@ pub fn prepare(
     store: &Path,
     names: &[String],
     hosts: Option<&dyn HostFiles>,
-    seen: &mut HashSet<String>,
+    seen: &mut BTreeSet<String>,
 ) -> Result<Prepared> {
     let mut cost = Cost::default();
     let mut roots = Vec::with_capacity(names.len());
@@ -531,7 +531,7 @@ fn adopt(
     mut kind: StoredKind,
     was_cached: bool,
     hosts: Option<&dyn HostFiles>,
-    seen: &mut HashSet<String>,
+    seen: &mut BTreeSet<String>,
     cost: &mut Cost,
     parallel: bool,
 ) -> Result<StoredKind> {
@@ -847,12 +847,12 @@ pub fn place(dir: &[u8]) -> Option<Place> {
 
 pub struct PathTrees {
     root: Hash,
-    trees: HashMap<Hash, Tree>,
+    trees: BTreeMap<Hash, Tree>,
 }
 
 impl PathTrees {
     fn decode(root: Hash, encoded: &[(Hash, Vec<u8>)]) -> io::Result<PathTrees> {
-        let mut trees = HashMap::with_capacity(encoded.len());
+        let mut trees = BTreeMap::new();
         for (h, bytes) in encoded {
             if Hash(tree::digest(bytes)) != *h {
                 return Err(io::Error::other("tree digest mismatch"));
@@ -1514,7 +1514,7 @@ mod tests {
         let store = Path::new("/store");
         ensure(&db, &fs, store, &["bbb".into()]).unwrap();
         fs.put("/store/bbb/readme", Ent::File(b"changed".to_vec(), false));
-        let p = prepare(&db, &fs, store, &["bbb".into()], Some(&hosts), &mut HashSet::new()).unwrap();
+        let p = prepare(&db, &fs, store, &["bbb".into()], Some(&hosts), &mut BTreeSet::new()).unwrap();
         assert_eq!((p.cost.reused_paths, p.cost.new_paths, p.cost.hashed_files), (0, 1, 1));
         assert_eq!(p.roots[0], model(&fs, Path::new("/store/bbb")).0);
         assert!(hosts.0.borrow().contains_key(&Hash::of(b"changed")));
@@ -1526,7 +1526,7 @@ mod tests {
         let db = MemTables::default();
         let names = ["aaa".into(), "bbb".into(), "ccc".into(), "fff".into(), "lll".into()];
         ensure(&db, &fs, Path::new("/store"), &names).unwrap();
-        let mut have: HashMap<Vec<u8>, Arc<Installed>> = HashMap::new();
+        let mut have: BTreeMap<Vec<u8>, Arc<Installed>> = BTreeMap::new();
         for name in &names {
             let kind = load(&db, name.as_bytes()).unwrap();
             have.insert(name.as_bytes().to_vec(), Arc::new(Installed::from_kind(&kind).unwrap()));
@@ -1569,7 +1569,7 @@ mod tests {
         let fs = tree();
         let db = MemTables::default();
         let hosts = Recorded::default();
-        prepare(&db, &fs, Path::new("/store"), &["aaa".into()], Some(&hosts), &mut HashSet::new()).unwrap();
+        prepare(&db, &fs, Path::new("/store"), &["aaa".into()], Some(&hosts), &mut BTreeSet::new()).unwrap();
         let h = Hash::of(b"tool-bytes");
         assert_eq!(hosts.0.borrow().get(&h).map(PathBuf::as_path), Some(Path::new("/store/aaa/bin/tool")), "the file is recorded where it lies in the store");
         assert!(db.get(Table::Meta, &meta_key(b"aaa")).is_some());

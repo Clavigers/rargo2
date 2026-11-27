@@ -41,13 +41,19 @@ impl TreesState {
         if self.complete.len() > COMPLETE_LIMIT {
             self.complete.retain(|_, g| *g == walked_at);
         }
+        assert!(
+            walked.iter().all(|d| self.is_complete(d, generation_now)),
+            "every tree walked in this generation is complete"
+        );
         true
     }
 
     pub fn begin_upload(&mut self) -> Upload {
         let up = self.next_upload;
+        assert!(!self.uploads.contains_key(&up), "upload {up} is new");
         self.next_upload += 1;
         self.uploads.insert(up, BTreeSet::new());
+        assert!(self.uploads[&up].is_empty() && up < self.next_upload, "upload {up} begins holding nothing");
         up
     }
 

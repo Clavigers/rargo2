@@ -208,6 +208,9 @@ impl Handshake {
     }
 
     fn recv_init(&mut self, pkt: &[u8], user: bool) -> io::Result<Action> {
+        assert!(self.phase == Phase::Waiting, "an initiator reads its answer only while waiting");
+        assert_eq!(user, matches!(self.role, Role::UserInit { .. }), "the answer is read for this initiator's role");
+        assert!(self.hs.is_some() && self.seen.is_empty(), "an initiator waits with its handshake and no answer yet");
         if !user && looks_like_transport(pkt) {
             return self.fail(io::ErrorKind::InvalidData, "packet from another connection");
         }
@@ -237,6 +240,7 @@ impl Handshake {
                 self.seen.push(pkt.to_vec());
                 let binding = user.then(|| cipher.binding());
                 self.phase = Phase::Done;
+                assert!(self.hs.is_none() && self.seen.len() == 1, "a finished initiator consumed one answer");
                 Ok(Action::Done(Agreed { cipher, user: None, binding }))
             }
             Err(e) => self.fail(e.kind(), e.to_string()),
@@ -267,6 +271,9 @@ impl Handshake {
     }
 
     fn recv_user_resp(&mut self, pkt: &[u8]) -> io::Result<Action> {
+        assert!(self.phase == Phase::Waiting, "a user responder reads a hello only while waiting");
+        assert!(matches!(self.role, Role::UserResp), "only a user responder reads a user hello");
+        assert!(self.name.is_none() && self.noise.is_none(), "a waiting responder has read no hello yet");
         if pkt.is_empty() {
             return self.fail(io::ErrorKind::Other, "empty key agreement");
         }
@@ -293,6 +300,7 @@ impl Handshake {
         self.name = Some(name.to_string());
         self.noise = Some(noise.to_vec());
         self.phase = Phase::NeedKey;
+        assert!(self.noise.as_ref().is_some_and(|n| n.len() == NOISE_LEN), "the kept key agreement is one Noise message");
         Ok(Action::NeedKey(name.to_string()))
     }
 
@@ -380,6 +388,14 @@ impl StateMachine for Handshake {
         for pkt in &self.seen {
             assert!(!pkt.is_empty(), "a consumed handshake packet has bytes");
         }
+        assert!(self.seen.len() <= 1, "a handshake consumes at most one packet");
+        if self.name.is_some() {
+            assert!(matches!(self.role, Role::UserResp), "only a user responder learns a name");
+        }
+        if self.notify.is_some() {
+            assert!(self.phase == Phase::Failed, "a refusal is sent only by a failed handshake");
+            assert!(matches!(self.role, Role::UserResp), "only a user responder sends a refusal");
+        }
         match self.phase {
             Phase::Fresh => {
                 assert!(self.last_sent.is_none());
@@ -388,10 +404,13 @@ impl StateMachine for Handshake {
                 assert!(self.pending.is_none());
                 assert!(self.noise.is_none());
                 assert!(self.failure.is_none());
+                assert!(self.name.is_none());
             }
             Phase::Waiting => {
                 assert!(self.pending.is_none());
                 assert!(self.failure.is_none());
+                assert!(self.seen.is_empty(), "a waiting handshake has consumed nothing");
+                assert!(self.name.is_none() && self.noise.is_none());
                 match &self.role {
                     Role::SharedInit { .. } | Role::UserInit { .. } => {
                         assert!(self.last_sent.is_some(), "an initiator has sent its hello");
@@ -407,15 +426,20 @@ impl StateMachine for Handshake {
                 assert!(self.last_sent.is_some());
                 assert!(self.failure.is_none());
                 match &self.role {
-                    Role::SharedResp { .. } | Role::UserResp => assert!(self.pending.is_some(), "a reply finishes the handshake"),
+                    Role::SharedResp { .. } | Role::UserResp => {
+                        assert!(self.pending.is_some(), "a reply finishes the handshake");
+                        assert_eq!(self.seen.len(), 1, "a responder replies to one hello");
+                    }
                     Role::SharedInit { .. } | Role::UserInit { .. } => {
                         assert!(self.pending.is_none());
                         assert!(self.hs.is_some());
+                        assert!(self.seen.is_empty(), "an initiator sends its hello before any answer");
                     }
                 }
             }
             Phase::NeedKey => {
                 assert!(matches!(self.role, Role::UserResp));
+                assert_eq!(self.seen.len(), 1, "a user responder asks for a key after one hello");
                 assert!(self.name.is_some());
                 assert!(self.noise.as_ref().is_some_and(|n| n.len() >= NOISE_LEN));
                 assert!(self.pending.is_none());
@@ -427,6 +451,7 @@ impl StateMachine for Handshake {
                 assert!(self.hs.is_none());
                 assert!(self.pending.is_none());
                 assert!(self.noise.is_none());
+                assert_eq!(self.seen.len(), 1, "a finished handshake consumed its one packet");
                 if matches!(self.role, Role::UserResp) {
                     assert!(self.name.is_some(), "a proven user has a name");
                 }

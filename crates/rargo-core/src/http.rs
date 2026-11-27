@@ -2,7 +2,7 @@ use rargo_machine::StateMachine;
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use crate::io::http::{self as outbound, Failure};
@@ -34,17 +34,33 @@ struct AuthState {
 impl AuthState {
     fn sweep(&mut self, now: u64) {
         self.pending.retain(|_, p| now.saturating_sub(p.made) < PENDING_FOR_MS);
+        assert!(self.pending.values().all(|p| now.saturating_sub(p.made) < PENDING_FOR_MS), "a swept state holds no expired login");
+        self.invariants();
     }
 
     fn begin(&mut self, device: String, code: String, now: u64) -> bool {
+        let before = self.pending.len();
         if device.is_empty() || code.is_empty() || self.pending.values().any(|p| p.code == code) || self.pending.contains_key(&device) {
+            assert_eq!(self.pending.len(), before, "a refused begin adds no login");
             return false;
         }
-        self.pending.insert(device, Pending { code, made: now, tries: 0, granted: None, denied: false, state: None });
+        self.pending.insert(device.clone(), Pending { code: code.clone(), made: now, tries: 0, granted: None, denied: false, state: None });
+        assert_eq!(self.pending.len(), before + 1, "a begin adds one login");
+        assert!(
+            self.pending.get(&device).is_some_and(|p| p.code == code && p.tries == 0 && p.granted.is_none() && !p.denied && p.state.is_none()),
+            "login {device} begins fresh with its code"
+        );
         true
     }
 
     fn poll(&mut self, device: &str, now: u64) -> serde_json::Value {
+        let answer = self.answer(device, now);
+        let pending = answer["status"] == "pending";
+        assert_eq!(self.pending.contains_key(device), pending, "a poll keeps login {device} only while it is pending");
+        answer
+    }
+
+    fn answer(&mut self, device: &str, now: u64) -> serde_json::Value {
         let Some(pending) = self.pending.get(device) else {
             return serde_json::json!({ "status": "expired" });
         };
@@ -58,6 +74,7 @@ impl AuthState {
         }
         if pending.granted.is_some() {
             let (token, user) = self.pending.remove(device).and_then(|p| p.granted).expect("a granted sign-in holds its token");
+            assert!(!token.is_empty() && !user.is_empty(), "an approved poll hands over a token for a user");
             return serde_json::json!({ "status": "approved", "token": token, "user": user });
         }
         serde_json::json!({ "status": "pending" })
@@ -73,15 +90,19 @@ impl AuthState {
         if pending.granted.is_some() {
             anyhow::bail!("this code has been confirmed already");
         }
+        assert!(pending.code == code && pending.granted.is_none(), "authorize hands out only the waiting login {code}");
         Ok(pending)
     }
 
     fn invite_attempt(&mut self, code: &str, now: u64) -> Result<()> {
         let pending = self.authorize(code, now)?;
+        let tries = pending.tries;
         if !pending.denied {
             pending.tries += 1;
             pending.denied = pending.tries > MAX_TRIES;
         }
+        assert!(pending.tries == tries || pending.tries == tries + 1, "an invitation counts as one try");
+        assert!(pending.tries <= MAX_TRIES + 1, "login {code} stops counting once denied");
         if pending.denied {
             anyhow::bail!("too many wrong invitations for this code: run `rargo auth` again");
         }
@@ -89,29 +110,38 @@ impl AuthState {
     }
 
     fn grant(&mut self, code: &str, token: String, user: String) -> bool {
-        match self.pending.values_mut().find(|p| p.code == code) {
+        let granted = match self.pending.values_mut().find(|p| p.code == code) {
             Some(p) if !p.denied && p.granted.is_none() => {
+                assert!(!token.is_empty() && !user.is_empty(), "login {code} is granted a token for a user");
                 p.granted = Some((token, user));
                 true
             }
             _ => false,
-        }
+        };
+        assert!(!granted || self.pending.values().any(|p| p.code == code && p.granted.is_some()), "a grant leaves login {code} granted");
+        granted
     }
 
-    fn take_github(&mut self, state: &str, now: u64) -> Option<String> {
+    fn take_github(&self, state: &str, now: u64) -> Option<String> {
         self.pending.values().find(|p| p.state.as_deref() == Some(state) && now.saturating_sub(p.made) < PENDING_FOR_MS).map(|p| p.code.clone())
     }
 
     fn grant_github(&mut self, state: &str, token: String, user: String) -> Option<String> {
-        match self.pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
+        let code = match self.pending.values_mut().find(|p| p.state.as_deref() == Some(state)) {
             Some(p) if !p.denied && p.granted.is_none() => {
+                assert!(!token.is_empty() && !user.is_empty(), "a GitHub sign-in is granted a token for a user");
                 let code = p.code.clone();
                 p.granted = Some((token, user));
                 p.state = None;
                 Some(code)
             }
             _ => None,
-        }
+        };
+        assert!(
+            code.as_ref().is_none_or(|c| self.pending.values().any(|p| &p.code == c && p.granted.is_some() && p.state.is_none())),
+            "a GitHub grant leaves its login granted and its sign-in spent"
+        );
+        code
     }
 }
 
@@ -122,6 +152,7 @@ impl StateMachine for AuthState {
             assert!(!p.code.is_empty(), "a pending login has a code");
             assert!(p.tries <= MAX_TRIES + 1, "login {} was tried {} times, over {}", p.code, p.tries, MAX_TRIES + 1);
             assert!(!(p.denied && p.granted.is_some()), "login {} is not both denied and granted", p.code);
+            assert!(!p.denied || p.tries > MAX_TRIES, "login {} is denied only after {} wrong invitations", p.code, MAX_TRIES);
             assert!(
                 p.granted.as_ref().is_none_or(|(token, user)| !token.is_empty() && !user.is_empty()),
                 "login {} is granted a token for a user",
@@ -271,7 +302,7 @@ impl StateMachine for Phase {
 struct Request {
     method: String,
     path: String,
-    query: HashMap<String, String>,
+    query: BTreeMap<String, String>,
     host: String,
     body: Vec<u8>,
     json: bool,
@@ -366,7 +397,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn form(s: &str) -> HashMap<String, String> {
+fn form(s: &str) -> BTreeMap<String, String> {
     s.split('&').filter(|p| !p.is_empty()).map(|p| {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
         (percent_decode(k), percent_decode(v))
@@ -860,12 +891,12 @@ pub struct Http {
     public: Option<String>,
     port: u16,
     state: Option<std::path::PathBuf>,
-    pending: parking_lot::Mutex<AuthState>,
+    pending: std::cell::RefCell<AuthState>,
 }
 
 impl Http {
     pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
-        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(AuthState::default()) }
+        Http { keys, public, port, state: None, pending: std::cell::RefCell::new(AuthState::default()) }
     }
 
     pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
@@ -908,7 +939,7 @@ impl Http {
         let mut event = Event::Request(req);
         loop {
             let act = {
-                let mut st = self.pending.lock();
+                let mut st = self.pending.borrow_mut();
                 let act = handle(&mut st, &mut phase, event, &cfg, now);
                 st.invariants();
                 phase.invariants();

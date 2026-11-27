@@ -15,7 +15,9 @@ What it records:
   each reviewer's verdict (`review_done`), and a merge done on GitHub by
   someone else (`merged`, by the human or an outsider).
 - Merges it does itself, as the merger, once CI passed and every reviewer
-  approved: `merged`, or `merge_failed`.
+  approved: `merged`, or `merge_failed`. Also `merge_failed conflict` for a
+  push whose CI is pending while its pull request conflicts with its base:
+  GitHub runs no CI on it, so it would wait for ever.
 
 An issue body says where an issue sits with lines of its own:
     Part of #N        its initiative
@@ -76,8 +78,14 @@ _first_seen: dict[tuple[int, str], datetime] = {}  # when a push was first found
 def ellipsis(gh: GitHub, pr: int, sha: str):
     """Ellipsis reviews every push on its own. Its review of this commit is
     the verdict: an approval approves; anything else it says asks for
-    changes. No review after ELLIPSIS_WAIT needs the owner."""
-    mine = [r for r in gh.reviews(pr) if r["user"]["login"] == ELLIPSIS and r.get("commit_id") == sha]
+    changes. It does not review a push that leaves the pull request's own
+    change as it was (main merged in, or a rebase onto main): its last review
+    is then the verdict on that push too. No review after ELLIPSIS_WAIT needs
+    the owner."""
+    all_ = [r for r in gh.reviews(pr) if r["user"]["login"] == ELLIPSIS]
+    mine = [r for r in all_ if r.get("commit_id") == sha]
+    if not mine and all_ and _same_change(gh, pr, all_[-1].get("commit_id"), sha):
+        mine = all_[-1:]
     if not mine:
         seen = _first_seen.setdefault((pr, sha), datetime.now(timezone.utc))
         if datetime.now(timezone.utc) - seen > ELLIPSIS_WAIT:
@@ -88,6 +96,24 @@ def ellipsis(gh: GitHub, pr: int, sha: str):
     if last["state"] == "APPROVED":
         return m.ReviewResult.approved, None
     return m.ReviewResult.changes, f"Ellipsis: {last.get('html_url', 'see its review on the pull request')}"
+
+
+_same: dict[tuple[str, str], bool] = {}  # (reviewed commit, pushed commit): the same change?
+
+
+def _same_change(gh: GitHub, pr: int, reviewed: str | None, sha: str) -> bool:
+    """Whether sha makes the change the reviewed commit made, against the
+    pull request's base. False when GitHub cannot say."""
+    if not reviewed:
+        return False
+    if (reviewed, sha) not in _same:
+        try:
+            base = gh.pull(pr)["base"]["ref"]
+            was, now = gh.change(base, reviewed), gh.change(base, sha)
+        except GitHubError:
+            return False
+        _same[(reviewed, sha)] = bool(now) and was == now
+    return _same[(reviewed, sha)]
 
 
 REVIEWERS: dict[str, Reviewer] = {"placeholder": placeholder, "ellipsis": ellipsis}
@@ -145,9 +171,17 @@ class Observer:
             return
         key = f"{pr}/{p.pushes}"
         if w.is_(M.CI, key, CiS.pending):
-            result = self._ci(p.sha)
+            runs = self._ci_runs(p.sha)
+            result = self._ci(runs)
             if result:
                 self._record(Role.ci, "ci_done", pr=pr, push=p.pushes, result=result)
+            elif (not runs and g.get("mergeable_state") == "dirty"
+                  and w.is_(M.ISSUE, p.issue, IssueS.checking)):
+                # GitHub starts no CI run on a pull request that conflicts with
+                # its base. "unknown" (just after a push) is not "dirty": wait.
+                self.say(f"pr {pr}: push {p.pushes} conflicts with its base; CI will not run")
+                self._record(Role.merger, "merge_failed", pr=pr, push=p.pushes, reason="conflict")
+                return
         for r in p.reviewers:
             if self.ledger.world.is_(M.REVIEW, f"{key}/{r}", ReviewS.pending):
                 try:
@@ -171,8 +205,11 @@ class Observer:
         if self.merging and green(w, pr) and w.is_(M.ISSUE, p.issue, IssueS.checking):
             self._merge(pr, p.pushes, p.sha)
 
-    def _ci(self, sha: str) -> str | None:
-        runs = [r for r in self.gh.check_runs(sha) if r["app"]["slug"] in self.ci_apps]
+    def _ci_runs(self, sha: str) -> list[dict]:
+        return [r for r in self.gh.check_runs(sha) if r["app"]["slug"] in self.ci_apps]
+
+    @staticmethod
+    def _ci(runs: list[dict]) -> str | None:
         if not runs or any(r["status"] != "completed" for r in runs):
             return None
         if any(r["conclusion"] in FAILED for r in runs):

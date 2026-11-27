@@ -21,7 +21,7 @@
                             acts on GitHub are the human's. Issues from OWNER
                             and the LOGINs given are the factory's
   pm SLUG CHECKOUT           run the project manager; it cuts release branches in the clone CHECKOUT
-  power-user CHECKOUT       run the power user; it uses each candidate build in the clone CHECKOUT
+  power-user SLUG CHECKOUT      run the power user; it uses each candidate build in the clone CHECKOUT
   dictator SLUG CHECKOUT     run the dictator; it plans in the clone CHECKOUT
   doc                       rewrite the generated half of DATA-MODEL.md
   schema                    JSON Schema of an event body
@@ -151,9 +151,10 @@ def main(argv: list[str]) -> int:
             Pm(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
                publish=shlex.split(cmd) if cmd else None).run()
             return 0
-        case ["power-user", checkout]:
+        case ["power-user", slug, checkout]:
+            from .github import GitHub
             from .poweruser import PowerUser
-            PowerUser(Ledger(env("FACTORY_LOG")), pathlib.Path(checkout),
+            PowerUser(Ledger(env("FACTORY_LOG")), GitHub(slug), pathlib.Path(checkout),
                       (HERE / "POWER-USER.md").read_text()).run()
             return 0
         case ["usage", state, *rest]:

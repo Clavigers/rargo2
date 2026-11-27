@@ -126,12 +126,16 @@ impl SchedState {
     }
 
     pub fn cancel(&mut self, job: Job) -> Effects {
+        assert!(!self.running.contains_key(&job), "cancel of {job}, which already runs");
+        let spare = self.spare;
         if let Some(place) = self.places.remove(&job) {
             self.waiters.remove(&place);
         }
         let mut fx = Effects::default();
         self.dispatch(false, &mut fx);
         self.return_spares(&mut fx);
+        assert!(!self.places.contains_key(&job) && !self.running.contains_key(&job), "{job} is gone");
+        self.assert_tokens_kept(spare, &fx);
         fx
     }
 
@@ -139,50 +143,80 @@ impl SchedState {
         let mem_kb = self.running.remove(&job).unwrap_or_else(|| panic!("release of {job}, which is not running"));
         assert!(self.mem_kb >= mem_kb, "memory released that was never granted");
         self.mem_kb -= mem_kb;
+        let spare = self.spare;
         self.spare += 1;
         let mut fx = Effects::default();
         self.dispatch(false, &mut fx);
         self.return_spares(&mut fx);
         fx.reconcile = self.running.is_empty();
+        assert!(!fx.grant.contains(&job) && !self.is_waiting(job), "a released job is gone");
+        self.assert_tokens_kept(spare + 1, &fx);
         fx
     }
 
     pub fn token_in(&mut self, n: usize) -> Effects {
+        let spare = self.spare;
         self.spare += n;
         let mut fx = Effects::default();
         self.dispatch(false, &mut fx);
         self.return_spares(&mut fx);
+        let out = fx.grant.len() + fx.put_tokens + self.spare;
+        assert_eq!(out, spare + n, "every token that came in is granted, put back or kept");
         fx
     }
 
     pub fn tick(&mut self, now_ms: u64, in_pipe: usize) -> Broker {
-        if self.spare == 0 && self.wanted() > 0 {
-            self.unclaimed_since = None;
-            return Broker::Read;
-        }
-        if !self.idle_wanted() || in_pipe == 0 {
-            self.unclaimed_since = None;
-            return Broker::Wait(if self.idle_wanted() { IDLE_DWELL_MS } else { BUSY_WAIT_MS });
-        }
-        match self.unclaimed_since {
-            Some(t) if now_ms.saturating_sub(t) >= IDLE_DWELL_MS => {
+        let since = self.unclaimed_since;
+        let step = 'step: {
+            if self.spare == 0 && self.wanted() > 0 {
                 self.unclaimed_since = None;
-                Broker::TakeForIdle
+                break 'step Broker::Read;
             }
-            Some(t) => Broker::Wait(IDLE_DWELL_MS - now_ms.saturating_sub(t)),
-            None => {
-                self.unclaimed_since = Some(now_ms);
-                Broker::Wait(IDLE_DWELL_MS)
+            if !self.idle_wanted() || in_pipe == 0 {
+                self.unclaimed_since = None;
+                break 'step Broker::Wait(if self.idle_wanted() { IDLE_DWELL_MS } else { BUSY_WAIT_MS });
             }
+            match self.unclaimed_since {
+                Some(t) if now_ms.saturating_sub(t) >= IDLE_DWELL_MS => {
+                    self.unclaimed_since = None;
+                    Broker::TakeForIdle
+                }
+                Some(t) => Broker::Wait(IDLE_DWELL_MS - now_ms.saturating_sub(t)),
+                None => {
+                    self.unclaimed_since = Some(now_ms);
+                    Broker::Wait(IDLE_DWELL_MS)
+                }
+            }
+        };
+        match step {
+            Broker::Read => assert!(self.spare == 0 && self.wanted() > 0, "the broker reads only for wanted work"),
+            Broker::TakeForIdle => assert!(
+                self.idle_wanted() && in_pipe > 0 && since.is_some(),
+                "a token is taken for idle work only after it lay unclaimed"
+            ),
+            Broker::Wait(ms) => assert!(ms > 0 && ms <= BUSY_WAIT_MS, "the broker waits a while"),
         }
+        assert!(
+            self.unclaimed_since.is_none() || (self.idle_wanted() && in_pipe > 0),
+            "the dwell clock runs only while idle work waits on a token in the pipe"
+        );
+        step
     }
 
     pub fn idle_token(&mut self) -> Effects {
+        assert!(self.idle_wanted(), "a token is taken for idle work only while some waits");
+        let spare = self.spare;
         self.spare += 1;
         let mut fx = Effects::default();
         self.dispatch(true, &mut fx);
         self.return_spares(&mut fx);
+        self.assert_tokens_kept(spare + 1, &fx);
         fx
+    }
+
+    /// Every token the step had is granted, put back, or kept spare.
+    fn assert_tokens_kept(&self, had: usize, fx: &Effects) {
+        assert_eq!(fx.grant.len() + fx.put_tokens + self.spare, had, "no token is lost or made");
     }
 
     pub fn reconcile(&self, in_pipe: usize) -> Reconcile {
@@ -225,6 +259,7 @@ impl SchedState {
             self.granted += 1;
             fx.grant.push(w.job);
         }
+        assert!(self.next_grant(idle_too).is_none(), "dispatch grants all it can");
     }
 
     fn return_spares(&mut self, fx: &mut Effects) {
@@ -233,6 +268,7 @@ impl SchedState {
             self.spare -= 1;
             fx.put_tokens += 1;
         }
+        assert!(self.spare <= self.wanted().min(1), "one spare token at most is kept, and only for wanted work");
     }
 }
 
@@ -244,11 +280,13 @@ impl StateMachine for SchedState {
             "only a lone job may exceed the memory budget"
         );
         assert!(self.peak_running >= self.running.len());
+        assert!(self.granted >= self.running.len() as u64, "every running job was granted");
         assert_eq!(self.places.len(), self.waiters.len(), "every waiter has one place");
         for (job, place) in &self.places {
             assert_eq!(self.waiters.get(place).map(|w| w.job), Some(*job), "the place of {job} holds it");
             assert!(!self.running.contains_key(job), "{job} does not wait and run at once");
             assert!(place.1 <= self.seq);
+            assert!(self.waiters[place].bypassed <= MAX_BYPASS, "{job} is passed over a bounded number of times");
         }
         assert!(self.spare <= 1, "spare tokens go back to the pipe");
         assert!(self.next_grant(false).is_none(), "a spare token is used at once by a waiter it can serve");
