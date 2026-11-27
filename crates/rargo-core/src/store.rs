@@ -933,14 +933,16 @@ mod tests {
     }
 
     fn noise(len: usize) -> Vec<u8> {
-        let mut a = vec![0u8; len];
+        // Eight bytes a step: these blobs are megabytes long.
+        let mut a = vec![0u8; len.next_multiple_of(8)];
         let mut x = 0x1234_5678_9abc_def0u64;
-        for b in a.iter_mut() {
+        for b in a.as_chunks_mut::<8>().0 {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            *b = x as u8;
+            *b = x.to_le_bytes();
         }
+        a.truncate(len);
         a
     }
 

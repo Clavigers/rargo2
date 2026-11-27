@@ -361,3 +361,104 @@ impl Drop for Owning {
         self.stopped.drain(..).for_each(|done| done());
     }
 }
+
+/// A database file in memory. It is redb's `InMemoryBackend` except that it
+/// keeps only the pages written to: that one grows by pushing a zero byte at a
+/// time, and a new database is megabytes long, so each database a test opened
+/// cost milliseconds of zeroing and page faults.
+#[derive(Debug, Default)]
+pub(crate) struct Memory(RwLock<Pages>);
+
+const PAGE: usize = 4096;
+
+#[derive(Debug, Default)]
+struct Pages {
+    len: usize,
+    /// A page never written to reads as zeros.
+    pages: Vec<Option<Box<[u8; PAGE]>>>,
+}
+
+impl Pages {
+    fn span(&self, offset: u64, len: usize) -> std::io::Result<(usize, usize)> {
+        let at = usize::try_from(offset).ok();
+        match at.and_then(|at| Some((at, at.checked_add(len)?))) {
+            Some((at, end)) if end <= self.len => Ok((at, end)),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "past the end of the database in memory")),
+        }
+    }
+}
+
+impl redb::StorageBackend for Memory {
+    fn len(&self) -> std::io::Result<u64> {
+        Ok(self.0.read().len as u64)
+    }
+
+    fn read(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+        let mem = self.0.read();
+        let (mut at, end) = mem.span(offset, len)?;
+        let mut out = Vec::with_capacity(len);
+        while at < end {
+            let n = (PAGE - at % PAGE).min(end - at);
+            match &mem.pages[at / PAGE] {
+                Some(page) => out.extend_from_slice(&page[at % PAGE..at % PAGE + n]),
+                None => out.resize(out.len() + n, 0),
+            }
+            at += n;
+        }
+        Ok(out)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        let len = usize::try_from(len).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let mut mem = self.0.write();
+        if len < mem.len {
+            mem.pages.truncate(len.div_ceil(PAGE));
+            if let Some(Some(last)) = mem.pages.last_mut().filter(|_| !len.is_multiple_of(PAGE)) {
+                last[len % PAGE..].fill(0);
+            }
+        }
+        mem.pages.resize_with(len.div_ceil(PAGE), || None);
+        mem.len = len;
+        Ok(())
+    }
+
+    fn sync_data(&self, _eventual: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let mut mem = self.0.write();
+        let (mut at, end) = mem.span(offset, data.len())?;
+        let mut data = data;
+        while at < end {
+            let n = (PAGE - at % PAGE).min(end - at);
+            let page = mem.pages[at / PAGE].get_or_insert_with(|| Box::new([0; PAGE]));
+            page[at % PAGE..at % PAGE + n].copy_from_slice(&data[..n]);
+            data = &data[n..];
+            at += n;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::{Memory, PAGE};
+    use redb::StorageBackend;
+
+    #[test]
+    fn memory_reads_back_its_writes_zeros_elsewhere_and_nothing_past_its_end() {
+        let m = Memory::default();
+        m.set_len(3 * PAGE as u64).unwrap();
+        m.write(PAGE as u64 - 2, b"abcd").unwrap();
+        assert_eq!(m.read(PAGE as u64 - 4, 8).unwrap(), b"\0\0abcd\0\0", "a write across pages reads back whole");
+        assert_eq!(m.read(2 * PAGE as u64, PAGE).unwrap(), vec![0; PAGE], "a page never written reads as zeros");
+        assert!(m.read(3 * PAGE as u64 - 1, 2).is_err() && m.write(3 * PAGE as u64, b"x").is_err());
+        assert!(m.read(u64::MAX, 2).is_err(), "an offset that overflows is out of range");
+
+        m.set_len(PAGE as u64 - 1).unwrap();
+        m.set_len(2 * PAGE as u64).unwrap();
+        assert_eq!(m.len().unwrap(), 2 * PAGE as u64);
+        assert_eq!(m.read(PAGE as u64 - 4, 8).unwrap(), b"\0\0a\0\0\0\0\0", "what a shrink cut off comes back as zeros");
+    }
+}

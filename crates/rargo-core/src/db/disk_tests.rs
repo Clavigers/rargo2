@@ -3,9 +3,62 @@ use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
 
-/// A disk image. Images are megabytes long, so disks share them and copy one
-/// only when it changes while shared.
-type Image = Rc<Vec<u8>>;
+const PAGE: usize = 4096;
+
+/// A disk image. Images are megabytes long and a commit touches a few pages,
+/// so images share their pages and copy one only when it changes while
+/// shared. Copying whole images made these tests spend most of their time in
+/// page faults.
+#[derive(Clone, Default)]
+struct Image {
+    len: usize,
+    pages: Vec<Rc<[u8; PAGE]>>,
+}
+
+impl Image {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn resize(&mut self, len: usize) {
+        if len < self.len {
+            self.pages.truncate(len.div_ceil(PAGE));
+            if let Some(last) = self.pages.last_mut().filter(|_| !len.is_multiple_of(PAGE)) {
+                Rc::make_mut(last)[len % PAGE..].fill(0);
+            }
+        } else if self.pages.len() < len.div_ceil(PAGE) {
+            let zero = Rc::new([0; PAGE]);
+            self.pages.resize(len.div_ceil(PAGE), zero);
+        }
+        self.len = len;
+    }
+
+    fn write(&mut self, at: usize, data: &[u8]) {
+        if self.len < at + data.len() {
+            self.resize(at + data.len());
+        }
+        let mut done = 0;
+        while done < data.len() {
+            let (page, offset) = ((at + done) / PAGE, (at + done) % PAGE);
+            let n = (PAGE - offset).min(data.len() - done);
+            Rc::make_mut(&mut self.pages[page])[offset..offset + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
+    }
+
+    fn read(&self, at: usize, len: usize) -> Option<Vec<u8>> {
+        if self.len < at + len {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            let (page, offset) = ((at + out.len()) / PAGE, (at + out.len()) % PAGE);
+            let n = (PAGE - offset).min(len - out.len());
+            out.extend_from_slice(&self.pages[page][offset..offset + n]);
+        }
+        Some(out)
+    }
+}
 
 #[derive(Clone)]
 enum Change {
@@ -14,15 +67,10 @@ enum Change {
 }
 
 impl Change {
-    fn apply(&self, image: &mut Vec<u8>) {
+    fn apply(&self, image: &mut Image) {
         match self {
-            Change::Resize(len) => image.resize(*len, 0),
-            Change::Write(at, data) => {
-                if image.len() < at + data.len() {
-                    image.resize(at + data.len(), 0);
-                }
-                image[*at..at + data.len()].copy_from_slice(data);
-            }
+            Change::Resize(len) => image.resize(*len),
+            Change::Write(at, data) => image.write(*at, data),
         }
     }
 }
@@ -65,7 +113,7 @@ impl FakeDisk {
                 return Err(io::ErrorKind::StorageFull.into());
             }
             s.changes += 1;
-            change.apply(Rc::make_mut(&mut s.live));
+            change.apply(&mut s.live);
             s.unsynced.push(change);
             Ok(())
         })
@@ -85,13 +133,13 @@ impl FakeDisk {
             match (bits % 3, change) {
                 (0, _) => {}
                 (1, Change::Write(at, data)) => {
-                    Change::Write(*at, data[..data.len() / 2].to_vec()).apply(Rc::make_mut(&mut image))
+                    Change::Write(*at, data[..data.len() / 2].to_vec()).apply(&mut image)
                 }
-                _ => change.apply(Rc::make_mut(&mut image)),
+                _ => change.apply(&mut image),
             }
         }
         if image.len() < len {
-            Rc::make_mut(&mut image).resize(len, 0);
+            image.resize(len);
         }
         image
     }
@@ -104,7 +152,7 @@ impl redb::StorageBackend for FakeDisk {
 
     fn read(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let at = offset as usize;
-        self.with(|s| s.live.get(at..at + len).map(<[u8]>::to_vec)).ok_or_else(|| io::ErrorKind::UnexpectedEof.into())
+        self.with(|s| s.live.read(at, len)).ok_or_else(|| io::ErrorKind::UnexpectedEof.into())
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
@@ -116,7 +164,7 @@ impl redb::StorageBackend for FakeDisk {
             if s.cut_after.is_some_and(|n| s.changes >= n) {
                 return Err(io::Error::other("the power is off"));
             }
-            s.safe = Rc::clone(&s.live);
+            s.safe = s.live.clone();
             s.unsynced.clear();
             Ok(())
         })
@@ -175,7 +223,7 @@ fn check_power_cuts(first_cut: usize) {
     };
     let mut cut = first_cut;
     loop {
-        let disk = FakeDisk::holding(Rc::clone(&empty));
+        let disk = FakeDisk::holding(empty.clone());
         let db = Db::on(disk).unwrap();
         let start = disk.with(|s| s.changes);
         disk.with(|s| s.cut_after = Some(start + cut));
