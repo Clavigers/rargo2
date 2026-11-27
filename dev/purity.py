@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import resource
@@ -112,22 +113,37 @@ def list_tests(program, cwd, env):
     return [line[:-len(": test")] for line in listed.stdout.splitlines() if line.endswith(": test")]
 
 
-def cpu(extra):
-    if measure(open(BUDGETS).read()) != MEASURE:
-        sys.exit(f"{BUDGETS} must measure {MEASURE}, which is what this script measures")
-    suite, default, slow = parse_budgets(open(BUDGETS).read())
+def test_programs(extra):
     root = os.getcwd()
-    asroot = [] if os.geteuid() == 0 else ["sudo", "-E"]
-    took, failed = {}, []
     for program in programs(extra):
         package = program.split("/")[3]
         crate = os.path.join(root, "crates", package)
+        executable = os.path.join(root, program)
+        env = dict(os.environ, CARGO_MANIFEST_DIR=crate, CARGO_PKG_NAME=package)
+        yield executable, crate, package, list_tests(executable, crate, env)
+
+
+def cpu(extra):
+    if measure(open(BUDGETS).read()) != MEASURE:
+        sys.exit(f"{BUDGETS} must measure {MEASURE}, which is what this script measures")
+    built = list(test_programs(extra))
+    if os.geteuid() != 0:
+        # Elevate once, after building and preparing runtimes, so getrusage
+        # counts the tests and their children without a sudo process per test.
+        supervisor = ["sudo", "-E", sys.executable, os.path.abspath(__file__), "cpu-built"]
+        sys.exit(subprocess.run(supervisor, input=json.dumps(built), text=True).returncode)
+    measure_cpu(built)
+
+
+def measure_cpu(built):
+    suite, default, slow = parse_budgets(open(BUDGETS).read())
+    took, failed = {}, []
+    for program, crate, package, tests in built:
         name = re.sub(r"-[0-9a-f]{16}$", "", os.path.basename(program))
         env = dict(os.environ, CARGO_MANIFEST_DIR=crate, CARGO_PKG_NAME=package)
-        for test in list_tests(os.path.join(root, program), crate, env):
+        for test in tests:
             key = f"{name} {test}"
-            ms, run = cpu_of([*asroot, os.path.join(root, program), "--exact", test, "--test-threads=1", "-q"],
-                             crate, env)
+            ms, run = cpu_of([program, "--exact", test, "--test-threads=1", "-q"], crate, env)
             took[key] = ms
             if run.returncode != 0:
                 failed.append(key)
@@ -214,6 +230,8 @@ def ratchet(base):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["cpu"]:
         cpu(sys.argv[2:])
+    elif sys.argv[1:] == ["cpu-built"]:
+        measure_cpu(json.load(sys.stdin))
     elif len(sys.argv) == 3 and sys.argv[1] == "ratchet":
         ratchet(sys.argv[2])
     else:
