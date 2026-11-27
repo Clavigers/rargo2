@@ -95,6 +95,7 @@ fn turns_off_alone(f: Fault) {
         Fault::Duplicate => r.duplicated,
         Fault::Reorder => r.reordered,
         Fault::ServerCrash => r.server_restarts,
+        Fault::Partition => r.partitioned,
     };
     let reports: Vec<_> = (0..12).chain(13..16).map(|s| run_off(s, None, Off::none().with(f)).expect("passes")).collect();
     assert!(reports.iter().all(|r| count(r, f) == 0), "--off {} leaves no {0}", f.name());
@@ -124,10 +125,15 @@ fn server_crashes_turn_off_alone() {
 }
 
 #[test]
+fn partitions_turn_off_alone() {
+    turns_off_alone(Fault::Partition);
+}
+
+#[test]
 fn a_seed_with_every_fault_off_replays_the_same_run() {
     let all = Fault::ALL.into_iter().fold(Off::none(), Off::with);
     let a = run_off(9, None, all.clone()).expect("passes");
-    assert_eq!((a.lost, a.duplicated, a.reordered, a.server_restarts), (0, 0, 0, 0));
+    assert_eq!((a.lost, a.duplicated, a.reordered, a.server_restarts, a.partitioned), (0, 0, 0, 0, 0));
     assert_eq!(a, run_off(9, None, all).expect("passes"), "a seed with faults off replays the same run");
 }
 
