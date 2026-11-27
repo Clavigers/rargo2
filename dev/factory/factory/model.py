@@ -634,8 +634,11 @@ class UseStarted(Event):
 
 @event({H, PU}, O)
 class UseEnded(Event):
+    """void: the session did not run to its end (it crashed, ran out of
+    quota or time, or was cut off), so it is not a use of the build."""
     event: Literal["use_ended"]
     use: Number
+    void: bool = False
 
 
 @event({PM}, D)
