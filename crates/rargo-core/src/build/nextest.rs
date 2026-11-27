@@ -145,7 +145,7 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                     let r = rounds.nextest(d, c, &p, &argv, &answers, &ran)?;
                     let asked: Vec<TestAsked> = rounds
                         .asked
-                        .lock()
+                        .borrow_mut()
                         .iter()
                         .map(|q| TestAsked { key: q.key.clone(), listing: q.listing })
                         .collect();
@@ -183,7 +183,7 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
             }
             NextEffect::RunTests(keys) => {
                 let rounds = rounds.as_ref().expect("tests run in the rounds");
-                let asked = std::mem::take(&mut *rounds.asked.lock());
+                let asked = std::mem::take(&mut *rounds.asked.borrow_mut());
                 let mut runs = TestRuns(Vec::new());
                 for key in keys {
                     let q = asked.iter().find(|q| q.key == key).expect("the core runs what nextest asked").clone();
@@ -289,7 +289,7 @@ struct Rounds {
     levels: Arc<Vec<u8>>,
     env: BTreeMap<Vec<u8>, Vec<u8>>,
     tests_view: Arc<dyn View>,
-    asked: Mutex<Vec<TestQuestion>>,
+    asked: RefCell<Vec<TestQuestion>>,
 }
 
 impl Rounds {
@@ -326,7 +326,7 @@ impl Rounds {
             seed: None,
             content: Some(d.engine.content.clone()),
         });
-        Rounds { base, layer, levels, env, tests_view, asked: Mutex::new(Vec::new()) }
+        Rounds { base, layer, levels, env, tests_view, asked: RefCell::new(Vec::new()) }
     }
 
     fn nextest(
@@ -363,7 +363,7 @@ impl Rounds {
             })?
             .result;
         let store = d.store();
-        let mut asked = self.asked.lock();
+        let mut asked = self.asked.borrow_mut();
         asked.clear();
         for (path, e) in &r.outputs.entries {
             if let (true, MEntry::File { hash, .. }) = (is_test_question(path), e)
@@ -667,7 +667,7 @@ fn metadata(d: &Arc<Daemon>, c: &Arc<Client>, p: &Prepared, args: Vec<String>) -
 }
 
 fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer, Option<Built>)> {
-    let kept = Arc::new(Mutex::new(Vec::new()));
+    let kept = std::rc::Rc::new(RefCell::new(Vec::new()));
     let cb = Arc::new(Client {
         args: args.clone(),
         root: c.root.clone(),
@@ -686,14 +686,14 @@ fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer,
         outbox: c.outbox.clone(),
         targets: c.targets.clone(),
     });
-    let keep = Mutex::new(None);
+    let keep = RefCell::new(None);
     let mut code = 101;
     for attempt in 0..3 {
-        kept.lock().clear();
+        kept.borrow_mut().clear();
         match run_request(d, &cb, Some(&keep)) {
             Ok(Finish::Code(k)) => code = k,
             Ok(Finish::Retry) if attempt < 2 => {
-                cb.outbox.lock().0.clear();
+                cb.outbox.borrow_mut().0.clear();
                 continue;
             }
             Ok(Finish::Retry) => c.out.error("the build kept producing inconsistent intermediate artifacts"),
@@ -706,7 +706,7 @@ fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer,
         (c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
         (c.cargo_home.clone(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned()),
     ]);
-    let out = back.text(&String::from_utf8_lossy(&kept.lock())).into_bytes();
+    let out = back.text(&String::from_utf8_lossy(&kept.borrow_mut())).into_bytes();
     Ok((Answer { args, out, err: Vec::new(), code }, keep.into_inner()))
 }
 

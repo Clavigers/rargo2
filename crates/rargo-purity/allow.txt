@@ -1,34 +1,19 @@
-locks	crates/rargo-core/src/build.rs	60	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/buildview.rs	10	shares state between threads outside a shell or worker pool: dashmap (4), atomics (6)
-locks	crates/rargo-core/src/chunk.rs	2	shares state between threads outside a shell or worker pool: dashmap (2)
 locks	crates/rargo-core/src/db.rs	4	shares the write buffer and commit serialization between threads: parking_lot locks (4)
-locks	crates/rargo-core/src/engine.rs	27	shares state between threads outside a shell or worker pool: atomics (15), parking_lot locks (6), once cells (4), dashmap (2)
-locks	crates/rargo-core/src/http.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
-locks	crates/rargo-core/src/incr.rs	10	shares state between threads outside a shell or worker pool: atomics (8), once cells (2)
 locks	crates/rargo-core/src/nixmanifest.rs	17	shares state between threads outside a shell or worker pool
-locks	crates/rargo-core/src/parse.rs	2	shares state between threads outside a shell or worker pool: dashmap (2)
-locks	crates/rargo-core/src/present.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
-locks	crates/rargo-core/src/remote.rs	114	shares state between threads outside a shell or worker pool: atomics (55), parking_lot locks (35), dashmap (13), once cells (12)
+locks	crates/rargo-core/src/remote.rs	5	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/sandbox.rs	6	shares state between threads outside a shell or worker pool: parking_lot locks (4), atomics (2)
 locks	crates/rargo-core/src/sandboxfs.rs	22	shares state between threads outside a shell or worker pool: atomics (10), dashmap (6), parking_lot locks (4), once cells (2)
 locks	crates/rargo-core/src/sched.rs	4	shares state between threads outside a shell or worker pool: parking_lot locks (4)
-locks	crates/rargo-core/src/serve.rs	4	shares state between threads outside a shell or worker pool: parking_lot locks (3), atomics (1)
-locks	crates/rargo-core/src/session.rs	12	shares state between threads outside a shell or worker pool: parking_lot locks (12)
-locks	crates/rargo-core/src/snapshot.rs	16	shares state between threads outside a shell or worker pool: atomics (7), dashmap (5), parking_lot locks (4)
+locks	crates/rargo-core/src/snapshot.rs	6	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/store.rs	6	shares state between threads outside a shell or worker pool: atomics (2), std locks (2), parking_lot locks (2)
 locks	crates/rargo-core/src/tokens.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
-locks	crates/rargo-core/src/trace.rs	9	shares state between threads outside a shell or worker pool: atomics (5), dashmap (2), parking_lot locks (2)
 locks	crates/rargo-core/src/view.rs	6	shares state between threads outside a shell or worker pool: dashmap (4), once cells (2)
 locks	crates/rargo-net/src/lib.rs	30	shares state between threads outside a shell or worker pool: atomics (12), parking_lot locks (12), once cells (6)
 locks	crates/rargo-net/src/link.rs	7	shares state between threads outside a shell or worker pool: std locks (9), atomics (2)
 locks	crates/rargo-proto/src/secure.rs	2	shares state between threads outside a shell or worker pool: atomics (2)
-locks	crates/rargo/src/daemon.rs	41	shares state between threads outside a shell or worker pool: std locks (22), atomics (19)
-locks	crates/rargo/src/main.rs	2	shares state between threads outside a shell or worker pool: once cells (2)
-locks	crates/rargo/src/mux.rs	10	shares state between threads outside a shell or worker pool: std locks (6), atomics (4)
 locks	crates/rargo/src/outfs.rs	30	shares state between threads outside a shell or worker pool: std locks (16), atomics (12), once cells (2)
-locks	crates/rargo/src/partial.rs	6	shares state between threads outside a shell or worker pool: std locks (4), atomics (2)
-locks	crates/rargo/src/tmp.rs	6	shares state between threads outside a shell or worker pool: atomics (6)
-locks	crates/rargo/src/watch.rs	2	shares state between threads outside a shell or worker pool: std locks (2)
+locks	crates/rargo/src/tmp.rs	2	shares state between threads outside a shell or worker pool
 hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/http.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/incr.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map

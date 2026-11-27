@@ -147,7 +147,7 @@ pub struct Output {
     pub quiet: bool,
     pub verbose: bool,
     pub tr: Translator,
-    kept: Option<std::sync::Arc<parking_lot::Mutex<Vec<u8>>>>,
+    kept: Option<std::rc::Rc<std::cell::RefCell<Vec<u8>>>>,
 }
 
 impl Output {
@@ -167,7 +167,7 @@ impl Output {
         }
     }
 
-    pub fn keeping_stdout(&self, into: std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Output {
+    pub fn keeping_stdout(&self, into: std::rc::Rc<std::cell::RefCell<Vec<u8>>>) -> Output {
         Output { kept: Some(into), ..self.derive(self.quiet, self.verbose, self.tr.clone()) }
     }
 
@@ -183,7 +183,7 @@ impl Output {
 
     pub fn raw_out(&self, b: &[u8]) {
         if let Some(k) = &self.kept {
-            k.lock().extend_from_slice(b);
+            k.borrow_mut().extend_from_slice(b);
             return;
         }
         if !b.is_empty() {
