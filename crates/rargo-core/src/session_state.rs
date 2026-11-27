@@ -292,10 +292,12 @@ impl SessionState {
     pub fn knows(&mut self, has: &mut ClientSet, digests: impl IntoIterator<Item = Digest>) {
         has.extend(digests);
         self.knows = true;
+        assert!(self.knows, "the client's set is known from now on");
     }
 
     pub fn set_lazy(&mut self) {
         self.lazy = true;
+        assert!(self.lazy, "a lazy session stays lazy");
     }
 
     pub fn is_lazy(&self) -> bool {
@@ -317,8 +319,10 @@ impl SessionState {
     pub fn client(&mut self, msg: ClientMsg) -> Step {
         let mut step = Step::default();
         if self.closed {
+            assert!(step == Step::default(), "a closed session ignores the client");
             return step;
         }
+        let asking = self.asking;
         match msg {
             ClientMsg::Run(_)
             | ClientMsg::Packed(_)
@@ -330,22 +334,26 @@ impl SessionState {
             | ClientMsg::Ping(_) => step.refused = Some(UNEXPECTED),
             ClientMsg::Trees(t) => {
                 if self.answer(Ask::Trees) {
+                    assert_eq!(asking, Some(Ask::Trees), "only the question asked is answered");
                     step.effects.push(Effect::Answer(Answer::Trees(t)));
                 }
             }
             ClientMsg::Env(e) => {
                 if self.answer(Ask::Env) {
+                    assert_eq!(asking, Some(Ask::Env), "only the question asked is answered");
                     step.effects.push(Effect::Answer(Answer::Env(e)));
                 }
             }
             ClientMsg::ReportId(id) => {
                 if self.answer(Ask::Report) {
+                    assert_eq!(asking, Some(Ask::Report), "only the question asked is answered");
                     step.effects.push(Effect::Answer(Answer::Report(id)));
                 }
             }
             ClientMsg::Changed => {
                 self.changed = true;
                 step.effects.push(Effect::Wake);
+                assert!(self.changed, "a change is remembered");
             }
             ClientMsg::Blobs(blobs) => {
                 for b in blobs {
@@ -362,6 +370,10 @@ impl SessionState {
                     step.effects.push(Effect::Store { hash, bytes });
                 }
                 step.effects.push(Effect::Wake);
+                assert!(
+                    step.effects.iter().all(|e| matches!(e, Effect::Store { .. } | Effect::Wake)),
+                    "whole blobs are only stored"
+                );
             }
             ClientMsg::BlobPart { hash, part, last } => {
                 step.bytes_in += part.data.len() as u64;
@@ -370,6 +382,7 @@ impl SessionState {
                     if self.parts.remove(&hash).is_some() {
                         step.effects.push(Effect::PartDrop(hash));
                     }
+                    assert!(!self.parts.contains_key(&hash), "an unreadable part ends its upload");
                     return step;
                 };
                 let up = match self.parts.entry(hash) {
@@ -392,13 +405,16 @@ impl SessionState {
                         step.refused = Some(MISMATCH);
                     }
                 }
+                assert_eq!(self.parts.contains_key(&hash), !last, "an upload is held until its last part");
             }
         }
+        assert!(!self.closed, "a message does not close the session");
         step
     }
 
     pub fn part_failed(&mut self, hash: &Digest) {
         self.parts.remove(hash);
+        assert!(!self.parts.contains_key(hash), "a failed upload is forgotten");
     }
 
     pub fn deliver(&mut self, has: &mut ClientSet, files: Vec<Delivery>, writes: Vec<Write>, targets: Vec<String>) -> Option<Outgoing> {
@@ -409,6 +425,8 @@ impl SessionState {
         let id = self.next_id;
         self.next_id += 1;
         self.delivered.extend(sizes.keys().copied());
+        assert!(self.next_id > id, "every delivery has its own id");
+        assert!(sizes.keys().all(|h| self.delivered.contains(h)), "what is delivered is remembered");
         let deliver = ServerMsg::Deliver { id, files, writes, targets };
         if self.lazy {
             let small = has.push_small(&sizes, self.sizes.lazy_small);
@@ -428,6 +446,7 @@ impl SessionState {
     pub fn fetch(&mut self, has: &mut ClientSet, id: u64, found: Vec<(Digest, Option<u64>)>) -> Outgoing {
         let wanted: Vec<(Digest, u64)> = found.into_iter().filter_map(|(h, size)| size.map(|s| (h, s))).collect();
         has.extend(wanted.iter().map(|(h, _)| *h));
+        assert!(wanted.iter().all(|(h, _)| has.has(h)), "the client has what it is sent");
         Outgoing::new(self.sizes, wanted, false, ServerMsg::Fetched { id }, true)
     }
 
@@ -439,16 +458,21 @@ impl SessionState {
         if self.credit < n {
             return Ok(false);
         }
+        let before = self.credit;
         self.credit -= n;
+        assert_eq!(self.credit + n, before, "a bulk message takes its cost from the window");
         Ok(true)
     }
 
     pub fn sent_bulk(&mut self, bytes: usize) {
+        let before = self.credit;
         self.credit = (self.credit + bulk_cost(bytes)).min(WINDOW);
+        assert!(self.credit >= before && self.credit <= WINDOW, "a sent message gives credit back, up to the window");
     }
 
     pub fn close_window(&mut self) {
         self.window_closed = true;
+        assert!(self.window_closed, "a closed window stays closed");
     }
 
     pub fn ask(&mut self, q: Question) -> Result<ServerMsg, Gone> {
@@ -461,19 +485,23 @@ impl SessionState {
             Question::Report(r) => (Ask::Report, ServerMsg::Report(r)),
         };
         self.asking = Some(a);
+        assert!(self.asking.is_some() && !self.closed, "an open session waits for its answer");
         Ok(m)
     }
 
     fn answer(&mut self, a: Ask) -> bool {
         if self.asking == Some(a) {
             self.asking = None;
+            assert!(self.asking.is_none(), "a question is answered once");
             return true;
         }
+        assert_ne!(self.asking, Some(a), "an answer to no question changes nothing");
         false
     }
 
     pub fn want(&mut self, hashes: &[Digest], stored: &dyn Fn(&Digest) -> bool) -> ServerMsg {
         self.wanted = hashes.iter().filter(|h| !stored(h)).copied().collect();
+        assert!(self.wanted.iter().all(|h| hashes.contains(h)), "only what is asked for is wanted");
         ServerMsg::WantBlobs(hashes.to_vec())
     }
 
@@ -484,13 +512,16 @@ impl SessionState {
         }
         if self.closed || self.changed {
             self.wanted.clear();
+            assert!(self.wanted.is_empty(), "a want that is gone holds no claim");
             return Progress::Gone;
         }
+        assert!(!self.wanted.is_empty() && !self.wanted.iter().any(stored), "a waiting want waits for blobs not stored");
         Progress::Wait
     }
 
     pub fn abandon_want(&mut self) {
         self.wanted.clear();
+        assert!(self.wanted.is_empty(), "an abandoned want holds no claim");
     }
 
     pub fn close(&mut self) -> Vec<Digest> {
@@ -498,7 +529,9 @@ impl SessionState {
         self.window_closed = true;
         self.asking = None;
         self.wanted.clear();
-        std::mem::take(&mut self.parts).into_keys().collect()
+        let parts: Vec<Digest> = std::mem::take(&mut self.parts).into_keys().collect();
+        assert!(self.closed && self.window_closed && self.parts.is_empty(), "a closed session holds nothing");
+        parts
     }
 }
 
@@ -631,6 +664,7 @@ impl Handshake {
     }
 
     fn end(&mut self, write: Vec<u8>, end: Shook) -> Shake {
+        assert!(!self.ended, "a handshake ends once");
         self.ended = true;
         Shake::Reply { write, end }
     }
