@@ -347,6 +347,21 @@ pub fn configured_dirs(
     out
 }
 
+/// The environment and translator for planning again with `dirs` added to
+/// `unmapped`, the environment as it was before [`build_paths`]. Mapping the
+/// already-mapped environment again would map its sandbox paths to themselves.
+pub fn map_again(
+    root: &str,
+    cargo_home: &str,
+    unmapped: &mut BTreeMap<String, String>,
+    dirs: Vec<(String, String)>,
+) -> (BTreeMap<String, String>, Translator) {
+    unmapped.extend(dirs);
+    let mut env = unmapped.clone();
+    let tr = build_paths(root, cargo_home, &mut env);
+    (env, tr)
+}
+
 pub fn base_env<'a>(
     server: impl IntoIterator<Item = (&'a String, &'a String)>,
     client: impl IntoIterator<Item = (&'a String, &'a String)>,
@@ -554,6 +569,29 @@ mod tests {
         assert_eq!(tr.path("/w/target/debug/two"), "/tmp/R/two/target/debug/two");
         let both = configured_dirs("/tmp/R/t", "/tmp/R/b", &tr, &BTreeMap::new());
         assert_eq!(both.len(), 2);
+    }
+
+    #[test]
+    fn a_configured_build_dir_keeps_a_target_dir_the_client_gave() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (given, env_dir, client) in [
+            (args(&["build"]), Some("/tmp/out"), "/tmp/out"),
+            (args(&["build", "--target-dir", "mytarget"]), None, "/tmp/R/two/mytarget"),
+        ] {
+            let mut env: BTreeMap<String, String> =
+                env_dir.map(|d| ("CARGO_TARGET_DIR".to_string(), d.to_string())).into_iter().collect();
+            flag_target_dir(&given, "/tmp/R/two", &mut env);
+            let mut unmapped = env.clone();
+            let tr = build_paths("/tmp/R/two", "/home/user/.cargo", &mut env);
+            let target = env["CARGO_TARGET_DIR"].clone();
+            let dirs = configured_dirs(&target, "/tmp/R/build", &tr, &env);
+            assert_eq!(dirs, vec![("CARGO_BUILD_BUILD_DIR".to_string(), "/tmp/R/build".to_string())]);
+            let (env, tr) = map_again("/tmp/R/two", "/home/user/.cargo", &mut unmapped, dirs);
+            assert_eq!(env["CARGO_TARGET_DIR"], target);
+            assert_eq!(tr.path(&format!("{target}/debug/two")), format!("{client}/debug/two"));
+            assert_eq!(tr.path("/w/target/rargo-external-build/debug/deps"), "/tmp/R/build/debug/deps");
+            assert!(configured_dirs(&target, &env["CARGO_BUILD_BUILD_DIR"], &tr, &env).is_empty());
+        }
     }
 
     #[test]
