@@ -1,6 +1,6 @@
 use rargo_machine::StateMachine;
 use crate::db::Table;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub const DELAY_MS: u64 = 100;
@@ -58,6 +58,8 @@ impl DbWriter {
     }
 
     fn write(&mut self, table: Table, key: &[u8], value: Value, now_ms: u64) {
+        assert!(self.seq < u64::MAX, "a write needs a fresh sequence number");
+        let since = self.since.unwrap_or(now_ms);
         self.seq += 1;
         self.bytes += size(key, &value);
         let old = self.pending.insert((table, key.to_vec()), Entry { value, seq: self.seq });
@@ -65,14 +67,19 @@ impl DbWriter {
             self.bytes -= size(key, &old.value);
         }
         self.since.get_or_insert(now_ms);
+        assert_eq!(self.since, Some(since), "writing preserves the first queued time");
     }
 
     pub fn put(&mut self, table: Table, key: &[u8], value: &[u8], now_ms: u64) {
-        self.write(table, key, Some(Arc::from(value)), now_ms);
+        let value: Arc<[u8]> = Arc::from(value);
+        self.write(table, key, Some(value.clone()), now_ms);
+        assert!(matches!(self.get(table, key), Some(Some(stored)) if Arc::ptr_eq(&stored, &value)),
+            "a put queues the new value");
     }
 
     pub fn delete(&mut self, table: Table, key: &[u8], now_ms: u64) {
         self.write(table, key, None, now_ms);
+        assert!(matches!(self.get(table, key), Some(None)), "a delete queues a tombstone");
     }
 
     pub fn get(&self, table: Table, key: &[u8]) -> Option<Value> {
@@ -106,11 +113,14 @@ impl DbWriter {
             b.seqs.push(e.seq);
         }
         self.flushing = !b.is_empty();
+        assert_eq!(b.writes.len(), self.pending.len(), "the batch covers the pending queue");
+        assert_eq!(b.seqs.len(), b.writes.len(), "each batch write has a sequence number");
         b
     }
 
     pub fn flushed(&mut self, batch: &Batch, now_ms: u64) {
         assert!(self.flushing || batch.is_empty(), "a flush ends only once it began");
+        assert_eq!(batch.writes.len(), batch.seqs.len(), "each batch write has a sequence number");
         for ((t, k, _), seq) in batch.writes.iter().zip(&batch.seqs) {
             let key = (*t, k.clone());
             if self.pending.get(&key).is_some_and(|e| e.seq == *seq) {
@@ -119,15 +129,24 @@ impl DbWriter {
             }
         }
         self.end_flush(now_ms);
+        assert!(!self.flushing, "a completed flush leaves no batch in flight");
     }
 
     pub fn failed(&mut self, now_ms: u64) {
+        assert!(self.flushing, "only an in-flight flush can fail");
+        let pending = self.pending.len();
+        let bytes = self.bytes;
         self.end_flush(now_ms);
+        assert!(!self.flushing, "a failed flush leaves no batch in flight");
+        assert_eq!((self.pending.len(), self.bytes), (pending, bytes), "a failed flush keeps the pending writes");
     }
 
     fn end_flush(&mut self, now_ms: u64) {
+        assert_eq!(self.since.is_some(), !self.pending.is_empty() || self.flushing,
+            "queued or in-flight writes have a start time");
         self.flushing = false;
         self.since = if self.pending.is_empty() { None } else { Some(now_ms) };
+        assert_eq!(self.since, (!self.pending.is_empty()).then_some(now_ms), "remaining writes restart the clock");
     }
 }
 
@@ -136,8 +155,11 @@ impl StateMachine for DbWriter {
         let bytes: usize = self.pending.iter().map(|((_, k), e)| size(k, &e.value)).sum();
         assert_eq!(bytes, self.bytes, "pending bytes are the sum of the pending writes");
         assert_eq!(self.since.is_some(), !self.pending.is_empty(), "the clock runs exactly while writes wait");
+        assert!(!self.flushing || !self.pending.is_empty(), "in-flight writes stay queued until acknowledged");
+        let mut seqs = BTreeSet::new();
         for e in self.pending.values() {
-            assert!(e.seq >= 1 && e.seq <= self.seq, "every write has its own number");
+            assert!(e.seq >= 1 && e.seq <= self.seq, "pending numbers come from the writer");
+            assert!(seqs.insert(e.seq), "every pending write has its own number");
         }
     }
 }
@@ -182,6 +204,16 @@ mod tests {
         fn failed(&mut self, now_ms: u64) {
             self.0.step(|w| w.failed(now_ms))
         }
+    }
+
+    #[test]
+    fn taking_an_empty_batch_leaves_the_writer_idle() {
+        let mut w = Writer::new();
+        let batch = w.take();
+        assert!(batch.is_empty());
+        w.flushed(&batch, 10);
+        assert_eq!(w.due(10), Due::Idle);
+        assert!(w.take().is_empty());
     }
 
     #[test]

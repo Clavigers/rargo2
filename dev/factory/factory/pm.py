@@ -6,10 +6,10 @@ Every few minutes it does the next thing that is due, and records it:
    since the last freeze, the next version (one patch above every tag,
    manifest and earlier version) is frozen at main's head. Its branch is
    release/X.Y.Z: that commit plus one that sets the version.
-2. Backport. A bug fix merged to main after the freeze is cherry-picked onto
-   the branch.
-3. Build. The branch's head, once CI passed on it, is the next candidate
+2. Build. The branch's head, once CI passed on it, is the next candidate
    build. CI that failed there is run again, three times at most.
+3. Backport. A bug fix merged to main after the freeze is cherry-picked onto
+   the branch, and its new head is built by a later step.
 4. Hold or publish. The world says which reasons hold the latest build
    (known bugs, too few power user sessions, too little soak, a backport in
    no build). When the reasons change it records them; when there are none
@@ -95,8 +95,8 @@ class Pm:
             if version is None:
                 return
         self._branch(version)
-        self._backport(version)
-        self._build(version)
+        self._build(version)  # before backporting: a head that passed is a build,
+        self._backport(version)  # whatever lands on the branch next
         self._hold_or_publish(version)
 
     def _freeze(self) -> str | None:

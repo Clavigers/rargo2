@@ -128,39 +128,16 @@ impl Trees {
     }
 
     fn hold(self: &Arc<Self>, root: Hash) -> Option<Arc<Snapshot>> {
-        let mut all: Vec<Hash> = Vec::new();
-        let mut seen: HashSet<Hash> = HashSet::new();
-        let mut todo = vec![root];
-        seen.insert(root);
-        while let Some(d) = todo.pop() {
-            let tree = self.get(&d)?;
-            if !self.store.has(&d) {
+        let all = worktree_hashes(root, |d| {
+            let tree = self.get(d)?;
+            if !self.store.has(d) {
                 match self.store.put_bytes(&tree.encode()) {
-                    Ok(stored) if stored == d => {}
+                    Ok(stored) if stored == *d => {}
                     _ => return None,
                 }
             }
-            all.push(d);
-            for (_, node) in &tree.entries {
-                match node {
-                    Node::File { hash, .. } => {
-                        let h = Hash(*hash);
-                        if seen.insert(h) {
-                            all.push(h);
-                        }
-                    }
-                    Node::Dir(sub) => {
-                        let sub = Hash(*sub);
-                        if seen.insert(sub) {
-                            todo.push(sub);
-                        }
-                    }
-                    Node::Symlink(_) => {}
-                }
-            }
-        }
-        assert_eq!(all.first(), Some(&root));
-        debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+            Some(tree)
+        })?;
         if !self.store.pin_all(&all) {
             return None;
         }
@@ -226,6 +203,37 @@ impl Trees {
         }
         Ok(())
     }
+}
+
+fn worktree_hashes(root: Hash, tree: impl Fn(&Hash) -> Option<Arc<Tree>>) -> Option<Vec<Hash>> {
+    let mut all: Vec<Hash> = Vec::new();
+    let mut seen: HashSet<Hash> = HashSet::new();
+    let mut todo = vec![root];
+    seen.insert(root);
+    while let Some(d) = todo.pop() {
+        let tree = tree(&d)?;
+        all.push(d);
+        for (_, node) in &tree.entries {
+            match node {
+                Node::File { hash, .. } => {
+                    let h = Hash(*hash);
+                    if seen.insert(h) {
+                        all.push(h);
+                    }
+                }
+                Node::Dir(sub) => {
+                    let sub = Hash(*sub);
+                    if seen.insert(sub) {
+                        todo.push(sub);
+                    }
+                }
+                Node::Symlink(_) => {}
+            }
+        }
+    }
+    assert_eq!(all.first(), Some(&root));
+    debug_assert_eq!(all.iter().collect::<HashSet<_>>().len(), all.len(), "each hash is pinned once");
+    Some(all)
 }
 
 struct Claims<'a> {
@@ -664,6 +672,33 @@ mod tests {
             trees.store.evict_to(0, &|_| false);
             assert!(!trees.store.has(&a_file) && !trees.store.has(&root));
             assert!(!trees.store.is_pinned(&a_file));
+        });
+    }
+
+    #[test]
+    fn a_held_snapshot_pins_its_whole_worktree_until_it_is_dropped() {
+        crate::io::sim::test(|| {
+            let (_d, trees, fake) = setup();
+            let v = fake.dir(vec![
+                ("src", fake.dir(vec![("a", fake.file(b"a")), ("deep", fake.dir(vec![("b", fake.file(b"b"))]))])),
+                ("top", fake.file(b"top")),
+            ]);
+            let root = root_of(&v);
+            let s = trees.sync(root, &fake).unwrap();
+            let held = worktree_hashes(root, |d| trees.get(d)).unwrap();
+            assert_eq!(held.len(), 6, "three manifests and three files");
+            assert!(held.iter().all(|h| trees.store.is_pinned(h)));
+
+            let output = trees.store.put_bytes(b"an output nobody holds").unwrap();
+            trees.store.evict_to(0, &|_| false);
+            assert!(!trees.store.has(&output));
+            assert!(held.iter().all(|h| trees.store.has(h)));
+            assert_eq!(s.read(b"src/deep/b").unwrap(), b"b");
+
+            drop(s);
+            assert!(held.iter().all(|h| !trees.store.is_pinned(h)));
+            trees.store.evict_to(0, &|_| false);
+            assert!(held.iter().all(|h| !trees.store.has(h)));
         });
     }
 

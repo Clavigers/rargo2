@@ -2,4 +2,3 @@ measure	cpu-across-runners	0	user and system CPU of each test run alone in its o
 suite	workspace	17000	every test of every test program in the workspace, measured at 6.5 s on rargo.rs and 6.6 to 11.1 s on GitHub runners
 test	default	1000	any test without a line of its own; the most of those measured at 383 ms on rargo.rs and 596 ms on a GitHub runner
 slow	rargo tests::writes_of_one_path_at_once_all_succeed	1300	measured at 842 ms on rargo.rs and 214 to 620 ms on GitHub runners: many threads write the same path at once
-slow	rargo_core snapshot::tests::a_synced_worktree_survives_eviction_to_a_small_budget_while_it_is_held	3600	measured at 1488 ms on rargo.rs and 1308 to 2374 ms on GitHub runners: it evicts and resyncs a real store on disk
