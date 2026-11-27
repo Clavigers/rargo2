@@ -15,7 +15,6 @@ locks	crates/rargo-proto/src/secure.rs	2	shares state between threads outside a 
 locks	crates/rargo/src/outfs.rs	30	shares state between threads outside a shell or worker pool: std locks (16), atomics (12), once cells (2)
 locks	crates/rargo/src/tmp.rs	2	shares state between threads outside a shell or worker pool
 hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-core/src/http.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/incr.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/nixmanifest.rs	7	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
