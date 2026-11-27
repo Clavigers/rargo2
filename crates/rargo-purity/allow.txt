@@ -13,7 +13,6 @@ hash-order	crates/rargo-core/src/snapshot.rs	6	HashMap or HashSet with the defau
 self-check	crates/rargo-core/src/flake.rs	4	4 step methods of Resolution assert nothing
 self-check	crates/rargo-core/src/nixmanifest.rs	5	5 step methods of Queue, Walk assert nothing
 self-check	crates/rargo-core/src/sandboxfs.rs	3	3 step methods of ObsCore assert nothing
-self-check	crates/rargo-core/src/store_index.rs	15	15 step methods of StoreIndex assert nothing
 self-check	crates/rargo-core/src/tokens.rs	7	7 step methods of Tokens assert nothing
 self-check	crates/rargo/src/daemon.rs	10	10 step methods of CommandState, Multipart assert nothing
 self-check	crates/rargo/src/mux.rs	5	5 step methods of MuxState assert nothing
