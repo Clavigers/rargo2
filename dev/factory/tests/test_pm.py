@@ -30,6 +30,14 @@ class Checks:
         self.reruns += 1
         return 1
 
+    released, notes = (), None
+
+    def release(self, tag):
+        return {"tag_name": tag} if tag in self.released else None
+
+    def set_release_notes(self, tag, path):
+        self.notes = (tag, path.read_text())
+
     def check_runs(self, sha):
         if self.result is None:
             return []
@@ -198,6 +206,46 @@ def test_a_failed_release_is_not_recorded(tmp_path):
     f = Factory(tmp_path, publish=("false",))
     f.pm.step()
     assert f.events() == ["frozen", "built"]
+
+
+def test_a_released_version_gets_its_notes_written_once(tmp_path):
+    f = Factory(tmp_path)
+    asked = []
+    def write(version, previous, out):
+        asked.append((version, previous))
+        out.write_text("## The build server no longer hangs\n" + "It did before. " * 30)
+        return 0
+    f.pm = Pm(f.ledger, f.checks, f.checkout, clock=lambda: f.now, publish=["true"], say=f.said.append,
+              notes_prompt="p", state=tmp_path / "state", write_notes=write)
+    f.pm.step()
+    assert not asked  # published in the log, but no tag yet
+    git(f.dev, "fetch", "-q", "origin")
+    git(f.dev, "tag", "v0.7.11", "origin/release/0.7.11")
+    git(f.dev, "push", "-q", "origin", "v0.7.11")
+    f.pm.step()
+    assert not asked  # a tag, but GitHub has no release for it yet
+    f.checks.released = ("v0.7.11",)
+    f.pm.step()
+    f.pm.step()
+    assert asked == [("0.7.11", "v0.7.10")]
+    assert f.checks.notes[0] == "v0.7.11" and "no longer hangs" in f.checks.notes[1]
+    assert (tmp_path / "state" / "notes" / "0.7.11.md").exists()
+
+
+def test_notes_a_session_did_not_write_are_not_put_on_the_release(tmp_path):
+    f = Factory(tmp_path)
+    tries = []
+    f.pm = Pm(f.ledger, f.checks, f.checkout, clock=lambda: f.now, publish=["true"], say=f.said.append,
+              notes_prompt="p", state=tmp_path / "state",
+              write_notes=lambda v, p, out: tries.append(v) or 0)
+    f.pm.step()
+    git(f.dev, "fetch", "-q", "origin")
+    git(f.dev, "tag", "v0.7.11", "origin/release/0.7.11")
+    git(f.dev, "push", "-q", "origin", "v0.7.11")
+    f.checks.released = ("v0.7.11",)
+    for _ in range(5):
+        f.pm.step()
+    assert len(tries) == 3 and f.checks.notes is None
 
 
 def test_bump_leaves_other_packages(tmp_path):
