@@ -294,13 +294,35 @@ pub fn with_target_dir(args: &[String], dir: &str) -> Vec<String> {
     out
 }
 
+/// Where a target directory outside the worktree lives inside the action filesystem.
+pub const EXTERNAL_TARGET_AT: &str = "/w/target/rargo-external";
+
+fn in_external_target(p: &str) -> bool {
+    p.strip_prefix(EXTERNAL_TARGET_AT).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// The program `rargo run` starts, as the client names it: one under an external target directory
+/// exists only at the client's own path, which the run's mount namespace does not remap.
+pub fn client_program(program: &str, sandbox_cwd: &str, tr: &Translator) -> String {
+    let abs = Path::new(sandbox_cwd).join(program).components().collect::<PathBuf>();
+    let abs = abs.to_string_lossy();
+    if in_external_target(&abs) { tr.path(&abs) } else { program.into() }
+}
+
+/// A path list (such as the dynamic library search path) with each entry under an external target
+/// directory given its client path.
+pub fn client_paths(value: &str, tr: &Translator) -> String {
+    let client = |part: &str| if in_external_target(part) { tr.path(part) } else { part.into() };
+    value.split(':').map(client).collect::<Vec<_>>().join(":")
+}
+
 pub fn build_paths(root: &str, cargo_home: &str, env: &mut BTreeMap<String, String>) -> Translator {
     let worktree_at = std::str::from_utf8(WORKTREE_AT).expect("worktree mount is ASCII");
     let mut pairs = vec![
         (worktree_at.into(), root.into()),
         (String::from_utf8_lossy(CARGO_HOME_AT).into_owned(), cargo_home.into()),
     ];
-    for (var, sandbox) in [("CARGO_TARGET_DIR", "/w/target/rargo-external"), ("CARGO_BUILD_BUILD_DIR", "/w/target/rargo-external-build")] {
+    for (var, sandbox) in [("CARGO_TARGET_DIR", EXTERNAL_TARGET_AT), ("CARGO_BUILD_BUILD_DIR", "/w/target/rargo-external-build")] {
         let Some(dir) = env.get_mut(var) else { continue };
         if !Path::new(dir).is_absolute() {
             continue;
@@ -592,6 +614,23 @@ mod tests {
             assert_eq!(tr.path("/w/target/rargo-external-build/debug/deps"), "/tmp/R/build/debug/deps");
             assert!(configured_dirs(&target, &env["CARGO_BUILD_BUILD_DIR"], &tr, &env).is_empty());
         }
+    }
+
+    #[test]
+    fn run_names_a_program_in_an_external_target_dir_by_its_client_path() {
+        let mut env = BTreeMap::from([("CARGO_TARGET_DIR".into(), "/tmp/x/one-out".into())]);
+        let tr = build_paths("/root/one", "/root/.cargo", &mut env);
+        for program in ["target/rargo-external/debug/one", "./target/rargo-external/debug/one", "/w/target/rargo-external/debug/one"] {
+            assert_eq!(client_program(program, "/w", &tr), "/tmp/x/one-out/debug/one", "{program}");
+        }
+        assert_eq!(client_program("rargo-external/debug/one", "/w/target", &tr), "/tmp/x/one-out/debug/one");
+        for inside in ["target/debug/one", "/w/target/debug/one", "/usr/bin/env", "target/rargo-externals/x"] {
+            assert_eq!(client_program(inside, "/w", &tr), inside);
+        }
+        assert_eq!(
+            client_paths("/w/target/rargo-external/debug/deps:/w/target/debug/deps:/usr/lib", &tr),
+            "/tmp/x/one-out/debug/deps:/w/target/debug/deps:/usr/lib"
+        );
     }
 
     #[test]
