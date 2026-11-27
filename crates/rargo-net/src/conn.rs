@@ -517,10 +517,33 @@ impl ConnState {
     }
 
     fn drain(&mut self, out: &mut Output) {
+        assert!(
+            self.recv
+                .pending
+                .keys()
+                .next()
+                .is_none_or(|&first| first >= self.recv.done_below),
+            "no completed message waits below the delivery point"
+        );
+        let below_before = self.recv.done_below;
+        let delivered_before = out.messages.len();
         while let Some(whole) = self.recv.pending.remove(&self.recv.done_below) {
             out.messages.push(whole);
             self.recv.done_below += 1;
         }
+        assert_eq!(
+            self.recv.done_below - below_before,
+            (out.messages.len() - delivered_before) as u64,
+            "the delivery point moves past exactly the messages delivered"
+        );
+        assert!(
+            self.recv
+                .pending
+                .keys()
+                .next()
+                .is_none_or(|&first| first > self.recv.done_below),
+            "every message still pending waits for an earlier one"
+        );
     }
 }
 
