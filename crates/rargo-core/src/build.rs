@@ -327,13 +327,11 @@ impl Daemon {
     }
 
     pub fn export_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let (tables, store) = (self.engine.traces.tables(), self.store().clone());
-        crate::io::cpu(move || export_cache(&*tables, &store, dir))
+        export_cache(&*self.engine.traces.tables(), self.store(), dir)
     }
 
     pub fn import_cache(&self, dir: &Path) -> Result<(usize, usize)> {
-        let store = self.store().clone();
-        let (traces, needs, blobs) = crate::io::cpu(move || import_blobs(&store, dir))?;
+        let (traces, needs, blobs) = import_blobs(self.store(), dir)?;
         let n = traces.len();
         for (key, t) in traces {
             self.engine.traces.insert(&key, t);
@@ -353,20 +351,15 @@ impl Daemon {
         let traces = self.engine.traces.tables();
         let (states, state_blobs) = self.incr.parts();
         let roots = self.trees.recent_roots();
-        let store = self.store().clone();
-        let (swept, gone) = crate::io::cpu(move || {
+        let store = self.store();
+        let mut live = crate::io::cpu(move || {
             let mut live = std::collections::BTreeSet::new();
             crate::trace::mark(&*traces, &mut live);
-            crate::incr::mark(&*states, &*state_blobs, &mut live);
-            crate::snapshot::mark_trees(&store, roots, &mut live);
-            let gone = RefCell::new(Vec::new());
-            let swept = store.sweep(&live, min_age_secs, &|h| gone.borrow_mut().push(*h));
-            (swept, gone.into_inner())
+            live
         });
-        for h in &gone {
-            self.engine.fs.forget_backing(h);
-        }
-        swept
+        crate::incr::mark(&*states, &*state_blobs, &mut live);
+        crate::snapshot::mark_trees(store, roots, &mut live);
+        store.sweep(&live, min_age_secs, &|h| self.engine.fs.forget_backing(h))
     }
 }
 
@@ -397,8 +390,8 @@ fn export_cache(tables: &dyn crate::db::Tables, store: &Store, dir: &Path) -> Re
         written += 1;
     }
     let bundle = (traces, crate::trace::all_needs_env(tables));
-    let raw = bincode::serialize(&bundle)?;
-    crate::io::file::write(dir.join("traces.bin"), zstd::encode_all(&raw[..], 3)?)?;
+    let packed = crate::io::cpu(|| -> Result<Vec<u8>> { Ok(zstd::encode_all(&bincode::serialize(&bundle)?[..], 3)?) })?;
+    crate::io::file::write(dir.join("traces.bin"), packed)?;
     Ok((bundle.0.len(), written))
 }
 
@@ -406,8 +399,9 @@ type Imported = (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>, usize);
 
 /// Puts the blobs exported under `dir` into `store` and reads the traces whose files are then all there.
 fn import_blobs(store: &Store, dir: &Path) -> Result<Imported> {
-    let raw = zstd::decode_all(&crate::io::file::read(dir.join("traces.bin"))?[..])?;
-    let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) = bincode::deserialize(&raw)?;
+    let packed = crate::io::file::read(dir.join("traces.bin"))?;
+    let (traces, needs): (Vec<(Hash, Trace)>, Vec<(Hash, Vec<String>)>) =
+        crate::io::cpu(|| -> Result<_> { Ok(bincode::deserialize(&zstd::decode_all(&packed[..])?)?) })?;
     let mut blobs = 0;
     for e in crate::io::file::read_dir(dir.join("blobs"))?.flatten() {
         let Some(want) = e.file_name().to_str().and_then(Hash::from_hex) else { continue };

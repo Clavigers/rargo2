@@ -449,7 +449,8 @@ pub(crate) fn resolve_shell(
     let hosts = d.pool.get().map(|p| p.host_sources().clone());
     let tables: Arc<dyn crate::db::Tables> = store.db().clone();
     let disk: Arc<dyn crate::nixmanifest::StoreFs> = Arc::new(crate::nixmanifest::Disk);
-    let cached = crate::io::cpu(|| store.db().get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
+    let db = store.db().clone();
+    let cached = crate::io::cpu(|| db.get(Table::Meta, &k).and_then(|v| bincode::deserialize::<FlakeEnv>(&v).ok()));
     let mut resolution = Resolution::new(shell_key, cached, host_ca_bundle().is_some());
     let mut scratch: Option<std::path::PathBuf> = None;
     let mut said = false;
@@ -520,7 +521,7 @@ pub(crate) fn resolve_shell(
     let (env, save) = done?;
     if save {
         let value = bincode::serialize(&env)?;
-        crate::io::cpu(|| store.db().put(Table::Meta, &k, &value));
+        crate::io::cpu(|| db.put(Table::Meta, &k, &value));
     }
     Ok(Arc::new(env))
 }

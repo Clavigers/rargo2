@@ -824,25 +824,25 @@ impl Engine {
                     let hash = self.content.hash(&info.src)?;
                     if !store.has(&hash) {
                         let (f, _, _) = self.content.open(&info.src)?;
-                        let (store, exec) = (&*store, info.exec());
-                        io::cpu(|| store.put_file_copy(&f, exec))?;
+                        store.put_file_copy(&f, info.exec())?;
                     }
                     Ok(MEntry::File { hash, exec: info.exec(), size: info.size })
                 }
             };
             upper.push((u.path, entry));
         }
-        let (entries, out_hash, err_hash) = io::cpu(move || -> Result<_> {
-            let mut scratch: Vec<(PathBuf, bool)> = upper.iter().filter_map(|(_, entry)| entry.as_ref().err().cloned()).collect();
-            scratch.sort();
-            scratch.dedup_by(|a, b| a.0 == b.0);
-            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> =
-                io::thread::par_map(scratch, |(path, exec)| -> Result<(PathBuf, (Hash, u64))> {
-                    let r = store
-                        .put_file_move(&path, exec)
-                        .with_context(|| format!("storing output file {}", path.display()))?;
-                    Ok((path, r))
-                });
+        let (entries, out_hash, err_hash) = (|| -> Result<_> {
+            let mut files: Vec<(PathBuf, bool)> = upper.iter().filter_map(|(_, entry)| entry.as_ref().err().cloned()).collect();
+            files.sort();
+            files.dedup_by(|a, b| a.0 == b.0);
+            let stored: Result<BTreeMap<PathBuf, (Hash, u64)>> = files
+                .iter()
+                .zip(store.put_files_move(files.clone()))
+                .map(|((path, _), put)| {
+                    let r = put.with_context(|| format!("storing output file {}", path.display()))?;
+                    Ok((path.clone(), r))
+                })
+                .collect();
             let stored = stored?;
             let entries: Vec<(Vec<u8>, MEntry)> = upper
                 .into_iter()
@@ -857,7 +857,7 @@ impl Engine {
             let out_hash = store.put_bytes(&stdout)?;
             let err_hash = store.put_bytes(&stderr)?;
             Ok((entries, out_hash, err_hash))
-        })?;
+        })()?;
         let _ = io::file::remove_dir_all(&scratch);
 
         let mut entries = entries;
