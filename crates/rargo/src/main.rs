@@ -524,6 +524,11 @@ fn main() {
         Ok(d) => d,
         Err(e) => die(&format!("cannot determine the current directory: {e}")),
     };
+    let manifest = cli::manifest_path_arg(&args).and_then(|given| io::file::canonicalize(cwd.join(given)).ok());
+    let (cwd, args) = match manifest.and_then(|m| cli::rehome(&cwd, &args, &m, find_root)) {
+        Some(moved) => moved,
+        None => (cwd, args),
+    };
     if kind == "build" {
         if let (Some(root), Ok(manifest)) = (find_root(&cwd), cli::find_manifest(&world, &args))
             && let Some((name, path)) = outside_path_dependency(&root, &manifest)

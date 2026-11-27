@@ -1543,7 +1543,7 @@ impl Daemon {
         let Some(root) = crate::find_root(&cwd) else {
             return Ok(Self::fail(
                 out,
-                format!("`{}` is not inside a git worktree or a cargo package; rargo needs to know what to sync", cwd.display()),
+                format!("`{}` is not inside a git worktree or a cargo package; rargo needs to know what to sync: run it inside the project, or name the project's manifest with --manifest-path", cwd.display()),
             ));
         };
         let Some(policy_dir) = rargo_proto::workspace::command_dir(&root, &cwd, &req.args) else {
