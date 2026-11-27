@@ -12,11 +12,13 @@ T0 = datetime(2026, 1, 5, 12, 0, tzinfo=timezone.utc)
 
 
 class Factory:
-    def __init__(self, tmp, uses_required=1, during=None):
+    def __init__(self, tmp, uses_required=1, during=None, use_gap_minutes=None):
         self.now = T0
         self.ledger = Ledger(tmp / "log.jsonl", clock=lambda: self.now)
         cfg = copy.deepcopy(CONFIG)
         cfg["release"] = {"freeze_every_days": 7, "uses_required": uses_required, "soak_minutes": 0}
+        if use_gap_minutes is not None:
+            cfg["release"]["use_gap_minutes"] = use_gap_minutes
         self("human", "config_applied", config=cfg)
         self.sessions, self.said, self.during, self.lost, self.exit = [], [], during, False, 0
         self.on_github = []
@@ -108,6 +110,32 @@ def test_a_new_build_is_used_but_not_before_the_gap(tmp_path):
     f.now += timedelta(hours=3)
     f.pu.step()
     assert f.sessions[-1] == (2, "0.7.11", 2, "b" * 40)
+
+
+def test_the_gap_is_the_configs_when_it_sets_one(tmp_path):
+    f = Factory(tmp_path, use_gap_minutes=15).candidate()
+    f.pu.step()
+    f("pm", "built", version="0.7.11", build=2, sha="b" * 40)
+    f.now += timedelta(minutes=5)
+    f.pu.step()
+    assert len(f.sessions) == 1
+    f.now += timedelta(minutes=15)
+    f.pu.step()
+    assert f.sessions[-1] == (2, "0.7.11", 2, "b" * 40)
+
+
+def test_a_failed_session_is_tried_again_after_the_gap_when_that_is_shorter(tmp_path):
+    f = Factory(tmp_path, use_gap_minutes=10).candidate()
+    f.exit = 1
+    f.pu.step()
+    assert f.ledger.world.uses[1].void
+    f.exit = 0
+    f.now += timedelta(minutes=5)
+    f.pu.step()
+    assert len(f.sessions) == 1
+    f.now += timedelta(minutes=10)
+    f.pu.step()
+    assert len(f.sessions) == 2
 
 
 def test_a_use_left_open_is_ended(tmp_path):
