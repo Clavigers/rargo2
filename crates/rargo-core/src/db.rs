@@ -303,7 +303,7 @@ impl redb::StorageBackend for SimFile {
 
 /// Memory that a reopened database finds as the failed one left it.
 #[derive(Clone, Debug, Default)]
-struct Memory(Arc<redb::backends::InMemoryBackend>);
+struct Memory(Arc<crate::io::db::Memory>);
 
 impl redb::StorageBackend for Memory {
     fn len(&self) -> std::io::Result<u64> {
