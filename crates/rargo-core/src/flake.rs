@@ -469,7 +469,7 @@ pub(crate) fn resolve_shell(
                 resolution.exists(&present);
             }
             Need::Evaluate => {
-                let at = crate::io::cpu(|| d.scratch("flake"))?;
+                let at = d.scratch("flake")?;
                 scratch = Some(at.clone());
                 let out = (|| -> Result<Vec<u8>> {
                     let dir = crate::io::cpu(|| -> Result<std::path::PathBuf> { Ok(match &src.root {
@@ -503,7 +503,8 @@ pub(crate) fn resolve_shell(
                 resolution.closed(run_nix(&at, c, uid, gid));
             }
             Need::Manifest(closure) => {
-                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), &d.nix_attached));
+                let attached = &d.nix_attached;
+                let prepared = crate::io::cpu(|| crate::nixmanifest::schedule(&tables, &disk, nix_store, &closure, hosts.as_ref(), attached));
                 let prepared = match prepared {
                     Ok(p) => p,
                     Err(e) => break Err(e),

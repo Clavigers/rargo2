@@ -152,11 +152,11 @@ fn check_in(d: &Arc<Daemon>, snapshot: &Arc<Snapshot>, who: &LastClient, scratch
         }
         (code, text)
     };
-    let before = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed);
+    let before = d.stats.verify_units.get();
     let started = time();
     let (code, mut text) = run(&["build"], "RARGO_VERIFY");
     let rargo_ran = (started, time());
-    let verified_units = d.stats.verify_units.load(std::sync::atomic::Ordering::Relaxed) - before;
+    let verified_units = d.stats.verify_units.get() - before;
     if code == 0 {
         let (_, tests) = run(&["test", "--no-fail-fast"], crate::build::VERIFY_TESTS);
         text.extend(tests.lines().filter(|l| l.starts_with("warning: verify: ") || l.starts_with("note: verify: ")).map(|l| format!("{l}\n")));
@@ -216,7 +216,7 @@ pub fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> I
             if running + waiting > 0 {
                 continue;
             }
-            let Some(who) = d.last_clients.lock().get(&worktree).cloned() else { continue };
+            let Some(who) = d.last_clients.borrow_mut().get(&worktree).cloned() else { continue };
             if who.checked == Some(snapshot.id) {
                 continue;
             }
@@ -225,8 +225,8 @@ pub fn background(d: Arc<Daemon>, interval: std::time::Duration, time: fn() -> I
                 Err(e) => format!("{}: drift check could not run: {e:#}\n", who.root),
             };
             eprint!("rargod: drift check: {text}");
-            *d.drift_report.lock() = Some(text);
-            if let Some(c) = d.last_clients.lock().get_mut(&worktree).filter(|c| c.at == who.at) {
+            *d.drift_report.borrow_mut() = Some(text);
+            if let Some(c) = d.last_clients.borrow_mut().get_mut(&worktree).filter(|c| c.at == who.at) {
                 c.checked = Some(snapshot.id);
             }
         }

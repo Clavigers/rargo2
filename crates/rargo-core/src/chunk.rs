@@ -1,5 +1,6 @@
 use crate::hash::Hash;
-use dashmap::DashMap;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use crate::io::file::File;
 use std::io;
@@ -20,20 +21,24 @@ pub struct ChunkRef {
 
 pub type Recipe = Vec<ChunkRef>;
 
+const GEAR: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut i = 0;
+    while i < t.len() {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        t[i] = z ^ (z >> 31);
+        i += 1;
+    }
+    t
+};
+
 fn gear() -> &'static [u64; 256] {
-    static T: std::sync::OnceLock<[u64; 256]> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let mut t = [0u64; 256];
-        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-        for v in t.iter_mut() {
-            x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = x;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            *v = z ^ (z >> 31);
-        }
-        t
-    })
+    static T: [u64; 256] = GEAR;
+    &T
 }
 
 fn cdc(data: &[u8], cuts: &mut Vec<usize>) {
@@ -208,39 +213,40 @@ pub fn chunk_file(file: &File) -> io::Result<Recipe> {
 
 #[derive(Default)]
 pub struct ChunkIndex {
-    at: DashMap<Hash, (Hash, u64, u32)>,
-    recipes: DashMap<Hash, Arc<Recipe>>,
+    at: RefCell<BTreeMap<Hash, (Hash, u64, u32)>>,
+    recipes: RefCell<BTreeMap<Hash, Arc<Recipe>>>,
 }
 
 impl ChunkIndex {
     pub fn add_blob(&self, blob: Hash, recipe: Arc<Recipe>) {
         let mut off = 0u64;
+        let mut at = self.at.borrow_mut();
         for c in recipe.iter() {
-            self.at.entry(c.hash).or_insert((blob, off, c.len));
+            at.entry(c.hash).or_insert((blob, off, c.len));
             off += c.len as u64;
         }
-        self.recipes.insert(blob, recipe);
-        assert!(self.recipes.contains_key(&blob));
+        self.recipes.borrow_mut().insert(blob, recipe);
+        assert!(self.recipes.borrow().contains_key(&blob));
     }
 
     pub fn recipe(&self, blob: &Hash) -> Option<Arc<Recipe>> {
-        self.recipes.get(blob).map(|r| r.clone())
+        self.recipes.borrow().get(blob).cloned()
     }
 
     pub fn has_chunk(&self, chunk: &Hash) -> bool {
-        self.at.contains_key(chunk)
+        self.at.borrow().contains_key(chunk)
     }
 
     pub fn locate(&self, chunk: &Hash) -> Option<(Hash, u64, u32)> {
-        self.at.get(chunk).map(|e| *e)
+        self.at.borrow().get(chunk).copied()
     }
 
     pub fn forget_chunk(&self, chunk: &Hash) {
-        self.at.remove(chunk);
+        self.at.borrow_mut().remove(chunk);
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.at.len()
+        self.at.borrow().len()
     }
 }
 
