@@ -39,26 +39,8 @@ if [ ! -x "$rel/rargod" ]; then
     cp "$S/build/release/rargod" "$S/build/release/rargo-sandbox" "$rel.tmp/"
     cp "$S/build/x86_64-unknown-linux-musl/release/rargo" "$rel.tmp/"
     strip "$rel.tmp/rargo"
-    planner=$S/planner
-    plan_src=$S/src/crates/rargo-plan
-    base=$(cat "$S/src/forks/cargo/BASE")
-    [ -d "$planner/.git" ] || git clone -q https://github.com/rust-lang/cargo.git "$planner" || fail "cannot clone cargo into $planner"
-    git -C "$planner" cat-file -e "$base^{commit}" 2>/dev/null || git -C "$planner" fetch -q origin || fail "cannot fetch cargo into $planner"
-    git -C "$planner" am --abort 2>/dev/null || true
-    git -C "$planner" checkout -q -f --detach "$base" || fail "cargo has no commit $base (forks/cargo/BASE at $want)"
-    git -C "$planner" clean -qfdx
-    git -C "$planner" -c user.name=rargo -c user.email=noreply@rargo.invalid am -q "$S/src/forks/cargo/"*.patch \
-        || fail "the patches in forks/cargo at $want do not apply to cargo $base"
-    grep -qF 'rargo-plan = { path = "/root/rargo/crates/rargo-plan" }' "$planner/Cargo.toml" \
-        || fail "the planner's Cargo.toml does not name rargo-plan as forks/cargo/0001 does, so it cannot be pointed at $plan_src"
-    sed -i "s|/root/rargo/crates/rargo-plan|$plan_src|" "$planner/Cargo.toml"
-    (cd "$planner" && CARGO_TARGET_DIR=$S/planner-build CFG_RELEASE_CHANNEL=stable cap cargo build --release --bin cargo) \
-        || fail "cannot build the planner against $plan_src at $want"
-    plan_version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$plan_src/Cargo.toml" | head -n 1)
-    used=$(cd "$planner" && cargo tree --offline -e normal -i rargo-plan --depth 0) || fail "cannot read which rargo-plan the planner was built against"
-    [ "$used" = "rargo-plan v$plan_version ($plan_src)" ] \
-        || fail "the planner was built against '$used', not rargo-plan v$plan_version ($plan_src) at $want"
-    cp "$S/planner-build/release/cargo" "$rel.tmp/planner-cargo"
+    planner=$(cap "$repo/deploy/planner.sh" "$S/src" "$S/planner" "$S/planner-build") || fail "cannot build the planner at $want"
+    cp "$planner" "$rel.tmp/planner-cargo"
     cp -R "$S/src/nix/default" "$rel.tmp/default-flake"
     mv "$rel.tmp" "$rel"
 fi
