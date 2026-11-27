@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use fusewire::abi::*;
 use fusewire::{Ctx, DirSink, Entry, Errno, Filesystem, Opened, Res, Session, SetAttr, TimeSet};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use crate::io::file::File;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -44,7 +44,7 @@ struct Dir {
     parent: u32,
     lower: Option<VPath>,
     traced: bool,
-    entries: HashMap<Box<[u8]>, Slot>,
+    entries: BTreeMap<Box<[u8]>, Slot>,
     dirty: bool,
     owner: Owner,
     lower_listed: bool,
@@ -257,7 +257,7 @@ fn initial_nodes(view: &dyn View, mountpoints: &[Vec<u8>]) -> Vec<Kind> {
         parent: 0,
         traced: view.traced(&root_path),
         lower: Some(root_path),
-        entries: HashMap::new(),
+        entries: BTreeMap::new(),
         dirty: false,
         owner: Owner { uid: 0, gid: 0, mode: 0o755 },
         lower_listed: false,
@@ -507,7 +507,7 @@ impl SandboxFs {
 }
 
 fn compact_obs(obs: Vec<(VPath, Obs)>) -> Vec<(VPath, Obs)> {
-    let mut implied: std::collections::HashSet<&[u8]> = Default::default();
+    let mut implied: std::collections::BTreeSet<&[u8]> = Default::default();
     for (p, o) in &obs {
         match o {
             Obs::Absent => {}
@@ -765,7 +765,7 @@ impl ActionFs {
                         parent,
                         lower: Some(path.clone()),
                         traced: child_traced,
-                        entries: HashMap::new(),
+                        entries: BTreeMap::new(),
                         dirty: false,
                         owner: *owner,
                         lower_listed: false,
@@ -932,7 +932,7 @@ impl ActionFs {
                 parent,
                 lower: None,
                 traced: false,
-                entries: HashMap::new(),
+                entries: BTreeMap::new(),
                 dirty: true,
                 owner: Owner::own(mode & 0o7777),
                 lower_listed: true,
