@@ -504,7 +504,7 @@ impl<'a> Visit<'a> for Scan<'_> {
             && let Some(ty) = &ty
         {
             match &i.trait_ {
-                Some((_, path, _)) if is_state_machine(path) && !self.testing() => {
+                Some((_, path, _)) if is_state_machine(path) => {
                     for item in &i.items {
                         let ImplItem::Fn(f) = item else { continue };
                         if f.sig.ident != "invariants" {

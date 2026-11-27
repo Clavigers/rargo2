@@ -134,9 +134,9 @@ fn a_state_machine_is_found_through_its_trait_and_without_assertions_or_tests_is
 }
 
 #[test]
-fn a_machine_whose_trait_impl_is_test_only_is_not_counted_yet() {
+fn a_machine_whose_trait_impl_is_test_only_is_counted() {
     let text = "pub struct S(u8);\nimpl S {\n    pub fn step(&mut self) { self.0 += 1; }\n}\n#[cfg(test)]\nimpl StateMachine for S {\n    fn invariants(&self) { assert!(self.0 < 9); }\n}";
-    assert!(of(Check::SelfCheck, &found("crates/a/src/lib.rs", text)).is_empty());
+    assert_eq!(of(Check::SelfCheck, &found("crates/a/src/lib.rs", text)), ["S::step changes the state and asserts nothing", "no test calls invariants() on S"]);
 }
 
 #[test]
