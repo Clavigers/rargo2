@@ -7,11 +7,7 @@ locks	crates/rargo-core/src/sandboxfs.rs	22	shares state between threads outside
 locks	crates/rargo-core/src/sched.rs	4	shares state between threads outside a shell or worker pool: parking_lot locks (4)
 locks	crates/rargo-core/src/snapshot.rs	6	shares state between threads outside a shell or worker pool
 locks	crates/rargo-core/src/store.rs	6	shares state between threads outside a shell or worker pool: atomics (2), std locks (2), parking_lot locks (2)
-locks	crates/rargo-core/src/tokens.rs	2	shares state between threads outside a shell or worker pool: parking_lot locks (2)
 locks	crates/rargo-core/src/view.rs	6	shares state between threads outside a shell or worker pool: dashmap (4), once cells (2)
-locks	crates/rargo-net/src/lib.rs	30	shares state between threads outside a shell or worker pool: atomics (12), parking_lot locks (12), once cells (6)
-locks	crates/rargo-net/src/link.rs	7	shares state between threads outside a shell or worker pool: std locks (9), atomics (2)
-locks	crates/rargo-proto/src/secure.rs	2	shares state between threads outside a shell or worker pool: atomics (2)
 locks	crates/rargo/src/outfs.rs	30	shares state between threads outside a shell or worker pool: std locks (16), atomics (12), once cells (2)
 locks	crates/rargo/src/tmp.rs	2	shares state between threads outside a shell or worker pool
 hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
@@ -22,7 +18,6 @@ hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the defaul
 hash-order	crates/rargo-core/src/sandboxfs.rs	5	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/serve.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/snapshot.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo-net/src/lib.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-proto/src/lib.rs	2	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/git.rs	4	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
