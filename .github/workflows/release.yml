@@ -27,6 +27,8 @@ jobs:
         run: dev/forks-test.sh
       - name: install.sh installs a release only once the build server runs it
         run: dev/release-local-test.sh
+      - name: The deploy brings the planner checkout up to a release's fork patches and builds it without changing it
+        run: dev/planner-test.sh
       - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: The default flake's toolchain has the standard library's sources, with and without a toolchain file
         run: dev/default-flake-check.sh
