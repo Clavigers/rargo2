@@ -18,9 +18,20 @@ class Factory:
         cfg = copy.deepcopy(CONFIG)
         cfg["release"] = {"freeze_every_days": 7, "uses_required": uses_required, "soak_minutes": 0}
         self("human", "config_applied", config=cfg)
-        self.sessions, self.said, self.during = [], [], during
-        self.pu = PowerUser(self.ledger, tmp / "use", "prompt", clock=lambda: self.now,
-                            settle=0, run=self.session, say=self.said.append)
+        self.sessions, self.said, self.during, self.lost = [], [], during, False
+        self.on_github = []
+        self.pu = PowerUser(self.ledger, self, tmp / "use", "prompt", clock=self.clock,
+                            poll=0, run=self.session, say=self.said.append)
+
+    def clock(self):
+        return self.now
+
+    def issues(self, since):  # GitHub, and the observer catching up as the power user waits
+        self.now += timedelta(minutes=1)
+        for i in self.on_github:
+            if i["number"] not in self.ledger.refresh().issues and not self.lost:
+                self("power_user", "filed", issue=i["number"], kind="bug")
+        return self.on_github
 
     def __call__(self, actor, event, **fields):
         self.now += timedelta(minutes=1)
@@ -66,6 +77,26 @@ def test_what_it_files_is_found_in_its_use(tmp_path):
     f.pu.step()
     assert f.ledger.world.issues[7].found == ("use", 1)
     assert "known_bugs" in f.ledger.world.hold_reasons("0.7.11")
+
+
+def test_the_use_stays_open_until_the_log_has_what_the_session_filed(tmp_path):
+    def files(f):
+        f.on_github.append({"number": 9, "body": "x\nFound in 0.7.11 build 1 (a), use session 1.\n"
+                                                 "<!-- factory-actor: power_user -->"})
+    f = Factory(tmp_path, during=files).candidate()
+    f.pu.step()
+    assert f.ledger.world.issues[9].found == ("use", 1)
+    assert "power user: use 1 filed [9]" in f.said
+
+
+def test_an_issue_the_log_never_gets_does_not_hold_the_use_open_for_ever(tmp_path):
+    def files(f):
+        f.lost = True
+        f.on_github.append({"number": 9, "body": "use session 1.\n<!-- factory-actor: power_user -->"})
+    f = Factory(tmp_path, during=files).candidate()
+    f.pu.clock = lambda: (setattr(f, "now", f.now + timedelta(minutes=5)), f.now)[1]
+    f.pu.step()
+    assert f.ledger.world.is_(M.USE, 1, "ended") and any("never got [9]" in s for s in f.said)
 
 
 def test_a_new_build_is_used_but_not_before_the_gap(tmp_path):
