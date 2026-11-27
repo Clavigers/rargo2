@@ -271,6 +271,19 @@ def test_merge_needs_green_and_approved_on_the_same_push():
         g("ci", "ci_done", pr=5, push=1, result="pass")
 
 
+def test_a_conflict_while_ci_is_pending_needs_work():
+    g = one_held()
+    g(C1, "push", issue=1, pr=5, push=1, sha=SHA)
+    with pytest.raises(Illegal, match="not green and approved"):
+        g("merger", "merge_failed", pr=5, push=1, reason="stale_base")  # only a conflict
+    g("merger", "merge_failed", pr=5, push=1, reason="conflict")  # GitHub runs no CI on it
+    w = g.w
+    assert w.is_(M.CI, "5/1", "void") and w.is_(M.REVIEW, "5/1/placeholder", "void")
+    assert w.needs_work(1)
+    with pytest.raises(Illegal, match="not green and approved"):
+        g("merger", "merge_failed", pr=5, push=1, reason="conflict")  # once
+
+
 def test_failed_ci_voids_the_review():
     g = one_held()
     g(C1, "push", issue=1, pr=5, push=1, sha=SHA)

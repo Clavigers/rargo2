@@ -1726,9 +1726,9 @@ impl Run {
                 break o;
             }
             let seed_layer = seed.as_ref().map(|s| {
-                let l = OutputsLayer::new();
+                let mut l = OutputState::default();
                 l.add_manifest(0, LEVEL_FULL, &s.manifest);
-                Arc::new(l)
+                Arc::new(OutputsLayer::frozen(l))
             });
             let outcome = self
                 .d
