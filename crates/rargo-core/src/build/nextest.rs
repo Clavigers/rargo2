@@ -757,8 +757,45 @@ fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer,
         (c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
         (c.cargo_home.clone(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned()),
     ]);
-    let out = back.text(&String::from_utf8_lossy(&kept.borrow_mut())).into_bytes();
+    let out = sandbox_package_ids(&back, &back.text(&String::from_utf8_lossy(&kept.borrow_mut()))).into_bytes();
     Ok((Answer { args, out, err: Vec::new(), code }, keep.into_inner()))
+}
+
+const PACKAGE_ID: &str = "\"package_id\":";
+
+/// The build's messages with each path package's ID as the sandbox names it.
+///
+/// The build prints those IDs for the client (#758), and nextest looks each
+/// one up in the metadata it was answered with, which names the packages by
+/// their sandbox paths. The path inside an ID follows `file://`, where the
+/// translation of plain paths does not reach.
+fn sandbox_package_ids(back: &Translator, out: &str) -> String {
+    let mut text = String::with_capacity(out.len());
+    let mut rest = out;
+    while let Some(at) = rest.find(PACKAGE_ID) {
+        let (before, value) = rest.split_at(at + PACKAGE_ID.len());
+        text.push_str(before);
+        let mut ids = serde_json::Deserializer::from_str(value).into_iter::<String>();
+        match ids.next() {
+            Some(Ok(id)) => {
+                text.push_str(&serde_json::Value::String(sandbox_package_id(back, &id)).to_string());
+                rest = &value[ids.byte_offset()..];
+            }
+            _ => rest = value,
+        }
+    }
+    text.push_str(rest);
+    text
+}
+
+fn sandbox_package_id(back: &Translator, id: &str) -> String {
+    let Some((url, fragment)) = id.rsplit_once('#') else { return id.to_string() };
+    let (name, version) = match fragment.split_once('@') {
+        Some((name, version)) => (name, version),
+        // Cargo leaves the name out when it is the last segment of the path.
+        None => (url.trim_end_matches('/').rsplit('/').next().unwrap_or_default(), fragment),
+    };
+    back.package_id(id, name, version)
 }
 
 
@@ -963,6 +1000,26 @@ mod tests {
     fn a_test_process_that_ran_names_its_server_cpu_and_wall_time_in_milliseconds() {
         let stats = crate::trace::Stats { wall_us: 2_345_678, cpu_us: 1_999, max_rss_kb: 7 };
         assert_eq!(ran_note("test app::a a", &stats), "test app::a a ran: 1 ms of CPU, 2345 ms on the server");
+    }
+
+    #[test]
+    fn the_build_s_path_package_ids_are_handed_to_nextest_as_the_sandbox_names_them() {
+        let back = Translator::new(vec![("/home/u/proj".into(), "/w".into())]);
+        let line = |id: &str| format!("{{\"reason\":\"compiler-artifact\",\"package_id\":\"{id}\",\"manifest_path\":\"/w/a/Cargo.toml\"}}\n");
+        for (client, sandbox) in [
+            ("path+file:///home/u/proj/a#0.1.0", "path+file:///w/a#0.1.0"),
+            ("path+file:///home/u/proj/a#other@0.1.0", "path+file:///w/a#other@0.1.0"),
+            // The root package: its name is the client directory's, not the sandbox's.
+            ("path+file:///home/u/proj#0.1.0", "path+file:///w#proj@0.1.0"),
+            ("path+file:///home/u/elsewhere/a#0.1.0", "path+file:///home/u/elsewhere/a#0.1.0"),
+            ("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0"),
+        ] {
+            assert_eq!(sandbox_package_ids(&back, &line(client)), line(sandbox), "{client}");
+        }
+        let two = format!("{}{}", line("path+file:///home/u/proj/a#0.1.0"), line("path+file:///home/u/proj/b#0.1.0"));
+        assert_eq!(sandbox_package_ids(&back, &two), format!("{}{}", line("path+file:///w/a#0.1.0"), line("path+file:///w/b#0.1.0")));
+        assert_eq!(sandbox_package_ids(&back, "{\"reason\":\"build-finished\",\"success\":true}\n"), "{\"reason\":\"build-finished\",\"success\":true}\n");
+        assert_eq!(sandbox_package_ids(&back, "\"package_id\":"), "\"package_id\":");
     }
 
     #[test]
