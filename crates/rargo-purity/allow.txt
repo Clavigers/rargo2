@@ -12,8 +12,6 @@ locks	crates/rargo/src/tmp.rs	2	shares state between threads outside a shell or 
 hash-order	crates/rargo-core/src/build.rs	25	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/remote.rs	17	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo-core/src/snapshot.rs	6	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
-hash-order	crates/rargo/src/daemon.rs	16	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 hash-order	crates/rargo/src/outfs.rs	11	HashMap or HashSet with the default random hasher, not yet a BTreeMap or a fixed-seed map
 self-check	crates/rargo-core/src/store_index.rs	15	15 step methods of StoreIndex assert nothing
-self-check	crates/rargo-core/src/worker_state.rs	8	8 step methods of Worker assert nothing
 self-check	crates/rargo-net/src/endpoint.rs	1	1 step method of EndpointState asserts nothing

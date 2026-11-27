@@ -13,7 +13,7 @@ use rargo_net::link::Link;
 use rargo_proto::{Blob, CONTROL, ClientMsg, Digest, LocalReply, LocalRequest, Offer, PROTO_VERSION, RunRequest, ServerMsg};
 use rayon::prelude::*;
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -65,8 +65,8 @@ struct WtState {
     policy_dir: PathBuf,
     loaded: Option<scan::Index>,
     last: Option<Arc<Snap>>,
-    watched: HashMap<PathBuf, i32>,
-    unwatched: HashSet<PathBuf>,
+    watched: BTreeMap<PathBuf, i32>,
+    unwatched: BTreeSet<PathBuf>,
     told_limit: bool,
     note: Option<String>,
 }
@@ -77,7 +77,7 @@ struct Worktree {
     wt_id: String,
     wt_cache: PathBuf,
     state: io::Mutex<WtState>,
-    events: RefCell<HashSet<PathBuf>>,
+    events: RefCell<BTreeSet<PathBuf>>,
     changed: io::Notify,
     running: io::Mutex<()>,
     last_used: Cell<Instant>,
@@ -91,7 +91,7 @@ pub struct Daemon {
     host: String,
     transport: String,
     mux: io::Mutex<Option<Rc<Mux>>>,
-    worktrees: RefCell<HashMap<PathBuf, Rc<Worktree>>>,
+    worktrees: RefCell<BTreeMap<PathBuf, Rc<Worktree>>>,
     // Keep mount creation from racing a checked copy to the same path.
     mounting: io::Mutex<()>,
     watcher: Option<Rc<Watcher>>,
@@ -102,8 +102,8 @@ pub struct Daemon {
     last_active: Cell<Instant>,
     pub counters: Counters,
     big_sync: io::Mutex<()>,
-    fetching: RefCell<HashMap<Digest, Rc<io::Mutex<()>>>>,
-    partials: RefCell<HashMap<Digest, (u64, Rc<Partial>)>>,
+    fetching: RefCell<BTreeMap<Digest, Rc<io::Mutex<()>>>>,
+    partials: RefCell<BTreeMap<Digest, (u64, Rc<Partial>)>>,
     next_partial: Cell<u64>,
     chunks: RefCell<crate::known::Chunks>,
     chunks_changed: Cell<bool>,
@@ -540,7 +540,7 @@ impl Daemon {
             host: crate::hostname(),
             transport: io::env::var("RARGO_TRANSPORT").unwrap_or_default(),
             mux: io::Mutex::new(None),
-            worktrees: RefCell::new(HashMap::new()),
+            worktrees: RefCell::new(BTreeMap::new()),
             mounting: io::Mutex::new(()),
             watcher,
             next_wt: Cell::new(1),
@@ -548,8 +548,8 @@ impl Daemon {
             last_active: Cell::new(io::now()),
             counters: Counters::default(),
             big_sync: io::Mutex::new(()),
-            fetching: RefCell::new(HashMap::new()),
-            partials: RefCell::new(HashMap::new()),
+            fetching: RefCell::new(BTreeMap::new()),
+            partials: RefCell::new(BTreeMap::new()),
             next_partial: Cell::new(0),
             chunks: RefCell::new(chunks),
             chunks_changed: Cell::new(false),
@@ -658,14 +658,14 @@ impl Daemon {
                 policy_dir: PathBuf::new(),
                 loaded: Some(loaded),
                 last: None,
-                watched: HashMap::new(),
-                unwatched: HashSet::new(),
+                watched: BTreeMap::new(),
+                unwatched: BTreeSet::new(),
                 told_limit: false,
                 note: None,
             }),
             wt_id,
             wt_cache,
-            events: RefCell::new(HashSet::new()),
+            events: RefCell::new(BTreeSet::new()),
             changed: io::Notify::new(),
             running: io::Mutex::new(()),
             last_used: Cell::new(io::now()),
@@ -787,8 +787,8 @@ impl Daemon {
     }
 
     fn watch(&self, w: &Watcher, wt: &Worktree, st: &mut WtState, snap: &Snap) {
-        let now: HashSet<&PathBuf> = snap.scan.dirs.iter().collect();
-        let mut unwatched = HashSet::new();
+        let now: BTreeSet<&PathBuf> = snap.scan.dirs.iter().collect();
+        let mut unwatched = BTreeSet::new();
         let mut added = Vec::new();
         let mut over_limit = 0usize;
         let mut failed = None;
@@ -870,7 +870,7 @@ impl Daemon {
         };
         add(&self.counters.offers, 1);
         if io::env::var_os("RARGO_DAEMON_TRACE").is_some() {
-            let new: HashSet<&Digest> = trees.iter().collect();
+            let new: BTreeSet<&Digest> = trees.iter().collect();
             let mut paths: Vec<String> = Vec::new();
             let mut todo: Vec<(String, Digest)> = vec![(String::new(), snap.scan.root)];
             while let Some((path, d)) = todo.pop() {
@@ -1195,7 +1195,7 @@ impl Daemon {
 
     fn fetch_chunks(self: &Rc<Self>, p: &Rc<Partial>, idx: Vec<u32>) -> Vec<u32> {
         let Ok(mux) = self.mux() else { return idx };
-        let mut left: HashSet<u32> = idx.iter().copied().collect();
+        let mut left: BTreeSet<u32> = idx.iter().copied().collect();
         let (tx, mut rx) = unbounded_channel();
         let hash = *p.hash();
         let id = mux.ask(&tx, |id| ClientMsg::Chunks { id, hash, idx });
