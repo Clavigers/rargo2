@@ -14,10 +14,12 @@ uses_required, with no backport waiting for a build. Then it
    finds them on GitHub by the session's line in their bodies), and records
    `use_ended`.
 
-Sessions are at least `gap` apart, so a week of small backports does not
-become a week of sessions. A session that did not exit cleanly (a crash, no
-quota, the time limit) ends its use as void: it is not a use of the build,
-and another is tried after `retry`. So is a use left open by a power user
+Sessions are at least the config's `release.use_gap_minutes` apart (three
+hours when it is not set), so a week of small backports does not become a
+week of sessions unless the config asks for that. A session that did not
+exit cleanly (a crash, no quota, the time limit) ends its use as void: it is
+not a use of the build, and another is tried after `retry`, or after the gap
+when that is shorter. So is a use left open by a power user
 that stopped, which the next one ends. It writes no code and touches no pull
 request.
 """
@@ -40,11 +42,13 @@ from .ledger import Alarm, Ledger, Refused, utc_now
 from .model import Role
 from .watchdog import BIN
 
+GAP = timedelta(hours=3)  # between sessions, when the config's release.use_gap_minutes is not set
+
 
 class PowerUser:
     def __init__(self, ledger: Ledger, gh, checkout: Path, prompt: str,
                  clock: Callable[[], datetime] = utc_now,
-                 gap: timedelta = timedelta(hours=3), retry: timedelta = timedelta(minutes=30),
+                 gap: timedelta | None = None, retry: timedelta = timedelta(minutes=30),
                  timeout: timedelta = timedelta(minutes=90),
                  settle: timedelta = timedelta(minutes=20), poll: float = 20.0,
                  run: Callable[..., int] | None = None,
@@ -71,8 +75,12 @@ class PowerUser:
         if w.config is None:
             return None
         mine = {n: u for n, u in w.uses.items() if u.by == Role.power_user}
+        gap = self.gap  # set only by a test; the config's otherwise
+        if gap is None:
+            minutes = w.config.release.use_gap_minutes
+            gap = GAP if minutes is None else timedelta(minutes=minutes)
         last = max(mine, default=None)  # after a session that failed, try again sooner
-        if last and self.clock() - w.since(M.USE, last) < (self.retry if mine[last].void else self.gap):
+        if last and self.clock() - w.since(M.USE, last) < (min(self.retry, gap) if mine[last].void else gap):
             return None
         for version, v in w.versions.items():
             build = len(v.builds)

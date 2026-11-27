@@ -175,6 +175,8 @@ class ReleaseRules(Strict):
     freeze_every_days: Annotated[int, Field(ge=1)]
     uses_required: Annotated[int, Field(ge=0)]
     soak_minutes: Annotated[int, Field(ge=0)]
+    # Power user sessions start at least this far apart. None: 180.
+    use_gap_minutes: Annotated[int, Field(ge=0)] | None = None
     # The model the power user's sessions run on, in Claude Code. None: the
     # Claude Code agents' model.
     use_model: Model | None = None
