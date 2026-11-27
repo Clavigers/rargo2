@@ -178,7 +178,13 @@ def release(lines: list[dict]) -> dict:
     cand = frozen[-1]["version"] if frozen and (not pub or frozen[-1]["version"] != pub[-1]["version"]) else None
     built = [l for l in lines if l["event"] == "built" and l["version"] == cand]
     held = [l for l in lines if l["event"] == "release_held" and l["version"] == cand]
-    return dict(latest=pub[-1]["version"] if pub else None, latest_t=pub[-1]["t"] if pub else None,
+    started = {l["use"]: l for l in lines if l["event"] == "use_started" and l["actor"] == "power_user"}
+    ended = {l["use"] for l in lines if l["event"] == "use_ended" and l["actor"] == "power_user"}
+    found = sum(1 for l in lines if l["event"] == "filed" and l["actor"] == "power_user")
+    return dict(using=next((dict(use=n, version=u["version"], build=u["build"], t=u["t"])
+                            for n, u in started.items() if n not in ended), None),
+                uses=len(ended), found=found,
+                latest=pub[-1]["version"] if pub else None, latest_t=pub[-1]["t"] if pub else None,
                 candidate=cand, build=built[-1]["build"] if built else None,
                 held=sorted(held[-1]["reasons"]) if held and built and held[-1]["build"] == built[-1]["build"] else [],
                 backports=sum(1 for l in lines if l["event"] == "backported" and l["version"] == cand),
