@@ -225,7 +225,7 @@ fn main() -> Result<()> {
             Ok(drive) => drive.detach(),
             Err(err) => stop(&session, Err(err.into())),
         }
-        io::background(move || evict_loop(evicting));
+        io::spawn(move || evict_loop(evicting));
         if let Some((addr, key)) = worker_link {
             match rargo_core::remote::Pool::listen(&daemon.engine, addr, key, &mut rargo_core::rng::Rng::new(pool_seed)) {
                 Ok(pool) => {
@@ -426,24 +426,21 @@ fn evict_loop((d, budget, cold_after): (Arc<Daemon>, u64, u64)) {
     let mut tick = 0u64;
     loop {
         io::sleep(std::time::Duration::from_secs(20));
-        let d = d.clone();
-        io::cpu(move || {
-            let store = &d.engine.store;
-            if tick % 6 == 5 {
-                let (n, bytes) = d.collect_garbage(600);
-                if n > 0 {
-                    eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
-                }
+        if tick % 6 == 5 {
+            let (n, bytes) = d.collect_garbage(600);
+            if n > 0 {
+                eprintln!("rargod: collected {n} unreferenced blobs, {} MiB", bytes >> 20);
             }
+        }
+        let (store, fs) = (d.engine.store.clone(), d.engine.fs.clone());
+        io::cpu(move || {
             if cold_after > 0 && (tick % 6 == 2 || cold_after < 120) {
-                let fs = d.engine.fs.clone();
                 let (n, freed) = store.freeze_idle(cold_after, &|h| fs.forget_backing(h));
                 if n > 0 {
                     eprintln!("rargod: {n} blobs went cold, {} MiB freed", freed >> 20);
                 }
             }
             if store.total_bytes() > budget {
-                let fs = d.engine.fs.clone();
                 let freed = store.evict(budget / 10 * 9, 600, &|_| false, &|h| fs.forget_backing(h));
                 if freed > 0 {
                     eprintln!("rargod: evicted {} MiB (store now {} MiB)", freed >> 20, store.total_bytes() >> 20);

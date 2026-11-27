@@ -1,5 +1,6 @@
 use crate::hash::Hash;
-use dashmap::DashMap;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use crate::io::file::File;
 use std::io;
@@ -208,39 +209,40 @@ pub fn chunk_file(file: &File) -> io::Result<Recipe> {
 
 #[derive(Default)]
 pub struct ChunkIndex {
-    at: DashMap<Hash, (Hash, u64, u32)>,
-    recipes: DashMap<Hash, Arc<Recipe>>,
+    at: RefCell<BTreeMap<Hash, (Hash, u64, u32)>>,
+    recipes: RefCell<BTreeMap<Hash, Arc<Recipe>>>,
 }
 
 impl ChunkIndex {
     pub fn add_blob(&self, blob: Hash, recipe: Arc<Recipe>) {
         let mut off = 0u64;
+        let mut at = self.at.borrow_mut();
         for c in recipe.iter() {
-            self.at.entry(c.hash).or_insert((blob, off, c.len));
+            at.entry(c.hash).or_insert((blob, off, c.len));
             off += c.len as u64;
         }
-        self.recipes.insert(blob, recipe);
-        assert!(self.recipes.contains_key(&blob));
+        self.recipes.borrow_mut().insert(blob, recipe);
+        assert!(self.recipes.borrow().contains_key(&blob));
     }
 
     pub fn recipe(&self, blob: &Hash) -> Option<Arc<Recipe>> {
-        self.recipes.get(blob).map(|r| r.clone())
+        self.recipes.borrow().get(blob).cloned()
     }
 
     pub fn has_chunk(&self, chunk: &Hash) -> bool {
-        self.at.contains_key(chunk)
+        self.at.borrow().contains_key(chunk)
     }
 
     pub fn locate(&self, chunk: &Hash) -> Option<(Hash, u64, u32)> {
-        self.at.get(chunk).map(|e| *e)
+        self.at.borrow().get(chunk).copied()
     }
 
     pub fn forget_chunk(&self, chunk: &Hash) {
-        self.at.remove(chunk);
+        self.at.borrow_mut().remove(chunk);
     }
 
     pub fn chunk_count(&self) -> usize {
-        self.at.len()
+        self.at.borrow().len()
     }
 }
 

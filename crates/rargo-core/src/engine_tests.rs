@@ -36,7 +36,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -498,7 +497,7 @@ impl Fx {
     }
 
     fn runs(&self) -> u64 {
-        self.engine.stats.runs.load(Ordering::Relaxed)
+        self.engine.stats.runs.get()
     }
 }
 
@@ -657,8 +656,8 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
         assert_eq!(fx.text(&first.result.stdout), "first\n");
         assert_eq!(fx.text(&second.result.stdout), "second\n", "the waiter must not accept a result for other inputs");
         assert_eq!(fx.runs(), 2);
-        assert_eq!(fx.engine.stats.joined.load(Ordering::Relaxed), 1);
-        assert_eq!(fx.engine.stats.joined_then_ran.load(Ordering::Relaxed), 1);
+        assert_eq!(fx.engine.stats.joined.get(), 1);
+        assert_eq!(fx.engine.stats.joined_then_ran.get(), 1);
 
         file::write(fx.work.join("in.txt"), "third\n").unwrap();
         file::write(other.join("in.txt"), "fourth\n").unwrap();
@@ -673,7 +672,7 @@ fn waiter_runs_its_own_when_the_trace_does_not_hold() {
         assert_eq!(fx.text(&a.result.stdout), "third\n");
         assert_eq!(fx.text(&b.result.stdout), "fourth\n");
         assert_eq!(fx.runs(), 4);
-        assert_eq!(fx.engine.stats.joined.load(Ordering::Relaxed), 1, "different predictions, no waiting");
+        assert_eq!(fx.engine.stats.joined.get(), 1, "different predictions, no waiting");
     });
 }
 
@@ -685,7 +684,7 @@ fn declared_environment_variables_become_part_of_the_key() {
         let a = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).unwrap();
         assert_eq!(fx.text(&a.result.stdout), "value=bar\n");
         assert_eq!(fx.runs(), 2);
-        assert_eq!(fx.engine.stats.env_reruns.load(Ordering::Relaxed), 1);
+        assert_eq!(fx.engine.stats.env_reruns.get(), 1);
         let b = fx.engine.obtain(fx.req(script, &[], &[("FOO", "bar")], &["FOO"])).unwrap();
         assert!(b.cached);
         assert_eq!(fx.text(&b.result.stdout), "value=bar\n");
@@ -795,7 +794,7 @@ fn a_hung_action_is_stopped_and_its_waiters_fail_with_it() {
         let waited = io::now().saturating_duration_since(started);
         assert!(waited >= Duration::from_secs(1) && waited < Duration::from_secs(2), "stopped at the timeout: {waited:?}");
         assert_eq!(fx.runs(), 1, "three identical requests, one run, and no rerun by the waiters");
-        assert_eq!(fx.engine.stats.joined.load(Ordering::Relaxed), 2);
+        assert_eq!(fx.engine.stats.joined.get(), 2);
         let ok = fx.engine.obtain(fx.req("echo fine", &[], &[], &[])).unwrap();
         assert_eq!(fx.text(&ok.result.stdout), "fine\n");
         io::yield_now();
