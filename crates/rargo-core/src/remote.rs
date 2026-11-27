@@ -247,7 +247,7 @@ impl BlobSource for StoreSource {
 
 pub struct Blobs {
     pub store: Arc<Store>,
-    pub index: ChunkIndex,
+    pub index: RefCell<ChunkIndex>,
     source: Arc<dyn BlobSource>,
     pub fetched_bytes: Cell<u64>,
     pub reused_bytes: Cell<u64>,
@@ -293,7 +293,7 @@ impl Blobs {
         let source = source.unwrap_or_else(|| Arc::new(StoreSource(store.clone())));
         Blobs {
             store,
-            index: ChunkIndex::default(),
+            index: RefCell::new(ChunkIndex::default()),
             source,
             fetched_bytes: Cell::new(0),
             reused_bytes: Cell::new(0),
@@ -316,12 +316,13 @@ impl Blobs {
     }
 
     pub fn recipe(&self, h: &Hash) -> Option<Arc<Recipe>> {
-        if let Some(r) = self.index.recipe(h) {
+        let known = self.index.borrow().recipe(h);
+        if let Some(r) = known {
             return Some(r);
         }
         let (source, blob) = (self.source.clone(), *h);
         let r = Arc::new(crate::io::cpu(move || chunk::chunk_file(&source.open(&blob).ok()?).ok())?);
-        self.index.add_blob(*h, r.clone());
+        self.index.borrow_mut().step(chunk::Event::AddBlob { blob: *h, recipe: r.clone() });
         Some(r)
     }
 
@@ -347,12 +348,12 @@ impl Blobs {
     }
 
     fn local_chunk(&self, c: &ChunkRef) -> Option<Vec<u8>> {
-        let (blob, off, len) = self.index.locate(&c.hash)?;
+        let (blob, off, len) = self.index.borrow().locate(&c.hash)?;
         let f = self.source.open(&blob).ok()?;
         match chunk::read_chunk(&f, off, len) {
             Ok(b) if Hash::of(&b) == c.hash => Some(b),
             _ => {
-                self.index.forget_chunk(&c.hash);
+                self.index.borrow_mut().step(chunk::Event::Forget(c.hash));
                 None
             }
         }
@@ -417,7 +418,7 @@ impl Blobs {
         }
         self.store.install_hashed(&tmp, got, size)?;
         assert!(self.store.has(h));
-        self.index.add_blob(*h, Arc::new(recipe.clone()));
+        self.index.borrow_mut().step(chunk::Event::AddBlob { blob: *h, recipe: Arc::new(recipe.clone()) });
         self.fetched_blobs.set(self.fetched_blobs.get() + 1);
         Ok(())
     }
