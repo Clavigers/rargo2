@@ -13,3 +13,7 @@ rargo-proto = { path = "../rargo-proto" }
 rargo-net = { path = "../rargo-net" }
 serde.workspace = true
 rargo-plan = { path = "../rargo-plan" }
+
+[dev-dependencies]
+# Speed up Snow's X25519 public-key derivation in simulator tests.
+curve25519-dalek = { version = "4.1.3", default-features = false, features = ["precomputed-tables"] }
