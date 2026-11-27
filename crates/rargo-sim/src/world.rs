@@ -1644,7 +1644,8 @@ impl World {
             return Ok(());
         }
         match c.watch.tick(Duration::from_millis(now)) {
-            Tick::Wait => {}
+            // The world never restarts its server, so a fresh dial would tell the client nothing new.
+            Tick::Wait | Tick::Probe => {}
             Tick::Ping(_) => self.send(Node::Client(client), Node::Server, Msg::Up(Up::Ping)),
             Tick::Silent(_) if bug == Some(Bug::DeafToSilence) => {}
             Tick::Silent(quiet) => {

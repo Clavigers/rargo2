@@ -1,7 +1,7 @@
 #[cfg(test)]
 use rargo_machine::StateMachine;
 use rargo_net::io::{self, UnboundedReceiver, UnboundedSender, unbounded_channel};
-use rargo::link_watch::{self, Tick, Watch};
+use rargo::link_watch::{self, Silence, Tick, Watch};
 use rargo_net::link::Link;
 use rargo_proto::{CONTROL, ClientMsg, Digest, Frame, Reorder, ServerMsg};
 use std::collections::BTreeMap;
@@ -148,6 +148,9 @@ enum DeadWait {
     Tick,
 }
 
+/// Dials the server afresh and says whether it answered: how a silent link tells a restarted server from a gone one.
+pub type Probe = Rc<dyn Fn() -> bool>;
+
 pub struct Mux {
     link: Rc<Link>,
     out: RefCell<Out>,
@@ -161,7 +164,9 @@ pub struct Mux {
 }
 
 impl Mux {
-    pub fn new(link: Link) -> Rc<Mux> {
+    /// A link over UDP that goes quiet is probed with `probe`; over TCP a quiet link may just be queued behind its data.
+    pub fn new(link: Link, probe: Option<Probe>) -> Rc<Mux> {
+        let probe = probe.filter(|_| link.kind() == "udp");
         let link = Rc::new(link);
         let (tx, mut rx) = unbounded_channel::<(Vec<u8>, usize)>();
         let (urgent, mut urgent_rx) = unbounded_channel::<Vec<u8>>();
@@ -243,6 +248,18 @@ impl Mux {
                 };
                 match tick {
                     Tick::Wait => {}
+                    Tick::Probe => {
+                        if let Some(probe) = probe.clone() {
+                            let p = m.clone();
+                            io::spawn(move || {
+                                let answered = probe();
+                                let now = io::now().saturating_duration_since(p.started);
+                                if p.watch.borrow_mut().probed(now, answered).is_some() {
+                                    p.die();
+                                }
+                            });
+                        }
+                    }
                     Tick::Ping(n) => {
                         let ping = rargo_proto::encode(&Frame { stream: rargo_proto::KEEPALIVE, seq: 0, msg: ClientMsg::Ping(n) });
                         let urgent = m.out.borrow().urgent.clone();
@@ -262,8 +279,8 @@ impl Mux {
         self.link.kind()
     }
 
-    /// How long the server had been silent when this link gave up on it, if that is why it closed.
-    pub fn silent(&self) -> Option<Duration> {
+    /// Why this link gave up on its server, and after how long a silence, if that is why it closed.
+    pub fn silent(&self) -> Option<Silence> {
         self.watch.borrow().silent()
     }
 
