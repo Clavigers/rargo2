@@ -558,12 +558,22 @@ fn main() {
 }
 
 fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, String)> {
-    let mut pending = vec![manifest.to_owned()];
+    let (entry_dir, entry_table) = read_dependency_manifest(manifest)?;
+    let selected_workspace = dependency_workspace(root, &entry_dir, &entry_table)
+        .filter(|(dir, table)| !workspace_excludes(dir, table, &entry_dir));
+    let mut pending = vec![(manifest.to_owned(), true)];
+    if let Some((dir, table)) = &selected_workspace {
+        pending.push((dir.join("Cargo.toml"), true));
+        pending.extend(workspace_patterns(table, "members")
+            .flat_map(|pattern| workspace_member_paths(dir, pattern))
+            .filter(|member| !workspace_excludes(dir, table, member))
+            .map(|member| (member.join("Cargo.toml"), true)));
+    }
     let mut seen = std::collections::BTreeSet::new();
     let mut entry = true;
-    while let Some(manifest) = pending.pop() {
+    while let Some((manifest, member)) = pending.pop() {
         let Some((dir, table)) = read_dependency_manifest(&manifest) else { continue };
-        if !dir.starts_with(root) || !seen.insert(dir.clone()) {
+        if !dir.starts_with(root) || !seen.insert((dir.clone(), member)) {
             continue;
         }
 
@@ -576,7 +586,9 @@ fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, Stri
         let dependencies = std::iter::once(&table).chain(targets)
             .flat_map(|section| {
                 ["dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies"]
-                    .into_iter().filter_map(|kind| section.get(kind)?.as_table())
+                    .into_iter()
+                    .filter(|kind| member || !matches!(*kind, "dev-dependencies" | "dev_dependencies"))
+                    .filter_map(|kind| section.get(kind)?.as_table())
             })
             .flatten()
             .filter_map(|(name, dependency)| {
@@ -586,39 +598,39 @@ fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, Stri
                     Some((&dir, name, dependency))
                 }
             });
-        let (patch_dir, patch_table) = workspace.as_ref().map_or((&dir, &table), |(dir, table)| (dir, table));
+        let (patch_dir, patch_table) = selected_workspace.as_ref().map_or((&entry_dir, &entry_table), |(dir, table)| (dir, table));
         // Cargo applies patches from the selected workspace, regardless of
         // which manifests in the dependency graph declare their own patches.
         let patches = entry.then(|| patch_table.get("patch")?.as_table()).flatten().into_iter()
             .flat_map(|sources| sources.values().filter_map(toml::Value::as_table))
             .flatten()
-            .map(|(name, dependency)| (patch_dir, name, dependency));
-        if entry {
-            if let Some(workspace) = patch_table.get("workspace") {
-                let patterns = |key| {
-                    workspace.get(key).and_then(toml::Value::as_array).into_iter()
-                        .flatten().filter_map(toml::Value::as_str)
-                };
-                let excluded: Vec<_> = patterns("exclude").collect();
-                for member in patterns("members").flat_map(|pattern| workspace_member_paths(patch_dir, pattern)) {
-                    let relative = member.strip_prefix(patch_dir).unwrap_or(&member);
-                    if !excluded.iter().any(|pattern| git::ignore::wildmatch(pattern.as_bytes(), relative.as_os_str().as_bytes(), true)) {
-                        pending.push(member.join("Cargo.toml"));
-                    }
-                }
-            }
-            entry = false;
-        }
-        for (base, name, dependency) in dependencies.chain(patches) {
+            .map(|(name, dependency)| ((patch_dir, name, dependency), false));
+        entry = false;
+        for ((base, name, dependency), from_member) in dependencies.map(|dependency| (dependency, member)).chain(patches) {
             let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else { continue };
             let Ok(resolved) = io::file::canonicalize(base.join(path)) else { continue };
             if !resolved.starts_with(root) {
                 return Some((name.clone(), path.to_owned()));
             }
-            pending.push(resolved.join("Cargo.toml"));
+            // Implicit membership only follows path dependencies of members.
+            let member = from_member && selected_workspace.as_ref().is_some_and(|(dir, table)| {
+                resolved.starts_with(dir) && !workspace_excludes(dir, table, &resolved)
+            });
+            pending.push((resolved.join("Cargo.toml"), member));
         }
     }
     None
+}
+
+fn workspace_patterns<'a>(table: &'a toml::Table, key: &str) -> impl Iterator<Item = &'a str> {
+    table.get("workspace").and_then(|workspace| workspace.get(key))
+        .and_then(toml::Value::as_array).into_iter().flatten().filter_map(toml::Value::as_str)
+}
+
+fn workspace_excludes(dir: &Path, table: &toml::Table, candidate: &Path) -> bool {
+    // Cargo treats exclusions as path prefixes, with literal member paths taking precedence.
+    workspace_patterns(table, "exclude").any(|path| candidate.starts_with(dir.join(path)))
+        && !workspace_patterns(table, "members").any(|path| candidate.starts_with(dir.join(path)))
 }
 
 // Expand member globs by reading only the directories at the wildcard positions.
@@ -982,6 +994,44 @@ mod tests {
             assert_eq!(outside_path_dependency(&root, &manifest), external("../../dep"));
             io::file::write(&inner_manifest, "[dependencies]\napp = { path = '..' }\nserde = '1'").unwrap();
             assert_eq!(outside_path_dependency(&root, &manifest), None);
+        });
+    }
+
+    #[test]
+    fn only_workspace_members_have_their_dev_paths_checked() {
+        io::sim::test(|| {
+            let temp = io::sim::tempdir();
+            let root = temp.join("app");
+            let vendor = root.join("vendor/foo");
+            io::file::create_dir_all(&vendor).unwrap();
+            io::file::create_dir(temp.join("testutil")).unwrap();
+            let manifest = root.join("Cargo.toml");
+            let vendor_manifest = vendor.join("Cargo.toml");
+            let deps = "[dependencies]\nfoo = { path = 'vendor/foo' }";
+            let excluded = format!("{deps}\n[workspace]\nexclude = ['vendor']");
+            for section in ["dev-dependencies", "target.'cfg(unix)'.dev_dependencies"] {
+                io::file::write(&vendor_manifest, format!("[{section}]\ntestutil = {{ path = '../../../testutil' }}")).unwrap();
+                for app in [deps, &excluded] {
+                    io::file::write(&manifest, app).unwrap();
+                    assert_eq!(outside_path_dependency(&root, &manifest), None);
+                }
+
+                let external = Some(("testutil".into(), "../../../testutil".into()));
+                for app in [
+                    format!("{deps}\n[workspace]"),
+                    "[workspace]\nmembers = ['vendor/*']".to_owned(),
+                ] {
+                    io::file::write(&manifest, app).unwrap();
+                    assert_eq!(outside_path_dependency(&root, &manifest), external);
+                }
+            }
+
+            io::file::write(&manifest, excluded).unwrap();
+            io::file::write(&vendor_manifest, "[build-dependencies]\ntestutil = { path = '../../../testutil' }").unwrap();
+            assert_eq!(
+                outside_path_dependency(&root, &manifest),
+                Some(("testutil".into(), "../../../testutil".into())),
+            );
         });
     }
 
