@@ -17,8 +17,6 @@ jobs:
       RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
-      # rargo can fetch the runtime closure for the test binaries through Nix.
-      - uses: cachix/install-nix-action@bb0495a1086c46893eee56f32fd192dfe4a15bb9
       - name: rargo, signed in to rargo.rs
         env:
           RARGO_TOKEN: ${{ secrets.RARGO_TOKEN }}
