@@ -16,6 +16,10 @@ pub(super) fn run(world: &Real, raw: &[OsString]) {
         Ok(None) => passthrough(raw),
         Err(why) => fallback(raw, &why),
     };
+    if let Some(error) = cli::unsupported_toolchain(world, None) {
+        drop(request);
+        die(&error);
+    }
     let files = match try_remote(world, &request) {
         Ok(files) => files,
         Err(why) => {

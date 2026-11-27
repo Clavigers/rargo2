@@ -125,6 +125,12 @@ fn die(msg: impl std::fmt::Display) -> Plan {
     Plan::Fail { text: format!("error: {msg}"), code: 101 }
 }
 
+pub fn unsupported_toolchain(w: &impl World, prefix: Option<&str>) -> Option<String> {
+    let source = prefix.filter(|arg| arg.starts_with('+')).map(|arg| format!("`{arg}`"))
+        .or_else(|| var(w, "RUSTUP_TOOLCHAIN").map(|_| "`RUSTUP_TOOLCHAIN`".into()))?;
+    Some(format!("rargo cannot use {source} for remote builds. Select Rust with `rust-toolchain.toml` when using the default flake, or in your project's `flake.nix`."))
+}
+
 pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
     if w.vars().iter().any(|(k, _)| k == "RARGO_BYPASS") {
         return Plan::Cargo { release: false, banner: None };
@@ -183,16 +189,20 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
             None => die("usage: rargo --rargo-daemon SOCKET"),
         };
     }
-    let (args, mut vars, kind) = match route(raw, w.vars().to_vec(), token_command) {
+    let (args, kind) = match route(raw, token_command) {
         Route::Local { release } => return Plan::Cargo { release, banner },
         Route::Usage(text) => return Plan::Fail { text, code: 2 },
-        Route::Remote { args, vars, kind } => (args, vars, kind),
+        Route::Remote { args, kind } => (args, kind),
     };
-    if kind == "build"
-        && let Err(e) = find_manifest(w, &args)
-    {
-        return die(e);
+    if kind == "build" {
+        if let Err(e) = find_manifest(w, &args) {
+            return die(e);
+        }
+        if let Some(error) = unsupported_toolchain(w, first.and_then(OsStr::to_str)) {
+            return die(error);
+        }
     }
+    let mut vars = w.vars().to_vec();
     if subcommand(&args) == Some("nextest")
         && !vars.iter().any(|(k, _)| k == "RARGO_NEXTEST_VERSION")
         && let Some(v) = w.nextest_version()
@@ -373,17 +383,15 @@ pub fn removed(host: &str, revoked: Result<bool, String>) -> (String, Option<Str
 enum Route {
     Local { release: bool },
     Usage(String),
-    Remote { args: Vec<String>, vars: Vec<(String, String)>, kind: &'static str },
+    Remote { args: Vec<String>, kind: &'static str },
 }
 
-fn route(raw: &[OsString], mut vars: Vec<(String, String)>, token_command: bool) -> Route {
+fn route(raw: &[OsString], token_command: bool) -> Route {
     let Ok(mut args) = raw.iter().map(|a| a.clone().into_string()).collect::<Result<Vec<_>, _>>() else {
         return Route::Local { release: false };
     };
-    if let Some(tc) = args.first().and_then(|a| a.strip_prefix('+')).map(str::to_owned) {
+    if args.first().is_some_and(|arg| arg.starts_with('+')) {
         args.remove(0);
-        vars.retain(|(k, _)| k != "RUSTUP_TOOLCHAIN");
-        vars.push(("RUSTUP_TOOLCHAIN".into(), tc));
     }
     let admin = match args.first().map(|s| s.as_str()) {
         Some("auth") if token_command => Some("__token"),
@@ -455,7 +463,7 @@ fn route(raw: &[OsString], mut vars: Vec<(String, String)>, token_command: bool)
     } else {
         "build"
     };
-    Route::Remote { args, vars, kind }
+    Route::Remote { args, kind }
 }
 
 pub fn subcommand(args: &[String]) -> Option<&str> {
@@ -698,8 +706,14 @@ mod tests {
                 None,
                 vec!["+nightly", "check", "--", "-h"],
                 fake(&[("RUSTUP_TOOLCHAIN", "stable"), ("RUSTFLAGS", "-W")]),
-                remote(&["check", "--", "-h"], &[("RUSTFLAGS", "-W"), ("RUSTUP_TOOLCHAIN", "nightly")], "build"),
+                fail("rargo cannot use `+nightly` for remote builds. Select Rust with `rust-toolchain.toml` when using the default flake, or in your project's `flake.nix`."),
             ),
+            (None, vec!["+nosuchtoolchain", "run"], fake(&[]), fail("rargo cannot use `+nosuchtoolchain` for remote builds. Select Rust with `rust-toolchain.toml` when using the default flake, or in your project's `flake.nix`.")),
+            (None, vec!["run"], fake(&[("RUSTUP_TOOLCHAIN", "1.70.0")]), fail("rargo cannot use `RUSTUP_TOOLCHAIN` for remote builds. Select Rust with `rust-toolchain.toml` when using the default flake, or in your project's `flake.nix`.")),
+            (None, vec!["check"], fake(&[("RUSTUP_TOOLCHAIN", "")]), remote(&["check"], &[("RUSTUP_TOOLCHAIN", "")], "build")),
+            (None, vec!["run", "--", "+nightly"], fake(&[]), remote(&["run", "--", "+nightly"], &[], "build")),
+            (None, vec!["+nightly", "metadata"], fake(&[("RUSTUP_TOOLCHAIN", "stable")]), cargo.clone()),
+            (None, vec!["+nightly", "check"], fake(&[("RARGO_BYPASS", "1")]), cargo.clone()),
             (None, vec!["build"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["--rargo-gc"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["build"], fake(&[("RARGO_FALLBACK", "cargo")]).no_creds(), Plan::Cargo { release: false, banner: None }),
