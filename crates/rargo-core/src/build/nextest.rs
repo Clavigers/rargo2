@@ -757,7 +757,8 @@ fn build(d: &Arc<Daemon>, c: &Arc<Client>, args: Vec<String>) -> Result<(Answer,
         (c.root.clone(), String::from_utf8_lossy(WORKTREE_AT).into_owned()),
         (c.cargo_home.clone(), String::from_utf8_lossy(CARGO_HOME_AT).into_owned()),
     ]);
-    let out = sandbox_package_ids(&back, &back.text(&String::from_utf8_lossy(&kept.borrow_mut()))).into_bytes();
+    let out = sandbox_package_ids(&back, &back.text(&String::from_utf8_lossy(&kept.borrow_mut())));
+    let out = settled_messages(&out).into_bytes();
     Ok((Answer { args, out, err: Vec::new(), code }, keep.into_inner()))
 }
 
@@ -798,6 +799,34 @@ fn sandbox_package_id(back: &Translator, id: &str) -> String {
     back.package_id(id, name, version)
 }
 
+const FINISHED: &str = "{\"reason\":\"build-finished\"";
+const FRESH: &str = ",\"fresh\":true}";
+const NOT_FRESH: &str = ",\"fresh\":false}";
+
+/// The build's messages as nextest is handed them: the same bytes for the
+/// same build, whatever order its units finished in and whichever of them
+/// came from the cache. Nextest reads the answer as a file of its sandbox, so
+/// a run of nextest is replayed only while these bytes stay the same.
+///
+/// Nextest takes the test binaries from the messages and reads neither their
+/// order nor `fresh`. The messages are sorted, `build-finished` stays last,
+/// and every artifact says it was built.
+fn settled_messages(out: &str) -> String {
+    let (finished, mut messages): (Vec<&str>, Vec<&str>) = out.lines().partition(|l| l.starts_with(FINISHED));
+    messages.sort_unstable();
+    let mut settled = String::with_capacity(out.len() + messages.len());
+    for line in messages.into_iter().chain(finished) {
+        match line.strip_suffix(FRESH) {
+            Some(rest) => {
+                settled.push_str(rest);
+                settled.push_str(NOT_FRESH);
+            }
+            None => settled.push_str(line),
+        }
+        settled.push('\n');
+    }
+    settled
+}
 
 const RELEASES: &str = "https://github.com/nextest-rs/nextest/releases";
 pub const CLIENT_VERSION_VAR: &str = "RARGO_NEXTEST_VERSION";
@@ -1020,6 +1049,24 @@ mod tests {
         assert_eq!(sandbox_package_ids(&back, &two), format!("{}{}", line("path+file:///w/a#0.1.0"), line("path+file:///w/b#0.1.0")));
         assert_eq!(sandbox_package_ids(&back, "{\"reason\":\"build-finished\",\"success\":true}\n"), "{\"reason\":\"build-finished\",\"success\":true}\n");
         assert_eq!(sandbox_package_ids(&back, "\"package_id\":"), "\"package_id\":");
+    }
+
+    #[test]
+    fn the_build_s_messages_are_the_same_bytes_whatever_order_they_came_in_and_whatever_was_cached() {
+        let artifact = |name: &str, fresh: bool| {
+            format!("{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\"}},\"executable\":null,\"fresh\":{fresh}}}\n")
+        };
+        let script = "{\"reason\":\"build-script-executed\",\"out_dir\":\"/w/target/out\"}\n";
+        let finished = "{\"reason\":\"build-finished\",\"success\":true}\n";
+        let first = format!("{}{script}{}{finished}", artifact("b", false), artifact("a", false));
+        let again = format!("{}{}{script}{finished}", artifact("a", true), artifact("b", true));
+        let settled = settled_messages(&first);
+        assert_eq!(settled, settled_messages(&again));
+        assert_eq!(settled, format!("{script}{}{}{finished}", artifact("a", false), artifact("b", false)));
+        assert_eq!(settled_messages(&settled), settled, "settled messages stay as they are");
+        assert_eq!(settled_messages(""), "");
+        let failed = "{\"reason\":\"build-finished\",\"success\":false}\n";
+        assert_eq!(settled_messages(&format!("{failed}text\n")), format!("text\n{failed}"));
     }
 
     #[test]
