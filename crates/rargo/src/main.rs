@@ -548,36 +548,111 @@ fn main() {
 }
 
 fn outside_path_dependency(root: &Path, manifest: &Path) -> Option<(String, String)> {
-    let dir = io::file::canonicalize(manifest.parent()?).ok()?;
-    if !dir.starts_with(root) {
-        return None;
-    }
-    let text = io::file::read_to_string(manifest).ok()?;
-    outside_path_dependency_in(root, &dir, &text, |path| io::file::canonicalize(path).ok())
-}
+    let mut pending = vec![manifest.to_owned()];
+    let mut seen = std::collections::BTreeSet::new();
+    let mut entry = true;
+    while let Some(manifest) = pending.pop() {
+        let Some((dir, table)) = read_dependency_manifest(&manifest) else { continue };
+        if !dir.starts_with(root) || !seen.insert(dir.clone()) {
+            continue;
+        }
 
-fn outside_path_dependency_in(
-    root: &Path,
-    dir: &Path,
-    text: &str,
-    resolve: impl Fn(&Path) -> Option<PathBuf>,
-) -> Option<(String, String)> {
-    let table = text.parse::<toml::Table>().ok()?;
-    let targets = table.get("target").and_then(toml::Value::as_table).into_iter()
-        .flat_map(|targets| targets.values().filter_map(toml::Value::as_table));
-    for section in std::iter::once(&table).chain(targets) {
-        for kind in ["dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies"] {
-            let Some(dependencies) = section.get(kind).and_then(toml::Value::as_table) else { continue };
-            for (name, dependency) in dependencies {
-                let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else { continue };
-                let joined = dir.join(path);
-                if resolve(&joined).is_some_and(|resolved| !resolved.starts_with(root)) {
-                    return Some((name.clone(), path.to_owned()));
+        let workspace = dependency_workspace(root, &dir, &table);
+        let inherited = workspace.as_ref().and_then(|(_, table)| {
+            table.get("workspace")?.get("dependencies")?.as_table()
+        });
+        let targets = table.get("target").and_then(toml::Value::as_table).into_iter()
+            .flat_map(|targets| targets.values().filter_map(toml::Value::as_table));
+        let dependencies = std::iter::once(&table).chain(targets)
+            .flat_map(|section| {
+                ["dependencies", "build-dependencies", "dev-dependencies", "build_dependencies", "dev_dependencies"]
+                    .into_iter().filter_map(|kind| section.get(kind)?.as_table())
+            })
+            .flatten()
+            .filter_map(|(name, dependency)| {
+                if dependency.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                    Some((&workspace.as_ref()?.0, name, inherited?.get(name)?))
+                } else {
+                    Some((&dir, name, dependency))
+                }
+            });
+        let (patch_dir, patch_table) = workspace.as_ref().map_or((&dir, &table), |(dir, table)| (dir, table));
+        // Cargo applies patches from the selected workspace, regardless of
+        // which manifests in the dependency graph declare their own patches.
+        let patches = entry.then(|| patch_table.get("patch")?.as_table()).flatten().into_iter()
+            .flat_map(|sources| sources.values().filter_map(toml::Value::as_table))
+            .flatten()
+            .map(|(name, dependency)| (patch_dir, name, dependency));
+        if entry {
+            if let Some(workspace) = patch_table.get("workspace") {
+                let patterns = |key| {
+                    workspace.get(key).and_then(toml::Value::as_array).into_iter()
+                        .flatten().filter_map(toml::Value::as_str)
+                };
+                let excluded: Vec<_> = patterns("exclude").collect();
+                for member in patterns("members").flat_map(|pattern| workspace_member_paths(patch_dir, pattern)) {
+                    let relative = member.strip_prefix(patch_dir).unwrap_or(&member);
+                    if !excluded.iter().any(|pattern| git::ignore::wildmatch(pattern.as_bytes(), relative.as_os_str().as_bytes(), true)) {
+                        pending.push(member.join("Cargo.toml"));
+                    }
                 }
             }
+            entry = false;
+        }
+        for (base, name, dependency) in dependencies.chain(patches) {
+            let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else { continue };
+            let Ok(resolved) = io::file::canonicalize(base.join(path)) else { continue };
+            if !resolved.starts_with(root) {
+                return Some((name.clone(), path.to_owned()));
+            }
+            pending.push(resolved.join("Cargo.toml"));
         }
     }
     None
+}
+
+// Expand member globs by reading only the directories at the wildcard positions.
+fn workspace_member_paths(base: &Path, pattern: &str) -> Vec<PathBuf> {
+    let mut paths = vec![base.to_owned()];
+    for component in Path::new(pattern).components() {
+        let name = component.as_os_str();
+        if !name.as_bytes().iter().any(|byte| matches!(byte, b'*' | b'?' | b'[')) {
+            for path in &mut paths {
+                path.push(name);
+            }
+            continue;
+        }
+        paths = paths.into_iter()
+            .filter_map(|path| io::file::read_dir(path).ok())
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().is_some_and(|candidate| {
+                git::ignore::wildmatch(name.as_bytes(), candidate.as_bytes(), true)
+            }))
+            .collect();
+    }
+    paths.sort_unstable();
+    paths
+}
+
+fn read_dependency_manifest(manifest: &Path) -> Option<(PathBuf, toml::Table)> {
+    let dir = io::file::canonicalize(manifest.parent()?).ok()?;
+    let table = io::file::read_to_string(manifest).ok()?.parse().ok()?;
+    Some((dir, table))
+}
+
+fn dependency_workspace(root: &Path, dir: &Path, table: &toml::Table) -> Option<(PathBuf, toml::Table)> {
+    if table.contains_key("workspace") {
+        return Some((dir.to_owned(), table.clone()));
+    }
+    if let Some(workspace) = table.get("package").and_then(|package| package.get("workspace")).and_then(toml::Value::as_str) {
+        return read_dependency_manifest(&dir.join(workspace).join("Cargo.toml"))
+            .filter(|(dir, _)| dir.starts_with(root));
+    }
+    dir.ancestors().skip(1).take_while(|dir| dir.starts_with(root))
+        .filter_map(|dir| read_dependency_manifest(&dir.join("Cargo.toml")))
+        .find(|(_, table)| table.contains_key("workspace"))
 }
 
 fn wrapper_config_keys(table: &toml::Table) -> impl Iterator<Item = &'static str> + '_ {
@@ -888,23 +963,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_path_dependencies_must_stay_inside_the_synced_worktree() {
-        let root = Path::new("/work/app");
-        let found = |content: &str| {
-            outside_path_dependency_in(root, root, content, |path| match path.to_str()? {
-                "/work/app/local" => Some(root.join("local")),
-                "/work/app/../dep" => Some(PathBuf::from("/work/dep")),
-                _ => panic!("unexpected dependency path {path:?}"),
-            })
-        };
+    fn path_dependencies_must_stay_inside_the_synced_worktree() {
+        io::sim::test(|| {
+            let temp = io::sim::tempdir();
+            let root = temp.join("app");
+            io::file::create_dir(&root).unwrap();
+            io::file::create_dir(temp.join("dep")).unwrap();
+            let inner = root.join("inner");
+            io::file::create_dir(&inner).unwrap();
+            let manifest = root.join("Cargo.toml");
+            let inner_manifest = inner.join("Cargo.toml");
+            let external = |path: &str| Some(("renamed".into(), path.into()));
+            for section in [
+                "dependencies",
+                "dev-dependencies",
+                "target.'cfg(unix)'.build-dependencies",
+                "patch.crates-io",
+            ] {
+                io::file::write(&manifest, format!("[{section}]\nrenamed = {{ package = 'dep', path = '../dep' }}")).unwrap();
+                assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
+            }
 
-        assert_eq!(found("[dependencies]\nlocal = { path = 'local' }\nserde = '1'"), None);
-        for section in ["dependencies", "dev-dependencies", "target.'cfg(unix)'.build-dependencies"] {
-            assert_eq!(
-                found(&format!("[{section}]\nrenamed = {{ package = 'dep', path = '../dep' }}")),
-                Some(("renamed".into(), "../dep".into())),
-            );
-        }
+            io::file::write(&manifest, "[dependencies]\ninner = { path = 'inner' }\n[workspace.dependencies]\nrenamed = { path = '../dep' }").unwrap();
+            io::file::write(&inner_manifest, "[dependencies]\nrenamed.workspace = true").unwrap();
+            assert_eq!(outside_path_dependency(&root, &inner_manifest), external("../dep"));
+            assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
+            io::file::write(&manifest, "[workspace]\nmembers = ['in*']\n[workspace.dependencies]\nrenamed = { path = '../dep' }").unwrap();
+            assert_eq!(outside_path_dependency(&root, &manifest), external("../dep"));
+
+            io::file::write(&inner_manifest, "[dependencies]\nrenamed = { path = '../../dep' }").unwrap();
+            assert_eq!(outside_path_dependency(&root, &manifest), external("../../dep"));
+            io::file::write(&inner_manifest, "[dependencies]\napp = { path = '..' }\nserde = '1'").unwrap();
+            assert_eq!(outside_path_dependency(&root, &manifest), None);
+        });
     }
 
     #[test]
