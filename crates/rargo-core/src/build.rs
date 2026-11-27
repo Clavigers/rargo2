@@ -995,6 +995,26 @@ struct Built {
     target_dirs: Vec<String>,
     env: BTreeMap<String, String>,
     cargo_override: Option<String>,
+    /// For each tested package's manifest dir, the manifest dirs of what its
+    /// tests depend on: for the translator of what nextest's tests print.
+    test_dep_dirs: BTreeMap<String, Vec<String>>,
+}
+
+/// [`dep_manifest_dirs`] of every test the plan runs, by the tested package's
+/// manifest dir.
+fn test_dep_dirs(plan: &rp::Plan) -> BTreeMap<String, Vec<String>> {
+    let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (i, u) in plan.units.iter().enumerate() {
+        if u.executable.is_none() {
+            continue;
+        }
+        let Some(dir) = manifest_dir(&u.manifest_path) else { continue };
+        let dirs = by_dir.entry(dir.to_string()).or_default();
+        dirs.extend(dep_manifest_dirs(&plan.units, i));
+        dirs.sort();
+        dirs.dedup();
+    }
+    by_dir
 }
 
 fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Built>>>) -> Result<Finish> {
@@ -1176,6 +1196,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
             target_dirs: vec![plan.target_dir.clone(), plan.build_dir.clone()],
             env: run.base_env.clone(),
             cargo_override: run.cargo_override.clone(),
+            test_dep_dirs: test_dep_dirs(plan),
         });
     }
 
@@ -1431,16 +1452,17 @@ impl UnitObserver {
 }
 
 /// The translator for what a test binary prints, given the tested package's
-/// manifest dir. Only that dir and the dependency sources under the cargo home
-/// are paths the test learns from its environment; any other `/w` or `/c`
-/// string it prints is its own data.
-fn test_output_translator(tr: &Translator, manifest_dir: Option<&str>) -> Translator {
+/// manifest dir and those of its dependencies in the worktree. Only these dirs
+/// and the dependency sources under the cargo home are paths the test learns
+/// from its environment (its cwd, `CARGO_MANIFEST_DIR`, the source paths in a
+/// panic); any other `/w` or `/c` string it prints is its own data.
+fn test_output_translator(tr: &Translator, manifest_dir: Option<&str>, dep_dirs: &[String]) -> Translator {
     let home = String::from_utf8_lossy(CARGO_HOME_AT).into_owned();
     let mut sandbox = vec![format!("{home}/registry"), format!("{home}/git")];
-    if let Some(dir) = manifest_dir
-        && vpath_starts_with(dir.as_bytes(), WORKTREE_AT)
-    {
-        sandbox.push(dir.to_string());
+    for dir in manifest_dir.into_iter().chain(dep_dirs.iter().map(String::as_str)) {
+        if vpath_starts_with(dir.as_bytes(), WORKTREE_AT) && !sandbox.iter().any(|s| s == dir) {
+            sandbox.push(dir.to_string());
+        }
     }
     Translator::new(
         sandbox
@@ -1455,6 +1477,29 @@ fn test_output_translator(tr: &Translator, manifest_dir: Option<&str>) -> Transl
 
 fn manifest_dir(manifest_path: &str) -> Option<&str> {
     Path::new(manifest_path).parent().and_then(Path::to_str)
+}
+
+/// The manifest dirs of the packages `unit` depends on, directly or not, other
+/// than its own: where the sources of a panic in a path dependency lie.
+fn dep_manifest_dirs(units: &[rp::Unit], unit: usize) -> Vec<String> {
+    let own = manifest_dir(&units[unit].manifest_path);
+    let mut seen = vec![false; units.len()];
+    let mut todo = vec![unit];
+    let mut dirs: Vec<String> = Vec::new();
+    while let Some(i) = todo.pop() {
+        if std::mem::replace(&mut seen[i], true) {
+            continue;
+        }
+        if let Some(dir) = manifest_dir(&units[i].manifest_path)
+            && Some(dir) != own
+            && !dirs.iter().any(|d| d == dir)
+        {
+            dirs.push(dir.to_string());
+        }
+        todo.extend(units[i].deps.iter().map(|d| d.unit as usize).filter(|&j| j < seen.len()));
+    }
+    dirs.sort();
+    dirs
 }
 
 fn translated(tr: &Translator, data: &[u8]) -> Vec<u8> {
@@ -2839,7 +2884,11 @@ impl Run {
                                 out: out.derive(
                                     out.quiet,
                                     out.verbose,
-                                    test_output_translator(&out.tr, manifest_dir(&plan.units[*unit as usize].manifest_path)),
+                                    test_output_translator(
+                                        &out.tr,
+                                        manifest_dir(&plan.units[*unit as usize].manifest_path),
+                                        &dep_manifest_dirs(&plan.units, *unit as usize),
+                                    ),
                                 ),
                                 explain: self.explain,
                                 label: format!("test of {}", plan.units[*unit as usize].desc),
@@ -3028,9 +3077,16 @@ mod tests {
     /// manifest is `manifest_path`, the client's worktree `/home/me/project` and
     /// its cargo home `/home/me/.cargo`.
     fn test_prints(manifest_path: &str, line: &str) -> (String, String) {
+        test_with_deps_prints(manifest_path, &[], line)
+    }
+
+    /// [`test_prints`], when the tested package depends on the packages in
+    /// `dep_dirs`.
+    fn test_with_deps_prints(manifest_path: &str, dep_dirs: &[&str], line: &str) -> (String, String) {
         use rargo_proto::ServerMsg;
 
         let (manifest_path, line) = (manifest_path.to_string(), line.to_string());
+        let dep_dirs: Vec<String> = dep_dirs.iter().map(|d| d.to_string()).collect();
         crate::io::sim::test(move || {
             let (tx, mut rx) = crate::io::unbounded_channel();
             let tr = Translator::new(vec![
@@ -3038,7 +3094,7 @@ mod tests {
                 ("/c".into(), "/home/me/.cargo".into()),
             ]);
             let observer = TestObserver {
-                out: Output::new(tx, false, false).derive(false, false, super::test_output_translator(&tr, super::manifest_dir(&manifest_path))),
+                out: Output::new(tx, false, false).derive(false, false, super::test_output_translator(&tr, super::manifest_dir(&manifest_path), &dep_dirs)),
                 explain: false,
                 label: String::new(),
             };
@@ -3071,6 +3127,38 @@ mod tests {
         let want = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/home/me/project/crates/rargo";
         assert_eq!(test_prints("/w/crates/rargo/Cargo.toml", line), (want.to_string(), format!("{want}\n")));
         assert_eq!(test_prints("/w/crates/rargo/Cargo.toml", "/w/crates/rargo-core/x").0, "/w/crates/rargo-core/x");
+    }
+
+    #[test]
+    fn a_test_prints_the_clients_paths_for_its_path_dependencies() {
+        let line = "thread 't' (3) panicked at /w/dep/src/lib.rs:1:17: dep manifest=/w/dep, not /w/other/x";
+        let want = "thread 't' (3) panicked at /home/me/project/dep/src/lib.rs:1:17: dep manifest=/home/me/project/dep, not /w/other/x";
+        assert_eq!(test_with_deps_prints("/w/app/Cargo.toml", &["/w/dep", "/c/registry/src/i/serde-1.0.0"], line).0, want);
+    }
+
+    #[test]
+    fn a_unit_s_dependency_dirs_are_those_of_every_package_it_depends_on_but_its_own() {
+        let unit = |manifest_path: &str, deps: &[u32]| -> rp::Unit {
+            let deps: Vec<serde_json::Value> = deps.iter().map(|u| serde_json::json!({"unit": u, "only_rmeta": false})).collect();
+            serde_json::from_value(serde_json::json!({
+                "kind": "Compile", "cmd": null, "deps": deps, "outputs": [], "rmeta_early": false, "needs_objects": false,
+                "pkg": "p", "pkg_id": "p", "pkg_name": "p", "pkg_version": "0.1.0", "desc": "p", "verb": "Compiling",
+                "is_local": true, "repository": null, "show_warnings": true, "fix_hint": null, "pkg_spec": "",
+                "manifest_path": manifest_path, "target_json": "", "profile_json": "", "features": [],
+                "executable": null, "script": null, "script_metas": [], "scrape_can_fail": false,
+            }))
+            .unwrap()
+        };
+        let units = [
+            unit("/w/dep/Cargo.toml", &[2]),
+            unit("/w/app/Cargo.toml", &[]),
+            unit("/w/deeper/Cargo.toml", &[3]),
+            unit("/c/registry/src/i/serde-1.0.0/Cargo.toml", &[]),
+            unit("/w/app/Cargo.toml", &[1, 0, 2]),
+            unit("/w/unrelated/Cargo.toml", &[]),
+        ];
+        assert_eq!(dep_manifest_dirs(&units, 4), ["/c/registry/src/i/serde-1.0.0", "/w/deeper", "/w/dep"]);
+        assert!(dep_manifest_dirs(&units, 5).is_empty());
     }
 
     #[test]

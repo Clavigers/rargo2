@@ -205,7 +205,7 @@ pub(super) fn run(d: &Arc<Daemon>, c: &Arc<Client>) -> Result<i32> {
                         None => format!("exit {}", result.code().unwrap_or(101)),
                     };
                     let answer =
-                        Ran::new(&p.tr, &q, store.read(&result.stdout)?, store.read(&result.stderr)?, status);
+                        Ran::new(&p.tr, built.as_ref(), &q, store.read(&result.stdout)?, store.read(&result.stderr)?, status);
                     ran.insert(q.key.clone(), answer);
                     fx.extend(run.test_ran(&q.key, cached));
                 }
@@ -460,11 +460,17 @@ impl Ran {
     /// The answer nextest is handed for a test process: what a test prints is
     /// translated by #684's rule for its package, here where the core knows
     /// which package that is; a listing is nextest's to parse, and kept as is.
-    fn new(tr: &Translator, q: &TestQuestion, out: Vec<u8>, err: Vec<u8>, status: String) -> Ran {
+    fn new(tr: &Translator, built: Option<&Built>, q: &TestQuestion, out: Vec<u8>, err: Vec<u8>, status: String) -> Ran {
+        let dir = q.var("CARGO_MANIFEST_DIR");
+        let deps = built.zip(dir).and_then(|(b, dir)| b.test_dep_dirs.get(dir)).map_or(&[][..], Vec::as_slice);
+        Ran::with_deps(tr, deps, q, out, err, status)
+    }
+
+    fn with_deps(tr: &Translator, deps: &[String], q: &TestQuestion, out: Vec<u8>, err: Vec<u8>, status: String) -> Ran {
         let (out, err) = match q.listing {
             true => (out, err),
             false => {
-                let tr = test_output_translator(tr, q.var("CARGO_MANIFEST_DIR"));
+                let tr = test_output_translator(tr, q.var("CARGO_MANIFEST_DIR"), deps);
                 (translated(&tr, &out), translated(&tr, &err))
             }
         };
@@ -999,7 +1005,7 @@ mod tests {
         let tr = client();
         let printed = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/w/crates/rargo\n";
         let q = question("/w/crates/rargo", false);
-        let r = Ran::new(&tr, &q, printed.as_bytes().to_vec(), b"at /c/registry/src/x/lib.rs:1\n".to_vec(), "exit 0".into());
+        let r = Ran::new(&tr, None, &q, printed.as_bytes().to_vec(), b"at /c/registry/src/x/lib.rs:1\n".to_vec(), "exit 0".into());
         let want = "fixture paths: /w/target/debug/app and /c/blobs, manifest=/home/me/project/crates/rargo\n";
         assert_eq!(String::from_utf8(r.out.clone()).unwrap(), want);
         assert_eq!(String::from_utf8(r.err.clone()).unwrap(), "at /home/me/.cargo/registry/src/x/lib.rs:1\n");
@@ -1025,9 +1031,17 @@ mod tests {
     }
 
     #[test]
+    fn a_test_run_by_nextest_prints_the_clients_paths_for_its_path_dependencies() {
+        let q = question("/w/app", false);
+        let deps = ["/w/dep".to_string()];
+        let r = Ran::with_deps(&client(), &deps, &q, Vec::new(), b"panicked at /w/dep/src/lib.rs:1:17 not /w/other\n".to_vec(), "exit 101".into());
+        assert_eq!(String::from_utf8(r.err).unwrap(), "panicked at /home/me/project/dep/src/lib.rs:1:17 not /w/other\n");
+    }
+
+    #[test]
     fn a_test_listing_is_handed_to_nextest_as_it_was_printed() {
         let q = question("/w", true);
-        let r = Ran::new(&client(), &q, b"/w/x: test\n".to_vec(), Vec::new(), "exit 0".into());
+        let r = Ran::new(&client(), None, &q, b"/w/x: test\n".to_vec(), Vec::new(), "exit 0".into());
         assert_eq!(r.out, b"/w/x: test\n");
         assert!(printed_lines(&HashMap::from([(q.key.clone(), r)])).is_empty());
     }
