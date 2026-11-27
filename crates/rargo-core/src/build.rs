@@ -2812,7 +2812,7 @@ impl Run {
                         rp::When::Verbose => out.verbose,
                     };
                     if show {
-                        out.status(verb, msg);
+                        out.status(verb, &client_text(msg, &out.tr.to_canonical(&self.c.cwd), &out.tr));
                     }
                 }
                 rp::Step::Run { cmd, .. } => {
@@ -2853,7 +2853,8 @@ impl Run {
                         expand::expand(cmd, &scripts, &plan.dylib_var, EnvRule::CargoVarsWin)?
                     };
                     if out.verbose {
-                        out.status("Running", &display_cmd(&cmd.program, &cmd.args));
+                        let shown = display_cmd(&cmd.program, &cmd.args);
+                        out.status("Running", &client_text(&shown, &out.tr.to_canonical(&self.c.cwd), &out.tr));
                     }
                     let mut argv = vec![bytes(&cmd.program)];
                     argv.extend(cmd.args.iter().map(|a| bytes(a)));
