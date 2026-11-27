@@ -15,7 +15,6 @@ jobs:
     env:
       RARGO_SERVER: rargo.rs
       RUSTFLAGS: -D warnings
-      RARGO_OUTPUT: copy
     steps:
       - uses: actions/checkout@v4
       # rargo can fetch the runtime closure for the test binaries through Nix.
@@ -71,4 +70,11 @@ jobs:
             echo "::warning::The rargo server did not answer. Retrying sign-in."
             sleep "$((remaining < 60 ? remaining : 60))"
           done
+      # rargo serves target/ over FUSE-over-io_uring, which the kernel leaves off by default.
+      - name: FUSE over io_uring
+        run: |
+          uname -r
+          grep FUSE_IO_URING "/boot/config-$(uname -r)" || true
+          sudo modprobe fuse
+          echo Y | sudo tee /sys/module/fuse/parameters/enable_uring
       - run: rargo nextest run --locked --workspace
