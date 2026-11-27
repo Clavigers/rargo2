@@ -15,8 +15,10 @@ uses_required, with no backport waiting for a build. Then it
    `use_ended`.
 
 Sessions are at least `gap` apart, so a week of small backports does not
-become a week of sessions. A use left open by a power user that stopped is
-ended when the next one starts. It writes no code and touches no pull
+become a week of sessions. A session that did not exit cleanly (a crash, no
+quota, the time limit) ends its use as void: it is not a use of the build,
+and another is tried after `retry`. So is a use left open by a power user
+that stopped, which the next one ends. It writes no code and touches no pull
 request.
 """
 from __future__ import annotations
@@ -42,13 +44,13 @@ from .watchdog import BIN
 class PowerUser:
     def __init__(self, ledger: Ledger, gh, checkout: Path, prompt: str,
                  clock: Callable[[], datetime] = utc_now,
-                 gap: timedelta = timedelta(hours=3),
+                 gap: timedelta = timedelta(hours=3), retry: timedelta = timedelta(minutes=30),
                  timeout: timedelta = timedelta(minutes=90),
                  settle: timedelta = timedelta(minutes=20), poll: float = 20.0,
                  run: Callable[..., int] | None = None,
                  say: Callable[[str], None] = print):
         self.ledger, self.gh, self.checkout, self.prompt = ledger, gh, Path(checkout), prompt
-        self.clock, self.gap, self.timeout = clock, gap, timeout
+        self.clock, self.gap, self.retry, self.timeout = clock, gap, retry, timeout
         self.settle, self.poll = settle, poll
         self.run_session = run or self._run_session
         self.say = say
@@ -67,15 +69,15 @@ class PowerUser:
         if w.config is None:
             return None
         mine = {n: u for n, u in w.uses.items() if u.by == Role.power_user}
-        last = max((w.since(M.USE, n) for n in mine), default=None)
-        if last and self.clock() - last < self.gap:
+        last = max(mine, default=None)  # after a session that failed, try again sooner
+        if last and self.clock() - w.since(M.USE, last) < (self.retry if mine[last].void else self.gap):
             return None
         for version, v in w.versions.items():
             build = len(v.builds)
             if not w.is_(M.VERSION, version, "candidate") or build == 0 or v.unbuilt:
                 continue
             ended = sum(1 for n, u in mine.items() if (u.version, u.build) == (version, build)
-                        and w.is_(M.USE, n, "ended"))
+                        and w.is_(M.USE, n, "ended") and not u.void)
             if ended < w.config.release.uses_required:
                 sha = [l["sha"] for l in self._lines("built") if l["version"] == version][-1]
                 return version, build, sha
@@ -85,7 +87,7 @@ class PowerUser:
         w = self.ledger.refresh()
         for n, u in w.uses.items():  # left open by a power user that stopped
             if u.by == Role.power_user and w.is_(M.USE, n, "open"):
-                self._record("use_ended", use=n)
+                self._record("use_ended", use=n, void=True)
         d = self.due()
         if d is None:
             return
@@ -94,12 +96,13 @@ class PowerUser:
         began = self.clock()
         self._record("use_started", use=use, version=version, build=build)
         self.say(f"power user: use {use}: {version} build {build} at {sha[:7]}")
+        code = None
         try:
             code = self.run_session(use, version, build, sha)
             self.say(f"power user: use {use} ended with exit {code}")
             self._settle(use, began)
         finally:
-            self._record("use_ended", use=use)
+            self._record("use_ended", use=use, void=code != 0)
 
     def _settle(self, use: int, began: datetime) -> None:
         """Wait until the log has every issue this session filed: they are
