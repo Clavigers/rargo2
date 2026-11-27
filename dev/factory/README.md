@@ -12,6 +12,7 @@ On the factory machine, under `/root/factory`, three systemd services:
 | `factory-observer` | Every minute: records what happened on GitHub into the log, and merges pull requests whose latest push passed CI and every reviewer. |
 | `factory-dictator` | Every 20 minutes: takes back work from agents that stopped or ran out of quota, preempts for bugs that waited too long, closes finished initiatives, and plans unparked initiatives into issues. |
 | `factory-pm` | The project manager. Every 5 minutes: freezes main into `release/X.Y.Z` when a week has passed with no candidate, cherry-picks bug fixes merged since, records each branch head that passed CI as a candidate build, and records why the build is held. It publishes only when nothing holds the build, by running the command in `FACTORY_RELEASE` with the version; that is unset, so today it publishes nothing. `dev/release.sh` still releases from main and does not yet release a branch. |
+| `factory-power-user` | The power user. When a candidate's latest build has had fewer use sessions than the config's `release.uses_required`, and at most once in 3 hours: one harness session (POWER-USER.md) builds that commit, runs its own server, uses rargo as a person would, and files bugs and friction, which the log records as found in that use. |
 | `factory-watchdog` | Keeps one headless session (Claude Code, Codex, Grok) running per agent that has work, each in its own worktree under `state/worktrees`. A session does one issue (`AGENT.md`) and ends. |
 
 ### Review

@@ -492,7 +492,7 @@ function render() {
     <div class="stat" style="margin-top:6px">freezes main, builds, holds or publishes</div>`;
   $('poweruser').className = 'box actor' + (R.pu_running ? '' : ' notrun');
   $('poweruser').innerHTML = `<div class="row"><div class="ic">${ic('agent')}</div><div><b>Power user</b><div class="sub" style="margin:0">${R.pu_running ? 'tries the release candidate' : 'in the data model, not running yet'}</div></div></div>
-    <div class="stat" style="margin-top:6px">uses each build; files bugs and friction</div>`;
+    <div class="stat" style="margin-top:6px">${R.using ? `using ${esc(R.using.version)} build ${R.using.build} since ${when(R.using.t)}` : R.pu_running ? `${R.uses} session${R.uses === 1 ? '' : 's'} done, ${R.found} issue${R.found === 1 ? '' : 's'} filed` : 'uses each build; files bugs and friction'}</div>`;
 
   $('agents').innerHTML = '<tr><th>Agent</th><th>Plan</th><th>State</th><th>Pushes</th><th>Closed</th><th>Given up</th></tr>'
     + S.agents.map(a => `<tr><td>${esc(a.name)}<small>${esc(a.model)}</small></td><td>${esc(a.plan)}</td><td style="color:${ST[agentState(a)]}">${names[agentState(a)] || a.state}</td><td>${a.pushes}</td><td>${a.closed}</td><td>${a.gave_up}</td></tr>`).join('');

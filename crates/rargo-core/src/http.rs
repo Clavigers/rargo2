@@ -2,7 +2,7 @@ use rargo_machine::StateMachine;
 use crate::session::Keys;
 use crate::tokens::{self, normal_code};
 use anyhow::{Context, Result, anyhow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use crate::io::http::{self as outbound, Failure};
@@ -271,7 +271,7 @@ impl StateMachine for Phase {
 struct Request {
     method: String,
     path: String,
-    query: HashMap<String, String>,
+    query: BTreeMap<String, String>,
     host: String,
     body: Vec<u8>,
     json: bool,
@@ -366,7 +366,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn form(s: &str) -> HashMap<String, String> {
+fn form(s: &str) -> BTreeMap<String, String> {
     s.split('&').filter(|p| !p.is_empty()).map(|p| {
         let (k, v) = p.split_once('=').unwrap_or((p, ""));
         (percent_decode(k), percent_decode(v))
@@ -860,12 +860,12 @@ pub struct Http {
     public: Option<String>,
     port: u16,
     state: Option<std::path::PathBuf>,
-    pending: parking_lot::Mutex<AuthState>,
+    pending: std::cell::RefCell<AuthState>,
 }
 
 impl Http {
     pub fn new(keys: Arc<Keys>, public: Option<String>, port: u16) -> Http {
-        Http { keys, public, port, state: None, pending: parking_lot::Mutex::new(AuthState::default()) }
+        Http { keys, public, port, state: None, pending: std::cell::RefCell::new(AuthState::default()) }
     }
 
     pub fn with_state(mut self, state: std::path::PathBuf) -> Http {
@@ -908,7 +908,7 @@ impl Http {
         let mut event = Event::Request(req);
         loop {
             let act = {
-                let mut st = self.pending.lock();
+                let mut st = self.pending.borrow_mut();
                 let act = handle(&mut st, &mut phase, event, &cfg, now);
                 st.invariants();
                 phase.invariants();
