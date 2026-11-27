@@ -112,6 +112,82 @@ enum Node {
     Link(PathBuf),
 }
 
+/// A path ordered byte by byte with `/` below every other byte. For the
+/// normal absolute paths kept here that is the order of their components, so
+/// a directory is followed by everything under it, but it is found without
+/// splitting either path into components, which took a third of the CPU of
+/// tests that use many files.
+#[derive(Clone)]
+struct Key(PathBuf);
+
+impl Key {
+    fn bytes(&self) -> &[u8] {
+        self.0.as_os_str().as_bytes()
+    }
+}
+
+impl PartialEq for Key {
+    fn eq(&self, other: &Key) -> bool {
+        self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for Key {}
+
+impl PartialOrd for Key {
+    fn partial_cmp(&self, other: &Key) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Key {
+    fn cmp(&self, other: &Key) -> std::cmp::Ordering {
+        let (a, b) = (self.bytes(), other.bytes());
+        let rank = |byte: u8| if byte == b'/' { 0 } else { u16::from(byte) + 1 };
+        // Paths here share long prefixes: skip the common part eight bytes at a time.
+        let n = a.len().min(b.len());
+        let mut i = 0;
+        while i + 8 <= n && a[i..i + 8] == b[i..i + 8] {
+            i += 8;
+        }
+        while i < n && a[i] == b[i] {
+            i += 1;
+        }
+        if i < n { rank(a[i]).cmp(&rank(b[i])) } else { a.len().cmp(&b.len()) }
+    }
+}
+
+/// The simulated filesystem's names, each normal and absolute.
+#[derive(Clone, Default)]
+struct Files(BTreeMap<Key, Node>);
+
+impl Files {
+    fn get(&self, path: &Path) -> Option<&Node> {
+        self.0.get(&Key(path.to_path_buf()))
+    }
+
+    fn get_mut(&mut self, path: &Path) -> Option<&mut Node> {
+        self.0.get_mut(&Key(path.to_path_buf()))
+    }
+
+    fn contains_key(&self, path: &Path) -> bool {
+        self.get(path).is_some()
+    }
+
+    fn insert(&mut self, path: PathBuf, node: Node) -> Option<Node> {
+        self.0.insert(Key(path), node)
+    }
+
+    fn remove(&mut self, path: &Path) -> Option<Node> {
+        self.0.remove(&Key(path.to_path_buf()))
+    }
+
+    /// `dir` and every path under it, in order.
+    fn under(&self, dir: &Path) -> Vec<PathBuf> {
+        self.0.range(Key(dir.to_path_buf())..).map(|(p, _)| &p.0).take_while(|p| p.starts_with(dir)).cloned().collect()
+    }
+}
+
 /// The bytes written to a pipe and not yet read.
 #[derive(Default)]
 struct Pipe {
@@ -151,7 +227,7 @@ enum Due {
 /// An explicit sync barrier for a simulated disk. Restoring it models loss of
 /// all later changes, including directory entries and writes to open files.
 pub struct DiskCheckpoint {
-    files: BTreeMap<PathBuf, Node>,
+    files: Files,
     inodes: BTreeMap<u64, Inode>,
 }
 
@@ -174,7 +250,7 @@ pub struct SimLoop {
     due: BTreeMap<(u64, u64), Due>,
     handles: BTreeMap<i32, Handle>,
     bound: BTreeMap<SocketAddr, i32>,
-    files: BTreeMap<PathBuf, Node>,
+    files: Files,
     inodes: BTreeMap<u64, Inode>,
     pipes: BTreeMap<u64, Pipe>,
     env: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
@@ -217,7 +293,7 @@ fn path_of(c: &CString) -> PathBuf {
 
 impl SimLoop {
     pub fn new(seed: u64, net: Net) -> SimLoop {
-        let mut files = BTreeMap::new();
+        let mut files = Files::default();
         files.insert(PathBuf::from("/"), Node::Dir { mode: 0o755, mtime_ns: (EPOCH_S * 1_000_000_000) as i64 });
         SimLoop {
             rng: Rng(seed),
@@ -617,7 +693,7 @@ impl SimLoop {
     }
 
     fn under(&self, dir: &Path) -> Vec<PathBuf> {
-        self.files.range(dir.to_path_buf()..).map(|(p, _)| p.clone()).take_while(|p| p.starts_with(dir)).collect()
+        self.files.under(dir)
     }
 
     fn remove_node(&mut self, path: &Path) {
@@ -1082,7 +1158,7 @@ pub(super) fn read_dir(path: &Path) -> Option<io::Result<Vec<(std::ffi::OsString
             .into_iter()
             .filter(|p| p.parent() == Some(dir.as_path()))
             .map(|p| {
-                let kind = match sim.files[&p] {
+                let kind = match sim.files.get(&p).expect("listed above") {
                     Node::Dir { .. } => 'd',
                     Node::File(_) => 'f',
                     Node::Link(_) => 'l',
@@ -1362,7 +1438,9 @@ pub fn tempdir() -> PathBuf {
     let dir = PathBuf::from(format!("/tmp/sim-{n}"));
     with(|sim| {
         let mtime_ns = sim.wall_ns();
-        sim.files.entry(PathBuf::from("/tmp")).or_insert(Node::Dir { mode: 0o777, mtime_ns });
+        if !sim.files.contains_key(Path::new("/tmp")) {
+            sim.files.insert(PathBuf::from("/tmp"), Node::Dir { mode: 0o777, mtime_ns });
+        }
         sim.files.insert(dir.clone(), Node::Dir { mode: 0o755, mtime_ns });
     });
     dir
@@ -1383,4 +1461,27 @@ fn run_on<R: 'static>(sim: SimLoop, main: impl FnOnce() -> R + 'static) -> (R, R
     });
     let value = out.borrow_mut().take().expect("the loop returns after main has finished");
     (value, report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Files, Node};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn names_sort_as_their_components_do_and_a_directory_is_followed_by_what_is_under_it() {
+        let names = ["/", "/a", "/a/b", "/a/b/c", "/a-b", "/a.b", "/a/b-c", "/a/bc", "/ab", "/b", "/a/b/c/d", "/a\u{e9}"];
+        let mut files = Files::default();
+        for name in names {
+            files.insert(PathBuf::from(name), Node::Dir { mode: 0o755, mtime_ns: 0 });
+        }
+        let ours: Vec<PathBuf> = files.0.keys().map(|k| k.0.clone()).collect();
+        let mut theirs: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+        theirs.sort();
+        assert_eq!(ours, theirs);
+        assert_eq!(files.under(Path::new("/a/b")), ["/a/b", "/a/b/c", "/a/b/c/d"].map(PathBuf::from));
+        assert_eq!(files.under(Path::new("/a")).len(), 6);
+        assert!(files.contains_key(Path::new("/a-b")) && !files.contains_key(Path::new("/a/b/c/d/e")));
+        assert!(files.remove(Path::new("/a/bc")).is_some() && files.get(Path::new("/a/bc")).is_none());
+    }
 }

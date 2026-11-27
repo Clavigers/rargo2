@@ -250,8 +250,10 @@ fn compiler_failures_are_repeatable_for_the_same_inputs() {
 
 #[test]
 fn builds_exercise_compiler_exits_and_discard_staged_artifacts_on_cancel() {
-    let reports: Vec<_> = (0..24).map(|seed| run(seed, None).expect("passes")).collect();
-    assert!(reports.iter().any(|r| r.failed_builds > 0));
-    assert!(reports.iter().any(|r| r.long_runs > 0 && r.cancelled_builds > 0 && r.aborted_runs > 0));
-    assert!(reports.iter().any(|r| r.cancelled_with_outputs > 0));
+    // Seed 3 fails a build, cancels one with staged outputs and aborts a long
+    // run; the seed batches run the invariants over a wider sample.
+    let r = run(3, None).expect("passes");
+    assert!(r.failed_builds > 0);
+    assert!(r.long_runs > 0 && r.cancelled_builds > 0 && r.aborted_runs > 0);
+    assert!(r.cancelled_with_outputs > 0);
 }

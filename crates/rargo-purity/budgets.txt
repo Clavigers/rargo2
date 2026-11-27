@@ -1,3 +1,3 @@
 measure	cpu-across-runners	0	user and system CPU of each test run alone in its own process, from getrusage; set from the most measured on rargo.rs and on GitHub runners, which differ by up to 1.7x
-suite	workspace	17000	every test of every test program in the workspace, measured at 6.5 s on rargo.rs and 6.6 to 11.1 s on GitHub runners
+suite	workspace	11000	every test of every test program in the workspace, measured at 5.6 s on a factory host after #580 (7.0 s before); GitHub runners use up to 1.7x that, about 9.5 s
 test	default	500	any test without a line of its own; after splitting the workspace scan and reducing simulator work, the slowest local test used 426 ms of CPU
