@@ -78,6 +78,26 @@ fn check_bad_network(seeds: std::ops::Range<u64>) {
 }
 
 #[test]
+fn a_connection_the_server_forgot_closes_at_the_clients_next_packet() {
+    let ((), _) = sim::run(5, Net::default(), || {
+        let server_addr = "10.0.0.1:7000".parse().unwrap();
+        let server = Endpoint::bind(server_addr, true).expect("the server binds");
+        let client = Endpoint::bind("10.0.0.2:0".parse().unwrap(), false).expect("the client binds");
+        let conn = client.connect(server_addr).expect("the client connects");
+        conn.send(b"hello").expect("the message is queued");
+        let accepted = server.accept().expect("a client arrives");
+        assert_eq!(accepted.recv().expect("the message arrives"), b"hello");
+        server.forget(accepted.id);
+        let start = io::now();
+        conn.send(b"again").expect("the message is queued");
+        while !conn.is_closed() {
+            assert!(io::now() - start < std::time::Duration::from_secs(1), "the client hears at once that the server forgot it");
+            io::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+}
+
+#[test]
 fn files_live_in_memory() {
     sim::test(|| {
         use crate::io::file;
