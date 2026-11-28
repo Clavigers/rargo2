@@ -1830,6 +1830,8 @@ impl Daemon {
         let mut placer = io::cpu(|| Placer::new(cache, placed_path.as_deref().map(Placed::load).unwrap_or_default(), names));
         let left_out = snap.and_then(|s| s.left_out.as_ref()).zip(wt);
         command.start(left_out.is_some());
+        let since_ns = io::system_now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0);
+        let mut written = BTreeSet::new();
         let mut bet_rx = None;
         if let Some(oneshot_rx) = bet {
             let (bet_tx, bet_notes) = unbounded_channel();
@@ -1948,6 +1950,17 @@ impl Daemon {
                         None => (files, writes),
                     };
                     let root = root.ok_or_else(|| std::io::Error::other("the server sent files for a command that has no worktree"))?;
+                    let sent = snap.map(|s| &s.scan.index);
+                    let writes = match sent {
+                        Some(sent) => {
+                            let (writes, notes) = io::cpu(|| crate::kept::keep_edits(root, &targets, sent, since_ns, &mut written, writes));
+                            for note in notes {
+                                let _ = out.send(LocalReply::Stderr(note.into_bytes()));
+                            }
+                            writes
+                        }
+                        None => writes,
+                    };
                     io::cpu(|| placer.deliver(root, &targets, files, writes))?;
                 }
                 CommandEffect::Blobs(blobs) => {
