@@ -1,0 +1,98 @@
+From fa40d659f94855a53366fc2b54c6649c46686f24 Mon Sep 17 00:00:00 2001
+From: codex-1 <codex-1@users.noreply.github.com>
+Date: Sat, 28 Nov 2026 04:43:11 +0100
+Subject: [PATCH] Match planned dev debuginfo to the selected toolchain
+
+---
+ src/workspace/profiles.rs | 47 +++++++++++++++++++++++++++++++++++----
+ 1 file changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/src/workspace/profiles.rs b/src/workspace/profiles.rs
+index bf436410c..fcd986f14 100644
+--- a/src/workspace/profiles.rs
++++ b/src/workspace/profiles.rs
+@@ -83,7 +83,7 @@ impl Profiles {
+                 .or_else(|| is_ci().then_some(false)),
+         };
+         let mut profiles = merge_config_profiles(ws, requested_profile)?;
+-        let rustc_host = ws.gctx().load_global_rustc(Some(ws))?.host;
++        let rustc = gctx.load_global_rustc(Some(ws))?;
+ 
+         let mut profile_makers = Profiles {
+             incremental,
+@@ -91,11 +91,12 @@ impl Profiles {
+             by_name: HashMap::default(),
+             original_profiles: profiles.clone(),
+             requested_profile,
+-            rustc_host,
++            rustc_host: rustc.host,
+             hint_min_opt_level: gctx.cli_unstable().hint_min_opt_level,
+         };
+ 
+-        Self::add_root_profiles(&mut profile_makers, &profiles);
++        let dev = Profile::default_dev_for(&rustc.version, crate::compiler::rargo::active());
++        Self::add_root_profiles(&mut profile_makers, &profiles, dev);
+ 
+         // Merge with predefined profiles.
+         use std::collections::btree_map::Entry;
+@@ -137,10 +138,11 @@ impl Profiles {
+     fn add_root_profiles(
+         profile_makers: &mut Profiles,
+         profiles: &BTreeMap<InternedString, TomlProfile>,
++        dev: Profile,
+     ) {
+         profile_makers.by_name.insert(
+             "dev".into(),
+-            ProfileMaker::new(Profile::default_dev(), profiles.get("dev").cloned()),
++            ProfileMaker::new(dev, profiles.get("dev").cloned()),
+         );
+ 
+         profile_makers.by_name.insert(
+@@ -771,6 +773,16 @@ impl cmp::PartialEq for Profile {
+ 
+ impl Profile {
+     /// Returns a built-in `dev` profile.
++    fn default_dev_for(version: &semver::Version, planning: bool) -> Profile {
++        let mut profile = Self::default_dev();
++        // Cargo shipped full dev debuginfo before Rust 1.102. Compare only
++        // the release components so 1.102 nightlies use the new default.
++        if planning && (version.major, version.minor) < (1, 102) {
++            profile.debuginfo = DebugInfo::Resolved(TomlDebugInfo::Full);
++        }
++        profile
++    }
++
+     fn default_dev() -> Profile {
+         Profile {
+             name: "dev".into(),
+@@ -1562,3 +1574,30 @@ fn validate_packages_unmatched(
+ fn is_off(s: &str) -> bool {
+     matches!(s, "off" | "n" | "no" | "none")
+ }
++
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn planned_dev_debuginfo_follows_toolchain_release() {
++        for (release, expected) in [
++            ("1.98.1", TomlDebugInfo::Full),
++            ("1.101.0", TomlDebugInfo::Full),
++            ("1.102.0-nightly", TomlDebugInfo::LineTablesOnly),
++            ("1.102.0", TomlDebugInfo::LineTablesOnly),
++        ] {
++            let version = release.parse().unwrap();
++            assert_eq!(
++                Profile::default_dev_for(&version, true).debuginfo,
++                DebugInfo::Resolved(expected),
++                "{release}"
++            );
++        }
++        assert_eq!(
++            Profile::default_dev_for(&"1.98.1".parse().unwrap(), false).debuginfo,
++            DebugInfo::Resolved(TomlDebugInfo::LineTablesOnly)
++        );
++    }
++}

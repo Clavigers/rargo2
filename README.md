@@ -65,6 +65,8 @@ A project without one gets rargo's default flake. It has:
 - gcc, cmake, pkg-config, perl, python3 and git;
 - the libraries openssl, zlib, sqlite, udev, alsa, wayland, xkbcommon, vulkan-loader, fontconfig, freetype and the X11 libraries.
 
+The `dev` profile's default debug info follows the Cargo version shipped with the project's Rust toolchain.
+
 Remote builds reject `+TOOLCHAIN` and nonempty `RUSTUP_TOOLCHAIN` overrides.
 
 If a build script needs another library, add a `flake.nix` that puts it in the shell's `buildInputs`.
