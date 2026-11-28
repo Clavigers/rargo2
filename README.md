@@ -67,6 +67,8 @@ A project without one gets rargo's default flake. It has:
 - gcc, cmake, pkg-config, perl, python3 and git;
 - the libraries openssl, zlib, sqlite, udev, alsa, wayland, xkbcommon, vulkan-loader, fontconfig, freetype and the X11 libraries.
 
+The `dev` profile's default debug info follows the Cargo version shipped with the project's Rust toolchain.
+
 Remote builds reject `+TOOLCHAIN` and nonempty `RUSTUP_TOOLCHAIN` overrides.
 To build for another target, list it in `rust-toolchain.toml` (`targets = ["wasm32-unknown-unknown"]`, beside a `channel`) or in your flake's toolchain; `rustup target add` does not change the server's toolchain.
 
