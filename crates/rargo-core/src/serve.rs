@@ -50,6 +50,8 @@ pub fn udp_connection(
 struct Stream {
     sess: Arc<Session>,
     abort: crate::io::AbortHandle<ServerMsg>,
+    /// Answers once the stream's pump has sent its last message.
+    pumped: Option<crate::io::oneshot::Receiver<()>>,
 }
 
 enum RecvWait {
@@ -232,13 +234,31 @@ pub fn link(d: Arc<Daemon>, link: Rc<Link>, presented: String, admin: bool, keys
                     let _ = pumping.join();
                     sess.close();
                 }
+                Route::Ended { stream } => {
+                    let gone = streams.borrow_mut().remove(&stream);
+                    if let Some(mut st) = gone {
+                        st.abort.abort();
+                        st.sess.send(ServerMsg::Stderr(TOKEN_ENDED.as_bytes().to_vec()));
+                        st.sess.send(ServerMsg::Exit(101));
+                        if let Some(pumped) = st.pumped.take() {
+                            // The link closes next: what the client is told goes out first, unless it stopped reading.
+                            let _ = crate::io::timeout(std::time::Duration::from_secs(10), move || pumped.recv());
+                        }
+                        st.sess.close();
+                    }
+                }
                 Route::Run { stream, req } => {
                     let (sess, rx) = Session::on_link(d.engine.store.clone(), has.clone(), d.stats.clone());
                     let (pump_link, pump_sess) = (link.clone(), sess.clone());
-                    let mut pumping = crate::io::spawn(move || pump(pump_link, stream, rx, pump_sess));
+                    let (pumped_tx, pumped) = crate::io::oneshot::channel();
+                    let mut pumping = crate::io::spawn(move || {
+                        pump(pump_link, stream, rx, pump_sess);
+                        let _ = pumped_tx.send(());
+                    });
                     let (serve_d, serve_user, serve_keys, serve_sess) = (d.clone(), user.clone(), keys.clone(), sess.clone());
                     let mut work = crate::io::spawn(move || serve(serve_d, *req, serve_user, admin, serve_keys, serve_sess));
-                    streams.borrow_mut().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle() });
+                    let pumped = Some(pumped);
+                    streams.borrow_mut().insert(stream, Stream { sess: sess.clone(), abort: work.abort_handle(), pumped });
                     let (streams2, conn2, sess2) = (streams.clone(), conn.clone(), sess.clone());
                     crate::io::spawn(move || {
                         let msg = match work.join() {
@@ -282,7 +302,7 @@ pub fn link(d: Arc<Daemon>, link: Rc<Link>, presented: String, admin: bool, keys
         if crate::io::now().saturating_duration_since(checked) > std::time::Duration::from_secs(2) {
             let valid = keys.still_valid(&presented);
             if !valid {
-                eprintln!("rargod: {user}: the key or token of this session is no longer valid; closing it");
+                eprintln!("rargod: {user}: the key or token of this session is no longer valid; ending what it runs and closing it");
             }
             todo.extend(conn.borrow_mut().key_checked(valid));
             checked = crate::io::now();
