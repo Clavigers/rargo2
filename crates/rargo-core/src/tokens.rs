@@ -465,7 +465,12 @@ impl Tokens {
         };
         let user = match (&invite.user, name) {
             (Some(user), _) => user.clone(),
-            (None, Some(name)) if valid_name(name) => name.to_owned(),
+            (None, Some(name)) if valid_name(name) => {
+                if self.tokens.iter().any(|token| token.user == name) {
+                    bail!("that name is already in use; choose another name");
+                }
+                name.to_owned()
+            }
             (None, _) => bail!("a name is needed: letters, digits, `-`, `_` and `.`"),
         };
         invite.uses_left -= 1;
@@ -856,6 +861,29 @@ mod tests {
     }
 
     #[test]
+    fn unnamed_invitations_require_a_new_user_name() {
+        let mut tokens = Tokens::default();
+        let at = 100;
+        tokens.create("alice", true, None, "command line", at, ("t-existing", "fixture-existing")).unwrap();
+        let code = tokens.invite(Invitation { user: None, admin: false, days: None, uses: 2, token_days: None }, at, "ABCD2345ABCD2345").unwrap();
+
+        let before = tokens.encode().unwrap();
+        let error = tokens.redeem(&code, Some("alice"), at, ("t-first", "fixture-first")).unwrap_err();
+        assert!(error.to_string().contains("name is already in use"));
+        assert_eq!(tokens.encode().unwrap(), before);
+
+        let token = tokens.redeem(&code, Some("bob"), at, ("t-first", "fixture-first")).unwrap().unwrap();
+        assert_eq!(token.user, "bob");
+        assert!(!token.admin);
+        assert_eq!(tokens.invited(&code, at).unwrap().uses_left, 1);
+
+        let named = tokens.invite(Invitation { user: Some("alice"), admin: false, days: None, uses: 1, token_days: None }, at, "WXYZ2345WXYZ2345").unwrap();
+        let token = tokens.redeem(&named, Some("ignored"), at, ("t-named", "fixture-named")).unwrap().unwrap();
+        assert_eq!(token.user, "alice");
+        tokens.invariants();
+    }
+
+    #[test]
     fn invitations_expire_and_successful_redemption_consumes_one_use() {
         let mut tokens = Tokens::default();
         let raw = "ABCD2345ABCD2345";
@@ -872,7 +900,7 @@ mod tests {
         tokens.invariants();
         assert_eq!(token.expires, Some(101 + 30 * 86400));
         assert_eq!(tokens.invited(&code, 102).unwrap().uses_left, 1);
-        let failed = tokens.redeem(&code, Some("ann"), 102, ("t-1", "duplicate")).unwrap();
+        let failed = tokens.redeem(&code, Some("bob"), 102, ("t-1", "duplicate")).unwrap();
         assert!(failed.unwrap_err().to_string().contains("duplicate token id"));
         tokens.invariants();
         assert!(tokens.invited(&code, 102).is_none(), "the use is spent even when making the token fails");
