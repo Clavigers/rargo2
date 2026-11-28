@@ -293,7 +293,7 @@ impl Blob {
 pub fn env_allowed(name: &str) -> bool {
     const EXACT: &[&str] = &[
         "LANG", "LANGUAGE", "TZ", "RUSTUP_TOOLCHAIN", "RUSTFLAGS", "RUSTDOCFLAGS", "TERM", "NO_COLOR", "BROWSER",
-        "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM", "UPDATE_EXPECT",
+        "CLICOLOR", "CLICOLOR_FORCE", "COLORTERM", "UPDATE_EXPECT", "INSTA_UPDATE",
     ];
     const PREFIXES: &[&str] = &["CARGO_", "RUSTC", "RUSTDOC", "RUST_", "LC_", "__CARGO", "RARGO_", "NEXTEST_"];
     const DROP: &[&str] = &[
@@ -334,6 +334,8 @@ mod tests {
         assert!(env_allowed("RUSTFLAGS"));
         assert!(env_allowed("RARGO_EXPLAIN"));
         assert!(env_allowed("UPDATE_EXPECT"));
+        assert!(env_allowed("INSTA_UPDATE"));
+        assert!(!env_allowed("INSTA_UPDATE_OTHER"));
         assert!(!env_allowed("UPDATE_EXPECT_OTHER"));
         assert!(!env_allowed("PATH"));
         assert!(!env_allowed("HOME"));
