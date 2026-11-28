@@ -566,6 +566,13 @@ fn sh(p: &mut Proc, script: &str) -> i32 {
         }
         "echo value=$FOO" => echo(p, "value", "FOO"),
         "echo other=$BAR" => echo(p, "other", "BAR"),
+        "test -n \"$KEY\" || { echo please set KEY >&2; exit 1; }; echo key=$KEY" => match p.var(b"KEY") {
+            Some(v) if !v.is_empty() => echo(p, "key", "KEY"),
+            _ => {
+                p.err("please set KEY\n");
+                1
+            }
+        },
         "echo oops >&2; exit 3" => {
             p.err("oops\n");
             3
@@ -842,6 +849,18 @@ fn declared_environment_variables_become_part_of_the_key() {
         assert_eq!(fx.text(&d.result.stdout), "value=\n");
         let e = fx.engine.obtain(fx.req("echo other=$BAR", &[], &[("BAR", "x")], &[])).unwrap();
         assert_eq!(fx.text(&e.result.stdout), "other=\n");
+    });
+}
+
+#[test]
+fn a_failed_action_that_declares_a_variable_runs_again_with_it() {
+    sim::test(|| {
+        let fx = fixture(sh);
+        let script = "test -n \"$KEY\" || { echo please set KEY >&2; exit 1; }; echo key=$KEY";
+        let a = fx.engine.obtain(fx.req(script, &[], &[("KEY", "k1")], &["KEY"])).unwrap();
+        assert!(a.result.success(), "{}", fx.text(&a.result.stderr));
+        assert_eq!(fx.text(&a.result.stdout), "key=k1\n");
+        assert_eq!(fx.engine.stats.env_reruns.get(), 1);
     });
 }
 
