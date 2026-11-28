@@ -21,6 +21,7 @@ mod mux;
 mod namespace;
 mod outfs;
 mod partial;
+mod kept;
 mod place;
 mod project;
 mod report;
