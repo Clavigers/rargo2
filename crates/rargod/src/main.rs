@@ -127,7 +127,7 @@ fn main() -> Result<()> {
     let keys = if tokens.path().ring_exists() {
         Keys::with_tokens(tokens.clone())
     } else if opts.listen.ip().is_loopback() {
-        Keys::open()
+        Keys::open(tokens.clone())
     } else {
         bail!(
             "nobody could connect: make an invitation first (rargod token invite --state {}), or listen on the loopback interface",
