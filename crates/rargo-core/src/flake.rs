@@ -129,6 +129,37 @@ fn run_nix(root: &Path, mut c: Command, uid: u32, gid: u32) -> std::result::Resu
     Ok(out.stdout)
 }
 
+#[derive(Debug)]
+pub(crate) struct ToolchainChannelError {
+    file: &'static str,
+    message: String,
+}
+
+impl std::fmt::Display for ToolchainChannelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.file, self.message)
+    }
+}
+
+impl std::error::Error for ToolchainChannelError {}
+
+fn toolchain_channel_error(file: &'static str, stderr: &str) -> Option<ToolchainChannelError> {
+    // Nix puts the pinned rust-overlay's channel selection error after the trace.
+    let message = stderr.strip_prefix("nix failed: ")?.lines().last()?.trim().strip_prefix("error: ")?;
+    let message = if let Some(channel) = message.strip_prefix("Unknown channel: ") {
+        format!("unknown channel {channel:?}")
+    } else if message == "Stable version with specific date is not supported"
+        || message == "Cannot specify date in both `channel` and `date`"
+        || (message.ends_with(" is not available")
+            && ["Stable ", "No stable ", "Nightly ", "Beta "].iter().any(|prefix| message.starts_with(prefix)))
+    {
+        message.to_owned()
+    } else {
+        return None;
+    };
+    Some(ToolchainChannelError { file, message })
+}
+
 fn candidates(names: &BTreeSet<String>) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for r in names {
@@ -486,9 +517,19 @@ pub(crate) fn resolve_shell(
                     }) })()?;
                     let mut c = nix();
                     c.args(["print-dev-env", "--json", "--no-write-lock-file"]).arg(format!(".#{shell}"));
-                    run_nix(&dir, c, uid, gid).map_err(anyhow::Error::msg)
+                    run_nix(&dir, c, uid, gid).map_err(|error| {
+                        if let Some((name, _)) = &src.toolchain
+                            && let Some(channel) = toolchain_channel_error(name, &error)
+                        {
+                            return channel.into();
+                        }
+                        anyhow::Error::msg(error)
+                    })
                 })();
-                resolution.evaluated(out.map_err(|e| format!("{e:#}")));
+                match out {
+                    Err(error) if error.is::<ToolchainChannelError>() => break Err(error),
+                    out => resolution.evaluated(out.map_err(|e| format!("{e:#}"))),
+                }
             }
             Need::Closure(roots) => {
                 let mut c = Command::new("nix-store");
@@ -579,6 +620,20 @@ mod tests {
     use super::*;
     use crate::test_support::Transcript;
     use expect_test::expect;
+
+    #[test]
+    fn bundled_toolchain_channel_errors_name_the_selected_file() {
+        for (file, message, expected) in [
+            ("rust-toolchain.toml", "Unknown channel: stabel", "rust-toolchain.toml: unknown channel \"stabel\""),
+            ("rust-toolchain", "Stable 1.20.5 is not available", "rust-toolchain: Stable 1.20.5 is not available"),
+            ("rust-toolchain.toml", "Nightly 2000-01-01 is not available", "rust-toolchain.toml: Nightly 2000-01-01 is not available"),
+        ] {
+            let trace = format!("nix failed: error:\n       … while calling the 'derivationStrict' builtin\n       error: {message}");
+            assert_eq!(toolchain_channel_error(file, &trace).unwrap().to_string(), expected);
+        }
+        let unrelated = "nix failed: error:\n       … while evaluating a derivation\n       error: undefined variable 'pkg'";
+        assert!(toolchain_channel_error("rust-toolchain.toml", unrelated).is_none());
+    }
 
     #[test]
     fn the_default_toolchain_has_the_standard_library_s_sources_whatever_the_toolchain_file_asks() {
