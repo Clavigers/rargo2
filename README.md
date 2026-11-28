@@ -13,6 +13,8 @@ Keep Cargo path dependencies inside the synced worktree. If a dependency lives i
 
 You need Linux. To run what rargo builds on your machine, with `rargo run` or straight from `target/`, you also need [Nix](https://nixos.org/download/).
 Built programs use the build server's C library from the Nix store; the first `rargo run` fetches it into the store, and the program then runs either way.
+Paths compiled into a program, `env!("CARGO_MANIFEST_DIR")` and whatever macros such as `include_dir!` or `sqlx::migrate!` derive from it, name `/w`, which is your checkout only under `rargo run`.
+A program that finds its files that way must be started with `rargo run`, and reports those paths as `/w/...`; a program that does not use such paths also runs straight from `target/`.
 
 ```sh
 cargo install rargo                 # or: curl -fsSL https://rargo.rs/install.sh | sh
