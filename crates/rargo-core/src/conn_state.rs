@@ -13,6 +13,8 @@ pub enum Route {
     Chunks { stream: u32, id: u64, hash: Digest, idx: Vec<u32> },
     Run { stream: u32, req: Box<RunRequest> },
     Refuse { stream: u32 },
+    /// A running request whose key is no longer valid: it ends, saying so, before the connection closes.
+    Ended { stream: u32 },
     Stream { stream: u32, msg: ClientMsg },
     Cancel { stream: u32 },
     Report { stream: u32, text: String },
@@ -102,7 +104,7 @@ impl ConnectionState {
             ClientMsg::Run(req) => {
                 if !key_valid {
                     let mut out = vec![Route::Refuse { stream }];
-                    out.extend(self.close());
+                    out.extend(self.key_ended());
                     return out;
                 }
                 if !self.running.insert(stream) {
@@ -139,7 +141,7 @@ impl ConnectionState {
     pub fn key_checked(&mut self, valid: bool) -> Vec<Route> {
         self.invariants();
         let was_closed = self.closed;
-        let routes = if valid { Vec::new() } else { self.close() };
+        let routes = if valid { Vec::new() } else { self.key_ended() };
         assert_eq!(self.closed, was_closed || !valid);
         self.invariants();
         routes
@@ -151,6 +153,15 @@ impl ConnectionState {
         assert!(self.closed);
         self.invariants();
         routes
+    }
+
+    /// The key is no longer valid: every running request ends, told why, and the connection closes.
+    fn key_ended(&mut self) -> Vec<Route> {
+        let mut out: Vec<Route> =
+            std::mem::take(&mut self.running).into_iter().map(|stream| Route::Ended { stream }).collect();
+        out.extend(self.close());
+        assert!(self.closed && out.iter().all(|r| !matches!(r, Route::Cancel { .. })), "an ended key cancels nothing silently");
+        out
     }
 
     pub fn close(&mut self) -> Vec<Route> {
@@ -479,6 +490,7 @@ mod tests {
                 Route::Chunks { stream, .. } => format!("chunks {stream}"),
                 Route::Run { stream, .. } => format!("run {stream}"),
                 Route::Refuse { stream } => format!("refuse {stream}"),
+                Route::Ended { stream } => format!("end {stream}"),
                 Route::Stream { stream, .. } => format!("to {stream}"),
                 Route::Cancel { stream } => format!("cancel {stream}"),
                 Route::Report { stream, text } => format!("report {stream}: {text}"),
@@ -597,10 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn a_request_on_a_key_no_longer_valid_is_refused_and_ends_the_connection() {
+    fn a_key_no_longer_valid_ends_its_running_requests_saying_so_and_the_connection() {
         expect![[r#"
             2: a build request: ["run 2"]
-            4: a build request: ["refuse 4", "cancel 2", "close"]
+            4: a build request: ["refuse 4", "end 2", "close"]
         "#]].assert_eq(&replay([
             Event::message(2, run(&["build"])),
             Event::Message(4, run(&["build"]), false),
@@ -608,10 +620,12 @@ mod tests {
         expect![[r#"
             2: a build request: ["run 2"]
             key valid=true: []
-            key valid=false: ["cancel 2", "close"]
+            key valid=false: ["end 2", "close"]
+            key valid=false: []
         "#]].assert_eq(&replay([
             Event::message(2, run(&["build"])),
             Event::KeyChecked(true),
+            Event::KeyChecked(false),
             Event::KeyChecked(false),
         ]));
     }
@@ -779,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_messages_cancel_each_stream_at_most_once_and_close_cancels_the_rest() {
+    fn generated_messages_end_each_stream_at_most_once_and_close_ends_the_rest() {
         for seed in 1..=300u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
             let mut c = ConnectionState::new();
@@ -822,6 +836,10 @@ mod tests {
                         Route::Cancel { stream: s } => {
                             assert!(model.remove(s), "seed {seed}: cancelled {s}, which was not running")
                         }
+                        Route::Ended { stream: s } => {
+                            assert!(was_run && !valid, "seed {seed}: only a refused key ends a stream");
+                            assert!(model.remove(s), "seed {seed}: ended {s}, which was not running")
+                        }
                         Route::Run { stream: s, .. } => assert!(model.insert(*s), "seed {seed}: {s} ran twice"),
                         Route::Stream { stream: s, .. } => assert!(model.contains(s)),
                         Route::Close => ended = true,
@@ -833,7 +851,7 @@ mod tests {
                     assert!(!c.is_running(stream));
                 }
                 if ended {
-                    assert!(model.is_empty(), "seed {seed}: closing cancelled every stream");
+                    assert!(model.is_empty(), "seed {seed}: closing cancelled or ended every stream");
                 }
                 assert_eq!(c.running, model, "seed {seed}");
                 c.invariants();
