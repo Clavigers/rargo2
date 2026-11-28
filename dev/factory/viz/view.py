@@ -173,7 +173,7 @@ def dictator(w: World, lines: list[dict]) -> dict:
 
 
 def release(lines: list[dict]) -> dict:
-    pub = [l for l in lines if l["event"] == "published"]
+    pub = [l for l in lines if l["event"] in ("published", "released_outside")]
     frozen = [l for l in lines if l["event"] == "frozen"]
     cand = frozen[-1]["version"] if frozen and (not pub or frozen[-1]["version"] != pub[-1]["version"]) else None
     built = [l for l in lines if l["event"] == "built" and l["version"] == cand]

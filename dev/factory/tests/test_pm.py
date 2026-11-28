@@ -254,6 +254,26 @@ def test_notes_a_session_did_not_write_are_not_put_on_the_release(tmp_path):
     assert len(tries) == 3 and f.checks.notes is None
 
 
+def test_a_candidate_someone_else_released_is_published_and_the_next_is_frozen(tmp_path):
+    f = Factory(tmp_path, soak=600)
+    f.pm.step()
+    assert f.events() == ["frozen", "built", "release_held"]
+    built = git(f.origin, "rev-parse", "release/0.7.11")
+    git(f.dev, "fetch", "-q", "origin")
+    git(f.dev, "tag", "v0.7.11", built)
+    git(f.dev, "push", "-q", "origin", "v0.7.11")
+    f.pm.step()
+    assert f.events()[-1] == "release_held"  # a tag alone is not a release
+    f.checks.released = ("v0.7.11",)
+    f.now += timedelta(minutes=5)
+    f.pm.step()
+    assert f.events()[3:5] == ["released_outside", "frozen"]
+    line = [json.loads(l) for l in open(f.ledger.path)][3 + 1]  # after the config
+    assert (line["build"], line["sha"]) == (1, built)
+    w = f.ledger.world
+    assert w.is_(M.VERSION, "0.7.11", "published") and w.is_(M.VERSION, "0.7.12", "candidate")
+
+
 def test_bump_leaves_other_packages(tmp_path):
     (tmp_path / "Cargo.toml").write_text('version = "1.0.0"\ndep = { version = "1.0.0" }\n')
     bump(tmp_path, "1.0.0", "1.0.1")

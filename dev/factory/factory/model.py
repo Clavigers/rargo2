@@ -676,6 +676,18 @@ class Published(Event):
     build: Number
 
 
+@event({PM}, D)
+class ReleasedOutside(Event):
+    """The version was released by someone other than the project manager:
+    its tag and its GitHub release exist. build is the candidate build the
+    tag points to, or absent if it points to none. No hold reason is asked:
+    the release is a fact, not a decision. The version is published."""
+    event: Literal["released_outside"]
+    version: Version
+    sha: Sha  # the commit the tag points to
+    build: Number | None = None
+
+
 EVENTS: tuple[type[Event], ...] = tuple(
     c for c in list(globals().values())
     if isinstance(c, type) and issubclass(c, Event) and c is not Event)
