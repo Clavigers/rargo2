@@ -15,29 +15,34 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Who may connect. A server started with no token file admits anyone on its
+/// machine, but only until a token file appears: tokens are made while it
+/// runs, and the first one closes it, just as a restart would.
 pub struct Keys {
-    open: bool,
-    tokens: Option<Arc<crate::tokens::TokenStore>>,
+    open_until_tokens: bool,
+    tokens: Arc<crate::tokens::TokenStore>,
 }
 
 impl Keys {
-    pub fn open() -> Keys {
-        Keys { open: true, tokens: None }
+    /// Admits anyone while `store`'s file does not exist, its holders after.
+    pub fn open(store: Arc<crate::tokens::TokenStore>) -> Keys {
+        Keys { open_until_tokens: true, tokens: store }
     }
 
     pub fn with_tokens(store: Arc<crate::tokens::TokenStore>) -> Keys {
-        Keys { open: false, tokens: Some(store) }
+        Keys { open_until_tokens: false, tokens: store }
     }
 
+    /// The token store, unless the server is still open and so issues none.
     pub fn tokens(&self) -> Option<&Arc<crate::tokens::TokenStore>> {
-        self.tokens.as_ref()
+        (!self.is_open()).then_some(&self.tokens)
     }
 
     fn lookup(&self, user: &str) -> Option<([u8; 32], bool)> {
-        if self.open {
+        if self.is_open() {
             return Some((secure::open_psk(), true));
         }
-        self.tokens.as_ref()?.lookup(user).map(|(key, admin, _)| (key, admin))
+        self.tokens.lookup(user).map(|(key, admin, _)| (key, admin))
     }
 
     pub fn still_valid(&self, user: &str) -> bool {
@@ -45,10 +50,10 @@ impl Keys {
     }
 
     pub fn name_of(&self, user: &str) -> String {
-        if self.open {
+        if self.is_open() {
             return user.to_string();
         }
-        self.tokens.as_ref().and_then(|t| t.lookup(user)).map(|(_, _, name)| name).unwrap_or_else(|| user.to_string())
+        self.tokens.lookup(user).map(|(_, _, name)| name).unwrap_or_else(|| user.to_string())
     }
 
     pub fn psk(&self, user: &str) -> Option<[u8; 32]> {
@@ -60,7 +65,7 @@ impl Keys {
     }
 
     pub fn is_open(&self) -> bool {
-        self.open
+        self.open_until_tokens && !crate::io::file::exists(self.tokens.path())
     }
 }
 
@@ -464,9 +469,12 @@ mod tests {
     #[test]
     fn an_open_server_admits_anyone_and_one_with_tokens_their_holders() {
         crate::io::sim::test(|| {
-            assert!(Keys::open().lookup("anyone").unwrap().1);
             let dir = crate::io::sim::tempdir();
             let store = Arc::new(crate::tokens::TokenStore::new(dir.join("tokens.json")));
+            let open = Keys::open(store.clone());
+            assert!(open.lookup("anyone").unwrap().1);
+            assert_eq!(open.lookup("anyone").unwrap().0, secure::open_psk());
+            assert!(open.is_open() && open.tokens().is_none());
             let (ann, secret) = store.create("ann", true, None, "test").unwrap();
             let (bob, _) = store.create("bob", false, None, "test").unwrap();
             let k = Keys::with_tokens(store.clone());
@@ -476,6 +484,22 @@ mod tests {
             assert_eq!(k.name_of(&bob.id), "bob");
             store.revoke(&bob.id).unwrap();
             assert!(!k.still_valid(&bob.id));
+        });
+    }
+
+    #[test]
+    fn an_open_server_closes_when_its_first_token_is_made_while_it_runs() {
+        crate::io::sim::test(|| {
+            let dir = crate::io::sim::tempdir();
+            let store = Arc::new(crate::tokens::TokenStore::new(dir.join("tokens.json")));
+            let keys = Keys::open(store.clone());
+            assert!(keys.is_open());
+            let (ann, secret) = store.create("ann", true, None, "test").unwrap();
+            assert!(!keys.is_open(), "the first token closes the server");
+            assert!(keys.tokens().is_some(), "and it now issues tokens");
+            assert_eq!(keys.lookup(&ann.id).unwrap(), (secure::psk_from_secret(secret.as_bytes()), true), "the new token is known");
+            assert!(keys.lookup("anyone").is_none(), "a client with no token is refused");
+            assert!(!keys.still_valid("anyone"), "and a session admitted while it was open ends");
         });
     }
 

@@ -1253,7 +1253,10 @@ mod tests {
         "#]].assert_eq(&outcomes.0);
         assert_eq!(server_for_host(&Cfg { public: None, port: 7459, has_tokens: false, access: String::new() }, "build.example:8080"), "build.example:7459");
         assert_eq!(server_for_host(&Cfg { public: Some("b.example:1".into()), port: 7459, has_tokens: false, access: String::new() }, "rargo.rs"), "b.example:1");
-        assert_eq!(Http::new(Arc::new(Keys::open()), None, 7459).server_for("build.example"), "build.example:7459");
+        crate::io::sim::test(|| {
+            let store = Arc::new(crate::tokens::TokenStore::new(crate::io::sim::tempdir().join("tokens.json")));
+            assert_eq!(Http::new(Arc::new(Keys::open(store)), None, 7459).server_for("build.example"), "build.example:7459");
+        });
     }
 
     #[test]
