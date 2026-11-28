@@ -535,6 +535,15 @@ impl FlakeEnv {
         self.env.get("PATH")?.split(':').map(|d| format!("{d}/{program}")).find(|p| Path::new(p).ring_is_file())
     }
 
+    pub(crate) fn git_warning(&self, worktree: &impl Worktree, shell: &str) -> Option<String> {
+        if worktree.node(b".git").is_none() || self.which("git").is_some() {
+            return None;
+        }
+        Some(format!(
+            "the build's `{shell}` dev shell has no `git` on PATH; build scripts and proc macros that call it may omit commit information. Add `pkgs.git` to the shell's `nativeBuildInputs` in flake.nix"
+        ))
+    }
+
     pub fn etc(&self, store: &Store, uid: u32, gid: u32) -> Result<Arc<BTreeMap<Vec<u8>, SynthEnt>>> {
         let mut m = BTreeMap::new();
         let mut file = |name: &str, content: String| -> Result<()> {
@@ -901,6 +910,32 @@ mod tests {
             }
             go(self, b"", f)
         }
+    }
+
+    #[test]
+    fn a_checkout_with_no_git_in_the_dev_shell_gets_a_warning() {
+        use crate::io::{file, sim};
+
+        sim::run(0, sim::Net::default(), || {
+            let bin = "/nix/store/00000000000000000000000000000000-tools/bin";
+            file::create_dir_all(bin).unwrap();
+            let flake = FlakeEnv {
+                env: BTreeMap::from([("PATH".into(), bin.into())]),
+                closure: Vec::new(),
+                roots: Vec::new(),
+                id: Hash::of(b""),
+            };
+            let mut tree = MemTree::default();
+            assert_eq!(flake.git_warning(&tree, "default"), None);
+
+            tree.file(".git/HEAD", "ref: refs/heads/main");
+            let warning = flake.git_warning(&tree, "default").expect("missing git warning");
+            assert!(warning.contains("`default` dev shell has no `git` on PATH"));
+            assert!(warning.contains("`pkgs.git`"));
+
+            file::write(format!("{bin}/git"), b"").unwrap();
+            assert_eq!(flake.git_warning(&tree, "default"), None);
+        });
     }
 
     #[test]
