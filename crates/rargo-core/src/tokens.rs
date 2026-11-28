@@ -456,6 +456,7 @@ impl Tokens {
     fn withdraw_invites(&mut self, at: u64, matches: impl Fn(&Invite) -> bool) -> usize {
         let before = self.invites.len();
         self.invites.retain(|invite| !invite.active(at) || !matches(invite));
+        debug_assert!(!self.invites.iter().any(|invite| invite.active(at) && matches(invite)));
         before - self.invites.len()
     }
 
