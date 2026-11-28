@@ -130,7 +130,8 @@ fn join(rel: &[u8], name: &[u8]) -> Vec<u8> {
     v
 }
 
-fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
+/// Whether a `[metadata.rargo.sync]` `exclude` pattern names the entry `name` at worktree path `rel`.
+pub fn excluded(patterns: &[String], rel: &[u8], name: &[u8]) -> bool {
     patterns.iter().any(|p| {
         let anchored = p.trim_end_matches('/').contains('/');
         let p = p.trim_matches('/').as_bytes();
