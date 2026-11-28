@@ -591,6 +591,32 @@ fn sh(p: &mut Proc, script: &str) -> i32 {
 }
 
 #[test]
+fn concurrent_first_requests_share_the_nix_hashing_worker() {
+    sim::run(0, sim::Net::default(), || {
+        let fx = fixture(sh);
+        let daemon = Rc::new(crate::build::Daemon::new(
+            crate::build::Config {
+                state_dir: fx.tmp.clone(),
+                planner: fx.tmp.join("planner"),
+                cargo_home: fx.tmp.join("cargo-home"),
+                uid: 1000,
+                gid: 1000,
+                server_env: Default::default(),
+            },
+            fx.engine,
+            1,
+        ));
+        let lookup = |daemon: Rc<crate::build::Daemon>| {
+            io::spawn(move || std::ptr::from_ref(daemon.nix_hashing()).addr())
+        };
+        let mut first = lookup(daemon.clone());
+        let mut second = lookup(daemon);
+
+        assert_eq!(first.join().unwrap(), second.join().unwrap());
+    });
+}
+
+#[test]
 fn replays_until_an_observed_input_changes() {
     sim::test(|| {
         let fx = fixture(sh);
