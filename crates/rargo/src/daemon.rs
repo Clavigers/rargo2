@@ -2204,8 +2204,24 @@ fn mountinfo() -> String {
 }
 
 fn mounts_at<'a>(info: &'a str, dir: &Path) -> impl Iterator<Item = &'a str> {
-    let here = dir.to_string_lossy().into_owned();
-    info.lines().filter(move |l| l.split(' ').nth(4) == Some(here.as_str()))
+    let here = mountinfo_path(dir);
+    info.lines().filter(move |l| l.split(' ').nth(4).map(str::as_bytes) == Some(here.as_slice()))
+}
+
+/// A path as `/proc/self/mountinfo` writes it: space, tab, newline and
+/// backslash become octal escapes.
+pub(crate) fn mountinfo_path(path: &Path) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        match byte {
+            b' ' => encoded.extend_from_slice(b"\\040"),
+            b'\t' => encoded.extend_from_slice(b"\\011"),
+            b'\n' => encoded.extend_from_slice(b"\\012"),
+            b'\\' => encoded.extend_from_slice(b"\\134"),
+            _ => encoded.push(byte),
+        }
+    }
+    encoded
 }
 
 fn dev_at(info: &str, dir: &Path) -> Option<u64> {
@@ -3234,6 +3250,16 @@ mod tests {
         assert_eq!(super::dev_at(info, Path::new("/w/target2")), Some(63));
         assert_eq!(super::dev_at(info, Path::new("/w")), None);
         assert_eq!(super::mounts_at(info, Path::new("/w/target")).count(), 2);
+    }
+
+    #[test]
+    fn a_mount_under_a_path_with_a_space_is_found() {
+        let info = "80 30 0:61 / /tmp/My\\040Projects/app/target rw - fuse.rargo rargo rw\n\
+                    81 30 0:62 / /tmp/a\\134b\\011c/target rw - fuse.rargo rargo rw\n";
+        assert_eq!(super::dev_at(info, Path::new("/tmp/My Projects/app/target")), Some(61));
+        assert_eq!(super::mounts_at(info, Path::new("/tmp/My Projects/app/target")).count(), 1);
+        assert_eq!(super::dev_at(info, Path::new("/tmp/a\\b\tc/target")), Some(62));
+        assert_eq!(super::dev_at(info, Path::new("/tmp/My\\040Projects/app/target")), None);
     }
 
     #[test]
