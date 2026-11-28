@@ -228,6 +228,12 @@ def test_a_released_version_gets_its_notes_written_once(tmp_path):
     f.pm.step()
     f.pm.step()
     assert asked == [("0.7.11", "v0.7.10")]
+    f.commit("by hand")  # a release the owner cut from main, which the log does not know
+    git(f.dev, "tag", "v0.7.12")
+    git(f.dev, "push", "-q", "origin", "main", "v0.7.12")
+    f.checks.released = ("v0.7.10", "v0.7.11", "v0.7.12")
+    f.pm.step()
+    assert asked[1:] == [("0.7.12", "v0.7.11")]  # and not 0.7.10: only the two newest
     assert f.checks.notes[0] == "v0.7.11" and "no longer hangs" in f.checks.notes[1]
     assert (tmp_path / "state" / "notes" / "0.7.11.md").exists()
 
