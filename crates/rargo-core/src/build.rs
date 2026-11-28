@@ -503,6 +503,7 @@ struct Prepared {
     /// `env` before [`build_paths`] mapped its directories into the sandbox.
     unmapped: BTreeMap<String, String>,
     channel: Option<&'static str>,
+    shell: &'static str,
 }
 
 fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<Prepared> {
@@ -581,7 +582,7 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
         err
     })?;
     let channel = vv.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
-    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, unmapped, channel })
+    Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, unmapped, channel, shell })
 }
 
 const RUSTC_PROBE: &str = "rustc -vV (the channel cargo plans on)";
@@ -1084,6 +1085,9 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
                 let first = prepared.is_none();
                 let ready = prepare(d, c, snapshot.clone())?;
                 if first {
+                    if let Some(warning) = ready.flake.git_warning(&*snapshot, ready.shell) {
+                        c.out.warn(&warning);
+                    }
                     phase(d, started, c, "worktree prepared");
                     remember_client(d, c)?;
                     // Resolve an unpinned registry install against the online index before planning from the cache.
