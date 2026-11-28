@@ -146,6 +146,8 @@ pub enum Plan {
     /// Run cargo, first printing `banner` if there is one.
     Cargo { release: bool, banner: Option<String> },
     CargoDelegated,
+    /// Run cargo because RARGO_FALLBACK=cargo is set and rargo cannot build remotely, for the reason given.
+    Fallback(String),
     Print(String),
     Status,
     StopDaemons,
@@ -154,6 +156,11 @@ pub enum Plan {
     Auth(Auth),
     Daemon(OsString),
     Remote { config: Config, args: Vec<String>, vars: Vec<(String, String)>, kind: &'static str },
+}
+
+/// The line printed before plain cargo builds in place of the server under RARGO_FALLBACK=cargo.
+pub fn fallback_note(reason: &str) -> String {
+    format!("rargo: {reason}; building locally (RARGO_FALLBACK=cargo)")
 }
 
 fn die(msg: impl std::fmt::Display) -> Plan {
@@ -251,7 +258,7 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
     };
     if config.secret.is_none() && !is_loopback(&config.server) && matches!(kind, "admin" | "drift" | "build") {
         if kind == "build" && var(w, "RARGO_FALLBACK") == Some("cargo") {
-            return Plan::Cargo { release: false, banner: None };
+            return Plan::Fallback(format!("this machine is not authenticated to {}", config.host));
         }
         return die(format!(
             "this machine is not authenticated to {}: run `rargo auth`, which also says how to get access if the server has not let you in yet",
@@ -809,7 +816,7 @@ mod tests {
             (None, vec!["+nightly", "check"], fake(&[("RARGO_BYPASS", "1")]), cargo.clone()),
             (None, vec!["build"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["--rargo-gc"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
-            (None, vec!["build"], fake(&[("RARGO_FALLBACK", "cargo")]).no_creds(), Plan::Cargo { release: false, banner: None }),
+            (None, vec!["build"], fake(&[("RARGO_FALLBACK", "cargo")]).no_creds(), Plan::Fallback("this machine is not authenticated to h.example".into())),
             (None, vec!["--rargo-gc"], fake(&[("RARGO_FALLBACK", "cargo")]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["--rargo-drift-check"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["--rargo-daemon-stop"], fake(&[("USER", "u")]).no_creds(), Plan::StopDaemons),
