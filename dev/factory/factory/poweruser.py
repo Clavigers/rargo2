@@ -32,13 +32,26 @@ use of the build, and another is tried after `retry`, or after the gap when
 that is shorter. So is a use left open by a power user
 that stopped, which the next one ends. It writes no code and touches no pull
 request.
+
+Each session runs in its own session (process group) with a directory the
+factory made for it, which it is told to work under (and is its TMPDIR).
+Whatever the session ended like, the factory then kills every process left
+of it (those in its session, or that carry its mark in their environment,
+or whose working directory or command line is in its directory), unmounts
+every mount under that directory, lazily if it must, and removes it, and
+says what it had to kill and unmount. It reaches nothing outside: not the
+shared server, not /root/.cache/rargo, not another session's directory.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -98,7 +111,10 @@ class PowerUser:
                  settle: timedelta = timedelta(minutes=20), poll: float = 20.0,
                  run: Callable[..., int] | None = None,
                  prepare: Callable[[str], None] | None = None,
-                 say: Callable[[str], None] = print):
+                 say: Callable[[str], None] = print,
+                 scratch: Path | None = None,
+                 mounts: Callable[[], list[str]] | None = None,
+                 unmount: Callable[[str, bool], bool] | None = None):
         self.ledger, self.gh, self.checkout, self.prompt = ledger, gh, Path(checkout), prompt
         self.clock, self.gap, self.retry, self.timeout = clock, gap, retry, timeout
         self.settle, self.poll = settle, poll
@@ -106,6 +122,9 @@ class PowerUser:
         self.run_session = run or self._run_session
         self.prepare = prepare or (self._checkout if run is None else lambda sha: None)
         self.say = say
+        self.scratch = Path(scratch or tempfile.gettempdir())  # where session directories are made
+        self.mounts = mounts or _mounts
+        self.unmount = unmount or _unmount
 
     def run(self, every: float = 300.0) -> None:
         while True:
@@ -208,32 +227,76 @@ class PowerUser:
         notes = "\n\n".join(
             f"--- an earlier session ended with:\n{text[-NOTE_CHARS:]}"
             for p in before[-NOTES:] if (text := p.read_text(errors="replace").strip()))
-        prompt = (self.prompt.replace("{version}", version).replace("{build}", str(build))
-                  .replace("{sha}", sha).replace("{use}", str(use))
-                  .replace("{session}", str(self.round)).replace("{focus}", f"{area}: {how}")
-                  .replace("{notes}", notes or "None: this is the first session."))
-        cmd = harness.command(t, prompt)
-        if cmd is None:
-            self.say(f"power user: no {t.type} here to run a session with")
-            return 127
-        argv, extra = cmd
-        env = os.environ | extra | {
-            "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.power_user,
-            "FACTORY_PYTHON": sys.executable,
-            "PATH": f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}"}
-        started = time.monotonic()
-        with open(log / f"use-{use}-{self.round}.log", "wb") as out:
-            try:
-                code = subprocess.run(argv, cwd=self.checkout, env=env, stdin=subprocess.DEVNULL,
-                                      stdout=out, stderr=subprocess.STDOUT,
-                                      timeout=self.timeout.total_seconds()).returncode
-            except subprocess.TimeoutExpired:
-                return 124
+        self.scratch.mkdir(parents=True, exist_ok=True)
+        work = Path(os.path.realpath(tempfile.mkdtemp(prefix=f"pu{use}.{self.round}.", dir=self.scratch)))
+        proc = None
+        try:
+            prompt = (self.prompt.replace("{dir}", str(work))
+                      .replace("{version}", version).replace("{build}", str(build))
+                      .replace("{sha}", sha).replace("{use}", str(use))
+                      .replace("{session}", str(self.round)).replace("{focus}", f"{area}: {how}")
+                      .replace("{notes}", notes or "None: this is the first session."))
+            cmd = harness.command(t, prompt)
+            if cmd is None:
+                self.say(f"power user: no {t.type} here to run a session with")
+                return 127
+            argv, extra = cmd
+            env = os.environ | extra | {
+                "TMPDIR": str(work), MARK: str(work),
+                "FACTORY_LOG": self.ledger.path, "FACTORY_ACTOR": Role.power_user,
+                "FACTORY_PYTHON": sys.executable,
+                "PATH": f"{BIN}{os.pathsep}{os.environ.get('PATH', '')}"}
+            started = time.monotonic()
+            with open(log / f"use-{use}-{self.round}.log", "wb") as out:
+                # its own session, so that what it starts is found by its session id too
+                proc = subprocess.Popen(argv, cwd=self.checkout, env=env, stdin=subprocess.DEVNULL,
+                                        stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    code = proc.wait(timeout=self.timeout.total_seconds())
+                except subprocess.TimeoutExpired:
+                    return 124
+                finally:
+                    self.clean(work, use, sid=proc.pid)
+                    proc.wait()
+        finally:
+            if proc is None:  # no session ran: only the directory to remove
+                self.clean(work, use)
         if code == 0 and time.monotonic() - started < MIN_SESSION.total_seconds():
             self.say(f"power user: use {use} session {self.round} ended within "
                      f"{MIN_SESSION.seconds // 60} minutes: not a session")
             return 75  # EX_TEMPFAIL: a harness that exits 0 saying it is out of quota
         return code
+
+    def clean(self, work: Path, use: int, sid: int | None = None) -> None:
+        """Kill what is left of the session that worked in WORK (and whose
+        session id is SID), unmount what it mounted there and remove it,
+        saying what was left."""
+        work = Path(os.path.realpath(work))
+        if not work.exists():
+            return
+        killed = _kill(work, sid)
+        unmounted, stuck = [], []
+        for _ in range(3):  # a lazy unmount can uncover a mount beneath it
+            here = sorted((p for p in self.mounts() if _under(p, work)), key=len, reverse=True)
+            if not here:
+                break
+            for p in here:
+                if self.unmount(p, False) or self.unmount(p, True):
+                    unmounted.append(p)
+                elif p not in stuck:
+                    stuck.append(p)
+        stuck = [p for p in self.mounts() if _under(p, work)]
+        size = _size(work)
+        if stuck:  # removing would reach into what is mounted there
+            self.say(f"power user: use {use} session {self.round}: could not unmount {stuck}: "
+                     f"left {work} in place")
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+        if killed or unmounted or size:
+            what = [f"killed {len(killed)}: " + "; ".join(killed)] if killed else []
+            what += [f"unmounted {len(unmounted)}: " + " ".join(unmounted)] if unmounted else []
+            what += [f"removed {work} ({size} bytes)"] if not stuck else []
+            self.say(f"power user: use {use} session {self.round} left behind: " + "; ".join(what))
 
     def _record(self, event: str, **fields) -> None:
         self.ledger.submit(Role.power_user, json.dumps({"event": event, **fields}))
@@ -242,3 +305,89 @@ class PowerUser:
         key = f'"event":"{event}"'
         with open(self.ledger.path) as f:
             return [json.loads(l) for l in f if key in l]
+
+
+MARK = "FACTORY_USE_DIR"  # in the environment of everything a session starts
+
+
+def _under(path: str, work: Path) -> bool:
+    return path == str(work) or path.startswith(str(work) + "/")
+
+
+def _ancestors() -> set[int]:
+    """This process and those above it: never killed, whatever they carry."""
+    pids, pid = set(), os.getpid()
+    while pid > 1 and pid not in pids:
+        pids.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return pids
+
+
+def _theirs(work: Path, sid: int | None) -> dict[int, str]:
+    """The processes left of the session that worked in WORK, with their
+    command lines: in its session SID, or with its mark in their environment,
+    their working directory in WORK, or WORK on their command line."""
+    found, mark, mine = {}, f"{MARK}={work}".encode(), _ancestors()
+    named = re.compile(re.escape(str(work)) + r"(/|\s|$)")
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) in mine:
+            continue
+        try:
+            stat = (d / "stat").read_text().rsplit(")", 1)[1].split()
+            if stat[0] in "ZX":
+                continue  # dead already, only not yet reaped
+            cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            hit = int(stat[3]) == sid or named.search(cmd) is not None
+            for look in (lambda: mark in (d / "environ").read_bytes().split(b"\0"),
+                         lambda: _under(os.readlink(d / "cwd"), work)):
+                try:
+                    hit = hit or look()
+                except OSError:
+                    pass
+            if hit:
+                found[int(d.name)] = cmd or f"[{(d / 'comm').read_text().strip()}]"
+        except (OSError, ValueError, IndexError):
+            continue  # gone, or not ours to read
+    return found
+
+
+def _kill(work: Path, sid: int | None) -> list[str]:
+    """Kill everything left of the session, until none is left: what is
+    killed can have started more."""
+    killed: dict[int, str] = {}
+    deadline = time.monotonic() + 30
+    while (left := _theirs(work, sid)) and time.monotonic() < deadline:
+        for pid, cmd in left.items():
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed.setdefault(pid, cmd)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.05)
+    return [f"{pid} {cmd[:200]}" for pid, cmd in killed.items()]
+
+
+def _mounts() -> list[str]:
+    def unescape(p: str) -> str:  # mountinfo writes space, tab, newline and backslash in octal
+        return p.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+    with open("/proc/self/mountinfo") as f:
+        return [unescape(l.split()[4]) for l in f if len(l.split()) > 4]
+
+
+def _unmount(path: str, lazy: bool) -> bool:
+    return subprocess.run(["umount", *(["-l"] if lazy else []), path],
+                          capture_output=True).returncode == 0
+
+
+def _size(work: Path) -> int:
+    total = 0
+    for root, dirs, files in os.walk(work):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total

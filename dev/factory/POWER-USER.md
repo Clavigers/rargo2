@@ -15,14 +15,18 @@ push nothing, and touch no pull request or existing issue beyond reading it.
 2. Build the candidate here: client and server, release mode. Use plain
    `cargo`, not an installed `rargo`, so that what you test is this commit.
 3. Run your own server from that build, on a free port, with its own state
-   directory under a fresh `mktemp -d`. `dev/rargod.sh` and
-   `dev/free-ports.py` show how. Point your client at it with its own cache
-   directory too.
+   directory under `{dir}`. `dev/rargod.sh` and `dev/free-ports.py` show how.
+   Point your client at it with its own cache directory there too.
+
+`{dir}` is this sitting's directory, made for it by the factory (it is also
+your `TMPDIR`): put everything you make there, projects and clones included,
+and nothing anywhere else. When the sitting ends, however it ends, the factory
+kills every process it left running, unmounts what it mounted under `{dir}`
+and removes it; what it had to clean up is noted against this sitting.
 
 Never use, stop, restart or reconfigure the shared server (`rargod.service`,
 `rargo.rs`, port 7459) or anything under `/root/.cache/rargo`: the agents'
-work depends on them. Stop your own server and remove your temporary
-directories before you end.
+work depends on them. Stop your own server before you end.
 
 ## Use it
 
