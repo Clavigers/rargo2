@@ -844,9 +844,9 @@ fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
     let (uid, gid) = (io::process::uid(), io::process::gid());
     if namespace::unshare(libc::CLONE_NEWNS).is_err() {
         namespace::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS)?;
-        io::file::write("/proc/self/setgroups", "deny")?;
-        io::file::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
-        io::file::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+        namespace::write_proc("/proc/self/setgroups", "deny")?;
+        namespace::write_proc("/proc/self/uid_map", &format!("{uid} {uid} 1"))?;
+        namespace::write_proc("/proc/self/gid_map", &format!("{gid} {gid} 1"))?;
     }
     mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
     let entries: Vec<io::file::DirEntry> = io::file::read_dir("/")?.filter_map(|e| e.ok()).collect();

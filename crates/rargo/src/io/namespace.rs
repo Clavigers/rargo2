@@ -17,6 +17,13 @@ pub(crate) fn unshare(flags: libc::c_int) -> io::Result<()> {
     done(unsafe { libc::unshare(flags) }.into())
 }
 
+/// Writes a namespace control file using a sequential write. These procfs
+/// files reject positioned writes with ESPIPE.
+pub(crate) fn write_proc(path: &str, value: &str) -> io::Result<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).open(path)?.write_all(value.as_bytes())
+}
+
 pub(crate) fn mount(src: Option<&Path>, tgt: &Path, fstype: Option<&str>, flags: libc::c_ulong, data: Option<&str>) -> io::Result<()> {
     let text = |s: &str| CString::new(s).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "text contains a nul"));
     let src_c = src.map(cstr).transpose()?;
