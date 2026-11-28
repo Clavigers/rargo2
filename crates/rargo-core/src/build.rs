@@ -70,6 +70,7 @@ pub struct Daemon {
     pub pool: OnceCell<Arc<crate::remote::Pool>>,
     pub(crate) nix_attached: std::rc::Rc<crate::nixmanifest::Attached>,
     nix_hashing: OnceCell<crate::nixmanifest::Hashing>,
+    nix_hashing_init: crate::io::Mutex<()>,
     pub drift_report: RefCell<Option<String>>,
     pub last_clients: RefCell<HashMap<String, crate::drift::LastClient>>,
     pub deliveries: RefCell<Deliveries>,
@@ -267,6 +268,7 @@ impl Daemon {
             pool: OnceCell::new(),
             nix_attached: Default::default(),
             nix_hashing: OnceCell::new(),
+            nix_hashing_init: crate::io::Mutex::new(()),
             drift_report: RefCell::new(None),
             last_clients: RefCell::new(HashMap::new()),
             deliveries: RefCell::new(Deliveries { random: crate::rng::Rng::new(seed), by_worktree: BTreeMap::new() }),
@@ -344,6 +346,11 @@ impl Daemon {
 
     /// The thread that hashes Nix store paths, started when it is first wanted.
     pub(crate) fn nix_hashing(&self) -> &crate::nixmanifest::Hashing {
+        if let Some(hashing) = self.nix_hashing.get() {
+            return hashing;
+        }
+        // Starting the worker reads cgroup files and can suspend this fiber.
+        let _init = self.nix_hashing_init.lock();
         self.nix_hashing.get_or_init(crate::nixmanifest::Hashing::start)
     }
 
