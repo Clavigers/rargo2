@@ -25,6 +25,8 @@ use crate::io::{Mutex as FiberMutex, Notify, UdpSocket, UnboundedReceiver, Unbou
 const FRAG: usize = 1200;
 const T_DATA: u8 = 1;
 const T_ACK: u8 = 2;
+/// "No such connection": the answer to a packet for a connection id the endpoint does not have.
+const T_RESET: u8 = 3;
 const DATA_HDR: usize = 1 + 8 + 8 + 4 + 4;
 const MIN_RTO: Duration = Duration::from_millis(10);
 const MAX_RTO: Duration = Duration::from_secs(2);
@@ -677,6 +679,7 @@ impl Endpoint {
         self.sync_tag(bytes);
         let now = io::now().saturating_duration_since(self.t0).as_millis() as u64;
         let routed = self.state.borrow_mut().recv(from, bytes, now);
+        let mut reset = None;
         for ev in routed.events {
             match ev {
                 endpoint::RouteEvent::Open { id, from } => self.open_conn(id, from),
@@ -698,6 +701,7 @@ impl Endpoint {
                         c.on_ack(msg, frag);
                     }
                 }
+                endpoint::RouteEvent::Reset { id } => reset = Some(id),
             }
         }
         if let Some(id) = routed.id {
@@ -705,6 +709,9 @@ impl Endpoint {
                 bump(&c.stats.recv_packets, 1);
                 bump(&c.stats.recv_bytes, routed.len as u64);
             }
+        }
+        if let Some(id) = reset {
+            self.forget(id);
         }
     }
 

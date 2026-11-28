@@ -2,7 +2,7 @@
 //! This type decides which connection a datagram belongs to, and which datagrams to send back.
 
 use rargo_machine::StateMachine;
-use super::{AGREEMENT, DATA_HDR, LinkKey, T_ACK, T_DATA, TAG, open, seal};
+use super::{AGREEMENT, DATA_HDR, LinkKey, T_ACK, T_DATA, T_RESET, TAG, open, seal};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
@@ -13,7 +13,11 @@ pub struct EndpointState {
     conns: BTreeMap<u64, Route>,
     forgotten: BTreeSet<u64>,
     acks: BTreeMap<u64, PendingAck>,
+    resets: Vec<(SocketAddr, u64)>,
 }
+
+/// At most this many resets wait for one `take_datagrams`.
+const RESETS_WAITING: usize = 64;
 
 struct Route {
     peer: SocketAddr,
@@ -32,6 +36,8 @@ pub enum RouteEvent {
     Peer { id: u64, from: SocketAddr },
     Data { id: u64, msg: u64, frag: u32, nfrags: u32, payload: Vec<u8> },
     Ack { id: u64, msg: u64, frag: u32 },
+    /// The peer does not know this connection: it restarted, or forgot it.
+    Reset { id: u64 },
 }
 
 pub struct Routed {
@@ -49,6 +55,7 @@ impl EndpointState {
             conns: BTreeMap::new(),
             forgotten: BTreeSet::new(),
             acks: BTreeMap::new(),
+            resets: Vec::new(),
         };
         s.invariants();
         s
@@ -97,7 +104,8 @@ impl EndpointState {
                     let (RouteEvent::Open { id: e_id, .. }
                     | RouteEvent::Peer { id: e_id, .. }
                     | RouteEvent::Data { id: e_id, .. }
-                    | RouteEvent::Ack { id: e_id, .. }) = e;
+                    | RouteEvent::Ack { id: e_id, .. }
+                    | RouteEvent::Reset { id: e_id }) = e;
                     assert_eq!(*e_id, id, "every event names the routed connection");
                 }
             }
@@ -126,8 +134,14 @@ impl EndpointState {
     }
 
     pub fn take_datagrams(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
-        let pending = self.acks.len();
+        let pending = self.acks.len() + self.resets.len();
         let mut out = Vec::new();
+        for (to, id) in std::mem::take(&mut self.resets) {
+            let mut pkt = vec![T_RESET];
+            pkt.extend_from_slice(&id.to_le_bytes());
+            seal(&self.key, &mut pkt);
+            out.push((to, pkt));
+        }
         for (id, ack) in std::mem::take(&mut self.acks) {
             let mut pkt = ack.body;
             seal(&self.key, &mut pkt);
@@ -139,8 +153,8 @@ impl EndpointState {
             }
             out.push((ack.to, pkt));
         }
-        assert!(self.acks.is_empty(), "every waiting acknowledgement is taken");
-        assert_eq!(out.len(), pending, "one datagram per connection with acknowledgements waiting");
+        assert!(self.acks.is_empty() && self.resets.is_empty(), "every waiting acknowledgement and reset is taken");
+        assert_eq!(out.len(), pending, "one datagram per reset and per connection with acknowledgements waiting");
         self.invariants();
         out
     }
@@ -153,18 +167,21 @@ impl EndpointState {
             return Routed { id: None, len: 0, events: Vec::new() };
         }
         let id = u64::from_le_bytes(pkt[1..9].try_into().unwrap());
+        if pkt[0] == T_RESET {
+            return self.reset(id, from);
+        }
         let first_msg = (pkt.len() >= 17).then(|| u64::from_le_bytes(pkt[9..17].try_into().unwrap()));
-        if !proven && pkt[0] == T_DATA && first_msg != Some(AGREEMENT) {
+        let opens = self.accepting && pkt[0] == T_DATA && first_msg == Some(AGREEMENT);
+        if self.forgotten.contains(&id) || (!self.conns.contains_key(&id) && !opens) {
+            self.unknown(id, from, pkt[0]);
             return Routed { id: None, len: 0, events: Vec::new() };
         }
-        if self.forgotten.contains(&id) {
+        if !proven && pkt[0] == T_DATA && first_msg != Some(AGREEMENT) {
             return Routed { id: None, len: 0, events: Vec::new() };
         }
         let mut events = Vec::new();
         if !self.conns.contains_key(&id) {
-            if !(self.accepting && pkt[0] == T_DATA) {
-                return Routed { id: None, len: 0, events: Vec::new() };
-            }
+            assert!(opens, "only an opening packet reaches here for an unknown id");
             assert!(!self.forgotten.contains(&id), "a forgotten id is never opened again");
             self.conns.insert(id, Route { peer: from, tag: None, last_heard: now });
             events.push(RouteEvent::Open { id, from });
@@ -200,6 +217,29 @@ impl EndpointState {
         Routed { id: Some(id), len, events }
     }
 
+    /// A data or acknowledgement packet for a connection this endpoint does not have: say so, so the
+    /// sender stops waiting on it. A reset is never answered, and is no longer than what it answers.
+    fn unknown(&mut self, id: u64, from: SocketAddr, kind: u8) {
+        if !matches!(kind, T_DATA | T_ACK) || self.resets.len() >= RESETS_WAITING || self.resets.contains(&(from, id)) {
+            return;
+        }
+        assert!(!self.conns.contains_key(&id) || self.forgotten.contains(&id), "only a connection this endpoint lacks is reset");
+        self.resets.push((from, id));
+        assert!(self.resets.len() <= RESETS_WAITING, "resets waiting are bounded");
+    }
+
+    /// A reset counts only from the connection's peer. With a shared key `admit` has already checked its seal;
+    /// a restarted server no longer knows a per-connection tag, so there it cannot be proven.
+    fn reset(&self, id: u64, from: SocketAddr) -> Routed {
+        let Some(c) = self.conns.get(&id) else {
+            return Routed { id: None, len: 0, events: Vec::new() };
+        };
+        if c.peer != from {
+            return Routed { id: None, len: 0, events: Vec::new() };
+        }
+        Routed { id: Some(id), len: 9, events: vec![RouteEvent::Reset { id }] }
+    }
+
     fn admit<'a>(&self, pkt: &'a [u8]) -> Option<(&'a [u8], bool)> {
         if !self.per_conn {
             return open(&self.key, pkt).map(|p| (p, true));
@@ -231,6 +271,7 @@ impl StateMachine for EndpointState {
             assert!(ack.body.len() >= 9 + 12, "a waiting acknowledgement carries its connection id and at least one entry");
             assert_eq!(ack.body.len() % 12, 9, "an acknowledgement is a header plus whole entries");
         }
+        assert!(self.resets.len() <= RESETS_WAITING, "resets waiting are bounded");
     }
 }
 
@@ -348,6 +389,75 @@ mod tests {
             Peer { id: 5, from: 10.1.0.1:3 }
             Data { id: 5, msg: 1, frag: 0, nfrags: 1, payload: [110, 101, 119] }
         "#]]);
+    }
+
+    fn reset(id: u64) -> Vec<u8> {
+        let mut pkt = vec![T_RESET];
+        pkt.extend_from_slice(&id.to_le_bytes());
+        pkt
+    }
+
+    fn ack_of(id: u64, msg: u64) -> Vec<u8> {
+        let mut pkt = vec![T_ACK];
+        pkt.extend_from_slice(&id.to_le_bytes());
+        pkt.extend_from_slice(&msg.to_le_bytes());
+        pkt.extend_from_slice(&0u32.to_le_bytes());
+        pkt
+    }
+
+    #[test]
+    fn a_restarted_server_says_it_does_not_know_a_connection() {
+        let mut s = EndpointState::new(true, true, None);
+        check(&mut s, at(1), &with_tag(data(7, 4, b"old"), &[5u8; 32]), 1, expect!["id=None, len=0\n"]);
+        check(&mut s, at(1), &ack_of(7, 3), 2, expect!["id=None, len=0\n"]);
+        check(&mut s, at(2), &data(9, 4, b"other"), 3, expect!["id=None, len=0\n"]);
+        check(&mut s, at(1), &reset(7), 4, expect!["id=None, len=0\n"]);
+        let sent = s.take_datagrams();
+        assert_eq!(sent, vec![(at(1), reset(7)), (at(2), reset(9))], "one reset per unknown connection, and none for a reset");
+        assert!(s.take_datagrams().is_empty());
+        check(&mut s, at(1), &data(11, AGREEMENT, b"hi"), 5, expect![[r#"
+            id=Some(11), len=27
+            Open { id: 11, from: 10.1.0.1:1 }
+            Data { id: 11, msg: 1, frag: 0, nfrags: 1, payload: [104, 105] }
+        "#]]);
+        assert!(s.take_datagrams().is_empty(), "an opening packet is not reset");
+        s.forget(11);
+        check(&mut s, at(1), &data(11, 4, b"late"), 6, expect!["id=None, len=0\n"]);
+        assert_eq!(s.take_datagrams(), vec![(at(1), reset(11))], "a forgotten connection is reset too");
+        for i in 0..2 * RESETS_WAITING as u64 {
+            s.recv(at(3), &data(100 + i, 4, b"x"), 7);
+        }
+        assert_eq!(s.take_datagrams().len(), RESETS_WAITING, "resets waiting are bounded");
+    }
+
+    #[test]
+    fn a_reset_counts_only_from_the_connections_peer() {
+        let mut s = EndpointState::new(false, true, None);
+        assert!(s.connect(7, at(1), 0));
+        s.set_tag(7, [5u8; 32]);
+        check(&mut s, at(2), &reset(7), 1, expect!["id=None, len=0\n"]);
+        check(&mut s, at(1), &reset(8), 2, expect!["id=None, len=0\n"]);
+        check(&mut s, at(1), &reset(7), 3, expect![[r#"
+            id=Some(7), len=9
+            Reset { id: 7 }
+        "#]]);
+        assert!(s.take_datagrams().is_empty(), "a reset is never answered");
+
+        let key = Some(Arc::new([9u8; 32]));
+        let mut keyed = EndpointState::new(false, false, key.clone());
+        assert!(keyed.connect(7, at(1), 0));
+        check(&mut keyed, at(1), &reset(7), 1, expect!["id=None, len=0\n"]);
+        let mut sealed = reset(7);
+        super::seal(&key, &mut sealed);
+        check(&mut keyed, at(1), &sealed, 2, expect![[r#"
+            id=Some(7), len=9
+            Reset { id: 7 }
+        "#]]);
+        let mut server = EndpointState::new(true, false, key.clone());
+        let mut old = data(7, 4, b"old");
+        super::seal(&key, &mut old);
+        server.recv(at(1), &old, 1);
+        assert_eq!(server.take_datagrams(), vec![(at(1), sealed)], "with a shared key the reset is sealed");
     }
 
     #[test]
