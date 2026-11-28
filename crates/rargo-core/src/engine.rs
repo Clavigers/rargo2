@@ -232,7 +232,23 @@ struct Teardown {
     scratch: PathBuf,
     running: Option<crate::sandbox::Running>,
     group: Option<crate::cgroup::ActionGroup>,
+    nix: Option<NixLease>,
     armed: bool,
+}
+
+/// One action's use of the tree that serves its nix closure, which the sandbox
+/// binds read-only at `/nix/store` so that every action of that closure shares
+/// the kernel's cache of it.
+struct NixLease {
+    fs: Rc<SandboxFs>,
+    key: crate::sandboxfs::ShareKey,
+    seq: u64,
+}
+
+impl Drop for NixLease {
+    fn drop(&mut self) {
+        self.fs.unshare(&self.key);
+    }
 }
 
 impl Drop for Teardown {
@@ -241,8 +257,8 @@ impl Drop for Teardown {
             return;
         }
         let running = self.running.take();
-        let (fs, action, scratch, group) =
-            (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take());
+        let (fs, action, scratch, group, nix) =
+            (self.fs.clone(), self.action.clone(), self.scratch.clone(), self.group.take(), self.nix.take());
         let (zygote, sched) = (self.zygote.clone(), self.sched.clone());
         drop(io::spawn(move || {
             let held = match (&running, &group) {
@@ -262,6 +278,7 @@ impl Drop for Teardown {
                 sched.restore(held);
             }
             let _ = fs.finish_action(&action);
+            drop(nix);
             io::cpu(move || {
                 drop(group);
                 let _ = io::file::remove_dir_all(&scratch);
@@ -783,6 +800,12 @@ impl Engine {
         let n = self.seq.get();
         self.seq.set(n + 1);
         let scratch = self.store.tmp_dir(&format!("act-{}-{n}", io::process::id()))?;
+        let nix = view.nix_share_key().and_then(|hash| {
+            let key = (hash, uid, gid);
+            let make = || Some((view.nix_share_view()?, self.store.tmp_dir(&format!("nix-share-{}", &hash.hex()[..16])).ok()?));
+            let seq = self.fs.share(key, make)?;
+            Some(NixLease { fs: self.fs.clone(), key, seq })
+        });
         let action = self.fs.create_action(ActionFsConfig {
             view,
             uid,
@@ -799,6 +822,7 @@ impl Engine {
             scratch: scratch.clone(),
             running: None,
             group: None,
+            nix,
             armed: true,
         };
         let run = self.run_in(spec, uid, gid, observer, &action, &mut teardown);
@@ -907,7 +931,15 @@ impl Engine {
             gid,
             caller: (io::process::uid(), io::process::gid()),
             flake: false,
-            binds: vec![],
+            binds: teardown
+                .nix
+                .iter()
+                .map(|n| crate::sandbox::Bind {
+                    host: self.mnt.join(SandboxFs::dir_name(n.seq)).join("nix/store"),
+                    inside: crate::buildview::NIX_STORE_AT.to_vec(),
+                    read_only: true,
+                })
+                .collect(),
         };
         let plan = crate::sandbox::plan(&setup, &host)?;
         *group_slot = plan.cgroup_dir().map(crate::cgroup::ActionGroup::open);

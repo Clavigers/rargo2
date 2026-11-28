@@ -17,6 +17,16 @@ pub fn read_at(fd: i32, off: u64, len: usize) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Reads into `buf` without reallocating it, for a caller that reads into one
+/// buffer again and again. Returns the buffer, still its full length, and the
+/// count of bytes read into its front.
+pub fn read_into(fd: i32, off: u64, buf: Vec<u8>) -> io::Result<(Vec<u8>, usize)> {
+    match op_event(Op::ReadInto { fd, off, buf })? {
+        Event::Read { n, buf } => Ok((buf, n)),
+        _ => Err(io::Error::other("read")),
+    }
+}
+
 pub fn write_at(fd: i32, off: u64, buf: &[u8]) -> io::Result<usize> {
     match op_event(Op::Write { fd, off, buf: buf.to_vec() })? {
         Event::Write { n } => Ok(n),

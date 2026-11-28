@@ -562,6 +562,7 @@ pub struct Plan {
     place: Place,
     asked: NetMode,
     flake: bool,
+    store_bound: bool,
     root: PathBuf,
     seq: u64,
     cgroup_root: Option<PathBuf>,
@@ -657,6 +658,8 @@ fn program_candidates(argv: &[Vec<u8>], env: &BTreeMap<Vec<u8>, Vec<u8>>) -> io:
         })
         .collect())
 }
+
+const STORE_KEPT: u64 = (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOATIME) as u64;
 
 fn bind_target(root: &Path, inside: &[u8]) -> io::Result<PathBuf> {
     let rel = Path::new(OsStr::from_bytes(inside));
@@ -792,11 +795,19 @@ pub fn plan(spec: &SetupSpec, host: &HostLayout) -> io::Result<Plan> {
         },
         link: dev.join("ptmx"),
     });
+    let stores: Vec<&Bind> = host.binds.iter().filter(|bind| bind.inside == b"/nix/store").collect();
+    let store_bound = !stores.is_empty();
+    if store_bound && (host.flake || stores.len() > 1 || stores.iter().any(|bind| !bind.read_only)) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a store bound at /nix/store is read-only and the only store there"));
+    }
     for bind in &host.binds {
         let target = bind_target(root, &bind.inside)?;
         b.mount(Some(&bind.host), target.clone(), None, (libc::MS_BIND | libc::MS_REC) as u64, None);
         if bind.read_only {
-            b.mount(None, target, None, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC) as u64, None);
+            // A remount sets every per-mount flag, so the store keeps what the
+            // sandbox mount has: without noatime each read would drop its cached attributes.
+            let kept = if bind.inside == b"/nix/store" { STORE_KEPT } else { 0 };
+            b.mount(None, target, None, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC) as u64 | kept, None);
         }
     }
     if host.flake {
@@ -818,6 +829,7 @@ pub fn plan(spec: &SetupSpec, host: &HostLayout) -> io::Result<Plan> {
         place: host.place,
         asked: spec.net,
         flake: host.flake,
+        store_bound,
         root: host.root.clone(),
         seq: host.seq,
         cgroup_root: host.cgroup_root.clone(),
@@ -847,13 +859,20 @@ pub(crate) struct Exec<'a> {
     pub(crate) argv: &'a [Vec<u8>],
     pub(crate) env: &'a [(Vec<u8>, Vec<u8>)],
     pub(crate) candidates: &'a [Vec<u8>],
+    /// What is bound at `/nix/store`, and whether read-only.
+    pub(crate) store: Option<(&'a Path, bool)>,
 }
 
 #[cfg(test)]
 impl Plan {
     pub(crate) fn exec(&self) -> Exec<'_> {
         let Some(Op::Exec { argv, env, candidates }) = self.ops.last() else { panic!("a plan ends in its exec") };
-        Exec { seq: self.seq, cwd: &self.cwd, argv, env, candidates }
+        let at = self.root.join("nix/store");
+        let mounts: Vec<&Mount> = self.ops.iter().filter_map(|op| match op { Op::Mount(m) if m.target == at => Some(m), _ => None }).collect();
+        let store = mounts.first().and_then(|m| m.src.as_deref()).map(|src| {
+            (src, mounts.iter().any(|m| m.flags & libc::MS_RDONLY as u64 != 0))
+        });
+        Exec { seq: self.seq, cwd: &self.cwd, argv, env, candidates, store }
     }
 }
 
@@ -908,10 +927,12 @@ impl StateMachine for Plan {
                 _ => None,
             })
             .collect();
-        if self.flake {
-            assert_eq!(nix.len(), 2, "a flake store is bound read-only");
+        if self.flake || self.store_bound {
+            assert!(!(self.flake && self.store_bound), "one store is mounted at /nix/store");
+            assert_eq!(nix.len(), 2, "a store is bound read-only");
             assert_eq!(nix[0].flags, (libc::MS_BIND | libc::MS_REC) as u64);
-            assert_eq!(nix[1].flags, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC) as u64);
+            let kept = if self.store_bound { STORE_KEPT } else { 0 };
+            assert_eq!(nix[1].flags, (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC) as u64 | kept);
             assert!(nix[1].src.is_none());
         } else {
             assert!(nix.is_empty(), "no flake store is mounted");
@@ -1062,6 +1083,9 @@ impl std::fmt::Display for Plan {
         writeln!(f, "asked-network: {asked}")?;
         writeln!(f, "network: {network}")?;
         writeln!(f, "flake: {}", if self.flake { "yes" } else { "no" })?;
+        if self.store_bound {
+            writeln!(f, "nix store: bound read-only")?;
+        }
         writeln!(f, "root: {}", self.root.display())?;
         match self.cgroup_dir() {
             Some(dir) => writeln!(f, "cgroup: {}", dir.display())?,
@@ -1706,6 +1730,19 @@ mod setup_tests {
             .unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert!(err.to_string().contains("within the root"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_store_is_bound_read_only_at_nix_store_and_alone() {
+        let store = |read_only| Bind { host: PathBuf::from("/fixture/mnt/a9/nix/store"), inside: b"/nix/store".to_vec(), read_only };
+        let plan = fixture(Place::Server, NetMode::Loopback, false, true, (0, 0), vec![store(true)]).unwrap();
+        plan.invariants();
+        assert!(plan.to_string().contains("nix store: bound read-only"));
+        for (flake, binds) in [(false, vec![store(false)]), (true, vec![store(true)]), (false, vec![store(true), store(true)])] {
+            let err = fixture(Place::Server, NetMode::Loopback, flake, true, (0, 0), binds).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("read-only and the only store"), "{err}");
         }
     }
 

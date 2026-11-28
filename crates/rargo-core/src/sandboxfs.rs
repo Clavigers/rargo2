@@ -341,7 +341,20 @@ pub struct SandboxFs {
     retired: RefCell<Vec<(std::time::Instant, i32)>>,
     tick: Cell<u64>,
     stats: FsStats,
+    shared: RefCell<BTreeMap<ShareKey, Shared>>,
 }
+
+/// A nix closure, and the owner its synthetic entries are shown with.
+pub type ShareKey = (crate::hash::Hash, u32, u32);
+
+struct Shared {
+    fs: Arc<ActionFs>,
+    users: usize,
+    used: u64,
+}
+
+/// How many shared trees no action uses are kept for the next build.
+const SHARED_KEEP: usize = 4;
 
 #[derive(Default)]
 pub struct FsStats {
@@ -369,6 +382,7 @@ impl SandboxFs {
             retired: RefCell::new(Vec::new()),
             tick: Cell::new(0),
             stats: FsStats::default(),
+            shared: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -399,7 +413,47 @@ impl SandboxFs {
         a
     }
 
-    pub fn finish_action(&self, a: &Arc<ActionFs>) -> Finished {
+    /// The tree shared by every action that shows the closure `key`, made by
+    /// `make` when none is kept, and counted as used until [`Self::unshare`].
+    pub fn share(&self, key: ShareKey, make: impl FnOnce() -> Option<(Arc<dyn View>, PathBuf)>) -> Option<u64> {
+        let tick = self.next_tick();
+        if let Some(shared) = self.shared.borrow_mut().get_mut(&key) {
+            shared.users += 1;
+            shared.used = tick;
+            return Some(shared.fs.seq);
+        }
+        let (view, scratch) = make()?;
+        let (_, uid, gid) = key;
+        let fs = self.create_action(ActionFsConfig { view, uid, gid, scratch, mountpoints: Vec::new(), size_blind: false });
+        let seq = fs.seq;
+        self.shared.borrow_mut().insert(key, Shared { fs, users: 1, used: tick });
+        Some(seq)
+    }
+
+    /// Ends one use of a shared tree; the least recently used of those no action
+    /// uses are dropped beyond [`SHARED_KEEP`].
+    pub fn unshare(&self, key: &ShareKey) {
+        let gone = {
+            let mut shared = self.shared.borrow_mut();
+            let entry = shared.get_mut(key).expect("a shared tree is unshared while it is kept");
+            assert!(entry.users > 0, "a shared tree is unshared once per share");
+            entry.users -= 1;
+            let mut idle: Vec<(u64, ShareKey)> = shared.iter().filter(|(_, s)| s.users == 0).map(|(k, s)| (s.used, *k)).collect();
+            idle.sort_unstable();
+            let extra = idle.len().saturating_sub(SHARED_KEEP);
+            idle.into_iter().take(extra).filter_map(|(_, k)| shared.remove(&k)).map(|s| s.fs).collect::<Vec<_>>()
+        };
+        for fs in gone {
+            self.retire_tree(&fs);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_trees(&self) -> Vec<(ShareKey, usize)> {
+        self.shared.borrow().iter().map(|(k, s)| (*k, s.users)).collect()
+    }
+
+    fn retire_tree<'a>(&self, a: &'a Arc<ActionFs>) -> crate::io::MutexGuard<'a, State> {
         self.actions.borrow_mut().remove(&a.seq);
         if let Some(s) = self.session.get() {
             // The kernel takes the mount root's lock for this, which a lookup that waits for
@@ -416,6 +470,11 @@ impl SandboxFs {
             }
         }
         self.reap_retired();
+        st
+    }
+
+    pub fn finish_action(&self, a: &Arc<ActionFs>) -> Finished {
+        let mut st = self.retire_tree(a);
         let mut upper = Vec::new();
         walk_upper(&st, &*a.view, ROOT_LOCAL, b"/", false, &mut upper);
 

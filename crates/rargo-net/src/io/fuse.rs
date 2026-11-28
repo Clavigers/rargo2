@@ -34,35 +34,43 @@ impl FuseDrive {
         // Linux still delivers FORGET, INTERRUPT and other control traffic here.
         let fd = session.device_fd();
         let (session, fs) = (Arc::clone(session), Rc::clone(fs));
-        let reader = super::spawn(move || loop {
-            match super::read_at(fd, 0, BUF_SIZE) {
-                Ok(request) if request.is_empty() => break session.ended(),
-                Ok(request) => {
-                    let opcode = request
-                        .get(4..8)
-                        .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()));
-                    if !matches!(
-                        opcode,
-                        Some(
-                            FUSE_FORGET
-                                | FUSE_BATCH_FORGET
-                                | FUSE_INTERRUPT
-                                | FUSE_DESTROY
-                                | FUSE_NOTIFY_REPLY
-                        )
-                    ) {
-                        eprintln!("error: FUSE-over-io_uring received an unexpected opcode on /dev/fuse: {opcode:?}");
-                        std::process::exit(101);
+        let reader = super::spawn(move || {
+            let mut buf = vec![0; BUF_SIZE];
+            loop {
+                match super::read_into(fd, 0, std::mem::take(&mut buf)) {
+                    Ok((_, 0)) => break session.ended(),
+                    Ok((back, n)) => {
+                        buf = back;
+                        let request = &buf[..n];
+                        let opcode = request
+                            .get(4..8)
+                            .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()));
+                        if !matches!(
+                            opcode,
+                            Some(
+                                FUSE_FORGET
+                                    | FUSE_BATCH_FORGET
+                                    | FUSE_INTERRUPT
+                                    | FUSE_DESTROY
+                                    | FUSE_NOTIFY_REPLY
+                            )
+                        ) {
+                            eprintln!("error: FUSE-over-io_uring received an unexpected opcode on /dev/fuse: {opcode:?}");
+                            std::process::exit(101);
+                        }
+                        let replies = replies(&session, fs.as_ref(), request);
+                        if !replies.is_empty() {
+                            let session = Arc::clone(&session);
+                            drop(super::spawn(move || answer(fd, &session, &replies)));
+                        }
                     }
-                    let (session, fs) = (Arc::clone(&session), Rc::clone(&fs));
-                    drop(super::spawn(move || answer(fd, &session, fs.as_ref(), &request)));
+                    Err(e)
+                        if matches!(
+                            e.raw_os_error(),
+                            Some(libc::EINTR | libc::EAGAIN | libc::ENOENT)
+                        ) => buf = vec![0; BUF_SIZE],
+                    Err(_) => break session.ended(),
                 }
-                Err(e)
-                    if matches!(
-                        e.raw_os_error(),
-                        Some(libc::EINTR | libc::EAGAIN | libc::ENOENT)
-                    ) => {}
-                Err(_) => break session.ended(),
             }
         });
         readers.push(reader);
@@ -236,9 +244,9 @@ fn serve_queue<F: Filesystem>(session: Arc<Session>, fs: Rc<F>, queue: u16) {
     session.ended();
 }
 
-fn answer<F: Filesystem>(fd: i32, session: &Session, fs: &F, request: &[u8]) {
-    for reply in replies(session, fs, request) {
-        if write_fuse(fd, &reply).is_err() {
+fn answer(fd: i32, session: &Session, replies: &[Vec<u8>]) {
+    for reply in replies {
+        if write_fuse(fd, reply).is_err() {
             return session.ended();
         }
     }

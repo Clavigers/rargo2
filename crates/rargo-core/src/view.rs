@@ -209,6 +209,15 @@ pub trait View {
     fn nix_closure(&self) -> &[(Vec<u8>, Hash)] {
         &[]
     }
+    /// Names the store paths this view shows at `/nix/store`, when they are a
+    /// closure every action of it may share: equal keys show the same store.
+    fn nix_share_key(&self) -> Option<Hash> {
+        None
+    }
+    /// A view of that closure at `/nix/store` and nothing else, untraced.
+    fn nix_share_view(&self) -> Option<std::sync::Arc<dyn View>> {
+        None
+    }
     fn stat(&self, path: &[u8]) -> Looked {
         match vsplit(path) {
             None => Looked::Dir(Owner { uid: 0, gid: 0, mode: 0o755 }),

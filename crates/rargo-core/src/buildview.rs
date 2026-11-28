@@ -264,8 +264,11 @@ pub struct BaseView {
     mounts: Vec<Mount>,
     memo: Arc<HostMemo>,
     accepts: MemoView,
+    min_gen: u64,
     nix: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>,
 }
+
+pub const NIX_STORE_AT: &[u8] = b"/nix/store";
 
 const DIR_OWNER: Owner = Owner { uid: 0, gid: 0, mode: 0o755 };
 
@@ -279,7 +282,32 @@ impl BaseView {
             assert!(mounts[i + 1..].iter().all(|o| o.at != m.at), "two mounts at {}", crate::view::show(&m.at));
         }
         let accepts = memo.open_view(min_gen);
-        BaseView { mounts, memo, accepts, nix: Arc::new(Vec::new()) }
+        BaseView { mounts, memo, accepts, min_gen, nix: Arc::new(Vec::new()) }
+    }
+
+    fn nix_store_names(&self) -> Option<&Arc<BTreeSet<Vec<u8>>>> {
+        self.mounts.iter().find_map(|m| match &m.region {
+            Region::NixStore { names } if m.at == NIX_STORE_AT && !m.traced => Some(names),
+            _ => None,
+        })
+    }
+
+    pub fn nix_share_key(&self) -> Option<crate::hash::Hash> {
+        let names = self.nix_store_names()?;
+        let mut key = crate::hash::KeyHasher::new("rargo nix store share");
+        for name in names.iter() {
+            key.field(name);
+        }
+        Some(key.finish())
+    }
+
+    pub fn nix_share_view(&self) -> Option<Arc<dyn View>> {
+        let names = self.nix_store_names()?.clone();
+        let mounts = vec![
+            Mount { at: b"/".to_vec(), region: Region::Empty, traced: false },
+            Mount { at: NIX_STORE_AT.to_vec(), region: Region::NixStore { names }, traced: false },
+        ];
+        Some(Arc::new(Hosted::new(BaseView::new(mounts, self.memo.clone(), self.min_gen))))
     }
 
     pub fn with_nix(mut self, nix: Arc<Vec<(Vec<u8>, crate::hash::Hash)>>) -> BaseView {
@@ -553,6 +581,14 @@ impl View for BaseView {
         &self.nix
     }
 
+    fn nix_share_key(&self) -> Option<crate::hash::Hash> {
+        BaseView::nix_share_key(self)
+    }
+
+    fn nix_share_view(&self) -> Option<Arc<dyn View>> {
+        BaseView::nix_share_view(self)
+    }
+
     fn stat(&self, path: &[u8]) -> Looked {
         given(self, self.step_stat(path))
     }
@@ -584,6 +620,14 @@ impl View for Hosted {
 
     fn nix_closure(&self) -> &[(Vec<u8>, crate::hash::Hash)] {
         &self.view.nix
+    }
+
+    fn nix_share_key(&self) -> Option<crate::hash::Hash> {
+        self.view.nix_share_key()
+    }
+
+    fn nix_share_view(&self) -> Option<Arc<dyn View>> {
+        self.view.nix_share_view()
     }
 
     fn stat(&self, path: &[u8]) -> Looked {
@@ -998,6 +1042,14 @@ impl View for BuildView {
         self.base.nix_closure()
     }
 
+    fn nix_share_key(&self) -> Option<crate::hash::Hash> {
+        self.base.nix_share_key()
+    }
+
+    fn nix_share_view(&self) -> Option<Arc<dyn View>> {
+        self.base.nix_share_view()
+    }
+
     fn stat(&self, path: &[u8]) -> Looked {
         let Some((dir, name)) = vsplit(path) else { return Looked::Dir(DIR_OWNER) };
         match self.layered(dir, name) {
@@ -1063,7 +1115,7 @@ impl ViewParts {
             (Some(r), false) => {
                 mounts.push(Mount { at: b"/".to_vec(), region: Region::Empty, traced: true });
                 mounts.push(Mount {
-                    at: b"/nix/store".to_vec(),
+                    at: NIX_STORE_AT.to_vec(),
                     region: Region::NixStore { names: r.store_names.clone() },
                     traced: false,
                 });

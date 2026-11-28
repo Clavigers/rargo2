@@ -171,8 +171,32 @@ pub(super) fn current_id() -> u64 {
     id
 }
 
+const SPARE_STACKS: usize = 64;
+
+thread_local! {
+    static SPARES: std::cell::RefCell<Vec<DefaultStack>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(super) fn fresh_stack() -> DefaultStack {
+    if let Some(stack) = SPARES.with(|s| s.borrow_mut().pop()) {
+        return stack;
+    }
     DefaultStack::new(STACK).unwrap_or_else(|e| panic!("a fiber stack could not be allocated: {e}"))
+}
+
+fn spare_stack(co: Coroutine<Resume, Pause, (), DefaultStack>) {
+    let stack = co.into_stack();
+    SPARES.with(|s| {
+        let mut spares = s.borrow_mut();
+        if spares.len() < SPARE_STACKS {
+            spares.push(stack);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(super) fn spare_stacks() -> usize {
+    SPARES.with(|s| s.borrow().len())
 }
 
 pub(super) fn boot(workers: usize) -> Loop {
@@ -472,7 +496,7 @@ pub(super) fn resume_one(sched: *mut Sched, id: u64) {
             }
         }
         Ok(CoroutineResult::Return(())) => {
-            drop(co);
+            spare_stack(co);
             finish(sched, id, None);
         }
         Err(payload) => {
