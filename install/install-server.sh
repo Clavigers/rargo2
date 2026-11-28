@@ -43,6 +43,8 @@ install -m 755 "$tmp/rargo-server/rargod" "$tmp/rargo-server/rargo-sandbox" "$tm
 install -d "$lib/$real/default-flake"
 install -m 644 "$tmp/rargo-server/default-flake/flake.nix" "$tmp/rargo-server/default-flake/flake.lock" "$lib/$real/default-flake/"
 ln -sfn "$lib/$real" "$lib/current"
+mkdir -p "$P/usr/local/bin"
+ln -sfn ../lib/rargo/current/rargod "$P/usr/local/bin/rargod"
 mkdir -p "$P/etc/modprobe.d" "$P/etc/tmpfiles.d"
 printf '%s\n' 'options fuse enable_uring=Y' >"$P/etc/modprobe.d/rargo-fuse-uring.conf"
 printf 'w %s - - - - Y\n' "$fuse_uring" >"$P/etc/tmpfiles.d/rargo-fuse-uring.conf"

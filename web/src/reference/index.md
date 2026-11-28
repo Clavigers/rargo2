@@ -75,7 +75,7 @@ Each test process is cached by its command line and what it reads. A changed fix
 
 # A Server
 
-Linux on x86_64, glibc 2.39 or newer (Ubuntu 24.04, Debian 13), root, FUSE, a C toolchain for the crates that need one, and Nix with flakes for the projects' environments. One command installs `rargod`, a systemd service for it, and rustup for the toolchains your projects ask for.
+Linux on x86_64, glibc 2.39 or newer (Ubuntu 24.04, Debian 13), root, FUSE, a C toolchain for the crates that need one, and Nix with flakes for the projects' environments. One command installs `rargod` (linked into `/usr/local/bin`), a systemd service for it, and rustup for the toolchains your projects ask for.
 
 <cmd>curl -fsSL https://rargo.rs/install-server.sh | sudo sh</cmd>
 

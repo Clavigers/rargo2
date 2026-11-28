@@ -31,14 +31,15 @@ rargo build
 The server needs Linux and root.
 
 The easiest way is the prebuilt server: `curl -fsSL https://rargo.rs/install-server.sh | sh`.
+It puts `rargod` in `/usr/local/bin`, so the Reference's `rargod token ...` commands run as written.
 To build it from this checkout:
 
 ```sh
 forks/setup.sh cargo                # clones rust-lang/cargo into /root/rargo-work/cargo and applies forks/cargo
 forks/build.sh                      # builds the planner against this checkout; prints its path
 cargo build --release               # builds rargod and rargo
-rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation
-rargod --state /var/lib/rargo --planner /root/rargo-work/cargo/target/release/cargo --listen 0.0.0.0:7459
+target/release/rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation
+target/release/rargod --state /var/lib/rargo --planner /root/rargo-work/cargo/target/release/cargo --listen 0.0.0.0:7459
 ```
 
 `RARGO_WORK` puts the forks somewhere other than `/root/rargo-work`.
