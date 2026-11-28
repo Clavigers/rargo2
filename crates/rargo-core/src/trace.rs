@@ -232,7 +232,7 @@ pub struct TraceCache {
     db: Arc<dyn Tables>,
     mem: RefCell<std::collections::BTreeMap<Hash, Arc<Vec<(u64, Arc<Trace>)>>>>,
     next_id: Cell<u64>,
-    env_names: RefCell<Option<std::collections::BTreeSet<String>>>,
+    env_names: crate::io::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub stats: CacheStats,
 }
 
@@ -244,7 +244,7 @@ fn trace_key(weak: &Hash, id: u64) -> Vec<u8> {
 
 impl TraceCache {
     pub fn new(db: Arc<dyn Tables>, seed: u64) -> TraceCache {
-        TraceCache { db, mem: RefCell::new(std::collections::BTreeMap::new()), env_names: RefCell::new(None), next_id: Cell::new(seed), stats: CacheStats::default() }
+        TraceCache { db, mem: RefCell::new(std::collections::BTreeMap::new()), env_names: crate::io::Mutex::new(None), next_id: Cell::new(seed), stats: CacheStats::default() }
     }
 
     fn load(&self, weak: &Hash) -> Arc<Vec<(u64, Arc<Trace>)>> {
@@ -337,7 +337,7 @@ impl TraceCache {
             let mut k = b"env:".to_vec();
             k.extend_from_slice(&weak.0);
             self.db.put(Table::Meta, &k, &bincode::serialize(&cur).unwrap());
-            if let Some(names) = &mut *self.env_names.borrow_mut() {
+            if let Some(names) = &mut *self.env_names.lock() {
                 names.extend(added.iter().cloned());
             }
         }
@@ -345,7 +345,9 @@ impl TraceCache {
     }
 
     pub fn every_env_name(&self) -> Vec<String> {
-        let mut names = self.env_names.borrow_mut();
+        // The initial database scan can suspend. Other readers and writers
+        // must wait on the fiber mutex while the cache is being populated.
+        let mut names = self.env_names.lock();
         names
             .get_or_insert_with(|| self.all_needs_env().into_iter().flat_map(|(_, v)| v).collect())
             .iter()
@@ -421,7 +423,7 @@ impl StateMachine for TraceCache {
             ids.sort_by(|a, b| b.cmp(a));
             ids
         };
-        let names: Option<std::collections::BTreeSet<String>> = self.env_names.borrow_mut().clone();
+        let names: Option<std::collections::BTreeSet<String>> = self.env_names.lock().clone();
         for (weak, list) in self.mem.borrow().iter() {
             let ids: Vec<u64> = list.iter().map(|(id, _)| *id).collect();
             assert!(ids.len() <= MAX_TRACES_PER_KEY, "{} traces are kept for one key, over {MAX_TRACES_PER_KEY}", ids.len());

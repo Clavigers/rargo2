@@ -332,7 +332,8 @@ fn token_command(args: &[String]) -> Result<()> {
     let usage = "usage: rargod token invite --state DIR [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
                  rargod token create --state DIR --user NAME [--admin] [--days N]\n       \
                  rargod token list --state DIR\n       \
-                 rargod token revoke --state DIR ID-OR-USER\n       \
+                 rargod token revoke --state DIR ID-OR-USER (also withdraws invitations for USER)\n       \
+                 rargod token revoke-invite --state DIR INVITATION-ID (ID from the token list)\n       \
                  rargod token allow --state DIR GITHUB-LOGIN [--admin]      (may sign in with GitHub through `rargo auth`)\n       \
                  rargod token disallow --state DIR GITHUB-LOGIN             (and revokes the tokens it signed in for)\n       \
                  rargod token github --state DIR --client-id ID --client-secret-file FILE --url https://NAME\n       \
