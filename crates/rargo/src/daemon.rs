@@ -1017,6 +1017,12 @@ impl Daemon {
         };
         if use_ == OutUse::Release {
             unmount();
+            // Another daemon (another server or token) may have mounted `target`;
+            // the outputs copied into it would land on that mount.
+            let dir = wt.root.join("target");
+            if copies_into(target.as_deref(), &dir) {
+                release_mounts(&dir);
+            }
             check(None)?;
             return Ok(None);
         }
@@ -2076,6 +2082,11 @@ fn out_use(shows: bool, explicit_target: bool) -> OutUse {
 /// Whether outputs for `target` are copied rather than shown by the mount on `mounted`.
 fn copied_beside(target: &Path, mounted: &Path) -> bool {
     !target.starts_with(mounted)
+}
+
+/// Whether a copying build with this explicit target dir, if any, writes under `dir`.
+fn copies_into(target: Option<&Path>, dir: &Path) -> bool {
+    target.is_none_or(|t| !copied_beside(t, dir))
 }
 
 fn explicit_target_dir(req: &LocalRequest) -> Option<&str> {
@@ -3143,6 +3154,16 @@ mod tests {
         ] {
             assert_eq!(copied_beside(Path::new(target), mounted), copied, "{target}");
         }
+    }
+
+    #[test]
+    fn a_copying_build_lets_go_of_any_mount_on_the_target_it_copies_into() {
+        let dir = Path::new("/w/target");
+        assert!(copies_into(None, dir));
+        assert!(copies_into(Some(Path::new("/w/target")), dir));
+        assert!(copies_into(Some(Path::new("/w/target/sub")), dir));
+        assert!(!copies_into(Some(Path::new("/w/target-other")), dir));
+        assert!(!copies_into(Some(Path::new("/tmp/x")), dir));
     }
 
     #[test]
