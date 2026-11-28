@@ -3,7 +3,7 @@
 rargo is remote cargo.
 
 `rargo build`, `check`, `test`, `run`, `clippy` and `doc` work like the cargo commands.
-They build on the server when invoked directly. Cargo aliases such as `lint` or `xtask` are passed to local Cargo, which expands and runs them on your machine. Rargo prints a notice on stderr when it hands off these commands.
+They build on the server when invoked directly. Cargo aliases such as `lint` or `xtask` are passed to local Cargo, which expands and runs them on your machine. `rargo clippy --fix` is passed to local Cargo too, as `rargo fix` is, because it edits your files. Rargo prints a notice on stderr when it hands off these commands.
 Your files go to the server. The server builds them. You get the output and the files you asked for.
 Everyone who uses the same server shares one cache.
 
