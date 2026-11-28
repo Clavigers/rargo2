@@ -505,6 +505,10 @@ fn main() {
             }
             passthrough(&raw)
         }
+        cli::Plan::CargoDelegated => {
+            eprintln!("rargo: passing this command to local Cargo");
+            passthrough(&raw)
+        }
         cli::Plan::Print(text) => {
             println!("{text}");
             return;
