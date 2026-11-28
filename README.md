@@ -32,6 +32,7 @@ The server needs Linux 6.14 or newer on x86_64, built with `CONFIG_FUSE_IO_URING
 Debian 13 and Ubuntu 24.04 ship older kernels: install one from trixie-backports, or Ubuntu's HWE kernel (`linux-generic-hwe-24.04`).
 
 The easiest way is the prebuilt server: `curl -fsSL https://rargo.rs/install-server.sh | sh`.
+It puts `rargod` in `/usr/local/bin`, so the Reference's `rargod token ...` commands run as written.
 To build it from this checkout, which also needs Rust:
 
 ```sh
@@ -40,8 +41,8 @@ modprobe fuse && echo Y > /sys/module/fuse/parameters/enable_uring   # off by de
 forks/setup.sh cargo                # clones rust-lang/cargo into /root/rargo-work/cargo and applies forks/cargo
 forks/build.sh                      # builds the planner against this checkout; prints its path
 cargo build --release               # builds rargod and rargo
-rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation
-rargod --state /var/lib/rargo --planner /root/rargo-work/cargo/target/release/cargo --listen 0.0.0.0:7459
+target/release/rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation
+target/release/rargod --state /var/lib/rargo --planner /root/rargo-work/cargo/target/release/cargo --listen 0.0.0.0:7459
 ```
 
 `RARGO_WORK` puts the forks somewhere other than `/root/rargo-work`.

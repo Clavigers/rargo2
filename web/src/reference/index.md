@@ -75,7 +75,7 @@ Each test process is cached by its command line and what it reads. A changed fix
 
 # A Server
 
-Linux 6.14 or newer on x86_64 with FUSE over io_uring (`CONFIG_FUSE_IO_URING`; the installer turns on `fuse.enable_uring`), glibc 2.39 or newer, root, a C toolchain for the crates that need one, and Nix with flakes for the projects' environments. One command installs `rargod`, a systemd service for it, and rustup for the toolchains your projects ask for.
+Linux 6.14 or newer on x86_64 with FUSE over io_uring (`CONFIG_FUSE_IO_URING`; the installer turns on `fuse.enable_uring`), glibc 2.39 or newer, root, a C toolchain for the crates that need one, and Nix with flakes for the projects' environments. One command installs `rargod` (linked into `/usr/local/bin`), a systemd service for it, and rustup for the toolchains your projects ask for.
 
 Debian 13 and Ubuntu 24.04 have the glibc but ship older kernels: install a kernel from trixie-backports, or Ubuntu's HWE kernel (`linux-generic-hwe-24.04`). The installer stops if FUSE over io_uring is missing.
 
