@@ -25,6 +25,9 @@ pub const AUTH_HELP: &str = "rargo auth [HOST]            get this machine a tok
 
 pub const STATUS_HELP: &str = "Usage: rargo status\n\nShow your server, account, daemon, mount and versions.";
 
+const TEST_CACHE_HELP: &str = "rargo can replay passing test results from its server cache.\n\
+     Pass --no-cache before -- to run the selected tests and doctests again.\n";
+
 pub const BANNER: &str = "Usage: rargo [CARGO COMMAND...]\n\n\
      rargo runs cargo, with build, check, clippy, test, run, doc, bench and nextest done on your rargo server.\n\n\
      rargo's own commands:\n    \
@@ -32,6 +35,7 @@ pub const BANNER: &str = "Usage: rargo [CARGO COMMAND...]\n\n\
      auth             Get, show or remove this machine's token for your server (`rargo help auth`)\n    \
      status           Show your server, account, daemon, mount and versions\n    \
      --rargo-version  Print rargo's version and protocol\n\n\
+     Use `rargo test --no-cache` to run tests and doctests again instead of replaying cached results.\n\n\
      Cargo's help follows.\n";
 
 /// Whether help may carry colour: `CARGO_TERM_COLOR` decides when it says always or never, then `NO_COLOR`, then the terminal.
@@ -197,6 +201,12 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
     let alone = |names: &[&str]| !cargo_link && raw.len() == 1 && first.and_then(OsStr::to_str).is_some_and(|a| names.contains(&a));
     let banner = if (raw.is_empty() && !cargo_link) || alone(&["--help", "-h", "help"]) {
         Some(BANNER.to_string())
+    } else if !cargo_link
+        && (matches!(first.and_then(OsStr::to_str), Some("test" | "t"))
+            && raw.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h")
+            || first.is_some_and(|a| a == "help") && matches!(second, Some("test" | "t")) && raw.len() == 2)
+    {
+        Some(TEST_CACHE_HELP.into())
     } else if alone(&["--version", "-V"]) {
         Some(version())
     } else {
@@ -741,6 +751,9 @@ mod tests {
             (None, vec!["help"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
             (None, vec!["help", "auth"], fake(&[]), Plan::Print(AUTH_HELP.into())),
             (None, vec!["help", "status"], fake(&[]), Plan::Print(STATUS_HELP.into())),
+            (None, vec!["test", "--help"], fake(&[]), Plan::Cargo { release: false, banner: Some(TEST_CACHE_HELP.into()) }),
+            (None, vec!["t", "-h"], fake(&[]), Plan::Cargo { release: false, banner: Some(TEST_CACHE_HELP.into()) }),
+            (None, vec!["help", "test"], fake(&[]), Plan::Cargo { release: false, banner: Some(TEST_CACHE_HELP.into()) }),
             (None, vec!["help", "build"], fake(&[]), cargo.clone()),
             (Some("cargo"), vec!["help", "auth"], fake(&[]), cargo.clone()),
             (None, vec!["--version"], fake(&[]), Plan::Cargo { release: false, banner: Some(version()) }),
@@ -795,7 +808,7 @@ mod tests {
             (None, vec!["clean", "--dry-run"], fake(&[]), cargo.clone()),
             (None, vec!["clean", "--help"], fake(&[]), cargo.clone()),
             (None, vec!["check", "--version"], fake(&[]), cargo.clone()),
-            (None, vec!["test", "-h"], fake(&[]), cargo.clone()),
+            (None, vec!["test", "-h"], fake(&[]), Plan::Cargo { release: false, banner: Some(TEST_CACHE_HELP.into()) }),
             (None, vec!["lint"], fake(&[]), Plan::CargoDelegated),
             (None, vec!["xtask", "build"], fake(&[]), Plan::CargoDelegated),
             (None, vec!["metadata"], fake(&[]), Plan::CargoDelegated),
