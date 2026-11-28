@@ -93,6 +93,8 @@ struct Proc {
     env: Vec<(Vec<u8>, Vec<u8>)>,
     stdout: io::PipeEnd,
     stderr: io::PipeEnd,
+    /// The tree bound at `/nix/store`, by its directory under the mount, and whether read-only.
+    store: Option<(Vec<u8>, bool)>,
 }
 
 impl Proc {
@@ -129,10 +131,21 @@ impl Proc {
         if path.starts_with(b"/") { path.to_vec() } else { vjoin(&self.cwd, path) }
     }
 
+    /// The rest of `path` below `/nix/store` when a tree is bound there, and that tree's directory.
+    fn in_store(&self, path: &[u8]) -> Option<(Vec<u8>, Vec<u8>, bool)> {
+        let (dir, read_only) = self.store.clone()?;
+        let rest = path.strip_prefix(b"/nix/store".as_slice())?;
+        (rest.is_empty() || rest.starts_with(b"/")).then(|| (dir, vjoin(b"/nix/store", rest), read_only))
+    }
+
     /// Looks a path up one name at a time from the root of the sandbox, as the kernel resolves it.
     fn walk(&mut self, path: &[u8]) -> Result<Option<Node>, i32> {
-        let path = self.absolute(path);
+        let mut path = self.absolute(path);
         let mut at = Node { id: self.root, mode: libc::S_IFDIR };
+        if let Some((dir, inner, _)) = self.in_store(&path) {
+            at = self.lookup(FUSE_ROOT_ID, &dir)?.expect("a bound tree is in the filesystem");
+            path = inner;
+        }
         for name in path.split(|c| *c == b'/').filter(|name| !name.is_empty()) {
             assert!(name != b"." && name != b"..", "the simulated kernel resolves plain names only");
             if !at.is(libc::S_IFDIR) {
@@ -197,6 +210,9 @@ impl Proc {
     /// Opens `path` for writing, created with `mode` or emptied, and writes `bytes` to it.
     fn write(&mut self, path: &[u8], bytes: &[u8], mode: u32) -> Result<(), i32> {
         let path = self.absolute(path);
+        if matches!(self.in_store(&path), Some((_, _, true))) {
+            return Err(libc::EROFS);
+        }
         let (dir, name) = vsplit(&path).ok_or(libc::EISDIR)?;
         let dir = self.walk(dir)?.ok_or(libc::ENOENT)?;
         if !dir.is(libc::S_IFDIR) {
@@ -340,6 +356,7 @@ enum Note {
 /// Stands where the zygote does: every launch is a fiber that acts as the planned process.
 struct Machine {
     fs: Rc<SandboxFs>,
+    mnt: PathBuf,
     shell: Shell,
     notes: io::UnboundedSender<Note>,
 }
@@ -358,6 +375,10 @@ impl Launcher for Machine {
             env: exec.env.to_vec(),
             stdout,
             stderr,
+            store: exec.store.map(|(src, read_only)| {
+                let dir = src.strip_prefix(&self.mnt).ok().and_then(|rel| rel.iter().next()).expect("a bound store is a tree of the mount");
+                (dir.as_encoded_bytes().to_vec(), read_only)
+            }),
         };
         let candidates = exec.candidates.to_vec();
         let shell = self.shell;
@@ -420,7 +441,7 @@ fn fixture_with(shell: Shell, action_timeout: Duration) -> Fx {
         }
     }));
 
-    let machine = Arc::new(Machine { fs: fs.clone(), shell, notes });
+    let machine = Arc::new(Machine { fs: fs.clone(), mnt: tmp.join("mnt"), shell, notes });
     let sched = Scheduler::new(8, u64::MAX).unwrap();
     let mut engine = Engine::new(store, content, fs, tmp.join("mnt"), machine, sched);
     engine.action_timeout = action_timeout;
@@ -450,6 +471,22 @@ impl Fx {
 
     fn view(&self) -> Arc<dyn View> {
         self.view_of(&self.work)
+    }
+
+    /// The host with only the closure `names` of its nix store at `/nix/store`, as a build of a flake sees it.
+    fn nix_view(&self, names: &[&str]) -> Arc<dyn View> {
+        let g = self.memo.advance();
+        let names = Arc::new(names.iter().map(|n| n.as_bytes().to_vec()).collect());
+        Arc::new(Hosted::new(BaseView::new(
+            vec![
+                Mount { at: b"/".to_vec(), region: Region::Host(HostRegion::new("/")), traced: true },
+                Mount { at: b"/w".to_vec(), region: Region::Host(HostRegion::new(&self.work)), traced: true },
+                Mount { at: self.tmp.clone().into_os_string().into_vec(), region: Region::Empty, traced: true },
+                Mount { at: b"/nix/store".to_vec(), region: Region::NixStore { names }, traced: false },
+            ],
+            self.memo.clone(),
+            g,
+        )))
     }
 
     fn view_of(&self, work: &Path) -> Arc<dyn View> {
@@ -541,6 +578,16 @@ fn sh(p: &mut Proc, script: &str) -> i32 {
             p.out("fine\n");
             0
         }
+        "cat /nix/store/aaa-tool/lib; test -e /nix/store/bbb-other/lib; touch /nix/store/aaa-tool/new" => {
+            let read = p.read(b"/nix/store/aaa-tool/lib").map(|b| show(&b)).unwrap_or_else(|e| format!("errno {e}"));
+            let other = p.exists(b"/nix/store/bbb-other/lib");
+            let wrote = match p.write(b"/nix/store/aaa-tool/new", b"", 0o644) {
+                Ok(()) => "written".to_string(),
+                Err(e) => std::io::Error::from_raw_os_error(e).to_string(),
+            };
+            p.out(&format!("read={read}\nother={other}\ntouch={wrote}\n"));
+            0
+        }
         "ls /w/big | wc -l; ls -la /w/big | grep -c rmeta; ls /w/big | sort | uniq -d | wc -l" => {
             let names = match p.list(b"/w/big") {
                 Ok(names) => names,
@@ -588,6 +635,47 @@ fn sh(p: &mut Proc, script: &str) -> i32 {
             }
         },
     }
+}
+
+#[test]
+fn actions_of_one_closure_share_a_read_only_store_that_shows_only_the_closure() {
+    sim::test(|| {
+        let fx = fixture(sh);
+        for name in ["aaa-tool", "bbb-other", "ccc-lib"] {
+            file::create_dir_all(format!("/nix/store/{name}")).unwrap();
+            file::write(format!("/nix/store/{name}/lib"), format!("{name} lib")).unwrap();
+        }
+        let script = "cat /nix/store/aaa-tool/lib; test -e /nix/store/bbb-other/lib; touch /nix/store/aaa-tool/new";
+        let run = |names: &[&str]| {
+            let mut r = fx.req(script, &[], &[], &[]);
+            r.view = fx.nix_view(names);
+            r.no_cache = true;
+            let got = fx.engine.obtain(r).unwrap();
+            assert!(got.result.success(), "{}", fx.text(&got.result.stderr));
+            fx.text(&got.result.stdout)
+        };
+        let seen = "read=aaa-tool lib\nother=false\ntouch=Read-only file system (os error 30)\n";
+        assert_eq!(run(&["aaa-tool", "ccc-lib"]), seen, "a store path outside the closure is absent and the store is read-only");
+        assert_eq!(run(&["aaa-tool", "ccc-lib"]), seen);
+        let trees = fx.engine.fs.shared_trees();
+        assert_eq!(trees.len(), 1, "actions of one closure share one tree");
+        assert_eq!(trees[0].1, 0, "a tree no running action uses is kept for the next");
+
+        let with_other = run(&["aaa-tool", "bbb-other"]);
+        assert_eq!(with_other, "read=aaa-tool lib\nother=true\ntouch=Read-only file system (os error 30)\n");
+        assert_eq!(fx.engine.fs.shared_trees().len(), 2, "another closure has its own tree");
+        for extra in ["ddd", "eee", "fff", "ggg"] {
+            file::create_dir_all(format!("/nix/store/{extra}")).unwrap();
+            run(&["aaa-tool", extra]);
+        }
+        assert_eq!(fx.engine.fs.shared_trees().len(), 4, "only the trees used last are kept");
+        assert_eq!(fx.engine.fs.stats().counts()[3], 0, "nothing was written through a shared tree");
+
+        let mut plain = fx.req("echo fine", &[], &[], &[]);
+        plain.no_cache = true;
+        assert_eq!(fx.text(&fx.engine.obtain(plain).unwrap().result.stdout), "fine\n", "a view with no closure binds no store");
+        assert_eq!(fx.engine.fs.shared_trees().len(), 4);
+    });
 }
 
 #[test]
