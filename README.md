@@ -18,6 +18,8 @@ Built programs use the build server's C library from the Nix store; the first `r
 Paths compiled into a program, `env!("CARGO_MANIFEST_DIR")` and whatever macros such as `include_dir!` or `sqlx::migrate!` derive from it, name `/w`, which is your checkout only under `rargo run`.
 A program that finds its files that way must be started with `rargo run`, and reports those paths as `/w/...`; a program that does not use such paths also runs straight from `target/`.
 
+When rargo mounts `target/`, the mounted build outputs are available only while the client daemon is running. They disappear from `target/` after a daemon stop, crash or reboot. To keep a binary for later, copy it out of `target/` while the daemon is running, or use `RARGO_OUTPUT=copy rargo build --release` to write the release outputs to disk.
+
 The path compiled in by `env!("CARGO")` points to the Farm’s Cargo in its Nix store and may be missing on your machine. To launch Cargo from your program, read `CARGO` at runtime with `std::env::var_os("CARGO")`. When Cargo is installed locally, `rargo run` sets that variable to its path.
 
 ```sh

@@ -209,6 +209,7 @@ So a second worktree, a fresh clone, or a colleague building the commit you just
 
 <aside>
 `target/` is mounted with FUSE when the client can. Otherwise results are copied into it, which works everywhere and costs the download.
+Mounted build outputs disappear from `target/` when the client daemon stops, crashes or the machine reboots. To keep a binary for later, copy it out of `target/` before stopping the daemon or build with `RARGO_OUTPUT=copy` to write the outputs to disk.
 </aside>
 
 # Configuration
