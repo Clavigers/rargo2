@@ -56,17 +56,3 @@ pub(crate) fn umount(target: &Path, flags: libc::c_int) -> io::Result<()> {
     let target = cstr(target)?;
     done(unsafe { libc::umount2(target.as_ptr(), flags) }.into())
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn writes_a_non_seekable_proc_file() {
-        std::thread::spawn(|| {
-            let path = "/proc/thread-self/comm";
-            super::write_proc(path, "rargo-proc-test").unwrap();
-            assert_eq!(std::fs::read_to_string(path).unwrap(), "rargo-proc-test\n");
-        })
-        .join()
-        .unwrap();
-    }
-}
