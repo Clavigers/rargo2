@@ -830,15 +830,33 @@ fn passthrough(args: &[OsString]) -> ! {
     io::process::exit(101)
 }
 
+/// Enters a mount namespace with `binds` in place, or fails with this process as it was.
+///
+/// Without the right to make a mount namespace directly, one is made inside a new user
+/// namespace, and a user namespace cannot be left again. Where the system lets an unprivileged
+/// process make one and then refuses it everything inside (Ubuntu's AppArmor restriction), a
+/// failed attempt would leave the program running as nobody, unable to reach even a socket any
+/// user may open. So the whole attempt is made first in a child, and only one that worked there
+/// is made here.
 fn enter_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
-    use namespace::mount;
-    let (uid, gid) = (io::process::uid(), io::process::gid());
     if namespace::unshare(libc::CLONE_NEWNS).is_err() {
-        namespace::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS)?;
-        io::file::write("/proc/self/setgroups", "deny")?;
-        io::file::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
-        io::file::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+        namespace::in_child(|| own_user_namespace().and_then(|()| build_namespace(binds)))?;
+        own_user_namespace()?;
     }
+    build_namespace(binds)
+}
+
+/// Moves this thread into a new user namespace, with a mount namespace of its own, as the same user.
+fn own_user_namespace() -> std::io::Result<()> {
+    let (uid, gid) = (io::process::uid(), io::process::gid());
+    namespace::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS)?;
+    io::file::write("/proc/self/setgroups", "deny")?;
+    io::file::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+    io::file::write("/proc/self/gid_map", format!("{gid} {gid} 1"))
+}
+
+fn build_namespace(binds: &[(String, String)]) -> std::io::Result<()> {
+    use namespace::mount;
     mount(None, Path::new("/"), None, libc::MS_REC | libc::MS_PRIVATE, None)?;
     let entries: Vec<io::file::DirEntry> = io::file::read_dir("/")?.filter_map(|e| e.ok()).collect();
     let covered = ["/tmp", "/mnt", "/media", "/srv", "/opt", "/home", "/var"]
