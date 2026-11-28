@@ -66,7 +66,7 @@ Once you are authenti&shy;cated with the server, you can run any cargo command w
 </cmd-list>
 
 <aside>
-What the Farm builds links against the Farm's own C library, from the Nix store. To run it on your machine, with `rargo run` or straight from `target/`, you need [Nix](https://nixos.org/download/) installed. The first `rargo run` fetches the library into your store; after that the program runs either way.
+What the Farm builds links against the Farm's own C library, from the Nix store. To run it on your machine, with `rargo run` or straight from `target/`, you need [Nix](https://nixos.org/download/) installed. The first `rargo run` fetches the library into your store; after that the program runs either way. Paths compiled into a program, `env!("CARGO_MANIFEST_DIR")` and whatever macros such as `include_dir!` or `sqlx::migrate!` derive from it, name `/w`, which is your checkout only under `rargo run`. A program that finds its files that way must be started with `rargo run`, and reports those paths as `/w/...`; a program that does not use such paths also runs straight from `target/`.
 </aside>
 
 
