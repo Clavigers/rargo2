@@ -1613,9 +1613,14 @@ impl Run {
         }
     }
 
-    fn action_env(&self, cmd: &rp::Cmd) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        let mut env: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.base_env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
+    fn action_env(&self, cmd: &rp::Cmd, kind: ActionKind) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let compile = matches!(kind, ActionKind::Rustc | ActionKind::Rustdoc | ActionKind::BuildScript);
+        let mut env: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .base_env
+            .iter()
+            .filter(|(k, _)| !(compile && compile_env_skips(k)))
+            .map(|(k, v)| (bytes(k), bytes(v)))
+            .collect();
         for (k, v) in &cmd.env {
             match v {
                 Some(v) => {
@@ -1783,7 +1788,7 @@ impl Run {
         let spec = ActionSpec {
             kind,
             argv,
-            env: self.action_env(&cmd),
+            env: self.action_env(&cmd, kind),
             cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
             net: if u.kind == rp::UnitKind::RunScript && self.policy.build_script_network(&u.pkg_name, &u.manifest_path) {
                 NetMode::Host
@@ -2880,7 +2885,7 @@ impl Run {
                     let mut spec = ActionSpec {
                         kind: akind,
                         argv,
-                        env: self.action_env(&cmd),
+                        env: self.action_env(&cmd, akind),
                         cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
                         net: if self.policy.test_network(&plan.units[*unit as usize].pkg_name) {
                             NetMode::Host
