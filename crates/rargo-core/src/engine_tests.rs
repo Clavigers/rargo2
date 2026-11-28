@@ -538,12 +538,12 @@ impl Fx {
     }
 }
 
-/// The command lines the tests below give `/bin/sh -c`, each doing what a shell would do with it.
-/// What the script `flaky` depends on without the engine seeing it.
+// What the script `flaky` depends on without the engine seeing it.
 thread_local! {
     static FLAKY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// The command lines the tests below give `/bin/sh -c`, each doing what a shell would do with it.
 fn sh(p: &mut Proc, script: &str) -> i32 {
     let echo = |p: &Proc, name: &str, var: &str| {
         let value = p.var(var.as_bytes()).unwrap_or_default();
