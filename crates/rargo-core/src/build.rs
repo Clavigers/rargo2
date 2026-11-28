@@ -3046,7 +3046,7 @@ impl Run {
 /// or through other libraries, but not through a build script.
 fn loaded_dylibs(units: &[rp::Unit], exes: impl Iterator<Item = u32>) -> Vec<usize> {
     let mut stack: Vec<u32> = exes.collect();
-    let mut seen: HashSet<u32> = stack.iter().copied().collect();
+    let mut seen: std::collections::BTreeSet<u32> = stack.iter().copied().collect();
     let mut found = Vec::new();
     while let Some(i) = stack.pop() {
         for d in &units[i as usize].deps {
