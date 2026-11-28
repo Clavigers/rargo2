@@ -7,6 +7,8 @@ They build on the server when invoked directly. Cargo aliases such as `lint` or 
 Your files go to the server. The server builds them. You get the output and the files you asked for.
 Everyone who uses the same server shares one cache.
 
+`rargo test` can replay successful test and doctest output when the executable and tracked inputs are unchanged. A replay is marked `Cached` on stderr. Clock and network state are outside the tracked inputs. Use `rargo test --no-cache` to run the selected tests again, including when their results depend on a live service. Put `--no-cache` before any `--` that introduces test harness arguments.
+
 Keep Cargo path dependencies inside the synced worktree. If a dependency lives in a sibling repository outside that worktree, move it inside and update the dependency path, or use `RARGO_FALLBACK=cargo` to let rargo build locally when it detects the external dependency.
 
 ## Use a server
