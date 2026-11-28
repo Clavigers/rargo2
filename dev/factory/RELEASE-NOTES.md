@@ -10,7 +10,10 @@ and touch nothing on GitHub: your whole output is one file.
 ## Find out what changed
 
 1. `git log --reverse --format='%h %s' {previous}..v{version}` is every
-   change in the release.
+   change in the release. `{previous}` may sit on a release branch, with
+   fixes cherry-picked onto it that are also in this list under the same
+   subject: `git log --format=%s -60 {previous}` shows them. Those shipped
+   already; leave them out.
 2. Sort them by who notices. Most merges are internal: tests, the simulator,
    refactors, CI, the factory under `dev/factory`. A user-visible change is
    one that alters what a person types, sees, waits for, installs or must

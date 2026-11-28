@@ -16,12 +16,12 @@ Every few minutes it does the next thing that is due, and records it:
    it publishes: it runs the release command, and records `published` only
    if that succeeded. With no release command set it publishes nothing and
    says so.
-5. Release notes. A version of the factory's whose tag has a GitHub release
-   gets its notes written: one harness session (RELEASE-NOTES.md) reads what
+5. Release notes. Each of the two newest version tags that has a GitHub
+   release gets its notes written: one harness session (RELEASE-NOTES.md) reads what
    changed since the tag before and writes notes for a person who uses
    rargo, and the project manager puts them on the release in place of the
-   list of pull request titles GitHub generates. It goes by the tag, not by
-   `published`, so a release made by hand gets notes too. The notes are kept
+   list of pull request titles GitHub generates. It goes by the tags, not by
+   the log's versions, so a release the owner cut from main gets notes too. The notes are kept
    in state/notes/X.Y.Z.md; a version with that file is done.
 
 It decides nothing a rule does not: what holds a release is the world's
@@ -73,6 +73,7 @@ def bump(root: Path, old: str, new: str) -> None:
             b if "source = " in b else b.replace(was, now) for b in blocks))
 
 
+NOTES_NEWEST = 2  # tags that get notes: older releases keep what they have
 NOTES_TRIES = 3  # sessions per version, until the project manager restarts
 NOTES_MIN = 300  # characters: less is not release notes
 NOTES_TIMEOUT = timedelta(minutes=30)
@@ -248,15 +249,15 @@ class Pm:
     def _notes(self) -> None:
         if self.notes_prompt is None or self.state is None:
             return
-        for version in self.ledger.world.versions:
+        tags = self._git("tag", "--list", "v[0-9]*.[0-9]*.[0-9]*", "--sort=-v:refname").split()
+        for tag, previous in list(zip(tags, tags[1:]))[:NOTES_NEWEST]:
+            version = tag[1:]
             out = self.state / "notes" / f"{version}.md"
-            tag = f"v{version}"
-            if out.exists() or self.notes_tries.get(version, 0) >= NOTES_TRIES or not self._has(tag):
+            if out.exists() or self.notes_tries.get(version, 0) >= NOTES_TRIES:
                 continue
             if self.gh.release(tag) is None:  # the release workflow has not made it yet
                 continue
             self.notes_tries[version] = self.notes_tries.get(version, 0) + 1
-            previous = self._git("describe", "--tags", "--abbrev=0", "--match", "v*", f"{tag}^")
             out.parent.mkdir(parents=True, exist_ok=True)
             draft = out.with_suffix(".draft.md")
             draft.unlink(missing_ok=True)
