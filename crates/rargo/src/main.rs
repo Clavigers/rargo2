@@ -923,6 +923,23 @@ fn exec(e: ExecRequest) -> ! {
     io::on_this_thread(|| exec_here(e))
 }
 
+fn exec_command(e: &ExecRequest, local_cargo: impl Fn() -> Option<PathBuf>) -> io::process::Command {
+    let mut cmd = io::process::Command::new(&e.program);
+    cmd.args(&e.args).current_dir(&e.cwd);
+    for (key, value) in &e.env {
+        match (key.as_str(), value) {
+            // The planner's Cargo path belongs to the build server.
+            ("CARGO", Some(_)) => match local_cargo() {
+                Some(path) => cmd.env(key, Path::new(&e.cwd).join(path)),
+                None => cmd.env_remove(key),
+            },
+            (_, Some(value)) => cmd.env(key, value),
+            (_, None) => cmd.env_remove(key),
+        };
+    }
+    cmd
+}
+
 fn exec_here(mut e: ExecRequest) -> ! {
     e.binds.retain(|(real, _)| Path::new(real).ring_exists());
     if e.binds.is_empty() {
@@ -941,14 +958,7 @@ fn exec_here(mut e: ExecRequest) -> ! {
             }
         }
     }
-    let mut cmd = io::process::Command::new(&e.program);
-    cmd.args(&e.args).current_dir(&e.cwd);
-    for (k, v) in &e.env {
-        match v {
-            Some(v) => cmd.env(k, v),
-            None => cmd.env_remove(k),
-        };
-    }
+    let mut cmd = exec_command(&e, real_cargo);
     let err = cmd.exec();
     let file = Path::new(&e.cwd).join(&e.program);
     let mut head = Vec::new();
@@ -1023,6 +1033,31 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn local_run_uses_client_cargo_instead_of_the_planners_path() {
+        let request = ExecRequest {
+            program: "target/debug/xtask".into(),
+            args: Vec::new(),
+            env: vec![
+                ("CARGO".into(), Some("/rargo/cargo".into())),
+                ("CARGO_MANIFEST_DIR".into(), Some("/w".into())),
+            ],
+            cwd: "/checkout".into(),
+            binds: Vec::new(),
+        };
+
+        for (cargo, expected) in [
+            (Some(PathBuf::from("/tools/bin/cargo")), Some("/tools/bin/cargo")),
+            (Some(PathBuf::from("tools/cargo")), Some("/checkout/tools/cargo")),
+            (None, None),
+        ] {
+            let mut command = exec_command(&request, || cargo.clone());
+            let env: std::collections::BTreeMap<_, _> = command.std_mut().get_envs().collect();
+            assert_eq!(env[std::ffi::OsStr::new("CARGO")], expected.map(std::ffi::OsStr::new));
+            assert_eq!(env[std::ffi::OsStr::new("CARGO_MANIFEST_DIR")], Some(std::ffi::OsStr::new("/w")));
+        }
+    }
 
     #[test]
     fn path_dependencies_must_stay_inside_the_synced_worktree() {
