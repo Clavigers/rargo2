@@ -1151,8 +1151,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
             Effect::ShowPlanFailure => {
                 let p = prepared.as_ref().expect("a plan failure follows a prepared worktree");
                 let (stdout, stderr) = plan_failure.take().expect("a plan failed");
-                c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&stdout)).as_bytes());
-                c.out.err_text(&String::from_utf8_lossy(&stderr));
+                show_plan_failure(&c.out, &p.tr, &stdout, &stderr);
                 Vec::new()
             }
             Effect::End(End::Code(code)) => return Ok(Finish::Code(code)),
@@ -1559,6 +1558,12 @@ fn dep_manifest_dirs(units: &[rp::Unit], unit: usize) -> Vec<String> {
     }
     dirs.sort();
     dirs
+}
+
+fn show_plan_failure(out: &Output, tr: &Translator, stdout: &[u8], stderr: &[u8]) {
+    let out = out.derive(out.quiet, out.verbose, tr.clone());
+    out.raw_out(tr.text(&String::from_utf8_lossy(stdout)).as_bytes());
+    out.err_text(&String::from_utf8_lossy(stderr));
 }
 
 fn translated(tr: &Translator, data: &[u8]) -> Vec<u8> {
@@ -3197,6 +3202,23 @@ fn missing_target_hint(target: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn locked_plan_failure_prints_the_clients_lockfile_path() {
+        use rargo_proto::ServerMsg;
+
+        crate::io::sim::test(|| {
+            let (tx, mut rx) = crate::io::unbounded_channel();
+            let out = Output::new(tx, false, false);
+            let tr = Translator::new(vec![("/w".into(), "/home/me/project".into())]);
+            for verb in ["create", "update"] {
+                let diagnostic = format!("error: cannot {verb} the lock file /w/Cargo.lock because --locked was passed\n");
+                super::show_plan_failure(&out, &tr, b"", diagnostic.as_bytes());
+                let ServerMsg::Stderr(err) = rx.recv().unwrap() else { panic!("expected stderr") };
+                assert_eq!(String::from_utf8(err).unwrap(), diagnostic.replace("/w/", "/home/me/project/"));
+            }
+        });
+    }
+
     /// What a test printing `line` shows the user, when the tested package's
     /// manifest is `manifest_path`, the client's worktree `/home/me/project` and
     /// its cargo home `/home/me/.cargo`.
