@@ -2579,6 +2579,9 @@ impl Run {
                 if let Some(hint) = library_hint(&u.pkg_name, &stderr, &stdout) {
                     self.c.out.note(&hint);
                 }
+                if let Some(hint) = tool_hint(&u.pkg_name, &stderr, &stdout) {
+                    self.c.out.note(&hint);
+                }
             }
             _ => {
                 let errors = match cnt.errors {
@@ -3120,6 +3123,29 @@ fn library_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
     })
 }
 
+/// The tools a build script looks for outside pkg-config, each with what its
+/// failure says and what a flake's dev shell needs to provide it.
+const TOOLS: [(&str, &str, &str); 2] = [
+    ("Could not find `protoc`", "protoc", "add `protobuf` to that shell's nativeBuildInputs"),
+    (
+        "Unable to find libclang",
+        "libclang",
+        "add `llvmPackages.libclang` to that shell's nativeBuildInputs and set `LIBCLANG_PATH = \"${pkgs.llvmPackages.libclang.lib}/lib\";` in it",
+    ),
+];
+
+fn tool_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
+    let said = format!("{stderr}\n{stdout}");
+    let wanted: Vec<_> = TOOLS.iter().filter(|(sign, _, _)| said.contains(sign)).collect();
+    (!wanted.is_empty()).then(|| {
+        let names = wanted.iter().map(|(_, name, _)| format!("`{name}`")).collect::<Vec<_>>().join(" and ");
+        let fixes = wanted.iter().map(|(_, _, fix)| *fix).collect::<Vec<_>>().join("; ");
+        format!(
+            "the build script of `{package}` looked for {names}, which the build's flake does not provide; rargo builds in the dev shell of the project's flake.nix, or in its default flake when there is none, so installing it or setting environment variables on this machine does not help: {fixes} (see https://github.com/Clavigers/rargo2#toolchain-and-system-libraries)"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     /// What a test printing `line` shows the user, when the tested package's
@@ -3226,6 +3252,19 @@ mod tests {
         ];
         assert_eq!(dep_manifest_dirs(&units, 4), ["/c/registry/src/i/serde-1.0.0", "/w/deeper", "/w/dep"]);
         assert!(dep_manifest_dirs(&units, 5).is_empty());
+    }
+
+    #[test]
+    fn a_build_script_that_failed_for_want_of_protoc_or_libclang_is_told_how_a_flake_provides_them() {
+        let protoc = "  called `Result::unwrap()` on an `Err` value: Custom { kind: NotFound, error: \"Could not find `protoc`. If `protoc` is installed, try setting the `PROTOC` environment variable to the path of the `protoc` binary. To install it on Debian, run `apt-get install protobuf-compiler`.\" }\n";
+        let hint = super::tool_hint("bg", protoc, "").expect("a hint");
+        assert!(hint.contains("`bg`") && hint.contains("`protoc`") && hint.contains("`protobuf`") && hint.contains("flake.nix") && !hint.contains("libclang"), "{hint}");
+        let clang = "  Unable to find libclang: \"couldn't find any valid shared libraries matching: ['libclang.so'], set the `LIBCLANG_PATH` environment variable to a path where one of these files can be found (invalid: [])\"\n";
+        let hint = super::tool_hint("librocksdb-sys", "", clang).expect("a hint from stdout too");
+        assert!(hint.contains("`libclang`") && hint.contains("llvmPackages.libclang") && hint.contains("LIBCLANG_PATH") && !hint.contains("protobuf"), "{hint}");
+        let both = super::tool_hint("x", protoc, clang).expect("a hint");
+        assert!(both.contains("`protoc` and `libclang`"), "{both}");
+        assert_eq!(super::tool_hint("cc-sys", "  error: linker `cc` not found\n", ""), None);
     }
 
     #[test]
