@@ -235,6 +235,7 @@ impl Mux {
             loop {
                 io::sleep(WATCH_STEP);
                 if m.is_dead() {
+                    m.die();
                     break;
                 }
                 let now = io::now().saturating_duration_since(m.started);

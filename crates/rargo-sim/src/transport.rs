@@ -116,7 +116,8 @@ impl Side {
                 payload,
             } => data_packet(*id, *msg, *frag, *nfrags, payload),
             RouteEvent::Ack { id, msg, frag } => ack_packet(*id, &[(*msg, *frag)]),
-            RouteEvent::Open { .. } | RouteEvent::Peer { .. } => return Ok(()),
+            // The world tears a link down itself on a restart or a cut, so a reset only repeats that.
+            RouteEvent::Open { .. } | RouteEvent::Peer { .. } | RouteEvent::Reset { .. } => return Ok(()),
         };
         let now = Duration::from_millis(now);
         let out = self.conn.on_datagram(now, &packet);
