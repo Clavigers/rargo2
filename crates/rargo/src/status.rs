@@ -1,6 +1,5 @@
 use crate::{cache_dir, daemon_socket, find_root, load_config, project};
 use rargo_net::io::UnixStream;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 pub fn run() {
@@ -91,16 +90,7 @@ pub fn run() {
 }
 
 fn rargo_mount(info: &[u8], target: &Path) -> bool {
-    let mut encoded = Vec::new();
-    for &byte in target.as_os_str().as_bytes() {
-        match byte {
-            b' ' => encoded.extend_from_slice(b"\\040"),
-            b'\t' => encoded.extend_from_slice(b"\\011"),
-            b'\n' => encoded.extend_from_slice(b"\\012"),
-            b'\\' => encoded.extend_from_slice(b"\\134"),
-            _ => encoded.push(byte),
-        }
-    }
+    let encoded = crate::daemon::mountinfo_path(target);
     info.split(|&b| b == b'\n')
         .filter_map(|line| {
             let mut fields = line.split(|&b| b == b' ');
