@@ -108,7 +108,28 @@ Signing in with GitHub needs a GitHub OAuth application of your own, whose callb
 
 `rargo @build.example:7459` needs nothing else: a name with a port is the server itself.
 
-A bare name like `rargo.rs` is asked over HTTPS where its server is. To use one, serve `https://YOUR-NAME/.well-known/rargo.json` and the paths under `/auth` from the build server, which answers them as plain HTTP on its TCP port. Any reverse proxy will do.
+A bare name like `rargo.rs` is asked over HTTPS where its server is. To use one, serve `https://YOUR-NAME/.well-known/rargo.json` and the paths under `/auth` from the build server, which answers them as plain HTTP on its TCP port. Any reverse proxy will do, if it passes on the name the client asked for, as `Host` or `X-Forwarded-Host`.
+
+`rargo.json` names the server that builds run on. Unless rargod was started with `--public HOST:PORT`, that is the request's name with rargod's own listen port: behind a proxy that sends its upstream address instead, which is nginx's default for `proxy_pass`, every client is sent to `127.0.0.1:7459` and dials its own machine. With nginx:
+
+<figure class="example">
+
+```nginx
+location ~ ^/(\.well-known/rargo\.json|auth) {
+    proxy_pass http://127.0.0.1:7459;
+    proxy_set_header Host $host;
+}
+```
+</figure>
+
+When builds must go somewhere other than the web name on the listen port (the name is a CDN or tunnel in front of another machine, or the public port is not the one rargod listens on), start rargod with `--public HOST:PORT`, or install it with `RARGO_PUBLIC=HOST:PORT`. To check what clients are told:
+
+<figure class="example">
+
+```sh
+curl -s https://YOUR-NAME/.well-known/rargo.json   # "server" is where builds go
+```
+</figure>
 
 ## What builds can see
 
