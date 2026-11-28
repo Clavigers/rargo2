@@ -314,6 +314,15 @@ impl TraceCache {
         self.mem.borrow_mut().insert(*weak, Arc::new(list));
     }
 
+    /// Removes every trace under `weak` that would replay for `view`: a real run there failed, so none of them is true now.
+    pub fn forget_holding(&self, weak: &Hash, view: &dyn View, content: &Content) -> usize {
+        let held: Vec<u64> = self.load(weak).iter().filter(|(_, t)| t.holds(view, content)).map(|(id, _)| *id).collect();
+        for id in &held {
+            self.remove(weak, *id);
+        }
+        held.len()
+    }
+
     pub fn needs_env(&self, weak: &Hash) -> Vec<String> {
         let mut k = b"env:".to_vec();
         k.extend_from_slice(&weak.0);
