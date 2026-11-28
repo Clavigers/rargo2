@@ -535,6 +535,10 @@ fn route(raw: &[OsString], token_command: bool) -> Route {
         {
             return Route::Local { release: false };
         }
+        // `clippy --fix` writes its fixes into your sources, so it runs where they are, as `rargo fix` does.
+        if subcommand(&args) == Some("clippy") && args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--fix") {
+            return Route::CargoDelegated;
+        }
         if args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--unit-graph") {
             return Route::Usage("error: rargo does not support --unit-graph for remote builds; use local Cargo to get a unit graph with local paths".into());
         }
@@ -791,6 +795,9 @@ mod tests {
             (None, vec!["lint"], fake(&[]), Plan::CargoDelegated),
             (None, vec!["xtask", "build"], fake(&[]), Plan::CargoDelegated),
             (None, vec!["metadata"], fake(&[]), Plan::CargoDelegated),
+            (None, vec!["clippy", "--fix"], fake(&[]), Plan::CargoDelegated),
+            (None, vec!["+nightly", "clippy", "--all-targets", "--fix", "--allow-dirty", "-p", "x"], fake(&[]), Plan::CargoDelegated),
+            (None, vec!["clippy", "--", "--fix"], fake(&[]), remote(&["clippy", "--", "--fix"], &[], "build")),
             (None, vec!["build", "--unit-graph"], fake(&[]), usage("error: rargo does not support --unit-graph for remote builds; use local Cargo to get a unit graph with local paths")),
             (None, vec!["build", "--", "--unit-graph"], fake(&[]), remote(&["build", "--", "--unit-graph"], &[], "build")),
             (None, vec!["--color", "always", "b"], fake(&[]), remote(&["--color", "always", "b"], &[], "build")),
