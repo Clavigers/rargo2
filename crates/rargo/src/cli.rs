@@ -145,6 +145,7 @@ pub enum Auth {
 pub enum Plan {
     /// Run cargo, first printing `banner` if there is one.
     Cargo { release: bool, banner: Option<String> },
+    CargoDelegated,
     Print(String),
     Status,
     StopDaemons,
@@ -225,6 +226,7 @@ pub fn plan(w: &impl World, argv0: Option<&OsStr>, raw: &[OsString]) -> Plan {
     }
     let (args, kind) = match route(raw, token_command) {
         Route::Local { release } => return Plan::Cargo { release, banner },
+        Route::CargoDelegated => return Plan::CargoDelegated,
         Route::Usage(text) => return Plan::Fail { text, code: 2 },
         Route::Remote { args, kind } => (args, kind),
     };
@@ -460,13 +462,14 @@ pub fn removed(host: &str, revoked: Result<bool, String>) -> (String, Option<Str
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
     Local { release: bool },
+    CargoDelegated,
     Usage(String),
     Remote { args: Vec<String>, kind: &'static str },
 }
 
 fn route(raw: &[OsString], token_command: bool) -> Route {
     let Ok(mut args) = raw.iter().map(|a| a.clone().into_string()).collect::<Result<Vec<_>, _>>() else {
-        return Route::Local { release: false };
+        return Route::CargoDelegated;
     };
     if args.first().is_some_and(|arg| arg.starts_with('+')) {
         args.remove(0);
@@ -521,7 +524,8 @@ fn route(raw: &[OsString], token_command: bool) -> Route {
                 });
                 return Route::Local { release: !read_only };
             }
-            _ => return Route::Local { release: false },
+            Some("help") | None => return Route::Local { release: false },
+            Some(_) => return Route::CargoDelegated,
         }
         if subcommand(&args) != Some("nextest")
             && args.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h" || a == "--version" || a == "-V")
@@ -719,7 +723,7 @@ mod tests {
             (None, vec!["status", "--help"], fake(&[]), Plan::Print(STATUS_HELP.into())),
             (None, vec!["status", "x"], fake(&[]), fail("usage: rargo status")),
             (None, vec!["status", "-h", "x"], fake(&[]), fail("usage: rargo status")),
-            (Some("/usr/bin/cargo"), vec!["status"], fake(&[]), cargo.clone()),
+            (Some("/usr/bin/cargo"), vec!["status"], fake(&[]), Plan::CargoDelegated),
             (Some("rargo"), vec!["-h"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
             (None, vec!["--help"], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
             (None, vec![], fake(&[]), Plan::Cargo { release: false, banner: Some(BANNER.into()) }),
@@ -785,7 +789,9 @@ mod tests {
             (None, vec!["clean", "--help"], fake(&[]), cargo.clone()),
             (None, vec!["check", "--version"], fake(&[]), cargo.clone()),
             (None, vec!["test", "-h"], fake(&[]), cargo.clone()),
-            (None, vec!["metadata"], fake(&[]), cargo.clone()),
+            (None, vec!["lint"], fake(&[]), Plan::CargoDelegated),
+            (None, vec!["xtask", "build"], fake(&[]), Plan::CargoDelegated),
+            (None, vec!["metadata"], fake(&[]), Plan::CargoDelegated),
             (None, vec!["build", "--unit-graph"], fake(&[]), usage("error: rargo does not support --unit-graph for remote builds; use local Cargo to get a unit graph with local paths")),
             (None, vec!["build", "--", "--unit-graph"], fake(&[]), remote(&["build", "--", "--unit-graph"], &[], "build")),
             (None, vec!["--color", "always", "b"], fake(&[]), remote(&["--color", "always", "b"], &[], "build")),
@@ -799,7 +805,7 @@ mod tests {
             (None, vec!["run"], fake(&[("RUSTUP_TOOLCHAIN", "1.70.0")]), fail("rargo cannot use `RUSTUP_TOOLCHAIN` for remote builds. Select Rust with `rust-toolchain.toml` when using the default flake, or in your project's `flake.nix`.")),
             (None, vec!["check"], fake(&[("RUSTUP_TOOLCHAIN", "")]), remote(&["check"], &[("RUSTUP_TOOLCHAIN", "")], "build")),
             (None, vec!["run", "--", "+nightly"], fake(&[]), remote(&["run", "--", "+nightly"], &[], "build")),
-            (None, vec!["+nightly", "metadata"], fake(&[("RUSTUP_TOOLCHAIN", "stable")]), cargo.clone()),
+            (None, vec!["+nightly", "metadata"], fake(&[("RUSTUP_TOOLCHAIN", "stable")]), Plan::CargoDelegated),
             (None, vec!["+nightly", "check"], fake(&[("RARGO_BYPASS", "1")]), cargo.clone()),
             (None, vec!["build"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
             (None, vec!["--rargo-gc"], fake(&[]).no_creds(), fail("this machine is not authenticated to h.example: run `rargo auth`, which also says how to get access if the server has not let you in yet")),
@@ -817,7 +823,7 @@ mod tests {
         }
         use std::os::unix::ffi::OsStringExt;
         let not_utf8 = vec![OsString::from("build"), OsString::from_vec(vec![0xff])];
-        assert_eq!(plan(&fake(&[]), None, &not_utf8), Plan::Cargo { release: false, banner: None });
+        assert_eq!(plan(&fake(&[]), None, &not_utf8), Plan::CargoDelegated);
     }
 
     #[test]
