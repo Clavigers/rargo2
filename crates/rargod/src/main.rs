@@ -500,12 +500,30 @@ mod tests {
     use rargo_core::http::Http;
     use rargo_core::tokens::{Github, TokenStore};
     use std::net::SocketAddr;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::time::Duration;
 
     const ACCESS: &str = "mail ops@example.com";
     const INVITATION_DEFAULT: &str = "ask this server's administrator for an invitation (`rargo auth invite`)";
+
+    struct TestState(PathBuf);
+
+    impl TestState {
+        fn new() -> Self {
+            let tmp = io::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(|| "/tmp".into());
+            let suffix = rargo_core::tokens::random_text(24, b"abcdefghijklmnopqrstuvwxyz").unwrap();
+            let path = tmp.join(format!("rargod-access-{suffix}"));
+            io::file::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestState {
+        fn drop(&mut self) {
+            let _ = io::file::remove_dir_all(&self.0);
+        }
+    }
 
     fn token(state: &Path, args: &[&str]) {
         let mut command = vec!["--state".into(), state.to_str().unwrap().into()];
@@ -578,8 +596,8 @@ mod tests {
 
     #[test]
     fn access_guidance_reaches_the_page_and_cli_on_an_invitation_only_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path();
+        let dir = TestState::new();
+        let state = dir.0.as_path();
         token(state, &["access", ACCESS]);
         assert!(Github::load(state).is_none());
         assert_eq!(io::file::read_to_string(state.join("access.txt")).unwrap(), ACCESS);
@@ -592,8 +610,8 @@ mod tests {
     #[test]
     fn either_command_order_preserves_access_guidance_with_github() {
         for access_first in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let state = dir.path();
+            let dir = TestState::new();
+            let state = dir.0.as_path();
             if access_first {
                 token(state, &["access", ACCESS]);
                 configure_github(state);
@@ -608,8 +626,8 @@ mod tests {
 
     #[test]
     fn legacy_github_access_guidance_is_used_until_explicitly_cleared() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path();
+        let dir = TestState::new();
+        let state = dir.0.as_path();
         Github {
             client_id: "test-id".into(),
             client_secret: "test-secret".into(),
