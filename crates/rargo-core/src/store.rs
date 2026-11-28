@@ -273,7 +273,7 @@ impl Store {
     }
 
     fn set_cold_disk(&self) {
-        let bytes = self.index.borrow_mut().cold_stats().2;
+        let bytes = self.index.borrow().cold_disk();
         self.db.put(Table::Meta, COLD_DISK_KEY, &bytes.to_le_bytes());
     }
 
@@ -311,6 +311,8 @@ impl Store {
         Ok(Some((size * variants.len() as u64).saturating_sub(added)))
     }
 
+    /// Freezes the blobs idle for `min_idle_secs`, one walk of the index for the pass. Between
+    /// blobs it lets the loop's other fibers run, so a pass over many blobs blocks no request.
     pub fn freeze_idle(&self, min_idle_secs: u64, before: &dyn Fn(&Hash)) -> (usize, u64) {
         let idle = self.index.borrow_mut().freeze_candidates(now_secs(), min_idle_secs);
         let (mut n, mut freed) = (0, 0);
@@ -318,6 +320,9 @@ impl Store {
             if let Ok(Some(b)) = self.freeze(&h, before) {
                 n += 1;
                 freed += b;
+            }
+            if crate::io::on_loop_thread() {
+                crate::io::yield_now();
             }
         }
         (n, freed)
@@ -1003,6 +1008,45 @@ mod tests {
             let (removed, _) = { gc }.join().unwrap();
             assert_eq!(removed, 1);
             assert_eq!(read, data, "the thawed blob reads back whole");
+        });
+    }
+
+    // A pass that freezes many blobs walks the index once, not once a blob, and lets the
+    // loop's other fibers run between blobs, so a request that comes during it is answered.
+    #[test]
+    fn a_freeze_pass_walks_the_index_once_and_yields_between_blobs() {
+        sim::test(|| {
+            let (_d, s) = store();
+            let (small, cold) = (10_000u32, 300u32);
+            for i in 0..small {
+                s.put_bytes(&i.to_le_bytes()).unwrap();
+            }
+            let base = noise(crate::store_index::COLD_MIN_SIZE as usize);
+            for i in 0..cold {
+                let mut b = base.clone();
+                b[..4].copy_from_slice(&i.to_le_bytes());
+                s.put_bytes(&b).unwrap();
+            }
+            let (ticks, done) = (std::rc::Rc::new(Cell::new(0u64)), std::rc::Rc::new(Cell::new(false)));
+            let other = {
+                let (ticks, done) = (ticks.clone(), done.clone());
+                crate::io::spawn(move || {
+                    while !done.get() {
+                        ticks.set(ticks.get() + 1);
+                        crate::io::yield_now();
+                    }
+                })
+            };
+            let seen = RefCell::new(Vec::new());
+            let walked = s.index.borrow().visited();
+            let (n, _) = s.freeze_idle(0, &|_| seen.borrow_mut().push(ticks.get()));
+            let walked = s.index.borrow().visited() - walked;
+            done.set(true);
+            { other }.join().unwrap();
+            assert_eq!(n, cold as usize);
+            assert!(walked <= u64::from(small + cold), "the pass went through {walked} blobs of {}", small + cold);
+            let seen = seen.into_inner();
+            assert!(seen.windows(2).all(|w| w[0] < w[1]), "another fiber runs between every two blobs: {seen:?}");
         });
     }
 

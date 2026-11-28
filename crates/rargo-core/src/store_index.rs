@@ -93,6 +93,7 @@ pub struct StoreIndex {
     generation: u64,
     whole_bytes: u64,
     cold_disk: u64,
+    visited: std::cell::Cell<u64>,
 }
 
 impl StoreIndex {
@@ -142,6 +143,21 @@ impl StoreIndex {
         }
     }
 
+    /// Every blob, counted into `visited`: each walk of the index goes through here.
+    fn walk(&self) -> std::collections::btree_map::Iter<'_, Hash, Blob> {
+        self.visited.set(self.visited.get() + self.blobs.len() as u64);
+        self.blobs.iter()
+    }
+
+    /// How many blobs the walks of the index have gone through, so a test can bound what a pass costs.
+    pub fn visited(&self) -> u64 {
+        self.visited.get()
+    }
+
+    pub fn cold_disk(&self) -> u64 {
+        self.cold_disk
+    }
+
     pub fn has(&self, h: &Hash) -> bool {
         self.blobs.contains_key(h)
     }
@@ -177,22 +193,22 @@ impl StoreIndex {
     }
 
     pub fn cold_stats(&self) -> (usize, u64, u64) {
-        let cold = self.blobs.values().filter(|b| !b.is_whole());
+        let cold = self.walk().map(|(_, b)| b).filter(|b| !b.is_whole());
         let (n, logical) = cold.fold((0, 0), |(n, l), b| (n + 1, l + b.size));
         (n, logical, self.cold_disk)
     }
 
     pub fn all_hashes(&self) -> Vec<Hash> {
-        self.blobs.keys().copied().collect()
+        self.walk().map(|(h, _)| *h).collect()
     }
 
     pub fn whole_count(&self) -> usize {
-        self.blobs.values().filter(|b| b.is_whole()).count()
+        self.walk().filter(|(_, b)| b.is_whole()).count()
     }
 
     pub fn live_chunks(&self) -> BTreeSet<Hash> {
         let mut live = BTreeSet::new();
-        for b in self.blobs.values() {
+        for (_, b) in self.walk() {
             if let Tier::Cold { recipe, .. } | Tier::Thawing { recipe, .. } = &b.tier {
                 live.extend(recipe.iter().map(|c| c.hash));
             }
@@ -249,8 +265,7 @@ impl StoreIndex {
     pub fn freeze_candidates(&self, now: u64, min_idle_secs: u64) -> Vec<Hash> {
         let cutoff = now.saturating_sub(min_idle_secs);
         let mut idle: Vec<(u64, Hash)> = self
-            .blobs
-            .iter()
+            .walk()
             .filter(|(_, b)| matches!(b.tier, Tier::Hot { .. }) && b.last_used <= cutoff && b.size >= COLD_MIN_SIZE)
             .map(|(h, b)| (b.last_used, *h))
             .collect();
@@ -376,7 +391,7 @@ impl StoreIndex {
         }
         let cutoff = now.saturating_sub(min_age_secs);
         let mut all: Vec<(u64, Hash)> =
-            self.blobs.iter().filter(|(_, b)| !b.is_moving()).map(|(h, b)| (b.last_used, *h)).collect();
+            self.walk().filter(|(_, b)| !b.is_moving()).map(|(h, b)| (b.last_used, *h)).collect();
         all.sort_unstable();
         let mut freed = 0u64;
         let mut out = Vec::new();
@@ -403,8 +418,7 @@ impl StoreIndex {
     pub fn sweep(&mut self, live: &dyn Fn(&Hash) -> bool, min_age_secs: u64, now: u64) -> Vec<Evicted> {
         let cutoff = now.saturating_sub(min_age_secs);
         let dead: Vec<Hash> = self
-            .blobs
-            .iter()
+            .walk()
             .filter(|(h, b)| {
                 !b.is_moving() && !live(h) && (min_age_secs == 0 || b.last_used <= cutoff) && !self.is_pinned(h)
             })
