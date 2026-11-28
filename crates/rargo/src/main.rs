@@ -939,24 +939,37 @@ fn exec_command(e: &ExecRequest, local_cargo: impl Fn() -> Option<PathBuf>) -> i
     cmd
 }
 
-fn exec_here(mut e: ExecRequest) -> ! {
-    e.binds.retain(|(real, _)| Path::new(real).ring_exists());
-    if e.binds.is_empty() {
-    } else if let Err(err) = enter_namespace(&e.binds) {
-        if io::env::var_os("RARGO_QUIET_NS").is_none() {
-            eprintln!(
-                "warning: cannot create a mount namespace ({err}); running without it. \
-                 Paths compiled into the program (such as CARGO_MANIFEST_DIR) will point to `{}`.",
-                e.binds.first().map(|b| b.1.as_str()).unwrap_or("/w")
-            );
-        }
-        e.program = to_real(&e.program, &e.binds);
+/// Gives the request the client's paths where the program would otherwise see the namespace's.
+/// The program itself is always started by its real path, which the namespace still shows, so
+/// that its `current_exe()` and `argv[0]` name a file that exists once it has exited; its
+/// environment keeps the namespace's paths unless there is no namespace.
+fn to_client(e: &mut ExecRequest, namespaced: bool) {
+    e.program = to_real(&e.program, &e.binds);
+    if !namespaced {
         for (_, v) in e.env.iter_mut() {
             if let Some(v) = v {
                 *v = to_real(v, &e.binds);
             }
         }
     }
+}
+
+fn exec_here(mut e: ExecRequest) -> ! {
+    e.binds.retain(|(real, _)| Path::new(real).ring_exists());
+    let namespaced = match if e.binds.is_empty() { Ok(()) } else { enter_namespace(&e.binds) } {
+        Ok(()) => true,
+        Err(err) => {
+            if io::env::var_os("RARGO_QUIET_NS").is_none() {
+                eprintln!(
+                    "warning: cannot create a mount namespace ({err}); running without it. \
+                     Paths compiled into the program (such as CARGO_MANIFEST_DIR) will point to `{}`.",
+                    e.binds.first().map(|b| b.1.as_str()).unwrap_or("/w")
+                );
+            }
+            false
+        }
+    };
+    to_client(&mut e, namespaced);
     let mut cmd = exec_command(&e, real_cargo);
     let err = cmd.exec();
     let file = Path::new(&e.cwd).join(&e.program);
@@ -1056,6 +1069,26 @@ mod tests {
             assert_eq!(env[std::ffi::OsStr::new("CARGO")], expected.map(std::ffi::OsStr::new));
             assert_eq!(env[std::ffi::OsStr::new("CARGO_MANIFEST_DIR")], Some(std::ffi::OsStr::new("/w")));
         }
+    }
+
+    #[test]
+    fn a_run_program_is_started_by_its_real_path_whether_or_not_there_is_a_namespace() {
+        let request = || ExecRequest {
+            program: "/w/target/debug/app".into(),
+            args: Vec::new(),
+            env: vec![("CARGO_MANIFEST_DIR".into(), Some("/w".into()))],
+            cwd: "/home/me/app/src".into(),
+            binds: vec![("/home/me/app".into(), "/w".into()), ("/home/me/.cargo".into(), "/c".into())],
+        };
+        for (namespaced, manifest_dir) in [(true, "/w"), (false, "/home/me/app")] {
+            let mut e = request();
+            to_client(&mut e, namespaced);
+            assert_eq!(e.program, "/home/me/app/target/debug/app", "namespaced: {namespaced}");
+            assert_eq!(e.env, vec![("CARGO_MANIFEST_DIR".to_string(), Some(manifest_dir.to_string()))]);
+        }
+        let mut e = ExecRequest { program: "target/debug/app".into(), ..request() };
+        to_client(&mut e, true);
+        assert_eq!(e.program, "target/debug/app");
     }
 
     #[test]
