@@ -47,6 +47,8 @@
           buildInputs = libs;
         };
         default = pkgs.mkShell {
+          # Native debug builds can run compiler probes with -O0 and -Werror.
+          hardeningDisable = [ "fortify" ];
           nativeBuildInputs = [ rust ] ++ tools;
           buildInputs = libs;
         };
