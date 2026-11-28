@@ -2813,6 +2813,21 @@ impl Run {
                 }
             }
         }
+        let delivered_exes = plan.roots.iter().copied().filter(|ri| plan.units[*ri as usize].executable.is_some() && !run_here.contains(ri));
+        for i in loaded_dylibs(&plan.units, delivered_exes) {
+            let u = &plan.units[i];
+            let Some((r, _)) = self.results[i].get() else { continue };
+            for o in &u.outputs {
+                let Some(MEntry::File { hash, exec, size }) = r.outputs.get(o.path.as_bytes()) else { continue };
+                if !matches!(o.flavor.as_str(), "Normal" | "Linkable") {
+                    continue;
+                }
+                push(&mut files, tr.path(&o.path), hash, *exec, *size, true);
+                if let Some(d) = &o.hardlink {
+                    push(&mut files, tr.path(d), hash, *exec, *size, false);
+                }
+            }
+        }
         let mut docs: BTreeMap<&[u8], (Hash, bool, u64)> = BTreeMap::new();
         for &i in &self.pd.facts.doc_order {
             let (Some(dir), Some((r, _))) = (&self.pd.facts.doc_dir[i], self.results[i].get()) else { continue };
@@ -3024,6 +3039,35 @@ impl Run {
         }
         Ok(Finish::Code(0))
     }
+}
+
+/// The `dylib` units the executables `exes` load at run time, which cargo leaves in the
+/// target directory and so must be delivered beside them: those they depend on, directly
+/// or through other libraries, but not through a build script.
+fn loaded_dylibs(units: &[rp::Unit], exes: impl Iterator<Item = u32>) -> Vec<usize> {
+    let mut stack: Vec<u32> = exes.collect();
+    let mut seen: std::collections::BTreeSet<u32> = stack.iter().copied().collect();
+    let mut found = Vec::new();
+    while let Some(i) = stack.pop() {
+        for d in &units[i as usize].deps {
+            let u = &units[d.unit as usize];
+            if u.kind != rp::UnitKind::Compile || !seen.insert(d.unit) {
+                continue;
+            }
+            if is_dylib(&u.target_json) {
+                found.push(d.unit as usize);
+            }
+            stack.push(d.unit);
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// Whether a unit's target, as the plan records it, builds a Rust `dylib`.
+fn is_dylib(target_json: &str) -> bool {
+    let target: serde_json::Value = serde_json::from_str(target_json).unwrap_or_default();
+    target["crate_types"].as_array().is_some_and(|a| a.iter().any(|t| t.as_str() == Some("dylib")))
 }
 
 fn stock_fingerprint(exe: &str, pkg: &str) -> Option<String> {
@@ -3323,6 +3367,36 @@ mod tests {
         ];
         assert_eq!(dep_manifest_dirs(&units, 4), ["/c/registry/src/i/serde-1.0.0", "/w/deeper", "/w/dep"]);
         assert!(dep_manifest_dirs(&units, 5).is_empty());
+    }
+
+    #[test]
+    fn an_executable_brings_the_dylibs_it_loads_however_deep_but_not_those_of_build_scripts() {
+        let unit = |kind: &str, crate_type: &str, deps: &[(u32, bool)]| -> rp::Unit {
+            let deps: Vec<serde_json::Value> = deps.iter().map(|(u, r)| serde_json::json!({"unit": u, "only_rmeta": r})).collect();
+            let target = serde_json::json!({"kind": [crate_type], "crate_types": [crate_type], "name": "p"}).to_string();
+            serde_json::from_value(serde_json::json!({
+                "kind": kind, "cmd": null, "deps": deps, "outputs": [], "rmeta_early": false, "needs_objects": false,
+                "pkg": "p", "pkg_id": "p", "pkg_name": "p", "pkg_version": "0.1.0", "desc": "p", "verb": "Compiling",
+                "is_local": true, "repository": null, "show_warnings": true, "fix_hint": null, "pkg_spec": "",
+                "manifest_path": "/w/Cargo.toml", "target_json": target, "profile_json": "", "features": [],
+                "executable": null, "script": null, "script_metas": [], "scrape_can_fail": false,
+            }))
+            .unwrap()
+        };
+        let units = [
+            unit("Compile", "dylib", &[]),
+            unit("Compile", "rlib", &[(0, true)]),
+            unit("Compile", "dylib", &[]),
+            unit("Compile", "bin", &[(2, false)]),
+            unit("RunScript", "bin", &[(3, false)]),
+            unit("Compile", "bin", &[(1, false), (4, false)]),
+            unit("Compile", "cdylib", &[]),
+            unit("Compile", "proc-macro", &[]),
+            unit("Compile", "bin", &[(6, false), (7, false)]),
+        ];
+        assert_eq!(loaded_dylibs(&units, [5].into_iter()), [0], "a dylib behind an rlib, as bevy_dylib behind bevy, but not one a build script loads");
+        assert!(loaded_dylibs(&units, [8].into_iter()).is_empty(), "cdylibs and proc macros are not loaded by the executable");
+        assert_eq!(loaded_dylibs(&units, [5, 3].into_iter()), [0, 2]);
     }
 
     #[test]
