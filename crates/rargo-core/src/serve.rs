@@ -367,7 +367,8 @@ pub fn link(d: Arc<Daemon>, link: Rc<Link>, presented: String, admin: bool, keys
 const TOKEN_USAGE: &str = "usage: rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n       \
                            rargo auth create --user NAME [--admin] [--days N]\n       \
                            rargo auth tokens\n       \
-                           rargo auth revoke ID-OR-USER\n       \
+                           rargo auth revoke ID-OR-USER (administrators also withdraw invitations for USER)\n       \
+                           rargo auth revoke-invite INVITATION-ID (ID from the token list)\n       \
                            rargo auth allow GITHUB-LOGIN [--admin]\n       \
                            rargo auth disallow GITHUB-LOGIN";
 
