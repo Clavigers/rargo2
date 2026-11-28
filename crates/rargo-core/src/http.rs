@@ -906,10 +906,10 @@ impl Http {
 
     fn view_cfg(&self) -> Cfg {
         let github = self.github();
-        let access = match &github {
-            Some(g) if !g.access.is_empty() => g.access.clone(),
-            _ => default_access(github.is_some()).to_string(),
-        };
+        let access = self.state.as_deref().and_then(tokens::load_access)
+            .or_else(|| github.as_ref().map(|g| g.access.clone()))
+            .filter(|access| !access.is_empty())
+            .unwrap_or_else(|| default_access(github.is_some()).to_string());
         Cfg { public: self.public.clone(), port: self.port, has_tokens: self.keys.tokens().is_some(), access }
     }
 
