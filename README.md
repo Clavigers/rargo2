@@ -28,12 +28,15 @@ rargo build
 
 ## Run a server
 
-The server needs Linux and root.
+The server needs Linux 6.14 or newer on x86_64, built with `CONFIG_FUSE_IO_URING` (rargod mounts FUSE over io_uring only), glibc 2.39 or newer, root, a C toolchain, and Nix with flakes.
+Debian 13 and Ubuntu 24.04 ship older kernels: install one from trixie-backports, or Ubuntu's HWE kernel (`linux-generic-hwe-24.04`).
 
 The easiest way is the prebuilt server: `curl -fsSL https://rargo.rs/install-server.sh | sh`.
-To build it from this checkout:
+To build it from this checkout, which also needs Rust:
 
 ```sh
+echo 'options fuse enable_uring=Y' > /etc/modprobe.d/rargo-fuse-uring.conf
+modprobe fuse && echo Y > /sys/module/fuse/parameters/enable_uring   # off by default; the installer does both
 forks/setup.sh cargo                # clones rust-lang/cargo into /root/rargo-work/cargo and applies forks/cargo
 forks/build.sh                      # builds the planner against this checkout; prints its path
 cargo build --release               # builds rargod and rargo
