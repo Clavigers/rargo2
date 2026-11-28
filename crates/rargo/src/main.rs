@@ -121,6 +121,11 @@ impl cli::World for Real {
         project::credential(host)
     }
 
+    fn auth_disabled(&self, host: &str) -> bool {
+        self.handle_signals();
+        project::server_status(host).is_ok_and(|info| info.get("auth").and_then(|a| a.as_bool()) == Some(false))
+    }
+
     fn nextest_version(&self) -> Option<String> {
         self.handle_signals();
         own_nextest_version()
