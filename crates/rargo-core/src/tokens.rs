@@ -60,7 +60,7 @@ pub struct Github {
     pub client_id: String,
     pub client_secret: String,
     pub url: String,
-    /// How someone the server has not let in yet gets access, completing "To build here, …"; empty for the default.
+    /// Access guidance stored here by older servers.
     #[serde(default)]
     pub access: String,
 }
@@ -76,14 +76,26 @@ impl Github {
     }
 
     pub fn save(&self, state: &Path) -> Result<()> {
-        use std::io::Write;
-        let path = Self::path(state);
-        let tmp = path.with_extension(format!("tmp{}", crate::io::process::id()));
-        let mut w = crate::io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
-        w.write_all(&serde_json::to_vec_pretty(self)?)?;
-        crate::io::file::rename(&tmp, &path)?;
-        Ok(())
+        save_setting(&Self::path(state), &serde_json::to_vec_pretty(self)?)
     }
+}
+
+/// An empty file explicitly restores the default, overriding any legacy guidance.
+pub(crate) fn load_access(state: &Path) -> Option<String> {
+    crate::io::file::read_to_string(state.join("access.txt")).ok()
+}
+
+pub fn save_access(state: &Path, access: &str) -> Result<()> {
+    save_setting(&state.join("access.txt"), access.as_bytes())
+}
+
+fn save_setting(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("tmp{}", crate::io::process::id()));
+    let mut w = crate::io::file::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(&tmp)?;
+    w.write_all(bytes)?;
+    crate::io::file::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn valid_login(login: &str) -> bool {

@@ -924,6 +924,8 @@ dependencies = [
  "libc",
  "rargo-core",
  "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

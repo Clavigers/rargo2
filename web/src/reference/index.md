@@ -102,7 +102,7 @@ rargo auth revoke ann            # her next build is refused
 
 The same commands run on the server itself as `rargod token invite|create|list|revoke|allow|disallow --state DIR` (`--state` is `/var/lib/rargo/state` after the installer). That is where the first administrator comes from: the installer's invitation, or `rargod token create --user NAME --admin`. Anyone else may list and revoke their own tokens.
 
-Signing in with GitHub needs a GitHub OAuth application of your own, whose callback is `https://YOUR-NAME/auth/github/callback`, given to the server once with `rargod token github`. Without one, `rargo auth` asks for an invitation; with one, it takes either. `rargod token access --state DIR TEXT` sets what the page and `rargo auth` tell someone not let in yet: "To build here, TEXT." Without it they name `rargod token allow` and `rargo auth invite`.
+Signing in with GitHub needs a GitHub OAuth application of your own, whose callback is `https://YOUR-NAME/auth/github/callback`, given to the server once with `rargod token github`. Without one, `rargo auth` asks for an invitation; with one, it takes either. `rargod token access --state DIR TEXT` works with or without GitHub sign-in and sets what the page and `rargo auth` tell someone not let in yet: "To build here, TEXT." Without it they name `rargod token allow` and `rargo auth invite`.
 
 ## A name instead of an address
 

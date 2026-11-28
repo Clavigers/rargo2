@@ -370,12 +370,10 @@ fn token_command(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if rest.first().map(String::as_str) == Some("access") {
-        let Some(mut github) = rargo_core::tokens::Github::load(&state) else {
-            bail!("the access text is shown on the GitHub sign-in page: set GitHub sign-in up first with `rargod token github`");
-        };
-        github.access = rest[1..].join(" ").trim().trim_end_matches('.').to_string();
-        github.save(&state)?;
-        match github.access.as_str() {
+        let text = rest[1..].join(" ");
+        let access = text.trim().trim_end_matches('.');
+        rargo_core::tokens::save_access(&state, access)?;
+        match access {
             "" => println!("`rargo auth` and its page now give the default way to get access"),
             text => println!("`rargo auth` and its page now say: To build here, {text}."),
         }
@@ -498,8 +496,132 @@ fn evict_loop((d, budget, cold_after): (Arc<Daemon>, u64, u64)) {
 
 #[cfg(test)]
 mod tests {
-    use super::watchdog_every;
+    use super::{Keys, io, token_command, watchdog_every};
+    use rargo_core::http::Http;
+    use rargo_core::tokens::{Github, TokenStore};
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::sync::Arc;
     use std::time::Duration;
+
+    const ACCESS: &str = "mail ops@example.com";
+    const INVITATION_DEFAULT: &str = "ask this server's administrator for an invitation (`rargo auth invite`)";
+
+    fn token(state: &Path, args: &[&str]) {
+        let mut command = vec!["--state".into(), state.to_str().unwrap().into()];
+        command.extend(args.iter().map(|arg| (*arg).to_string()));
+        token_command(&command).unwrap();
+    }
+
+    fn configure_github(state: &Path) {
+        let secret = state.join("secret");
+        io::file::write(&secret, "test-secret").unwrap();
+        token(state, &[
+            "github", "--client-id", "test-id", "--client-secret-file",
+            secret.to_str().unwrap(), "--url", "https://build.example",
+        ]);
+    }
+
+    fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
+        let mut stream = io::TcpStream::connect(addr).unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: build.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        let mut buf = [0; 4096];
+        loop {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&buf[..n]);
+        }
+        String::from_utf8(response).unwrap()
+    }
+
+    #[allow(clippy::arc_with_non_send_sync, reason = "The server API shares these values among fibers on one thread")]
+    fn check_auth(state: &Path, access: &str, github: bool) {
+        io::run(1, || {
+            let listener = io::TcpListener::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let store = Arc::new(TokenStore::new(state.join("tokens.json")));
+            let http = Http::new(Arc::new(Keys::with_tokens(store)), None, addr.port()).with_state(state.to_path_buf());
+            let mut server = io::spawn(move || {
+                for _ in 0..if github { 2 } else { 3 } {
+                    let (stream, _) = listener.accept().unwrap();
+                    http.serve(stream).unwrap();
+                }
+            });
+
+            let protocol = rargo_core::proto::PROTO_VERSION;
+            let response = request(addr, "POST", "/auth/start", &format!(r#"{{"protocol":{protocol}}}"#));
+            assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+            let (_, body) = response.split_once("\r\n\r\n").unwrap();
+            let started: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(started["access"], access);
+
+            let page = request(addr, "GET", started["path"].as_str().unwrap(), "");
+            assert!(page.starts_with("HTTP/1.1 200 "), "{page}");
+            assert!(page.contains(&format!("To build here, {access}.")), "{page}");
+            assert_eq!(page.contains("Sign in with GitHub"), github);
+
+            if !github {
+                let code = started["code"].as_str().unwrap();
+                let denied = request(addr, "GET", &format!("/auth/github?code={code}"), "");
+                assert!(denied.starts_with("HTTP/1.1 403 "), "{denied}");
+            }
+            server.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn access_guidance_reaches_the_page_and_cli_on_an_invitation_only_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        token(state, &["access", ACCESS]);
+        assert!(Github::load(state).is_none());
+        assert_eq!(io::file::read_to_string(state.join("access.txt")).unwrap(), ACCESS);
+        check_auth(state, ACCESS, false);
+
+        token(state, &["access", ""]);
+        check_auth(state, INVITATION_DEFAULT, false);
+    }
+
+    #[test]
+    fn either_command_order_preserves_access_guidance_with_github() {
+        for access_first in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path();
+            if access_first {
+                token(state, &["access", ACCESS]);
+                configure_github(state);
+            } else {
+                configure_github(state);
+                token(state, &["access", ACCESS]);
+            }
+            assert_eq!(Github::load(state).unwrap().client_id, "test-id");
+            check_auth(state, ACCESS, true);
+        }
+    }
+
+    #[test]
+    fn legacy_github_access_guidance_is_used_until_explicitly_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        Github {
+            client_id: "test-id".into(),
+            client_secret: "test-secret".into(),
+            url: "https://build.example".into(),
+            access: ACCESS.into(),
+        }.save(state).unwrap();
+        configure_github(state);
+        check_auth(state, ACCESS, true);
+
+        token(state, &["access", ""]);
+        check_auth(state, "ask this server's administrator to allow your GitHub account (`rargod token allow YOUR-LOGIN`) or for an invitation (`rargo auth invite`)", true);
+    }
 
     #[test]
     fn the_watchdog_is_pinged_at_half_its_timeout_and_only_when_meant_for_this_process() {
