@@ -1649,11 +1649,10 @@ impl Run {
     }
 
     fn action_env(&self, cmd: &rp::Cmd, kind: ActionKind) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        let compile = matches!(kind, ActionKind::Rustc | ActionKind::Rustdoc | ActionKind::BuildScript);
         let mut env: BTreeMap<Vec<u8>, Vec<u8>> = self
             .base_env
             .iter()
-            .filter(|(k, _)| !(compile && compile_env_skips(k)))
+            .filter(|(k, _)| !action_env_skips(kind, k, &self.policy))
             .map(|(k, v)| (bytes(k), bytes(v)))
             .collect();
         for (k, v) in &cmd.env {
@@ -1846,9 +1845,6 @@ impl Run {
         let parser_d = self.d.clone();
         let declared_env: Arc<dyn Fn(&ActionResult, &Store) -> Vec<String>> = match (&u.kind, script) {
             (rp::UnitKind::RunScript, Some(s)) => Arc::new(move |r, store| {
-                if !r.success() {
-                    return Vec::new();
-                }
                 let Ok(stdout) = store.read(&r.stdout) else { return Vec::new() };
                 match &*parser_d.parser.parse(&s, &stdout) {
                     Ok(o) => o.rerun_if_env_changed.clone(),
