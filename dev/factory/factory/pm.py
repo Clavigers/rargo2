@@ -24,6 +24,13 @@ Every few minutes it does the next thing that is due, and records it:
    the log's versions, so a release the owner cut from main gets notes too. The notes are kept
    in state/notes/X.Y.Z.md; a version with that file is done.
 
+A candidate whose tag already has a GitHub release was released by someone
+else (the owner, by hand). The project manager records `released_outside`,
+with the build the tag points to, and the version is published: it is not
+built, backported or held any more. Such a version does not count towards
+freeze_every_days, since its freeze was cut short, so the next candidate is
+frozen from main at once.
+
 It decides nothing a rule does not: what holds a release is the world's
 hold_reasons, and the log refuses a `published` they forbid. Every step can
 be repeated: one that stopped half way is finished by the next.
@@ -113,6 +120,8 @@ class Pm:
         self._git("fetch", "-q", "--prune", "--tags", "--force", "origin")  # a tag moved on origin must not stop us
         self._notes()
         version = next((v for v in w.versions if w.is_(M.VERSION, v, "candidate")), None)
+        if version is not None and self._released_outside(version):
+            version = None
         if version is None:
             version = self._freeze()
             if version is None:
@@ -122,9 +131,22 @@ class Pm:
         self._backport(version)  # whatever lands on the branch next
         self._hold_or_publish(version)
 
+    def _released_outside(self, version: str) -> bool:
+        tag = f"v{version}"
+        if not self._has(tag) or self.gh.release(tag) is None:
+            return False
+        sha = self._git("rev-parse", f"{tag}^{{commit}}")
+        builds = [l["build"] for l in self._lines("built") if l["version"] == version and l["sha"] == sha]
+        fields = {"build": builds[-1]} if builds else {}
+        if not self._record("released_outside", version=version, sha=sha, **fields):
+            return False
+        self._once(f"{version} was released outside the factory at {sha[:7]}"
+                   + (f" (build {builds[-1]})" if builds else ", which is no candidate build"), tell=True)
+        return True
+
     def _freeze(self) -> str | None:
-        w = self.ledger.world
-        last = max((v.frozen for v in w.versions.values()), default=None)
+        w = self.ledger.refresh()
+        last = max((v.frozen for v in w.versions.values() if not v.outside), default=None)
         if last and self.clock() - last < timedelta(days=w.config.release.freeze_every_days):
             return None
         sha = self._git("rev-parse", "origin/main")

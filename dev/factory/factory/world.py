@@ -70,6 +70,7 @@ class Version:
     builds: list[datetime] = field(default_factory=list)
     backports: set[int] = field(default_factory=set)
     unbuilt: set[int] = field(default_factory=set)
+    outside: bool = False  # released by someone other than the project manager
 
 
 @dataclass
@@ -965,6 +966,15 @@ def _(w: World, e: m.Published, a):
     _latest_build(w, e)
     if held := w.hold_reasons(e.version):
         w.fail(f"{e.version} build {e.build} is held: {sorted(held)}")
+    w.enter(M.VERSION, e.version, "published")
+
+
+@on(m.ReleasedOutside)
+def _(w: World, e: m.ReleasedOutside, a):
+    r = _candidate(w, e.version)
+    if e.build is not None and not 1 <= e.build <= len(r.builds):
+        w.fail(f"{e.version} has no build {e.build}")
+    r.outside = True
     w.enter(M.VERSION, e.version, "published")
 
 
