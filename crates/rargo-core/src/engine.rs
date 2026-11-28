@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 pub trait Observer {
     fn miss(&self) {}
+    fn cache_hit(&self) {}
     fn queued(&self, _running: usize, _waiting: usize) {}
     fn wants_explanation(&self) -> bool {
         false
@@ -483,6 +484,7 @@ impl Engine {
     }
 
     fn replay(&self, result: &ActionResult, observer: &dyn Observer) {
+        observer.cache_hit();
         if let Ok(out) = self.store.read(&result.stdout) {
             if !out.is_empty() {
                 observer.stdout(&out);

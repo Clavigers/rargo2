@@ -57,6 +57,8 @@ Now, the rargo client knows which rargo server it should send actions requests t
 The Farm lets in the people its owner has let in. `rargo auth` opens a page that asks you to prove you are one of them. If you need access, [open a request on GitHub](https://github.com/sadosystems/rargo/issues/new?title=Request%20access%20to%20the%20Rargo%20Farm) with your GitHub username. You can also skip the Farm: [a server of your own](/reference#a-server) is one command, and `rargo @HOST` puts it in the same user config file.
 </aside>
 
+If your project has no `flake.nix` or Rust toolchain file, rargo builds it with the pinned nightly Rust in its default shell. To use stable Rust, add a [`rust-toolchain.toml` file](/reference#what-builds-can-see) to your workspace.
+
 Once you are authenti&shy;cated with the server, you can run any cargo command with rargo, the work will be done on the public farm and the result will be streamed back.
 
 <cmd-list>

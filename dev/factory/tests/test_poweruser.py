@@ -1,7 +1,11 @@
 """The power user, against a real log."""
 import copy
 import json
+import shutil
+import subprocess
+import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from factory import machines as M
 from factory.ledger import Ledger
@@ -262,3 +266,116 @@ def test_a_checkout_that_fails_opens_no_use(tmp_path):
     except subprocess.CalledProcessError:
         pass
     assert f.ledger.world.uses == {} and f.sessions == []
+
+
+class Leaky:
+    """A power user whose session is a shell script that leaves things behind,
+    with a stand-in mount table: a directory holding `.mounted` is mounted,
+    and the first plain unmount of each fails, as a busy FUSE mount's does."""
+    def __init__(self, tmp, monkeypatch, script, timeout=timedelta(minutes=5)):
+        import factory.poweruser as P
+        self.tmp, self.scratch, self.said, self.unmounted = tmp, tmp / "scratch", [], []
+        self.elsewhere = tmp / "elsewhere"  # another session's, or the shared cache
+        self.elsewhere.mkdir()
+        (self.elsewhere / ".mounted").touch()
+        (self.elsewhere / "keep").write_text("not the session's")
+        self.other = tmp / "scratch" / "pu9.1.other"  # another session's directory
+        self.other.mkdir(parents=True)
+        (self.other / "keep").touch()
+        self.pids = tmp / "pids"
+        monkeypatch.setattr(P.harness, "command", lambda t, prompt: (
+            ["sh", "-c", script, "sh", str(self.pids), prompt], {}))
+        self.f = Factory(tmp).candidate()
+        self.f.ledger.refresh()
+        self.pu = P.PowerUser(self.f.ledger, self.f, tmp / "use", "work in {dir}", clock=self.f.clock,
+                              say=self.said.append, prepare=lambda sha: None, timeout=timeout,
+                              scratch=self.scratch, mounts=self.mounts, unmount=self.unmount)
+        (tmp / "use").mkdir()
+
+    def mounts(self):
+        return [str(p.parent) for p in self.tmp.rglob(".mounted")]
+
+    def unmount(self, path, lazy):
+        if not lazy and path not in self.unmounted:
+            self.unmounted.append(path)
+            return False
+        (Path(path) / ".mounted").unlink()
+        return True
+
+    def run(self):
+        return self.pu._run_session(1, "0.7.11", 1, SHA)
+
+    def alive(self, pid):
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] not in "ZX"
+        except OSError:
+            return False
+
+
+# Leaves, in the directory it is given: a child in its process group, one in
+# a session of its own (found by the mark in its environment), one with an
+# empty environment that only works there, a mount and files.
+LEAK = """
+dir=${2#work in }
+mkdir -p "$dir/proj/target" && touch "$dir/proj/target/.mounted"
+head -c 4096 /dev/zero > "$dir/big"
+sleep 300 & echo $! >> "$1"
+setsid sleep 301 & echo $! >> "$1"
+(cd "$dir" && exec env -i setsid sleep 302) & echo $! >> "$1"
+sleep 0.2
+"""
+
+
+def _leaves_nothing(k, outsider):
+    deadline = time.monotonic() + 5
+    pids = [int(p) for p in k.pids.read_text().split()]
+    while any(k.alive(p) for p in pids) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(pids) == 3 and not any(k.alive(p) for p in pids)
+    assert list(k.scratch.iterdir()) == [k.other]  # its own directory is gone, another's is not
+    assert (k.other / "keep").exists() and (k.elsewhere / "keep").exists()
+    assert k.mounts() == [str(k.elsewhere)] and len(k.unmounted) == 1  # its mount only, lazily
+    assert outsider.poll() is None  # a process that is not the session's lives on
+    said = " ".join(k.said)
+    assert "left behind: killed " in said and "unmounted 1" in said and "4096 bytes" in said
+
+
+def test_a_session_that_exits_leaves_nothing_behind(tmp_path, monkeypatch):
+    k = Leaky(tmp_path, monkeypatch, LEAK)
+    outsider = subprocess.Popen(["sleep", "300"], cwd=k.other)
+    try:
+        k.run()
+        _leaves_nothing(k, outsider)
+    finally:
+        outsider.kill()
+        outsider.wait()
+
+
+def test_a_session_that_is_killed_or_times_out_leaves_nothing_behind(tmp_path, monkeypatch):
+    for script, timeout, code in ((LEAK + "kill -9 $$\n", timedelta(minutes=5), -9),
+                                  (LEAK + "sleep 30\n", timedelta(seconds=1), 124)):
+        (tmp_path / "t").mkdir()
+        k = Leaky(tmp_path / "t", monkeypatch, script, timeout=timeout)
+        outsider = subprocess.Popen(["sleep", "300"])
+        try:
+            assert k.run() == code
+            _leaves_nothing(k, outsider)
+        finally:
+            outsider.kill()
+            outsider.wait()
+        shutil.rmtree(tmp_path / "t")
+
+
+def test_a_session_that_leaves_nothing_is_not_reported(tmp_path, monkeypatch):
+    k = Leaky(tmp_path, monkeypatch, "true")
+    k.run()
+    assert list(k.scratch.iterdir()) == [k.other] and not any("left behind" in s for s in k.said)
+
+
+def test_a_mount_that_will_not_go_keeps_its_directory(tmp_path, monkeypatch):
+    k = Leaky(tmp_path, monkeypatch, LEAK)
+    k.pu.unmount = lambda path, lazy: False
+    k.run()
+    left = [p for p in k.scratch.iterdir() if p != k.other]
+    assert len(left) == 1 and (left[0] / "proj" / "target" / ".mounted").exists()
+    assert any("could not unmount" in s for s in k.said)

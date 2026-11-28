@@ -7,6 +7,8 @@ They build on the server when invoked directly. Cargo aliases such as `lint` or 
 Your files go to the server. The server builds them. You get the output and the files you asked for.
 Everyone who uses the same server shares one cache.
 
+`rargo test` can replay successful test and doctest output when the executable and tracked inputs are unchanged. A replay is marked `Cached` on stderr. Clock and network state are outside the tracked inputs. Use `rargo test --no-cache` to run the selected tests again, including when their results depend on a live service. Put `--no-cache` before any `--` that introduces test harness arguments.
+
 Keep Cargo path dependencies inside the synced worktree. If a dependency lives in a sibling repository outside that worktree, move it inside and update the dependency path, or use `RARGO_FALLBACK=cargo` to let rargo build locally when it detects the external dependency.
 
 ## Use a server
@@ -28,17 +30,21 @@ rargo build
 
 ## Run a server
 
-The server needs Linux and root.
+The server needs Linux 6.14 or newer on x86_64, built with `CONFIG_FUSE_IO_URING` (rargod mounts FUSE over io_uring only), glibc 2.39 or newer, root, a C toolchain, and Nix with flakes.
+Debian 13 and Ubuntu 24.04 ship older kernels: install one from trixie-backports, or Ubuntu's HWE kernel (`linux-generic-hwe-24.04`).
 
 The easiest way is the prebuilt server: `curl -fsSL https://rargo.rs/install-server.sh | sh`.
-To build it from this checkout:
+It puts `rargod` in `/usr/local/bin`, so the Reference's `rargod token ...` commands run as written.
+To build it from this checkout, which also needs Rust:
 
 ```sh
+echo 'options fuse enable_uring=Y' > /etc/modprobe.d/rargo-fuse-uring.conf
+modprobe fuse && echo Y > /sys/module/fuse/parameters/enable_uring   # off by default; the installer does both
 forks/setup.sh cargo                # clones rust-lang/cargo into /root/rargo-work/cargo and applies forks/cargo
 forks/build.sh                      # builds the planner against this checkout; prints its path
 cargo build --release               # builds rargod and rargo
-rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation
-rargod --state /var/lib/rargo --planner /root/rargo-work/cargo/target/release/cargo --listen 0.0.0.0:7459
+target/release/rargod token invite --state /var/lib/rargo --user ann --admin   # prints an invitation
+target/release/rargod --state /var/lib/rargo --planner /root/rargo-work/cargo/target/release/cargo --listen 0.0.0.0:7459
 ```
 
 `RARGO_WORK` puts the forks somewhere other than `/root/rargo-work`.
@@ -66,6 +72,8 @@ A project without one gets rargo's default flake. It has:
 - the Rust toolchain that `rust-toolchain.toml` names (a pinned nightly if there is none), with `rust-src`, `clippy` and `rustfmt`;
 - gcc, cmake, pkg-config, perl, python3 and git;
 - the libraries openssl, zlib, sqlite, udev, alsa, wayland, xkbcommon, vulkan-loader, fontconfig, freetype and the X11 libraries.
+
+The `dev` profile's default debug info follows the Cargo version shipped with the project's Rust toolchain.
 
 Remote builds reject `+TOOLCHAIN` and nonempty `RUSTUP_TOOLCHAIN` overrides.
 To build for another target, list it in `rust-toolchain.toml` (`targets = ["wasm32-unknown-unknown"]`, beside a `channel`) or in your flake's toolchain; `rustup target add` does not change the server's toolchain.

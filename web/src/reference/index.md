@@ -75,7 +75,9 @@ Each test process is cached by its command line and what it reads. A changed fix
 
 # A Server
 
-Linux on x86_64, glibc 2.39 or newer (Ubuntu 24.04, Debian 13), root, FUSE, a C toolchain for the crates that need one, and Nix with flakes for the projects' environments. One command installs `rargod`, a systemd service for it, and rustup for the toolchains your projects ask for.
+Linux 6.14 or newer on x86_64 with FUSE over io_uring (`CONFIG_FUSE_IO_URING`; the installer turns on `fuse.enable_uring`), glibc 2.39 or newer, root, a C toolchain for the crates that need one, and Nix with flakes for the projects' environments. One command installs `rargod` (linked into `/usr/local/bin`), a systemd service for it, and rustup for the toolchains your projects ask for.
+
+Debian 13 and Ubuntu 24.04 have the glibc but ship older kernels: install a kernel from trixie-backports, or Ubuntu's HWE kernel (`linux-generic-hwe-24.04`). The installer stops if FUSE over io_uring is missing.
 
 <cmd>curl -fsSL https://rargo.rs/install-server.sh | sudo sh</cmd>
 
@@ -106,7 +108,28 @@ Signing in with GitHub needs a GitHub OAuth application of your own, whose callb
 
 `rargo @build.example:7459` needs nothing else: a name with a port is the server itself.
 
-A bare name like `rargo.rs` is asked over HTTPS where its server is. To use one, serve `https://YOUR-NAME/.well-known/rargo.json` and the paths under `/auth` from the build server, which answers them as plain HTTP on its TCP port. Any reverse proxy will do.
+A bare name like `rargo.rs` is asked over HTTPS where its server is. To use one, serve `https://YOUR-NAME/.well-known/rargo.json` and the paths under `/auth` from the build server, which answers them as plain HTTP on its TCP port. Any reverse proxy will do, if it passes on the name the client asked for, as `Host` or `X-Forwarded-Host`.
+
+`rargo.json` names the server that builds run on. Unless rargod was started with `--public HOST:PORT`, that is the request's name with rargod's own listen port: behind a proxy that sends its upstream address instead, which is nginx's default for `proxy_pass`, every client is sent to `127.0.0.1:7459` and dials its own machine. With nginx:
+
+<figure class="example">
+
+```nginx
+location ~ ^/(\.well-known/rargo\.json|auth) {
+    proxy_pass http://127.0.0.1:7459;
+    proxy_set_header Host $host;
+}
+```
+</figure>
+
+When builds must go somewhere other than the web name on the listen port (the name is a CDN or tunnel in front of another machine, or the public port is not the one rargod listens on), start rargod with `--public HOST:PORT`, or install it with `RARGO_PUBLIC=HOST:PORT`. To check what clients are told:
+
+<figure class="example">
+
+```sh
+curl -s https://YOUR-NAME/.well-known/rargo.json   # "server" is where builds go
+```
+</figure>
 
 ## What builds can see
 
@@ -116,8 +139,20 @@ library's source, GCC for C and C++, binutils, Make, CMake, pkg-config,
 Perl, Python 3 and Git, and the libraries OpenSSL, zlib, SQLite, udev,
 ALSA, Wayland, xkbcommon, the Vulkan loader, fontconfig, FreeType and
 the X11 libraries. The project's `rust-toolchain.toml` or
-`rust-toolchain` selects Rust. The sandbox exposes the selected closure and keeps
-the server's system libraries outside the build. The server needs Nix with flakes.
+`rust-toolchain` selects Rust. If neither file is present, the default shell
+uses the nightly Rust version pinned by the rargo release. The sandbox exposes
+the selected closure and keeps the server's system libraries outside the build.
+The server needs Nix with flakes.
+
+To use stable Rust in the default shell, create `rust-toolchain.toml` in
+your Cargo workspace with these contents:
+
+<figure class="example">
+```toml
+[toolchain]
+channel = "stable"
+```
+</figure>
 
 From your Cargo workspace, download the shell for the release you use
 and inspect its files. Here `version` is the version published at
