@@ -83,6 +83,8 @@ pub trait World {
     fn cwd(&self) -> PathBuf;
     fn is_file(&self, path: &Path) -> bool;
     fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String>;
+    /// Whether the server says it has authentication disabled, so `rargo auth` has nothing to do there.
+    fn auth_disabled(&self, host: &str) -> bool;
 }
 
 fn var<'a>(w: &'a impl World, name: &str) -> Option<&'a str> {
@@ -341,7 +343,11 @@ pub fn named(w: &impl World, host: &str, path: &Path) -> String {
     let mut text = format!("{} now names `{host}` as your rargo server.", path.display());
     if host.contains(':') || w.resolve(host).is_ok() {
         if w.credential(host).is_none() && var(w, "RARGO_TOKEN").is_none() {
-            text.push_str("\nNext: `rargo auth`, then `rargo build`.");
+            if w.auth_disabled(host) {
+                text.push_str("\nThis server has authentication disabled. Next: `rargo build`.");
+            } else {
+                text.push_str("\nNext: `rargo auth`, then `rargo build`.");
+            }
         }
     } else {
         text.push_str(&format!("\nwarning: no rargo server answers for `{host}` right now (https://{host}/.well-known/rargo.json)"));
@@ -421,6 +427,7 @@ pub fn auth_status(w: &impl World, host: &str, from: Option<&HostFrom>) -> Strin
     text.push_str(&match w.credential(host) {
         Some(c) if c.name.is_empty() => format!("{host} (server {server}): authenticated (token {})", c.id),
         Some(c) => format!("{host} (server {server}): authenticated as {} (token {})", c.name, c.id),
+        None if w.auth_disabled(host) => format!("{host} (server {server}): authentication disabled; nothing needs doing"),
         None => format!("{host} (server {server}): not authenticated; run `rargo auth`"),
     });
     text
@@ -571,6 +578,7 @@ mod tests {
         cwd: PathBuf,
         files: Vec<PathBuf>,
         holders: Vec<(String, Result<Option<String>, String>)>,
+        open: Vec<String>,
         asked: RefCell<Vec<String>>,
     }
 
@@ -588,6 +596,7 @@ mod tests {
             cwd: "/w/app/src".into(),
             files: vec!["/w/app/Cargo.toml".into()],
             holders: Vec::new(),
+            open: Vec::new(),
             asked: RefCell::new(Vec::new()),
         }
     }
@@ -643,6 +652,11 @@ mod tests {
         fn holder(&self, host: &str, token: &str) -> Result<Option<String>, String> {
             self.asked.borrow_mut().push(format!("holder {host}"));
             self.holders.iter().find(|(t, _)| t == token).map_or(Ok(None), |(_, h)| h.clone())
+        }
+
+        fn auth_disabled(&self, host: &str) -> bool {
+            self.asked.borrow_mut().push(format!("auth_disabled {host}"));
+            self.open.iter().any(|h| h == host)
         }
 
         fn nextest_version(&self) -> Option<String> {
@@ -948,6 +962,14 @@ mod tests {
         assert_eq!(auth_status(&w, "h.example", Some(&HostFrom::Env)), "server named by RARGO_SERVER\nh.example (server srv.example:7459): authenticated (token stored)");
         assert_eq!(auth_status(&w, "named.example:1", Some(&HostFrom::File(PATH.into()))), format!("server named by {PATH}\nnamed.example:1 (server named.example:1): authenticated as ann (token t2)"));
         assert_eq!(auth_status(&w, "gone.example", None), "gone.example (server unknown (no answer from gone.example)): not authenticated; run `rargo auth`");
+
+        let mut w = fake(&[]);
+        w.open.push("127.0.0.1:27097".into());
+        assert_eq!(auth_status(&w, "127.0.0.1:27097", None), "127.0.0.1:27097 (server 127.0.0.1:27097): authentication disabled; nothing needs doing");
+        assert_eq!(
+            named(&w, "127.0.0.1:27097", path),
+            format!("{PATH} now names `127.0.0.1:27097` as your rargo server.\nThis server has authentication disabled. Next: `rargo build`.")
+        );
 
         let ann = format!("t9.{SECRET}");
         let stranger = format!("t8.{SECRET}");
