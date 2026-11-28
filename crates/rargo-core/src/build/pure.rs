@@ -411,12 +411,12 @@ pub fn map_again(
 }
 
 /// Whether a variable of the client stays out of a compile's (rustc,
-/// rustdoc, build script) environment, and so out of its key. These are read
-/// by the program or test being run (`RUST_LOG`, `RUST_BACKTRACE`), by
-/// cargo while planning (its `CARGO_*` settings, which reach a compile only
-/// through the plan's arguments), or are the locale. A compile that does read
-/// one (`env!`, `rerun-if-env-changed`) declares it and gets it back from the
-/// client, as any undeclared variable does.
+/// rustdoc) environment, and so out of its key. These are read by the
+/// program or test being run (`RUST_LOG`, `RUST_BACKTRACE`), by cargo while
+/// planning (its `CARGO_*` settings, which reach a compile only through the
+/// plan's arguments), or are the locale. A compile that does read one
+/// (`env!`, `option_env!`) writes it to its dep-info, also when it fails,
+/// and gets it back from the client, as any undeclared variable does.
 pub fn compile_env_skips(name: &str) -> bool {
     const RUST_KEPT: &[&str] = &["RUST_MIN_STACK", "RUST_TARGET_PATH"];
     const CARGO_KEPT: &[&str] = &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_HOME"];
@@ -427,6 +427,14 @@ pub fn compile_env_skips(name: &str) -> bool {
         _ if name.starts_with("CARGO_") => !CARGO_KEPT.contains(&name),
         _ => false,
     }
+}
+
+/// Whether the client's variable `name` is left out of an action of `kind`.
+/// Only rustc and rustdoc lose the [`compile_env_skips`] ones: a build script
+/// may read any variable without declaring it, so it gets them all, as under
+/// cargo. A variable the policy passes reaches every action.
+pub fn action_env_skips(kind: crate::trace::ActionKind, name: &str, policy: &crate::policy::Policy) -> bool {
+    matches!(kind, crate::trace::ActionKind::Rustc | crate::trace::ActionKind::Rustdoc) && compile_env_skips(name) && !policy.passes(name)
 }
 
 pub fn base_env<'a>(
@@ -560,6 +568,27 @@ mod tests {
         ] {
             assert!(!compile_env_skips(kept), "{kept}");
         }
+    }
+
+    #[test]
+    fn build_scripts_and_runs_get_what_compiles_skip_and_the_policy_passes_to_all() {
+        use crate::trace::ActionKind;
+        let policy = crate::policy::Policy::load(Some(
+            "[package]\nname = \"p\"\n[package.metadata.rargo.env]\npass = [\"RUST_APP_*\", \"LC_ALL\"]\n",
+        ))
+        .unwrap();
+        let none = crate::policy::Policy::default();
+        for name in ["RUST_APP_FLAVOR", "CARGO_APP_FLAVOR", "LC_ALL", "LANG", "RUST_LOG"] {
+            for kind in [ActionKind::BuildScript, ActionKind::Test, ActionKind::Other] {
+                assert!(!action_env_skips(kind, name, &none), "{kind:?} {name}");
+            }
+            assert!(action_env_skips(ActionKind::Rustc, name, &none), "{name}");
+            assert!(action_env_skips(ActionKind::Rustdoc, name, &none), "{name}");
+        }
+        for (name, passed) in [("RUST_APP_KEY", true), ("LC_ALL", true), ("LC_CTYPE", false), ("RUST_LOG", false)] {
+            assert_eq!(!action_env_skips(ActionKind::Rustc, name, &policy), passed, "{name}");
+        }
+        assert!(!action_env_skips(ActionKind::Rustc, "RUSTFLAGS", &none));
     }
 
     #[test]

@@ -122,7 +122,8 @@ enum Probe {
 
 enum Offered {
     Sent,
-    Changed,
+    /// A file was not what the scan read by the time it was sent: the one named, when it is known.
+    Changed(Option<PathBuf>),
     Bet(io::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>),
 }
 
@@ -193,6 +194,58 @@ enum BetAnswer {
 const KEPT_CHANGING: &str = "the worktree kept changing while it was being synced";
 const UNEXPECTED: &str = "unexpected answer from the server";
 
+/// The error that ends a command whose worktree kept changing, naming the file that changed last, relative to `root`.
+fn kept_changing_text(root: &Path, file: Option<&Path>) -> String {
+    let Some(rel) = file.map(|f| f.strip_prefix(root).unwrap_or(f).to_string_lossy().into_owned()) else {
+        return KEPT_CHANGING.into();
+    };
+    format!(
+        "{KEPT_CHANGING}: `{rel}` changed between being read and being sent.\n\
+         If a program writes to it while rargo runs, leave it out of the sync with `exclude = [\"/{rel}\"]` under \
+         `[package.metadata.rargo.sync]` (or `[workspace.metadata.rargo.sync]`) in Cargo.toml, or write it outside the project."
+    )
+}
+
+/// The daemon's own `rargo:` lines while a worktree is being synced. A stderr that is no terminal may be a file in the
+/// worktree (`> build.log 2>&1`, `| tee build.log`): a line written to it after the scan, before the server has what the
+/// scan read, changes a file being sent, and the sync starts over, again and again. Such lines wait until the server
+/// has the worktree; to a terminal they go at once.
+struct Held(RefCell<Option<Vec<u8>>>);
+
+impl Held {
+    fn new(hold: bool) -> Self {
+        Self(RefCell::new(hold.then(Vec::new)))
+    }
+
+    /// What to write now of `bytes`: nothing while lines are held.
+    fn say(&self, bytes: Vec<u8>) -> Option<Vec<u8>> {
+        match self.0.borrow_mut().as_mut() {
+            Some(held) => {
+                held.extend_from_slice(&bytes);
+                None
+            }
+            None => Some(bytes),
+        }
+    }
+
+    /// Stops holding lines: what was held, to write now.
+    fn release(&self) -> Option<Vec<u8>> {
+        self.0.borrow_mut().take().filter(|held| !held.is_empty())
+    }
+
+    fn release_to(&self, out: &UnboundedSender<LocalReply>) {
+        if let Some(bytes) = self.release() {
+            let _ = out.send(LocalReply::Stderr(bytes));
+        }
+    }
+
+    fn say_to(&self, out: &UnboundedSender<LocalReply>, bytes: Vec<u8>) {
+        if let Some(bytes) = self.say(bytes) {
+            let _ = out.send(LocalReply::Stderr(bytes));
+        }
+    }
+}
+
 struct CommandState {
     kind: CommandKind,
     phase: CommandPhase,
@@ -200,6 +253,8 @@ struct CommandState {
     after: Option<After>,
     retry_used: bool,
     changes: u8,
+    /// The file last found changed while the worktree was sent, for the error that ends a command it kept changing.
+    changed_file: Option<PathBuf>,
     probe: Probe,
     visible: bool,
     capture_errors: bool,
@@ -214,7 +269,7 @@ struct CommandState {
 impl CommandState {
     fn new(kind: CommandKind, probe: Probe) -> Self {
         Self {
-            kind, phase: CommandPhase::Link, bet: false, after: None, retry_used: false, changes: 0, probe, visible: false,
+            kind, phase: CommandPhase::Link, bet: false, after: None, retry_used: false, changes: 0, changed_file: None, probe, visible: false,
             capture_errors: false, heard: Vec::new(), fetching: None, delivery_ready: false, last: None, token: None,
             silence: None,
         }
@@ -902,19 +957,22 @@ impl Daemon {
         if blob_bytes <= PUSH_BLIND && probe != Probe::Wait {
             let snap2 = snap.clone();
             let wanted: Vec<Digest> = blobs.iter().map(|(d, _)| *d).collect();
-            let packed = io::cpu(move || -> Option<Vec<Blob>> {
+            let packed = io::cpu(move || -> Result<Vec<Blob>, Option<PathBuf>> {
                 wanted
                     .iter()
                     .map(|h| {
-                        let (path, _) = snap2.scan.files.get(h)?;
-                        let bytes = rargo_net::io::file::read(path).ok()?;
-                        (*blake3::hash(&bytes).as_bytes() == *h).then(|| Blob::pack(*h, &bytes))
+                        let (path, _) = snap2.scan.files.get(h).ok_or(None)?;
+                        let bytes = rargo_net::io::file::read(path).map_err(|_| Some(path.clone()))?;
+                        (*blake3::hash(&bytes).as_bytes() == *h).then(|| Blob::pack(*h, &bytes)).ok_or_else(|| Some(path.clone()))
                     })
                     .collect()
             });
-            let Some(packed) = packed else {
-                self.knowledge.borrow_mut().changed(wt.id, true);
-                return Ok(Offered::Changed);
+            let packed = match packed {
+                Ok(packed) => packed,
+                Err(file) => {
+                    self.knowledge.borrow_mut().changed(wt.id, true);
+                    return Ok(Offered::Changed(file));
+                }
             };
             add(&self.counters.offered_bytes, tree_bytes + blob_bytes);
             let msg = ClientMsg::Offer(Box::new(Offer { id, root: snap.scan.root, trees: encoded, blobs: packed, ask: false }));
@@ -961,9 +1019,9 @@ impl Daemon {
             };
             let bytes: u64 = missing.iter().filter_map(|h| snap.scan.files.get(h)).map(|(_, s)| *s).sum();
             add(&self.counters.offered_bytes, bytes);
-            if !upload(mux, CONTROL, snap, missing)? {
+            if let Err(file) = upload(mux, CONTROL, snap, missing)? {
                 self.knowledge.borrow_mut().changed(wt.id, true);
-                return Ok(Offered::Changed);
+                return Ok(Offered::Changed(file));
             }
         }
         self.has_now(Some(wt), snap);
@@ -1532,7 +1590,7 @@ impl Daemon {
                         let mux = link.clone().expect("a link before a request");
                         let (env, env_checked) = env_for(&Policy::default());
                         let run = RunRequest { env, env_checked, ..base.clone() };
-                        match self.converse(&mux, run, None, None, None, req, out, &mut command, None) {
+                        match self.converse(&mux, run, None, None, None, req, out, None, &mut command, None) {
                             Ok(Some(reply)) => return Ok(reply),
                             Ok(None) => command.again(),
                             Err(_) if mux.is_dead() => command.link_lost(mux.silent().map(|gone| (gone, "its answer"))),
@@ -1557,16 +1615,27 @@ impl Daemon {
         };
         let wt = self.worktree(&root);
         let stats = sync_stats(&req.vars, &req.args);
-        let say = |wait: Wait| {
-            if stats {
-                let _ = out.send(LocalReply::Stderr(waits::line(&wait).into_bytes()));
-            }
-        };
         let _running = match wt.running.try_lock() {
             Some(running) => running,
             None => {
-                say(Wait::Worktree);
+                if stats {
+                    let _ = out.send(LocalReply::Stderr(waits::line(&Wait::Worktree).into_bytes()));
+                }
                 wt.running.lock()
+            }
+        };
+        let held = Held::new(stats && !req.stderr_tty);
+        struct Release<'a>(&'a Held, &'a UnboundedSender<LocalReply>);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                self.0.release_to(self.1);
+            }
+        }
+        let _release = Release(&held, out);
+        let tell = |text: String| held.say_to(out, text.into_bytes());
+        let say = |wait: Wait| {
+            if stats {
+                tell(waits::line(&wait));
             }
         };
         let shown = if req.kind == "sync" {
@@ -1574,7 +1643,10 @@ impl Daemon {
         } else {
             match self.out_for(&wt, req, &cwd) {
                 Ok(shown) => shown,
-                Err(err) => return Ok(Self::fail(out, err.to_string())),
+                Err(err) => {
+                    held.release_to(out);
+                    return Ok(Self::fail(out, err.to_string()));
+                }
             }
         };
         let mut home_files = Vec::new();
@@ -1587,7 +1659,7 @@ impl Daemon {
         let taken_up = io::now();
         let phase = |what: &str| {
             if stats {
-                let _ = out.send(LocalReply::Stderr(format!("rargo: phase {:>8.3} s  {what}\n", io::now().saturating_duration_since(taken_up).as_secs_f64()).into_bytes()));
+                tell(format!("rargo: phase {:>8.3} s  {what}\n", io::now().saturating_duration_since(taken_up).as_secs_f64()));
             }
         };
         let mut step = command.begin();
@@ -1620,7 +1692,7 @@ impl Daemon {
                     }
                     let (fresh, scanned) = self.fresh(&wt, &mut st)?;
                     if let Some(note) = st.note.take() {
-                        let _ = out.send(LocalReply::Stderr(note.into_bytes()));
+                        tell(note);
                     }
                     if stats {
                         let text = if scanned {
@@ -1636,7 +1708,7 @@ impl Daemon {
                         } else {
                             format!("rargo: no scan needed, {} files watched and unchanged\n", fresh.scan.file_count)
                         };
-                        let _ = out.send(LocalReply::Stderr(text.into_bytes()));
+                        tell(text);
                     }
                     phase("worktree read");
                     snap = Some(fresh);
@@ -1647,6 +1719,7 @@ impl Daemon {
                     match self.offer(&mux, &wt, &fresh, probe) {
                         Ok(Offered::Sent) => {
                             phase("worktree offered and what the server lacked sent");
+                            held.release_to(out);
                             command.offered(Sent::All)
                         }
                         Ok(Offered::Bet(answer)) => {
@@ -1654,7 +1727,10 @@ impl Daemon {
                             bet = Some(answer);
                             command.offered(Sent::Bet)
                         }
-                        Ok(Offered::Changed) => command.offered(Sent::Changed),
+                        Ok(Offered::Changed(file)) => {
+                            command.changed_file = file;
+                            command.offered(Sent::Changed)
+                        }
                         Err(e) if mux.is_dead() => {
                             failure = Some(e);
                             command.link_lost(mux.silent().map(|gone| (gone, "its answer to the worktree offer")))
@@ -1687,7 +1763,7 @@ impl Daemon {
                         ..base.clone()
                     };
                     phase("request sent");
-                    match self.converse(&mux, run, Some(&fresh), Some(&wt), shown.as_ref(), req, out, &mut command, bet.take()) {
+                    match self.converse(&mux, run, Some(&fresh), Some(&wt), shown.as_ref(), req, out, Some(&held), &mut command, bet.take()) {
                         Ok(Some(reply)) => {
                             phase("answer complete");
                             return Ok(reply);
@@ -1708,10 +1784,17 @@ impl Daemon {
                     command.rescanned()
                 }
                 Step::Exit(code) => return Ok(LocalReply::Exit(code)),
-                Step::Fail(text) => return Ok(Self::fail(out, text.into())),
+                Step::Fail(text) => {
+                    held.release_to(out);
+                    let text = if text == KEPT_CHANGING { kept_changing_text(&root, command.changed_file.as_deref()) } else { text.into() };
+                    return Ok(Self::fail(out, text));
+                }
                 Step::Error(text) => return Err(std::io::Error::other(text)),
                 Step::GiveUp => return Err(failure.take().unwrap_or_else(lost)),
-                Step::Silent { gone, waiting_for } => return Ok(self.silent(out, gone, waiting_for)),
+                Step::Silent { gone, waiting_for } => {
+                    held.release_to(out);
+                    return Ok(self.silent(out, gone, waiting_for));
+                }
             };
         }
     }
@@ -1726,6 +1809,7 @@ impl Daemon {
         shown: Option<&(Rc<OutFs>, PathBuf)>,
         req: &LocalRequest,
         out: &UnboundedSender<LocalReply>,
+        held: Option<&Held>,
         command: &mut CommandState,
         bet: Option<io::oneshot::Receiver<(Vec<Digest>, Vec<Digest>)>>,
     ) -> std::io::Result<Option<LocalReply>> {
@@ -1788,6 +1872,9 @@ impl Daemon {
                             if let Some(s) = snap {
                                 self.has_now(wt, s);
                             }
+                            if let Some(held) = held {
+                                held.release_to(out);
+                            }
                             add(&self.counters.probes_known, 1);
                             continue;
                         }
@@ -1807,7 +1894,13 @@ impl Daemon {
                     mux.post(stream, &ClientMsg::Changed);
                     return Ok(None);
                 }
-                CommandEffect::Relay(reply) => { let _ = out.send(reply); }
+                CommandEffect::Relay(reply) => {
+                    // The server builds only from a worktree it has: what it says comes after the sync.
+                    if let Some(held) = held {
+                        held.release_to(out);
+                    }
+                    let _ = out.send(reply);
+                }
                 CommandEffect::Trees(want) => {
                     self.knowledge.borrow_mut().missing(want.iter());
                     let trees: Vec<Vec<u8>> = want.iter().filter_map(|d| snap.and_then(|s| s.scan.trees.get(d)).cloned()).collect();
@@ -1815,10 +1908,14 @@ impl Daemon {
                 }
                 CommandEffect::Upload(want) => {
                     self.knowledge.borrow_mut().missing(want.iter());
-                    let ok = match snap {
+                    let sent = match snap {
                         Some(s) => upload(mux, stream, s, want)?,
-                        None => false,
+                        None => Err(None),
                     };
+                    let ok = sent.is_ok();
+                    if let Err(file) = sent {
+                        command.changed_file = file;
+                    }
                     if matches!(command.uploaded(ok), CommandEffect::Abandon) {
                         mux.post(stream, &ClientMsg::Changed);
                         return Ok(None);
@@ -2120,8 +2217,24 @@ fn mountinfo() -> String {
 }
 
 fn mounts_at<'a>(info: &'a str, dir: &Path) -> impl Iterator<Item = &'a str> {
-    let here = dir.to_string_lossy().into_owned();
-    info.lines().filter(move |l| l.split(' ').nth(4) == Some(here.as_str()))
+    let here = mountinfo_path(dir);
+    info.lines().filter(move |l| l.split(' ').nth(4).map(str::as_bytes) == Some(here.as_slice()))
+}
+
+/// A path as `/proc/self/mountinfo` writes it: space, tab, newline and
+/// backslash become octal escapes.
+pub(crate) fn mountinfo_path(path: &Path) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    for &byte in path.as_os_str().as_bytes() {
+        match byte {
+            b' ' => encoded.extend_from_slice(b"\\040"),
+            b'\t' => encoded.extend_from_slice(b"\\011"),
+            b'\n' => encoded.extend_from_slice(b"\\012"),
+            b'\\' => encoded.extend_from_slice(b"\\134"),
+            _ => encoded.push(byte),
+        }
+    }
+    encoded
 }
 
 fn dev_at(info: &str, dir: &Path) -> Option<u64> {
@@ -2326,34 +2439,39 @@ impl StateMachine for Multipart {
     }
 }
 
-fn upload(mux: &Rc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<bool> {
-    let Some(plan) = UploadPlan::new(want, &snap.scan.files, rargo_proto::BATCH_SIZE) else { return Ok(false) };
+/// Sends the files `want` names; `Err(file)` when one is no longer what the scan read, naming it when it is known.
+fn upload(mux: &Rc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> std::io::Result<Result<(), Option<PathBuf>>> {
+    let Some(plan) = UploadPlan::new(want, &snap.scan.files, rargo_proto::BATCH_SIZE) else { return Ok(Err(None)) };
     let UploadPlan { batches, multipart, part_size, .. } = plan;
     for window in batches.chunks(8) {
         let window = window.to_vec();
-        let packed: Vec<Option<Vec<Blob>>> = io::cpu(move || {
+        let packed: Vec<Result<Vec<Blob>, PathBuf>> = io::cpu(move || {
             window
                 .par_iter()
                 .map(|batch| {
                     batch
                         .par_iter()
                         .map(|file| {
-                            let bytes = rargo_net::io::file::read(&file.path).ok()?;
+                            let bytes = rargo_net::io::file::read(&file.path).map_err(|_| file.path.clone())?;
                             (bytes.len() as u64 == file.size && *blake3::hash(&bytes).as_bytes() == file.hash)
                                 .then(|| Blob::pack(file.hash, &bytes))
+                                .ok_or_else(|| file.path.clone())
                         })
-                        .collect::<Option<Vec<Blob>>>()
+                        .collect::<Result<Vec<Blob>, PathBuf>>()
                 })
                 .collect()
         });
         for blobs in packed {
-            let Some(blobs) = blobs else { return Ok(false) };
+            let blobs = match blobs {
+                Ok(blobs) => blobs,
+                Err(path) => return Ok(Err(Some(path))),
+            };
             let n = blobs.iter().map(|b| b.data.len()).sum();
             mux.post_bulk(stream, &ClientMsg::Blobs(blobs), n)?;
         }
     }
     for UploadFile { hash, path, size } in multipart {
-        let Ok(mut f) = rargo_net::io::file::File::open(&path) else { return Ok(false) };
+        let Ok(mut f) = rargo_net::io::file::File::open(&path) else { return Ok(Err(Some(path))) };
         let mut content = Multipart { hash, size, part_size, bytes: 0, hasher: blake3::Hasher::new(), held: None };
         loop {
             let mut buf = vec![0u8; part_size];
@@ -2372,13 +2490,13 @@ fn upload(mux: &Rc<Mux>, stream: u32, snap: &Arc<Snap>, want: Vec<Digest>) -> st
             match content.read(buf) {
                 Ok(Some((frame, bytes))) => mux.post_bulk(stream, &frame, bytes)?,
                 Ok(None) => {}
-                Err(()) => return Ok(false),
+                Err(()) => return Ok(Err(Some(path))),
             }
         }
-        let Some((frame, bytes)) = content.finish() else { return Ok(false) };
+        let Some((frame, bytes)) = content.finish() else { return Ok(Err(Some(path))) };
         mux.post_bulk(stream, &frame, bytes)?;
     }
-    Ok(true)
+    Ok(Ok(()))
 }
 
 
@@ -3148,6 +3266,16 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_under_a_path_with_a_space_is_found() {
+        let info = "80 30 0:61 / /tmp/My\\040Projects/app/target rw - fuse.rargo rargo rw\n\
+                    81 30 0:62 / /tmp/a\\134b\\011c/target rw - fuse.rargo rargo rw\n";
+        assert_eq!(super::dev_at(info, Path::new("/tmp/My Projects/app/target")), Some(61));
+        assert_eq!(super::mounts_at(info, Path::new("/tmp/My Projects/app/target")).count(), 1);
+        assert_eq!(super::dev_at(info, Path::new("/tmp/a\\b\tc/target")), Some(62));
+        assert_eq!(super::dev_at(info, Path::new("/tmp/My\\040Projects/app/target")), None);
+    }
+
+    #[test]
     fn another_target_dir_keeps_the_mounted_target_and_only_copy_mode_releases_it() {
         assert_eq!(out_use(true, false), OutUse::Mount);
         assert_eq!(out_use(true, true), OutUse::Keep);
@@ -3214,5 +3342,33 @@ mod tests {
         assert!(!is_no_link(&no_link(Error::new(ErrorKind::PermissionDenied, rargo_proto::REFUSED))));
         let passed = (|| -> std::io::Result<()> { Err(no_link(Error::new(ErrorKind::TimedOut, "timed out")))? })();
         assert!(is_no_link(&passed.unwrap_err()));
+    }
+
+    #[test]
+    fn to_a_stderr_that_may_be_a_worktree_file_the_sync_lines_wait_for_the_sync_and_keep_their_order() {
+        let said = |held: &Held, text: &str| held.say(text.as_bytes().to_vec()).map(|b| String::from_utf8(b).unwrap());
+        let file = Held::new(true);
+        assert_eq!(said(&file, "rargo: scanned\n"), None);
+        assert_eq!(said(&file, "rargo: phase worktree read\n"), None);
+        assert_eq!(file.release(), Some(b"rargo: scanned\nrargo: phase worktree read\n".to_vec()));
+        assert_eq!(said(&file, "rargo: phase request sent\n").as_deref(), Some("rargo: phase request sent\n"));
+        assert_eq!(file.release(), None, "lines are given out once");
+        let nothing = Held::new(true);
+        assert_eq!(nothing.release(), None, "nothing held is nothing to write");
+        let terminal = Held::new(false);
+        assert_eq!(said(&terminal, "rargo: scanned\n").as_deref(), Some("rargo: scanned\n"));
+        assert_eq!(terminal.release(), None);
+    }
+
+    #[test]
+    fn a_worktree_that_kept_changing_names_the_file_and_how_to_leave_it_out() {
+        let root = Path::new("/home/ann/redir");
+        expect_test::expect![[r#"
+            the worktree kept changing while it was being synced: `logs/build.log` changed between being read and being sent.
+            If a program writes to it while rargo runs, leave it out of the sync with `exclude = ["/logs/build.log"]` under `[package.metadata.rargo.sync]` (or `[workspace.metadata.rargo.sync]`) in Cargo.toml, or write it outside the project."#]]
+        .assert_eq(&kept_changing_text(root, Some(&root.join("logs/build.log"))));
+        assert_eq!(kept_changing_text(root, None), KEPT_CHANGING);
+        let exclude = ["/logs/build.log".to_string()];
+        assert!(scan::excluded(&exclude, b"logs/build.log", b"build.log"), "the pattern the error gives leaves the file out");
     }
 }

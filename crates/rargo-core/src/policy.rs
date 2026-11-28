@@ -115,6 +115,10 @@ impl Policy {
         Ok(Policy { env: m.env, network: m.network, flake: m.flake, sync: m.sync, nextest: m.nextest })
     }
 
+    pub fn passes(&self, name: &str) -> bool {
+        self.env.pass.iter().any(|p| matches(p, name))
+    }
+
     pub fn passed_env<'a>(&self, client: impl IntoIterator<Item = (&'a String, &'a String)>) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = client
             .into_iter()
