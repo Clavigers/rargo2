@@ -569,8 +569,26 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     if !vpath_starts_with(sandbox_cwd.as_bytes(), WORKTREE_AT) {
         bail!("the current directory `{}` is not inside the worktree `{}`", c.cwd, c.root);
     }
-    let channel = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd)?.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
+    let vv = rustc_vv(d, c, &plan_base, &flake, &env, &sandbox_cwd).map_err(|err| {
+        if missing_shell_rustc(&err)
+            && let Some(root) = crate::flake::source(&*snapshot, &dir, &files).root
+        {
+            return err.context(format!(
+                "the `{shell}` dev shell selected from `{}` could not find `rustc`; add the Rust toolchain to `devShells.<system>.{shell}` or the flake output that provides that shell",
+                root.join("flake.nix").display(),
+            ));
+        }
+        err
+    })?;
+    let channel = vv.map(|vv| cargo_channel(&vv, env.get("RUSTC_BOOTSTRAP").map(String::as_str)));
     Ok(Prepared { snapshot, parts, generation, policy, plan_base, flake, base: Arc::new(base), tr, sandbox_cwd, env, unmapped, channel })
+}
+
+const RUSTC_PROBE: &str = "rustc -vV (the channel cargo plans on)";
+
+fn missing_shell_rustc(err: &anyhow::Error) -> bool {
+    let missing = std::io::Error::from_raw_os_error(libc::ENOENT);
+    err.to_string() == format!("could not start `{RUSTC_PROBE}`: rargo: cannot execute `rustc`: {missing}")
 }
 
 const CHANNEL_VAR: &str = "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS";
@@ -606,7 +624,7 @@ fn rustc_vv(
         mkdirs: vec![],
         root_id: flake.id,
         discard: vec![],
-        label: "rustc -vV (the channel cargo plans on)".into(),
+        label: RUSTC_PROBE.into(),
     };
     let outcome = d
         .engine
@@ -3232,6 +3250,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_a_missing_shell_rustc_gets_flake_toolchain_guidance() {
+        let failure = |program, errno| anyhow!(
+            "could not start `{RUSTC_PROBE}`: rargo: cannot execute `{program}`: {}",
+            std::io::Error::from_raw_os_error(errno),
+        );
+        assert!(missing_shell_rustc(&failure("rustc", libc::ENOENT)));
+        assert!(!missing_shell_rustc(&failure("rustc", libc::EACCES)));
+        assert!(!missing_shell_rustc(&failure("/custom/rustc", libc::ENOENT)));
+        assert!(!missing_shell_rustc(&anyhow!("could not start `{RUSTC_PROBE}`: rargo: sandbox setup failed")));
+    }
 
     #[test]
     fn cargo_plans_on_the_channel_of_the_flake_s_rustc() {
