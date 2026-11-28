@@ -410,6 +410,25 @@ pub fn map_again(
     (env, tr)
 }
 
+/// Whether a variable of the client stays out of a compile's (rustc,
+/// rustdoc, build script) environment, and so out of its key. These are read
+/// by the program or test being run (`RUST_LOG`, `RUST_BACKTRACE`), by
+/// cargo while planning (its `CARGO_*` settings, which reach a compile only
+/// through the plan's arguments), or are the locale. A compile that does read
+/// one (`env!`, `rerun-if-env-changed`) declares it and gets it back from the
+/// client, as any undeclared variable does.
+pub fn compile_env_skips(name: &str) -> bool {
+    const RUST_KEPT: &[&str] = &["RUST_MIN_STACK", "RUST_TARGET_PATH"];
+    const CARGO_KEPT: &[&str] = &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_HOME"];
+    match name {
+        "LANG" | "LANGUAGE" => true,
+        _ if name.starts_with("LC_") => true,
+        _ if name.starts_with("RUST_") => !RUST_KEPT.contains(&name),
+        _ if name.starts_with("CARGO_") => !CARGO_KEPT.contains(&name),
+        _ => false,
+    }
+}
+
 pub fn base_env<'a>(
     server: impl IntoIterator<Item = (&'a String, &'a String)>,
     client: impl IntoIterator<Item = (&'a String, &'a String)>,
@@ -525,6 +544,23 @@ pub fn rustup_failure(ran: Result<(bool, &[u8]), &str>) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compile_env_skips_what_only_runs_and_planning_read() {
+        for skipped in [
+            "RUST_LOG", "RUST_BACKTRACE", "RUST_LIB_BACKTRACE", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE",
+            "CARGO_NET_RETRY", "CARGO_INCREMENTAL", "CARGO_MAKE_TIMESTAMP", "CARGO_BUILD_JOBS",
+        ] {
+            assert!(compile_env_skips(skipped), "{skipped}");
+        }
+        for kept in [
+            "RUSTFLAGS", "RUSTDOCFLAGS", "RUSTC", "RUSTC_BOOTSTRAP", "RUSTUP_TOOLCHAIN", "RUST_MIN_STACK",
+            "RUST_TARGET_PATH", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_BUILD_DIR", "CARGO_HOME",
+            "__CARGO_DEFAULT_LIB_METADATA", "TZ", "PATH", "HOME",
+        ] {
+            assert!(!compile_env_skips(kept), "{kept}");
+        }
+    }
 
     #[test]
     fn external_target_dir_uses_the_action_fs_and_translates_for_delivery() {
