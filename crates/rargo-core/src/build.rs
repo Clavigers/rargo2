@@ -2929,8 +2929,8 @@ impl Run {
                         out.note(&nextest::ran_note(&format!("test of {}", plan.units[*unit as usize].desc), &outcome.result.stats));
                     }
                     let r = &outcome.result;
+                    self.apply_worktree_writes(&r.outputs);
                     if r.success() {
-                        self.apply_worktree_writes(&r.outputs);
                         continue;
                     }
                     let which = match kind {
