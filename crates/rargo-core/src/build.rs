@@ -1575,6 +1575,10 @@ struct TestObserver {
 }
 
 impl Observer for TestObserver {
+    fn cache_hit(&self) {
+        self.out.err_text(&format!("      Cached {} (pass `--no-cache` to run again)\n", self.label));
+    }
+
     fn wants_explanation(&self) -> bool {
         self.explain
     }

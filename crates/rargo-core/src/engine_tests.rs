@@ -617,6 +617,38 @@ fn concurrent_first_requests_share_the_nix_hashing_worker() {
 }
 
 #[test]
+fn cache_hit_is_announced_before_replayed_output() {
+    #[derive(Default)]
+    struct Recorded(RefCell<Vec<Vec<u8>>>);
+
+    impl crate::engine::Observer for Recorded {
+        fn cache_hit(&self) {
+            self.0.borrow_mut().push(b"cache hit".to_vec());
+        }
+
+        fn stdout(&self, data: &[u8]) {
+            self.0.borrow_mut().push(data.to_vec());
+        }
+    }
+
+    sim::test(|| {
+        let fx = fixture(sh);
+        let observer = Arc::new(Recorded::default());
+        let run = |no_cache| {
+            let mut req = fx.req("echo fine", &[], &[], &[]);
+            req.observer = observer.clone();
+            req.no_cache = no_cache;
+            let outcome = fx.engine.obtain(req).unwrap();
+            (outcome.cached, observer.0.take())
+        };
+        let printed = b"fine\n".to_vec();
+        assert_eq!(run(false), (false, vec![printed.clone()]));
+        assert_eq!(run(false), (true, vec![b"cache hit".to_vec(), printed.clone()]));
+        assert_eq!(run(true), (false, vec![printed]));
+    });
+}
+
+#[test]
 fn replays_until_an_observed_input_changes() {
     sim::test(|| {
         let fx = fixture(sh);
