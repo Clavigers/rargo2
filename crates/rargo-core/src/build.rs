@@ -200,6 +200,7 @@ struct Counts {
     fix_disallowed: bool,
     errors: usize,
     warnings_seen: usize,
+    missing_target: Option<String>,
 }
 
 #[derive(Default)]
@@ -212,6 +213,7 @@ struct Ui {
     future_incompat: BTreeMap<usize, Vec<String>>,
     counts: HashMap<usize, Counts>,
     said_waiting: bool,
+    said_missing_target: bool,
 }
 
 struct Run {
@@ -2382,6 +2384,9 @@ impl Run {
             rp::MessageFormat::Human | rp::MessageFormat::Short => true,
             rp::MessageFormat::Json { render_diagnostics, .. } => render_diagnostics,
         };
+        if let Some(target) = missing_target(&v) {
+            self.ui.borrow_mut().counts.entry(i).or_default().missing_target = Some(target);
+        }
         let diag = match (v.get("rendered").and_then(|r| r.as_str()), v.get("message").and_then(|m| m.as_str()), v.get("level").and_then(|l| l.as_str())) {
             (Some(rendered), Some(message), Some(level)) if v.get("children").is_some() => {
                 Some((rendered, message, level))
@@ -2616,6 +2621,11 @@ impl Run {
                     self.c.out.error(&format!(
                         "{what}\n\nCaused by:\n  process didn't exit successfully: {shown} ({status})"
                     ));
+                }
+                if let Some(target) = &cnt.missing_target {
+                    if !std::mem::replace(&mut self.ui.borrow_mut().said_missing_target, true) {
+                        self.c.out.note(&missing_target_hint(target));
+                    }
                 }
             }
         }
@@ -3156,6 +3166,26 @@ fn tool_hint(package: &str, stderr: &str, stdout: &str) -> Option<String> {
     })
 }
 
+/// The target that a rustc diagnostic says is not installed: rustc's E0463
+/// for `std` or `core` carries the note "the `T` target may not be installed".
+fn missing_target(v: &serde_json::Value) -> Option<String> {
+    if v["code"]["code"].as_str() != Some("E0463") {
+        return None;
+    }
+    v["children"].as_array()?.iter().find_map(|c| {
+        let m = c["message"].as_str()?;
+        let rest = m.strip_prefix("the `")?;
+        let (target, tail) = rest.split_once('`')?;
+        (tail == " target may not be installed").then(|| target.to_string())
+    })
+}
+
+fn missing_target_hint(target: &str) -> String {
+    format!(
+        "the build's toolchain lacks the `{target}` target, and `rustup target add` does not change it: rargo builds with the toolchain of the project's flake.nix, or of its default flake when there is none; add `targets = [\"{target}\"]` to the `[toolchain]` table of `rust-toolchain.toml` (with a `channel`, such as \"stable\"), or, with a flake.nix of your own, add the target to the Rust toolchain in its dev shell (see https://github.com/Clavigers/rargo2#toolchain-and-system-libraries)"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     /// What a test printing `line` shows the user, when the tested package's
@@ -3262,6 +3292,17 @@ mod tests {
         ];
         assert_eq!(dep_manifest_dirs(&units, 4), ["/c/registry/src/i/serde-1.0.0", "/w/deeper", "/w/dep"]);
         assert!(dep_manifest_dirs(&units, 5).is_empty());
+    }
+
+    #[test]
+    fn a_compile_that_failed_for_want_of_its_target_is_told_to_name_it_in_the_toolchain() {
+        let e0463 = r#"{"$message_type":"diagnostic","message":"can't find crate for `std`","code":{"code":"E0463","explanation":null},"level":"error","spans":[],"children":[{"message":"the `wasm32-unknown-unknown` target may not be installed","code":null,"level":"note","spans":[],"children":[],"rendered":null},{"message":"consider downloading the target with `rustup target add wasm32-unknown-unknown`","code":null,"level":"help","spans":[],"children":[],"rendered":null}],"rendered":"error[E0463]: can't find crate for `std`\n"}"#;
+        let v: serde_json::Value = serde_json::from_str(e0463).unwrap();
+        assert_eq!(super::missing_target(&v).as_deref(), Some("wasm32-unknown-unknown"));
+        let hint = super::missing_target_hint("wasm32-unknown-unknown");
+        assert!(hint.contains(r#"targets = ["wasm32-unknown-unknown"]"#) && hint.contains("rust-toolchain.toml") && hint.contains("flake.nix") && hint.contains("rustup target add"), "{hint}");
+        let other_crate = r#"{"message":"can't find crate for `serde`","code":{"code":"E0463"},"level":"error","children":[],"rendered":"x"}"#;
+        assert_eq!(super::missing_target(&serde_json::from_str(other_crate).unwrap()), None);
     }
 
     #[test]

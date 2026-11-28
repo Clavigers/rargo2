@@ -66,6 +66,7 @@ A project without one gets rargo's default flake. It has:
 - the libraries openssl, zlib, sqlite, udev, alsa, wayland, xkbcommon, vulkan-loader, fontconfig, freetype and the X11 libraries.
 
 Remote builds reject `+TOOLCHAIN` and nonempty `RUSTUP_TOOLCHAIN` overrides.
+To build for another target, list it in `rust-toolchain.toml` (`targets = ["wasm32-unknown-unknown"]`, beside a `channel`) or in your flake's toolchain; `rustup target add` does not change the server's toolchain.
 
 If a build script needs another library, add a `flake.nix` that puts it in the shell's `buildInputs`.
 A build script that needs a tool, such as `protoc` (prost-build, tonic-build) or libclang (bindgen), needs it in the shell too: `protobuf`, or `llvmPackages.libclang` with `LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";`, in its `nativeBuildInputs`.
