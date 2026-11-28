@@ -517,6 +517,11 @@ impl Engine {
     }
 
     pub fn obtain(&self, req: Request) -> Result<Outcome> {
+        self.obtain_as(req, true)
+    }
+
+    /// With `forget_failed`, a `no_cache` run that fails removes the traces it bypassed, so a later run cannot replay an older pass.
+    fn obtain_as(&self, req: Request, forget_failed: bool) -> Result<Outcome> {
         let id = self.actions.borrow_mut().begin();
         let _requester = Requester { engine: self, id };
         let mut announced = false;
@@ -582,6 +587,9 @@ impl Engine {
                 if tainted {
                     self.stats.tainted.set(self.stats.tainted.get() + 1);
                 }
+                if forget_failed && req.no_cache && !tainted && !result.success() {
+                    self.traces.forget_holding(&key, &*req.view, &self.content);
+                }
                 let cacheable = !tainted && (req.cacheable)(&result);
                 let ran = self.actions.borrow_mut().ran(id, tainted, cacheable);
                 match ran {
@@ -644,7 +652,7 @@ impl Engine {
         }
         req.no_cache = true;
         req.cacheable = Arc::new(|_| false);
-        let failure = match self.obtain(req) {
+        let failure = match self.obtain_as(req, false) {
             Ok(o) if o.result.success() => return Kept::Holds,
             Ok(o) => match o.result.code() {
                 Some(c) => format!("exit status: {c}"),

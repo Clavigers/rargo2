@@ -539,6 +539,11 @@ impl Fx {
 }
 
 /// The command lines the tests below give `/bin/sh -c`, each doing what a shell would do with it.
+/// What the script `flaky` depends on without the engine seeing it.
+thread_local! {
+    static FLAKY_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn sh(p: &mut Proc, script: &str) -> i32 {
     let echo = |p: &Proc, name: &str, var: &str| {
         let value = p.var(var.as_bytes()).unwrap_or_default();
@@ -566,6 +571,14 @@ fn sh(p: &mut Proc, script: &str) -> i32 {
         }
         "echo value=$FOO" => echo(p, "value", "FOO"),
         "echo other=$BAR" => echo(p, "other", "BAR"),
+        "flaky" => {
+            if FLAKY_FAILS.get() {
+                p.err("flaked\n");
+                1
+            } else {
+                0
+            }
+        }
         "echo oops >&2; exit 3" => {
             p.err("oops\n");
             3
@@ -896,6 +909,36 @@ fn a_request_with_caching_turned_off_runs_and_records_what_it_ran() {
         assert!(kept.cached, "what it ran was recorded");
         assert_eq!(fx.text(&kept.result.stdout), "fine\n");
         assert_eq!(fx.runs(), 2);
+    });
+}
+
+#[test]
+fn a_failed_run_with_caching_turned_off_forgets_the_pass_it_bypassed() {
+    sim::test(|| {
+        let fx = fixture(sh);
+        let fresh = || {
+            let mut r = fx.req("flaky", &[], &[], &[]);
+            r.no_cache = true;
+            r
+        };
+        FLAKY_FAILS.set(false);
+        assert!(fx.engine.obtain(fx.req("flaky", &[], &[], &[])).unwrap().result.success());
+        assert!(fx.engine.obtain(fx.req("flaky", &[], &[], &[])).unwrap().cached, "the pass is recorded");
+
+        FLAKY_FAILS.set(true);
+        let failed = fx.engine.obtain(fresh()).unwrap();
+        assert!(!failed.cached && !failed.result.success());
+        assert_eq!(fx.runs(), 2);
+
+        let next = fx.engine.obtain(fx.req("flaky", &[], &[], &[])).unwrap();
+        assert!(!next.cached, "the newest real run failed, so the older pass is not replayed");
+        assert!(!next.result.success());
+        assert_eq!(fx.runs(), 3);
+
+        FLAKY_FAILS.set(false);
+        assert!(fx.engine.obtain(fx.req("flaky", &[], &[], &[])).unwrap().result.success());
+        assert!(fx.engine.obtain(fx.req("flaky", &[], &[], &[])).unwrap().cached, "a later pass is recorded again");
+        assert_eq!(fx.runs(), 4);
     });
 }
 
