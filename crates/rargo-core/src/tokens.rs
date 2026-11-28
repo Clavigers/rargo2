@@ -618,7 +618,7 @@ impl Command {
                     }
                     bail!("none of your tokens that still work has the id `{id}` (you may revoke only your own)");
                 }
-                let _ = writeln!(out, "revoked {n} token(s); the next command on an open session is refused");
+                let _ = writeln!(out, "revoked {n} token(s); a command they are running ends, saying so, and the next is refused");
             }
             Command::Invite { user, admin, days, uses, token_days } => {
                 let spec = Invitation { user: user.as_deref(), admin: *admin, days: Some(*days), uses: *uses, token_days: *token_days };
@@ -778,7 +778,7 @@ mod tests {
         assert!(e.contains("you may revoke only your own"), "{e}");
         assert!(t.lookup("t-002", at).is_some(), "not someone else's");
         let (n, _) = run(&mut t, "revoke t-001", &ann, at, 0, false).unwrap();
-        assert_eq!(n, "revoked 1 token(s); the next command on an open session is refused\n");
+        assert_eq!(n, "revoked 1 token(s); a command they are running ends, saying so, and the next is refused\n");
         assert!(t.lookup("t-001", at).is_none(), "her own");
         let (n, _) = run(&mut t, "revoke bob", &boss, at, 0, false).unwrap();
         assert!(n.starts_with("revoked 1 token(s)"), "{n}");
