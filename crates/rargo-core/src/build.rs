@@ -1151,8 +1151,7 @@ fn run_request(d: &Arc<Daemon>, c: &Arc<Client>, keep: Option<&RefCell<Option<Bu
             Effect::ShowPlanFailure => {
                 let p = prepared.as_ref().expect("a plan failure follows a prepared worktree");
                 let (stdout, stderr) = plan_failure.take().expect("a plan failed");
-                c.out.raw_out(p.tr.text(&String::from_utf8_lossy(&stdout)).as_bytes());
-                c.out.err_text(&String::from_utf8_lossy(&stderr));
+                show_plan_failure(&c.out, &p.tr, &stdout, &stderr);
                 Vec::new()
             }
             Effect::End(End::Code(code)) => return Ok(Finish::Code(code)),
@@ -1561,6 +1560,12 @@ fn dep_manifest_dirs(units: &[rp::Unit], unit: usize) -> Vec<String> {
     dirs
 }
 
+fn show_plan_failure(out: &Output, tr: &Translator, stdout: &[u8], stderr: &[u8]) {
+    let out = out.derive(out.quiet, out.verbose, tr.clone());
+    out.raw_out(tr.text(&String::from_utf8_lossy(stdout)).as_bytes());
+    out.err_text(&String::from_utf8_lossy(stderr));
+}
+
 fn translated(tr: &Translator, data: &[u8]) -> Vec<u8> {
     match std::str::from_utf8(data) {
         Ok(s) => tr.text(s).into_bytes(),
@@ -1643,9 +1648,14 @@ impl Run {
         }
     }
 
-    fn action_env(&self, cmd: &rp::Cmd) -> BTreeMap<Vec<u8>, Vec<u8>> {
-        let mut env: BTreeMap<Vec<u8>, Vec<u8>> =
-            self.base_env.iter().map(|(k, v)| (bytes(k), bytes(v))).collect();
+    fn action_env(&self, cmd: &rp::Cmd, kind: ActionKind) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        let compile = matches!(kind, ActionKind::Rustc | ActionKind::Rustdoc | ActionKind::BuildScript);
+        let mut env: BTreeMap<Vec<u8>, Vec<u8>> = self
+            .base_env
+            .iter()
+            .filter(|(k, _)| !(compile && compile_env_skips(k)))
+            .map(|(k, v)| (bytes(k), bytes(v)))
+            .collect();
         for (k, v) in &cmd.env {
             match v {
                 Some(v) => {
@@ -1813,7 +1823,7 @@ impl Run {
         let spec = ActionSpec {
             kind,
             argv,
-            env: self.action_env(&cmd),
+            env: self.action_env(&cmd, kind),
             cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
             net: if u.kind == rp::UnitKind::RunScript && self.policy.build_script_network(&u.pkg_name, &u.manifest_path) {
                 NetMode::Host
@@ -2936,7 +2946,7 @@ impl Run {
                     let mut spec = ActionSpec {
                         kind: akind,
                         argv,
-                        env: self.action_env(&cmd),
+                        env: self.action_env(&cmd, akind),
                         cwd: bytes(cmd.cwd.as_deref().unwrap_or(&plan.cwd)),
                         net: if self.policy.test_network(&plan.units[*unit as usize].pkg_name) {
                             NetMode::Host
@@ -3236,6 +3246,23 @@ fn missing_target_hint(target: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn locked_plan_failure_prints_the_clients_lockfile_path() {
+        use rargo_proto::ServerMsg;
+
+        crate::io::sim::test(|| {
+            let (tx, mut rx) = crate::io::unbounded_channel();
+            let out = Output::new(tx, false, false);
+            let tr = Translator::new(vec![("/w".into(), "/home/me/project".into())]);
+            for verb in ["create", "update"] {
+                let diagnostic = format!("error: cannot {verb} the lock file /w/Cargo.lock because --locked was passed\n");
+                super::show_plan_failure(&out, &tr, b"", diagnostic.as_bytes());
+                let ServerMsg::Stderr(err) = rx.recv().unwrap() else { panic!("expected stderr") };
+                assert_eq!(String::from_utf8(err).unwrap(), diagnostic.replace("/w/", "/home/me/project/"));
+            }
+        });
+    }
+
     /// What a test printing `line` shows the user, when the tested package's
     /// manifest is `manifest_path`, the client's worktree `/home/me/project` and
     /// its cargo home `/home/me/.cargo`.
