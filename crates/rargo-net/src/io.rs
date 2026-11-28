@@ -19,7 +19,7 @@ mod task;
 pub use fuse::FuseDrive;
 
 pub use fiber::{drive, loop_running, on_fiber, on_loop_thread};
-pub use fs::{close_fd, fsync_fd, open_at, read_at, read_ready, rename_at, stat_at, try_read, write_at};
+pub use fs::{close_fd, fsync_fd, open_at, read_at, read_into, read_ready, rename_at, stat_at, try_read, write_at};
 pub use process::{output, wait_exit, wait_exited};
 pub use pipe::{pipe, queued, write_now, PipeEnd};
 pub use random::{os_random, seeded_random};

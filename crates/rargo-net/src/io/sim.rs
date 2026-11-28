@@ -839,6 +839,13 @@ impl SimLoop {
                 let buf = data[start..end].to_vec();
                 Event::Read { n: buf.len(), buf }
             }
+            Op::ReadInto { fd, off, mut buf } => {
+                let data = &self.file(fd)?.data;
+                let start = (off as usize).min(data.len());
+                let n = buf.len().min(data.len() - start);
+                buf[..n].copy_from_slice(&data[start..start + n]);
+                Event::Read { n, buf }
+            }
             Op::Write { fd, off, buf } => {
                 let torn = self.torn_write.take();
                 let bytes = &buf[..torn.unwrap_or(buf.len()).min(buf.len())];

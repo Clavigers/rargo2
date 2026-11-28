@@ -287,3 +287,39 @@ fn a_pool_thread_calls_back_into_the_loop_that_gave_it_work_even_while_another_l
         assert_eq!(answer, 42);
     });
 }
+
+#[test]
+fn a_finished_fiber_lends_its_stack_to_the_next_and_only_a_few_are_kept() {
+    drive(1, || {
+        let spares = super::fiber::spare_stacks();
+        spawn(|| ()).join().unwrap();
+        assert_eq!(super::fiber::spare_stacks(), spares + 1, "a finished fiber's stack is kept");
+        let mut deep = spawn(|| {
+            let mut frame = [1u8; 64 << 10];
+            std::hint::black_box(&mut frame);
+            yield_now();
+            frame.iter().map(|&b| u64::from(b)).sum::<u64>()
+        });
+        assert_eq!(super::fiber::spare_stacks(), spares, "the next fiber runs on the kept stack");
+        assert_eq!(deep.join().unwrap(), 64 << 10);
+
+        let many: Vec<_> = (0..100).map(|_| spawn(yield_now)).collect();
+        for mut fiber in many {
+            fiber.join().unwrap();
+        }
+        assert_eq!(super::fiber::spare_stacks(), 64, "no more stacks are kept than the loop is likely to reuse");
+    });
+}
+
+#[test]
+fn a_read_into_a_buffer_fills_its_front_and_hands_back_the_whole_buffer() {
+    drive(1, || {
+        use std::os::fd::AsRawFd;
+        let (read, write) = super::pipe().unwrap();
+        assert_eq!(super::write_at(write.as_raw_fd(), 0, b"hello").unwrap(), 5);
+        let (buf, n) = super::read_into(read.as_raw_fd(), 0, vec![7; 64]).unwrap();
+        assert_eq!((n, buf.len()), (5, 64));
+        assert_eq!(&buf[..5], b"hello");
+        assert!(buf[5..].iter().all(|&b| b == 7), "the bytes past the read are left alone");
+    });
+}

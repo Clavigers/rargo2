@@ -23,6 +23,7 @@ pub enum Op {
     Socket { domain: i32, ty: i32, proto: i32 },
     Shutdown { fd: i32, how: i32 },
     Read { fd: i32, off: u64, len: usize },
+    ReadInto { fd: i32, off: u64, buf: Vec<u8> },
     Write { fd: i32, off: u64, buf: Vec<u8> },
     OpenAt { dir: i32, path: CString, flags: i32, mode: u32 },
     Statx { dir: i32, path: CString, flags: i32 },
@@ -149,6 +150,11 @@ pub(super) fn prepare(token: u64, op: Op, inflight: &mut BTreeMap<u64, Slot>) ->
         }
         Op::Read { fd, off, len } => {
             let mut buf = vec![0u8; len];
+            let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32).offset(off).build().user_data(token);
+            inflight.insert(token, Slot::buf(Kind::Read, buf));
+            entry
+        }
+        Op::ReadInto { fd, off, mut buf } => {
             let entry = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32).offset(off).build().user_data(token);
             inflight.insert(token, Slot::buf(Kind::Read, buf));
             entry

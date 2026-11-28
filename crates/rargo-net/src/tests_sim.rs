@@ -140,6 +140,20 @@ fn files_live_in_memory() {
 }
 
 #[test]
+fn a_simulated_read_into_a_buffer_fills_its_front_and_hands_back_the_whole_buffer() {
+    sim::test(|| {
+        let dir = sim::tempdir();
+        io::file::write(dir.join("f"), b"hello").unwrap();
+        let fd = io::open_at(libc::AT_FDCWD, &dir.join("f"), libc::O_RDONLY, 0).unwrap();
+        let (buf, n) = io::read_into(fd, 1, vec![7; 8]).unwrap();
+        assert_eq!((n, &buf[..]), (4, &b"ello\x07\x07\x07\x07"[..]));
+        let (buf, n) = io::read_into(fd, 9, buf).unwrap();
+        assert_eq!((n, buf.len()), (0, 8), "a read past the end reads nothing");
+        io::close_fd(fd).unwrap();
+    });
+}
+
+#[test]
 fn a_simulated_file_keeps_what_a_content_store_relies_on() {
     sim::test(|| {
         use crate::io::file;
