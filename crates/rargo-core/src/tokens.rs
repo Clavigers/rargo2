@@ -453,6 +453,13 @@ impl Tokens {
         Ok(code)
     }
 
+    fn withdraw_invites(&mut self, at: u64, matches: impl Fn(&Invite) -> bool) -> usize {
+        let before = self.invites.len();
+        self.invites.retain(|invite| !invite.active(at) || !matches(invite));
+        debug_assert!(!self.invites.iter().any(|invite| invite.active(at) && matches(invite)));
+        before - self.invites.len()
+    }
+
     fn invited(&self, code: &str, at: u64) -> Option<&Invite> {
         let h = code_hash(code);
         self.invites.iter().find(|i| i.code == h && i.active(at))
@@ -513,6 +520,7 @@ pub type Said = (String, String);
 pub enum Command {
     List { all: bool, user: String },
     Revoke { id: String, owner: Option<String> },
+    RevokeInvite { id: String },
     Invite { user: Option<String>, admin: bool, days: u32, uses: u32, token_days: Option<u32> },
     Create { user: String, admin: bool, days: Option<u32>, note: String },
     Allow { login: String, admin: bool },
@@ -558,6 +566,7 @@ impl Command {
                 "user `{}` may not administer this server (an administrator's token is made on the server with `rargod token create --admin`, `token invite --admin` or `token allow --admin`)",
                 asker.user
             ),
+            "revoke-invite" => Command::RevokeInvite { id: first()? },
             "invite" => Command::Invite { user, admin, days: days.unwrap_or(7), uses, token_days },
             "create" => Command::Create { user: user.context("--user NAME is required")?, admin, days, note: asker.from.into() },
             "allow" => Command::Allow { login: first()?, admin },
@@ -600,11 +609,12 @@ impl Command {
                         for i in open {
                             let _ = writeln!(
                                 out,
-                                "  for {}{}: {} use(s) left, expires {}",
+                                "  for {}{}: {} use(s) left, expires {} (ID {})",
                                 i.user.as_deref().unwrap_or("anyone"),
                                 if i.admin { " (administrator)" } else { "" },
                                 i.uses_left,
-                                when(i.expires, at)
+                                when(i.expires, at),
+                                i.code
                             );
                         }
                     }
@@ -612,13 +622,29 @@ impl Command {
             }
             Command::Revoke { id, owner } => {
                 let n = tokens.revoke(id, owner.as_deref());
-                if n == 0 {
+                let withdrawn = if owner.is_none() {
+                    tokens.withdraw_invites(at, |invite| invite.user.as_deref() == Some(id.as_str()))
+                } else {
+                    0
+                };
+                if n == 0 && withdrawn == 0 {
                     if owner.is_none() {
-                        bail!("no token that still works has the id or user `{id}`");
+                        bail!("no token or active invitation matches `{id}`");
                     }
                     bail!("none of your tokens that still work has the id `{id}` (you may revoke only your own)");
                 }
-                let _ = writeln!(out, "revoked {n} token(s); a command they are running ends, saying so, and the next is refused");
+                if n > 0 {
+                    let _ = writeln!(out, "revoked {n} token(s); a command they are running ends, saying so, and the next is refused");
+                }
+                if withdrawn > 0 {
+                    let _ = writeln!(out, "withdrew {withdrawn} invitation(s)");
+                }
+            }
+            Command::RevokeInvite { id } => {
+                if tokens.withdraw_invites(at, |invite| invite.code == *id) == 0 {
+                    bail!("no active invitation has the ID `{id}`");
+                }
+                let _ = writeln!(out, "withdrew 1 invitation");
             }
             Command::Invite { user, admin, days, uses, token_days } => {
                 let spec = Invitation { user: user.as_deref(), admin: *admin, days: Some(*days), uses: *uses, token_days: *token_days };
@@ -722,6 +748,40 @@ mod tests {
     }
 
     #[test]
+    fn administrators_can_withdraw_named_and_unnamed_invitations() {
+        let mut tokens = Tokens::default();
+        let admin = Asker { user: "root", admin: true, from: "test" };
+        let eve = Asker { user: "eve", admin: false, from: "test" };
+        let at = 100;
+        run(&mut tokens, "create --user eve", &admin, at, 1, false).unwrap();
+        let (named, _) = run(&mut tokens, "invite --user eve --uses 2", &admin, at, 2, false).unwrap();
+        let (unnamed, _) = run(&mut tokens, "invite", &admin, at, 3, false).unwrap();
+        let (invite_only, _) = run(&mut tokens, "invite --user tmp", &admin, at, 4, false).unwrap();
+        let id = code_hash(unnamed.trim());
+
+        let (listed, _) = run(&mut tokens, "list", &admin, at, 0, false).unwrap();
+        assert!(listed.contains(&format!("(ID {id})")));
+        assert!(!listed.contains(unnamed.trim()));
+        assert!(run(&mut tokens, &format!("revoke-invite {id}"), &eve, at, 0, false).is_err());
+        assert!(run(&mut tokens, "revoke t-001", &eve, at, 0, false).is_ok());
+        assert!(tokens.invited(named.trim(), at).is_some());
+        run(&mut tokens, "create --user eve", &admin, at, 5, false).unwrap();
+
+        let (out, _) = run(&mut tokens, "revoke eve", &admin, at, 0, false).unwrap();
+        assert!(out.contains("revoked 1 token(s)") && out.contains("withdrew 1 invitation(s)"));
+        assert!(tokens.lookup("t-005", at).is_none());
+        assert!(tokens.redeem(named.trim(), None, at, ("t-test", "secret")).is_err());
+        let (out, _) = run(&mut tokens, "revoke tmp", &admin, at, 0, false).unwrap();
+        assert_eq!(out, "withdrew 1 invitation(s)\n");
+        assert!(tokens.invited(invite_only.trim(), at).is_none());
+
+        assert!(tokens.invited(unnamed.trim(), at).is_some());
+        run(&mut tokens, &format!("revoke-invite {id}"), &admin, at, 0, false).unwrap();
+        assert!(tokens.redeem(unnamed.trim(), Some("eve"), at, ("t-test", "secret")).is_err());
+        assert!(run(&mut tokens, &format!("revoke-invite {id}"), &admin, at, 0, false).is_err());
+    }
+
+    #[test]
     fn token_commands_do_everything_for_an_administrator_and_a_users_own_tokens_for_anyone() {
         let mut t = Tokens::default();
         let boss = Asker { user: "boss", admin: true, from: "test" };
@@ -757,13 +817,13 @@ mod tests {
         let (all, _) = run(&mut t, "list", &boss, at + 86400, 0, false).unwrap();
         assert_eq!(
             all,
-            "ID               USER                 ADMIN  EXPIRES      FROM\n\
+            format!("ID               USER                 ADMIN  EXPIRES      FROM\n\
              t-001            ann                         in 2 days    test\n\
              t-002            bob                  yes    never        test\n\
              \nGitHub accounts that may sign in: some-login, Lead (administrator)\n\
              \ninvitations not used up: 2\n\
-             \x20 for cat (administrator): 2 use(s) left, expires in 1 days\n\
-             \x20 for anyone: 1 use(s) left, expires in 6 days\n"
+             \x20 for cat (administrator): 2 use(s) left, expires in 1 days (ID {})\n\
+             \x20 for anyone: 1 use(s) left, expires in 6 days (ID {})\n", code_hash(code.trim()), code_hash("ABCD-QQQ5-EFGH-QQQ5"))
         );
         let (later, _) = run(&mut t, "list", &boss, at + 3 * 86400, 0, false).unwrap();
         assert!(later.contains("ann                         expired") && later.contains("invitations not used up: 1"), "{later}");
@@ -783,7 +843,7 @@ mod tests {
         let (n, _) = run(&mut t, "revoke bob", &boss, at, 0, false).unwrap();
         assert!(n.starts_with("revoked 1 token(s)"), "{n}");
         let e = run(&mut t, "revoke bob", &boss, at, 0, false).unwrap_err().to_string();
-        assert_eq!(e, "no token that still works has the id or user `bob`");
+        assert_eq!(e, "no token or active invitation matches `bob`");
         let (revoked, _) = run(&mut t, "list", &boss, at, 0, false).unwrap();
         assert!(revoked.contains("bob                  yes    revoked"), "{revoked}");
 

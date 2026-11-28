@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 pub const ROUTED: &[&str] =
     &["build", "b", "check", "c", "clippy", "test", "t", "run", "r", "doc", "d", "bench", "rustc", "rustdoc", "nextest"];
 
-pub const TOKEN_COMMANDS: &[&str] = &["invite", "create", "tokens", "revoke", "allow", "disallow"];
+pub const TOKEN_COMMANDS: &[&str] = &["invite", "create", "tokens", "revoke", "revoke-invite", "allow", "disallow"];
 
 pub const AUTH_HELP: &str = "rargo auth [HOST]            get this machine a token for your server (or HOST), confirmed in a browser\n\
      rargo auth --token T [HOST]  store a token an administrator made (rargod token create)\n\
@@ -18,7 +18,8 @@ pub const AUTH_HELP: &str = "rargo auth [HOST]            get this machine a tok
      rargo auth invite [--user NAME] [--admin] [--days N] [--uses N] [--token-days N]\n\
      rargo auth create --user NAME [--admin] [--days N]\n\
      rargo auth tokens\n\
-     rargo auth revoke ID-OR-USER\n\
+     rargo auth revoke ID-OR-USER (administrators also withdraw invitations for USER)\n\
+     rargo auth revoke-invite INVITATION-ID (ID from the token list)\n\
      rargo auth allow GITHUB-LOGIN [--admin]\n\
      rargo auth disallow GITHUB-LOGIN";
 
@@ -762,6 +763,7 @@ mod tests {
             (None, vec!["auth", "a", "b"], fake(&[]), fail("unexpected `b` (see `rargo auth --help`)")),
             (None, vec!["auth", "tokens"], fake(&[]), remote(&["__token", "list"], &[], "admin")),
             (None, vec!["auth", "revoke", "bob"], fake(&[]), remote(&["__token", "revoke", "bob"], &[], "admin")),
+            (None, vec!["auth", "revoke-invite", "abc"], fake(&[]), remote(&["__token", "revoke-invite", "abc"], &[], "admin")),
             (None, vec!["auth", "invite", "--admin"], fake(&[]), remote(&["__token", "invite", "--admin"], &[], "admin")),
             (None, vec!["--rargo-status"], fake(&[]), remote(&["__status"], &[], "admin")),
             (None, vec!["--rargo-settle", "x"], fake(&[]), remote(&["__settle"], &[], "admin")),
