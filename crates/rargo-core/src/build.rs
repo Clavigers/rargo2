@@ -520,7 +520,13 @@ fn prepare(d: &Arc<Daemon>, c: &Arc<Client>, snapshot: Arc<Snapshot>) -> Result<
     let (dd, snap, uid, gid, files) = (d.clone(), snapshot.clone(), c.uid, c.gid, policy.flake.files.clone());
     let shell = if subcommand_pos(&c.args).is_some_and(|i| c.args[i] == "install") { "install" } else { "default" };
     let flake = crate::flake::resolve_shell(&dd, &snap, &dir, &files, (uid, gid), shell, &|| say(c, Wait::Toolchain))
-        .context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")?;
+        .map_err(|error| {
+            if error.is::<crate::flake::ToolchainChannelError>() {
+                error
+            } else {
+                error.context("evaluating the build flake (name extra inputs under metadata.rargo.flake.files in Cargo.toml)")
+            }
+        })?;
     let mut links = Vec::new();
     for (at, tool) in [("/bin/sh", "sh"), ("/usr/bin/env", "env")] {
         if let Some(target) = flake.which(tool).or_else(|| if tool == "sh" { flake.which("bash") } else { None }) {
