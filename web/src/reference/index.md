@@ -139,8 +139,20 @@ library's source, GCC for C and C++, binutils, Make, CMake, pkg-config,
 Perl, Python 3 and Git, and the libraries OpenSSL, zlib, SQLite, udev,
 ALSA, Wayland, xkbcommon, the Vulkan loader, fontconfig, FreeType and
 the X11 libraries. The project's `rust-toolchain.toml` or
-`rust-toolchain` selects Rust. The sandbox exposes the selected closure and keeps
-the server's system libraries outside the build. The server needs Nix with flakes.
+`rust-toolchain` selects Rust. If neither file is present, the default shell
+uses the nightly Rust version pinned by the rargo release. The sandbox exposes
+the selected closure and keeps the server's system libraries outside the build.
+The server needs Nix with flakes.
+
+To use stable Rust in the default shell, create `rust-toolchain.toml` in
+your Cargo workspace with these contents:
+
+<figure class="example">
+```toml
+[toolchain]
+channel = "stable"
+```
+</figure>
 
 From your Cargo workspace, download the shell for the release you use
 and inspect its files. Here `version` is the version published at
