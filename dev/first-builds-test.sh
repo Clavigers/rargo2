@@ -40,6 +40,10 @@ cleanup() {
         wait "$app_stop" "$!" || true
     fi
     stop_server
+    # A wedged server can be killed before it unmounts its sandbox.
+    if mountpoint -q "$tmp/state/mnt"; then
+        umount -l "$tmp/state/mnt"
+    fi
     if (( status != 0 )); then
         for log in "$tmp"/*.log; do
             if [[ -f "$log" ]]; then
