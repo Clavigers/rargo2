@@ -158,6 +158,10 @@ fn ring_refused_text(why: &str) -> String {
     format!("error: rargo cannot run on this machine: {why}\n       RARGO_FALLBACK=cargo builds with plain cargo meanwhile\n")
 }
 
+fn unreachable_reason(server: &str, why: &str) -> String {
+    format!("cannot reach the rargo server at {server} ({})", plain_cause(why))
+}
+
 fn unreachable_text(server: &str, why: &str) -> String {
     format!(
         "error: cannot reach the rargo server at {server}: {}\n       \
@@ -433,14 +437,25 @@ fn relay(reply: LocalReply, cfg: &Config, raw: &[OsString]) {
         }
         LocalReply::Exit(code) => io::process::exit(code),
         LocalReply::Exec(e) => exec(e),
-        LocalReply::Unreachable(why) => fall_back_or_end(&unreachable_text(&cfg.server, &why), raw),
-        LocalReply::Refused(text) => fall_back_or_end(&text, raw),
+        LocalReply::Unreachable(why) => fall_back_or_end(&unreachable_reason(&cfg.server, &why), &unreachable_text(&cfg.server, &why), raw),
+        LocalReply::Refused(text) => fall_back_or_end(&refused_reason(&cfg.server, cfg.secret.is_some()), &text, raw),
     }
 }
 
-/// When rargo cannot build here, plain cargo builds instead under RARGO_FALLBACK=cargo; otherwise the command ends with `text`.
-fn fall_back_or_end(text: &str, raw: &[OsString]) -> ! {
+/// Why a build falls back when the server refused this machine, in a few words.
+fn refused_reason(server: &str, had_token: bool) -> String {
+    if had_token {
+        format!("the rargo server at {server} does not accept this machine's token")
+    } else {
+        format!("this machine is not authenticated to the rargo server at {server}")
+    }
+}
+
+/// When rargo cannot build here, plain cargo builds instead under RARGO_FALLBACK=cargo, saying so and
+/// `reason` first; otherwise the command ends with `text`.
+fn fall_back_or_end(reason: &str, text: &str, raw: &[OsString]) -> ! {
     if io::env::var_os("RARGO_FALLBACK").is_some_and(|v| v == "cargo") {
+        eprintln!("{}", cli::fallback_note(reason));
         passthrough(raw);
     }
     eprint!("{text}");
@@ -510,6 +525,10 @@ fn main() {
             }
             passthrough(&raw)
         }
+        cli::Plan::Fallback(reason) => {
+            eprintln!("{}", cli::fallback_note(&reason));
+            passthrough(&raw)
+        }
         cli::Plan::CargoDelegated => {
             eprintln!("rargo: passing this command to local Cargo");
             passthrough(&raw)
@@ -546,6 +565,7 @@ fn main() {
             && let Some((name, path, source)) = outside_config_dependency(root, &configs)
         {
             fall_back_or_end(
+                &format!("path dependency `{name}` in {source} is outside the synced worktree"),
                 &format!(
                     "error: path dependency `{name}` in {source} points to `{}`, outside the synced worktree `{}`\n         move the dependency inside the worktree and update its path, or run with RARGO_FALLBACK=cargo to build locally\n",
                     path.display(),
@@ -558,6 +578,7 @@ fn main() {
             && let Some((name, path)) = outside_path_dependency(&root, &manifest)
         {
             fall_back_or_end(
+                &format!("path dependency `{name}` is outside the synced worktree"),
                 &format!(
                     "error: path dependency `{name}` points to `{path}`, outside the synced worktree `{}`\n         move the dependency inside the worktree and update its path, or run with RARGO_FALLBACK=cargo to build locally\n",
                     root.display(),
@@ -580,7 +601,7 @@ fn main() {
     };
     let cache = cache_dir();
     if let Some(why) = io::unavailable() {
-        fall_back_or_end(&ring_refused_text(&why), &raw);
+        fall_back_or_end(&format!("rargo cannot run on this machine: {why}"), &ring_refused_text(&why), &raw);
     }
     through_daemon(cfg, cache, req, &raw)
 }
@@ -1022,6 +1043,22 @@ mod tests {
         let text = super::unreachable_text("build.example:7459", "Connection refused (os error 111)");
         assert!(text.starts_with("error: cannot reach the rargo server at build.example:7459: connection refused\n"), "{text}");
         assert!(text.contains("`rargo @HOST`") && text.contains("RARGO_FALLBACK=cargo") && !text.contains("os error"), "{text}");
+    }
+
+    #[test]
+    fn a_fallback_build_says_on_one_line_why_it_builds_locally() {
+        assert_eq!(
+            cli::fallback_note(&super::unreachable_reason("127.0.0.1:1", "Connection refused (os error 111)")),
+            "rargo: cannot reach the rargo server at 127.0.0.1:1 (connection refused); building locally (RARGO_FALLBACK=cargo)"
+        );
+        assert_eq!(
+            cli::fallback_note(&super::refused_reason("127.0.0.1:24317", false)),
+            "rargo: this machine is not authenticated to the rargo server at 127.0.0.1:24317; building locally (RARGO_FALLBACK=cargo)"
+        );
+        assert_eq!(
+            super::refused_reason("b.example:7459", true),
+            "the rargo server at b.example:7459 does not accept this machine's token"
+        );
     }
 
     #[test]
